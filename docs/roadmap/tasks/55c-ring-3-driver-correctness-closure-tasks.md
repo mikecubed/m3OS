@@ -59,6 +59,19 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - The R2 `BarCoverage` invariant helper lives **once** in `kernel-core::iommu`. VT-d and AMD-Vi backends both call it; no backend redefines BAR-coverage semantics.
 - The R1 errno translation (`net_error_to_neg_errno`) already exists — Phase 55c does not duplicate it. `sys_net_send` and any `sys_sendto` extension both route through the same function.
 
+### YAGNI
+
+- No syscall, struct field, or capability bit is added speculatively. `sys_notif_bind` carries exactly the two caps it needs; it does not pre-reserve space for future bind flags.
+- The `BOUND_TCB` array is sized at `MAX_NOTIFS`. If the bound-slot count needs to grow, extend `MAX_NOTIFS` with a tracked rationale — do not pre-allocate.
+- `RecvResult` has exactly two variants. A third variant (e.g., `TimerFired`) is deferred until a driver actually needs it.
+- G.1's design memo picks one send-path shape and does not implement both.
+
+### Boy Scout Rule
+
+- Leave every file you touch cleaner than you found it: fix a stale comment, remove a dead import, or clarify an opaque variable name. Keep changes scoped to the task at hand; do not open unrelated refactors.
+- When a task reveals a lint suppression (`#[allow(...)]`) with no documented justification, either add a justification comment or remove it.
+- Dead test stubs that are no longer accurate must be updated or removed before the task is marked complete — do not leave misleading `#[ignore]` annotations without a comment naming the exact blocker.
+
 ### Error discipline
 
 - Non-test code contains no `.unwrap()`, `.expect()`, `panic!()`, `todo!()`, or `unreachable!()` outside documented fail-fast sites. Every such site carries an inline comment naming the reason.
@@ -525,6 +538,20 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - [ ] Both Phase 56 docs name `RecvResult` + `IrqNotification::bind_to_endpoint` as the required pattern for display-driver and input-driver event loops.
 - [ ] The Phase 56 tasks touching a driver loop list "consumes Phase 55c bound notifications" as a precondition.
 
+### J.5 — Phase 55c learning doc
+
+**File:** `docs/roadmap/55c-ring-3-driver-correctness-closure-learning.md` (new)
+**Symbol:** N/A
+**Why it matters:** Every completed phase requires a learning doc. Phase 56 authors and future contributors need a structured explanation of the three primitives Phase 55c added. Without it the roadmap has a gap at the exact point where Phase 56's driver loop design decisions depend on understanding what Phase 55c established.
+
+**Acceptance:**
+- [ ] Doc follows the aligned-learning-doc template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
+- [ ] **What This Doc Covers** lists exactly: (1) bound notifications and the seL4 wake-model composition pattern (R3); (2) IOMMU domain MMIO identity mapping for claimed devices (R2); (3) driver-restart error propagation through the kernel's `RemoteNic` facade to userspace `EAGAIN` (R1).
+- [ ] **Key Files** table names at minimum: `kernel-core/src/ipc/bound_notif.rs`, `kernel/src/ipc/notification.rs`, `kernel/src/ipc/endpoint.rs`, `kernel-core/src/iommu/bar_coverage.rs`, `kernel/src/net/remote.rs`, `userspace/lib/driver_runtime/src/ipc/mod.rs`, `userspace/drivers/e1000/src/io.rs`.
+- [ ] **How This Phase Differs From Later Work** notes that Phase 56 consumes `RecvResult` and `IrqNotification::bind_to_endpoint` — those primitives are taught in this doc, not in Phase 56's doc.
+- [ ] Doc added to `docs/roadmap/README.md` alongside the design doc and task doc links for Phase 55c.
+- [ ] `docs/roadmap/55c-ring-3-driver-correctness-closure.md` **Companion Task List** section updated to include a link to this learning doc.
+
 ### J.4 — Version bump to `v0.55.3`
 
 **Files:**
@@ -576,7 +603,10 @@ If `sys_net_send` (or the `sys_sendto` extension) breaks existing net paths:
 
 ## Documentation Notes
 
-- The design doc names seL4 bound notifications as the reference for R3. Keep the comparison table in `docs/roadmap/55c-ring-3-driver-correctness-closure.md` ("How Real OS Implementations Differ") in sync with any future pivot.
-- Every task File / Symbol entry points at the exact code location. If a file is renamed or split during implementation, update this doc before closing the task.
+- **Learning doc is mandatory.** J.5 must be complete before the phase is marked Complete. The aligned-learning-doc template from `docs/appendix/doc-templates.md` is the required shape — do not merge the phase-complete commit (J.4) without the learning doc in tree.
+- **What changed vs Phase 55b.** Phase 55b shipped the ring-3 driver host but left three correctness gaps. Phase 55c closes all three. The learning doc and post-mortem (J.2) are the canonical record of what was wrong, why it was not caught earlier, and what Phase 55c fixed.
+- **Prefer exact files over directories.** Every task's **File** / **Files** entry names a concrete path, not a directory. If a file is renamed or split during implementation, update this doc before closing the task.
+- **Prefer exact symbols over generic descriptions.** Every task's **Symbol** entry names the specific function, type, or constant — not the module or crate. Generic descriptions like "net module" are not acceptable.
+- The design doc names seL4 bound notifications as the reference for R3. Keep the comparison table in `docs/roadmap/55c-ring-3-driver-correctness-closure.md` ("How Real OS Implementations Differ") in sync with any future pivot away from the seL4 model.
 - The Phase 56 precondition entries in J.3 must be reviewed during Phase 56 kickoff; if 55c slips, 56's planning baseline slips with it.
-- The 55b residuals strike-through in J.1 is load-bearing documentation: subsequent readers should see "closed in 55c" rather than a stale open item.
+- The 55b residuals strike-through in J.1 is load-bearing documentation: subsequent readers should see "closed in 55c" rather than a stale open item. Do not close J.1 with a vague edit — the pointer must name the exact Track letters (G/H for R1, C/D for R2, A–F for R3).
