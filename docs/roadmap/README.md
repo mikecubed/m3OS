@@ -166,8 +166,9 @@ flowchart TD
     P54a --> P55["Phase 55<br/>Hardware Substrate"]
     P55 --> P55a["Phase 55a<br/>IOMMU Substrate"]
     P55a --> P55b["Phase 55b<br/>Ring-3 Driver Host"]
+    P55b --> P55c["Phase 55c<br/>Ring-3 Driver Correctness Closure"]
     P47 --> P56["Phase 56<br/>Display and Input Architecture"]
-    P55b --> P56
+    P55c --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
     P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
     P55b --> P58
@@ -286,13 +287,14 @@ flowchart TD
 | 54 | Deep Serverization | Move meaningful storage/VFS and UDP policy slices into supervised ring-3 services with explicit degraded-mode fallbacks | Complete | `phase-54` | [Phase 54](./54-deep-serverization.md) | [Tasks](./tasks/54-deep-serverization-tasks.md) |
 | 54a | Post-Serverization Kernel Hygiene | Close the CLOEXEC/NONBLOCK plumbing gap and relocate arch-syscall cleanup wrappers into their owning subsystems | Planned | `phase-54a` | [Phase 54a](./54a-post-serverization-kernel-hygiene.md) | [Tasks](./tasks/54a-post-serverization-kernel-hygiene-tasks.md) |
 
-### Hardware, Local-System, and Release Phases (55 and 55a complete, 55b+ planned)
+### Hardware, Local-System, and Release Phases (55, 55a, 55b complete; 55c+ planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
 | 55 | Hardware Substrate | A narrow, real-hardware support story: PCIe MCFG + MSI/MSI-X, reusable hardware-access layer, NVMe storage, Intel 82540EM e1000 networking | Complete | `phase-55` | [Phase 55](./55-hardware-substrate.md) | [Tasks](./tasks/55-hardware-substrate-tasks.md) |
 | 55a | IOMMU Substrate | ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, closes the Phase 55 IOMMU caveat | Complete | `phase-55a` | [Phase 55a](./55a-iommu-substrate.md) | [Tasks](./tasks/55a-iommu-substrate-tasks.md) |
 | 55b | Ring-3 Driver Host | Capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers, completes the Phase 55 ring-3 extraction deferral | Complete | `phase-55b` | [Phase 55b](./55b-ring-3-driver-host.md) | [Tasks](./tasks/55b-ring-3-driver-host-tasks.md) |
+| 55c | Ring-3 Driver Correctness Closure | Bound-notification event multiplexing (closes SSH-over-e1000 deadlock), IOMMU BAR identity coverage (closes `--iommu` device-smoke timeouts), userspace `EAGAIN` visibility during driver restart — closes the three correctness residuals Phase 55b left behind | Planned | `phase-55c` | [Phase 55c](./55c-ring-3-driver-correctness-closure.md) | [Tasks](./tasks/55c-ring-3-driver-correctness-closure-tasks.md) |
 | 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Planned | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | [Tasks](./tasks/56-display-and-input-architecture-tasks.md) |
 | 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Planned | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | Deferred until implementation planning |
 | 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |
@@ -400,7 +402,8 @@ gantt
     Hardware Substrate      :done, p55, after p54a, 1
     IOMMU Substrate         :p55a, after p55, 1
     Ring-3 Driver Host      :p55b, after p55a, 1
-    Display and Input       :p56, after p55b, 1
+    Ring-3 Driver Correctness :p55c, after p55b, 1
+    Display and Input       :p56, after p55c, 1
     Audio and Local Session :p57, after p56, 1
     Release 1.0 Gate        :p58, after p57, 1
 
