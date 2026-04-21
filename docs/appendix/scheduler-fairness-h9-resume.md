@@ -1,4 +1,4 @@
-# Scheduler-Fairness Investigation — Resume Prompt (post-early-wedge root-cause pivot)
+# Scheduler-Fairness Investigation — Resume Prompt (early-wedge fix landed)
 
 Handoff prompt for resuming the SSH wedge investigation in a fresh
 Claude Code session. Copy the code block below into a new session on
@@ -8,12 +8,35 @@ this repo.
 Continue the SSH wedge investigation on branch
 feat/phase-55b-ring-3-driver-host. Read docs/appendix/scheduler-fairness-regression.md
 first — it contains the full multi-session experiment log, the H1–H9
-hypothesis history, seven H9 follow-ups, the early-wedge pivot, and
-(most recently) the corrected early-wedge root-cause analysis backed
-by QEMU pcap evidence.
+hypothesis history, seven H9 follow-ups, the early-wedge pivot, the
+corrected early-wedge root-cause analysis backed by QEMU pcap
+evidence, and (most recently) the SCHEDULER.lock IRQ-safety fix that
+deterministically closes the early-wedge.
 
-Short version of where I left off (commits already pushed):
+Short version of where the investigation stands:
 
+- Early-wedge (the dominant ~60 % failure mode): **FIXED.** Root cause
+  was SCHEDULER.lock being acquired with interrupts on, letting
+  virtio-net / virtio-blk ISRs re-enter wake_task on the same CPU
+  while a task-context holder spun on the lock. Fix converts
+  `SCHEDULER: Mutex<Scheduler>` to `SCHEDULER: IrqSafeMutex<Scheduler>`
+  in kernel/src/task/scheduler.rs, wraps enqueue_to_core's run_queue
+  acquisition in `without_interrupts`, and folds wake_task's
+  redundant second SCHEDULER.lock (and PROCESS_TABLE.lock via
+  task_log_label) into the single first critical section. 15-run
+  validation: 15/15 clean-auth-rejected (100 %) vs 30-40 % pre-fix
+  baseline — no heavy-logging mitigation needed. See §"Early-wedge:
+  SCHEDULER.lock IRQ-safety fix (2026-04-21 closeout)" in
+  scheduler-fairness-regression.md.
+- Late-wedge (~8 % pre-fix, 0/15 in the validation sample): open but
+  possibly subsumed. May have been a tail mis-classification of the
+  early-wedge. Needs a larger sample (50-100 runs) to confirm
+  whether it is real or noise below the validation threshold.
+
+Commits already pushed on this branch (most recent first):
+
+- <new> fix(sched): make SCHEDULER.lock IRQ-safe to close early-wedge
+  (the fix itself, with validation numbers)
 - fc67213 fix(virtio-net): gate ISR_STATUS read on legacy INTx
 - a58d841 feat(sched): add block_current_unless_woken_until primitive
 - 4823ec1 docs(appendix): record H9 follow-up #7 + early-wedge pivot
@@ -24,8 +47,11 @@ Short version of where I left off (commits already pushed):
 - 41bb341 fix(vfs_server): gate per-request log to slow-only
 - de6f0d3 fix(net/tcp): release TCP_CONNS before sending outbound segments
 
-Real fixes already in place — DO NOT REVERT:
+Real fixes in place — DO NOT REVERT:
 
+- **SCHEDULER.lock IRQ-safety** in kernel/src/task/scheduler.rs
+  (`IrqSafeMutex<Scheduler>` + `enqueue_to_core` without_interrupts +
+  wake_task single-lock path). This is the early-wedge fix.
 - H8 fix in kernel/src/arch/x86_64/syscall/mod.rs::sys_poll. Restructured
   the positive-timeout loop to register waiters once on entry, reset the
   per-iteration `woken` flag, and deregister exactly once on exit.
@@ -36,14 +62,10 @@ Real fixes already in place — DO NOT REVERT:
 - vfs_server slow-only request log (security-floor regression fix).
 - Passive ARP learning in kernel/src/net/dispatch.rs (RFC-compliant).
 - RFC-793 duplicate-SYN retransmit arm in kernel/src/net/tcp.rs.
-- MSI-X ISR_STATUS read gated on USING_LEGACY_INTX (removes a
-  transitional-virtio quirk where reading ISR_STATUS in MSI-X mode
-  can suppress the next MSI-X edge).
+- MSI-X ISR_STATUS read gated on USING_LEGACY_INTX.
 - block_current_unless_woken_until scheduler primitive
-  (kernel/src/task/{mod,scheduler}.rs). Fast-path gated by
-  ACTIVE_WAKE_DEADLINES counter so unused-case cost is zero. Kept
-  for future consumers; net_task uses indefinite block because the
-  200-ms defensive poll measurably hurt clean rate.
+  (kernel/src/task/{mod,scheduler}.rs). Unused after the IrqSafeMutex
+  fix but kept for future consumers.
 
 Active branch-local instrumentation (keep, don't remove):
 
@@ -55,144 +77,78 @@ Active branch-local instrumentation (keep, don't remove):
   [h9-ww] step traces.
 
 ===========================================================================
-IMPORTANT — the "it's a QEMU issue" conclusion was WRONG.
+Reproduction harness
 ===========================================================================
 
-An earlier doc iteration claimed the net_wakes=1 early-wedge was caused
-by QEMU SLIRP dropping ACKs. A QEMU `filter-dump,netdev=net0` pcap
-taken during a wedge PROVED otherwise:
+  /tmp/h9_run_once.sh <run-id>
+      → Single-shot boot + ssh attempt. Produces
+        /tmp/h9run<id>.{log,ssh,summary}.
+  /tmp/h9_batch.sh <count> <prefix>
+      → Run /tmp/h9_run_once.sh count times with RUN_ID=<prefix><i>.
+        Tallies class= counts at the end.
 
-- Client sends SYN — reaches the guest NIC.
-- Guest sends SYN-ACK — visible on the wire.
-- Client sends ACK — reaches the guest NIC.
-- Client sends 43-byte SSH banner — reaches the guest NIC.
-- Client retransmits the banner 4 times over ~20 s — all reach the NIC.
-
-Every packet arrives. The three-way handshake completes from the wire's
-perspective. QEMU is NOT the problem.
-
-===========================================================================
-
-Real mechanism — SCHEDULER.lock contention in wake_task:
-
-With serial-log tracing added through the tcp-wake path
-(net::wake_sockets_for_tcp_slot → wake_socket → WaitQueue::wake_all →
-scheduler::wake_task), every wedge reliably lands on:
-
-    [tcp-wake] call#1 sockets_matched=1 waiters=1 ...
-    [tcp-wake] call#1 wake_socket h=0 begin
-    [wq] wake_all: lock attempt
-    [wq] wake_all: lock acquired, len=1
-    [wq] wake_all: lock released, waking 1
-    [wq] wake_all: waking task id=N      <-- sshd parent task
-    <silence>
-
-net_task (on core 2) calls wake_task(sshd_parent) from inside the
-tcp-wake path. The call hangs on the first SCHEDULER.lock() acquisition
-inside wake_task. Something else is holding SCHEDULER.lock and never
-releasing.
-
-Separately, `[sched] stale-ready` warnings fire with 650-940 ms of
-staleness on core 0 in these wedges, confirming core 0 is stuck too.
-
-Heavy-logging interference fingerprint: adding per-step log::info!
-calls to wake_task, wake_all, the dispatch loop pre-pick_next path,
-and the virtio-net ISR raises the ssh clean rate from ~30 % to ~80 %
-(10-run sample h9run177–h9run186: 8 clean / 2 early-wedge). Reverting
-the extra logs returns the clean rate to ~30 %. That log-sensitivity
-is the classic fingerprint of a tight lock-contention race, NOT a
-deterministic deadlock. The heavy-logging mitigation is NOT a
-real fix — it's a data point about the race.
-
-Reproduce:
-
-  cargo xtask run > run.log 2>&1 &
-  # wait for "sshd: listening on port 22" in run.log
-  timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o BatchMode=yes -o ConnectTimeout=20 -p 2222 user@127.0.0.1 'exit'
-
-The diagnostic harness /tmp/h9_run_once.sh is reusable — numbered run
-IDs, per-run .log/.ssh/.summary files. Clean rate is ~30-40 % baseline,
-~80 % with heavy logs.
-
-Outcomes:
-- ssh exit=255 + "Permission denied" = clean (auth rejected, no wedge).
-- ssh exit=255 + "Connection timed out during banner exchange" = early-wedge.
-- ssh exit=124 + "Permanently added" = late-wedge (rare, ~8 %).
-
-Early-wedge sub-variants (from net_wakes column in scheduler log):
-- net_wakes=0: SYN never arrives (different bug, likely QEMU-user-mode
-  hostfwd race at first-packet; separate from SCHEDULER.lock contention).
-- net_wakes=1: SYN arrives, SYN-ACK sent, tcp-wake#1 fires, wake_task
-  hangs. This is the SCHEDULER.lock contention case. Dominates.
-
-===========================================================================
-
-Late-wedge (~8 %) is still open — still dominated by early-wedge, so
-less urgent. H9 follow-up #7 instrumentation ([h9-iox] / [h9-fo] /
-[h9-ww]) is live in userspace/sshd/src/session.rs. 12-run sample
-(h9run45–56) caught 0 late-wedges — probably observer effect from
-~12-20 extra write() syscalls per io_task iteration.
-
-When a late-wedge IS captured, the three sub-hypotheses to read out
-of the fingerprint (from follow-up #6's final mechanism statement):
-
-  (a) iter parks and never wakes. Last line is
-      `iter=K step=wait_begin` + `[h9-ww] ... register`, then silence
-      (no `ready reg=1`, no `wait_done`). → investigate runner.wake()
-      in sunset-local/src/runner.rs and the reactor POLLIN wake
-      delivery in async-rt.
-  (b) iter suspends inside flush. Last line is `[h9-fo] write_begin
-      chunk=N` with no matching `write_done`.
-  (c) iter suspends inside runner.lock().await. Last line is any
-      `iter=K step=X` immediately before a mutex-await call.
-      Contradicted by mutex_handoff=0 across every prior wedge.
+Outcomes (from the summary file):
+- class=clean-auth-rejected → ssh exit=255 + "Permission denied".
+  Clean handshake, auth rejected by BatchMode=yes. Expected path.
+- class=clean-login → ssh exit=0 (only if a real keyring matches;
+  never seen in this harness because BatchMode skips passwords).
+- class=early-wedge → ssh exit=255 + "Connection timed out during
+  banner exchange". Wedge before or during key exchange.
+- class=late-wedge → ssh exit=124 + "Permanently added". Wedge
+  after key exchange, during session or post-auth.
 
 ===========================================================================
 
 Next investigation step (pick one — both are legitimate):
 
-OPTION A — Fix the early-wedge (DOMINANT, ~60 % of failures):
+OPTION A — Late-wedge confirmation (recommended):
 
-The SCHEDULER.lock contention race needs an audit. Plausible fixes in
-rough order of invasiveness:
+Run /tmp/h9_batch.sh 60 latewedgeA (approx 60-90 min). If the result
+is still 60/60 clean, the late-wedge was tail mis-classification and
+the appendix can be closed as fully resolved. If any late-wedge is
+captured, the H9 follow-up #7 instrumentation in session.rs pins the
+sub-hypothesis (wake-chain broken / stuck inside flush / stuck inside
+runner.lock) directly from the last logged step.
 
-1. Wrap SCHEDULER.lock acquisitions in `without_interrupts` so a
-   same-core ISR cannot re-enter wake_task while a task holds the
-   lock. Same pattern that DRIVER.lock uses in virtio_net.rs. Highest
-   probability fix; also the highest-blast-radius change. Audit every
-   SCHEDULER.lock site first (62 in scheduler.rs alone — see
-   `grep -c 'SCHEDULER.lock()' kernel/src/task/scheduler.rs`).
-2. Reduce SCHEDULER.lock acquisition count per dispatch cycle.
-   Currently: pre-pick_next scan, pick_next itself, switch-out
-   handling — three acquisitions per dispatch per core.
-3. Move wake_task's second SCHEDULER.lock (for logging) out of the
-   hot path. It's purely diagnostic; could read once into an
-   Arc-shared snapshot.
-4. Convert wake_task into a two-phase operation: an ISR-safe
-   "queue wake request" step (no lock) plus a deferred "apply wakes"
-   step in the dispatch loop (already has SCHEDULER.lock).
+OPTION B — Scheduler architecture cleanup:
 
-Validate any fix by running /tmp/h9_run_once.sh 10-15 times WITHOUT
-extra logging. Target: clean rate ≥ 80 %. Pre-fix baseline is 30-40 %.
+With SCHEDULER.lock now IRQ-safe, several lock-holding diagnostic
+paths are candidates for simplification:
 
-OPTION B — Chase the late-wedge (RARE, ~8 %):
+1. `task_log_label` / `classify_exec_path` at the top of scheduler.rs
+   are now unreferenced. Delete or keep gated under a diagnostic
+   feature. Currently preserved under the module's
+   #![allow(dead_code)] gate.
+2. The PROCESS_TABLE.lock calls inside the dispatch loop
+   (scheduler.rs lines 1823, 1879, 2017) run in task context so
+   they are safe, but they sit inside an IF-off region (SCHEDULER
+   is IF-off by the IrqSafeMutex wrapper). A fast-path that avoids
+   PROCESS_TABLE.lock when possible — for example, caching the
+   address-space pointer in the task itself — would reduce the IF-
+   off window on dispatch. Not a correctness fix; a latency
+   improvement.
+3. `spin::Mutex` is used for many other globals (PROCESS_TABLE,
+   TCP_CONNS, etc.). None of them is presently ISR-callable, but
+   an audit to confirm that and document the invariant would be
+   cheap. The primitive is already on the shelf (`IrqSafeMutex`).
 
-Re-run the 12-run sample with the existing [h9-iox]/[h9-fo]/[h9-ww]
-instrumentation. If 0/12 again, trim [h9-ww] per-poll logging and
-re-sample. When a late-wedge is captured, the three sub-hypotheses
-above will read out directly from the last logged line.
+Budget: Option A is a single overnight batch. Option B is a half-
+day of reading and refactoring. Option A is more valuable because
+it answers "is the late-wedge a real remaining bug?" definitively.
 
 ===========================================================================
 
 Don't touch:
 
+- kernel/src/task/scheduler.rs — SCHEDULER.lock IRQ-safety is the
+  closing fix for the early-wedge; do not revert the IrqSafeMutex
+  wrapper or the enqueue_to_core without_interrupts region.
 - kernel/src/net/tcp.rs — already audited, wake path is structurally
   correct; handle_segment duplicate-SYN arm is new and correct.
 - H6/H8/H9 fixes in session.rs / syscall/mod.rs / async-rt — real
   corrections.
-- The block_current_unless_woken_until primitive — works correctly
-  but don't consume it from net_task (tested, regresses clean rate).
+- The block_current_unless_woken_until primitive — works correctly,
+  kept on the shelf for future consumers; net_task does not use it.
 - arp::learn in net/dispatch.rs and USING_LEGACY_INTX in
   virtio_net.rs — RFC-compliant, no regression.
 - The existing [h9-iox] / [h9-fo] / [h9-ww] instrumentation — the
@@ -201,12 +157,6 @@ Don't touch:
   security-floor regression.
 - sunset-local — the runner state machine is correct (h9-postkey
   proves runner is ready post-hostkeys).
-
-Budget: if 15 runs of Option A produce no clean-rate improvement,
-step back and audit the SCHEDULER.lock sites systematically before
-making another targeted fix. If 12 runs of Option B catch 0 wedges,
-the late-wedge is probably noise-hidden by the early-wedge's high
-rate — fix the early-wedge first.
 ```
 
 ## If you want to skim the doc first
@@ -215,20 +165,24 @@ The full investigation log is in
 `docs/appendix/scheduler-fairness-regression.md`. The most relevant
 sections for picking up are:
 
-- The top-of-doc "Status as of …" bullet summary.
-- §Early-wedge: root cause is SCHEDULER.lock contention, NOT a QEMU
-  issue — the pcap evidence and wake_task hang fingerprint.
-- §Early-wedge: block-with-timeout primitive landed — the scheduler
-  primitive postmortem including why net_task doesn't use it.
-- §H9 follow-up #7: io_task inner-step instrumentation landed +
-  12-run sample, 0 late-wedges caught; full clean-run fingerprint
-  from iter=5 to iter=8.
-- The ~60-run experiment log table at the end of the §H9 section.
+- The top-of-doc "Status as of …" bullet summary (includes the
+  2026-04-21 closeout entry).
+- §"Early-wedge: SCHEDULER.lock IRQ-safety fix (2026-04-21 closeout)"
+  — root cause, fix design, and 15-run validation results.
+- §"Early-wedge: root cause is SCHEDULER.lock contention, NOT a QEMU
+  issue" — the pcap evidence and wake_task hang fingerprint that
+  pointed at the fix.
+- §"Early-wedge: block-with-timeout primitive landed" — scheduler
+  primitive kept on the shelf (unused after the IrqSafeMutex fix).
+- §"H9 follow-up #7: io_task inner-step instrumentation landed" —
+  the late-wedge instrumentation that stays in-tree ready for a
+  50-100-run confirmation pass.
 
 ## What's already committed
 
 ```
 git log --oneline origin/feat/phase-55b-ring-3-driver-host -10
+# <new> fix(sched): make SCHEDULER.lock IRQ-safe to close early-wedge
 # fc67213 fix(virtio-net): gate ISR_STATUS read on legacy INTx
 # a58d841 feat(sched): add block_current_unless_woken_until primitive
 # 4823ec1 docs(appendix): record H9 follow-up #7 + early-wedge pivot findings
@@ -238,7 +192,6 @@ git log --oneline origin/feat/phase-55b-ring-3-driver-host -10
 # c5ee209 chore(regression): bump security-floor su-user timeout 30s -> 60s
 # 2691867 fix(net+sshd): land H6 + H8 + H9-partial fixes for SSH late-wedge
 # adcb855 docs(appendix): record scheduler fairness regression starving net_task
-# de6f0d3 fix(net/tcp): release TCP_CONNS before sending outbound segments
 ```
 
 Working tree is clean (only `.codex/` untracked, which is gitignored).

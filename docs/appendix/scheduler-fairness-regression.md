@@ -1,6 +1,18 @@
 # Scheduler Fairness Regression: SSH Session Spin / Core-0 Fairness Investigation
 
-**Status:** Unfixed, partially narrowed — branch-local investigation updated on 2026-04-21.
+**Status:** **Early-wedge root cause fixed (2026-04-21)** — `SCHEDULER.lock()`
+converted to an IRQ-safe mutex (`IrqSafeMutex<Scheduler>`) so that a same-core
+ISR (virtio-net, virtio-blk) calling `wake_task` can no longer deadlock a
+task-context holder of the lock. 15-run validation sample with the fix and
+**no** heavy-logging mitigation: **15/15 clean-auth-rejected** (100 %) vs the
+30–40 % pre-fix baseline. `enqueue_to_core` additionally wraps its per-core
+`run_queue.lock()` in `without_interrupts` to close the follow-on window where
+the run queue was held with IF on. `wake_task`'s redundant second
+`SCHEDULER.lock()` (and the `PROCESS_TABLE.lock()` re-entry via the old
+`task_log_label`) are folded into the first critical section. Late-wedge
+(~8 % pre-fix) is still open but the dominant failure mode is closed — the
+follow-up #7 instrumentation stays in-tree so the next sampling pass can
+capture one.
 **Severity:** High for interactive SSH and related userspace workloads. The VM
 can hang at multiple points in the SSH path: before key exchange, during key
 exchange, before the password prompt, after login, or on the first typed input.
@@ -128,6 +140,27 @@ H6's patch is still worth landing as a semantic improvement. The H8
 fix is a correctness fix for every `sys_poll` caller with a positive
 timeout, not just sshd. H9 (via follow-up #8 sampling) and the
 early-wedge are the remaining diagnosis items.
+
+- Early-wedge (2026-04-21 late): **ROOT-CAUSE FIXED.** Converted
+  `SCHEDULER: Mutex<Scheduler>` to
+  `SCHEDULER: IrqSafeMutex<Scheduler>` in `kernel/src/task/scheduler.rs`
+  — the new wrapper masks interrupts on the current CPU for the duration
+  of every critical section, so the virtio-net and virtio-blk ISRs (which
+  call `wake_task` synchronously) can no longer reach a same-core task
+  holding `SCHEDULER.lock`. `enqueue_to_core` additionally wraps its
+  per-core `run_queue.lock()` in `interrupts::without_interrupts(…)` so
+  that the brief IF-on window between dropping `SCHEDULER` and acquiring
+  `run_queue` is also covered. `wake_task`'s redundant second
+  `SCHEDULER.lock()` (and the `PROCESS_TABLE.lock()` re-entry via
+  `task_log_label`) were folded into the first critical section so the
+  wake path now takes the lock exactly once. **15-run validation
+  sample** without heavy-logging mitigation: 15/15 = 100 % clean
+  (pre-fix baseline 30–40 %). All 15 runs show a clean SSH handshake
+  (`[tcp] connection established (passive)`, `sshd: accepted client`,
+  `sshd: session child pid=…`) and terminate with auth-rejected as
+  expected for `BatchMode=yes`. No `[sched] stale-ready` beyond
+  early-boot artifacts. See §"Early-wedge: SCHEDULER.lock IRQ-safety
+  fix" below for the code-level detail.
 
 ---
 
@@ -1737,6 +1770,121 @@ in the scheduler log is a single-number classifier for outcome:
 clean runs see 10–12 wakes; `net_wakes=1` early-wedges are exactly
 that; `net_wakes=0` early-wedges are the "SYN never arrives" variant.
 Useful for batch analysis of large run samples.
+
+### Early-wedge: SCHEDULER.lock IRQ-safety fix (2026-04-21 closeout)
+
+The failed-experiment note above ("ISR-driven wake in `timer_handler`
+… hard deadlock, same-CPU ISR re-entrance when the interrupted task
+held `SCHEDULER.lock`") turned out to describe the root cause of the
+early-wedge itself, not a quirk of the watchdog experiment. The
+existing `virtio_net::virtio_net_irq_handler` and
+`virtio_blk::virtio_blk_irq_handler` already call `wake_task` —
+`scheduler::wake_task` synchronously from ISR context, and
+`scheduler::SCHEDULER.lock()` was a plain `spin::Mutex` that did
+not mask interrupts on its holder. Whenever a task-context holder
+of `SCHEDULER.lock` on core X was interrupted by the virtio-net
+IRQ on the same core, the ISR's `wake_task` spun on
+`SCHEDULER.lock` forever (the same-core holder cannot progress
+while the ISR runs). The serial-log fingerprint documented above
+— "`[wq] wake_all: waking task id=N` on core 2, then silence, with
+`[sched] stale-ready` firing on core 0" — is exactly that scenario:
+net\_task on core 2 executes `wake_task(sshd_parent)`, and the
+wake is successful up to the moment the SCHEDULER.lock holder on
+core 0 is interrupted by a local IRQ that also re-enters
+`wake_task`. Heavy logging closed the race probabilistically by
+slowing down every path and pushing the interrupted interval out
+of the deadlock window; it was not a fix.
+
+**The fix**, landed in `kernel/src/task/scheduler.rs`:
+
+1. New `IrqSafeMutex<T>` wrapper (private to the kernel crate)
+   that saves the current IF state on `lock()`, masks interrupts
+   on the current CPU, and restores IF on guard drop. Guard fields
+   are declared so the inner `spin::MutexGuard` drops before the
+   interrupt-restore helper — the spinlock is always released
+   before an ISR can re-enter the freed slot. A matching
+   `try_lock()` variant is exposed for the panic-diagnostic path.
+2. `pub(super) static SCHEDULER: Mutex<Scheduler>` →
+   `pub(super) static SCHEDULER: IrqSafeMutex<Scheduler>`. All
+   62 existing `SCHEDULER.lock()` call sites keep their textual
+   form unchanged and now automatically mask interrupts for the
+   duration of each critical section. `kernel/src/task/mod.rs`'s
+   `try_lock_scheduler` (used by `panic_diag`) gets a type-only
+   update to return `Option<IrqSafeGuard<'static, Scheduler>>`.
+3. `enqueue_to_core` wraps its per-core `run_queue.lock()` body
+   in `interrupts::without_interrupts(…)`. This closes the brief
+   IF-on window between dropping `SCHEDULER.lock` and acquiring
+   the per-core run queue lock — without this, the ISR could
+   still deadlock on `run_queue.lock` held by a task-context
+   caller that just released `SCHEDULER.lock`.
+4. `wake_task` now takes `SCHEDULER.lock` exactly once. The
+   previous implementation re-acquired `SCHEDULER.lock` just to
+   snapshot task fields for the `[sched] wake_task …` log line
+   and then called `task_log_label`, which itself called
+   `PROCESS_TABLE.lock()`. In a same-core ISR context this
+   introduced two more cross-lock windows (one at the second
+   `SCHEDULER.lock`, one at `PROCESS_TABLE.lock`); a dedicated
+   helper `label_from_name_only` replaces the PROCESS-TABLE
+   lookup with a static match on `task.name` when `pid == 0`
+   (the only name-based labels the wake log ever used) and
+   returns `None` otherwise, so a pid-based exec-path
+   classification is no longer attempted from the wake path.
+
+Result. 15-run validation sample without heavy-logging (plain
+`cargo xtask run` + single `ssh -p 2222 user@127.0.0.1 exit`):
+
+| Outcome | Count | Rate |
+|---|---|---|
+| `clean-auth-rejected` | 15 | 100 % |
+| `early-wedge` | 0 | 0 % |
+| `late-wedge` | 0 | 0 % |
+
+Pre-fix baseline was 30–40 % clean; heavy-logging mitigation
+reached ~80 %. The fix closes the race deterministically. Per-run
+log fingerprints on all 15 runs:
+
+- `sshd: listening on port 22` (kernel ready).
+- `[tcp] connection established (passive)` (SYN/SYN-ACK/ACK).
+- `sshd: accepted client fd=4 count=1`.
+- `sshd: host key ready`.
+- `sshd: session child pid=14 sock_fd=4`.
+- 15 `[tcp-wake]` events per run (listener + session socket +
+  teardown, matches the pre-regression baseline).
+- 6–7 `[sched] stale-ready` entries per run, all at
+  `ready_at_tick ≤ 2638` — exclusively early-boot artifacts where
+  BSP initialises tasks before AP cores enter their dispatch
+  loops. No `stale-ready` during or after the SSH handshake.
+
+The `task_log_label` / `classify_exec_path` helpers at the top
+of `scheduler.rs` are now unreferenced but left in place under
+the module's `#![allow(dead_code)]` gate because a future
+slow-path diagnostic (one that is not on the ISR-callable wake
+path) may want the PROCESS_TABLE-backed exec-path classification
+back. They are safe to delete if that never materialises.
+
+The `block_current_unless_woken_until` primitive landed earlier
+in this investigation remains correct but still unused — the
+SCHEDULER IrqSafeMutex fix closes the early-wedge without
+needing the periodic-wake watchdog it was designed to support.
+It stays in-tree for any future consumer that genuinely needs a
+timeout-bounded block (e.g. a real user-facing `nanosleep(2)`
+implementation).
+
+**Late-wedge.** With the early-wedge gone, the observed
+distribution in the 15-run sample is 100 % clean — no
+late-wedge was captured either. That could mean the late-wedge
+has always been a tail mis-classification caused by the
+early-wedge's heavy tail (`ssh exit=124 + "Permanently added"`
+can occur when the banner window elapsed narrowly before the
+connection completed), or it could simply be noise below the
+sampling threshold of 15 runs. A larger sample (50–100 runs) is
+needed to confirm whether the late-wedge is a separate real bug
+or an artefact of the early-wedge. The H9 follow-up #7
+instrumentation (`[h9-iox]` / `[h9-fo]` / `[h9-ww]` in
+`userspace/sshd/src/session.rs`) stays in-tree ready for the
+next sampling pass; if the late-wedge is genuine, this
+instrumentation pins the sub-hypothesis directly from the last
+logged step.
 
 #### H9 follow-up #7: io_task inner-step instrumentation (12 more runs, no late-wedge caught)
 
