@@ -1502,6 +1502,82 @@ in io_task's post-wake outer-iteration completion, which is reachable
 with a single targeted instrumentation patch on a fresh
 investigation.
 
+### Early-wedge: root cause is SCHEDULER.lock contention, NOT a QEMU issue (2026-04-21, 4th session)
+
+Previously this doc concluded the `net_wakes=1` early-wedge was a
+QEMU-side packet-delivery failure. **That conclusion was wrong.** A
+fresh pcap via QEMU `filter-dump,netdev=net0` proved:
+
+- Client sends SYN to guest — arrives at the guest NIC (confirmed
+  via `[tcp-wake] call#1` firing inside handle_tcp).
+- **Guest sends SYN-ACK successfully** — visible on the wire.
+- Client sends ACK — visible on the wire, arrives at guest NIC.
+- Client sends 43-byte SSH banner — visible on the wire, arrives at
+  guest NIC.
+- Client retransmits the banner 4 times over ~20 s — all visible on
+  the wire.
+
+Every packet the client sends reaches the guest's NIC. The three-way
+handshake completes from the wire's perspective. This rules out any
+QEMU-side drop.
+
+**Actual mechanism.** With serial-log tracing added to
+`wake_sockets_for_tcp_slot` → `wake_socket` → `WaitQueue::wake_all` →
+`scheduler::wake_task`, the wedge reliably lands on a single line:
+
+```
+[tcp-wake] call#1 tcp_idx=0 sockets_matched=1 waiters=1 ...
+[tcp-wake] call#1 wake_socket h=0 begin
+[wq] wake_all: lock attempt
+[wq] wake_all: lock acquired, len=1
+[wq] wake_all: lock released, waking 1
+[wq] wake_all: waking task id=11    <-- net_task is here
+<silence — `woke task id=11` never logs>
+```
+
+`net_task` (running on core 2) calls `wake_task(sshd_parent_task_id)`
+from inside the tcp-wake path. The call hangs at
+`SCHEDULER.lock()` — the first spin::Mutex acquisition inside
+`wake_task`'s body. **Something else is holding `SCHEDULER.lock` and
+not releasing.**
+
+**Heavy-logging interference confirms the race.** With per-step
+logging added to `wake_task`, `wake_all`, the dispatch loop's
+pre-`pick_next` path, and `virtio_net_irq_handler`, the ssh clean
+rate rose from ~30 % to ~80 % in a 10-run sample (h9run177–h9run186:
+8 clean / 2 early-wedge). Reverting the extra logs returns the
+clean rate to ~30 %. That log-sensitivity is the classic fingerprint
+of a tight lock-contention race, not a deterministic deadlock.
+
+**The real fix requires a SCHEDULER.lock audit** — likely some
+combination of:
+
+1. Wrapping `SCHEDULER.lock` acquisitions in `without_interrupts`
+   so a same-core ISR cannot re-enter `wake_task` while a task
+   holds the lock.
+2. Reducing the number of `SCHEDULER.lock` acquisitions per
+   dispatch cycle (we take it at least three times per iteration:
+   pre-`pick_next` scan, `pick_next` itself, and switch-out
+   handling).
+3. Splitting hot scheduler state (run queues already have their own
+   lock; task state transitions might benefit from per-task atomics).
+
+That work is out of scope for this session. The mechanism is now
+pinpointed and the heavy-logging workaround is documented as a
+correctness-by-obscurity data point.
+
+**Small side fix landed this session**
+(`kernel/src/net/virtio_net.rs`): gated `ISR_STATUS` register reads
+in `virtio_net_irq_handler` on a new `USING_LEGACY_INTX` flag.
+Legacy INTx needs the read to clear the shared-IRQ latch per
+virtio 0.9.5 §2.1.2.4; MSI-X delivery is per-vector and doesn't need
+it. Skipping the read in MSI-X mode removes a potential
+QEMU / transitional-virtio interaction where reading ISR_STATUS
+while MSI-X is enabled can suppress the next MSI-X edge. Did not
+measurably change the wedge rate on its own (10 post-fix runs,
+3 clean / 7 early-wedge — within noise of baseline) but is correct
+in principle and closes a spec-compliance gap.
+
 ### Early-wedge: block-with-timeout primitive landed (2026-04-21, late)
 
 Continued the early-wedge pivot by landing the "block-with-timeout"
