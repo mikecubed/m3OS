@@ -1435,7 +1435,7 @@ pub fn wake_task(id: TaskId) -> bool {
             last_migrated_tick,
         ) = snapshot;
         if let Some(label) = label {
-            log::info!(
+            log::debug!(
                 "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
                 id.0,
                 pid_for_log,
