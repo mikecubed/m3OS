@@ -280,32 +280,41 @@ mis-classifications of slow early-wedges that narrowly elapsed the
   `wake_task` single-lock path. Commit `ac37270`.
 - [x] **Validation:** 15-run (Phase 1) and 60-run (Phase 2)
   clean-rate batches at 100 %. Commits `2c331ec`, `fd2c044`.
-- [ ] **Global lock audit.** Inventory every `spin::Mutex` /
-  `spin::RwLock` static in the kernel and classify each as
-  ISR-callable or not. Any that reaches `wake_task` or any
-  lock an ISR holds transitively should be converted to
-  `IrqSafeMutex` or prove the no-ISR invariant in a doc comment.
-  `PROCESS_TABLE`, `TCP_CONNS`, socket tables, pipe tables are
-  the first candidates.
-- [ ] **Remove branch-local debug instrumentation** added
-  during the investigation (the `[h9-*]` traces in
-  `userspace/sshd/src/session.rs` and
-  `userspace/async-rt/src/executor.rs`, the `wake_task[h9]`
-  and `sshd fork-child` logs, the `NET_WAKE_*` counters, and
-  the `debug_sshd_fork_child` Task fields). The
-  `IrqSafeMutex` primitive is the durable artifact; the
-  diagnostics can go.
+- [x] **Remove branch-local debug instrumentation** added
+  during the investigation (the `[h9-*]` traces, `wake_task[h9]`
+  / `sshd fork-child` logs, `NET_WAKE_*` counters, the
+  `debug_sshd_fork_child` Task fields, and the `wake_count` /
+  `NOTIFY_SIGNAL_*` / `MUTEX_HANDOFF_*` async-rt counters).
+  Commit `0263c58`.
+- [x] **ISR-safe invariant doc on every ISR handler.** Module-
+  level "ISR contract" added to
+  `kernel/src/arch/x86_64/interrupts.rs`; per-handler doc
+  comments on `virtio_net_irq_handler` and
+  `virtio_blk_irq_handler` now enumerate which lock discipline
+  each relies on. Commit `c519a60`.
+- [x] **Global lock audit.** Inventoried every `spin::Mutex`
+  static in `kernel/src/` (~45 locks). **One POTENTIALLY
+  UNSAFE lock found and fixed:** `RAW_INPUT_ROUTER` (keyboard
+  scancode router) was acquired by `keyboard_handler` in ISR
+  context AND by `read_raw_scancode` / `reset_raw_input_state`
+  in task context without disabling interrupts — the same bug
+  class as `SCHEDULER.lock`. Fixed in commit `c519a60` by
+  wrapping both task-context callers in
+  `interrupts::without_interrupts(…)`. Every remaining lock is
+  one of: task-only (never reached from ISR), init-only
+  (acquired before interrupts are enabled), ISR-only (never
+  held in task context), or already disciplined (ISR plus
+  task-context callers wrapped in `without_interrupts` — the
+  `virtio_net::DRIVER`, `virtio_blk::DRIVER`, and
+  `DEVICE_IRQ_TABLE` patterns). `PROCESS_TABLE` is task-only —
+  the page-fault redirection trampoline acquires it but runs
+  *outside* ISR context by design (see
+  `fault_kill_trampoline`). No further action needed.
 - [ ] **Regression harness.** `/tmp/h9_run_once.sh` and
   `/tmp/h9_batch.sh` live outside the tree. Promote both into
-  `tests/` or `scripts/` (as a named regression so the class of
-  bug is continuously guarded against) and wire into
+  `tests/` or `scripts/` (as a named regression so the class
+  of bug is continuously guarded against) and wire into
   `cargo xtask test` when time permits.
-- [ ] **Diagnostic comment on every ISR handler.** Each
-  `extern "x86-interrupt" fn …_handler` should carry a short
-  "ISR-safe invariant" comment enumerating what it's allowed to
-  call. `virtio_net_irq_handler` and `virtio_blk_irq_handler`
-  had no such invariant; adding it would have caught the call
-  to `wake_task` during review.
 
 ## Related
 
