@@ -206,6 +206,32 @@ impl TcpConnection {
                 self.state = TcpState::SynReceived;
                 log::debug!("[tcp] SYN-ACK sent (passive open)");
             }
+            TcpState::SynReceived if has_syn && !has_ack => {
+                // Duplicate SYN while in SynReceived means the client did
+                // not receive (or did not like) our prior SYN-ACK.
+                // Re-queue the SYN-ACK with the original ISN so the
+                // client can retry the handshake. Without this, a lost
+                // SYN-ACK produces a permanent wedge: the client keeps
+                // retransmitting SYNs, each one hitting the `_ => {}`
+                // default arm silently, with no server-side recovery.
+                //
+                // RFC 793 3.4: "If the state is SYN-RECEIVED, then any
+                // arriving SYN which does not match the recorded
+                // parameters is treated as an error" — but when it DOES
+                // match (same peer, same port), RFC-compliant behaviour
+                // is to re-send SYN-ACK (or RST; re-send is the
+                // recovery path we want here).
+                self.queue_segment(pending, TCP_SYN | TCP_ACK, &[]);
+                log::info!(
+                    "[tcp] SYN-ACK re-queued (duplicate SYN in SynReceived) local_port={} remote={}.{}.{}.{}:{}",
+                    self.local_port,
+                    self.remote_ip[0],
+                    self.remote_ip[1],
+                    self.remote_ip[2],
+                    self.remote_ip[3],
+                    self.remote_port,
+                );
+            }
             TcpState::SynReceived if has_ack => {
                 self.snd_una = header.ack;
                 self.snd_wnd = header.window;

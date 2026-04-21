@@ -41,6 +41,12 @@ pub fn process_rx_frames(raw: &[u8]) -> bool {
         }
         ethernet::ETHERTYPE_IPV4 => {
             if let Some((header, payload)) = ipv4::parse(&frame.payload) {
+                // Passive ARP learning: populate the cache with
+                // (sender_ip, sender_mac) before dispatching. Without this,
+                // the first inbound TCP SYN dropped the reply-side SYN-ACK
+                // because arp::resolve(gateway) missed the cache; see
+                // arp::learn for the full rationale.
+                arp::learn(header.src, frame.src);
                 ipv4::handle_ipv4(&header, payload);
             }
         }

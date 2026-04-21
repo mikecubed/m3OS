@@ -83,6 +83,28 @@ pub fn resolve(target_ip: Ipv4Addr) -> Option<MacAddr> {
     ARP_CACHE.lock().lookup(target_ip)
 }
 
+/// Populate the ARP cache from a non-ARP source (e.g. inbound IPv4 traffic).
+///
+/// Called by the ethernet dispatcher on every inbound IPv4 frame so the
+/// cache learns `(sender_ip, sender_mac)` passively — without the usual
+/// request/reply exchange. This fixes the "first inbound packet drop"
+/// early-wedge: previously, the first SYN from a peer arrived before any
+/// ARP traffic, so `ipv4::send`'s reply path missed the cache and
+/// silently dropped the SYN-ACK. Passive learning populates the cache
+/// before the reply path runs, so the first reply goes out immediately.
+///
+/// In m3OS's simple routing, inbound packets from non-local hosts
+/// arrive via the gateway (QEMU's user-mode NAT appears as a single
+/// gateway MAC); ipv4::send only uses ARP entries for the next-hop IP,
+/// so cached entries for arbitrary peer IPs are harmless — they just
+/// sit unused.
+pub fn learn(sender_ip: Ipv4Addr, sender_mac: MacAddr) {
+    if sender_mac == [0; 6] || sender_ip == [0; 4] || sender_mac == MAC_BROADCAST {
+        return;
+    }
+    ARP_CACHE.lock().insert(sender_ip, sender_mac);
+}
+
 /// Send an ARP request to resolve `target_ip`.
 pub fn send_request(target_ip: Ipv4Addr) {
     let our_mac = match super::mac_address() {
