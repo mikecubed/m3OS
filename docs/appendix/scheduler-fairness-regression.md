@@ -111,11 +111,23 @@ starvation is the root cause.
   established`). Different bug, very likely a missed virtio-net IRQ at
   first-packet time or a QEMU user-mode hostfwd race. Not addressed by
   the H6 / H8 fixes.
+- H9 follow-up #7 (2026-04-21, 12 runs h9run45–h9run56): io_task
+  inner-step instrumentation landed (`[h9-iox]`, `[h9-fo]`, `[h9-ww]`
+  in `userspace/sshd/src/session.rs`). **0 late-wedges captured** in
+  12 runs; instrumentation validated against the clean-run path
+  (full iter=5–8 trace documented). Probable observer effect — the
+  extra per-iteration `write()` syscalls may have pushed the
+  distribution toward early-wedge (7/12 = 58 %, top of prior
+  samples). Instrumentation stays in-tree ready for the next
+  sampling pass. The three sub-hypotheses (wake-chain broken /
+  stuck inside flush / stuck inside runner.lock) remain
+  uncaptured — any late-wedge captured with this instrumentation
+  would pin exactly one of them.
 
 H6's patch is still worth landing as a semantic improvement. The H8
 fix is a correctness fix for every `sys_poll` caller with a positive
-timeout, not just sshd. H9 and the early-wedge are the remaining
-diagnosis items.
+timeout, not just sshd. H9 (via follow-up #8 sampling) and the
+early-wedge are the remaining diagnosis items.
 
 ---
 
@@ -1490,6 +1502,222 @@ in io_task's post-wake outer-iteration completion, which is reachable
 with a single targeted instrumentation patch on a fresh
 investigation.
 
+### Early-wedge: partial fix + mechanism narrowed (2026-04-21)
+
+Separate pivot from H9, working on the early-wedge that now dominates
+the failure distribution (58 % of the h9run45–56 sample, 40–60 % of
+post-fix samples). Two small correctness fixes landed in the net
+stack, plus a failed watchdog experiment that narrowed the remaining
+unfixable mechanism to "guest virtio-net RX loses subsequent packets
+after the first SYN."
+
+**Fix 1 — Passive ARP learning** (`kernel/src/net/arp.rs` +
+`kernel/src/net/dispatch.rs`). The `process_rx_frames` dispatcher
+now populates the ARP cache with `(sender_ip, sender_mac)` for every
+inbound IPv4 frame. Intended to prevent the classic "first outbound
+packet drops because ARP cache is empty" scenario — `ipv4::send`
+silently drops packets when `arp::resolve` misses. RFC-compliant
+(many real stacks do this as ARP snoop); safe in all m3OS routing
+contexts because `ipv4::send` only uses ARP entries for the next-hop
+IP, so any extra cached entry sits unused.
+
+Did NOT measurably change the wedge rate: post-fix h9run89–98 →
+4 clean / 6 early-wedge (40 %) vs pre-fix h9run45–56 → 5 clean /
+7 early-wedge (42 %). The ARP-miss hypothesis turned out wrong —
+passive learning never had anything to "fix" because outbound SYN-ACKs
+in the early-wedge path had a populated cache to begin with.
+(The diagnostic `[ipv4] arp miss` log added during investigation
+produced `arp_miss=0` across every clean and every wedge run.)
+
+**Fix 2 — RFC-793 duplicate-SYN retransmit** (`kernel/src/net/tcp.rs`).
+Added a `TcpState::SynReceived if has_syn && !has_ack` arm that
+re-queues SYN-ACK on duplicate-SYN arrival. Previously this case hit
+the `_ => {}` default and was silently dropped. RFC 793 3.4 is
+ambiguous between re-send and RST here; re-send is the recovery path
+we want.
+
+Did NOT trigger in any observed wedge: `syn_ack_requeued=0` across all
+10 post-fix runs. In the `net_wakes=1` sub-variant (client sends SYN,
+guest sends SYN-ACK, no further activity), the client never
+retransmits SYN — QEMU SLIRP's internal TCP treats the first SYN-ACK
+as sufficient and waits for the banner. The duplicate-SYN arm is
+kept as correct belt-and-suspenders behaviour for clients that *do*
+retransmit.
+
+**Failed experiment — periodic net_task watchdog.** Two attempts:
+
+1. ISR-driven wake in `timer_handler` (every 20 ticks / ~20 ms at
+   1 kHz). Calls `wake_task(net_task_id)` from the timer ISR. **Hard
+   deadlock** — same-CPU ISR re-entrance when the interrupted task
+   held `SCHEDULER.lock`. Manifested as "tick counter freezes after
+   ~200 ticks, system silent until QEMU killed" in h9run68. Reverted.
+
+2. Task-context watchdog spawned alongside `net_task`, using
+   `yield_now` in a tick-bounded loop. Avoids the ISR lock hazard.
+   **Broke boot** — the yield-loop hogs its core when it's the only
+   Ready task (yield returns essentially instantly when there's
+   nothing else to schedule), starving boot progress. Observed as
+   "sshd never listens within 90 s" in h9run84–88. Reverted.
+
+The safe shape — "block-with-timeout" — requires a new scheduler
+primitive that tracks per-task wake deadlines and force-wakes expired
+blocked tasks from the timer handler *without* taking `SCHEDULER.lock`
+from ISR context. That's a real but non-trivial scheduler change,
+out of scope for this session.
+
+**Mechanism statement for the remaining early-wedge.** Across every
+`net_wakes=1` wedge run (about half of wedges; the other half are
+`net_wakes=0`, "SYN never reaches virtio-net"):
+
+1. Client sends SYN → virtio-net RX IRQ → net_task wakes → `handle_tcp`
+   → SYN-ACK queued → `ipv4::send` → `arp::resolve` hits (cache
+   populated from the inbound SYN's source MAC via Fix 1) → SYN-ACK
+   goes out via `send_frame`.
+2. `[tcp-wake] call#1 waiters=1` fires — listener waiter registered.
+3. QEMU SLIRP receives SYN-ACK, marks connection established on its
+   internal side, sends ACK to guest.
+4. **The ACK never reaches virtio-net RX.** No subsequent IRQ fires.
+   `net_wakes` stays at 1. Guest's TCP remains in `SynReceived`.
+5. `sshd`'s poll on the listener sees no POLLIN (listener is still
+   not `Established`), continues its 1 s yield-loop silently until
+   ssh client times out at 20 s.
+
+Whether the ACK is never sent by SLIRP (SLIRP-side stall), lost in
+transit between SLIRP and virtio-net (QEMU bug), or delivered to
+virtio-net without an IRQ (virtio-net driver bug) is unresolved. A
+working periodic RX drain watchdog — once the scheduler primitive
+exists — would recover from cases 2 and 3 by draining the RX queue
+defensively regardless of IRQ state.
+
+**Incidental finding.** `[sched] wake_task ... name=net ...` count
+in the scheduler log is a single-number classifier for outcome:
+clean runs see 10–12 wakes; `net_wakes=1` early-wedges are exactly
+that; `net_wakes=0` early-wedges are the "SYN never arrives" variant.
+Useful for batch analysis of large run samples.
+
+#### H9 follow-up #7: io_task inner-step instrumentation (12 more runs, no late-wedge caught)
+
+Fresh-session pass. Three branch-local instrumentation additions
+landed in `userspace/sshd/src/session.rs`:
+
+| Change | Purpose |
+|---|---|
+| `[h9-iox] iter=N step=…` — unratelimited step trace over every outer iteration of `io_task`: `top` → `flush_a_begin` → `flush_a_done` → `feed_begin pending=X` → per-call `feed_input ret=0 ‖ ret_c=N ‖ ret=err` → `feed_done pending=X` → `sw_begin` → `sw_done input_ready=B output_pending=B should_wait=B` → `wait_begin` → `wait_done` → `flush_b_begin` → `flush_b_done` → per-read `read n=N`, `read_input ret_c=N` → `iter_end`. | Definitively locates the step at which an io_task iteration suspends in a late-wedge. |
+| `[h9-fo] entry ‖ lock_acquired ‖ write_begin chunk=N ‖ write_done chunk=N ‖ exit ok bytes=T ‖ exit err bytes=T` on `flush_output_locked`. | Distinguishes "hung before output lock," "hung inside `write_all_nonblocking`," and "exited normally." |
+| `[h9-ww] fd=F events=E register ‖ ready reg=0 ‖ ready reg=1 ‖ ready_on_register` on `WaitWake::poll`. | Distinguishes "Ready without registering" (fd already has events), "register now" (first-poll path), and "Ready after register" (wake arrived). |
+
+12 fresh runs (h9run45–h9run56). Outcomes:
+
+- **5 clean** (45, 46, 49, 52, 54) — `Permission denied` after full
+  handshake.
+- **7 early-wedge** (47, 48, 50, 51, 53, 55, 56) — `Connection timed
+  out during banner exchange`; no session child spawned; `[h9-iox]`
+  logs absent.
+- **0 late-wedge.**
+
+The io_task post-wake iteration hypothesis therefore **remains
+untested** after this pass. The ~8 % baseline late-wedge rate × 12
+runs gave ~60 % expected catch; we got 0. Two possibilities:
+
+1. **Observer effect.** The additional logging (roughly 12–20 new
+   `write()` syscalls per io_task outer iteration, plus flush and
+   WaitWake transitions) materially changes timing enough to suppress
+   the late-wedge branch. The early-wedge rate of 7/12 (~58 %) is at
+   the high end of prior samples (~40–50 % post-H9-fix), which is
+   weakly consistent with logging overhead pushing the failure mode
+   earlier.
+2. **Sample noise.** 12 runs at 8 % ≈ 1 ± 1; 0 is within noise.
+
+#### Clean-run fingerprint (h9run45, iter=5 through iter=8)
+
+The new instrumentation gives a complete picture of post-handshake
+io_task behavior in a CLEAN run. This is the reference that a
+late-wedge must be compared against:
+
+```
+iter=5 step=top
+iter=5 step=flush_a_begin
+[h9-fo] entry fd=4 ... exit ok bytes=0
+iter=5 step=flush_a_done
+iter=5 step=feed_begin pending=48
+iter=5 step=feed_input ret_c=48           ← runner accepts 48 B (KEX)
+iter=5 step=feed_done pending=0
+iter=5 step=sw_begin
+iter=5 step=sw_done input_ready=0 output_pending=0 should_wait=1
+iter=5 step=wait_begin
+[h9-ww] fd=4 events=1 register            ← WaitWake registers
+  (while parked: progress_task runs →
+   progress:event hostkeys,
+   flush_output_locked fires with write_begin chunk=208 / write_done)
+[h9-ww] fd=4 events=1 ready reg=1         ← wake arrives, Ready
+iter=5 step=wait_done
+iter=5 step=flush_b_begin
+[h9-fo] entry ... exit ok bytes=0
+iter=5 step=flush_b_done
+iter=5 step=read n=60                      ← client responded
+iter=5 step=read_input ret_c=16
+iter=5 step=read_input ret=0              ← partial consume
+iter=5 step=iter_end
+iter=6 step=top
+iter=6 step=flush_a_begin
+ ...
+```
+
+Key clean-path signatures to match against any late-wedge capture:
+
+- Each outer iteration reaches `iter_end` cleanly.
+- `WaitWake` alternates between `register` and `ready reg=1` — fd=4,
+  events=POLLIN only.
+- `flush_output_locked` exits with `bytes=0` when called by io_task
+  directly; the 208 B KEX reply and 44 B / 52 B auth responses are
+  flushed by **progress_task** (also through `flush_output_locked`,
+  visible as `[h9-fo] write_begin chunk=N`).
+- `feed_input` returns `ret_c=N` (consumed) on iterations where the
+  runner is ready, `ret=0` otherwise; `pending` correspondingly
+  drops or stays constant across iterations.
+
+#### Expected late-wedge fingerprint (to be captured)
+
+Given the hypothesis in §H9 follow-up #6's "Final mechanism
+statement," the late-wedge should fingerprint as one of:
+
+- **(a) iter parks and never wakes.** Last `[h9-iox]` line is
+  `iter=K step=wait_begin` followed by `[h9-ww] fd=4 events=1
+  register`, then silence. Missing subsequent `[h9-ww] … ready
+  reg=1` and missing `iter=K step=wait_done`. ⇒ wake chain into
+  io_task is broken; next step is to audit `runner.wake()` in
+  `sunset-local/src/runner.rs` and the reactor's POLLIN delivery
+  from `sys_poll` to the userspace executor.
+- **(b) iter suspends inside flush.** Last line is `[h9-fo] write_begin
+  chunk=N` without matching `write_done`. ⇒ `write_all_nonblocking`
+  hangs on `async_fd.writable().await` despite §H9 follow-up #6
+  Finding 1 asserting `write()` never returns EAGAIN for TCP. A
+  capture here would falsify that finding.
+- **(c) iter suspends inside `runner.lock().await`.** Last line is an
+  `iter=K step=X` that is immediately before an `await guard =
+  runner.lock().await` call, without the follow-up log. ⇒ some other
+  task holds the runner mutex indefinitely. Contradicted by
+  `mutex_handoff=0` across all prior wedges, but a concrete capture
+  would settle it.
+
+Next-session action: repeat the 12-run sample. At 8 % baseline,
+expected catch is ~60 % within 12 runs; if 0 wedges caught again,
+trim the instrumentation (especially the `[h9-ww]` per-poll log)
+and re-sample — the per-poll log may be the biggest observer-effect
+contributor since WaitWake is re-polled on every spurious wake.
+
+#### Incidental observation: net_task wake count separates early-wedge from clean
+
+A useful side signal from the 12-run sample is that the kernel
+`[sched] wake_task: ... name=net ...` count cleanly separates the
+outcomes:
+
+- Clean runs: 10–12 net_task wakes (full TCP handshake).
+- Early-wedge runs: 0–1 net_task wakes (SYN arrives, then nothing).
+
+This is a single-number classifier for outcome that doesn't require
+parsing session-child logs. Useful as a sanity check when sampling.
+
 ### Experiment log — 14 runs (baseline, H6, H8 diagnosis, H8 fix)
 
 Captured 2026-04-21 on `feat/phase-55b-ring-3-driver-host`. Each run:
@@ -1544,6 +1772,12 @@ against 127.0.0.1, QEMU killed ~30–60 s later.
 | h9run27 | same | **late-wedge** | host key + timeout | 44 | 9 (parked) |
 | h9run28–39 | + `[h9-postkey] input_ready out_empty` probe via new `ContinueProbe` action | 6 clean / 1 late-wedge / 5 early-wedge | mixed | various | h9run31 (only late-wedge): `input_ready=1 out_empty=0` — runner state correct, io_task ran only 5 outer iters total → suspended inside `flush_output_locked → write_all_nonblocking → async_fd.writable().await` waiting for socket POLLOUT (later disproven — see follow-up #6) |
 | h9run40–44 | + `yield_now` after `progress_notify.wait()` in `Yield` arm | 2 clean / 1 late-wedge / 2 early-wedge | mixed | various | Yield-arm yield didn't close the wedge — late-wedge still 1/5 (within noise of ~8 % baseline) |
+| h9run45–56 | + `[h9-iox]` step trace / `[h9-fo]` flush entry-exit / `[h9-ww]` WaitWake register-vs-Ready in `session.rs` | 5 clean / 7 early-wedge / 0 late-wedge | mixed | various | 12 runs, **no late-wedge captured**. Clean-run fingerprint now fully documented (iter=5–8, see §H9 follow-up #7). Observer effect probably shifted distribution toward early-wedge (7/12 = 58 %, top of prior samples). Instrumentation is ready for the next sampling pass. |
+| h9run57–66 | + passive `arp::learn` in dispatch; `[ipv4] arp miss` diagnostic log | 5 clean / 5 early-wedge / 0 late-wedge | mixed | various | `arp_miss=0` in every run — ARP cache was always populated when SYN-ACK was attempted. The "first inbound packet drops outbound reply" hypothesis was wrong; Fix 1 is correct but no-op for this wedge. |
+| h9run67 | + duplicate-SYN retransmit arm in tcp.rs | early-wedge | host key + timeout | n/a | SYN-ACK queued and sent; no duplicate SYN ever arrived (client doesn't retransmit), so the new arm didn't trigger. Confirmed: client TCP treats initial SYN-ACK as sufficient and waits for banner — the wedge is later than the TCP handshake. |
+| h9run68–73 | + timer-handler watchdog (every 20 ticks call `wake_task(net_task_id)` from ISR) | 0 clean / 6 early-wedge | banner timeout | 0 | **Deadlock**: timer ISR → wake_task → `SCHEDULER.lock` → spin-wait on same-CPU task already holding the lock. Manifested as tick counter freezing after 200 ticks. Reverted. |
+| h9run84–88 | + task-context watchdog (`net_watchdog_task` with `yield_now` tick-bounded wait) | boot hang | "sshd never listened in 90 s" | n/a | Watchdog yield-loop hogs its core when it is the only Ready task — starves boot. Reverted. |
+| h9run89–98 | post-cleanup (Fixes 1+2 only; no watchdog) | 4 clean / 6 early-wedge / 0 late-wedge | mixed | various | Correctness fixes keep but don't measurably change wedge rate (40 % clean vs 42 % pre-fix). Remaining early-wedge mechanism: guest virtio-net RX loses subsequent packets after the first SYN. Requires block-with-timeout scheduler primitive to fix safely. |
 
 Summary across conditions:
 
