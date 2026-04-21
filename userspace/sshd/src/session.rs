@@ -134,10 +134,24 @@ struct WaitWake {
 impl Future for WaitWake {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // H9 follow-up #7: log first-register vs Ready transitions so we can
+        // tell whether io_task's WaitWake even registers on the reactor.
         if fd_has_events(self.fd, self.events) || self.registered {
+            write_str(STDOUT_FILENO, "[h9-ww] fd=");
+            write_u64(STDOUT_FILENO, self.fd as u64);
+            write_str(STDOUT_FILENO, " events=");
+            write_u64(STDOUT_FILENO, self.events as u64);
+            write_str(STDOUT_FILENO, " ready reg=");
+            write_u64(STDOUT_FILENO, self.registered as u64);
+            write_str(STDOUT_FILENO, "\n");
             Poll::Ready(())
         } else {
             self.registered = true;
+            write_str(STDOUT_FILENO, "[h9-ww] fd=");
+            write_u64(STDOUT_FILENO, self.fd as u64);
+            write_str(STDOUT_FILENO, " events=");
+            write_u64(STDOUT_FILENO, self.events as u64);
+            write_str(STDOUT_FILENO, " register\n");
             if (self.events & syscall_lib::POLLIN) != 0 {
                 executor::reactor().register_read(self.fd, cx.waker().clone());
             }
@@ -145,6 +159,9 @@ impl Future for WaitWake {
                 executor::reactor().register_write(self.fd, cx.waker().clone());
             }
             if fd_has_events(self.fd, self.events) {
+                write_str(STDOUT_FILENO, "[h9-ww] fd=");
+                write_u64(STDOUT_FILENO, self.fd as u64);
+                write_str(STDOUT_FILENO, " ready_on_register\n");
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -290,6 +307,12 @@ async fn io_task(
 
     loop {
         h9_io_iter = h9_io_iter.saturating_add(1);
+        // H9 follow-up #7: unconditional step trace so we can see which
+        // step of io_task's outer loop body suspends in late-wedge runs.
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=top\n");
+
         if h9_io_iter <= 30 || h9_io_iter.is_multiple_of(50) {
             // H9 next-step instrumentation: dump io_task's view of the
             // runner's output buffer length and pending input length so we
@@ -313,24 +336,43 @@ async fn io_task(
         }
 
         // --- Output direction: flush sunset output to socket ---
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=flush_a_begin\n");
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
             session_notify.signal();
             return;
         }
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=flush_a_done\n");
 
         // --- Input direction: feed pending bytes to runner ---
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=feed_begin pending=");
+        write_u64(STDOUT_FILENO, pending_len as u64);
+        write_str(STDOUT_FILENO, "\n");
         while pending_len > 0 {
             let mut guard = runner.lock().await;
             match guard.input(&pending[..pending_len]) {
                 Ok(0) => {
+                    write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                    write_u64(STDOUT_FILENO, h9_io_iter);
+                    write_str(STDOUT_FILENO, " step=feed_input ret=0\n");
                     drop(guard);
                     progress_notify.signal();
                     session_notify.signal();
                     break;
                 }
                 Ok(c) => {
+                    write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                    write_u64(STDOUT_FILENO, h9_io_iter);
+                    write_str(STDOUT_FILENO, " step=feed_input ret_c=");
+                    write_u64(STDOUT_FILENO, c as u64);
+                    write_str(STDOUT_FILENO, "\n");
                     pending.copy_within(c..pending_len, 0);
                     pending_len -= c;
                     drop(guard);
@@ -338,6 +380,9 @@ async fn io_task(
                     session_notify.signal();
                 }
                 Err(_) => {
+                    write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                    write_u64(STDOUT_FILENO, h9_io_iter);
+                    write_str(STDOUT_FILENO, " step=feed_input ret=err\n");
                     state.borrow_mut().session_done = true;
                     state.borrow_mut().exit_code = 1;
                     session_notify.signal();
@@ -345,6 +390,11 @@ async fn io_task(
                 }
             }
         }
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=feed_done pending=");
+        write_u64(STDOUT_FILENO, pending_len as u64);
+        write_str(STDOUT_FILENO, "\n");
 
         // Arm runner wakers before sleeping. If we already have buffered socket
         // data, wake when sunset is ready to accept more input again; otherwise
@@ -354,6 +404,11 @@ async fn io_task(
         // output is pending, skip the park and loop back to flush — otherwise
         // the unconditional arm combines with sunset's progress()→wake() path
         // to keep io_task and progress_task in a mutual-wake ping-pong.
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=sw_begin\n");
+        let mut sw_input_ready = 0u64;
+        let mut sw_output_pending = 0u64;
         let should_wait = {
             let waker = get_current_waker().await;
             let mut guard = runner.lock().await;
@@ -369,8 +424,19 @@ async fn io_task(
             if !output_pending {
                 guard.set_output_waker(&waker);
             }
+            sw_input_ready = input_ready as u64;
+            sw_output_pending = output_pending as u64;
             !input_ready && !output_pending
         };
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=sw_done input_ready=");
+        write_u64(STDOUT_FILENO, sw_input_ready);
+        write_str(STDOUT_FILENO, " output_pending=");
+        write_u64(STDOUT_FILENO, sw_output_pending);
+        write_str(STDOUT_FILENO, " should_wait=");
+        write_u64(STDOUT_FILENO, should_wait as u64);
+        write_str(STDOUT_FILENO, "\n");
 
         if !should_wait {
             should_wait_false_count = should_wait_false_count.saturating_add(1);
@@ -379,12 +445,18 @@ async fn io_task(
         }
 
         // Wait for socket readable (incoming data) or output waker (outgoing data).
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=wait_begin\n");
         WaitWake {
             fd: sock_fd,
             events: syscall_lib::POLLIN,
             registered: false,
         }
         .await;
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=wait_done\n");
         wait_wake_count = wait_wake_count.saturating_add(1);
         log_sshd_loop_counter("io_task:wake", wait_wake_count);
 
@@ -393,35 +465,57 @@ async fn io_task(
         }
 
         // Flush output first (handles the output_waker wakeup case).
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=flush_b_begin\n");
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
             session_notify.signal();
             return;
         }
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=flush_b_done\n");
 
         // Read from the client socket directly — it is non-blocking, so wakes
         // from runner output or spurious polls are harmless retries.
         if pending_len == 0 {
             let n = syscall_lib::read(sock_fd, &mut sock_buf);
+            write_str(STDOUT_FILENO, "[h9-iox] iter=");
+            write_u64(STDOUT_FILENO, h9_io_iter);
+            write_str(STDOUT_FILENO, " step=read n=");
+            write_u64(STDOUT_FILENO, n as u64);
+            write_str(STDOUT_FILENO, "\n");
             if n > 0 {
                 let mut consumed = 0;
                 while consumed < n as usize {
                     let mut guard = runner.lock().await;
                     match guard.input(&sock_buf[consumed..n as usize]) {
                         Ok(0) => {
+                            write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                            write_u64(STDOUT_FILENO, h9_io_iter);
+                            write_str(STDOUT_FILENO, " step=read_input ret=0\n");
                             drop(guard);
                             progress_notify.signal();
                             session_notify.signal();
                             break;
                         }
                         Ok(c) => {
+                            write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                            write_u64(STDOUT_FILENO, h9_io_iter);
+                            write_str(STDOUT_FILENO, " step=read_input ret_c=");
+                            write_u64(STDOUT_FILENO, c as u64);
+                            write_str(STDOUT_FILENO, "\n");
                             consumed += c;
                             drop(guard);
                             progress_notify.signal();
                             session_notify.signal();
                         }
                         Err(_) => {
+                            write_str(STDOUT_FILENO, "[h9-iox] iter=");
+                            write_u64(STDOUT_FILENO, h9_io_iter);
+                            write_str(STDOUT_FILENO, " step=read_input ret=err\n");
                             state.borrow_mut().session_done = true;
                             state.borrow_mut().exit_code = 1;
                             session_notify.signal();
@@ -449,6 +543,9 @@ async fn io_task(
                 log_sshd_loop_counter("io_task:read eagain", read_eagain_count);
             }
         }
+        write_str(STDOUT_FILENO, "[h9-iox] iter=");
+        write_u64(STDOUT_FILENO, h9_io_iter);
+        write_str(STDOUT_FILENO, " step=iter_end\n");
     }
 }
 
@@ -1342,11 +1439,23 @@ async fn flush_output_locked(
     sock_fd: i32,
     output_lock: &SharedOutputLock,
 ) -> bool {
+    // H9 follow-up #7: entry/exit trace with cumulative byte count. Every
+    // caller goes through this function, so we can see whether io_task is
+    // stuck before acquiring the output_lock, inside write_all_nonblocking,
+    // or reaches empty-buffer completion.
+    write_str(STDOUT_FILENO, "[h9-fo] entry fd=");
+    write_u64(STDOUT_FILENO, sock_fd as u64);
+    write_str(STDOUT_FILENO, "\n");
     let _flush_guard = output_lock.lock().await;
+    write_str(STDOUT_FILENO, "[h9-fo] lock_acquired\n");
+    let mut total_bytes: usize = 0;
     loop {
         let mut guard = runner.lock().await;
         let out = guard.output_buf();
         if out.is_empty() {
+            write_str(STDOUT_FILENO, "[h9-fo] exit ok bytes=");
+            write_u64(STDOUT_FILENO, total_bytes as u64);
+            write_str(STDOUT_FILENO, "\n");
             return true;
         }
         let mut tmp = [0u8; 4096];
@@ -1354,9 +1463,19 @@ async fn flush_output_locked(
         tmp[..chunk].copy_from_slice(&out[..chunk]);
         drop(guard);
 
+        write_str(STDOUT_FILENO, "[h9-fo] write_begin chunk=");
+        write_u64(STDOUT_FILENO, chunk as u64);
+        write_str(STDOUT_FILENO, "\n");
         if write_all_nonblocking(sock_fd, &tmp[..chunk]).await.is_err() {
+            write_str(STDOUT_FILENO, "[h9-fo] exit err bytes=");
+            write_u64(STDOUT_FILENO, total_bytes as u64);
+            write_str(STDOUT_FILENO, "\n");
             return false;
         }
+        total_bytes = total_bytes.saturating_add(chunk);
+        write_str(STDOUT_FILENO, "[h9-fo] write_done chunk=");
+        write_u64(STDOUT_FILENO, chunk as u64);
+        write_str(STDOUT_FILENO, "\n");
 
         let mut guard = runner.lock().await;
         guard.consume_output(chunk);
