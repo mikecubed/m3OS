@@ -7391,14 +7391,18 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     //    the target shell (ion) reads its per-user config + history from ext2
     //    via multi-hop IPC (syscall -> vfs_server -> fat_server -> block I/O).
     //    Under -smp 2 TCG in CI this reliably exceeds 10s; aligned to 30s to
-    //    match the login bootstrap budget in boot_and_login_steps.
+    //    match the login bootstrap budget in boot_and_login_steps. Raised to
+    //    60s after observing intermittent timeouts in the full regression
+    //    suite under serial QEMU load — the prior 30s budget had no slack
+    //    when init's reap loop and vfs_server's ext2 traffic both hit
+    //    core 0 during ion's first-config read.
     steps.push(SmokeStep::Send {
         input: "/bin/su user\n",
         label: "guest/auth: drop into user shell via su",
     });
     steps.push(SmokeStep::Wait {
         pattern: "$ ",
-        timeout_secs: 30,
+        timeout_secs: 60,
         label: "guest/auth: user shell prompt after su user",
     });
     steps.push(SmokeStep::Send {
