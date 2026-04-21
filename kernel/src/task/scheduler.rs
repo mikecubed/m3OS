@@ -71,28 +71,6 @@ use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
 type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, u64, u64);
 
-fn classify_exec_path(path: &str) -> Option<&'static str> {
-    match path {
-        "/bin/sshd" => Some("sshd"),
-        "/bin/login" => Some("login"),
-        "/bin/sh0" => Some("sh0"),
-        "/bin/vfs_server" => Some("vfs_server"),
-        "/bin/console_server" => Some("console_server"),
-        "/bin/ls" => Some("ls"),
-        _ => None,
-    }
-}
-
-fn task_log_label(pid: u32, task_name: &'static str) -> Option<&'static str> {
-    if pid == 0 {
-        return matches!(task_name, "net" | "console" | "serial-stdin").then_some(task_name);
-    }
-    let table = crate::process::PROCESS_TABLE.lock();
-    table
-        .find(pid)
-        .and_then(|proc| classify_exec_path(proc.exec_path.as_str()))
-}
-
 // ---------------------------------------------------------------------------
 // IRQ-safe scheduler lock wrapper
 // ---------------------------------------------------------------------------
@@ -770,35 +748,6 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task_idx: idx as u32,
         core: current_core,
     });
-    if name == "fork-child" {
-        let is_sshd_child = {
-            let table = crate::process::PROCESS_TABLE.lock();
-            table
-                .find(fork_pid)
-                .map(|proc| proc.exec_path.as_str() == "/bin/sshd")
-                .unwrap_or(false)
-        };
-        let task_saved_rsp = {
-            let mut sched = SCHEDULER.lock();
-            if is_sshd_child {
-                let task = &mut sched.tasks[idx];
-                task.debug_sshd_fork_child = true;
-                task.debug_sshd_fork_child_cycles = 0;
-            }
-            sched.tasks[idx].saved_rsp
-        };
-        if is_sshd_child {
-            log::info!(
-                "[sched] sshd fork-child spawn: pid={} task_idx={} core={} saved_rsp={:#x} user_rip={:#x} user_rsp={:#x}",
-                fork_pid,
-                idx,
-                current_core,
-                task_saved_rsp,
-                fork_rip,
-                fork_rsp
-            );
-        }
-    }
     enqueue_to_core(current_core, idx);
 
     current_core
@@ -1047,20 +996,6 @@ pub fn current_task_debug_snapshot() -> Option<CurrentTaskDebugSnapshot> {
         task.last_ready_tick,
         task.last_migrated_tick,
     ))
-}
-
-/// Returns true when the currently running task is one of the explicitly
-/// tagged SSH fork-children under investigation.
-pub fn current_task_is_debug_sshd_fork_child() -> bool {
-    let Some(idx) = get_current_task_idx() else {
-        return false;
-    };
-    let sched = SCHEDULER.lock();
-    sched
-        .tasks
-        .get(idx)
-        .map(|task| task.debug_sshd_fork_child)
-        .unwrap_or(false)
 }
 
 /// Best-effort debug snapshot for an arbitrary task id.
@@ -1421,12 +1356,12 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
 /// context (virtio-net, virtio-blk) therefore cannot re-enter a task-context
 /// holder on the same core — see the root-cause note at [`IrqSafeMutex`].
 pub fn wake_task(id: TaskId) -> bool {
-    // H9 instrumentation: capture everything we might want to log in the
+    // Capture everything we need for the optional diagnostic log in the
     // same critical section so we don't need a second `SCHEDULER.lock()` —
-    // a second acquisition would add latency to the ISR wake path and
-    // formerly re-entered a PROCESS_TABLE lookup via `task_log_label`,
-    // reintroducing the exact deadlock class this refactor prevents.
-    let (enqueue, woke, debug_outcome, snapshot) = {
+    // a second acquisition on this path formerly re-entered a
+    // PROCESS_TABLE lookup via `task_log_label`, reintroducing the ISR
+    // deadlock class this primitive exists to prevent.
+    let (enqueue, woke, snapshot) = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
             debug_assert!(
@@ -1435,13 +1370,14 @@ pub fn wake_task(id: TaskId) -> bool {
                 idx,
                 sched.tasks.len()
             );
-            let sshd_fork_child = sched.tasks[idx].debug_sshd_fork_child;
             let pid_for_log = sched.tasks[idx].pid;
             let name_for_log = sched.tasks[idx].name;
             let cur_state = sched.tasks[idx].state;
             let label = label_from_name_only(name_for_log, pid_for_log);
             let snapshot_tuple = (
                 label,
+                pid_for_log,
+                name_for_log,
                 sched.tasks[idx].assigned_core,
                 sched.tasks[idx].affinity_mask,
                 sched.tasks[idx].last_ready_tick,
@@ -1464,18 +1400,7 @@ pub fn wake_task(id: TaskId) -> bool {
                         sched.tasks[idx].wake_after_switch = true;
                         sched.tasks[idx].last_migrated_tick =
                             crate::arch::x86_64::interrupts::tick_count();
-                        (
-                            None,
-                            true,
-                            (
-                                sshd_fork_child,
-                                pid_for_log,
-                                name_for_log,
-                                "wake-after-switch",
-                                cur_state,
-                            ),
-                            snapshot_tuple,
-                        )
+                        (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
                         sched.tasks[idx].state = TaskState::Ready;
@@ -1484,57 +1409,31 @@ pub fn wake_task(id: TaskId) -> bool {
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
                             true,
-                            (
-                                sshd_fork_child,
-                                pid_for_log,
-                                name_for_log,
-                                "blocked-to-ready",
-                                cur_state,
-                            ),
                             snapshot_tuple,
                         )
                     }
                 }
-                _ => (
-                    None,
-                    false,
-                    (
-                        sshd_fork_child,
-                        pid_for_log,
-                        name_for_log,
-                        "noop-not-blocked",
-                        cur_state,
-                    ),
-                    snapshot_tuple,
-                ),
+                _ => (None, false, snapshot_tuple),
             }
         } else {
-            (
-                None,
-                false,
-                (false, 0u32, "<missing>", "missing-task-id", TaskState::Dead),
-                (None, 0, 0, 0, 0),
-            )
+            (None, false, (None, 0, "<missing>", 0, 0, 0, 0))
         }
     };
-    let (sshd_fork_child, pid_for_log, name_for_log, branch, branch_state) = debug_outcome;
-    if sshd_fork_child {
-        log::info!(
-            "[sched] wake_task[h9]: id={} pid={} name={} branch={} prior_state={:?}",
-            id.0,
-            pid_for_log,
-            name_for_log,
-            branch,
-            branch_state
-        );
-    }
     if let Some((core, idx, prev_state)) = enqueue {
         crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
             task_idx: idx as u32,
             state_before: prev_state,
             core,
         });
-        let (label, assigned_core, affinity_mask, last_ready_tick, last_migrated_tick) = snapshot;
+        let (
+            label,
+            pid_for_log,
+            name_for_log,
+            assigned_core,
+            affinity_mask,
+            last_ready_tick,
+            last_migrated_tick,
+        ) = snapshot;
         if let Some(label) = label {
             log::info!(
                 "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
@@ -1556,12 +1455,11 @@ pub fn wake_task(id: TaskId) -> bool {
     }
 }
 
-/// ISR-safe label lookup: classifies tasks without touching
-/// `PROCESS_TABLE.lock()`. The old helper `task_log_label` called
-/// `PROCESS_TABLE.lock()` for pid != 0, which meant a same-core ISR
-/// calling `wake_task` could deadlock against a task holding that lock.
-/// This variant gives up exec-path classification in exchange for being
-/// callable from any context.
+/// ISR-safe label lookup: classifies kernel tasks (pid == 0) by name so
+/// the `[sched] wake_task` diagnostic log can fire for `net`, `console`,
+/// and `serial-stdin` without touching `PROCESS_TABLE.lock()` — doing
+/// that would reintroduce the ISR-deadlock class the `IrqSafeMutex`
+/// refactor just eliminated. Userspace tasks are not labelled here.
 fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static str> {
     if pid == 0 {
         return matches!(task_name, "net" | "console" | "serial-stdin").then_some(task_name);
@@ -1847,7 +1745,6 @@ pub fn run() -> ! {
                 let now = crate::arch::x86_64::interrupts::tick_count();
                 let is_idle = sched.idle_tasks.contains(&Some(idx));
                 let task = &mut sched.tasks[idx];
-                let sshd_fork_child = task.debug_sshd_fork_child;
                 let stale_ticks = now.saturating_sub(task.last_ready_tick);
                 // 50 ticks ≈ 500 ms at 100 Hz — catches the 1-second hang
                 // pattern without spamming on normal brief waits.
@@ -1868,25 +1765,6 @@ pub fn run() -> ! {
                     core: core_id,
                     rsp,
                 });
-                // H9 instrumentation: tighter gate so we can see whether the
-                // task is being dispatched silently between widely-spaced
-                // log points. Cycles 0..=20 are always logged so warm-up is
-                // visible; thereafter every 100th dispatch logs.
-                if sshd_fork_child
-                    && (task.debug_sshd_fork_child_cycles <= 20
-                        || task.debug_sshd_fork_child_cycles.is_multiple_of(100))
-                {
-                    log::info!(
-                        "[sched] sshd fork-child dispatch: pid={} task_idx={} core={} rsp={:#x} ready_at={} migrated_at={} cycles={}",
-                        task.pid,
-                        idx,
-                        core_id,
-                        rsp,
-                        task.last_ready_tick,
-                        task.last_migrated_tick,
-                        task.debug_sshd_fork_child_cycles
-                    );
-                }
                 Some((rsp, idx))
             } else {
                 None
@@ -2114,7 +1992,6 @@ pub fn run() -> ! {
                 );
                 if sidx < sched.tasks.len() {
                     let task = &mut sched.tasks[sidx];
-                    let sshd_fork_child = task.debug_sshd_fork_child;
                     task.saved_rsp = saved_rsp;
                     // F.2: Validate saved_rsp after yield/block save.
                     if let Some((base, top)) = task.stack_bounds() {
@@ -2160,31 +2037,6 @@ pub fn run() -> ! {
                         pending == switched && task.state == TaskState::Running;
 
                     task.wake_after_switch = false;
-
-                    if sshd_fork_child {
-                        task.debug_sshd_fork_child_cycles =
-                            task.debug_sshd_fork_child_cycles.saturating_add(1);
-                    }
-
-                    // H9 instrumentation: tighter gate matching the
-                    // dispatch-side widening above. Cycles 1..=20 always
-                    // logged, then every 100th cycle.
-                    if sshd_fork_child
-                        && (task.debug_sshd_fork_child_cycles <= 20
-                            || task.debug_sshd_fork_child_cycles.is_multiple_of(100))
-                    {
-                        log::info!(
-                            "[sched] sshd fork-child switch-out: pid={} task_idx={} core={} saved_rsp={:#x} state={:?} wake_after_switch={} reenqueue_after_yield={} cycles={}",
-                            task.pid,
-                            sidx,
-                            core_id,
-                            saved_rsp,
-                            task.state,
-                            wake_after_switch,
-                            reenqueue_after_yield,
-                            task.debug_sshd_fork_child_cycles
-                        );
-                    }
 
                     if (wake_after_switch && blocked) || reenqueue_after_yield {
                         task.state = TaskState::Ready;

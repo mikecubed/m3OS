@@ -12,15 +12,7 @@ use core::cell::{Cell, RefCell, UnsafeCell};
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
-
-/// H9 instrumentation: total `MutexGuard::drop` calls that handed off the
-/// lock to a queued waiter (i.e., woke a waker via `pop_front + wake`).
-pub static MUTEX_HANDOFF_WAKES: AtomicU64 = AtomicU64::new(0);
-/// H9 instrumentation: total `MutexGuard::drop` calls that found an empty
-/// waiter queue (no handoff occurred).
-pub static MUTEX_DROP_NO_WAITER: AtomicU64 = AtomicU64::new(0);
 
 /// An async mutex for single-threaded executors.
 ///
@@ -128,10 +120,7 @@ impl<'a, T> Drop for MutexGuard<'a, T> {
         self.mutex.locked.set(false);
         // Wake the next waiter, if any.
         if let Some(waker) = self.mutex.waiters.borrow_mut().pop_front() {
-            MUTEX_HANDOFF_WAKES.fetch_add(1, Ordering::Relaxed);
             waker.wake();
-        } else {
-            MUTEX_DROP_NO_WAITER.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

@@ -1609,7 +1609,6 @@ pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64
 pub fn fork_child_trampoline() -> ! {
     let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
-    let debug_sshd_child = crate::task::scheduler::current_task_is_debug_sshd_fork_child();
 
     // u32::MAX sentinel if task index is unexpectedly unset (should not happen
     // since this runs as a scheduled task, but avoids a misleading 0).
@@ -1620,19 +1619,6 @@ pub fn fork_child_trampoline() -> ! {
         pid: ctx.pid,
         task_idx,
     });
-    let task_pid_before = crate::task::scheduler::current_task_debug_snapshot()
-        .map(|(_, pid, _, _, _, _, _, _)| pid)
-        .unwrap_or(0);
-    if debug_sshd_child {
-        log::info!(
-            "[sched] fork_child_trampoline: task_idx={} ctx_pid={} task_pid_before={} user_rip={:#x} user_rsp={:#x}",
-            task_idx,
-            ctx.pid,
-            task_pid_before,
-            ctx.user_rip,
-            ctx.user_rsp
-        );
-    }
 
     debug_assert!(
         ctx.user_rip != 0,
@@ -1649,17 +1635,6 @@ pub fn fork_child_trampoline() -> ! {
 
     // Store PID in the current task so the scheduler can restore it on re-dispatch.
     crate::task::set_current_task_pid(ctx.pid);
-    let task_pid_after = crate::task::scheduler::current_task_debug_snapshot()
-        .map(|(_, pid, _, _, _, _, _, _)| pid)
-        .unwrap_or(0);
-    if debug_sshd_child {
-        log::info!(
-            "[sched] fork_child_trampoline: task_idx={} ctx_pid={} task_pid_after={}",
-            task_idx,
-            ctx.pid,
-            task_pid_after
-        );
-    }
 
     // Look up page table root and kernel stack for this process.
     let (cr3_phys, kstack_top) = {

@@ -10,7 +10,7 @@ use core::future::Future;
 use core::pin::Pin;
 #[cfg(not(feature = "std"))]
 use core::sync::atomic::AtomicI32;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 // ---------------------------------------------------------------------------
@@ -75,10 +75,6 @@ pub struct TaskHeader {
     pub queued: AtomicBool,
     /// Whether this task has completed execution.
     pub completed: AtomicBool,
-    /// H9 instrumentation: how many times this task has been woken since
-    /// creation. Incremented by every `wake()` / `wake_by_ref()`. Used by
-    /// `block_on`'s per-iteration dump to identify the persistent waker.
-    pub wake_count: AtomicU64,
     /// Waker registered by a `JoinHandle` awaiting this task's completion.
     pub join_waker: UnsafeCell<Option<Waker>>,
 }
@@ -95,7 +91,6 @@ impl TaskHeader {
             woken: AtomicBool::new(true),
             queued: AtomicBool::new(false),
             completed: AtomicBool::new(false),
-            wake_count: AtomicU64::new(0),
             join_waker: UnsafeCell::new(None),
         }
     }
@@ -158,7 +153,6 @@ unsafe fn clone_fn(ptr: *const ()) -> RawWaker {
 
 unsafe fn wake_fn(ptr: *const ()) {
     let arc = unsafe { Arc::from_raw(ptr as *const TaskHeader) };
-    arc.wake_count.fetch_add(1, Ordering::Relaxed);
     arc.woken.store(true, Ordering::Release);
     signal_wake_pipe();
     // arc is dropped here, decrementing refcount
@@ -166,7 +160,6 @@ unsafe fn wake_fn(ptr: *const ()) {
 
 unsafe fn wake_by_ref_fn(ptr: *const ()) {
     let arc = unsafe { Arc::from_raw(ptr as *const TaskHeader) };
-    arc.wake_count.fetch_add(1, Ordering::Relaxed);
     arc.woken.store(true, Ordering::Release);
     signal_wake_pipe();
     // Don't drop — this is wake_by_ref
