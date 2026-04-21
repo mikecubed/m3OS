@@ -388,6 +388,13 @@ fn cmd_kill(name: &str) -> i32 {
         write_str(STDERR_FILENO, "service: no status available\n");
         return 1;
     }
+    if n as usize >= buf.len() {
+        write_str(
+            STDERR_FILENO,
+            "service: status file too large or truncated\n",
+        );
+        return 1;
+    }
     let text = match core::str::from_utf8(&buf[..n as usize]) {
         Ok(s) => s,
         Err(_) => {

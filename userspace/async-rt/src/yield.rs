@@ -37,3 +37,53 @@ impl Future for YieldNow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::Wake;
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn yield_now_pending_then_ready_and_wakes() {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&flag));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(yield_now());
+
+        // First poll: must return Pending and must self-wake.
+        let poll1 = fut.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll1, Poll::Pending),
+            "expected Pending on first poll"
+        );
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "waker must be called on first poll"
+        );
+
+        // Second poll: must return Ready.
+        let poll2 = fut.as_mut().poll(&mut cx);
+        assert!(
+            matches!(poll2, Poll::Ready(())),
+            "expected Ready on second poll"
+        );
+    }
+}

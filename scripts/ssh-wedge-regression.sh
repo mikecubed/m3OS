@@ -57,7 +57,7 @@ SUMMARY="${ARTIFACT_DIR}/ssh-wedge-${RUN_ID}.summary"
 
 cd "$REPO_ROOT"
 
-cargo xtask run > "$LOG" 2>&1 &
+setsid cargo xtask run > "$LOG" 2>&1 &
 QPID=$!
 
 # Wait for sshd to listen.
@@ -77,11 +77,9 @@ if ! grep -q "sshd: listening on port 22" "$LOG"; then
         echo "ssh_log=${SSH_LOG}"
     } > "$SUMMARY"
     cat "$SUMMARY"
-    kill -TERM "$QPID" 2>/dev/null || true
+    kill -TERM -- -"$QPID" 2>/dev/null || true
     sleep 2
-    kill -KILL "$QPID" 2>/dev/null || true
-    pkill -TERM -f "qemu-system-x86_64" 2>/dev/null || true
-    pkill -KILL -f "qemu-system-x86_64" 2>/dev/null || true
+    kill -KILL -- -"$QPID" 2>/dev/null || true
     wait "$QPID" 2>/dev/null || true
     exit 2
 fi
@@ -104,11 +102,9 @@ set -e
 # Let sshd flush its session-teardown logs before we tear QEMU down.
 sleep 3
 
-kill -TERM "$QPID" 2>/dev/null || true
-pkill -TERM -f "qemu-system-x86_64" 2>/dev/null || true
+kill -TERM -- -"$QPID" 2>/dev/null || true
 sleep 2
-kill -KILL "$QPID" 2>/dev/null || true
-pkill -KILL -f "qemu-system-x86_64" 2>/dev/null || true
+kill -KILL -- -"$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 
 # Classify.
