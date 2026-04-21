@@ -76,7 +76,8 @@ pub use scheduler::{
 ///
 /// Returns `None` if the lock is already held (e.g. during a panic while
 /// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
-pub(crate) fn try_lock_scheduler() -> Option<spin::MutexGuard<'static, scheduler::Scheduler>> {
+pub(crate) fn try_lock_scheduler() -> Option<scheduler::IrqSafeGuard<'static, scheduler::Scheduler>>
+{
     scheduler::SCHEDULER.try_lock()
 }
 

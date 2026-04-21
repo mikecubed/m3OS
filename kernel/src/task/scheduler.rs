@@ -94,10 +94,104 @@ fn task_log_label(pid: u32, task_name: &'static str) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// IRQ-safe scheduler lock wrapper
+// ---------------------------------------------------------------------------
+//
+// A same-core interrupt that calls `wake_task` can deadlock a task-context
+// holder of `SCHEDULER.lock()`. [`IrqSafeMutex`] prevents that by masking
+// interrupts for the duration of the critical section — the same pattern
+// used by `virtio_net::DRIVER` (wrapped in `without_interrupts`) and the
+// frame allocator's `with_frame_alloc_irq_safe` helper. Root cause analysis
+// is in `docs/appendix/scheduler-fairness-regression.md` (early-wedge).
+//
+// The guard's fields are dropped in declaration order: the inner spin
+// guard releases the lock *before* [`InterruptRestore`] re-enables IF,
+// so an ISR cannot fire during the unlock window and reach a just-freed
+// lock with stale `was_enabled` state.
+pub(crate) struct IrqSafeMutex<T: ?Sized> {
+    inner: Mutex<T>,
+}
+
+pub(crate) struct IrqSafeGuard<'a, T: ?Sized + 'a> {
+    guard: spin::MutexGuard<'a, T>,
+    _restore: InterruptRestore,
+}
+
+struct InterruptRestore {
+    was_enabled: bool,
+}
+
+impl<T> IrqSafeMutex<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+}
+
+impl<T: ?Sized> IrqSafeMutex<T> {
+    pub(crate) fn lock(&self) -> IrqSafeGuard<'_, T> {
+        let was_enabled = interrupts::are_enabled();
+        if was_enabled {
+            interrupts::disable();
+        }
+        let guard = self.inner.lock();
+        IrqSafeGuard {
+            guard,
+            _restore: InterruptRestore { was_enabled },
+        }
+    }
+
+    /// Non-blocking lock attempt — returns `None` if the inner spinlock is
+    /// already held. Used by the panic-diagnostic path so it can inspect
+    /// task state without deadlocking if the scheduler was holding the lock
+    /// at the moment the panic fired.
+    pub(crate) fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
+        let was_enabled = interrupts::are_enabled();
+        if was_enabled {
+            interrupts::disable();
+        }
+        match self.inner.try_lock() {
+            Some(guard) => Some(IrqSafeGuard {
+                guard,
+                _restore: InterruptRestore { was_enabled },
+            }),
+            None => {
+                if was_enabled {
+                    interrupts::enable();
+                }
+                None
+            }
+        }
+    }
+}
+
+impl<T: ?Sized> core::ops::Deref for IrqSafeGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T: ?Sized> core::ops::DerefMut for IrqSafeGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl Drop for InterruptRestore {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            interrupts::enable();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Statics
 // ---------------------------------------------------------------------------
 
-pub(super) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub(super) static SCHEDULER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
 // Per-core helpers
@@ -552,6 +646,13 @@ fn least_loaded_core(sched: &Scheduler) -> u8 {
 }
 
 /// Enqueue a task index into a specific core's run queue and signal it.
+///
+/// The body runs with interrupts masked on the current CPU so that a
+/// same-core ISR cannot re-enter and deadlock on `run_queue.lock()` —
+/// the ISR-callable wake path (virtio-net, virtio-blk) funnels through
+/// `wake_task` → `enqueue_to_core`, and the task-context holder must not
+/// be preempted while the per-core run queue is locked. See the root-cause
+/// note at [`IrqSafeMutex`].
 fn enqueue_to_core(core_id: u8, idx: usize) {
     debug_assert!(
         (core_id as usize) < crate::smp::MAX_CORES,
@@ -559,32 +660,34 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
         core_id,
         crate::smp::MAX_CORES
     );
-    if let Some(data) = crate::smp::get_core_data(core_id) {
-        data.run_queue.lock().push_back(idx);
-        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
-            task_idx: idx as u32,
-            core: core_id,
-        });
-        data.reschedule.store(true, Ordering::Relaxed);
-        // Phase 54: when we enqueue onto a DIFFERENT core than the caller's,
-        // setting the reschedule flag alone won't wake a halted target core
-        // — `hlt` only wakes on an interrupt. Send a reschedule IPI so the
-        // target picks up the new task immediately instead of waiting for
-        // its next local timer tick (~10 ms on APs).
-        //
-        // Without this, the high-volume cross-core IPC introduced by the
-        // broadened VFS routing in commit 3944b9b causes deterministic
-        // login hangs on `/etc/services.d` STAT and intermittent hangs
-        // during subsequent interactive commands — wake_task returns true
-        // (state flips Blocked→Ready) but the idle target core never
-        // notices the new run-queue entry.
-        if crate::smp::is_per_core_ready() {
-            let current = crate::smp::per_core().core_id;
-            if current != core_id {
-                crate::smp::ipi::send_ipi_to_core(core_id, crate::smp::ipi::IPI_RESCHEDULE);
+    interrupts::without_interrupts(|| {
+        if let Some(data) = crate::smp::get_core_data(core_id) {
+            data.run_queue.lock().push_back(idx);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
+                task_idx: idx as u32,
+                core: core_id,
+            });
+            data.reschedule.store(true, Ordering::Relaxed);
+            // Phase 54: when we enqueue onto a DIFFERENT core than the caller's,
+            // setting the reschedule flag alone won't wake a halted target core
+            // — `hlt` only wakes on an interrupt. Send a reschedule IPI so the
+            // target picks up the new task immediately instead of waiting for
+            // its next local timer tick (~10 ms on APs).
+            //
+            // Without this, the high-volume cross-core IPC introduced by the
+            // broadened VFS routing in commit 3944b9b causes deterministic
+            // login hangs on `/etc/services.d` STAT and intermittent hangs
+            // during subsequent interactive commands — wake_task returns true
+            // (state flips Blocked→Ready) but the idle target core never
+            // notices the new run-queue entry.
+            if crate::smp::is_per_core_ready() {
+                let current = crate::smp::per_core().core_id;
+                if current != core_id {
+                    crate::smp::ipi::send_ipi_to_core(core_id, crate::smp::ipi::IPI_RESCHEDULE);
+                }
             }
         }
-    }
+    });
 }
 
 /// Allocate a slot for a new task, reusing a dead slot from the free list
@@ -1311,12 +1414,19 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
 }
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
+///
+/// ISR-safe. The critical section below runs under `SCHEDULER.lock()` which
+/// now masks interrupts for its duration; the follow-up `enqueue_to_core`
+/// call does the same for the per-core run queue. Callers from interrupt
+/// context (virtio-net, virtio-blk) therefore cannot re-enter a task-context
+/// holder on the same core — see the root-cause note at [`IrqSafeMutex`].
 pub fn wake_task(id: TaskId) -> bool {
-    // H9 instrumentation: capture which branch wake_task took so we can
-    // distinguish "blocked → ready transition" from "no-op because already
-    // running/ready" or "missing task id". The diagnostic log fires below,
-    // outside the SCHEDULER lock.
-    let (enqueue, woke, debug_outcome) = {
+    // H9 instrumentation: capture everything we might want to log in the
+    // same critical section so we don't need a second `SCHEDULER.lock()` —
+    // a second acquisition would add latency to the ISR wake path and
+    // formerly re-entered a PROCESS_TABLE lookup via `task_log_label`,
+    // reintroducing the exact deadlock class this refactor prevents.
+    let (enqueue, woke, debug_outcome, snapshot) = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
             debug_assert!(
@@ -1329,6 +1439,14 @@ pub fn wake_task(id: TaskId) -> bool {
             let pid_for_log = sched.tasks[idx].pid;
             let name_for_log = sched.tasks[idx].name;
             let cur_state = sched.tasks[idx].state;
+            let label = label_from_name_only(name_for_log, pid_for_log);
+            let snapshot_tuple = (
+                label,
+                sched.tasks[idx].assigned_core,
+                sched.tasks[idx].affinity_mask,
+                sched.tasks[idx].last_ready_tick,
+                sched.tasks[idx].last_migrated_tick,
+            );
             match cur_state {
                 TaskState::BlockedOnRecv
                 | TaskState::BlockedOnSend
@@ -1356,6 +1474,7 @@ pub fn wake_task(id: TaskId) -> bool {
                                 "wake-after-switch",
                                 cur_state,
                             ),
+                            snapshot_tuple,
                         )
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
@@ -1372,6 +1491,7 @@ pub fn wake_task(id: TaskId) -> bool {
                                 "blocked-to-ready",
                                 cur_state,
                             ),
+                            snapshot_tuple,
                         )
                     }
                 }
@@ -1385,6 +1505,7 @@ pub fn wake_task(id: TaskId) -> bool {
                         "noop-not-blocked",
                         cur_state,
                     ),
+                    snapshot_tuple,
                 ),
             }
         } else {
@@ -1392,6 +1513,7 @@ pub fn wake_task(id: TaskId) -> bool {
                 None,
                 false,
                 (false, 0u32, "<missing>", "missing-task-id", TaskState::Dead),
+                (None, 0, 0, 0, 0),
             )
         }
     };
@@ -1412,29 +1534,19 @@ pub fn wake_task(id: TaskId) -> bool {
             state_before: prev_state,
             core,
         });
-        let task = {
-            let sched = SCHEDULER.lock();
-            (
-                sched.tasks[idx].pid,
-                sched.tasks[idx].name,
-                sched.tasks[idx].assigned_core,
-                sched.tasks[idx].affinity_mask,
-                sched.tasks[idx].last_ready_tick,
-                sched.tasks[idx].last_migrated_tick,
-            )
-        };
-        if let Some(label) = task_log_label(task.0, task.1) {
+        let (label, assigned_core, affinity_mask, last_ready_tick, last_migrated_tick) = snapshot;
+        if let Some(label) = label {
             log::info!(
                 "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
                 id.0,
-                task.0,
-                task.1,
+                pid_for_log,
+                name_for_log,
                 label,
                 prev_state,
-                task.2,
-                task.3,
-                task.4,
-                task.5
+                assigned_core,
+                affinity_mask,
+                last_ready_tick,
+                last_migrated_tick
             );
         }
         enqueue_to_core(core, idx);
@@ -1442,6 +1554,19 @@ pub fn wake_task(id: TaskId) -> bool {
     } else {
         woke
     }
+}
+
+/// ISR-safe label lookup: classifies tasks without touching
+/// `PROCESS_TABLE.lock()`. The old helper `task_log_label` called
+/// `PROCESS_TABLE.lock()` for pid != 0, which meant a same-core ISR
+/// calling `wake_task` could deadlock against a task holding that lock.
+/// This variant gives up exec-path classification in exchange for being
+/// callable from any context.
+fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static str> {
+    if pid == 0 {
+        return matches!(task_name, "net" | "console" | "serial-stdin").then_some(task_name);
+    }
+    None
 }
 
 /// Store a [`Message`] in a task's pending slot.
