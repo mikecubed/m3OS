@@ -310,11 +310,15 @@ mis-classifications of slow early-wedges that narrowly elapsed the
   the page-fault redirection trampoline acquires it but runs
   *outside* ISR context by design (see
   `fault_kill_trampoline`). No further action needed.
-- [ ] **Regression harness.** `/tmp/h9_run_once.sh` and
-  `/tmp/h9_batch.sh` live outside the tree. Promote both into
-  `tests/` or `scripts/` (as a named regression so the class
-  of bug is continuously guarded against) and wire into
-  `cargo xtask test` when time permits.
+- [x] **Regression harness promoted in-tree.**
+  `scripts/ssh-wedge-regression.sh` (single-shot) and
+  `scripts/ssh-wedge-regression-batch.sh` (N-run tally with
+  non-zero exit on any captured wedge). Honours `ARTIFACT_DIR`
+  and a handful of timeout environment variables. Not yet
+  wired into `cargo xtask test` — each run boots a full VM,
+  so it is not a good fit for an every-commit check. A
+  follow-up could add a dedicated `cargo xtask ssh-regression
+  --count N` subcommand for manual or CI invocation.
 
 ## Related
 

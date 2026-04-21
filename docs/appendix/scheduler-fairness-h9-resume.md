@@ -17,15 +17,15 @@ and the failed experiments along the way. Read the post-mortem first;
 dip into the regression log when you want to see how the root cause
 was narrowed.
 
-## Reproduction harness (kept for future regression testing)
+## Reproduction harness (in-tree)
 
 ```
-/tmp/h9_run_once.sh <run-id>
-    → Single-shot boot + ssh attempt. Produces
-      /tmp/h9run<id>.{log,ssh,summary}.
-/tmp/h9_batch.sh <count> <prefix>
-    → Run /tmp/h9_run_once.sh count times with RUN_ID=<prefix><i>.
-      Tallies class= counts at the end.
+scripts/ssh-wedge-regression.sh <run-id>
+    → Single-shot boot + ssh attempt. Writes
+      ${ARTIFACT_DIR:-/tmp}/ssh-wedge-<run-id>.{log,ssh,summary}.
+scripts/ssh-wedge-regression-batch.sh <count> <prefix>
+    → Runs the single-shot harness N times, tallies class= counts,
+      exits non-zero if any wedge is captured.
 ```
 
 Classification from the `summary` file:
@@ -38,7 +38,5 @@ Classification from the `summary` file:
   banner exchange". The pre-fix dominant failure.
 - `class=late-wedge` → `ssh` exit 124 + "Permanently added". A
   slow-tail artefact in pre-fix samples; no longer observed.
-
-Both scripts live outside the tree under `/tmp/`. If the class of bug
-recurs, the **Action items** in the post-mortem call for moving the
-harness into `tests/` or `scripts/` as a named regression.
+- `class=boot-failed` → `sshd: listening on port 22` never appeared.
+  Likely an unrelated boot-path regression.
