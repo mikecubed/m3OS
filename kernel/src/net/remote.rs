@@ -488,27 +488,32 @@ impl RemoteNic {
         mac: MacAddr,
         fallback_endpoint: Option<EndpointId>,
     ) -> Option<EndpointId> {
-        let mut installed = None;
+        let mut live_endpoint = None;
         {
             let mut slot = REMOTE_NIC.lock();
-            if let Some(entry) = slot.as_mut() {
+            if let Some(ep) = fallback_endpoint {
+                if let Some(entry) = slot.as_mut() {
+                    entry.endpoint = ep;
+                    entry.mac = mac;
+                } else {
+                    *slot = Some(NicEntry {
+                        endpoint: ep,
+                        mac,
+                        tx_queue: VecDeque::new(),
+                    });
+                }
+                live_endpoint = Some(ep);
+            } else if let Some(entry) = slot.as_mut() {
                 entry.mac = mac;
-            } else if let Some(ep) = fallback_endpoint {
-                *slot = Some(NicEntry {
-                    endpoint: ep,
-                    mac,
-                    tx_queue: VecDeque::new(),
-                });
-                installed = Some(ep);
             }
         }
-        if installed.is_some() {
+        if live_endpoint.is_some() {
             REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
             RESTART_SUSPECTED.store(false, Ordering::Release);
             ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
             LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
         }
-        installed
+        live_endpoint
     }
 }
 
@@ -522,6 +527,10 @@ mod tests {
         RESTART_SUSPECTED.store(false, Ordering::Release);
         ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
         LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
+    }
+
+    fn registered_endpoint() -> Option<EndpointId> {
+        REMOTE_NIC.lock().as_ref().map(|entry| entry.endpoint)
     }
 
     #[test_case]
@@ -543,6 +552,23 @@ mod tests {
 
         let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
         assert_eq!(RemoteNic::ensure_link_event_entry(mac, None), None);
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn link_event_recovers_restart_suspected_slot_with_live_endpoint() {
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(3), [0; 6]);
+        RemoteNic::on_ipc_error();
+
+        let recovered_ep = EndpointId(7);
+        let mac = [0x52, 0x54, 0x00, 0xde, 0xad, 0xbe];
+        assert_eq!(
+            RemoteNic::ensure_link_event_entry(mac, Some(recovered_ep)),
+            Some(recovered_ep)
+        );
+        assert!(!RESTART_SUSPECTED.load(Ordering::Acquire));
+        assert_eq!(registered_endpoint(), Some(recovered_ep));
         assert_eq!(RemoteNic::mac_address(), Some(mac));
     }
 }
