@@ -142,7 +142,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Acceptance:**
 - [ ] Given an arbitrary sequence of `bind`, `signal(bits)`, `send(label)`, `recv()`, the state after each `recv()` satisfies: exactly one wake is dispatched **or** at least one source becomes pending and is observable on the next recv.
 - [ ] Signals arriving during a blocked recv are never merged with an earlier send's label.
-- [ ] `proptest` configured with at least 1024 cases; runs under `cargo test -p kernel-core --release`.
+- [ ] `proptest` configured with at least 1024 cases; runs under `cargo test -p kernel-core --release --target x86_64-unknown-linux-gnu`.
 
 ---
 
@@ -188,7 +188,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Why it matters:** The one new syscall.
 
 **Acceptance:**
-- [ ] Syscall number allocated in the existing IPC range (`0x1118` next free).
+- [ ] Syscall number allocated as the next free slot after the current IPC block (`0x1111`).
 - [ ] `ipc_recv_msg` doc comment updated to note the new wake-kind encoding.
 - [ ] Every test in B.2 now passes.
 - [ ] `cargo xtask check` passes.
@@ -538,21 +538,21 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - [ ] Both Phase 56 docs name `RecvResult` + `IrqNotification::bind_to_endpoint` as the required pattern for display-driver and input-driver event loops.
 - [ ] The Phase 56 tasks touching a driver loop list "consumes Phase 55c bound notifications" as a precondition.
 
-### J.5 — Phase 55c learning doc
+### J.4 — Phase 55c learning doc
 
 **File:** `docs/roadmap/55c-ring-3-driver-correctness-closure-learning.md` (new)
 **Symbol:** N/A
 **Why it matters:** Every completed phase requires a learning doc. Phase 56 authors and future contributors need a structured explanation of the three primitives Phase 55c added. Without it the roadmap has a gap at the exact point where Phase 56's driver loop design decisions depend on understanding what Phase 55c established.
 
 **Acceptance:**
-- [ ] Doc follows the aligned-learning-doc template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
+- [ ] Doc follows the **aligned legacy learning doc** template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
 - [ ] **What This Doc Covers** lists exactly: (1) bound notifications and the seL4 wake-model composition pattern (R3); (2) IOMMU domain MMIO identity mapping for claimed devices (R2); (3) driver-restart error propagation through the kernel's `RemoteNic` facade to userspace `EAGAIN` (R1).
 - [ ] **Key Files** table names at minimum: `kernel-core/src/ipc/bound_notif.rs`, `kernel/src/ipc/notification.rs`, `kernel/src/ipc/endpoint.rs`, `kernel-core/src/iommu/bar_coverage.rs`, `kernel/src/net/remote.rs`, `userspace/lib/driver_runtime/src/ipc/mod.rs`, `userspace/drivers/e1000/src/io.rs`.
 - [ ] **How This Phase Differs From Later Work** notes that Phase 56 consumes `RecvResult` and `IrqNotification::bind_to_endpoint` — those primitives are taught in this doc, not in Phase 56's doc.
 - [ ] Doc added to `docs/roadmap/README.md` alongside the design doc and task doc links for Phase 55c.
 - [ ] `docs/roadmap/55c-ring-3-driver-correctness-closure.md` **Companion Task List** section updated to include a link to this learning doc.
 
-### J.4 — Version bump to `v0.55.3`
+### J.5 — Version bump to `v0.55.3`
 
 **Files:**
 - `kernel/Cargo.toml`
@@ -603,7 +603,7 @@ If `sys_net_send` (or the `sys_sendto` extension) breaks existing net paths:
 
 ## Documentation Notes
 
-- **Learning doc is mandatory.** J.5 must be complete before the phase is marked Complete. The aligned-learning-doc template from `docs/appendix/doc-templates.md` is the required shape — do not merge the phase-complete commit (J.4) without the learning doc in tree.
+- **Learning doc is mandatory.** J.4 must be complete before the phase is marked Complete. The **aligned legacy learning doc** template from `docs/appendix/doc-templates.md` is the required shape — do not merge the phase-complete commit (J.5) without the learning doc in tree.
 - **What changed vs Phase 55b.** Phase 55b shipped the ring-3 driver host but left three correctness gaps. Phase 55c closes all three. The learning doc and post-mortem (J.2) are the canonical record of what was wrong, why it was not caught earlier, and what Phase 55c fixed.
 - **Prefer exact files over directories.** Every task's **File** / **Files** entry names a concrete path, not a directory. If a file is renamed or split during implementation, update this doc before closing the task.
 - **Prefer exact symbols over generic descriptions.** Every task's **Symbol** entry names the specific function, type, or constant — not the module or crate. Generic descriptions like "net module" are not acceptable.
