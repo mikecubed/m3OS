@@ -9,16 +9,26 @@
 //! - A bound notification was signalled → [`WakeKind::Notification`] carrying
 //!   the drained notification bitset.
 //!
-//! A dedicated 1-byte "recv kind" out-register carries the tag so that the
-//! syscall return value remains unambiguous. [`RECV_KIND_MESSAGE`] and
-//! [`RECV_KIND_NOTIFICATION`] define the two legal tag values.
+//! The kernel-side helper surface uses a `(kind_tag, `[`Message`]`)` pair to
+//! distinguish the wake source without colliding with negative errnos.
+//! [`RECV_KIND_MESSAGE`] and [`RECV_KIND_NOTIFICATION`] define the two legal
+//! helper tags.
+//!
+//! The userspace syscall ABI projects that helper pair onto the existing
+//! `ipc_recv_msg` return convention:
+//!
+//! - Message wake → syscall return value is the peer label; the written
+//!   [`Message`] header carries the same label plus payload words.
+//! - Notification wake → syscall return value is
+//!   [`RECV_KIND_NOTIFICATION`]; the written synthetic [`Message`] carries
+//!   `label = 0` and `data[0] = drained_bits`.
 //!
 //! # Encoding rules
 //!
-//! | Wake source  | `kind` byte            | `IpcMessage.label` | `IpcMessage.data[0]` |
-//! |--------------|------------------------|--------------------|----------------------|
-//! | Message      | `RECV_KIND_MESSAGE`    | peer-provided      | message payload      |
-//! | Notification | `RECV_KIND_NOTIFICATION` | `0`              | drained bits         |
+//! | Wake source  | helper `kind` byte       | syscall return value       | `IpcMessage.label` | `IpcMessage.data[0]` |
+//! |--------------|--------------------------|----------------------------|--------------------|----------------------|
+//! | Message      | `RECV_KIND_MESSAGE`      | peer-provided label        | peer-provided      | message payload      |
+//! | Notification | `RECV_KIND_NOTIFICATION` | `RECV_KIND_NOTIFICATION`   | `0`                | drained bits         |
 //!
 //! Negative errnos remain in the syscall return channel; they are never mixed
 //! with the kind tag.
@@ -40,11 +50,13 @@ pub enum WakeKind {
     Notification(u64),
 }
 
-/// Encode a [`WakeKind`] into a `(kind tag, `[`Message`]`)` pair suitable for
-/// returning from the recv syscall.
+/// Encode a [`WakeKind`] into the kernel-side `(kind tag, `[`Message`]`)`
+/// helper representation used by the recv path.
 ///
-/// The caller places `kind` in the dedicated kind out-register and copies
-/// the [`Message`] into the userspace IPC buffer.
+/// The syscall wrapper may project this helper pair onto a slightly different
+/// ABI: message wakes surface `msg.label` as the syscall return value, while
+/// notification wakes surface [`RECV_KIND_NOTIFICATION`] and write a synthetic
+/// message with `msg.label = 0` and `msg.data[0] = drained_bits`.
 pub fn encode_wake_kind(wake: WakeKind) -> (u8, Message) {
     match wake {
         WakeKind::Message(label) => (RECV_KIND_MESSAGE, Message::new(label)),
