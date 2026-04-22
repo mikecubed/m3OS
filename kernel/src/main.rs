@@ -616,9 +616,11 @@ fn net_task() -> ! {
         net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
         let mut any =
             net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
-        while any {
+        let mut drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
+        while any || drained_remote_tx != 0 {
             net::dispatch::process_rx();
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+            drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
         }
         // Park on the unified flag: the virtio-net ISR and RemoteNic both
         // set it, so a wake from either path reliably unblocks the task.

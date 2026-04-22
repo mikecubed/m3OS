@@ -48,8 +48,6 @@ use kernel_core::driver_ipc::net::{
 use kernel_core::types::{EndpointId, MacAddr};
 use spin::Mutex;
 
-use super::NIC_WOKEN;
-
 // ---------------------------------------------------------------------------
 // Tunable — TX queue depth cap
 // ---------------------------------------------------------------------------
@@ -291,6 +289,7 @@ impl RemoteNic {
             frame.len(),
             entry.tx_queue.len(),
         );
+        crate::net::virtio_net::wake_net_task();
         Ok(())
     }
 
@@ -412,7 +411,7 @@ impl RemoteNic {
                 }
                 let frame = &header_and_frame[header_size..header_size + frame_len];
                 if super::dispatch::process_rx_frames(frame) {
-                    NIC_WOKEN.store(true, Ordering::Release);
+                    crate::net::virtio_net::wake_net_task();
                     1
                 } else {
                     log::warn!(
@@ -481,7 +480,7 @@ impl RemoteNic {
             // One-line hook: link-down resets TCP retransmit timers per Phase 16.
             super::tcp::on_link_down();
         }
-        NIC_WOKEN.store(true, Ordering::Release);
+        crate::net::virtio_net::wake_net_task();
     }
 
     fn ensure_link_event_entry(
