@@ -21,6 +21,7 @@
 pub mod acpi_integration;
 pub mod amdvi_page_table;
 pub mod amdvi_regs;
+pub mod bar_coverage;
 pub mod contract;
 pub mod device_map;
 pub mod identity;
@@ -29,3 +30,6 @@ pub mod regions;
 pub mod tables;
 pub mod vtd_page_table;
 pub mod vtd_regs;
+
+#[cfg(test)]
+mod bar_coverage_proptest;
