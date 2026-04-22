@@ -110,13 +110,55 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
     // Clear any persistent bound-notification entry for the dying task after
     // waiter teardown so signal() cannot observe a stale waiter for an already
     // unbound task.
-    if let Some(task_sched_idx) = scheduler::task_idx_for_task_id(task_id) {
-        notification::clear_bound_task(task_sched_idx);
-    }
+    cleanup_task_bound_notif(task_id);
     scheduler::mark_ipc_cleaned(task_id);
 
     log::trace!(
         "[ipc] cleanup_task_ipc: cleaned up IPC state for task {}",
         task_id.0
     );
+}
+
+pub(crate) fn cleanup_task_bound_notif(task_id: TaskId) {
+    if let Some(task_sched_idx) = scheduler::task_idx_for_task_id(task_id) {
+        notification::clear_bound_task(task_sched_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_task_bound_notif;
+    use crate::ipc::notification::{NotifId, TCB_BOUND_NOTIF, bind_task, clear_bound_task};
+    use crate::task::{TaskId, scheduler};
+    use core::sync::atomic::Ordering;
+
+    #[test_case]
+    fn cleanup_task_bound_notif_uses_scheduler_lookup_and_clears_binding() {
+        const TASK_IDX: usize = 53;
+        let task_id = TaskId(0xBEEF);
+        let notif_id = NotifId(53);
+
+        scheduler::install_test_task_idx(task_id, TASK_IDX);
+        clear_bound_task(TASK_IDX);
+
+        bind_task(notif_id, TASK_IDX).expect("bind_task must succeed on a free slot");
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK_IDX].load(Ordering::Acquire),
+            notif_id.0,
+            "bind_task must publish the task-side binding before cleanup",
+        );
+
+        cleanup_task_bound_notif(task_id);
+
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK_IDX].load(Ordering::Acquire),
+            0xff,
+            "cleanup seam must clear the task-side binding through the shared path",
+        );
+        bind_task(notif_id, TASK_IDX)
+            .expect("cleanup seam must free the notif-side binding for a later rebind");
+
+        // leave the global slot clean for subsequent tests
+        clear_bound_task(TASK_IDX);
+    }
 }

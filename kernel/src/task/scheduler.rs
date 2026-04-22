@@ -1625,6 +1625,28 @@ pub fn mark_ipc_cleaned(id: TaskId) {
     }
 }
 
+#[cfg(test)]
+fn test_task_entry() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
+    let mut sched = SCHEDULER.lock();
+    while sched.tasks.len() <= idx {
+        let mut filler = Task::new(test_task_entry, "test-filler");
+        filler.state = TaskState::Dead;
+        sched.tasks.push(filler);
+    }
+
+    let mut task = Task::new(test_task_entry, "test-cleanup");
+    task.id = task_id;
+    task.state = TaskState::Ready;
+    sched.tasks[idx] = task;
+}
+
 /// Return whether any live task other than `excluding` still holds a cap to
 /// `ep_id`.
 pub fn other_task_holds_endpoint_cap(excluding: TaskId, ep_id: EndpointId) -> bool {
