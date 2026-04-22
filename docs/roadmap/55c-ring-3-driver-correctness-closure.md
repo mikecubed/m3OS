@@ -130,11 +130,9 @@ loop {
 
 The existing `device_smoke_script_nvme` and `device_smoke_script_e1000` in `xtask/src/main.rs` already accept `--iommu`. The regression harness is updated so a `--iommu` failure fails the same CI lane that catches the non-IOMMU case, not a separate optional lane. The Phase 55b R2 residual entry is struck.
 
-### R1.1 — `sys_net_send` syscall
+### R1.1 — Userspace send-path restart visibility
 
-A new syscall `sys_net_send(socket_fd, buf_ptr, len, flags) -> isize` in `kernel/src/syscall/net.rs`. Routes through `RemoteNic::send_frame` when registered; falls back to the existing virtio-net path only when no ring-3 net driver is bound. On `NetDriverError::DriverRestarting`, returns `-EAGAIN` through `net_error_to_neg_errno`.
-
-Alternative surface (chosen for minimal ABI churn): extend the existing `sys_sendto` to prefer `RemoteNic` and propagate the error byte. Final shape decided in the Track G design task (G.1 below); both variants land the same EAGAIN visibility.
+Track G resolves the exact syscall shape: either a new `sys_net_send(socket_fd, buf_ptr, len, flags) -> isize` in `kernel/src/syscall/net.rs`, or an extension of the existing `sys_sendto` path. In either variant, the userspace send path routes through `RemoteNic::send_frame` when a ring-3 net driver is registered, falls back to the existing virtio-net path only when no ring-3 net driver is bound, and surfaces `NetDriverError::DriverRestarting` as `-EAGAIN` through `net_error_to_neg_errno`.
 
 ### R1.2 — `e1000-crash-smoke` asserts EAGAIN
 

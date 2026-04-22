@@ -1,17 +1,17 @@
 # Phase 55b Residuals — Scheduling Record
 
-**Status:** Open — two real follow-ups + documented annotations
+**Status:** Assigned — two real follow-ups now owned by Phase 55c + documented annotations
 **Source:** Phase 55b (Ring-3 Driver Host) closure pass
 **Discovered:** During the Phase 55b closure work (waves 15–17); Phase 55b itself is landed as of v0.55.2
-**Audience:** Roadmap planning — the two *real* items below need a phase assignment
+**Audience:** Roadmap planning and closure tracking — the two *real* items below are assigned to Phase 55c
 
 ## Why this document exists
 
-Phase 55b's architectural goal (ring-3 NVMe + e1000 drivers, IOMMU-isolated, supervised, restartable) is delivered and live at runtime. During the closure pass two real follow-ups surfaced that do **not** belong to Phase 55b's scope but cannot be ignored. This doc records them precisely so they can be scheduled against later phases rather than getting lost in commit history.
+Phase 55b's architectural goal (ring-3 NVMe + e1000 drivers, IOMMU-isolated, supervised, restartable) is delivered and live at runtime. During the closure pass two real follow-ups surfaced that do **not** belong to Phase 55b's scope but cannot be ignored. This doc records them precisely so their later owner — Phase 55c — stays explicit rather than getting lost in commit history.
 
 It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not gaps) so future readers don't mistake them for debt.
 
-## Section 1 — Real follow-ups that need a phase assignment
+## Section 1 — Real follow-ups assigned to Phase 55c
 
 ### R1 — `sys_net_send` syscall for userspace-observable EAGAIN
 
@@ -102,6 +102,6 @@ These do **not** belong in a future phase's scope.
 - `docs/55b-ring-3-driver-host.md` — Phase 55b learning doc (contains the Outcome Metrics section)
 - `docs/roadmap/55b-ring-3-driver-host.md` — Phase 55b design doc
 - `docs/roadmap/tasks/55b-ring-3-driver-host-tasks.md` — Phase 55b task list
-- `docs/roadmap/55a-iommu-substrate.md` — owner of R2
-- `docs/roadmap/60-networking-and-github.md` — candidate owner of R1
+- `docs/roadmap/55c-ring-3-driver-correctness-closure.md` — owner of R1 and R2
+- `docs/roadmap/tasks/55c-ring-3-driver-correctness-closure-tasks.md` — execution plan for R1 and R2
 - `docs/roadmap/58-release-1-0-gate.md` — gate that R2 must clear
