@@ -232,13 +232,10 @@ fn init_task() -> ! {
     task::spawn(remote_nic_ingress_task, "net-ingress");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
-    // Spawn Phase 16 network processing task.  VirtIO-net ready is enough to
-    // justify the task; the ring-3 e1000 driver (`userspace/drivers/e1000`)
-    // delivers RX frames via RemoteNic IPC and does not require the task to
-    // spin on a kernel-side IRQ flag.
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
-        task::spawn(net_task, "net");
-    }
+    // Spawn the shared network processing task. Both NIC backends rely on it:
+    // virtio-net wakes it from the kernel IRQ path, and the ring-3 e1000 path
+    // uses it to flush RemoteNic TX plus process ingress-triggered wakeups.
+    task::spawn(net_task, "net");
 
     // Phase 52: stdin_feeder_task removed — userspace stdin_feeder reads from
     // the userspace kbd_server via IPC and pushes to stdin via stdin_push syscall.
