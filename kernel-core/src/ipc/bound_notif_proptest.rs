@@ -15,8 +15,8 @@
 //! `signal()` always OR-accumulates into `signal_bits` regardless of binding
 //! state (the notification pending word is always updated, mirroring real
 //! hardware). `recv()` dispatches at most one wake per call:
-//! 1. If `message_queue` is non-empty → dispatch the front message.
-//! 2. Else if `bound && signal_bits != 0` → drain and dispatch the bits.
+//! 1. If `bound && signal_bits != 0` → drain and dispatch the bits (highest priority).
+//! 2. Else if `message_queue` is non-empty → dispatch the front message.
 //! 3. Otherwise → no pending wake (returns `None`).
 //!
 //! Signals accumulated while unbound are preserved in `signal_bits` and become
@@ -36,10 +36,9 @@
 //!   or the signal bitset is zero.
 //! - **Binding-dependent observability**: `recv()` dispatches notification bits
 //!   only while `bound == true`; unbound signals are never dispatched.
-//! - **No-lost-wake across later recvs**: if `recv()` dispatches a message while
-//!   a notification is pending, the notification must survive until the next
-//!   recv where it is dispatchable (still bound, no higher-priority message)
-//!   and be returned then without contamination.
+//! - **No-lost-wake across later recvs**: if `recv()` dispatches a notification
+//!   while messages are queued, those messages must survive and be returned by
+//!   subsequent recv calls without contamination.
 //!
 //! Proptest runs at least 1024 cases (configured via `ProptestConfig`).
 
@@ -106,16 +105,18 @@ mod tests {
 
         /// Dispatch one wake, or return `None` if nothing is dispatchable.
         ///
-        /// Messages take priority over notifications (seL4-style: a waiting
-        /// sender unblocks before a queued IRQ signal).
+        /// Notifications take priority over messages (kernel-first drain path,
+        /// mirroring `recv_msg_with_notif`): if `self.bound` and `signal_bits
+        /// != 0`, the bits are drained and returned before the message queue is
+        /// inspected.
         /// Notification bits are only dispatched when `self.bound == true`.
         fn recv(&mut self) -> Option<WakeKind> {
-            if !self.message_queue.is_empty() {
-                Some(WakeKind::Message(self.message_queue.remove(0)))
-            } else if self.bound && self.signal_bits != 0 {
+            if self.bound && self.signal_bits != 0 {
                 let bits = self.signal_bits;
                 self.signal_bits = 0;
                 Some(WakeKind::Notification(bits))
+            } else if !self.message_queue.is_empty() {
+                Some(WakeKind::Message(self.message_queue.remove(0)))
             } else {
                 None
             }
@@ -178,9 +179,8 @@ mod tests {
         /// one `model.recv()` call. Additional assertions (A-R2) carry a
         /// pending-notification obligation across later operations: once a
         /// signal exists, every generated `Op::Recv` must either preserve that
-        /// signal in model state or, when the signal is dispatchable (still
-        /// bound and no higher-priority message is queued), return it as a
-        /// notification wake.
+        /// signal in model state (when the receiver is unbound) or, when the
+        /// signal is dispatchable (bound), return it as a notification wake.
         #[test]
         fn bound_notif_race_safety(ops in op_sequence(24)) {
             let mut model = RecvModel::new();
@@ -192,10 +192,10 @@ mod tests {
             let mut accumulated_bits: u64 = 0;
 
             // A-R2 pending-notification obligation:
-            // whenever the model has signal bits pending, later Op::Recv steps
-            // must either preserve those bits (if a message still has priority
-            // or the receiver is unbound) or dispatch them as a notification
-            // once they become visible to recv().
+            // whenever the model has signal bits pending and the receiver is
+            // bound, the next Op::Recv must dispatch them as a notification
+            // (notifications take priority over queued messages); bits are only
+            // preserved when the receiver is unbound.
             let mut pending_notification: Option<u64> = None;
 
             for op in ops {
@@ -223,8 +223,7 @@ mod tests {
                         // dispatch step.
                         let expected_notification = pending_notification;
                         let notification_dispatchable = expected_notification.is_some()
-                            && model.bound
-                            && model.message_queue.is_empty();
+                            && model.bound;
 
                         // Exactly one model.recv() per Op::Recv.
                         let recv_result = model.recv();
@@ -239,14 +238,14 @@ mod tests {
                                 );
                                 pending_labels.remove(pos.unwrap());
 
-                                // A-R2 — if a notification was already pending but not
-                                // dispatchable here because a message had priority, the
-                                // signal bits must survive this receive step.
+                                // A-R2 — if a notification was already pending but the
+                                // receiver was unbound (not dispatchable), the signal
+                                // bits must survive this receive step.
                                 if expected_notification.is_some() {
                                     prop_assert_ne!(
                                         model.signal_bits, 0,
-                                        "signal_bits must survive a message-priority recv \
-                                         when a notification is still pending"
+                                        "signal_bits must survive a message recv when the \
+                                         receiver is unbound and a notification is still pending"
                                     );
                                 }
                             }
@@ -343,32 +342,43 @@ mod tests {
             // Bind first so that both messages and notifications are observable.
             model.bind();
 
-            // Send a message first, then signal.
+            // Send a message, then signal.
             model.send(label);
             model.signal(bits);
 
-            // First recv must return the message (messages have priority).
-            match model.recv() {
-                Some(WakeKind::Message(got_label)) => {
-                    prop_assert_eq!(got_label, label, "message label must be unmodified");
-                }
-                other => prop_assert!(
-                    false,
-                    "expected Message wake, got {:?}",
-                    other
-                ),
-            }
-
-            // If bits != 0, the notification must still be pending (A-R2 guarantee)
-            // and must be returned by the very next recv() without contamination.
             if bits != 0 {
+                // Notifications take priority: first recv must return the
+                // notification without any label contamination.
                 match model.recv() {
                     Some(WakeKind::Notification(got_bits)) => {
                         prop_assert_eq!(got_bits, bits, "notification bits must be unmodified");
                     }
                     other => prop_assert!(
                         false,
-                        "expected Notification wake after message, got {:?}",
+                        "expected Notification wake (notifications have priority), got {:?}",
+                        other
+                    ),
+                }
+                // The message must still be pending (A-R2 guarantee: no-lost-wake).
+                match model.recv() {
+                    Some(WakeKind::Message(got_label)) => {
+                        prop_assert_eq!(got_label, label, "message label must be unmodified");
+                    }
+                    other => prop_assert!(
+                        false,
+                        "expected Message wake after notification, got {:?}",
+                        other
+                    ),
+                }
+            } else {
+                // No notification bits pending: message is dispatched directly.
+                match model.recv() {
+                    Some(WakeKind::Message(got_label)) => {
+                        prop_assert_eq!(got_label, label, "message label must be unmodified");
+                    }
+                    other => prop_assert!(
+                        false,
+                        "expected Message wake when bits == 0, got {:?}",
                         other
                     ),
                 }
