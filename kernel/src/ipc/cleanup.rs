@@ -107,6 +107,12 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
         notification::release(notif_id);
     }
     notification::clear_waiter(task_id);
+    // Clear any persistent bound-notification entry for the dying task after
+    // waiter teardown so signal() cannot observe a stale waiter for an already
+    // unbound task.
+    if let Some(task_sched_idx) = scheduler::task_idx_for_task_id(task_id) {
+        notification::clear_bound_task(task_sched_idx);
+    }
     scheduler::mark_ipc_cleaned(task_id);
 
     log::trace!(

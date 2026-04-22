@@ -26,7 +26,7 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x110B`;
+//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1111`;
 //!   earlier phases used low numbers 4 and 7, remapped in Phase 50).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
@@ -57,8 +57,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x110F` are translated to internal
-/// dispatch numbers 1–16 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x1111` are translated to internal
+/// dispatch numbers 1–18 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
@@ -76,9 +76,10 @@ pub use registry::RegistryError;
 /// | 12 | 0x110B | `create_endpoint()` | — → new CapHandle |
 /// | 13 | 0x110C | `ipc_send_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` |
 /// | 14 | 0x110D | `ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` → label |
-/// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label |
+/// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label or `1` on notification wake |
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
 /// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
+/// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/MAX |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -117,8 +118,8 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, 12, and 17 do not use arg0 as a cap handle — handle them
-    // before the cap-lookup preamble.
+    // Syscalls 10, 11, 12, 17, and 18 do not use arg0 as a pre-looked-up cap
+    // handle — process them before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
     }
@@ -130,6 +131,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 17 {
         return ipc_store_reply_bulk(task_id, arg0, arg1);
+    }
+    if number == 18 {
+        return sys_notif_bind(task_id, arg0, arg1);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -554,7 +558,8 @@ fn ipc_send_with_bulk(
 /// (label + data[0..4]) to `msg_ptr` and any bulk data to `buf_ptr`
 /// via `copy_to_user`.  `buf_len` caps the bulk copy.
 ///
-/// Returns the message label on success, or `u64::MAX` on error.
+/// Returns the message label on message wake, `1` on notification wake, or
+/// `u64::MAX` on error.
 fn ipc_recv_msg(
     task_id: crate::task::TaskId,
     ep_id: endpoint::EndpointId,
@@ -563,9 +568,19 @@ fn ipc_recv_msg(
     buf_len: u64,
 ) -> u64 {
     use crate::task::scheduler;
+    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION};
 
-    let msg = endpoint::recv_msg(task_id, ep_id);
-    if msg.label == u64::MAX {
+    let (kind, msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
+        if let Some(notif_id) = notification::lookup_bound_notif(task_sched_idx) {
+            endpoint::recv_msg_with_notif(task_id, ep_id, notif_id)
+        } else {
+            (RECV_KIND_MESSAGE, endpoint::recv_msg(task_id, ep_id))
+        }
+    } else {
+        (RECV_KIND_MESSAGE, endpoint::recv_msg(task_id, ep_id))
+    };
+
+    if msg.label == u64::MAX && kind == RECV_KIND_MESSAGE {
         return u64::MAX;
     }
 
@@ -587,7 +602,8 @@ fn ipc_recv_msg(
     }
 
     // Copy bulk data to the receiver's buffer if present.
-    if buf_ptr != 0
+    if kind == RECV_KIND_MESSAGE
+        && buf_ptr != 0
         && let Some(bulk) = scheduler::take_bulk_data(task_id)
     {
         let copy_len = bulk.len().min(buf_len as usize);
@@ -600,7 +616,62 @@ fn ipc_recv_msg(
         }
     }
 
-    msg.label
+    if kind == RECV_KIND_NOTIFICATION {
+        u64::from(RECV_KIND_NOTIFICATION)
+    } else {
+        msg.label
+    }
+}
+
+/// Syscall 18 (0x1111): bind a notification object to the calling task's TCB.
+///
+/// Binding allows `ipc_recv_msg` to consult the notification's pending bits
+/// before parking on the endpoint, delivering a notification wake when an IRQ
+/// or task-context signal fires.
+///
+/// # Return value
+///
+/// - `0` on success (including idempotent re-bind of the same pair).
+/// - `u64::MAX` on capability-not-found (EBADF equivalent).
+/// - `NEG_EBUSY` if the notification is already bound to a different task.
+fn sys_notif_bind(task_id: crate::task::TaskId, notif_cap_handle: u64, ep_cap_handle: u64) -> u64 {
+    use crate::task::scheduler;
+
+    const NEG_EBUSY: u64 = (-16_i64) as u64;
+
+    if notif_cap_handle > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let notif_id = match scheduler::task_cap(task_id, notif_cap_handle as CapHandle) {
+        Ok(Capability::Notification(id)) => id,
+        _ => return u64::MAX,
+    };
+
+    if ep_cap_handle > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    match scheduler::task_cap(task_id, ep_cap_handle as CapHandle) {
+        Ok(Capability::Endpoint(_)) => {}
+        _ => return u64::MAX,
+    }
+
+    let task_sched_idx = match scheduler::get_current_task_idx() {
+        Some(idx) => idx,
+        None => return u64::MAX,
+    };
+
+    match notification::bind_task(notif_id, task_sched_idx) {
+        Ok(()) => {
+            log::trace!(
+                "[ipc] sys_notif_bind: task {} (sched_idx={}) bound to notif {:?}",
+                task_id.0,
+                task_sched_idx,
+                notif_id,
+            );
+            0
+        }
+        Err(()) => NEG_EBUSY,
+    }
 }
 
 // ---------------------------------------------------------------------------

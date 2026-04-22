@@ -673,6 +673,7 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
 fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
     if let Some(idx) = sched.free_list.pop() {
         // Reuse a dead slot.
+        crate::ipc::notification::clear_bound_task(idx);
         sched.tasks[idx] = task;
         idx
     } else {
@@ -1153,6 +1154,10 @@ pub fn block_current_on_reply_unless_message() {
     block_current_unless_message(TaskState::BlockedOnReply);
 }
 
+pub fn block_current_on_notif_unless_message() {
+    block_current_unless_message(TaskState::BlockedOnNotif);
+}
+
 pub fn block_current_on_futex() {
     block_current(TaskState::BlockedOnFutex);
 }
@@ -1604,6 +1609,12 @@ pub fn server_endpoint(id: TaskId) -> Option<EndpointId> {
 pub fn task_notification_caps(id: TaskId) -> alloc::vec::Vec<NotifId> {
     let sched = SCHEDULER.lock();
     sched.notification_caps(id)
+}
+
+/// Return the scheduler task-vec index for `id`, if it is still live.
+pub fn task_idx_for_task_id(id: TaskId) -> Option<usize> {
+    let sched = SCHEDULER.lock();
+    sched.find(id)
 }
 
 /// Mark that per-task IPC teardown has completed for `id`.

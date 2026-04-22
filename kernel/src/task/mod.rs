@@ -50,6 +50,8 @@ use alloc::boxed::Box;
 
 use crate::ipc::{CapabilityTable, Message};
 
+pub(crate) const MAX_TASKS: usize = 256;
+
 pub use kernel_core::types::TaskId;
 
 pub mod blocking_mutex;
