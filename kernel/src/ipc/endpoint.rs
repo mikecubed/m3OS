@@ -377,10 +377,10 @@ pub fn recv_msg_with_notif(
     notif_id: NotifId,
 ) -> (u8, Message) {
     use super::notification;
-    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION};
+    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
 
     let bits = notification::drain_bits(notif_id);
-    if bits != 0 {
+    if classify_recv(bits) == RECV_KIND_NOTIFICATION {
         let mut msg = Message::new(0);
         msg.data[0] = bits;
         return (RECV_KIND_NOTIFICATION, msg);

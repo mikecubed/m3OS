@@ -6,22 +6,36 @@
 
 //! QEMU integration tests for Phase 55c Track B — bound-notification recv wiring.
 //!
-//! Each test implements the relevant state-machine fragment inline using only
-//! `core::sync::atomic::*` — no heap, no kernel library linkage required.
-//! The state arrays mirror the kernel's `PENDING`, `BOUND_TCB`, and
-//! `TCB_BOUND_NOTIF` arrays so the tests exercise the same logic paths.
+//! Each test exercises a **real** shared seam from `kernel_core`, not a
+//! hand-rolled copy of the kernel's internal logic.
 //!
-//! # Scenarios covered
+//! | Test | B.x | Seam called | Scenario |
+//! |---|---|---|---|
+//! | `notif_signal_before_recv_returns_notification_kind` | B.4 | `kernel_core::ipc::wake_kind::classify_recv` | non-zero bits → `RECV_KIND_NOTIFICATION` fast path |
+//! | `queued_sender_before_recv_returns_message_kind` | B.4 | `kernel_core::ipc::wake_kind::classify_recv` | zero bits → `RECV_KIND_MESSAGE` (endpoint-queue branch) |
+//! | `process_exit_clears_binding_smoke` | B.5 | `kernel_core::ipc::bound_notif::BoundNotifTable` | bind → unbind → slot free |
 //!
-//! | Test | B.x | Scenario |
-//! |---|---|---|
-//! | `notif_signal_before_recv_returns_notification_kind` | B.4 | signal fires before recv → fast-path returns `RECV_KIND_NOTIFICATION` |
-//! | `queued_sender_before_recv_returns_message_kind` | B.4 | sender queued before recv → returns `RECV_KIND_MESSAGE` |
-//! | `process_exit_clears_binding_smoke` | B.5 | bind → clear → slot unbound |
+//! # Why these seams?
+//!
+//! `classify_recv` is the function `endpoint::recv_msg_with_notif` calls for
+//! its initial priority check (Phase 55c Track B wiring).  Any change to the
+//! notification-wins-over-message rule breaks both the production path and
+//! these tests simultaneously.
+//!
+//! `BoundNotifTable` is the pure-logic model of the TCB binding lifecycle that
+//! lives in `kernel_core` (host-testable).  The ISR-safe atomic implementation
+//! (`notification::clear_bound_task`) is exercised by the inline `#[test_case]`
+//! blocks inside `kernel/src/ipc/notification.rs` which call the real function
+//! on the real global state arrays.
+
+extern crate alloc;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
+use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
+use kernel_core::ipc::bound_notif::BoundNotifTable;
+use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
+use kernel_core::types::{NotifId, TaskId};
 use x86_64::instructions::{hlt, port::Port};
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -38,114 +52,24 @@ fn bound_recv_kernel_test(_boot_info: &'static mut BootInfo) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal recv-kind tags (mirrors kernel_core::ipc::wake_kind)
+// Stub global allocator — satisfies the linker; tests must not actually
+// allocate (all kernel_core types used here are stack-only / const-new).
 // ---------------------------------------------------------------------------
 
-const RECV_KIND_MESSAGE: u8 = 0;
-const RECV_KIND_NOTIFICATION: u8 = 1;
+struct NoAlloc;
+
+unsafe impl GlobalAlloc for NoAlloc {
+    unsafe fn alloc(&self, _: Layout) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
+}
+
+#[global_allocator]
+static STUB_ALLOC: NoAlloc = NoAlloc;
 
 // ---------------------------------------------------------------------------
-// Inline state-machine mirroring kernel notification.rs (no_alloc)
-// ---------------------------------------------------------------------------
-
-const MAX_NOTIFS: usize = 64;
-const MAX_TASKS: usize = 64;
-
-const NOTIF_NONE: u8 = 0xff;
-const TCB_NONE: i32 = -1;
-
-/// Pending notification bits — mirrors `PENDING` in `kernel/src/ipc/notification.rs`.
-static PENDING: [AtomicU64; MAX_NOTIFS] = {
-    const ZERO: AtomicU64 = AtomicU64::new(0);
-    [ZERO; MAX_NOTIFS]
-};
-
-/// `BOUND_TCB[notif_idx]` = scheduler index of the bound task, or `TCB_NONE`.
-/// Mirrors `BOUND_TCB` in `kernel/src/ipc/notification.rs`.
-static BOUND_TCB: [AtomicI32; MAX_NOTIFS] = {
-    const NONE: AtomicI32 = AtomicI32::new(TCB_NONE);
-    [NONE; MAX_NOTIFS]
-};
-
-/// `TCB_BOUND_NOTIF[task_sched_idx]` = notification index bound to this task,
-/// or `NOTIF_NONE`. Mirrors `TCB_BOUND_NOTIF` in `kernel/src/ipc/notification.rs`.
-static TCB_BOUND_NOTIF: [AtomicU8; MAX_TASKS] = {
-    const NONE: AtomicU8 = AtomicU8::new(NOTIF_NONE);
-    [NONE; MAX_TASKS]
-};
-
-/// Set pending bits on `notif_idx`.
-fn signal(notif_idx: usize, bits: u64) {
-    PENDING[notif_idx].fetch_or(bits, Ordering::AcqRel);
-}
-
-/// Atomically clear and return all pending bits for `notif_idx`.
-fn drain_bits(notif_idx: usize) -> u64 {
-    PENDING[notif_idx].swap(0, Ordering::AcqRel)
-}
-
-/// Bind task `task_sched_idx` to `notif_idx`.
-///
-/// Returns `true` on success, `false` if the slot is already taken by a
-/// different task (matches `notification::bind_task` behaviour).
-fn bind_task(notif_idx: usize, task_sched_idx: usize) -> bool {
-    match BOUND_TCB[notif_idx].compare_exchange(
-        TCB_NONE,
-        task_sched_idx as i32,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {
-            TCB_BOUND_NOTIF[task_sched_idx].store(notif_idx as u8, Ordering::Release);
-            true
-        }
-        Err(existing) if existing == task_sched_idx as i32 => true, // idempotent
-        Err(_) => false,                                            // busy
-    }
-}
-
-/// Clear the binding for `task_sched_idx` (called on process exit).
-///
-/// Mirrors `notification::clear_bound_task` in `kernel/src/ipc/notification.rs`.
-fn clear_bound_task(task_sched_idx: usize) {
-    let notif_byte = TCB_BOUND_NOTIF[task_sched_idx].swap(NOTIF_NONE, Ordering::AcqRel);
-    if notif_byte == NOTIF_NONE {
-        return;
-    }
-    let notif_idx = notif_byte as usize;
-    let _ = BOUND_TCB[notif_idx].compare_exchange(
-        task_sched_idx as i32,
-        TCB_NONE,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-}
-
-/// Simulate `recv_msg_with_notif` for the scenarios that don't require
-/// actual scheduler blocking.
-///
-/// Returns `RECV_KIND_NOTIFICATION` if `notif_idx` has pending bits (fast
-/// path — signal arrived before the recv call).
-/// Returns `RECV_KIND_MESSAGE` if `has_pending_sender` is true (a sender
-/// was already queued in the endpoint before the recv call).
-fn recv_kind(notif_idx: usize, has_pending_sender: bool) -> u8 {
-    // Fast path: drain notification bits first — mirrors the first check in
-    // `endpoint::recv_msg_with_notif`.
-    let bits = drain_bits(notif_idx);
-    if bits != 0 {
-        return RECV_KIND_NOTIFICATION;
-    }
-    // Sender-queue path: mirrors the branch where `ep.senders.pop_front()`
-    // succeeds immediately, returning the queued message without blocking.
-    if has_pending_sender {
-        return RECV_KIND_MESSAGE;
-    }
-    // In the real kernel the task would block; not reachable in these tests.
-    RECV_KIND_MESSAGE
-}
-
-// ---------------------------------------------------------------------------
-// Tests
+// Test infrastructure
 // ---------------------------------------------------------------------------
 
 trait Testable {
@@ -178,130 +102,109 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 
 // ---------------------------------------------------------------------------
 // B.4 — Extend ipc_recv_msg with bound-notification fast path
+//
+// Both tests drive `classify_recv` — the shared function that
+// `endpoint::recv_msg_with_notif` calls as its first priority check.
+// Regression in the "notification wins over queued sender" rule
+// will fail both the production recv path and these tests.
 // ---------------------------------------------------------------------------
 
-/// Signal fires *before* the recv call → `recv_kind` fast-path returns
-/// `RECV_KIND_NOTIFICATION` immediately without consulting the endpoint queue.
+/// Non-zero pending bits → `classify_recv` returns `RECV_KIND_NOTIFICATION`.
 ///
-/// This mirrors the first branch of `endpoint::recv_msg_with_notif`:
+/// This mirrors the fast-path opening of `endpoint::recv_msg_with_notif`:
 /// ```text
 /// let bits = notification::drain_bits(notif_id);
-/// if bits != 0 { return (RECV_KIND_NOTIFICATION, msg); }
+/// if classify_recv(bits) == RECV_KIND_NOTIFICATION {
+///     return (RECV_KIND_NOTIFICATION, msg);
+/// }
 /// ```
+/// A signal that arrives **before** the recv call leaves non-zero bits in
+/// `PENDING`; `drain_bits` returns those bits and `classify_recv` selects the
+/// notification branch without ever consulting the endpoint sender queue.
 #[test_case]
 fn notif_signal_before_recv_returns_notification_kind() {
-    const NOTIF: usize = 3;
-    const TASK: usize = 7;
     const BITS: u64 = 0b1010_0101;
 
-    // Reset state (tests may run in any order).
-    PENDING[NOTIF].store(0, Ordering::SeqCst);
-    BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
-    TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
-
-    // Step 1: bind task to notification (as sys_notif_bind would do).
-    assert!(bind_task(NOTIF, TASK), "bind must succeed on a free slot");
-
-    // Step 2: signal the notification (as an IRQ handler or peer task would).
-    signal(NOTIF, BITS);
-
-    // Step 3: recv — fast path must drain the bits and return notification kind.
-    let kind = recv_kind(NOTIF, false);
+    // classify_recv is the actual function recv_msg_with_notif delegates to.
+    let kind = classify_recv(BITS);
     assert_eq!(
         kind, RECV_KIND_NOTIFICATION,
-        "signal before recv must produce RECV_KIND_NOTIFICATION"
+        "non-zero pending bits must select RECV_KIND_NOTIFICATION",
     );
 
-    // Verify bits were fully drained.
+    // After drain the pending word is zero: the next recv takes the message path.
+    let kind_after_drain = classify_recv(0);
     assert_eq!(
-        PENDING[NOTIF].load(Ordering::Acquire),
-        0,
-        "drain_bits must clear PENDING after the fast-path return"
+        kind_after_drain, RECV_KIND_MESSAGE,
+        "zero bits (post-drain) must select RECV_KIND_MESSAGE",
     );
 }
 
-/// A sender is already queued in the endpoint before the recv call.
-/// `recv_kind` must return `RECV_KIND_MESSAGE` (the sender-queue branch of
-/// `recv_msg_with_notif`, where `ep.senders.pop_front()` succeeds immediately).
+/// Zero pending bits + queued sender → `classify_recv` returns `RECV_KIND_MESSAGE`.
+///
+/// When `drain_bits` returns 0, `recv_msg_with_notif` skips the notification
+/// fast path and falls through to `ep.senders.pop_front()`.  `classify_recv(0)`
+/// encodes that decision: zero bits always routes to the message / sender path.
 ///
 /// There are no pending notification bits so the fast path is skipped.
 #[test_case]
 fn queued_sender_before_recv_returns_message_kind() {
-    const NOTIF: usize = 5;
-    const TASK: usize = 11;
-
-    // Reset state.
-    PENDING[NOTIF].store(0, Ordering::SeqCst);
-    BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
-    TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
-
-    // No notification bits pending.
-    assert_eq!(
-        drain_bits(NOTIF),
-        0,
-        "no bits should be pending before this test"
-    );
-
-    // Simulate: a sender is already queued in the endpoint (`has_pending_sender = true`).
-    let kind = recv_kind(NOTIF, true);
+    // No notification bits pending (as if drain_bits returned 0).
+    let pending_bits: u64 = 0;
+    let kind = classify_recv(pending_bits);
     assert_eq!(
         kind, RECV_KIND_MESSAGE,
-        "queued sender before recv must produce RECV_KIND_MESSAGE"
+        "zero pending bits must route to the message path (queued-sender branch)",
     );
 }
 
 // ---------------------------------------------------------------------------
 // B.5 — TCB teardown clears binding
+//
+// Drives `BoundNotifTable` — the kernel-core shared model of the bind/unbind
+// lifecycle.  The ISR-safe atomic implementation (`notification::clear_bound_task`
+// called by `cleanup_task_ipc`) is exercised by the inline `#[test_case]`
+// in `kernel/src/ipc/notification.rs` which runs against the real global arrays.
 // ---------------------------------------------------------------------------
 
-/// Process exit must clear the `BOUND_TCB` / `TCB_BOUND_NOTIF` entries for
-/// the dying task so that no dangling binding persists after the TCB is freed.
+/// Process exit must clear both sides of the `notif ↔ task` binding so that
+/// no dangling entry persists after the TCB is freed.
 ///
-/// This mirrors `notification::clear_bound_task` called by `cleanup_task_ipc`
-/// during task teardown (Phase 55c Track B, B.5 acceptance criterion).
+/// This test drives `BoundNotifTable::bind` / `unbind` — the shared pure-logic
+/// helpers that model the same invariant the kernel enforces with atomic arrays.
 #[test_case]
 fn process_exit_clears_binding_smoke() {
-    const NOTIF: usize = 9;
-    const TASK: usize = 21;
+    let mut table = BoundNotifTable::new();
+    let notif = NotifId(9);
+    let tcb = TaskId(21);
 
-    // Reset state.
-    PENDING[NOTIF].store(0, Ordering::SeqCst);
-    BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
-    TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
-
-    // Step 1: bind task to notification.
-    assert!(bind_task(NOTIF, TASK), "bind must succeed on a free slot");
-
-    // Verify both sides of the binding are populated.
-    assert_eq!(
-        BOUND_TCB[NOTIF].load(Ordering::Acquire),
-        TASK as i32,
-        "BOUND_TCB must point to the bound task after bind_task"
-    );
-    assert_eq!(
-        TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
-        NOTIF as u8,
-        "TCB_BOUND_NOTIF must point to the notification after bind_task"
-    );
-
-    // Step 2: simulate process exit by clearing the binding.
-    clear_bound_task(TASK);
-
-    // Step 3: both sides must be reset to their sentinel values.
-    assert_eq!(
-        BOUND_TCB[NOTIF].load(Ordering::Acquire),
-        TCB_NONE,
-        "BOUND_TCB must be cleared after process exit"
-    );
-    assert_eq!(
-        TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
-        NOTIF_NONE,
-        "TCB_BOUND_NOTIF must be cleared after process exit"
-    );
-
-    // Step 4: the slot must be available for a new bind (no dangling reference).
+    // Step 1: bind task to notification (as sys_notif_bind does).
     assert!(
-        bind_task(NOTIF, TASK),
-        "notif slot must be available for a new bind after clear"
+        table.bind(notif, tcb).is_ok(),
+        "bind must succeed on an unbound slot",
+    );
+    assert_eq!(
+        table.lookup(notif),
+        Some(tcb),
+        "lookup must return the bound task after bind",
+    );
+
+    // Step 2: simulate process exit — clear the binding via the shared helper.
+    let was = table.unbind(notif);
+    assert_eq!(
+        was,
+        Some(tcb),
+        "unbind must return the previously bound task",
+    );
+
+    // Step 3: slot must be unbound and available for a new bind.
+    assert_eq!(
+        table.lookup(notif),
+        None,
+        "lookup must return None after unbind",
+    );
+    assert!(
+        table.bind(notif, tcb).is_ok(),
+        "re-bind must succeed after unbind (no dangling reference)",
     );
 }

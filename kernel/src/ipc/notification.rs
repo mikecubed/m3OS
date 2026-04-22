@@ -778,3 +778,127 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         // On wake, loop back to drain pending bits.
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel unit tests (run in the main kernel test binary via #[test_case])
+// ---------------------------------------------------------------------------
+
+/// These tests run inline inside the kernel after `mm::init` but before the
+/// scheduler and task system are started.  They have direct access to the
+/// real global arrays (`PENDING`, `BOUND_TCB`, `TCB_BOUND_NOTIF`) and the
+/// actual `bind_task` / `clear_bound_task` / `drain_bits` functions — so
+/// any regression in their logic is caught here, not by a separate copy.
+///
+/// Use indices ≥ 50 to avoid colliding with kernel boot-time allocations.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel_core::ipc::wake_kind;
+
+    // ------------------------------------------------------------------
+    // B.5 — Process exit clears the bound-notification TCB entry
+    //
+    // The real `cleanup_task_ipc` path calls `clear_bound_task`.
+    // This test exercises the actual function (not a copy) with the real
+    // global atomic arrays so any regression in the clear logic fails here.
+    // ------------------------------------------------------------------
+
+    #[test_case]
+    fn clear_bound_task_wires_both_sides_of_binding() {
+        const NOTIF: usize = 50;
+        const TASK: usize = 50;
+        let notif_id = NotifId(NOTIF as u8);
+
+        // Reset global state to a known baseline for this slot.
+        PENDING[NOTIF].store(0, Ordering::SeqCst);
+        BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
+
+        // Bind via the real bind_task (same path as sys_notif_bind).
+        bind_task(notif_id, TASK).expect("bind_task must succeed on a free slot");
+
+        // Verify both sides of the binding are live.
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TASK as i32,
+            "BOUND_TCB must record the bound task after bind_task",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            NOTIF as u8,
+            "TCB_BOUND_NOTIF must record the notification after bind_task",
+        );
+
+        // Simulate process exit: call the REAL cleanup path.
+        // cleanup_task_ipc calls clear_bound_task(task_sched_idx).
+        clear_bound_task(TASK);
+
+        // Both sides must be reset to their unbound sentinels.
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "BOUND_TCB must be TCB_NONE after clear_bound_task",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            NOTIF_NONE,
+            "TCB_BOUND_NOTIF must be NOTIF_NONE after clear_bound_task",
+        );
+
+        // The slot must be available for a new bind — no dangling reference.
+        bind_task(notif_id, TASK).expect("re-bind must succeed after clear");
+        // Leave the slot clean for subsequent tests.
+        clear_bound_task(TASK);
+    }
+
+    // ------------------------------------------------------------------
+    // B.4 supplement — drain_bits exercises the real PENDING array
+    //
+    // The fast-path in `recv_msg_with_notif` is:
+    //   let bits = notification::drain_bits(notif_id);
+    //   if classify_recv(bits) == RECV_KIND_NOTIFICATION { return ... }
+    //
+    // This test verifies drain_bits on the actual global PENDING array so
+    // that regressions in the drain logic (wrong index, missing swap, …)
+    // fail loudly in the kernel test binary.
+    // ------------------------------------------------------------------
+
+    #[test_case]
+    fn drain_bits_returns_pending_and_clears_atomically() {
+        const NOTIF: usize = 51;
+        let notif_id = NotifId(NOTIF as u8);
+        const BITS: u64 = 0b1010_0101;
+
+        // Reset state.
+        PENDING[NOTIF].store(0, Ordering::SeqCst);
+
+        // Set bits (mirrors what signal_irq does in ISR context).
+        PENDING[NOTIF].fetch_or(BITS, Ordering::Release);
+
+        // drain_bits must return all bits and clear PENDING atomically.
+        let got = drain_bits(notif_id);
+        assert_eq!(got, BITS, "drain_bits must return the exact pending bits");
+        assert_eq!(
+            PENDING[NOTIF].load(Ordering::Acquire),
+            0,
+            "drain_bits must clear PENDING to zero",
+        );
+
+        // A second drain must return 0 (nothing left).
+        assert_eq!(drain_bits(notif_id), 0, "second drain must return 0");
+
+        // classify_recv (the shared seam used by recv_msg_with_notif) must
+        // select NOTIFICATION for the first drain result…
+        assert_eq!(
+            wake_kind::classify_recv(got),
+            wake_kind::RECV_KIND_NOTIFICATION,
+            "non-zero drained bits must classify as NOTIFICATION",
+        );
+        // …and MESSAGE after the bits are exhausted.
+        assert_eq!(
+            wake_kind::classify_recv(0),
+            wake_kind::RECV_KIND_MESSAGE,
+            "zero drained bits must classify as MESSAGE",
+        );
+    }
+}

@@ -56,6 +56,26 @@ pub fn encode_wake_kind(wake: WakeKind) -> (u8, Message) {
     }
 }
 
+/// Classify a recv-path priority check based on drained notification bits.
+///
+/// Called by [`endpoint::recv_msg_with_notif`] as the **first** action: the
+/// drained pending bits are the sole input. When they are non-zero the
+/// notification takes priority over any queued endpoint sender and the recv
+/// returns immediately with [`RECV_KIND_NOTIFICATION`]. When the bits are
+/// zero the caller proceeds to inspect the endpoint sender queue, returning
+/// [`RECV_KIND_MESSAGE`] if a sender is present or blocking otherwise.
+///
+/// Extracting the rule here makes it testable via `kernel_core` in contexts
+/// where the real `notification::drain_bits` global state is unavailable (e.g.
+/// the standalone QEMU integration-test binary in `kernel/tests/bound_recv.rs`).
+pub const fn classify_recv(pending_bits: u64) -> u8 {
+    if pending_bits != 0 {
+        RECV_KIND_NOTIFICATION
+    } else {
+        RECV_KIND_MESSAGE
+    }
+}
+
 /// Decode a `(kind tag, `[`Message`]`)` pair back into a [`WakeKind`].
 ///
 /// An unknown `kind` byte falls back to [`WakeKind::Message`] so that
@@ -177,5 +197,26 @@ mod tests {
         );
         assert_eq!(decode_wake_kind(km, mm), m);
         assert_eq!(decode_wake_kind(kn, mn), n);
+    }
+
+    // --- classify_recv (Track B shared seam) ---
+
+    #[test]
+    fn classify_recv_nonzero_bits_returns_notification() {
+        assert_eq!(classify_recv(1), RECV_KIND_NOTIFICATION);
+        assert_eq!(classify_recv(u64::MAX), RECV_KIND_NOTIFICATION);
+        assert_eq!(classify_recv(0b1010_0101), RECV_KIND_NOTIFICATION);
+    }
+
+    #[test]
+    fn classify_recv_zero_bits_returns_message() {
+        assert_eq!(classify_recv(0), RECV_KIND_MESSAGE);
+    }
+
+    #[test]
+    fn classify_recv_matches_encode_wake_kind_notification_path() {
+        let bits: u64 = 0xdead_beef;
+        let (kind, _) = encode_wake_kind(WakeKind::Notification(bits));
+        assert_eq!(classify_recv(bits), kind);
     }
 }
