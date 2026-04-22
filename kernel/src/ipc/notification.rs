@@ -548,17 +548,6 @@ pub(super) fn bind_task(notif_id: NotifId, task_sched_idx: usize) -> Result<(), 
     }
     let new_val = task_sched_idx as i32;
 
-    match BOUND_TCB[notif_idx].compare_exchange(
-        TCB_NONE,
-        new_val,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {}
-        Err(existing) if existing == new_val => {}
-        Err(_) => return Err(()),
-    }
-
     match TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
         NOTIF_NONE,
         notif_id.0,
@@ -568,9 +557,22 @@ pub(super) fn bind_task(notif_id: NotifId, task_sched_idx: usize) -> Result<(), 
         Ok(_) => {}
         Err(existing) if existing == notif_id.0 => {}
         Err(_) => {
-            let _ = BOUND_TCB[notif_idx].compare_exchange(
-                new_val,
-                TCB_NONE,
+            return Err(());
+        }
+    }
+
+    match BOUND_TCB[notif_idx].compare_exchange(
+        TCB_NONE,
+        new_val,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(existing) if existing == new_val => {}
+        Err(_) => {
+            let _ = TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
+                notif_id.0,
+                NOTIF_NONE,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             );
@@ -867,6 +869,38 @@ mod tests {
             TCB_NONE,
             "bind_task must not publish a one-sided BOUND_TCB entry on failure",
         );
+    }
+
+    #[test_case]
+    fn bind_task_does_not_publish_forward_binding_when_task_already_bound() {
+        const FIRST_NOTIF: usize = 53;
+        const SECOND_NOTIF: usize = 54;
+        const TASK: usize = 53;
+        let first = NotifId(FIRST_NOTIF as u8);
+        let second = NotifId(SECOND_NOTIF as u8);
+
+        BOUND_TCB[FIRST_NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        BOUND_TCB[SECOND_NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
+
+        bind_task(first, TASK).expect("initial bind must succeed");
+        assert_eq!(
+            bind_task(second, TASK),
+            Err(()),
+            "second bind must fail when the task is already bound elsewhere",
+        );
+        assert_eq!(
+            BOUND_TCB[SECOND_NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "failed bind must not publish a forward mapping visible to IRQ wakeups",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            first.0,
+            "failed bind must preserve the original reverse binding",
+        );
+
+        clear_bound_task(TASK);
     }
 
     // ------------------------------------------------------------------
