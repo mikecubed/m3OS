@@ -151,8 +151,13 @@ pub trait IrqBackend {
     /// Drop.
     fn release(&self, notif_cap: u32);
 
-    /// Bind `notif_cap` to `ep_cap` so that `ipc_recv_msg` on `ep_cap`
-    /// can wake on notification signals (Track B bound-recv path).
+    /// Bind `notif_cap` into the recv loop that services `ep_cap`.
+    ///
+    /// The current kernel validates `ep_cap` and then records the binding at
+    /// task scope because each ring-3 driver task serves a single command
+    /// endpoint. `ep_cap` is therefore both the checked endpoint handle and the
+    /// future-proof call site where a later per-endpoint kernel binding can
+    /// land without changing this trait.
     ///
     /// The default implementation is a no-op so existing mock backends
     /// compile without change. [`SyscallBackend`] overrides to call
@@ -432,13 +437,13 @@ impl<B: IrqBackend> IrqNotification<B> {
         self.last_observed.set(observed & !bits);
         Ok(())
     }
-    /// Bind this IRQ notification to `ep` for the bound-recv path (Track B).
+    /// Bind this IRQ notification into the recv loop that services `ep`.
     ///
-    /// After a successful bind, a call to `ipc_recv_msg` on `ep` will return
+    /// After a successful bind, `ipc_recv_msg` in the current task will return
     /// [`RecvResult::Notification`] when this notification's pending bits are
-    /// non-zero, before checking the endpoint's sender queue. Drivers call
-    /// this once during init so a single `handle_next` loop can service both
-    /// IPC messages and IRQ-sourced notifications.
+    /// non-zero, before checking the endpoint's sender queue. The current
+    /// kernel stores that binding per task after validating `ep`, which matches
+    /// the one-command-endpoint-per-driver-task model used today.
     ///
     /// Delegates to [`IrqBackend::bind_to_endpoint`]. The production
     /// [`SyscallBackend`] calls `syscall_lib::sys_notif_bind`; mock backends

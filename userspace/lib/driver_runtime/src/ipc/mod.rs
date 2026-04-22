@@ -203,12 +203,38 @@ impl SyscallBackend {
     /// server returns from `ipc_recv_msg`. Matches the `vfs_server`
     /// / `net_server` convention documented in Phase 54.
     const REPLY_CAP_HANDLE: u32 = 1;
+
+    fn decode_recv_result(
+        rc: u64,
+        msg: syscall_lib::IpcMessage,
+        mut buf: alloc::vec::Vec<u8>,
+    ) -> RecvResult {
+        use kernel_core::ipc::wake_kind::RECV_KIND_NOTIFICATION;
+
+        // Track B's kernel ABI returns `rc = RECV_KIND_NOTIFICATION (= 1)` for
+        // notification wakes and writes a synthetic message with `label = 0`,
+        // `data[0] = drained_bits`. A regular message wake returns `rc = label`.
+        //
+        // That means a legitimate message with label 1 would collide if we
+        // keyed on `rc` alone. Disambiguate using the written message header:
+        // only the synthetic notification wake has `rc == 1 && msg.label == 0`.
+        if rc == u64::from(RECV_KIND_NOTIFICATION) && msg.label == 0 {
+            return RecvResult::Notification(msg.data[0]);
+        }
+
+        let real_len = (msg.data[1] as usize).min(buf.len());
+        buf.truncate(real_len);
+        RecvResult::Message(RecvFrame {
+            label: msg.label,
+            data0: msg.data[0],
+            bulk: buf,
+        })
+    }
 }
 
 impl IpcBackend for SyscallBackend {
     fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError> {
         use alloc::vec;
-        use kernel_core::ipc::wake_kind::RECV_KIND_NOTIFICATION;
         let mut msg = syscall_lib::IpcMessage::new(0);
         let mut buf = vec![0u8; Self::MAX_BULK_RECV];
         let rc = syscall_lib::ipc_recv_msg(endpoint.raw(), &mut msg, &mut buf);
@@ -217,22 +243,7 @@ impl IpcBackend for SyscallBackend {
                 kernel_core::device_host::DeviceHostError::Internal,
             ));
         }
-        // The kernel returns RECV_KIND_NOTIFICATION (1) when the bound
-        // notification fires. In that case msg.label == 0 and msg.data[0]
-        // carries the drained notification bitset (see kernel/src/ipc/mod.rs
-        // `ipc_recv_msg` and `kernel_core::ipc::wake_kind::encode_wake_kind`).
-        if rc == u64::from(RECV_KIND_NOTIFICATION) {
-            return Ok(RecvResult::Notification(msg.data[0]));
-        }
-        // Message wake: truncate the recv buffer to the real bulk length the
-        // kernel reported in `msg.data[1]`.
-        let real_len = (msg.data[1] as usize).min(buf.len());
-        buf.truncate(real_len);
-        Ok(RecvResult::Message(RecvFrame {
-            label: msg.label,
-            data0: msg.data[0],
-            bulk: buf,
-        }))
+        Ok(Self::decode_recv_result(rc, msg, buf))
     }
 
     fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {
@@ -451,5 +462,34 @@ pub(crate) mod mock {
 
         // Queue exhausted — third recv must error.
         assert!(mock.recv(ep).is_err(), "empty queue must return Err");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_recv_result_disambiguates_notification_from_message_label_one() {
+        let mut msg = syscall_lib::IpcMessage::new(1);
+        msg.data[0] = 0x55;
+        msg.data[1] = 3;
+        let decoded = SyscallBackend::decode_recv_result(1, msg, alloc::vec![1, 2, 3, 4]);
+        assert_eq!(
+            decoded,
+            RecvResult::Message(RecvFrame {
+                label: 1,
+                data0: 0x55,
+                bulk: alloc::vec![1, 2, 3],
+            })
+        );
+    }
+
+    #[test]
+    fn decode_recv_result_recognizes_synthetic_notification_wake() {
+        let mut msg = syscall_lib::IpcMessage::new(0);
+        msg.data[0] = 0b1010;
+        let decoded = SyscallBackend::decode_recv_result(1, msg, alloc::vec![0u8; 8]);
+        assert_eq!(decoded, RecvResult::Notification(0b1010));
     }
 }
