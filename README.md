@@ -90,6 +90,11 @@ cargo xtask image
 cargo xtask check
 ```
 
+The default pre-push hook runs `cargo xtask check`, `cargo xtask smoke-test`,
+and `cargo xtask regression`. Set `M3OS_E1000_REGRESSION=1` before `git push`
+to also add the Phase 55c `cargo xtask ssh-e1000-banner-check` e1000 SSH-banner
+regression gate.
+
 `cargo xtask run` is the primary supported workflow. It builds
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img`, keeps the companion ext2
 data disk at `target/x86_64-unknown-none/release/disk.img`, and also emits
