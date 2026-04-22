@@ -462,19 +462,87 @@ impl RemoteNic {
             event.mac[4],
             event.mac[5],
         );
-        // Update the stored MAC so `mac_address()` returns the real hardware
-        // address.  On the lazy-registration path the MAC is initialised to
-        // `[0; 6]`; the first `NET_LINK_STATE` from the driver overwrites it.
-        {
-            let mut slot = REMOTE_NIC.lock();
-            if let Some(entry) = slot.as_mut() {
-                entry.mac = event.mac;
-            }
+        if let Some(ep) = Self::ensure_link_event_entry(
+            event.mac,
+            crate::ipc::registry::lookup_endpoint_id("net.nic"),
+        ) {
+            log::info!(
+                "[remote_nic] link-state bootstrap registered ring-3 NIC driver: endpoint={:?} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                ep,
+                event.mac[0],
+                event.mac[1],
+                event.mac[2],
+                event.mac[3],
+                event.mac[4],
+                event.mac[5],
+            );
         }
         if !event.up {
             // One-line hook: link-down resets TCP retransmit timers per Phase 16.
             super::tcp::on_link_down();
         }
         NIC_WOKEN.store(true, Ordering::Release);
+    }
+
+    fn ensure_link_event_entry(
+        mac: MacAddr,
+        fallback_endpoint: Option<EndpointId>,
+    ) -> Option<EndpointId> {
+        let mut installed = None;
+        {
+            let mut slot = REMOTE_NIC.lock();
+            if let Some(entry) = slot.as_mut() {
+                entry.mac = mac;
+            } else if let Some(ep) = fallback_endpoint {
+                *slot = Some(NicEntry {
+                    endpoint: ep,
+                    mac,
+                    tx_queue: VecDeque::new(),
+                });
+                installed = Some(ep);
+            }
+        }
+        if installed.is_some() {
+            REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
+            RESTART_SUSPECTED.store(false, Ordering::Release);
+            ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
+            LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
+        }
+        installed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_remote_nic_state() {
+        *REMOTE_NIC.lock() = None;
+        REMOTE_NIC_REGISTERED.store(false, Ordering::Release);
+        RESTART_SUSPECTED.store(false, Ordering::Release);
+        ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
+        LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
+    }
+
+    #[test_case]
+    fn link_event_bootstraps_missing_remote_nic_entry() {
+        reset_remote_nic_state();
+
+        let ep = EndpointId(9);
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+        assert_eq!(RemoteNic::ensure_link_event_entry(mac, Some(ep)), Some(ep));
+        assert!(REMOTE_NIC_REGISTERED.load(Ordering::Acquire));
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn link_event_updates_existing_remote_nic_mac_in_place() {
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(3), [0; 6]);
+
+        let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        assert_eq!(RemoteNic::ensure_link_event_entry(mac, None), None);
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
     }
 }

@@ -667,13 +667,20 @@ pub fn run_io_loop(
         Ok(n) => n,
         Err(_) => syscall_lib::exit(4),
     };
-    link_state_atomic().store(device.link_up_initial(), Ordering::Release);
+    let initial_link_up = device.link_up_initial();
+    let initial_mac = device.mac();
+    link_state_atomic().store(initial_link_up, Ordering::Release);
 
     // Wrap device in RefCell so on_message and on_notification closures
     // can each borrow it mutably in their exclusive call arms without
     // conflicting at compile time.
     let device = core::cell::RefCell::new(device);
     let net_server = NetServer::new(command_endpoint).with_ingress_endpoint(ingress_endpoint);
+    let _ = net_server.publish_link_state(NetLinkEvent {
+        up: initial_link_up,
+        mac: initial_mac,
+        speed_mbps: 0,
+    });
 
     loop {
         // Stage the notification bit-mask from the on_notification arm
