@@ -71,9 +71,12 @@ proptest! {
     #[test]
     fn overlapping_bars_union_coverage_succeeds(
         base_a in 0u64..(1u64 << 32),
-        len_a in 0x1000usize..=0x1_0000usize,
-        // offset < len_a ensures bar_b's base lands inside bar_a's window.
-        offset in 0x800usize..=0x8000usize,
+        // prop_flat_map derives offset from the same len_a so that
+        // offset is always in 1..len_a, guaranteeing bar_b starts
+        // strictly inside bar_a's window and real overlap is ensured.
+        (len_a, offset) in (0x1000usize..=0x1_0000usize).prop_flat_map(|la| {
+            (Just(la), 1usize..la)
+        }),
         len_b in 0x1000usize..=0x1_0000usize,
     ) {
         let base_b = base_a.saturating_add(offset as u64);
