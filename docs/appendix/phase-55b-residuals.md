@@ -27,7 +27,7 @@ It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not
 2. Update `userspace/e1000-crash-smoke/` to assert `EAGAIN` on mid-crash send (today it only asserts the infrastructure steps).
 3. Remove `#[ignore]` from the now-observable stub in `kernel-core/tests/driver_restart.rs`.
 
-**Recommended owner:** **Phase 60 (Networking and GitHub)** — the natural net-syscall expansion phase. An earlier hotfix phase is also reasonable if the user wants EAGAIN visibility before 1.0 ships.
+**Recommended owner:** **Phase 55c (Ring-3 Driver Correctness Closure)** — the ring-3-driver correctness follow-up that groups the SSH-over-e1000 wake fix, IOMMU BAR identity coverage, and userspace-visible restart handling into one pre-1.0 closure pass.
 
 **Acceptance for closure:**
 - `e1000-crash-smoke` binary observes `EAGAIN` (or equivalent) from its `sendto()` call during the mid-crash window.
@@ -51,7 +51,7 @@ It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not
 2. Re-run `cargo xtask device-smoke --device nvme --iommu` and `--device e1000 --iommu`; both should pass like their non-IOMMU counterparts (~6 s each).
 3. Audit any other MMIO window the ring-3 driver might touch (MSI-X tables, PCIe config writes, etc.) for the same gap.
 
-**Recommended owner:** **Phase 55a follow-up** (hotfix / 55a.1) **or** folded into whichever phase introduces the first driver that consumes VT-d in anger. If 1.0 shipping claims "IOMMU-isolated ring-3 drivers", **this must close before Phase 58**.
+**Recommended owner:** **Phase 55c (Ring-3 Driver Correctness Closure)** — the pre-1.0 ring-3-driver follow-up that groups the SSH-over-e1000 wake fix, IOMMU BAR identity coverage, and userspace-visible restart handling into one closure pass. If 1.0 shipping claims "IOMMU-isolated ring-3 drivers", **this must close before Phase 58**.
 
 **Acceptance for closure:**
 - `cargo xtask device-smoke --device nvme --iommu` passes end-to-end.
@@ -92,8 +92,8 @@ These do **not** belong in a future phase's scope.
 
 | Item | Severity | Recommended owner | Must-fix-before-1.0? |
 |---|---|---|---|
-| **R1** `sys_net_send` | Medium | Phase 60 (Networking and GitHub) | No — a Phase 58 "known limitation" note is acceptable |
-| **R2** IOMMU VT-d MMIO | Medium-High | Phase 55a follow-up (55a.1) or pre-58 hotfix | **Yes** — 1.0 claims "IOMMU-isolated ring-3 drivers"; R2 makes the claim partially false under `--iommu` |
+| **R1** `sys_net_send` | Medium | Phase 55c (Ring-3 Driver Correctness Closure) | **Yes** — the pre-1.0 ring-3 driver story now depends on userspace-visible restart handling |
+| **R2** IOMMU VT-d MMIO | Medium-High | Phase 55c (Ring-3 Driver Correctness Closure) | **Yes** — 1.0 claims "IOMMU-isolated ring-3 drivers"; R2 makes the claim partially false under `--iommu` |
 | §2 annotations | None | No phase | No — correct as-is |
 | §3 metrics | None | No phase | No — documented in learning doc |
 

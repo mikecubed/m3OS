@@ -119,7 +119,7 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 
 ## Inherited Follow-ups from Earlier Phases
 
-- **Phase 55b `sys_net_send` EAGAIN surfacing** — the Phase 55b `RemoteNic::send_frame` facade returns `NetDriverError::DriverRestarting` to kernel-side callers, but no userspace-observable surface exists for a `sendto()` to see that EAGAIN. Candidate owner per [`docs/appendix/phase-55b-residuals.md`](../appendix/phase-55b-residuals.md) (item R1). Closing this unblocks one `#[ignore]` stub in `kernel-core/tests/driver_restart.rs` and lets `userspace/e1000-crash-smoke/` assert end-to-end mid-restart behaviour. Not must-fix-before-1.0; a "known limitation" note in Phase 58 is acceptable.
+- **Phase 55c follow-through for userspace `EAGAIN` visibility** — Phase 55c pulled the old Phase 55b `sys_net_send` / `sendto()` restart-surfacing gap forward because the pre-1.0 ring-3 driver story now depends on it. Phase 60 should treat that userspace-visible `EAGAIN` contract as baseline behavior and build future networking work on top of it rather than reopening ownership.
 
 ## Deferred Until Later
 

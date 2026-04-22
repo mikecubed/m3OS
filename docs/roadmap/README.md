@@ -171,7 +171,7 @@ flowchart TD
     P55c --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
     P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
-    P55b --> P58
+    P55c --> P58
     P57 -.->|optional local-system branch| P58
 
     %% Post-1.0 platform growth
@@ -405,7 +405,7 @@ gantt
     Ring-3 Driver Correctness Closure :p55c, after p55b, 1
     Display and Input       :p56, after p55c, 1
     Audio and Local Session :p57, after p56, 1
-    Release 1.0 Gate        :p58, after p57, 1
+    Release 1.0 Gate        :p58, after p55c, 1
 
     section Post-1.0 Platform Growth (planned)
     Cross-Compiled Toolchains :p59, after p58, 1

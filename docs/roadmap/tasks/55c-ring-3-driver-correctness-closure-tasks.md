@@ -54,7 +54,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 ### DRY
 
 - The R3 bound-notification state model lives **once** in `kernel-core::ipc::bound_notif`. The kernel's `notification.rs` and `endpoint.rs` consume it; pure-logic tests and the kernel path share the same invariants.
-- `WakeKind` and its `WAKE_KIND_NOTIFICATION` sentinel live **once** in `kernel-core::ipc`. No file redefines the bit layout.
+- `WakeKind` and its recv-kind constants live **once** in `kernel-core::ipc`. No file redefines the recv-kind or notification-bit layout.
 - `RecvResult` lives **once** in `driver_runtime::ipc`. Drivers consume it; `NetServer`/`BlockServer` dispatch on it; mock and syscall backends produce it.
 - The R2 `BarCoverage` invariant helper lives **once** in `kernel-core::iommu`. VT-d and AMD-Vi backends both call it; no backend redefines BAR-coverage semantics.
 - The R1 errno translation (`net_error_to_neg_errno`) already exists — Phase 55c does not duplicate it. `sys_net_send` and any `sys_sendto` extension both route through the same function.
@@ -125,12 +125,13 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 **File:** `kernel-core/src/ipc/wake_kind.rs` (new)
 **Symbol:** `WakeKind`, `encode_wake_kind`, `decode_wake_kind`
-**Why it matters:** The label field of `IpcMessage` carries either a peer-provided label or a notification-bit mask. Encoding both through one field lets us extend `ipc_recv_msg` without a new syscall or a wider ABI.
+**Why it matters:** The recv path has to distinguish message wakes from notification wakes without colliding with existing IPC protocols that already use `IpcMessage.label` for negative-errno replies.
 
 **Acceptance:**
-- [ ] `WakeKind::Message(label)` and `WakeKind::Notification(bits)` round-trip through a single `u64`.
-- [ ] `WAKE_KIND_NOTIFICATION = 1 << 63`; peer labels always clear bit 63 (assertion in encode).
-- [ ] Tests: round-trip for arbitrary `u63` label, arbitrary `u64` bit mask, mixed interleavings.
+- [ ] `WakeKind::Message(label)` and `WakeKind::Notification(bits)` round-trip through the recv ABI: syscall return kind + `IpcMessage` payload.
+- [ ] `RECV_KIND_MESSAGE = 0`, `RECV_KIND_NOTIFICATION = 1`; negative errnos remain in the syscall return channel for real failures.
+- [ ] On notification wake, drained bits are written to `IpcMessage.data[0]`; on message wake, `IpcMessage.label` remains the peer-provided label.
+- [ ] Tests: round-trip for arbitrary `u64` labels, arbitrary `u64` bit masks, mixed interleavings.
 - [ ] At least 3 unit tests land red before encode/decode implementation.
 
 ### A.3 — Property tests for wake-race atomicity
@@ -203,7 +204,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - [ ] Fast path: bound notification with pending bits → drain atomically, return `WakeKind::Notification(bits)` without touching the endpoint queue.
 - [ ] Slow path: caller registers as both endpoint receiver and notification waiter, blocks. Subsequent `send` or `signal` wakes with the corresponding `WakeKind`.
 - [ ] Lock order documented: endpoint → notification.
-- [ ] `WakeKind` encoded through the `IpcMessage.label` field per A.2.
+- [ ] `WakeKind` encoded through the recv return-kind channel plus `IpcMessage` payload layout per A.2.
 - [ ] Integration test in `kernel/tests/bound_recv.rs` (QEMU harness): signal during blocked recv → `RecvResult::Notification`; message during blocked recv → `RecvResult::Message`.
 - [ ] No regression in existing `kernel/tests/ipc_call_reply.rs`.
 
@@ -315,7 +316,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 **Acceptance:**
 - [ ] `IpcBackend::recv -> Result<RecvResult, DriverRuntimeError>`.
-- [ ] `SyscallBackend::recv` decodes `WakeKind` from the kernel (bit 63 of `IpcMessage.label`) and returns the matching variant.
+- [ ] `SyscallBackend::recv` decodes `WakeKind` from the kernel's recv return kind plus the `IpcMessage` payload layout from A.2 and returns the matching variant.
 - [ ] `NetServer::handle_next` grows a two-closure API: one for messages, one for notifications.
 - [ ] `BlockServer::handle_next` grows the same shape; notification closure default is a no-op.
 - [ ] Every E.1 test passes.

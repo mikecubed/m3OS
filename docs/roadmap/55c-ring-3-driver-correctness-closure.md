@@ -82,7 +82,7 @@ One new syscall:
 
 One extended syscall:
 
-- `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` — return value gains a sentinel for "notification wake". The `IpcMessage.label` field is repurposed: the high bit (`WAKE_KIND_NOTIFICATION = 1 << 63`) indicates notification wake; the low 63 bits carry the drained notification bits. On message wake the high bit is clear and the low bits are the peer's label as before. Backward-compatible because existing labels are bounded by the caller's encoding and never set bit 63.
+- `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` — return value gains a small success-kind channel: `0` for message wake, `1` for notification wake, negative errnos unchanged for real syscall failures. On message wake, `IpcMessage.label` stays the peer's label as before. On notification wake, the drained notification bits are written to `IpcMessage.data[0]`. This keeps wake discrimination disjoint from existing protocols that already use negative errnos in `IpcMessage.label`.
 
 ### R3.4 — `driver_runtime` RecvResult
 
