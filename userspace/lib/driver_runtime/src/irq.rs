@@ -384,6 +384,24 @@ impl<B: IrqBackend> IrqNotification<B> {
     /// `IrqNotification` is responsible for. Bits outside the mask
     /// are discarded silently — they belong to other subscriptions
     /// on the same notification object.
+    ///
+    /// # When to prefer `bind_to_endpoint` instead
+    ///
+    /// Drivers that already own a command endpoint (e.g., the e1000
+    /// and NVMe ring-3 drivers from Phase 55b/c) should call
+    /// [`bind_to_endpoint`](Self::bind_to_endpoint) after subscribing
+    /// and then *not* call `wait` at all.  After binding, the kernel
+    /// delivers IRQ wakes through the same `ipc_recv_msg` path that
+    /// delivers TX / block requests, so a single
+    /// `NetServer::handle_next` (or `BlockServer::handle_next_with_notification`)
+    /// call handles both event types without two separate blocking points.
+    /// Using `wait` in addition to a bound endpoint risks deadlock: the
+    /// loop blocks in `wait` while the command endpoint accumulates
+    /// backpressure.
+    ///
+    /// `wait` remains in the API for drivers or test harnesses that
+    /// operate without a command endpoint — stand-alone IRQ consumers
+    /// that process hardware events and have no peer to reply to.
     pub fn wait(&self) -> u64 {
         let raw = self.backend.wait(self.cap_handle);
         let bits = raw & self.bit_mask;

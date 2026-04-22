@@ -325,20 +325,33 @@ fn build_userspace_bins() {
         } else {
             "-Zbuild-std=core,compiler_builtins"
         };
+
+        // Some packages gate their [[bin]] target behind a required-feature to
+        // prevent duplicate-symbol link errors when the package also exposes a
+        // [lib] and cargo test builds all targets for the host.
+        // e1000_driver uses "os-binary" to enable its _start entry point.
+        let extra_features: &[&str] = match pkg {
+            "e1000_driver" => &["--features", "os-binary"],
+            _ => &[],
+        };
+
+        let mut build_args = vec![
+            "build",
+            "--release",
+            "--package",
+            pkg,
+            "--bin",
+            bin,
+            "--target",
+            "x86_64-unknown-none",
+            build_std,
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ];
+        build_args.extend_from_slice(extra_features);
+
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args([
-                "build",
-                "--release",
-                "--package",
-                pkg,
-                "--bin",
-                bin,
-                "--target",
-                "x86_64-unknown-none",
-                build_std,
-                "-Zbuild-std-features=compiler-builtins-mem",
-            ])
+            .args(&build_args)
             .status()
             .unwrap_or_else(|_| panic!("failed to build userspace binary {bin}"));
 
