@@ -204,6 +204,30 @@ pub const fn net_send_dispatch(has_socket: bool, frame_result: Result<(), NetDri
     net_send_result_to_syscall_ret(frame_result)
 }
 
+/// Phase 55c Track G R1 — `sys_sendto` restart-gate, pure-logic seam.
+///
+/// Maps the `(is_registered, is_restarting)` state pair that
+/// `RemoteNic::check_restart_gate()` observes to an optional `NEG_EAGAIN`
+/// return value for `sys_sendto`.
+///
+/// | `is_registered` | `is_restarting` | Returns |
+/// |---|---|---|
+/// | `true`  | `true`  | `Some(-11)` (`NEG_EAGAIN`) |
+/// | `true`  | `false` | `None` — proceed normally |
+/// | `false` | any     | `None` — no ring-3 NIC; use virtio fallback |
+///
+/// `sys_sendto`'s UDP/ICMP branches call this logic indirectly via
+/// `RemoteNic::check_restart_gate()` (which reads the two `AtomicBool`s);
+/// this function is the host-testable pure-logic mirror tested in
+/// `kernel-core/tests/driver_restart.rs`.
+pub const fn sendto_restart_errno(is_registered: bool, is_restarting: bool) -> Option<i64> {
+    if is_registered && is_restarting {
+        Some(-11) // NEG_EAGAIN
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NetFrameHeader encoding — private helpers shared by send and rx paths.
 // ---------------------------------------------------------------------------

@@ -231,6 +231,31 @@ impl RemoteNic {
         REMOTE_NIC.lock().as_ref().map(|e| e.mac)
     }
 
+    /// Phase 55c Track G R1 — pre-send gate for `sys_sendto`.
+    ///
+    /// Returns `Some(NetDriverError::DriverRestarting)` when a ring-3 NIC
+    /// driver is registered **and** `RESTART_SUSPECTED` is set (an IPC
+    /// transport failure was detected on `drain_tx_queue`).  `sys_sendto`
+    /// maps this to `NEG_EAGAIN` via `net_error_to_neg_errno` and returns
+    /// early, satisfying the R1 contract: userspace `sendto()` observes
+    /// `-EAGAIN` during a driver restart window.
+    ///
+    /// Returns `None` when no ring-3 NIC is registered (caller falls
+    /// through to the virtio-net fire-and-forget path) or when the
+    /// registered driver is healthy.
+    ///
+    /// Lock-free: two `AtomicBool` reads with `Acquire` ordering — safe on
+    /// the hot syscall path without holding any lock.
+    pub fn check_restart_gate() -> Option<NetDriverError> {
+        if REMOTE_NIC_REGISTERED.load(Ordering::Acquire)
+            && RESTART_SUSPECTED.load(Ordering::Acquire)
+        {
+            Some(NetDriverError::DriverRestarting)
+        } else {
+            None
+        }
+    }
+
     /// Enqueue a raw Ethernet frame for delivery to the ring-3 driver over IPC.
     ///
     /// Returns [`NetDriverError::DeviceAbsent`] when no driver is registered,

@@ -1,9 +1,12 @@
-//! Phase 55c Track G.3 (resend) — `sys_net_send`: raw frame transmit with
+//! Phase 55c Track G.3 — `sys_net_send`: direct raw-frame transmit path with
 //! socket-capability gate and `NetDriverError` propagation.
 //!
-//! Bridges the arch-level syscall dispatcher (`arch::x86_64::syscall::mod.rs`)
-//! to `RemoteNic::send_frame`, surfacing `NetDriverError::DriverRestarting`
-//! as `NEG_EAGAIN` (-11) to userspace.
+//! This is a **supplementary** send path for callers that construct raw Ethernet
+//! frames directly (e.g., `e1000-crash-smoke`).  The R1 contract — that
+//! userspace `sendto()` observes `-EAGAIN` during a ring-3 driver restart — is
+//! satisfied by the `sys_sendto` restart gate in
+//! `kernel/src/arch/x86_64/syscall/mod.rs` (see `RemoteNic::check_restart_gate`).
+//! `sys_net_send` is not required for the contract to hold.
 //!
 //! ## Design shape chosen (G.1)
 //!
@@ -18,10 +21,6 @@
 //! (`current_fd_entry`) and passes `has_socket = true` only when the entry's
 //! backend is `FdBackend::Socket`.  Callers without an open socket receive
 //! `NEG_EBADF` (-9) without any driver interaction.
-//!
-//! This preserves the existing socket-fd validation model: raw frame injection
-//! is available only to processes that have legitimately opened a socket,
-//! matching the ownership proof that `sys_sendto` requires.
 //!
 //! ## Dispatch priority
 //!
