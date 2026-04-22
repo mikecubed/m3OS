@@ -369,8 +369,15 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
 ///
 /// # Lock order
 ///
-/// Endpoint lock (`ENDPOINTS`) is acquired first, then the notification
-/// `WAITERS` lock. These must never be acquired in the reverse order.
+/// When both locks must be held simultaneously, the canonical order is
+/// `ENDPOINTS` first, then notification `WAITERS`. This order must never be
+/// reversed.
+///
+/// In the registration-window cleanup path (`register_recv_waiter` returns
+/// `Some`), `WAITERS` is acquired and released entirely inside
+/// `register_recv_waiter` before this function re-acquires `ENDPOINTS` to
+/// remove the receiver from the queue. The two locks are therefore **not** held
+/// simultaneously in that path, and no lock-order inversion occurs.
 pub fn recv_msg_with_notif(
     receiver: TaskId,
     ep_id: EndpointId,

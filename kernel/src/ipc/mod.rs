@@ -79,7 +79,7 @@ pub use registry::RegistryError;
 /// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label or `1` on notification wake |
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
 /// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
-/// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/NEG_EBADF |
+/// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/NEG_EBADF/u64::MAX |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -635,6 +635,9 @@ fn ipc_recv_msg(
 /// - `NEG_EBADF` (-9) on invalid or missing capability (bad handle, wrong
 ///   capability type, or handle out of range). No side effects on error.
 /// - `NEG_EBUSY` (-16) if the notification is already bound to a different task.
+/// - `u64::MAX` on internal error: `get_current_task_idx()` returned `None`,
+///   meaning the calling task has no active scheduler slot. This should not
+///   occur in normal operation but is returned rather than panicking.
 fn sys_notif_bind(task_id: crate::task::TaskId, notif_cap_handle: u64, ep_cap_handle: u64) -> u64 {
     use crate::task::scheduler;
 

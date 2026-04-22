@@ -570,9 +570,11 @@ pub fn ipc_store_reply_bulk(buf: &[u8]) -> u64 {
 /// scope, which matches the one-command-endpoint-per-driver-task model used by
 /// ring-3 drivers today.
 ///
-/// Returns 0 on success, or a negative errno:
+/// Returns 0 on success, or an error value:
 /// - `-9` (EBADF): invalid capability handle or wrong type.
 /// - `-16` (EBUSY): notification already bound to a different task.
+/// - `u64::MAX`: internal kernel error; the calling task has no active
+///   scheduler slot. Should not occur in normal operation.
 pub fn sys_notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
     unsafe {
         syscall2(
