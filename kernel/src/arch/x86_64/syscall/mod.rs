@@ -1225,6 +1225,14 @@ mod syscall_nr {
     pub const BLOCK_READ: u64 = 0x1011;
     /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
     pub const BLOCK_WRITE: u64 = 0x1012;
+    /// Phase 55c Track G.3 (resend): transmit a raw Ethernet frame.
+    ///
+    /// `sys_net_send(sock_fd, buf_ptr, len)` — the caller must own an open
+    /// socket fd (`sock_fd = arg0`); the dispatcher validates it against the
+    /// calling process's fd table before forwarding to `sys_net_send`.
+    /// `DriverRestarting` surfaces as `NEG_EAGAIN` to userspace.
+    /// See `docs/appendix/phase-55c-net-send-shape.md`.
+    pub const NET_SEND: u64 = 0x1013;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1580,6 +1588,22 @@ pub extern "C" fn syscall_handler(
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
+        NET_SEND => {
+            // arg0 = sock_fd, arg1 = buf_ptr, arg2 = len
+            //
+            // Validate the socket capability boundary here, where current_fd_entry
+            // is accessible. Pass has_socket=true only when the fd is a live
+            // FdBackend::Socket; everything else (missing fd, pipe, file, unix
+            // socket) is rejected — raw frame injection requires a real socket.
+            let has_socket = {
+                let fd_idx = arg0 as usize;
+                fd_idx < MAX_FDS
+                    && current_fd_entry(fd_idx)
+                        .map(|e| matches!(e.backend, FdBackend::Socket { .. }))
+                        .unwrap_or(false)
+            };
+            crate::syscall::net::sys_net_send(has_socket, arg1, arg2)
+        }
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -13571,6 +13595,12 @@ pub(super) fn sys_sendto(
                     } else {
                         local_port
                     };
+                    // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
+                    // driver is in a restart window.  Socket fd is already
+                    // validated by the FdBackend::Socket check above.
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
+                    }
                     crate::net::udp::send(dst_ip, dst_port, src_port, &tmp[..capped]);
                     capped as u64
                 }
@@ -13613,6 +13643,10 @@ pub(super) fn sys_sendto(
                     PING_EXPECTED_SEQ.store(seq, Ordering::Release);
                     let icmp_pkt =
                         kernel_core::net::icmp::build(ICMP_ECHO_REQUEST, 0, rest, payload);
+                    // Phase 55c Track G R1: same restart gate as the UDP path.
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
+                    }
                     crate::net::ipv4::send(dst_ip, crate::net::ipv4::PROTO_ICMP, &icmp_pkt);
                     capped as u64
                 }

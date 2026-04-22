@@ -57,7 +57,10 @@ use kernel_core::device_host::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, RegistryError,
 };
 use kernel_core::driver_ipc::block::{BlkReplyHeader, BlockDriverError, encode_blk_reply};
-use kernel_core::driver_ipc::net::{NetDriverError, net_error_to_neg_errno};
+use kernel_core::driver_ipc::net::{
+    NetDriverError, net_error_to_neg_errno, net_send_dispatch, net_send_result_to_syscall_ret,
+    sendto_restart_errno,
+};
 use kernel_core::driver_ipc::{BlockDispatchState, RemoteDeviceError};
 use kernel_core::service::{
     ExitClassification, RestartPolicy, ServiceState, classify_exit, should_restart,
@@ -417,6 +420,277 @@ fn net_error_to_neg_errno_hard_errors_are_eio() {
 }
 
 // ---------------------------------------------------------------------------
+// G.2 — sys_net_send mid-restart EAGAIN observability (Phase 55c Track G)
+// ---------------------------------------------------------------------------
+// These tests verify that the composition `RemoteNic::send_frame returns
+// Err(DriverRestarting)` → `net_send_result_to_syscall_ret` → `-EAGAIN`
+// is wired correctly through the chosen send-path shape.  The helper
+// `net_send_result_to_syscall_ret` is the pure-logic layer that
+// `kernel/src/syscall/net.rs::sys_net_send` delegates to; testing it
+// here keeps the invariant host-testable without QEMU.
+
+/// Phase 55c G.2 — end-to-end EAGAIN observability.
+///
+/// Proves that a `RemoteNic::send_frame` return value of
+/// `Err(NetDriverError::DriverRestarting)` propagates to `-EAGAIN` (-11)
+/// when fed through `net_send_result_to_syscall_ret` — the pure-logic
+/// bridge that `sys_net_send` uses.  This is the load-bearing invariant
+/// for R1 correctness; if `DriverRestarting` silently maps to anything
+/// other than `EAGAIN` the restart window is invisible to userspace.
+#[test]
+fn sys_net_send_mid_restart_returns_eagain() {
+    let result: Result<(), NetDriverError> = Err(NetDriverError::DriverRestarting);
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        -11_i64,
+        "DriverRestarting must surface as NEG_EAGAIN (-11) through sys_net_send"
+    );
+}
+
+/// Phase 55c G.2 — success path is zero.
+///
+/// `Ok(())` from `RemoteNic::send_frame` must map to 0 (success) —
+/// not to any errno.  Verifies the identity case is not accidentally
+/// swallowed by the errno-mapping logic.
+#[test]
+fn sys_net_send_success_returns_zero() {
+    let result: Result<(), NetDriverError> = Ok(());
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        0_i64,
+        "Ok(()) must map to 0 (syscall success)"
+    );
+}
+
+/// Phase 55c G.2 — non-retriable errors are EIO, not EAGAIN.
+///
+/// `DeviceAbsent`, `LinkDown`, and `InvalidFrame` are hard errors;
+/// callers must not retry them as if they were transient.  Verifying
+/// this guards against accidentally broadening the EAGAIN surface.
+#[test]
+fn sys_net_send_hard_errors_return_eio() {
+    for &variant in &[
+        NetDriverError::LinkDown,
+        NetDriverError::DeviceAbsent,
+        NetDriverError::InvalidFrame,
+    ] {
+        let result: Result<(), NetDriverError> = Err(variant);
+        assert_eq!(
+            net_send_result_to_syscall_ret(result),
+            -5_i64,
+            "{variant:?} must map to NEG_EIO (-5), not EAGAIN"
+        );
+    }
+}
+
+/// Phase 55c G.2 — RingFull is retriable (EAGAIN), not a hard error.
+///
+/// `RingFull` is a transient backpressure condition; the caller should
+/// retry.  Maps to `EAGAIN` identically to `DriverRestarting`.
+#[test]
+fn sys_net_send_ring_full_returns_eagain() {
+    let result: Result<(), NetDriverError> = Err(NetDriverError::RingFull);
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        -11_i64,
+        "RingFull must map to NEG_EAGAIN (-11)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G.3 — sys_net_send dispatch-seam: socket boundary + errno mapping combined
+//
+// These tests exercise `net_send_dispatch`, which is the actual function the
+// kernel's `sys_net_send` calls after the arch dispatcher resolves the socket
+// fd.  Unlike the G.2 tests above (which cover only the pure-logic
+// `net_send_result_to_syscall_ret` helper), these tests cover the full ABI
+// path:
+//
+//   arch dispatch validates sock_fd → has_socket bool
+//   → net_send_dispatch(has_socket, frame_result)
+//   → NEG_EBADF | net_send_result_to_syscall_ret(frame_result)
+//
+// This seam is the load-bearing boundary between the socket capability check
+// and the errno mapping; if either invariant regresses the test fails.
+// ---------------------------------------------------------------------------
+
+/// G.3 — caller without a socket fd receives NEG_EBADF.
+///
+/// The arch dispatcher passes `has_socket = false` when `arg0` does not
+/// resolve to a `FdBackend::Socket` entry.  `net_send_dispatch` must gate on
+/// this and return `NEG_EBADF` (-9) without touching the driver path.
+#[test]
+fn sys_net_send_dispatch_no_socket_returns_ebadf() {
+    // frame_result is irrelevant — the socket gate fires first.
+    for result in [
+        Ok(()),
+        Err(NetDriverError::DriverRestarting),
+        Err(NetDriverError::RingFull),
+        Err(NetDriverError::LinkDown),
+    ] {
+        assert_eq!(
+            net_send_dispatch(false, result),
+            -9_i64,
+            "no socket must return NEG_EBADF (-9) regardless of frame_result"
+        );
+    }
+}
+
+/// G.3 — valid socket + DriverRestarting surfaces as EAGAIN through dispatch.
+///
+/// This is the load-bearing R1 invariant for Track G: a caller with a live
+/// socket fd that hits a driver restart window must see -EAGAIN (-11), not
+/// -EIO, so it can retry.
+#[test]
+fn sys_net_send_dispatch_driver_restarting_returns_eagain() {
+    assert_eq!(
+        net_send_dispatch(true, Err(NetDriverError::DriverRestarting)),
+        -11_i64,
+        "DriverRestarting must surface as NEG_EAGAIN (-11) through the dispatch seam"
+    );
+}
+
+/// G.3 — valid socket + RingFull surfaces as EAGAIN through dispatch.
+///
+/// `RingFull` is retriable; callers with a live socket must see EAGAIN, not
+/// EIO, so they know to back off and retry.
+#[test]
+fn sys_net_send_dispatch_ring_full_returns_eagain() {
+    assert_eq!(
+        net_send_dispatch(true, Err(NetDriverError::RingFull)),
+        -11_i64,
+        "RingFull must surface as NEG_EAGAIN (-11) through the dispatch seam"
+    );
+}
+
+/// G.3 — valid socket + successful send returns zero through dispatch.
+#[test]
+fn sys_net_send_dispatch_success_returns_zero() {
+    assert_eq!(
+        net_send_dispatch(true, Ok(())),
+        0_i64,
+        "successful send through dispatch seam must return 0"
+    );
+}
+
+/// G.3 — valid socket + hard errors return EIO, not EAGAIN.
+///
+/// Guards against accidentally broadening the EAGAIN surface: only
+/// `DriverRestarting` and `RingFull` are retriable; all other errors are
+/// hard failures that the caller must not retry blindly.
+#[test]
+fn sys_net_send_dispatch_hard_errors_return_eio() {
+    for variant in [
+        NetDriverError::LinkDown,
+        NetDriverError::DeviceAbsent,
+        NetDriverError::InvalidFrame,
+    ] {
+        assert_eq!(
+            net_send_dispatch(true, Err(variant)),
+            -5_i64,
+            "{variant:?} must map to NEG_EIO (-5) through the dispatch seam, not EAGAIN"
+        );
+    }
+}
+
+/// G.3 — socket gate takes precedence: socket boundary beats frame_result.
+///
+/// Proves that the gate ordering is `socket check → errno mapping`, not the
+/// reverse.  Without a socket, even a successful frame result returns EBADF.
+#[test]
+fn sys_net_send_dispatch_gate_precedes_result_mapping() {
+    // Success result — but no socket → EBADF, not 0.
+    assert_eq!(net_send_dispatch(false, Ok(())), -9_i64);
+    // EAGAIN-class result — but no socket → EBADF, not -11.
+    assert_eq!(
+        net_send_dispatch(false, Err(NetDriverError::DriverRestarting)),
+        -9_i64
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G.3 (sendto path) — sendto_restart_errno: the sys_sendto restart gate seam
+//
+// These tests cover the pure-logic seam that the kernel's `sys_sendto` UDP
+// and ICMP branches exercise via `RemoteNic::sendto_restart_ret()`.
+//
+// The production flow is:
+//
+//   sys_sendto (FdBackend::Socket validated above)
+//   → RemoteNic::sendto_restart_ret()     // reads two AtomicBools and forwards
+//       to sendto_restart_errno(...)
+//   → return NEG_EAGAIN (-11)
+//
+// `sendto_restart_errno(is_registered, is_restarting)` is the host-testable
+// seam that production invokes through that wrapper. Testing it proves the
+// same gate invariant production executes:
+//   registered + restarting  → Some(-11) (EAGAIN)
+//   registered + healthy     → None (proceed to send)
+//   unregistered + any state → None (use virtio fallback)
+// ---------------------------------------------------------------------------
+
+/// G.3 sendto — registered ring-3 NIC in restart window surfaces EAGAIN.
+///
+/// This is the load-bearing R1 acceptance bullet for the sendto path:
+/// a `sendto()` call during a driver restart window must return `-EAGAIN`
+/// so callers can back off and retry, not -EIO or a silent success.
+#[test]
+fn sendto_restart_gate_registered_restarting_returns_eagain() {
+    assert_eq!(
+        sendto_restart_errno(true, true),
+        Some(-11_i64),
+        "registered + restarting must return Some(NEG_EAGAIN) (-11)"
+    );
+}
+
+/// G.3 sendto — registered ring-3 NIC in healthy state returns None.
+///
+/// When the driver is registered and healthy, `sys_sendto` must NOT
+/// short-circuit with EAGAIN — it must proceed to the normal send path.
+#[test]
+fn sendto_restart_gate_registered_healthy_returns_none() {
+    assert_eq!(
+        sendto_restart_errno(true, false),
+        None,
+        "registered + healthy must return None (proceed normally)"
+    );
+}
+
+/// G.3 sendto — no ring-3 NIC registered; gate returns None regardless.
+///
+/// When no ring-3 NIC driver is registered, `sys_sendto` falls through
+/// to the virtio-net fire-and-forget path.  The restart gate must not
+/// interfere.
+#[test]
+fn sendto_restart_gate_unregistered_returns_none() {
+    // Both restarting and healthy variants must pass through.
+    assert_eq!(
+        sendto_restart_errno(false, false),
+        None,
+        "not registered + healthy must return None"
+    );
+    assert_eq!(
+        sendto_restart_errno(false, true),
+        None,
+        "not registered + restart flag set must return None (not our restart)"
+    );
+}
+
+/// G.3 sendto — gate returns NEG_EAGAIN exactly (-11), not EIO or EBADF.
+///
+/// Guards against errno-mapping regressions: the returned value must be
+/// precisely -11 (`EAGAIN`), not -5 (`EIO`) or -9 (`EBADF`).
+#[test]
+fn sendto_restart_gate_eagain_value_is_correct() {
+    let ret = sendto_restart_errno(true, true);
+    assert!(ret.is_some(), "registered+restarting must return Some");
+    let errno = ret.unwrap();
+    assert_ne!(errno, -5_i64, "must not be EIO (-5)");
+    assert_ne!(errno, -9_i64, "must not be EBADF (-9)");
+    assert_eq!(errno, -11_i64, "must be exactly NEG_EAGAIN (-11)");
+}
+
+// ---------------------------------------------------------------------------
 // 9. Registry pre-crash handle invalidation: stale PID sees NotClaimed
 // ---------------------------------------------------------------------------
 
@@ -556,23 +830,35 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
 ///   - `e1000-restart-crash` QEMU regression added to `xtask` (gated behind
 ///     `M3OS_ENABLE_CRASH_SMOKE`); exercises the full kill → restart → send cycle.
 ///
-/// Remaining blocker (phase-55c net-send errno propagation):
-///   The EAGAIN surface within `RemoteNic::send_frame` is kernel-side only;
-///   it does not propagate to userspace `sendto()` because there is no
-///   `sys_net_send` syscall — the net stack's `send_frame` is fire-and-forget
-///   with a virtio-net fallback. Adding `sys_net_send` that propagates
-///   `NetDriverError` as errno is a phase-55c work item.
+/// **Phase 55c Track G resend progress:**
+///   - `sys_net_send` (syscall 0x1013) added with socket-capability gate.
+///     Callers must pass a valid open socket fd as the first argument; the arch
+///     dispatcher validates it against `FdBackend::Socket` before calling the
+///     handler.  `DriverRestarting` → `NEG_EAGAIN` surfaces through
+///     `net_send_dispatch` (pure-logic seam tested in G.3 tests above).
+///   - POSIX `sendto()` (syscall 44) UDP and ICMP branches now call
+///     `RemoteNic::sendto_restart_ret()` before the fire-and-forget send.
+///     When the ring-3 NIC is registered and in a restart window, `sendto()`
+///     returns `NEG_EAGAIN` (-11), satisfying the R1 contract.  Pure-logic
+///     seam coverage is in the G.3 `sendto_restart_errno` tests above.
+///
+/// Remaining blocker for full QEMU smoke:
 ///   ICMP/TCP post-restart connectivity requires the full E.3 TX/RX server
 ///   loop in the e1000 driver (not yet landed; driver exits after bring-up).
-///   This test is also QEMU-only.
+///   This test is QEMU-only.
 #[test]
-#[ignore = "phase-55c net-send errno deferred: F.3d-3 resolved RemoteNic EAGAIN surface \
-            (kernel-side) and added e1000-crash-smoke + xtask regression. Remaining blocker: \
-            sys_net_send syscall to propagate NetDriverError::DriverRestarting as NEG_EAGAIN \
-            to userspace sendto() — no such syscall exists yet. ICMP/TCP post-restart check \
-            deferred until e1000 driver has E.3 TX/RX server loop. QEMU-only test."]
+#[ignore = "QEMU-only: sys_sendto UDP/ICMP now surfaces NEG_EAGAIN via RemoteNic::sendto_restart_ret(). \
+            sys_net_send (0x1013) also surfaces NEG_EAGAIN for direct callers. \
+            Pure-logic seam coverage: G.3 sendto_restart_errno tests + net_send_dispatch tests. \
+            Remaining blocker: e1000 driver E.3 TX/RX server loop for post-restart ICMP/TCP. \
+            QEMU regression e1000-restart-crash (M3OS_ENABLE_CRASH_SMOKE) exercises the \
+            kill/restart cycle; post-restart connectivity check deferred to Track H."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
-    // intentionally empty — see doc comment above for specific blockers
+    // Phase 55c Track G (second resend): sys_sendto UDP/ICMP branches call
+    // RemoteNic::sendto_restart_ret() before the fire-and-forget send path.
+    // When RESTART_SUSPECTED is set, sendto() returns NEG_EAGAIN (-11).
+    // The post-restart ICMP/TCP connectivity path requires the e1000 E.3
+    // server loop and is covered by Track H.
 }
 
 /// Phase 55b Track F.3d-1: max-restart path resolved.
