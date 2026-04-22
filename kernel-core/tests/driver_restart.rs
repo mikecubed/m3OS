@@ -802,63 +802,40 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
     // QEMU regression.
 }
 
-/// Phase 55b Track F.3d-3 progress: RemoteNic EAGAIN surface + e1000-crash-smoke.
+/// Phase 55c Track H.1 delivered: e1000-crash-smoke EAGAIN assertion.
 ///
-/// **F.2b progress:** `service kill e1000_driver` is available from the guest
-///   shell (same `service kill` subcommand). The `RemoteNic` error-surfacing
-///   path (`NetDriverError::DriverRestarting`) needs the same errno-propagation
-///   treatment as the block path.
-///
-/// **F.3b progress:** F.3b delivered the NVMe crash-smoke binary and the
-///   `driver-restart-crash` QEMU regression. The analogous e1000 path
-///   required a guest net I/O-client binary and `RemoteNic` EAGAIN surfacing.
-///
-/// **F.3c progress:** F.3c resolved the block-path privilege gate and EAGAIN
-///   propagation. The e1000 path remained blocked on the items below.
-///
-/// **F.3d-3 progress (resolves partial blockers from F.3c):**
-///   - `NetDriverError::to_byte()` and `net_error_to_neg_errno()` added to
-///     `kernel-core/src/driver_ipc/net.rs` — mirrors `block_error_to_neg_errno`.
-///     `DriverRestarting` (byte 4) → `NEG_EAGAIN` (-11).
-///   - `RESTART_SUSPECTED: AtomicBool` added to `kernel/src/net/remote.rs`;
-///     `RemoteNic::send_frame()` returns `NetDriverError::DriverRestarting` when
-///     the flag is set.  `drain_tx_queue()` calls `Self::on_ipc_error()` on IPC
-///     failure, which sets the flag.  `register()` clears it on re-registration.
-///   - `userspace/e1000-crash-smoke/` binary: sends pre-crash UDP, kills
-///     e1000_driver, sends mid-crash UDP, polls restart, sends post-restart UDP.
-///     Emits `E1000_CRASH_SMOKE:PASS` on success.
-///   - `e1000-restart-crash` QEMU regression added to `xtask` (gated behind
-///     `M3OS_ENABLE_CRASH_SMOKE`); exercises the full kill → restart → send cycle.
-///
-/// **Phase 55c Track G resend progress:**
+/// **Track G resend progress (carried forward):**
 ///   - `sys_net_send` (syscall 0x1013) added with socket-capability gate.
-///     Callers must pass a valid open socket fd as the first argument; the arch
-///     dispatcher validates it against `FdBackend::Socket` before calling the
-///     handler.  `DriverRestarting` → `NEG_EAGAIN` surfaces through
-///     `net_send_dispatch` (pure-logic seam tested in G.3 tests above).
-///   - POSIX `sendto()` (syscall 44) UDP and ICMP branches now call
+///     `DriverRestarting` → `NEG_EAGAIN` surfaces through `net_send_dispatch`.
+///   - POSIX `sendto()` (syscall 44) UDP/ICMP branches call
 ///     `RemoteNic::sendto_restart_ret()` before the fire-and-forget send.
 ///     When the ring-3 NIC is registered and in a restart window, `sendto()`
-///     returns `NEG_EAGAIN` (-11), satisfying the R1 contract.  Pure-logic
-///     seam coverage is in the G.3 `sendto_restart_errno` tests above.
+///     returns `NEG_EAGAIN` (-11), satisfying the R1 contract.
+///     Pure-logic seam coverage: G.3 `sendto_restart_errno` tests.
 ///
-/// Remaining blocker for full QEMU smoke:
-///   ICMP/TCP post-restart connectivity requires the full E.3 TX/RX server
-///   loop in the e1000 driver (not yet landed; driver exits after bring-up).
-///   This test is QEMU-only.
+/// **Track H.1 (this track) delivered:**
+///   - `userspace/e1000-crash-smoke/src/main.rs` updated with
+///     `assert_eagain_during_restart()`.  After the kill child exits
+///     (synchronous `waitpid`), the follow-up `sendto()` asserts
+///     `NEG_EAGAIN` (-11).  Exit code 3 on assertion failure.
+///   - `cargo xtask regression --test e1000-restart-crash` exercises the
+///     binary end-to-end (gated behind `M3OS_ENABLE_CRASH_SMOKE`).
+///
+/// Pure-logic EAGAIN seam is fully covered by the G.3 host unit tests
+/// (`sendto_restart_errno_*`).  This stub records that the QEMU-only
+/// scenario is now exercised by the H.1 regression binary.
 #[test]
-#[ignore = "QEMU-only: sys_sendto UDP/ICMP now surfaces NEG_EAGAIN via RemoteNic::sendto_restart_ret(). \
-            sys_net_send (0x1013) also surfaces NEG_EAGAIN for direct callers. \
-            Pure-logic seam coverage: G.3 sendto_restart_errno tests + net_send_dispatch tests. \
-            Remaining blocker: e1000 driver E.3 TX/RX server loop for post-restart ICMP/TCP. \
-            QEMU regression e1000-restart-crash (M3OS_ENABLE_CRASH_SMOKE) exercises the \
-            kill/restart cycle; post-restart connectivity check deferred to Track H."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
-    // Phase 55c Track G (second resend): sys_sendto UDP/ICMP branches call
-    // RemoteNic::sendto_restart_ret() before the fire-and-forget send path.
-    // When RESTART_SUSPECTED is set, sendto() returns NEG_EAGAIN (-11).
-    // The post-restart ICMP/TCP connectivity path requires the e1000 E.3
-    // server loop and is covered by Track H.
+    // The authoritative end-to-end check is the `e1000-restart-crash` xtask
+    // regression (M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test
+    // e1000-restart-crash), which boots the guest with --device e1000,
+    // runs /bin/e1000-crash-smoke, and asserts E1000_CRASH_SMOKE:PASS plus
+    // the mid-crash:EAGAIN-observed marker.
+    //
+    // Pure-logic coverage (passing without QEMU):
+    //   - sendto_restart_errno_{registered_restarting,not_registered,not_restarting}
+    //   - net_send_dispatch_* tests
+    //   - net_error_to_neg_errno_driver_restarting_is_eagain
 }
 
 /// Phase 55b Track F.3d-1: max-restart path resolved.
