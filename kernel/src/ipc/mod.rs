@@ -79,7 +79,7 @@ pub use registry::RegistryError;
 /// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label or `1` on notification wake |
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
 /// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
-/// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/MAX |
+/// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/NEG_EBADF |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -632,27 +632,29 @@ fn ipc_recv_msg(
 /// # Return value
 ///
 /// - `0` on success (including idempotent re-bind of the same pair).
-/// - `u64::MAX` on capability-not-found (EBADF equivalent).
-/// - `NEG_EBUSY` if the notification is already bound to a different task.
+/// - `NEG_EBADF` (-9) on invalid or missing capability (bad handle, wrong
+///   capability type, or handle out of range). No side effects on error.
+/// - `NEG_EBUSY` (-16) if the notification is already bound to a different task.
 fn sys_notif_bind(task_id: crate::task::TaskId, notif_cap_handle: u64, ep_cap_handle: u64) -> u64 {
     use crate::task::scheduler;
 
+    const NEG_EBADF: u64 = (-9_i64) as u64;
     const NEG_EBUSY: u64 = (-16_i64) as u64;
 
     if notif_cap_handle > u64::from(u32::MAX) {
-        return u64::MAX;
+        return NEG_EBADF;
     }
     let notif_id = match scheduler::task_cap(task_id, notif_cap_handle as CapHandle) {
         Ok(Capability::Notification(id)) => id,
-        _ => return u64::MAX,
+        _ => return NEG_EBADF,
     };
 
     if ep_cap_handle > u64::from(u32::MAX) {
-        return u64::MAX;
+        return NEG_EBADF;
     }
     match scheduler::task_cap(task_id, ep_cap_handle as CapHandle) {
         Ok(Capability::Endpoint(_)) => {}
-        _ => return u64::MAX,
+        _ => return NEG_EBADF,
     }
 
     let task_sched_idx = match scheduler::get_current_task_idx() {

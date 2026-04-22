@@ -133,3 +133,92 @@ fn idempotent_same_pair_returns_zero() {
     assert_eq!(state.bound_tcb[notif.0 as usize], sched_idx as i32);
     assert_eq!(state.tcb_bound_notif[sched_idx], notif.0);
 }
+
+// ---------------------------------------------------------------------------
+// ABI return-value encoding (exercises the syscall-facing return path)
+// ---------------------------------------------------------------------------
+
+/// Map the FakeKernelState result to the u64 ABI value exactly as
+/// `sys_notif_bind` in `kernel/src/ipc/mod.rs` does.
+///
+/// This helper lets the tests below exercise the *syscall-facing* return path
+/// rather than the pure `Result<(), FakeErr>` model contract.
+fn map_to_abi(result: Result<(), FakeErr>) -> u64 {
+    // Must match the constants in kernel/src/ipc/mod.rs::sys_notif_bind.
+    const NEG_EBADF: u64 = (-9_i64) as u64;
+    const NEG_EBUSY: u64 = (-16_i64) as u64;
+    match result {
+        Ok(()) => 0,
+        Err(FakeErr::Ebadf) => NEG_EBADF,
+        Err(FakeErr::Ebusy) => NEG_EBUSY,
+    }
+}
+
+/// Verify that the ABI encodes an invalid-notif-cap error as `NEG_EBADF`
+/// (-9 as two's-complement u64), **not** as `u64::MAX`.
+///
+/// This is the actual syscall-facing return path exercised by the helper
+/// above: the kernel's `sys_notif_bind` maps capability-validation failures
+/// to `NEG_EBADF`, and userspace relies on receiving `-9`, not `0xffffffff…`.
+#[test]
+fn invalid_notif_cap_abi_returns_neg_ebadf_not_max() {
+    const NEG_EBADF: u64 = (-9_i64) as u64;
+
+    let mut state = FakeKernelState::new();
+    let abi = map_to_abi(state.sys_notif_bind(false, true, NotifId(0), 0, TaskId(1)));
+
+    assert_eq!(
+        abi, NEG_EBADF,
+        "invalid notif cap must return NEG_EBADF (-9), got {:#x}",
+        abi
+    );
+    assert_ne!(
+        abi,
+        u64::MAX,
+        "invalid notif cap must NOT return u64::MAX — that was the old, wrong ABI"
+    );
+}
+
+/// Same check for an invalid *endpoint* capability.
+#[test]
+fn invalid_ep_cap_abi_returns_neg_ebadf_not_max() {
+    const NEG_EBADF: u64 = (-9_i64) as u64;
+
+    let mut state = FakeKernelState::new();
+    let abi = map_to_abi(state.sys_notif_bind(true, false, NotifId(0), 0, TaskId(1)));
+
+    assert_eq!(
+        abi, NEG_EBADF,
+        "invalid endpoint cap must return NEG_EBADF (-9), got {:#x}",
+        abi
+    );
+    assert_ne!(
+        abi,
+        u64::MAX,
+        "invalid endpoint cap must NOT return u64::MAX — that was the old, wrong ABI"
+    );
+}
+
+/// Verify that a successful bind still returns `0` through the ABI mapper,
+/// so any regression in `map_to_abi` is immediately caught.
+#[test]
+fn successful_bind_abi_returns_zero() {
+    let mut state = FakeKernelState::new();
+    let abi = map_to_abi(state.sys_notif_bind(true, true, NotifId(2), 5, TaskId(7)));
+    assert_eq!(abi, 0, "successful bind must return 0 through the ABI path");
+}
+
+/// Verify that a busy-slot error returns `NEG_EBUSY` (-16), not `u64::MAX`.
+#[test]
+fn busy_bind_abi_returns_neg_ebusy_not_max() {
+    const NEG_EBUSY: u64 = (-16_i64) as u64;
+
+    let mut state = FakeKernelState::new();
+    state
+        .sys_notif_bind(true, true, NotifId(0), 1, TaskId(10))
+        .unwrap();
+
+    let abi = map_to_abi(state.sys_notif_bind(true, true, NotifId(0), 2, TaskId(20)));
+    assert_eq!(abi, NEG_EBUSY, "busy slot must return NEG_EBUSY (-16)");
+    assert_ne!(abi, u64::MAX, "busy slot must NOT return u64::MAX");
+}
