@@ -402,7 +402,7 @@ gantt
     Hardware Substrate      :done, p55, after p54a, 1
     IOMMU Substrate         :p55a, after p55, 1
     Ring-3 Driver Host      :p55b, after p55a, 1
-    Ring-3 Driver Correctness :p55c, after p55b, 1
+    Ring-3 Driver Correctness Closure :p55c, after p55b, 1
     Display and Input       :p56, after p55c, 1
     Audio and Local Session :p57, after p56, 1
     Release 1.0 Gate        :p58, after p57, 1
