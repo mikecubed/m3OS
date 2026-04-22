@@ -635,27 +635,7 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
     };
 
     if let Err(e) = claim_result {
-        return match e {
-            DeviceHostError::AlreadyClaimed => NEG_EBUSY,
-            // `claim_pci_device_by_bdf` returns `NotFound` for an absent
-            // BDF; `NotClaimed` is the corresponding DeviceHostError
-            // surface. Map it to ENODEV per acceptance.
-            DeviceHostError::NotClaimed => NEG_ENODEV,
-            // D.3 — IOMMU BAR-coverage validation failed. The domain has
-            // been torn down and the PCI slot released. Return EIO so the
-            // caller can distinguish this from a missing-device error.
-            DeviceHostError::Internal => NEG_EIO,
-            // Any other surface at this site is an internal bug — log and
-            // surface as ENODEV so the caller retries / bails rather
-            // than interpreting a random errno.
-            other => {
-                log::warn!(
-                    "[device-host] sys_device_claim({segment:#x},{bus:#04x},{dev:#04x},{func}) \
-                     unexpected registry error: {other:?}"
-                );
-                NEG_ENODEV
-            }
-        };
+        return device_claim_error_to_errno(e, segment, bus, dev, func);
     }
 
     // 2) Registry now owns the PciDeviceHandle. Install the capability in
@@ -2784,14 +2764,8 @@ fn bar_coverage_iommu_map_error_maps_to_neg_eio_at_syscall_gate() {
         "IOMMU map failure inside the BAR-coverage path must be DeviceHostError::Internal"
     );
 
-    // 2. Apply the exact errno translation from sys_device_claim's error arm.
-    //    DeviceHostError::Internal → NEG_EIO is the D.3 syscall-level contract.
-    let syscall_errno: isize = match coverage_err {
-        DeviceHostError::Internal => NEG_EIO,
-        DeviceHostError::AlreadyClaimed => NEG_EBUSY,
-        DeviceHostError::NotClaimed => NEG_ENODEV,
-        _ => NEG_ENODEV,
-    };
+    // 2. Exercise the exact translation seam that sys_device_claim uses.
+    let syscall_errno = device_claim_error_to_errno(coverage_err, 0, 0, 1, 0);
     assert_eq!(
         syscall_errno, NEG_EIO,
         "DeviceHostError::Internal from a BAR-coverage failure must surface as \
@@ -2834,14 +2808,15 @@ fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
         "no domain with active IOMMU must return DeviceHostError::Internal"
     );
 
-    // Verify syscall-gate errno translation: same match arm as sys_device_claim.
-    let errno: isize =
-        match validate_domain_presence(None, /*iommu_active=*/ true, 0, 0, 1, 0).unwrap_err() {
-            DeviceHostError::Internal => NEG_EIO,
-            DeviceHostError::AlreadyClaimed => NEG_EBUSY,
-            DeviceHostError::NotClaimed => NEG_ENODEV,
-            _ => NEG_ENODEV,
-        };
+    // Verify syscall-gate errno translation through the shared seam that
+    // sys_device_claim itself now uses.
+    let errno = device_claim_error_to_errno(
+        validate_domain_presence(None, /*iommu_active=*/ true, 0, 0, 1, 0).unwrap_err(),
+        0,
+        0,
+        1,
+        0,
+    );
     assert_eq!(
         errno, NEG_EIO,
         "DeviceHostError::Internal from no-domain+active-IOMMU must map to \
@@ -2858,4 +2833,33 @@ fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
         fallback_result.unwrap().is_none(),
         "identity-fallback must return Ok(None)"
     );
+}
+fn device_claim_error_to_errno(
+    error: DeviceHostError,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> isize {
+    match error {
+        DeviceHostError::AlreadyClaimed => NEG_EBUSY,
+        // `claim_pci_device_by_bdf` returns `NotFound` for an absent
+        // BDF; `NotClaimed` is the corresponding DeviceHostError
+        // surface. Map it to ENODEV per acceptance.
+        DeviceHostError::NotClaimed => NEG_ENODEV,
+        // D.3 — IOMMU BAR-coverage validation failed. The domain has
+        // been torn down and the PCI slot released. Return EIO so the
+        // caller can distinguish this from a missing-device error.
+        DeviceHostError::Internal => NEG_EIO,
+        // Any other surface at this site is an internal bug — log and
+        // surface as ENODEV so the caller retries / bails rather
+        // than interpreting a random errno.
+        other => {
+            log::warn!(
+                "[device-host] sys_device_claim({segment:#x},{bus:#04x},{dev:#04x},{func}) \
+                 unexpected registry error: {other:?}"
+            );
+            NEG_ENODEV
+        }
+    }
 }
