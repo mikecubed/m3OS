@@ -259,6 +259,12 @@ mod tests {
                                 );
                                 pending_labels.remove(pos.unwrap());
 
+                                prop_assert!(
+                                    !notification_dispatchable,
+                                    "entry-state fast path must not return a message while a \
+                                     bound notification is already dispatchable"
+                                );
+
                                 // A-R2 — if a notification was already pending but the
                                 // receiver was unbound (not dispatchable), the signal
                                 // bits must survive this receive step.
