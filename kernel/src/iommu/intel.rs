@@ -979,3 +979,58 @@ impl VtdUnit {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// D.1 — BAR identity mapping (Track D)
+// ---------------------------------------------------------------------------
+
+impl VtdUnit {
+    /// Identity-map each MMIO BAR in the given domain and return a
+    /// [`BarCoverage`] recording every range that was installed.
+    ///
+    /// For each non-zero-length entry in `bars`, the physical range
+    /// `[base, base + len)` is identity-mapped (IOVA == phys) with
+    /// `READ | WRITE` permissions. The range is 4 KiB–page-aligned before
+    /// the IOMMU call: `base` is rounded down and `len` is rounded up to
+    /// cover the full BAR window.
+    ///
+    /// `AlreadyMapped` from the underlying [`IommuUnit::map`] is treated as
+    /// success — the range may have been pre-installed by `pre_map_reserved`
+    /// and the coverage is still valid. Any other error is propagated and
+    /// the caller should treat the domain as unusable.
+    ///
+    /// Called from `sys_device_claim` (Track D.3) through
+    /// `install_and_verify_bar_coverage`; also directly accessible for
+    /// integration tests under `cargo xtask device-smoke --device nvme
+    /// --iommu`.
+    #[allow(dead_code)]
+    pub fn install_bar_identity_maps(
+        &mut self,
+        domain: DomainId,
+        bars: &[kernel_core::iommu::bar_coverage::Bar],
+    ) -> Result<kernel_core::iommu::bar_coverage::BarCoverage, DomainError> {
+        use kernel_core::iommu::bar_coverage::BarCoverage;
+        let mut coverage = BarCoverage::new();
+        for bar in bars {
+            if bar.len == 0 {
+                continue;
+            }
+            let aligned_base = bar.base & !0xFFF;
+            let end = bar.base.saturating_add(bar.len as u64);
+            let aligned_end = (end + 0xFFF) & !0xFFF;
+            let aligned_len = (aligned_end - aligned_base) as usize;
+            match self.map(
+                domain,
+                Iova(aligned_base),
+                PhysAddr(aligned_base),
+                aligned_len,
+                MapFlags::READ | MapFlags::WRITE,
+            ) {
+                Ok(()) | Err(DomainError::AlreadyMapped) => {}
+                Err(e) => return Err(e),
+            }
+            coverage.record_mapped(aligned_base, aligned_len);
+        }
+        Ok(coverage)
+    }
+}

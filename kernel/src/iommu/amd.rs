@@ -844,6 +844,56 @@ fn write_phys_u64(phys: u64, value: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// D.2 — BAR identity mapping (Track D)
+// ---------------------------------------------------------------------------
+
+impl AmdViUnit {
+    /// Identity-map each MMIO BAR in the given domain and return a
+    /// [`BarCoverage`] recording every range that was installed.
+    ///
+    /// Mirrors [`VtdUnit::install_bar_identity_maps`] for the AMD-Vi
+    /// backend. For each non-zero-length entry in `bars`, the physical
+    /// range `[base, base + len)` is identity-mapped (IOVA == phys) with
+    /// `READ | WRITE` permissions. The range is 4 KiB–page-aligned before
+    /// the IOMMU call.
+    ///
+    /// `AlreadyMapped` is treated as success — the range may have been
+    /// pre-installed by `pre_map_reserved`. Any other error is propagated
+    /// and the caller should treat the domain as unusable.
+    #[allow(dead_code)]
+    pub fn install_bar_identity_maps(
+        &mut self,
+        domain: DomainId,
+        bars: &[kernel_core::iommu::bar_coverage::Bar],
+    ) -> Result<kernel_core::iommu::bar_coverage::BarCoverage, DomainError> {
+        use kernel_core::iommu::bar_coverage::BarCoverage;
+        use kernel_core::iommu::contract::{Iova, MapFlags, PhysAddr};
+        let mut coverage = BarCoverage::new();
+        for bar in bars {
+            if bar.len == 0 {
+                continue;
+            }
+            let aligned_base = bar.base & !0xFFF;
+            let end = bar.base.saturating_add(bar.len as u64);
+            let aligned_end = (end + 0xFFF) & !0xFFF;
+            let aligned_len = (aligned_end - aligned_base) as usize;
+            match self.map(
+                domain,
+                Iova(aligned_base),
+                PhysAddr(aligned_base),
+                aligned_len,
+                MapFlags::READ | MapFlags::WRITE,
+            ) {
+                Ok(()) | Err(DomainError::AlreadyMapped) => {}
+                Err(e) => return Err(e),
+            }
+            coverage.record_mapped(aligned_base, aligned_len);
+        }
+        Ok(coverage)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit registry
 // ---------------------------------------------------------------------------
 
