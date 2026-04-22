@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use spin::{Lazy, Mutex};
 
-use super::{CapError, Capability, Message};
+use super::{CapError, Capability, Message, NotifId};
 use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::EndpointId;
@@ -349,6 +349,144 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 "[ipc] recv_msg: woke with no pending message — IPC logic bug"
             );
             Message::new(u64::MAX)
+        }
+    }
+}
+
+/// Receive a message or a notification on an endpoint.
+///
+/// Extends [`recv_msg`] with a bound-notification fast path: if the calling
+/// task has a notification bound and its `PENDING` bits are non-zero, drains
+/// them atomically and returns `(1, notification_bits)` without touching the
+/// endpoint queue.
+///
+/// # Return value
+///
+/// Returns a tuple `(kind: u8, msg: Message)`:
+/// - `(0, msg)` — a peer delivered a message; `msg` is the full [`Message`].
+/// - `(1, bits_msg)` — a bound notification fired; `bits_msg.data[0]` carries
+///   the drained bit mask and `bits_msg.label = 0`.
+///
+/// # Lock order
+///
+/// Endpoint lock (`ENDPOINTS`) is acquired first, then the notification
+/// `WAITERS` lock. These must never be acquired in the reverse order.
+pub fn recv_msg_with_notif(
+    receiver: TaskId,
+    ep_id: EndpointId,
+    notif_id: NotifId,
+) -> (u8, Message) {
+    use super::notification;
+    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
+
+    let bits = notification::drain_bits(notif_id);
+    if classify_recv(bits) == RECV_KIND_NOTIFICATION {
+        let mut msg = Message::new(0);
+        msg.data[0] = bits;
+        return (RECV_KIND_NOTIFICATION, msg);
+    }
+
+    let action = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) if !e.closed => e,
+            _ => return (RECV_KIND_MESSAGE, Message::new(u64::MAX)),
+        };
+        if let Some(pending) = ep.senders.pop_front() {
+            Some(pending)
+        } else {
+            ep.receivers.push_back(receiver);
+            None
+        }
+    };
+
+    match action {
+        Some(mut pending) => {
+            let reply_cap_handle = if pending.wants_reply {
+                match scheduler::insert_cap(receiver, Capability::Reply(pending.task)) {
+                    Ok(handle) => Some(handle),
+                    Err(_) => {
+                        log::warn!("[ipc] recv_msg_with_notif: cap table full");
+                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                        let _ = scheduler::wake_task(pending.task);
+                        return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+                    }
+                }
+            } else {
+                None
+            };
+
+            if transfer_cap(pending.task, receiver, &mut pending.msg).is_err() {
+                if let Some(handle) = reply_cap_handle {
+                    let _ = scheduler::remove_task_cap(receiver, handle);
+                }
+                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                let _ = scheduler::wake_task(pending.task);
+                return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+            }
+
+            scheduler::deliver_message(receiver, pending.msg);
+            transfer_bulk(pending.task, receiver);
+            if !pending.wants_reply {
+                scheduler::complete_send(pending.task);
+                let _ = scheduler::wake_task(pending.task);
+            }
+
+            match scheduler::take_message(receiver) {
+                Some(msg) => (RECV_KIND_MESSAGE, msg),
+                None => (RECV_KIND_MESSAGE, Message::new(u64::MAX)),
+            }
+        }
+        None => {
+            let task_sched_idx = match scheduler::get_current_task_idx() {
+                Some(idx) => idx,
+                None => {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                    return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+                }
+            };
+
+            if let Some(bits2) =
+                notification::register_recv_waiter(notif_id, receiver, task_sched_idx)
+            {
+                let mut reg = ENDPOINTS.lock();
+                if let Some(ep) = reg.get_mut(ep_id) {
+                    ep.receivers.retain(|&r| r != receiver);
+                }
+                let mut msg = Message::new(0);
+                msg.data[0] = bits2;
+                return (RECV_KIND_NOTIFICATION, msg);
+            }
+
+            scheduler::block_current_on_notif_unless_message();
+            notification::unregister_recv_waiter(notif_id, receiver);
+
+            if let Some(msg) = scheduler::take_message(receiver) {
+                return (RECV_KIND_MESSAGE, msg);
+            }
+
+            let bits = notification::drain_bits(notif_id);
+            if bits != 0 {
+                {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                }
+                if let Some(msg) = scheduler::take_message(receiver) {
+                    notification::signal(notif_id, bits);
+                    return (RECV_KIND_MESSAGE, msg);
+                }
+                let mut msg = Message::new(0);
+                msg.data[0] = bits;
+                (RECV_KIND_NOTIFICATION, msg)
+            } else {
+                debug_assert!(false, "[ipc] recv_msg_with_notif: spurious wake");
+                (RECV_KIND_MESSAGE, Message::new(u64::MAX))
+            }
         }
     }
 }
