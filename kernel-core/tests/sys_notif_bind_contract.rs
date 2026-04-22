@@ -17,6 +17,7 @@
 //! | `bind_returns_ebadf_on_invalid_notif_cap` | EBADF on bad notif cap |
 //! | `bind_returns_ebadf_on_invalid_endpoint_cap` | EBADF on bad endpoint cap |
 //! | `idempotent_same_pair_returns_zero` | Idempotent re-bind succeeds |
+//! | `missing_scheduler_slot_abi_returns_max` | Internal error returns `u64::MAX` |
 
 use kernel_core::ipc::bound_notif::{BindError, BoundNotifTable, MAX_NOTIFS};
 use kernel_core::types::{NotifId, TaskId};
@@ -34,6 +35,7 @@ struct FakeKernelState {
 enum FakeErr {
     Ebadf,
     Ebusy,
+    Internal,
 }
 
 impl FakeKernelState {
@@ -151,6 +153,7 @@ fn map_to_abi(result: Result<(), FakeErr>) -> u64 {
         Ok(()) => 0,
         Err(FakeErr::Ebadf) => NEG_EBADF,
         Err(FakeErr::Ebusy) => NEG_EBUSY,
+        Err(FakeErr::Internal) => u64::MAX,
     }
 }
 
@@ -221,4 +224,13 @@ fn busy_bind_abi_returns_neg_ebusy_not_max() {
     let abi = map_to_abi(state.sys_notif_bind(true, true, NotifId(0), 2, TaskId(20)));
     assert_eq!(abi, NEG_EBUSY, "busy slot must return NEG_EBUSY (-16)");
     assert_ne!(abi, u64::MAX, "busy slot must NOT return u64::MAX");
+}
+
+/// Verify that the exceptional "no active scheduler slot" path returns the
+/// dedicated `u64::MAX` sentinel rather than being conflated with a negative
+/// errno.
+#[test]
+fn missing_scheduler_slot_abi_returns_max() {
+    let abi = map_to_abi(Err(FakeErr::Internal));
+    assert_eq!(abi, u64::MAX);
 }

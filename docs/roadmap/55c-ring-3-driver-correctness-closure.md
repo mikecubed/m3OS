@@ -78,7 +78,7 @@ Each `Notification` gains an optional bound-TCB pointer. When set, the binding i
 
 One new syscall:
 
-- `sys_notif_bind(notif_cap, ep_cap) -> 0 | -EBUSY | -EBADF` — one-shot bind. Idempotent when re-bound with the same `(notif_cap, ep_cap)` pair.
+- `sys_notif_bind(notif_cap, ep_cap) -> 0 | -EBUSY | -EBADF | u64::MAX` — one-shot bind. The kernel validates `ep_cap` on every call, then records the binding at task scope, so re-binding the same notification from the same task stays idempotent. `u64::MAX` is reserved for the internal "no active scheduler slot" path and should not occur in normal operation.
 
 One extended syscall:
 

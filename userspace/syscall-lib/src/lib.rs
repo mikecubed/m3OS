@@ -501,8 +501,13 @@ pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u
 ///
 /// Blocks until a message arrives on the endpoint.  The kernel writes
 /// the [`IpcMessage`] header (label + data[0..4]) to `msg` and copies
-/// any attached bulk data into `buf`.  Returns the label on success,
-/// `u64::MAX` on error.
+/// any attached bulk data into `buf`.
+///
+/// Returns:
+/// - the message label on a message wake,
+/// - `RECV_KIND_NOTIFICATION` (= 1) on a bound-notification wake, with the
+///   drained pending-bit mask in `msg.data[0]` and `msg.label = 0`,
+/// - `u64::MAX` on error.
 pub fn ipc_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
     unsafe {
         syscall6(
@@ -522,7 +527,12 @@ pub fn ipc_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) ->
 /// Combines reply + recv_msg in one syscall.  The reply carries only a
 /// label (no bulk data in the reply direction).  The received message
 /// header is written to `msg` and any bulk payload to `buf`.
-/// Returns the next message label on success, `u64::MAX` on error.
+///
+/// Returns:
+/// - the next message label on a message wake,
+/// - `RECV_KIND_NOTIFICATION` (= 1) on a bound-notification wake, with the
+///   drained pending-bit mask in `msg.data[0]` and `msg.label = 0`,
+/// - `u64::MAX` on error.
 pub fn ipc_reply_recv_msg(
     reply_cap_handle: u32,
     reply_label: u64,

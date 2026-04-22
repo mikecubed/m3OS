@@ -264,14 +264,22 @@ impl IrqBackend for SyscallBackend {
 
     fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
         // Delegates to `sys_notif_bind` (syscall 0x1111, Track B).
-        // A non-zero negative return is a kernel-side error; zero is success.
+        // `u64::MAX` is the kernel's internal-error sentinel; negative values
+        // are errno returns sign-extended into the u64 result register.
         let rc = syscall_lib::sys_notif_bind(notif_cap, ep_cap);
-        let signed = rc as i64;
-        if signed < 0 {
-            Err(errno_to_driver_runtime_error(signed))
-        } else {
-            Ok(())
-        }
+        decode_notif_bind_result(rc)
+    }
+}
+
+fn decode_notif_bind_result(rc: u64) -> Result<(), DriverRuntimeError> {
+    if rc == u64::MAX {
+        return Err(DriverRuntimeError::from(DeviceHostError::Internal));
+    }
+    let signed = rc as i64;
+    if signed < 0 {
+        Err(errno_to_driver_runtime_error(signed))
+    } else {
+        Ok(())
     }
 }
 
@@ -286,12 +294,13 @@ impl IrqBackend for SyscallBackend {
 /// [`DeviceHostError`] variant.
 fn errno_to_driver_runtime_error(errno: i64) -> DriverRuntimeError {
     let mapped = match errno {
-        -9 => DeviceHostError::BadDeviceCap,      // EBADF
-        -1 => DeviceHostError::BadDeviceCap,      // EPERM (policy reject)
-        -3 => DeviceHostError::BadDeviceCap,      // ESRCH (task gone)
-        -12 => DeviceHostError::Internal,         // ENOMEM (notif alloc)
-        -19 => DeviceHostError::BadDeviceCap,     // ENODEV
-        -22 => DeviceHostError::IrqUnavailable,   // EINVAL (no vector)
+        -16 => DeviceHostError::AlreadyClaimed, // EBUSY (notif already bound)
+        -9 => DeviceHostError::BadDeviceCap,    // EBADF
+        -1 => DeviceHostError::BadDeviceCap,    // EPERM (policy reject)
+        -3 => DeviceHostError::BadDeviceCap,    // ESRCH (task gone)
+        -12 => DeviceHostError::Internal,       // ENOMEM (notif alloc)
+        -19 => DeviceHostError::BadDeviceCap,   // ENODEV
+        -22 => DeviceHostError::IrqUnavailable, // EINVAL (no vector)
         -23 => DeviceHostError::CapacityExceeded, // ENFILE (irq cap full)
         _ => DeviceHostError::Internal,
     };
@@ -950,5 +959,26 @@ mod tests {
         let (n_cap, e_cap) = records[0];
         assert_eq!(n_cap, notif.cap_handle(), "notif cap forwarded correctly");
         assert_eq!(e_cap, ep.raw(), "endpoint cap forwarded correctly");
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_internal_sentinel_to_internal_error() {
+        let err = decode_notif_bind_result(u64::MAX).expect_err("u64::MAX must fail");
+        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::Internal));
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_negative_errno_to_driver_error() {
+        let err = decode_notif_bind_result((-9_i64) as u64).expect_err("negative errno must fail");
+        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::BadDeviceCap));
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_busy_errno_to_already_claimed() {
+        let err = decode_notif_bind_result((-16_i64) as u64).expect_err("busy errno must fail");
+        assert_eq!(
+            err,
+            DriverRuntimeError::from(DeviceHostError::AlreadyClaimed)
+        );
     }
 }
