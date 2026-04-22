@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
-use super::{EndpointCap, IpcBackend, NotificationCap, RecvFrame, SyscallBackend};
+use super::{EndpointCap, IpcBackend, NotificationCap, RecvResult, SyscallBackend};
 
 pub use kernel_core::driver_ipc::net::{
     MAX_FRAME_BYTES, NET_FRAME_HEADER_SIZE, NET_LINK_EVENT_BODY_SIZE, NET_LINK_EVENT_SIZE,
@@ -131,46 +131,71 @@ impl<B: IpcBackend> NetServer<B> {
         self.endpoint
     }
 
-    /// Pull one TX request off the endpoint, run the closure, reply.
+    /// Pull one TX request or notification off the endpoint and dispatch.
     ///
-    /// Behavior:
+    /// Two closures are required so the driver can act on both event
+    /// kinds in one call:
+    ///
+    /// - `on_message`: called with a decoded [`NetRequest`] when the
+    ///   kernel sends a TX request. Returns a [`NetReply`] whose
+    ///   `status` is encoded and sent back.
+    /// - `on_notification`: called with the drained notification bit
+    ///   mask when the notification bound to this endpoint via
+    ///   `sys_notif_bind` fires. No reply is sent for notifications.
+    ///
+    /// Behavior on `RecvResult::Message`:
     ///
     /// - Successful decode produces a [`NetRequest`] whose `frame`
     ///   field carries the peer's payload truncated to the minimum
     ///   of `header.frame_len` and the bytes actually present in
-    ///   the recv buffer. The closure returns a [`NetReply`] whose
-    ///   `status` is encoded as a single byte and stamped in the
-    ///   reply bulk slot.
+    ///   the recv buffer. The `on_message` closure returns a
+    ///   [`NetReply`] whose `status` is encoded as a single byte and
+    ///   stamped in the reply bulk slot.
     /// - Malformed decode replies with
     ///   [`NetDriverError::InvalidFrame`] and never runs the
     ///   closure. The method still returns `Ok(())` because the
     ///   frame was processed (badly, but not catastrophically).
-    pub fn handle_next<F>(&self, mut f: F) -> Result<(), DriverRuntimeError>
+    pub fn handle_next<F, G>(
+        &self,
+        mut on_message: F,
+        mut on_notification: G,
+    ) -> Result<(), DriverRuntimeError>
     where
         F: FnMut(NetRequest) -> NetReply,
+        G: FnMut(u64),
     {
-        let frame_in: RecvFrame = self.backend.lock().recv(self.endpoint)?;
-        match decode_net_send(&frame_in.bulk) {
-            Ok(header) => {
-                // Slice the trailing payload down to `frame_len` (or
-                // whatever the peer actually sent, if shorter).
-                let declared = header.frame_len as usize;
-                let start = NET_FRAME_HEADER_SIZE.min(frame_in.bulk.len());
-                let available = frame_in.bulk.len() - start;
-                let take = declared.min(available);
-                let frame_bytes = frame_in.bulk[start..start + take].to_vec();
-                let req = NetRequest {
-                    header,
-                    frame: frame_bytes,
-                };
-                let reply = f(req);
-                self.write_reply(reply, frame_in.label)
+        // Bind to a local so the MutexGuard is dropped before the match body
+        // calls write_reply (which re-acquires the lock).
+        let recv_result = self.backend.lock().recv(self.endpoint)?;
+        match recv_result {
+            RecvResult::Notification(bits) => {
+                on_notification(bits);
+                Ok(())
             }
-            Err(_) => {
-                let reply = NetReply {
-                    status: NetDriverError::InvalidFrame,
-                };
-                self.write_reply(reply, frame_in.label)
+            RecvResult::Message(frame_in) => {
+                match decode_net_send(&frame_in.bulk) {
+                    Ok(header) => {
+                        // Slice the trailing payload down to `frame_len` (or
+                        // whatever the peer actually sent, if shorter).
+                        let declared = header.frame_len as usize;
+                        let start = NET_FRAME_HEADER_SIZE.min(frame_in.bulk.len());
+                        let available = frame_in.bulk.len() - start;
+                        let take = declared.min(available);
+                        let frame_bytes = frame_in.bulk[start..start + take].to_vec();
+                        let req = NetRequest {
+                            header,
+                            frame: frame_bytes,
+                        };
+                        let reply = on_message(req);
+                        self.write_reply(reply, frame_in.label)
+                    }
+                    Err(_) => {
+                        let reply = NetReply {
+                            status: NetDriverError::InvalidFrame,
+                        };
+                        self.write_reply(reply, frame_in.label)
+                    }
+                }
             }
         }
     }
@@ -317,12 +342,15 @@ mod tests {
 
         let server = NetServer::with_backend(ep(), mock);
         let observed: core::cell::RefCell<Option<NetRequest>> = core::cell::RefCell::new(None);
-        let result = server.handle_next(|req| {
-            *observed.borrow_mut() = Some(req.clone());
-            NetReply {
-                status: NetDriverError::Ok,
-            }
-        });
+        let result = server.handle_next(
+            |req| {
+                *observed.borrow_mut() = Some(req.clone());
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {},
+        );
         assert!(result.is_ok());
 
         let seen = observed.borrow().clone().expect("closure ran");
@@ -351,12 +379,15 @@ mod tests {
 
         let server = NetServer::with_backend(ep(), mock);
         let closure_called = core::cell::Cell::new(false);
-        let result = server.handle_next(|_| {
-            closure_called.set(true);
-            NetReply {
-                status: NetDriverError::Ok,
-            }
-        });
+        let result = server.handle_next(
+            |_| {
+                closure_called.set(true);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {},
+        );
         assert!(result.is_ok());
         assert!(!closure_called.get(), "closure must not run on malformed");
 
@@ -424,5 +455,81 @@ mod tests {
         // full event out of a side channel. At minimum the low bit
         // must be set when `up == true`.
         assert_ne!(sig.bits & 0x1, 0);
+    }
+
+    // -- Track E.1 tests ---------------------------------------------------
+
+    #[test]
+    fn net_server_handle_next_dispatches_message_variant() {
+        let frame: Vec<u8> = (0u8..32).collect();
+        let mut mock = MockBackend::new();
+        mock.push_request(RecvFrame {
+            label: NET_SEND_FRAME as u64,
+            data0: 0,
+            bulk: send_frame_bytes(frame.len() as u16, &frame),
+        });
+
+        let server = NetServer::with_backend(ep(), mock);
+        let message_called = core::cell::Cell::new(false);
+        let notif_called = core::cell::Cell::new(false);
+
+        let result = server.handle_next(
+            |req| {
+                message_called.set(true);
+                assert_eq!(req.frame, frame);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {
+                notif_called.set(true);
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            message_called.get(),
+            "on_message must be called for Message variant"
+        );
+        assert!(
+            !notif_called.get(),
+            "on_notification must not be called for Message variant"
+        );
+    }
+
+    #[test]
+    fn net_server_handle_next_dispatches_notification_variant() {
+        const NOTIF_BITS: u64 = 0b0011;
+        let mut mock = MockBackend::new();
+        mock.push_notification(NOTIF_BITS);
+
+        let server = NetServer::with_backend(ep(), mock);
+        let message_called = core::cell::Cell::new(false);
+        let observed_bits: core::cell::Cell<u64> = core::cell::Cell::new(0);
+
+        let result = server.handle_next(
+            |_req| {
+                message_called.set(true);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |bits| {
+                observed_bits.set(bits);
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            !message_called.get(),
+            "on_message must not be called for Notification variant"
+        );
+        assert_eq!(
+            observed_bits.get(),
+            NOTIF_BITS,
+            "on_notification receives the drained bits"
+        );
+
+        // No reply should have been sent for a notification wake.
+        let mock = server.backend.lock();
+        assert_eq!(mock.replies.len(), 0, "no reply for notification wake");
     }
 }
