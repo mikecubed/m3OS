@@ -2347,3 +2347,98 @@ pub(crate) fn test_synthetic_irq_subscribe_and_signal_with_existing_notif(
 
     Ok(bits)
 }
+
+// ---------------------------------------------------------------------------
+// D.3 — BAR identity-coverage validation tests
+// ---------------------------------------------------------------------------
+
+/// D.3 — `iommu.missing_bar_coverage` structured error fields.
+///
+/// Validates that [`kernel_core::iommu::bar_coverage::assert_bar_identity_mapped`]
+/// returns a [`BarCoverageError`] carrying the BAR index and physical base,
+/// matching the fields emitted by the `iommu.missing_bar_coverage` warn log
+/// event in [`install_and_verify_bar_coverage`].
+///
+/// Pure-logic `#[test_case]` — no IOMMU hardware required.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_missing_bar_yields_structured_error_fields() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    // Coverage maps BAR 0 only; BAR 2 (NVMe MMIO) is intentionally absent.
+    let bars = [
+        Bar {
+            index: 0,
+            base: 0xFE00_0000,
+            len: 0x4000,
+        },
+        Bar {
+            index: 2,
+            base: 0xFEB0_0000,
+            len: 0x1000,
+        },
+    ];
+    let mut coverage = BarCoverage::new();
+    coverage.record_mapped(0xFE00_0000, 0x4000);
+
+    let err = assert_bar_identity_mapped(&bars, &coverage)
+        .expect_err("BAR 2 not in coverage; assertion must fail");
+
+    // D.3 acceptance: error carries bar_index and phys_base for the
+    // structured `iommu.missing_bar_coverage` log event.
+    assert_eq!(
+        err.bar_index, 2,
+        "bar_index must identify the uncovered BAR"
+    );
+    assert_eq!(
+        err.phys_base, 0xFEB0_0000,
+        "phys_base must match the uncovered BAR base"
+    );
+    assert_eq!(err.len, 0x1000, "len must match the uncovered BAR length");
+}
+
+/// D.3 — Fully-covered BARs pass the assertion.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_full_coverage_passes_assertion() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    let bars = [
+        Bar {
+            index: 0,
+            base: 0xFE00_0000,
+            len: 0x4000,
+        },
+        Bar {
+            index: 2,
+            base: 0xFEB0_0000,
+            len: 0x1000,
+        },
+    ];
+    let mut coverage = BarCoverage::new();
+    coverage.record_mapped(0xFE00_0000, 0x4000);
+    coverage.record_mapped(0xFEB0_0000, 0x1000);
+
+    assert!(
+        assert_bar_identity_mapped(&bars, &coverage).is_ok(),
+        "fully-covered BARs must pass the assertion"
+    );
+}
+
+/// D.3 — Zero-length (vestigial) BARs are always covered.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_zero_length_bar_skipped_by_assertion() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    let bars = [Bar {
+        index: 1,
+        base: 0x1000,
+        len: 0,
+    }];
+    let empty = BarCoverage::new();
+    assert!(
+        assert_bar_identity_mapped(&bars, &empty).is_ok(),
+        "zero-length BAR must be skipped by the assertion"
+    );
+}
