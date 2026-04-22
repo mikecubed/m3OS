@@ -86,6 +86,10 @@ pub const SERVER_READY_SENTINEL: &str = "E1000_SMOKE:server:READY\n";
 /// registration just makes the endpoint discoverable by name.
 pub const SERVICE_NAME: &str = "net.nic";
 
+/// Kernel-owned ingress service the driver uses to publish RX frames and
+/// link-state events back into `RemoteNic`.
+pub const INGRESS_SERVICE_NAME: &str = "net.nic.ingress";
+
 /// Sentinel PCI BDF QEMU uses for `-device e1000` under m3OS (bus 0,
 /// device 3, function 0 — slot +3, the net family's conventional
 /// location). Parallel to the `nvme_driver` sentinel.
@@ -136,11 +140,29 @@ fn program_main(_args: &[&str]) -> i32 {
                 syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: service register failed\n");
                 return 5;
             }
+            let ingress = syscall_lib::ipc_lookup_service(INGRESS_SERVICE_NAME);
+            if ingress == u64::MAX {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "e1000_driver: ingress service lookup failed\n",
+                );
+                return 7;
+            }
+            let ingress_u32 = match u32::try_from(ingress) {
+                Ok(id) => id,
+                Err(_) => {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "e1000_driver: ingress endpoint id out of u32 range\n",
+                    );
+                    return 8;
+                }
+            };
             // Sentinel: the driver is live and entering its server loop.
             // F.4b's device-smoke script waits for this line.
             syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
             // Enter the IRQ / IPC server loop — never returns.
-            io::run_io_loop(dev, EndpointCap::new(ep_u32))
+            io::run_io_loop(dev, EndpointCap::new(ep_u32), EndpointCap::new(ingress_u32))
         }
         Err(init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: reset timeout\n");
@@ -236,5 +258,10 @@ mod tests {
     #[test]
     fn service_name_matches_acceptance() {
         assert_eq!(SERVICE_NAME, "net.nic");
+    }
+
+    #[test]
+    fn ingress_service_name_matches_acceptance() {
+        assert_eq!(INGRESS_SERVICE_NAME, "net.nic.ingress");
     }
 }

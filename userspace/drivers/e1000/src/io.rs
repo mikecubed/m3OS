@@ -608,7 +608,7 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
             mac: device.mac,
             speed_mbps: 0,
         };
-        net_server.publish_link_state(event);
+        let _ = net_server.publish_link_state(event);
     } else if outcome.icr & irq_cause::LSC != 0 && !outcome.link_up {
         // Link went down — tell the kernel net stack so it can
         // reset retransmit timers (Phase 16 behavior).
@@ -617,7 +617,7 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
             mac: device.mac,
             speed_mbps: 0,
         };
-        net_server.publish_link_state(event);
+        let _ = net_server.publish_link_state(event);
     }
     let (drained, dropped) = if outcome.rx_drain_needed {
         drain_rx_to_server(device, net_server)
@@ -648,10 +648,16 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
 /// accidentally skip error handling — the only exit is a panic path or
 /// an `exit` syscall invoked from a child call.
 ///
-/// `endpoint` is the command endpoint the kernel's `RemoteNic` facade
-/// (Track E.4) sends `NET_SEND_FRAME` requests on.
+/// `command_endpoint` is the TX command endpoint the kernel's `RemoteNic`
+/// facade sends `NET_SEND_FRAME` requests on. `ingress_endpoint` is the
+/// kernel-owned endpoint the driver publishes `NET_RX_FRAME` and
+/// `NET_LINK_STATE` events to.
 #[allow(dead_code)] // called from main.rs program_main.
-pub fn run_io_loop(device: E1000Device, command_endpoint: EndpointCap) -> ! {
+pub fn run_io_loop(
+    device: E1000Device,
+    command_endpoint: EndpointCap,
+    ingress_endpoint: EndpointCap,
+) -> ! {
     // subscribe_and_bind atomically:
     //   1. subscribes IRQ,
     //   2. binds the notification into command_endpoint's recv loop,
@@ -667,7 +673,7 @@ pub fn run_io_loop(device: E1000Device, command_endpoint: EndpointCap) -> ! {
     // can each borrow it mutably in their exclusive call arms without
     // conflicting at compile time.
     let device = core::cell::RefCell::new(device);
-    let net_server = NetServer::new(command_endpoint);
+    let net_server = NetServer::new(command_endpoint).with_ingress_endpoint(ingress_endpoint);
 
     loop {
         // Stage the notification bit-mask from the on_notification arm

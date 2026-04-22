@@ -211,6 +211,14 @@ fn init_task() -> ! {
         .expect("[init] failed to register console service");
     log::info!("[init] service registry: console={:?}", console_ep);
 
+    let remote_nic_ingress_ep = ipc::endpoint::ENDPOINTS.lock().create();
+    ipc::registry::register("net.nic.ingress", remote_nic_ingress_ep)
+        .expect("[init] failed to register net.nic.ingress service");
+    log::info!(
+        "[init] service registry: net.nic.ingress={:?}",
+        remote_nic_ingress_ep
+    );
+
     // Phase 52: kbd endpoint creation and registration moved to the userspace
     // kbd_server service (kernel/initrd/etc/services.d/kbd.conf).  The kernel
     // no longer pre-registers or spawns a ring-0 kbd_server_task.
@@ -221,6 +229,7 @@ fn init_task() -> ! {
 
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
+    task::spawn(remote_nic_ingress_task, "net-ingress");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
     // Spawn Phase 16 network processing task.  VirtIO-net ready is enough to
@@ -244,6 +253,46 @@ fn init_task() -> ! {
     log::info!("[init] service set started — yielding");
     loop {
         task::yield_now();
+    }
+}
+
+/// Kernel ingress task for ring-3 NIC events.
+///
+/// The e1000 driver sends `NET_RX_FRAME` and `NET_LINK_STATE` as fire-and-forget
+/// bulk IPC messages to the `net.nic.ingress` service. This task is the only
+/// receiver for that endpoint and forwards the payloads into `RemoteNic`.
+fn remote_nic_ingress_task() -> ! {
+    use kernel_core::driver_ipc::net::{NET_LINK_STATE, NET_RX_FRAME};
+
+    let my_id = task::current_task_id().expect("[net-ingress] no task id");
+    let ep_id =
+        ipc::registry::lookup("net.nic.ingress").expect("[net-ingress] endpoint not in registry");
+    task::set_server_endpoint(my_id, ep_id);
+
+    log::info!("[net-ingress] ready");
+
+    loop {
+        let msg = ipc::endpoint::recv_msg(my_id, ep_id);
+        let bulk = task::take_bulk_data(my_id).unwrap_or_default();
+        match msg.label {
+            label if label == NET_RX_FRAME as u64 => {
+                if bulk.is_empty() {
+                    log::warn!("[net-ingress] NET_RX_FRAME arrived without bulk payload");
+                } else {
+                    net::remote::RemoteNic::inject_rx_frame(&bulk);
+                }
+            }
+            label if label == NET_LINK_STATE as u64 => {
+                if bulk.is_empty() {
+                    log::warn!("[net-ingress] NET_LINK_STATE arrived without payload");
+                } else {
+                    net::remote::RemoteNic::handle_link_state(&bulk);
+                }
+            }
+            label => {
+                log::warn!("[net-ingress] unexpected message label {}", label);
+            }
+        }
     }
 }
 

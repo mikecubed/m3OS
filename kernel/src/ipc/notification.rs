@@ -543,7 +543,7 @@ pub fn clear_waiter(task_id: TaskId) {
 /// Task-context only (may not be called from ISR).
 pub(super) fn bind_task(notif_id: NotifId, task_sched_idx: usize) -> Result<(), ()> {
     let notif_idx = notif_id.0 as usize;
-    if notif_idx >= MAX_NOTIFS {
+    if notif_idx >= MAX_NOTIFS || task_sched_idx >= MAX_TASKS {
         return Err(());
     }
     let new_val = task_sched_idx as i32;
@@ -559,24 +559,22 @@ pub(super) fn bind_task(notif_id: NotifId, task_sched_idx: usize) -> Result<(), 
         Err(_) => return Err(()),
     }
 
-    if task_sched_idx < MAX_TASKS {
-        match TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
-            NOTIF_NONE,
-            notif_id.0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {}
-            Err(existing) if existing == notif_id.0 => {}
-            Err(_) => {
-                let _ = BOUND_TCB[notif_idx].compare_exchange(
-                    new_val,
-                    TCB_NONE,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-                return Err(());
-            }
+    match TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
+        NOTIF_NONE,
+        notif_id.0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(existing) if existing == notif_id.0 => {}
+        Err(_) => {
+            let _ = BOUND_TCB[notif_idx].compare_exchange(
+                new_val,
+                TCB_NONE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return Err(());
         }
     }
 
@@ -849,6 +847,26 @@ mod tests {
         bind_task(notif_id, TASK).expect("re-bind must succeed after clear");
         // Leave the slot clean for subsequent tests.
         clear_bound_task(TASK);
+    }
+
+    #[test_case]
+    fn bind_task_rejects_task_slots_outside_reverse_table() {
+        const NOTIF: usize = 52;
+        let notif_id = NotifId(NOTIF as u8);
+        let out_of_range_task = MAX_TASKS;
+
+        BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
+
+        assert_eq!(
+            bind_task(notif_id, out_of_range_task),
+            Err(()),
+            "bind_task must reject task indices that cannot be recorded in TCB_BOUND_NOTIF",
+        );
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "bind_task must not publish a one-sided BOUND_TCB entry on failure",
+        );
     }
 
     // ------------------------------------------------------------------

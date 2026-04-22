@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
-use super::{EndpointCap, IpcBackend, NotificationCap, RecvResult, SyscallBackend};
+use super::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
 
 pub use kernel_core::driver_ipc::net::{
     MAX_FRAME_BYTES, NET_FRAME_HEADER_SIZE, NET_LINK_EVENT_BODY_SIZE, NET_LINK_EVENT_SIZE,
@@ -69,17 +69,14 @@ pub struct NetReply {
 /// Driver-side net server. See the module-level docs for the three
 /// cross-seam paths this type mediates.
 ///
-/// The RX endpoint and link notification are optional so a driver
-/// can construct a `NetServer` before the kernel has stood up either
-/// one; `publish_rx_frame` returns
+/// The kernel ingress endpoint is optional so a driver can construct a
+/// `NetServer` before the kernel has stood it up; `publish_rx_frame` returns
 /// [`DriverRuntimeError::Device(DeviceHostError::NotClaimed)`] if
-/// the RX endpoint is missing, and `publish_link_state` silently
-/// drops when the link notification is missing — a driver is
-/// expected to wire both before the first frame arrives.
+/// the ingress endpoint is missing. Drivers are expected to wire the
+/// ingress endpoint before the first RX frame or link-state event arrives.
 pub struct NetServer<B: IpcBackend = SyscallBackend> {
     endpoint: EndpointCap,
-    rx_endpoint: Option<EndpointCap>,
-    link_notification: Option<NotificationCap>,
+    ingress_endpoint: Option<EndpointCap>,
     pub(crate) backend: Mutex<B>,
 }
 
@@ -89,8 +86,7 @@ impl NetServer<SyscallBackend> {
     pub fn new(endpoint: EndpointCap) -> Self {
         Self {
             endpoint,
-            rx_endpoint: None,
-            link_notification: None,
+            ingress_endpoint: None,
             backend: Mutex::new(SyscallBackend),
         }
     }
@@ -103,27 +99,22 @@ impl<B: IpcBackend> NetServer<B> {
     pub fn with_backend(endpoint: EndpointCap, backend: B) -> Self {
         Self {
             endpoint,
-            rx_endpoint: None,
-            link_notification: None,
+            ingress_endpoint: None,
             backend: Mutex::new(backend),
         }
     }
 
-    /// Register the kernel endpoint the driver pushes RX frames to.
-    /// `publish_rx_frame` is only valid after this is set — a
-    /// driver's init path looks this endpoint up (via the service
-    /// manager) and stamps it here before entering its ISR loop.
-    pub fn with_rx_endpoint(mut self, rx: EndpointCap) -> Self {
-        self.rx_endpoint = Some(rx);
+    /// Register the kernel ingress endpoint the driver publishes both RX
+    /// frames and link-state events to.
+    pub fn with_ingress_endpoint(mut self, ingress: EndpointCap) -> Self {
+        self.ingress_endpoint = Some(ingress);
         self
     }
 
-    /// Register the notification capability the driver signals on
-    /// link-state changes. `publish_link_state` is a silent no-op
-    /// until this is set.
-    pub fn with_link_notification(mut self, notif: NotificationCap) -> Self {
-        self.link_notification = Some(notif);
-        self
+    /// Back-compat alias for older call sites that described the same kernel
+    /// endpoint as the RX endpoint.
+    pub fn with_rx_endpoint(self, rx: EndpointCap) -> Self {
+        self.with_ingress_endpoint(rx)
     }
 
     /// The command-endpoint this server listens on.
@@ -219,16 +210,15 @@ impl<B: IpcBackend> NetServer<B> {
     /// kernel buffer.
     ///
     /// The frame travels as a bulk payload alongside a
-    /// [`NET_RX_FRAME`]-labelled fire-and-forget send to the RX
-    /// endpoint the caller registered via
-    /// [`Self::with_rx_endpoint`].
+    /// [`NET_RX_FRAME`]-labelled fire-and-forget send to the kernel ingress
+    /// endpoint the caller registered via [`Self::with_ingress_endpoint`].
     pub fn publish_rx_frame(&self, frame: &[u8]) -> Result<(), DriverRuntimeError> {
         if frame.len() > MAX_FRAME_BYTES as usize {
             return Err(DriverRuntimeError::Device(
                 kernel_core::device_host::DeviceHostError::Internal,
             ));
         }
-        let rx = match self.rx_endpoint {
+        let ingress = match self.ingress_endpoint {
             Some(ep) => ep,
             None => {
                 return Err(DriverRuntimeError::Device(
@@ -245,39 +235,23 @@ impl<B: IpcBackend> NetServer<B> {
         bulk.extend_from_slice(frame);
         self.backend
             .lock()
-            .send_buf(rx, NET_RX_FRAME as u64, 0, &bulk)
+            .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)
     }
 
-    /// Signal link-state change to the kernel net stack.
-    ///
-    /// The signal word packs the `up` flag in bit 0 so the kernel
-    /// can wake on link-up / link-down edges without pulling the
-    /// full event out of a side channel. Encoded speed rides in
-    /// the bits above so a single 64-bit signal communicates the
-    /// whole event without a follow-up RPC.
-    ///
-    /// The schema's [`encode_net_link_event`] bytes are not sent
-    /// over the notification — they are staged in a way the
-    /// kernel-side `RemoteNic` can poll if it wants the full
-    /// breakdown (MAC, speed) and reconcile against its own
-    /// policy. For the C.4 contract test we only assert the
-    /// notification's bit-0 edge is delivered.
-    pub fn publish_link_state(&self, state: NetLinkEvent) {
-        let notif = match self.link_notification {
-            Some(n) => n,
-            None => return,
+    /// Publish a `NET_LINK_STATE` event to the kernel net stack.
+    pub fn publish_link_state(&self, state: NetLinkEvent) -> Result<(), DriverRuntimeError> {
+        let ingress = match self.ingress_endpoint {
+            Some(ep) => ep,
+            None => {
+                return Err(DriverRuntimeError::Device(
+                    kernel_core::device_host::DeviceHostError::NotClaimed,
+                ));
+            }
         };
-        // Bit 0 = up, bits 32..64 = speed (mbps).
-        let mut bits = 0u64;
-        if state.up {
-            bits |= 0x1;
-        }
-        bits |= (state.speed_mbps as u64) << 32;
-        // Silently absorb signalling errors — a driver that can't
-        // reach the notification cap is already in a bad state and
-        // the kernel supervisor will restart it; we don't want to
-        // panic from an interrupt-adjacent path.
-        let _ = self.backend.lock().signal_notification(notif, bits);
+        let bulk = encode_net_link_event(state);
+        self.backend
+            .lock()
+            .send_buf(ingress, NET_LINK_STATE as u64, 0, &bulk)
     }
 }
 
@@ -307,7 +281,7 @@ fn net_driver_error_to_byte(e: NetDriverError) -> u8 {
 mod tests {
     use super::*;
     use crate::ipc::mock::MockBackend;
-    use crate::ipc::{EndpointCap, NotificationCap, RecvFrame};
+    use crate::ipc::{EndpointCap, RecvFrame};
 
     fn ep() -> EndpointCap {
         EndpointCap::new(11)
@@ -315,10 +289,6 @@ mod tests {
     fn rx_ep() -> EndpointCap {
         EndpointCap::new(12)
     }
-    fn link_notif() -> NotificationCap {
-        NotificationCap::new(13)
-    }
-
     fn send_frame_bytes(frame_len: u16, frame: &[u8]) -> Vec<u8> {
         let header = NetFrameHeader {
             kind: NET_SEND_FRAME,
@@ -401,9 +371,8 @@ mod tests {
 
     #[test]
     fn publish_rx_frame_emits_rx_notify_envelope_with_frame_bulk() {
-        let server = NetServer::with_backend(ep(), MockBackend::new())
-            .with_rx_endpoint(rx_ep())
-            .with_link_notification(link_notif());
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
 
         let frame: Vec<u8> = (0u8..64).collect();
         let result = server.publish_rx_frame(&frame);
@@ -435,26 +404,26 @@ mod tests {
     }
 
     #[test]
-    fn publish_link_state_signals_encoded_link_event_on_notification() {
+    fn publish_link_state_emits_link_event_on_ingress_endpoint() {
         let server =
-            NetServer::with_backend(ep(), MockBackend::new()).with_link_notification(link_notif());
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
 
         let event = NetLinkEvent {
             up: true,
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
             speed_mbps: 1000,
         };
-        server.publish_link_state(event);
+        server
+            .publish_link_state(event)
+            .expect("link-state publish must send on the ingress endpoint");
 
         let mock = server.backend.lock();
-        assert_eq!(mock.signals.len(), 1);
-        let sig = &mock.signals[0];
-        assert_eq!(sig.notif, link_notif());
-        // The signal bit word packs the `up` flag so the kernel can
-        // wake on link-up / link-down edges without pulling the
-        // full event out of a side channel. At minimum the low bit
-        // must be set when `up == true`.
-        assert_ne!(sig.bits & 0x1, 0);
+        assert_eq!(mock.sends.len(), 1);
+        let send = &mock.sends[0];
+        assert_eq!(send.endpoint, rx_ep());
+        assert_eq!(send.label, NET_LINK_STATE as u64);
+        let decoded = decode_net_link_event(&send.bulk).expect("link-state payload decodes");
+        assert_eq!(decoded, event);
     }
 
     // -- Track E.1 tests ---------------------------------------------------
