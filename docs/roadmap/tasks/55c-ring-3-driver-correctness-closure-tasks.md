@@ -1,6 +1,6 @@
 # Phase 55c — Ring-3 Driver Correctness Closure: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-55c
 **Depends on:** Phase 6 (IPC Core) ✅, Phase 50 (IPC Completion) ✅, Phase 52c (Kernel Architecture Evolution) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅
 **Goal:** Close three ring-3-specific correctness gaps Phase 55b left behind: **R3** (event-multiplexing deadlock — post-handshake SSH hang over `--device e1000`), **R2** (IOMMU VT-d / AMD-Vi identity coverage missing for device MMIO BARs under `--iommu`), and **R1** (userspace `sendto()` never observes `EAGAIN` during ring-3 driver restart). All three ship together because they share the `kernel/src/net/remote.rs`, `kernel/src/ipc`, and `userspace/lib/driver_runtime` surfaces; splitting would force the same files to churn three times. Kernel version bumps to `v0.55.3`. Updates `docs/appendix/phase-55b-residuals.md` to strike R1 and R2.
@@ -18,7 +18,7 @@
 | G | **R1 kernel:** `sys_net_send` (or `sys_sendto` extension — final shape decided in G.1), `RemoteNic::send_frame` → `-EAGAIN` translation through `net_error_to_neg_errno`, socket-layer preference for `RemoteNic` when registered | None (parallel to A/B) | Planned |
 | H | **R1 userspace:** `e1000-crash-smoke` EAGAIN assertion; unignore `qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds` | G | Planned |
 | I | **Regressions:** `scripts/ssh_e1000_banner_check.sh` (R3), `cargo xtask device-smoke --device {nvme,e1000} --iommu` (R2) wired into the same CI lane, EAGAIN smoke (R1) | D, F, H | Planned |
-| J | **Documentation + version:** 55b residuals strike-throughs; Phase 56 bound-notification precondition note; `v0.55.3` bump | I | Planned |
+| J | **Documentation + version:** 55b residuals strike-throughs; Phase 56 bound-notification precondition note; `v0.55.3` bump | I | ✅ Done |
 
 ---
 
@@ -509,22 +509,22 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Why it matters:** The residuals doc is the canonical "what we know is still wrong" index. Once closed, R1 and R2 must vanish from it (with a pointer to Phase 55c's delivery).
 
 **Acceptance:**
-- [ ] R1 section replaced with a one-line "Closed in Phase 55c (Track G/H)" pointer.
-- [ ] R2 section replaced with a one-line "Closed in Phase 55c (Track C/D)" pointer.
-- [ ] Section 4 scheduling summary updated to reflect both as closed.
+- [x] R1 section replaced with a one-line "Closed in Phase 55c (Track G/H)" pointer.
+- [x] R2 section replaced with a one-line "Closed in Phase 55c (Track C/D)" pointer.
+- [x] Section 4 scheduling summary updated to reflect both as closed.
 
-### J.2 — Post-mortem: `docs/post-mortems/2026-MM-DD-e1000-bound-notif.md`
+### J.2 — Post-mortem: `docs/post-mortems/2026-04-22-e1000-bound-notif.md`
 
-**File:** `docs/post-mortems/2026-MM-DD-e1000-bound-notif.md` (new)
+**File:** `docs/post-mortems/2026-04-22-e1000-bound-notif.md` (new)
 **Symbol:** N/A
 **Why it matters:** The post-mortem trail captures what was learned at each design turn. R3 needs one; R1 / R2 can appear as brief entries under the same post-mortem's "adjacent closures" section.
 
 **Acceptance:**
-- [ ] Root cause statement: "Ring-3 driver main loop alternately blocks on `IrqNotification::wait` and `Endpoint::recv`; the two wake sources are serialized, not multiplexed."
-- [ ] Why Phase 55b did not catch it: device-smoke exercises one-shot ICMP echo; SSH is the first sustained bidirectional workload.
-- [ ] Fix applied: bound notifications per seL4's model.
-- [ ] Confirmation: SSH banner arrives within 5 s after `cargo xtask run --device e1000`.
-- [ ] Adjacent closures: R1 (EAGAIN surface) and R2 (IOMMU BAR identity-map) closed in the same phase.
+- [x] Root cause statement: "Ring-3 driver main loop alternately blocks on `IrqNotification::wait` and `Endpoint::recv`; the two wake sources are serialized, not multiplexed."
+- [x] Why Phase 55b did not catch it: device-smoke exercises one-shot ICMP echo; SSH is the first sustained bidirectional workload.
+- [x] Fix applied: bound notifications per seL4's model.
+- [x] Confirmation: SSH banner arrives within 5 s after `cargo xtask run --device e1000`.
+- [x] Adjacent closures: R1 (EAGAIN surface) and R2 (IOMMU BAR identity-map) closed in the same phase.
 
 ### J.3 — Phase 56 driver template updates
 
@@ -536,8 +536,8 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Why it matters:** Later IRQ-backed display/input drivers will have the same mix of async events and sync requests. The roadmap should record the Phase 55c pattern early without mislabeling the socket-centric Phase 56 compositor core as a hard consumer.
 
 **Acceptance:**
-- [ ] Both Phase 56 docs mention Phase 55c bound notifications only as a later template for IRQ-backed userspace drivers, not as a hard prerequisite for the socket-centric Phase 56 compositor core.
-- [ ] The Phase 56 tasks touching a driver loop stay consistent with that boundary: PS/2/input services keep their existing wait/send split, while later IRQ-backed display/input drivers may adopt the Phase 55c pattern.
+- [x] Both Phase 56 docs mention Phase 55c bound notifications only as a later template for IRQ-backed userspace drivers, not as a hard prerequisite for the socket-centric Phase 56 compositor core.
+- [x] The Phase 56 tasks touching a driver loop stay consistent with that boundary: PS/2/input services keep their existing wait/send split, while later IRQ-backed display/input drivers may adopt the Phase 55c pattern.
 
 ### J.4 — Phase 55c learning doc
 
@@ -546,12 +546,12 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Why it matters:** Every completed phase requires a learning doc. Future IRQ-backed driver authors and roadmap contributors need a structured explanation of the three primitives Phase 55c added. Without it the roadmap has a gap at the exact point where later display/input and driver-host work would want to reuse what Phase 55c established.
 
 **Acceptance:**
-- [ ] Doc follows the **aligned legacy learning doc** template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
-- [ ] **What This Doc Covers** lists exactly: (1) bound notifications and the seL4 wake-model composition pattern (R3); (2) IOMMU domain MMIO identity mapping for claimed devices (R2); (3) driver-restart error propagation through the kernel's `RemoteNic` facade to userspace `EAGAIN` (R1).
-- [ ] **Key Files** table names at minimum: `kernel-core/src/ipc/bound_notif.rs`, `kernel/src/ipc/notification.rs`, `kernel/src/ipc/endpoint.rs`, `kernel-core/src/iommu/bar_coverage.rs`, `kernel/src/net/remote.rs`, `userspace/lib/driver_runtime/src/ipc/mod.rs`, `userspace/drivers/e1000/src/io.rs`.
-- [ ] **How This Phase Differs From Later Work** notes that later IRQ-backed userspace drivers may consume `RecvResult` and `IrqNotification::bind_to_endpoint`, but the Phase 56 compositor core itself does not depend on them.
-- [ ] Doc added to `docs/roadmap/README.md` alongside the design doc and task doc links for Phase 55c.
-- [ ] `docs/roadmap/55c-ring-3-driver-correctness-closure.md` **Companion Task List** section updated to include a link to this learning doc.
+- [x] Doc follows the **aligned legacy learning doc** template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
+- [x] **What This Doc Covers** lists exactly: (1) bound notifications and the seL4 wake-model composition pattern (R3); (2) IOMMU domain MMIO identity mapping for claimed devices (R2); (3) driver-restart error propagation through the kernel's `RemoteNic` facade to userspace `EAGAIN` (R1).
+- [x] **Key Files** table names at minimum: `kernel-core/src/ipc/bound_notif.rs`, `kernel/src/ipc/notification.rs`, `kernel/src/ipc/endpoint.rs`, `kernel-core/src/iommu/bar_coverage.rs`, `kernel/src/net/remote.rs`, `userspace/lib/driver_runtime/src/ipc/mod.rs`, `userspace/drivers/e1000/src/io.rs`.
+- [x] **How This Phase Differs From Later Work** notes that later IRQ-backed userspace drivers may consume `RecvResult` and `IrqNotification::bind_to_endpoint`, but the Phase 56 compositor core itself does not depend on them.
+- [x] Doc added to `docs/roadmap/README.md` alongside the design doc and task doc links for Phase 55c.
+- [x] `docs/roadmap/55c-ring-3-driver-correctness-closure.md` **Companion Task List** section updated to include a link to this learning doc.
 
 ### J.5 — Version bump to `v0.55.3`
 
@@ -567,11 +567,11 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 **Why it matters:** The repo's declared version must stay in sync with the completed phase.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.55.3"`.
-- [ ] `AGENTS.md` project-overview line updated.
-- [ ] `README.md` version line updated.
-- [ ] Both roadmap READMEs reflect Phase 55c as Complete.
-- [ ] `cargo xtask check` passes.
+- [x] `kernel/Cargo.toml` `version = "0.55.3"`.
+- [x] `AGENTS.md` project-overview line updated.
+- [x] `README.md` version line updated.
+- [x] Both roadmap READMEs reflect Phase 55c as Complete.
+- [x] `cargo xtask check` passes.
 
 ---
 

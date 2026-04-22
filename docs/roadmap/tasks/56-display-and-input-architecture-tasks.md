@@ -5,6 +5,14 @@
 **Depends on:** Phase 46 (System Services) ✅, Phase 47 (DOOM) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅
 **Goal:** Replace the kernel-owned framebuffer and single-app input model with a single userspace display service that owns presentation, arbitrates surfaces for multiple graphical clients, routes focus-aware keyboard and mouse events, and exposes the four contract points a tiling-first compositor experience (Goal A in `docs/appendix/gui/tiling-compositor-path.md`) needs so the tiling UX can land on top without protocol rework.
 
+> **Note on Phase 55c:** The Phase 56 compositor core is socket-centric and does not
+> depend on `RecvResult` or `IrqNotification::bind_to_endpoint` as prerequisites. The
+> Phase 55c bound-notification pattern is available as a template for later IRQ-backed
+> userspace drivers (e.g., a future vsync or HID driver that genuinely mixes async
+> hardware events with sync IPC requests). PS/2 and early input services in Phase 56
+> keep their existing wait/send split; adoption of the Phase 55c pattern is opt-in for
+> any IRQ-backed driver introduced in Phase 56 or later.
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
