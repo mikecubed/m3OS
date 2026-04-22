@@ -13,8 +13,8 @@
 //! 3. Issue a follow-up `sendto()` in the restart window and **assert** it
 //!    returns `-EAGAIN` (-11).  Phase 55c Track G wired `sendto_restart_errno`
 //!    so that `sys_sendto` returns `NEG_EAGAIN` when `RESTART_SUSPECTED` is
-//!    set.  Any return other than `-EAGAIN` or a successful byte count
-//!    (driver already restarted) is treated as a hard failure (exit 3).
+//!    set.  Only `-EAGAIN` satisfies the H.1 assertion; any other return
+//!    (successful byte count or unexpected errno) is a hard failure (exit 3).
 //! 4. Poll `/run/services.status` until `e1000_driver` shows `running`.
 //! 5. Send another UDP datagram — confirms the restart path is complete.
 //! 6. Emit structured markers for QEMU regression grep.
@@ -146,18 +146,18 @@ fn program_main(_args: &[&str]) -> i32 {
     //
     // Policy (mirrors nvme-crash-smoke step 3.5):
     //   - NEG_EAGAIN → assertion passes (expected)
-    //   - bytes-sent → driver restarted before we caught the window; OK
+    //   - bytes-sent → driver restarted before EAGAIN window; hard failure, exit 3
     //   - any other negative errno → hard failure, exit 3
     // ------------------------------------------------------------------
     let mid_payload = b"e1000-smoke-mid-crash";
     match assert_eagain_during_restart(fd, mid_payload) {
-        EaginResult::EagainObserved => {
+        EagainResult::EagainObserved => {
             write_str(
                 STDOUT_FILENO,
                 "E1000_CRASH_SMOKE:mid-crash:EAGAIN-observed\n",
             );
         }
-        EaginResult::RestartedFast => {
+        EagainResult::RestartedFast => {
             // Diagnostic marker kept for observability, but EAGAIN was
             // never seen — the H.1 regression assertion requires it.
             write_str(
@@ -171,7 +171,7 @@ fn program_main(_args: &[&str]) -> i32 {
             close(fd);
             return 3;
         }
-        EaginResult::UnexpectedErrno => {
+        EagainResult::UnexpectedErrno => {
             write_str(
                 STDOUT_FILENO,
                 "E1000_CRASH_SMOKE:FAIL step=2.5 unexpected errno from sendto\n",
@@ -244,11 +244,13 @@ fn udp_send(fd: i32, payload: &[u8]) -> bool {
 }
 
 /// Result of the EAGAIN assertion during a driver restart window.
-enum EaginResult {
+enum EagainResult {
     /// sendto returned NEG_EAGAIN (-11) — RESTART_SUSPECTED was set.
     EagainObserved,
-    /// sendto returned a byte count — the driver restarted before we
-    /// caught the window.  Treated as valid: the restart completed.
+    /// sendto returned a successful byte count — the driver restarted before
+    /// the EAGAIN window was caught.  **Treated as a failure (exit 3)**: the
+    /// H.1 regression must confirm EAGAIN was surfaced; a fast restart that
+    /// skips the RESTART_SUSPECTED state is itself a contract violation.
     RestartedFast,
     /// sendto returned an unexpected negative errno (not EAGAIN).
     UnexpectedErrno,
@@ -261,27 +263,28 @@ enum EaginResult {
 /// kill child exiting and the kernel setting `RESTART_SUSPECTED`.
 ///
 /// Returns:
-/// - `EagainObserved` if `NEG_EAGAIN` is seen on any attempt — H.1 passes.
-/// - `RestartedFast` if a successful byte count is seen without EAGAIN having
+/// - `EagainResult::EagainObserved` if `NEG_EAGAIN` is seen on any attempt — H.1 passes.
+/// - `EagainResult::RestartedFast` if a successful byte count is seen without EAGAIN having
 ///   been observed first.  **The caller treats this as a failure (exit 3)**
 ///   because the H.1 regression must confirm EAGAIN was surfaced; the marker
 ///   is kept only for diagnostic visibility.
-/// - `UnexpectedErrno` if any attempt returns a negative value other than
+/// - `EagainResult::UnexpectedErrno` if any attempt returns a negative value other than
 ///   `NEG_EAGAIN` — errno propagation regression; caller exits 3.
-fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EaginResult {
+fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EagainResult {
     let remote = SockaddrIn::new(GATEWAY_IP, REMOTE_PORT);
     for _ in 0u32..5 {
         let ret = sendto(fd, payload, 0, &remote);
         if ret == NEG_EAGAIN {
-            return EaginResult::EagainObserved;
+            return EagainResult::EagainObserved;
         }
         if ret == payload.len() as isize {
-            // Driver restarted before we caught the window — valid.
-            return EaginResult::RestartedFast;
+            // Driver restarted before the RESTART_SUSPECTED window was caught —
+            // EAGAIN was never surfaced, which fails the H.1 assertion.
+            return EagainResult::RestartedFast;
         }
         if ret < 0 {
             // Unexpected errno (e.g., EBADF, EIO): errno propagation is wrong.
-            return EaginResult::UnexpectedErrno;
+            return EagainResult::UnexpectedErrno;
         }
         // Partial send is unexpected but not fatal; retry.
     }
@@ -289,7 +292,7 @@ fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EaginResult {
     // but no confirmed full send either. Driver state is ambiguous —
     // report as RestartedFast so the caller can emit the diagnostic
     // marker before failing with exit 3.
-    EaginResult::RestartedFast
+    EagainResult::RestartedFast
 }
 
 /// Poll `/run/services.status` until the named service shows `running`
