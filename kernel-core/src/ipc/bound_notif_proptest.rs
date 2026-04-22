@@ -211,7 +211,7 @@ mod tests {
                         // Track every bit ever signaled; recv() only dispatches
                         // a subset when bound, so this is a superset bound.
                         accumulated_bits |= bits;
-                        pending_notification = Some(model.signal_bits);
+                        pending_notification = (model.signal_bits != 0).then_some(model.signal_bits);
                     }
                     Op::Send(label) => {
                         model.send(label);
