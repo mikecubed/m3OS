@@ -611,10 +611,23 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
             Err(DeviceHostError::AlreadyClaimed)
         } else {
             match claim_pci_device_by_bdf(segment, bus, dev, func, RING3_DRIVER_TAG) {
-                Ok(handle) => match reg.insert_claim(pid, key, handle) {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(DeviceHostError::from(e)),
-                },
+                Ok(handle) => {
+                    // D.3 — Install IOMMU BAR identity maps and verify coverage
+                    // before committing the claim. If coverage validation fails,
+                    // `handle` is dropped here (tearing down the IOMMU domain and
+                    // releasing the PCI slot) and the error propagates to the
+                    // `claim_result` error arm without inserting into the registry.
+                    if let Err(e) =
+                        install_and_verify_bar_coverage(&handle, segment, bus, dev, func)
+                    {
+                        Err(e)
+                    } else {
+                        match reg.insert_claim(pid, key, handle) {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(DeviceHostError::from(e)),
+                        }
+                    }
+                }
                 Err(ClaimError::NotFound) => Err(DeviceHostError::NotClaimed),
                 Err(ClaimError::AlreadyClaimed) => Err(DeviceHostError::AlreadyClaimed),
             }
@@ -622,23 +635,7 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
     };
 
     if let Err(e) = claim_result {
-        return match e {
-            DeviceHostError::AlreadyClaimed => NEG_EBUSY,
-            // `claim_pci_device_by_bdf` returns `NotFound` for an absent
-            // BDF; `NotClaimed` is the corresponding DeviceHostError
-            // surface. Map it to ENODEV per acceptance.
-            DeviceHostError::NotClaimed => NEG_ENODEV,
-            // Any other surface at this site is an internal bug — log and
-            // surface as ENODEV so the caller retries / bails rather
-            // than interpreting a random errno.
-            other => {
-                log::warn!(
-                    "[device-host] sys_device_claim({segment:#x},{bus:#04x},{dev:#04x},{func}) \
-                     unexpected registry error: {other:?}"
-                );
-                NEG_ENODEV
-            }
-        };
+        return device_claim_error_to_errno(e, segment, bus, dev, func);
     }
 
     // 2) Registry now owns the PciDeviceHandle. Install the capability in
@@ -874,6 +871,240 @@ fn user_map_error_to_errno(e: UserMapError) -> isize {
 /// surface; a future phase may introduce a dedicated `-EMFILE`-style code.
 fn capacity_exceeded_errno() -> isize {
     NEG_ENOMEM
+}
+
+// ---------------------------------------------------------------------------
+// D.3 — BAR identity-coverage validation helper
+// ---------------------------------------------------------------------------
+
+/// Guard the IOMMU domain presence for a new device claim.
+///
+/// This function contains the no-domain logic that was previously inlined at
+/// the top of [`install_and_verify_bar_coverage`]. Extracting it makes the
+/// no-domain + active-IOMMU fail-closed path directly testable without
+/// requiring a live [`PciDeviceHandle`].
+///
+/// # Return value
+///
+/// * `Ok(Some(snap))` — the claim carries a domain; proceed with BAR
+///   identity mapping.
+/// * `Ok(None)` — no domain and no hardware IOMMU active; identity-map
+///   fallback is acceptable (`install_and_verify_bar_coverage` returns
+///   `Ok(())` immediately).
+/// * `Err(DeviceHostError::Internal)` — no domain but a hardware IOMMU is
+///   active; missing per-device coverage is an invariant violation. A
+///   structured `iommu.missing_bar_coverage error=no_domain` warn event is
+///   emitted before returning. At the `sys_device_claim` syscall gate this
+///   maps to `NEG_EIO`.
+fn validate_domain_presence(
+    domain: Option<crate::pci::DomainSnapshot>,
+    iommu_active: bool,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Result<Option<crate::pci::DomainSnapshot>, DeviceHostError> {
+    match domain {
+        Some(s) => Ok(Some(s)),
+        None if iommu_active => {
+            log::warn!(
+                "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+                 error=no_domain",
+                segment,
+                bus,
+                dev,
+                func,
+            );
+            Err(DeviceHostError::Internal)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Identity-map every MMIO BAR of `handle`'s device in the IOMMU domain
+/// attached to the claim, then assert full coverage via
+/// [`kernel_core::iommu::bar_coverage::assert_bar_identity_mapped`].
+///
+/// # Return value
+///
+/// * `Ok(())` — all MMIO BARs are identity-mapped and coverage is complete.
+/// * `Err(DeviceHostError::Internal)` — any of the following:
+///   - A non-zero MMIO BAR register failed to decode (unexpected sizing
+///     error from `map_bar`). The claim must not proceed.
+///   - An IOMMU domain mapping call failed. A structured
+///     `iommu.missing_bar_coverage` warn event is emitted.
+///   - The coverage assertion detected a gap after all mappings completed.
+///   - The claim carries no IOMMU domain while `crate::iommu::active()`
+///     reports a hardware IOMMU is present (missing per-device coverage).
+///
+/// # Identity-fallback path
+///
+/// When no hardware IOMMU is active (`crate::iommu::active()` is `false`)
+/// and the claim carries no domain (`handle.domain_snapshot()` returns
+/// `None`), the check is skipped and `Ok(())` is returned — DMA flows
+/// through the identity-map allocator and no IOMMU translation tables
+/// exist to populate. When an IOMMU **is** active but the claim has no
+/// domain, the claim is rejected (`Err(DeviceHostError::Internal)`) with
+/// an `iommu.missing_bar_coverage` event so the gap does not go unnoticed.
+///
+/// # Lock ordering
+///
+/// This helper is called while `DEVICE_HOST_REGISTRY` is held (lock slot 3).
+/// It may acquire `iommu::REGISTRY` (lock slot 6), consistent with the
+/// documented order: `DEVICE_HOST_REGISTRY → iommu::registry`.
+fn install_and_verify_bar_coverage(
+    handle: &PciDeviceHandle,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Result<(), DeviceHostError> {
+    use crate::pci::bar::{BarMapping, map_bar};
+    use kernel_core::iommu::bar_coverage::Bar;
+
+    let snap = match validate_domain_presence(
+        handle.domain_snapshot(),
+        crate::iommu::active(),
+        segment,
+        bus,
+        dev,
+        func,
+    )? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Collect MMIO BARs. Use the raw BAR value to detect 64-bit BAR
+    // pairs and skip the high slot, avoiding a spurious sizing-dance
+    // on the high-address register.
+    //
+    // A raw register value of zero means the slot is unimplemented — skip
+    // it without calling map_bar (which would perform a destructive sizing
+    // dance). For any non-zero MMIO-typed register, map_bar must succeed:
+    // a decode or sizing error is unexpected and fails the claim rather
+    // than silently dropping the BAR from coverage.
+    let raw_bars = handle.bars();
+    let mut bars: alloc::vec::Vec<Bar> = alloc::vec::Vec::new();
+    let mut i: u8 = 0;
+    while i < 6 {
+        let raw = raw_bars[i as usize];
+        let is_io_bar = raw & 1 != 0;
+        // bits[2:1] == 0b10 indicate a 64-bit MMIO BAR (consumes two slots).
+        let is_64bit = !is_io_bar && ((raw >> 1) & 3 == 2);
+
+        if !is_io_bar && raw != 0 {
+            // Non-zero MMIO-typed register: decode must succeed.
+            match map_bar(handle, i) {
+                Ok(BarMapping::Mmio { region, .. }) if region.size() > 0 => {
+                    bars.push(Bar {
+                        index: i,
+                        base: region.phys_base(),
+                        len: region.size() as usize,
+                    });
+                }
+                Ok(BarMapping::Mmio { .. }) => {
+                    // Zero-sized after decode — vestigial BAR, skip.
+                }
+                Ok(BarMapping::Pio { .. }) | Err(_) => {
+                    // Unexpected: raw says MMIO but decode returned a PIO
+                    // mapping or failed entirely. Fail closed so the gap
+                    // cannot slip through coverage verification unnoticed.
+                    log::warn!(
+                        "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+                         bar_index={} error=bar_decode_failure",
+                        segment,
+                        bus,
+                        dev,
+                        func,
+                        i,
+                    );
+                    return Err(DeviceHostError::Internal);
+                }
+            }
+        }
+        // PIO BAR (is_io_bar) or empty slot (raw == 0): neither has MMIO
+        // to cover; advance without calling map_bar.
+        i += if is_64bit { 2 } else { 1 };
+    }
+
+    verify_bar_coverage_for_domain(&bars, snap, segment, bus, dev, func)
+}
+
+/// Inner logic shared by [`install_and_verify_bar_coverage`] and the
+/// D.3 syscall-level failure tests: identity-map each BAR in the given
+/// IOMMU domain, then assert full coverage.
+///
+/// Extracted so tests can inject synthetic `bars` and `DomainSnapshot`
+/// values without requiring a live `PciDeviceHandle` or PCI hardware.
+/// Production callers always reach this through
+/// [`install_and_verify_bar_coverage`] after the BAR-collection phase.
+fn verify_bar_coverage_for_domain(
+    bars: &[kernel_core::iommu::bar_coverage::Bar],
+    snap: crate::pci::DomainSnapshot,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Result<(), DeviceHostError> {
+    use kernel_core::iommu::bar_coverage::{BarCoverage, assert_bar_identity_mapped};
+    use kernel_core::iommu::contract::{DomainError, Iova, MapFlags, PhysAddr};
+
+    // Identity-map every collected MMIO BAR in the device's IOMMU domain,
+    // recording each successfully mapped range in `coverage`.
+    let mut coverage = BarCoverage::new();
+    for bar in bars {
+        if bar.len == 0 {
+            continue;
+        }
+        let aligned_base = bar.base & !0xFFF;
+        let end = bar.base.saturating_add(bar.len as u64);
+        let aligned_end = (end + 0xFFF) & !0xFFF;
+        let aligned_len = (aligned_end - aligned_base) as usize;
+
+        match crate::iommu::registry::map(
+            snap.unit_index,
+            snap.domain,
+            Iova(aligned_base),
+            PhysAddr(aligned_base),
+            aligned_len,
+            MapFlags::READ | MapFlags::WRITE,
+        ) {
+            Ok(()) | Err(DomainError::AlreadyMapped) => {
+                coverage.record_mapped(aligned_base, aligned_len);
+            }
+            Err(e) => {
+                log::warn!(
+                    "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+                     bar_index={} error={:?}",
+                    segment,
+                    bus,
+                    dev,
+                    func,
+                    bar.index,
+                    e,
+                );
+                return Err(DeviceHostError::Internal);
+            }
+        }
+    }
+
+    // Verify that coverage is complete — every collected BAR must be fully
+    // spanned by the coverage set. A gap means a BAR was silently lost,
+    // which is an IOMMU invariant violation.
+    match assert_bar_identity_mapped(bars, &coverage) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            log::warn!(
+                "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} bar_index={}",
+                segment,
+                bus,
+                dev,
+                func,
+                err.bar_index,
+            );
+            Err(DeviceHostError::Internal)
+        }
+    }
 }
 
 /// Read a claimed device's BAR metadata through the PCI sizing-dance
@@ -2346,4 +2577,289 @@ pub(crate) fn test_synthetic_irq_subscribe_and_signal_with_existing_notif(
     }
 
     Ok(bits)
+}
+
+// ---------------------------------------------------------------------------
+// D.3 — BAR identity-coverage validation tests
+// ---------------------------------------------------------------------------
+
+/// D.3 — `iommu.missing_bar_coverage` structured error fields.
+///
+/// Validates that [`kernel_core::iommu::bar_coverage::assert_bar_identity_mapped`]
+/// returns a [`BarCoverageError`] carrying the BAR index and physical base,
+/// matching the fields emitted by the `iommu.missing_bar_coverage` warn log
+/// event in [`install_and_verify_bar_coverage`].
+///
+/// Pure-logic `#[test_case]` — no IOMMU hardware required.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_missing_bar_yields_structured_error_fields() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    // Coverage maps BAR 0 only; BAR 2 (NVMe MMIO) is intentionally absent.
+    let bars = [
+        Bar {
+            index: 0,
+            base: 0xFE00_0000,
+            len: 0x4000,
+        },
+        Bar {
+            index: 2,
+            base: 0xFEB0_0000,
+            len: 0x1000,
+        },
+    ];
+    let mut coverage = BarCoverage::new();
+    coverage.record_mapped(0xFE00_0000, 0x4000);
+
+    let err = assert_bar_identity_mapped(&bars, &coverage)
+        .expect_err("BAR 2 not in coverage; assertion must fail");
+
+    // D.3 acceptance: error carries bar_index and phys_base for the
+    // structured `iommu.missing_bar_coverage` log event.
+    assert_eq!(
+        err.bar_index, 2,
+        "bar_index must identify the uncovered BAR"
+    );
+    assert_eq!(
+        err.phys_base, 0xFEB0_0000,
+        "phys_base must match the uncovered BAR base"
+    );
+    assert_eq!(err.len, 0x1000, "len must match the uncovered BAR length");
+}
+
+/// D.3 — Fully-covered BARs pass the assertion.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_full_coverage_passes_assertion() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    let bars = [
+        Bar {
+            index: 0,
+            base: 0xFE00_0000,
+            len: 0x4000,
+        },
+        Bar {
+            index: 2,
+            base: 0xFEB0_0000,
+            len: 0x1000,
+        },
+    ];
+    let mut coverage = BarCoverage::new();
+    coverage.record_mapped(0xFE00_0000, 0x4000);
+    coverage.record_mapped(0xFEB0_0000, 0x1000);
+
+    assert!(
+        assert_bar_identity_mapped(&bars, &coverage).is_ok(),
+        "fully-covered BARs must pass the assertion"
+    );
+}
+
+/// D.3 — Zero-length (vestigial) BARs are always covered.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_zero_length_bar_skipped_by_assertion() {
+    use kernel_core::iommu::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
+
+    let bars = [Bar {
+        index: 1,
+        base: 0x1000,
+        len: 0,
+    }];
+    let empty = BarCoverage::new();
+    assert!(
+        assert_bar_identity_mapped(&bars, &empty).is_ok(),
+        "zero-length BAR must be skipped by the assertion"
+    );
+}
+
+/// D.3 — Syscall-level failure path: IOMMU map error during claim returns
+/// `DeviceHostError::Internal` (EIO at the syscall boundary).
+///
+/// Exercises `verify_bar_coverage_for_domain` — the same function reached
+/// by `sys_device_claim` through `install_and_verify_bar_coverage` — with
+/// an injected failure: a `DomainSnapshot` pointing to a non-existent IOMMU
+/// unit index causes `crate::iommu::registry::map` to return
+/// `Err(DomainError::InvalidRange)`, which is the expected failure mode
+/// when an IOMMU unit is removed or was never registered.
+///
+/// Expected outcome per D.3 contract:
+/// * `verify_bar_coverage_for_domain` returns `Err(DeviceHostError::Internal)`.
+/// * A `iommu.missing_bar_coverage` warn event is emitted (verified by
+///   inspection of the code path, which always logs before returning Err).
+/// * At the syscall gate this surfaces as `NEG_EIO` — the caller distinguishes
+///   it from `ENODEV` (missing device) and `EBUSY` (already claimed).
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_iommu_map_error_returns_internal() {
+    use crate::pci::DomainSnapshot;
+    use kernel_core::iommu::bar_coverage::Bar;
+    use kernel_core::iommu::contract::DomainId;
+
+    // usize::MAX is guaranteed absent from the IOMMU registry; map() will
+    // return Err(DomainError::InvalidRange), triggering the error path in
+    // verify_bar_coverage_for_domain.
+    let snap = DomainSnapshot {
+        unit_index: usize::MAX,
+        domain: DomainId(0),
+    };
+    let bars = [Bar {
+        index: 0,
+        base: 0xFE00_0000,
+        len: 0x1000,
+    }];
+
+    let result = verify_bar_coverage_for_domain(
+        &bars, snap, /*segment=*/ 0, /*bus=*/ 0, /*dev=*/ 1, /*func=*/ 0,
+    );
+    assert_eq!(
+        result,
+        Err(DeviceHostError::Internal),
+        "IOMMU registry map failure must surface as DeviceHostError::Internal \
+         (maps to NEG_EIO at the sys_device_claim syscall gate)"
+    );
+}
+
+/// D.3 — Syscall gate: BAR-coverage IOMMU map failure maps `DeviceHostError::Internal`
+/// to `NEG_EIO`.
+///
+/// Drives `verify_bar_coverage_for_domain` — the exact function that
+/// `install_and_verify_bar_coverage` calls, which `sys_device_claim` calls — with
+/// an injected IOMMU failure (unit index `usize::MAX` is always absent from the
+/// registry). Then applies the same `match` arm that `sys_device_claim` uses to
+/// convert the error to a negative errno. The `iommu.missing_bar_coverage` warn
+/// event is emitted inside `verify_bar_coverage_for_domain` before it returns;
+/// it is visible in serial output.
+///
+/// This is the D.3 syscall-contract test: the path from BAR coverage failure →
+/// `DeviceHostError::Internal` → `NEG_EIO` is the observable contract the caller
+/// distinguishes from `ENODEV` (missing device) and `EBUSY` (already claimed).
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_iommu_map_error_maps_to_neg_eio_at_syscall_gate() {
+    use crate::pci::DomainSnapshot;
+    use kernel_core::iommu::bar_coverage::Bar;
+    use kernel_core::iommu::contract::DomainId;
+
+    // usize::MAX is always absent from the IOMMU registry — map() returns
+    // Err(DomainError::InvalidRange), triggering the coverage failure path.
+    let snap = DomainSnapshot {
+        unit_index: usize::MAX,
+        domain: DomainId(0),
+    };
+    let bars = [Bar {
+        index: 0,
+        base: 0xFE00_0000,
+        len: 0x1000,
+    }];
+
+    // 1. Drive the same helper sys_device_claim reaches via
+    //    install_and_verify_bar_coverage.
+    let coverage_err = verify_bar_coverage_for_domain(&bars, snap, 0, 0, 1, 0)
+        .expect_err("IOMMU map failure must return Err(DeviceHostError::Internal)");
+    assert_eq!(
+        coverage_err,
+        DeviceHostError::Internal,
+        "IOMMU map failure inside the BAR-coverage path must be DeviceHostError::Internal"
+    );
+
+    // 2. Exercise the exact translation seam that sys_device_claim uses.
+    let syscall_errno = device_claim_error_to_errno(coverage_err, 0, 0, 1, 0);
+    assert_eq!(
+        syscall_errno, NEG_EIO,
+        "DeviceHostError::Internal from a BAR-coverage failure must surface as \
+         NEG_EIO (-5) at the sys_device_claim syscall gate (D.3 contract)"
+    );
+}
+
+/// D.3 — No-domain + active-IOMMU failure branch is actually exercised.
+///
+/// Calls `validate_domain_presence` with `domain = None` and
+/// `iommu_active = true`, directly exercising the fail-closed path that
+/// `install_and_verify_bar_coverage` gates at the top of the domain check.
+/// This replaces the earlier assertion-only test that merely confirmed
+/// `crate::iommu::active() == false` in the test environment.
+///
+/// Expected outcomes per D.3 contract:
+/// 1. `validate_domain_presence` returns `Err(DeviceHostError::Internal)`.
+/// 2. Applying the same errno translation as `sys_device_claim` yields `NEG_EIO`.
+/// 3. The `iommu.missing_bar_coverage error=no_domain` warn event is emitted
+///    inside `validate_domain_presence` (visible in serial output).
+///
+/// Also confirms the identity-fallback accept path (`domain = None`,
+/// `iommu_active = false`) returns `Ok(None)`.
+#[cfg(test)]
+#[test_case]
+fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
+    // Fail-closed path: active IOMMU + no domain → reject the claim.
+    let fail_result = validate_domain_presence(
+        None, /*iommu_active=*/ true, /*segment=*/ 0, /*bus=*/ 0, /*dev=*/ 1,
+        /*func=*/ 0,
+    );
+    // DomainSnapshot does not derive PartialEq; assert on the error variant directly.
+    assert!(
+        fail_result.is_err(),
+        "no domain with active IOMMU must return Err"
+    );
+    assert_eq!(
+        fail_result.unwrap_err(),
+        DeviceHostError::Internal,
+        "no domain with active IOMMU must return DeviceHostError::Internal"
+    );
+
+    // Verify syscall-gate errno translation through the shared seam that
+    // sys_device_claim itself now uses.
+    let errno = device_claim_error_to_errno(
+        validate_domain_presence(None, /*iommu_active=*/ true, 0, 0, 1, 0).unwrap_err(),
+        0,
+        0,
+        1,
+        0,
+    );
+    assert_eq!(
+        errno, NEG_EIO,
+        "DeviceHostError::Internal from no-domain+active-IOMMU must map to \
+         NEG_EIO (-5) at the sys_device_claim gate (D.3 contract)"
+    );
+
+    // Identity-fallback path: no domain, no active IOMMU → accept.
+    let fallback_result = validate_domain_presence(None, /*iommu_active=*/ false, 0, 0, 1, 0);
+    assert!(
+        fallback_result.is_ok(),
+        "no domain with inactive IOMMU must return Ok (identity-fallback)"
+    );
+    assert!(
+        fallback_result.unwrap().is_none(),
+        "identity-fallback must return Ok(None)"
+    );
+}
+fn device_claim_error_to_errno(
+    error: DeviceHostError,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> isize {
+    match error {
+        DeviceHostError::AlreadyClaimed => NEG_EBUSY,
+        // `claim_pci_device_by_bdf` returns `NotFound` for an absent
+        // BDF; `NotClaimed` is the corresponding DeviceHostError
+        // surface. Map it to ENODEV per acceptance.
+        DeviceHostError::NotClaimed => NEG_ENODEV,
+        // D.3 — IOMMU BAR-coverage validation failed. The domain has
+        // been torn down and the PCI slot released. Return EIO so the
+        // caller can distinguish this from a missing-device error.
+        DeviceHostError::Internal => NEG_EIO,
+        // Any other surface at this site is an internal bug — log and
+        // surface as ENODEV so the caller retries / bails rather
+        // than interpreting a random errno.
+        other => {
+            log::warn!(
+                "[device-host] sys_device_claim({segment:#x},{bus:#04x},{dev:#04x},{func}) \
+                 unexpected registry error: {other:?}"
+            );
+            NEG_ENODEV
+        }
+    }
 }
