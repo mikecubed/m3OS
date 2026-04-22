@@ -150,6 +150,17 @@ pub trait IrqBackend {
     /// backend implements this as a no-op. Mocks use it to observe
     /// Drop.
     fn release(&self, notif_cap: u32);
+
+    /// Bind `notif_cap` to `ep_cap` so that `ipc_recv_msg` on `ep_cap`
+    /// can wake on notification signals (Track B bound-recv path).
+    ///
+    /// The default implementation is a no-op so existing mock backends
+    /// compile without change. [`SyscallBackend`] overrides to call
+    /// `syscall_lib::sys_notif_bind`.
+    fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+        let _ = (notif_cap, ep_cap);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +255,18 @@ impl IrqBackend for SyscallBackend {
         // is disabled, and the notification is unbound"). Leaving
         // this as a documented no-op avoids a bogus syscall and
         // keeps Drop infallible.
+    }
+
+    fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+        // Delegates to `sys_notif_bind` (syscall 0x1111, Track B).
+        // A non-zero negative return is a kernel-side error; zero is success.
+        let rc = syscall_lib::sys_notif_bind(notif_cap, ep_cap);
+        let signed = rc as i64;
+        if signed < 0 {
+            Err(errno_to_driver_runtime_error(signed))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -409,6 +432,20 @@ impl<B: IrqBackend> IrqNotification<B> {
         self.last_observed.set(observed & !bits);
         Ok(())
     }
+    /// Bind this IRQ notification to `ep` for the bound-recv path (Track B).
+    ///
+    /// After a successful bind, a call to `ipc_recv_msg` on `ep` will return
+    /// [`RecvResult::Notification`] when this notification's pending bits are
+    /// non-zero, before checking the endpoint's sender queue. Drivers call
+    /// this once during init so a single `handle_next` loop can service both
+    /// IPC messages and IRQ-sourced notifications.
+    ///
+    /// Delegates to [`IrqBackend::bind_to_endpoint`]. The production
+    /// [`SyscallBackend`] calls `syscall_lib::sys_notif_bind`; mock backends
+    /// return `Ok(())` by default so existing tests are unaffected.
+    pub fn bind_to_endpoint(&self, ep: crate::ipc::EndpointCap) -> Result<(), DriverRuntimeError> {
+        self.backend.bind_to_endpoint(self.cap_handle, ep.raw())
+    }
 }
 
 impl IrqNotification<SyscallBackend> {
@@ -540,6 +577,8 @@ mod tests {
         next_cap: u32,
         subs: Vec<SubRecord>,
         inject_subscribe_error: Option<DriverRuntimeError>,
+        /// Records (notif_cap, ep_cap) pairs for bind_to_endpoint assertions.
+        bind_records: Vec<(u32, u32)>,
     }
 
     #[derive(Debug)]
@@ -646,6 +685,20 @@ mod tests {
             if let Some(sub) = st.subs.iter_mut().find(|s| s.cap_handle == notif_cap) {
                 sub.released = true;
             }
+        }
+
+        fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+            self.state
+                .borrow_mut()
+                .bind_records
+                .push((notif_cap, ep_cap));
+            Ok(())
+        }
+    }
+
+    impl MockBackend {
+        fn bind_records(&self) -> alloc::vec::Vec<(u32, u32)> {
+            self.state.borrow().bind_records.clone()
         }
     }
 
@@ -851,5 +904,28 @@ mod tests {
         let notif = IrqNotification::from_parts(cap, 0b1, backend);
         assert_eq!(notif.wait(), 0b1);
         assert!(notif.ack(0b1).is_ok());
+    }
+
+    // -- Track E.3 test — bind_to_endpoint --------------------------------
+
+    #[test]
+    fn bind_to_endpoint_delegates_to_backend_and_records_caps() {
+        use crate::ipc::EndpointCap;
+
+        let backend = MockBackend::new();
+        let device = MockDevice { cap_handle: 5 };
+        let notif = IrqNotification::subscribe_with_backend(backend.clone(), &device, None)
+            .expect("subscribe");
+
+        let ep = EndpointCap::new(77);
+        notif
+            .bind_to_endpoint(ep)
+            .expect("bind_to_endpoint must succeed");
+
+        let records = backend.bind_records();
+        assert_eq!(records.len(), 1, "exactly one bind recorded");
+        let (n_cap, e_cap) = records[0];
+        assert_eq!(n_cap, notif.cap_handle(), "notif cap forwarded correctly");
+        assert_eq!(e_cap, ep.raw(), "endpoint cap forwarded correctly");
     }
 }

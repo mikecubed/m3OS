@@ -323,6 +323,9 @@ pub const SYS_IPC_REPLY_RECV_MSG: u64 = 0x110F;
 /// Store bulk data to be sent with the next IPC reply (Phase 54).
 pub const SYS_IPC_STORE_REPLY_BULK: u64 = 0x1110;
 
+/// Bind a notification capability to an endpoint for the bound-recv path (Phase 55c Track B).
+pub const SYS_NOTIF_BIND: u64 = 0x1111;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -554,6 +557,25 @@ pub fn ipc_store_reply_bulk(buf: &[u8]) -> u64 {
             SYS_IPC_STORE_REPLY_BULK,
             buf.as_ptr() as u64,
             buf.len() as u64,
+        )
+    }
+}
+
+/// Bind a notification capability to an endpoint for the bound-recv path (Phase 55c Track B).
+///
+/// After a successful bind, `ipc_recv_msg` on `ep_cap_handle` will return
+/// `RECV_KIND_NOTIFICATION` (= 1) when the bound notification's pending bits
+/// are non-zero, delivering the drained bit mask in `IpcMessage.data[0]`.
+///
+/// Returns 0 on success, or a negative errno:
+/// - `-9` (EBADF): invalid capability handle or wrong type.
+/// - `-16` (EBUSY): notification already bound to a different task.
+pub fn sys_notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
+    unsafe {
+        syscall2(
+            SYS_NOTIF_BIND,
+            notif_cap_handle as u64,
+            ep_cap_handle as u64,
         )
     }
 }

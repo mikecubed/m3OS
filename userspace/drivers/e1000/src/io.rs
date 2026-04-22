@@ -636,13 +636,20 @@ pub fn run_io_loop(mut device: E1000Device, command_endpoint: EndpointCap) -> ! 
             let _ = handle_irq_and_drain(&mut device, &net_server);
             let _ = irq.ack(bits);
         }
-        let _ = net_server.handle_next(|req| {
-            let status = match send_frame(&mut device, &req.frame) {
-                Ok(()) => NetDriverError::Ok,
-                Err(e) => e,
-            };
-            driver_runtime::ipc::net::NetReply { status }
-        });
+        let _ = net_server.handle_next(
+            |req| {
+                let status = match send_frame(&mut device, &req.frame) {
+                    Ok(()) => NetDriverError::Ok,
+                    Err(e) => e,
+                };
+                driver_runtime::ipc::net::NetReply { status }
+            },
+            |_bits| {
+                // Notification wake on the command endpoint: no-op for now.
+                // IRQ-sourced notifications are handled via the separate
+                // `handle_irq_and_drain` path above.
+            },
+        );
     }
 }
 
