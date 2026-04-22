@@ -26,7 +26,7 @@
 //! | 0    | All assertions passed |
 //! | 1    | Pre-crash setup failure (socket / bind / pre-crash send) |
 //! | 2    | Kill-delivery failure (fork / waitpid) |
-//! | 3    | **EAGAIN assertion failed** — follow-up sendto returned unexpected errno |
+//! | 3    | **EAGAIN assertion failed** — follow-up sendto returned unexpected errno, or EAGAIN was never observed (driver restarted before window) |
 //! | 4    | Post-restart send failure |
 //!
 //! # Outputs
@@ -158,10 +158,18 @@ fn program_main(_args: &[&str]) -> i32 {
             );
         }
         EaginResult::RestartedFast => {
+            // Diagnostic marker kept for observability, but EAGAIN was
+            // never seen — the H.1 regression assertion requires it.
             write_str(
                 STDOUT_FILENO,
                 "E1000_CRASH_SMOKE:mid-crash:restarted-fast\n",
             );
+            write_str(
+                STDOUT_FILENO,
+                "E1000_CRASH_SMOKE:FAIL step=2.5 EAGAIN never observed\n",
+            );
+            close(fd);
+            return 3;
         }
         EaginResult::UnexpectedErrno => {
             write_str(
@@ -253,11 +261,13 @@ enum EaginResult {
 /// kill child exiting and the kernel setting `RESTART_SUSPECTED`.
 ///
 /// Returns:
-/// - `EagainObserved` if `NEG_EAGAIN` is seen on any attempt.
-/// - `RestartedFast` if a successful byte count is seen (driver already
-///   restarted before EAGAIN could be observed).
-/// - `UnexpectedErrno` if any attempt returns a negative value other
-///   than `NEG_EAGAIN` — this indicates a regression in errno propagation.
+/// - `EagainObserved` if `NEG_EAGAIN` is seen on any attempt — H.1 passes.
+/// - `RestartedFast` if a successful byte count is seen without EAGAIN having
+///   been observed first.  **The caller treats this as a failure (exit 3)**
+///   because the H.1 regression must confirm EAGAIN was surfaced; the marker
+///   is kept only for diagnostic visibility.
+/// - `UnexpectedErrno` if any attempt returns a negative value other than
+///   `NEG_EAGAIN` — errno propagation regression; caller exits 3.
 fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EaginResult {
     let remote = SockaddrIn::new(GATEWAY_IP, REMOTE_PORT);
     for _ in 0u32..5 {
@@ -275,8 +285,10 @@ fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EaginResult {
         }
         // Partial send is unexpected but not fatal; retry.
     }
-    // Five attempts: no EAGAIN, no full success, no unexpected error.
-    // Treat as RestartedFast (driver came back between each try).
+    // Five attempts exhausted: EAGAIN was never seen, no unexpected errno,
+    // but no confirmed full send either. Driver state is ambiguous —
+    // report as RestartedFast so the caller can emit the diagnostic
+    // marker before failing with exit 3.
     EaginResult::RestartedFast
 }
 

@@ -817,14 +817,22 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
 ///   - `userspace/e1000-crash-smoke/src/main.rs` updated with
 ///     `assert_eagain_during_restart()`.  After the kill child exits
 ///     (synchronous `waitpid`), the follow-up `sendto()` asserts
-///     `NEG_EAGAIN` (-11).  Exit code 3 on assertion failure.
+///     `NEG_EAGAIN` (-11).  If EAGAIN is never observed the binary exits 3.
 ///   - `cargo xtask regression --test e1000-restart-crash` exercises the
 ///     binary end-to-end (gated behind `M3OS_ENABLE_CRASH_SMOKE`).
 ///
 /// Pure-logic EAGAIN seam is fully covered by the G.3 host unit tests
-/// (`sendto_restart_errno_*`).  This stub records that the QEMU-only
-/// scenario is now exercised by the H.1 regression binary.
+/// (`sendto_restart_errno_*`).  **This stub is `#[ignore]`** — the QEMU-only
+/// scenario is authoritatively exercised by the H.1 regression binary.
 #[test]
+#[ignore = "QEMU-only: the authoritative check is the `e1000-restart-crash` xtask \
+            regression (M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test \
+            e1000-restart-crash), which boots the guest with --device e1000, runs \
+            /bin/e1000-crash-smoke, and asserts E1000_CRASH_SMOKE:PASS plus the \
+            mid-crash:EAGAIN-observed marker. Pure-logic EAGAIN seam coverage lives \
+            in the G.3 host unit tests (sendto_restart_errno_*). This stub remains \
+            #[ignore] because QEMU infrastructure is not available in \
+            cargo test -p kernel-core."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
     // The authoritative end-to-end check is the `e1000-restart-crash` xtask
     // regression (M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test
