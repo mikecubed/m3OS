@@ -36,9 +36,10 @@
 //!   or the signal bitset is zero.
 //! - **Binding-dependent observability**: `recv()` dispatches notification bits
 //!   only while `bound == true`; unbound signals are never dispatched.
-//! - **No-lost-wake across next recv**: if `recv()` dispatches a message while
-//!   a notification was also pending, the notification must survive and be
-//!   returned by the immediately following `recv()` without contamination.
+//! - **No-lost-wake across later recvs**: if `recv()` dispatches a message while
+//!   a notification is pending, the notification must survive until the next
+//!   recv where it is dispatchable (still bound, no higher-priority message)
+//!   and be returned then without contamination.
 //!
 //! Proptest runs at least 1024 cases (configured via `ProptestConfig`).
 
@@ -174,11 +175,12 @@ mod tests {
         /// The generator emits arbitrary sequences of `Bind`, `Unbind`,
         /// `Signal`, `Send`, and `Recv` so that binding-state transitions are
         /// continuously exercised. Each generated `Op::Recv` performs exactly
-        /// one `model.recv()` call. Additional assertions (A-R2) verify that
-        /// when recv() dispatches a message while a notification was also
-        /// pending, the notification survives (immediate check) and is still
-        /// observable at the very next generated `Op::Recv` (deferred check),
-        /// without consuming extra recv() calls inside the first handler.
+        /// one `model.recv()` call. Additional assertions (A-R2) carry a
+        /// pending-notification obligation across later operations: once a
+        /// signal exists, every generated `Op::Recv` must either preserve that
+        /// signal in model state or, when the signal is dispatchable (still
+        /// bound and no higher-priority message is queued), return it as a
+        /// notification wake.
         #[test]
         fn bound_notif_race_safety(ops in op_sequence(24)) {
             let mut model = RecvModel::new();
@@ -189,13 +191,12 @@ mod tests {
             // we can validate no-merge.
             let mut accumulated_bits: u64 = 0;
 
-            // A-R2 deferred observability state:
-            // When a message is dispatched while a notification was also pending,
-            // signal_bits must survive and be observable at the very next
-            // generated Op::Recv.  We carry the expected non-zero signal_bits
-            // value here and check it at the start of the next Op::Recv without
-            // consuming any extra recv() calls inside the current handler.
-            let mut deferred_check: Option<u64> = None;
+            // A-R2 pending-notification obligation:
+            // whenever the model has signal bits pending, later Op::Recv steps
+            // must either preserve those bits (if a message still has priority
+            // or the receiver is unbound) or dispatch them as a notification
+            // once they become visible to recv().
+            let mut pending_notification: Option<u64> = None;
 
             for op in ops {
                 match op {
@@ -210,35 +211,24 @@ mod tests {
                         // Track every bit ever signaled; recv() only dispatches
                         // a subset when bound, so this is a superset bound.
                         accumulated_bits |= bits;
+                        pending_notification = Some(model.signal_bits);
                     }
                     Op::Send(label) => {
                         model.send(label);
                         pending_labels.push(label);
                     }
                     Op::Recv => {
-                        // A-R2 deferred check: the previous Op::Recv dispatched
-                        // a message while a notification was also pending.  Those
-                        // signal_bits must still be present now — they can only
-                        // grow (from Op::Signal) or stay the same between recvs.
-                        // No intermediate Op::Recv ran because take() clears the
-                        // flag on the very next Op::Recv.
-                        if let Some(saved_bits) = deferred_check.take() {
-                            prop_assert_ne!(
-                                model.signal_bits, 0,
-                                "signal_bits must survive until the next Op::Recv \
-                                 (saved={:#x}, current signal_bits={:#x})",
-                                saved_bits,
-                                model.signal_bits
-                            );
-                        }
-
-                        // Snapshot observability state before the single dispatch
-                        // so we can set the deferred check if needed.
-                        let pending_signal_before = model.bound && model.signal_bits != 0;
-                        let signal_bits_before = model.signal_bits;
+                        // Snapshot whether a pending notification should be
+                        // visible to this recv before we perform the single
+                        // dispatch step.
+                        let expected_notification = pending_notification;
+                        let notification_dispatchable = expected_notification.is_some()
+                            && model.bound
+                            && model.message_queue.is_empty();
 
                         // Exactly one model.recv() per Op::Recv.
-                        match model.recv() {
+                        let recv_result = model.recv();
+                        match recv_result {
                             Some(WakeKind::Message(label)) => {
                                 // No-loss: the label must have been in the pending queue.
                                 let pos = pending_labels.iter().position(|&l| l == label);
@@ -249,24 +239,33 @@ mod tests {
                                 );
                                 pending_labels.remove(pos.unwrap());
 
-                                // A-R2 — no-lost-wake: if a notification was also pending
-                                // when this message was dispatched, signal_bits must still
-                                // be non-zero now (immediate check) and must remain
-                                // observable at the next generated Op::Recv (deferred check).
-                                if pending_signal_before {
+                                // A-R2 — if a notification was already pending but not
+                                // dispatchable here because a message had priority, the
+                                // signal bits must survive this receive step.
+                                if expected_notification.is_some() {
                                     prop_assert_ne!(
                                         model.signal_bits, 0,
-                                        "signal_bits={:#x} must survive a message dispatch \
-                                         (no-lost-wake)",
-                                        signal_bits_before
+                                        "signal_bits must survive a message-priority recv \
+                                         when a notification is still pending"
                                     );
-                                    // Carry forward: the next Op::Recv must still see
-                                    // signal_bits != 0.  Do NOT consume extra recv() calls
-                                    // here — deferred state carries the obligation forward.
-                                    deferred_check = Some(model.signal_bits);
                                 }
                             }
                             Some(WakeKind::Notification(bits)) => {
+                                if let Some(expected_bits) = expected_notification {
+                                    prop_assert!(
+                                        notification_dispatchable,
+                                        "notification wake must only satisfy a pending \
+                                         obligation when it is dispatchable \
+                                         (bound={}, msg_count={})",
+                                        model.bound,
+                                        model.message_queue.len()
+                                    );
+                                    prop_assert_eq!(
+                                        bits, expected_bits,
+                                        "next dispatchable notification recv must return \
+                                         the full pending bitset without contamination"
+                                    );
+                                }
                                 // The bits must be non-zero.
                                 prop_assert_ne!(
                                     bits, 0,
@@ -293,6 +292,18 @@ mod tests {
                                 accumulated_bits = model.signal_bits;
                             }
                             None => {
+                                if let Some(expected_bits) = expected_notification {
+                                    prop_assert!(
+                                        !notification_dispatchable,
+                                        "dispatchable notification obligation {:#x} \
+                                         cannot result in None",
+                                        expected_bits
+                                    );
+                                    prop_assert_ne!(
+                                        model.signal_bits, 0,
+                                        "undispatched notification bits must remain pending"
+                                    );
+                                }
                                 // recv() returns None iff nothing is dispatchable:
                                 // message queue is empty AND (unbound OR signal_bits == 0).
                                 prop_assert!(
@@ -305,6 +316,12 @@ mod tests {
                                 );
                             }
                         }
+
+                        // Carry the remaining notification obligation forward to
+                        // later operations. A notification wake clears the
+                        // obligation; otherwise the pending bits remain live and
+                        // must eventually be observed once dispatchable.
+                        pending_notification = (model.signal_bits != 0).then_some(model.signal_bits);
                     }
                 }
             }
