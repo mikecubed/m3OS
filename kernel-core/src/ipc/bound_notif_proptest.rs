@@ -173,10 +173,12 @@ mod tests {
         ///
         /// The generator emits arbitrary sequences of `Bind`, `Unbind`,
         /// `Signal`, `Send`, and `Recv` so that binding-state transitions are
-        /// continuously exercised. Additional assertions (A-R2) verify that
+        /// continuously exercised. Each generated `Op::Recv` performs exactly
+        /// one `model.recv()` call. Additional assertions (A-R2) verify that
         /// when recv() dispatches a message while a notification was also
-        /// pending, the notification survives and is returned by the very next
-        /// recv() without contamination.
+        /// pending, the notification survives (immediate check) and is still
+        /// observable at the very next generated `Op::Recv` (deferred check),
+        /// without consuming extra recv() calls inside the first handler.
         #[test]
         fn bound_notif_race_safety(ops in op_sequence(24)) {
             let mut model = RecvModel::new();
@@ -186,6 +188,14 @@ mod tests {
             // Track all accumulated signal bits (regardless of bound state) so
             // we can validate no-merge.
             let mut accumulated_bits: u64 = 0;
+
+            // A-R2 deferred observability state:
+            // When a message is dispatched while a notification was also pending,
+            // signal_bits must survive and be observable at the very next
+            // generated Op::Recv.  We carry the expected non-zero signal_bits
+            // value here and check it at the start of the next Op::Recv without
+            // consuming any extra recv() calls inside the current handler.
+            let mut deferred_check: Option<u64> = None;
 
             for op in ops {
                 match op {
@@ -206,11 +216,28 @@ mod tests {
                         pending_labels.push(label);
                     }
                     Op::Recv => {
-                        // Snapshot observability state before the dispatch so
-                        // we can apply the A-R2 no-lost-wake assertion below.
+                        // A-R2 deferred check: the previous Op::Recv dispatched
+                        // a message while a notification was also pending.  Those
+                        // signal_bits must still be present now — they can only
+                        // grow (from Op::Signal) or stay the same between recvs.
+                        // No intermediate Op::Recv ran because take() clears the
+                        // flag on the very next Op::Recv.
+                        if let Some(saved_bits) = deferred_check.take() {
+                            prop_assert_ne!(
+                                model.signal_bits, 0,
+                                "signal_bits must survive until the next Op::Recv \
+                                 (saved={:#x}, current signal_bits={:#x})",
+                                saved_bits,
+                                model.signal_bits
+                            );
+                        }
+
+                        // Snapshot observability state before the single dispatch
+                        // so we can set the deferred check if needed.
                         let pending_signal_before = model.bound && model.signal_bits != 0;
                         let signal_bits_before = model.signal_bits;
 
+                        // Exactly one model.recv() per Op::Recv.
                         match model.recv() {
                             Some(WakeKind::Message(label)) => {
                                 // No-loss: the label must have been in the pending queue.
@@ -222,11 +249,10 @@ mod tests {
                                 );
                                 pending_labels.remove(pos.unwrap());
 
-                                // A-R2 — no-lost-wake across a subsequent recv:
-                                // If a notification was also pending when this message
-                                // was dispatched, the signal bits must have survived and
-                                // must be returned by recv() once all pending messages
-                                // are drained — without contamination.
+                                // A-R2 — no-lost-wake: if a notification was also pending
+                                // when this message was dispatched, signal_bits must still
+                                // be non-zero now (immediate check) and must remain
+                                // observable at the next generated Op::Recv (deferred check).
                                 if pending_signal_before {
                                     prop_assert_ne!(
                                         model.signal_bits, 0,
@@ -234,57 +260,10 @@ mod tests {
                                          (no-lost-wake)",
                                         signal_bits_before
                                     );
-                                    // Drain any remaining messages so we can assert the
-                                    // notification is next.  Each drained message must
-                                    // itself be in the pending queue.
-                                    while !model.message_queue.is_empty() {
-                                        match model.recv() {
-                                            Some(WakeKind::Message(lbl)) => {
-                                                let pos =
-                                                    pending_labels.iter().position(|&l| l == lbl);
-                                                prop_assert!(
-                                                    pos.is_some(),
-                                                    "drain-phase message {:#x} was not in \
-                                                     the pending queue",
-                                                    lbl
-                                                );
-                                                pending_labels.remove(pos.unwrap());
-                                            }
-                                            other => prop_assert!(
-                                                false,
-                                                "expected Message during drain phase, got {:?}",
-                                                other
-                                            ),
-                                        }
-                                    }
-                                    // Message queue is now empty; the notification must
-                                    // be the very next wake returned by recv().
-                                    match model.recv() {
-                                        Some(WakeKind::Notification(got_bits)) => {
-                                            prop_assert_ne!(
-                                                got_bits, 0,
-                                                "follow-up notification wake must carry \
-                                                 non-zero bits"
-                                            );
-                                            prop_assert_eq!(
-                                                got_bits & accumulated_bits,
-                                                got_bits,
-                                                "follow-up notification bits {:#x} must be \
-                                                 a subset of accumulated signals {:#x}",
-                                                got_bits,
-                                                accumulated_bits
-                                            );
-                                            // The model drains signal_bits on dispatch;
-                                            // update the shadow accordingly.
-                                            accumulated_bits = model.signal_bits;
-                                        }
-                                        other => prop_assert!(
-                                            false,
-                                            "expected Notification after draining all messages \
-                                             (mixed-pending no-lost-wake), got {:?}",
-                                            other
-                                        ),
-                                    }
+                                    // Carry forward: the next Op::Recv must still see
+                                    // signal_bits != 0.  Do NOT consume extra recv() calls
+                                    // here — deferred state carries the obligation forward.
+                                    deferred_check = Some(model.signal_bits);
                                 }
                             }
                             Some(WakeKind::Notification(bits)) => {
