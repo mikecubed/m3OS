@@ -1225,6 +1225,11 @@ mod syscall_nr {
     pub const BLOCK_READ: u64 = 0x1011;
     /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
     pub const BLOCK_WRITE: u64 = 0x1012;
+    /// Phase 55c Track G.3: transmit a raw Ethernet frame with full
+    /// `NetDriverError` propagation so `DriverRestarting` surfaces as
+    /// `NEG_EAGAIN` to userspace.  See `docs/appendix/phase-55c-net-send-shape.md`
+    /// and `kernel/src/syscall/net.rs` for the implementation.
+    pub const NET_SEND: u64 = 0x1013;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1580,6 +1585,7 @@ pub extern "C" fn syscall_handler(
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
+        NET_SEND => crate::syscall::net::sys_net_send(arg0, arg1),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;

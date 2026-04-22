@@ -87,6 +87,15 @@ static REMOTE_NIC_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// the Phase 55b D.4b / F.2b semantics for the block path.
 static RESTART_SUSPECTED: AtomicBool = AtomicBool::new(false);
 
+/// Deduplicate the "driver absent" warn log on the `send_frame` hot path.
+/// Set when the first absent-driver warn is emitted; cleared on `register`.
+/// Subsequent `send_frame` calls during the same restart window skip the
+/// warn so the log is not flooded.  Matches the observability requirement in
+/// Phase 55c Track G.3: "logs `driver.absent` (warn, deduplicated) on the
+/// first send during a restart window; subsequent sends during the same window
+/// do not re-log until restart completes."
+static ABSENT_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
+
 /// Cold-path miss counter used by `is_registered` to rate-limit repeated
 /// service-registry lookups when no ring-3 NIC driver is present. An actual
 /// registry lookup is attempted only when the low `LOOKUP_RETRY_MASK` bits
@@ -130,6 +139,9 @@ impl RemoteNic {
         // Clear restart-suspected on successful re-registration so subsequent
         // send_frame calls are admitted again.
         RESTART_SUSPECTED.store(false, Ordering::Release);
+        // Clear the absent-warn dedup flag so the first send after a restart
+        // emits a fresh log line if the driver goes absent again.
+        ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
         // Reset the cold-path miss counter so the first post-(re)registration
         // lookup is not deferred by the retry cadence.
         LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
@@ -245,7 +257,12 @@ impl RemoteNic {
         let entry = match slot.as_mut() {
             Some(e) => e,
             None => {
-                log::warn!("[remote_nic] send_frame: driver absent");
+                // Deduplicate: only emit the warn on the first absent-driver
+                // call per restart window.  Subsequent calls are silently
+                // counted until `register()` clears `ABSENT_WARN_EMITTED`.
+                if !ABSENT_WARN_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[remote_nic] driver.absent: no ring-3 NIC registered");
+                }
                 return Err(NetDriverError::DeviceAbsent);
             }
         };

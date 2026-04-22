@@ -57,7 +57,9 @@ use kernel_core::device_host::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, RegistryError,
 };
 use kernel_core::driver_ipc::block::{BlkReplyHeader, BlockDriverError, encode_blk_reply};
-use kernel_core::driver_ipc::net::{NetDriverError, net_error_to_neg_errno};
+use kernel_core::driver_ipc::net::{
+    NetDriverError, net_error_to_neg_errno, net_send_result_to_syscall_ret,
+};
 use kernel_core::driver_ipc::{BlockDispatchState, RemoteDeviceError};
 use kernel_core::service::{
     ExitClassification, RestartPolicy, ServiceState, classify_exit, should_restart,
@@ -414,6 +416,84 @@ fn net_error_to_neg_errno_hard_errors_are_eio() {
             "{variant:?} (byte {byte}) must map to NEG_EIO (-5)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// G.2 — sys_net_send mid-restart EAGAIN observability (Phase 55c Track G)
+// ---------------------------------------------------------------------------
+// These tests verify that the composition `RemoteNic::send_frame returns
+// Err(DriverRestarting)` → `net_send_result_to_syscall_ret` → `-EAGAIN`
+// is wired correctly through the chosen send-path shape.  The helper
+// `net_send_result_to_syscall_ret` is the pure-logic layer that
+// `kernel/src/syscall/net.rs::sys_net_send` delegates to; testing it
+// here keeps the invariant host-testable without QEMU.
+
+/// Phase 55c G.2 — end-to-end EAGAIN observability.
+///
+/// Proves that a `RemoteNic::send_frame` return value of
+/// `Err(NetDriverError::DriverRestarting)` propagates to `-EAGAIN` (-11)
+/// when fed through `net_send_result_to_syscall_ret` — the pure-logic
+/// bridge that `sys_net_send` uses.  This is the load-bearing invariant
+/// for R1 correctness; if `DriverRestarting` silently maps to anything
+/// other than `EAGAIN` the restart window is invisible to userspace.
+#[test]
+fn sys_net_send_mid_restart_returns_eagain() {
+    let result: Result<(), NetDriverError> = Err(NetDriverError::DriverRestarting);
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        -11_i64,
+        "DriverRestarting must surface as NEG_EAGAIN (-11) through sys_net_send"
+    );
+}
+
+/// Phase 55c G.2 — success path is zero.
+///
+/// `Ok(())` from `RemoteNic::send_frame` must map to 0 (success) —
+/// not to any errno.  Verifies the identity case is not accidentally
+/// swallowed by the errno-mapping logic.
+#[test]
+fn sys_net_send_success_returns_zero() {
+    let result: Result<(), NetDriverError> = Ok(());
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        0_i64,
+        "Ok(()) must map to 0 (syscall success)"
+    );
+}
+
+/// Phase 55c G.2 — non-retriable errors are EIO, not EAGAIN.
+///
+/// `DeviceAbsent`, `LinkDown`, and `InvalidFrame` are hard errors;
+/// callers must not retry them as if they were transient.  Verifying
+/// this guards against accidentally broadening the EAGAIN surface.
+#[test]
+fn sys_net_send_hard_errors_return_eio() {
+    for &variant in &[
+        NetDriverError::LinkDown,
+        NetDriverError::DeviceAbsent,
+        NetDriverError::InvalidFrame,
+    ] {
+        let result: Result<(), NetDriverError> = Err(variant);
+        assert_eq!(
+            net_send_result_to_syscall_ret(result),
+            -5_i64,
+            "{variant:?} must map to NEG_EIO (-5), not EAGAIN"
+        );
+    }
+}
+
+/// Phase 55c G.2 — RingFull is retriable (EAGAIN), not a hard error.
+///
+/// `RingFull` is a transient backpressure condition; the caller should
+/// retry.  Maps to `EAGAIN` identically to `DriverRestarting`.
+#[test]
+fn sys_net_send_ring_full_returns_eagain() {
+    let result: Result<(), NetDriverError> = Err(NetDriverError::RingFull);
+    assert_eq!(
+        net_send_result_to_syscall_ret(result),
+        -11_i64,
+        "RingFull must map to NEG_EAGAIN (-11)"
+    );
 }
 
 // ---------------------------------------------------------------------------

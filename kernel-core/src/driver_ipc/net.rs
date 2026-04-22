@@ -147,6 +147,28 @@ pub const fn net_error_to_neg_errno(error_byte: u8) -> i64 {
     }
 }
 
+/// Map the `Result<(), NetDriverError>` returned by `RemoteNic::send_frame`
+/// to a syscall return value.
+///
+/// This is the pure-logic bridge used by `sys_net_send` in
+/// `kernel/src/syscall/net.rs`.  Keeping the mapping in `kernel-core`
+/// makes it host-testable without QEMU.
+///
+/// | Outcome | Return |
+/// |---------|--------|
+/// | `Ok(())` | 0 (success) |
+/// | `Err(DriverRestarting)` | `-11` (`NEG_EAGAIN`) |
+/// | `Err(RingFull)` | `-11` (`NEG_EAGAIN`) |
+/// | `Err(_)` | `-5` (`NEG_EIO`) |
+///
+/// Phase 55c Track G.3 — single source of truth for the R1 EAGAIN surface.
+pub const fn net_send_result_to_syscall_ret(result: Result<(), NetDriverError>) -> i64 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => net_error_to_neg_errno(e.to_byte()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NetFrameHeader encoding — private helpers shared by send and rx paths.
 // ---------------------------------------------------------------------------
