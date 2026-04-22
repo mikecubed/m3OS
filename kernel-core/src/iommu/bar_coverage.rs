@@ -29,7 +29,7 @@
 //! other module under `kernel_core::iommu::`. It depends only on
 //! [`super::regions::ReservedRegionSet`] for its interval-merge algebra.
 
-use super::regions::ReservedRegionSet;
+use super::regions::{RegionFlags, ReservedRegion, ReservedRegionSet};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -88,8 +88,15 @@ impl BarCoverage {
     ///
     /// Zero-length records are silently ignored. Overlapping and touching
     /// records are merged into a single contiguous span.
-    pub fn record_mapped(&mut self, _phys: u64, _len: usize) {
-        unimplemented!("C.1 implementation pending — tests committed first (TDD red)")
+    pub fn record_mapped(&mut self, phys: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.mapped.insert(ReservedRegion {
+            start: phys,
+            len,
+            flags: RegionFlags::NONE,
+        });
     }
 
     /// Return `true` if the range `[base, base + len)` is fully covered.
@@ -97,8 +104,15 @@ impl BarCoverage {
     /// A zero-length range is always considered covered (vestigial BARs
     /// require no identity mapping). A non-zero range is covered iff a single
     /// merged region exists whose `start <= base` and whose `end >= base + len`.
-    pub fn covers(&self, _base: u64, _len: usize) -> bool {
-        unimplemented!("C.1 implementation pending — tests committed first (TDD red)")
+    pub fn covers(&self, base: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = base.saturating_add(len as u64);
+        match self.mapped.contains(base) {
+            None => false,
+            Some(region) => region.end() >= end,
+        }
     }
 }
 
@@ -117,10 +131,22 @@ impl BarCoverage {
 /// Zero-length BARs are skipped — they are vestigial and contribute nothing
 /// to the MMIO window that the IOMMU must protect.
 pub fn assert_bar_identity_mapped(
-    _bars: &[Bar],
-    _coverage: &BarCoverage,
+    bars: &[Bar],
+    coverage: &BarCoverage,
 ) -> Result<(), BarCoverageError> {
-    unimplemented!("C.1 implementation pending — tests committed first (TDD red)")
+    for bar in bars {
+        if bar.len == 0 {
+            continue;
+        }
+        if !coverage.covers(bar.base, bar.len) {
+            return Err(BarCoverageError {
+                bar_index: bar.index,
+                phys_base: bar.base,
+                len: bar.len,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +164,11 @@ mod tests {
     fn single_bar_identity_maps() {
         let mut coverage = BarCoverage::new();
         coverage.record_mapped(0x1_0000, 0x4000);
-        let bars = [Bar { index: 0, base: 0x1_0000, len: 0x4000 }];
+        let bars = [Bar {
+            index: 0,
+            base: 0x1_0000,
+            len: 0x4000,
+        }];
         assert!(assert_bar_identity_mapped(&bars, &coverage).is_ok());
     }
 
@@ -150,8 +180,16 @@ mod tests {
         coverage.record_mapped(0x8000_0000, 0x10000);
         coverage.record_mapped(0x9000_0000, 0x4000);
         let bars = [
-            Bar { index: 0, base: 0x8000_0000, len: 0x10000 },
-            Bar { index: 2, base: 0x9000_0000, len: 0x4000 },
+            Bar {
+                index: 0,
+                base: 0x8000_0000,
+                len: 0x10000,
+            },
+            Bar {
+                index: 2,
+                base: 0x9000_0000,
+                len: 0x4000,
+            },
         ];
         assert!(assert_bar_identity_mapped(&bars, &coverage).is_ok());
     }
@@ -163,9 +201,13 @@ mod tests {
     fn missing_bar_fails_assertion_with_typed_error() {
         let mut coverage = BarCoverage::new();
         coverage.record_mapped(0x1_0000, 0x2000); // maps only the first half
-        let bars = [Bar { index: 3, base: 0x1_0000, len: 0x4000 }];
-        let err = assert_bar_identity_mapped(&bars, &coverage)
-            .expect_err("partial coverage must fail");
+        let bars = [Bar {
+            index: 3,
+            base: 0x1_0000,
+            len: 0x4000,
+        }];
+        let err =
+            assert_bar_identity_mapped(&bars, &coverage).expect_err("partial coverage must fail");
         assert_eq!(err.bar_index, 3);
         assert_eq!(err.phys_base, 0x1_0000);
         assert_eq!(err.len, 0x4000);
@@ -177,7 +219,11 @@ mod tests {
     #[test]
     fn zero_length_bar_is_noop() {
         let coverage = BarCoverage::new();
-        let bars = [Bar { index: 1, base: 0xDEAD_BEEF, len: 0 }];
+        let bars = [Bar {
+            index: 1,
+            base: 0xDEAD_BEEF,
+            len: 0,
+        }];
         assert!(assert_bar_identity_mapped(&bars, &coverage).is_ok());
     }
 
@@ -192,8 +238,16 @@ mod tests {
         let mut coverage = BarCoverage::new();
         coverage.record_mapped(0x4000, 0x6000);
         let bars = [
-            Bar { index: 0, base: 0x4000, len: 0x4000 },
-            Bar { index: 1, base: 0x6000, len: 0x4000 },
+            Bar {
+                index: 0,
+                base: 0x4000,
+                len: 0x4000,
+            },
+            Bar {
+                index: 1,
+                base: 0x6000,
+                len: 0x4000,
+            },
         ];
         assert!(assert_bar_identity_mapped(&bars, &coverage).is_ok());
     }
@@ -204,9 +258,12 @@ mod tests {
     #[test]
     fn entirely_unmapped_bar_fails() {
         let coverage = BarCoverage::new();
-        let bars = [Bar { index: 2, base: 0xC000_0000, len: 0x1000 }];
-        let err = assert_bar_identity_mapped(&bars, &coverage)
-            .expect_err("unmapped BAR must fail");
+        let bars = [Bar {
+            index: 2,
+            base: 0xC000_0000,
+            len: 0x1000,
+        }];
+        let err = assert_bar_identity_mapped(&bars, &coverage).expect_err("unmapped BAR must fail");
         assert_eq!(err.bar_index, 2);
     }
 
@@ -216,7 +273,11 @@ mod tests {
         let mut coverage = BarCoverage::new();
         coverage.record_mapped(0x2000, 0x1000); // maps [0x2000, 0x3000)
         // BAR needs [0x1000, 0x3000) — 0x1000..0x2000 is uncovered.
-        let bars = [Bar { index: 0, base: 0x1000, len: 0x2000 }];
+        let bars = [Bar {
+            index: 0,
+            base: 0x1000,
+            len: 0x2000,
+        }];
         let err = assert_bar_identity_mapped(&bars, &coverage)
             .expect_err("partial coverage at start must fail");
         assert_eq!(err.bar_index, 0);
@@ -227,7 +288,11 @@ mod tests {
     fn record_mapped_zero_length_is_noop() {
         let mut coverage = BarCoverage::new();
         coverage.record_mapped(0x1000, 0); // no-op
-        let bars = [Bar { index: 0, base: 0x1000, len: 0x1000 }];
+        let bars = [Bar {
+            index: 0,
+            base: 0x1000,
+            len: 0x1000,
+        }];
         assert!(assert_bar_identity_mapped(&bars, &coverage).is_err());
     }
 }

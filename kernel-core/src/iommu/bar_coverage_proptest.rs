@@ -11,7 +11,7 @@
 
 use proptest::prelude::*;
 
-use super::bar_coverage::{assert_bar_identity_mapped, Bar, BarCoverage};
+use super::bar_coverage::{Bar, BarCoverage, assert_bar_identity_mapped};
 
 // ---------------------------------------------------------------------------
 // Strategies
