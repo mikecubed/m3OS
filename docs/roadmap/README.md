@@ -168,7 +168,7 @@ flowchart TD
     P55a --> P55b["Phase 55b<br/>Ring-3 Driver Host"]
     P55b --> P55c["Phase 55c<br/>Ring-3 Driver Correctness Closure"]
     P47 --> P56["Phase 56<br/>Display and Input Architecture"]
-    P55c --> P56
+    P55b --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
     P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
     P55c --> P58
@@ -403,7 +403,7 @@ gantt
     IOMMU Substrate         :p55a, after p55, 1
     Ring-3 Driver Host      :p55b, after p55a, 1
     Ring-3 Driver Correctness Closure :p55c, after p55b, 1
-    Display and Input       :p56, after p55c, 1
+    Display and Input       :p56, after p55b, 1
     Audio and Local Session :p57, after p56, 1
     Release 1.0 Gate        :p58, after p55c, 1
 

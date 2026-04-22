@@ -40,14 +40,14 @@ This is a correctness blocker for any 1.0 claim of "IOMMU-isolated ring-3 driver
 
 Per `docs/appendix/phase-55b-residuals.md`, `RemoteNic::send_frame` in `kernel/src/net/remote.rs` correctly returns `NetDriverError::DriverRestarting` to kernel-side callers during a driver restart window, but the existing userspace net datapath (`sys_sendto`, UDP/TCP socket writes) does not route through that surface — it prefers the virtio-net fallback or surfaces a generic error. Consequence: a userspace application observes a silent success (virtio-net handled it) or a generic failure, never the ring-3-specific `EAGAIN`. The `qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds` stub in `kernel-core/tests/driver_restart.rs` is `#[ignore]`-d for this reason.
 
-The R1 residual recommended Phase 60 (Networking and GitHub) as the owner. Phase 55c pulls it forward because it shares surfaces with R3 (both touch `kernel/src/net/remote.rs`) and because shipping Phase 58 with this gap makes the 1.0 "supervised ring-3 drivers" claim weaker than it has to be.
+The original R1 residual was left for later scheduling. Phase 55c pulls it forward because it shares surfaces with R3 (both touch `kernel/src/net/remote.rs`) and because shipping Phase 58 with this gap makes the 1.0 "supervised ring-3 drivers" claim weaker than it has to be.
 
 ### Scheduling rationale
 
 1. All three are ring-3-driver correctness gaps. Grouping them yields one review, one regression harness update, one version bump, one learning-doc delta.
 2. R2 is an R1 prerequisite under `--iommu`: the e1000 driver cannot even start without MMIO coverage.
 3. R3 is the only novel primitive (bound notifications). R1 and R2 are wiring closures on existing infrastructure.
-4. Phase 56's display and input drivers need R3's primitive on day one (vsync notifications interleaved with composition requests; HID interrupts interleaved with mode-set requests). Landing R3 before 56 is free; landing it after means a follow-up sweep across three drivers plus the display server.
+4. Later IRQ-backed display/input drivers can reuse R3's primitive directly (vsync notifications interleaved with composition requests; HID interrupts interleaved with mode-set requests). Landing R3 before those later drivers is free; landing it after means a follow-up sweep across the first userspace driver loops that actually need IRQ + request multiplexing.
 5. The project explicitly models after seL4 (CLAUDE.md: *"Synchronous rendezvous + async notification objects (seL4-style)"*). Bound notifications are the canonical seL4 answer to the TCB-waits-on-two-sources problem.
 
 ## Learning Goals
@@ -120,11 +120,11 @@ loop {
 
 ### R2.1 — IOMMU BAR identity-coverage invariant
 
-`kernel-core/src/iommu/` gains a pure-logic invariant and accompanying test: for every claimed `PciDeviceHandle`, the device's IOMMU domain carries an identity mapping of every BAR's `(base, length)` pair. The invariant is enforced at `sys_device_claim` time (the kernel has the BAR metadata from PCI enumeration) and revalidated at `sys_device_mmio_map`.
+`kernel-core/src/iommu/` gains a pure-logic invariant and accompanying test: for every claimed `PciDeviceHandle`, the device's IOMMU domain carries an identity mapping of every BAR's `(base, length)` pair. The invariant is enforced at `sys_device_claim` time, when the kernel already has the BAR metadata from PCI enumeration.
 
 ### R2.2 — VT-d / AMD-Vi domain setup extends to MMIO
 
-`kernel/src/iommu/vtd.rs` and `kernel/src/iommu/amdvi.rs` extend per-device domain setup to insert identity-mapped 4 KiB pages covering each BAR. The existing DMA domain plumbing is unchanged. The domain's page-table walker handles both DMA and MMIO without branching because both are identity-mapped.
+`kernel/src/iommu/intel.rs` and `kernel/src/iommu/amd.rs` extend per-device domain setup to insert identity-mapped 4 KiB pages covering each BAR. The existing DMA domain plumbing is unchanged. The domain's page-table walker handles both DMA and MMIO without branching because both are identity-mapped.
 
 ### R2.3 — Device-smoke regression asserts `--iommu` parity
 
@@ -132,7 +132,7 @@ The existing `device_smoke_script_nvme` and `device_smoke_script_e1000` in `xtas
 
 ### R1.1 — Userspace send-path restart visibility
 
-Track G resolves the exact syscall shape: either a new `sys_net_send(socket_fd, buf_ptr, len, flags) -> isize` in `kernel/src/syscall/net.rs`, or an extension of the existing `sys_sendto` path. In either variant, the userspace send path routes through `RemoteNic::send_frame` when a ring-3 net driver is registered, falls back to the existing virtio-net path only when no ring-3 net driver is bound, and surfaces `NetDriverError::DriverRestarting` as `-EAGAIN` through `net_error_to_neg_errno`.
+Track G resolves the exact syscall shape: either a new `sys_net_send(socket_fd, buf_ptr, len, flags) -> isize` dispatched from the current arch-level syscall entry point (optionally extracted into a new helper module), or an extension of the existing `sys_sendto` path. In either variant, the userspace send path routes through `RemoteNic::send_frame` when a ring-3 net driver is registered, falls back to the existing virtio-net path only when no ring-3 net driver is bound, and surfaces `NetDriverError::DriverRestarting` as `-EAGAIN` through `net_error_to_neg_errno`.
 
 ### R1.2 — `e1000-crash-smoke` asserts EAGAIN
 

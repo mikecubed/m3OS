@@ -155,7 +155,7 @@ flowchart TD
     P55 --> P55a["Phase 55a Tasks"]
     P55a --> P55b["Phase 55b Tasks"]
     P55b --> P55c["Phase 55c Tasks"]
-    P55c --> P56["Phase 56 Tasks"]
+    P55b --> P56["Phase 56 Tasks"]
 ```
 
 ## Task Documents

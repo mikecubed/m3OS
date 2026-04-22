@@ -119,7 +119,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 ## Acceptance Criteria
 
 - A written 1.0 support matrix exists that starts from the Phase 53 bounded headless/reference baseline, with explicit supported workflows, hardware scope, and non-goals.
-- The project has a documented validation bundle that extends the Phase 53 gate bundle with any Phase 55 hardware-specific gates.
+- The project has a documented validation bundle that extends the Phase 53 gate bundle with the Phase 55 hardware-specific gates plus the Phase 55c closure evidence for SSH-over-e1000 wake correctness, `--iommu` device-smoke parity, and userspace-visible restart handling.
 - The docs explicitly state whether 1.0 is headless/reference-only or also includes the local-system branch.
 - Top-level docs, roadmap docs, and version references all reflect the same release promise.
 - Later work such as toolchains, GitHub integration, Node.js, and Claude Code is explicitly framed as 1.x growth if not part of the chosen release.

@@ -46,7 +46,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 ### SOLID and module boundaries
 
-- **Single Responsibility.** `kernel-core::ipc::bound_notif` owns the R3 pure-logic state model. `kernel/src/ipc/notification.rs` owns the ISR-reachable `BOUND_TCB` array. `kernel/src/ipc/endpoint.rs` owns the recv-path bound-aware fast path. `kernel/src/ipc/mod.rs` owns `sys_notif_bind` dispatch. `kernel-core::iommu::bar_coverage` owns the R2 invariant. `kernel/src/iommu/{vtd,amdvi}.rs` owns the R2 wiring. `kernel/src/net/remote.rs` owns the R1 EAGAIN translation. `kernel/src/syscall/net.rs` owns the R1 syscall dispatch. `driver_runtime::ipc` owns the `RecvResult` surface. No module takes on a second concern.
+- **Single Responsibility.** `kernel-core::ipc::bound_notif` owns the R3 pure-logic state model. `kernel/src/ipc/notification.rs` owns the ISR-reachable `BOUND_TCB` array. `kernel/src/ipc/endpoint.rs` owns the recv-path bound-aware fast path. `kernel/src/ipc/mod.rs` owns `sys_notif_bind` dispatch. `kernel-core::iommu::bar_coverage` owns the R2 invariant. `kernel/src/iommu/{intel,amd}.rs` owns the R2 wiring. `kernel/src/net/remote.rs` owns the R1 EAGAIN translation. `kernel/src/arch/x86_64/syscall/mod.rs` owns the current R1 send-path dispatch unless Track G explicitly extracts a new helper. `driver_runtime::ipc` owns the `RecvResult` surface. No module takes on a second concern.
 - **Open / Closed.** The e1000 driver consumes the bound-notification primitive through `driver_runtime::RecvResult`; it does not reach into `syscall_lib` directly. A future driver lands by consuming the same `RecvResult` surface — not by editing `driver_runtime` or the kernel. The R2 BAR-coverage helper is called once per claim; adding a third IOMMU backend (e.g., a future RISC-V IOMMU) lands by adding a backend file, not by editing the helper.
 - **Interface Segregation.** `sys_notif_bind` exposes a minimal surface: two capability handles in, one status code out. `sys_net_send` — if chosen over extending `sys_sendto` — exposes only the send path; receive stays in the existing socket surface.
 - **Liskov Substitution.** NVMe's `BlockServer::handle_next` is substitutable before and after E.2 — the `RecvResult::Notification` arm is a documented no-op for drivers that have no bound notification. Existing NVMe tests stay green. `RemoteNic::send_frame` is substitutable at every caller before and after G.3 — the EAGAIN path replaces an existing generic-error path, not a silent success.
@@ -183,7 +183,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 **Files:**
 - `kernel/src/ipc/mod.rs`
-- `kernel/src/syscall.rs`
+- `kernel/src/arch/x86_64/syscall/mod.rs`
 
 **Symbol:** `sys_notif_bind`
 **Why it matters:** The one new syscall.
@@ -216,7 +216,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 **Acceptance:**
 - [ ] Process exit walks `TCB_BOUND_NOTIF` for the dying task, clears the corresponding `BOUND_TCB` entry, and clears the self slot.
-- [ ] Notification release (`sys_notif_release`) clears the binding if present, and wakes the bound TCB with a defined "source gone" state.
+- [ ] Notification release (`sys_notif_release`) clears the binding if present; any later recv falls back to the ordinary endpoint-only path.
 - [ ] Test: `process_exit_clears_binding_smoke` in `kernel/tests/`.
 
 ---
@@ -257,8 +257,8 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 ### D.1 — VT-d domain extension for BAR identity mapping
 
-**File:** `kernel/src/iommu/vtd.rs`
-**Symbol:** `VtdDomain::install_bar_identity_maps`
+**File:** `kernel/src/iommu/intel.rs`
+**Symbol:** `IntelIommuDomain::install_bar_identity_maps`
 **Why it matters:** Closes the R2 residual on VT-d hosts (Intel). `CTRL.RST` writes reach hardware.
 
 **Acceptance:**
@@ -268,8 +268,8 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 
 ### D.2 — AMD-Vi domain extension for BAR identity mapping
 
-**File:** `kernel/src/iommu/amdvi.rs`
-**Symbol:** `AmdViDomain::install_bar_identity_maps`
+**File:** `kernel/src/iommu/amd.rs`
+**Symbol:** `AmdIommuDomain::install_bar_identity_maps`
 **Why it matters:** Parity with VT-d on AMD hosts. Mirror of D.1 against the AMD-Vi backend.
 
 **Acceptance:**
@@ -399,11 +399,11 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 ### G.3 — Implement the chosen send-path shape
 
 **Files:**
-- `kernel/src/syscall/net.rs` (if new syscall)
-- `kernel/src/net/socket/mod.rs` (if extended `sys_sendto`)
+- `kernel/src/arch/x86_64/syscall/mod.rs` (current send-path dispatch, or bridge into an extracted helper if Track G chooses one)
 - `kernel/src/net/remote.rs`
+- `kernel/src/syscall/net.rs` (new helper module only if Track G chooses to extract one)
 
-**Symbols:** `sys_net_send` or `sys_sendto::send`, `RemoteNic::send_frame`
+**Symbols:** `sys_net_send` or `sys_sendto`, `RemoteNic::send_frame`
 **Why it matters:** The load-bearing R1 change.
 
 **Acceptance:**
@@ -455,7 +455,7 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - [ ] Connects `ssh -oBatchMode=yes root@127.0.0.1 -p2222`; captures first 64 bytes.
 - [ ] Asserts the captured prefix contains `SSH-2.0-`.
 - [ ] Fails with a distinct exit code if the banner is not received within 5 s.
-- [ ] Mirrors the `scripts/ssh_wedge_check.sh` reference shape.
+- [ ] Mirrors the `scripts/ssh-wedge-regression.sh` reference shape.
 
 ### I.2 — `cargo xtask ssh-e1000-banner-check` subcommand
 
@@ -533,23 +533,23 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - `docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`
 
 **Symbol:** N/A
-**Why it matters:** Every Phase 56 driver has the same mix of async events and sync requests. Phase 56 should specify the bound-notification usage up front.
+**Why it matters:** Later IRQ-backed display/input drivers will have the same mix of async events and sync requests. The roadmap should record the Phase 55c pattern early without mislabeling the socket-centric Phase 56 compositor core as a hard consumer.
 
 **Acceptance:**
-- [ ] Both Phase 56 docs name `RecvResult` + `IrqNotification::bind_to_endpoint` as the required pattern for display-driver and input-driver event loops.
-- [ ] The Phase 56 tasks touching a driver loop list "consumes Phase 55c bound notifications" as a precondition.
+- [ ] Both Phase 56 docs mention Phase 55c bound notifications only as a later template for IRQ-backed userspace drivers, not as a hard prerequisite for the socket-centric Phase 56 compositor core.
+- [ ] The Phase 56 tasks touching a driver loop stay consistent with that boundary: PS/2/input services keep their existing wait/send split, while later IRQ-backed display/input drivers may adopt the Phase 55c pattern.
 
 ### J.4 — Phase 55c learning doc
 
 **File:** `docs/roadmap/55c-ring-3-driver-correctness-closure-learning.md` (new)
 **Symbol:** N/A
-**Why it matters:** Every completed phase requires a learning doc. Phase 56 authors and future contributors need a structured explanation of the three primitives Phase 55c added. Without it the roadmap has a gap at the exact point where Phase 56's driver loop design decisions depend on understanding what Phase 55c established.
+**Why it matters:** Every completed phase requires a learning doc. Future IRQ-backed driver authors and roadmap contributors need a structured explanation of the three primitives Phase 55c added. Without it the roadmap has a gap at the exact point where later display/input and driver-host work would want to reuse what Phase 55c established.
 
 **Acceptance:**
 - [ ] Doc follows the **aligned legacy learning doc** template from `docs/appendix/doc-templates.md`: `Aligned Roadmap Phase`, `Status`, `Source Ref`, `Supersedes Legacy Doc` (N/A), `Overview`, `What This Doc Covers`, `Core Implementation`, `Key Files`, `How This Phase Differs From Later Work`, `Related Roadmap Docs`, `Deferred or Later-Phase Topics`.
 - [ ] **What This Doc Covers** lists exactly: (1) bound notifications and the seL4 wake-model composition pattern (R3); (2) IOMMU domain MMIO identity mapping for claimed devices (R2); (3) driver-restart error propagation through the kernel's `RemoteNic` facade to userspace `EAGAIN` (R1).
 - [ ] **Key Files** table names at minimum: `kernel-core/src/ipc/bound_notif.rs`, `kernel/src/ipc/notification.rs`, `kernel/src/ipc/endpoint.rs`, `kernel-core/src/iommu/bar_coverage.rs`, `kernel/src/net/remote.rs`, `userspace/lib/driver_runtime/src/ipc/mod.rs`, `userspace/drivers/e1000/src/io.rs`.
-- [ ] **How This Phase Differs From Later Work** notes that Phase 56 consumes `RecvResult` and `IrqNotification::bind_to_endpoint` — those primitives are taught in this doc, not in Phase 56's doc.
+- [ ] **How This Phase Differs From Later Work** notes that later IRQ-backed userspace drivers may consume `RecvResult` and `IrqNotification::bind_to_endpoint`, but the Phase 56 compositor core itself does not depend on them.
 - [ ] Doc added to `docs/roadmap/README.md` alongside the design doc and task doc links for Phase 55c.
 - [ ] `docs/roadmap/55c-ring-3-driver-correctness-closure.md` **Companion Task List** section updated to include a link to this learning doc.
 
@@ -609,5 +609,5 @@ If `sys_net_send` (or the `sys_sendto` extension) breaks existing net paths:
 - **Prefer exact files over directories.** Every task's **File** / **Files** entry names a concrete path, not a directory. If a file is renamed or split during implementation, update this doc before closing the task.
 - **Prefer exact symbols over generic descriptions.** Every task's **Symbol** entry names the specific function, type, or constant — not the module or crate. Generic descriptions like "net module" are not acceptable.
 - The design doc names seL4 bound notifications as the reference for R3. Keep the comparison table in `docs/roadmap/55c-ring-3-driver-correctness-closure.md` ("How Real OS Implementations Differ") in sync with any future pivot away from the seL4 model.
-- The Phase 56 precondition entries in J.3 must be reviewed during Phase 56 kickoff; if 55c slips, 56's planning baseline slips with it.
+- The Phase 56 wording in J.3 is advisory only: it records a later IRQ-driver template, not a hard Phase 56 prerequisite.
 - The 55b residuals strike-through in J.1 is load-bearing documentation: subsequent readers should see "closed in 55c" rather than a stale open item. Do not close J.1 with a vague edit — the pointer must name the exact Track letters (G/H for R1, C/D for R2, A–F for R3).
