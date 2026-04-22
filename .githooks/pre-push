@@ -41,5 +41,16 @@ fi
 echo "pre-push: running cargo xtask smoke-test..."
 cargo xtask smoke-test --timeout 300
 
+echo "pre-push: running cargo xtask device-smoke --device nvme --iommu..."
+cargo xtask device-smoke --device nvme --iommu --timeout 90
+
+echo "pre-push: running cargo xtask device-smoke --device e1000 --iommu..."
+cargo xtask device-smoke --device e1000 --iommu --timeout 90
+
 echo "pre-push: running cargo xtask regression..."
 cargo xtask regression --timeout 90
+
+if [ "${M3OS_E1000_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask ssh-e1000-banner-check..."
+    cargo xtask ssh-e1000-banner-check --timeout 30
+fi

@@ -55,7 +55,10 @@ After cloning, install the git hooks so quality gates run before commits and pus
 ./setup.sh
 ```
 
-This sets `core.hooksPath` to `.githooks/`, which contains pre-commit and pre-push hooks that run `cargo xtask check`.
+This sets `core.hooksPath` to `.githooks/`. The pre-commit hook runs
+`cargo xtask check`; the pre-push hook runs `cargo xtask check`,
+`cargo xtask smoke-test`, and `cargo xtask regression`, plus
+`cargo xtask ssh-e1000-banner-check` when `M3OS_E1000_REGRESSION=1` is set.
 
 ## Architecture
 

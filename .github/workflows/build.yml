@@ -57,6 +57,11 @@ jobs:
           rm -f target/x86_64-unknown-none/release/disk.img
           cargo xtask smoke-test --timeout 300
 
+      - name: "Device-smoke parity lane (NVMe + e1000 under IOMMU)"
+        run: |
+          cargo xtask device-smoke --device nvme --iommu --timeout 90
+          cargo xtask device-smoke --device e1000 --iommu --timeout 90
+
       - name: Regression suite (SMP races + headless operator workflows)
         run: cargo xtask regression --timeout 90
 
