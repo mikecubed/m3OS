@@ -13598,9 +13598,8 @@ pub(super) fn sys_sendto(
                     // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
                     // driver is in a restart window.  Socket fd is already
                     // validated by the FdBackend::Socket check above.
-                    if let Some(err) = crate::net::remote::RemoteNic::check_restart_gate() {
-                        return kernel_core::driver_ipc::net::net_error_to_neg_errno(err.to_byte())
-                            as u64;
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
                     }
                     crate::net::udp::send(dst_ip, dst_port, src_port, &tmp[..capped]);
                     capped as u64
@@ -13645,9 +13644,8 @@ pub(super) fn sys_sendto(
                     let icmp_pkt =
                         kernel_core::net::icmp::build(ICMP_ECHO_REQUEST, 0, rest, payload);
                     // Phase 55c Track G R1: same restart gate as the UDP path.
-                    if let Some(err) = crate::net::remote::RemoteNic::check_restart_gate() {
-                        return kernel_core::driver_ipc::net::net_error_to_neg_errno(err.to_byte())
-                            as u64;
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
                     }
                     crate::net::ipv4::send(dst_ip, crate::net::ipv4::PROTO_ICMP, &icmp_pkt);
                     capped as u64

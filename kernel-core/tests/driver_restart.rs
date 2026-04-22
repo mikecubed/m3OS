@@ -612,18 +612,18 @@ fn sys_net_send_dispatch_gate_precedes_result_mapping() {
 // G.3 (sendto path) — sendto_restart_errno: the sys_sendto restart gate seam
 //
 // These tests cover the pure-logic seam that the kernel's `sys_sendto` UDP
-// and ICMP branches exercise via `RemoteNic::check_restart_gate()`.
+// and ICMP branches exercise via `RemoteNic::sendto_restart_ret()`.
 //
 // The production flow is:
 //
 //   sys_sendto (FdBackend::Socket validated above)
-//   → RemoteNic::check_restart_gate()     // reads two AtomicBools
-//   → if Some(DriverRestarting)           // maps to NEG_EAGAIN via
-//       net_error_to_neg_errno(err.to_byte())
+//   → RemoteNic::sendto_restart_ret()     // reads two AtomicBools and forwards
+//       to sendto_restart_errno(...)
 //   → return NEG_EAGAIN (-11)
 //
 // `sendto_restart_errno(is_registered, is_restarting)` is the host-testable
-// pure-logic mirror.  Testing it proves the gate invariant:
+// seam that production invokes through that wrapper. Testing it proves the
+// same gate invariant production executes:
 //   registered + restarting  → Some(-11) (EAGAIN)
 //   registered + healthy     → None (proceed to send)
 //   unregistered + any state → None (use virtio fallback)
@@ -837,7 +837,7 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
 ///     handler.  `DriverRestarting` → `NEG_EAGAIN` surfaces through
 ///     `net_send_dispatch` (pure-logic seam tested in G.3 tests above).
 ///   - POSIX `sendto()` (syscall 44) UDP and ICMP branches now call
-///     `RemoteNic::check_restart_gate()` before the fire-and-forget send.
+///     `RemoteNic::sendto_restart_ret()` before the fire-and-forget send.
 ///     When the ring-3 NIC is registered and in a restart window, `sendto()`
 ///     returns `NEG_EAGAIN` (-11), satisfying the R1 contract.  Pure-logic
 ///     seam coverage is in the G.3 `sendto_restart_errno` tests above.
@@ -847,7 +847,7 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
 ///   loop in the e1000 driver (not yet landed; driver exits after bring-up).
 ///   This test is QEMU-only.
 #[test]
-#[ignore = "QEMU-only: sys_sendto UDP/ICMP now surfaces NEG_EAGAIN via RemoteNic::check_restart_gate(). \
+#[ignore = "QEMU-only: sys_sendto UDP/ICMP now surfaces NEG_EAGAIN via RemoteNic::sendto_restart_ret(). \
             sys_net_send (0x1013) also surfaces NEG_EAGAIN for direct callers. \
             Pure-logic seam coverage: G.3 sendto_restart_errno tests + net_send_dispatch tests. \
             Remaining blocker: e1000 driver E.3 TX/RX server loop for post-restart ICMP/TCP. \
@@ -855,7 +855,7 @@ fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
             kill/restart cycle; post-restart connectivity check deferred to Track H."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
     // Phase 55c Track G (second resend): sys_sendto UDP/ICMP branches call
-    // RemoteNic::check_restart_gate() before the fire-and-forget send path.
+    // RemoteNic::sendto_restart_ret() before the fire-and-forget send path.
     // When RESTART_SUSPECTED is set, sendto() returns NEG_EAGAIN (-11).
     // The post-restart ICMP/TCP connectivity path requires the e1000 E.3
     // server loop and is covered by Track H.
