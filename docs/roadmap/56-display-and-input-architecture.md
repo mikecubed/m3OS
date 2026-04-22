@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-56
-**Depends on:** Phase 46 (System Services) ✅, Phase 52 (First Service Extractions) ✅, Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅ (one known open bug — `docs/appendix/phase-55b-residuals.md` R2, does not affect Phase 56), Phase 55b (Ring-3 Driver Host) ✅
+**Depends on:** Phase 46 (System Services) ✅, Phase 52 (First Service Extractions) ✅, Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅
 **Builds on:** Turns the single-app DOOM graphics proof into a real userspace-owned display/input architecture with explicit ownership, event routing, and crash boundaries
 **Primary Components:** future userspace display server, input services, kernel/src/fb, kernel input/interrupt mediation, docs/09-framebuffer-and-shell.md, docs/29-pty-subsystem.md
 
@@ -93,6 +93,7 @@ The client protocol defines the long-term shape of the GUI stack more than any s
 - Builds on the graphical proof from Phase 47 by turning one-app graphics into a multi-client architecture.
 - Reuses the service and restart model from Phases 46 and 52 so the UI stack remains supervised and recoverable.
 - Depends on the hardware and transport groundwork from Phases 50 and 55 to avoid graphics-only special cases.
+- Later IRQ-backed display/input drivers can reuse the Phase 55c bound-notification pattern, but the Phase 56 compositor core itself remains socket-centric and does not require `RecvResult` / `IrqNotification::bind_to_endpoint` as a prerequisite.
 
 ## Implementation Outline
 

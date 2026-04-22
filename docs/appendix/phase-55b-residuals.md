@@ -1,17 +1,17 @@
 # Phase 55b Residuals — Scheduling Record
 
-**Status:** Open — two real follow-ups + documented annotations
+**Status:** Assigned — two real follow-ups now owned by Phase 55c + documented annotations
 **Source:** Phase 55b (Ring-3 Driver Host) closure pass
 **Discovered:** During the Phase 55b closure work (waves 15–17); Phase 55b itself is landed as of v0.55.2
-**Audience:** Roadmap planning — the two *real* items below need a phase assignment
+**Audience:** Roadmap planning and closure tracking — the two *real* items below are assigned to Phase 55c
 
 ## Why this document exists
 
-Phase 55b's architectural goal (ring-3 NVMe + e1000 drivers, IOMMU-isolated, supervised, restartable) is delivered and live at runtime. During the closure pass two real follow-ups surfaced that do **not** belong to Phase 55b's scope but cannot be ignored. This doc records them precisely so they can be scheduled against later phases rather than getting lost in commit history.
+Phase 55b's architectural goal (ring-3 NVMe + e1000 drivers, IOMMU-isolated, supervised, restartable) is delivered and live at runtime. During the closure pass two real follow-ups surfaced that do **not** belong to Phase 55b's scope but cannot be ignored. This doc records them precisely so their later owner — Phase 55c — stays explicit rather than getting lost in commit history.
 
 It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not gaps) so future readers don't mistake them for debt.
 
-## Section 1 — Real follow-ups that need a phase assignment
+## Section 1 — Real follow-ups assigned to Phase 55c
 
 ### R1 — `sys_net_send` syscall for userspace-observable EAGAIN
 
@@ -27,7 +27,7 @@ It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not
 2. Update `userspace/e1000-crash-smoke/` to assert `EAGAIN` on mid-crash send (today it only asserts the infrastructure steps).
 3. Remove `#[ignore]` from the now-observable stub in `kernel-core/tests/driver_restart.rs`.
 
-**Recommended owner:** **Phase 60 (Networking and GitHub)** — the natural net-syscall expansion phase. An earlier hotfix phase is also reasonable if the user wants EAGAIN visibility before 1.0 ships.
+**Recommended owner:** **Phase 55c (Ring-3 Driver Correctness Closure)** — the ring-3-driver correctness follow-up that groups the SSH-over-e1000 wake fix, IOMMU BAR identity coverage, and userspace-visible restart handling into one pre-1.0 closure pass.
 
 **Acceptance for closure:**
 - `e1000-crash-smoke` binary observes `EAGAIN` (or equivalent) from its `sendto()` call during the mid-crash window.
@@ -51,7 +51,7 @@ It also inventories the `#[ignore]` test stubs that are *correctly* ignored (not
 2. Re-run `cargo xtask device-smoke --device nvme --iommu` and `--device e1000 --iommu`; both should pass like their non-IOMMU counterparts (~6 s each).
 3. Audit any other MMIO window the ring-3 driver might touch (MSI-X tables, PCIe config writes, etc.) for the same gap.
 
-**Recommended owner:** **Phase 55a follow-up** (hotfix / 55a.1) **or** folded into whichever phase introduces the first driver that consumes VT-d in anger. If 1.0 shipping claims "IOMMU-isolated ring-3 drivers", **this must close before Phase 58**.
+**Recommended owner:** **Phase 55c (Ring-3 Driver Correctness Closure)** — the pre-1.0 ring-3-driver follow-up that groups the SSH-over-e1000 wake fix, IOMMU BAR identity coverage, and userspace-visible restart handling into one closure pass. If 1.0 shipping claims "IOMMU-isolated ring-3 drivers", **this must close before Phase 58**.
 
 **Acceptance for closure:**
 - `cargo xtask device-smoke --device nvme --iommu` passes end-to-end.
@@ -92,8 +92,8 @@ These do **not** belong in a future phase's scope.
 
 | Item | Severity | Recommended owner | Must-fix-before-1.0? |
 |---|---|---|---|
-| **R1** `sys_net_send` | Medium | Phase 60 (Networking and GitHub) | No — a Phase 58 "known limitation" note is acceptable |
-| **R2** IOMMU VT-d MMIO | Medium-High | Phase 55a follow-up (55a.1) or pre-58 hotfix | **Yes** — 1.0 claims "IOMMU-isolated ring-3 drivers"; R2 makes the claim partially false under `--iommu` |
+| **R1** `sys_net_send` | Medium | Phase 55c (Ring-3 Driver Correctness Closure) | **Yes** — the pre-1.0 ring-3 driver story now depends on userspace-visible restart handling |
+| **R2** IOMMU VT-d MMIO | Medium-High | Phase 55c (Ring-3 Driver Correctness Closure) | **Yes** — 1.0 claims "IOMMU-isolated ring-3 drivers"; R2 makes the claim partially false under `--iommu` |
 | §2 annotations | None | No phase | No — correct as-is |
 | §3 metrics | None | No phase | No — documented in learning doc |
 
@@ -102,6 +102,6 @@ These do **not** belong in a future phase's scope.
 - `docs/55b-ring-3-driver-host.md` — Phase 55b learning doc (contains the Outcome Metrics section)
 - `docs/roadmap/55b-ring-3-driver-host.md` — Phase 55b design doc
 - `docs/roadmap/tasks/55b-ring-3-driver-host-tasks.md` — Phase 55b task list
-- `docs/roadmap/55a-iommu-substrate.md` — owner of R2
-- `docs/roadmap/60-networking-and-github.md` — candidate owner of R1
+- `docs/roadmap/55c-ring-3-driver-correctness-closure.md` — owner of R1 and R2
+- `docs/roadmap/tasks/55c-ring-3-driver-correctness-closure-tasks.md` — execution plan for R1 and R2
 - `docs/roadmap/58-release-1-0-gate.md` — gate that R2 must clear

@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-58
-**Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55 (Hardware Substrate) ✅
+**Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55c (Ring-3 Driver Correctness Closure)
 **Builds on:** Converts the convergence, hardening, and hardware work into an explicit release promise, while giving the project a disciplined place to decide whether the local-system branch is in scope for 1.0 or deferred to 1.x
 **Primary Components:** docs/roadmap/README.md, README.md, docs/README.md, xtask validation flows, release and support-matrix documentation
 
@@ -54,9 +54,9 @@ Align the top-level docs, roadmap, learning-doc index, support notes, and versio
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Headless baseline | Phase 53 headless/reference gates (see [Phase 53 § Gate Bundle](./53-headless-hardening.md#gate-bundle)) pass on a post-Phase 53a image, and Phase 55 hardware work is complete | Pull missing validation or support-boundary work into this phase |
+| Headless baseline | Phase 53 headless/reference gates (see [Phase 53 § Gate Bundle](./53-headless-hardening.md#gate-bundle)) pass on a post-Phase 53a image, and the Phase 55c ring-3 driver correctness closure is complete for the shipped hardware story | Pull missing validation or support-boundary work into this phase |
 | Optional GUI baseline | If 1.0 is meant to include a local-system milestone, Phase 47 and Phases 56-57 are complete enough to justify it | Otherwise explicitly defer the local-system branch to 1.x |
-| Release-evidence baseline | The project can name the exact tests, targets, and docs that prove the claim — these are the Phase 53 gate bundle plus any Phase 55 hardware-specific gates | Add the missing release-gate automation or manual checklist items |
+| Release-evidence baseline | The project can name the exact tests, targets, and docs that prove the claim — these are the Phase 53 gate bundle plus the Phase 55 / 55c hardware and ring-3-driver closure gates that back the supported-driver story | Add the missing release-gate automation or manual checklist items |
 | Versioning baseline | The project agrees that the kernel crate version tracks the roadmap phase number even if the public release language says "1.0" | Add the missing versioning documentation and cross-reference updates |
 
 ## Important Components and How They Work
@@ -66,18 +66,21 @@ Align the top-level docs, roadmap, learning-doc index, support notes, and versio
 The support matrix is the central artifact of the phase. It starts from the
 bounded [Phase 53 support boundary](./53-headless-hardening.md#support-boundary)
 — QEMU x86_64 with OVMF, SSH-first remote admin, shipped ports and Rust std
-path — and extends it only where Phase 55 hardware work adds new supported
-targets. The matrix ties together hardware scope, validated workflows, release
-non-goals, and the public story the project can defend.
+path — and extends it only where the Phase 55 hardware work and Phase 55c
+correctness closure add new supported targets or stronger evidence for the
+ring-3 driver story. The matrix ties together hardware scope, validated
+workflows, release non-goals, and the public story the project can defend.
 
 ### Validation gate bundle
 
 The validation gate bundle starts from the
 [Phase 53 gate bundle](./53-headless-hardening.md#gate-bundle) (exact `cargo
-xtask` commands and manual operator checks) and adds any Phase 55
-hardware-specific gates. It defines which commands and manual checks are
-required for the selected release promise and serves as the operational proof
-behind the release contract.
+xtask` commands and manual operator checks) and adds the Phase 55
+hardware-specific gates plus the Phase 55c closure evidence for SSH-over-e1000
+wake correctness, `--iommu` device-smoke parity, and driver-restart `EAGAIN`
+visibility. It defines which commands and manual checks are required for the
+selected release promise and serves as the operational proof behind the release
+contract.
 
 ### Documentation and version alignment
 
@@ -86,7 +89,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 ## How This Builds on Earlier Phases
 
 - Builds on Phase 53's bounded headless/reference baseline — the support boundary, gate bundle, and closure contract are fixed inputs, not re-opened scope.
-- Builds on Phase 55's hardware promise as additional supported targets beyond the Phase 53 QEMU reference.
+- Builds on Phase 55's hardware promise and Phase 55c's ring-3 driver correctness closure as additional supported-target evidence beyond the Phase 53 QEMU reference.
 - Optionally includes the local-system milestones from Phase 47 and Phases 56-57 if the project chooses the broader release target.
 - Creates the stable boundary after which later ecosystem work can clearly be called 1.x growth instead of hidden release debt.
 - Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 58 can close.
@@ -116,7 +119,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 ## Acceptance Criteria
 
 - A written 1.0 support matrix exists that starts from the Phase 53 bounded headless/reference baseline, with explicit supported workflows, hardware scope, and non-goals.
-- The project has a documented validation bundle that extends the Phase 53 gate bundle with any Phase 55 hardware-specific gates.
+- The project has a documented validation bundle that extends the Phase 53 gate bundle with the Phase 55 hardware-specific gates plus the Phase 55c closure evidence for SSH-over-e1000 wake correctness, `--iommu` device-smoke parity, and userspace-visible restart handling.
 - The docs explicitly state whether 1.0 is headless/reference-only or also includes the local-system branch.
 - Top-level docs, roadmap docs, and version references all reflect the same release promise.
 - Later work such as toolchains, GitHub integration, Node.js, and Claude Code is explicitly framed as 1.x growth if not part of the chosen release.

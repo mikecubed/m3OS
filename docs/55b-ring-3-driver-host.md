@@ -240,9 +240,8 @@ planning gap rather than an implementation failure.
 ## Deferred or Later-Phase Topics
 
 > **Note:** Two concrete follow-ups discovered during the Phase 55b closure
-> pass — `sys_net_send` for userspace-observable EAGAIN (owner: Phase 60)
-> and the IOMMU VT-d MMIO translation bug (owner: Phase 55a follow-up,
-> must-fix before Phase 58) — are tracked separately in
+> pass — userspace-visible send-path restart handling and the IOMMU VT-d MMIO
+> translation bug — are now both owned by Phase 55c and are tracked separately in
 > [`docs/appendix/phase-55b-residuals.md`](./appendix/phase-55b-residuals.md)
 > so they can be scheduled against their real owners rather than left
 > implicit here.
