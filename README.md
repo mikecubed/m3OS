@@ -8,8 +8,9 @@ networking) on top of the VirtIO baseline, an IOMMU substrate that routes
 device DMA through per-device VT-d / AMD-Vi translation domains, and a roadmap
 toward stronger service isolation and broader platform support.
 
-**Current kernel version:** v0.55.2 (Phase 55 hardware substrate + Phase 55a
-IOMMU substrate + Phase 55b ring-3 driver host).
+**Current kernel version:** v0.55.3 (Phase 55 hardware substrate + Phase 55a
+IOMMU substrate + Phase 55b ring-3 driver host + Phase 55c ring-3 driver correctness
+closure).
 
 ## Quick Start
 

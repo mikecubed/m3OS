@@ -1,6 +1,6 @@
 # Phase 55c - Ring-3 Driver Correctness Closure
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-55c
 **Depends on:** Phase 55b (Ring-3 Driver Host) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 50 (IPC Completion) ✅, Phase 52c (Kernel Architecture Evolution) ✅, Phase 6 (IPC Core) ✅
 **Builds on:** Phase 55b shipped ring-3 NVMe and e1000 drivers but left three ring-3-specific correctness gaps unresolved. Two were recorded explicitly in `docs/appendix/phase-55b-residuals.md` — **R1** (`sys_net_send` surface for userspace-visible `EAGAIN` during driver restart) and **R2** (IOMMU VT-d identity-map coverage for device MMIO BARs under `--iommu`). The third — **R3** (event-multiplexing deadlock in the ring-3 driver main loop) — was discovered post-closure when SSH over `--device e1000` hung after the TCP handshake. Phase 55c closes all three under one ring-3-correctness umbrella so Phase 56 (display, input) starts from a driver substrate that is actually correct, not just partially working.
@@ -232,6 +232,7 @@ The removal of `irq.wait()` from the hot path is the load-bearing change. The dr
 ## Companion Task List
 
 - [Phase 55c Task List](./tasks/55c-ring-3-driver-correctness-closure-tasks.md)
+- [Phase 55c Learning Doc](./55c-ring-3-driver-correctness-closure-learning.md)
 
 ## How Real OS Implementations Differ
 
