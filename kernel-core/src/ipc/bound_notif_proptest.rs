@@ -4,7 +4,20 @@
 //! that no sequence of `bind`, `unbind`, `signal` / `send` / `recv` can lose
 //! a wake or accidentally merge a notification signal with a message label.
 //!
-//! # Model
+//! # Model scope — entry-state fast path only
+//!
+//! This model captures the **already-pending entry-state fast path** of
+//! `recv_msg_with_notif` (`kernel/src/ipc/endpoint.rs`): the behavior when
+//! signal bits or messages are already pending at the moment `recv()` is
+//! called, before any blocking occurs.
+//!
+//! **This model does NOT cover the blocked-wake path.**  In the real kernel,
+//! when the caller blocks and is later woken, the ordering is different: the
+//! scheduler's `take_message` is checked first (lines 467–469), and only if
+//! no queued message is found are notification bits drained (lines 471–485).
+//! Furthermore, if both a message and bits arrive during the block, the
+//! message is returned and the bits are re-signalled for the next recv
+//! (lines 479–481).  The model below does not reproduce that path.
 //!
 //! The model maintains two independent pending pools plus a binding flag:
 //!
@@ -14,10 +27,15 @@
 //!
 //! `signal()` always OR-accumulates into `signal_bits` regardless of binding
 //! state (the notification pending word is always updated, mirroring real
-//! hardware). `recv()` dispatches at most one wake per call:
-//! 1. If `bound && signal_bits != 0` → drain and dispatch the bits (highest priority).
+//! hardware). Within this fast-path model, `recv()` dispatches at most one
+//! wake per call using the entry-state priority order:
+//! 1. If `bound && signal_bits != 0` → drain and dispatch the bits.
 //! 2. Else if `message_queue` is non-empty → dispatch the front message.
 //! 3. Otherwise → no pending wake (returns `None`).
+//!
+//! This notification-first order reflects the fast path in
+//! `recv_msg_with_notif` (the `register_recv_waiter` already-pending check).
+//! It is **not** a claim about the blocked-wake ordering in the real kernel.
 //!
 //! Signals accumulated while unbound are preserved in `signal_bits` and become
 //! observable after the next `bind()`.
@@ -55,8 +73,9 @@ mod tests {
     /// Simplified sequential model of the bound-notification recv path.
     ///
     /// This is intentionally not lock-free; the correctness of the sequential
-    /// interleaving is what we are proving. The kernel's actual implementation
-    /// (Track B) must produce the same observable outcomes.
+    /// interleaving is what we are proving for the already-pending entry-state
+    /// fast path. The real kernel has additional blocked-wake behavior that is
+    /// documented in the module-level scope note above.
     ///
     /// The `bound` flag models whether the receiver (TCB) is currently bound to
     /// a notification object. Signals always OR-accumulate into `signal_bits`
@@ -105,10 +124,11 @@ mod tests {
 
         /// Dispatch one wake, or return `None` if nothing is dispatchable.
         ///
-        /// Notifications take priority over messages (kernel-first drain path,
-        /// mirroring `recv_msg_with_notif`): if `self.bound` and `signal_bits
-        /// != 0`, the bits are drained and returned before the message queue is
-        /// inspected.
+        /// Models the **entry-state fast path** of `recv_msg_with_notif`: when
+        /// signal bits are already pending at entry (before any block), they are
+        /// drained first. This does not model the blocked-wake ordering, where
+        /// the real kernel checks for a queued message before draining bits.
+        ///
         /// Notification bits are only dispatched when `self.bound == true`.
         fn recv(&mut self) -> Option<WakeKind> {
             if self.bound && self.signal_bits != 0 {
@@ -191,11 +211,12 @@ mod tests {
             // we can validate no-merge.
             let mut accumulated_bits: u64 = 0;
 
-            // A-R2 pending-notification obligation:
+            // A-R2 pending-notification obligation (entry-state fast path):
             // whenever the model has signal bits pending and the receiver is
             // bound, the next Op::Recv must dispatch them as a notification
-            // (notifications take priority over queued messages); bits are only
-            // preserved when the receiver is unbound.
+            // (fast-path entry-state ordering); bits are only preserved when
+            // the receiver is unbound.  This obligation tracks the model's
+            // sequential behaviour, not the real kernel's blocked-wake path.
             let mut pending_notification: Option<u64> = None;
 
             for op in ops {
@@ -326,12 +347,12 @@ mod tests {
             }
         }
 
-        /// Signals arriving during a blocked recv are never merged with an
-        /// earlier send's label: notification bits and message labels stay
-        /// in independent pools and never cross-contaminate.
+        /// Pending signal bits and message labels, both already present at recv
+        /// entry, stay in independent pools and never cross-contaminate.
         ///
         /// The model is explicitly bound before the send/signal so that both
-        /// sources are observable, directly exercising the bound path.
+        /// sources are observable.  This exercises the entry-state fast path
+        /// only: both items are enqueued before any recv is issued.
         #[test]
         fn signals_never_merge_with_message_labels(
             label in any::<u64>(),
@@ -347,8 +368,8 @@ mod tests {
             model.signal(bits);
 
             if bits != 0 {
-                // Notifications take priority: first recv must return the
-                // notification without any label contamination.
+                // Fast-path entry-state ordering: signal bits already pending
+                // at entry are drained before the message queue is inspected.
                 match model.recv() {
                     Some(WakeKind::Notification(got_bits)) => {
                         prop_assert_eq!(got_bits, bits, "notification bits must be unmodified");
