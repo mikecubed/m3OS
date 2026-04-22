@@ -6806,24 +6806,26 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
         });
-        // Phase 55b Track F.3d-3: e1000 crash-and-restart smoke.
-        // Exercises RemoteNic::send_frame → DriverRestarting (kernel log)
-        // and the kill → restart → send cycle. Requires --device e1000.
-        // Gated behind the same M3OS_ENABLE_CRASH_SMOKE env-var as the NVMe
-        // smoke; pass --test e1000-restart-crash to select only this test.
-        tests.push(RegressionTest {
-            name: "e1000-restart-crash",
-            description: "Phase 55b F.3d-3: e1000-crash-smoke — kill e1000_driver → \
-                 RESTART_SUSPECTED → restart → post-restart send success",
-            guest_steps: e1000_restart_crash_steps,
-            timeout_secs: 180,
-            devices: DeviceSet {
-                nvme: false,
-                e1000: true,
-                iommu: false,
-            },
-        });
     }
+
+    // Phase 55b Track F.3d-3 / Phase 55c Track I.4: e1000 crash-and-restart smoke.
+    //
+    // Exercises RemoteNic::send_frame → DriverRestarting / EAGAIN and the
+    // kill → restart → post-restart send path. This remains part of the normal
+    // regression registry so `cargo xtask regression --test e1000-restart-crash`
+    // is always a valid command, matching the documented acceptance path.
+    tests.push(RegressionTest {
+        name: "e1000-restart-crash",
+        description: "Phase 55b F.3d-3 / Phase 55c I.4: e1000-crash-smoke — kill \
+             e1000_driver → EAGAIN / restart suspected → restart → post-restart send success",
+        guest_steps: e1000_restart_crash_steps,
+        timeout_secs: 180,
+        devices: DeviceSet {
+            nvme: false,
+            e1000: true,
+            iommu: false,
+        },
+    });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
     //

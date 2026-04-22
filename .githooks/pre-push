@@ -41,6 +41,12 @@ fi
 echo "pre-push: running cargo xtask smoke-test..."
 cargo xtask smoke-test --timeout 300
 
+echo "pre-push: running cargo xtask device-smoke --device nvme --iommu..."
+cargo xtask device-smoke --device nvme --iommu --timeout 90
+
+echo "pre-push: running cargo xtask device-smoke --device e1000 --iommu..."
+cargo xtask device-smoke --device e1000 --iommu --timeout 90
+
 echo "pre-push: running cargo xtask regression..."
 cargo xtask regression --timeout 90
 

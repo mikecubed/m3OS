@@ -128,8 +128,23 @@ fi
 
 sleep 1
 
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [ -z "$PYTHON_BIN" ]; then
+    {
+        echo "run=${RUN_ID}"
+        echo "banner_exit=-1"
+        echo "ssh_exit=-1"
+        echo "class=missing-python"
+        echo "log=${LOG}"
+        echo "ssh_log=${SSH_LOG}"
+        echo "banner_log=${BANNER_LOG}"
+    } > "$SUMMARY"
+    cat "$SUMMARY"
+    exit 5
+fi
+
 set +e
-python - "$SSH_PORT" "$BANNER_TIMEOUT_S" "$BANNER_LOG" <<'PY'
+"$PYTHON_BIN" - "$SSH_PORT" "$BANNER_TIMEOUT_S" "$BANNER_LOG" <<'PY'
 import pathlib
 import socket
 import sys
