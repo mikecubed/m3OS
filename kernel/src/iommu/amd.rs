@@ -658,6 +658,8 @@ impl IommuUnit for AmdViUnit {
             )?;
             offset += 4096;
         }
+        self.invalidate_iotlb(domain)
+            .map_err(|_| DomainError::HardwareFault)?;
         Ok(())
     }
 

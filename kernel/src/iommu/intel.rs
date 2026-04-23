@@ -331,10 +331,10 @@ impl VtdUnit {
         // Low 64 bits:
         //   bit 0    : present
         //   bit 1    : fault-processing disable (0 → faults enabled)
-        //   bits 3:2 : translation type (00 = legacy second-level)
+        //   bits 3:2 : translation type (00 = legacy multi-level / second-level)
         //   bits 11:4: reserved
         //   bits 63:12 : second-level page-table pointer (pfn-aligned)
-        let low = (sl_root_phys & !0xFFFu64) | 0x1;
+        let low = sl_root_phys & !0xFFFu64;
         // High 64 bits:
         //   bits 2:0   : address-width (48-bit = value 2, per §9.3)
         //   bits 15:8  : reserved
@@ -348,8 +348,10 @@ impl VtdUnit {
         };
         let high = aw_code | ((vtd_domain_id as u64) << 8);
 
-        Self::write_table_entry(ctx_phys, entry_offset, low);
         Self::write_table_entry(ctx_phys, entry_offset + 8, high);
+        Self::write_table_entry(ctx_phys, entry_offset, low);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Self::write_table_entry(ctx_phys, entry_offset, low | 0x1);
         Ok(())
     }
 
@@ -834,6 +836,10 @@ impl IommuUnit for VtdUnit {
         if let Some(state) = self.domains.iter_mut().find(|d| d.id == domain) {
             state.pt_pages = pt_pages;
         }
+        // Fresh translations are not guaranteed to become visible until the
+        // IOTLB is invalidated; otherwise devices can keep faulting on a
+        // just-mapped IOVA range.
+        self.invalidate_iotlb_global();
         Ok(())
     }
 
@@ -975,7 +981,9 @@ impl VtdUnit {
         if let Some(state) = self.domains.iter_mut().find(|d| d.id == domain_id) {
             state.bound_bdf = ((bus as u16) << 8) | (dev_fn as u16);
         }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.invalidate_context_cache_global();
+        self.invalidate_iotlb_global();
         Ok(())
     }
 }

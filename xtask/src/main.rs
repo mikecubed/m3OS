@@ -25,7 +25,7 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// so QEMU sees exactly one `-machine` flag rather than two — multiple
 /// `-machine` arguments would let the later invocation clobber the earlier
 /// one and silently drop settings.
-pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off"];
+pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -1731,9 +1731,17 @@ fn qemu_args_with_devices_resolved(
     // Phase 55 (F.1): `--device e1000` swaps the virtio-net-pci device out for
     // the Intel 82540EM classic e1000. The netdev remains unchanged.
     let nic_device = if devices.e1000 {
-        "e1000,netdev=net0"
+        if devices.iommu {
+            "e1000,netdev=net0,addr=0x3"
+        } else {
+            "e1000,netdev=net0"
+        }
     } else {
-        "virtio-net-pci,netdev=net0"
+        if devices.iommu {
+            "virtio-net-pci,netdev=net0,addr=0x3"
+        } else {
+            "virtio-net-pci,netdev=net0"
+        }
     };
     args.extend([
         "-device".to_string(),
@@ -1745,10 +1753,20 @@ fn qemu_args_with_devices_resolved(
     // Phase 24: virtio-blk data disk.
     let data_disk = uefi_image.parent().unwrap().join("disk.img");
     if data_disk.exists() {
-        args.extend([
-            "-drive".to_string(),
-            format!("file={},format=raw,if=virtio", data_disk.display()),
-        ]);
+        if devices.iommu {
+            let data_disk_addr = if devices.nvme { "0x5" } else { "0x4" };
+            args.extend([
+                "-drive".to_string(),
+                format!("file={},if=none,id=osdisk0,format=raw", data_disk.display()),
+                "-device".to_string(),
+                format!("virtio-blk-pci,drive=osdisk0,addr={data_disk_addr}"),
+            ]);
+        } else {
+            args.extend([
+                "-drive".to_string(),
+                format!("file={},format=raw,if=virtio", data_disk.display()),
+            ]);
+        }
     }
 
     // Phase 55 (F.1): `--device nvme` adds a second drive behind a QEMU NVMe
@@ -1762,14 +1780,18 @@ fn qemu_args_with_devices_resolved(
             "-drive".to_string(),
             format!("file={},if=none,id=nvme0,format=raw", nvme_path.display()),
             "-device".to_string(),
-            "nvme,serial=deadbeef,drive=nvme0".to_string(),
+            if devices.iommu {
+                "nvme,serial=deadbeef,drive=nvme0,addr=0x4".to_string()
+            } else {
+                "nvme,serial=deadbeef,drive=nvme0".to_string()
+            },
         ]);
     }
 
     // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
     // the q35 machine. The partnering `q35,kernel_irqchip=split` machine
     // property is emitted by `build_machine_arg` above; `IOMMU_QEMU_ARGS`
-    // carries only the `-device intel-iommu,x-scalable-mode=off` pair.
+    // carries only the `-device intel-iommu,x-scalable-mode=off,aw-bits=48` pair.
     if devices.iommu {
         args.extend(IOMMU_QEMU_ARGS.iter().map(|s| (*s).to_string()));
     }
@@ -8611,6 +8633,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qemu_args_with_iommu_pin_driver_sentinel_slots() {
+        let fake_nvme = Path::new("/tmp/m3os-test-nvme-iommu-never-created.img");
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: true,
+            },
+            Some(fake_nvme),
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-net-pci,netdev=net0,addr=0x3"]),
+            "q35/iommu should pin the default NIC to the e1000 sentinel slot"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "nvme,serial=deadbeef,drive=nvme0,addr=0x4"]),
+            "q35/iommu should pin the NVMe controller to the ring-3 driver sentinel slot"
+        );
+    }
+
+    #[test]
+    fn qemu_args_with_iommu_and_nvme_move_root_disk_off_nvme_slot() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("m3os-xtask-iommu-{unique}"));
+        fs::create_dir_all(&temp_root).unwrap();
+        let uefi = temp_root.join("boot-uefi-m3os.img");
+        let disk = temp_root.join("disk.img");
+        fs::write(&uefi, []).unwrap();
+        fs::write(&disk, []).unwrap();
+
+        let args = qemu_args_with_devices_resolved(
+            &uefi,
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: true,
+            },
+            Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-blk-pci,drive=osdisk0,addr=0x5"]),
+            "q35/iommu + nvme should move the root virtio-blk disk off the NVMe sentinel slot"
+        );
+
+        let _ = fs::remove_file(&uefi);
+        let _ = fs::remove_file(&disk);
+        let _ = fs::remove_dir(&temp_root);
+    }
+
     // --------------------------------------------------------------
     // Phase 55a Track F.1: `--iommu` flag parsing + QEMU wiring
     // --------------------------------------------------------------
@@ -8652,8 +8739,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|w| w == ["-device", "intel-iommu,x-scalable-mode=off"]),
-            "expected `-device intel-iommu,x-scalable-mode=off` pair when --iommu is set"
+                .any(|w| w == ["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"]),
+            "expected `-device intel-iommu,x-scalable-mode=off,aw-bits=48` pair when --iommu is set"
         );
         assert!(
             args.windows(2)
@@ -8693,7 +8780,7 @@ mod tests {
         // `build_machine_arg`.
         assert_eq!(
             IOMMU_QEMU_ARGS,
-            &["-device", "intel-iommu,x-scalable-mode=off",]
+            &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48",]
         );
         let args = qemu_args_with_devices_resolved(
             Path::new("target/boot-uefi-m3os.img"),

@@ -667,9 +667,12 @@ pub fn claim_pci_device_by_bdf(
     Err(ClaimError::NotFound)
 }
 
-/// Look up the IOMMU unit for `dev`, request a domain, and pre-map any
-/// reserved regions. Returns `(None, None)` on any failure — the caller
-/// proceeds with an identity-fallback handle.
+/// Look up the IOMMU unit for `dev`, request a domain, bind the requester to
+/// it, and pre-map any reserved regions.
+///
+/// Returns `(None, None)` on any failure — the caller proceeds with an
+/// identity-fallback handle instead of handing drivers an unbound translated
+/// domain.
 fn attach_domain(
     dev: &PciDevice,
 ) -> (
@@ -690,6 +693,24 @@ fn attach_domain(
     match crate::iommu::registry::create_domain(unit_index) {
         Ok(domain) => {
             let id = domain.id();
+            if let Err(e) = crate::iommu::registry::bind_pci_device(
+                unit_index,
+                id,
+                dev.bus,
+                dev.device,
+                dev.function,
+            ) {
+                log::warn!(
+                    "[pci] iommu: bind_device on unit {} failed for {:02x}:{:02x}.{}: {} — falling back to identity",
+                    unit_index,
+                    dev.bus,
+                    dev.device,
+                    dev.function,
+                    e,
+                );
+                let _ = crate::iommu::registry::destroy_domain(unit_index, domain);
+                return (None, None);
+            }
             // Pre-map firmware reserved regions so RMRR-owned devices
             // keep working (E.4).
             crate::iommu::registry::pre_map_reserved(unit_index, id);

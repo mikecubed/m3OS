@@ -67,6 +67,25 @@ impl RegisteredUnit {
             RegisteredUnit::Identity(_) => "identity",
         }
     }
+
+    /// Bind a PCI requester BDF to an existing domain on the owning unit.
+    ///
+    /// VT-d currently implements per-device binding directly. Other unit
+    /// types return `NotAvailable` so higher layers can degrade cleanly
+    /// instead of handing drivers an unbound translated domain.
+    #[allow(dead_code)]
+    pub fn bind_pci_device(
+        &mut self,
+        domain: DomainId,
+        bus: u8,
+        device: u8,
+        function: u8,
+    ) -> Result<(), IommuError> {
+        match self {
+            RegisteredUnit::Vtd(u) => u.bind_device(domain, bus, device, function),
+            RegisteredUnit::AmdVi(_) | RegisteredUnit::Identity(_) => Err(IommuError::NotAvailable),
+        }
+    }
 }
 
 impl IommuUnit for RegisteredUnit {
@@ -251,6 +270,24 @@ pub fn destroy_domain(unit_index: usize, domain: DmaDomain) -> Result<(), IommuE
         return Err(IommuError::NotAvailable);
     };
     unit.destroy_domain(domain)
+}
+
+/// Bind `(bus, device, function)` to an existing domain on the given unit.
+///
+/// This is the claim-time step that makes the IOMMU use the new domain for a
+/// requester's DMA traffic. Without it, later `map()` calls populate a domain
+/// page table that no device ever actually uses.
+#[allow(dead_code)]
+pub fn bind_pci_device(
+    unit_index: usize,
+    domain: DomainId,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Result<(), IommuError> {
+    let mut reg = REGISTRY.lock();
+    let unit = reg.get_mut(unit_index).ok_or(IommuError::NotAvailable)?;
+    unit.bind_pci_device(domain, bus, device, function)
 }
 
 /// Install a mapping in the domain. Thin delegator through the registry
