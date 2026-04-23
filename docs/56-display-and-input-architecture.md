@@ -258,7 +258,7 @@ Phase 56 exposes these only to `display_server`-internal code and to the control
 | Verb | Effect |
 |---|---|
 | `register_bind(modifier_mask, keycode)` | Allocates a new `BindId` or returns a typed error if already registered. |
-| `unregister_bind(bind_id)` | Removes the bind. |
+| `unregister_bind(modifier_mask, keycode)` | Removes the bind matching the `(modifier_mask, keycode)` pair. Mirrors `ControlCommand::UnregisterBind`. |
 | `match_bind(modifier_mask, keycode) -> Option<BindId>` | Pure-logic lookup used by the dispatcher and unit tests. |
 
 The matcher and grab state machine live in `kernel-core::input::bind_table` (D.4) so the policy is host-testable.

@@ -54,7 +54,7 @@ pub const MAX_FRAME_BODY_LEN: u16 = 4096;
 
 /// Hard upper bound on `SurfaceListReply` / `FrameStatsReply` entry count.
 /// Decoder rejects larger counts with
-/// [`ProtocolError::BodyTooLarge`] so a malformed control-socket peer
+/// [`ProtocolError::ListTooLong`] so a malformed control-socket peer
 /// cannot coerce a large allocation.
 pub const MAX_LIST_ENTRIES: u32 = 256;
 
