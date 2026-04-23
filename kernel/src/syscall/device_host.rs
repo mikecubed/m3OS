@@ -1409,7 +1409,7 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
 
     // ---- Allocate a vector (MSI preferred, INTx fallback) ------------------
 
-    let vector = match allocate_device_vector(key) {
+    let allocated_vector = match allocate_device_vector(key) {
         Ok(v) => v,
         Err(e) => {
             // On fresh-allocation unwind, free the slot we just took.
@@ -1425,7 +1425,15 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
 
     // ---- Install binding (registry + ISR mirror + dispatch table) ----------
 
-    if let Err(e) = bind_irq_vector(pid, key, vector, notif, bit_index, kernel_owns_notif) {
+    if let Err(e) = bind_irq_vector(
+        pid,
+        key,
+        allocated_vector.vector,
+        allocated_vector.legacy_irq_line,
+        notif,
+        bit_index,
+        kernel_owns_notif,
+    ) {
         // On fresh-allocation unwind, free the slot we just took.
         if kernel_owns_notif {
             crate::ipc::notification::free(notif);
@@ -1434,7 +1442,7 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
         // back into a free slot in MSI_POOL. Silent failure here is safe —
         // the vector stays reserved but no ISR is wired (slow-leak only
         // until driver exits, at which point its MSI cap is disabled).
-        reclaim_device_vector(vector);
+        reclaim_device_vector(allocated_vector.vector);
         return match e {
             IrqRegistryError::CapacityExceeded => NEG_ENFILE,
             IrqRegistryError::VectorBusy => NEG_EINVAL,
@@ -1454,8 +1462,8 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
         Ok(h) => h,
         Err(_) => {
             // Unwind every step in reverse.
-            let _ = unbind_irq_vector(vector);
-            reclaim_device_vector(vector);
+            let _ = unbind_irq_vector(allocated_vector.vector);
+            reclaim_device_vector(allocated_vector.vector);
             // Only release the notification slot when the kernel allocated it.
             if kernel_owns_notif {
                 crate::ipc::notification::release(notif);
@@ -1471,7 +1479,7 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_a
         key.bus,
         key.dev,
         key.func,
-        vector,
+        allocated_vector.vector,
         notif.0,
         bit_index,
         handle,
@@ -1493,12 +1501,18 @@ enum VectorAllocError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllocatedDeviceVector {
+    vector: u8,
+    legacy_irq_line: Option<u8>,
+}
+
 /// Reserve and program an IDT vector for the device behind `key`.
 ///
 /// Order follows the B.4 acceptance: MSI-X if advertised, MSI if not, INTx
 /// as last resort. The returned vector is within the device-IRQ stub bank
 /// so [`install_device_irq_shim`] can arm it.
-fn allocate_device_vector(key: DeviceCapKey) -> Result<u8, VectorAllocError> {
+fn allocate_device_vector(key: DeviceCapKey) -> Result<AllocatedDeviceVector, VectorAllocError> {
     // Find the PciDevice descriptor through the claim slot. We do not
     // hold the registry lock across `allocate_msi_vectors` because MSI
     // programming touches PCI config space and may take the PCI registry
@@ -1513,12 +1527,18 @@ fn allocate_device_vector(key: DeviceCapKey) -> Result<u8, VectorAllocError> {
     };
 
     if let Some(allocated) = crate::pci::allocate_msi_vectors(&dev_copy, 1) {
-        return Ok(allocated.first_vector);
+        return Ok(AllocatedDeviceVector {
+            vector: allocated.first_vector,
+            legacy_irq_line: None,
+        });
     }
 
     // Fallback: legacy INTx on the first free slot in the device-IRQ bank.
     if let Some(vec) = crate::pci::reserve_msi_vectors(1) {
-        return Ok(vec);
+        return Ok(AllocatedDeviceVector {
+            vector: vec,
+            legacy_irq_line: (dev_copy.interrupt_line != 0xFF).then_some(dev_copy.interrupt_line),
+        });
     }
 
     Err(VectorAllocError::Unavailable)
@@ -1544,6 +1564,7 @@ fn bind_irq_vector(
     pid: Pid,
     key: DeviceCapKey,
     vector: u8,
+    legacy_irq_line: Option<u8>,
     notif: NotifId,
     bit_index: u8,
     kernel_owns_notif: bool,
@@ -1579,6 +1600,22 @@ fn bind_irq_vector(
         let mut reg = IRQ_BINDING_REGISTRY.lock();
         let _ = reg.release_vector(vector);
         return Err(IrqRegistryError::VectorBusy);
+    }
+
+    if let Some(irq_line) = legacy_irq_line {
+        if crate::acpi::io_apic_address().is_some() {
+            crate::arch::x86_64::apic::route_pci_irq(irq_line, vector);
+            log::info!(
+                "device_host.irq_subscribe routed legacy INTx line {} to vector {:#x}",
+                irq_line,
+                vector,
+            );
+        } else {
+            log::warn!(
+                "device_host.irq_subscribe legacy INTx line {} has no I/O APIC routing; IRQ may not fire",
+                irq_line,
+            );
+        }
     }
 
     publish_shim_binding(offset, notif, bit_index);

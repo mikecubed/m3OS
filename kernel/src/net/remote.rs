@@ -343,8 +343,9 @@ impl RemoteNic {
             let mut bulk = alloc::vec::Vec::with_capacity(hdr_bytes.len() + frame.len());
             bulk.extend_from_slice(&hdr_bytes);
             bulk.extend_from_slice(frame);
+            let bulk_len = bulk.len();
             scheduler::deliver_bulk(task_id, bulk);
-            let msg = Message::with2(NET_SEND_FRAME as u64, frame.len() as u64, 0);
+            let msg = Message::with2(NET_SEND_FRAME as u64, 0, bulk_len as u64);
             if endpoint::send(task_id, endpoint, msg) {
                 forwarded += 1;
             } else {

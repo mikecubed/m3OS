@@ -245,10 +245,12 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         7 => {
             // notify_wait(notif_cap_handle) — blocks until bits are pending.
-            // Errors return 0, not u64::MAX.
-            match cap {
-                Capability::Notification(notif_id) => notification::wait(task_id, notif_id),
-                _ => 0,
+            // DeviceIrq caps alias their underlying notification so ring-3
+            // drivers can wait on the handle returned by
+            // sys_device_irq_subscribe directly. Errors return 0, not u64::MAX.
+            match cap.ipc_notification_id() {
+                Some(notif_id) => notification::wait(task_id, notif_id),
+                None => 0,
             }
         }
         8 => {
@@ -648,7 +650,10 @@ fn sys_notif_bind(task_id: crate::task::TaskId, notif_cap_handle: u64, ep_cap_ha
         return NEG_EBADF;
     }
     let notif_id = match scheduler::task_cap(task_id, notif_cap_handle as CapHandle) {
-        Ok(Capability::Notification(id)) => id,
+        Ok(cap) => match cap.ipc_notification_id() {
+            Some(id) => id,
+            None => return NEG_EBADF,
+        },
         _ => return NEG_EBADF,
     };
 
