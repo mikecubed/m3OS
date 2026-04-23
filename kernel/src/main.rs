@@ -261,6 +261,11 @@ fn init_task() -> ! {
 fn remote_nic_ingress_task() -> ! {
     use kernel_core::driver_ipc::net::{NET_LINK_STATE, NET_RX_FRAME};
 
+    // Keep the fire-and-forget RX ingress receiver near the front of the
+    // run queue so ring-3 NIC publish paths spend less time blocked in the
+    // rendezvous send window between packets.
+    let _ = task::sys_nice(-9, 0);
+
     let my_id = task::current_task_id().expect("[net-ingress] no task id");
     let ep_id =
         ipc::registry::lookup("net.nic.ingress").expect("[net-ingress] endpoint not in registry");
@@ -599,6 +604,10 @@ fn serial_echo(s: &str) {
 /// [`task::scheduler::block_current_unless_woken`]; on wake it drains all
 /// pending frames through the network dispatch stack.
 fn net_task() -> ! {
+    // Prioritize protocol dispatch slightly above normal userspace so queued
+    // ring-3 NIC RX/TX work drains promptly once the ingress task wakes us.
+    let _ = task::sys_nice(-8, 0);
+
     // Register this task's id with the virtio-net ISR so it can wake us.
     // The ring-3 e1000 driver wakes the task via RemoteNic IPC — no kernel
     // task-id registration is needed for it.
@@ -613,9 +622,11 @@ fn net_task() -> ! {
         net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
         let mut any =
             net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        let mut drained_remote_rx = net::remote::RemoteNic::drain_rx_queue();
         let mut drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
-        while any || drained_remote_tx != 0 {
+        while any || drained_remote_rx != 0 || drained_remote_tx != 0 {
             net::dispatch::process_rx();
+            drained_remote_rx = net::remote::RemoteNic::drain_rx_queue();
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
             drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
         }

@@ -29,8 +29,9 @@
 //!
 //! The ring-3 driver uses `ipc_send_buf` to deliver a `NET_RX_FRAME` header
 //! (8 bytes) + bulk frame. The kernel net task's existing receive endpoint
-//! calls `RemoteNic::inject_rx_frame` directly with the decoded frame bytes;
-//! that function calls `dispatch::process_rx_frames` and sets `NIC_WOKEN`.
+//! calls `RemoteNic::inject_rx_frame`, which validates and queues the raw frame
+//! bytes, then wakes the shared net task. The actual protocol dispatch runs in
+//! `drain_rx_queue`, matching the deferred-processing model used by virtio-net.
 //!
 //! # Link-state
 //!
@@ -57,6 +58,11 @@ use spin::Mutex;
 /// matching the Phase 16 net-stack convention for overflow conditions.
 const TX_QUEUE_DEPTH: usize = 64;
 
+/// Maximum number of received frames staged for deferred dispatch by the
+/// shared network task. When this queue overflows frames are dropped so the
+/// ring-3 driver does not block indefinitely on synchronous ingress IPC.
+const RX_QUEUE_DEPTH: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Global facade registry
 // ---------------------------------------------------------------------------
@@ -69,6 +75,9 @@ struct NicEntry {
     /// Pending TX frames: raw Ethernet bytes waiting to be forwarded to the
     /// driver endpoint via IPC.
     tx_queue: VecDeque<alloc::vec::Vec<u8>>,
+    /// Pending RX frames: raw Ethernet bytes staged by the net-ingress IPC
+    /// task and later dispatched by the shared net task.
+    rx_queue: VecDeque<alloc::vec::Vec<u8>>,
 }
 
 /// Global slot for the registered `RemoteNic`. `None` while no ring-3 NIC
@@ -131,6 +140,7 @@ impl RemoteNic {
                 endpoint,
                 mac,
                 tx_queue: VecDeque::new(),
+                rx_queue: VecDeque::new(),
             });
         }
         REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
@@ -208,6 +218,7 @@ impl RemoteNic {
                         endpoint: ep,
                         mac: [0u8; 6],
                         tx_queue: VecDeque::new(),
+                        rx_queue: VecDeque::new(),
                     });
                 }
             }
@@ -393,11 +404,9 @@ impl RemoteNic {
     /// valid `NET_RX_FRAME` header (8 bytes) followed by the raw Ethernet
     /// frame bytes.
     ///
-    /// On success, the frame is passed to `dispatch::process_rx_frames` and
-    /// `NIC_WOKEN` is set to wake the net task's next poll iteration.
-    /// Returns the number of frames actually dispatched (0 or 1) — a frame
-    /// rejected by the Ethernet parser is counted as zero so metrics and
-    /// callers that read the return value do not over-report throughput.
+    /// On success, the frame is copied into the bounded RemoteNic RX queue and
+    /// `NIC_WOKEN` is set to wake the shared net task's next poll iteration.
+    /// Returns the number of frames queued (0 or 1).
     pub fn inject_rx_frame(header_and_frame: &[u8]) -> usize {
         match decode_net_rx_notify(header_and_frame) {
             Ok(hdr) => {
@@ -411,22 +420,59 @@ impl RemoteNic {
                     return 0;
                 }
                 let frame = &header_and_frame[header_size..header_size + frame_len];
-                if super::dispatch::process_rx_frames(frame) {
-                    crate::net::virtio_net::wake_net_task();
-                    1
-                } else {
+                if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+                    let _ = Self::is_registered();
+                }
+                let mut slot = REMOTE_NIC.lock();
+                let Some(entry) = slot.as_mut() else {
+                    log::warn!("[remote_nic] RX: no ring-3 NIC registered");
+                    return 0;
+                };
+                if entry.rx_queue.len() >= RX_QUEUE_DEPTH {
                     log::warn!(
-                        "[remote_nic] RX: malformed Ethernet frame dropped ({} bytes)",
+                        "[remote_nic] RX queue full ({} frames) — dropping {}-byte frame",
+                        RX_QUEUE_DEPTH,
                         frame.len(),
                     );
-                    0
+                    return 0;
                 }
+                entry.rx_queue.push_back(frame.to_vec());
+                drop(slot);
+                crate::net::virtio_net::wake_net_task();
+                1
             }
             Err(e) => {
                 log::warn!("[remote_nic] RX: bad NET_RX_FRAME header: {:?}", e);
                 0
             }
         }
+    }
+
+    /// Drain deferred RX frames staged by `inject_rx_frame`.
+    ///
+    /// Called from the shared network task so ring-3 NIC ingress follows the
+    /// same deferred-dispatch model as virtio-net. Returns the number of
+    /// frames successfully accepted by the protocol stack.
+    pub fn drain_rx_queue() -> usize {
+        let frames = {
+            let mut slot = REMOTE_NIC.lock();
+            let Some(entry) = slot.as_mut() else {
+                return 0;
+            };
+            entry.rx_queue.drain(..).collect::<alloc::vec::Vec<_>>()
+        };
+        let mut dispatched = 0usize;
+        for frame in frames {
+            if super::dispatch::process_rx_frames(&frame) {
+                dispatched += 1;
+            } else {
+                log::warn!(
+                    "[remote_nic] RX: malformed Ethernet frame dropped ({} bytes)",
+                    frame.len(),
+                );
+            }
+        }
+        dispatched
     }
 
     /// Handle a `NET_LINK_STATE` IPC payload from the ring-3 driver.
@@ -500,6 +546,7 @@ impl RemoteNic {
                         endpoint: ep,
                         mac,
                         tx_queue: VecDeque::new(),
+                        rx_queue: VecDeque::new(),
                     });
                 }
                 live_endpoint = Some(ep);
@@ -531,6 +578,14 @@ mod tests {
 
     fn registered_endpoint() -> Option<EndpointId> {
         REMOTE_NIC.lock().as_ref().map(|entry| entry.endpoint)
+    }
+
+    fn queued_rx_frames() -> usize {
+        REMOTE_NIC
+            .lock()
+            .as_ref()
+            .map(|entry| entry.rx_queue.len())
+            .unwrap_or(0)
     }
 
     #[test_case]
@@ -570,5 +625,46 @@ mod tests {
         assert!(!RESTART_SUSPECTED.load(Ordering::Acquire));
         assert_eq!(registered_endpoint(), Some(recovered_ep));
         assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn inject_rx_frame_queues_payload_for_deferred_dispatch() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(4), [0; 6]);
+
+        let frame = [0u8; 14];
+        let header = NetFrameHeader {
+            kind: NET_RX_FRAME,
+            frame_len: frame.len() as u16,
+            flags: 0,
+        };
+        let mut payload = encode_net_send(header).to_vec();
+        payload.extend_from_slice(&frame);
+
+        assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
+        assert_eq!(queued_rx_frames(), 1);
+    }
+
+    #[test_case]
+    fn drain_rx_queue_removes_malformed_frames_after_deferred_queueing() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(5), [0; 6]);
+
+        let frame = [0u8; 14];
+        let header = NetFrameHeader {
+            kind: NET_RX_FRAME,
+            frame_len: frame.len() as u16,
+            flags: 0,
+        };
+        let mut payload = encode_net_send(header).to_vec();
+        payload.extend_from_slice(&frame);
+
+        assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
+        assert_eq!(RemoteNic::drain_rx_queue(), 0);
+        assert_eq!(queued_rx_frames(), 0);
     }
 }
