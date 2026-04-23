@@ -1,9 +1,3 @@
-// Note: the opcode table and wrapped-event imports below are referenced by
-// the codec implementation landing in the follow-up A.0 commit; the stub
-// bodies in this commit do not yet consume them. The `allow` below is
-// removed when the implementation lands.
-#![allow(dead_code, unused_imports)]
-
 //! Phase 56 client-protocol and control-socket wire format.
 //!
 //! This module is the single declaration site for every Phase 56 protocol
@@ -418,51 +412,780 @@ impl From<EventCodecError> for ProtocolError {
 }
 
 // ---------------------------------------------------------------------------
-// Codec impls — stubbed in the test-first commit; real implementation lands
-// in the follow-up commit that makes these tests pass.
+// Framing + primitive read/write helpers
+// ---------------------------------------------------------------------------
+
+fn write_frame_header(buf: &mut [u8], body_len: u16, opcode: u16) -> Result<(), ProtocolError> {
+    if buf.len() < FRAME_HEADER_SIZE {
+        return Err(ProtocolError::Truncated);
+    }
+    buf[0..2].copy_from_slice(&body_len.to_le_bytes());
+    buf[2..4].copy_from_slice(&opcode.to_le_bytes());
+    Ok(())
+}
+
+fn parse_frame_header(buf: &[u8]) -> Result<(u16, u16, &[u8], usize), ProtocolError> {
+    if buf.len() < FRAME_HEADER_SIZE {
+        return Err(ProtocolError::Truncated);
+    }
+    let body_len = u16::from_le_bytes([buf[0], buf[1]]);
+    if body_len > MAX_FRAME_BODY_LEN {
+        return Err(ProtocolError::BodyTooLarge);
+    }
+    let opcode = u16::from_le_bytes([buf[2], buf[3]]);
+    let total = FRAME_HEADER_SIZE + body_len as usize;
+    if buf.len() < total {
+        return Err(ProtocolError::Truncated);
+    }
+    let body = &buf[FRAME_HEADER_SIZE..total];
+    Ok((body_len, opcode, body, total))
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> Result<u16, ProtocolError> {
+    let s = buf
+        .get(offset..offset + 2)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> Result<u32, ProtocolError> {
+    let s = buf
+        .get(offset..offset + 4)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_i32(buf: &[u8], offset: usize) -> Result<i32, ProtocolError> {
+    let s = buf
+        .get(offset..offset + 4)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> Result<u64, ProtocolError> {
+    let s = buf
+        .get(offset..offset + 8)
+        .ok_or(ProtocolError::Truncated)?;
+    Ok(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
+}
+
+fn write_rect(buf: &mut [u8], rect: Rect) {
+    buf[0..4].copy_from_slice(&rect.x.to_le_bytes());
+    buf[4..8].copy_from_slice(&rect.y.to_le_bytes());
+    buf[8..12].copy_from_slice(&rect.w.to_le_bytes());
+    buf[12..16].copy_from_slice(&rect.h.to_le_bytes());
+}
+
+fn read_rect(buf: &[u8], offset: usize) -> Result<Rect, ProtocolError> {
+    Ok(Rect {
+        x: read_i32(buf, offset)?,
+        y: read_i32(buf, offset + 4)?,
+        w: read_u32(buf, offset + 8)?,
+        h: read_u32(buf, offset + 12)?,
+    })
+}
+
+fn layer_from_u8(v: u8) -> Result<Layer, ProtocolError> {
+    match v {
+        0 => Ok(Layer::Background),
+        1 => Ok(Layer::Bottom),
+        2 => Ok(Layer::Top),
+        3 => Ok(Layer::Overlay),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn keyboard_interactivity_from_u8(v: u8) -> Result<KeyboardInteractivity, ProtocolError> {
+    match v {
+        0 => Ok(KeyboardInteractivity::None),
+        1 => Ok(KeyboardInteractivity::OnDemand),
+        2 => Ok(KeyboardInteractivity::Exclusive),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn disconnect_reason_from_u8(v: u8) -> Result<DisconnectReason, ProtocolError> {
+    match v {
+        0 => Ok(DisconnectReason::VersionMismatch),
+        1 => Ok(DisconnectReason::UnknownOpcode),
+        2 => Ok(DisconnectReason::MalformedFrame),
+        3 => Ok(DisconnectReason::ResourceExhausted),
+        4 => Ok(DisconnectReason::ServerShutdown),
+        5 => Ok(DisconnectReason::ProtocolViolation),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn event_kind_from_u8(v: u8) -> Result<EventKind, ProtocolError> {
+    match v {
+        0 => Ok(EventKind::SurfaceCreated),
+        1 => Ok(EventKind::SurfaceDestroyed),
+        2 => Ok(EventKind::FocusChanged),
+        3 => Ok(EventKind::BindTriggered),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn control_error_code_from_u8(v: u8) -> Result<ControlErrorCode, ProtocolError> {
+    match v {
+        0 => Ok(ControlErrorCode::UnknownVerb),
+        1 => Ok(ControlErrorCode::MalformedFrame),
+        2 => Ok(ControlErrorCode::BadArgs),
+        3 => Ok(ControlErrorCode::UnknownSurface),
+        4 => Ok(ControlErrorCode::ResourceExhausted),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn surface_role_tag_from_u8(v: u8) -> Result<SurfaceRoleTag, ProtocolError> {
+    match v {
+        0 => Ok(SurfaceRoleTag::Toplevel),
+        1 => Ok(SurfaceRoleTag::Layer),
+        2 => Ok(SurfaceRoleTag::Cursor),
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+/// Size on the wire of a surface-role payload (tag + role body), in bytes.
+fn role_wire_size(role: &SurfaceRole) -> usize {
+    match role {
+        SurfaceRole::Toplevel => 1,
+        SurfaceRole::Layer(_) => 24,
+        SurfaceRole::Cursor(_) => 9,
+    }
+}
+
+fn write_role(buf: &mut [u8], role: &SurfaceRole) -> usize {
+    match role {
+        SurfaceRole::Toplevel => {
+            buf[0] = 0;
+            1
+        }
+        SurfaceRole::Layer(cfg) => {
+            buf[0] = 1;
+            buf[1] = cfg.layer as u8;
+            buf[2] = cfg.anchor_mask;
+            buf[3..7].copy_from_slice(&cfg.exclusive_zone.to_le_bytes());
+            buf[7] = cfg.keyboard_interactivity as u8;
+            buf[8..12].copy_from_slice(&cfg.margin[0].to_le_bytes());
+            buf[12..16].copy_from_slice(&cfg.margin[1].to_le_bytes());
+            buf[16..20].copy_from_slice(&cfg.margin[2].to_le_bytes());
+            buf[20..24].copy_from_slice(&cfg.margin[3].to_le_bytes());
+            24
+        }
+        SurfaceRole::Cursor(cfg) => {
+            buf[0] = 2;
+            buf[1..5].copy_from_slice(&cfg.hotspot_x.to_le_bytes());
+            buf[5..9].copy_from_slice(&cfg.hotspot_y.to_le_bytes());
+            9
+        }
+    }
+}
+
+fn read_role(buf: &[u8]) -> Result<(SurfaceRole, usize), ProtocolError> {
+    let tag = *buf.first().ok_or(ProtocolError::Truncated)?;
+    match tag {
+        0 => Ok((SurfaceRole::Toplevel, 1)),
+        1 => {
+            if buf.len() < 24 {
+                return Err(ProtocolError::Truncated);
+            }
+            let layer = layer_from_u8(buf[1])?;
+            let anchor_mask = buf[2];
+            if (anchor_mask & !ANCHOR_ALL) != 0 {
+                return Err(ProtocolError::InvalidAnchorMask);
+            }
+            let exclusive_zone = read_u32(buf, 3)?;
+            let keyboard_interactivity = keyboard_interactivity_from_u8(buf[7])?;
+            let margin = [
+                read_i32(buf, 8)?,
+                read_i32(buf, 12)?,
+                read_i32(buf, 16)?,
+                read_i32(buf, 20)?,
+            ];
+            Ok((
+                SurfaceRole::Layer(LayerConfig {
+                    layer,
+                    anchor_mask,
+                    exclusive_zone,
+                    keyboard_interactivity,
+                    margin,
+                }),
+                24,
+            ))
+        }
+        2 => {
+            if buf.len() < 9 {
+                return Err(ProtocolError::Truncated);
+            }
+            let hotspot_x = read_i32(buf, 1)?;
+            let hotspot_y = read_i32(buf, 5)?;
+            Ok((
+                SurfaceRole::Cursor(CursorConfig {
+                    hotspot_x,
+                    hotspot_y,
+                }),
+                9,
+            ))
+        }
+        _ => Err(ProtocolError::InvalidEnum),
+    }
+}
+
+fn expect_body_len(actual: u16, expected: u16) -> Result<(), ProtocolError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ProtocolError::BodyLengthMismatch)
+    }
+}
+
+fn encode_fixed_body<F>(
+    buf: &mut [u8],
+    opcode: u16,
+    body_len: usize,
+    write_body: F,
+) -> Result<usize, ProtocolError>
+where
+    F: FnOnce(&mut [u8]),
+{
+    if body_len > MAX_FRAME_BODY_LEN as usize {
+        return Err(ProtocolError::BodyTooLarge);
+    }
+    let total = FRAME_HEADER_SIZE + body_len;
+    if buf.len() < total {
+        return Err(ProtocolError::Truncated);
+    }
+    write_frame_header(buf, body_len as u16, opcode)?;
+    if body_len > 0 {
+        write_body(&mut buf[FRAME_HEADER_SIZE..total]);
+    }
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// ClientMessage codec
 // ---------------------------------------------------------------------------
 
 impl ClientMessage {
     /// Encode into a caller-supplied buffer; never allocates.
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+        match self {
+            Self::Hello {
+                protocol_version,
+                capabilities,
+            } => encode_fixed_body(buf, OP_CLIENT_HELLO, 8, |body| {
+                body[0..4].copy_from_slice(&protocol_version.to_le_bytes());
+                body[4..8].copy_from_slice(&capabilities.to_le_bytes());
+            }),
+            Self::Goodbye => encode_fixed_body(buf, OP_CLIENT_GOODBYE, 0, |_| {}),
+            Self::CreateSurface { surface_id } => {
+                encode_fixed_body(buf, OP_CLIENT_CREATE_SURFACE, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::DestroySurface { surface_id } => {
+                encode_fixed_body(buf, OP_CLIENT_DESTROY_SURFACE, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::SetSurfaceRole { surface_id, role } => {
+                let role_size = role_wire_size(role);
+                let body_len = 4 + role_size;
+                encode_fixed_body(buf, OP_CLIENT_SET_SURFACE_ROLE, body_len, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                    let _ = write_role(&mut body[4..], role);
+                })
+            }
+            Self::AttachBuffer {
+                surface_id,
+                buffer_id,
+            } => encode_fixed_body(buf, OP_CLIENT_ATTACH_BUFFER, 8, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
+            }),
+            Self::DamageSurface { surface_id, rect } => {
+                encode_fixed_body(buf, OP_CLIENT_DAMAGE_SURFACE, 20, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                    write_rect(&mut body[4..20], *rect);
+                })
+            }
+            Self::CommitSurface { surface_id } => {
+                encode_fixed_body(buf, OP_CLIENT_COMMIT_SURFACE, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::AckConfigure { surface_id, serial } => {
+                encode_fixed_body(buf, OP_CLIENT_ACK_CONFIGURE, 8, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                    body[4..8].copy_from_slice(&serial.to_le_bytes());
+                })
+            }
+        }
     }
 
     /// Decode a single [`ClientMessage`] from the start of `buf`.
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
+        let (body_len, opcode, body, total) = parse_frame_header(buf)?;
+        let msg = match opcode {
+            OP_CLIENT_HELLO => {
+                expect_body_len(body_len, 8)?;
+                let protocol_version = read_u32(body, 0)?;
+                let capabilities = read_u32(body, 4)?;
+                Self::Hello {
+                    protocol_version,
+                    capabilities,
+                }
+            }
+            OP_CLIENT_GOODBYE => {
+                expect_body_len(body_len, 0)?;
+                Self::Goodbye
+            }
+            OP_CLIENT_CREATE_SURFACE => {
+                expect_body_len(body_len, 4)?;
+                Self::CreateSurface {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_CLIENT_DESTROY_SURFACE => {
+                expect_body_len(body_len, 4)?;
+                Self::DestroySurface {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_CLIENT_SET_SURFACE_ROLE => {
+                if body_len < 5 {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                let surface_id = SurfaceId(read_u32(body, 0)?);
+                let (role, consumed) = read_role(&body[4..])?;
+                if 4 + consumed != body_len as usize {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                Self::SetSurfaceRole { surface_id, role }
+            }
+            OP_CLIENT_ATTACH_BUFFER => {
+                expect_body_len(body_len, 8)?;
+                Self::AttachBuffer {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    buffer_id: BufferId(read_u32(body, 4)?),
+                }
+            }
+            OP_CLIENT_DAMAGE_SURFACE => {
+                expect_body_len(body_len, 20)?;
+                Self::DamageSurface {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    rect: read_rect(body, 4)?,
+                }
+            }
+            OP_CLIENT_COMMIT_SURFACE => {
+                expect_body_len(body_len, 4)?;
+                Self::CommitSurface {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_CLIENT_ACK_CONFIGURE => {
+                expect_body_len(body_len, 8)?;
+                Self::AckConfigure {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    serial: read_u32(body, 4)?,
+                }
+            }
+            _ => return Err(ProtocolError::UnknownOpcode(opcode)),
+        };
+        Ok((msg, total))
     }
 }
+
+// ---------------------------------------------------------------------------
+// ServerMessage codec
+// ---------------------------------------------------------------------------
 
 impl ServerMessage {
     /// Encode into a caller-supplied buffer; never allocates.
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+        match self {
+            Self::Welcome {
+                protocol_version,
+                capabilities,
+            } => encode_fixed_body(buf, OP_SERVER_WELCOME, 8, |body| {
+                body[0..4].copy_from_slice(&protocol_version.to_le_bytes());
+                body[4..8].copy_from_slice(&capabilities.to_le_bytes());
+            }),
+            Self::Disconnect { reason } => {
+                encode_fixed_body(buf, OP_SERVER_DISCONNECT, 1, |body| {
+                    body[0] = *reason as u8;
+                })
+            }
+            Self::SurfaceConfigured {
+                surface_id,
+                rect,
+                serial,
+            } => encode_fixed_body(buf, OP_SERVER_SURFACE_CONFIGURED, 24, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                write_rect(&mut body[4..20], *rect);
+                body[20..24].copy_from_slice(&serial.to_le_bytes());
+            }),
+            Self::SurfaceDestroyed { surface_id } => {
+                encode_fixed_body(buf, OP_SERVER_SURFACE_DESTROYED, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::FocusIn { surface_id } => encode_fixed_body(buf, OP_SERVER_FOCUS_IN, 4, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+            }),
+            Self::FocusOut { surface_id } => {
+                encode_fixed_body(buf, OP_SERVER_FOCUS_OUT, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::Key(ev) => {
+                let body_len = KEY_EVENT_WIRE_SIZE;
+                let total = FRAME_HEADER_SIZE + body_len;
+                if buf.len() < total {
+                    return Err(ProtocolError::Truncated);
+                }
+                write_frame_header(buf, body_len as u16, OP_SERVER_KEY_EVENT)?;
+                ev.encode(&mut buf[FRAME_HEADER_SIZE..total])?;
+                Ok(total)
+            }
+            Self::Pointer(ev) => {
+                let body_len = POINTER_EVENT_WIRE_SIZE;
+                let total = FRAME_HEADER_SIZE + body_len;
+                if buf.len() < total {
+                    return Err(ProtocolError::Truncated);
+                }
+                write_frame_header(buf, body_len as u16, OP_SERVER_POINTER_EVENT)?;
+                ev.encode(&mut buf[FRAME_HEADER_SIZE..total])?;
+                Ok(total)
+            }
+            Self::BufferReleased {
+                surface_id,
+                buffer_id,
+            } => encode_fixed_body(buf, OP_SERVER_BUFFER_RELEASED, 8, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
+            }),
+        }
     }
 
     /// Decode a single [`ServerMessage`] from the start of `buf`.
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
+        let (body_len, opcode, body, total) = parse_frame_header(buf)?;
+        let msg = match opcode {
+            OP_SERVER_WELCOME => {
+                expect_body_len(body_len, 8)?;
+                Self::Welcome {
+                    protocol_version: read_u32(body, 0)?,
+                    capabilities: read_u32(body, 4)?,
+                }
+            }
+            OP_SERVER_DISCONNECT => {
+                expect_body_len(body_len, 1)?;
+                Self::Disconnect {
+                    reason: disconnect_reason_from_u8(body[0])?,
+                }
+            }
+            OP_SERVER_SURFACE_CONFIGURED => {
+                expect_body_len(body_len, 24)?;
+                Self::SurfaceConfigured {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    rect: read_rect(body, 4)?,
+                    serial: read_u32(body, 20)?,
+                }
+            }
+            OP_SERVER_SURFACE_DESTROYED => {
+                expect_body_len(body_len, 4)?;
+                Self::SurfaceDestroyed {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_SERVER_FOCUS_IN => {
+                expect_body_len(body_len, 4)?;
+                Self::FocusIn {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_SERVER_FOCUS_OUT => {
+                expect_body_len(body_len, 4)?;
+                Self::FocusOut {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_SERVER_KEY_EVENT => {
+                expect_body_len(body_len, KEY_EVENT_WIRE_SIZE as u16)?;
+                let (ev, _) = KeyEvent::decode(body)?;
+                Self::Key(ev)
+            }
+            OP_SERVER_POINTER_EVENT => {
+                expect_body_len(body_len, POINTER_EVENT_WIRE_SIZE as u16)?;
+                let (ev, _) = PointerEvent::decode(body)?;
+                Self::Pointer(ev)
+            }
+            OP_SERVER_BUFFER_RELEASED => {
+                expect_body_len(body_len, 8)?;
+                Self::BufferReleased {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    buffer_id: BufferId(read_u32(body, 4)?),
+                }
+            }
+            _ => return Err(ProtocolError::UnknownOpcode(opcode)),
+        };
+        Ok((msg, total))
     }
 }
+
+// ---------------------------------------------------------------------------
+// ControlCommand codec
+// ---------------------------------------------------------------------------
 
 impl ControlCommand {
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+        match self {
+            Self::Version => encode_fixed_body(buf, OP_CTL_VERSION, 0, |_| {}),
+            Self::ListSurfaces => encode_fixed_body(buf, OP_CTL_LIST_SURFACES, 0, |_| {}),
+            Self::Focus { surface_id } => encode_fixed_body(buf, OP_CTL_FOCUS, 4, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+            }),
+            Self::RegisterBind {
+                modifier_mask,
+                keycode,
+            } => encode_fixed_body(buf, OP_CTL_REGISTER_BIND, 6, |body| {
+                body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
+                body[2..6].copy_from_slice(&keycode.to_le_bytes());
+            }),
+            Self::UnregisterBind {
+                modifier_mask,
+                keycode,
+            } => encode_fixed_body(buf, OP_CTL_UNREGISTER_BIND, 6, |body| {
+                body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
+                body[2..6].copy_from_slice(&keycode.to_le_bytes());
+            }),
+            Self::Subscribe { event_kind } => encode_fixed_body(buf, OP_CTL_SUBSCRIBE, 1, |body| {
+                body[0] = *event_kind as u8;
+            }),
+            Self::FrameStats => encode_fixed_body(buf, OP_CTL_FRAME_STATS, 0, |_| {}),
+        }
     }
 
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
+        let (body_len, opcode, body, total) = parse_frame_header(buf)?;
+        let cmd = match opcode {
+            OP_CTL_VERSION => {
+                expect_body_len(body_len, 0)?;
+                Self::Version
+            }
+            OP_CTL_LIST_SURFACES => {
+                expect_body_len(body_len, 0)?;
+                Self::ListSurfaces
+            }
+            OP_CTL_FOCUS => {
+                expect_body_len(body_len, 4)?;
+                Self::Focus {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_CTL_REGISTER_BIND => {
+                expect_body_len(body_len, 6)?;
+                Self::RegisterBind {
+                    modifier_mask: read_u16(body, 0)?,
+                    keycode: read_u32(body, 2)?,
+                }
+            }
+            OP_CTL_UNREGISTER_BIND => {
+                expect_body_len(body_len, 6)?;
+                Self::UnregisterBind {
+                    modifier_mask: read_u16(body, 0)?,
+                    keycode: read_u32(body, 2)?,
+                }
+            }
+            OP_CTL_SUBSCRIBE => {
+                expect_body_len(body_len, 1)?;
+                Self::Subscribe {
+                    event_kind: event_kind_from_u8(body[0])?,
+                }
+            }
+            OP_CTL_FRAME_STATS => {
+                expect_body_len(body_len, 0)?;
+                Self::FrameStats
+            }
+            _ => return Err(ProtocolError::UnknownOpcode(opcode)),
+        };
+        Ok((cmd, total))
     }
 }
 
+// ---------------------------------------------------------------------------
+// ControlEvent codec
+// ---------------------------------------------------------------------------
+
 impl ControlEvent {
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+        match self {
+            Self::VersionReply { protocol_version } => {
+                encode_fixed_body(buf, OP_CTL_EVT_VERSION_REPLY, 4, |body| {
+                    body[0..4].copy_from_slice(&protocol_version.to_le_bytes());
+                })
+            }
+            Self::SurfaceListReply { ids } => {
+                if ids.len() as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let body_len = 4 + ids.len() * 4;
+                encode_fixed_body(buf, OP_CTL_EVT_SURFACE_LIST_REPLY, body_len, |body| {
+                    body[0..4].copy_from_slice(&(ids.len() as u32).to_le_bytes());
+                    for (i, id) in ids.iter().enumerate() {
+                        let start = 4 + i * 4;
+                        body[start..start + 4].copy_from_slice(&id.0.to_le_bytes());
+                    }
+                })
+            }
+            Self::Ack => encode_fixed_body(buf, OP_CTL_EVT_ACK, 0, |_| {}),
+            Self::Error { code } => encode_fixed_body(buf, OP_CTL_EVT_ERROR, 1, |body| {
+                body[0] = *code as u8;
+            }),
+            Self::FrameStatsReply { samples } => {
+                if samples.len() as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let body_len = 4 + samples.len() * 12;
+                encode_fixed_body(buf, OP_CTL_EVT_FRAME_STATS_REPLY, body_len, |body| {
+                    body[0..4].copy_from_slice(&(samples.len() as u32).to_le_bytes());
+                    for (i, s) in samples.iter().enumerate() {
+                        let start = 4 + i * 12;
+                        body[start..start + 8].copy_from_slice(&s.frame_index.to_le_bytes());
+                        body[start + 8..start + 12]
+                            .copy_from_slice(&s.compose_micros.to_le_bytes());
+                    }
+                })
+            }
+            Self::SurfaceCreated { surface_id, role } => {
+                encode_fixed_body(buf, OP_CTL_EVT_SURFACE_CREATED, 5, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                    body[4] = *role as u8;
+                })
+            }
+            Self::SurfaceDestroyed { surface_id } => {
+                encode_fixed_body(buf, OP_CTL_EVT_SURFACE_DESTROYED, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
+            Self::FocusChanged { focused } => {
+                encode_fixed_body(buf, OP_CTL_EVT_FOCUS_CHANGED, 5, |body| {
+                    let (flag, id) = match focused {
+                        Some(id) => (1u8, id.0),
+                        None => (0u8, 0u32),
+                    };
+                    body[0] = flag;
+                    body[1..5].copy_from_slice(&id.to_le_bytes());
+                })
+            }
+            Self::BindTriggered {
+                modifier_mask,
+                keycode,
+            } => encode_fixed_body(buf, OP_CTL_EVT_BIND_TRIGGERED, 6, |body| {
+                body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
+                body[2..6].copy_from_slice(&keycode.to_le_bytes());
+            }),
+        }
     }
 
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
-        Err(ProtocolError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtocolError> {
+        let (body_len, opcode, body, total) = parse_frame_header(buf)?;
+        let evt = match opcode {
+            OP_CTL_EVT_VERSION_REPLY => {
+                expect_body_len(body_len, 4)?;
+                Self::VersionReply {
+                    protocol_version: read_u32(body, 0)?,
+                }
+            }
+            OP_CTL_EVT_SURFACE_LIST_REPLY => {
+                if body_len < 4 {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                let count = read_u32(body, 0)?;
+                if count > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let expected = 4 + count as usize * 4;
+                if body_len as usize != expected {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                let mut ids = Vec::with_capacity(count as usize);
+                for i in 0..count as usize {
+                    let start = 4 + i * 4;
+                    ids.push(SurfaceId(read_u32(body, start)?));
+                }
+                Self::SurfaceListReply { ids }
+            }
+            OP_CTL_EVT_ACK => {
+                expect_body_len(body_len, 0)?;
+                Self::Ack
+            }
+            OP_CTL_EVT_ERROR => {
+                expect_body_len(body_len, 1)?;
+                Self::Error {
+                    code: control_error_code_from_u8(body[0])?,
+                }
+            }
+            OP_CTL_EVT_FRAME_STATS_REPLY => {
+                if body_len < 4 {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                let count = read_u32(body, 0)?;
+                if count > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let expected = 4 + count as usize * 12;
+                if body_len as usize != expected {
+                    return Err(ProtocolError::BodyLengthMismatch);
+                }
+                let mut samples = Vec::with_capacity(count as usize);
+                for i in 0..count as usize {
+                    let start = 4 + i * 12;
+                    samples.push(FrameStatSample {
+                        frame_index: read_u64(body, start)?,
+                        compose_micros: read_u32(body, start + 8)?,
+                    });
+                }
+                Self::FrameStatsReply { samples }
+            }
+            OP_CTL_EVT_SURFACE_CREATED => {
+                expect_body_len(body_len, 5)?;
+                Self::SurfaceCreated {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    role: surface_role_tag_from_u8(body[4])?,
+                }
+            }
+            OP_CTL_EVT_SURFACE_DESTROYED => {
+                expect_body_len(body_len, 4)?;
+                Self::SurfaceDestroyed {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
+            OP_CTL_EVT_FOCUS_CHANGED => {
+                expect_body_len(body_len, 5)?;
+                let flag = body[0];
+                let id = SurfaceId(read_u32(body, 1)?);
+                let focused = match flag {
+                    0 => None,
+                    1 => Some(id),
+                    _ => return Err(ProtocolError::InvalidEnum),
+                };
+                Self::FocusChanged { focused }
+            }
+            OP_CTL_EVT_BIND_TRIGGERED => {
+                expect_body_len(body_len, 6)?;
+                Self::BindTriggered {
+                    modifier_mask: read_u16(body, 0)?,
+                    keycode: read_u32(body, 2)?,
+                }
+            }
+            _ => return Err(ProtocolError::UnknownOpcode(opcode)),
+        };
+        Ok((evt, total))
     }
 }
 
@@ -514,7 +1237,6 @@ mod tests {
     // ---- ClientMessage round-trips, one per variant --------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_hello_round_trips() {
         encode_decode_round_trip_client(ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -523,13 +1245,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_goodbye_round_trips() {
         encode_decode_round_trip_client(ClientMessage::Goodbye);
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_create_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::CreateSurface {
             surface_id: SurfaceId(1),
@@ -537,7 +1257,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_destroy_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::DestroySurface {
             surface_id: SurfaceId(7),
@@ -545,7 +1264,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_set_surface_role_toplevel_round_trips() {
         encode_decode_round_trip_client(ClientMessage::SetSurfaceRole {
             surface_id: SurfaceId(3),
@@ -554,7 +1272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_set_surface_role_layer_round_trips() {
         let role = SurfaceRole::Layer(LayerConfig {
             layer: Layer::Top,
@@ -570,7 +1287,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_set_surface_role_cursor_round_trips() {
         let role = SurfaceRole::Cursor(CursorConfig {
             hotspot_x: 4,
@@ -583,7 +1299,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_attach_buffer_round_trips() {
         encode_decode_round_trip_client(ClientMessage::AttachBuffer {
             surface_id: SurfaceId(9),
@@ -592,7 +1307,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_damage_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::DamageSurface {
             surface_id: SurfaceId(9),
@@ -606,7 +1320,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_commit_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::CommitSurface {
             surface_id: SurfaceId(9),
@@ -614,7 +1327,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_ack_configure_round_trips() {
         encode_decode_round_trip_client(ClientMessage::AckConfigure {
             surface_id: SurfaceId(9),
@@ -623,7 +1335,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_short_buffer_encode_returns_truncated() {
         let mut tiny = [0u8; FRAME_HEADER_SIZE - 1];
         let err = ClientMessage::Goodbye.encode(&mut tiny).unwrap_err();
@@ -631,14 +1342,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_empty_buffer_decode_returns_truncated() {
         let err = ClientMessage::decode(&[]).unwrap_err();
         assert_eq!(err, ProtocolError::Truncated);
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_body_too_large_is_rejected() {
         let mut buf = [0u8; FRAME_HEADER_SIZE];
         buf[0..2].copy_from_slice(&(MAX_FRAME_BODY_LEN + 1).to_le_bytes());
@@ -648,7 +1357,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_unknown_opcode_reports_offending_value() {
         let mut buf = [0u8; FRAME_HEADER_SIZE];
         buf[0..2].copy_from_slice(&0u16.to_le_bytes());
@@ -658,7 +1366,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn client_set_surface_role_rejects_bad_role_tag() {
         let mut buf = [0u8; FRAME_HEADER_SIZE + 5];
         buf[0..2].copy_from_slice(&5u16.to_le_bytes());
@@ -672,7 +1379,6 @@ mod tests {
     // ---- ServerMessage round-trips, one per variant --------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_welcome_round_trips() {
         encode_decode_round_trip_server(ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
@@ -681,7 +1387,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_disconnect_round_trips_for_each_reason() {
         for reason in [
             DisconnectReason::VersionMismatch,
@@ -696,7 +1401,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_surface_configured_round_trips() {
         encode_decode_round_trip_server(ServerMessage::SurfaceConfigured {
             surface_id: SurfaceId(11),
@@ -711,7 +1415,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_surface_destroyed_round_trips() {
         encode_decode_round_trip_server(ServerMessage::SurfaceDestroyed {
             surface_id: SurfaceId(1),
@@ -719,7 +1422,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_focus_in_and_out_round_trip() {
         encode_decode_round_trip_server(ServerMessage::FocusIn {
             surface_id: SurfaceId(2),
@@ -730,7 +1432,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_key_event_round_trips() {
         let ev = KeyEvent {
             timestamp_ms: 100,
@@ -743,7 +1444,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_pointer_event_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 200,
@@ -759,7 +1459,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn server_buffer_released_round_trips() {
         encode_decode_round_trip_server(ServerMessage::BufferReleased {
             surface_id: SurfaceId(5),
@@ -770,19 +1469,16 @@ mod tests {
     // ---- ControlCommand round-trips, one per verb ----------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_version_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::Version);
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_list_surfaces_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::ListSurfaces);
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_focus_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::Focus {
             surface_id: SurfaceId(3),
@@ -790,7 +1486,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_register_bind_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::RegisterBind {
             modifier_mask: MOD_SUPER,
@@ -799,7 +1494,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_unregister_bind_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::UnregisterBind {
             modifier_mask: MOD_SUPER,
@@ -808,7 +1502,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_subscribe_round_trips() {
         for kind in [
             EventKind::SurfaceCreated,
@@ -821,7 +1514,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_cmd_frame_stats_round_trips() {
         encode_decode_round_trip_ctl_cmd(ControlCommand::FrameStats);
     }
@@ -829,7 +1521,6 @@ mod tests {
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_version_reply_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::VersionReply {
             protocol_version: PROTOCOL_VERSION,
@@ -837,7 +1528,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_surface_list_reply_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::SurfaceListReply {
             ids: vec![SurfaceId(1), SurfaceId(2), SurfaceId(3)],
@@ -845,13 +1535,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_ack_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::Ack);
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_error_round_trips_for_each_code() {
         for code in [
             ControlErrorCode::UnknownVerb,
@@ -865,7 +1553,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_frame_stats_reply_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::FrameStatsReply {
             samples: vec![
@@ -882,7 +1569,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_surface_created_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::SurfaceCreated {
             surface_id: SurfaceId(8),
@@ -891,7 +1577,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_surface_destroyed_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::SurfaceDestroyed {
             surface_id: SurfaceId(8),
@@ -899,7 +1584,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_focus_changed_round_trips_both_states() {
         encode_decode_round_trip_ctl_evt(ControlEvent::FocusChanged {
             focused: Some(SurfaceId(5)),
@@ -908,7 +1592,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_bind_triggered_round_trips() {
         encode_decode_round_trip_ctl_evt(ControlEvent::BindTriggered {
             modifier_mask: MOD_SUPER,
@@ -917,7 +1600,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn ctl_evt_surface_list_reply_caps_entry_count() {
         let mut buf = [0u8; FRAME_HEADER_SIZE + 4];
         let body_len = 4u16;
@@ -1218,7 +1900,6 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_client_message_round_trips(msg in arb_client_message()) {
             let mut buf = [0u8; SCRATCH_BUF_LEN];
             let n = msg.encode(&mut buf).expect("encode");
@@ -1228,7 +1909,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_server_message_round_trips(msg in arb_server_message()) {
             let mut buf = [0u8; SCRATCH_BUF_LEN];
             let n = msg.encode(&mut buf).expect("encode");
@@ -1238,7 +1918,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_control_command_round_trips(cmd in arb_control_command()) {
             let mut buf = [0u8; SCRATCH_BUF_LEN];
             let n = cmd.encode(&mut buf).expect("encode");
@@ -1248,7 +1927,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_control_event_round_trips(evt in arb_control_event()) {
             let mut buf = [0u8; SCRATCH_BUF_LEN];
             let n = evt.encode(&mut buf).expect("encode");

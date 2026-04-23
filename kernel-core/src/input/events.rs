@@ -151,27 +151,143 @@ pub enum EventCodecError {
 impl KeyEvent {
     /// Encode into a caller-supplied buffer. Returns the number of bytes
     /// written on success. Never allocates.
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, EventCodecError> {
-        Err(EventCodecError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, EventCodecError> {
+        if buf.len() < KEY_EVENT_WIRE_SIZE {
+            return Err(EventCodecError::Truncated);
+        }
+        if (self.modifiers.0 & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        buf[0..8].copy_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.keycode.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.symbol.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.modifiers.0.to_le_bytes());
+        buf[18] = self.kind as u8;
+        Ok(KEY_EVENT_WIRE_SIZE)
     }
 
     /// Decode a [`KeyEvent`] from the start of `buf`. Returns the event and
     /// the number of bytes consumed.
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), EventCodecError> {
-        Err(EventCodecError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), EventCodecError> {
+        if buf.len() < KEY_EVENT_WIRE_SIZE {
+            return Err(EventCodecError::Truncated);
+        }
+        let timestamp_ms = u64::from_le_bytes(array8(&buf[0..8]));
+        let keycode = u32::from_le_bytes(array4(&buf[8..12]));
+        let symbol = u32::from_le_bytes(array4(&buf[12..16]));
+        let mod_bits = u16::from_le_bytes(array2(&buf[16..18]));
+        if (mod_bits & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        let kind = match buf[18] {
+            0 => KeyEventKind::Down,
+            1 => KeyEventKind::Up,
+            2 => KeyEventKind::Repeat,
+            _ => return Err(EventCodecError::InvalidKeyKind),
+        };
+        Ok((
+            Self {
+                timestamp_ms,
+                keycode,
+                symbol,
+                modifiers: ModifierState(mod_bits),
+                kind,
+            },
+            KEY_EVENT_WIRE_SIZE,
+        ))
     }
 }
 
 impl PointerEvent {
     /// Encode into a caller-supplied buffer. Never allocates.
-    pub fn encode(&self, _buf: &mut [u8]) -> Result<usize, EventCodecError> {
-        Err(EventCodecError::Truncated)
+    pub fn encode(&self, buf: &mut [u8]) -> Result<usize, EventCodecError> {
+        if buf.len() < POINTER_EVENT_WIRE_SIZE {
+            return Err(EventCodecError::Truncated);
+        }
+        if (self.modifiers.0 & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        buf[0..8].copy_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.dx.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.dy.to_le_bytes());
+        let (abs_flag, abs_x, abs_y) = match self.abs_position {
+            Some((x, y)) => (1u8, x, y),
+            None => (0u8, 0i32, 0i32),
+        };
+        buf[16] = abs_flag;
+        buf[17..21].copy_from_slice(&abs_x.to_le_bytes());
+        buf[21..25].copy_from_slice(&abs_y.to_le_bytes());
+        let (btn_tag, btn_index) = match self.button {
+            PointerButton::None => (0u8, 0u8),
+            PointerButton::Down(i) => (1u8, i),
+            PointerButton::Up(i) => (2u8, i),
+        };
+        buf[25] = btn_tag;
+        buf[26] = btn_index;
+        buf[27..31].copy_from_slice(&self.wheel_dx.to_le_bytes());
+        buf[31..35].copy_from_slice(&self.wheel_dy.to_le_bytes());
+        buf[35..37].copy_from_slice(&self.modifiers.0.to_le_bytes());
+        Ok(POINTER_EVENT_WIRE_SIZE)
     }
 
     /// Decode a [`PointerEvent`] from the start of `buf`.
-    pub fn decode(_buf: &[u8]) -> Result<(Self, usize), EventCodecError> {
-        Err(EventCodecError::Truncated)
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize), EventCodecError> {
+        if buf.len() < POINTER_EVENT_WIRE_SIZE {
+            return Err(EventCodecError::Truncated);
+        }
+        let timestamp_ms = u64::from_le_bytes(array8(&buf[0..8]));
+        let dx = i32::from_le_bytes(array4(&buf[8..12]));
+        let dy = i32::from_le_bytes(array4(&buf[12..16]));
+        let abs_flag = buf[16];
+        let abs_x = i32::from_le_bytes(array4(&buf[17..21]));
+        let abs_y = i32::from_le_bytes(array4(&buf[21..25]));
+        let abs_position = match abs_flag {
+            0 => None,
+            1 => Some((abs_x, abs_y)),
+            _ => return Err(EventCodecError::InvalidAbsFlag),
+        };
+        let btn_tag = buf[25];
+        let btn_index = buf[26];
+        let button = match btn_tag {
+            0 => PointerButton::None,
+            1 => PointerButton::Down(btn_index),
+            2 => PointerButton::Up(btn_index),
+            _ => return Err(EventCodecError::InvalidButtonTag),
+        };
+        let wheel_dx = i32::from_le_bytes(array4(&buf[27..31]));
+        let wheel_dy = i32::from_le_bytes(array4(&buf[31..35]));
+        let mod_bits = u16::from_le_bytes(array2(&buf[35..37]));
+        if (mod_bits & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        Ok((
+            Self {
+                timestamp_ms,
+                dx,
+                dy,
+                abs_position,
+                button,
+                wheel_dx,
+                wheel_dy,
+                modifiers: ModifierState(mod_bits),
+            },
+            POINTER_EVENT_WIRE_SIZE,
+        ))
     }
+}
+
+fn array2(slice: &[u8]) -> [u8; 2] {
+    [slice[0], slice[1]]
+}
+
+fn array4(slice: &[u8]) -> [u8; 4] {
+    [slice[0], slice[1], slice[2], slice[3]]
+}
+
+fn array8(slice: &[u8]) -> [u8; 8] {
+    [
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]
 }
 
 #[cfg(test)]
@@ -182,7 +298,6 @@ mod tests {
     // ---- KeyEvent round-trip -------------------------------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_down_round_trips() {
         let ev = KeyEvent {
             timestamp_ms: 0x1234_5678_9abc_def0,
@@ -200,7 +315,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_up_round_trips() {
         let ev = KeyEvent {
             timestamp_ms: 0,
@@ -216,7 +330,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_repeat_round_trips() {
         let ev = KeyEvent {
             timestamp_ms: 42,
@@ -231,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_short_buffer_returns_truncated() {
         let ev = KeyEvent {
             timestamp_ms: 0,
@@ -247,7 +359,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_rejects_unknown_kind_tag() {
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         buf[18] = 7;
@@ -258,7 +369,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn key_event_rejects_unknown_modifier_bit() {
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         let bad = MOD_ALL | (1 << 15);
@@ -272,7 +382,6 @@ mod tests {
     // ---- PointerEvent round-trip ---------------------------------------
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_motion_only_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 100,
@@ -292,7 +401,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_with_absolute_position_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 500,
@@ -310,7 +418,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_button_down_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 1,
@@ -328,7 +435,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_button_up_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 2,
@@ -346,7 +452,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_wheel_round_trips() {
         let ev = PointerEvent {
             timestamp_ms: 0,
@@ -364,7 +469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_rejects_invalid_abs_flag() {
         let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
         buf[16] = 5;
@@ -375,7 +479,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_rejects_invalid_button_tag() {
         let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
         buf[25] = 9;
@@ -386,7 +489,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
     fn pointer_event_short_buffer_returns_truncated() {
         let tiny = [0u8; POINTER_EVENT_WIRE_SIZE - 1];
         assert_eq!(
@@ -465,7 +567,6 @@ mod tests {
 
     proptest! {
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_key_event_round_trips(ev in arb_key_event()) {
             let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
             ev.encode(&mut buf).expect("encode");
@@ -475,7 +576,6 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "A.0 stub: real codec impl lands in A.0 commit 2"]
         fn prop_pointer_event_round_trips(ev in arb_pointer_event()) {
             let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
             ev.encode(&mut buf).expect("encode");
