@@ -140,8 +140,24 @@ pub const ANCHOR_RIGHT: u8 = 1 << 3;
 /// the four edge flags; the decoder rejects mixed usage.
 pub const ANCHOR_CENTER: u8 = 1 << 4;
 
+/// Union of the four edge-anchor bits (top, bottom, left, right), excluding
+/// [`ANCHOR_CENTER`]. Any bit in [`ANCHOR_CENTER`] combined with any bit in
+/// `ANCHOR_EDGES` on the wire is a protocol violation — see the mutual-
+/// exclusivity rule on [`ANCHOR_CENTER`].
+pub const ANCHOR_EDGES: u8 = ANCHOR_TOP | ANCHOR_BOTTOM | ANCHOR_LEFT | ANCHOR_RIGHT;
+
 /// Union of all defined anchor bits.
-pub const ANCHOR_ALL: u8 = ANCHOR_TOP | ANCHOR_BOTTOM | ANCHOR_LEFT | ANCHOR_RIGHT | ANCHOR_CENTER;
+pub const ANCHOR_ALL: u8 = ANCHOR_EDGES | ANCHOR_CENTER;
+
+/// True iff `mask` is a legal [`LayerConfig::anchor_mask`]: contains no bits
+/// outside [`ANCHOR_ALL`] and does not mix [`ANCHOR_CENTER`] with any edge
+/// anchor.
+pub const fn is_valid_anchor_mask(mask: u8) -> bool {
+    if (mask & !ANCHOR_ALL) != 0 {
+        return false;
+    }
+    !((mask & ANCHOR_CENTER) != 0 && (mask & ANCHOR_EDGES) != 0)
+}
 
 /// Layer-stacking ordering for `Layer` surfaces. Wire tag is the explicit
 /// discriminant value.
@@ -594,7 +610,7 @@ fn read_role(buf: &[u8]) -> Result<(SurfaceRole, usize), ProtocolError> {
             }
             let layer = layer_from_u8(buf[1])?;
             let anchor_mask = buf[2];
-            if (anchor_mask & !ANCHOR_ALL) != 0 {
+            if !is_valid_anchor_mask(anchor_mask) {
                 return Err(ProtocolError::InvalidAnchorMask);
             }
             let exclusive_zone = read_u32(buf, 3)?;
@@ -692,6 +708,11 @@ impl ClientMessage {
                 })
             }
             Self::SetSurfaceRole { surface_id, role } => {
+                if let SurfaceRole::Layer(cfg) = role
+                    && !is_valid_anchor_mask(cfg.anchor_mask)
+                {
+                    return Err(ProtocolError::InvalidAnchorMask);
+                }
                 let role_size = role_wire_size(role);
                 let body_len = 4 + role_size;
                 encode_fixed_body(buf, OP_CLIENT_SET_SURFACE_ROLE, body_len, |body| {
@@ -1376,6 +1397,68 @@ mod tests {
         assert_eq!(err, ProtocolError::InvalidEnum);
     }
 
+    fn layer_role_frame_with_anchor(mask: u8) -> [u8; FRAME_HEADER_SIZE + 28] {
+        let mut buf = [0u8; FRAME_HEADER_SIZE + 28];
+        buf[0..2].copy_from_slice(&28u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&OP_CLIENT_SET_SURFACE_ROLE.to_le_bytes());
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8] = 1; // role_tag = Layer
+        buf[9] = Layer::Top as u8;
+        buf[10] = mask;
+        buf[11..15].copy_from_slice(&0u32.to_le_bytes());
+        buf[15] = KeyboardInteractivity::None as u8;
+        // margins already zeroed
+        buf
+    }
+
+    #[test]
+    fn is_valid_anchor_mask_rejects_center_plus_edge() {
+        assert!(is_valid_anchor_mask(0));
+        assert!(is_valid_anchor_mask(ANCHOR_TOP));
+        assert!(is_valid_anchor_mask(ANCHOR_TOP | ANCHOR_RIGHT));
+        assert!(is_valid_anchor_mask(ANCHOR_CENTER));
+        assert!(!is_valid_anchor_mask(ANCHOR_CENTER | ANCHOR_TOP));
+        assert!(!is_valid_anchor_mask(ANCHOR_CENTER | ANCHOR_EDGES));
+        assert!(!is_valid_anchor_mask(1 << 7));
+    }
+
+    #[test]
+    fn client_layer_role_decode_rejects_center_plus_edge_anchor() {
+        let buf = layer_role_frame_with_anchor(ANCHOR_CENTER | ANCHOR_TOP);
+        assert_eq!(
+            ClientMessage::decode(&buf).unwrap_err(),
+            ProtocolError::InvalidAnchorMask
+        );
+    }
+
+    #[test]
+    fn client_layer_role_decode_rejects_undefined_anchor_bit() {
+        let buf = layer_role_frame_with_anchor(1 << 7);
+        assert_eq!(
+            ClientMessage::decode(&buf).unwrap_err(),
+            ProtocolError::InvalidAnchorMask
+        );
+    }
+
+    #[test]
+    fn client_layer_role_encode_rejects_center_plus_edge_anchor() {
+        let msg = ClientMessage::SetSurfaceRole {
+            surface_id: SurfaceId(1),
+            role: SurfaceRole::Layer(LayerConfig {
+                layer: Layer::Top,
+                anchor_mask: ANCHOR_CENTER | ANCHOR_RIGHT,
+                exclusive_zone: 0,
+                keyboard_interactivity: KeyboardInteractivity::None,
+                margin: [0; 4],
+            }),
+        };
+        let mut buf = [0u8; SCRATCH_BUF_LEN];
+        assert_eq!(
+            msg.encode(&mut buf).unwrap_err(),
+            ProtocolError::InvalidAnchorMask
+        );
+    }
+
     // ---- ServerMessage round-trips, one per variant --------------------
 
     #[test]
@@ -1648,7 +1731,12 @@ mod tests {
     }
 
     fn arb_anchor_mask() -> impl Strategy<Value = u8> {
-        (0u8..=ANCHOR_ALL).prop_map(|m| m & ANCHOR_ALL)
+        prop_oneof![
+            // Any combination of edge anchors (including the empty mask).
+            0u8..=ANCHOR_EDGES,
+            // `CENTER` on its own — the only legal way CENTER appears.
+            Just(ANCHOR_CENTER),
+        ]
     }
 
     fn arb_layer_config() -> impl Strategy<Value = LayerConfig> {

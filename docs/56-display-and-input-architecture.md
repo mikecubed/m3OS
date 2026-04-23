@@ -291,7 +291,7 @@ Additional roles (e.g. `Popup`, `Subsurface`, tablet-specific roles) are not req
 | Field | Type | Semantics |
 |---|---|---|
 | `layer` | `u8` | `0 = Background`, `1 = Bottom`, `2 = Top`, `3 = Overlay`. Determines compose ordering relative to `Toplevel`. |
-| `anchor_mask` | `u8` | Bitmask: `TOP=1`, `BOTTOM=2`, `LEFT=4`, `RIGHT=8`, `CENTER=16`. `CENTER` is mutually exclusive with edge anchors; a mixed mask decodes to `ProtocolError::InvalidAnchorMask`. |
+| `anchor_mask` | `u8` | Bitmask: `TOP=1`, `BOTTOM=2`, `LEFT=4`, `RIGHT=8`, `CENTER=16`. `CENTER` is mutually exclusive with the edge-anchor bits; a mixed mask (`CENTER` plus any of `TOP` / `BOTTOM` / `LEFT` / `RIGHT`) is rejected by both encoder and decoder with `ProtocolError::InvalidAnchorMask`. The predicate [`is_valid_anchor_mask`] encodes the rule. |
 | `exclusive_zone` | `u32` | Pixels reserved from the `Toplevel` band on the anchored edge. `0` means no reservation. |
 | `keyboard_interactivity` | `u8` | `0 = None` (no key events), `1 = OnDemand` (only when focused), `2 = Exclusive` (claims focus while mapped). At most one `Exclusive` layer surface per seat; a second attempt is rejected with a typed protocol error (E.2). |
 | `margin` | `[i32; 4]` | `[top, right, bottom, left]` pixels between the anchor and the surface rect. |
