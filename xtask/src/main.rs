@@ -4978,6 +4978,42 @@ fn signed_path(path: &Path) -> PathBuf {
     }
 }
 
+fn mkfs_ext2_arg_variants() -> [&'static [&'static str]; 2] {
+    [
+        &["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"],
+        &["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"],
+    ]
+}
+
+fn format_ext2_partition(part_tmp: &Path) {
+    let mut failures: Vec<(String, std::process::Output)> = Vec::new();
+
+    for args in mkfs_ext2_arg_variants() {
+        let output = Command::new("mkfs.ext2")
+            .args(args)
+            .arg(part_tmp)
+            .output()
+            .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
+        if output.status.success() {
+            return;
+        }
+        failures.push((args.join(" "), output));
+    }
+
+    eprintln!("Error: mkfs.ext2 failed for all supported argument forms");
+    for (args, output) in failures {
+        eprintln!("  args: {args}");
+        eprintln!("  status: {}", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            for line in stderr.lines() {
+                eprintln!("    stderr: {line}");
+            }
+        }
+    }
+    std::process::exit(1);
+}
+
 /// Create a 64 MB raw data disk image with an MBR partition table and an
 /// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
@@ -5069,25 +5105,10 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     }
 
     // Format with mkfs.ext2 (4K blocks, ext2 rev 0, no optional features).
-    // Newer e2fsprogs (>=1.47.4, Arch) removed -r; try -E revision=0 first
-    // (rev 0 implies no features, so -O none is not needed), then fall back
-    // to -r 0 -O none for older versions (Ubuntu 22.04/24.04).
-    let mkfs_status = Command::new("mkfs.ext2")
-        .args(["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"])
-        .arg(&part_tmp)
-        .status()
-        .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
-    if !mkfs_status.success() {
-        let fallback = Command::new("mkfs.ext2")
-            .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
-            .arg(&part_tmp)
-            .status()
-            .expect("failed to run mkfs.ext2");
-        if !fallback.success() {
-            eprintln!("Error: mkfs.ext2 failed (exit {})", fallback);
-            std::process::exit(1);
-        }
-    }
+    // Different e2fsprogs releases disagree on whether the legacy `-r 0` form
+    // or the newer `-E revision=0` form is accepted, so try both quietly and
+    // only emit diagnostics if neither host variant works.
+    format_ext2_partition(&part_tmp);
 
     // Populate files using debugfs.
     populate_ext2_files(&part_tmp, output_dir, enable_telnet, smoke_test_mode);
@@ -8536,6 +8557,30 @@ mod tests {
         let (devices, _) = extract_device_flags(&input).unwrap();
         assert!(devices.nvme);
         assert!(devices.e1000);
+    }
+
+    #[test]
+    fn mkfs_ext2_compatibility_prefers_legacy_revision_flags_first() {
+        let variants = mkfs_ext2_arg_variants();
+
+        assert_eq!(
+            variants[0],
+            ["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"],
+            "mkfs compatibility should try the legacy `-r 0 -O none` form first \
+             so Ubuntu/Omarchy hosts avoid the unsupported `-E revision=0` path"
+        );
+    }
+
+    #[test]
+    fn mkfs_ext2_compatibility_keeps_revision_extended_option_as_fallback() {
+        let variants = mkfs_ext2_arg_variants();
+
+        assert_eq!(
+            variants[1],
+            ["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"],
+            "mkfs compatibility must retain the `-E revision=0` fallback for \
+             hosts whose e2fsprogs no longer accept `-r 0`"
+        );
     }
 
     #[test]

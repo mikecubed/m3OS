@@ -83,28 +83,23 @@ syscall_lib::entry_point!(program_main);
 /// IPC operation label: read one scancode from kbd_server.
 const KBD_READ: u64 = 1;
 
+fn lookup_kbd_service() -> u32 {
+    loop {
+        let handle = syscall_lib::ipc_lookup_service("kbd");
+        if handle != u64::MAX {
+            return handle as u32;
+        }
+        let _ = syscall_lib::nanosleep_for(0, 20_000_000); // 20 ms
+    }
+}
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: starting\n");
 
     // Look up the "kbd" service to obtain an endpoint capability.
-    // Retry with short sleeps because the service manager starts us as soon
-    // as kbd_server is forked, which is before it has registered its IPC
-    // endpoint.
-    let kbd_handle = {
-        let mut h = u64::MAX;
-        for _ in 0..50 {
-            h = syscall_lib::ipc_lookup_service("kbd");
-            if h != u64::MAX {
-                break;
-            }
-            let _ = syscall_lib::nanosleep_for(0, 20_000_000); // 20 ms
-        }
-        if h == u64::MAX {
-            syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: failed to lookup 'kbd'\n");
-            return 1;
-        }
-        h as u32
-    };
+    // Retry indefinitely because service state is "running" as soon as init
+    // forks the task, which still races service-registry publication.
+    let mut kbd_handle = lookup_kbd_service();
 
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: ready\n");
 
@@ -115,7 +110,12 @@ fn program_main(_args: &[&str]) -> i32 {
         // Request one scancode from kbd_server via IPC.  This blocks until
         // the keyboard service has a scancode ready (it blocks on IRQ1
         // internally).  The scancode is returned as the reply label.
-        let sc = syscall_lib::ipc_call(kbd_handle, KBD_READ, 0) as u8;
+        let sc_rc = syscall_lib::ipc_call(kbd_handle, KBD_READ, 0);
+        if sc_rc == u64::MAX {
+            kbd_handle = lookup_kbd_service();
+            continue;
+        }
+        let sc = sc_rc as u8;
 
         // Key-release (break) codes: bit 7 set.
         if sc >= 0x80 {
