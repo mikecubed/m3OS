@@ -390,6 +390,7 @@ pub fn signal_irq(irq: u8) {
     // Phase 52: push waiter to per-core ISR wakeup queue (lock-free).
     // Use compare_exchange to atomically claim the waiter, preventing
     // duplicate pushes when multiple IRQs arrive before the task wakes.
+    let mut pushed_waiter_idx = -1;
     if let Some(isr_waiter) = ISR_WAITERS.get(idx as usize) {
         let waiter_idx = isr_waiter.load(Ordering::Acquire);
         if waiter_idx >= 0
@@ -397,8 +398,9 @@ pub fn signal_irq(irq: u8) {
                 .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             && let Some(data) = crate::smp::try_per_core()
+            && data.isr_wake_queue.push(waiter_idx as usize)
         {
-            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+            pushed_waiter_idx = waiter_idx;
         }
     }
 
@@ -408,6 +410,7 @@ pub fn signal_irq(irq: u8) {
     // gracefully (no-op).
     let bound = BOUND_TCB[idx as usize].load(Ordering::Acquire);
     if bound >= 0
+        && bound != pushed_waiter_idx
         && let Some(data) = crate::smp::try_per_core()
     {
         let _ = data.isr_wake_queue.push(bound as usize);
@@ -445,6 +448,7 @@ pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
 
     // Push the waiter (if any) to the per-core ISR wake queue — mirrors
     // the logic in `signal_irq` but without the `IRQ_MAP` indirection.
+    let mut pushed_waiter_idx = -1;
     if let Some(isr_waiter) = ISR_WAITERS.get(idx) {
         let waiter_idx = isr_waiter.load(Ordering::Acquire);
         if waiter_idx >= 0
@@ -452,14 +456,16 @@ pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
                 .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             && let Some(data) = crate::smp::try_per_core()
+            && data.isr_wake_queue.push(waiter_idx as usize)
         {
-            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+            pushed_waiter_idx = waiter_idx;
         }
     }
 
     // Also wake any task parked in recv_msg_with_notif with this notification bound.
     let bound = BOUND_TCB[idx].load(Ordering::Acquire);
     if bound >= 0
+        && bound != pushed_waiter_idx
         && let Some(data) = crate::smp::try_per_core()
     {
         let _ = data.isr_wake_queue.push(bound as usize);

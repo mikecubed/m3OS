@@ -8112,7 +8112,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 
     let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut frames_to_free: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    let mut device_frame_unmapped = false;
     let mut fb_fully_unmapped = false;
     let mut vma_changed = false;
     {
@@ -8175,8 +8174,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             if let Some((frame_phys, is_device_frame)) = guard_frame {
                 if !is_device_frame {
                     frames_to_free.push(frame_phys);
-                } else {
-                    device_frame_unmapped = true;
                 }
                 unmapped_addrs.push(page_addr);
                 continue;
@@ -8204,8 +8201,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                         // Only return system-RAM frames to the allocator after the
                         // batched shootdown has invalidated every stale translation.
                         frames_to_free.push(frame.start_address().as_u64());
-                    } else {
-                        device_frame_unmapped = true;
                     }
                     unmapped_addrs.push(page_addr);
                 }
@@ -8256,10 +8251,10 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         );
     }
 
-    // Only release framebuffer ownership when ALL device pages are gone.
-    // A partial unmap must not clear the owner — another process could then
-    // claim the FB via CAS while the current owner still has pages mapped.
-    if device_frame_unmapped && fb_fully_unmapped && crate::fb::fb_owner_pid() == pid {
+    // Restore text-console ownership whenever the current process no longer has
+    // any framebuffer mappings. That lifecycle is separate from whether this
+    // particular munmap call tore down device-backed pages.
+    if fb_fully_unmapped && crate::fb::fb_owner_pid() == pid {
         crate::fb::restore_console();
     }
 
