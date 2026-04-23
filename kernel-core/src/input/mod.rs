@@ -1,3 +1,5 @@
+pub mod events;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScancodeSink {
     Tty,
