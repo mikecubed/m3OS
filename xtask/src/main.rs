@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Seek, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use anyhow::Context;
@@ -1531,24 +1532,66 @@ fn convert_to_vhdx(uefi_image: &Path) {
 /// Checks for `x86_64-linux-musl-gcc` (Debian/Ubuntu cross-compiler),
 /// `x86_64-unknown-linux-musl1.2-gcc` (Arch `musl-gcc-cross-bin`),
 /// and `musl-gcc` (Debian/Ubuntu `musl-tools` wrapper), in that order.
+///
+/// Some minimal musl cross toolchains (for example a hand-installed raiden or
+/// musl-cross-make toolchain under `/opt/`) omit musl's empty static
+/// compatibility stubs (`libdl.a`, `libpthread.a`, `librt.a`). Ports like TCC
+/// still link `-ldl`, so we reject those toolchains here and keep searching for
+/// a distro-provided compiler that can satisfy the full static link.
 fn find_musl_cc() -> Option<&'static str> {
-    let candidates = [
-        "x86_64-linux-musl-gcc",
-        "x86_64-unknown-linux-musl1.2-gcc",
-        "musl-gcc",
-    ];
-    for cc in candidates {
-        if Command::new(cc)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return Some(cc);
+    static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MUSL_CC.get_or_init(|| {
+        let candidates = [
+            "x86_64-linux-musl-gcc",
+            "x86_64-unknown-linux-musl1.2-gcc",
+            "musl-gcc",
+        ];
+        for cc in candidates {
+            if !Command::new(cc)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                continue;
+            }
+            if musl_cc_has_static_compat_stubs(cc) {
+                return Some(cc);
+            }
+            eprintln!(
+                "warning: skipping musl compiler `{cc}` — static link check for \
+                 -ldl/-lpthread/-lrt failed; install/use a distro musl toolchain \
+                 (musl-tools or musl-gcc-cross-bin)"
+            );
         }
+        None
+    })
+}
+
+fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let src = dir.path().join("stub-check.c");
+    let out = dir.path().join("stub-check");
+    if fs::write(&src, "int main(void) { return 0; }\n").is_err() {
+        return false;
     }
-    None
+    Command::new(cc)
+        .args([
+            "-static",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-ldl",
+            "-lpthread",
+            "-lrt",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn find_ovmf() -> PathBuf {
