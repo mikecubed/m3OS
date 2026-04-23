@@ -1,52 +1,35 @@
 ---
-current-task: "PR #116 review resolution — 11 new unresolved copilot threads (round 6)"
-current-phase: "triage-complete"
-next-action: "begin fix batch 1"
-workspace: "feat/phase-55b-ring-3-driver-host (PR #116)"
-last-updated: "2026-04-20T12:00:00Z"
+current-task: "Debug framebuffer login keyboard regression in normal mode"
+current-phase: "fix-complete"
+next-action: "done"
+workspace: "feat/phase-55c-ring3-driver-closure"
+last-updated: "2026-04-23T16:18:18Z"
 ---
 
-## Review surface
+## Decisions
 
-PR #116 — new copilot round. 11 unresolved threads, all from
-`copilot-pull-request-reviewer`. Previous rounds (1–5) resolved.
-7 distinct fixes close all 11 threads (several threads are duplicates on the
-same line / docstring / function).
-
-## Decisions (round 6 — 11 new unresolved threads)
-
-| Thread ID | File:Line | Verdict | Action |
-|---|---|---|---|
-| PRRT_kwDORTRVIM58QGTk | kernel/src/blk/mod.rs:59 | valid — `write_sectors` doc mentions `payload_grant` parameter that isn't in the signature | fix (doc only) |
-| PRRT_kwDORTRVIM58QGUm | kernel/src/pci/mod.rs:436 | valid — doc says "Consume this handle" but signature is `&self` | fix (doc only) |
-| PRRT_kwDORTRVIM58QGU- | kernel/src/pci/mod.rs:441 | duplicate of QGUm — same docstring | fix (covered by one change) |
-| PRRT_kwDORTRVIM58QGVa | kernel/src/arch/x86_64/syscall/mod.rs:1588 | valid — inline `-19_i64` for ENODEV; codebase has `NEG_ENODEV` elsewhere | fix (add file-level const, use it here and at two function-local occurrences) |
-| PRRT_kwDORTRVIM58QGVv | kernel/src/pci/bar.rs:590 | partially valid — `tlb_shootdown_range` already page-aligns internally, so no real bug today; explicit page-rounded end removes implicit coupling | fix (defense-in-depth) |
-| PRRT_kwDORTRVIM58QGWG | kernel/src/pci/bar.rs:596 | duplicate of QGVv | fix (covered by one change) |
-| PRRT_kwDORTRVIM58QGWj | kernel/src/pci/bar.rs:615 | duplicate of QGVv | fix (covered by one change) |
-| PRRT_kwDORTRVIM58QGW8 | kernel/src/pci/bar.rs:630 | duplicate of QGVv | fix (covered by one change) |
-| PRRT_kwDORTRVIM58QGXM | userspace/coreutils-rs/src/service.rs:421 | valid — error-message format `kill(<name>, pid=<n>)` reads like a syscall signature but mixes name + pid | fix (reformat to separate label from syscall form) |
-| PRRT_kwDORTRVIM58QGXe | kernel/src/task/scheduler.rs:852 | valid — doc says "if the task is alive"; impl only checks existence | fix (doc only → "if the task exists") |
-| PRRT_kwDORTRVIM58QGX7 | kernel/src/task/scheduler.rs:862 | duplicate of QGXe — same docstring | fix (covered by one change) |
+- Symptom: keyboard input never works for the normal framebuffer/login/shell path in QEMU GUI, while the serial console still accepts input and DOOM receives keys normally once launched from the serial console.
+- Confirmed architecture split: DOOM uses the raw framebuffer + `sys_read_scancode()` path directly, while normal login/shell input depends on the userspace `kbd_server` → `stdin_feeder` → `push_raw_input()` bridge.
+- Root cause: `userspace/stdin_feeder` retried `ipc_lookup_service("kbd")` with `syscall_lib::nanosleep(20_000_000)` under the assumption that the argument was nanoseconds, but `syscall_lib::nanosleep()` interprets its argument as whole seconds. When `stdin_feeder` raced ahead of `kbd_server` registration on boot, it slept for ~20 million seconds after the first miss, leaving the normal framebuffer input path effectively dead.
+- Fix applied: added `syscall_lib::nanosleep_for(seconds, nanoseconds)` and switched `stdin_feeder`'s startup retry loop to `nanosleep_for(0, 20_000_000)` so the intended 20 ms backoff is real.
+- Validation outcome: `cargo xtask check` passed after the change. A follow-up `cargo xtask smoke-test --timeout 60` did not validate guest behaviour because the host-side run aborted before boot with the pre-existing ext2 tool error `Bad option(s) specified: revision`.
 
 ## Files Touched
 
-(round-6 fix scope, not yet edited)
-- kernel/src/blk/mod.rs
-- kernel/src/pci/mod.rs
-- kernel/src/arch/x86_64/syscall/mod.rs
-- kernel/src/pci/bar.rs
-- userspace/coreutils-rs/src/service.rs
-- kernel/src/task/scheduler.rs
+- .agent/SESSION.md
+- userspace/stdin_feeder/src/main.rs
+- userspace/syscall-lib/src/lib.rs
 
 ## Open Questions
 
-(none — all 11 triaged)
+- Interactive confirmation in QEMU GUI is still needed to prove the framebuffer login path now receives keys end-to-end.
 
 ## Blockers
 
-(none)
+- Host-side smoke boot in this environment is currently blocked by the ext2 image tooling error `Bad option(s) specified: revision`, so it cannot be used here to validate the GUI keyboard fix.
 
 ## Failed Hypotheses
 
-(none)
+- **DO-NOT-RETRY:** "The remaining regression is specifically a post-DOOM framebuffer ownership handoff bug." Evidence: the clarified user report says normal framebuffer login input never works even before DOOM starts; DOOM only demonstrates that the raw scancode path still works.
+- **DO-NOT-RETRY:** "Foreground process-group (`FG_PGID`) routing is the main cause." Evidence: the shell currently does not implement job-control handoff (`setpgid`/`tcsetpgrp`) for DOOM launches, and that theory does not explain why framebuffer login input is dead before any shell command runs.
+- **DO-NOT-RETRY:** "The raw/TTY scancode router itself is latching the wrong sink after DOOM exits." Evidence: `kernel_core::input::ScancodeRouter` resets correctly and DOOM already proves raw keyboard delivery works; the actual always-broken path is the userspace TTY bridge.

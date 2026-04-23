@@ -1531,10 +1531,15 @@ pub fn setpgid(pid: i32, pgid: i32) -> isize {
 
 /// Sleep for `seconds` seconds.
 pub fn nanosleep(seconds: u64) -> isize {
+    nanosleep_for(seconds, 0)
+}
+
+/// Sleep for the supplied `(seconds, nanoseconds)` duration.
+pub fn nanosleep_for(seconds: u64, nanoseconds: u32) -> isize {
     // The kernel's nanosleep reads a timespec struct from a user pointer:
     //   bytes 0..8: tv_sec (i64)
     //   bytes 8..16: tv_nsec (i64)
-    let ts: [i64; 2] = [seconds as i64, 0];
+    let ts: [i64; 2] = [seconds as i64, nanoseconds as i64];
     unsafe { syscall2(SYS_NANOSLEEP, ts.as_ptr() as u64, 0) as isize }
 }
 

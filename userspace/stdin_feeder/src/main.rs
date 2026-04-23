@@ -97,7 +97,7 @@ fn program_main(_args: &[&str]) -> i32 {
             if h != u64::MAX {
                 break;
             }
-            syscall_lib::nanosleep(20_000_000); // 20 ms
+            let _ = syscall_lib::nanosleep_for(0, 20_000_000); // 20 ms
         }
         if h == u64::MAX {
             syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: failed to lookup 'kbd'\n");
