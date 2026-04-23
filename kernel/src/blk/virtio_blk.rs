@@ -411,8 +411,14 @@ static DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 
 pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 
+// The legacy virtio-blk implementation still uses one shared descriptor
+// chain, one scratch page, one DMA buffer, and one wake flag. Serialize all
+// task-context I/O through that single in-flight slot until the driver grows
+// true multi-request bookkeeping.
+static REQUEST_LOCK: Mutex<()> = Mutex::new(());
+
 // Single wake flag reused across requests — requests are fully serialized
-// under DRIVER.lock(), so only one task is ever waiting at a time.
+// under REQUEST_LOCK, so only one task is ever waiting at a time.
 static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 
 // ===========================================================================
@@ -453,6 +459,7 @@ fn virtio_blk_irq_handler() {
 
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
+    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(
@@ -499,6 +506,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
+    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(

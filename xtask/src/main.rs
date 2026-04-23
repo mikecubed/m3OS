@@ -5214,17 +5214,18 @@ fn populate_ext2_files(
         String::new()
     };
 
-    let smoke_mode_cmds = if smoke_test_mode {
-        format!(
-            "write \"{}\" etc/m3os-smoke-test-mode\n\
-             sif etc/m3os-smoke-test-mode mode 0x81A4\n\
-             sif etc/m3os-smoke-test-mode uid 0\n\
-             sif etc/m3os-smoke-test-mode gid 0\n",
-            smoke_mode_tmp.display()
-        )
-    } else {
-        String::new()
-    };
+    fs::write(
+        &smoke_mode_tmp,
+        if smoke_test_mode { b"1\n" } else { b"0\n" },
+    )
+    .expect("write temp smoke-mode marker");
+    let smoke_mode_cmds = format!(
+        "write \"{}\" etc/m3os-smoke-test-mode\n\
+         sif etc/m3os-smoke-test-mode mode 0x81A4\n\
+         sif etc/m3os-smoke-test-mode uid 0\n\
+         sif etc/m3os-smoke-test-mode gid 0\n",
+        smoke_mode_tmp.display()
+    );
 
     // CI toggle: dropping this marker tells the guest smoke-runner to skip
     // the TCC compile + hello-verify steps (both emit SKIP instead of PASS).

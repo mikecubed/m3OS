@@ -41,7 +41,6 @@ const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
-const SMOKE_MODE_SETTLE_SECS: u64 = 3;
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -697,6 +696,7 @@ struct ServiceManager {
     respawn_login: bool,
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
+    defer_status_writes: bool,
 }
 
 /// Syslog severity levels.
@@ -723,6 +723,7 @@ impl ServiceManager {
             login_pid: -1,
             respawn_login: true,
             syslog_fd: -1,
+            defer_status_writes: false,
         }
     }
 
@@ -967,6 +968,7 @@ impl ServiceManager {
 
     /// Boot all services in dependency order.
     fn boot_services(&mut self) {
+        self.defer_status_writes = true;
         let (graph, unresolvable) = DepGraph::build(&self.services, self.count);
 
         // Mark services with unresolvable deps as PermanentlyStopped.
@@ -984,8 +986,6 @@ impl ServiceManager {
             }
             i += 1;
         }
-        self.write_status_file();
-
         // Check for cycles.
         if graph.has_cycle(self.count) {
             write_str(
@@ -1020,6 +1020,7 @@ impl ServiceManager {
                 }
                 si += 1;
             }
+            self.defer_status_writes = false;
             return;
         }
 
@@ -1044,6 +1045,7 @@ impl ServiceManager {
             }
             i += 1;
         }
+        self.defer_status_writes = false;
     }
 
     fn check_deps_ready(&self, graph: &DepGraph, idx: usize) -> bool {
@@ -1143,8 +1145,11 @@ impl ServiceManager {
         write_str(STDOUT_FILENO, "\n");
         self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
 
-        // Write status immediately on state transition.
-        self.write_status_file();
+        // During the initial boot wave, batch status writes so PID 1 doesn't
+        // stall on a filesystem round-trip after every single service fork.
+        if !self.defer_status_writes {
+            self.write_status_file();
+        }
     }
 
     /// Handle a reaped child PID with its exit status.
@@ -1874,10 +1879,6 @@ fn spawn_login() -> i32 {
 fn spawn_smoke_runner() -> i32 {
     let pid = fork();
     if pid == 0 {
-        // Let boot-time services finish their initial ext2/syslog work before
-        // the smoke runner starts mutating the filesystem.
-        let _ = nanosleep(SMOKE_MODE_SETTLE_SECS);
-
         let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -1898,6 +1899,9 @@ fn spawn_smoke_runner() -> i32 {
         write_str(STDOUT_FILENO, "init: failed to fork smoke-runner\n");
         return -1;
     }
+    write_str(STDOUT_FILENO, "init: smoke-runner pid=");
+    write_u64(STDOUT_FILENO, pid as u64);
+    write_str(STDOUT_FILENO, "\n");
     pid as i32
 }
 
@@ -1906,8 +1910,10 @@ fn smoke_test_mode_enabled() -> bool {
     if fd < 0 {
         return false;
     }
+    let mut buf = [0u8; 4];
+    let n = read(fd as i32, &mut buf);
     close(fd as i32);
-    true
+    n > 0 && buf[0] == b'1'
 }
 
 // ---------------------------------------------------------------------------
@@ -1967,7 +1973,8 @@ pub extern "C" fn _start() -> ! {
 
     // Spawn the initial interactive session unless the smoke-test marker asks
     // PID 1 to run the guest smoke runner directly.
-    if smoke_test_mode_enabled() {
+    let smoke_mode = smoke_test_mode_enabled();
+    if smoke_mode {
         write_str(
             STDOUT_FILENO,
             "init: smoke-test mode enabled, scheduling /bin/smoke-runner\n",
@@ -1984,12 +1991,6 @@ pub extern "C" fn _start() -> ! {
             // Not fatal — services may still be running.
         }
     }
-
-    // Create control command file with root-only permissions (mode 0600).
-    mgr.create_control_file();
-
-    // Write initial status file.
-    mgr.write_status_file();
 
     // Track iterations for periodic status writes.
     let mut loop_count: u32 = 0;
@@ -2023,12 +2024,17 @@ pub extern "C" fn _start() -> ! {
         // Check for control commands every 3rd iteration (reduces syscall noise
         // on serial, keeping control latency under 3 seconds).
         loop_count = loop_count.wrapping_add(1);
-        if loop_count.is_multiple_of(3) {
+        if !smoke_mode && loop_count == 10 {
+            mgr.create_control_file();
+            mgr.write_status_file();
+        }
+
+        if !smoke_mode && loop_count.is_multiple_of(3) {
             mgr.check_control_commands();
         }
 
         // Periodically write status file (every ~10 iterations).
-        if loop_count.is_multiple_of(10) {
+        if !smoke_mode && loop_count.is_multiple_of(10) {
             mgr.write_status_file();
         }
 

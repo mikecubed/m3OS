@@ -554,7 +554,10 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
             }
         }
         let routed = vfs_service_open(&resolved, flags);
-        if routed != NEG_ENOENT && routed != NEG_EIO {
+        // If the userspace VFS path is unavailable (service absent, transport
+        // failure during a stale-registry window, or explicit I/O miss), fall
+        // back to the kernel ext2 path for new opens.
+        if routed != NEG_ENOENT && routed != NEG_EIO && routed != u64::MAX {
             return routed;
         }
         return open_resolved_path(&resolved, flags, mode_arg);

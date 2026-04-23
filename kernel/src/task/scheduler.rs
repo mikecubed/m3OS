@@ -724,9 +724,19 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     let now = crate::arch::x86_64::interrupts::tick_count();
-    task.assigned_core = current_core;
+    let target_core = if fork_pid == 1 {
+        current_core
+    } else {
+        least_loaded_core(&sched)
+    };
+    task.assigned_core = target_core;
     task.last_migrated_tick = now;
     task.last_ready_tick = now;
+    // Fresh fork children need one prompt first dispatch so they can consume
+    // `fork_ctx` in `fork_child_trampoline` and enter their normal userspace
+    // wait/exec path. Restore the default priority as soon as the trampoline
+    // takes the context.
+    task.priority = 19;
     // Publish the child PID before the first dispatch so pid-based lifecycle
     // operations (for example exit_group teardown) can target the task even if
     // it has not reached fork_child_trampoline yet.
@@ -747,11 +757,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTaskSpawned {
         pid: fork_pid,
         task_idx: idx as u32,
-        core: current_core,
+        core: target_core,
     });
-    enqueue_to_core(current_core, idx);
+    enqueue_to_core(target_core, idx);
 
-    current_core
+    target_core
 }
 
 /// Register an idle task for a specific core.
@@ -948,7 +958,11 @@ pub fn set_current_user_return(urs: crate::task::UserReturnState) {
 
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
-    SCHEDULER.lock().tasks[idx].fork_ctx.take()
+    let mut sched = SCHEDULER.lock();
+    let task = &mut sched.tasks[idx];
+    let ctx = task.fork_ctx.take()?;
+    task.priority = 20;
+    Some(ctx)
 }
 
 /// Return the PID associated with the given task index.
@@ -1403,13 +1417,10 @@ pub fn wake_task(id: TaskId) -> bool {
                     }
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
-                        sched.tasks[idx].last_migrated_tick =
-                            crate::arch::x86_64::interrupts::tick_count();
                         (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
                         sched.tasks[idx].state = TaskState::Ready;
-                        sched.tasks[idx].last_migrated_tick = now;
                         sched.tasks[idx].last_ready_tick = now;
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
@@ -2056,7 +2067,6 @@ pub fn run() -> ! {
                         };
                         hog_info = Some((task.pid, task.name, ran_ticks, task.state, exec_path));
                     }
-
                     let wake_after_switch = task.wake_after_switch;
                     let blocked = matches!(
                         task.state,
