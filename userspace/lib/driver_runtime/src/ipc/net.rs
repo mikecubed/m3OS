@@ -213,10 +213,31 @@ impl<B: IpcBackend> NetServer<B> {
     /// [`NET_RX_FRAME`]-labelled fire-and-forget send to the kernel ingress
     /// endpoint the caller registered via [`Self::with_ingress_endpoint`].
     pub fn publish_rx_frame(&self, frame: &[u8]) -> Result<(), DriverRuntimeError> {
-        if frame.len() > MAX_FRAME_BYTES as usize {
-            return Err(DriverRuntimeError::Device(
-                kernel_core::device_host::DeviceHostError::Internal,
-            ));
+        self.publish_rx_frames(core::slice::from_ref(&frame))
+    }
+
+    /// Batch variant of [`Self::publish_rx_frame`] — concatenates multiple
+    /// RX frames into a single `NET_RX_FRAME` bulk so the driver pays one
+    /// synchronous IPC rendezvous per drain pass instead of one per frame.
+    ///
+    /// The kernel-side ingress parser (`RemoteNic::inject_rx_frame`) walks
+    /// the bulk record-by-record, so a single-record bulk is identical to
+    /// the pre-batch protocol. Frames whose combined header+payload would
+    /// exceed the kernel's IPC bulk limit are split into multiple sends
+    /// (each sub-batch small enough to fit).
+    ///
+    /// Returns the first error encountered on the underlying `send_buf`
+    /// call. Frames in sub-batches before the failure were already delivered.
+    pub fn publish_rx_frames(&self, frames: &[&[u8]]) -> Result<(), DriverRuntimeError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        for frame in frames {
+            if frame.len() > MAX_FRAME_BYTES as usize {
+                return Err(DriverRuntimeError::Device(
+                    kernel_core::device_host::DeviceHostError::Internal,
+                ));
+            }
         }
         let ingress = match self.ingress_endpoint {
             Some(ep) => ep,
@@ -226,16 +247,36 @@ impl<B: IpcBackend> NetServer<B> {
                 ));
             }
         };
-        let header = NetFrameHeader {
-            kind: NET_RX_FRAME,
-            frame_len: frame.len() as u16,
-            flags: 0,
-        };
-        let mut bulk = encode_net_rx_notify(header);
-        bulk.extend_from_slice(frame);
-        self.backend
-            .lock()
-            .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)
+
+        // Kernel `ipc_send_buf` caps bulk at 4 KiB. Group frames into
+        // sub-batches small enough to fit; the common case for interactive
+        // workloads is 1–2 frames per drain, which fits in a single send.
+        const MAX_BULK_BYTES: usize = 4096;
+        let mut bulk: Vec<u8> = Vec::new();
+
+        for frame in frames {
+            let record_size = NET_FRAME_HEADER_SIZE + frame.len();
+            if !bulk.is_empty() && bulk.len() + record_size > MAX_BULK_BYTES {
+                self.backend
+                    .lock()
+                    .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)?;
+                bulk.clear();
+            }
+            let header = NetFrameHeader {
+                kind: NET_RX_FRAME,
+                frame_len: frame.len() as u16,
+                flags: 0,
+            };
+            bulk.extend_from_slice(&encode_net_rx_notify(header));
+            bulk.extend_from_slice(frame);
+        }
+
+        if !bulk.is_empty() {
+            self.backend
+                .lock()
+                .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)?;
+        }
+        Ok(())
     }
 
     /// Publish a `NET_LINK_STATE` event to the kernel net stack.
@@ -399,6 +440,79 @@ mod tests {
         let oversized = alloc::vec![0u8; (MAX_FRAME_BYTES as usize) + 1];
         let result = server.publish_rx_frame(&oversized);
         assert!(result.is_err());
+        let mock = server.backend.lock();
+        assert_eq!(mock.sends.len(), 0);
+    }
+
+    #[test]
+    fn publish_rx_frames_batches_multiple_frames_into_one_send() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+
+        let frame_a: Vec<u8> = (0u8..16).collect();
+        let frame_b: Vec<u8> = (16u8..48).collect();
+        let frame_c: Vec<u8> = (48u8..80).collect();
+        let frames: Vec<&[u8]> =
+            alloc::vec![frame_a.as_slice(), frame_b.as_slice(), frame_c.as_slice()];
+        server.publish_rx_frames(&frames).expect("batch publish");
+
+        let mock = server.backend.lock();
+        // Three small frames easily fit in one 4 KiB bulk — one send_buf.
+        assert_eq!(mock.sends.len(), 1);
+        let send = &mock.sends[0];
+        assert_eq!(send.label, NET_RX_FRAME as u64);
+
+        // Walk the bulk: each record is [header, frame_bytes], concatenated.
+        let mut pos = 0;
+        for expected in [&frame_a, &frame_b, &frame_c] {
+            let hdr = decode_net_rx_notify(&send.bulk[pos..pos + NET_FRAME_HEADER_SIZE])
+                .expect("header decodes");
+            assert_eq!(hdr.kind, NET_RX_FRAME);
+            assert_eq!(hdr.frame_len as usize, expected.len());
+            pos += NET_FRAME_HEADER_SIZE;
+            assert_eq!(&send.bulk[pos..pos + expected.len()], expected.as_slice());
+            pos += expected.len();
+        }
+        assert_eq!(pos, send.bulk.len());
+    }
+
+    #[test]
+    fn publish_rx_frames_splits_into_sub_batches_when_bulk_would_overflow() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+
+        // Two max-size frames would exceed 4 KiB when concatenated with their
+        // headers, so the publisher must split them across two send_buf calls.
+        let big = alloc::vec![0x55u8; MAX_FRAME_BYTES as usize];
+        let frames: Vec<&[u8]> = alloc::vec![big.as_slice(), big.as_slice(), big.as_slice()];
+        server
+            .publish_rx_frames(&frames)
+            .expect("split-batch publish");
+
+        let mock = server.backend.lock();
+        // 3 × (1522 + 8) = 4590 bytes total — must be at least two sub-batches
+        // since a single 4 KiB bulk holds at most two full-size frames.
+        assert!(
+            mock.sends.len() >= 2,
+            "expected >= 2 sub-batches, got {}",
+            mock.sends.len()
+        );
+        for send in &mock.sends {
+            assert!(
+                send.bulk.len() <= 4096,
+                "sub-batch bulk exceeds kernel limit: {}",
+                send.bulk.len()
+            );
+        }
+    }
+
+    #[test]
+    fn publish_rx_frames_rejects_oversized_frame_and_sends_nothing() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+        let oversized = alloc::vec![0u8; (MAX_FRAME_BYTES as usize) + 1];
+        let frames: Vec<&[u8]> = alloc::vec![oversized.as_slice()];
+        assert!(server.publish_rx_frames(&frames).is_err());
         let mock = server.backend.lock();
         assert_eq!(mock.sends.len(), 0);
     }

@@ -514,21 +514,37 @@ pub fn drain_rx_to_server<B: IpcBackend>(
         })
         .collect();
     let descs: &mut [E1000RxDesc; RX_RING_SIZE] = &mut device.rx.descs;
-    let mut dropped = 0usize;
     let mut next_to_read = device.rx.next_to_read;
+    // Collect the whole drain locally before publishing so we can batch
+    // multiple frames into a single `NET_RX_FRAME` send. Without this, every
+    // drained frame costs one synchronous IPC rendezvous to the kernel
+    // ingress task, which blocks the driver's main loop and prevents it from
+    // returning to `handle_next` to service outbound TX. Under sustained
+    // bidirectional workloads (SSH interactive sessions with bursty RX) the
+    // per-frame rendezvous serializes the TX path for the combined drain
+    // duration — observed as "client hangs but server still sees keystrokes"
+    // because server-side echoes queue up kernel-side waiting for the driver
+    // to free up. See docs/post-mortems/2026-04-22-e1000-bound-notif.md for
+    // the ring-3 e1000 IPC topology this publish participates in.
+    let mut collected: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     let drained = drain_rx(
         &device.mmio,
         descs.as_mut_slice(),
         &bufs,
         &buf_iova,
         &mut next_to_read,
-        |frame| {
-            if net_server.publish_rx_frame(frame).is_err() {
-                dropped += 1;
-            }
-        },
+        |frame| collected.push(frame.to_vec()),
     );
     device.rx.next_to_read = next_to_read;
+    let dropped = if collected.is_empty() {
+        0
+    } else {
+        let frame_refs: alloc::vec::Vec<&[u8]> = collected.iter().map(|v| v.as_slice()).collect();
+        match net_server.publish_rx_frames(&frame_refs) {
+            Ok(()) => 0,
+            Err(_) => collected.len(),
+        }
+    };
     (drained, dropped)
 }
 

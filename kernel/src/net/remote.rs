@@ -397,36 +397,51 @@ impl RemoteNic {
         }
     }
 
-    /// Inject a single received Ethernet frame into the kernel net stack.
+    /// Inject one or more received Ethernet frames into the kernel net stack.
     ///
-    /// Called from the net task's IPC receive loop when the driver sends a
-    /// `NET_RX_FRAME` message. The `header_and_frame` slice must contain a
-    /// valid `NET_RX_FRAME` header (8 bytes) followed by the raw Ethernet
-    /// frame bytes.
+    /// Called from the `net.nic.ingress` task's IPC receive loop when the
+    /// driver sends a `NET_RX_FRAME` message. The bulk is a concatenation of
+    /// `[NetFrameHeader, frame_bytes]` records so the driver can batch several
+    /// RX frames into a single synchronous IPC send and only pay one
+    /// send-side rendezvous per drain pass instead of one per frame. A
+    /// single-record bulk (the pre-batch layout) is just the N=1 case.
     ///
-    /// On success, the frame is copied into the bounded RemoteNic RX queue and
-    /// `NIC_WOKEN` is set to wake the shared net task's next poll iteration.
-    /// Returns the number of frames queued (0 or 1).
+    /// On success each record is copied into the bounded RemoteNic RX queue
+    /// and the shared net task is woken. Returns the number of frames queued.
     pub fn inject_rx_frame(header_and_frame: &[u8]) -> usize {
-        match decode_net_rx_notify(header_and_frame) {
-            Ok(hdr) => {
-                let frame_len = hdr.frame_len as usize;
-                let header_size = kernel_core::driver_ipc::net::NET_FRAME_HEADER_SIZE;
-                if header_and_frame.len() < header_size + frame_len {
+        let header_size = kernel_core::driver_ipc::net::NET_FRAME_HEADER_SIZE;
+        let mut pos = 0;
+        let mut queued = 0usize;
+        if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+            let _ = Self::is_registered();
+        }
+        while pos + header_size <= header_and_frame.len() {
+            let hdr = match decode_net_rx_notify(&header_and_frame[pos..pos + header_size]) {
+                Ok(h) => h,
+                Err(e) => {
                     log::warn!(
-                        "[remote_nic] RX: payload shorter than declared frame_len {}",
-                        frame_len,
+                        "[remote_nic] RX: bad NET_RX_FRAME header at offset {}: {:?}",
+                        pos,
+                        e,
                     );
-                    return 0;
+                    break;
                 }
-                let frame = &header_and_frame[header_size..header_size + frame_len];
-                if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
-                    let _ = Self::is_registered();
-                }
+            };
+            let frame_len = hdr.frame_len as usize;
+            if pos + header_size + frame_len > header_and_frame.len() {
+                log::warn!(
+                    "[remote_nic] RX: payload shorter than declared frame_len {} at offset {}",
+                    frame_len,
+                    pos,
+                );
+                break;
+            }
+            let frame = &header_and_frame[pos + header_size..pos + header_size + frame_len];
+            {
                 let mut slot = REMOTE_NIC.lock();
                 let Some(entry) = slot.as_mut() else {
                     log::warn!("[remote_nic] RX: no ring-3 NIC registered");
-                    return 0;
+                    break;
                 };
                 if entry.rx_queue.len() >= RX_QUEUE_DEPTH {
                     log::warn!(
@@ -434,18 +449,17 @@ impl RemoteNic {
                         RX_QUEUE_DEPTH,
                         frame.len(),
                     );
-                    return 0;
+                } else {
+                    entry.rx_queue.push_back(frame.to_vec());
+                    queued += 1;
                 }
-                entry.rx_queue.push_back(frame.to_vec());
-                drop(slot);
-                crate::net::virtio_net::wake_net_task();
-                1
             }
-            Err(e) => {
-                log::warn!("[remote_nic] RX: bad NET_RX_FRAME header: {:?}", e);
-                0
-            }
+            pos += header_size + frame_len;
         }
+        if queued > 0 {
+            crate::net::virtio_net::wake_net_task();
+        }
+        queued
     }
 
     /// Drain deferred RX frames staged by `inject_rx_frame`.
@@ -666,5 +680,32 @@ mod tests {
         assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
         assert_eq!(RemoteNic::drain_rx_queue(), 0);
         assert_eq!(queued_rx_frames(), 0);
+    }
+
+    #[test_case]
+    fn inject_rx_frame_queues_each_record_in_a_multi_frame_batch() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(6), [0; 6]);
+
+        // Build a bulk carrying three concatenated [header, frame] records —
+        // the batched publish shape the ring-3 driver emits.
+        let frame_a = [0xAAu8; 14];
+        let frame_b = [0xBBu8; 32];
+        let frame_c = [0xCCu8; 17];
+        let mut bulk: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for frame in [frame_a.as_slice(), frame_b.as_slice(), frame_c.as_slice()] {
+            let header = NetFrameHeader {
+                kind: NET_RX_FRAME,
+                frame_len: frame.len() as u16,
+                flags: 0,
+            };
+            bulk.extend_from_slice(&encode_net_send(header));
+            bulk.extend_from_slice(frame);
+        }
+
+        assert_eq!(RemoteNic::inject_rx_frame(&bulk), 3);
+        assert_eq!(queued_rx_frames(), 3);
     }
 }
