@@ -667,12 +667,14 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
 /// `command_endpoint` is the TX command endpoint the kernel's `RemoteNic`
 /// facade sends `NET_SEND_FRAME` requests on. `ingress_endpoint` is the
 /// kernel-owned endpoint the driver publishes `NET_RX_FRAME` and
-/// `NET_LINK_STATE` events to.
+/// `NET_LINK_STATE` events to — `None` means the kernel did not spawn the
+/// ingress receiver, and RX publishes silently drop. TX still works through
+/// the command endpoint.
 #[allow(dead_code)] // called from main.rs program_main.
 pub fn run_io_loop(
     device: E1000Device,
     command_endpoint: EndpointCap,
-    ingress_endpoint: EndpointCap,
+    ingress_endpoint: Option<EndpointCap>,
 ) -> ! {
     // subscribe_and_bind atomically:
     //   1. subscribes IRQ,
@@ -691,7 +693,10 @@ pub fn run_io_loop(
     // can each borrow it mutably in their exclusive call arms without
     // conflicting at compile time.
     let device = core::cell::RefCell::new(device);
-    let net_server = NetServer::new(command_endpoint).with_ingress_endpoint(ingress_endpoint);
+    let net_server = match ingress_endpoint {
+        Some(ep) => NetServer::new(command_endpoint).with_ingress_endpoint(ep),
+        None => NetServer::new(command_endpoint),
+    };
     let _ = net_server.publish_link_state(NetLinkEvent {
         up: initial_link_up,
         mac: initial_mac,

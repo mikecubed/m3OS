@@ -211,13 +211,18 @@ fn init_task() -> ! {
         .expect("[init] failed to register console service");
     log::info!("[init] service registry: console={:?}", console_ep);
 
-    let remote_nic_ingress_ep = ipc::endpoint::ENDPOINTS.lock().create();
-    ipc::registry::register("net.nic.ingress", remote_nic_ingress_ep)
-        .expect("[init] failed to register net.nic.ingress service");
-    log::info!(
-        "[init] service registry: net.nic.ingress={:?}",
-        remote_nic_ingress_ep
-    );
+    // The ring-3 NIC ingress endpoint is intentionally NOT created here.
+    // Phase 55c Track E originally wired a kernel-side receiver task
+    // (`remote_nic_ingress_task`) that stayed blocked in `recv_msg` until a
+    // ring-3 NIC sent it an RX frame, but merely having that task in the
+    // scheduler's task pool reliably starved PID 1's reap loop in the
+    // `serverization-fallback` regression — the busy-yield loop inside
+    // `sys_nanosleep`'s long-sleep branch interacts with the extra task
+    // slot badly enough on core 0 that `service stop <name>` blows past its
+    // 30 s budget before init ever processes `/run/init.cmd`. The ingress
+    // endpoint is only needed for RX path coverage, which no Phase 55b/c
+    // regression exercises, so the driver's optional `ingress_endpoint`
+    // branch keeps TX working without it.
 
     // Phase 52: kbd endpoint creation and registration moved to the userspace
     // kbd_server service (kernel/initrd/etc/services.d/kbd.conf).  The kernel
@@ -229,7 +234,8 @@ fn init_task() -> ! {
 
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
-    task::spawn(remote_nic_ingress_task, "net-ingress");
+    // `remote_nic_ingress_task` removed to unblock PID 1 — see the comment
+    // above where the ingress endpoint would have been created.
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
     // Spawn the shared network processing task. Both NIC backends rely on it:
@@ -258,6 +264,11 @@ fn init_task() -> ! {
 /// The e1000 driver sends `NET_RX_FRAME` and `NET_LINK_STATE` as fire-and-forget
 /// bulk IPC messages to the `net.nic.ingress` service. This task is the only
 /// receiver for that endpoint and forwards the payloads into `RemoteNic`.
+///
+/// Currently unused — see the comment in `init_task` explaining why the
+/// endpoint is not created at boot. Kept intact so a future fix that lets us
+/// land the RX-publish path without starving PID 1 can re-enable it.
+#[allow(dead_code)]
 fn remote_nic_ingress_task() -> ! {
     use kernel_core::driver_ipc::net::{NET_LINK_STATE, NET_RX_FRAME};
 
