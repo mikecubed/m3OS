@@ -207,9 +207,30 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // ------------------------------------------------------------------
     // Step 4: Post-restart send.
+    //
+    // `service: running` (Step 3) fires as soon as PID 1 flips the status
+    // field after calling `start_service`, which schedules the new
+    // e1000_driver process. The driver still needs a few scheduling quanta
+    // to re-open its PCI device, remap DMA buffers, and call
+    // `ipc_register_service("net.nic")` before `send_frame` can succeed —
+    // during that window the kernel returns `NEG_EAGAIN` (DeviceAbsent /
+    // DriverRestarting). Retry the send with short backoffs so the smoke
+    // passes deterministically across that gap.
     // ------------------------------------------------------------------
     let post_payload = b"e1000-smoke-post-restart";
-    if !udp_send(fd, post_payload) {
+    let mut attempts = 0;
+    let max_attempts = 30; // ~30 seconds worst-case with 1 s backoff.
+    let sent_ok = loop {
+        if udp_send(fd, post_payload) {
+            break true;
+        }
+        attempts += 1;
+        if attempts >= max_attempts {
+            break false;
+        }
+        let _ = nanosleep(1);
+    };
+    if !sent_ok {
         write_str(
             STDOUT_FILENO,
             "E1000_CRASH_SMOKE:FAIL step=4 post-restart send\n",

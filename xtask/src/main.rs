@@ -6906,7 +6906,14 @@ fn regression_tests() -> Vec<RegressionTest> {
         description: "Phase 55b F.3d-3 / Phase 55c I.4: e1000-crash-smoke — kill \
              e1000_driver → EAGAIN / restart suspected → restart → post-restart send success",
         guest_steps: e1000_restart_crash_steps,
-        timeout_secs: 180,
+        // Bumped from 180 to 360 because the e1000 ring-3 driver does ~515
+        // DMA allocs (one per RX/TX slot) at startup; each is a kernel
+        // syscall + info log line. Under QEMU --snapshot the combined
+        // syscall + virtio-blk-backed serial throughput puts e1000 bring-up
+        // at ~200s in this harness even on a fast host. Reductions in the
+        // driver's DMA allocation pattern or downgrading the info-level
+        // log would shrink this further.
+        timeout_secs: 360,
         devices: DeviceSet {
             nvme: false,
             e1000: true,
@@ -7331,22 +7338,29 @@ fn max_restart_exceeded_steps() -> Vec<SmokeStep> {
 ///
 /// Sequence:
 ///   1. Boot and login.
-///   2. Wait for the e1000 driver bring-up marker (E1000_SMOKE:link:PASS).
-///   3. Launch `/bin/e1000-crash-smoke`.
-///   4. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
-///   5. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
-///   6. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
-///   7. Confirm `E1000_CRASH_SMOKE:PASS`.
-///   8. Confirm the guest shell observed `e1000-crash-smoke` exit 0.
+///   2. Launch `/bin/e1000-crash-smoke` (which implicitly requires the
+///      e1000 driver to be up — its first `pre-crash-send` step fails
+///      otherwise).
+///   3. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
+///   4. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
+///   5. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
+///   6. Confirm `E1000_CRASH_SMOKE:PASS`.
+///   7. Confirm the guest shell observed `e1000-crash-smoke` exit 0.
 fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
+    // Note on e1000 bring-up: the `E1000_SMOKE:link:PASS` marker is emitted
+    // during boot (under QEMU --snapshot, after ~500 DMA allocs the
+    // ring-3 driver does at startup). Waiting for it explicitly here —
+    // whether before or after `boot_and_login_steps` — is fragile: the
+    // serial buffer is drained on every intermediate pattern match, so a
+    // standalone `E1000_SMOKE:link:PASS` wait either consumes the
+    // pre-login output (leaving no `init: started 'net_udp'` for the
+    // subsequent boot-marker step to find) or lands after the marker has
+    // already scrolled past. The downstream `E1000_CRASH_SMOKE:pre-crash-
+    // send:OK` assertion already verifies e1000 is up and sending — if
+    // the driver hadn't brought up the link, that marker would never
+    // appear either. So we skip the explicit bring-up gate and rely on
+    // the natural smoke flow below.
     let mut steps = boot_and_login_steps();
-
-    // Wait for e1000 bring-up before launching the smoke binary.
-    steps.push(SmokeStep::Wait {
-        pattern: "E1000_SMOKE:link:PASS",
-        timeout_secs: 120,
-        label: "guest/e1000-crash-smoke: wait for e1000 bring-up",
-    });
     steps.push(SmokeStep::Sleep { millis: 500 });
 
     // Launch the smoke client.
@@ -7369,7 +7383,10 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
 
     steps.push(SmokeStep::Wait {
         pattern: "E1000_CRASH_SMOKE:post-restart-send:OK",
-        timeout_secs: 30,
+        // Bumped from 30 s because `e1000-crash-smoke` retries the post-
+        // restart send for ~30 s internally to cross the DriverRestarting
+        // window. The outer wait has to outlast the inner retry budget.
+        timeout_secs: 90,
         label: "guest/e1000-crash-smoke: post-restart send OK",
     });
 
