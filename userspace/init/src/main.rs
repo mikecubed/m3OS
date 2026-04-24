@@ -1077,9 +1077,17 @@ impl ServiceManager {
 
         svc.status = ServiceStatus::Starting;
 
-        write_str(STDOUT_FILENO, "init: starting '");
-        write(STDOUT_FILENO, svc.name.as_bytes());
-        write_str(STDOUT_FILENO, "'\n");
+        // Emit the "init: starting 'name'\n" line in one syscall — same
+        // rationale as the batched "init: started 'name' pid=N\n" write
+        // below. Otherwise the two init-initiated writes race with output
+        // from concurrently-spawned services on the shared serial console
+        // and break regression pattern matching.
+        let mut starting_buf = [0u8; 64];
+        let mut starting_pos = 0;
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, b"init: starting '");
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, svc.name.as_bytes());
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, b"'\n");
+        write(STDOUT_FILENO, &starting_buf[..starting_pos]);
 
         let pid = fork();
         if pid < 0 {
@@ -1138,11 +1146,20 @@ impl ServiceManager {
         self.services[idx].last_change_time = now;
         self.pid_table.insert(pid as i32, idx);
 
-        write_str(STDOUT_FILENO, "init: started '");
-        write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-        write_str(STDOUT_FILENO, "' pid=");
-        write_u64(STDOUT_FILENO, pid as u64);
-        write_str(STDOUT_FILENO, "\n");
+        // Emit the "init: started 'name' pid=N\n" line in one syscall so
+        // output from the just-forked child can't land mid-line on the shared
+        // serial console. Interleaved mid-line writes caused the regression
+        // test harness to miss the "init: started 'net_udp' pid=" pattern in
+        // roughly half of runs — see the step 1 timeout failures in the
+        // Phase 55c regression report.
+        let mut buf = [0u8; 96];
+        let mut pos = 0;
+        pos += append_to_buf(&mut buf, pos, b"init: started '");
+        pos += append_to_buf(&mut buf, pos, self.services[idx].name.as_bytes());
+        pos += append_to_buf(&mut buf, pos, b"' pid=");
+        pos += append_u64_to_buf(&mut buf, pos, pid as u64);
+        pos += append_to_buf(&mut buf, pos, b"\n");
+        write(STDOUT_FILENO, &buf[..pos]);
         self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
 
         // During the initial boot wave, batch status writes so PID 1 doesn't
@@ -1802,6 +1819,47 @@ impl ServiceManager {
 
 /// Write a u32 value as decimal ASCII into a buffer. Returns bytes written.
 #[allow(dead_code)]
+/// Append `src` to `buf` starting at `pos`, truncating to `buf.len()`.
+/// Returns the number of bytes actually appended.
+fn append_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let avail = buf.len() - pos;
+    let n = src.len().min(avail);
+    buf[pos..pos + n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// Append decimal representation of `val` to `buf` starting at `pos`.
+/// Returns the number of bytes actually appended (may truncate on overflow).
+fn append_u64_to_buf(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let mut tmp = [0u8; 20];
+    let mut n = val;
+    let mut i = 0;
+    if n == 0 {
+        tmp[0] = b'0';
+        i = 1;
+    } else {
+        while n > 0 && i < tmp.len() {
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+    }
+    let avail = buf.len() - pos;
+    let len = i.min(avail);
+    let mut j = 0;
+    while j < len {
+        buf[pos + j] = tmp[i - 1 - j];
+        j += 1;
+    }
+    len
+}
+
 fn write_u32_to_buf(buf: &mut [u8], val: u32) -> usize {
     if val == 0 {
         if !buf.is_empty() {
@@ -1965,6 +2023,18 @@ pub extern "C" fn _start() -> ! {
     // Load service definitions.
     mgr.load_services();
 
+    // Check smoke-mode marker *before* booting services. At this point
+    // vfs_server has not been spawned yet, so the `open()` syscall falls
+    // back to the kernel's direct ext2 path and completes synchronously.
+    // If we check after `boot_services()` instead, the request races with
+    // vfs_server startup and can block PID 1 in `BlockedOnReply` before it
+    // reaches `spawn_login()` — the symptom observed in the `cargo xtask
+    // regression` harness where every test times out waiting for the login
+    // prompt even though all services have already started. See the
+    // 2026-04-23 boot / vfs post-mortem for the vfs-availability gap this
+    // avoids.
+    let smoke_mode = smoke_test_mode_enabled();
+
     // Boot all services in dependency order.
     mgr.boot_services();
 
@@ -1973,7 +2043,6 @@ pub extern "C" fn _start() -> ! {
 
     // Spawn the initial interactive session unless the smoke-test marker asks
     // PID 1 to run the guest smoke runner directly.
-    let smoke_mode = smoke_test_mode_enabled();
     if smoke_mode {
         write_str(
             STDOUT_FILENO,
