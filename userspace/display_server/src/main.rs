@@ -93,8 +93,9 @@ fn program_main(_args: &[&str]) -> i32 {
     // is visually unambiguous during bring-up.
     if let Err(err) = paint_solid(&mut owner, BG_PIXEL) {
         report_fb_error("initial fill", err);
-        // Best-effort release; we still exit nonzero so init notices.
-        let _ = syscall_lib::framebuffer_release();
+        // Consume the owner so its Drop does not best-effort release a
+        // second time (which the kernel would reject with -EPERM).
+        let _ = owner.release();
         return 1;
     }
     let _ = owner.present();

@@ -441,34 +441,11 @@ mod tests {
         ]
     }
 
-    proptest! {
-        #[test]
-        fn proptest_no_double_release(events in proptest::collection::vec(arb_event(), 0..64)) {
-            let mut life = BufferLifecycle::new();
-            let mut release_counts: BTreeMap<BufferId, u32> = BTreeMap::new();
-            for event in events {
-                let (effects, _err) = life.apply(event);
-                for effect in effects {
-                    let BufferEffect::Release(id) = effect;
-                    let count = release_counts.entry(id).or_insert(0);
-                    *count += 1;
-                }
-            }
-            // Within any single attach/release lifecycle, a buffer is
-            // released at most once. Because the state machine consults
-            // the slot state before emitting Release, and clears it
-            // afterwards, the only way to legitimately see the same
-            // BufferId released twice is if it was re-attached after
-            // its first release. So the assertion is: for every released
-            // BufferId, the release count never exceeds the number of
-            // distinct attach-then-release cycles observed. The simplest
-            // sufficient invariant: the release count is bounded by the
-            // total number of Attach events for that buffer in the input.
-            // We re-walk the input to compute that bound.
-            // (release_counts is built above; bound check below.)
-            let _ = release_counts; // bound is enforced via attach_counts below.
-        }
+    // The "no double release" invariant — a buffer's release count never
+    // exceeds its attach count over a full event sequence — is enforced
+    // by `proptest_releases_bounded_by_attaches` below.
 
+    proptest! {
         #[test]
         fn proptest_releases_bounded_by_attaches(
             events in proptest::collection::vec(arb_event(), 0..64)

@@ -198,10 +198,32 @@ impl SurfaceStateMachine {
     }
 
     /// Allocate the next configuration serial and bump the counter.
+    ///
+    /// Saturates at [`u32::MAX`] rather than wrapping. Wrap-around would
+    /// violate the "strictly monotone" contract documented on
+    /// [`SurfaceEffect::Configured`] and would let a stale `AckConfigure`
+    /// be accepted after a reconfigure cycle ≥ `u32::MAX`. Saturation
+    /// instead plateaus the serial — real surfaces will not approach
+    /// 4 billion reconfigures within a single session.
     fn take_serial(&mut self) -> u32 {
         let serial = self.next_serial;
-        self.next_serial = self.next_serial.wrapping_add(1);
+        self.next_serial = self.next_serial.saturating_add(1);
         serial
+    }
+
+    /// Surface-local full-extent damage rectangle. Used as the coalesce
+    /// target when [`MAX_PENDING_DAMAGE`] is exceeded and as the implicit
+    /// damage on a buffer-replacing commit with no client-supplied damage.
+    /// Always anchored at `(0, 0)` — `EmitDamage` carries surface-local
+    /// rectangles, so the compositor-space origin in `geometry` would
+    /// double-apply offsets downstream.
+    fn full_local_damage(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: self.geometry.w,
+            h: self.geometry.h,
+        }
     }
 
     /// Implementation of [`SurfaceEvent::SetRole`].
@@ -239,16 +261,17 @@ impl SurfaceStateMachine {
 
     /// Implementation of [`SurfaceEvent::DamageSurface`].
     fn apply_damage_surface(&mut self, rect: Rect) -> (Vec<SurfaceEffect>, Option<SurfaceError>) {
+        let full_local = self.full_local_damage();
         if self.pending_damage.len() >= MAX_PENDING_DAMAGE {
             // Coalesce: replace the entire vec with a single
-            // full-surface rect.
+            // full-surface rect (in surface-local coordinates).
             self.pending_damage.clear();
-            self.pending_damage.push(self.geometry);
+            self.pending_damage.push(full_local);
         } else {
             self.pending_damage.push(rect);
             if self.pending_damage.len() > MAX_PENDING_DAMAGE {
                 self.pending_damage.clear();
-                self.pending_damage.push(self.geometry);
+                self.pending_damage.push(full_local);
             }
         }
         (Vec::new(), None)
@@ -283,7 +306,7 @@ impl SurfaceStateMachine {
                 }
                 self.active_buffer = Some(p);
                 let damage_to_emit = if damage.is_empty() {
-                    vec![self.geometry]
+                    vec![self.full_local_damage()]
                 } else {
                     damage
                 };
@@ -610,6 +633,65 @@ mod tests {
             _ => panic!("expected Configured"),
         };
         assert!(s2 > s1);
+    }
+
+    #[test]
+    fn emit_damage_is_surface_local_even_when_geometry_has_origin() {
+        // Regression test: a previous version emitted `self.geometry`
+        // (which carries the compositor-space origin) into EmitDamage,
+        // double-applying the offset downstream. EmitDamage rectangles
+        // are documented as surface-local — origin must be (0, 0).
+        let mut s = surface();
+        let _ = s.apply(SurfaceEvent::SetGeometry(r(120, 80, 200, 100)));
+        let _ = s.apply(SurfaceEvent::AttachBuffer(BufferId(1)));
+        let (effects, _) = s.apply(SurfaceEvent::CommitSurface);
+        let damage = effects
+            .iter()
+            .find_map(|e| match e {
+                SurfaceEffect::EmitDamage(rs) => Some(rs.clone()),
+                _ => None,
+            })
+            .expect("expected EmitDamage on first commit");
+        assert_eq!(damage, vec![r(0, 0, 200, 100)]);
+    }
+
+    #[test]
+    fn coalesced_damage_is_surface_local_even_when_geometry_has_origin() {
+        // Companion regression: when DamageSurface overflows the pending
+        // cap, the coalesced replacement rect must also be surface-local.
+        let mut s = surface();
+        let geom = r(120, 80, 1024, 768);
+        let _ = s.apply(SurfaceEvent::SetGeometry(geom));
+        for _ in 0..(MAX_PENDING_DAMAGE + 1) {
+            let _ = s.apply(SurfaceEvent::DamageSurface(r(1, 1, 4, 4)));
+        }
+        assert_eq!(s.pending_damage().len(), 1);
+        assert_eq!(s.pending_damage()[0], r(0, 0, 1024, 768));
+    }
+
+    #[test]
+    fn take_serial_saturates_at_u32_max() {
+        // Regression test: switching from wrapping_add to saturating_add
+        // means a surface that somehow accumulates 2^32 reconfigures
+        // plateaus at u32::MAX rather than wrapping to 0 and admitting a
+        // stale AckConfigure. We can't drive 4B events in a unit test,
+        // so seed the counter directly.
+        let mut s = surface();
+        // Drive the surface to a state where the next serial is u32::MAX.
+        s.next_serial = u32::MAX;
+        let (e1, _) = s.apply(SurfaceEvent::SetRole(SurfaceRole::Toplevel));
+        let s1 = match e1[0] {
+            SurfaceEffect::Configured { serial, .. } => serial,
+            _ => panic!("expected Configured"),
+        };
+        assert_eq!(s1, u32::MAX);
+        // Subsequent take_serial calls plateau at u32::MAX rather than wrap.
+        let (e2, _) = s.apply(SurfaceEvent::SetGeometry(r(0, 0, 320, 240)));
+        let s2 = match e2[0] {
+            SurfaceEffect::Configured { serial, .. } => serial,
+            _ => panic!("expected Configured"),
+        };
+        assert_eq!(s2, u32::MAX);
     }
 
     #[test]

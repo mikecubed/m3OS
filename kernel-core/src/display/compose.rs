@@ -14,7 +14,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::display::fb_owner::{FbError, FramebufferOwner, PixelFormat, bytes_per_pixel};
+use crate::display::fb_owner::{FbError, FramebufferOwner, bytes_per_pixel};
 use crate::display::protocol::{Layer, Rect, SurfaceId};
 
 /// Logical layer ordering used by the composer. Lower values are drawn
@@ -217,13 +217,21 @@ pub fn compose_frame<O: FramebufferOwner>(
     output: Rect,
     surfaces: &mut [ComposeSurface<'_>],
 ) -> Result<usize, ComposeError> {
+    // The pixel format is owned by the framebuffer; clients are required
+    // by the Phase 56 protocol to submit pixel data in the same format.
+    // Deriving bpp from the owner keeps validation, sub-rect extraction,
+    // and stride math consistent if a future phase introduces additional
+    // packed formats.
+    let bpp = bytes_per_pixel(owner.metadata().pixel_format);
+    let bpp_usize = bpp as usize;
+
     // 1. Validate every surface's pixel length up front. We refuse to
     //    issue any writes if a single surface is malformed; partial frames
     //    leave torn pixels on screen which is worse than a dropped frame.
     for surface in surfaces.iter() {
         let expected = (surface.rect.w as usize)
             .saturating_mul(surface.rect.h as usize)
-            .saturating_mul(4);
+            .saturating_mul(bpp_usize);
         if surface.pixels.len() != expected {
             return Err(ComposeError::PixelLengthMismatch);
         }
@@ -235,12 +243,6 @@ pub fn compose_frame<O: FramebufferOwner>(
     // 3. For each surface, build the occlusion list of *higher-layer*
     //    opaque surfaces. We walk by index so we can slice in front of
     //    `i` for the occluders.
-    //
-    // Phase 56 pixel format is BGRA8888 (matches the kernel framebuffer
-    // driver and the protocol spec). If a future phase introduces other
-    // formats, this is the spot to plumb the correct PixelFormat through
-    // — extract_subrect just needs bytes-per-pixel.
-    let bpp = bytes_per_pixel(PixelFormat::Bgra8888);
     let mut writes = 0usize;
 
     for i in 0..surfaces.len() {
@@ -304,7 +306,7 @@ pub fn compose_frame<O: FramebufferOwner>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::fb_owner::{FbMetadata, RecordingFramebufferOwner};
+    use crate::display::fb_owner::{FbMetadata, PixelFormat, RecordingFramebufferOwner};
     use proptest::prelude::*;
 
     fn rect(x: i32, y: i32, w: u32, h: u32) -> Rect {
