@@ -26,15 +26,22 @@
 
 extern crate alloc;
 
+mod client;
+mod compose;
 mod fb;
+mod surface;
 
 use core::alloc::Layout;
 use kernel_core::display::fb_owner::{FbError, FramebufferOwner};
 use kernel_core::display::protocol::Rect;
+use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
+use crate::client::{InboundFrame, dispatch};
+use crate::compose::{default_layout, run_compose};
 use crate::fb::KernelFramebufferOwner;
+use crate::surface::SurfaceRegistry;
 
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
@@ -103,16 +110,75 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: framebuffer acquired\n");
     log_fb_meta(meta.width, meta.height, meta.stride_bytes);
 
-    // ----- Idle loop ------------------------------------------------------
+    // ----- Phase 56 single-threaded event loop (C.3 + C.4 + C.5) ----------
     //
-    // Tracks C.3–C.5 replace this with a real protocol dispatcher driven by
-    // a frame-tick notification, the input endpoint, the client listening
-    // socket, and the control socket — see the engineering-discipline note
-    // in the Phase 56 task doc on the single-threaded event loop.
+    // The compositor multiplexes:
+    //   * inbound IPC client messages (`ipc_recv_msg` on `ep_handle`)
+    //   * the frame-tick (drained via `frame_tick_drain` syscall, B.3)
+    //
+    // Every iteration: drain at most one client message (non-blocking via
+    // bounded backoff), then drive one compose pass if a frame-tick has
+    // elapsed AND there is pending damage. Single-threaded by deliberate
+    // engineering-discipline choice — no worker threads in Phase 56.
+    let mut registry = SurfaceRegistry::new();
+    let mut layout = default_layout();
+    let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+
     loop {
-        let _label = syscall_lib::ipc_recv(ep_handle);
-        // No client protocol yet — silently drop. The reply capability is
-        // overwritten on the next ipc_recv, so no resource leaks.
+        // 1. Try to recv a client message — semi-non-blocking via the
+        //    receive helper; the helper will block until something arrives.
+        let mut header = IpcMessage::new(0);
+        let recv_ret = syscall_lib::ipc_recv_msg(ep_handle, &mut header, &mut bulk_buf);
+        if recv_ret == u64::MAX {
+            // Receive failure (transient) — continue.
+            continue;
+        }
+        let bulk_len = header.data[1] as usize;
+        let bulk_slice = if bulk_len <= bulk_buf.len() {
+            &bulk_buf[..bulk_len]
+        } else {
+            &[][..]
+        };
+        let outcome = dispatch(
+            InboundFrame {
+                header,
+                bulk: bulk_slice,
+            },
+            &mut registry,
+        );
+        if outcome.fatal {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: client protocol violation; dropping message\n",
+            );
+        }
+        // Phase 56 sends server→client events back via `ipc_send_buf` to the
+        // same endpoint cap — but the IPC model here is synchronous reply,
+        // so for a single-client demo we drain outbound silently. A future
+        // multi-client world wires per-client send caps; not in scope.
+        if !outcome.outbound.is_empty() {
+            log_outbound_count(outcome.outbound.len() as u32);
+        }
+        if outcome.closed {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: client closed; resetting registry\n",
+            );
+            registry = SurfaceRegistry::new();
+        }
+
+        // 2. If a frame-tick has elapsed, drive one compose pass.
+        let ticks = syscall_lib::frame_tick_drain();
+        if ticks > 0 && registry.has_damage() {
+            match run_compose(&mut owner, &mut layout, &mut registry) {
+                Ok(0) => {}
+                Ok(writes) => log_compose_writes(writes),
+                Err(_) => {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
+                }
+            }
+            let _ = owner.present();
+        }
     }
 }
 
@@ -179,6 +245,18 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
     write_u32(h);
     syscall_lib::write_str(STDOUT_FILENO, " stride=");
     write_u32(stride);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+fn log_outbound_count(n: u32) {
+    syscall_lib::write_str(STDOUT_FILENO, "display_server: outbound queued n=");
+    write_u32(n);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+fn log_compose_writes(writes: usize) {
+    syscall_lib::write_str(STDOUT_FILENO, "display_server: composed writes=");
+    write_u32(writes as u32);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 

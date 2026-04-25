@@ -201,6 +201,8 @@ static MAX_RESTART_SMOKE_ELF: &[u8] = generated_initrd_asset!("max-restart-smoke
 static E1000_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("e1000-crash-smoke");
 // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
 static DISPLAY_SERVER_ELF: &[u8] = generated_initrd_asset!("display_server");
+// Phase 56 Track C.6: protocol-reference client (visual smoke).
+static GFX_DEMO_ELF: &[u8] = generated_initrd_asset!("gfx-demo");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -565,6 +567,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "e1000-crash-smoke",
         RamdiskNode::File {
             content: E1000_CRASH_SMOKE_ELF,
+        },
+    ),
+    // Phase 56 Track C.6: protocol-reference client (visual smoke).
+    (
+        "gfx-demo",
+        RamdiskNode::File {
+            content: GFX_DEMO_ELF,
         },
     ),
 ];
