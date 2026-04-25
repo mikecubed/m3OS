@@ -116,21 +116,47 @@ fn program_main(_args: &[&str]) -> i32 {
     //   * inbound IPC client messages (`ipc_recv_msg` on `ep_handle`)
     //   * the frame-tick (drained via `frame_tick_drain` syscall, B.3)
     //
-    // Every iteration: drain at most one client message (non-blocking via
-    // bounded backoff), then drive one compose pass if a frame-tick has
-    // elapsed AND there is pending damage. Single-threaded by deliberate
-    // engineering-discipline choice — no worker threads in Phase 56.
+    // Every iteration: receive one client message (`ipc_recv_msg` blocks
+    // until traffic arrives), dispatch it, send the reply via the
+    // implicit reply capability that the kernel stores at
+    // `REPLY_CAP_HANDLE` (= 1) on every client `ipc_call*`, then drive
+    // one compose pass if a frame-tick has elapsed AND there is pending
+    // damage.
+    //
+    // Reply convention:
+    //   * `RESP_OK` (= 0)        — message accepted, no further data
+    //   * `RESP_FATAL` (= u64::MAX) — protocol violation; client should
+    //                                 disconnect and reconnect
+    //
+    // The fuller server→client event channel (`Welcome`,
+    // `SurfaceConfigured`, `BufferReleased`, ...) is currently logged
+    // for diagnostic visibility but not yet transported back: per-client
+    // out-of-band send caps land alongside Track D's input dispatcher
+    // and Track E's control socket. For Phase 56's single-client demo
+    // this keeps the call/reply contract intact (no deadlocked clients)
+    // without prematurely committing to a multi-client wire.
+    //
+    // Frame-tick caveat: `ipc_recv_msg` blocks, so frame-tick-driven
+    // composition only progresses while clients send traffic. `gfx-demo`
+    // sends a fixed sequence at startup and then idles — that's enough
+    // for Phase 56's protocol-reference smoke. A non-blocking
+    // try-recv (or notification-bound recv) lands with the C.5 follow-up
+    // when the input services start delivering events on this endpoint.
+    const REPLY_CAP_HANDLE: u32 = 1;
+    const RESP_OK: u64 = 0;
+    const RESP_FATAL: u64 = u64::MAX;
     let mut registry = SurfaceRegistry::new();
     let mut layout = default_layout();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
 
     loop {
-        // 1. Try to recv a client message — semi-non-blocking via the
-        //    receive helper; the helper will block until something arrives.
+        // 1. Receive one client message. `ipc_recv_msg` blocks until a
+        //    message arrives.
         let mut header = IpcMessage::new(0);
         let recv_ret = syscall_lib::ipc_recv_msg(ep_handle, &mut header, &mut bulk_buf);
         if recv_ret == u64::MAX {
-            // Receive failure (transient) — continue.
+            // Receive failure (transient) — continue without sending a
+            // reply since there is no pending caller in this branch.
             continue;
         }
         let bulk_len = header.data[1] as usize;
@@ -152,10 +178,6 @@ fn program_main(_args: &[&str]) -> i32 {
                 "display_server: client protocol violation; dropping message\n",
             );
         }
-        // Phase 56 sends server→client events back via `ipc_send_buf` to the
-        // same endpoint cap — but the IPC model here is synchronous reply,
-        // so for a single-client demo we drain outbound silently. A future
-        // multi-client world wires per-client send caps; not in scope.
         if !outcome.outbound.is_empty() {
             log_outbound_count(outcome.outbound.len() as u32);
         }
@@ -167,7 +189,14 @@ fn program_main(_args: &[&str]) -> i32 {
             registry = SurfaceRegistry::new();
         }
 
-        // 2. If a frame-tick has elapsed, drive one compose pass.
+        // 2. Reply to the caller so any `ipc_call*` request unblocks.
+        //    Without this any client doing call/call_buf would deadlock,
+        //    and the frame-tick path below could never run because the
+        //    next `ipc_recv_msg` would observe an unbounded queue.
+        let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
+        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, reply_label, 0);
+
+        // 3. If a frame-tick has elapsed, drive one compose pass.
         let ticks = syscall_lib::frame_tick_drain();
         if ticks > 0 && registry.has_damage() {
             match run_compose(&mut owner, &mut layout, &mut registry) {

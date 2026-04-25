@@ -26,6 +26,14 @@ use kernel_core::display::compose::ComposeLayer;
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, Layer, Rect, ServerMessage, SurfaceId, SurfaceRole,
 };
+
+/// High-water mark for the pending-bulk queue. A client that ships
+/// `LABEL_PIXELS` without a matching `AttachBuffer` more than this many
+/// times in flight is exceeding the documented Phase 56 resource bound;
+/// the dispatcher closes the connection on overflow instead of growing
+/// the compositor's memory unboundedly. Recorded in the H.1 learning doc
+/// alongside the per-client surface and outbound-event-queue caps.
+pub const MAX_PENDING_BULK: usize = 4;
 use kernel_core::display::surface::{
     SurfaceEffect, SurfaceError, SurfaceEvent, SurfaceStateMachine,
 };
@@ -118,9 +126,18 @@ impl SurfaceRegistry {
     }
 
     /// Receive a bulk-transported pixel buffer and queue it for the next
-    /// `AttachBuffer` verb. Returns the buffer ID for client tracking.
-    pub fn receive_bulk(&mut self, buf: CommittedBuffer) {
+    /// `AttachBuffer` verb. Returns `true` if accepted, `false` if the
+    /// pending-bulk queue is at [`MAX_PENDING_BULK`] and the dispatcher
+    /// should treat the over-flood as a protocol violation. Phase 56's
+    /// engineering-discipline rule on per-client resource bounds is
+    /// enforced here, not at the IPC seam, so a future multi-client
+    /// world can apply the same cap per ClientId.
+    pub fn receive_bulk(&mut self, buf: CommittedBuffer) -> bool {
+        if self.pending_bulk.len() >= MAX_PENDING_BULK {
+            return false;
+        }
         self.pending_bulk.push(buf);
+        true
     }
 
     /// Forward a [`ClientMessage`] into the appropriate surface. Returns

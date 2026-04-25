@@ -52,6 +52,10 @@ pub const LABEL_PIXELS: u64 = 2;
 /// `MAX_BULK_LEN`).
 pub const MAX_BULK_BYTES: usize = 4096;
 
+/// Bytes per BGRA8888 pixel — used to validate that the bulk length on a
+/// `LABEL_PIXELS` frame matches `width * height * BYTES_PER_PIXEL_BGRA8888`.
+pub const BYTES_PER_PIXEL_BGRA8888: usize = 4;
+
 /// Outcome of one dispatch loop iteration.
 #[derive(Debug, Default)]
 pub struct DispatchOutcome {
@@ -89,15 +93,35 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
 
     match frame.header.label {
         LABEL_PIXELS => {
-            // Stash the bulk into the registry's pending-bulk slot. The
-            // next AttachBuffer with a matching BufferId will consume it.
+            // Validate the declared geometry before storing pixels. A
+            // misdeclared `width`/`height` would otherwise force every
+            // subsequent compose to fail with `PixelLengthMismatch` — a
+            // log-spam vector for malformed clients. Treat the mismatch
+            // (or any overflow) as a fatal protocol violation so the
+            // dispatcher closes the offending client.
             let buffer_id = BufferId(frame.header.data[0] as u32);
-            registry.receive_bulk(CommittedBuffer {
+            let width = frame.header.data[2] as u32;
+            let height = frame.header.data[3] as u32;
+            let expected = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|wh| wh.checked_mul(BYTES_PER_PIXEL_BGRA8888));
+            if expected != Some(frame.bulk.len()) {
+                out.fatal = true;
+                return out;
+            }
+            // Resource bound — `receive_bulk` returns `false` if the
+            // pending-bulk queue is at the documented cap. Refusing
+            // additional buffers protects compositor memory from a
+            // client that floods `LABEL_PIXELS` without `AttachBuffer`.
+            if !registry.receive_bulk(CommittedBuffer {
                 buffer_id,
-                width: frame.header.data[2] as u32,
-                height: frame.header.data[3] as u32,
+                width,
+                height,
                 pixels: frame.bulk.to_vec(),
-            });
+            }) {
+                out.fatal = true;
+                return out;
+            }
         }
         LABEL_VERB => match decode_message(frame.bulk) {
             Ok(msg) => match msg {

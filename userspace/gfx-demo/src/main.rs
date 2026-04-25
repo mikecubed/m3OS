@@ -10,7 +10,7 @@
 //!   2. Send `Hello { protocol_version, capabilities = 0 }`.
 //!   3. Allocate a 32 × 32 BGRA8888 surface buffer (the largest size that
 //!      fits the kernel's `MAX_BULK_LEN` of 4096 bytes — see
-//!      `userspace/syscall-lib/src/surface_buffer.rs`).
+//!      `userspace/lib/surface_buffer/`).
 //!   4. Walk the surface lifecycle: `CreateSurface`, `SetSurfaceRole`
 //!      (Toplevel), `AttachBuffer`, `CommitSurface`.
 //!   5. Idle — the demo stays alive so a developer can manually inspect the
@@ -59,11 +59,12 @@ fn alloc_error(_layout: Layout) -> ! {
 /// composer wiring lands.
 const DEMO_FILL_BGRA: u32 = 0x00FF_8800;
 
-/// IPC labels. The Phase 56 protocol does not yet pin label semantics on
-/// the kernel-IPC seam — we use `0` for protocol-verb messages (the
-/// encoded body is the source of truth) and reserve `2` for future bulk
-/// pixel transport. Documented here so reviewers see the seam.
-const LABEL_PROTOCOL: u64 = 0;
+/// IPC labels. Must match the `display_server::client` dispatcher:
+/// protocol-verb messages travel on label `1` (`LABEL_VERB`), pixel-bulk
+/// messages on label `2` (`LABEL_PIXELS`). A future cleanup will lift
+/// these constants into a shared crate so the demo and the server can
+/// import a single source of truth.
+const LABEL_PROTOCOL: u64 = 1;
 
 /// Stack buffer for `ClientMessage::encode`. The largest Phase 56
 /// client-message body is `SetSurfaceRole(Layer)` at ~24 bytes; a 128-byte

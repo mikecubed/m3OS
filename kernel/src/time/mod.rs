@@ -2,45 +2,54 @@
 //!
 //! Bridges the periodic LAPIC timer (1000 Hz, configured by `apic::init`) into
 //! the configurable frame-tick rate consumed by `display_server` and any
-//! future animation client. The pure-logic config + saturating coalescer
-//! lives in [`kernel_core::display::frame_tick`]; this module owns the
-//! kernel-side wiring (the per-tick subdivider that turns timer ticks into
-//! frame-tick events and the syscall-facing accessors).
+//! future animation client. The pure-logic [`FrameTickConfig`] period math
+//! lives in [`kernel_core::display::frame_tick`]; the kernel side keeps a
+//! lock-free `AtomicU32` counter so the timer ISR and the syscall consumer
+//! can never deadlock against each other.
 //!
-//! # Concurrency
+//! # Concurrency — no ISR-vs-task locks
 //!
-//! - [`maybe_emit_frame_tick`] is called from the timer ISR every LAPIC
-//!   timer fire. It increments a private subdivision counter and, every
-//!   `lapic_period_ms()` ticks, accumulates one frame-tick into
-//!   [`FRAME_TICK_COUNTER`].
-//! - [`frame_tick_drain`] is the syscall-facing consumer; it returns the
-//!   number of frame-ticks accumulated since the last drain. Coalescing is
-//!   saturating in `FrameTickCounter`, so a slow consumer never sees the
-//!   queue grow without bound.
+//! [`on_timer_tick_isr`] is called from the LAPIC timer ISR every ms.
+//! [`frame_tick_drain`] is called from task / syscall context. They share
+//! state via two atomics:
 //!
-//! Both paths use a `spin::Mutex` because the pure-logic counter holds two
-//! `u64` halves and reading/updating them atomically across the `accumulate`
-//! / `drain` calls is the simplest correct option. The lock is uncontended in
-//! practice: the ISR holds it for the duration of an integer increment and
-//! the syscall path holds it for one drain call.
+//! * `FRAME_TICK_SUBDIV` — single-producer subdivider; the ISR is the only
+//!   writer (the consumer side resets it via `set_frame_tick_hz` and the
+//!   ISR itself when it rolls over).
+//! * `FRAME_TICK_PENDING` — saturating count of frame-ticks accumulated
+//!   since the last drain. ISR `fetch_add` (saturating-clamped); consumer
+//!   `swap(0)` to drain. Both are `Relaxed` because there is no ordering
+//!   relationship to enforce — the consumer reads whatever has been
+//!   published so far and that is exactly the contract.
+//!
+//! Replacing the earlier `Mutex<FrameTickCounter>` with atomics removes
+//! the ISR-vs-task deadlock risk flagged in PR #123 review thread and
+//! aligns with Phase 52c's "no allocation, no locks held across ISR
+//! re-entry" rule.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use kernel_core::display::frame_tick::{FrameTickConfig, FrameTickCounter};
-use spin::Mutex;
+use kernel_core::display::frame_tick::FrameTickConfig;
+
+/// Saturating ceiling for the pending frame-tick count. Above this we
+/// stop incrementing — userspace will observe the cap on its next drain
+/// and resume from zero. 1_000_000 frame-ticks ≈ 4.6 hours of pending at
+/// 60 Hz: large enough that a momentarily slow consumer sees an honest
+/// count, small enough that the saturation branch is reachable in
+/// pathological situations and the counter cannot wrap past `u32::MAX`.
+const FRAME_TICK_SAT_CAP: u32 = 1_000_000;
 
 /// Configured frame-tick rate (Hz). Default 60 Hz per
 /// `FrameTickConfig::DEFAULT_HZ`.
 static FRAME_TICK_HZ: AtomicU32 = AtomicU32::new(FrameTickConfig::DEFAULT_HZ);
 
 /// Subdivider — counts LAPIC timer fires (1 ms each) and rolls over every
-/// `lapic_period_ms()` ticks to emit one frame-tick. Read/written only by
-/// the timer ISR (single-producer); a relaxed atomic is sufficient because
-/// the only consumer is itself.
+/// `lapic_period_ms()` ticks to emit one frame-tick. Written by the ISR;
+/// read+reset by the ISR (rollover) and by `set_frame_tick_hz`.
 static FRAME_TICK_SUBDIV: AtomicU32 = AtomicU32::new(0);
 
-/// Saturating counter shared with userspace via `sys_frame_tick_drain`.
-static FRAME_TICK_COUNTER: Mutex<FrameTickCounter> = Mutex::new(FrameTickCounter::new());
+/// Saturating count of frame-ticks observed since the last drain.
+static FRAME_TICK_PENDING: AtomicU32 = AtomicU32::new(0);
 
 /// Currently configured frame-tick rate in Hz. Returns a value in
 /// `FrameTickConfig::MIN_HZ..=FrameTickConfig::MAX_HZ`.
@@ -60,11 +69,10 @@ pub fn set_frame_tick_hz(hz: u32) -> Option<()> {
 }
 
 /// Drain pending frame-tick events. Returns the number of frame-ticks
-/// observed since the last drain (saturating coalesce inside
-/// `FrameTickCounter`). Called from `sys_frame_tick_drain`.
+/// observed since the last drain (saturating). Called from
+/// `sys_frame_tick_drain`. Lock-free.
 pub fn frame_tick_drain() -> u32 {
-    let (missed, _total) = FRAME_TICK_COUNTER.lock().drain();
-    missed
+    FRAME_TICK_PENDING.swap(0, Ordering::Relaxed)
 }
 
 /// Called from the timer ISR every LAPIC timer fire. Subdivides the 1 kHz
@@ -72,10 +80,9 @@ pub fn frame_tick_drain() -> u32 {
 ///
 /// # ISR contract
 ///
-/// * No allocation, no blocking, no IPC. Holds the `FRAME_TICK_COUNTER`
-///   mutex for the duration of one integer increment.
-/// * Safe to call from any timer firing on any CPU; coalescing is
-///   saturating so a slow consumer is harmless.
+/// * No allocation, no blocking, no IPC, no locks.
+/// * Two relaxed atomic operations per fire (subdiv increment + maybe a
+///   pending increment). Safe to call from any timer firing on any CPU.
 pub fn on_timer_tick_isr() {
     let hz = FRAME_TICK_HZ.load(Ordering::Relaxed);
     let Some(config) = FrameTickConfig::new(hz) else {
@@ -89,11 +96,20 @@ pub fn on_timer_tick_isr() {
     let next = prev + 1;
     if next >= period_ms {
         FRAME_TICK_SUBDIV.store(0, Ordering::Relaxed);
-        FRAME_TICK_COUNTER.lock().accumulate(1);
+        // Saturating increment of the pending count. `compare_exchange`
+        // loop is overkill for a pending counter that doesn't need
+        // exact-once semantics; a `fetch_add` followed by clamp gets us
+        // there with one atomic op on the fast path.
+        let cur = FRAME_TICK_PENDING.fetch_add(1, Ordering::Relaxed);
+        if cur >= FRAME_TICK_SAT_CAP {
+            // Already at cap; undo the wrap by clamping back. The race
+            // window where another concurrent ISR also incremented is
+            // benign — the worst case is the count plateaus at SAT_CAP.
+            FRAME_TICK_PENDING.store(FRAME_TICK_SAT_CAP, Ordering::Relaxed);
+        }
     }
 }
 
 // Pure-logic frame-tick coalescing is covered host-side by tests in
 // `kernel_core::display::frame_tick`. The kernel-side wiring above is a
-// thin AtomicU32 + Mutex<FrameTickCounter> shim and exercised through the
-// QEMU integration paths.
+// pure-atomic shim and is exercised through the QEMU integration paths.
