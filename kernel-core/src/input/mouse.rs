@@ -1,0 +1,434 @@
+//! Phase 56 Track B.2 — PS/2 AUX (mouse) packet decoder.
+//!
+//! Pure-logic, host-testable. Consumes raw bytes from the kernel's PS/2 AUX
+//! ring buffer and emits one `MousePacket` per complete packet. Two packet
+//! shapes are supported: the legacy 3-byte standard packet and the 4-byte
+//! IntelliMouse extension (with wheel). The decoder enters IntelliMouse mode
+//! only after `enable_wheel_mode()` is called by the driver glue (typically
+//! after the Magic Knock handshake succeeds in ring 0).
+
+/// One fully decoded PS/2 mouse packet.
+///
+/// Internal kernel-side representation; userspace `mouse_server` lifts this
+/// into the public `PointerEvent` (timestamping, button-edge tracking, Y-axis
+/// flip). Holding both shapes here keeps the wire-codec types in `events.rs`
+/// free of PS/2-specific quirks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MousePacket {
+    /// Sign-extended X delta (PS/2 9-bit two's-complement).
+    pub dx: i16,
+    /// Sign-extended Y delta (PS/2 native: +Y = up; caller flips).
+    pub dy: i16,
+    /// Wheel delta: 0 in 3-byte mode, signed 8-bit in 4-byte mode.
+    pub wheel: i8,
+    /// Left button currently pressed.
+    pub left: bool,
+    /// Right button currently pressed.
+    pub right: bool,
+    /// Middle button currently pressed.
+    pub middle: bool,
+    /// PS/2 status bit 6 — X delta overflowed and is unreliable.
+    pub x_overflow: bool,
+    /// PS/2 status bit 7 — Y delta overflowed and is unreliable.
+    pub y_overflow: bool,
+}
+
+/// Errors observable from outside the decoder.
+///
+/// Today only `LostSync` is defined; additional variants would be `#[non_exhaustive]`-gated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecoderError {
+    /// First byte of a packet must have status bit 3 set; if it isn't,
+    /// the byte is dropped and the decoder reports this so callers can
+    /// log the resync.
+    LostSync,
+}
+
+/// Event surfaced by `Ps2MouseDecoder::feed`.
+///
+/// Either a complete packet was assembled, or a stray byte was discarded
+/// while hunting for the next aligned status byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecoderEvent {
+    /// One fully assembled PS/2 mouse packet.
+    Packet(MousePacket),
+    /// A misaligned byte was dropped during resync recovery.
+    Resync,
+}
+
+/// PS/2 AUX byte-stream decoder.
+///
+/// Stateful but allocation-free: framing position lives in three bytes of
+/// state plus a fixed 4-byte buffer. Safe to drive from the kernel's PS/2
+/// IRQ bottom half because no method allocates or panics.
+pub struct Ps2MouseDecoder {
+    /// True when the IntelliMouse 4-byte protocol is active.
+    wheel_mode: bool,
+    /// 0..=3 — number of bytes already accumulated for the current packet.
+    cursor: u8,
+    /// Buffer for the in-progress packet (max 4 bytes).
+    bytes: [u8; 4],
+}
+
+/// Status-byte mask for the always-1 sync bit (bit 3).
+const STATUS_SYNC_BIT: u8 = 1 << 3;
+/// Status-byte mask for the X-sign bit (bit 4).
+const STATUS_X_SIGN: u8 = 1 << 4;
+/// Status-byte mask for the Y-sign bit (bit 5).
+const STATUS_Y_SIGN: u8 = 1 << 5;
+/// Status-byte mask for the X-overflow bit (bit 6).
+const STATUS_X_OVERFLOW: u8 = 1 << 6;
+/// Status-byte mask for the Y-overflow bit (bit 7).
+const STATUS_Y_OVERFLOW: u8 = 1 << 7;
+/// Status-byte mask for the left-button bit (bit 0).
+const STATUS_LEFT_BUTTON: u8 = 1 << 0;
+/// Status-byte mask for the right-button bit (bit 1).
+const STATUS_RIGHT_BUTTON: u8 = 1 << 1;
+/// Status-byte mask for the middle-button bit (bit 2).
+const STATUS_MIDDLE_BUTTON: u8 = 1 << 2;
+
+impl Default for Ps2MouseDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ps2MouseDecoder {
+    /// Construct a decoder in 3-byte standard mode with empty framing.
+    pub const fn new() -> Self {
+        Self {
+            wheel_mode: false,
+            cursor: 0,
+            bytes: [0; 4],
+        }
+    }
+
+    /// Switch to the IntelliMouse 4-byte packet shape.
+    ///
+    /// Resets framing so a half-decoded 3-byte packet does not bleed into
+    /// the new shape.
+    pub fn enable_wheel_mode(&mut self) {
+        self.wheel_mode = true;
+        self.cursor = 0;
+    }
+
+    /// Switch back to the legacy 3-byte packet shape.
+    ///
+    /// Resets framing for the same reason as `enable_wheel_mode`.
+    pub fn disable_wheel_mode(&mut self) {
+        self.wheel_mode = false;
+        self.cursor = 0;
+    }
+
+    /// Whether the decoder is currently expecting 4-byte (wheel) packets.
+    pub const fn wheel_mode(&self) -> bool {
+        self.wheel_mode
+    }
+
+    /// Number of bytes accumulated toward the next packet (`0..=3`).
+    pub const fn pending_bytes(&self) -> u8 {
+        self.cursor
+    }
+
+    /// Reset framing without dropping wheel mode; used when the AUX ring
+    /// has been observed to skip bytes (overrun).
+    pub fn resync(&mut self) {
+        self.cursor = 0;
+        self.bytes = [0; 4];
+    }
+
+    /// Feed a single byte and optionally produce an event.
+    ///
+    /// Returns `Some(Packet)` exactly when a packet boundary is crossed,
+    /// `Some(Resync)` when a byte is dropped to recover framing, and `None`
+    /// while accumulating the middle bytes of a packet.
+    pub fn feed(&mut self, byte: u8) -> Option<DecoderEvent> {
+        if self.cursor == 0 && (byte & STATUS_SYNC_BIT) == 0 {
+            // Misaligned status byte — drop it and report the resync.
+            return Some(DecoderEvent::Resync);
+        }
+
+        // Safe indexing: cursor is always 0..=3 at this point.
+        let idx = self.cursor as usize;
+        if idx < self.bytes.len() {
+            self.bytes[idx] = byte;
+        }
+        self.cursor = self.cursor.saturating_add(1);
+
+        let packet_len: u8 = if self.wheel_mode { 4 } else { 3 };
+        if self.cursor < packet_len {
+            return None;
+        }
+
+        let status = self.bytes[0];
+        let dx_low = self.bytes[1] as i16;
+        let dy_low = self.bytes[2] as i16;
+        let dx = if (status & STATUS_X_SIGN) != 0 {
+            dx_low - 256
+        } else {
+            dx_low
+        };
+        let dy = if (status & STATUS_Y_SIGN) != 0 {
+            dy_low - 256
+        } else {
+            dy_low
+        };
+        let wheel = if self.wheel_mode {
+            self.bytes[3] as i8
+        } else {
+            0
+        };
+
+        let packet = MousePacket {
+            dx,
+            dy,
+            wheel,
+            left: (status & STATUS_LEFT_BUTTON) != 0,
+            right: (status & STATUS_RIGHT_BUTTON) != 0,
+            middle: (status & STATUS_MIDDLE_BUTTON) != 0,
+            x_overflow: (status & STATUS_X_OVERFLOW) != 0,
+            y_overflow: (status & STATUS_Y_OVERFLOW) != 0,
+        };
+
+        self.cursor = 0;
+        Some(DecoderEvent::Packet(packet))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn feed_all(decoder: &mut Ps2MouseDecoder, bytes: &[u8]) -> alloc::vec::Vec<DecoderEvent> {
+        let mut out = alloc::vec::Vec::new();
+        for &b in bytes {
+            if let Some(ev) = decoder.feed(b) {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_3_byte_zero_motion_packet() {
+        let mut d = Ps2MouseDecoder::new();
+        assert_eq!(d.feed(0x08), None);
+        assert_eq!(d.feed(0), None);
+        let ev = d.feed(0).expect("packet emitted");
+        match ev {
+            DecoderEvent::Packet(p) => {
+                assert_eq!(
+                    p,
+                    MousePacket {
+                        dx: 0,
+                        dy: 0,
+                        wheel: 0,
+                        left: false,
+                        right: false,
+                        middle: false,
+                        x_overflow: false,
+                        y_overflow: false,
+                    }
+                );
+            }
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn decodes_button_state() {
+        let mut d = Ps2MouseDecoder::new();
+        let events = feed_all(&mut d, &[0x0F, 0, 0]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => {
+                assert!(p.left);
+                assert!(p.right);
+                assert!(p.middle);
+            }
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn decodes_negative_x_delta() {
+        let mut d = Ps2MouseDecoder::new();
+        let events = feed_all(&mut d, &[0x18, 0xFE, 0]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => assert_eq!(p.dx, -2),
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn decodes_negative_y_delta() {
+        let mut d = Ps2MouseDecoder::new();
+        let events = feed_all(&mut d, &[0x28, 0, 0xFD]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => assert_eq!(p.dy, -3),
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn decodes_overflow_bits() {
+        let mut d = Ps2MouseDecoder::new();
+        let events = feed_all(&mut d, &[0xC8, 0, 0]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => {
+                assert!(p.x_overflow);
+                assert!(p.y_overflow);
+            }
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn lost_sync_drops_byte_and_emits_resync_event() {
+        let mut d = Ps2MouseDecoder::new();
+        let ev = d.feed(0x00).expect("resync emitted");
+        assert_eq!(ev, DecoderEvent::Resync);
+        assert_eq!(d.pending_bytes(), 0);
+
+        // After recovery a normal packet decodes cleanly.
+        assert_eq!(d.feed(0x08), None);
+        assert_eq!(d.feed(0), None);
+        let pkt = d.feed(0).expect("packet emitted");
+        assert!(matches!(pkt, DecoderEvent::Packet(_)));
+    }
+
+    #[test]
+    fn wheel_mode_decodes_4_byte_packet_with_signed_wheel() {
+        let mut d = Ps2MouseDecoder::new();
+        d.enable_wheel_mode();
+        assert_eq!(d.feed(0x08), None);
+        assert_eq!(d.feed(5), None);
+        assert_eq!(d.feed(5), None);
+        let ev = d.feed(0xFF).expect("packet emitted");
+        match ev {
+            DecoderEvent::Packet(p) => {
+                assert_eq!(p.wheel, -1);
+                assert_eq!(p.dx, 5);
+                assert_eq!(p.dy, 5);
+            }
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn wheel_mode_handles_zero_wheel() {
+        let mut d = Ps2MouseDecoder::new();
+        d.enable_wheel_mode();
+        let events = feed_all(&mut d, &[0x08, 0, 0, 0]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => assert_eq!(p.wheel, 0),
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn resync_clears_partial_packet() {
+        let mut d = Ps2MouseDecoder::new();
+        assert_eq!(d.feed(0x08), None);
+        assert_eq!(d.feed(0x42), None);
+        assert_eq!(d.pending_bytes(), 2);
+        d.resync();
+        assert_eq!(d.pending_bytes(), 0);
+
+        let events = feed_all(&mut d, &[0x08, 0, 0]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], DecoderEvent::Packet(_)));
+    }
+
+    #[test]
+    fn disable_wheel_mode_returns_to_3_byte_packets() {
+        let mut d = Ps2MouseDecoder::new();
+        d.enable_wheel_mode();
+        d.disable_wheel_mode();
+        assert!(!d.wheel_mode());
+        let events = feed_all(&mut d, &[0x08, 1, 2]);
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            DecoderEvent::Packet(p) => {
+                assert_eq!(p.dx, 1);
+                assert_eq!(p.dy, 2);
+                assert_eq!(p.wheel, 0);
+            }
+            DecoderEvent::Resync => panic!("unexpected resync"),
+        }
+    }
+
+    #[test]
+    fn cursor_starts_zero_after_completed_packet() {
+        let mut d = Ps2MouseDecoder::new();
+        let _ = feed_all(&mut d, &[0x08, 0, 0]);
+        assert_eq!(d.pending_bytes(), 0);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_decoder_never_panics(stream in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let mut d = Ps2MouseDecoder::new();
+            for b in stream {
+                let _ = d.feed(b);
+            }
+        }
+
+        #[test]
+        fn proptest_decoded_packet_has_status_bit_set(
+            stream in proptest::collection::vec(any::<u8>(), 0..1024)
+        ) {
+            // Mirror the decoder's framing logic to track which byte became
+            // the status byte for each emitted packet, then assert bit 3 was
+            // set in that captured status byte.
+            let mut d = Ps2MouseDecoder::new();
+            // Randomly enable wheel mode to exercise both packet shapes.
+            if stream.first().copied().unwrap_or(0) & 1 == 1 {
+                d.enable_wheel_mode();
+            }
+            let mut pending: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            for b in stream {
+                // Predict whether this byte will form a packet.
+                let was_idle = pending.is_empty();
+                let dropped = was_idle && (b & STATUS_SYNC_BIT) == 0;
+                if !dropped {
+                    pending.push(b);
+                }
+                let packet_len: usize = if d.wheel_mode() { 4 } else { 3 };
+                let event = d.feed(b);
+                if pending.len() == packet_len {
+                    // Decoder must have just emitted a Packet.
+                    match event {
+                        Some(DecoderEvent::Packet(_)) => {
+                            prop_assert!((pending[0] & STATUS_SYNC_BIT) != 0);
+                        }
+                        other => {
+                            prop_assert!(false, "expected Packet, got {:?}", other);
+                        }
+                    }
+                    pending.clear();
+                } else if dropped {
+                    prop_assert_eq!(event, Some(DecoderEvent::Resync));
+                } else {
+                    prop_assert_eq!(event, None);
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_internal_state_bounded(
+            stream in proptest::collection::vec(any::<u8>(), 0..4096)
+        ) {
+            let mut d = Ps2MouseDecoder::new();
+            for b in stream {
+                let _ = d.feed(b);
+                prop_assert!(d.pending_bytes() <= 3);
+            }
+        }
+    }
+}

@@ -1,4 +1,5 @@
 pub mod events;
+pub mod mouse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScancodeSink {

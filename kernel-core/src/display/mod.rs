@@ -7,4 +7,10 @@
 //! Phase 56 DRY discipline: no parallel definitions across `display_server`
 //! and each client library.
 
+pub mod buffer;
+pub mod compose;
+pub mod fb_owner;
+pub mod frame_tick;
+pub mod layout;
 pub mod protocol;
+pub mod surface;
