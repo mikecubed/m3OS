@@ -2553,7 +2553,9 @@ fn install_irq_binding(
     bit_index: u8,
     kernel_owns_notif: bool,
 ) -> Result<(), IrqRegistryError> {
-    bind_irq_vector(pid, key, vector, notif, bit_index, kernel_owns_notif)
+    // The test path does not exercise legacy INTx routing — pass `None`
+    // so `bind_irq_vector`'s legacy-IRQ bookkeeping is bypassed.
+    bind_irq_vector(pid, key, vector, None, notif, bit_index, kernel_owns_notif)
 }
 
 /// Counterpart of [`install_irq_binding`] for the test-only path.

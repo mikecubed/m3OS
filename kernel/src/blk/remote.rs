@@ -33,10 +33,18 @@ use kernel_core::driver_ipc::block::{
 use crate::ipc::EndpointId;
 use crate::ipc::{endpoint, message::Message, registry};
 use crate::task::scheduler;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::{Lazy, Mutex};
 
 static REMOTE_BLOCK: Lazy<Mutex<RemoteBlockInner>> =
     Lazy::new(|| Mutex::new(RemoteBlockInner::new()));
+
+/// Lock-free fast-path mirror of `REMOTE_BLOCK.lock().endpoint.is_some()`.
+/// Allows `on_endpoint_closed` (called from `cleanup_task_ipc` for every
+/// dying task's every owned endpoint) to skip the mutex acquisition when
+/// no block driver has registered, matching the analogous fast-path used
+/// by `RemoteNic::on_endpoint_closed`.
+static REMOTE_BLOCK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 struct RemoteBlockInner {
     state: BlockDispatchState,
@@ -66,6 +74,7 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
     let mut g = REMOTE_BLOCK.lock();
     g.state.register(device_name);
     g.endpoint = Some(ep);
+    REMOTE_BLOCK_REGISTERED.store(true, Ordering::Release);
     log::info!(
         "[blk::remote] registered '{}' on endpoint '{}'",
         device_name,
@@ -142,6 +151,7 @@ pub fn is_registered() -> bool {
     if !g.state.is_registered() {
         g.state.register("nvme0");
         g.endpoint = Some(ep);
+        REMOTE_BLOCK_REGISTERED.store(true, Ordering::Release);
         log::info!(
             "[blk::remote] auto-registered ring-3 NVMe driver via service \
              registry ('nvme.block' → endpoint {:?}, owner task_id={})",
@@ -401,6 +411,32 @@ fn on_ipc_error() {
             "[blk::remote] driver '{}' unreachable — marking mid-restart",
             g.state.device_name().unwrap_or("<unknown>")
         );
+    }
+}
+
+/// Driver-death detection hook fired by `cleanup_task_ipc` when an endpoint
+/// owned by a dying task is closed.
+///
+/// Mirrors `RemoteNic::on_endpoint_closed`: latches `is_restarting()` on
+/// driver process exit so consumers see the restart window immediately
+/// instead of waiting for the next IPC call to fail. No-op when no driver
+/// is registered or the closed endpoint is not the registered one.
+pub fn on_endpoint_closed(ep_id: EndpointId) {
+    // Fast-path: skip the mutex acquisition entirely when no driver is
+    // registered. Mirrors `RemoteNic::on_endpoint_closed` so cleanup
+    // overhead during boot and stop_service stays lock-free in the
+    // no-driver configuration exercised by `serverization-fallback`.
+    if !REMOTE_BLOCK_REGISTERED.load(Ordering::Acquire) {
+        return;
+    }
+    let registered = REMOTE_BLOCK.lock().endpoint;
+    if registered == Some(ep_id) {
+        log::warn!(
+            "[blk::remote] driver endpoint {:?} closed by owner exit — \
+             marking mid-restart",
+            ep_id,
+        );
+        on_ipc_error();
     }
 }
 

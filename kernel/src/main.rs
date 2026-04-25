@@ -211,18 +211,29 @@ fn init_task() -> ! {
         .expect("[init] failed to register console service");
     log::info!("[init] service registry: console={:?}", console_ep);
 
-    // The ring-3 NIC ingress endpoint is intentionally NOT created here.
-    // Phase 55c Track E originally wired a kernel-side receiver task
-    // (`remote_nic_ingress_task`) that stayed blocked in `recv_msg` until a
-    // ring-3 NIC sent it an RX frame, but merely having that task in the
-    // scheduler's task pool reliably starved PID 1's reap loop in the
-    // `serverization-fallback` regression — the busy-yield loop inside
-    // `sys_nanosleep`'s long-sleep branch interacts with the extra task
-    // slot badly enough on core 0 that `service stop <name>` blows past its
-    // 30 s budget before init ever processes `/run/init.cmd`. The ingress
-    // endpoint is only needed for RX path coverage, which no Phase 55b/c
-    // regression exercises, so the driver's optional `ingress_endpoint`
-    // branch keeps TX working without it.
+    // Ring-3 NIC ingress endpoint (Phase 55c Track E, restored 2026-04-24).
+    //
+    // The original Track E design spawned a dedicated `remote_nic_ingress_task`
+    // that sat blocked on `recv_msg` until a ring-3 NIC sent an RX frame.
+    // Merely having that task in the scheduler reliably starved PID 1's reap
+    // loop in `serverization-fallback` because the busy-yield loop inside
+    // `sys_nanosleep`'s long-sleep branch interacts with the extra task slot
+    // badly enough on core 0 that `service stop <name>` blew past its 30 s
+    // budget. See `docs/post-mortems/2026-04-24-ingress-task-starvation.md`.
+    //
+    // The fix: keep the ingress IPC contract intact (the driver still sends
+    // `NET_RX_FRAME`/`NET_LINK_STATE` to `net.nic.ingress` via `send_buf`)
+    // but fold the receive into `net_task` via the new `recv_msg_nowait`
+    // primitive. The `set_endpoint_pending_send_hook` call below wires
+    // driver-side enqueues to wake `net_task`, which drains the queue on its
+    // next iteration and wakes the (now blocked-on-send) driver task. No
+    // dedicated receiver task is on the run queue, so PID 1 sees no extra
+    // contention.
+    let ingress_ep = ipc::endpoint::ENDPOINTS.lock().create();
+    ipc::registry::register("net.nic.ingress", ingress_ep)
+        .expect("[init] failed to register net.nic.ingress service");
+    ipc::endpoint::set_endpoint_pending_send_hook(ingress_ep, wake_net_for_ingress);
+    log::info!("[init] service registry: net.nic.ingress={:?}", ingress_ep);
 
     // Phase 52: kbd endpoint creation and registration moved to the userspace
     // kbd_server service (kernel/initrd/etc/services.d/kbd.conf).  The kernel
@@ -234,8 +245,9 @@ fn init_task() -> ! {
 
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
-    // `remote_nic_ingress_task` removed to unblock PID 1 — see the comment
-    // above where the ingress endpoint would have been created.
+    // No dedicated `remote_nic_ingress_task` — the ingress queue is drained
+    // by `net_task` via `recv_msg_nowait` (see the ingress endpoint setup
+    // above and the drain loop in `net_task`).
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
     // Spawn the shared network processing task. Both NIC backends rely on it:
@@ -259,55 +271,13 @@ fn init_task() -> ! {
     }
 }
 
-/// Kernel ingress task for ring-3 NIC events.
-///
-/// The e1000 driver sends `NET_RX_FRAME` and `NET_LINK_STATE` as fire-and-forget
-/// bulk IPC messages to the `net.nic.ingress` service. This task is the only
-/// receiver for that endpoint and forwards the payloads into `RemoteNic`.
-///
-/// Currently unused — see the comment in `init_task` explaining why the
-/// endpoint is not created at boot. Kept intact so a future fix that lets us
-/// land the RX-publish path without starving PID 1 can re-enable it.
-#[allow(dead_code)]
-fn remote_nic_ingress_task() -> ! {
-    use kernel_core::driver_ipc::net::{NET_LINK_STATE, NET_RX_FRAME};
-
-    // Keep the fire-and-forget RX ingress receiver near the front of the
-    // run queue so ring-3 NIC publish paths spend less time blocked in the
-    // rendezvous send window between packets.
-    let _ = task::sys_nice(-9, 0);
-
-    let my_id = task::current_task_id().expect("[net-ingress] no task id");
-    let ep_id =
-        ipc::registry::lookup("net.nic.ingress").expect("[net-ingress] endpoint not in registry");
-    task::set_server_endpoint(my_id, ep_id);
-
-    log::info!("[net-ingress] ready");
-
-    loop {
-        let msg = ipc::endpoint::recv_msg(my_id, ep_id);
-        let bulk = task::take_bulk_data(my_id).unwrap_or_default();
-        match msg.label {
-            label if label == NET_RX_FRAME as u64 => {
-                if bulk.is_empty() {
-                    log::warn!("[net-ingress] NET_RX_FRAME arrived without bulk payload");
-                } else {
-                    net::remote::RemoteNic::inject_rx_frame(&bulk);
-                }
-            }
-            label if label == NET_LINK_STATE as u64 => {
-                if bulk.is_empty() {
-                    log::warn!("[net-ingress] NET_LINK_STATE arrived without payload");
-                } else {
-                    net::remote::RemoteNic::handle_link_state(&bulk);
-                }
-            }
-            label => {
-                log::warn!("[net-ingress] unexpected message label {}", label);
-            }
-        }
-    }
-}
+// `remote_nic_ingress_task` (Phase 55c Track E original design) was deleted
+// 2026-04-24. The dedicated kernel receiver task starved PID 1's reap loop
+// just by sitting blocked on `recv_msg` — see the post-mortem at
+// `docs/post-mortems/2026-04-24-ingress-task-starvation.md`. The replacement
+// is `drain_remote_nic_ingress` (called from `net_task` below) which uses
+// the new `recv_msg_nowait` primitive to drain the ingress endpoint without
+// adding a task to the run queue.
 
 /// Load `/sbin/init` from the ramdisk and launch it as userspace PID 1.
 fn spawn_userspace_init() {
@@ -616,16 +586,20 @@ fn serial_echo(s: &str) {
 /// pending frames through the network dispatch stack.
 fn net_task() -> ! {
     // Prioritize protocol dispatch slightly above normal userspace so queued
-    // ring-3 NIC RX/TX work drains promptly once the ingress task wakes us.
+    // ring-3 NIC RX/TX work drains promptly once the ingress send wakes us.
     let _ = task::sys_nice(-8, 0);
 
     // Register this task's id with the virtio-net ISR so it can wake us.
-    // The ring-3 e1000 driver wakes the task via RemoteNic IPC — no kernel
-    // task-id registration is needed for it.
-    if let Some(id) = task::scheduler::current_task_id() {
-        net::virtio_net::set_net_task_id(id);
-    }
-    log::info!("[net] network processing task started");
+    // The ring-3 e1000 driver wakes the task via the per-endpoint pending-send
+    // hook installed by `init_task` for `net.nic.ingress`, which calls
+    // `wake_net_task()` on the same `NIC_WOKEN` flag this task parks on.
+    let my_id = task::scheduler::current_task_id().expect("[net] no task id");
+    net::virtio_net::set_net_task_id(my_id);
+    let ingress_ep = ipc::registry::lookup_endpoint_id("net.nic.ingress");
+    log::info!(
+        "[net] network processing task started (ingress={:?})",
+        ingress_ep,
+    );
 
     loop {
         // Clear the unified wake flag up front so any edge set between now
@@ -633,24 +607,93 @@ fn net_task() -> ! {
         net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
         let mut any =
             net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        // Edge-triggered ingress drain: only call `recv_msg_nowait` when
+        // the pending-send hook has explicitly signaled work. Skipping the
+        // unconditional drain keeps `net_task`'s park loop free of
+        // `ENDPOINTS.lock()` acquisitions when no ring-3 NIC is publishing.
+        let mut drained_ingress =
+            if net::INGRESS_HAS_WORK.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                drain_remote_nic_ingress(my_id, ingress_ep)
+            } else {
+                0
+            };
         let mut drained_remote_rx = net::remote::RemoteNic::drain_rx_queue();
         let mut drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
-        while any || drained_remote_rx != 0 || drained_remote_tx != 0 {
+        while any || drained_ingress != 0 || drained_remote_rx != 0 || drained_remote_tx != 0 {
             net::dispatch::process_rx();
+            drained_ingress =
+                if net::INGRESS_HAS_WORK.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                    drain_remote_nic_ingress(my_id, ingress_ep)
+                } else {
+                    0
+                };
             drained_remote_rx = net::remote::RemoteNic::drain_rx_queue();
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
             drained_remote_tx = net::remote::RemoteNic::drain_tx_queue();
         }
-        // Park on the unified flag: the virtio-net ISR and RemoteNic both
-        // set it, so a wake from either path reliably unblocks the task.
-        //
-        // The timed-wait variant `block_current_unless_woken_until` is
-        // available via the new scheduler primitive but intentionally unused
-        // here: indefinite block gives the highest clean-rate; the primitive
-        // is kept on the shelf for future consumers whose wake source is
-        // known to drop IRQs.
+        // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
+        // ingress pending-send hook all set it, so a wake from any path
+        // reliably unblocks the task.
         task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
+}
+
+/// Pending-send hook installed on the `net.nic.ingress` endpoint.
+///
+/// Sets `INGRESS_HAS_WORK` (an edge-triggered drain gate) and wakes the
+/// shared net task. The gate keeps `net_task`'s no-traffic park loop free
+/// of `ENDPOINTS.lock()` acquisitions: without it, calling
+/// `recv_msg_nowait` on every wake amplifies PID 1 starvation under
+/// `serverization-fallback`'s nanosleep busy-yield.
+fn wake_net_for_ingress() {
+    net::INGRESS_HAS_WORK.store(true, core::sync::atomic::Ordering::Release);
+    net::virtio_net::wake_net_task();
+}
+
+/// Drain queued ingress messages from the ring-3 NIC driver.
+///
+/// Returns the number of messages processed. This replaces the dedicated
+/// `remote_nic_ingress_task` that Phase 55c Track E originally spawned —
+/// keeping that task blocked on `recv_msg` introduced PID 1 starvation
+/// (see `docs/post-mortems/2026-04-24-ingress-task-starvation.md`).
+fn drain_remote_nic_ingress(
+    my_id: task::TaskId,
+    ingress_ep: Option<ipc::endpoint::EndpointId>,
+) -> usize {
+    use kernel_core::driver_ipc::net::{NET_LINK_STATE, NET_RX_FRAME};
+
+    let Some(ep_id) = ingress_ep else {
+        return 0;
+    };
+    let mut count = 0usize;
+    while let Some(msg) = ipc::endpoint::recv_msg_nowait(my_id, ep_id) {
+        if msg.label == u64::MAX {
+            // Sentinel from cleanup: endpoint closed mid-drain. Stop.
+            break;
+        }
+        let bulk = task::take_bulk_data(my_id).unwrap_or_default();
+        match msg.label {
+            label if label == NET_RX_FRAME as u64 => {
+                if bulk.is_empty() {
+                    log::warn!("[net-ingress] NET_RX_FRAME arrived without bulk payload");
+                } else {
+                    net::remote::RemoteNic::inject_rx_frame(&bulk);
+                }
+            }
+            label if label == NET_LINK_STATE as u64 => {
+                if bulk.is_empty() {
+                    log::warn!("[net-ingress] NET_LINK_STATE arrived without payload");
+                } else {
+                    net::remote::RemoteNic::handle_link_state(&bulk);
+                }
+            }
+            label => {
+                log::warn!("[net-ingress] unexpected message label {}", label);
+            }
+        }
+        count += 1;
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------

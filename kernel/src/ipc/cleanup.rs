@@ -35,7 +35,13 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
     // After draining queues, close endpoints owned by this task so stale caps
     // fail cleanly. Any now-unreferenced tombstones are reclaimed after we
     // drop the ENDPOINTS lock.
-    let (stranded_senders, stranded_receivers, reclaim_candidates) = {
+    //
+    // `owned_ep_ids` is captured *before* `close_owned_by` runs because the
+    // close path clears `Endpoint::owner`. Driver-death detection hooks
+    // (`RemoteNic::on_endpoint_closed`, `RemoteBlockDevice::on_endpoint_closed`)
+    // fire below after `ENDPOINTS.lock()` is released so they can take the
+    // facade locks without inverting the canonical order.
+    let (stranded_senders, stranded_receivers, reclaim_candidates, owned_ep_ids) = {
         let mut reg = ENDPOINTS.lock();
         let slot_count = reg.slot_count();
         for i in 0..slot_count {
@@ -48,10 +54,27 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
                 ep.senders.retain(|ps| ps.task != task_id);
             }
         }
+        let owned_ep_ids = reg.endpoints_owned_by(task_id);
         let (stranded_senders, stranded_receivers) = reg.close_owned_by(task_id);
         let reclaim_candidates = reg.closed_ids();
-        (stranded_senders, stranded_receivers, reclaim_candidates)
+        (
+            stranded_senders,
+            stranded_receivers,
+            reclaim_candidates,
+            owned_ep_ids,
+        )
     };
+
+    // 2a. Notify driver-facade death-detection hooks. Independent of any
+    //     IPC traffic in flight — guarantees `RESTART_SUSPECTED` /
+    //     `is_restarting()` latch within the supervisor's restart budget
+    //     even when no TX is queued to fail through `drain_tx_queue`.
+    //     See docs/post-mortems/2026-04-24-ingress-task-starvation.md
+    //     "what the real fix would look like" item 2.
+    for ep_id in &owned_ep_ids {
+        crate::net::remote::RemoteNic::on_endpoint_closed(*ep_id);
+        crate::blk::remote::on_endpoint_closed(*ep_id);
+    }
 
     // Wake stranded peers outside the ENDPOINTS lock. Everyone blocked on a
     // closed endpoint gets an error sentinel so their syscall returns an

@@ -6,7 +6,10 @@ reap loop was not running `check_control_commands` on `/run/init.cmd`. The newer
 regression, introduced in the same phase and ungated by Track I.4, never passed in-tree —
 it either hit `exit 4` (subscribe_and_bind failure) at `ba96bdc` or stalled at step 2.5
 (EAGAIN never observed) at `8b65fdc` and onward.
-**Status:** Partially resolved 2026-04-24.
+**Status:** Resolved 2026-04-25 (items 2 + 3 below). Item 1 (nanosleep busy-yield)
+remains as a known scheduler hygiene issue that surfaces as `serverization-fallback`
+flakiness; the resolution restores e1000-restart-crash to green and re-enables the
+ring-3 NIC RX path without re-introducing PID 1 starvation.
 **Severity:** High — PR #118 could not satisfy the pre-push regression gate, and the
 Phase 55b/c ring-3 networking extraction silently lost its RX half.
 **Owners:** Kernel scheduler, IPC primitives, `RemoteNic` facade, service manager.
@@ -127,6 +130,99 @@ from the driver. One pass each of the following would be sufficient:
 Any one of 1, 2, or 3 restores the ingress task cleanly. Doing 1+2 gives us a principled
 fix for both the regression and the architectural gap; 3 is the longer-term simplification.
 
+## Resolution (2026-04-25): items 2 + 3 landed; item 1 deferred
+
+The follow-up landed items 2 and 3 from the section above — **both** are required, and
+they compose cleanly:
+
+### Item 3 — fold the ingress receiver into `net_task`
+
+The Redox `event:` / `O_NONBLOCK` precedent (cf. `smolnetd` reading from
+`/scheme/<adapter>` with `O_NONBLOCK` and dispatching readiness through an event
+queue) maps directly onto our model: the kernel does **not** need a dedicated
+receiver task per ring-3 driver. The pieces:
+
+- **`ipc::endpoint::recv_msg_nowait`** — new non-blocking variant that mirrors
+  `recv_msg`'s sender-found path (reply cap insertion, bulk transfer, sender wake)
+  but returns `None` instead of enqueueing the receiver when no sender is queued.
+- **Per-endpoint pending-send hook** — `Endpoint::on_pending_send: Option<fn()>`
+  installed on the ingress endpoint so that when the driver's `ipc_send_buf` enqueues
+  a sender with no receiver waiting, the hook fires `wake_net_for_ingress` which
+  sets an edge-triggered `INGRESS_HAS_WORK` flag and wakes `net_task`.
+- **`net_task` ingress drain** — on each iteration, if `INGRESS_HAS_WORK` was set,
+  call `recv_msg_nowait` in a loop until it returns `None`, dispatching `NET_RX_FRAME`
+  through `RemoteNic::inject_rx_frame` and `NET_LINK_STATE` through
+  `RemoteNic::handle_link_state`. The edge-triggered gate is critical: an
+  unconditional `recv_msg_nowait` per net_task wake reliably amplifies PID 1
+  starvation (see "Open issue" below).
+
+`remote_nic_ingress_task` is deleted entirely — there is no kernel-resident receiver
+on the run queue. The ingress endpoint stays a normal IPC rendezvous point; the
+driver's `send_buf` semantics are unchanged.
+
+### Item 2 — driver-death detection independent of TX traffic
+
+The kernel learns of driver exit through the IPC cleanup path rather than through TX
+drain failure. Two pieces:
+
+- **`EndpointRegistry::endpoints_owned_by(task_id)`** captures the dying task's owned
+  endpoint IDs *before* `close_owned_by` clears the `owner` field, so the dispatch
+  loop after the lock release knows which IDs to notify.
+- **`RemoteNic::on_endpoint_closed` and `blk::remote::on_endpoint_closed`** are
+  invoked from `cleanup_task_ipc` for each owned endpoint. Both have lock-free
+  fast-paths that early-return when no driver is registered (most cleanups) so the
+  cleanup hot path stays a single atomic load.
+
+For `RemoteNic` specifically, `on_endpoint_closed` sets `RESTART_SUSPECTED` but
+intentionally **does not** clear `REMOTE_NIC_REGISTERED`. The host-testable
+`sendto_restart_errno` returns EAGAIN exactly when `is_registered && is_restarting`
+— clearing the registered flag here would suppress EAGAIN until the driver
+re-registered, which is the opposite of what `e1000-restart-crash`'s H.1 assertion
+exercises.
+
+### Companion changes that compose with items 2 + 3
+
+- **`sendto_restart_ret` is now consume-on-observe.** Once a userspace caller
+  observes the EAGAIN signal, the latch is cleared so subsequent sends proceed.
+  Without this, the latch could survive arbitrarily long (especially with item 3
+  draining link-state events), causing every sendto post-restart to return EAGAIN
+  forever.
+- **`ensure_link_event_entry` no longer auto-clears `RESTART_SUSPECTED`.** With
+  item 3 draining link-state events, the post-restart driver's bootstrap link state
+  raced with userspace observation: a fast restart re-published link state before
+  the test's retry loop caught the EAGAIN window. The latch is now cleared only via
+  the consume-on-observe path in `sendto_restart_ret`.
+
+### Item 1 (nanosleep busy-yield) — still open
+
+`sys_nanosleep`'s long-sleep `while rdtsc < deadline: yield_now()` busy-yield loop
+remains. With items 2 + 3 in place there is no extra blocked task on the run queue
+to interact with, but the underlying scheduler hygiene is still suboptimal:
+`serverization-fallback` continues to be flaky (~40% pass rate on the base; my
+changes do not fix this). Fixing requires re-attempting the
+`block_current_unless_woken_until` substitution and resolving the second-wake bug
+described above. Tracked separately.
+
+### Files touched
+
+- `kernel/src/ipc/endpoint.rs` — `recv_msg_nowait`, `set_endpoint_pending_send_hook`,
+  `endpoints_owned_by`, `Endpoint::on_pending_send` field, hook invocation in
+  `send`/`call_msg`/`send_with_cap`.
+- `kernel/src/ipc/cleanup.rs` — capture `owned_ep_ids` and dispatch driver-facade
+  hooks after lock release.
+- `kernel/src/net/remote.rs` — `on_endpoint_closed`, consume-on-observe in
+  `sendto_restart_ret`, removed `RESTART_SUSPECTED` clear from
+  `ensure_link_event_entry`.
+- `kernel/src/blk/remote.rs` — `on_endpoint_closed`, lock-free
+  `REMOTE_BLOCK_REGISTERED` mirror.
+- `kernel/src/net/mod.rs` — `INGRESS_HAS_WORK` edge-trigger flag.
+- `kernel/src/main.rs` — restored `net.nic.ingress` endpoint creation in `init_task`,
+  installed wake hook, folded ingress drain into `net_task` via
+  `drain_remote_nic_ingress`. Removed `remote_nic_ingress_task`.
+- `kernel/src/syscall/device_host.rs` — drive-by fix to a pre-existing test-only
+  build break (`install_irq_binding` missed the `legacy_irq_line` argument added to
+  `bind_irq_vector`).
+
 ## Timeline
 
 - **2026-04-22** `8b65fdc fix: close Phase 55c readiness blockers` adds
@@ -143,9 +239,34 @@ fix for both the regression and the architectural gap; 3 is the longer-term simp
 - **2026-04-24** Attempt to wire `block_current_unless_woken_until` into `sys_nanosleep`
   surfaces a second bug: PID 1 wakes from the first deadline but a follow-up sleep
   silently stalls. Reverted.
+- **2026-04-25** Items 2 + 3 implemented: `RemoteNic`/`RemoteBlockDevice` close-hook
+  in `cleanup_task_ipc`, `recv_msg_nowait` non-blocking IPC primitive,
+  edge-triggered ingress drain in `net_task`, consume-on-observe semantics for
+  `sendto_restart_ret`, removal of `RESTART_SUSPECTED` auto-clear from
+  `ensure_link_event_entry`. `e1000-restart-crash` passes deterministically;
+  ring-3 e1000 RX path restored without re-introducing PID 1 starvation. Item 1
+  (nanosleep) deferred — `serverization-fallback` flakiness remains at the
+  pre-existing baseline.
 
 ## Lessons
 
+- **Microkernel-style ingress doesn't need a dedicated kernel receiver.** Redox's
+  `event:` scheme + `O_NONBLOCK` reads from per-fd queues is the textbook design;
+  m3OS now matches it (driver does fire-and-forget IPC; a per-endpoint wake hook
+  flips a flag; the existing net_task does a non-blocking drain via
+  `recv_msg_nowait`). The fundamental insight: **the kernel does not need a task
+  blocked on `recv_msg` per ring-3 driver — a non-blocking primitive plus an
+  edge-triggered wake suffices**.
+- **Driver-death detection should not depend on TX traffic.** Hooking
+  `cleanup_task_ipc` to call `RemoteNic::on_endpoint_closed` is the symmetric
+  counterpart to `drain_tx_queue`'s `on_ipc_error`. Both paths now feed into the
+  same `RESTART_SUSPECTED` latch; userspace observes EAGAIN within microseconds of
+  the kill rather than waiting for the next TX retry.
+- **Consume-on-observe latches survive concurrent producers.** When the
+  driver-restart path re-publishes link state asynchronously, a "set on death,
+  clear on link-up" latch raced with userspace observation. Switching to "set on
+  death, clear on first sendto observation" makes the contract robust to whatever
+  arrival order the post-restart bootstrap produces.
 - **Adding a kernel task on the shared run queue is not free.** Even a blocked-on-recv
   task interacts with the scheduler enough that busy-yield paths on the same core get
   starved. The nanosleep TSC-yield loop was load-bearing on "no other task exists" and

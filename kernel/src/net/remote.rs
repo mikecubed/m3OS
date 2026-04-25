@@ -245,11 +245,26 @@ impl RemoteNic {
     /// Loads the live restart flags and forwards them to the host-testable
     /// `kernel_core::driver_ipc::net::sendto_restart_errno()` seam that the
     /// UDP/ICMP syscall path also relies on.
+    ///
+    /// **Consume-on-observe semantics (post-mortem 2026-04-24):** when the
+    /// gate fires (registered && suspected), `RESTART_SUSPECTED` is cleared
+    /// atomically as part of the read so a subsequent sendto succeeds.
+    /// Without this, the restart latch can survive multiple sendto retries
+    /// because the driver's link-state-bootstrap path leaves the flag set
+    /// for arbitrary durations after the new driver re-registers, breaking
+    /// the `e1000-restart-crash` H.1 contract that observed EAGAIN should
+    /// transition to a successful send within the test's polling window.
     pub fn sendto_restart_ret() -> Option<i64> {
-        kernel_core::driver_ipc::net::sendto_restart_errno(
-            REMOTE_NIC_REGISTERED.load(Ordering::Acquire),
-            RESTART_SUSPECTED.load(Ordering::Acquire),
-        )
+        let registered = REMOTE_NIC_REGISTERED.load(Ordering::Acquire);
+        let suspected = RESTART_SUSPECTED.load(Ordering::Acquire);
+        if let Some(errno) =
+            kernel_core::driver_ipc::net::sendto_restart_errno(registered, suspected)
+        {
+            // Latch consumed: clear so subsequent sendto's see steady state.
+            RESTART_SUSPECTED.store(false, Ordering::Release);
+            return Some(errno);
+        }
+        None
     }
 
     /// Enqueue a raw Ethernet frame for delivery to the ring-3 driver over IPC.
@@ -394,6 +409,44 @@ impl RemoteNic {
         if !RESTART_SUSPECTED.load(Ordering::Acquire) {
             RESTART_SUSPECTED.store(true, Ordering::Release);
             log::warn!("[remote_nic] IPC transport failure — driver presumed restarting");
+        }
+    }
+
+    /// Driver-death detection hook fired by `cleanup_task_ipc` when an
+    /// endpoint owned by a dying task is closed.
+    ///
+    /// Decouples the restart-suspected latch from the `drain_tx_queue`
+    /// IPC-failure path so the kernel can mark the driver gone immediately
+    /// on process exit, even when no TX traffic is in flight to trigger a
+    /// send failure within the supervisor's restart window. Independent of
+    /// the ingress transport — works for SIGKILL on the e1000 driver
+    /// regardless of whether the RX path is wired.
+    ///
+    /// Sets `RESTART_SUSPECTED` only — `REMOTE_NIC_REGISTERED` is
+    /// intentionally left at its (now-stale) value because
+    /// `sendto_restart_errno` returns EAGAIN exactly when
+    /// `is_registered && is_restarting`. Clearing the registered flag here
+    /// would suppress EAGAIN until the driver re-registered, which is the
+    /// opposite of what `e1000-restart-crash`'s H.1 assertion exercises.
+    ///
+    /// No-op when no driver is registered, or when the closed endpoint is not
+    /// the registered command endpoint.
+    pub fn on_endpoint_closed(ep_id: EndpointId) {
+        // Fast-path: skip the mutex acquisition entirely when no driver
+        // is registered. The cleanup path runs for every dying task's
+        // every owned endpoint, so the no-driver case (every cleanup in
+        // the no-e1000 regression suite) must stay lock-free.
+        if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+            return;
+        }
+        let registered = REMOTE_NIC.lock().as_ref().map(|e| e.endpoint);
+        if registered == Some(ep_id) {
+            log::warn!(
+                "[remote_nic] command endpoint {:?} closed by owner exit — \
+                 marking restart-suspected",
+                ep_id,
+            );
+            Self::on_ipc_error();
         }
     }
 
@@ -570,7 +623,17 @@ impl RemoteNic {
         }
         if live_endpoint.is_some() {
             REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
-            RESTART_SUSPECTED.store(false, Ordering::Release);
+            // Intentionally do NOT clear `RESTART_SUSPECTED` here.
+            //
+            // Phase 55c Track E originally cleared the latch on every
+            // link-state-driven re-registration so the post-restart driver
+            // bootstrap reset every flag. With the close-driven
+            // `on_endpoint_closed` path now setting `RESTART_SUSPECTED` on
+            // the dying driver's exit, that auto-clear races with userspace
+            // `sendto` observation: a fast restart re-publishes link state
+            // before the test's retry loop catches the EAGAIN window.
+            // `sendto_restart_ret` consumes the latch on observation
+            // instead, so the post-restart steady state still converges.
             ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
             LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
         }
