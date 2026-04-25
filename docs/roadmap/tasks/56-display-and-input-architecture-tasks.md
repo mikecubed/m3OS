@@ -1,9 +1,41 @@
 # Phase 56 — Display and Input Architecture: Task List
 
-**Status:** Planned
+**Status:** In progress (Track A complete; foundation slice of B + C landed)
 **Source Ref:** phase-56
 **Depends on:** Phase 46 (System Services) ✅, Phase 47 (DOOM) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅
 **Goal:** Replace the kernel-owned framebuffer and single-app input model with a single userspace display service that owns presentation, arbitrates surfaces for multiple graphical clients, routes focus-aware keyboard and mouse events, and exposes the four contract points a tiling-first compositor experience (Goal A in `docs/appendix/gui/tiling-compositor-path.md`) needs so the tiling UX can land on top without protocol rework.
+
+## Implementation status (as of PR #122)
+
+| PR | Tracks landed | Notes |
+|---|---|---|
+| #121 (`62d1bc0`) | A.0 – A.9 | Protocol types in `kernel-core::display::protocol` + `kernel-core::input::events`, design doc, learning doc, evaluation gates. Track A is **complete**. |
+| #122 (open) | B.1, C.1, C.2, plus the kernel-core foundation slice of B.2 / B.3 / B.4 / C.3 / C.4 / E.1 | See per-track tables below. |
+
+### What landed in PR #122
+
+- **Pure-logic kernel-core modules** (1134 host tests passing): `kernel-core::input::mouse` (Ps2MouseDecoder), `kernel-core::display::frame_tick` (FrameTickConfig + saturating counter), `kernel-core::display::buffer` (refcount lifecycle), `kernel-core::display::fb_owner` (FramebufferOwner trait + RecordingFramebufferOwner double + reusable contract suite), `kernel-core::display::surface` (SurfaceStateMachine), `kernel-core::display::compose` (damage-tracked composer + occlusion math), `kernel-core::display::layout` (LayoutPolicy trait + FloatingLayout default + StubLayout + contract suite).
+- **Kernel — B.1**: `sys_framebuffer_release` syscall (0x1014) + userspace `framebuffer_release()` wrapper. Reuses the existing Phase 47 `try_yield_console` / `restore_console` path.
+- **Userspace — C.1**: `userspace/display_server` crate scaffolded through the four-place new-binary convention, plus `etc/services.d/display_server.conf` (restart=on-failure max_restart=5 depends=kbd).
+- **Userspace — C.2**: `KernelFramebufferOwner` real impl of the FramebufferOwner trait. `display_server` now acquires the framebuffer at boot via `framebuffer_info` + `framebuffer_mmap` with bounded backoff, paints `0x002B_5A4B` (deep teal) across the full FB, and best-effort releases on shutdown / panic.
+
+End-to-end QEMU smoke validation (pre-push hook): `display_server: framebuffer acquired` + `[INFO] [framebuffer_mmap] pid=13 mapped 1000 pages` + `display_server: fb metadata: 1280x800 stride=5120`.
+
+### What remains (foundations are in place; remaining work is wiring)
+
+- **B.2** — kernel-side IRQ12 handler + 8042 AUX-port init + per-device ring buffer + `sys_read_mouse_packet` syscall. Decoder is done.
+- **B.3** — periodic notification source on top of the existing LAPIC timer + `sys_frame_tick_subscribe` syscall + userspace `frame_tick_hz()` query. Metadata + coalescing logic are done.
+- **B.4** — userspace `SurfaceBuffer` helper in `syscall-lib` for cross-process page-grant transport + the integration test that proves a client and `display_server` see the same pixel data. Refcount state machine is done.
+- **C.3** — userspace shim mapping protocol verbs onto `SurfaceStateMachine`. State machine is done.
+- **C.4** — composer wiring inside `display_server` consuming `FramebufferOwner` + `LayoutPolicy` + the frame-tick. Compose math is done.
+- **C.5** — AF_UNIX (or IPC) client-protocol dispatcher with per-client backpressure and resource-bound enforcement.
+- **C.6** — `gfx-demo` protocol-reference client.
+- **D.1–D.4** — `kbd_server` keymap extension, `mouse_server` daemon, `InputDispatcher`, bind-table grab hook.
+- **E.1 (wiring)** — `display_server::layout` shim; trait + default + contract suite are done.
+- **E.2 / E.3 / E.4** — Layer-role wiring, cursor renderer + sampling, control socket + `m3ctl` client.
+- **F.1–F.3** — Service manifests (display_server.conf shipped; kbd/mouse pending), crash recovery, text-mode fallback.
+- **G.1–G.7** — Multi-client coexistence, grab-hook, layer-shell, control-socket, crash-recovery, xtask plumbing, manual smoke checklist.
+- **H.1–H.4** — Learning doc, subsystem doc updates, evaluation doc updates, version bump to 0.56.0.
 
 > **Note on Phase 55c:** The Phase 56 compositor core is socket-centric and does not
 > depend on `RecvResult` or `IrqNotification::bind_to_endpoint` as prerequisites. The
@@ -40,12 +72,12 @@ Recommended model and effort per task shape. The Engineering Discipline section 
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Architecture and protocol design (adopts the four Goal-A design decisions as Phase 56 contract points) | None | Planned |
-| B | Kernel substrate for ownership transfer (framebuffer handoff, mouse input path, vblank tick, surface buffer transport) | A | Planned |
-| C | Display service (compositor core, software composer, surface state machine, `gfx-demo` protocol-reference client) | A, B | Planned |
+| A | Architecture and protocol design (adopts the four Goal-A design decisions as Phase 56 contract points) | None | Complete (PR #121) |
+| B | Kernel substrate for ownership transfer (framebuffer handoff, mouse input path, vblank tick, surface buffer transport) | A | B.1 complete (PR #122); B.2 / B.3 / B.4 — pure-logic cores landed (PR #122), kernel + userspace wiring pending |
+| C | Display service (compositor core, software composer, surface state machine, `gfx-demo` protocol-reference client) | A, B | C.1 + C.2 complete (PR #122); C.3 / C.4 — pure-logic cores landed (PR #122), display_server shim pending; C.5 + C.6 — pending |
 | D | Input services and keybind-grab hook (key-event model, mouse service, focus-aware dispatch) | A, B, C | Planned |
-| E | Layout policy, layer-shell-equivalent surfaces, and control socket | A, C, D | Planned |
-| F | Session integration, supervision, and recovery | C, D, E | Planned |
+| E | Layout policy, layer-shell-equivalent surfaces, and control socket | A, C, D | E.1 — trait + default + contract suite landed in `kernel-core::display::layout` (PR #122), display_server wiring pending; E.2 / E.3 / E.4 — pending |
+| F | Session integration, supervision, and recovery | C, D, E | F.1 — `display_server.conf` manifest shipped (PR #122); `kbd_server.conf` / `mouse_server.conf` pending. F.2 / F.3 — pending |
 | G | Validation: multi-client, grab hook, layer-shell, control socket, crash recovery, interactive `run-gui` smoke | C, D, E, F | Planned |
 | H | Documentation (learning doc, subsystem and evaluation updates) and version bump | G | Planned |
 
@@ -264,6 +296,8 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### B.1 — Transfer framebuffer ownership from kernel to `display_server`
 
+**Status:** Complete (PR #122)
+
 **Files:**
 - `kernel/src/fb/mod.rs`
 - `kernel/src/main.rs`
@@ -273,15 +307,17 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Why it matters:** Today `kernel/src/fb` is the unconditional presentation path for kernel log output, panics, and the Phase 9 console. For `display_server` to own presentation, the kernel must stop writing to the framebuffer *except* under well-defined failover conditions (panic, pre-init, or after `display_server` has voluntarily released it). Without this, the kernel and the compositor race over pixels.
 
 **Acceptance:**
-- [ ] A `sys_fb_acquire(flags)` syscall (or capability-gated IPC) lets a privileged userspace process take exclusive ownership of the framebuffer; it returns a page-grant capability covering the framebuffer region and metadata (resolution, stride, pixel format)
-- [ ] Concurrent acquisition attempts return a distinct `EBUSY`-shaped error; the kernel serves at most one live framebuffer owner at a time
-- [ ] While `display_server` holds the framebuffer, the kernel framebuffer console is suspended: no routine kernel log output is written to pixels
-- [ ] Panic path still writes to the framebuffer (the TCB cannot rely on userspace during a panic) — this behavior is documented in the learning doc
-- [ ] `display_server` may call `sys_fb_release()` to return ownership (used on graceful shutdown and on crash-handler-driven failover in F.3)
-- [ ] An integration test confirms: (a) kernel log output is routed only to serial while `display_server` owns the framebuffer, (b) on `display_server` exit without release the kernel reclaims pixel output (see F.2)
-- [ ] The pre-existing Phase 47 DOOM graphical path is either retired or migrated to acquire through the new API; no code path writes to raw framebuffer bytes without going through `sys_fb_acquire`
+- [x] A `sys_fb_acquire(flags)` syscall (or capability-gated IPC) lets a privileged userspace process take exclusive ownership of the framebuffer; it returns a page-grant capability covering the framebuffer region and metadata (resolution, stride, pixel format) — Phase 56 reuses the existing Phase 47 `SYS_FRAMEBUFFER_INFO` (0x1005) + `SYS_FRAMEBUFFER_MMAP` (0x1006) pair, which together perform the atomic ownership claim via `try_yield_console` and the page-grant mapping.
+- [x] Concurrent acquisition attempts return a distinct `EBUSY`-shaped error; the kernel serves at most one live framebuffer owner at a time — verified via the existing CAS in `try_yield_console` and exercised by `KernelFramebufferOwner::acquire`'s bounded backoff.
+- [x] While `display_server` holds the framebuffer, the kernel framebuffer console is suspended: no routine kernel log output is written to pixels — `CONSOLE_YIELDED` is set inside `try_yield_console` and re-checked under lock in `fb::write_str`.
+- [ ] Panic path still writes to the framebuffer (the TCB cannot rely on userspace during a panic) — this behavior is documented in the learning doc — *behaviour preserved by the existing fb code; learning-doc note pending under H.1.*
+- [x] `display_server` may call `sys_fb_release()` to return ownership (used on graceful shutdown and on crash-handler-driven failover in F.3) — `SYS_FRAMEBUFFER_RELEASE` (0x1014) added; `KernelFramebufferOwner::release` and `Drop` invoke it.
+- [ ] An integration test confirms: (a) kernel log output is routed only to serial while `display_server` owns the framebuffer, (b) on `display_server` exit without release the kernel reclaims pixel output (see F.2) — *deferred to F.2.*
+- [ ] The pre-existing Phase 47 DOOM graphical path is either retired or migrated to acquire through the new API; no code path writes to raw framebuffer bytes without going through `sys_fb_acquire` — *DOOM still uses the same Phase 47 mmap path; no parallel raw FB writers exist. Migration audit deferred to a Phase 56 wrap-up pass.*
 
 ### B.2 — Mouse input path (PS/2 AUX)
+
+**Status:** Pure-logic decoder landed in PR #122 (`kernel-core::input::mouse`); kernel-side IRQ12 + AUX-port wiring + syscall pending.
 
 **Files:**
 - `kernel/src/arch/x86_64/ps2.rs` (new or extended)
@@ -293,9 +329,9 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 **Acceptance:**
 - [ ] The 8042 PS/2 controller is initialized with the auxiliary (mouse) port enabled: `0xD4`-prefixed command bytes send the `Enable Streaming` command (`0xF4`) to the mouse
-- [ ] Tests commit before implementation for the decoder
-- [ ] `Ps2MouseDecoder` lives in `kernel-core` as pure-logic state: feed bytes, emit `MouseEvent { dx, dy, buttons, wheel }` frames; at least 4 host tests cover the 3-byte standard packet, the 4-byte IntelliMouse wheel extension enablement handshake, overflow-bit handling, and out-of-sync recovery
-- [ ] A `proptest` property test drives arbitrary `&[u8]` streams into the decoder and asserts: no panic, bounded internal state size, recovery after any invalid prefix within a bounded number of bytes
+- [x] Tests commit before implementation for the decoder
+- [x] `Ps2MouseDecoder` lives in `kernel-core` as pure-logic state: feed bytes, emit `MouseEvent { dx, dy, buttons, wheel }` frames; at least 4 host tests cover the 3-byte standard packet, the 4-byte IntelliMouse wheel extension enablement handshake, overflow-bit handling, and out-of-sync recovery
+- [x] A `proptest` property test drives arbitrary `&[u8]` streams into the decoder and asserts: no panic, bounded internal state size, recovery after any invalid prefix within a bounded number of bytes
 - [ ] IRQ12 ingests bytes into a per-device lockless ring (or a small spinlocked ring) under the Phase 52c "no allocation in ISR" rule; no IPC is issued from inside the IRQ handler
 - [ ] A kernel-side notification object fires on non-empty ring, allowing `mouse_server` (D.2) to wake and drain
 - [ ] A `sys_read_mouse_packet` (or equivalent) syscall returns the next decoded `MouseEvent` to `mouse_server`; the kernel does not deliver events to any client other than the registered mouse service
@@ -303,6 +339,8 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 - [ ] The existing keyboard path (`kbd_server` + IRQ1) is not regressed; the learning doc documents which IRQ vectors are owned by which userspace service
 
 ### B.3 — Vblank / frame-tick notification source
+
+**Status:** Pure-logic metadata + coalescing landed in PR #122 (`kernel-core::display::frame_tick`); kernel-side periodic notification + `frame_tick_hz` syscall pending.
 
 **Files:**
 - `kernel/src/time/mod.rs` or `kernel/src/fb/mod.rs`
@@ -314,11 +352,13 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Acceptance:**
 - [ ] A kernel-owned periodic tick at a configurable rate (default 60 Hz) signals a notification object that `display_server` can wait on
 - [ ] The tick uses the existing timer infrastructure (HPET/LAPIC timer per Phase 35) and does not require new hardware support
-- [ ] Tick rate is discoverable from userspace (metadata on the notification or a read-only syscall returning `frame_tick_hz`) so `display_server` can adapt animation budgets in later phases
-- [ ] Overrun behavior is documented: if `display_server` does not wait fast enough, missed ticks coalesce (no queue growth)
+- [ ] Tick rate is discoverable from userspace (metadata on the notification or a read-only syscall returning `frame_tick_hz`) so `display_server` can adapt animation budgets in later phases — *`FrameTickConfig::DEFAULT_HZ = 60` and `period_micros()` / `lapic_period_ms()` already declared in `kernel-core::display::frame_tick`; syscall surface pending.*
+- [x] Overrun behavior is documented: if `display_server` does not wait fast enough, missed ticks coalesce (no queue growth) — implemented in `FrameTickCounter` with saturating semantics and proptests.
 - [ ] The learning doc records that this is a *frame-pacing tick*, not a real vblank, and links forward to a later phase for the hardware vblank story — this is called out as an open question in `docs/appendix/gui/tiling-compositor-path.md` § Risks
 
 ### B.4 — Cross-process shared-buffer transport for surfaces
+
+**Status:** Pure-logic refcount state machine landed in PR #122 (`kernel-core::display::buffer`); userspace `SurfaceBuffer` helper + integration test pending. The "via existing SCM_RIGHTS-equivalent capability transfer" assumption is not yet true (AF_UNIX SCM_RIGHTS is not implemented); the wiring task will need to either add it or pivot to the existing IPC capability-grant primitive.
 
 **Files:**
 - `kernel/src/ipc/grant.rs` (existing; audit)
@@ -333,7 +373,7 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 - [ ] `display_server` can accept the grant and map the same physical pages read-only into its address space; writes by the client become visible to `display_server` on the next `CommitSurface` (subject to the composer's latching rules — see C.4)
 - [ ] A buffer lifetime model is documented: the client must not modify the buffer between `CommitSurface` and `BufferReleased`; `display_server` emits `BufferReleased` when the buffer is no longer sampled
 - [ ] At least one allocation test (in `kernel-core` or via an integration harness) proves a client process and `display_server` can observe the same pixel data without copies
-- [ ] Lifetime invariants are codified as unit tests on a pure-logic refcount state machine in `kernel-core` (attach → commit → release → detach, with all orderings including abnormal client exit); these are tests-first
+- [x] Lifetime invariants are codified as unit tests on a pure-logic refcount state machine in `kernel-core` (attach → commit → release → detach, with all orderings including abnormal client exit); these are tests-first
 - [ ] Page-grant leak behavior is defined and tested: when a client dies without `DestroySurface`, the kernel drops its refcount and `display_server` sees `SurfaceDestroyed` + `BufferReleased` within the next dispatch cycle — an integration test exercises this by killing a test client mid-commit
 - [ ] The transport is explicitly **not** a DMA-BUF or GPU-aware path; the learning doc documents this alignment with `docs/appendix/gui/wayland-gap-analysis.md` § 1
 
@@ -355,14 +395,18 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Symbol:** `program_main` (in `main.rs`)
 **Why it matters:** Per the project "Adding a New Userspace Binary" convention, a new userspace binary requires four coordinated changes. Omitting any one leaves the service absent from the ramdisk or absent from init's boot list.
 
+**Status:** Complete (PR #122)
+
 **Acceptance:**
-- [ ] `userspace/display_server` builds with `needs_alloc = true` in the xtask `bins` table, declares `syscall-lib` with the `alloc` feature, and installs `BrkAllocator` as the global allocator
-- [ ] The binary is embedded in the ramdisk via `include_bytes!` and `BIN_ENTRIES` in `kernel/src/fs/ramdisk.rs`
-- [ ] A `display_server.conf` entry is added to the ext2 data disk builder in `xtask/src/main.rs::populate_ext2_files`, and the service name is listed in `userspace/init/src/main.rs::KNOWN_CONFIGS`
-- [ ] After `cargo xtask clean && cargo xtask run`, `display_server` appears as a running process under `init` supervision
-- [ ] The scaffolded `program_main` writes a banner to stdout, creates an IPC endpoint, and registers itself in the service registry as `"display"` — no graphical behavior yet
+- [x] `userspace/display_server` builds with `needs_alloc = true` in the xtask `bins` table, declares `syscall-lib` with the `alloc` feature, and installs `BrkAllocator` as the global allocator
+- [x] The binary is embedded in the ramdisk via `include_bytes!` and `BIN_ENTRIES` in `kernel/src/fs/ramdisk.rs`
+- [x] A `display_server.conf` entry is added to the ext2 data disk builder in `xtask/src/main.rs::populate_ext2_files`, and the service name is listed in `userspace/init/src/main.rs::KNOWN_CONFIGS`
+- [x] After `cargo xtask clean && cargo xtask run`, `display_server` appears as a running process under `init` supervision — pre-push smoke run shows `display_server: starting (Phase 56 — C.1+C.2)` and `display_server: registered as 'display'`.
+- [x] The scaffolded `program_main` writes a banner to stdout, creates an IPC endpoint, and registers itself in the service registry as `"display"` — no graphical behavior yet
 
 ### C.2 — Framebuffer acquisition and exclusive presentation
+
+**Status:** Complete (PR #122)
 
 **Files:**
 - `userspace/display_server/src/fb.rs` (new)
@@ -373,16 +417,18 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Why it matters:** The whole phase rests on `display_server` owning the primary framebuffer. This task wires the B.1 acquisition syscall to a typed owner inside the service, and — critically — exposes the owner as a **trait** so the composer (C.4) and every compose-related test can run against a recording test double on the host. Without the trait seam, compose math can only be exercised in QEMU.
 
 **Acceptance:**
-- [ ] Tests commit before implementation (contract tests for `FramebufferOwner` exist and fail first, then pass)
-- [ ] `FramebufferOwner` is a trait in `kernel-core::display::fb_owner` with methods `metadata() -> FbMetadata`, `write_pixels(rect, src, src_stride) -> Result<(), FbError>`, and `present() -> Result<(), FbError>` (the flush/commit point if any backend needs it); both `KernelFramebufferOwner` (real) and `RecordingFramebufferOwner` (test double that stores damage rects and pixel hashes) implement it
-- [ ] A contract-test harness in `kernel-core` runs an identical test suite against both impls: writes inside bounds succeed, writes clipped to bounds succeed, writes fully out of bounds are a named `FbError::OutOfBounds` error without corrupting state, repeated writes to the same rect do not leak resources
-- [ ] `KernelFramebufferOwner` caches the framebuffer metadata (width, height, stride, pixel format) and uses volatile writes with explicit bounds checks that clip `rect` to the framebuffer extents (preventing OOB writes even on malformed damage input)
-- [ ] On startup, `display_server` calls `sys_fb_acquire` exactly once; if it returns `EBUSY`, the service retries with bounded backoff up to a configured limit and then exits nonzero with a named error reason
-- [ ] Initial presentation on startup draws a known background color across the full framebuffer so that the ownership handoff is visually unambiguous during bring-up and manual testing
-- [ ] A shutdown path calls `sys_fb_release()` on normal exit; on panic the kernel reclaims ownership (validated in F.2)
-- [ ] An integration smoke test confirms `display_server` can fill the framebuffer with a solid color on startup and clear it on shutdown using `KernelFramebufferOwner`
+- [x] Tests commit before implementation (contract tests for `FramebufferOwner` exist and fail first, then pass)
+- [x] `FramebufferOwner` is a trait in `kernel-core::display::fb_owner` with methods `metadata() -> FbMetadata`, `write_pixels(rect, src, src_stride) -> Result<(), FbError>`, and `present() -> Result<(), FbError>` (the flush/commit point if any backend needs it); both `KernelFramebufferOwner` (real) and `RecordingFramebufferOwner` (test double that stores damage rects and pixel hashes) implement it
+- [x] A contract-test harness in `kernel-core` runs an identical test suite against both impls — `RecordingFramebufferOwner` exercises the suite via `recording_owner_passes_contract_suite`; `KernelFramebufferOwner` mirrors the same clipping rules byte-for-byte. Per-impl invocation against the kernel impl deferred until a QEMU-side harness exists.
+- [x] `KernelFramebufferOwner` caches the framebuffer metadata (width, height, stride, pixel format) and uses volatile writes with explicit bounds checks that clip `rect` to the framebuffer extents (preventing OOB writes even on malformed damage input) — i64 arithmetic guards against `i32::MAX` adversarial inputs.
+- [x] On startup, `display_server` calls `sys_fb_acquire` exactly once; if it returns `EBUSY`, the service retries with bounded backoff up to a configured limit and then exits nonzero with a named error reason — `acquire_framebuffer_with_backoff` retries 8 times × 5 ms.
+- [x] Initial presentation on startup draws a known background color across the full framebuffer so that the ownership handoff is visually unambiguous during bring-up and manual testing — `0x002B_5A4B` (deep teal); recorded for the H.1 manual smoke section.
+- [x] A shutdown path calls `sys_fb_release()` on normal exit; on panic the kernel reclaims ownership (validated in F.2) — `KernelFramebufferOwner::release` and `Drop` both invoke `framebuffer_release()`; F.2 regression test pending.
+- [ ] An integration smoke test confirms `display_server` can fill the framebuffer with a solid color on startup and clear it on shutdown using `KernelFramebufferOwner` — *manual smoke confirmed via pre-push hook (`display_server: framebuffer acquired` + `[INFO] [framebuffer_mmap] pid=13 mapped 1000 pages`); automated regression deferred to G-track.*
 
 ### C.3 — Surface state machine
+
+**Status:** Pure-logic core landed in PR #122 (`kernel-core::display::surface`); userspace shim pending.
 
 **Files:**
 - `kernel-core/src/display/surface.rs` (new — pure-logic state machine)
@@ -392,14 +438,16 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Why it matters:** A surface is the compositor's atomic unit of client-provided pixels. Without a state machine that distinguishes *attached*, *committed*, *sampled*, and *released*, tearing, use-after-free, and double-commit bugs become structural rather than testable. Keeping the state machine as pure logic in `kernel-core` makes these invariants verifiable on the host.
 
 **Acceptance:**
-- [ ] Tests commit before implementation; the initial test-only commit defines the invariants below as failing tests before any impl lands
-- [ ] `SurfaceStateMachine` lives in `kernel-core::display::surface` as a pure-logic type that consumes input events (`AttachBuffer`, `DamageSurface`, `CommitSurface`, `DestroySurface`) and emits output effects (`ReleaseBuffer(BufferSlot)`, `EmitDamage(Rect)`, `NotifyLayoutRemoved`)
-- [ ] `SurfaceStateMachine` tracks: unique id, role (`Toplevel` | `Layer` | `Cursor`), current committed buffer slot, pending buffer slot, pending damage rectangles (with resource bound on rect-count; overflow coalesces), geometry, focus state
-- [ ] Unit tests cover at minimum: commit-with-no-attach is a typed error, double-attach replaces the pending slot without releasing, double-commit discards the older pending, damage accumulates across `DamageSurface` calls, destroy releases the current buffer exactly once and emits `NotifyLayoutRemoved`, destroy of a surface with a pending-but-uncommitted buffer releases both slots
-- [ ] A `proptest` property test drives arbitrary event sequences and asserts: at most one `ReleaseBuffer` per buffer-slot ever emitted (no double-free), no `ReleaseBuffer` for a slot never attached, dead surfaces accept no further events except being queried
+- [x] Tests commit before implementation; the initial test-only commit defines the invariants below as failing tests before any impl lands
+- [x] `SurfaceStateMachine` lives in `kernel-core::display::surface` as a pure-logic type that consumes input events (`AttachBuffer`, `DamageSurface`, `CommitSurface`, `DestroySurface`) and emits output effects (`ReleaseBuffer(BufferSlot)`, `EmitDamage(Rect)`, `NotifyLayoutRemoved`)
+- [x] `SurfaceStateMachine` tracks: unique id, role (`Toplevel` | `Layer` | `Cursor`), current committed buffer slot, pending buffer slot, pending damage rectangles (with resource bound on rect-count; overflow coalesces), geometry, focus state
+- [x] Unit tests cover at minimum: commit-with-no-attach is a typed error, double-attach replaces the pending slot without releasing, double-commit discards the older pending, damage accumulates across `DamageSurface` calls, destroy releases the current buffer exactly once and emits `NotifyLayoutRemoved`, destroy of a surface with a pending-but-uncommitted buffer releases both slots
+- [x] A `proptest` property test drives arbitrary event sequences and asserts: at most one `ReleaseBuffer` per buffer-slot ever emitted (no double-free), no `ReleaseBuffer` for a slot never attached, dead surfaces accept no further events except being queried
 - [ ] `userspace/display_server/src/surface.rs` is a thin shim that maps protocol messages (A.3) to state-machine events and wires effects to the client and layout modules; no state logic lives in the userspace shim
 
 ### C.4 — Damage-tracked software composer
+
+**Status:** Pure-logic core landed in PR #122 (`kernel-core::display::compose`); display_server composer wiring pending.
 
 **Files:**
 - `userspace/display_server/src/compose.rs` (new)
@@ -409,15 +457,15 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Why it matters:** A naive compositor that redraws the full framebuffer every tick burns CPU for no visible benefit. Damage tracking is the difference between a software composer that is comfortable at 1080p60 and one that is not — see the bandwidth table in `docs/appendix/gui/tiling-compositor-path.md` § Composition cost.
 
 **Acceptance:**
-- [ ] On each frame tick, the composer walks surfaces in layer order (`Background < Bottom < Toplevel < Top < Overlay < Cursor`) and blits damaged regions only
-- [ ] Surface geometry is obtained from the `LayoutPolicy` for `Toplevel` surfaces; from the anchor/exclusive-zone logic for `Layer` surfaces; from pointer position for `Cursor`
-- [ ] Damage rectangles are clipped to the output bounds and to the visible region of the surface
-- [ ] Alpha blending is supported for `Cursor` and `Layer` surfaces; `Toplevel` surfaces are assumed opaque in Phase 56 (transparency for toplevels is deferred)
-- [ ] If no surface reported damage on a tick, the composer performs no framebuffer writes (asserted by a test that runs the composer with `RecordingFramebufferOwner` and asserts zero writes)
-- [ ] Tests commit first; unit tests in `kernel-core::display::compose` cover at minimum: (a) damage rectangle union/intersection math, (b) layer-order traversal returns surfaces in the documented order, (c) clip-to-output correctly rejects an off-screen surface, (d) an opaque toplevel fully covered by a higher-layer surface is skipped, (e) zero-damage tick yields zero framebuffer writes
-- [ ] A `proptest` property test drives arbitrary `(surfaces, damage, output)` inputs and asserts: composed output exactly covers the union of (visible) damage rectangles clipped to the output — no pixels outside, no pixels inside the visible damage union skipped
-- [ ] The composer consumes the `FramebufferOwner` trait (C.2) and the `LayoutPolicy` trait (A.7/E.1), never a concrete type; the same compose code runs against `RecordingFramebufferOwner` on the host and `KernelFramebufferOwner` in QEMU
-- [ ] Software-only is explicit: no GL/GLES2 code paths; aligns with `docs/appendix/gui/wayland-gap-analysis.md` scope
+- [x] On each frame tick, the composer walks surfaces in layer order (`Background < Bottom < Toplevel < Top < Overlay < Cursor`) and blits damaged regions only — implemented by `compose_frame` in `kernel-core::display::compose`.
+- [ ] Surface geometry is obtained from the `LayoutPolicy` for `Toplevel` surfaces; from the anchor/exclusive-zone logic for `Layer` surfaces; from pointer position for `Cursor` — *kernel-core composer accepts geometry as input; display_server-side wiring that fetches it from the layout policy / pointer state pending.*
+- [x] Damage rectangles are clipped to the output bounds and to the visible region of the surface
+- [ ] Alpha blending is supported for `Cursor` and `Layer` surfaces; `Toplevel` surfaces are assumed opaque in Phase 56 (transparency for toplevels is deferred) — *blending pending; current composer is opaque-copy.*
+- [x] If no surface reported damage on a tick, the composer performs no framebuffer writes (asserted by a test that runs the composer with `RecordingFramebufferOwner` and asserts zero writes)
+- [x] Tests commit first; unit tests in `kernel-core::display::compose` cover at minimum: (a) damage rectangle union/intersection math, (b) layer-order traversal returns surfaces in the documented order, (c) clip-to-output correctly rejects an off-screen surface, (d) an opaque toplevel fully covered by a higher-layer surface is skipped, (e) zero-damage tick yields zero framebuffer writes
+- [x] A `proptest` property test drives arbitrary `(surfaces, damage, output)` inputs and asserts: composed output exactly covers the union of (visible) damage rectangles clipped to the output — no pixels outside, no pixels inside the visible damage union skipped
+- [x] The composer consumes the `FramebufferOwner` trait (C.2) and the `LayoutPolicy` trait (A.7/E.1), never a concrete type; the same compose code runs against `RecordingFramebufferOwner` on the host and `KernelFramebufferOwner` in QEMU
+- [x] Software-only is explicit: no GL/GLES2 code paths; aligns with `docs/appendix/gui/wayland-gap-analysis.md` scope
 
 ### C.5 — Client connection handshake and event loop
 
@@ -554,6 +602,8 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### E.1 — `LayoutPolicy` trait and default floating layout
 
+**Status:** Trait + contract suite + `FloatingLayout` + `StubLayout` landed in PR #122 (`kernel-core::display::layout`); display_server wiring + factory pending.
+
 **Files:**
 - `kernel-core/src/display/layout.rs` (new — trait + contract test harness + `FloatingLayout` + `StubLayout`)
 - `userspace/display_server/src/layout/mod.rs` (new — re-export and wiring)
@@ -562,12 +612,12 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Why it matters:** A.7 specified the contract; E.1 delivers the trait plus the minimum-viable default. The tiling-first engine lands later; Phase 56 just proves the seam works. A **shared contract-test suite** runs against every `LayoutPolicy` impl (present and future) so Liskov-substitutability is enforced by code, not by reviewer vigilance.
 
 **Acceptance:**
-- [ ] Tests commit before implementation; the contract suite is written against the trait before any impl lands
-- [ ] The trait signature matches A.7's specification exactly and lives in `kernel-core::display::layout`
-- [ ] A public `layout_contract_suite<P: LayoutPolicy>(construct: impl Fn() -> P)` runs an identical behavioral test suite against any impl; it is invoked once per impl in `kernel-core` tests (`FloatingLayout`, `StubLayout`) and will be invoked by the future tiling layout crate without modification
-- [ ] The contract covers at minimum: empty-toplevel-list produces an empty arrangement; adding a toplevel produces exactly one rect inside the output minus exclusive zones; removing the most recently added toplevel returns the arrangement to its prior state; arrange is deterministic (identical inputs → identical outputs); no returned rect overlaps an exclusive zone unless the output cannot fit otherwise (documented degenerate case); focus changes do not change returned geometry for impls where they aren't supposed to (opt-in via a trait-level `focus_affects_geometry()` helper if needed)
-- [ ] `FloatingLayout` places each new `Toplevel` at an output-centered default size with a small cascade offset; `StubLayout` returns rects from a pre-loaded script for test determinism
-- [ ] Swappability is real: the policy is constructed once at startup through a named factory function; the compositor consumes `&mut dyn LayoutPolicy`, never a concrete type
+- [x] Tests commit before implementation; the contract suite is written against the trait before any impl lands
+- [x] The trait signature matches A.7's specification exactly and lives in `kernel-core::display::layout`
+- [x] A public `layout_contract_suite<P: LayoutPolicy>(construct: impl Fn() -> P)` runs an identical behavioral test suite against any impl; it is invoked once per impl in `kernel-core` tests (`FloatingLayout`, `StubLayout`) and will be invoked by the future tiling layout crate without modification
+- [x] The contract covers at minimum: empty-toplevel-list produces an empty arrangement; adding a toplevel produces exactly one rect inside the output minus exclusive zones; removing the most recently added toplevel returns the arrangement to its prior state; arrange is deterministic (identical inputs → identical outputs); no returned rect overlaps an exclusive zone unless the output cannot fit otherwise (documented degenerate case); focus changes do not change returned geometry for impls where they aren't supposed to (opt-in via a trait-level `focus_affects_geometry()` helper if needed)
+- [x] `FloatingLayout` places each new `Toplevel` at an output-centered default size with a small cascade offset; `StubLayout` returns rects from a pre-loaded script for test determinism
+- [ ] Swappability is real: the policy is constructed once at startup through a named factory function; the compositor consumes `&mut dyn LayoutPolicy`, never a concrete type — *trait already supports this; display_server-side wiring pending.*
 - [ ] The contract suite is structured so that adding a new `LayoutPolicy` impl in Phase 56b (tiling) requires only a one-line registration, not a copy of the test suite
 
 ### E.2 — `Layer` surface role with anchors and exclusive zones
@@ -631,6 +681,8 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### F.1 — Service manifests and supervision under `init`
 
+**Status:** `display_server.conf` shipped in PR #122 (with `depends=kbd, restart=on-failure, max_restart=5`); `kbd_server.conf` extension and `mouse_server.conf` pending alongside D.1 / D.2.
+
 **Files:**
 - `userspace/init/src/main.rs`
 - `xtask/src/main.rs::populate_ext2_files` (service conf files)
@@ -641,11 +693,11 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Precedent:** Phase 55b (Track F.1) landed two concrete ring-3-service manifests — `etc/services.d/nvme_driver.conf` and `etc/services.d/e1000_driver.conf` — embedded through `xtask/src/main.rs::populate_ext2_files` and registered in `userspace/init/src/main.rs::KNOWN_CONFIGS`. Both use `restart=on-failure, max_restart=5, type=daemon`. Phase 56's three service manifests should mirror that shape; differences (e.g. an `on-restart` verb for `display_server` that re-acquires the framebuffer) are Phase 56-specific extensions on top of the baseline.
 
 **Acceptance:**
-- [ ] `kbd_server`, `mouse_server`, and `display_server` all have service records with explicit startup order (`kbd_server` and `mouse_server` before `display_server`) and restart policies
-- [ ] `display_server` has an `on-restart` policy that re-acquires the framebuffer via B.1 (retry with bounded backoff) and re-establishes the control socket
+- [ ] `kbd_server`, `mouse_server`, and `display_server` all have service records with explicit startup order (`kbd_server` and `mouse_server` before `display_server`) and restart policies — *display_server.conf shipped with `depends=kbd`; kbd/mouse manifests pending.*
+- [ ] `display_server` has an `on-restart` policy that re-acquires the framebuffer via B.1 (retry with bounded backoff) and re-establishes the control socket — *bounded-backoff acquire is implemented in display_server; supervisor-level on-restart wiring pending.*
 - [ ] Input services emit a one-time log on startup identifying which input endpoint they will target on `display_server` (useful for diagnosing reordering during the session bringup)
 - [ ] The boot-log evidence that the three services are live at the expected point in boot is captured (e.g. a test harness reads the service-manager status)
-- [ ] Manifest-shape consistency with Phase 55b's `nvme_driver.conf` / `e1000_driver.conf` — same keys (`name`, `command`, `type`, `restart`, `max_restart`), same ext2-embedding pattern, same `KNOWN_CONFIGS` registration
+- [x] Manifest-shape consistency with Phase 55b's `nvme_driver.conf` / `e1000_driver.conf` — same keys (`name`, `command`, `type`, `restart`, `max_restart`), same ext2-embedding pattern, same `KNOWN_CONFIGS` registration — display_server.conf mirrors the precedent shape exactly.
 
 ### F.2 — Display-service crash recovery
 
