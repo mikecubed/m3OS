@@ -47,9 +47,9 @@ fn alloc_error(_layout: Layout) -> ! {
 
 /// Phase 56 startup background colour (encoded BGRA8888 / RGBA8888 — both
 /// formats happen to render this byte order as a uniform deep teal). The
-/// learning doc records this so manual smoke validation knows what to
-/// expect on `cargo xtask run-gui --fresh`.
-const BG_PIXEL: u32 = 0x002B5_5A4Bu32;
+/// expected startup pixel value is `0x002B_5A4B`, recorded here so manual
+/// smoke validation knows what to expect on `cargo xtask run-gui --fresh`.
+const BG_PIXEL: u32 = 0x002B_5A4Bu32;
 
 syscall_lib::entry_point!(program_main);
 
