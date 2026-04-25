@@ -8,11 +8,12 @@
 //!   1. Look up the `"display"` service in the IPC registry (with bounded
 //!      retry — `display_server` may still be coming up at boot).
 //!   2. Send `Hello { protocol_version, capabilities = 0 }`.
-//!   3. Allocate a 32 × 32 BGRA8888 surface buffer (the largest size that
-//!      fits the kernel's `MAX_BULK_LEN` of 4096 bytes — see
-//!      `userspace/lib/surface_buffer/`).
+//!   3. Allocate a 16 × 16 BGRA8888 surface buffer (1024 bytes pixels +
+//!      8 bytes geometry header in the IPC bulk wire = 1032 bytes total,
+//!      well below the kernel's 4096-byte `MAX_BULK_LEN`). Backed by
+//!      `userspace/lib/surface_buffer/`.
 //!   4. Walk the surface lifecycle: `CreateSurface`, `SetSurfaceRole`
-//!      (Toplevel), `AttachBuffer`, `CommitSurface`.
+//!      (Toplevel), `LABEL_PIXELS` bulk, `AttachBuffer`, `CommitSurface`.
 //!   5. Idle — the demo stays alive so a developer can manually inspect the
 //!      composited output via `cargo xtask run-gui`.
 //!
@@ -24,12 +25,11 @@
 //!
 //! # Pixel transport
 //!
-//! True per-buffer pixel transport (Track B.4 + composer wiring in C.4) is
-//! still landing in follow-up PRs. This client therefore stops after the
-//! protocol-verb round-trip and *does not* push pixel bytes across IPC; the
-//! background colour `0x00FF_8800` (orange) documented below is the value
-//! the surface buffer is filled with, ready to ship the moment the bulk
-//! transport is enabled.
+//! The demo ships a `LABEL_PIXELS` bulk frame ahead of `AttachBuffer` so
+//! `display_server` actually receives the orange-filled `0x00FF_8800`
+//! pixel data and not just the protocol verbs. The IPC bulk format is
+//! `[w: u32 LE | h: u32 LE | pixel_bytes...]` — see
+//! `display_server::client::PIXEL_BULK_HEADER_LEN`.
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
@@ -65,6 +65,9 @@ const DEMO_FILL_BGRA: u32 = 0x00FF_8800;
 /// these constants into a shared crate so the demo and the server can
 /// import a single source of truth.
 const LABEL_PROTOCOL: u64 = 1;
+const LABEL_PIXELS: u64 = 2;
+/// LABEL_PIXELS bulk header: `[w: u32 LE | h: u32 LE]` — 8 bytes.
+const PIXEL_BULK_HEADER_LEN: usize = 8;
 
 /// Stack buffer for `ClientMessage::encode`. The largest Phase 56
 /// client-message body is `SetSurfaceRole(Layer)` at ~24 bytes; a 128-byte
@@ -110,9 +113,15 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     // 2. Allocate the surface buffer. SurfaceBuffer::new is fallible —
-    //    handle every variant rather than unwrapping.
+    //    handle every variant rather than unwrapping. Demo size is 16×16
+    //    BGRA = 1024 bytes pixels; the IPC bulk wire adds an 8-byte
+    //    geometry header (see `display_server::client` LABEL_PIXELS
+    //    framing) so the total payload is 1032 bytes — well below the
+    //    kernel's 4096-byte `MAX_BULK_LEN`.
+    const DEMO_W: u32 = 16;
+    const DEMO_H: u32 = 16;
     let mut surface_buf =
-        match SurfaceBuffer::new(SurfaceBufferId(1), 32, 32, PixelFormat::Bgra8888) {
+        match SurfaceBuffer::new(SurfaceBufferId(1), DEMO_W, DEMO_H, PixelFormat::Bgra8888) {
             Ok(b) => b,
             Err(_) => {
                 syscall_lib::write_str(STDOUT_FILENO, "gfx-demo: SurfaceBuffer::new failed\n");
@@ -122,7 +131,7 @@ fn program_main(_args: &[&str]) -> i32 {
     surface_buf.fill(DEMO_FILL_BGRA);
     syscall_lib::write_str(
         STDOUT_FILENO,
-        "gfx-demo: allocated 32x32 BGRA buffer, filled with orange\n",
+        "gfx-demo: allocated 16x16 BGRA buffer, filled with orange\n",
     );
 
     // 3. CreateSurface.
@@ -142,7 +151,21 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
-    // 5. AttachBuffer.
+    // 5. LABEL_PIXELS bulk — must precede `AttachBuffer` so the server
+    //    has the pixel data queued under our `BufferId`. Wire format:
+    //    `[w_le_u32 | h_le_u32 | pixels...]`. data0 carries the buffer id.
+    if !send_pixels(
+        server_handle,
+        BufferId(1),
+        DEMO_W,
+        DEMO_H,
+        surface_buf.pixels(),
+    ) {
+        return 1;
+    }
+
+    // 6. AttachBuffer — pulls our LABEL_PIXELS bulk by id from the
+    //    server's pending-bulk queue.
     let attach = ClientMessage::AttachBuffer {
         surface_id: SurfaceId(1),
         buffer_id: BufferId(1),
@@ -151,7 +174,7 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
-    // 6. CommitSurface — final verb that asks the compositor to flip.
+    // 7. CommitSurface — final verb that asks the compositor to flip.
     let commit = ClientMessage::CommitSurface {
         surface_id: SurfaceId(1),
     };
@@ -222,6 +245,28 @@ fn send_message(server_handle: u32, msg: &ClientMessage, buf: &mut [u8], step: &
     syscall_lib::write_str(STDOUT_FILENO, "gfx-demo: sent ");
     syscall_lib::write_str(STDOUT_FILENO, step);
     syscall_lib::write_str(STDOUT_FILENO, " ok\n");
+    true
+}
+
+/// Send a `LABEL_PIXELS` bulk frame: `[w_le_u32 | h_le_u32 | pixels...]`.
+/// `data0` carries the `BufferId` so the server can match the bulk
+/// against the next `AttachBuffer` verb.
+fn send_pixels(server_handle: u32, buffer_id: BufferId, w: u32, h: u32, pixels: &[u8]) -> bool {
+    let mut payload: alloc::vec::Vec<u8> =
+        alloc::vec::Vec::with_capacity(PIXEL_BULK_HEADER_LEN + pixels.len());
+    payload.extend_from_slice(&w.to_le_bytes());
+    payload.extend_from_slice(&h.to_le_bytes());
+    payload.extend_from_slice(pixels);
+    let reply =
+        syscall_lib::ipc_call_buf(server_handle, LABEL_PIXELS, buffer_id.0 as u64, &payload);
+    if reply == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "gfx-demo: ipc_call_buf failed for LABEL_PIXELS\n",
+        );
+        return false;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "gfx-demo: sent LABEL_PIXELS bulk ok\n");
     true
 }
 

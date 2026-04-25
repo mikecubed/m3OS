@@ -83,16 +83,20 @@ pub struct DispatchResult {
     pub created: Vec<(SurfaceId, SurfaceRole)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceShimError {
     UnknownSurface(SurfaceId),
     DuplicateSurface(SurfaceId),
     StateMachine(SurfaceError),
-    /// Attached a buffer that was never queued via the bulk transport. The
-    /// dispatcher attaches the most-recently-received bulk buffer when the
-    /// client sends `AttachBuffer`; this error means no such bulk preceded
-    /// the verb.
-    NoPendingBulk,
+    /// `AttachBuffer` referenced a `BufferId` that is not present in
+    /// the dispatcher's pending-bulk queue. Distinct from the prior
+    /// `NoPendingBulk` which conflated "no bulk at all" with "wrong
+    /// id"; the two diagnostics behave very differently for a debugging
+    /// reviewer or a future control-socket query.
+    PendingBulkIdMismatch {
+        expected: BufferId,
+        pending: Vec<BufferId>,
+    },
 }
 
 /// Registry of all surfaces owned by all connected clients.
@@ -179,16 +183,23 @@ impl SurfaceRegistry {
                 surface_id,
                 buffer_id,
             } => {
-                let buf = self
+                // Search pending_bulk for the entry whose `buffer_id`
+                // matches. This preserves attach order independent of
+                // arrival order (clients can ship multiple LABEL_PIXELS
+                // bulks before their matching AttachBuffer verbs) and
+                // distinguishes "bulk for this id is missing" from
+                // "wrong id pulled by LIFO" — the previous pop()-then-
+                // push-back path could deadlock both: the same older
+                // buffer kept getting re-popped on every attach.
+                let pending_index = self
                     .pending_bulk
-                    .pop()
-                    .ok_or(SurfaceShimError::NoPendingBulk)?;
-                if buf.buffer_id != *buffer_id {
-                    // Recycle: protocol mismatch between the bulk we
-                    // received and the AttachBuffer the client sent.
-                    self.pending_bulk.push(buf);
-                    return Err(SurfaceShimError::NoPendingBulk);
-                }
+                    .iter()
+                    .position(|b| b.buffer_id == *buffer_id)
+                    .ok_or(SurfaceShimError::PendingBulkIdMismatch {
+                        expected: *buffer_id,
+                        pending: self.pending_bulk.iter().map(|b| b.buffer_id).collect(),
+                    })?;
+                let buf = self.pending_bulk.remove(pending_index);
                 self.apply_event(
                     *surface_id,
                     SurfaceEvent::AttachBuffer(*buffer_id),
@@ -247,19 +258,49 @@ impl SurfaceRegistry {
         let (effects, err) = s.state.apply(event);
         for e in &effects {
             match e {
-                SurfaceEffect::ReleaseBuffer(slot) => {
-                    if let Some(b) = s.committed_buffer.take() {
+                SurfaceEffect::ReleaseBuffer(buffer_id) => {
+                    // The state machine names the *specific* buffer to
+                    // release. Drop the slot whose id matches — pending
+                    // first (the state machine emits releases for both
+                    // pending and active buffers, e.g. on destroy or on
+                    // pending replacement) — and emit `BufferReleased`
+                    // for that exact id. The previous code unconditionally
+                    // dropped `committed_buffer` and could release the
+                    // wrong buffer.
+                    if let Some(buf) = s.pending_buffer.as_ref()
+                        && buf.buffer_id == *buffer_id
+                    {
+                        let _ = s.pending_buffer.take();
                         result.outbound.push(ServerMessage::BufferReleased {
                             surface_id,
-                            buffer_id: b.buffer_id,
+                            buffer_id: *buffer_id,
+                        });
+                        continue;
+                    }
+                    if let Some(buf) = s.committed_buffer.as_ref()
+                        && buf.buffer_id == *buffer_id
+                    {
+                        let _ = s.committed_buffer.take();
+                        result.outbound.push(ServerMessage::BufferReleased {
+                            surface_id,
+                            buffer_id: *buffer_id,
                         });
                     }
-                    let _ = slot;
                 }
-                SurfaceEffect::EmitDamage(_) | SurfaceEffect::NotifyLayoutRemoved => {
-                    // C.4 (composer) and E.1 (layout) consume these via
-                    // the dedicated trait paths; not surfaced to the
-                    // client outbound queue.
+                SurfaceEffect::EmitDamage(_) => {
+                    // A damage-only commit (DamageSurface → CommitSurface
+                    // without re-attaching a buffer) is valid — the state
+                    // machine emits `EmitDamage` so the composer can re-
+                    // blit the existing committed buffer's damaged regions.
+                    // Mark the surface dirty so the C.4 compose gate picks
+                    // it up; full-rect damage is the Phase 56 default and
+                    // partial-damage plumbing lands with the C.4 follow-up.
+                    s.dirty = true;
+                }
+                SurfaceEffect::NotifyLayoutRemoved => {
+                    // C.4 (composer) and E.1 (layout) consume this via the
+                    // dedicated trait paths; not surfaced to the client
+                    // outbound queue.
                 }
                 SurfaceEffect::Configured { .. } => {
                     // Generated separately on commit; the state machine's

@@ -107,9 +107,13 @@ static MOUSE_RING_TAIL: AtomicUsize = AtomicUsize::new(0);
 /// Decoder state — fed from the IRQ12 handler.
 static MOUSE_DECODER: Mutex<Ps2MouseDecoder> = Mutex::new(Ps2MouseDecoder::new());
 
-/// True after `init_mouse` has successfully initialized the AUX port. The
-/// IRQ handler runs even when this is false (in case a stray IRQ12 fires
-/// before init), so it's a no-op until init has wired things up.
+/// Records successful AUX-port initialization. **Informational only — it
+/// does not gate the IRQ12 path.** The actual gate is the PIC mask: until
+/// [`init_mouse`] has unmasked IRQ12 (and the BIOS / firmware hasn't left
+/// it unmasked), no IRQ12 fires. If a stray IRQ12 *does* fire before init,
+/// `mouse_handler` and [`feed_byte_isr`] still read, decode, and queue the
+/// byte through the normal path. The [`is_ready`] accessor exposes this
+/// flag for diagnostics (e.g. a future `mouse_server` health check).
 static MOUSE_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Pop the next decoded packet from the ring, or `None` if empty.
