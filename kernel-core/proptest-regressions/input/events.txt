@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8bb648b43198e63e21037ec70d58ed27e65484131947b16396ef59185343b930 # shrinks to ev = KeyEvent { timestamp_ms: 0, keycode: 0, symbol: 0, modifiers: ModifierState(0), kind: Down }
+cc 0c96e154aede1b33f5ba351272e182e4ddae971c266d885dfa5c66f5848f3e8f # shrinks to ev = PointerEvent { timestamp_ms: 0, dx: 0, dy: 0, abs_position: None, button: None, wheel_dx: 0, wheel_dy: 0, modifiers: ModifierState(0) }

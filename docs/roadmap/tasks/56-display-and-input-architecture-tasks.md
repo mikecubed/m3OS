@@ -13,17 +13,40 @@
 > keep their existing wait/send split; adoption of the Phase 55c pattern is opt-in for
 > any IRQ-backed driver introduced in Phase 56 or later.
 
+## Model and Effort Guidance
+
+Recommended model and effort per task shape. The Engineering Discipline section below (property tests, contract-test suites, state-machine invariants, codec round-trips) is exactly where the capability gap between models shows up most — a protocol type declared wrong in A.0 or an ordering bug in D.3 propagates into every later track.
+
+| Task shape | Model | Effort | Rationale |
+|---|---|---|---|
+| A.0 codec + A.3/A.4 wire format + A.5–A.8 design | Opus 4.7 | extended thinking | Every later task imports these types; a rename or byte-layout miss cascades |
+| B.1/B.3/B.4 kernel syscalls + page-grant audit, B.2 PS/2 decoder | Opus 4.7 | extended thinking | Ring 0, IRQ boundaries, capability transfer — mistakes corrupt state silently |
+| C.3 surface state machine, C.4 compose math, D.3 dispatcher, D.4 bind table, E.1 layout contract, E.3 cursor damage | Opus 4.7 | extended thinking | Pure-logic cores with property-test invariants; Opus produces sharper invariants and better counterexample handling |
+| C.1 scaffold, C.5 client loop, D.1/D.2 service wiring, E.2/E.4 socket wiring, F.1 manifests | Sonnet 4.6 | standard | Mechanical once the A.0 types + traits exist |
+| C.6 `gfx-demo`, G.1–G.5 regression tests | Sonnet 4.6 | standard | Specs are tight; execution is the work |
+| G.6/G.7 xtask + smoke checklist | Sonnet 4.6 | standard | Integration plumbing, no deep invariants |
+| H.1–H.4 docs, subsystem updates, version bump | Sonnet 4.6 | standard | Writing, not designing |
+
+**Heuristic for unlisted tasks:** if the acceptance list contains `proptest` or "contract-test suite runs against every impl," it's Opus + extended thinking. If it's "follow the four-step new-binary convention" or "add a bullet to `docs/README.md`," it's Sonnet standard.
+
+**Workflow recommendations:**
+1. Land Track A first, in isolation, before anything else (Opus only). Freeze the types; every later task imports from them. Run `/ultrareview` on Track A before merge to front-load feedback while the protocol is still malleable.
+2. Tracks C.3, D.3, D.4, E.1 are pure-logic and independent after A.0 lands — `/flow:parallel-impl` across worktrees is a real win. Convergence goes through the `kernel-core` contract-test suites.
+3. The `ccc:*` skills auto-fire on write operations and enforce the same rules as the Engineering Discipline section below — let them catch routine violations so the model's attention stays on invariants.
+4. For the two or three subtlest pieces (surface state machine, damage math, input routing), run a `/codex:rescue` second-opinion pass after the initial Opus implementation lands. These are exactly the "passed its own tests but missed an ordering" bugs a different model catches well.
+5. Skip extended thinking on the wiring tracks — Sonnet 4.6 at default effort is sufficient and the savings compound across ~15 Sonnet-scale tasks.
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Architecture and protocol design (adopts the four Goal-A design decisions as Phase 56 contract points) | None | Planned |
 | B | Kernel substrate for ownership transfer (framebuffer handoff, mouse input path, vblank tick, surface buffer transport) | A | Planned |
-| C | Display service (compositor core, software composer, surface state machine) | A, B | Planned |
+| C | Display service (compositor core, software composer, surface state machine, `gfx-demo` protocol-reference client) | A, B | Planned |
 | D | Input services and keybind-grab hook (key-event model, mouse service, focus-aware dispatch) | A, B, C | Planned |
 | E | Layout policy, layer-shell-equivalent surfaces, and control socket | A, C, D | Planned |
 | F | Session integration, supervision, and recovery | C, D, E | Planned |
-| G | Validation: multi-client, grab hook, layer-shell, control socket, crash recovery | C, D, E, F | Planned |
+| G | Validation: multi-client, grab hook, layer-shell, control socket, crash recovery, interactive `run-gui` smoke | C, D, E, F | Planned |
 | H | Documentation (learning doc, subsystem and evaluation updates) and version bump | G | Planned |
 
 ---
@@ -414,6 +437,31 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 - [ ] A fuzz-style robustness test (driven by `proptest` over arbitrary `Vec<u8>` frames) feeds the client message handler and asserts: no panic, no allocation beyond a documented per-message budget, malformed messages produce a typed `ProtocolError` and a named-reason disconnect
 - [ ] Per-client resource bounds (max surfaces, max in-flight buffers, outbound queue high-water mark) are enforced inside this module; exceeding a bound disconnects the offending client with a named reason and emits a structured log event — other clients and the composer are unaffected
 
+### C.6 — `gfx-demo` protocol-reference client
+
+**Files:**
+- `Cargo.toml` (workspace `members`)
+- `xtask/src/main.rs` (`bins` array in `build_userspace` + `populate_ext2_files` for `gfx-demo.conf`)
+- `kernel/src/fs/ramdisk.rs` (include + `BIN_ENTRIES` tuple)
+- `userspace/init/src/main.rs::KNOWN_CONFIGS`
+- `userspace/gfx-demo/Cargo.toml` (new)
+- `userspace/gfx-demo/src/main.rs` (new)
+
+**Symbol:** `program_main`, `run_demo_loop`
+**Why it matters:** Every Track A/C/D/E piece is exercised by `cargo xtask test`, but without a shipped graphical client a learner running `cargo xtask run-gui --fresh` sees only the C.2 background fill and the E.3 default arrow cursor — no toplevel, no proof the protocol works end-to-end at runtime. `gfx-demo` is a deliberately minimal visual-smoke client: a colored `Toplevel` surface, a cursor that renders above it, and input events echoed to serial. It is **not** a terminal, launcher, or useful app — it is a protocol reference and a manual-smoke target. Phase 57's terminal emulator is categorically different work (PTY integration, font rendering, scrollback) and can either retire `gfx-demo` or keep it as a reference client without entanglement.
+
+**Acceptance:**
+- [ ] Tests commit before implementation (the demo client's protocol handshake path is exercised by a small unit test using the A.0 codec; the demo binary itself is manually smoked)
+- [ ] `userspace/gfx-demo` follows the "Adding a New Userspace Binary" four-step convention (workspace member, xtask `bins` entry with `needs_alloc = true`, ramdisk embedding, `KNOWN_CONFIGS` registration, `gfx-demo.conf` in `populate_ext2_files`)
+- [ ] The binary opens an AF_UNIX stream to `display_server`, performs `Hello` with the current protocol version, creates one `Toplevel` surface via `CreateSurface` + `SetSurfaceRole(Toplevel)`, fills a buffer allocated via the B.4 `SurfaceBuffer` helper with a distinctive solid color (recorded in H.1 so testers know what to expect), sends `AttachBuffer` + `DamageSurface(full)` + `CommitSurface`, and reaches a "configured" state after receiving `SurfaceConfigured`
+- [ ] After configuration, the demo enters an event loop that prints every inbound `KeyEvent` and `PointerEvent` to stdout (which is routed to serial in the default QEMU run) in a stable one-line human-readable format; no `println!` is used for anything other than event echo
+- [ ] Cursor movement is visible because the demo does **not** register a `Cursor` surface — it relies on E.3's `DefaultArrowCursor`, confirming the default-cursor path works without a client-provided cursor
+- [ ] The demo exits cleanly on `Goodbye` from the server or on EOF; on a `display_server` crash the demo logs a named reason and exits with a distinct status so F.2's recovery regression can observe the client-side half of the failover
+- [ ] The demo contains **no** `unwrap`/`expect`/`panic!` outside of documented fail-fast initialization (consistent with the Engineering Discipline section); every fallible call returns a typed error
+- [ ] The service manifest (`gfx-demo.conf`) starts one instance after `display_server` in the F.1 startup order; restart policy is `on-failure` with `max_restart=3` so a persistent bug does not restart-loop forever
+- [ ] The crate is documented in H.1 as a *protocol-reference demo*, not a product — with an explicit line saying "Phase 57's terminal emulator is the real graphical client; `gfx-demo` can be retired or retained as a reference at that phase's discretion"
+- [ ] A screenshot or recorded terminal transcript (a plain-text serial log is acceptable) captured from `cargo xtask run-gui --fresh` is attached to the Phase 56 PR showing the filled toplevel, the visible cursor, and event-echo lines for at least one key press and one pointer motion
+
 ---
 
 ## Track D — Input Services and Keybind-Grab Hook
@@ -697,6 +745,7 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 - [ ] `m3ctl version` returns a non-empty version string matching Phase 56's protocol version from A.3
 - [ ] `m3ctl list-surfaces` is empty at startup; after a client creates a `Toplevel`, a second `m3ctl list-surfaces` lists it
 - [ ] `m3ctl subscribe SurfaceCreated` receives an event when a client creates a new surface
+- [ ] `m3ctl frame-stats` returns a non-empty sample window with strictly-increasing frame indices and per-sample composition durations greater than zero — confirming the observability verb surfaces real data rather than a placeholder
 - [ ] Malformed framing closes the control connection with a named reason; unknown verbs return an `UnknownCommand` error without closing
 
 ### G.5 — Display-service crash recovery regression test
@@ -724,6 +773,23 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 - [ ] A failing Phase 56 regression test produces readable output that names the failing acceptance criterion
 - [ ] Test runtimes are bounded: any single Phase 56 test must complete under 60 seconds or carry an explicit higher `--timeout` annotation
 
+### G.7 — Interactive `run-gui` smoke validation
+
+**Files:**
+- `docs/56-display-and-input-architecture.md` (learning doc — "Manual smoke validation" section added by H.1)
+- `userspace/gfx-demo/` (exercised target)
+
+**Symbol:** `run_gui_smoke`
+**Why it matters:** `cargo xtask test` exercises the compositor through pixel-sampling harnesses and control-socket introspection, but "a human can boot the image and see a working compositor" is a separate signal that CI cannot produce. This task is the manual counterpart to G.1–G.6 and is the first thing a learner or reviewer does after `cargo xtask run-gui --fresh`. Codifying the expected visible state prevents the QEMU boot from silently regressing into "no toplevel, no cursor motion" while CI still passes.
+
+**Acceptance:**
+- [ ] The learning doc's "Manual smoke validation" section (H.1) lists the exact command `cargo xtask run-gui --fresh` and the exact expected visible state: solid background color (named), default arrow cursor visible, one `gfx-demo` toplevel with the named color present, cursor moves in response to PS/2 mouse input, key presses produce serial-log event-echo lines from `gfx-demo`
+- [ ] The section lists the exact serial-log signatures that confirm each supervised service reached a healthy state: `display_server` banner + framebuffer acquisition log line, `kbd_server` banner + IRQ1 attach, `mouse_server` banner + IRQ12 attach, `gfx-demo` banner + `SurfaceConfigured` receipt
+- [ ] The section lists the exact `m3ctl` commands a tester runs to confirm the control socket is live: `m3ctl version`, `m3ctl list-surfaces` (shows the `gfx-demo` toplevel), `m3ctl frame-stats` (non-empty window)
+- [ ] The section records known-acceptable visual artifacts (e.g. tearing under rapid motion per the Documentation Notes line) so testers do not file them as regressions
+- [ ] The PR that closes Phase 56 attaches at minimum a serial-log transcript demonstrating the above; a screenshot of the QEMU framebuffer is encouraged when practical
+- [ ] A one-page checklist version of the smoke steps lives in the learning doc so a future reviewer can re-run it without re-reading the whole phase
+
 ---
 
 ## Track H — Documentation and Version
@@ -738,7 +804,11 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 - [ ] `docs/56-display-and-input-architecture.md` exists and follows the aligned learning-doc template
 - [ ] Sections cover: display ownership, client protocol, input event model + grab hook, surface roles + layer-shell-equivalent, layout-module seam, control socket, session + recovery, and how Phase 56 differs from later GUI work (tiling engine, animations, native clients, Wayland)
 - [ ] Cross-references `docs/appendix/gui/tiling-compositor-path.md` (Goal A) and `docs/appendix/gui/wayland-gap-analysis.md` (Path A/B/C scope)
-- [ ] Key files table lists all new modules introduced in Phase 56 (`userspace/display_server`, `userspace/mouse_server`, `userspace/m3ctl`, `kernel-core/src/input/{keymap,mouse}.rs`, `kernel-core/src/display/{compose,frame_tick}.rs`)
+- [ ] Key files table lists all new modules introduced in Phase 56 (`userspace/display_server`, `userspace/mouse_server`, `userspace/m3ctl`, `userspace/gfx-demo`, `kernel-core/src/input/{keymap,mouse}.rs`, `kernel-core/src/display/{compose,frame_tick}.rs`)
+- [ ] A "Manual smoke validation" section satisfies every bullet of G.7 — the exact `cargo xtask run-gui --fresh` command, the exact expected visible state, the exact serial-log signatures for each supervised service, the `m3ctl` verbs that prove the control socket is live, and a one-page checklist testers can re-run
+- [ ] A "Protocol-reference demo" subsection documents `gfx-demo`'s role: minimal visual-smoke client, not a product; names the solid color it fills so testers know exactly what they are looking at; records that Phase 57's terminal emulator is the real graphical client and that `gfx-demo` may be retired or retained as a reference at Phase 57's discretion
+- [ ] Resource-bound defaults referenced by the Engineering Discipline section (per-client surface count, in-flight buffer count, outbound event-queue depth) are written down in this doc with their initial numeric values
+- [ ] Accepted Phase 56 limitations are called out explicitly: tearing under motion (no back-buffer), US-QWERTY-only keymap, PS/2 mouse only, software-only composition
 - [ ] Doc is linked from `docs/README.md`
 
 ### H.2 — Update subsystem and roadmap docs
@@ -795,6 +865,9 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 - [ ] `docs/roadmap/README.md` Phase 56 row status is `Complete`
 - [ ] `docs/roadmap/tasks/README.md` Phase 56 row status is `Complete`
 - [ ] A repo-wide search for the previous `0.55.x` version string returns no user-facing references that should have been bumped (generated lockfiles excepted)
+- [ ] `cargo xtask check` passes on the final Phase 56 branch — clippy with `-D warnings`, rustfmt, and the `kernel-core` host-side unit tests all green; evidence is attached to the closing PR (CI run link or locally-captured output)
+- [ ] `cargo xtask test` passes on the final Phase 56 branch — all Phase 56 QEMU regressions (G.1–G.6) green within their declared timeouts
+- [ ] The Phase 56 pre-commit and pre-push hooks from `.githooks/` ran on every commit in the branch history (evidence: no commit bypasses `--no-verify`); the PR description confirms
 
 ---
 
@@ -813,6 +886,8 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
   **Status update (post-Phase-55c planning):** Phase 55a and 55b are now both landed (v0.55.2). Phase 56 still pulls two *soft* precedents from Phase 55b, both reflected in the F.1 / F.2 tasks above: (a) the `etc/services.d/*.conf` manifest shape from `nvme_driver.conf` / `e1000_driver.conf`, and (b) the `service kill <name>` + `cargo xtask regression --test driver-restart-guest` crash-regression harness. Phase 55c's bound-notification work is relevant as a later template for IRQ-backed userspace drivers, but it is not a hard prerequisite for the socket-centric Phase 56 compositor core documented here.
 
 - **`driver_runtime` API as future template.** Phase 56's three services (`display_server`, `kbd_server`, `mouse_server`) do not own PCIe hardware and therefore do not consume `userspace/lib/driver_runtime/` directly. When a later phase adds a USB HID driver or a GPU/display-engine driver — both explicitly deferred to post-56 phases — that driver should adopt the Phase 55b `driver_runtime` API shape (`DeviceHandle`, `Mmio<T>`, `DmaBuffer<T>`, `IrqNotification`, `BlockServer` / `NetServer` IPC helper pattern) rather than reinvent the capability-gated hardware-access surface. The Phase 55b learning doc at `docs/55b-ring-3-driver-host.md` documents this template stability promise.
+- **`gfx-demo` is a protocol-reference demo, not a product.** C.6 ships a minimal visual-smoke client (`userspace/gfx-demo/`) so `cargo xtask run-gui --fresh` produces a visible toplevel + cursor + event-echo at the end of Phase 56. It is deliberately not a terminal, launcher, or useful app — Phase 57 owns the real graphical-client story (terminal emulator + PTY bridge + font rendering + session entry). `gfx-demo` and the Phase 57 terminal occupy different layers and do not compete; Phase 57 may retire `gfx-demo` or retain it as an in-tree protocol reference at its discretion.
+- **Phase 57 prerequisite posture.** Phase 56 as scoped here satisfies the Phase 57 "display/session baseline" evaluation gate: the four Goal-A contract points (A.5/A.6/A.7/A.8), supervised services (F.1), crash recovery (F.2), text-mode fallback (F.3), the page-grant surface-buffer transport (B.4), and the post-keymap symbol + modifier input model (A.4/D.1) are all the client-facing surface the Phase 57 terminal needs. Audio (new subsystem), font rendering, and higher-level session semantics (login-to-graphical, launcher) are Phase 57's work and are explicitly out of scope here.
 - **Goal-A contract points are explicit.** The four design decisions from `docs/appendix/gui/tiling-compositor-path.md` (swappable layout module, keybind grab hook, layer-shell-equivalent role, control socket) are delivered by A.7/E.1, A.5/D.4, A.6/E.2, and A.8/E.4 respectively. Each contract point ships a trait / role / hook / socket in Phase 56; the tiling-specific *implementations* built on top of them (tiling layout engine, chord engine, bar/launcher clients) ship in Phase 56b / 57b and are explicitly out of scope here.
 - **Explicit non-Wayland framing.** The client protocol (A.3) is m3OS-native, not Wayland. `docs/appendix/gui/wayland-gap-analysis.md` Path A (`wl_shm` adapter) is not in Phase 56 scope and is only reachable as an *additive* phase after Phase 56 lands.
 - **Mouse scope is narrow.** Phase 56 ships PS/2 AUX motion + 3 buttons + optional wheel. Touchpad gestures, tablet/pen input, touch, and USB HID breadth are all deferred.
