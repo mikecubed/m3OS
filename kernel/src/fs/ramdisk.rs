@@ -199,6 +199,8 @@ static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke")
 static MAX_RESTART_SMOKE_ELF: &[u8] = generated_initrd_asset!("max-restart-smoke");
 // Phase 55b Track F.3d-3: e1000 crash-and-restart end-to-end smoke client.
 static E1000_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("e1000-crash-smoke");
+// Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
+static DISPLAY_SERVER_ELF: &[u8] = generated_initrd_asset!("display_server");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -340,6 +342,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "net_server",
         RamdiskNode::File {
             content: NET_SERVER_ELF,
+        },
+    ),
+    // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
+    (
+        "display_server",
+        RamdiskNode::File {
+            content: DISPLAY_SERVER_ELF,
         },
     ),
     // Phase 32: build tools and utilities
