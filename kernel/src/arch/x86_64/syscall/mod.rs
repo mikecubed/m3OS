@@ -1735,11 +1735,11 @@ fn check_pending_signals(syscall_result: u64) {
                 use crate::process::SignalDisposition;
                 match disposition {
                     SignalDisposition::Terminate => {
-                        log::debug!("[p{}] killed by signal {}", pid, signum);
+                        log::info!("[signal] [p{}] killed by signal {}", pid, signum);
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
-                        log::debug!("[p{}] stopped by signal {}", pid, signum);
+                        log::info!("[signal] [p{}] stopped by signal {}", pid, signum);
                         {
                             let mut table = crate::process::PROCESS_TABLE.lock();
                             if let Some(proc) = table.find_mut(pid) {
@@ -9663,6 +9663,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         if let Some(FdBackend::PtySlave { pty_id }) = &backend {
             let calling_pid = crate::process::current_pid();
             let pty_id_val = *pty_id;
+            let caller_pgid = {
+                let pt = crate::process::PROCESS_TABLE.lock();
+                pt.find(calling_pid).map(|p| p.pgid).unwrap_or(0)
+            };
             let mut pt = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = pt.find_mut(calling_pid) {
                 // Must be session leader with no controlling terminal.
@@ -9670,6 +9674,15 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     return NEG_EPERM;
                 }
                 proc.controlling_tty = Some(crate::process::ControllingTty::Pty(pty_id_val));
+            }
+            drop(pt);
+            // Linux 4.6+ behaviour: when a session leader binds an empty-fg-pgrp
+            // controlling tty via TIOCSCTTY, automatically populate the PTY's
+            // foreground process group with the caller's pgid. Without this,
+            // `close_master`'s SIGHUP-to-fg-pgrp path is a no-op (sends to
+            // pgid 0) and the ion shell never receives SIGHUP on disconnect.
+            if caller_pgid != 0 {
+                crate::pty::set_slave_fg_pgid(pty_id_val, caller_pgid);
             }
             return 0;
         }

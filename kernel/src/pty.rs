@@ -42,6 +42,22 @@ pub fn wake_slave(id: u32) {
     }
 }
 
+/// Set the slave-side foreground process group for a PTY pair.
+///
+/// Called from `TIOCSCTTY` when a session leader binds the controlling tty
+/// so the kernel's `close_master` SIGHUP-to-fg-pgrp delivery has a target.
+/// Without this, `slave_fg_pgid` stays 0 and `close_master` skips the
+/// SIGHUP path entirely — the symptom we hit on PR #118 where ion never
+/// receives SIGHUP after sshd closes the PTY master.
+pub fn set_slave_fg_pgid(id: u32, pgid: u32) {
+    if (id as usize) < MAX_PTYS {
+        let mut table = PTY_TABLE.lock();
+        if let Some(Some(pair)) = table.get_mut(id as usize) {
+            pair.slave_fg_pgid = pgid;
+        }
+    }
+}
+
 /// Allocate a new PTY pair. Returns the PTY ID (index) or `Err(())` if full.
 pub fn alloc_pty() -> Result<u32, ()> {
     let mut table = PTY_TABLE.lock();

@@ -1463,15 +1463,41 @@ async fn drain_pty_locked(
 // ---------------------------------------------------------------------------
 
 /// Clean up all session resources.
+///
+/// The interactive shell (`/bin/ion`) installs handlers for SIGHUP, SIGINT,
+/// and SIGTERM that merely set a PENDING flag and do not terminate the
+/// process. Only SIGKILL is unblockable. To guarantee bounded cleanup time
+/// we send SIGHUP first (so well-behaved shells exit gracefully), poll
+/// `waitpid(WNOHANG)` for a brief grace period, and escalate to SIGKILL if
+/// the shell is still alive. Without this escalation `cleanup` would block
+/// indefinitely on `waitpid(_, _, 0)`, preventing `close(sock_fd)` from ever
+/// running and leaving the OpenSSH client hung waiting for FIN.
 fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<i32>) {
     if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
         log_sshd_step("cleanup:start");
     }
     if let Some(pid) = shell_pid {
         log_sshd_step_u64("cleanup:kill shell", "child_pid", pid as u64);
-        syscall_lib::kill(pid as i32, 1); // SIGHUP
+        // ion catches SIGHUP/SIGINT/SIGTERM and merely sets a PENDING flag;
+        // only SIGKILL is unblockable. Send SIGHUP first (graceful), poll
+        // waitpid(WNOHANG) for ~500ms, then escalate to SIGKILL so cleanup
+        // always completes in bounded time.
+        syscall_lib::kill(pid as i32, syscall_lib::SIGHUP as i32);
         let mut status: i32 = 0;
-        waitpid(pid as i32, &mut status, 0);
+        let mut reaped = false;
+        for _ in 0..20 {
+            let ret = waitpid(pid as i32, &mut status, syscall_lib::WNOHANG);
+            if ret > 0 {
+                reaped = true;
+                break;
+            }
+            syscall_lib::nanosleep_for(0, 25_000_000);
+        }
+        if !reaped {
+            log_sshd_step_u64("cleanup:escalate SIGKILL", "child_pid", pid as u64);
+            syscall_lib::kill(pid as i32, syscall_lib::SIGKILL as i32);
+            waitpid(pid as i32, &mut status, 0);
+        }
         log_sshd_step_u64("cleanup:waitpid shell", "status", status as u64);
     }
     if let Some(fd) = pty_master {
