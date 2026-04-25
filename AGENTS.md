@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Kernel v0.55.2 with functional userspace (init, shell, coreutils, networking, SMP, storage, signals, editor, multi-user, PTY, telnet/SSH servers, crypto, musl cross-compilation, ports system, service manager, IPC), real-hardware storage via NVMe and networking via Intel e1000 (classic 82540EM) on top of the VirtIO baseline, plus the Phase 55a IOMMU substrate (ACPI DMAR/IVRS parsing, per-device VT-d and AMD-Vi translation domains, IOMMU-routed `DmaBuffer<T>` with an identity-fallback for non-IOMMU platforms), and ring-3 driver hosting (capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers with `RemoteBlockDevice`/`RemoteNic` kernel facades — Phase 55b). See `docs/appendix/codebase-map.md` for full workspace and source layout.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Kernel v0.55.3 with functional userspace (init, shell, coreutils, networking, SMP, storage, signals, editor, multi-user, PTY, telnet/SSH servers, crypto, musl cross-compilation, ports system, service manager, IPC), real-hardware storage via NVMe and networking via Intel e1000 (classic 82540EM) on top of the VirtIO baseline, plus the Phase 55a IOMMU substrate (ACPI DMAR/IVRS parsing, per-device VT-d and AMD-Vi translation domains, IOMMU-routed `DmaBuffer<T>` with an identity-fallback for non-IOMMU platforms), ring-3 driver hosting (capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers with `RemoteBlockDevice`/`RemoteNic` kernel facades — Phase 55b), and Phase 55c ring-3 driver correctness closure (bound-notification event multiplexing, IOMMU BAR identity coverage, userspace EAGAIN visibility during driver restart). See `docs/appendix/codebase-map.md` for full workspace and source layout.
 
 ## Build & Run
 
@@ -55,7 +55,10 @@ After cloning, install the git hooks so quality gates run before commits and pus
 ./setup.sh
 ```
 
-This sets `core.hooksPath` to `.githooks/`, which contains pre-commit and pre-push hooks that run `cargo xtask check`.
+This sets `core.hooksPath` to `.githooks/`. The pre-commit hook runs
+`cargo xtask check`; the pre-push hook runs `cargo xtask check`,
+`cargo xtask smoke-test`, and `cargo xtask regression`, plus
+`cargo xtask ssh-e1000-banner-check` when `M3OS_E1000_REGRESSION=1` is set.
 
 ## Architecture
 

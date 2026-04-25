@@ -292,6 +292,27 @@ async fn io_task(
             return;
         }
 
+        // Shell-exit backstop (pair to the one in channel_relay_task). io_task
+        // wakes on every inbound TCP segment (user keystrokes, acks, keep-
+        // alives), so polling waitpid here catches shell-exit even when the
+        // PTY master's POLLHUP path is slow or the channel relay task is
+        // blocked on backpressure. Without this, a clean shell exit after
+        // Ctrl-D can leave the main loop parked on session_notify while the
+        // socket remains open — observed as "Ctrl-D doesn't close SSH from
+        // the client".
+        let shell_pid = state.borrow().shell_pid;
+        if let Some(pid) = shell_pid {
+            let mut status: i32 = 0;
+            let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
+            if ret > 0 {
+                log_sshd_step_u64("io_task:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().session_done = true;
+                state.borrow_mut().shell_pid = None;
+                session_notify.signal();
+                return;
+            }
+        }
+
         // --- Output direction: flush sunset output to socket ---
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
@@ -487,6 +508,25 @@ async fn progress_task(
     loop {
         if state.borrow().session_done {
             return;
+        }
+
+        // Shell-exit backstop (pair to the ones in io_task and
+        // channel_relay_task). progress_task wakes on every protocol event
+        // (auth, channel, pty, shell requests, keepalives), so polling
+        // waitpid here gives a third independent detection path for a
+        // cleanly exiting shell. All three tasks race to set session_done
+        // and signal the main loop — whichever wakes first wins.
+        let shell_pid = state.borrow().shell_pid;
+        if let Some(pid) = shell_pid {
+            let mut status: i32 = 0;
+            let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
+            if ret > 0 {
+                log_sshd_step_u64("progress:shell_exited_backstop", "child_pid", pid as u64);
+                state.borrow_mut().session_done = true;
+                state.borrow_mut().shell_pid = None;
+                session_notify.signal();
+                return;
+            }
         }
 
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
@@ -900,6 +940,35 @@ async fn channel_relay_task(
     loop {
         if state.borrow().session_done {
             return;
+        }
+
+        // Shell-exit backstop: the main loop only re-checks `waitpid` when
+        // something signals `session_notify`. If the shell exits and nothing
+        // naturally fires `session_notify` (observed on user-side Ctrl-D:
+        // the shell closes stdin, exits; the PTY master's POLLHUP should
+        // wake this task via the reactor — but when the reactor is not the
+        // only path and the main loop's notify goes unfired, the session
+        // hangs until TCP tears down). Polling `waitpid(WNOHANG)` here
+        // guarantees that any task wake (socket data, PTY activity, channel
+        // capacity) re-checks shell-exit status on every iteration; if the
+        // shell is gone we mark the session done and signal the main loop
+        // so `close(sock_fd)` runs and the client sees a clean FIN.
+        let shell_pid = state.borrow().shell_pid;
+        if let Some(pid) = shell_pid {
+            let mut status: i32 = 0;
+            let ret = syscall_lib::waitpid(pid as i32, &mut status, WNOHANG);
+            if ret > 0 {
+                log_sshd_step_u64(
+                    "channel_relay:shell_exited_backstop",
+                    "child_pid",
+                    pid as u64,
+                );
+                let _ = flush_output_locked(&runner, sock_fd, &output_lock).await;
+                state.borrow_mut().session_done = true;
+                state.borrow_mut().shell_pid = None;
+                session_notify.signal();
+                return;
+            }
         }
 
         // --- Direction 1: runner channel -> PTY (client keystrokes -> shell) ---
@@ -1394,15 +1463,41 @@ async fn drain_pty_locked(
 // ---------------------------------------------------------------------------
 
 /// Clean up all session resources.
+///
+/// The interactive shell (`/bin/ion`) installs handlers for SIGHUP, SIGINT,
+/// and SIGTERM that merely set a PENDING flag and do not terminate the
+/// process. Only SIGKILL is unblockable. To guarantee bounded cleanup time
+/// we send SIGHUP first (so well-behaved shells exit gracefully), poll
+/// `waitpid(WNOHANG)` for a brief grace period, and escalate to SIGKILL if
+/// the shell is still alive. Without this escalation `cleanup` would block
+/// indefinitely on `waitpid(_, _, 0)`, preventing `close(sock_fd)` from ever
+/// running and leaving the OpenSSH client hung waiting for FIN.
 fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<i32>) {
     if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
         log_sshd_step("cleanup:start");
     }
     if let Some(pid) = shell_pid {
         log_sshd_step_u64("cleanup:kill shell", "child_pid", pid as u64);
-        syscall_lib::kill(pid as i32, 1); // SIGHUP
+        // ion catches SIGHUP/SIGINT/SIGTERM and merely sets a PENDING flag;
+        // only SIGKILL is unblockable. Send SIGHUP first (graceful), poll
+        // waitpid(WNOHANG) for ~500ms, then escalate to SIGKILL so cleanup
+        // always completes in bounded time.
+        syscall_lib::kill(pid as i32, syscall_lib::SIGHUP as i32);
         let mut status: i32 = 0;
-        waitpid(pid as i32, &mut status, 0);
+        let mut reaped = false;
+        for _ in 0..20 {
+            let ret = waitpid(pid as i32, &mut status, syscall_lib::WNOHANG);
+            if ret > 0 {
+                reaped = true;
+                break;
+            }
+            syscall_lib::nanosleep_for(0, 25_000_000);
+        }
+        if !reaped {
+            log_sshd_step_u64("cleanup:escalate SIGKILL", "child_pid", pid as u64);
+            syscall_lib::kill(pid as i32, syscall_lib::SIGKILL as i32);
+            waitpid(pid as i32, &mut status, 0);
+        }
         log_sshd_step_u64("cleanup:waitpid shell", "status", status as u64);
     }
     if let Some(fd) = pty_master {

@@ -6,6 +6,15 @@
 **Builds on:** Turns the single-app DOOM graphics proof into a real userspace-owned display/input architecture with explicit ownership, event routing, and crash boundaries
 **Primary Components:** future userspace display server, input services, kernel/src/fb, kernel input/interrupt mediation, docs/09-framebuffer-and-shell.md, docs/29-pty-subsystem.md
 
+> **Note on Phase 55c:** Phase 55c is not a hard prerequisite for Phase 56. The Phase 56
+> compositor core is socket-centric and does not require the Phase 55c bound-notification
+> primitives (`RecvResult`, `IrqNotification::bind_to_endpoint`, `sys_notif_bind`). The
+> Phase 55c pattern serves as a later template for any IRQ-backed userspace driver
+> introduced in Phase 56 or beyond (such as a future vsync or HID interrupt driver that
+> genuinely mixes async hardware events with sync IPC requests). PS/2 and initial input
+> services introduced in Phase 56 keep their existing wait/send split; the Phase 55c
+> pattern is opt-in.
+
 ## Milestone Goal
 
 m3OS gains a real display and input model: one userspace-owned display service controls presentation, keyboard and mouse events are routed through an explicit focus-aware protocol, and multiple graphical clients can coexist without raw framebuffer conflicts.

@@ -482,6 +482,17 @@ pub fn set_net_task_id(id: TaskId) {
     log::info!("[net] registered net_task id={}", id.0);
 }
 
+/// Wake the shared network task after RX/TX progress from any NIC backend.
+pub fn wake_net_task() {
+    crate::net::NIC_WOKEN.store(true, Ordering::Release);
+    let raw = NET_TASK_ID.load(Ordering::Acquire);
+    if raw != 0 {
+        let _ = wake_task(TaskId(raw));
+    } else {
+        crate::task::scheduler::signal_reschedule();
+    }
+}
+
 /// Returns the MAC address of the virtio-net device, if initialized.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<MacAddr> {
@@ -549,11 +560,7 @@ fn virtio_net_irq_handler() {
     // scheduler tick. The shared `net::NIC_WOKEN` flag is what `net_task`
     // parks on, so set it alongside the driver-specific flag.
     NET_IRQ_WOKEN.store(true, Ordering::Release);
-    crate::net::NIC_WOKEN.store(true, Ordering::Release);
-    let raw = NET_TASK_ID.load(Ordering::Acquire);
-    if raw != 0 {
-        let _ = wake_task(TaskId(raw));
-    }
+    wake_net_task();
 }
 
 // ===========================================================================

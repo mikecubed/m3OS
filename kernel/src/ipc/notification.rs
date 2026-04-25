@@ -35,9 +35,10 @@
 //!
 //! To achieve this, the module separates its state into two layers:
 //!
-//! - **Lock-free layer** (`PENDING`, `IRQ_MAP`, `ISR_WAITERS`): plain
-//!   `AtomicU64`/`AtomicU8`/`AtomicI32` arrays indexed by `NotifId`.
-//!   Safe to read/write from interrupt handlers.
+//! - **Lock-free layer** (`PENDING`, `IRQ_MAP`, `ISR_WAITERS`, `BOUND_TCB`,
+//!   `TCB_BOUND_NOTIF`): plain `AtomicU64`/`AtomicU8`/`AtomicI32` arrays
+//!   indexed by `NotifId` or scheduler task index. Safe to read/write from
+//!   interrupt handlers.
 //! - **Mutex-protected layer** (`WAITERS`, `ALLOCATED`): holds waiter and
 //!   allocation state.  Only accessed from task context, never from
 //!   interrupt handlers.
@@ -150,6 +151,55 @@ static ISR_WAITERS: [AtomicI32; MAX_NOTIFS] = {
     [NO_WAITER; MAX_NOTIFS]
 };
 
+/// Maximum number of task scheduler-Vec entries tracked by [`TCB_BOUND_NOTIF`].
+///
+/// Must cover the maximum scheduler-task-Vec index. Entries beyond this bound
+/// are silently treated as "no binding" at fast-path lookup time.
+pub(crate) const MAX_TASKS: usize = crate::task::MAX_TASKS;
+
+/// Sentinel: no task is bound to this notification slot.
+const TCB_NONE: i32 = -1;
+
+/// Sentinel: no notification is bound to this task slot.
+const NOTIF_NONE: u8 = 0xff;
+
+// ---------------------------------------------------------------------------
+// Bound-notification lookup tables (Track B — ISR-safe, lock-free)
+// ---------------------------------------------------------------------------
+
+/// Persistent TCB binding table.
+///
+/// `BOUND_TCB[notif_idx]` = scheduler task-Vec index of the task that called
+/// `sys_notif_bind` for this notification, or `TCB_NONE` (-1) if unbound.
+///
+/// **ISR-safety**: reads via `load(Acquire)` in `signal_irq` /
+/// `signal_irq_bit` without acquiring any lock — safe from interrupt context.
+///
+/// **Lock order**: BOUND_TCB is lock-free and imposes no ordering constraint.
+/// When both the endpoint lock and the notification WAITERS lock must be held,
+/// endpoint must be acquired first (endpoint → WAITERS).
+///
+/// Parallel to `ISR_WAITERS` but **persistent**: set at bind time by
+/// `sys_notif_bind` and cleared only at task exit or explicit unbind.
+#[allow(clippy::declare_interior_mutable_const)]
+static BOUND_TCB: [AtomicI32; MAX_NOTIFS] = {
+    const NONE: AtomicI32 = AtomicI32::new(TCB_NONE);
+    [NONE; MAX_NOTIFS]
+};
+
+/// Per-task notification binding index.
+///
+/// `TCB_BOUND_NOTIF[task_sched_idx]` = `NotifId.0` of the notification bound
+/// to that task, or `NOTIF_NONE` (0xff) if the task has no bound notification.
+///
+/// **ISR-safety**: reads via `load(Acquire)` — safe from interrupt context.
+/// Written by `bind_task` / `clear_bound_task` only from task context.
+#[allow(clippy::declare_interior_mutable_const)]
+pub(crate) static TCB_BOUND_NOTIF: [AtomicU8; MAX_TASKS] = {
+    const NONE: AtomicU8 = AtomicU8::new(NOTIF_NONE);
+    [NONE; MAX_TASKS]
+};
+
 // ---------------------------------------------------------------------------
 // Mutex-protected waiter state (task context only)
 // ---------------------------------------------------------------------------
@@ -241,6 +291,19 @@ pub fn release(id: NotifId) {
             return;
         }
 
+        let bound = BOUND_TCB[idx].swap(TCB_NONE, Ordering::AcqRel);
+        if bound >= 0 {
+            let task_idx = bound as usize;
+            if task_idx < MAX_TASKS {
+                let _ = TCB_BOUND_NOTIF[task_idx].compare_exchange(
+                    id.0,
+                    NOTIF_NONE,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+
         for slot in &IRQ_MAP {
             let _ = slot.compare_exchange(id.0, 0xff, Ordering::AcqRel, Ordering::Acquire);
         }
@@ -327,6 +390,7 @@ pub fn signal_irq(irq: u8) {
     // Phase 52: push waiter to per-core ISR wakeup queue (lock-free).
     // Use compare_exchange to atomically claim the waiter, preventing
     // duplicate pushes when multiple IRQs arrive before the task wakes.
+    let mut pushed_waiter_idx = -1;
     if let Some(isr_waiter) = ISR_WAITERS.get(idx as usize) {
         let waiter_idx = isr_waiter.load(Ordering::Acquire);
         if waiter_idx >= 0
@@ -334,9 +398,22 @@ pub fn signal_irq(irq: u8) {
                 .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             && let Some(data) = crate::smp::try_per_core()
+            && data.isr_wake_queue.push(waiter_idx as usize)
         {
-            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+            pushed_waiter_idx = waiter_idx;
         }
+    }
+
+    // Also wake any task parked in recv_msg with this notification bound.
+    // BOUND_TCB is persistent (not cleared by the push), so we just push
+    // without CAS-clearing — the ISR drain handles non-BlockedOnNotif tasks
+    // gracefully (no-op).
+    let bound = BOUND_TCB[idx as usize].load(Ordering::Acquire);
+    if bound >= 0
+        && bound != pushed_waiter_idx
+        && let Some(data) = crate::smp::try_per_core()
+    {
+        let _ = data.isr_wake_queue.push(bound as usize);
     }
 
     // Trigger a reschedule so the blocked task runs on the next tick and
@@ -371,6 +448,7 @@ pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
 
     // Push the waiter (if any) to the per-core ISR wake queue — mirrors
     // the logic in `signal_irq` but without the `IRQ_MAP` indirection.
+    let mut pushed_waiter_idx = -1;
     if let Some(isr_waiter) = ISR_WAITERS.get(idx) {
         let waiter_idx = isr_waiter.load(Ordering::Acquire);
         if waiter_idx >= 0
@@ -378,9 +456,19 @@ pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
                 .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             && let Some(data) = crate::smp::try_per_core()
+            && data.isr_wake_queue.push(waiter_idx as usize)
         {
-            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+            pushed_waiter_idx = waiter_idx;
         }
+    }
+
+    // Also wake any task parked in recv_msg_with_notif with this notification bound.
+    let bound = BOUND_TCB[idx].load(Ordering::Acquire);
+    if bound >= 0
+        && bound != pushed_waiter_idx
+        && let Some(data) = crate::smp::try_per_core()
+    {
+        let _ = data.isr_wake_queue.push(bound as usize);
     }
 
     scheduler::signal_reschedule();
@@ -446,6 +534,154 @@ pub fn clear_waiter(task_id: TaskId) {
             // Also clear the ISR mirror so signal_irq doesn't push a dead task.
             ISR_WAITERS[i].store(-1, Ordering::Release);
         }
+    }
+}
+
+/// Bind `notif_id` to the task at `task_sched_idx`.
+///
+/// Updates both `BOUND_TCB[notif_idx]` and `TCB_BOUND_NOTIF[task_sched_idx]`.
+///
+/// - Returns `Ok(())` if newly bound or already bound to the same task
+///   (idempotent).
+/// - Returns `Err(())` if the notification is already bound to a different
+///   task or the task is already bound to a different notification.
+///
+/// Task-context only (may not be called from ISR).
+pub(super) fn bind_task(notif_id: NotifId, task_sched_idx: usize) -> Result<(), ()> {
+    let notif_idx = notif_id.0 as usize;
+    if notif_idx >= MAX_NOTIFS || task_sched_idx >= MAX_TASKS {
+        return Err(());
+    }
+    let new_val = task_sched_idx as i32;
+
+    match TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
+        NOTIF_NONE,
+        notif_id.0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(existing) if existing == notif_id.0 => {}
+        Err(_) => {
+            return Err(());
+        }
+    }
+
+    match BOUND_TCB[notif_idx].compare_exchange(
+        TCB_NONE,
+        new_val,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(existing) if existing == new_val => {}
+        Err(_) => {
+            let _ = TCB_BOUND_NOTIF[task_sched_idx].compare_exchange(
+                notif_id.0,
+                NOTIF_NONE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return Err(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Clear the binding for a dying task.
+///
+/// Called during task cleanup (`cleanup_task_ipc`). ISR-safe to call because
+/// all writes are lock-free atomics; the caller need not hold any lock.
+pub(crate) fn clear_bound_task(task_sched_idx: usize) {
+    if task_sched_idx >= MAX_TASKS {
+        return;
+    }
+    let notif_idx_byte = TCB_BOUND_NOTIF[task_sched_idx].swap(NOTIF_NONE, Ordering::AcqRel);
+    if notif_idx_byte == NOTIF_NONE {
+        return;
+    }
+    let notif_idx = notif_idx_byte as usize;
+    if notif_idx < MAX_NOTIFS {
+        let _ = BOUND_TCB[notif_idx].compare_exchange(
+            task_sched_idx as i32,
+            TCB_NONE,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Look up the notification bound to a task.
+///
+/// Returns `Some(NotifId)` if the task at `task_sched_idx` has a bound
+/// notification, or `None` otherwise. ISR-safe (lock-free read).
+pub(super) fn lookup_bound_notif(task_sched_idx: usize) -> Option<NotifId> {
+    if task_sched_idx >= MAX_TASKS {
+        return None;
+    }
+    let val = TCB_BOUND_NOTIF[task_sched_idx].load(Ordering::Acquire);
+    if val == NOTIF_NONE {
+        None
+    } else {
+        Some(NotifId(val))
+    }
+}
+
+/// Atomically drain pending bits from a notification.
+///
+/// Returns the bits that were pending (0 if none). ISR-safe.
+pub(super) fn drain_bits(notif_id: NotifId) -> u64 {
+    let idx = notif_id.0 as usize;
+    if idx >= MAX_NOTIFS {
+        return 0;
+    }
+    PENDING[idx].swap(0, Ordering::AcqRel)
+}
+
+/// Register a task as the current recv waiter for a bound notification.
+///
+/// Returns `Some(bits)` if a notification arrived in the registration window,
+/// in which case the caller must not block. Returns `None` once registration
+/// completed and the task may safely park.
+pub(super) fn register_recv_waiter(
+    notif_id: NotifId,
+    receiver: TaskId,
+    task_sched_idx: usize,
+) -> Option<u64> {
+    let idx = notif_id.0 as usize;
+    if idx >= MAX_NOTIFS {
+        return Some(0);
+    }
+
+    let mut waiters = WAITERS.lock();
+    let bits = PENDING[idx].swap(0, Ordering::AcqRel);
+    if bits != 0 {
+        return Some(bits);
+    }
+
+    debug_assert!(
+        waiters[idx].is_none(),
+        "[ipc] recv_msg_with_notif: two tasks waiting on same notification {idx}"
+    );
+    waiters[idx] = Some(receiver);
+    if task_sched_idx < MAX_TASKS {
+        ISR_WAITERS[idx].store(task_sched_idx as i32, Ordering::Release);
+    }
+    None
+}
+
+/// Unregister a task from the recv waiter slot for a bound notification.
+pub(super) fn unregister_recv_waiter(notif_id: NotifId, receiver: TaskId) {
+    let idx = notif_id.0 as usize;
+    if idx >= MAX_NOTIFS {
+        return;
+    }
+
+    let mut waiters = WAITERS.lock();
+    if waiters[idx] == Some(receiver) {
+        waiters[idx] = None;
+        ISR_WAITERS[idx].store(-1, Ordering::Release);
     }
 }
 
@@ -546,5 +782,181 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         // Block using the dedicated notification state.
         scheduler::block_current_on_notif();
         // On wake, loop back to drain pending bits.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel unit tests (run in the main kernel test binary via #[test_case])
+// ---------------------------------------------------------------------------
+
+/// These tests run inline inside the kernel after `mm::init` but before the
+/// scheduler and task system are started.  They have direct access to the
+/// real global arrays (`PENDING`, `BOUND_TCB`, `TCB_BOUND_NOTIF`) and the
+/// actual `bind_task` / `clear_bound_task` / `drain_bits` functions — so
+/// any regression in their logic is caught here, not by a separate copy.
+///
+/// Use indices ≥ 50 to avoid colliding with kernel boot-time allocations.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel_core::ipc::wake_kind;
+
+    // ------------------------------------------------------------------
+    // B.5 — Process exit clears the bound-notification TCB entry
+    //
+    // The real `cleanup_task_ipc` path calls `clear_bound_task`.
+    // This test exercises the actual function (not a copy) with the real
+    // global atomic arrays so any regression in the clear logic fails here.
+    // ------------------------------------------------------------------
+
+    #[test_case]
+    fn clear_bound_task_wires_both_sides_of_binding() {
+        const NOTIF: usize = 50;
+        const TASK: usize = 50;
+        let notif_id = NotifId(NOTIF as u8);
+
+        // Reset global state to a known baseline for this slot.
+        PENDING[NOTIF].store(0, Ordering::SeqCst);
+        BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
+
+        // Bind via the real bind_task (same path as sys_notif_bind).
+        bind_task(notif_id, TASK).expect("bind_task must succeed on a free slot");
+
+        // Verify both sides of the binding are live.
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TASK as i32,
+            "BOUND_TCB must record the bound task after bind_task",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            NOTIF as u8,
+            "TCB_BOUND_NOTIF must record the notification after bind_task",
+        );
+
+        // Simulate process exit: call the REAL cleanup path.
+        // cleanup_task_ipc calls clear_bound_task(task_sched_idx).
+        clear_bound_task(TASK);
+
+        // Both sides must be reset to their unbound sentinels.
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "BOUND_TCB must be TCB_NONE after clear_bound_task",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            NOTIF_NONE,
+            "TCB_BOUND_NOTIF must be NOTIF_NONE after clear_bound_task",
+        );
+
+        // The slot must be available for a new bind — no dangling reference.
+        bind_task(notif_id, TASK).expect("re-bind must succeed after clear");
+        // Leave the slot clean for subsequent tests.
+        clear_bound_task(TASK);
+    }
+
+    #[test_case]
+    fn bind_task_rejects_task_slots_outside_reverse_table() {
+        const NOTIF: usize = 52;
+        let notif_id = NotifId(NOTIF as u8);
+        let out_of_range_task = MAX_TASKS;
+
+        BOUND_TCB[NOTIF].store(TCB_NONE, Ordering::SeqCst);
+
+        assert_eq!(
+            bind_task(notif_id, out_of_range_task),
+            Err(()),
+            "bind_task must reject task indices that cannot be recorded in TCB_BOUND_NOTIF",
+        );
+        assert_eq!(
+            BOUND_TCB[NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "bind_task must not publish a one-sided BOUND_TCB entry on failure",
+        );
+    }
+
+    #[test_case]
+    fn bind_task_does_not_publish_forward_binding_when_task_already_bound() {
+        const FIRST_NOTIF: usize = 53;
+        const SECOND_NOTIF: usize = 54;
+        const TASK: usize = 53;
+        let first = NotifId(FIRST_NOTIF as u8);
+        let second = NotifId(SECOND_NOTIF as u8);
+
+        BOUND_TCB[FIRST_NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        BOUND_TCB[SECOND_NOTIF].store(TCB_NONE, Ordering::SeqCst);
+        TCB_BOUND_NOTIF[TASK].store(NOTIF_NONE, Ordering::SeqCst);
+
+        bind_task(first, TASK).expect("initial bind must succeed");
+        assert_eq!(
+            bind_task(second, TASK),
+            Err(()),
+            "second bind must fail when the task is already bound elsewhere",
+        );
+        assert_eq!(
+            BOUND_TCB[SECOND_NOTIF].load(Ordering::Acquire),
+            TCB_NONE,
+            "failed bind must not publish a forward mapping visible to IRQ wakeups",
+        );
+        assert_eq!(
+            TCB_BOUND_NOTIF[TASK].load(Ordering::Acquire),
+            first.0,
+            "failed bind must preserve the original reverse binding",
+        );
+
+        clear_bound_task(TASK);
+    }
+
+    // ------------------------------------------------------------------
+    // B.4 supplement — drain_bits exercises the real PENDING array
+    //
+    // The fast-path in `recv_msg_with_notif` is:
+    //   let bits = notification::drain_bits(notif_id);
+    //   if classify_recv(bits) == RECV_KIND_NOTIFICATION { return ... }
+    //
+    // This test verifies drain_bits on the actual global PENDING array so
+    // that regressions in the drain logic (wrong index, missing swap, …)
+    // fail loudly in the kernel test binary.
+    // ------------------------------------------------------------------
+
+    #[test_case]
+    fn drain_bits_returns_pending_and_clears_atomically() {
+        const NOTIF: usize = 51;
+        let notif_id = NotifId(NOTIF as u8);
+        const BITS: u64 = 0b1010_0101;
+
+        // Reset state.
+        PENDING[NOTIF].store(0, Ordering::SeqCst);
+
+        // Set bits (mirrors what signal_irq does in ISR context).
+        PENDING[NOTIF].fetch_or(BITS, Ordering::Release);
+
+        // drain_bits must return all bits and clear PENDING atomically.
+        let got = drain_bits(notif_id);
+        assert_eq!(got, BITS, "drain_bits must return the exact pending bits");
+        assert_eq!(
+            PENDING[NOTIF].load(Ordering::Acquire),
+            0,
+            "drain_bits must clear PENDING to zero",
+        );
+
+        // A second drain must return 0 (nothing left).
+        assert_eq!(drain_bits(notif_id), 0, "second drain must return 0");
+
+        // classify_recv (the shared seam used by recv_msg_with_notif) must
+        // select NOTIFICATION for the first drain result…
+        assert_eq!(
+            wake_kind::classify_recv(got),
+            wake_kind::RECV_KIND_NOTIFICATION,
+            "non-zero drained bits must classify as NOTIFICATION",
+        );
+        // …and MESSAGE after the bits are exhausted.
+        assert_eq!(
+            wake_kind::classify_recv(0),
+            wake_kind::RECV_KIND_MESSAGE,
+            "zero drained bits must classify as MESSAGE",
+        );
     }
 }

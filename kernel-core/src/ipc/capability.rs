@@ -59,6 +59,22 @@ pub enum Capability {
     },
 }
 
+impl Capability {
+    /// Return the notification object this capability aliases for IPC recv/wait paths.
+    ///
+    /// Plain [`Capability::Notification`] caps expose the notification directly.
+    /// [`Capability::DeviceIrq`] caps carry the same notification ID that the
+    /// kernel signals from the ISR shim, so drivers can wait on or bind the IRQ
+    /// without needing a second standalone notification capability.
+    pub fn ipc_notification_id(self) -> Option<NotifId> {
+        match self {
+            Capability::Notification(id) => Some(id),
+            Capability::DeviceIrq { notif, .. } => Some(notif),
+            _ => None,
+        }
+    }
+}
+
 /// Errors returned by capability-table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapError {
@@ -273,6 +289,27 @@ mod tests {
         table.insert(Capability::Reply(TaskId(11))).unwrap();
         table.insert(Capability::Notification(NotifId(7))).unwrap();
         assert_eq!(table.notification_ids(), vec![NotifId(2), NotifId(7)]);
+    }
+
+    #[test]
+    fn ipc_notification_id_accepts_plain_notification_caps() {
+        let cap = Capability::Notification(NotifId(5));
+        assert_eq!(cap.ipc_notification_id(), Some(NotifId(5)));
+    }
+
+    #[test]
+    fn ipc_notification_id_accepts_device_irq_caps() {
+        let cap = Capability::DeviceIrq {
+            device: DeviceCapKey::new(0, 0, 3, 0),
+            notif: NotifId(9),
+        };
+        assert_eq!(cap.ipc_notification_id(), Some(NotifId(9)));
+    }
+
+    #[test]
+    fn ipc_notification_id_rejects_non_notification_caps() {
+        let cap = Capability::Endpoint(EndpointId(1));
+        assert_eq!(cap.ipc_notification_id(), None);
     }
 
     #[test]

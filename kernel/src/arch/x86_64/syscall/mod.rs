@@ -554,7 +554,10 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
             }
         }
         let routed = vfs_service_open(&resolved, flags);
-        if routed != NEG_ENOENT && routed != NEG_EIO {
+        // If the userspace VFS path is unavailable (service absent, transport
+        // failure during a stale-registry window, or explicit I/O miss), fall
+        // back to the kernel ext2 path for new opens.
+        if routed != NEG_ENOENT && routed != NEG_EIO && routed != u64::MAX {
             return routed;
         }
         return open_resolved_path(&resolved, flags, mode_arg);
@@ -1225,10 +1228,18 @@ mod syscall_nr {
     pub const BLOCK_READ: u64 = 0x1011;
     /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
     pub const BLOCK_WRITE: u64 = 0x1012;
+    /// Phase 55c Track G.3 (resend): transmit a raw Ethernet frame.
+    ///
+    /// `sys_net_send(sock_fd, buf_ptr, len)` — the caller must own an open
+    /// socket fd (`sock_fd = arg0`); the dispatcher validates it against the
+    /// calling process's fd table before forwarding to `sys_net_send`.
+    /// `DriverRestarting` surfaces as `NEG_EAGAIN` to userspace.
+    /// See `docs/appendix/phase-55c-net-send-shape.md`.
+    pub const NET_SEND: u64 = 0x1013;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x1110;
+    pub const IPC_LAST: u64 = 0x1111;
 
     // -- device host (Phase 55b Track B) --
     //
@@ -1580,6 +1591,22 @@ pub extern "C" fn syscall_handler(
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
+        NET_SEND => {
+            // arg0 = sock_fd, arg1 = buf_ptr, arg2 = len
+            //
+            // Validate the socket capability boundary here, where current_fd_entry
+            // is accessible. Pass has_socket=true only when the fd is a live
+            // FdBackend::Socket; everything else (missing fd, pipe, file, unix
+            // socket) is rejected — raw frame injection requires a real socket.
+            let has_socket = {
+                let fd_idx = arg0 as usize;
+                fd_idx < MAX_FDS
+                    && current_fd_entry(fd_idx)
+                        .map(|e| matches!(e.backend, FdBackend::Socket { .. }))
+                        .unwrap_or(false)
+            };
+            crate::syscall::net::sys_net_send(has_socket, arg1, arg2)
+        }
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -1708,11 +1735,11 @@ fn check_pending_signals(syscall_result: u64) {
                 use crate::process::SignalDisposition;
                 match disposition {
                     SignalDisposition::Terminate => {
-                        log::debug!("[p{}] killed by signal {}", pid, signum);
+                        log::info!("[signal] [p{}] killed by signal {}", pid, signum);
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
-                        log::debug!("[p{}] stopped by signal {}", pid, signum);
+                        log::info!("[signal] [p{}] stopped by signal {}", pid, signum);
                         {
                             let mut table = crate::process::PROCESS_TABLE.lock();
                             if let Some(proc) = table.find_mut(pid) {
@@ -8085,7 +8112,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 
     let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut frames_to_free: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    let mut device_frame_unmapped = false;
     let mut fb_fully_unmapped = false;
     let mut vma_changed = false;
     {
@@ -8148,8 +8174,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             if let Some((frame_phys, is_device_frame)) = guard_frame {
                 if !is_device_frame {
                     frames_to_free.push(frame_phys);
-                } else {
-                    device_frame_unmapped = true;
                 }
                 unmapped_addrs.push(page_addr);
                 continue;
@@ -8177,8 +8201,6 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                         // Only return system-RAM frames to the allocator after the
                         // batched shootdown has invalidated every stale translation.
                         frames_to_free.push(frame.start_address().as_u64());
-                    } else {
-                        device_frame_unmapped = true;
                     }
                     unmapped_addrs.push(page_addr);
                 }
@@ -8229,10 +8251,10 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         );
     }
 
-    // Only release framebuffer ownership when ALL device pages are gone.
-    // A partial unmap must not clear the owner — another process could then
-    // claim the FB via CAS while the current owner still has pages mapped.
-    if device_frame_unmapped && fb_fully_unmapped && crate::fb::fb_owner_pid() == pid {
+    // Restore text-console ownership whenever the current process no longer has
+    // any framebuffer mappings. That lifecycle is separate from whether this
+    // particular munmap call tore down device-backed pages.
+    if fb_fully_unmapped && crate::fb::fb_owner_pid() == pid {
         crate::fb::restore_console();
     }
 
@@ -9641,6 +9663,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         if let Some(FdBackend::PtySlave { pty_id }) = &backend {
             let calling_pid = crate::process::current_pid();
             let pty_id_val = *pty_id;
+            let caller_pgid = {
+                let pt = crate::process::PROCESS_TABLE.lock();
+                pt.find(calling_pid).map(|p| p.pgid).unwrap_or(0)
+            };
             let mut pt = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = pt.find_mut(calling_pid) {
                 // Must be session leader with no controlling terminal.
@@ -9648,6 +9674,15 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     return NEG_EPERM;
                 }
                 proc.controlling_tty = Some(crate::process::ControllingTty::Pty(pty_id_val));
+            }
+            drop(pt);
+            // Linux 4.6+ behaviour: when a session leader binds an empty-fg-pgrp
+            // controlling tty via TIOCSCTTY, automatically populate the PTY's
+            // foreground process group with the caller's pgid. Without this,
+            // `close_master`'s SIGHUP-to-fg-pgrp path is a no-op (sends to
+            // pgid 0) and the ion shell never receives SIGHUP on disconnect.
+            if caller_pgid != 0 {
+                crate::pty::set_slave_fg_pgid(pty_id_val, caller_pgid);
             }
             return 0;
         }
@@ -13571,6 +13606,12 @@ pub(super) fn sys_sendto(
                     } else {
                         local_port
                     };
+                    // Phase 55c Track G R1: surface EAGAIN when the ring-3 NIC
+                    // driver is in a restart window.  Socket fd is already
+                    // validated by the FdBackend::Socket check above.
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
+                    }
                     crate::net::udp::send(dst_ip, dst_port, src_port, &tmp[..capped]);
                     capped as u64
                 }
@@ -13613,6 +13654,10 @@ pub(super) fn sys_sendto(
                     PING_EXPECTED_SEQ.store(seq, Ordering::Release);
                     let icmp_pkt =
                         kernel_core::net::icmp::build(ICMP_ECHO_REQUEST, 0, rest, payload);
+                    // Phase 55c Track G R1: same restart gate as the UDP path.
+                    if let Some(err) = crate::net::remote::RemoteNic::sendto_restart_ret() {
+                        return err as u64;
+                    }
                     crate::net::ipv4::send(dst_ip, crate::net::ipv4::PROTO_ICMP, &icmp_pkt);
                     capped as u64
                 }

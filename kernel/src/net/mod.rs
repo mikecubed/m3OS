@@ -33,6 +33,14 @@ use core::sync::atomic::AtomicBool;
 /// so a wake from any driver reliably unblocks it.
 pub static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
 
+/// Edge-triggered flag set by the `net.nic.ingress` pending-send hook to
+/// tell `net_task` it has ingress messages to drain. Without this gate
+/// `net_task` would call `recv_msg_nowait` (acquiring `ENDPOINTS.lock()`)
+/// on every wake even with no ring-3 NIC publishing — the lock-acquire
+/// hot-path interacts badly with PID 1's `sys_nanosleep` busy-yield in
+/// `serverization-fallback` and amplifies the documented starvation.
+pub static INGRESS_HAS_WORK: AtomicBool = AtomicBool::new(false);
+
 // ===========================================================================
 // Driver dispatch — Phase 55 E.4
 // ===========================================================================

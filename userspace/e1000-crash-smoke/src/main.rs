@@ -1,29 +1,36 @@
-//! Phase 55b Track F.3d-3 — e1000 crash-and-restart end-to-end smoke test.
+//! Phase 55c Track H.1 — e1000 crash-and-restart end-to-end smoke test.
 //!
-//! Exercises the `RemoteNic` restart-suspected state machine added in F.3d-3.
-//! Covers the observable side of `NetDriverError::DriverRestarting`:
+//! Exercises the `RemoteNic` restart-suspected state machine and the
+//! Phase 55c Track G EAGAIN surface wired through `sendto_restart_errno`.
+//! This is the load-bearing R1 regression binary.
+//!
+//! # Steps
 //!
 //! 1. Send a UDP datagram to the QEMU gateway (10.0.2.2) — confirms the
 //!    network path (virtio-net or RemoteNic) is alive before the kill.
-//! 2. Kill the e1000 driver via `service kill e1000_driver`.
-//!    - On the kernel side, the next `drain_tx_queue` will fail → sets
-//!      `RESTART_SUSPECTED` → subsequent `send_frame` calls return
-//!      `NetDriverError::DriverRestarting` (observable in the kernel log).
-//!    - From userspace, UDP `send()` falls back to virtio-net if RemoteNic
-//!      is not registered, so the userspace-visible error is the service
-//!      restart latency, not an EAGAIN errno.
-//! 3. Poll `/run/services.status` until `e1000_driver` shows `running`.
-//! 4. Send another UDP datagram — confirms the restart path is complete.
-//! 5. Emit structured markers for QEMU regression grep.
+//! 2. Kill the e1000 driver via `service kill e1000_driver` and wait for
+//!    the kill child to exit (synchronous).
+//! 3. Issue follow-up `sendto()` attempts in the restart window and **assert**
+//!    that at least one attempt returns `-EAGAIN` (-11). Phase 55c Track G
+//!    wired `sendto_restart_errno` so that `sys_sendto` returns `NEG_EAGAIN`
+//!    when `RESTART_SUSPECTED` is set. Early successful sends are retried with
+//!    a short sleep between attempts while the async TX drain latches that
+//!    restart-suspected state; the assertion fails only if the retry budget
+//!    expires without ever observing `-EAGAIN` or if an unexpected negative
+//!    errno appears.
+//! 4. Poll `/run/services.status` until `e1000_driver` shows `running`.
+//! 5. Send another UDP datagram — confirms the restart path is complete.
+//! 6. Emit structured markers for QEMU regression grep.
 //!
-//! # Why no EAGAIN observation from userspace
+//! # Exit codes
 //!
-//! There is no `sys_net_send` kernel syscall that propagates
-//! `NetDriverError::DriverRestarting` as `NEG_EAGAIN` to userspace — the net
-//! stack's `send_frame` is fire-and-forget with a virtio-net fallback. A
-//! `sys_net_send` syscall is a phase-55c work item. The EAGAIN side is proved
-//! by the pure-logic host tests in `kernel-core/tests/driver_restart.rs`
-//! (`net_error_to_neg_errno_driver_restarting_is_eagain`).
+//! | Code | Meaning |
+//! |------|---------|
+//! | 0    | All assertions passed |
+//! | 1    | Pre-crash setup failure (socket / bind / pre-crash send) |
+//! | 2    | Kill-delivery failure (fork / waitpid) |
+//! | 3    | **EAGAIN assertion failed** — follow-up sendto returned unexpected errno, or EAGAIN was never observed within the retry budget |
+//! | 4    | Post-restart send failure |
 //!
 //! # Outputs
 //!
@@ -31,7 +38,8 @@
 //! E1000_CRASH_SMOKE:BEGIN
 //! E1000_CRASH_SMOKE:pre-crash-send:OK
 //! E1000_CRASH_SMOKE:kill-delivered
-//! E1000_CRASH_SMOKE:restart-confirmed     (or restart-timeout:SKIP)
+//! E1000_CRASH_SMOKE:mid-crash:EAGAIN-observed   (or mid-crash:restarted-fast)
+//! E1000_CRASH_SMOKE:restart-confirmed           (or restart-timeout:SKIP)
 //! E1000_CRASH_SMOKE:post-restart-send:OK
 //! E1000_CRASH_SMOKE:PASS
 //! ```
@@ -49,6 +57,10 @@ const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const REMOTE_PORT: u16 = 9999;
 // Local source port for the UDP socket.
 const LOCAL_PORT: u16 = 40124;
+
+// Linux errno value EAGAIN (negated isize), as surfaced by Track G's
+// sendto_restart_errno through sys_sendto when RESTART_SUSPECTED is set.
+const NEG_EAGAIN: isize = -11;
 
 // Service paths for killing the e1000 driver.
 const SERVICE_BIN: &[u8] = b"/bin/service\0";
@@ -115,14 +127,8 @@ fn program_main(_args: &[&str]) -> i32 {
         exit(126);
     }
 
-    // Parent: issue a mid-crash send while the child is delivering SIGKILL.
-    // The result (success or failure) is logged but not treated as a
-    // hard failure — the key observation is at the kernel log level where
-    // RESTART_SUSPECTED → DriverRestarting is recorded.
-    let mid_payload = b"e1000-smoke-mid-crash";
-    let mid_ok = udp_send(fd, mid_payload);
-
-    // Wait for the killer child to finish.
+    // Wait for the killer child to finish before asserting EAGAIN, so that
+    // the kernel has had a chance to set RESTART_SUSPECTED on the RemoteNic.
     let mut child_status = 0i32;
     let waited = waitpid(kill_pid as i32, &mut child_status, 0);
     if waited != kill_pid as isize {
@@ -130,16 +136,55 @@ fn program_main(_args: &[&str]) -> i32 {
         close(fd);
         return 2;
     }
-
-    if mid_ok {
-        write_str(
-            STDOUT_FILENO,
-            "E1000_CRASH_SMOKE:mid-crash:send-succeeded\n",
-        );
-    } else {
-        write_str(STDOUT_FILENO, "E1000_CRASH_SMOKE:mid-crash:EAGAIN\n");
-    }
     write_str(STDOUT_FILENO, "E1000_CRASH_SMOKE:kill-delivered\n");
+
+    // ------------------------------------------------------------------
+    // Step 2.5 (H.1): Assert EAGAIN from sendto() during restart window.
+    //
+    // Phase 55c Track G wired sendto_restart_errno so that sys_sendto
+    // returns NEG_EAGAIN (-11) when the e1000 RemoteNic has RESTART_SUSPECTED
+    // set. After the kill child has exited, the kernel clears the driver's
+    // IPC endpoint and sets RESTART_SUSPECTED via the async TX drain path
+    // (remote.rs::on_ipc_error). The EAGAIN window may open slightly after
+    // the kill child exits, so the retry loop continues past early successful
+    // sends until EAGAIN is observed or the budget is exhausted.
+    //
+    // Policy:
+    //   - NEG_EAGAIN on any attempt → assertion passes (H.1 satisfied)
+    //   - budget exhausted without EAGAIN → hard failure, exit 3
+    //   - any unexpected negative errno → hard failure, exit 3
+    // ------------------------------------------------------------------
+    let mid_payload = b"e1000-smoke-mid-crash";
+    match assert_eagain_during_restart(fd, mid_payload) {
+        EagainResult::EagainObserved => {
+            write_str(
+                STDOUT_FILENO,
+                "E1000_CRASH_SMOKE:mid-crash:EAGAIN-observed\n",
+            );
+        }
+        EagainResult::RestartedFast => {
+            // Diagnostic marker kept for observability, but EAGAIN was
+            // never seen — the H.1 regression assertion requires it.
+            write_str(
+                STDOUT_FILENO,
+                "E1000_CRASH_SMOKE:mid-crash:restarted-fast\n",
+            );
+            write_str(
+                STDOUT_FILENO,
+                "E1000_CRASH_SMOKE:FAIL step=2.5 EAGAIN never observed\n",
+            );
+            close(fd);
+            return 3;
+        }
+        EagainResult::UnexpectedErrno => {
+            write_str(
+                STDOUT_FILENO,
+                "E1000_CRASH_SMOKE:FAIL step=2.5 unexpected errno from sendto\n",
+            );
+            close(fd);
+            return 3;
+        }
+    }
 
     // ------------------------------------------------------------------
     // Step 3: Poll for e1000_driver restart.
@@ -162,9 +207,30 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // ------------------------------------------------------------------
     // Step 4: Post-restart send.
+    //
+    // `service: running` (Step 3) fires as soon as PID 1 flips the status
+    // field after calling `start_service`, which schedules the new
+    // e1000_driver process. The driver still needs a few scheduling quanta
+    // to re-open its PCI device, remap DMA buffers, and call
+    // `ipc_register_service("net.nic")` before `send_frame` can succeed —
+    // during that window the kernel returns `NEG_EAGAIN` (DeviceAbsent /
+    // DriverRestarting). Retry the send with short backoffs so the smoke
+    // passes deterministically across that gap.
     // ------------------------------------------------------------------
     let post_payload = b"e1000-smoke-post-restart";
-    if !udp_send(fd, post_payload) {
+    let mut attempts = 0;
+    let max_attempts = 30; // ~30 seconds worst-case with 1 s backoff.
+    let sent_ok = loop {
+        if udp_send(fd, post_payload) {
+            break true;
+        }
+        attempts += 1;
+        if attempts >= max_attempts {
+            break false;
+        }
+        let _ = nanosleep(1);
+    };
+    if !sent_ok {
         write_str(
             STDOUT_FILENO,
             "E1000_CRASH_SMOKE:FAIL step=4 post-restart send\n",
@@ -201,6 +267,62 @@ fn udp_send(fd: i32, payload: &[u8]) -> bool {
     let remote = SockaddrIn::new(GATEWAY_IP, REMOTE_PORT);
     let sent = sendto(fd, payload, 0, &remote);
     sent == payload.len() as isize
+}
+
+/// Result of the EAGAIN assertion during a driver restart window.
+enum EagainResult {
+    /// sendto returned NEG_EAGAIN (-11) — RESTART_SUSPECTED was set.
+    EagainObserved,
+    /// EAGAIN was never seen across all retry attempts — either the driver
+    /// restarted before the RESTART_SUSPECTED latch was observed, or the
+    /// retry budget was exhausted without catching the window.
+    /// **Treated as a failure (exit 3)**: the H.1 regression must confirm
+    /// EAGAIN was surfaced; skipping the RESTART_SUSPECTED state is itself
+    /// a contract violation.
+    RestartedFast,
+    /// sendto returned an unexpected negative errno (not EAGAIN).
+    UnexpectedErrno,
+}
+
+/// Issue UDP sendtos and check for EAGAIN during the driver restart window.
+///
+/// Loops up to 5 times with a 1-second sleep between attempts so the assertion
+/// spans the scheduling jitter between the kill child exiting and the kernel
+/// setting `RESTART_SUSPECTED`.
+///
+/// A **successful send does not terminate the loop** — `RESTART_SUSPECTED` is
+/// latched asynchronously by the TX-drain path in `remote.rs::on_ipc_error`,
+/// so an early successful send only means the kernel has not yet processed the
+/// IPC failure.  The loop continues retrying until either EAGAIN is observed
+/// or the budget is exhausted.
+///
+/// Returns:
+/// - `EagainResult::EagainObserved` if `NEG_EAGAIN` is seen on any attempt — H.1 passes.
+/// - `EagainResult::RestartedFast` if the budget is exhausted without ever
+///   seeing EAGAIN.  **The caller treats this as a failure (exit 3)** because
+///   the H.1 regression must confirm EAGAIN was surfaced.
+/// - `EagainResult::UnexpectedErrno` if any attempt returns a negative value
+///   other than `NEG_EAGAIN` — errno propagation regression; caller exits 3.
+fn assert_eagain_during_restart(fd: i32, payload: &[u8]) -> EagainResult {
+    let remote = SockaddrIn::new(GATEWAY_IP, REMOTE_PORT);
+    for _ in 0u32..5 {
+        let ret = sendto(fd, payload, 0, &remote);
+        if ret == NEG_EAGAIN {
+            return EagainResult::EagainObserved;
+        }
+        if ret < 0 {
+            // Unexpected errno (e.g., EBADF, EIO): errno propagation is wrong.
+            return EagainResult::UnexpectedErrno;
+        }
+        // ret >= 0: either a full send (ret == payload.len()) or a partial send.
+        // RESTART_SUSPECTED is latched asynchronously by the TX drain path, so
+        // a successful send here means the kernel has not yet processed the IPC
+        // failure. Keep retrying after a short sleep — the EAGAIN window may
+        // still be ahead.
+        let _ = nanosleep(1);
+    }
+    // Budget exhausted without ever observing EAGAIN.
+    EagainResult::RestartedFast
 }
 
 /// Poll `/run/services.status` until the named service shows `running`

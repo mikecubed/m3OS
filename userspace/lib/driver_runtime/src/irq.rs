@@ -150,6 +150,22 @@ pub trait IrqBackend {
     /// backend implements this as a no-op. Mocks use it to observe
     /// Drop.
     fn release(&self, notif_cap: u32);
+
+    /// Bind `notif_cap` into the recv loop that services `ep_cap`.
+    ///
+    /// The current kernel validates `ep_cap` and then records the binding at
+    /// task scope because each ring-3 driver task serves a single command
+    /// endpoint. `ep_cap` is therefore both the checked endpoint handle and the
+    /// future-proof call site where a later per-endpoint kernel binding can
+    /// land without changing this trait.
+    ///
+    /// The default implementation is a no-op so existing mock backends
+    /// compile without change. [`SyscallBackend`] overrides to call
+    /// `syscall_lib::sys_notif_bind`.
+    fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+        let _ = (notif_cap, ep_cap);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +261,26 @@ impl IrqBackend for SyscallBackend {
         // this as a documented no-op avoids a bogus syscall and
         // keeps Drop infallible.
     }
+
+    fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+        // Delegates to `sys_notif_bind` (syscall 0x1111, Track B).
+        // `u64::MAX` is the kernel's internal-error sentinel; negative values
+        // are errno returns sign-extended into the u64 result register.
+        let rc = syscall_lib::sys_notif_bind(notif_cap, ep_cap);
+        decode_notif_bind_result(rc)
+    }
+}
+
+fn decode_notif_bind_result(rc: u64) -> Result<(), DriverRuntimeError> {
+    if rc == u64::MAX {
+        return Err(DriverRuntimeError::from(DeviceHostError::Internal));
+    }
+    let signed = rc as i64;
+    if signed < 0 {
+        Err(errno_to_driver_runtime_error(signed))
+    } else {
+        Ok(())
+    }
 }
 
 /// Map a signed kernel return code (negative errno) to a
@@ -258,12 +294,13 @@ impl IrqBackend for SyscallBackend {
 /// [`DeviceHostError`] variant.
 fn errno_to_driver_runtime_error(errno: i64) -> DriverRuntimeError {
     let mapped = match errno {
-        -9 => DeviceHostError::BadDeviceCap,      // EBADF
-        -1 => DeviceHostError::BadDeviceCap,      // EPERM (policy reject)
-        -3 => DeviceHostError::BadDeviceCap,      // ESRCH (task gone)
-        -12 => DeviceHostError::Internal,         // ENOMEM (notif alloc)
-        -19 => DeviceHostError::BadDeviceCap,     // ENODEV
-        -22 => DeviceHostError::IrqUnavailable,   // EINVAL (no vector)
+        -16 => DeviceHostError::AlreadyClaimed, // EBUSY (notif already bound)
+        -9 => DeviceHostError::BadDeviceCap,    // EBADF
+        -1 => DeviceHostError::BadDeviceCap,    // EPERM (policy reject)
+        -3 => DeviceHostError::BadDeviceCap,    // ESRCH (task gone)
+        -12 => DeviceHostError::Internal,       // ENOMEM (notif alloc)
+        -19 => DeviceHostError::BadDeviceCap,   // ENODEV
+        -22 => DeviceHostError::IrqUnavailable, // EINVAL (no vector)
         -23 => DeviceHostError::CapacityExceeded, // ENFILE (irq cap full)
         _ => DeviceHostError::Internal,
     };
@@ -356,6 +393,24 @@ impl<B: IrqBackend> IrqNotification<B> {
     /// `IrqNotification` is responsible for. Bits outside the mask
     /// are discarded silently — they belong to other subscriptions
     /// on the same notification object.
+    ///
+    /// # When to prefer `bind_to_endpoint` instead
+    ///
+    /// Drivers that already own a command endpoint (e.g., the e1000
+    /// and NVMe ring-3 drivers from Phase 55b/c) should call
+    /// [`bind_to_endpoint`](Self::bind_to_endpoint) after subscribing
+    /// and then *not* call `wait` at all.  After binding, the kernel
+    /// delivers IRQ wakes through the same `ipc_recv_msg` path that
+    /// delivers TX / block requests, so a single
+    /// `NetServer::handle_next` (or `BlockServer::handle_next_with_notification`)
+    /// call handles both event types without two separate blocking points.
+    /// Using `wait` in addition to a bound endpoint risks deadlock: the
+    /// loop blocks in `wait` while the command endpoint accumulates
+    /// backpressure.
+    ///
+    /// `wait` remains in the API for drivers or test harnesses that
+    /// operate without a command endpoint — stand-alone IRQ consumers
+    /// that process hardware events and have no peer to reply to.
     pub fn wait(&self) -> u64 {
         let raw = self.backend.wait(self.cap_handle);
         let bits = raw & self.bit_mask;
@@ -408,6 +463,20 @@ impl<B: IrqBackend> IrqNotification<B> {
         // bits. The next wait() will install a fresh observed mask.
         self.last_observed.set(observed & !bits);
         Ok(())
+    }
+    /// Bind this IRQ notification into the recv loop that services `ep`.
+    ///
+    /// After a successful bind, `ipc_recv_msg` in the current task will return
+    /// [`RecvResult::Notification`] when this notification's pending bits are
+    /// non-zero, before checking the endpoint's sender queue. The current
+    /// kernel stores that binding per task after validating `ep`, which matches
+    /// the one-command-endpoint-per-driver-task model used today.
+    ///
+    /// Delegates to [`IrqBackend::bind_to_endpoint`]. The production
+    /// [`SyscallBackend`] calls `syscall_lib::sys_notif_bind`; mock backends
+    /// return `Ok(())` by default so existing tests are unaffected.
+    pub fn bind_to_endpoint(&self, ep: crate::ipc::EndpointCap) -> Result<(), DriverRuntimeError> {
+        self.backend.bind_to_endpoint(self.cap_handle, ep.raw())
     }
 }
 
@@ -540,6 +609,8 @@ mod tests {
         next_cap: u32,
         subs: Vec<SubRecord>,
         inject_subscribe_error: Option<DriverRuntimeError>,
+        /// Records (notif_cap, ep_cap) pairs for bind_to_endpoint assertions.
+        bind_records: Vec<(u32, u32)>,
     }
 
     #[derive(Debug)]
@@ -646,6 +717,20 @@ mod tests {
             if let Some(sub) = st.subs.iter_mut().find(|s| s.cap_handle == notif_cap) {
                 sub.released = true;
             }
+        }
+
+        fn bind_to_endpoint(&self, notif_cap: u32, ep_cap: u32) -> Result<(), DriverRuntimeError> {
+            self.state
+                .borrow_mut()
+                .bind_records
+                .push((notif_cap, ep_cap));
+            Ok(())
+        }
+    }
+
+    impl MockBackend {
+        fn bind_records(&self) -> alloc::vec::Vec<(u32, u32)> {
+            self.state.borrow().bind_records.clone()
         }
     }
 
@@ -851,5 +936,49 @@ mod tests {
         let notif = IrqNotification::from_parts(cap, 0b1, backend);
         assert_eq!(notif.wait(), 0b1);
         assert!(notif.ack(0b1).is_ok());
+    }
+
+    // -- Track E.3 test — bind_to_endpoint --------------------------------
+
+    #[test]
+    fn bind_to_endpoint_delegates_to_backend_and_records_caps() {
+        use crate::ipc::EndpointCap;
+
+        let backend = MockBackend::new();
+        let device = MockDevice { cap_handle: 5 };
+        let notif = IrqNotification::subscribe_with_backend(backend.clone(), &device, None)
+            .expect("subscribe");
+
+        let ep = EndpointCap::new(77);
+        notif
+            .bind_to_endpoint(ep)
+            .expect("bind_to_endpoint must succeed");
+
+        let records = backend.bind_records();
+        assert_eq!(records.len(), 1, "exactly one bind recorded");
+        let (n_cap, e_cap) = records[0];
+        assert_eq!(n_cap, notif.cap_handle(), "notif cap forwarded correctly");
+        assert_eq!(e_cap, ep.raw(), "endpoint cap forwarded correctly");
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_internal_sentinel_to_internal_error() {
+        let err = decode_notif_bind_result(u64::MAX).expect_err("u64::MAX must fail");
+        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::Internal));
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_negative_errno_to_driver_error() {
+        let err = decode_notif_bind_result((-9_i64) as u64).expect_err("negative errno must fail");
+        assert_eq!(err, DriverRuntimeError::from(DeviceHostError::BadDeviceCap));
+    }
+
+    #[test]
+    fn decode_notif_bind_result_maps_busy_errno_to_already_claimed() {
+        let err = decode_notif_bind_result((-16_i64) as u64).expect_err("busy errno must fail");
+        assert_eq!(
+            err,
+            DriverRuntimeError::from(DeviceHostError::AlreadyClaimed)
+        );
     }
 }

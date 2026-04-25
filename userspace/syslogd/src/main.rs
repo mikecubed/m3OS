@@ -135,6 +135,8 @@ fn setup_socket() -> Option<i32> {
 
 /// Poll timeout in milliseconds -- also controls how often we drain /dev/kmsg.
 const POLL_TIMEOUT_MS: i32 = 2000;
+const MAX_SOCKET_DRAIN_PER_LOOP: usize = 4;
+const MAX_KMSG_DRAIN_PER_LOOP: usize = 4;
 
 fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
     let mut recv_buf = [0u8; 2048];
@@ -153,6 +155,7 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 
         if n > 0 && (fds[0].revents & POLLIN) != 0 {
             // Drain all pending datagrams.
+            let mut drained = 0usize;
             loop {
                 let mut sender = SockaddrUn::new("");
                 let nr = syscall_lib::recvfrom_unix(
@@ -170,9 +173,11 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
                 if len > 0 {
                     syscall_lib::write(msg_fd, &line_buf[..len]);
                 }
-                // If only one datagram was pending, break rather than busy-loop.
-                // recvfrom on a SOCK_DGRAM socket will return an error or 0
-                // when nothing is available.
+                drained += 1;
+                if drained >= MAX_SOCKET_DRAIN_PER_LOOP {
+                    let _ = syscall_lib::nanosleep(0);
+                    break;
+                }
             }
         }
 
@@ -188,6 +193,7 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 // ---------------------------------------------------------------------------
 
 fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
+    let mut drained = 0usize;
     loop {
         let nr = syscall_lib::read(kmsg_fd, buf);
         if nr <= 0 {
@@ -200,6 +206,11 @@ fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf:
             syscall_lib::write(kern_fd, &line_buf[..len]);
             // Also write to messages for unified viewing.
             syscall_lib::write(msg_fd, &line_buf[..len]);
+        }
+        drained += 1;
+        if drained >= MAX_KMSG_DRAIN_PER_LOOP {
+            let _ = syscall_lib::nanosleep(0);
+            break;
         }
     }
 }

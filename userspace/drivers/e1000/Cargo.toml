@@ -4,9 +4,24 @@ version = "0.55.2"
 edition = "2024"
 description = "Phase 55b Track E — ring-3 e1000 NIC driver (scaffold)."
 
+# Phase 55c Track F: the library target exposes init/io/rings for integration
+# tests on x86_64-unknown-linux-gnu without the OS binary's _start symbol.
+[lib]
+name = "e1000_driver"
+path = "src/lib.rs"
+
+# The binary defines _start via syscall_lib::entry_point!.  Building it on
+# x86_64-unknown-linux-gnu (the test host) causes a duplicate-symbol link
+# error because Scrt1.o also defines _start.  Gate it on "os-binary" so
+# `cargo test --target x86_64-unknown-linux-gnu` skips the [[bin]] target
+# entirely; xtask adds --features os-binary when building the OS image.
+[features]
+os-binary = []
+
 [[bin]]
 name = "e1000_driver"
 path = "src/main.rs"
+required-features = ["os-binary"]
 
 [dependencies]
 driver_runtime = { path = "../../lib/driver_runtime" }

@@ -460,6 +460,36 @@ pub fn subscribe_irq(
     IrqNotification::<IrqSyscallBackend>::subscribe(&view, None)
 }
 
+/// Subscribe to the e1000 IRQ, bind the notification into `endpoint`'s
+/// recv loop, and arm `IMS` — in that order.
+///
+/// Phase 55c Track F.2 requires the three operations in this sequence:
+///
+/// 1. [`subscribe_irq`] — registers the IRQ subscription with the kernel
+///    and obtains an [`IrqNotification`] cap.
+/// 2. [`IrqNotification::bind_to_endpoint`] — tells the kernel to deliver
+///    IRQ wakes via the same `ipc_recv_msg` path that services
+///    `endpoint`.  After binding, `NetServer::handle_next` returns
+///    `RecvResult::Notification(bits)` on an IRQ wake instead of
+///    `RecvResult::Message`, so a single recv loop handles both events.
+/// 3. [`arm_irqs`] — writes `IMS` to unmask the selected ICR causes.
+///    Arming last ensures no IRQ can fire before the endpoint binding
+///    is live; an early IRQ would be lost.
+///
+/// On success returns the `IrqNotification` the caller should use to
+/// [`ack`](IrqNotification::ack) each wake.  On error the subscription
+/// or binding failed and the driver should exit so the service manager
+/// can restart it.
+pub fn subscribe_and_bind(
+    device: &E1000Device,
+    endpoint: EndpointCap,
+) -> Result<IrqNotification<IrqSyscallBackend>, driver_runtime::DriverRuntimeError> {
+    let irq = subscribe_irq(&device.pci)?;
+    irq.bind_to_endpoint(endpoint)?;
+    arm_irqs(device);
+    Ok(irq)
+}
+
 /// Drain the RX ring of `device`, publishing every frame to the
 /// kernel net stack through `net_server.publish_rx_frame`.
 ///
@@ -484,21 +514,37 @@ pub fn drain_rx_to_server<B: IpcBackend>(
         })
         .collect();
     let descs: &mut [E1000RxDesc; RX_RING_SIZE] = &mut device.rx.descs;
-    let mut dropped = 0usize;
     let mut next_to_read = device.rx.next_to_read;
+    // Collect the whole drain locally before publishing so we can batch
+    // multiple frames into a single `NET_RX_FRAME` send. Without this, every
+    // drained frame costs one synchronous IPC rendezvous to the kernel
+    // ingress task, which blocks the driver's main loop and prevents it from
+    // returning to `handle_next` to service outbound TX. Under sustained
+    // bidirectional workloads (SSH interactive sessions with bursty RX) the
+    // per-frame rendezvous serializes the TX path for the combined drain
+    // duration — observed as "client hangs but server still sees keystrokes"
+    // because server-side echoes queue up kernel-side waiting for the driver
+    // to free up. See docs/post-mortems/2026-04-22-e1000-bound-notif.md for
+    // the ring-3 e1000 IPC topology this publish participates in.
+    let mut collected: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     let drained = drain_rx(
         &device.mmio,
         descs.as_mut_slice(),
         &bufs,
         &buf_iova,
         &mut next_to_read,
-        |frame| {
-            if net_server.publish_rx_frame(frame).is_err() {
-                dropped += 1;
-            }
-        },
+        |frame| collected.push(frame.to_vec()),
     );
     device.rx.next_to_read = next_to_read;
+    let dropped = if collected.is_empty() {
+        0
+    } else {
+        let frame_refs: alloc::vec::Vec<&[u8]> = collected.iter().map(|v| v.as_slice()).collect();
+        match net_server.publish_rx_frames(&frame_refs) {
+            Ok(()) => 0,
+            Err(_) => collected.len(),
+        }
+    };
     (drained, dropped)
 }
 
@@ -578,7 +624,7 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
             mac: device.mac,
             speed_mbps: 0,
         };
-        net_server.publish_link_state(event);
+        let _ = net_server.publish_link_state(event);
     } else if outcome.icr & irq_cause::LSC != 0 && !outcome.link_up {
         // Link went down — tell the kernel net stack so it can
         // reset retransmit timers (Phase 16 behavior).
@@ -587,7 +633,7 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
             mac: device.mac,
             speed_mbps: 0,
         };
-        net_server.publish_link_state(event);
+        let _ = net_server.publish_link_state(event);
     }
     let (drained, dropped) = if outcome.rx_drain_needed {
         drain_rx_to_server(device, net_server)
@@ -597,52 +643,96 @@ pub fn handle_irq_and_drain<B: IpcBackend>(
     (outcome, drained, dropped)
 }
 
-/// Main driver loop: subscribes to the IRQ, initialises the link
-/// atomic from the device's bring-up status, arms `IMS`, and
-/// alternates between `irq.wait()` → `handle_irq_and_drain` and
-/// `net_server.handle_next` which dispatches TX requests through
-/// [`send_frame`].
+/// Main driver loop: subscribes to the IRQ, binds the notification into
+/// the command-endpoint recv path via [`subscribe_and_bind`], initialises
+/// the link atomic, and dispatches events through a single
+/// `NetServer::handle_next` call per iteration.
 ///
-/// The function is intentionally non-returning (`-> !`) so callers
-/// do not accidentally skip error handling — the only exit is a
-/// panic path or an `exit` syscall invoked from a child call.
+/// **Dispatch arms (Phase 55c Track F.2):**
 ///
-/// Supplied `endpoint` is the command endpoint the kernel's
-/// `RemoteNic` facade (E.4) sends `NET_SEND_FRAME` requests on.
-/// Track F.1 wires this endpoint through the service manager's
-/// capability grant.
-#[allow(dead_code)] // F.1 flips the main binary into calling this.
-pub fn run_io_loop(mut device: E1000Device, command_endpoint: EndpointCap) -> ! {
-    // Subscribe BEFORE arming IMS so a stray IRQ cannot fire into an
-    // unregistered handler — mirrors Phase 55 E.3's publish-before-IMS
-    // ordering.
-    let irq = match subscribe_irq(&device.pci) {
+/// - `RecvResult::Notification(bits)` — the bound IRQ notification fired.
+///   The bits are recorded inside the loop body, then
+///   [`handle_irq_and_drain`] drains the RX ring and the bits are
+///   acknowledged via [`IrqNotification::ack`].  The notification arrives
+///   through the same `ipc_recv_msg` path as TX requests — no separate
+///   blocking wait on the [`IrqNotification`] is needed.
+/// - `RecvResult::Message(req)` — a `NET_SEND_FRAME` TX request arrived.
+///   [`send_frame`] posts the descriptor and the loop replies via the
+///   backend.
+///
+/// The function is intentionally non-returning (`-> !`) so callers do not
+/// accidentally skip error handling — the only exit is a panic path or
+/// an `exit` syscall invoked from a child call.
+///
+/// `command_endpoint` is the TX command endpoint the kernel's `RemoteNic`
+/// facade sends `NET_SEND_FRAME` requests on. `ingress_endpoint` is the
+/// kernel-owned endpoint the driver publishes `NET_RX_FRAME` and
+/// `NET_LINK_STATE` events to — `None` means the kernel did not spawn the
+/// ingress receiver, and RX publishes silently drop. TX still works through
+/// the command endpoint.
+#[allow(dead_code)] // called from main.rs program_main.
+pub fn run_io_loop(
+    device: E1000Device,
+    command_endpoint: EndpointCap,
+    ingress_endpoint: Option<EndpointCap>,
+) -> ! {
+    // subscribe_and_bind atomically:
+    //   1. subscribes IRQ,
+    //   2. binds the notification into command_endpoint's recv loop,
+    //   3. arms IMS.
+    // Binding before arming ensures no IRQ fires into an unbound endpoint.
+    let irq = match subscribe_and_bind(&device, command_endpoint) {
         Ok(n) => n,
-        Err(_) => {
-            // Fall back to a polled RX path: spin-sleep and drain,
-            // without IRQ. Kept explicit so F.1's failure mode is
-            // clear from logs.
-            syscall_lib::exit(4)
-        }
+        Err(_) => syscall_lib::exit(4),
     };
-    link_state_atomic().store(device.link_up_initial(), Ordering::Release);
-    arm_irqs(&device);
+    let initial_link_up = device.link_up_initial();
+    let initial_mac = device.mac();
+    link_state_atomic().store(initial_link_up, Ordering::Release);
 
-    let net_server = NetServer::new(command_endpoint);
+    // Wrap device in RefCell so on_message and on_notification closures
+    // can each borrow it mutably in their exclusive call arms without
+    // conflicting at compile time.
+    let device = core::cell::RefCell::new(device);
+    let net_server = match ingress_endpoint {
+        Some(ep) => NetServer::new(command_endpoint).with_ingress_endpoint(ep),
+        None => NetServer::new(command_endpoint),
+    };
+    let _ = net_server.publish_link_state(NetLinkEvent {
+        up: initial_link_up,
+        mac: initial_mac,
+        speed_mbps: 0,
+    });
 
     loop {
-        let bits = irq.wait();
+        // Stage the notification bit-mask from the on_notification arm
+        // so we can call handle_irq_and_drain *after* handle_next
+        // releases its backend lock, avoiding a re-entrant Mutex
+        // acquisition inside drain_rx_to_server.
+        let irq_bits = core::cell::Cell::new(0u64);
+
+        let _ = net_server.handle_next(
+            |req| {
+                let mut dev = device.borrow_mut();
+                let status = match send_frame(&mut *dev, &req.frame) {
+                    Ok(()) => NetDriverError::Ok,
+                    Err(e) => e,
+                };
+                driver_runtime::ipc::net::NetReply { status }
+            },
+            |bits| {
+                // Record the bits; drain happens after handle_next returns.
+                irq_bits.set(bits);
+            },
+        );
+
+        // On Notification(bits): handle_irq_and_drain, then irq.ack(bits).
+        let bits = irq_bits.get();
         if bits != 0 {
-            let _ = handle_irq_and_drain(&mut device, &net_server);
+            let mut dev = device.borrow_mut();
+            let _ = handle_irq_and_drain(&mut *dev, &net_server);
+            drop(dev);
             let _ = irq.ack(bits);
         }
-        let _ = net_server.handle_next(|req| {
-            let status = match send_frame(&mut device, &req.frame) {
-                Ok(()) => NetDriverError::Ok,
-                Err(e) => e,
-            };
-            driver_runtime::ipc::net::NetReply { status }
-        });
     }
 }
 

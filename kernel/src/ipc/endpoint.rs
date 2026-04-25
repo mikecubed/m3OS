@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use spin::{Lazy, Mutex};
 
-use super::{CapError, Capability, Message};
+use super::{CapError, Capability, Message, NotifId};
 use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::EndpointId;
@@ -131,6 +131,26 @@ impl EndpointRegistry {
         self.slots.get_mut(id.0 as usize)?.as_mut()
     }
 
+    /// Return the IDs of every endpoint currently owned by `task_id`.
+    ///
+    /// Captured by `cleanup_task_ipc` *before* [`close_owned_by`] runs so the
+    /// driver-facade death-detection hooks
+    /// (`RemoteNic::on_endpoint_closed`, `RemoteBlockDevice::on_endpoint_closed`)
+    /// can fire after `ENDPOINTS.lock()` is released. After `close_owned_by`
+    /// the `owner` field has been cleared, so a post-close walk would miss
+    /// the association.
+    pub(super) fn endpoints_owned_by(&self, task_id: TaskId) -> Vec<EndpointId> {
+        let mut out = Vec::new();
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(ep) = slot
+                && ep.owner == Some(task_id)
+            {
+                out.push(EndpointId(i as u8));
+            }
+        }
+        out
+    }
+
     /// Close all endpoints owned by `task_id`.
     ///
     /// Closed endpoints stay tombstoned until no live task still holds a cap
@@ -212,6 +232,13 @@ pub struct Endpoint {
     /// reference this [`EndpointId`]. Closed endpoints reject new IPC until
     /// the slot can be safely reclaimed.
     pub(super) closed: bool,
+    /// Optional hook fired *after* a sender enqueues itself with no
+    /// receiver waiting. Used by `net_task` to learn that the
+    /// `net.nic.ingress` endpoint has work without a dedicated kernel
+    /// receiver task on the run queue. Invoked outside `ENDPOINTS.lock()`
+    /// so the hook may freely acquire other kernel locks (e.g.
+    /// `SCHEDULER.lock()` via `wake_task`).
+    pub(super) on_pending_send: Option<fn()>,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
@@ -236,7 +263,23 @@ impl Endpoint {
             receivers: VecDeque::new(),
             owner: None,
             closed: false,
+            on_pending_send: None,
         }
+    }
+}
+
+/// Install a hook to invoke whenever a sender enqueues onto `ep_id` with no
+/// receiver waiting. Used by `net_task` to drain the `net.nic.ingress`
+/// endpoint without a dedicated kernel receiver task — see
+/// `docs/post-mortems/2026-04-24-ingress-task-starvation.md` "what the real
+/// fix would look like" item 3.
+///
+/// The hook runs outside `ENDPOINTS.lock()` so it may safely call into the
+/// scheduler (e.g. `wake_task`).
+pub fn set_endpoint_pending_send_hook(ep_id: EndpointId, hook: fn()) {
+    let mut reg = ENDPOINTS.lock();
+    if let Some(ep) = reg.get_mut(ep_id) {
+        ep.on_pending_send = Some(hook);
     }
 }
 
@@ -353,6 +396,220 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
     }
 }
 
+/// Non-blocking receive: pop one queued sender from `ep_id`, if any, and
+/// deliver its message to `receiver`.
+///
+/// Returns:
+/// - `Some(msg)` when a sender was queued; the sender is woken (or its reply
+///   cap is inserted into the receiver's table for `call`-shaped sends),
+///   bulk data has been transferred, and `msg` is the full [`Message`].
+/// - `None` when the senders queue is empty or the endpoint is closed/invalid.
+///   The receiver is **not** enqueued and does **not** block.
+///
+/// Used by `net_task` to drain the `net.nic.ingress` endpoint without a
+/// dedicated kernel receiver task. Replaces the Phase 55c Track E
+/// `remote_nic_ingress_task` that starved PID 1's reap loop just by sitting
+/// blocked on `recv_msg`.
+///
+/// Mirrors `recv_msg`'s sender-found path exactly. The deliver/take dance
+/// is preserved so the receiver's `pending_msg` slot stays the single
+/// authoritative source of an IPC message — a future blocking caller would
+/// observe a consistent state if a wake races with a delivery.
+pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
+    let mut pending = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = reg.get_mut(ep_id).filter(|e| !e.closed)?;
+        ep.senders.pop_front()?
+    };
+
+    let reply_cap_handle = if pending.wants_reply {
+        match scheduler::insert_cap(receiver, Capability::Reply(pending.task)) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                log::warn!(
+                    "[ipc] recv_msg_nowait: capability table full, unblocking sender without reply"
+                );
+                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                let _ = scheduler::wake_task(pending.task);
+                return Some(Message::new(u64::MAX));
+            }
+        }
+    } else {
+        None
+    };
+
+    if transfer_cap(pending.task, receiver, &mut pending.msg).is_err() {
+        log::warn!(
+            "[ipc] recv_msg_nowait: capability transfer failed, dropping message from task {}",
+            pending.task.0,
+        );
+        if let Some(handle) = reply_cap_handle {
+            let _ = scheduler::remove_task_cap(receiver, handle);
+        }
+        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+        let _ = scheduler::wake_task(pending.task);
+        return Some(Message::new(u64::MAX));
+    }
+
+    scheduler::deliver_message(receiver, pending.msg);
+    transfer_bulk(pending.task, receiver);
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
+        task_idx: receiver.0 as u32,
+        ep: ep_id.0 as u32,
+    });
+    if !pending.wants_reply {
+        scheduler::complete_send(pending.task);
+        let _ = scheduler::wake_task(pending.task);
+    }
+
+    scheduler::take_message(receiver)
+}
+
+/// Receive a message or a notification on an endpoint.
+///
+/// Extends [`recv_msg`] with a bound-notification fast path: if the calling
+/// task has a notification bound and its `PENDING` bits are non-zero, drains
+/// them atomically and returns `(1, notification_bits)` without touching the
+/// endpoint queue.
+///
+/// # Return value
+///
+/// Returns a tuple `(kind: u8, msg: Message)`:
+/// - `(0, msg)` — a peer delivered a message; `msg` is the full [`Message`].
+/// - `(1, bits_msg)` — a bound notification fired; `bits_msg.data[0]` carries
+///   the drained bit mask and `bits_msg.label = 0`.
+///
+/// # Lock order
+///
+/// When both locks must be held simultaneously, the canonical order is
+/// `ENDPOINTS` first, then notification `WAITERS`. This order must never be
+/// reversed.
+///
+/// In the registration-window cleanup path (`register_recv_waiter` returns
+/// `Some`), `WAITERS` is acquired and released entirely inside
+/// `register_recv_waiter` before this function re-acquires `ENDPOINTS` to
+/// remove the receiver from the queue. The two locks are therefore **not** held
+/// simultaneously in that path, and no lock-order inversion occurs.
+pub fn recv_msg_with_notif(
+    receiver: TaskId,
+    ep_id: EndpointId,
+    notif_id: NotifId,
+) -> (u8, Message) {
+    use super::notification;
+    use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION, classify_recv};
+
+    let bits = notification::drain_bits(notif_id);
+    if classify_recv(bits) == RECV_KIND_NOTIFICATION {
+        let mut msg = Message::new(0);
+        msg.data[0] = bits;
+        return (RECV_KIND_NOTIFICATION, msg);
+    }
+
+    let action = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) if !e.closed => e,
+            _ => return (RECV_KIND_MESSAGE, Message::new(u64::MAX)),
+        };
+        if let Some(pending) = ep.senders.pop_front() {
+            Some(pending)
+        } else {
+            ep.receivers.push_back(receiver);
+            None
+        }
+    };
+
+    match action {
+        Some(mut pending) => {
+            let reply_cap_handle = if pending.wants_reply {
+                match scheduler::insert_cap(receiver, Capability::Reply(pending.task)) {
+                    Ok(handle) => Some(handle),
+                    Err(_) => {
+                        log::warn!("[ipc] recv_msg_with_notif: cap table full");
+                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                        let _ = scheduler::wake_task(pending.task);
+                        return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+                    }
+                }
+            } else {
+                None
+            };
+
+            if transfer_cap(pending.task, receiver, &mut pending.msg).is_err() {
+                if let Some(handle) = reply_cap_handle {
+                    let _ = scheduler::remove_task_cap(receiver, handle);
+                }
+                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                let _ = scheduler::wake_task(pending.task);
+                return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+            }
+
+            scheduler::deliver_message(receiver, pending.msg);
+            transfer_bulk(pending.task, receiver);
+            if !pending.wants_reply {
+                scheduler::complete_send(pending.task);
+                let _ = scheduler::wake_task(pending.task);
+            }
+
+            match scheduler::take_message(receiver) {
+                Some(msg) => (RECV_KIND_MESSAGE, msg),
+                None => (RECV_KIND_MESSAGE, Message::new(u64::MAX)),
+            }
+        }
+        None => {
+            let task_sched_idx = match scheduler::get_current_task_idx() {
+                Some(idx) => idx,
+                None => {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                    return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+                }
+            };
+
+            if let Some(bits2) =
+                notification::register_recv_waiter(notif_id, receiver, task_sched_idx)
+            {
+                let mut reg = ENDPOINTS.lock();
+                if let Some(ep) = reg.get_mut(ep_id) {
+                    ep.receivers.retain(|&r| r != receiver);
+                }
+                let mut msg = Message::new(0);
+                msg.data[0] = bits2;
+                return (RECV_KIND_NOTIFICATION, msg);
+            }
+
+            scheduler::block_current_on_notif_unless_message();
+            notification::unregister_recv_waiter(notif_id, receiver);
+
+            if let Some(msg) = scheduler::take_message(receiver) {
+                return (RECV_KIND_MESSAGE, msg);
+            }
+
+            let bits = notification::drain_bits(notif_id);
+            if bits != 0 {
+                {
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id) {
+                        ep.receivers.retain(|&r| r != receiver);
+                    }
+                }
+                if let Some(msg) = scheduler::take_message(receiver) {
+                    notification::signal(notif_id, bits);
+                    return (RECV_KIND_MESSAGE, msg);
+                }
+                let mut msg = Message::new(0);
+                msg.data[0] = bits;
+                (RECV_KIND_NOTIFICATION, msg)
+            } else {
+                debug_assert!(false, "[ipc] recv_msg_with_notif: spurious wake");
+                (RECV_KIND_MESSAGE, Message::new(u64::MAX))
+            }
+        }
+    }
+}
+
 /// Receive a message from an endpoint.
 ///
 /// Identical to [`recv_msg`] but returns only the message label.
@@ -382,21 +639,21 @@ fn transfer_bulk(src: TaskId, dst: TaskId) {
 /// endpoint ID is invalid.  The syscall dispatcher propagates `false` as
 /// `u64::MAX` to the caller.
 pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
-    let matched_receiver = {
+    let (matched_receiver, pending_hook) = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) if !e.closed => e,
             _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
-            Some(receiver)
+            (Some(receiver), None)
         } else {
             ep.senders.push_back(PendingSend {
                 task: sender,
                 msg,
                 wants_reply: false,
             });
-            None
+            (None, ep.on_pending_send)
         }
     };
 
@@ -417,6 +674,12 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
+            // If a pending-send hook is installed (e.g. `net_task` watches
+            // `net.nic.ingress`), invoke it before blocking so the hook
+            // owner is woken to drain the queue.
+            if let Some(hook) = pending_hook {
+                hook();
+            }
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
@@ -440,7 +703,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
 /// `label = u64::MAX` on error.  Use this when the caller needs the reply
 /// data payload (e.g. a VFS server forwarding a fat_server reply to a client).
 pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
-    let matched_receiver = {
+    let (matched_receiver, pending_hook) = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) if !e.closed => e,
@@ -448,16 +711,21 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         };
 
         if let Some(receiver) = ep.receivers.pop_front() {
-            Some(receiver)
+            (Some(receiver), None)
         } else {
             ep.senders.push_back(PendingSend {
                 task: caller,
                 msg,
                 wants_reply: true,
             });
-            None
+            (None, ep.on_pending_send)
         }
     };
+    if matched_receiver.is_none()
+        && let Some(hook) = pending_hook
+    {
+        hook();
+    }
 
     match matched_receiver {
         Some(receiver) => {
@@ -631,23 +899,28 @@ fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<
 /// If the message carries a capability and the receiver's table is full,
 /// the send fails and returns `false`.  The sender retains the capability.
 pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> bool {
-    let matched_receiver = {
+    let (matched_receiver, pending_hook) = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) if !e.closed => e,
             _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
-            Some(receiver)
+            (Some(receiver), None)
         } else {
             ep.senders.push_back(PendingSend {
                 task: sender,
                 msg,
                 wants_reply: false,
             });
-            None
+            (None, ep.on_pending_send)
         }
     };
+    if matched_receiver.is_none()
+        && let Some(hook) = pending_hook
+    {
+        hook();
+    }
 
     match matched_receiver {
         Some(receiver) => {

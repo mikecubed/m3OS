@@ -673,6 +673,7 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
 fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
     if let Some(idx) = sched.free_list.pop() {
         // Reuse a dead slot.
+        crate::ipc::notification::clear_bound_task(idx);
         sched.tasks[idx] = task;
         idx
     } else {
@@ -723,9 +724,19 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     let now = crate::arch::x86_64::interrupts::tick_count();
-    task.assigned_core = current_core;
+    let target_core = if fork_pid == 1 {
+        current_core
+    } else {
+        least_loaded_core(&sched)
+    };
+    task.assigned_core = target_core;
     task.last_migrated_tick = now;
     task.last_ready_tick = now;
+    // Fresh fork children need one prompt first dispatch so they can consume
+    // `fork_ctx` in `fork_child_trampoline` and enter their normal userspace
+    // wait/exec path. Restore the default priority as soon as the trampoline
+    // takes the context.
+    task.priority = 19;
     // Publish the child PID before the first dispatch so pid-based lifecycle
     // operations (for example exit_group teardown) can target the task even if
     // it has not reached fork_child_trampoline yet.
@@ -746,11 +757,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTaskSpawned {
         pid: fork_pid,
         task_idx: idx as u32,
-        core: current_core,
+        core: target_core,
     });
-    enqueue_to_core(current_core, idx);
+    enqueue_to_core(target_core, idx);
 
-    current_core
+    target_core
 }
 
 /// Register an idle task for a specific core.
@@ -947,7 +958,11 @@ pub fn set_current_user_return(urs: crate::task::UserReturnState) {
 
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
-    SCHEDULER.lock().tasks[idx].fork_ctx.take()
+    let mut sched = SCHEDULER.lock();
+    let task = &mut sched.tasks[idx];
+    let ctx = task.fork_ctx.take()?;
+    task.priority = 20;
+    Some(ctx)
 }
 
 /// Return the PID associated with the given task index.
@@ -1151,6 +1166,10 @@ pub fn block_current_on_reply() {
 
 pub fn block_current_on_reply_unless_message() {
     block_current_unless_message(TaskState::BlockedOnReply);
+}
+
+pub fn block_current_on_notif_unless_message() {
+    block_current_unless_message(TaskState::BlockedOnNotif);
 }
 
 pub fn block_current_on_futex() {
@@ -1398,13 +1417,10 @@ pub fn wake_task(id: TaskId) -> bool {
                     }
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
-                        sched.tasks[idx].last_migrated_tick =
-                            crate::arch::x86_64::interrupts::tick_count();
                         (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
                         sched.tasks[idx].state = TaskState::Ready;
-                        sched.tasks[idx].last_migrated_tick = now;
                         sched.tasks[idx].last_ready_tick = now;
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
@@ -1606,12 +1622,40 @@ pub fn task_notification_caps(id: TaskId) -> alloc::vec::Vec<NotifId> {
     sched.notification_caps(id)
 }
 
+/// Return the scheduler task-vec index for `id`, if it is still live.
+pub fn task_idx_for_task_id(id: TaskId) -> Option<usize> {
+    let sched = SCHEDULER.lock();
+    sched.find(id)
+}
+
 /// Mark that per-task IPC teardown has completed for `id`.
 pub fn mark_ipc_cleaned(id: TaskId) {
     let mut sched = SCHEDULER.lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].ipc_cleaned = true;
     }
+}
+
+#[cfg(test)]
+fn test_task_entry() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
+    let mut sched = SCHEDULER.lock();
+    while sched.tasks.len() <= idx {
+        let mut filler = Task::new(test_task_entry, "test-filler");
+        filler.state = TaskState::Dead;
+        sched.tasks.push(filler);
+    }
+
+    let mut task = Task::new(test_task_entry, "test-cleanup");
+    task.id = task_id;
+    task.state = TaskState::Ready;
+    sched.tasks[idx] = task;
 }
 
 /// Return whether any live task other than `excluding` still holds a cap to
@@ -2023,7 +2067,6 @@ pub fn run() -> ! {
                         };
                         hog_info = Some((task.pid, task.name, ran_ticks, task.state, exec_path));
                     }
-
                     let wake_after_switch = task.wake_after_switch;
                     let blocked = matches!(
                         task.state,

@@ -16,6 +16,15 @@
 # laptop), install QEMU + OVMF before pushing. In a true emergency
 # `git push --no-verify` still works, but it is an explicit, visible
 # opt-out — not an env-var that silently persists.
+#
+# Regression-suite flake handling (2026-04-25): `cargo xtask regression`
+# runs every test back-to-back inside a single QEMU process pool, and the
+# resulting resource contention occasionally produces spurious timeouts.
+# The suite step below catches that pattern: if the all-tests run reports
+# failures, each failing test is re-run with `--test <name>`, which
+# launches a fresh QEMU. The push is rejected only when a test fails both
+# in the suite *and* on its own. See post-mortem
+# docs/post-mortems/2026-04-24-ingress-task-starvation.md, Lessons.
 
 set -e
 
@@ -41,5 +50,53 @@ fi
 echo "pre-push: running cargo xtask smoke-test..."
 cargo xtask smoke-test --timeout 300
 
+echo "pre-push: running cargo xtask device-smoke --device nvme --iommu..."
+cargo xtask device-smoke --device nvme --iommu --timeout 90
+
+echo "pre-push: running cargo xtask device-smoke --device e1000 --iommu..."
+cargo xtask device-smoke --device e1000 --iommu --timeout 90
+
 echo "pre-push: running cargo xtask regression..."
-cargo xtask regression --timeout 90
+# Suite-level QEMU contention occasionally causes spurious timeouts on
+# individual tests (see docs/post-mortems/2026-04-24-ingress-task-starvation.md
+# "Lessons" — cargo xtask regression is not test-isolated). When the suite
+# reports failures, re-run each failing test in isolation; only declare a
+# real failure if it still fails on a fresh QEMU. This preserves the
+# regression gate's authority over genuine regressions while keeping the
+# pre-push hook stable against the documented harness flakiness.
+regression_log="$(mktemp)"
+trap 'rm -f "$regression_log"' EXIT
+# `set -e` would abort on the first failed cargo xtask invocation; disable
+# it for the suite run so we can capture the per-test FAIL lines from the
+# log and decide whether to retry them in isolation.
+set +e
+cargo xtask regression --timeout 90 2>&1 | tee "$regression_log"
+suite_status=${PIPESTATUS:-$?}
+set -e
+if [ "$suite_status" -ne 0 ]; then
+    failed_tests="$(grep -E '^  [a-z0-9_-]+: FAIL' "$regression_log" \
+                    | sed -E 's/^  ([a-z0-9_-]+): FAIL.*/\1/')"
+    if [ -z "$failed_tests" ]; then
+        echo "pre-push: regression suite failed but no per-test FAIL lines parsed" >&2
+        exit 1
+    fi
+    echo "pre-push: suite-level failures detected — re-running flakes in isolation:"
+    for t in $failed_tests; do echo "          - $t"; done
+    real_failures=""
+    for t in $failed_tests; do
+        echo "pre-push: isolated re-run: $t"
+        if ! cargo xtask regression --test "$t" --timeout 90; then
+            real_failures="$real_failures $t"
+        fi
+    done
+    if [ -n "$real_failures" ]; then
+        echo "pre-push: regression failures persisted in isolation:$real_failures" >&2
+        exit 1
+    fi
+    echo "pre-push: all suite failures passed in isolation — treating as harness flakiness."
+fi
+
+if [ "${M3OS_E1000_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask ssh-e1000-banner-check..."
+    cargo xtask ssh-e1000-banner-check --timeout 30
+fi

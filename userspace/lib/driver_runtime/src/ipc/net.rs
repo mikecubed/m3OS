@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
-use super::{EndpointCap, IpcBackend, NotificationCap, RecvFrame, SyscallBackend};
+use super::{EndpointCap, IpcBackend, RecvResult, SyscallBackend};
 
 pub use kernel_core::driver_ipc::net::{
     MAX_FRAME_BYTES, NET_FRAME_HEADER_SIZE, NET_LINK_EVENT_BODY_SIZE, NET_LINK_EVENT_SIZE,
@@ -69,17 +69,14 @@ pub struct NetReply {
 /// Driver-side net server. See the module-level docs for the three
 /// cross-seam paths this type mediates.
 ///
-/// The RX endpoint and link notification are optional so a driver
-/// can construct a `NetServer` before the kernel has stood up either
-/// one; `publish_rx_frame` returns
+/// The kernel ingress endpoint is optional so a driver can construct a
+/// `NetServer` before the kernel has stood it up; `publish_rx_frame` returns
 /// [`DriverRuntimeError::Device(DeviceHostError::NotClaimed)`] if
-/// the RX endpoint is missing, and `publish_link_state` silently
-/// drops when the link notification is missing — a driver is
-/// expected to wire both before the first frame arrives.
+/// the ingress endpoint is missing. Drivers are expected to wire the
+/// ingress endpoint before the first RX frame or link-state event arrives.
 pub struct NetServer<B: IpcBackend = SyscallBackend> {
     endpoint: EndpointCap,
-    rx_endpoint: Option<EndpointCap>,
-    link_notification: Option<NotificationCap>,
+    ingress_endpoint: Option<EndpointCap>,
     pub(crate) backend: Mutex<B>,
 }
 
@@ -89,8 +86,7 @@ impl NetServer<SyscallBackend> {
     pub fn new(endpoint: EndpointCap) -> Self {
         Self {
             endpoint,
-            rx_endpoint: None,
-            link_notification: None,
+            ingress_endpoint: None,
             backend: Mutex::new(SyscallBackend),
         }
     }
@@ -103,27 +99,22 @@ impl<B: IpcBackend> NetServer<B> {
     pub fn with_backend(endpoint: EndpointCap, backend: B) -> Self {
         Self {
             endpoint,
-            rx_endpoint: None,
-            link_notification: None,
+            ingress_endpoint: None,
             backend: Mutex::new(backend),
         }
     }
 
-    /// Register the kernel endpoint the driver pushes RX frames to.
-    /// `publish_rx_frame` is only valid after this is set — a
-    /// driver's init path looks this endpoint up (via the service
-    /// manager) and stamps it here before entering its ISR loop.
-    pub fn with_rx_endpoint(mut self, rx: EndpointCap) -> Self {
-        self.rx_endpoint = Some(rx);
+    /// Register the kernel ingress endpoint the driver publishes both RX
+    /// frames and link-state events to.
+    pub fn with_ingress_endpoint(mut self, ingress: EndpointCap) -> Self {
+        self.ingress_endpoint = Some(ingress);
         self
     }
 
-    /// Register the notification capability the driver signals on
-    /// link-state changes. `publish_link_state` is a silent no-op
-    /// until this is set.
-    pub fn with_link_notification(mut self, notif: NotificationCap) -> Self {
-        self.link_notification = Some(notif);
-        self
+    /// Back-compat alias for older call sites that described the same kernel
+    /// endpoint as the RX endpoint.
+    pub fn with_rx_endpoint(self, rx: EndpointCap) -> Self {
+        self.with_ingress_endpoint(rx)
     }
 
     /// The command-endpoint this server listens on.
@@ -131,46 +122,71 @@ impl<B: IpcBackend> NetServer<B> {
         self.endpoint
     }
 
-    /// Pull one TX request off the endpoint, run the closure, reply.
+    /// Pull one TX request or notification off the endpoint and dispatch.
     ///
-    /// Behavior:
+    /// Two closures are required so the driver can act on both event
+    /// kinds in one call:
+    ///
+    /// - `on_message`: called with a decoded [`NetRequest`] when the
+    ///   kernel sends a TX request. Returns a [`NetReply`] whose
+    ///   `status` is encoded and sent back.
+    /// - `on_notification`: called with the drained notification bit
+    ///   mask when the notification bound to this endpoint via
+    ///   `sys_notif_bind` fires. No reply is sent for notifications.
+    ///
+    /// Behavior on `RecvResult::Message`:
     ///
     /// - Successful decode produces a [`NetRequest`] whose `frame`
     ///   field carries the peer's payload truncated to the minimum
     ///   of `header.frame_len` and the bytes actually present in
-    ///   the recv buffer. The closure returns a [`NetReply`] whose
-    ///   `status` is encoded as a single byte and stamped in the
-    ///   reply bulk slot.
+    ///   the recv buffer. The `on_message` closure returns a
+    ///   [`NetReply`] whose `status` is encoded as a single byte and
+    ///   stamped in the reply bulk slot.
     /// - Malformed decode replies with
     ///   [`NetDriverError::InvalidFrame`] and never runs the
     ///   closure. The method still returns `Ok(())` because the
     ///   frame was processed (badly, but not catastrophically).
-    pub fn handle_next<F>(&self, mut f: F) -> Result<(), DriverRuntimeError>
+    pub fn handle_next<F, G>(
+        &self,
+        mut on_message: F,
+        mut on_notification: G,
+    ) -> Result<(), DriverRuntimeError>
     where
         F: FnMut(NetRequest) -> NetReply,
+        G: FnMut(u64),
     {
-        let frame_in: RecvFrame = self.backend.lock().recv(self.endpoint)?;
-        match decode_net_send(&frame_in.bulk) {
-            Ok(header) => {
-                // Slice the trailing payload down to `frame_len` (or
-                // whatever the peer actually sent, if shorter).
-                let declared = header.frame_len as usize;
-                let start = NET_FRAME_HEADER_SIZE.min(frame_in.bulk.len());
-                let available = frame_in.bulk.len() - start;
-                let take = declared.min(available);
-                let frame_bytes = frame_in.bulk[start..start + take].to_vec();
-                let req = NetRequest {
-                    header,
-                    frame: frame_bytes,
-                };
-                let reply = f(req);
-                self.write_reply(reply, frame_in.label)
+        // Bind to a local so the MutexGuard is dropped before the match body
+        // calls write_reply (which re-acquires the lock).
+        let recv_result = self.backend.lock().recv(self.endpoint)?;
+        match recv_result {
+            RecvResult::Notification(bits) => {
+                on_notification(bits);
+                Ok(())
             }
-            Err(_) => {
-                let reply = NetReply {
-                    status: NetDriverError::InvalidFrame,
-                };
-                self.write_reply(reply, frame_in.label)
+            RecvResult::Message(frame_in) => {
+                match decode_net_send(&frame_in.bulk) {
+                    Ok(header) => {
+                        // Slice the trailing payload down to `frame_len` (or
+                        // whatever the peer actually sent, if shorter).
+                        let declared = header.frame_len as usize;
+                        let start = NET_FRAME_HEADER_SIZE.min(frame_in.bulk.len());
+                        let available = frame_in.bulk.len() - start;
+                        let take = declared.min(available);
+                        let frame_bytes = frame_in.bulk[start..start + take].to_vec();
+                        let req = NetRequest {
+                            header,
+                            frame: frame_bytes,
+                        };
+                        let reply = on_message(req);
+                        self.write_reply(reply, frame_in.label)
+                    }
+                    Err(_) => {
+                        let reply = NetReply {
+                            status: NetDriverError::InvalidFrame,
+                        };
+                        self.write_reply(reply, frame_in.label)
+                    }
+                }
             }
         }
     }
@@ -194,16 +210,36 @@ impl<B: IpcBackend> NetServer<B> {
     /// kernel buffer.
     ///
     /// The frame travels as a bulk payload alongside a
-    /// [`NET_RX_FRAME`]-labelled fire-and-forget send to the RX
-    /// endpoint the caller registered via
-    /// [`Self::with_rx_endpoint`].
+    /// [`NET_RX_FRAME`]-labelled fire-and-forget send to the kernel ingress
+    /// endpoint the caller registered via [`Self::with_ingress_endpoint`].
     pub fn publish_rx_frame(&self, frame: &[u8]) -> Result<(), DriverRuntimeError> {
-        if frame.len() > MAX_FRAME_BYTES as usize {
-            return Err(DriverRuntimeError::Device(
-                kernel_core::device_host::DeviceHostError::Internal,
-            ));
+        self.publish_rx_frames(core::slice::from_ref(&frame))
+    }
+
+    /// Batch variant of [`Self::publish_rx_frame`] — concatenates multiple
+    /// RX frames into a single `NET_RX_FRAME` bulk so the driver pays one
+    /// synchronous IPC rendezvous per drain pass instead of one per frame.
+    ///
+    /// The kernel-side ingress parser (`RemoteNic::inject_rx_frame`) walks
+    /// the bulk record-by-record, so a single-record bulk is identical to
+    /// the pre-batch protocol. Frames whose combined header+payload would
+    /// exceed the kernel's IPC bulk limit are split into multiple sends
+    /// (each sub-batch small enough to fit).
+    ///
+    /// Returns the first error encountered on the underlying `send_buf`
+    /// call. Frames in sub-batches before the failure were already delivered.
+    pub fn publish_rx_frames(&self, frames: &[&[u8]]) -> Result<(), DriverRuntimeError> {
+        if frames.is_empty() {
+            return Ok(());
         }
-        let rx = match self.rx_endpoint {
+        for frame in frames {
+            if frame.len() > MAX_FRAME_BYTES as usize {
+                return Err(DriverRuntimeError::Device(
+                    kernel_core::device_host::DeviceHostError::Internal,
+                ));
+            }
+        }
+        let ingress = match self.ingress_endpoint {
             Some(ep) => ep,
             None => {
                 return Err(DriverRuntimeError::Device(
@@ -211,48 +247,52 @@ impl<B: IpcBackend> NetServer<B> {
                 ));
             }
         };
-        let header = NetFrameHeader {
-            kind: NET_RX_FRAME,
-            frame_len: frame.len() as u16,
-            flags: 0,
-        };
-        let mut bulk = encode_net_rx_notify(header);
-        bulk.extend_from_slice(frame);
-        self.backend
-            .lock()
-            .send_buf(rx, NET_RX_FRAME as u64, 0, &bulk)
+
+        // Kernel `ipc_send_buf` caps bulk at 4 KiB. Group frames into
+        // sub-batches small enough to fit; the common case for interactive
+        // workloads is 1–2 frames per drain, which fits in a single send.
+        const MAX_BULK_BYTES: usize = 4096;
+        let mut bulk: Vec<u8> = Vec::new();
+
+        for frame in frames {
+            let record_size = NET_FRAME_HEADER_SIZE + frame.len();
+            if !bulk.is_empty() && bulk.len() + record_size > MAX_BULK_BYTES {
+                self.backend
+                    .lock()
+                    .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)?;
+                bulk.clear();
+            }
+            let header = NetFrameHeader {
+                kind: NET_RX_FRAME,
+                frame_len: frame.len() as u16,
+                flags: 0,
+            };
+            bulk.extend_from_slice(&encode_net_rx_notify(header));
+            bulk.extend_from_slice(frame);
+        }
+
+        if !bulk.is_empty() {
+            self.backend
+                .lock()
+                .send_buf(ingress, NET_RX_FRAME as u64, 0, &bulk)?;
+        }
+        Ok(())
     }
 
-    /// Signal link-state change to the kernel net stack.
-    ///
-    /// The signal word packs the `up` flag in bit 0 so the kernel
-    /// can wake on link-up / link-down edges without pulling the
-    /// full event out of a side channel. Encoded speed rides in
-    /// the bits above so a single 64-bit signal communicates the
-    /// whole event without a follow-up RPC.
-    ///
-    /// The schema's [`encode_net_link_event`] bytes are not sent
-    /// over the notification — they are staged in a way the
-    /// kernel-side `RemoteNic` can poll if it wants the full
-    /// breakdown (MAC, speed) and reconcile against its own
-    /// policy. For the C.4 contract test we only assert the
-    /// notification's bit-0 edge is delivered.
-    pub fn publish_link_state(&self, state: NetLinkEvent) {
-        let notif = match self.link_notification {
-            Some(n) => n,
-            None => return,
+    /// Publish a `NET_LINK_STATE` event to the kernel net stack.
+    pub fn publish_link_state(&self, state: NetLinkEvent) -> Result<(), DriverRuntimeError> {
+        let ingress = match self.ingress_endpoint {
+            Some(ep) => ep,
+            None => {
+                return Err(DriverRuntimeError::Device(
+                    kernel_core::device_host::DeviceHostError::NotClaimed,
+                ));
+            }
         };
-        // Bit 0 = up, bits 32..64 = speed (mbps).
-        let mut bits = 0u64;
-        if state.up {
-            bits |= 0x1;
-        }
-        bits |= (state.speed_mbps as u64) << 32;
-        // Silently absorb signalling errors — a driver that can't
-        // reach the notification cap is already in a bad state and
-        // the kernel supervisor will restart it; we don't want to
-        // panic from an interrupt-adjacent path.
-        let _ = self.backend.lock().signal_notification(notif, bits);
+        let bulk = encode_net_link_event(state);
+        self.backend
+            .lock()
+            .send_buf(ingress, NET_LINK_STATE as u64, 0, &bulk)
     }
 }
 
@@ -282,7 +322,7 @@ fn net_driver_error_to_byte(e: NetDriverError) -> u8 {
 mod tests {
     use super::*;
     use crate::ipc::mock::MockBackend;
-    use crate::ipc::{EndpointCap, NotificationCap, RecvFrame};
+    use crate::ipc::{EndpointCap, RecvFrame};
 
     fn ep() -> EndpointCap {
         EndpointCap::new(11)
@@ -290,10 +330,6 @@ mod tests {
     fn rx_ep() -> EndpointCap {
         EndpointCap::new(12)
     }
-    fn link_notif() -> NotificationCap {
-        NotificationCap::new(13)
-    }
-
     fn send_frame_bytes(frame_len: u16, frame: &[u8]) -> Vec<u8> {
         let header = NetFrameHeader {
             kind: NET_SEND_FRAME,
@@ -317,12 +353,15 @@ mod tests {
 
         let server = NetServer::with_backend(ep(), mock);
         let observed: core::cell::RefCell<Option<NetRequest>> = core::cell::RefCell::new(None);
-        let result = server.handle_next(|req| {
-            *observed.borrow_mut() = Some(req.clone());
-            NetReply {
-                status: NetDriverError::Ok,
-            }
-        });
+        let result = server.handle_next(
+            |req| {
+                *observed.borrow_mut() = Some(req.clone());
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {},
+        );
         assert!(result.is_ok());
 
         let seen = observed.borrow().clone().expect("closure ran");
@@ -351,12 +390,15 @@ mod tests {
 
         let server = NetServer::with_backend(ep(), mock);
         let closure_called = core::cell::Cell::new(false);
-        let result = server.handle_next(|_| {
-            closure_called.set(true);
-            NetReply {
-                status: NetDriverError::Ok,
-            }
-        });
+        let result = server.handle_next(
+            |_| {
+                closure_called.set(true);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {},
+        );
         assert!(result.is_ok());
         assert!(!closure_called.get(), "closure must not run on malformed");
 
@@ -370,9 +412,8 @@ mod tests {
 
     #[test]
     fn publish_rx_frame_emits_rx_notify_envelope_with_frame_bulk() {
-        let server = NetServer::with_backend(ep(), MockBackend::new())
-            .with_rx_endpoint(rx_ep())
-            .with_link_notification(link_notif());
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
 
         let frame: Vec<u8> = (0u8..64).collect();
         let result = server.publish_rx_frame(&frame);
@@ -404,25 +445,174 @@ mod tests {
     }
 
     #[test]
-    fn publish_link_state_signals_encoded_link_event_on_notification() {
+    fn publish_rx_frames_batches_multiple_frames_into_one_send() {
         let server =
-            NetServer::with_backend(ep(), MockBackend::new()).with_link_notification(link_notif());
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+
+        let frame_a: Vec<u8> = (0u8..16).collect();
+        let frame_b: Vec<u8> = (16u8..48).collect();
+        let frame_c: Vec<u8> = (48u8..80).collect();
+        let frames: Vec<&[u8]> =
+            alloc::vec![frame_a.as_slice(), frame_b.as_slice(), frame_c.as_slice()];
+        server.publish_rx_frames(&frames).expect("batch publish");
+
+        let mock = server.backend.lock();
+        // Three small frames easily fit in one 4 KiB bulk — one send_buf.
+        assert_eq!(mock.sends.len(), 1);
+        let send = &mock.sends[0];
+        assert_eq!(send.label, NET_RX_FRAME as u64);
+
+        // Walk the bulk: each record is [header, frame_bytes], concatenated.
+        let mut pos = 0;
+        for expected in [&frame_a, &frame_b, &frame_c] {
+            let hdr = decode_net_rx_notify(&send.bulk[pos..pos + NET_FRAME_HEADER_SIZE])
+                .expect("header decodes");
+            assert_eq!(hdr.kind, NET_RX_FRAME);
+            assert_eq!(hdr.frame_len as usize, expected.len());
+            pos += NET_FRAME_HEADER_SIZE;
+            assert_eq!(&send.bulk[pos..pos + expected.len()], expected.as_slice());
+            pos += expected.len();
+        }
+        assert_eq!(pos, send.bulk.len());
+    }
+
+    #[test]
+    fn publish_rx_frames_splits_into_sub_batches_when_bulk_would_overflow() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+
+        // Two max-size frames would exceed 4 KiB when concatenated with their
+        // headers, so the publisher must split them across two send_buf calls.
+        let big = alloc::vec![0x55u8; MAX_FRAME_BYTES as usize];
+        let frames: Vec<&[u8]> = alloc::vec![big.as_slice(), big.as_slice(), big.as_slice()];
+        server
+            .publish_rx_frames(&frames)
+            .expect("split-batch publish");
+
+        let mock = server.backend.lock();
+        // 3 × (1522 + 8) = 4590 bytes total — must be at least two sub-batches
+        // since a single 4 KiB bulk holds at most two full-size frames.
+        assert!(
+            mock.sends.len() >= 2,
+            "expected >= 2 sub-batches, got {}",
+            mock.sends.len()
+        );
+        for send in &mock.sends {
+            assert!(
+                send.bulk.len() <= 4096,
+                "sub-batch bulk exceeds kernel limit: {}",
+                send.bulk.len()
+            );
+        }
+    }
+
+    #[test]
+    fn publish_rx_frames_rejects_oversized_frame_and_sends_nothing() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
+        let oversized = alloc::vec![0u8; (MAX_FRAME_BYTES as usize) + 1];
+        let frames: Vec<&[u8]> = alloc::vec![oversized.as_slice()];
+        assert!(server.publish_rx_frames(&frames).is_err());
+        let mock = server.backend.lock();
+        assert_eq!(mock.sends.len(), 0);
+    }
+
+    #[test]
+    fn publish_link_state_emits_link_event_on_ingress_endpoint() {
+        let server =
+            NetServer::with_backend(ep(), MockBackend::new()).with_ingress_endpoint(rx_ep());
 
         let event = NetLinkEvent {
             up: true,
             mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
             speed_mbps: 1000,
         };
-        server.publish_link_state(event);
+        server
+            .publish_link_state(event)
+            .expect("link-state publish must send on the ingress endpoint");
 
         let mock = server.backend.lock();
-        assert_eq!(mock.signals.len(), 1);
-        let sig = &mock.signals[0];
-        assert_eq!(sig.notif, link_notif());
-        // The signal bit word packs the `up` flag so the kernel can
-        // wake on link-up / link-down edges without pulling the
-        // full event out of a side channel. At minimum the low bit
-        // must be set when `up == true`.
-        assert_ne!(sig.bits & 0x1, 0);
+        assert_eq!(mock.sends.len(), 1);
+        let send = &mock.sends[0];
+        assert_eq!(send.endpoint, rx_ep());
+        assert_eq!(send.label, NET_LINK_STATE as u64);
+        let decoded = decode_net_link_event(&send.bulk).expect("link-state payload decodes");
+        assert_eq!(decoded, event);
+    }
+
+    // -- Track E.1 tests ---------------------------------------------------
+
+    #[test]
+    fn net_server_handle_next_dispatches_message_variant() {
+        let frame: Vec<u8> = (0u8..32).collect();
+        let mut mock = MockBackend::new();
+        mock.push_request(RecvFrame {
+            label: NET_SEND_FRAME as u64,
+            data0: 0,
+            bulk: send_frame_bytes(frame.len() as u16, &frame),
+        });
+
+        let server = NetServer::with_backend(ep(), mock);
+        let message_called = core::cell::Cell::new(false);
+        let notif_called = core::cell::Cell::new(false);
+
+        let result = server.handle_next(
+            |req| {
+                message_called.set(true);
+                assert_eq!(req.frame, frame);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |_bits| {
+                notif_called.set(true);
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            message_called.get(),
+            "on_message must be called for Message variant"
+        );
+        assert!(
+            !notif_called.get(),
+            "on_notification must not be called for Message variant"
+        );
+    }
+
+    #[test]
+    fn net_server_handle_next_dispatches_notification_variant() {
+        const NOTIF_BITS: u64 = 0b0011;
+        let mut mock = MockBackend::new();
+        mock.push_notification(NOTIF_BITS);
+
+        let server = NetServer::with_backend(ep(), mock);
+        let message_called = core::cell::Cell::new(false);
+        let observed_bits: core::cell::Cell<u64> = core::cell::Cell::new(0);
+
+        let result = server.handle_next(
+            |_req| {
+                message_called.set(true);
+                NetReply {
+                    status: NetDriverError::Ok,
+                }
+            },
+            |bits| {
+                observed_bits.set(bits);
+            },
+        );
+        assert!(result.is_ok());
+        assert!(
+            !message_called.get(),
+            "on_message must not be called for Notification variant"
+        );
+        assert_eq!(
+            observed_bits.get(),
+            NOTIF_BITS,
+            "on_notification receives the drained bits"
+        );
+
+        // No reply should have been sent for a notification wake.
+        let mock = server.backend.lock();
+        assert_eq!(mock.replies.len(), 0, "no reply for notification wake");
     }
 }

@@ -16,9 +16,9 @@
 
 use syscall_lib::{
     AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SockaddrUn, WNOHANG,
-    clock_gettime, close, execve, exit, fork, getdents64, kill, mount, nanosleep, open, read,
-    rt_sigaction_simple, sendto_unix, set_nonblocking, setuid, socket, waitpid, write, write_str,
-    write_u64,
+    clock_gettime, close, execve, exit, fork, getdents64, kill, mount, nanosleep, nanosleep_for,
+    open, read, rt_sigaction_simple, sendto_unix, set_nonblocking, setuid, socket, waitpid, write,
+    write_str, write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,7 +41,6 @@ const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
-const SMOKE_MODE_SETTLE_SECS: u64 = 3;
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -691,12 +690,20 @@ struct ServiceManager {
     count: usize,
     discovered_disabled: [FixedStr<MAX_NAME>; MAX_DISCOVERED_DISABLED],
     discovered_disabled_count: usize,
+    /// Cached disabled-marker state for `/etc/services.d/<name>.disabled`.
+    /// Populated by `refresh_disabled_cache()` at startup and after every
+    /// enable/disable control command. Reap-loop status writes consult this
+    /// cache instead of issuing synchronous `open()` calls through
+    /// `vfs_server`, which prevents PID 1 from stalling in `BlockedOnReply`.
+    disabled_cache: [FixedStr<MAX_NAME>; MAX_DISCOVERED_DISABLED],
+    disabled_cache_count: usize,
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
     respawn_login: bool,
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
+    defer_status_writes: bool,
 }
 
 /// Syslog severity levels.
@@ -718,11 +725,14 @@ impl ServiceManager {
             count: 0,
             discovered_disabled: [FixedStr::new(); MAX_DISCOVERED_DISABLED],
             discovered_disabled_count: 0,
+            disabled_cache: [FixedStr::new(); MAX_DISCOVERED_DISABLED],
+            disabled_cache_count: 0,
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
             respawn_login: true,
             syslog_fd: -1,
+            defer_status_writes: false,
         }
     }
 
@@ -967,6 +977,7 @@ impl ServiceManager {
 
     /// Boot all services in dependency order.
     fn boot_services(&mut self) {
+        self.defer_status_writes = true;
         let (graph, unresolvable) = DepGraph::build(&self.services, self.count);
 
         // Mark services with unresolvable deps as PermanentlyStopped.
@@ -984,8 +995,6 @@ impl ServiceManager {
             }
             i += 1;
         }
-        self.write_status_file();
-
         // Check for cycles.
         if graph.has_cycle(self.count) {
             write_str(
@@ -1020,6 +1029,7 @@ impl ServiceManager {
                 }
                 si += 1;
             }
+            self.defer_status_writes = false;
             return;
         }
 
@@ -1044,6 +1054,7 @@ impl ServiceManager {
             }
             i += 1;
         }
+        self.defer_status_writes = false;
     }
 
     fn check_deps_ready(&self, graph: &DepGraph, idx: usize) -> bool {
@@ -1075,9 +1086,17 @@ impl ServiceManager {
 
         svc.status = ServiceStatus::Starting;
 
-        write_str(STDOUT_FILENO, "init: starting '");
-        write(STDOUT_FILENO, svc.name.as_bytes());
-        write_str(STDOUT_FILENO, "'\n");
+        // Emit the "init: starting 'name'\n" line in one syscall — same
+        // rationale as the batched "init: started 'name' pid=N\n" write
+        // below. Otherwise the two init-initiated writes race with output
+        // from concurrently-spawned services on the shared serial console
+        // and break regression pattern matching.
+        let mut starting_buf = [0u8; 64];
+        let mut starting_pos = 0;
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, b"init: starting '");
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, svc.name.as_bytes());
+        starting_pos += append_to_buf(&mut starting_buf, starting_pos, b"'\n");
+        write(STDOUT_FILENO, &starting_buf[..starting_pos]);
 
         let pid = fork();
         if pid < 0 {
@@ -1136,15 +1155,27 @@ impl ServiceManager {
         self.services[idx].last_change_time = now;
         self.pid_table.insert(pid as i32, idx);
 
-        write_str(STDOUT_FILENO, "init: started '");
-        write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-        write_str(STDOUT_FILENO, "' pid=");
-        write_u64(STDOUT_FILENO, pid as u64);
-        write_str(STDOUT_FILENO, "\n");
+        // Emit the "init: started 'name' pid=N\n" line in one syscall so
+        // output from the just-forked child can't land mid-line on the shared
+        // serial console. Interleaved mid-line writes caused the regression
+        // test harness to miss the "init: started 'net_udp' pid=" pattern in
+        // roughly half of runs — see the step 1 timeout failures in the
+        // Phase 55c regression report.
+        let mut buf = [0u8; 96];
+        let mut pos = 0;
+        pos += append_to_buf(&mut buf, pos, b"init: started '");
+        pos += append_to_buf(&mut buf, pos, self.services[idx].name.as_bytes());
+        pos += append_to_buf(&mut buf, pos, b"' pid=");
+        pos += append_u64_to_buf(&mut buf, pos, pid as u64);
+        pos += append_to_buf(&mut buf, pos, b"\n");
+        write(STDOUT_FILENO, &buf[..pos]);
         self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
 
-        // Write status immediately on state transition.
-        self.write_status_file();
+        // During the initial boot wave, batch status writes so PID 1 doesn't
+        // stall on a filesystem round-trip after every single service fork.
+        if !self.defer_status_writes {
+            self.write_status_file();
+        }
     }
 
     /// Handle a reaped child PID with its exit status.
@@ -1552,6 +1583,17 @@ impl ServiceManager {
     }
 
     /// Append disabled services so they remain visible to `service list`.
+    ///
+    /// Historically this performed synchronous `open()` calls on each
+    /// `/etc/services.d/<name>.disabled` marker to probe disabled state. Under
+    /// the ring-3 VFS service topology (Phase 54+) those O_RDONLY opens route
+    /// through `vfs_server` — which means every reap-loop status write blocks
+    /// PID 1 in `BlockedOnReply` waiting for a reply that gets starved by the
+    /// interactive shell. The resulting stall prevented `init` from processing
+    /// `/run/init.cmd` control commands, which in turn broke
+    /// `service stop <name>` end-to-end. We now rely on the cached
+    /// `disabled_mask` populated during `load_services()` and refreshed by
+    /// the `enable`/`disable` control commands, so no per-write IPC is needed.
     fn write_disabled_entries(&self, fd: i32) {
         for path in KNOWN_CONFIGS {
             let prefix = b"/etc/services.d/";
@@ -1561,15 +1603,9 @@ impl ServiceManager {
             }
             let name = &path[prefix.len()..path.len() - suffix.len()];
 
-            if self.has_loaded_service(name) || !Self::is_disabled(name) {
+            if self.has_loaded_service(name) || !self.is_disabled_cached(name) {
                 continue;
             }
-
-            let cfg_fd = open(path, O_RDONLY, 0);
-            if cfg_fd < 0 {
-                continue;
-            }
-            close(cfg_fd as i32);
 
             write(fd, name);
             write_str(fd, " disabled pid=0 restarts=0 changed=0\n");
@@ -1580,7 +1616,7 @@ impl ServiceManager {
             let name = self.discovered_disabled[i].as_bytes();
             if self.has_loaded_service(name)
                 || self.is_known_config_name(name)
-                || !Self::is_disabled(name)
+                || !self.is_disabled_cached(name)
             {
                 i += 1;
                 continue;
@@ -1621,6 +1657,16 @@ impl ServiceManager {
         }
         let n = n as usize;
 
+        // Diagnostic: record what command we received so the regression
+        // harness can correlate "service: stop X requested" with init's
+        // actual parse result.
+        write_str(STDOUT_FILENO, "init: control: received ");
+        let echo_len = n.min(buf.len()).min(64);
+        let _ = write(STDOUT_FILENO, &buf[..echo_len]);
+        if echo_len > 0 && buf[echo_len - 1] != b'\n' {
+            write_str(STDOUT_FILENO, "\n");
+        }
+
         // Parse command: "start <name>", "stop <name>", "restart <name>"
         if n >= 6 && bytes_eq(&buf[..5], b"start") && buf[5] == b' ' {
             let name = trim_newline(&buf[6..n]);
@@ -1659,6 +1705,8 @@ impl ServiceManager {
             write_str(STDOUT_FILENO, "'\n");
             // Write marker file /etc/services.d/<name>.disabled
             Self::write_disabled_marker(name);
+            self.remember_disabled_service(name);
+            self.refresh_disabled_cache();
         } else if n >= 7 && bytes_eq(&buf[..6], b"enable") && buf[6] == b' ' {
             let name = trim_newline(&buf[7..n]);
             write_str(STDOUT_FILENO, "init: control: enabling '");
@@ -1666,6 +1714,7 @@ impl ServiceManager {
             write_str(STDOUT_FILENO, "'\n");
             // Remove marker file /etc/services.d/<name>.disabled
             Self::remove_disabled_marker(name);
+            self.refresh_disabled_cache();
         }
     }
 
@@ -1750,6 +1799,72 @@ impl ServiceManager {
         None
     }
 
+    /// Fast in-memory lookup for the disabled-marker cache. Used by the
+    /// reap-loop status writer to avoid per-iteration IPC to `vfs_server`.
+    fn is_disabled_cached(&self, name: &[u8]) -> bool {
+        let mut i = 0;
+        while i < self.disabled_cache_count {
+            if self.disabled_cache[i].eq_bytes(name) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Rebuild `disabled_cache` by probing each candidate `.disabled` marker
+    /// once. Invoked at startup (after the root filesystem mounts) and again
+    /// whenever a control command enables or disables a service — never from
+    /// the hot reap-loop path.
+    fn refresh_disabled_cache(&mut self) {
+        self.disabled_cache_count = 0;
+        let remember = |slot: &mut [FixedStr<MAX_NAME>; MAX_DISCOVERED_DISABLED],
+                        count: &mut usize,
+                        name: &[u8]| {
+            let mut i = 0;
+            while i < *count {
+                if slot[i].eq_bytes(name) {
+                    return;
+                }
+                i += 1;
+            }
+            if *count < MAX_DISCOVERED_DISABLED {
+                slot[*count] = FixedStr::from_bytes(name);
+                *count += 1;
+            }
+        };
+
+        for path in KNOWN_CONFIGS {
+            let prefix = b"/etc/services.d/";
+            let suffix = b".conf\0";
+            if path.len() <= prefix.len() + suffix.len() {
+                continue;
+            }
+            let name = &path[prefix.len()..path.len() - suffix.len()];
+            if Self::is_disabled(name) {
+                remember(
+                    &mut self.disabled_cache,
+                    &mut self.disabled_cache_count,
+                    name,
+                );
+            }
+        }
+
+        let mut i = 0;
+        while i < self.discovered_disabled_count {
+            let name_buf = self.discovered_disabled[i];
+            let name = name_buf.as_bytes();
+            if Self::is_disabled(name) {
+                remember(
+                    &mut self.disabled_cache,
+                    &mut self.disabled_cache_count,
+                    name,
+                );
+            }
+            i += 1;
+        }
+    }
+
     fn remember_disabled_service(&mut self, name: &[u8]) {
         let mut i = 0;
         while i < self.discovered_disabled_count {
@@ -1797,6 +1912,47 @@ impl ServiceManager {
 
 /// Write a u32 value as decimal ASCII into a buffer. Returns bytes written.
 #[allow(dead_code)]
+/// Append `src` to `buf` starting at `pos`, truncating to `buf.len()`.
+/// Returns the number of bytes actually appended.
+fn append_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let avail = buf.len() - pos;
+    let n = src.len().min(avail);
+    buf[pos..pos + n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// Append decimal representation of `val` to `buf` starting at `pos`.
+/// Returns the number of bytes actually appended (may truncate on overflow).
+fn append_u64_to_buf(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let mut tmp = [0u8; 20];
+    let mut n = val;
+    let mut i = 0;
+    if n == 0 {
+        tmp[0] = b'0';
+        i = 1;
+    } else {
+        while n > 0 && i < tmp.len() {
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+    }
+    let avail = buf.len() - pos;
+    let len = i.min(avail);
+    let mut j = 0;
+    while j < len {
+        buf[pos + j] = tmp[i - 1 - j];
+        j += 1;
+    }
+    len
+}
+
 fn write_u32_to_buf(buf: &mut [u8], val: u32) -> usize {
     if val == 0 {
         if !buf.is_empty() {
@@ -1874,10 +2030,6 @@ fn spawn_login() -> i32 {
 fn spawn_smoke_runner() -> i32 {
     let pid = fork();
     if pid == 0 {
-        // Let boot-time services finish their initial ext2/syslog work before
-        // the smoke runner starts mutating the filesystem.
-        let _ = nanosleep(SMOKE_MODE_SETTLE_SECS);
-
         let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -1898,6 +2050,9 @@ fn spawn_smoke_runner() -> i32 {
         write_str(STDOUT_FILENO, "init: failed to fork smoke-runner\n");
         return -1;
     }
+    write_str(STDOUT_FILENO, "init: smoke-runner pid=");
+    write_u64(STDOUT_FILENO, pid as u64);
+    write_str(STDOUT_FILENO, "\n");
     pid as i32
 }
 
@@ -1906,8 +2061,10 @@ fn smoke_test_mode_enabled() -> bool {
     if fd < 0 {
         return false;
     }
+    let mut buf = [0u8; 4];
+    let n = read(fd as i32, &mut buf);
     close(fd as i32);
-    true
+    n > 0 && buf[0] == b'1'
 }
 
 // ---------------------------------------------------------------------------
@@ -1959,6 +2116,24 @@ pub extern "C" fn _start() -> ! {
     // Load service definitions.
     mgr.load_services();
 
+    // Cache the set of services that are disabled right now. Doing this once
+    // (before `vfs_server` registers) lets subsequent reap-loop status writes
+    // answer "is this name disabled?" from memory, avoiding the synchronous
+    // `open()` → `vfs_server` IPC round-trip that was starving PID 1.
+    mgr.refresh_disabled_cache();
+
+    // Check smoke-mode marker *before* booting services. At this point
+    // vfs_server has not been spawned yet, so the `open()` syscall falls
+    // back to the kernel's direct ext2 path and completes synchronously.
+    // If we check after `boot_services()` instead, the request races with
+    // vfs_server startup and can block PID 1 in `BlockedOnReply` before it
+    // reaches `spawn_login()` — the symptom observed in the `cargo xtask
+    // regression` harness where every test times out waiting for the login
+    // prompt even though all services have already started. See the
+    // 2026-04-23 boot / vfs post-mortem for the vfs-availability gap this
+    // avoids.
+    let smoke_mode = smoke_test_mode_enabled();
+
     // Boot all services in dependency order.
     mgr.boot_services();
 
@@ -1967,7 +2142,7 @@ pub extern "C" fn _start() -> ! {
 
     // Spawn the initial interactive session unless the smoke-test marker asks
     // PID 1 to run the guest smoke runner directly.
-    if smoke_test_mode_enabled() {
+    if smoke_mode {
         write_str(
             STDOUT_FILENO,
             "init: smoke-test mode enabled, scheduling /bin/smoke-runner\n",
@@ -1984,12 +2159,6 @@ pub extern "C" fn _start() -> ! {
             // Not fatal — services may still be running.
         }
     }
-
-    // Create control command file with root-only permissions (mode 0600).
-    mgr.create_control_file();
-
-    // Write initial status file.
-    mgr.write_status_file();
 
     // Track iterations for periodic status writes.
     let mut loop_count: u32 = 0;
@@ -2020,21 +2189,36 @@ pub extern "C" fn _start() -> ! {
             mgr.handle_child_exit(ret as i32, status);
         }
 
-        // Check for control commands every 3rd iteration (reduces syscall noise
-        // on serial, keeping control latency under 3 seconds).
         loop_count = loop_count.wrapping_add(1);
-        if loop_count.is_multiple_of(3) {
-            mgr.check_control_commands();
-        }
-
-        // Periodically write status file (every ~10 iterations).
-        if loop_count.is_multiple_of(10) {
+        if !smoke_mode && loop_count == 1 {
+            // Publish the control-file and status-file entrypoints as soon as
+            // the reap loop begins so `service` can hand work to PID 1 without
+            // waiting 10 iterations (~1 s at 100 ms/iter) for them to appear.
+            mgr.create_control_file();
             mgr.write_status_file();
         }
 
-        // Sleep briefly if no child was reaped to avoid busy-spinning.
+        // Check for control commands on every iteration. With the cooperative
+        // yield at the tail of the loop, control latency stays sub-second even
+        // when PID 1 shares a core with an interactive shell.
+        if !smoke_mode {
+            mgr.check_control_commands();
+        }
+
+        // Periodically write status file (every ~1 s at 100 ms/iter).
+        if !smoke_mode && loop_count.is_multiple_of(10) {
+            mgr.write_status_file();
+        }
+
+        // Yield once if no child was reaped. A single yield is cheap — the
+        // scheduler hands the CPU to other runnable tasks, then returns here.
+        // Using `nanosleep_for(0, 0)` is a compatible "yield" on this kernel:
+        // `sys_nanosleep` treats the zero-duration case as a cooperative yield.
+        // We intentionally avoid a timed sleep (even 100 ms) because the
+        // kernel's long-sleep path uses a TSC-yield loop that on a contended
+        // single core keeps PID 1 "running" and starves `serial-stdin`.
         if ret <= 0 {
-            nanosleep(1);
+            nanosleep_for(0, 0);
         }
     }
 }

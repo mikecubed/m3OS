@@ -29,8 +29,9 @@
 //!
 //! The ring-3 driver uses `ipc_send_buf` to deliver a `NET_RX_FRAME` header
 //! (8 bytes) + bulk frame. The kernel net task's existing receive endpoint
-//! calls `RemoteNic::inject_rx_frame` directly with the decoded frame bytes;
-//! that function calls `dispatch::process_rx_frames` and sets `NIC_WOKEN`.
+//! calls `RemoteNic::inject_rx_frame`, which validates and queues the raw frame
+//! bytes, then wakes the shared net task. The actual protocol dispatch runs in
+//! `drain_rx_queue`, matching the deferred-processing model used by virtio-net.
 //!
 //! # Link-state
 //!
@@ -48,8 +49,6 @@ use kernel_core::driver_ipc::net::{
 use kernel_core::types::{EndpointId, MacAddr};
 use spin::Mutex;
 
-use super::NIC_WOKEN;
-
 // ---------------------------------------------------------------------------
 // Tunable — TX queue depth cap
 // ---------------------------------------------------------------------------
@@ -58,6 +57,11 @@ use super::NIC_WOKEN;
 /// is not yet receiving. Frames beyond this cap are dropped with a warn log,
 /// matching the Phase 16 net-stack convention for overflow conditions.
 const TX_QUEUE_DEPTH: usize = 64;
+
+/// Maximum number of received frames staged for deferred dispatch by the
+/// shared network task. When this queue overflows frames are dropped so the
+/// ring-3 driver does not block indefinitely on synchronous ingress IPC.
+const RX_QUEUE_DEPTH: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Global facade registry
@@ -71,6 +75,9 @@ struct NicEntry {
     /// Pending TX frames: raw Ethernet bytes waiting to be forwarded to the
     /// driver endpoint via IPC.
     tx_queue: VecDeque<alloc::vec::Vec<u8>>,
+    /// Pending RX frames: raw Ethernet bytes staged by the net-ingress IPC
+    /// task and later dispatched by the shared net task.
+    rx_queue: VecDeque<alloc::vec::Vec<u8>>,
 }
 
 /// Global slot for the registered `RemoteNic`. `None` while no ring-3 NIC
@@ -86,6 +93,15 @@ static REMOTE_NIC_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `NetDriverError::DriverRestarting` instead of queuing the frame, mirroring
 /// the Phase 55b D.4b / F.2b semantics for the block path.
 static RESTART_SUSPECTED: AtomicBool = AtomicBool::new(false);
+
+/// Deduplicate the "driver absent" warn log on the `send_frame` hot path.
+/// Set when the first absent-driver warn is emitted; cleared on `register`.
+/// Subsequent `send_frame` calls during the same restart window skip the
+/// warn so the log is not flooded.  Matches the observability requirement in
+/// Phase 55c Track G.3: "logs `driver.absent` (warn, deduplicated) on the
+/// first send during a restart window; subsequent sends during the same window
+/// do not re-log until restart completes."
+static ABSENT_WARN_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Cold-path miss counter used by `is_registered` to rate-limit repeated
 /// service-registry lookups when no ring-3 NIC driver is present. An actual
@@ -124,12 +140,16 @@ impl RemoteNic {
                 endpoint,
                 mac,
                 tx_queue: VecDeque::new(),
+                rx_queue: VecDeque::new(),
             });
         }
         REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
         // Clear restart-suspected on successful re-registration so subsequent
         // send_frame calls are admitted again.
         RESTART_SUSPECTED.store(false, Ordering::Release);
+        // Clear the absent-warn dedup flag so the first send after a restart
+        // emits a fresh log line if the driver goes absent again.
+        ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
         // Reset the cold-path miss counter so the first post-(re)registration
         // lookup is not deferred by the retry cadence.
         LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
@@ -198,6 +218,7 @@ impl RemoteNic {
                         endpoint: ep,
                         mac: [0u8; 6],
                         tx_queue: VecDeque::new(),
+                        rx_queue: VecDeque::new(),
                     });
                 }
             }
@@ -217,6 +238,33 @@ impl RemoteNic {
     /// driver is registered.
     pub fn mac_address() -> Option<MacAddr> {
         REMOTE_NIC.lock().as_ref().map(|e| e.mac)
+    }
+
+    /// Phase 55c Track G R1 — pre-send errno gate for `sys_sendto`.
+    ///
+    /// Loads the live restart flags and forwards them to the host-testable
+    /// `kernel_core::driver_ipc::net::sendto_restart_errno()` seam that the
+    /// UDP/ICMP syscall path also relies on.
+    ///
+    /// **Consume-on-observe semantics (post-mortem 2026-04-24):** when the
+    /// gate fires (registered && suspected), `RESTART_SUSPECTED` is cleared
+    /// atomically as part of the read so a subsequent sendto succeeds.
+    /// Without this, the restart latch can survive multiple sendto retries
+    /// because the driver's link-state-bootstrap path leaves the flag set
+    /// for arbitrary durations after the new driver re-registers, breaking
+    /// the `e1000-restart-crash` H.1 contract that observed EAGAIN should
+    /// transition to a successful send within the test's polling window.
+    pub fn sendto_restart_ret() -> Option<i64> {
+        let registered = REMOTE_NIC_REGISTERED.load(Ordering::Acquire);
+        let suspected = RESTART_SUSPECTED.load(Ordering::Acquire);
+        if let Some(errno) =
+            kernel_core::driver_ipc::net::sendto_restart_errno(registered, suspected)
+        {
+            // Latch consumed: clear so subsequent sendto's see steady state.
+            RESTART_SUSPECTED.store(false, Ordering::Release);
+            return Some(errno);
+        }
+        None
     }
 
     /// Enqueue a raw Ethernet frame for delivery to the ring-3 driver over IPC.
@@ -245,7 +293,12 @@ impl RemoteNic {
         let entry = match slot.as_mut() {
             Some(e) => e,
             None => {
-                log::warn!("[remote_nic] send_frame: driver absent");
+                // Deduplicate: only emit the warn on the first absent-driver
+                // call per restart window.  Subsequent calls are silently
+                // counted until `register()` clears `ABSENT_WARN_EMITTED`.
+                if !ABSENT_WARN_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[remote_nic] driver.absent: no ring-3 NIC registered");
+                }
                 return Err(NetDriverError::DeviceAbsent);
             }
         };
@@ -262,6 +315,7 @@ impl RemoteNic {
             frame.len(),
             entry.tx_queue.len(),
         );
+        crate::net::virtio_net::wake_net_task();
         Ok(())
     }
 
@@ -315,8 +369,9 @@ impl RemoteNic {
             let mut bulk = alloc::vec::Vec::with_capacity(hdr_bytes.len() + frame.len());
             bulk.extend_from_slice(&hdr_bytes);
             bulk.extend_from_slice(frame);
+            let bulk_len = bulk.len();
             scheduler::deliver_bulk(task_id, bulk);
-            let msg = Message::with2(NET_SEND_FRAME as u64, frame.len() as u64, 0);
+            let msg = Message::with2(NET_SEND_FRAME as u64, 0, bulk_len as u64);
             if endpoint::send(task_id, endpoint, msg) {
                 forwarded += 1;
             } else {
@@ -357,47 +412,134 @@ impl RemoteNic {
         }
     }
 
-    /// Inject a single received Ethernet frame into the kernel net stack.
+    /// Driver-death detection hook fired by `cleanup_task_ipc` when an
+    /// endpoint owned by a dying task is closed.
     ///
-    /// Called from the net task's IPC receive loop when the driver sends a
-    /// `NET_RX_FRAME` message. The `header_and_frame` slice must contain a
-    /// valid `NET_RX_FRAME` header (8 bytes) followed by the raw Ethernet
-    /// frame bytes.
+    /// Decouples the restart-suspected latch from the `drain_tx_queue`
+    /// IPC-failure path so the kernel can mark the driver gone immediately
+    /// on process exit, even when no TX traffic is in flight to trigger a
+    /// send failure within the supervisor's restart window. Independent of
+    /// the ingress transport — works for SIGKILL on the e1000 driver
+    /// regardless of whether the RX path is wired.
     ///
-    /// On success, the frame is passed to `dispatch::process_rx_frames` and
-    /// `NIC_WOKEN` is set to wake the net task's next poll iteration.
-    /// Returns the number of frames actually dispatched (0 or 1) — a frame
-    /// rejected by the Ethernet parser is counted as zero so metrics and
-    /// callers that read the return value do not over-report throughput.
+    /// Sets `RESTART_SUSPECTED` only — `REMOTE_NIC_REGISTERED` is
+    /// intentionally left at its (now-stale) value because
+    /// `sendto_restart_errno` returns EAGAIN exactly when
+    /// `is_registered && is_restarting`. Clearing the registered flag here
+    /// would suppress EAGAIN until the driver re-registered, which is the
+    /// opposite of what `e1000-restart-crash`'s H.1 assertion exercises.
+    ///
+    /// No-op when no driver is registered, or when the closed endpoint is not
+    /// the registered command endpoint.
+    pub fn on_endpoint_closed(ep_id: EndpointId) {
+        // Fast-path: skip the mutex acquisition entirely when no driver
+        // is registered. The cleanup path runs for every dying task's
+        // every owned endpoint, so the no-driver case (every cleanup in
+        // the no-e1000 regression suite) must stay lock-free.
+        if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+            return;
+        }
+        let registered = REMOTE_NIC.lock().as_ref().map(|e| e.endpoint);
+        if registered == Some(ep_id) {
+            log::warn!(
+                "[remote_nic] command endpoint {:?} closed by owner exit — \
+                 marking restart-suspected",
+                ep_id,
+            );
+            Self::on_ipc_error();
+        }
+    }
+
+    /// Inject one or more received Ethernet frames into the kernel net stack.
+    ///
+    /// Called from the `net.nic.ingress` task's IPC receive loop when the
+    /// driver sends a `NET_RX_FRAME` message. The bulk is a concatenation of
+    /// `[NetFrameHeader, frame_bytes]` records so the driver can batch several
+    /// RX frames into a single synchronous IPC send and only pay one
+    /// send-side rendezvous per drain pass instead of one per frame. A
+    /// single-record bulk (the pre-batch layout) is just the N=1 case.
+    ///
+    /// On success each record is copied into the bounded RemoteNic RX queue
+    /// and the shared net task is woken. Returns the number of frames queued.
     pub fn inject_rx_frame(header_and_frame: &[u8]) -> usize {
-        match decode_net_rx_notify(header_and_frame) {
-            Ok(hdr) => {
-                let frame_len = hdr.frame_len as usize;
-                let header_size = kernel_core::driver_ipc::net::NET_FRAME_HEADER_SIZE;
-                if header_and_frame.len() < header_size + frame_len {
+        let header_size = kernel_core::driver_ipc::net::NET_FRAME_HEADER_SIZE;
+        let mut pos = 0;
+        let mut queued = 0usize;
+        if !REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+            let _ = Self::is_registered();
+        }
+        while pos + header_size <= header_and_frame.len() {
+            let hdr = match decode_net_rx_notify(&header_and_frame[pos..pos + header_size]) {
+                Ok(h) => h,
+                Err(e) => {
                     log::warn!(
-                        "[remote_nic] RX: payload shorter than declared frame_len {}",
-                        frame_len,
+                        "[remote_nic] RX: bad NET_RX_FRAME header at offset {}: {:?}",
+                        pos,
+                        e,
                     );
-                    return 0;
+                    break;
                 }
-                let frame = &header_and_frame[header_size..header_size + frame_len];
-                if super::dispatch::process_rx_frames(frame) {
-                    NIC_WOKEN.store(true, Ordering::Release);
-                    1
-                } else {
+            };
+            let frame_len = hdr.frame_len as usize;
+            if pos + header_size + frame_len > header_and_frame.len() {
+                log::warn!(
+                    "[remote_nic] RX: payload shorter than declared frame_len {} at offset {}",
+                    frame_len,
+                    pos,
+                );
+                break;
+            }
+            let frame = &header_and_frame[pos + header_size..pos + header_size + frame_len];
+            {
+                let mut slot = REMOTE_NIC.lock();
+                let Some(entry) = slot.as_mut() else {
+                    log::warn!("[remote_nic] RX: no ring-3 NIC registered");
+                    break;
+                };
+                if entry.rx_queue.len() >= RX_QUEUE_DEPTH {
                     log::warn!(
-                        "[remote_nic] RX: malformed Ethernet frame dropped ({} bytes)",
+                        "[remote_nic] RX queue full ({} frames) — dropping {}-byte frame",
+                        RX_QUEUE_DEPTH,
                         frame.len(),
                     );
-                    0
+                } else {
+                    entry.rx_queue.push_back(frame.to_vec());
+                    queued += 1;
                 }
             }
-            Err(e) => {
-                log::warn!("[remote_nic] RX: bad NET_RX_FRAME header: {:?}", e);
-                0
+            pos += header_size + frame_len;
+        }
+        if queued > 0 {
+            crate::net::virtio_net::wake_net_task();
+        }
+        queued
+    }
+
+    /// Drain deferred RX frames staged by `inject_rx_frame`.
+    ///
+    /// Called from the shared network task so ring-3 NIC ingress follows the
+    /// same deferred-dispatch model as virtio-net. Returns the number of
+    /// frames successfully accepted by the protocol stack.
+    pub fn drain_rx_queue() -> usize {
+        let frames = {
+            let mut slot = REMOTE_NIC.lock();
+            let Some(entry) = slot.as_mut() else {
+                return 0;
+            };
+            entry.rx_queue.drain(..).collect::<alloc::vec::Vec<_>>()
+        };
+        let mut dispatched = 0usize;
+        for frame in frames {
+            if super::dispatch::process_rx_frames(&frame) {
+                dispatched += 1;
+            } else {
+                log::warn!(
+                    "[remote_nic] RX: malformed Ethernet frame dropped ({} bytes)",
+                    frame.len(),
+                );
             }
         }
+        dispatched
     }
 
     /// Handle a `NET_LINK_STATE` IPC payload from the ring-3 driver.
@@ -433,19 +575,200 @@ impl RemoteNic {
             event.mac[4],
             event.mac[5],
         );
-        // Update the stored MAC so `mac_address()` returns the real hardware
-        // address.  On the lazy-registration path the MAC is initialised to
-        // `[0; 6]`; the first `NET_LINK_STATE` from the driver overwrites it.
-        {
-            let mut slot = REMOTE_NIC.lock();
-            if let Some(entry) = slot.as_mut() {
-                entry.mac = event.mac;
-            }
+        if let Some(ep) = Self::ensure_link_event_entry(
+            event.mac,
+            crate::ipc::registry::lookup_endpoint_id("net.nic"),
+        ) {
+            log::info!(
+                "[remote_nic] link-state bootstrap registered ring-3 NIC driver: endpoint={:?} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                ep,
+                event.mac[0],
+                event.mac[1],
+                event.mac[2],
+                event.mac[3],
+                event.mac[4],
+                event.mac[5],
+            );
         }
         if !event.up {
             // One-line hook: link-down resets TCP retransmit timers per Phase 16.
             super::tcp::on_link_down();
         }
-        NIC_WOKEN.store(true, Ordering::Release);
+        crate::net::virtio_net::wake_net_task();
+    }
+
+    fn ensure_link_event_entry(
+        mac: MacAddr,
+        fallback_endpoint: Option<EndpointId>,
+    ) -> Option<EndpointId> {
+        let mut live_endpoint = None;
+        {
+            let mut slot = REMOTE_NIC.lock();
+            if let Some(ep) = fallback_endpoint {
+                if let Some(entry) = slot.as_mut() {
+                    entry.endpoint = ep;
+                    entry.mac = mac;
+                } else {
+                    *slot = Some(NicEntry {
+                        endpoint: ep,
+                        mac,
+                        tx_queue: VecDeque::new(),
+                        rx_queue: VecDeque::new(),
+                    });
+                }
+                live_endpoint = Some(ep);
+            } else if let Some(entry) = slot.as_mut() {
+                entry.mac = mac;
+            }
+        }
+        if live_endpoint.is_some() {
+            REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
+            // Intentionally do NOT clear `RESTART_SUSPECTED` here.
+            //
+            // Phase 55c Track E originally cleared the latch on every
+            // link-state-driven re-registration so the post-restart driver
+            // bootstrap reset every flag. With the close-driven
+            // `on_endpoint_closed` path now setting `RESTART_SUSPECTED` on
+            // the dying driver's exit, that auto-clear races with userspace
+            // `sendto` observation: a fast restart re-publishes link state
+            // before the test's retry loop catches the EAGAIN window.
+            // `sendto_restart_ret` consumes the latch on observation
+            // instead, so the post-restart steady state still converges.
+            ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
+            LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
+        }
+        live_endpoint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_remote_nic_state() {
+        *REMOTE_NIC.lock() = None;
+        REMOTE_NIC_REGISTERED.store(false, Ordering::Release);
+        RESTART_SUSPECTED.store(false, Ordering::Release);
+        ABSENT_WARN_EMITTED.store(false, Ordering::Relaxed);
+        LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
+    }
+
+    fn registered_endpoint() -> Option<EndpointId> {
+        REMOTE_NIC.lock().as_ref().map(|entry| entry.endpoint)
+    }
+
+    fn queued_rx_frames() -> usize {
+        REMOTE_NIC
+            .lock()
+            .as_ref()
+            .map(|entry| entry.rx_queue.len())
+            .unwrap_or(0)
+    }
+
+    #[test_case]
+    fn link_event_bootstraps_missing_remote_nic_entry() {
+        reset_remote_nic_state();
+
+        let ep = EndpointId(9);
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+        assert_eq!(RemoteNic::ensure_link_event_entry(mac, Some(ep)), Some(ep));
+        assert!(REMOTE_NIC_REGISTERED.load(Ordering::Acquire));
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn link_event_updates_existing_remote_nic_mac_in_place() {
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(3), [0; 6]);
+
+        let mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        assert_eq!(RemoteNic::ensure_link_event_entry(mac, None), None);
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn link_event_recovers_restart_suspected_slot_with_live_endpoint() {
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(3), [0; 6]);
+        RemoteNic::on_ipc_error();
+
+        let recovered_ep = EndpointId(7);
+        let mac = [0x52, 0x54, 0x00, 0xde, 0xad, 0xbe];
+        assert_eq!(
+            RemoteNic::ensure_link_event_entry(mac, Some(recovered_ep)),
+            Some(recovered_ep)
+        );
+        assert!(!RESTART_SUSPECTED.load(Ordering::Acquire));
+        assert_eq!(registered_endpoint(), Some(recovered_ep));
+        assert_eq!(RemoteNic::mac_address(), Some(mac));
+    }
+
+    #[test_case]
+    fn inject_rx_frame_queues_payload_for_deferred_dispatch() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(4), [0; 6]);
+
+        let frame = [0u8; 14];
+        let header = NetFrameHeader {
+            kind: NET_RX_FRAME,
+            frame_len: frame.len() as u16,
+            flags: 0,
+        };
+        let mut payload = encode_net_send(header).to_vec();
+        payload.extend_from_slice(&frame);
+
+        assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
+        assert_eq!(queued_rx_frames(), 1);
+    }
+
+    #[test_case]
+    fn drain_rx_queue_removes_malformed_frames_after_deferred_queueing() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(5), [0; 6]);
+
+        let frame = [0u8; 14];
+        let header = NetFrameHeader {
+            kind: NET_RX_FRAME,
+            frame_len: frame.len() as u16,
+            flags: 0,
+        };
+        let mut payload = encode_net_send(header).to_vec();
+        payload.extend_from_slice(&frame);
+
+        assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
+        assert_eq!(RemoteNic::drain_rx_queue(), 0);
+        assert_eq!(queued_rx_frames(), 0);
+    }
+
+    #[test_case]
+    fn inject_rx_frame_queues_each_record_in_a_multi_frame_batch() {
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+
+        reset_remote_nic_state();
+        RemoteNic::register(EndpointId(6), [0; 6]);
+
+        // Build a bulk carrying three concatenated [header, frame] records —
+        // the batched publish shape the ring-3 driver emits.
+        let frame_a = [0xAAu8; 14];
+        let frame_b = [0xBBu8; 32];
+        let frame_c = [0xCCu8; 17];
+        let mut bulk: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for frame in [frame_a.as_slice(), frame_b.as_slice(), frame_c.as_slice()] {
+            let header = NetFrameHeader {
+                kind: NET_RX_FRAME,
+                frame_len: frame.len() as u16,
+                flags: 0,
+            };
+            bulk.extend_from_slice(&encode_net_send(header));
+            bulk.extend_from_slice(frame);
+        }
+
+        assert_eq!(RemoteNic::inject_rx_frame(&bulk), 3);
+        assert_eq!(queued_rx_frames(), 3);
     }
 }

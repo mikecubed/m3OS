@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Seek, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use anyhow::Context;
@@ -24,7 +25,7 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// so QEMU sees exactly one `-machine` flag rather than two — multiple
 /// `-machine` arguments would let the later invocation clobber the earlier
 /// one and silently drop settings.
-pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off"];
+pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -191,6 +192,14 @@ fn main() {
             });
             cmd_device_smoke(&device_smoke_args);
         }
+        Some("ssh-e1000-banner-check") => {
+            let banner_args = parse_ssh_e1000_banner_check_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_ssh_e1000_banner_check(&banner_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -236,7 +245,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000 [--iommu] [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000 [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -325,20 +334,33 @@ fn build_userspace_bins() {
         } else {
             "-Zbuild-std=core,compiler_builtins"
         };
+
+        // Some packages gate their [[bin]] target behind a required-feature to
+        // prevent duplicate-symbol link errors when the package also exposes a
+        // [lib] and cargo test builds all targets for the host.
+        // e1000_driver uses "os-binary" to enable its _start entry point.
+        let extra_features: &[&str] = match pkg {
+            "e1000_driver" => &["--features", "os-binary"],
+            _ => &[],
+        };
+
+        let mut build_args = vec![
+            "build",
+            "--release",
+            "--package",
+            pkg,
+            "--bin",
+            bin,
+            "--target",
+            "x86_64-unknown-none",
+            build_std,
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ];
+        build_args.extend_from_slice(extra_features);
+
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
-            .args([
-                "build",
-                "--release",
-                "--package",
-                pkg,
-                "--bin",
-                bin,
-                "--target",
-                "x86_64-unknown-none",
-                build_std,
-                "-Zbuild-std-features=compiler-builtins-mem",
-            ])
+            .args(&build_args)
             .status()
             .unwrap_or_else(|_| panic!("failed to build userspace binary {bin}"));
 
@@ -1510,24 +1532,66 @@ fn convert_to_vhdx(uefi_image: &Path) {
 /// Checks for `x86_64-linux-musl-gcc` (Debian/Ubuntu cross-compiler),
 /// `x86_64-unknown-linux-musl1.2-gcc` (Arch `musl-gcc-cross-bin`),
 /// and `musl-gcc` (Debian/Ubuntu `musl-tools` wrapper), in that order.
+///
+/// Some minimal musl cross toolchains (for example a hand-installed raiden or
+/// musl-cross-make toolchain under `/opt/`) omit musl's empty static
+/// compatibility stubs (`libdl.a`, `libpthread.a`, `librt.a`). Ports like TCC
+/// still link `-ldl`, so we reject those toolchains here and keep searching for
+/// a distro-provided compiler that can satisfy the full static link.
 fn find_musl_cc() -> Option<&'static str> {
-    let candidates = [
-        "x86_64-linux-musl-gcc",
-        "x86_64-unknown-linux-musl1.2-gcc",
-        "musl-gcc",
-    ];
-    for cc in candidates {
-        if Command::new(cc)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return Some(cc);
+    static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MUSL_CC.get_or_init(|| {
+        let candidates = [
+            "x86_64-linux-musl-gcc",
+            "x86_64-unknown-linux-musl1.2-gcc",
+            "musl-gcc",
+        ];
+        for cc in candidates {
+            if !Command::new(cc)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                continue;
+            }
+            if musl_cc_has_static_compat_stubs(cc) {
+                return Some(cc);
+            }
+            eprintln!(
+                "warning: skipping musl compiler `{cc}` — static link check for \
+                 -ldl/-lpthread/-lrt failed; install/use a distro musl toolchain \
+                 (musl-tools or musl-gcc-cross-bin)"
+            );
         }
+        None
+    })
+}
+
+fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let src = dir.path().join("stub-check.c");
+    let out = dir.path().join("stub-check");
+    if fs::write(&src, "int main(void) { return 0; }\n").is_err() {
+        return false;
     }
-    None
+    Command::new(cc)
+        .args([
+            "-static",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-ldl",
+            "-lpthread",
+            "-lrt",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn find_ovmf() -> PathBuf {
@@ -1667,9 +1731,17 @@ fn qemu_args_with_devices_resolved(
     // Phase 55 (F.1): `--device e1000` swaps the virtio-net-pci device out for
     // the Intel 82540EM classic e1000. The netdev remains unchanged.
     let nic_device = if devices.e1000 {
-        "e1000,netdev=net0"
+        if devices.iommu {
+            "e1000,netdev=net0,addr=0x3"
+        } else {
+            "e1000,netdev=net0"
+        }
     } else {
-        "virtio-net-pci,netdev=net0"
+        if devices.iommu {
+            "virtio-net-pci,netdev=net0,addr=0x3"
+        } else {
+            "virtio-net-pci,netdev=net0"
+        }
     };
     args.extend([
         "-device".to_string(),
@@ -1681,10 +1753,20 @@ fn qemu_args_with_devices_resolved(
     // Phase 24: virtio-blk data disk.
     let data_disk = uefi_image.parent().unwrap().join("disk.img");
     if data_disk.exists() {
-        args.extend([
-            "-drive".to_string(),
-            format!("file={},format=raw,if=virtio", data_disk.display()),
-        ]);
+        if devices.iommu {
+            let data_disk_addr = if devices.nvme { "0x5" } else { "0x4" };
+            args.extend([
+                "-drive".to_string(),
+                format!("file={},if=none,id=osdisk0,format=raw", data_disk.display()),
+                "-device".to_string(),
+                format!("virtio-blk-pci,drive=osdisk0,addr={data_disk_addr}"),
+            ]);
+        } else {
+            args.extend([
+                "-drive".to_string(),
+                format!("file={},format=raw,if=virtio", data_disk.display()),
+            ]);
+        }
     }
 
     // Phase 55 (F.1): `--device nvme` adds a second drive behind a QEMU NVMe
@@ -1698,14 +1780,18 @@ fn qemu_args_with_devices_resolved(
             "-drive".to_string(),
             format!("file={},if=none,id=nvme0,format=raw", nvme_path.display()),
             "-device".to_string(),
-            "nvme,serial=deadbeef,drive=nvme0".to_string(),
+            if devices.iommu {
+                "nvme,serial=deadbeef,drive=nvme0,addr=0x4".to_string()
+            } else {
+                "nvme,serial=deadbeef,drive=nvme0".to_string()
+            },
         ]);
     }
 
     // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
     // the q35 machine. The partnering `q35,kernel_irqchip=split` machine
     // property is emitted by `build_machine_arg` above; `IOMMU_QEMU_ARGS`
-    // carries only the `-device intel-iommu,x-scalable-mode=off` pair.
+    // carries only the `-device intel-iommu,x-scalable-mode=off,aw-bits=48` pair.
     if devices.iommu {
         args.extend(IOMMU_QEMU_ARGS.iter().map(|s| (*s).to_string()));
     }
@@ -4409,6 +4495,40 @@ fn parse_device_smoke_args(args: &[String]) -> Result<DeviceSmokeArgs, String> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshE1000BannerCheckArgs {
+    timeout_secs: u64,
+    display: bool,
+}
+
+/// Parse `cargo xtask ssh-e1000-banner-check [--timeout <secs>] [--display]`.
+fn parse_ssh_e1000_banner_check_args(args: &[String]) -> Result<SshE1000BannerCheckArgs, String> {
+    let mut timeout_secs = 30u64;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--display" => display = true,
+            "--timeout" => {
+                index += 1;
+                timeout_secs = args
+                    .get(index)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            other => return Err(format!("unknown ssh-e1000-banner-check flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(SshE1000BannerCheckArgs {
+        timeout_secs,
+        display,
+    })
+}
+
 /// Expect-style smoke script for `--device nvme`.
 ///
 /// Phase 55b F.4b — full data-path round-trip:
@@ -4481,6 +4601,39 @@ fn device_smoke_script_e1000() -> Vec<SmokeStep> {
     ]
 }
 
+/// Build the smoke-step list for `cargo xtask device-smoke`.
+///
+/// When both NVMe and e1000 are requested we still run the full per-device
+/// assertions in one boot so the shared CI lane fails if either device regresses
+/// under the selected hardware profile (including `--iommu`).
+fn device_smoke_steps(devices: DeviceSet) -> Vec<SmokeStep> {
+    fn strip_shared_kernel_wait(mut steps: Vec<SmokeStep>) -> Vec<SmokeStep> {
+        if matches!(
+            steps.first(),
+            Some(SmokeStep::Wait {
+                pattern: "[m3os] Hello from kernel",
+                ..
+            })
+        ) {
+            steps.remove(0);
+        }
+        steps
+    }
+
+    let mut steps = Vec::new();
+    if devices.nvme {
+        steps.extend(device_smoke_script_nvme());
+    }
+    if devices.e1000 {
+        if steps.is_empty() {
+            steps.extend(device_smoke_script_e1000());
+        } else {
+            steps.extend(strip_shared_kernel_wait(device_smoke_script_e1000()));
+        }
+    }
+    steps
+}
+
 /// Run the Phase 55b F.4 device-path data smoke for the requested `devices`.
 ///
 /// Builds the kernel, creates the UEFI image and data disk, then launches QEMU
@@ -4524,28 +4677,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
         }
     }
 
-    // Select the appropriate smoke script based on the requested device.
-    // When both are requested (nvme + e1000) we concatenate both scripts so a
-    // single QEMU boot asserts both `driver.registered` events.
-    let mut steps: Vec<SmokeStep> = Vec::new();
-    if args.devices.nvme {
-        steps.extend(device_smoke_script_nvme());
-    }
-    if args.devices.e1000 {
-        // Re-use the UEFI-stub and kernel-main Wait steps only if nvme wasn't
-        // already requested (they appear once in the log regardless).
-        if args.devices.nvme {
-            // Only append the driver registration wait — the early-boot waits
-            // already passed in the nvme script above.
-            steps.push(SmokeStep::Wait {
-                pattern: "driver.registered: e1000_driver",
-                timeout_secs: 60,
-                label: "wait for e1000_driver to register with device host",
-            });
-        } else {
-            steps.extend(device_smoke_script_e1000());
-        }
-    }
+    let steps = device_smoke_steps(args.devices);
 
     let base_timeout_secs = args.timeout_secs;
     const MAX_ATTEMPTS: usize = 3;
@@ -4607,6 +4739,39 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
 
     eprintln!("device-smoke: FAILED after {MAX_ATTEMPTS} attempts\n{last_err}");
     std::process::exit(1);
+}
+
+/// Build the command-line contract for the Phase 55c R3 SSH banner regression:
+///
+/// `scripts/ssh_e1000_banner_check.sh <run-id> --timeout <secs> [--display]`
+fn ssh_e1000_banner_check_command(
+    workspace_root: &Path,
+    run_id: &str,
+    args: &SshE1000BannerCheckArgs,
+) -> (PathBuf, Vec<String>) {
+    let script = workspace_root.join("scripts/ssh_e1000_banner_check.sh");
+    let mut argv = vec![
+        run_id.to_string(),
+        "--timeout".to_string(),
+        args.timeout_secs.to_string(),
+    ];
+    if args.display {
+        argv.push("--display".to_string());
+    }
+    (script, argv)
+}
+
+fn cmd_ssh_e1000_banner_check(args: &SshE1000BannerCheckArgs) {
+    let root = workspace_root();
+    let (script, argv) = ssh_e1000_banner_check_command(&root, "xtask", args);
+    let status = Command::new(&script)
+        .args(&argv)
+        .current_dir(&root)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to launch {}: {err}", script.display()));
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 fn cmd_fmt(fix: bool) {
@@ -4813,6 +4978,42 @@ fn signed_path(path: &Path) -> PathBuf {
     }
 }
 
+fn mkfs_ext2_arg_variants() -> [&'static [&'static str]; 2] {
+    [
+        &["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"],
+        &["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"],
+    ]
+}
+
+fn format_ext2_partition(part_tmp: &Path) {
+    let mut failures: Vec<(String, std::process::Output)> = Vec::new();
+
+    for args in mkfs_ext2_arg_variants() {
+        let output = Command::new("mkfs.ext2")
+            .args(args)
+            .arg(part_tmp)
+            .output()
+            .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
+        if output.status.success() {
+            return;
+        }
+        failures.push((args.join(" "), output));
+    }
+
+    eprintln!("Error: mkfs.ext2 failed for all supported argument forms");
+    for (args, output) in failures {
+        eprintln!("  args: {args}");
+        eprintln!("  status: {}", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            for line in stderr.lines() {
+                eprintln!("    stderr: {line}");
+            }
+        }
+    }
+    std::process::exit(1);
+}
+
 /// Create a 64 MB raw data disk image with an MBR partition table and an
 /// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
@@ -4904,25 +5105,10 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     }
 
     // Format with mkfs.ext2 (4K blocks, ext2 rev 0, no optional features).
-    // Newer e2fsprogs (>=1.47.4, Arch) removed -r; try -E revision=0 first
-    // (rev 0 implies no features, so -O none is not needed), then fall back
-    // to -r 0 -O none for older versions (Ubuntu 22.04/24.04).
-    let mkfs_status = Command::new("mkfs.ext2")
-        .args(["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"])
-        .arg(&part_tmp)
-        .status()
-        .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
-    if !mkfs_status.success() {
-        let fallback = Command::new("mkfs.ext2")
-            .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
-            .arg(&part_tmp)
-            .status()
-            .expect("failed to run mkfs.ext2");
-        if !fallback.success() {
-            eprintln!("Error: mkfs.ext2 failed (exit {})", fallback);
-            std::process::exit(1);
-        }
-    }
+    // Different e2fsprogs releases disagree on whether the legacy `-r 0` form
+    // or the newer `-E revision=0` form is accepted, so try both quietly and
+    // only emit diagnostics if neither host variant works.
+    format_ext2_partition(&part_tmp);
 
     // Populate files using debugfs.
     populate_ext2_files(&part_tmp, output_dir, enable_telnet, smoke_test_mode);
@@ -5071,17 +5257,18 @@ fn populate_ext2_files(
         String::new()
     };
 
-    let smoke_mode_cmds = if smoke_test_mode {
-        format!(
-            "write \"{}\" etc/m3os-smoke-test-mode\n\
-             sif etc/m3os-smoke-test-mode mode 0x81A4\n\
-             sif etc/m3os-smoke-test-mode uid 0\n\
-             sif etc/m3os-smoke-test-mode gid 0\n",
-            smoke_mode_tmp.display()
-        )
-    } else {
-        String::new()
-    };
+    fs::write(
+        &smoke_mode_tmp,
+        if smoke_test_mode { b"1\n" } else { b"0\n" },
+    )
+    .expect("write temp smoke-mode marker");
+    let smoke_mode_cmds = format!(
+        "write \"{}\" etc/m3os-smoke-test-mode\n\
+         sif etc/m3os-smoke-test-mode mode 0x81A4\n\
+         sif etc/m3os-smoke-test-mode uid 0\n\
+         sif etc/m3os-smoke-test-mode gid 0\n",
+        smoke_mode_tmp.display()
+    );
 
     // CI toggle: dropping this marker tells the guest smoke-runner to skip
     // the TCC compile + hello-verify steps (both emit SKIP instead of PASS).
@@ -6706,24 +6893,33 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
         });
-        // Phase 55b Track F.3d-3: e1000 crash-and-restart smoke.
-        // Exercises RemoteNic::send_frame → DriverRestarting (kernel log)
-        // and the kill → restart → send cycle. Requires --device e1000.
-        // Gated behind the same M3OS_ENABLE_CRASH_SMOKE env-var as the NVMe
-        // smoke; pass --test e1000-restart-crash to select only this test.
-        tests.push(RegressionTest {
-            name: "e1000-restart-crash",
-            description: "Phase 55b F.3d-3: e1000-crash-smoke — kill e1000_driver → \
-                 RESTART_SUSPECTED → restart → post-restart send success",
-            guest_steps: e1000_restart_crash_steps,
-            timeout_secs: 180,
-            devices: DeviceSet {
-                nvme: false,
-                e1000: true,
-                iommu: false,
-            },
-        });
     }
+
+    // Phase 55b Track F.3d-3 / Phase 55c Track I.4: e1000 crash-and-restart smoke.
+    //
+    // Exercises RemoteNic::send_frame → DriverRestarting / EAGAIN and the
+    // kill → restart → post-restart send path. This remains part of the normal
+    // regression registry so `cargo xtask regression --test e1000-restart-crash`
+    // is always a valid command, matching the documented acceptance path.
+    tests.push(RegressionTest {
+        name: "e1000-restart-crash",
+        description: "Phase 55b F.3d-3 / Phase 55c I.4: e1000-crash-smoke — kill \
+             e1000_driver → EAGAIN / restart suspected → restart → post-restart send success",
+        guest_steps: e1000_restart_crash_steps,
+        // Bumped from 180 to 360 because the e1000 ring-3 driver does ~515
+        // DMA allocs (one per RX/TX slot) at startup; each is a kernel
+        // syscall + info log line. Under QEMU --snapshot the combined
+        // syscall + virtio-blk-backed serial throughput puts e1000 bring-up
+        // at ~200s in this harness even on a fast host. Reductions in the
+        // driver's DMA allocation pattern or downgrading the info-level
+        // log would shrink this further.
+        timeout_secs: 360,
+        devices: DeviceSet {
+            nvme: false,
+            e1000: true,
+            iommu: false,
+        },
+    });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
     //
@@ -7142,26 +7338,34 @@ fn max_restart_exceeded_steps() -> Vec<SmokeStep> {
 ///
 /// Sequence:
 ///   1. Boot and login.
-///   2. Wait for the e1000 driver bring-up marker (E1000_SMOKE:link:PASS).
-///   3. Launch `/bin/e1000-crash-smoke`.
-///   4. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
-///   5. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
-///   6. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
-///   7. Confirm `E1000_CRASH_SMOKE:PASS`.
+///   2. Launch `/bin/e1000-crash-smoke` (which implicitly requires the
+///      e1000 driver to be up — its first `pre-crash-send` step fails
+///      otherwise).
+///   3. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
+///   4. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
+///   5. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
+///   6. Confirm `E1000_CRASH_SMOKE:PASS`.
+///   7. Confirm the guest shell observed `e1000-crash-smoke` exit 0.
 fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
+    // Note on e1000 bring-up: the `E1000_SMOKE:link:PASS` marker is emitted
+    // during boot (under QEMU --snapshot, after ~500 DMA allocs the
+    // ring-3 driver does at startup). Waiting for it explicitly here —
+    // whether before or after `boot_and_login_steps` — is fragile: the
+    // serial buffer is drained on every intermediate pattern match, so a
+    // standalone `E1000_SMOKE:link:PASS` wait either consumes the
+    // pre-login output (leaving no `init: started 'net_udp'` for the
+    // subsequent boot-marker step to find) or lands after the marker has
+    // already scrolled past. The downstream `E1000_CRASH_SMOKE:pre-crash-
+    // send:OK` assertion already verifies e1000 is up and sending — if
+    // the driver hadn't brought up the link, that marker would never
+    // appear either. So we skip the explicit bring-up gate and rely on
+    // the natural smoke flow below.
     let mut steps = boot_and_login_steps();
-
-    // Wait for e1000 bring-up before launching the smoke binary.
-    steps.push(SmokeStep::Wait {
-        pattern: "E1000_SMOKE:link:PASS",
-        timeout_secs: 120,
-        label: "guest/e1000-crash-smoke: wait for e1000 bring-up",
-    });
     steps.push(SmokeStep::Sleep { millis: 500 });
 
     // Launch the smoke client.
     steps.push(SmokeStep::Send {
-        input: "/bin/e1000-crash-smoke\n",
+        input: "/bin/e1000-crash-smoke ; /bin/echo E1000_CRASH_SMOKE:exit:$?\n",
         label: "guest/e1000-crash-smoke: launch e1000-crash-smoke",
     });
 
@@ -7179,7 +7383,10 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
 
     steps.push(SmokeStep::Wait {
         pattern: "E1000_CRASH_SMOKE:post-restart-send:OK",
-        timeout_secs: 30,
+        // Bumped from 30 s because `e1000-crash-smoke` retries the post-
+        // restart send for ~30 s internally to cross the DriverRestarting
+        // window. The outer wait has to outlast the inner retry budget.
+        timeout_secs: 90,
         label: "guest/e1000-crash-smoke: post-restart send OK",
     });
 
@@ -7187,6 +7394,11 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
         pattern: "E1000_CRASH_SMOKE:PASS",
         timeout_secs: 15,
         label: "guest/e1000-crash-smoke: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:exit:0",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: exit code 0",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
@@ -8365,6 +8577,30 @@ mod tests {
     }
 
     #[test]
+    fn mkfs_ext2_compatibility_prefers_legacy_revision_flags_first() {
+        let variants = mkfs_ext2_arg_variants();
+
+        assert_eq!(
+            variants[0],
+            ["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"],
+            "mkfs compatibility should try the legacy `-r 0 -O none` form first \
+             so Ubuntu/Omarchy hosts avoid the unsupported `-E revision=0` path"
+        );
+    }
+
+    #[test]
+    fn mkfs_ext2_compatibility_keeps_revision_extended_option_as_fallback() {
+        let variants = mkfs_ext2_arg_variants();
+
+        assert_eq!(
+            variants[1],
+            ["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"],
+            "mkfs compatibility must retain the `-E revision=0` fallback for \
+             hosts whose e2fsprogs no longer accept `-r 0`"
+        );
+    }
+
+    #[test]
     fn extract_device_flags_rejects_unknown_name() {
         let input = string_args(&["--device", "realtek"]);
         let err = extract_device_flags(&input).unwrap_err();
@@ -8459,6 +8695,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qemu_args_with_iommu_pin_driver_sentinel_slots() {
+        let fake_nvme = Path::new("/tmp/m3os-test-nvme-iommu-never-created.img");
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: true,
+            },
+            Some(fake_nvme),
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-net-pci,netdev=net0,addr=0x3"]),
+            "q35/iommu should pin the default NIC to the e1000 sentinel slot"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "nvme,serial=deadbeef,drive=nvme0,addr=0x4"]),
+            "q35/iommu should pin the NVMe controller to the ring-3 driver sentinel slot"
+        );
+    }
+
+    #[test]
+    fn qemu_args_with_iommu_and_nvme_move_root_disk_off_nvme_slot() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("m3os-xtask-iommu-{unique}"));
+        fs::create_dir_all(&temp_root).unwrap();
+        let uefi = temp_root.join("boot-uefi-m3os.img");
+        let disk = temp_root.join("disk.img");
+        fs::write(&uefi, []).unwrap();
+        fs::write(&disk, []).unwrap();
+
+        let args = qemu_args_with_devices_resolved(
+            &uefi,
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: true,
+            },
+            Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-blk-pci,drive=osdisk0,addr=0x5"]),
+            "q35/iommu + nvme should move the root virtio-blk disk off the NVMe sentinel slot"
+        );
+
+        let _ = fs::remove_file(&uefi);
+        let _ = fs::remove_file(&disk);
+        let _ = fs::remove_dir(&temp_root);
+    }
+
     // --------------------------------------------------------------
     // Phase 55a Track F.1: `--iommu` flag parsing + QEMU wiring
     // --------------------------------------------------------------
@@ -8500,8 +8801,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|w| w == ["-device", "intel-iommu,x-scalable-mode=off"]),
-            "expected `-device intel-iommu,x-scalable-mode=off` pair when --iommu is set"
+                .any(|w| w == ["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"]),
+            "expected `-device intel-iommu,x-scalable-mode=off,aw-bits=48` pair when --iommu is set"
         );
         assert!(
             args.windows(2)
@@ -8541,7 +8842,7 @@ mod tests {
         // `build_machine_arg`.
         assert_eq!(
             IOMMU_QEMU_ARGS,
-            &["-device", "intel-iommu,x-scalable-mode=off",]
+            &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48",]
         );
         let args = qemu_args_with_devices_resolved(
             Path::new("target/boot-uefi-m3os.img"),
@@ -8726,6 +9027,109 @@ mod tests {
             parse_sign_args(&string_args(&["--key", "keys/dev.key"]), &workspace_root).unwrap_err();
 
         assert_eq!(error, "missing unsigned EFI path");
+    }
+
+    #[test]
+    fn parse_ssh_e1000_banner_check_args_defaults() {
+        let parsed = parse_ssh_e1000_banner_check_args(&[]).unwrap();
+        assert_eq!(
+            parsed,
+            SshE1000BannerCheckArgs {
+                timeout_secs: 30,
+                display: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_ssh_e1000_banner_check_args_accepts_timeout_and_display() {
+        let parsed =
+            parse_ssh_e1000_banner_check_args(&string_args(&["--timeout", "45", "--display"]))
+                .unwrap();
+        assert_eq!(
+            parsed,
+            SshE1000BannerCheckArgs {
+                timeout_secs: 45,
+                display: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_e1000_banner_check_command_matches_documented_contract() {
+        let workspace_root = PathBuf::from("/workspace/m3os");
+        let args = SshE1000BannerCheckArgs {
+            timeout_secs: 45,
+            display: true,
+        };
+        let (script, argv) = ssh_e1000_banner_check_command(&workspace_root, "ci-lane", &args);
+
+        assert_eq!(
+            script,
+            workspace_root.join("scripts/ssh_e1000_banner_check.sh")
+        );
+        assert_eq!(
+            argv,
+            string_args(&["ci-lane", "--timeout", "45", "--display"])
+        );
+    }
+
+    #[test]
+    fn device_smoke_steps_keep_same_assertions_with_iommu_enabled() {
+        let base = device_smoke_steps(DeviceSet {
+            nvme: true,
+            e1000: true,
+            iommu: false,
+        });
+        let iommu = device_smoke_steps(DeviceSet {
+            nvme: true,
+            e1000: true,
+            iommu: true,
+        });
+
+        assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));
+        assert_eq!(
+            smoke_step_labels(&iommu)
+                .into_iter()
+                .filter(|label| *label == "wait for kernel first message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            wait_pattern_for_label(
+                &iommu,
+                "wait for nvme_driver 512 B LBA-0 round-trip self-test to pass"
+            ),
+            Some("NVME_SMOKE:rw:PASS")
+        );
+        assert_eq!(
+            wait_timeout_for_label(
+                &iommu,
+                "wait for e1000_driver link-state confirmation at bring-up"
+            ),
+            Some(90)
+        );
+        assert_eq!(
+            wait_pattern_for_label(
+                &iommu,
+                "wait for e1000_driver to enter its IRQ/IPC server loop (Track E.3b)"
+            ),
+            Some("E1000_SMOKE:server:READY")
+        );
+    }
+
+    #[test]
+    fn e1000_restart_crash_steps_require_zero_exit_code_marker() {
+        let steps = e1000_restart_crash_steps();
+
+        assert_eq!(
+            send_input_for_label(&steps, "guest/e1000-crash-smoke: launch e1000-crash-smoke"),
+            Some("/bin/e1000-crash-smoke ; /bin/echo E1000_CRASH_SMOKE:exit:$?\n")
+        );
+        assert_eq!(
+            wait_pattern_for_label(&steps, "guest/e1000-crash-smoke: exit code 0"),
+            Some("E1000_CRASH_SMOKE:exit:0")
+        );
     }
 
     #[test]

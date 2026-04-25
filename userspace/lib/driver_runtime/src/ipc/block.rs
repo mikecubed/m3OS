@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 
 use spin::Mutex;
 
-use super::{EndpointCap, IpcBackend, RecvFrame, SyscallBackend};
+use super::{EndpointCap, IpcBackend, RecvFrame, RecvResult, SyscallBackend};
 
 pub use kernel_core::driver_ipc::block::{
     BLK_READ, BLK_REPLY_HEADER_SIZE, BLK_REQUEST_HEADER_SIZE, BLK_STATUS, BLK_WRITE,
@@ -135,6 +135,18 @@ impl<B: IpcBackend> BlockServer<B> {
 
     /// Pull one request off the endpoint, run the closure, reply.
     ///
+    /// This is the compatibility wrapper for drivers that do not care about
+    /// notification wakes. [`RecvResult::Notification`] is handled by a
+    /// default no-op callback so existing callers keep the old single-closure
+    /// shape.
+    pub fn handle_next<F>(&self, f: F) -> Result<(), DriverRuntimeError>
+    where
+        F: FnMut(BlkRequest) -> BlkReply,
+    {
+        self.handle_next_with_notification(f, |_bits| {})
+    }
+    /// Pull one request or notification off the endpoint, dispatch, reply.
+    ///
     /// Acceptance bullets satisfied:
     ///
     /// - Closure receives exactly the decoded request shape: the
@@ -148,11 +160,22 @@ impl<B: IpcBackend> BlockServer<B> {
     ///   a [`BlockDriverError::InvalidRequest`] reply; the method
     ///   returns `Ok(())` because it successfully processed the
     ///   (malformed) frame.
-    pub fn handle_next<F>(&self, mut f: F) -> Result<(), DriverRuntimeError>
+    pub fn handle_next_with_notification<F, N>(
+        &self,
+        mut f: F,
+        mut on_notification: N,
+    ) -> Result<(), DriverRuntimeError>
     where
         F: FnMut(BlkRequest) -> BlkReply,
+        N: FnMut(u64),
     {
-        let frame: RecvFrame = self.backend.lock().recv(self.endpoint)?;
+        let frame: RecvFrame = match self.backend.lock().recv(self.endpoint)? {
+            RecvResult::Notification(bits) => {
+                on_notification(bits);
+                return Ok(());
+            }
+            RecvResult::Message(frame) => frame,
+        };
         match decode_blk_request(&frame.bulk) {
             Ok((header, payload_grant)) => {
                 // Bulk write data rides after the fixed-width header
@@ -397,5 +420,80 @@ mod tests {
             bulk: Vec::new(),
         });
         assert!(result.is_err());
+    }
+
+    // -- Track E.1 test ----------------------------------------------------
+
+    #[test]
+    fn block_server_handle_next_ignores_notification_variant() {
+        let mut mock = MockBackend::new();
+        mock.push_notification(0b1111);
+
+        let server = BlockServer::with_backend(endpoint(), mock);
+        let closure_called = core::cell::Cell::new(false);
+
+        let result = server.handle_next(|_req| {
+            closure_called.set(true);
+            BlkReply {
+                header: BlkReplyHeader {
+                    cmd_id: 0,
+                    status: BlockDriverError::Ok,
+                    bytes: 0,
+                },
+                payload_grant: 0,
+                bulk: Vec::new(),
+            }
+        });
+
+        assert!(result.is_ok(), "notification wake must return Ok");
+        assert!(
+            !closure_called.get(),
+            "closure must not be invoked on notification wake"
+        );
+
+        // No reply must have been sent.
+        let mock = server.backend.lock();
+        assert_eq!(mock.replies.len(), 0, "no reply for notification wake");
+    }
+
+    #[test]
+    fn block_server_handle_next_dispatches_notification_variant() {
+        const NOTIF_BITS: u64 = 0b1111;
+        let mut mock = MockBackend::new();
+        mock.push_notification(NOTIF_BITS);
+
+        let server = BlockServer::with_backend(endpoint(), mock);
+        let closure_called = core::cell::Cell::new(false);
+        let observed_bits = core::cell::Cell::new(0u64);
+
+        let result = server.handle_next_with_notification(
+            |_req| {
+                closure_called.set(true);
+                BlkReply {
+                    header: BlkReplyHeader {
+                        cmd_id: 0,
+                        status: BlockDriverError::Ok,
+                        bytes: 0,
+                    },
+                    payload_grant: 0,
+                    bulk: Vec::new(),
+                }
+            },
+            |bits| observed_bits.set(bits),
+        );
+
+        assert!(result.is_ok(), "notification wake must return Ok");
+        assert!(
+            !closure_called.get(),
+            "message closure must not be invoked on notification wake"
+        );
+        assert_eq!(
+            observed_bits.get(),
+            NOTIF_BITS,
+            "notification callback must receive drained bits"
+        );
+
+        let mock = server.backend.lock();
+        assert_eq!(mock.replies.len(), 0, "no reply for notification wake");
     }
 }

@@ -331,10 +331,10 @@ impl VtdUnit {
         // Low 64 bits:
         //   bit 0    : present
         //   bit 1    : fault-processing disable (0 → faults enabled)
-        //   bits 3:2 : translation type (00 = legacy second-level)
+        //   bits 3:2 : translation type (00 = legacy multi-level / second-level)
         //   bits 11:4: reserved
         //   bits 63:12 : second-level page-table pointer (pfn-aligned)
-        let low = (sl_root_phys & !0xFFFu64) | 0x1;
+        let low = sl_root_phys & !0xFFFu64;
         // High 64 bits:
         //   bits 2:0   : address-width (48-bit = value 2, per §9.3)
         //   bits 15:8  : reserved
@@ -348,8 +348,10 @@ impl VtdUnit {
         };
         let high = aw_code | ((vtd_domain_id as u64) << 8);
 
-        Self::write_table_entry(ctx_phys, entry_offset, low);
         Self::write_table_entry(ctx_phys, entry_offset + 8, high);
+        Self::write_table_entry(ctx_phys, entry_offset, low);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Self::write_table_entry(ctx_phys, entry_offset, low | 0x1);
         Ok(())
     }
 
@@ -834,6 +836,10 @@ impl IommuUnit for VtdUnit {
         if let Some(state) = self.domains.iter_mut().find(|d| d.id == domain) {
             state.pt_pages = pt_pages;
         }
+        // Fresh translations are not guaranteed to become visible until the
+        // IOTLB is invalidated; otherwise devices can keep faulting on a
+        // just-mapped IOVA range.
+        self.invalidate_iotlb_global();
         Ok(())
     }
 
@@ -975,7 +981,64 @@ impl VtdUnit {
         if let Some(state) = self.domains.iter_mut().find(|d| d.id == domain_id) {
             state.bound_bdf = ((bus as u16) << 8) | (dev_fn as u16);
         }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.invalidate_context_cache_global();
+        self.invalidate_iotlb_global();
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D.1 — BAR identity mapping (Track D)
+// ---------------------------------------------------------------------------
+
+impl VtdUnit {
+    /// Identity-map each MMIO BAR in the given domain and return a
+    /// [`BarCoverage`] recording every range that was installed.
+    ///
+    /// For each non-zero-length entry in `bars`, the physical range
+    /// `[base, base + len)` is identity-mapped (IOVA == phys) with
+    /// `READ | WRITE` permissions. The range is 4 KiB–page-aligned before
+    /// the IOMMU call: `base` is rounded down and `len` is rounded up to
+    /// cover the full BAR window.
+    ///
+    /// `AlreadyMapped` from the underlying [`IommuUnit::map`] is treated as
+    /// success — the range may have been pre-installed by `pre_map_reserved`
+    /// and the coverage is still valid. Any other error is propagated and
+    /// the caller should treat the domain as unusable.
+    ///
+    /// Called from `sys_device_claim` (Track D.3) through
+    /// `install_and_verify_bar_coverage`; also directly accessible for
+    /// integration tests under `cargo xtask device-smoke --device nvme
+    /// --iommu`.
+    #[allow(dead_code)]
+    pub fn install_bar_identity_maps(
+        &mut self,
+        domain: DomainId,
+        bars: &[kernel_core::iommu::bar_coverage::Bar],
+    ) -> Result<kernel_core::iommu::bar_coverage::BarCoverage, DomainError> {
+        use kernel_core::iommu::bar_coverage::BarCoverage;
+        let mut coverage = BarCoverage::new();
+        for bar in bars {
+            if bar.len == 0 {
+                continue;
+            }
+            let aligned_base = bar.base & !0xFFF;
+            let end = bar.base.saturating_add(bar.len as u64);
+            let aligned_end = (end + 0xFFF) & !0xFFF;
+            let aligned_len = (aligned_end - aligned_base) as usize;
+            match self.map(
+                domain,
+                Iova(aligned_base),
+                PhysAddr(aligned_base),
+                aligned_len,
+                MapFlags::READ | MapFlags::WRITE,
+            ) {
+                Ok(()) | Err(DomainError::AlreadyMapped) => {}
+                Err(e) => return Err(e),
+            }
+            coverage.record_mapped(aligned_base, aligned_len);
+        }
+        Ok(coverage)
     }
 }

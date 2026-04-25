@@ -8,8 +8,9 @@ networking) on top of the VirtIO baseline, an IOMMU substrate that routes
 device DMA through per-device VT-d / AMD-Vi translation domains, and a roadmap
 toward stronger service isolation and broader platform support.
 
-**Current kernel version:** v0.55.2 (Phase 55 hardware substrate + Phase 55a
-IOMMU substrate + Phase 55b ring-3 driver host).
+**Current kernel version:** v0.55.3 (Phase 55 hardware substrate + Phase 55a
+IOMMU substrate + Phase 55b ring-3 driver host + Phase 55c ring-3 driver correctness
+closure).
 
 ## Quick Start
 
@@ -89,6 +90,11 @@ cargo xtask image
 # Lint, format-check, run host-side kernel-core tests
 cargo xtask check
 ```
+
+The default pre-push hook runs `cargo xtask check`, `cargo xtask smoke-test`,
+and `cargo xtask regression`. Set `M3OS_E1000_REGRESSION=1` before `git push`
+to also add the Phase 55c `cargo xtask ssh-e1000-banner-check` e1000 SSH-banner
+regression gate.
 
 `cargo xtask run` is the primary supported workflow. It builds
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img`, keeps the companion ext2

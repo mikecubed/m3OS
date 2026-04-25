@@ -15,3 +15,4 @@
 //! this module instead so the arch tree stops accreting per-subsystem code.
 
 pub mod device_host;
+pub mod net;

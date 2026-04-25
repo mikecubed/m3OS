@@ -147,6 +147,87 @@ pub const fn net_error_to_neg_errno(error_byte: u8) -> i64 {
     }
 }
 
+/// Map the `Result<(), NetDriverError>` returned by `RemoteNic::send_frame`
+/// to a syscall return value.
+///
+/// This is the pure-logic bridge used by `sys_net_send` in
+/// `kernel/src/syscall/net.rs`.  Keeping the mapping in `kernel-core`
+/// makes it host-testable without QEMU.
+///
+/// | Outcome | Return |
+/// |---------|--------|
+/// | `Ok(())` | 0 (success) |
+/// | `Err(DriverRestarting)` | `-11` (`NEG_EAGAIN`) |
+/// | `Err(RingFull)` | `-11` (`NEG_EAGAIN`) |
+/// | `Err(_)` | `-5` (`NEG_EIO`) |
+///
+/// Phase 55c Track G.3 — single source of truth for the R1 EAGAIN surface.
+pub const fn net_send_result_to_syscall_ret(result: Result<(), NetDriverError>) -> i64 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => net_error_to_neg_errno(e.to_byte()),
+    }
+}
+
+/// Gate-and-route for `sys_net_send` — the full ABI/dispatch seam.
+///
+/// Encapsulates the two invariants that the syscall dispatch arm must enforce:
+///
+/// 1. **Socket capability boundary**: the caller must own an open socket fd.
+///    If `has_socket` is `false` this function returns `NEG_EBADF` (-9)
+///    without touching the driver path.  The arch-level dispatcher resolves
+///    this flag by calling `current_fd_entry(arg0)` and checking that the
+///    backend is `FdBackend::Socket`.
+///
+/// 2. **Driver-error → errno mapping**: delegates to
+///    [`net_send_result_to_syscall_ret`], which is the single source of truth
+///    for `DriverRestarting`/`RingFull` → `NEG_EAGAIN` and everything else →
+///    `NEG_EIO`.
+///
+/// The kernel's `kernel/src/syscall/net.rs::sys_net_send` calls this after
+/// the userspace buffer copy so both the socket-boundary and errno-mapping
+/// invariants are exercised on the same code path that the tests cover.
+///
+/// | `has_socket` | `frame_result`         | Return |
+/// |---|---|---|
+/// | `false`      | any                    | `-9`  (`NEG_EBADF`)  |
+/// | `true`       | `Ok(())`               | `0`                  |
+/// | `true`       | `Err(DriverRestarting)` | `-11` (`NEG_EAGAIN`) |
+/// | `true`       | `Err(RingFull)`        | `-11` (`NEG_EAGAIN`) |
+/// | `true`       | `Err(_)`               | `-5`  (`NEG_EIO`)    |
+///
+/// Phase 55c Track G resend — tested in `kernel-core/tests/driver_restart.rs`.
+pub const fn net_send_dispatch(has_socket: bool, frame_result: Result<(), NetDriverError>) -> i64 {
+    if !has_socket {
+        return -9; // NEG_EBADF
+    }
+    net_send_result_to_syscall_ret(frame_result)
+}
+
+/// Phase 55c Track G R1 — `sys_sendto` restart-gate return seam.
+///
+/// Maps the `(is_registered, is_restarting)` state pair consumed by the
+/// production `sys_sendto` UDP/ICMP branches to an optional `NEG_EAGAIN`
+/// return value.
+///
+/// | `is_registered` | `is_restarting` | Returns |
+/// |---|---|---|
+/// | `true`  | `true`  | `Some(-11)` (`NEG_EAGAIN`) |
+/// | `true`  | `false` | `None` — proceed normally |
+/// | `false` | any     | `None` — no ring-3 NIC; use virtio fallback |
+///
+/// `sys_sendto`'s UDP/ICMP branches call this exact function through
+/// `RemoteNic::sendto_restart_ret()`, which loads the two `AtomicBool`s and
+/// forwards them here. Tests in `kernel-core/tests/driver_restart.rs` therefore
+/// cover the same seam production executes rather than a detached mirror.
+pub const fn sendto_restart_errno(is_registered: bool, is_restarting: bool) -> Option<i64> {
+    if is_registered && is_restarting {
+        Some(-11) // NEG_EAGAIN
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NetFrameHeader encoding — private helpers shared by send and rx paths.
 // ---------------------------------------------------------------------------
