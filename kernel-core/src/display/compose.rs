@@ -192,7 +192,8 @@ fn extract_subrect(
         let src_row_end = src_row_start + sub_w * bpp;
         let dst_row_start = row * sub_w * bpp;
         let dst_row_end = dst_row_start + sub_w * bpp;
-        out[dst_row_start..dst_row_end].copy_from_slice(&surface_pixels[src_row_start..src_row_end]);
+        out[dst_row_start..dst_row_end]
+            .copy_from_slice(&surface_pixels[src_row_start..src_row_end]);
     }
     out
 }
@@ -349,7 +350,10 @@ mod tests {
         assert!(ComposeLayer::Top < ComposeLayer::Overlay);
         assert!(ComposeLayer::Overlay < ComposeLayer::Cursor);
         // From<Layer> mappings.
-        assert_eq!(ComposeLayer::from(Layer::Background), ComposeLayer::Background);
+        assert_eq!(
+            ComposeLayer::from(Layer::Background),
+            ComposeLayer::Background
+        );
         assert_eq!(ComposeLayer::from(Layer::Bottom), ComposeLayer::Bottom);
         assert_eq!(ComposeLayer::from(Layer::Top), ComposeLayer::Top);
         assert_eq!(ComposeLayer::from(Layer::Overlay), ComposeLayer::Overlay);
@@ -472,9 +476,30 @@ mod tests {
         // Submit in a *non*-canonical order: cursor first, background second,
         // top third. The composer must still emit them background → cursor.
         let mut surfaces = [
-            make_surface(3, ComposeLayer::Cursor, rect(50, 50, 10, 10), &cur_damage, &cur_pixels, false),
-            make_surface(1, ComposeLayer::Background, rect(0, 0, 100, 100), &bg_damage, &bg_pixels, false),
-            make_surface(2, ComposeLayer::Top, rect(40, 40, 20, 20), &top_damage, &top_pixels, false),
+            make_surface(
+                3,
+                ComposeLayer::Cursor,
+                rect(50, 50, 10, 10),
+                &cur_damage,
+                &cur_pixels,
+                false,
+            ),
+            make_surface(
+                1,
+                ComposeLayer::Background,
+                rect(0, 0, 100, 100),
+                &bg_damage,
+                &bg_pixels,
+                false,
+            ),
+            make_surface(
+                2,
+                ComposeLayer::Top,
+                rect(40, 40, 20, 20),
+                &top_damage,
+                &top_pixels,
+                false,
+            ),
         ];
         let result = compose_frame(&mut owner, rect(0, 0, 100, 100), &mut surfaces);
         assert_eq!(result, Ok(3));
@@ -482,9 +507,21 @@ mod tests {
         assert_eq!(writes.len(), 3);
         // The clipped_rect of each recorded write tells us which surface drew it,
         // because each surface has a distinct rectangle.
-        assert_eq!(writes[0].clipped_rect, rect(0, 0, 100, 100), "background drawn first");
-        assert_eq!(writes[1].clipped_rect, rect(40, 40, 20, 20), "top drawn after background");
-        assert_eq!(writes[2].clipped_rect, rect(50, 50, 10, 10), "cursor drawn last");
+        assert_eq!(
+            writes[0].clipped_rect,
+            rect(0, 0, 100, 100),
+            "background drawn first"
+        );
+        assert_eq!(
+            writes[1].clipped_rect,
+            rect(40, 40, 20, 20),
+            "top drawn after background"
+        );
+        assert_eq!(
+            writes[2].clipped_rect,
+            rect(50, 50, 10, 10),
+            "cursor drawn last"
+        );
     }
 
     #[test]
@@ -496,8 +533,22 @@ mod tests {
         let top_damage = [rect(0, 0, 100, 100)];
         // Toplevel fully covers the background (same rect, opaque).
         let mut surfaces = [
-            make_surface(1, ComposeLayer::Background, rect(0, 0, 100, 100), &bg_damage, &bg_pixels, false),
-            make_surface(2, ComposeLayer::Toplevel, rect(0, 0, 100, 100), &top_damage, &top_pixels, true),
+            make_surface(
+                1,
+                ComposeLayer::Background,
+                rect(0, 0, 100, 100),
+                &bg_damage,
+                &bg_pixels,
+                false,
+            ),
+            make_surface(
+                2,
+                ComposeLayer::Toplevel,
+                rect(0, 0, 100, 100),
+                &top_damage,
+                &top_pixels,
+                true,
+            ),
         ];
         let result = compose_frame(&mut owner, rect(0, 0, 100, 100), &mut surfaces);
         assert_eq!(result, Ok(1));

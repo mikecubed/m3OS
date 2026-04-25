@@ -161,7 +161,10 @@ impl BufferLifecycle {
                 // no-op for the slot but is documented as still raising
                 // the AttachReplacedPending warning so the caller can
                 // notice the protocol-level redundancy.
-                (Vec::new(), Some(BufferTransitionError::AttachReplacedPending))
+                (
+                    Vec::new(),
+                    Some(BufferTransitionError::AttachReplacedPending),
+                )
             }
             Some(existing) => {
                 // The previously-pending buffer is being replaced before
@@ -177,7 +180,10 @@ impl BufferLifecycle {
 
     fn apply_commit(&mut self) -> (Vec<BufferEffect>, Option<BufferTransitionError>) {
         let Some(pending) = self.pending else {
-            return (Vec::new(), Some(BufferTransitionError::CommitWithoutPending));
+            return (
+                Vec::new(),
+                Some(BufferTransitionError::CommitWithoutPending),
+            );
         };
 
         let mut effects = Vec::new();
@@ -190,9 +196,7 @@ impl BufferLifecycle {
         (effects, None)
     }
 
-    fn apply_sampling_complete(
-        &mut self,
-    ) -> (Vec<BufferEffect>, Option<BufferTransitionError>) {
+    fn apply_sampling_complete(&mut self) -> (Vec<BufferEffect>, Option<BufferTransitionError>) {
         let Some(active) = self.active else {
             return (Vec::new(), Some(BufferTransitionError::NothingActive));
         };
@@ -218,9 +222,7 @@ impl BufferLifecycle {
         (effects, None)
     }
 
-    fn apply_client_gone(
-        &mut self,
-    ) -> (Vec<BufferEffect>, Option<BufferTransitionError>) {
+    fn apply_client_gone(&mut self) -> (Vec<BufferEffect>, Option<BufferTransitionError>) {
         // The client is gone; the kernel will reclaim the page-grant on
         // its own. Drop the slot state without emitting any Release
         // effects, since there is no longer anyone to deliver them to.
@@ -368,10 +370,7 @@ mod tests {
         let (effects, err) = life.apply(BufferEvent::Destroy);
         assert_eq!(
             effects,
-            vec![
-                BufferEffect::Release(b(1)),
-                BufferEffect::Release(b(2)),
-            ]
+            vec![BufferEffect::Release(b(1)), BufferEffect::Release(b(2)),]
         );
         assert!(err.is_none());
         assert!(life.is_dead());
@@ -392,7 +391,11 @@ mod tests {
             BufferEvent::SamplingComplete,
         ] {
             let (effects, err) = life.apply(event);
-            assert!(effects.is_empty(), "unexpected effects after destroy: {:?}", effects);
+            assert!(
+                effects.is_empty(),
+                "unexpected effects after destroy: {:?}",
+                effects
+            );
             assert_eq!(err, Some(BufferTransitionError::SurfaceDead));
         }
     }

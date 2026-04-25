@@ -335,7 +335,7 @@ impl SurfaceStateMachine {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
-    use crate::display::protocol::{LayerConfig, Layer, KeyboardInteractivity};
+    use crate::display::protocol::{KeyboardInteractivity, Layer, LayerConfig};
     use proptest::prelude::*;
     use std::collections::HashSet;
 
@@ -467,8 +467,7 @@ mod tests {
         let geom = r(0, 0, 1024, 768);
         let _ = s.apply(SurfaceEvent::SetGeometry(geom));
         for i in 0..MAX_PENDING_DAMAGE {
-            let (eff, err) =
-                s.apply(SurfaceEvent::DamageSurface(r(i as i32, i as i32, 4, 4)));
+            let (eff, err) = s.apply(SurfaceEvent::DamageSurface(r(i as i32, i as i32, 4, 4)));
             assert!(err.is_none());
             assert!(eff.is_empty());
         }
@@ -653,10 +652,7 @@ mod tests {
     }
 
     fn arb_event_with_destroy() -> impl Strategy<Value = SurfaceEvent> {
-        prop_oneof![
-            arb_event(),
-            Just(SurfaceEvent::DestroySurface),
-        ]
+        prop_oneof![arb_event(), Just(SurfaceEvent::DestroySurface),]
     }
 
     proptest! {

@@ -106,12 +106,7 @@ pub trait FramebufferOwner {
     /// row of `clipped_rect.w` pixels, or [`FbError::Truncated`] when
     /// `src` is too short to cover the clipped rectangle given that
     /// stride.
-    fn write_pixels(
-        &mut self,
-        rect: Rect,
-        src: &[u8],
-        src_stride: u32,
-    ) -> Result<(), FbError>;
+    fn write_pixels(&mut self, rect: Rect, src: &[u8], src_stride: u32) -> Result<(), FbError>;
 
     /// Optional commit/flush point. Backends that double-buffer use this
     /// to swap; in-memory backends usually ignore it. Default impl is a
@@ -291,12 +286,7 @@ impl FramebufferOwner for RecordingFramebufferOwner {
         self.metadata
     }
 
-    fn write_pixels(
-        &mut self,
-        rect: Rect,
-        src: &[u8],
-        src_stride: u32,
-    ) -> Result<(), FbError> {
+    fn write_pixels(&mut self, rect: Rect, src: &[u8], src_stride: u32) -> Result<(), FbError> {
         let bpp = bytes_per_pixel(self.metadata.pixel_format);
         let clipped = clip_rect(rect, self.metadata.width, self.metadata.height);
 
@@ -304,7 +294,11 @@ impl FramebufferOwner for RecordingFramebufferOwner {
             return Ok(());
         }
 
-        let row_bytes = clipped.clipped.w.checked_mul(bpp).ok_or(FbError::InvalidStride)?;
+        let row_bytes = clipped
+            .clipped
+            .w
+            .checked_mul(bpp)
+            .ok_or(FbError::InvalidStride)?;
         if src_stride < row_bytes {
             return Err(FbError::InvalidStride);
         }
@@ -427,7 +421,7 @@ where
         let m = meta(100, 100);
         let mut owner = constructor(m);
         // Rect straddles the right edge: x=98, w=10 → clipped to x=98, w=2.
-        let src = [0x42u8; 10 * 1 * 4];
+        let src = [0x42u8; 10 * 4];
         let res = owner.write_pixels(
             Rect {
                 x: 98,
@@ -456,14 +450,18 @@ where
             &src,
             4 * 4,
         );
-        assert_eq!(res, Ok(()), "fully out-of-bounds write must succeed (no-op)");
+        assert_eq!(
+            res,
+            Ok(()),
+            "fully out-of-bounds write must succeed (no-op)"
+        );
     }
 
     // 5. negative_origin_clipped_correctly
     {
         let m = meta(100, 100);
         let mut owner = constructor(m);
-        let src = [0x33u8; 10 * 1 * 4];
+        let src = [0x33u8; 10 * 4];
         let res = owner.write_pixels(
             Rect {
                 x: -5,
@@ -474,7 +472,11 @@ where
             &src,
             10 * 4,
         );
-        assert_eq!(res, Ok(()), "negative-origin write must succeed after clipping");
+        assert_eq!(
+            res,
+            Ok(()),
+            "negative-origin write must succeed after clipping"
+        );
     }
 
     // 6. zero_area_write_is_noop_returns_ok

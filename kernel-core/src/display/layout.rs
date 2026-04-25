@@ -207,12 +207,8 @@ impl LayoutPolicy for FloatingLayout {
         for surface in toplevels {
             let (w, h) = pick_size(surface.preferred_size, usable);
             // Center the window in the usable rect.
-            let center_x = usable
-                .x
-                .saturating_add((usable.w as i32 - w as i32) / 2);
-            let center_y = usable
-                .y
-                .saturating_add((usable.h as i32 - h as i32) / 2);
+            let center_x = usable.x.saturating_add((usable.w as i32 - w as i32) / 2);
+            let center_y = usable.y.saturating_add((usable.h as i32 - h as i32) / 2);
             let cascade_off = (self.cascade_slot as i32) * CASCADE_OFFSET_PX;
             let rect = Rect {
                 x: center_x.saturating_add(cascade_off),
@@ -260,10 +256,19 @@ impl LayoutPolicy for StubLayout {
         _output: OutputGeometry,
         _exclusive_zones: &[Rect],
     ) -> Vec<(SurfaceId, Rect)> {
-        let default_rect = Rect { x: 0, y: 0, w: 0, h: 0 };
+        let default_rect = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
         let mut out = Vec::with_capacity(toplevels.len());
         for surface in toplevels {
-            let rect = self.script.get(self.cursor).copied().unwrap_or(default_rect);
+            let rect = self
+                .script
+                .get(self.cursor)
+                .copied()
+                .unwrap_or(default_rect);
             self.cursor += 1;
             out.push((surface.id, rect));
         }
@@ -279,7 +284,14 @@ impl LayoutPolicy for StubLayout {
 /// the system must satisfy. Downstream layouts (e.g. tiling layouts in
 /// later phases) reuse this function to keep behavior interchangeable.
 pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
-    let output = OutputGeometry { rect: Rect { x: 0, y: 0, w: 1024, h: 768 } };
+    let output = OutputGeometry {
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: 1024,
+            h: 768,
+        },
+    };
 
     // 1. Empty toplevels → empty result.
     {
@@ -291,7 +303,10 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     // 2. Single toplevel produces exactly one rect.
     {
         let mut layout = constructor();
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) }];
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, SurfaceId(1));
@@ -301,9 +316,18 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     {
         let mut layout = constructor();
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (200, 150) },
-            LayoutSurface { id: SurfaceId(3), preferred_size: (400, 300) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (200, 150),
+            },
+            LayoutSurface {
+                id: SurfaceId(3),
+                preferred_size: (400, 300),
+            },
         ];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), toplevels.len());
@@ -318,8 +342,14 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     {
         let mut layout = constructor();
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (200, 150) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (200, 150),
+            },
         ];
         let result = layout.arrange(&toplevels, output, &[]);
         for (_, rect) in &result {
@@ -344,8 +374,14 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     //    fresh-instance runs.
     {
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (250, 180) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (250, 180),
+            },
         ];
         let mut layout_a = constructor();
         let mut layout_b = constructor();
@@ -357,10 +393,16 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     // 6. add+remove roundtrip is internally consistent.
     {
         let mut layout = constructor();
-        let surface = LayoutSurface { id: SurfaceId(7), preferred_size: (300, 200) };
+        let surface = LayoutSurface {
+            id: SurfaceId(7),
+            preferred_size: (300, 200),
+        };
         layout.on_surface_added(surface);
         layout.on_surface_removed(SurfaceId(7));
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) }];
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 1);
     }
@@ -369,7 +411,10 @@ pub fn layout_contract_suite<P: LayoutPolicy, F: Fn() -> P>(constructor: F) {
     {
         let mut layout = constructor();
         layout.on_focus_changed(Some(SurfaceId(1)));
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) }];
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, SurfaceId(1));
@@ -392,8 +437,13 @@ mod tests {
     #[test]
     fn floating_layout_centers_single_toplevel() {
         let mut layout = FloatingLayout::new();
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) }];
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 1);
         // Centered: x = (1024 - 300) / 2 = 362; y = (768 - 200) / 2 = 284.
@@ -404,35 +454,69 @@ mod tests {
     #[test]
     fn floating_layout_cascades_multiple_toplevels() {
         let mut layout = FloatingLayout::new();
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (300, 200) },
-            LayoutSurface { id: SurfaceId(3), preferred_size: (300, 200) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(3),
+                preferred_size: (300, 200),
+            },
         ];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 3);
         // First surface centered (slot 0); successive surfaces shifted by
         // CASCADE_OFFSET_PX per slot.
         assert_eq!(result[0].1, rect(362, 284, 300, 200));
-        assert_eq!(result[1].1, rect(362 + CASCADE_OFFSET_PX, 284 + CASCADE_OFFSET_PX, 300, 200));
+        assert_eq!(
+            result[1].1,
+            rect(362 + CASCADE_OFFSET_PX, 284 + CASCADE_OFFSET_PX, 300, 200)
+        );
         assert_eq!(
             result[2].1,
-            rect(362 + 2 * CASCADE_OFFSET_PX, 284 + 2 * CASCADE_OFFSET_PX, 300, 200)
+            rect(
+                362 + 2 * CASCADE_OFFSET_PX,
+                284 + 2 * CASCADE_OFFSET_PX,
+                300,
+                200
+            )
         );
     }
 
     #[test]
     fn floating_layout_clamps_oversize_to_output() {
         let mut layout = FloatingLayout::new();
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
         // Preferred size huge — should fall back to ~60% of usable area.
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (10_000, 10_000) }];
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (10_000, 10_000),
+        }];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 1);
         let (_, r) = result[0];
-        assert!(r.w <= output.rect.w, "width {} > output {}", r.w, output.rect.w);
-        assert!(r.h <= output.rect.h, "height {} > output {}", r.h, output.rect.h);
+        assert!(
+            r.w <= output.rect.w,
+            "width {} > output {}",
+            r.w,
+            output.rect.w
+        );
+        assert!(
+            r.h <= output.rect.h,
+            "height {} > output {}",
+            r.h,
+            output.rect.h
+        );
         // 60% of usable: 1024 * 0.6 = 614, 768 * 0.6 = 460.
         assert_eq!(r.w, (1024 * 6) / 10);
         assert_eq!(r.h, (768 * 6) / 10);
@@ -441,10 +525,15 @@ mod tests {
     #[test]
     fn floating_layout_subtracts_top_edge_exclusive_zone() {
         let mut layout = FloatingLayout::new();
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
         // Top-edge bar 24px tall.
         let zones = [rect(0, 0, 1024, 24)];
-        let toplevels = [LayoutSurface { id: SurfaceId(1), preferred_size: (300, 200) }];
+        let toplevels = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
         let result = layout.arrange(&toplevels, output, &zones);
         assert_eq!(result.len(), 1);
         let (_, r) = result[0];
@@ -460,31 +549,58 @@ mod tests {
         let mut layout = StubLayout::new();
         layout.push(rect(0, 0, 100, 100));
         layout.push(rect(100, 100, 200, 200));
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (0, 0) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (0, 0) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (0, 0),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (0, 0),
+            },
         ];
         let result = layout.arrange(&toplevels, output, &[]);
-        assert_eq!(result, alloc::vec![
-            (SurfaceId(1), rect(0, 0, 100, 100)),
-            (SurfaceId(2), rect(100, 100, 200, 200)),
-        ]);
+        assert_eq!(
+            result,
+            alloc::vec![
+                (SurfaceId(1), rect(0, 0, 100, 100)),
+                (SurfaceId(2), rect(100, 100, 200, 200)),
+            ]
+        );
     }
 
     #[test]
     fn stub_layout_runs_out_of_script_returns_default() {
         let mut layout = StubLayout::new();
         layout.push(rect(0, 0, 100, 100));
-        let output = OutputGeometry { rect: rect(0, 0, 1024, 768) };
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
         let toplevels = [
-            LayoutSurface { id: SurfaceId(1), preferred_size: (0, 0) },
-            LayoutSurface { id: SurfaceId(2), preferred_size: (0, 0) },
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (0, 0),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (0, 0),
+            },
         ];
         let result = layout.arrange(&toplevels, output, &[]);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1, rect(0, 0, 100, 100));
-        assert_eq!(result[1].1, Rect { x: 0, y: 0, w: 0, h: 0 });
+        assert_eq!(
+            result[1].1,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0
+            }
+        );
     }
 
     #[test]
