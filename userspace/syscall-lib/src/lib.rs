@@ -256,6 +256,9 @@ pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1005;
 /// Phase 47: framebuffer mmap syscall.
 pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
 
+/// Phase 56 Track B.1: explicit framebuffer release syscall.
+pub const SYS_FRAMEBUFFER_RELEASE: u64 = 0x1014;
+
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
@@ -1874,6 +1877,17 @@ pub fn framebuffer_info(buf: &mut [u8]) -> isize {
 /// Callers should check `ret > u64::MAX - 4096` to detect error values.
 pub fn framebuffer_mmap() -> u64 {
     unsafe { syscall0(SYS_FRAMEBUFFER_MMAP) }
+}
+
+/// Phase 56 Track B.1: release the framebuffer back to the kernel console.
+///
+/// Counterpart to [`framebuffer_mmap`]. Tears down the FB mapping in the
+/// calling process's address space and restores the kernel framebuffer
+/// console. Returns 0 on success, negative errno (specifically `-EPERM`
+/// when the caller does not own the framebuffer, `-ENOENT` when no FB
+/// mapping was found despite the owner flag being set).
+pub fn framebuffer_release() -> isize {
+    unsafe { syscall0(SYS_FRAMEBUFFER_RELEASE) as isize }
 }
 
 /// Reads one raw PS/2 scancode from the keyboard ring buffer.

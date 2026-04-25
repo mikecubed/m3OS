@@ -1236,6 +1236,10 @@ mod syscall_nr {
     /// `DriverRestarting` surfaces as `NEG_EAGAIN` to userspace.
     /// See `docs/appendix/phase-55c-net-send-shape.md`.
     pub const NET_SEND: u64 = 0x1013;
+    /// Phase 56 Track B.1: explicit release of the framebuffer back to the
+    /// kernel console. Pair with [`FRAMEBUFFER_MMAP`]; only callable by the
+    /// process that currently owns the framebuffer.
+    pub const FRAMEBUFFER_RELEASE: u64 = 0x1014;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1578,6 +1582,7 @@ pub extern "C" fn syscall_handler(
         KTRACE => sys_ktrace(arg0, arg1, arg2),
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
+        FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -8831,6 +8836,43 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
         virt_addr
     );
     virt_addr
+}
+
+// ---------------------------------------------------------------------------
+// Phase 56 Track B.1: explicit framebuffer release syscall (0x1014)
+//
+// Counterpart to FRAMEBUFFER_MMAP. Tears down the framebuffer mapping in
+// the calling process's address space and restores the kernel console.
+// Returns 0 on success, NEG_EPERM if the caller does not own the FB,
+// NEG_ENOENT if the caller owns the FB but no FB-flagged VMA was found
+// (already munmapped — restore is still triggered for safety).
+// ---------------------------------------------------------------------------
+
+pub(super) fn sys_framebuffer_release() -> u64 {
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return NEG_EPERM;
+    }
+
+    // Locate the FB-flagged VMA so we can hand its (addr, len) to the
+    // existing munmap path; that path already restores the console once
+    // every FB-flagged mapping has been torn down.
+    let fb_mapping = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree
+            .iter()
+            .find(|m| (m.flags & FB_MAPPING_FLAG) != 0)
+            .map(|m| (m.start, m.len))
+    });
+
+    match fb_mapping {
+        Some(Some((addr, len))) => sys_linux_munmap(addr, len),
+        _ => {
+            // Owner flag was set but no VMA matched — restore the console
+            // anyway so the system isn't stuck with a yielded screen.
+            crate::fb::restore_console();
+            NEG_ENOENT
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
