@@ -326,6 +326,10 @@ fn build_userspace_bins() {
         // Phase 55b Track F.3d-3: e1000 crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("e1000-crash-smoke", "e1000-crash-smoke", false),
+        // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
+        // `needs_alloc = true` because the daemon depends on `kernel-core`
+        // and will use `alloc` types as the protocol surface lands.
+        ("display_server", "display_server", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -5199,6 +5203,13 @@ fn populate_ext2_files(
         "name=nvme_driver\ncommand=/drivers/nvme\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
     let e1000_driver_conf = "name=e1000_driver\ncommand=/drivers/e1000\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
 
+    // Phase 56 Track C.1: ring-3 display server (compositor) scaffold.
+    // Depends on `kbd` so input arrives before the compositor binds the
+    // framebuffer.  restart=on-failure mirrors the driver shape: supervised
+    // crash recovery without infinite loops while the protocol surface is
+    // still under development.
+    let display_server_conf = "name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -5219,6 +5230,7 @@ fn populate_ext2_files(
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
+    let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -5236,6 +5248,8 @@ fn populate_ext2_files(
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
     fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
+    fs::write(&display_server_conf_tmp, display_server_conf)
+        .expect("write temp display_server.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -5459,6 +5473,10 @@ fn populate_ext2_files(
          sif etc/services.d/e1000_driver.conf mode 0x81A4\n\
          sif etc/services.d/e1000_driver.conf uid 0\n\
          sif etc/services.d/e1000_driver.conf gid 0\n\
+         write \"{display_server_conf}\" etc/services.d/display_server.conf\n\
+         sif etc/services.d/display_server.conf mode 0x81A4\n\
+         sif etc/services.d/display_server.conf uid 0\n\
+         sif etc/services.d/display_server.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5481,6 +5499,7 @@ fn populate_ext2_files(
         net_server_conf = net_server_conf_tmp.display(),
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
+        display_server_conf = display_server_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,

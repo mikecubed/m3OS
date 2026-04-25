@@ -74,6 +74,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // Phase 55b F.1: ring-3 driver process configs.
     b"/etc/services.d/nvme_driver.conf\0",
     b"/etc/services.d/e1000_driver.conf\0",
+    // Phase 56 Track C: display server (compositor).
+    b"/etc/services.d/display_server.conf\0",
 ];
 
 // ---------------------------------------------------------------------------
