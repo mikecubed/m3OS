@@ -5,70 +5,163 @@
 //! (or [`PointerRouteDecision`] for pointer events). Owns *no* compositor
 //! state — every call site supplies a [`CompositorState<'a>`] view.
 //!
+//! ## Decision order
+//!
+//! Key events (see [`InputDispatcher::route_key_event`]):
+//!   1. [`BindTable::match_bind`] hit on a [`KeyEventKind::Down`] →
+//!      [`GrabState::start_grab`] + return [`RouteDecision::Grab`].
+//!      The matching `Repeat`/`Up` for that keycode are suppressed by
+//!      step (2) below — clients never see half a chord.
+//!   2. [`GrabState::is_grabbed`] hit (any kind) → suppress; for
+//!      [`KeyEventKind::Up`] additionally call
+//!      [`GrabState::clear_on_keyup`].
+//!   3. `active_exclusive_layer` set → `DeliverTo(layer)`.
+//!   4. `focused` set → `DeliverTo(focused)`.
+//!   5. otherwise → [`RouteDecision::Drop`].
+//!
+//! Pointer events (see [`InputDispatcher::route_pointer_event`]):
+//!   * Hit-test against `surface_geometry` (top-of-stack first).
+//!     Boundary: **top-left-inclusive, bottom-right-exclusive** — a
+//!     point `(x, y)` is inside `Rect { x: rx, y: ry, w, h }` iff
+//!     `rx <= x < rx + w && ry <= y < ry + h`.
+//!   * Motion that crosses a surface boundary emits a
+//!     [`EnterOrLeave::Leave`] for the previous hovered surface
+//!     followed by an [`EnterOrLeave::Enter`] for the new hovered
+//!     surface, then delivers the event to the new surface.
+//!   * [`PointerButton::Down`] on a [`SurfaceRole::Toplevel`] requests
+//!     a focus change to that surface, *unless* an
+//!     [`crate::display::protocol::KeyboardInteractivity::Exclusive`]
+//!     layer is active.
+//!
+//! ## Resource discipline
+//!
+//! `surface_geometry` is a borrowed slice; the dispatcher does not own
+//! or copy it. The enter/leave effect buffer is a fixed-capacity inline
+//! array (max two effects per pointer event — at most one leave for the
+//! prior hovered surface and one enter for the new hovered surface).
+//!
+//! ## `InputSource` trait
+//!
+//! Producer-side abstraction. The real `display_server` wires two impls
+//! — one for `kbd_server` and one for `mouse_server`. Tests substitute a
+//! [`MockInputSource`] that scripts events for assertions about routing.
+//! Defining producer behaviour as a trait keeps the dispatcher pure
+//! logic and lets the same code drive both real services and test
+//! doubles.
+//!
 //! Spec: `docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`
 //! § D.3 (lines ~588–605).
-//!
-//! Stub-only file used to commit failing tests before the implementation.
-//! Replaced wholesale by the green-test commit.
-
-#![allow(dead_code, unused_variables, unused_mut)]
 
 use crate::display::protocol::{LayerConfig, Rect, SurfaceId, SurfaceRole};
 use crate::input::bind_table::{BindId, BindTable, GrabState};
-use crate::input::events::{KeyEvent, PointerEvent};
+use crate::input::events::{KeyEvent, KeyEventKind, PointerButton, PointerEvent};
 
-/// Per-decision routing outcome produced by [`InputDispatcher::route_key_event`].
+/// Per-decision routing outcome produced by
+/// [`InputDispatcher::route_key_event`].
+///
+/// `#[non_exhaustive]` so future variants (e.g. `BoundCursorOnly` for
+/// grab-hold pointer routing in later phases) can be added without
+/// breaking downstream matchers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum RouteDecision {
+    /// Deliver the event verbatim to the named surface.
     DeliverTo(SurfaceId),
+    /// The event matched a registered keybind grab; `BindId` identifies
+    /// the registered handler. The dispatcher already updated
+    /// [`GrabState`] so the matching `Repeat` / `Up` will be
+    /// suppressed.
     Grab(BindId),
+    /// Suppress the event entirely (no client receives it). Used for
+    /// post-grab `Repeat`/`Up`, and for the no-focus / no-layer case.
     Drop,
 }
 
-/// `PointerEnter`/`PointerLeave` direction tag.
+/// `PointerEnter`/`PointerLeave` direction tag. Distinct from
+/// [`RouteDecision`] because pointer events may emit *both* an
+/// enter/leave pair *and* a delivery in one decision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnterOrLeave {
     Leave,
     Enter,
 }
 
+/// Bounded effect-buffer capacity for [`EnterLeaveBuf`]. At most two:
+/// one leave for the prior hovered surface and one enter for the new
+/// hovered surface, in that order.
 pub const MAX_ENTER_LEAVE: usize = 2;
 
+/// Inline effect buffer carried alongside a pointer-route decision.
+/// Bounded to [`MAX_ENTER_LEAVE`] entries — no allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnterLeaveBuf {
     entries: [Option<(SurfaceId, EnterOrLeave)>; MAX_ENTER_LEAVE],
 }
 
 impl EnterLeaveBuf {
+    /// Construct an empty buffer.
     pub const fn new() -> Self {
         Self {
             entries: [None; MAX_ENTER_LEAVE],
         }
     }
 
+    /// Push an effect; ignored if the buffer is full. The dispatcher
+    /// never emits more than two effects per pointer event so this
+    /// path is unreachable in practice; we silently drop rather than
+    /// panic to keep the dispatcher allocation- and panic-free.
+    fn push(&mut self, surface: SurfaceId, kind: EnterOrLeave) {
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some((surface, kind));
+                return;
+            }
+        }
+    }
+
+    /// Iterate effects in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (SurfaceId, EnterOrLeave)> + '_ {
         self.entries.iter().copied().flatten()
     }
 
+    /// Number of recorded effects.
     pub fn len(&self) -> usize {
         self.entries.iter().filter(|e| e.is_some()).count()
     }
 
+    /// True iff no effects were recorded.
     pub fn is_empty(&self) -> bool {
         self.entries.iter().all(|e| e.is_none())
     }
 }
 
+/// Per-pointer-event routing decision.
+///
+/// Carries any [`EnterOrLeave`] effects (`enter_leave`) emitted by the
+/// motion crossing a surface boundary, plus an optional delivery target
+/// (`deliver_to`) and an optional focus-change request
+/// (`focus_change`) triggered by a button-down on a `Toplevel`.
+///
+/// `#[non_exhaustive]` so later phases (e.g. drag-and-drop sources,
+/// pointer locks) can extend it.
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub struct PointerRouteDecision {
+    /// `PointerLeave(prev)` then `PointerEnter(new)` effects in
+    /// insertion order. Maximum two entries.
     pub enter_leave: EnterLeaveBuf,
+    /// Surface to deliver the event to; `None` means "suppress" (the
+    /// cursor is over no surface).
     pub deliver_to: Option<SurfaceId>,
+    /// If `Some`, the dispatcher requests a focus change to this
+    /// surface. Only emitted on `PointerButton::Down` on a `Toplevel`
+    /// when no `Exclusive` layer is active.
     pub focus_change: Option<SurfaceId>,
 }
 
 impl PointerRouteDecision {
+    /// Construct an empty decision (no effects, no delivery, no focus
+    /// change).
     pub const fn new() -> Self {
         Self {
             enter_leave: EnterLeaveBuf::new(),
@@ -78,15 +171,38 @@ impl PointerRouteDecision {
     }
 }
 
+/// Borrow-only view of compositor state used by [`InputDispatcher`].
+///
+/// Lifetime `'a` ties the borrows to the caller's owning state. Tests
+/// substitute a script-driven mock; the real `display_server` shim
+/// wraps its registry + focus tracker in this view per call.
 pub struct CompositorState<'a> {
+    /// Currently keyboard-focused surface (any role).
     pub focused: Option<SurfaceId>,
+    /// Surface that owns exclusive keyboard focus while mapped (a
+    /// `Layer` with [`crate::display::protocol::KeyboardInteractivity::Exclusive`]).
+    /// When `Some`, all key events route here regardless of `focused`.
     pub active_exclusive_layer: Option<SurfaceId>,
+    /// Pointer position, in output-local coordinates.
     pub pointer_position: (i32, i32),
+    /// Stacked surface geometry; **front-of-slice = bottom-of-stack**,
+    /// **end-of-slice = top-of-stack**. Hit-testing iterates in
+    /// reverse so the top-most surface wins.
     pub surface_geometry: &'a [SurfaceGeometry],
+    /// Bind-table reference; the dispatcher consults
+    /// [`BindTable::match_bind`] on every `KeyDown` and never mutates
+    /// it.
     pub bind_table: &'a BindTable,
+    /// Per-keycode grab state owned by the caller. The dispatcher
+    /// mutates it (start/clear) but never holds it across calls.
     pub grab_state: &'a mut GrabState,
 }
 
+/// One entry in the dispatcher's `surface_geometry` slice. Carries the
+/// fields needed to drive hit-testing and keyboard-routing decisions.
+///
+/// Distinct from [`crate::display::compose::ComposeSurface`] because
+/// the dispatcher cares about role, not pixels.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SurfaceGeometry {
     pub id: SurfaceId,
@@ -95,6 +211,7 @@ pub struct SurfaceGeometry {
 }
 
 impl SurfaceGeometry {
+    /// Convenience: create a `Toplevel` entry.
     pub const fn toplevel(id: SurfaceId, rect: Rect) -> Self {
         Self {
             id,
@@ -103,6 +220,7 @@ impl SurfaceGeometry {
         }
     }
 
+    /// Convenience: create a `Layer` entry from a layer config.
     pub const fn layer(id: SurfaceId, rect: Rect, cfg: LayerConfig) -> Self {
         Self {
             id,
@@ -111,57 +229,208 @@ impl SurfaceGeometry {
         }
     }
 
+    /// True iff `(x, y)` is inside `self.rect` under the
+    /// **top-left-inclusive, bottom-right-exclusive** convention.
     pub fn contains(&self, x: i32, y: i32) -> bool {
         rect_contains(self.rect, x, y)
     }
 }
 
-/// Stub: always returns `false`. The green-test commit replaces this with
-/// the real top-left-inclusive / bottom-right-exclusive hit-test.
-pub fn rect_contains(_r: Rect, _x: i32, _y: i32) -> bool {
-    false
+/// `Rect` hit-test under the dispatcher's chosen boundary convention:
+/// **top-left-inclusive, bottom-right-exclusive**. A 0-width or
+/// 0-height rect contains nothing.
+///
+/// Width and height arithmetic is widened to `i64` so the rect's right
+/// and bottom edges cannot overflow `i32` and silently wrap; an
+/// overflow returns `false`.
+pub fn rect_contains(r: Rect, x: i32, y: i32) -> bool {
+    if r.w == 0 || r.h == 0 {
+        return false;
+    }
+    let xi = x as i64;
+    let yi = y as i64;
+    let left = r.x as i64;
+    let top = r.y as i64;
+    let right = match left.checked_add(r.w as i64) {
+        Some(v) => v,
+        None => return false,
+    };
+    let bottom = match top.checked_add(r.h as i64) {
+        Some(v) => v,
+        None => return false,
+    };
+    xi >= left && xi < right && yi >= top && yi < bottom
 }
 
+/// Pure-logic input dispatcher. Owns no compositor state; every method
+/// takes a [`CompositorState`] view.
+///
+/// Dispatcher state that is *not* compositor state — the previously
+/// hovered pointer surface, used to detect motion crossings — lives
+/// here. This is the dispatcher's *own* memory and survives between
+/// calls.
 #[derive(Default)]
 pub struct InputDispatcher {
+    /// Surface currently hovered by the pointer (most-recent enter, no
+    /// matching leave yet). `None` means the pointer is not over any
+    /// surface or the dispatcher has not yet seen a pointer event.
     hovered: Option<SurfaceId>,
 }
 
 impl InputDispatcher {
+    /// Construct a dispatcher in the initial state (no hovered
+    /// surface).
     pub const fn new() -> Self {
         Self { hovered: None }
     }
 
+    /// Reset hover tracking. Call this when the compositor knows the
+    /// previously hovered surface has been destroyed; the next pointer
+    /// event will then emit the correct `PointerEnter` for whatever
+    /// surface (if any) the pointer is now over.
     pub fn forget_hovered(&mut self) {
-        // Stub: does nothing.
+        self.hovered = None;
     }
 
+    /// True iff the dispatcher currently believes the pointer is
+    /// hovering the named surface. Exposed for tests and for the
+    /// `display_server` shim's surface-destroyed cleanup path.
     pub fn hovered(&self) -> Option<SurfaceId> {
         self.hovered
     }
 
-    /// Stub: always returns `Drop`. Replaced by the green-test commit.
+    /// Route a key event. See module docs for the exact decision
+    /// order.
     pub fn route_key_event(
         &mut self,
-        _ev: &KeyEvent,
-        _state: &mut CompositorState<'_>,
+        ev: &KeyEvent,
+        state: &mut CompositorState<'_>,
     ) -> RouteDecision {
+        match ev.kind {
+            KeyEventKind::Down => self.route_key_down(ev, state),
+            KeyEventKind::Repeat => self.route_key_repeat(ev, state),
+            KeyEventKind::Up => self.route_key_up(ev, state),
+        }
+    }
+
+    fn route_key_down(&mut self, ev: &KeyEvent, state: &mut CompositorState<'_>) -> RouteDecision {
+        // (1) Bind-table match wins over any focus routing.
+        if let Some(id) = state.bind_table.match_bind(ev.modifiers.bits(), ev.keycode) {
+            // Record the grab so the matching Repeat/Up are suppressed.
+            // If the grab table is full, `start_grab` returns false; we
+            // still return `Grab(id)` — the bind fires once. Subsequent
+            // repeats will then *not* be suppressed by the grab path
+            // and will fall through to focus routing in step (3) / (4).
+            // D.4 documents this capacity-overrun degradation.
+            let _ = state.grab_state.start_grab(ev.keycode, id);
+            return RouteDecision::Grab(id);
+        }
+
+        // (3) Exclusive layer wins over normal focus.
+        if let Some(layer) = state.active_exclusive_layer {
+            return RouteDecision::DeliverTo(layer);
+        }
+        // (4) Normal focus.
+        if let Some(focused) = state.focused {
+            return RouteDecision::DeliverTo(focused);
+        }
+        // (5) Otherwise drop.
         RouteDecision::Drop
     }
 
-    /// Stub: always returns an empty decision. Replaced by the green-test commit.
+    fn route_key_repeat(
+        &mut self,
+        ev: &KeyEvent,
+        state: &mut CompositorState<'_>,
+    ) -> RouteDecision {
+        // (2) If the keycode is currently grabbed, suppress the repeat.
+        if state.grab_state.is_grabbed(ev.keycode).is_some() {
+            return RouteDecision::Drop;
+        }
+        // No grab match — fall through to focus routing.
+        if let Some(layer) = state.active_exclusive_layer {
+            return RouteDecision::DeliverTo(layer);
+        }
+        if let Some(focused) = state.focused {
+            return RouteDecision::DeliverTo(focused);
+        }
+        RouteDecision::Drop
+    }
+
+    fn route_key_up(&mut self, ev: &KeyEvent, state: &mut CompositorState<'_>) -> RouteDecision {
+        // (2) If the keycode is currently grabbed, clear it and
+        // suppress.
+        if state.grab_state.is_grabbed(ev.keycode).is_some() {
+            let _ = state.grab_state.clear_on_keyup(ev.keycode);
+            return RouteDecision::Drop;
+        }
+        // No grab — fall through to focus routing.
+        if let Some(layer) = state.active_exclusive_layer {
+            return RouteDecision::DeliverTo(layer);
+        }
+        if let Some(focused) = state.focused {
+            return RouteDecision::DeliverTo(focused);
+        }
+        RouteDecision::Drop
+    }
+
+    /// Route a pointer event. See module docs for the hit-test
+    /// convention, enter/leave emission, and click-to-focus rule.
     pub fn route_pointer_event(
         &mut self,
-        _ev: &PointerEvent,
-        _state: &mut CompositorState<'_>,
+        ev: &PointerEvent,
+        state: &mut CompositorState<'_>,
     ) -> PointerRouteDecision {
-        PointerRouteDecision::new()
+        let mut decision = PointerRouteDecision::new();
+
+        // 1. Hit-test the *current* pointer position against all
+        //    surfaces, top-of-stack first (= reverse iteration).
+        let hit = hit_test(state.surface_geometry, state.pointer_position);
+
+        // 2. If the hovered-surface tracking changed since the last
+        //    call, emit Leave(prev) then Enter(new) in that order.
+        if self.hovered != hit {
+            if let Some(prev) = self.hovered {
+                decision.enter_leave.push(prev, EnterOrLeave::Leave);
+            }
+            if let Some(new) = hit {
+                decision.enter_leave.push(new, EnterOrLeave::Enter);
+            }
+            self.hovered = hit;
+        }
+
+        // 3. Delivery target: the hovered surface, if any.
+        decision.deliver_to = hit;
+
+        // 4. Click-to-focus: a button-down on a Toplevel requests
+        //    focus change, unless an exclusive layer is active.
+        if state.active_exclusive_layer.is_none()
+            && matches!(ev.button, PointerButton::Down(_))
+            && let Some(target) = hit
+            && let Some(geom) = find_geometry(state.surface_geometry, target)
+            && matches!(geom.role, SurfaceRole::Toplevel)
+        {
+            decision.focus_change = Some(target);
+        }
+
+        decision
     }
 }
 
-/// Stub: always returns `None`. Replaced by the green-test commit.
-fn hit_test(_geom: &[SurfaceGeometry], _pos: (i32, i32)) -> Option<SurfaceId> {
+/// Top-of-stack-first hit-test. The dispatcher's slice convention is
+/// "front = bottom-of-stack, end = top-of-stack" (mirrors compose layer
+/// ordering), so the iterator runs in reverse.
+fn hit_test(geom: &[SurfaceGeometry], (x, y): (i32, i32)) -> Option<SurfaceId> {
+    for entry in geom.iter().rev() {
+        if entry.contains(x, y) {
+            return Some(entry.id);
+        }
+    }
     None
+}
+
+fn find_geometry(geom: &[SurfaceGeometry], id: SurfaceId) -> Option<&SurfaceGeometry> {
+    geom.iter().find(|g| g.id == id)
 }
 
 // ---------------------------------------------------------------------------
@@ -169,11 +438,24 @@ fn hit_test(_geom: &[SurfaceGeometry], _pos: (i32, i32)) -> Option<SurfaceId> {
 // ---------------------------------------------------------------------------
 
 /// Producer-side abstraction for one stream of input events.
+///
+/// The real `display_server` wires two impls — one for `kbd_server`
+/// and one for `mouse_server`. Tests substitute a [`MockInputSource`]
+/// that scripts events for assertions about routing.
 pub trait InputSource {
+    /// Return the next available [`KeyEvent`], or `None` if the source
+    /// has nothing pending. Must be non-blocking; the dispatcher's
+    /// main loop drains until both sources return `None`.
     fn poll_key(&mut self) -> Option<KeyEvent>;
+
+    /// Return the next available [`PointerEvent`], or `None` if the
+    /// source has nothing pending. Must be non-blocking.
     fn poll_pointer(&mut self) -> Option<PointerEvent>;
 }
 
+/// Test-only scripted input source. Pushes events into FIFO queues;
+/// the dispatcher's main loop drains them via
+/// [`InputSource::poll_key`] / [`InputSource::poll_pointer`].
 #[cfg(any(test, feature = "std"))]
 pub struct MockInputSource {
     keys: alloc::collections::VecDeque<KeyEvent>,
@@ -189,6 +471,7 @@ impl Default for MockInputSource {
 
 #[cfg(any(test, feature = "std"))]
 impl MockInputSource {
+    /// Construct an empty source.
     pub fn new() -> Self {
         Self {
             keys: alloc::collections::VecDeque::new(),
@@ -196,10 +479,12 @@ impl MockInputSource {
         }
     }
 
+    /// Schedule a key event.
     pub fn push_key(&mut self, ev: KeyEvent) {
         self.keys.push_back(ev);
     }
 
+    /// Schedule a pointer event.
     pub fn push_pointer(&mut self, ev: PointerEvent) {
         self.pointers.push_back(ev);
     }
@@ -347,8 +632,7 @@ mod tests {
                 layer_cfg(KeyboardInteractivity::Exclusive),
             ),
         ];
-        let mut state =
-            build_state(Some(surf(7)), Some(surf(99)), (0, 0), &geom, &bt, &mut gs);
+        let mut state = build_state(Some(surf(7)), Some(surf(99)), (0, 0), &geom, &bt, &mut gs);
         let mut d = InputDispatcher::new();
         let result = d.route_key_event(&key_down(0, 1), &mut state);
         assert_eq!(result, RouteDecision::DeliverTo(surf(99)));
@@ -728,7 +1012,11 @@ mod tests {
     }
 
     fn arb_button_op() -> impl Strategy<Value = ButtonOp> {
-        prop_oneof![Just(ButtonOp::None), Just(ButtonOp::Down), Just(ButtonOp::Up)]
+        prop_oneof![
+            Just(ButtonOp::None),
+            Just(ButtonOp::Down),
+            Just(ButtonOp::Up)
+        ]
     }
 
     fn arb_op() -> impl Strategy<Value = Op> {
