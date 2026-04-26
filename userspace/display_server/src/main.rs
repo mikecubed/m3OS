@@ -46,8 +46,8 @@ use syscall_lib::heap::BrkAllocator;
 use crate::client::{InboundFrame, dispatch};
 use crate::compose::{ComposeContext, default_layout, run_compose};
 use crate::control::{
-    ControlSubscriptions, publish_bind_triggered, publish_focus_changed, publish_surface_created,
-    publish_surface_destroyed, record_frame_sample,
+    ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
+    publish_surface_created, publish_surface_destroyed, record_frame_sample,
 };
 use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
@@ -68,13 +68,50 @@ fn alloc_error(_layout: Layout) -> ! {
 /// smoke validation knows what to expect on `cargo xtask run-gui --fresh`.
 const BG_PIXEL: u32 = 0x002B_5A4Bu32;
 
-syscall_lib::entry_point!(program_main);
+syscall_lib::entry_point_with_env!(program_main);
 
-fn program_main(_args: &[&str]) -> i32 {
+/// Phase 56 Track F.2 — debug-crash gate. The dispatcher consults this
+/// once per `ControlCommand::DebugCrash` it decodes; production boots
+/// leave it disabled so a hostile client cannot crash the compositor.
+/// The gate is set from the env var
+/// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` read once at startup. The init
+/// daemon passes the env var through only when `/etc/m3os-smoke-test-mode`
+/// is present (see `userspace/init/src/main.rs::ENV_DISPLAY_SERVER_DEBUG_CRASH`).
+const ENV_DEBUG_CRASH: &str = "M3OS_DISPLAY_SERVER_DEBUG_CRASH";
+
+/// Read the debug-crash gate from the process environment. Matches a
+/// strict `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` so a typo or alternate
+/// truthy spelling stays disabled.
+fn debug_crash_policy_from_env(env: &[&str]) -> DebugCrashPolicy {
+    for entry in env {
+        if let Some(value) = entry.strip_prefix(ENV_DEBUG_CRASH).and_then(|rest| {
+            // Match exactly `KEY=value` (single `=`).
+            rest.strip_prefix('=')
+        }) && value == "1"
+        {
+            return DebugCrashPolicy::enabled();
+        }
+    }
+    DebugCrashPolicy::disabled()
+}
+
+fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     syscall_lib::write_str(
         STDOUT_FILENO,
         "display_server: starting (Phase 56 — C.1+C.2)\n",
     );
+
+    // Phase 56 Track F.2 — read the debug-crash gate once at startup.
+    // The dispatcher consults this on every `ControlCommand::DebugCrash`;
+    // disabled (the production default) shadows the verb back to
+    // `UnknownVerb`.
+    let debug_crash = debug_crash_policy_from_env(env);
+    if debug_crash.is_enabled() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: F.2 debug-crash verb ENABLED via M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\n",
+        );
+    }
 
     // ----- Service registration -------------------------------------------
     let ep_handle = syscall_lib::create_endpoint();
@@ -503,6 +540,7 @@ fn program_main(_args: &[&str]) -> i32 {
             &mut control_subs,
             &mut bind_table,
             &frame_stats,
+            debug_crash,
         );
         // TODO(C.5-bulk-drain): replace the above no-op with a
         // notif-bind multiplex'd recv on the control endpoint.
@@ -531,6 +569,7 @@ fn serve_control_iter(
     bind_table: &mut BindTable,
     subscriptions: &mut control::ControlSubscriptions,
     frame_stats: &FrameStatsRing,
+    debug_crash: DebugCrashPolicy,
     reply_buf: &mut [u8],
 ) -> usize {
     use kernel_core::display::control::{
@@ -582,6 +621,7 @@ fn serve_control_iter(
         bind_table,
         subscriptions,
         frame_stats,
+        debug_crash,
         reply_buf,
     ) {
         Ok(Some(n)) => n,

@@ -353,10 +353,20 @@ pub enum ServerMessage {
 pub enum ControlCommand {
     Version,
     ListSurfaces,
-    Focus { surface_id: SurfaceId },
-    RegisterBind { modifier_mask: u16, keycode: u32 },
-    UnregisterBind { modifier_mask: u16, keycode: u32 },
-    Subscribe { event_kind: EventKind },
+    Focus {
+        surface_id: SurfaceId,
+    },
+    RegisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    UnregisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    Subscribe {
+        event_kind: EventKind,
+    },
     FrameStats,
     /// Phase 56 Track F.2 — debug-only crash trigger.
     ///
