@@ -5,12 +5,14 @@ A serious, still-maturing bootable operating system written in Rust, targeting
 experimentation, with a real userspace, networking, remote access, a bounded
 set of real-hardware drivers (NVMe storage, Intel 82540EM classic e1000
 networking) on top of the VirtIO baseline, an IOMMU substrate that routes
-device DMA through per-device VT-d / AMD-Vi translation domains, and a roadmap
-toward stronger service isolation and broader platform support.
+device DMA through per-device VT-d / AMD-Vi translation domains, a ring-3
+display server with focus-aware input dispatch and layer-shell-equivalent
+surface roles, and a roadmap toward stronger service isolation and broader
+platform support.
 
-**Current kernel version:** v0.55.3 (Phase 55 hardware substrate + Phase 55a
+**Current kernel version:** v0.56.0 (Phase 55 hardware substrate + Phase 55a
 IOMMU substrate + Phase 55b ring-3 driver host + Phase 55c ring-3 driver correctness
-closure).
+closure + Phase 56 display and input architecture).
 
 ## Quick Start
 
