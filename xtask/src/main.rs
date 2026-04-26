@@ -314,9 +314,9 @@ fn build_userspace_bins() {
         // (ButtonTracker, decode_packet, PointerEvent codec) so needs_alloc.
         ("mouse_server", "mouse_server", true), // Phase 56 D.2: ring-3 mouse (alloc for kernel-core dep)
         ("stdin_feeder", "stdin_feeder", false), // Phase 52: ring-3 stdin
-        ("fat_server", "fat_server", true), // Phase 54: ring-3 FAT storage (alloc)
-        ("vfs_server", "vfs_server", true), // Phase 54: ring-3 VFS service (alloc)
-        ("net_server", "net_server", true), // Phase 54: ring-3 UDP network service (alloc)
+        ("fat_server", "fat_server", true),     // Phase 54: ring-3 FAT storage (alloc)
+        ("vfs_server", "vfs_server", true),     // Phase 54: ring-3 VFS service (alloc)
+        ("net_server", "net_server", true),     // Phase 54: ring-3 UDP network service (alloc)
         // Phase 55b Tracks D.1 / E.1: ring-3 device driver scaffolds
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         // Real bring-up lands in D.2/D.3 and E.2/E.3.
@@ -5269,8 +5269,7 @@ fn populate_ext2_files(
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
     fs::write(&console_conf_tmp, console_conf).expect("write temp console.conf");
     fs::write(&kbd_conf_tmp, kbd_conf).expect("write temp kbd.conf");
-    fs::write(&mouse_server_conf_tmp, mouse_server_conf)
-        .expect("write temp mouse_server.conf");
+    fs::write(&mouse_server_conf_tmp, mouse_server_conf).expect("write temp mouse_server.conf");
     fs::write(&stdin_feeder_conf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
