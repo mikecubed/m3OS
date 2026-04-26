@@ -312,9 +312,12 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     //
     // Every iteration: receive one client message (`ipc_recv_msg` blocks
     // until traffic arrives), dispatch it, send the reply via the
-    // reply capability the kernel staged in `header.data[2]` (Phase 56
+    // reply capability the kernel staged in `header.data[3]` (Phase 56
     // close-out — the kernel now reports the reply-cap handle so
-    // userspace doesn't have to guess), then drive one compose pass
+    // userspace doesn't have to guess; `data[3]` is reserved for this
+    // purpose because `data[0..3]` are claimed by existing protocol
+    // payloads in vfs_server / net_server / ramdisk), then drive one
+    // compose pass
     // if a frame-tick has elapsed AND there is pending damage.
     //
     // Reply convention:
@@ -422,13 +425,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         prev_surface_ids = cur_surface_ids;
 
         // 2. Reply to the caller so any `ipc_call*` request unblocks.
-        //    Phase 56 close-out — the kernel populates `header.data[2]`
+        //    Phase 56 close-out — the kernel populates `header.data[3]`
         //    with the reply-cap handle so userspace doesn't have to
         //    guess. Skip reply when there's no graphical message this
         //    iteration or no cap (fire-and-forget sender).
         if had_graphical {
             let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
-            let reply_cap = header.data[2] as u32;
+            let reply_cap = header.data[3] as u32;
             if reply_cap != 0 {
                 let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
             }
@@ -654,8 +657,8 @@ fn serve_one_control_request(
         return;
     }
     // Phase 56 close-out — the kernel writes the reply-cap handle into
-    // `header.data[2]`. Use it directly instead of guessing.
-    let reply_cap = header.data[2] as u32;
+    // `header.data[3]`. Use it directly instead of guessing.
+    let reply_cap = header.data[3] as u32;
     if label != control::LABEL_CTL_CMD {
         // Unknown label. Stage an error reply so the client can
         // observe the protocol violation.

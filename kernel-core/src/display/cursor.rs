@@ -209,6 +209,19 @@ impl ClientCursor {
         height: u32,
         cfg: CursorConfig,
     ) -> Result<Self, ClientCursorError> {
+        Self::from_vec(pixels.to_vec(), width, height, cfg)
+    }
+
+    /// Owning variant of [`new`] that avoids an extra `to_vec()` clone
+    /// when the caller has already built a `Vec<u32>` (e.g.
+    /// `userspace/display_server/src/surface.rs::cursor_from_committed`
+    /// decoding the committed BGRA byte stream).
+    pub fn from_vec(
+        pixels: alloc::vec::Vec<u32>,
+        width: u32,
+        height: u32,
+        cfg: CursorConfig,
+    ) -> Result<Self, ClientCursorError> {
         if width == 0 || height == 0 {
             return Err(ClientCursorError::ZeroSize);
         }
@@ -225,7 +238,7 @@ impl ClientCursor {
             });
         }
         Ok(Self {
-            pixels: pixels.to_vec(),
+            pixels,
             width,
             height,
             hotspot_x: cfg.hotspot_x,

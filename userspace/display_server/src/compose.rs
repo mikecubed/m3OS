@@ -148,6 +148,17 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
     // Gate: skip compose work if there is no surface damage AND no
     // cursor motion. The frame is a no-op.
+    //
+    // Trade-off: when only the cursor moved (no surface damage), the
+    // path below still walks every mapped surface and re-blits with
+    // full-surface damage rectangles. That is correct (cursor pixels
+    // are composited on top, so the underlying surfaces must be
+    // re-emitted under the old + new cursor rects) but wastes work
+    // when the cursor box is small relative to surface area. A
+    // dedicated cursor-only fast path that re-blits only the damaged
+    // regions of the underlying surfaces is deferred to a Phase 56
+    // follow-up; today every mouse move triggers a full repaint of
+    // every mapped surface.
     let surface_damage = registry.has_damage();
     if !surface_damage && !cursor_motion {
         return Ok(0);

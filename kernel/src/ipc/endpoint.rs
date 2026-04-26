@@ -355,11 +355,18 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 return Message::new(u64::MAX);
             }
             // Phase 56 close-out — communicate the assigned reply-cap handle
-            // to the receiver via `data[2]`. Userspace can use this directly
+            // to the receiver via `data[3]`. Userspace can use this directly
             // in `ipc_reply` instead of guessing the slot via a hardcoded
             // convention. `0` (no reply cap) signals fire-and-forget messages.
+            //
+            // NB: this MUST be `data[3]`, not `data[2]`. `data[2]` is already
+            // claimed by existing protocol payloads (vfs_server `max_bytes`
+            // for `VFS_READ`, net_server IP/port for `NET_UDP_BIND` /
+            // `NET_UDP_SENDTO`, ramdisk `max_len`); writing the handle there
+            // would silently corrupt those services on the recv-pops-sender
+            // race path.
             if let Some(handle) = reply_cap_handle {
-                pending.msg.data[2] = handle as u64;
+                pending.msg.data[3] = handle as u64;
             }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
@@ -459,9 +466,10 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
     }
 
     // Phase 56 close-out — communicate the assigned reply-cap handle to the
-    // receiver via `data[2]` (mirrors the same convention in `recv_msg`).
+    // receiver via `data[3]` (mirrors the same convention in `recv_msg`).
+    // See `recv_msg` for why this MUST be `data[3]`, not `data[2]`.
     if let Some(handle) = reply_cap_handle {
-        pending.msg.data[2] = handle as u64;
+        pending.msg.data[3] = handle as u64;
     }
 
     scheduler::deliver_message(receiver, pending.msg);
@@ -558,10 +566,11 @@ pub fn recv_msg_with_notif(
             }
 
             // Phase 56 close-out — communicate the assigned reply-cap handle
-            // to the receiver via `data[2]` (mirrors the same convention in
-            // `recv_msg` and `recv_msg_nowait`).
+            // to the receiver via `data[3]` (mirrors the same convention in
+            // `recv_msg` and `recv_msg_nowait`). See `recv_msg` for why this
+            // MUST be `data[3]`, not `data[2]`.
             if let Some(handle) = reply_cap_handle {
-                pending.msg.data[2] = handle as u64;
+                pending.msg.data[3] = handle as u64;
             }
 
             scheduler::deliver_message(receiver, pending.msg);
@@ -881,6 +890,15 @@ pub fn reply_recv_msg(
 /// error; the caller should abort the send.
 ///
 /// If `msg` has no attached cap, this is a no-op returning `Ok(())`.
+///
+/// # `data[3]` precedence (Phase 56 close-out)
+///
+/// `data[3]` is shared with the reply-cap handle that `recv_msg` /
+/// `recv_msg_nowait` / `recv_msg_with_notif` write for `wants_reply`
+/// senders. Today no caller combines `wants_reply` with an attached
+/// capability, so the two writes never race. Any future caller that
+/// needs both must extend the IPC message format — `data[3]` cannot
+/// carry both a transferred-cap handle and a reply-cap handle.
 fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<(), CapError> {
     if let Some(cap) = msg.cap.take() {
         match scheduler::insert_cap(receiver, cap) {

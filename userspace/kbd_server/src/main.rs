@@ -290,8 +290,20 @@ fn emit_key_event(ev: &KeyEvent) {
     let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
     match ev.encode(&mut buf) {
         Ok(_) => {
-            // Stage the bulk and reply.
-            let _ = syscall_lib::ipc_store_reply_bulk(&buf);
+            // Stage the bulk and reply. If staging fails (kernel bulk
+            // slot unavailable, oversized buf, copy fault — surfaces
+            // as `u64::MAX`), we cannot deliver the encoded event;
+            // reply with the timeout sentinel so the client doesn't
+            // see a `KBD_EVENT_PULL` label paired with an empty bulk
+            // and silently mis-decode.
+            if syscall_lib::ipc_store_reply_bulk(&buf) == u64::MAX {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "kbd_server: error: ipc_store_reply_bulk failed; replying with sentinel\n",
+                );
+                syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+                return;
+            }
             syscall_lib::ipc_reply(REPLY_CAP_HANDLE, KBD_EVENT_PULL, 0);
         }
         Err(_) => {

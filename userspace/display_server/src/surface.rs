@@ -608,14 +608,16 @@ fn cursor_from_committed(
     }
     // Decode the BGRA byte stream into u32 cells. Each cell is one
     // pixel (BGRA in little-endian wire byte order — `to_le_bytes`
-    // round-trips back to `[B, G, R, A]`).
+    // round-trips back to `[B, G, R, A]`). Hand the owned `Vec`
+    // directly to `from_vec` so we don't pay a second alloc + clone
+    // inside `ClientCursor::new`.
     let pixel_count = byte_count / 4;
     let mut packed: Vec<u32> = Vec::with_capacity(pixel_count);
     for chunk in buf.pixels.chunks_exact(4) {
         let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
         packed.push(u32::from_le_bytes(arr));
     }
-    ClientCursor::new(&packed, buf.width, buf.height, cfg)
+    ClientCursor::from_vec(packed, buf.width, buf.height, cfg)
 }
 
 impl Default for SurfaceRegistry {

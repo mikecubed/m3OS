@@ -1208,11 +1208,12 @@ mod tests {
         for &phys in &held {
             free_frame(phys);
         }
-        // Match the `before` baseline: drain per-CPU caches AND
-        // surface any empty slab pages back to the buddy pool before
-        // sampling `after`. Either drain alone is insufficient — the
-        // per-CPU drain misses slab pages, and the slab reclaim
-        // misses cache-resident frames.
+        // Match the `before` baseline: drain the allocator's per-CPU
+        // caches (which `reclaim_allocator_local_caches` also folds
+        // empty slab pages back into via the underlying allocator
+        // hooks) before sampling `after`. The two-call symmetry is
+        // what keeps the test deterministic — `before` ran the same
+        // helper.
         crate::mm::heap::reclaim_allocator_local_caches("test/after-baseline");
         let after = available_count();
         assert_eq!(

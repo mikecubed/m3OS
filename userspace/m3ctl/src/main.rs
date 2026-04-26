@@ -374,13 +374,22 @@ fn role_tag_str(tag: SurfaceRoleTag) -> &'static str {
 // Synthetic-reply fallback
 // ---------------------------------------------------------------------------
 
-/// Until the userspace bulk-drain helper lands, the kernel-staged
-/// reply bulk on `ipc_call_buf` is not visible to the caller. This
-/// helper synthesises a structurally-correct fallback reply for each
-/// verb so a developer running `m3ctl version` end-to-end at least
-/// observes a well-formed protocol round-trip log.
+/// Synthesise a structurally-correct fallback reply for each verb when
+/// `ipc_take_pending_bulk` returns 0 bytes — i.e. the server replied
+/// with no staged bulk. This covers two legitimate cases:
 ///
-/// The TODO marker in `program_main` documents the swap point.
+/// 1. **Void replies** — verbs whose contract is "fire-and-acknowledge"
+///    (e.g. `ControlCommand::DebugCrash`, `ControlCommand::SetCursor`)
+///    succeed by replying with a label and no bulk; the caller maps
+///    that to `ControlEvent::Ack`.
+/// 2. **Empty replies** — verbs that return a list which happens to be
+///    empty this iteration (e.g. `ListSurfaces` on a fresh boot,
+///    `FrameStats` before the first compose pass) — the structural
+///    reply is a well-formed event with an empty payload.
+///
+/// Failing to drain (`ipc_take_pending_bulk == u64::MAX`) is a
+/// transport error and is logged separately; this helper only handles
+/// the success-with-zero-bulk case.
 fn synthetic_reply_for(cmd: &ControlCommand) -> ControlEvent {
     use kernel_core::display::control::PROTOCOL_VERSION;
     match cmd {
