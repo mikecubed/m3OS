@@ -8,4 +8,7 @@ name = "kbd_server"
 path = "src/main.rs"
 
 [dependencies]
-syscall-lib = { path = "../syscall-lib" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# Phase 56 Track D.1 — pure-logic scancode decoder, US QWERTY keymap,
+# modifier tracker, and key-repeat scheduler.
+kernel-core = { path = "../../kernel-core", default-features = false }

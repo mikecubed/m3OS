@@ -1,5 +1,6 @@
 pub mod bind_table;
 pub mod events;
+pub mod keymap;
 pub mod mouse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
