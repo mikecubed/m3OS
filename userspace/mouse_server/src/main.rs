@@ -83,11 +83,16 @@ const REPLY_CAP_HANDLE: u32 = 1;
 /// reader does not pin a CPU.
 const POLL_INTERVAL_NS: u32 = 5_000_000;
 
-/// Best-effort upper bound on total wait time for a single
-/// `MOUSE_EVENT_PULL` request. Identical to kbd_server's bound: at 5 ms per
-/// cycle this is ~30 s of patience, more than enough for interactive input
-/// but bounded so cancelled pulls do not pin the server forever.
-const MAX_PULL_POLLS: u32 = 6_000;
+/// Phase 56 close-out — non-blocking pull semantics. mouse_server checks
+/// the AUX ring once and replies immediately: an event if queued,
+/// `u64::MAX` (timeout sentinel) otherwise. display_server's main loop
+/// drives the wait by polling every 1 ms via its multiplex
+/// (`SYS_IPC_TRY_RECV_MSG`).
+///
+/// Pre-close-out this was 6_000 × 5 ms = 30 s. That pinned
+/// display_server's main loop on every drain pass and blocked the
+/// control endpoint.
+const MAX_PULL_POLLS: u32 = 1;
 
 /// `read_mouse_packet` returns this when the AUX ring is empty.
 /// Mirrors `-libc::EAGAIN` (-11) — the kernel returns the value as a signed

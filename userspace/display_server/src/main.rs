@@ -286,28 +286,34 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
 
     loop {
-        // 1. Receive one client message. `ipc_recv_msg` blocks until a
-        //    message arrives.
+        // 1. Try to receive one graphical-endpoint message non-blocking.
+        //    Phase 56 close-out: switched from blocking `ipc_recv_msg`
+        //    to `ipc_try_recv_msg` so this loop can multiplex the
+        //    graphical endpoint, the control endpoint, the frame-tick
+        //    drain, and the input pull-paths in a single thread. If
+        //    `ipc_try_recv_msg` returns `u64::MAX`, no client traffic
+        //    is queued; we fall through with `had_graphical = false`
+        //    so the dispatch + reply block is skipped.
         let mut header = IpcMessage::new(0);
-        let recv_ret = syscall_lib::ipc_recv_msg(ep_handle, &mut header, &mut bulk_buf);
-        if recv_ret == u64::MAX {
-            // Receive failure (transient) — continue without sending a
-            // reply since there is no pending caller in this branch.
-            continue;
-        }
-        let bulk_len = header.data[1] as usize;
-        let bulk_slice = if bulk_len <= bulk_buf.len() {
-            &bulk_buf[..bulk_len]
+        let recv_ret = syscall_lib::ipc_try_recv_msg(ep_handle, &mut header, &mut bulk_buf);
+        let had_graphical = recv_ret != u64::MAX;
+        let outcome = if had_graphical {
+            let bulk_len = header.data[1] as usize;
+            let bulk_slice = if bulk_len <= bulk_buf.len() {
+                &bulk_buf[..bulk_len]
+            } else {
+                &[][..]
+            };
+            dispatch(
+                InboundFrame {
+                    header,
+                    bulk: bulk_slice,
+                },
+                &mut registry,
+            )
         } else {
-            &[][..]
+            client::DispatchOutcome::default()
         };
-        let outcome = dispatch(
-            InboundFrame {
-                header,
-                bulk: bulk_slice,
-            },
-            &mut registry,
-        );
         if outcome.fatal {
             syscall_lib::write_str(
                 STDOUT_FILENO,
@@ -358,18 +364,16 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         prev_surface_ids = cur_surface_ids;
 
         // 2. Reply to the caller so any `ipc_call*` request unblocks.
-        //    Without this any client doing call/call_buf would deadlock,
-        //    and the frame-tick path below could never run because the
-        //    next `ipc_recv_msg` would observe an unbounded queue.
-        //
         //    Phase 56 close-out — the kernel populates `header.data[2]`
         //    with the reply-cap handle so userspace doesn't have to
-        //    guess. Skip reply when there's no cap (fire-and-forget
-        //    sender).
-        let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
-        let reply_cap = header.data[2] as u32;
-        if reply_cap != 0 {
-            let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
+        //    guess. Skip reply when there's no graphical message this
+        //    iteration or no cap (fire-and-forget sender).
+        if had_graphical {
+            let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
+            let reply_cap = header.data[2] as u32;
+            if reply_cap != 0 {
+                let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
+            }
         }
 
         // 3. If a frame-tick has elapsed, drive one compose pass. The
@@ -540,6 +544,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &frame_stats,
             debug_crash,
         );
+
+        // Yield briefly when the iteration had no graphical traffic so
+        // we don't busy-spin. 1 ms ≈ 1000 polls/sec — well below the
+        // 60 Hz frame-tick rate but with enough headroom for control-
+        // socket interactive latency.
+        if !had_graphical {
+            let _ = syscall_lib::nanosleep_for(0, 1_000_000);
+        }
     }
 }
 

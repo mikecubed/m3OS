@@ -77,16 +77,17 @@ const REPLY_CAP_HANDLE: u32 = 1;
 /// (matches the legacy 5 ms cadence).
 const POLL_INTERVAL_NS: u32 = 5_000_000;
 
-/// Best-effort upper bound on total wait time for a single
-/// `KBD_EVENT_PULL` request. Prevents the server from blocking
-/// forever if the client cancels mid-call (the kernel will
-/// eventually deliver the cancellation as a notification, but the
-/// existing IPC surface doesn't expose that yet).
+/// Phase 56 close-out — the pull pattern is now non-blocking on the
+/// server side. kbd_server checks the scancode buffer once and
+/// replies immediately: an event if queued, `u64::MAX` (timeout
+/// sentinel) otherwise. display_server's main loop drives the wait by
+/// polling every 1 ms via its multiplex (`SYS_IPC_TRY_RECV_MSG`).
 ///
-/// At 5 ms per poll cycle this works out to ~30 s of patience, which
-/// is more than long enough for interactive input but bounded so
-/// stuck pulls don't pin the server forever.
-const MAX_PULL_POLLS: u32 = 6_000;
+/// Pre-close-out this was 6_000 × 5 ms = 30 s. That pinned
+/// display_server's main loop on every drain pass and blocked the
+/// control endpoint. Moving the wait to the caller side restores the
+/// multiplex.
+const MAX_PULL_POLLS: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Pipeline state
