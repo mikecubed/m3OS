@@ -172,6 +172,24 @@ impl SurfaceRegistry {
         self.surfaces.len()
     }
 
+    /// All registered surface ids in ascending order. Used by the
+    /// control-socket `list-surfaces` verb (E.4) and by `main.rs` to
+    /// compute create / destroy deltas for subscription event push.
+    /// Ascending order is stable because the underlying `BTreeMap`
+    /// orders by `SurfaceId(u32)`; a reviewer can rely on it.
+    pub fn surface_ids(&self) -> Vec<SurfaceId> {
+        self.surfaces.keys().copied().collect()
+    }
+
+    /// Lookup the registered role of `surface_id`. Returns `None` if
+    /// the surface is unknown or has not yet had `SetSurfaceRole`
+    /// called on it. Used by the control-socket `SurfaceCreated` event
+    /// emit path (E.4) so the wire-tag (`SurfaceRoleTag`) reflects the
+    /// actual role rather than a default guess.
+    pub fn surface_role(&self, surface_id: SurfaceId) -> Option<SurfaceRole> {
+        self.surfaces.get(&surface_id).and_then(|s| s.role)
+    }
+
     /// Receive a bulk-transported pixel buffer and queue it for the next
     /// `AttachBuffer` verb. Returns `true` if accepted, `false` if the
     /// pending-bulk queue is at [`MAX_PENDING_BULK`] and the dispatcher
