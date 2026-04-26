@@ -46,8 +46,8 @@ use syscall_lib::heap::BrkAllocator;
 use crate::client::{InboundFrame, dispatch};
 use crate::compose::{ComposeContext, default_layout, run_compose};
 use crate::control::{
-    ControlSubscriptions, publish_bind_triggered, publish_focus_changed,
-    publish_surface_created, publish_surface_destroyed, record_frame_sample,
+    ControlSubscriptions, publish_bind_triggered, publish_focus_changed, publish_surface_created,
+    publish_surface_destroyed, record_frame_sample,
 };
 use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};

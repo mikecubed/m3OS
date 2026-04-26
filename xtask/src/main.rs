@@ -339,6 +339,11 @@ fn build_userspace_bins() {
         // `needs_alloc = true` because the demo allocates a SurfaceBuffer
         // and links the kernel-core protocol codec.
         ("gfx-demo", "gfx-demo", true),
+        // Phase 56 Track E.4: minimal control-socket client. One-shot
+        // CLI; `needs_alloc = true` because the binary links the
+        // kernel-core control codec (which uses Vec for list payloads)
+        // and uses `format!` for human-readable output.
+        ("m3ctl", "m3ctl", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {

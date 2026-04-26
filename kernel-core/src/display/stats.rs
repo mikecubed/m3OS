@@ -229,7 +229,10 @@ mod tests {
         let v = r.snapshot_newest_first();
         // Newest sample is the last we pushed; oldest retained is
         // `total - CAPACITY = (CAPACITY+5) - CAPACITY = 5`.
-        assert_eq!(v.first().copied(), Some(s(CAPACITY as u64 + 4, (CAPACITY + 4) as u32)));
+        assert_eq!(
+            v.first().copied(),
+            Some(s(CAPACITY as u64 + 4, (CAPACITY + 4) as u32))
+        );
         assert_eq!(v.last().copied(), Some(s(5, 5)));
         assert_eq!(v.len(), CAPACITY);
     }

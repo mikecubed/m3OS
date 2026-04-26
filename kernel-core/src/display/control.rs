@@ -151,9 +151,7 @@ impl From<ProtocolError> for ControlError {
     ///   conversion total without losing the underlying error kind.
     fn from(err: ProtocolError) -> Self {
         match err {
-            ProtocolError::Truncated | ProtocolError::BodyTooLarge => {
-                ControlError::MalformedFrame
-            }
+            ProtocolError::Truncated | ProtocolError::BodyTooLarge => ControlError::MalformedFrame,
             ProtocolError::UnknownOpcode(opcode) => ControlError::UnknownVerb { opcode },
             other => ControlError::BadArgs {
                 expected: 0,

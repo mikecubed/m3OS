@@ -62,7 +62,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use kernel_core::display::control::{
-    ControlCommand, ControlError, ControlEvent, ControlErrorCode, EventKind, FrameStatSample,
+    ControlCommand, ControlError, ControlErrorCode, ControlEvent, EventKind, FrameStatSample,
     PROTOCOL_VERSION, SurfaceId, SurfaceRoleTag, encode_event,
 };
 use kernel_core::display::protocol::SurfaceRole;
@@ -181,12 +181,7 @@ impl ControlSubscriptions {
     /// Construct an empty registry.
     pub fn new() -> Self {
         Self {
-            subscribers: [
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ],
+            subscribers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             pending_events: BTreeMap::new(),
         }
     }
@@ -198,11 +193,7 @@ impl ControlSubscriptions {
     /// `EventKind` variant that is not yet supported returns
     /// `Err(ControlErrorCode::BadArgs)` (the verb is known; the
     /// argument is not).
-    pub fn subscribe(
-        &mut self,
-        client: ClientId,
-        kind: EventKind,
-    ) -> Result<(), ControlErrorCode> {
+    pub fn subscribe(&mut self, client: ClientId, kind: EventKind) -> Result<(), ControlErrorCode> {
         let idx = match event_kind_index(kind) {
             Some(i) => i,
             None => return Err(ControlErrorCode::BadArgs),
@@ -514,11 +505,7 @@ pub fn publish_focus_changed(subs: &mut ControlSubscriptions, focused: Option<Su
 
 /// Convenience: publish a `BindTriggered` event. The `(mask, keycode)`
 /// pair on the wire matches the registration the bind originated from.
-pub fn publish_bind_triggered(
-    subs: &mut ControlSubscriptions,
-    modifier_mask: u16,
-    keycode: u32,
-) {
+pub fn publish_bind_triggered(subs: &mut ControlSubscriptions, modifier_mask: u16, keycode: u32) {
     // TODO(C.5-bulk-drain): see publish_surface_created.
     subs.publish(ControlEvent::BindTriggered {
         modifier_mask,
@@ -529,11 +516,7 @@ pub fn publish_bind_triggered(
 /// Push a freshly-measured frame compose sample onto the
 /// observability ring. Called once per `compose_frame` from
 /// `main.rs`.
-pub fn record_frame_sample(
-    ring: &mut FrameStatsRing,
-    frame_index: u64,
-    compose_micros: u32,
-) {
+pub fn record_frame_sample(ring: &mut FrameStatsRing, frame_index: u64, compose_micros: u32) {
     ring.push(FrameStatSample {
         frame_index,
         compose_micros,

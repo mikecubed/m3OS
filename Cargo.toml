@@ -73,6 +73,8 @@ members = [
     "userspace/display_server",
     # Phase 56 Track C.6 — protocol-reference client (visual smoke)
     "userspace/gfx-demo",
+    # Phase 56 Track E.4 — minimal control-socket client (one-shot CLI)
+    "userspace/m3ctl",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
