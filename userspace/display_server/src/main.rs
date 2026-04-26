@@ -254,10 +254,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     //
     // Every iteration: receive one client message (`ipc_recv_msg` blocks
     // until traffic arrives), dispatch it, send the reply via the
-    // implicit reply capability that the kernel stores at
-    // `REPLY_CAP_HANDLE` (= 1) on every client `ipc_call*`, then drive
-    // one compose pass if a frame-tick has elapsed AND there is pending
-    // damage.
+    // reply capability the kernel staged in `header.data[2]` (Phase 56
+    // close-out — the kernel now reports the reply-cap handle so
+    // userspace doesn't have to guess), then drive one compose pass
+    // if a frame-tick has elapsed AND there is pending damage.
     //
     // Reply convention:
     //   * `RESP_OK` (= 0)        — message accepted, no further data
@@ -278,7 +278,6 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // for Phase 56's protocol-reference smoke. A non-blocking
     // try-recv (or notification-bound recv) lands with the C.5 follow-up
     // when the input services start delivering events on this endpoint.
-    const REPLY_CAP_HANDLE: u32 = 1;
     const RESP_OK: u64 = 0;
     const RESP_FATAL: u64 = u64::MAX;
     let mut registry = SurfaceRegistry::new();
@@ -362,8 +361,16 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         //    Without this any client doing call/call_buf would deadlock,
         //    and the frame-tick path below could never run because the
         //    next `ipc_recv_msg` would observe an unbounded queue.
+        //
+        //    Phase 56 close-out — the kernel populates `header.data[2]`
+        //    with the reply-cap handle so userspace doesn't have to
+        //    guess. Skip reply when there's no cap (fire-and-forget
+        //    sender).
         let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
-        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, reply_label, 0);
+        let reply_cap = header.data[2] as u32;
+        if reply_cap != 0 {
+            let _ = syscall_lib::ipc_reply(reply_cap, reply_label, 0);
+        }
 
         // 3. If a frame-tick has elapsed, drive one compose pass. The
         //    pure-logic `compose_frame` already calls
@@ -568,6 +575,9 @@ fn serve_one_control_request(
         // this iteration; the next frame-tick poll will retry.
         return;
     }
+    // Phase 56 close-out — the kernel writes the reply-cap handle into
+    // `header.data[2]`. Use it directly instead of guessing.
+    let reply_cap = header.data[2] as u32;
     if label != control::LABEL_CTL_CMD {
         // Unknown label. Stage an error reply so the client can
         // observe the protocol violation.
@@ -581,7 +591,9 @@ fn serve_one_control_request(
         if n > 0 {
             let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
         }
-        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, control::LABEL_CTL_REPLY, 0);
+        if reply_cap != 0 {
+            let _ = syscall_lib::ipc_reply(reply_cap, control::LABEL_CTL_REPLY, 0);
+        }
         return;
     }
 
@@ -604,11 +616,10 @@ fn serve_one_control_request(
     if n > 0 {
         let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
     }
-    let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, control::LABEL_CTL_REPLY, 0);
+    if reply_cap != 0 {
+        let _ = syscall_lib::ipc_reply(reply_cap, control::LABEL_CTL_REPLY, 0);
+    }
 }
-
-/// Reply-cap slot for `ipc_reply`. Same convention as kbd_server / mouse_server.
-const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Phase 56 Track E.4 — single-iteration control-endpoint dispatch
 /// helper. Decodes one `ControlCommand` from `bulk`, invokes the

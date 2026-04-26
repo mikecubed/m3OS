@@ -354,6 +354,13 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 let _ = scheduler::wake_task(pending.task);
                 return Message::new(u64::MAX);
             }
+            // Phase 56 close-out — communicate the assigned reply-cap handle
+            // to the receiver via `data[2]`. Userspace can use this directly
+            // in `ipc_reply` instead of guessing the slot via a hardcoded
+            // convention. `0` (no reply cap) signals fire-and-forget messages.
+            if let Some(handle) = reply_cap_handle {
+                pending.msg.data[2] = handle as u64;
+            }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
             transfer_bulk(pending.task, receiver);
@@ -451,6 +458,12 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         return Some(Message::new(u64::MAX));
     }
 
+    // Phase 56 close-out — communicate the assigned reply-cap handle to the
+    // receiver via `data[2]` (mirrors the same convention in `recv_msg`).
+    if let Some(handle) = reply_cap_handle {
+        pending.msg.data[2] = handle as u64;
+    }
+
     scheduler::deliver_message(receiver, pending.msg);
     transfer_bulk(pending.task, receiver);
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
@@ -542,6 +555,13 @@ pub fn recv_msg_with_notif(
                 scheduler::deliver_message(pending.task, Message::new(u64::MAX));
                 let _ = scheduler::wake_task(pending.task);
                 return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
+            }
+
+            // Phase 56 close-out — communicate the assigned reply-cap handle
+            // to the receiver via `data[2]` (mirrors the same convention in
+            // `recv_msg` and `recv_msg_nowait`).
+            if let Some(handle) = reply_cap_handle {
+                pending.msg.data[2] = handle as u64;
             }
 
             scheduler::deliver_message(receiver, pending.msg);
