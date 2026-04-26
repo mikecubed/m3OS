@@ -35,9 +35,10 @@
 //!
 //! ## Wire constants
 //!
-//! `MOUSE_EVENT_PULL = 2` — assumed to mirror D.1's `KBD_EVENT_PULL = 2`
-//! on the `"mouse"` service. If D.2 picks a different label this is a
-//! one-line constant change.
+//! `MOUSE_EVENT_PULL = 1` — picked by D.2's `mouse_server`. (D.1's
+//! `kbd_server` uses `KBD_EVENT_PULL = 2` because it also serves the
+//! legacy `KBD_READ = 1` text-mode label on the same endpoint;
+//! `mouse_server` has no legacy label, so it starts at 1.)
 //!
 //! ## Reply-bulk plumbing (deferred)
 //!
@@ -82,10 +83,11 @@ pub const KBD_EVENT_PULL: u64 = 2;
 /// `mouse_server` (D.2) at startup.
 pub const MOUSE_SERVICE_NAME: &str = "mouse";
 
-/// IPC label `mouse_server` is expected to accept for typed
-/// `PointerEvent` pulls. Mirrors D.1's `KBD_EVENT_PULL = 2` shape; if
-/// D.2 picks a different label this is a one-line constant change.
-pub const MOUSE_EVENT_PULL: u64 = 2;
+/// IPC label `mouse_server` accepts for typed `PointerEvent` pulls.
+/// Picked by D.2 — `mouse_server` has no legacy text-mode label so it
+/// starts at 1 (vs `kbd_server` which reserves 1 for legacy
+/// `KBD_READ`).
+pub const MOUSE_EVENT_PULL: u64 = 1;
 
 /// Service-lookup retry attempts before [`lookup_with_backoff`] gives
 /// up.
