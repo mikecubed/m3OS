@@ -1601,6 +1601,33 @@ mod tests {
         encode_decode_round_trip_ctl_cmd(ControlCommand::FrameStats);
     }
 
+    // Phase 56 Track F.2 — debug-only crash verb. Round-trip must
+    // succeed at the codec layer regardless of build flavor; the
+    // dispatcher (display_server::control) is the seam that decides
+    // whether to honor the verb (gated by env var) or short-circuit
+    // it back to `ControlError::UnknownVerb`. Keeping the codec
+    // unconditional avoids a parallel "debug" verb namespace and
+    // matches the F.2 spec.
+    #[test]
+    fn ctl_cmd_debug_crash_round_trips() {
+        encode_decode_round_trip_ctl_cmd(ControlCommand::DebugCrash);
+    }
+
+    #[test]
+    fn ctl_cmd_debug_crash_uses_zero_body() {
+        // F.2 wire-format guard: the verb carries no payload, so the
+        // body_len on the wire must be exactly zero. Encoding into a
+        // buffer that is exactly FRAME_HEADER_SIZE bytes long must
+        // succeed.
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        let n = ControlCommand::DebugCrash
+            .encode(&mut buf)
+            .expect("encode debug-crash into header-only buffer");
+        assert_eq!(n, FRAME_HEADER_SIZE);
+        let body_len = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(body_len, 0);
+    }
+
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
@@ -1949,6 +1976,7 @@ mod tests {
             }),
             arb_event_kind().prop_map(|event_kind| ControlCommand::Subscribe { event_kind }),
             Just(ControlCommand::FrameStats),
+            Just(ControlCommand::DebugCrash),
         ]
     }
 

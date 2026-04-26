@@ -277,6 +277,18 @@ mod tests {
         round_trip_command(ControlCommand::FrameStats);
     }
 
+    // Phase 56 Track F.2 — debug-only crash verb. The codec layer
+    // (façade and protocol) must round-trip this verb unconditionally;
+    // the runtime gate lives one layer up in
+    // `display_server::control::dispatch_command`, where an env-var
+    // check at startup decides whether to honor the verb or return
+    // `ControlError::UnknownVerb`. See the H.1 learning-doc subsection
+    // "Crash recovery" for the rationale.
+    #[test]
+    fn round_trip_debug_crash() {
+        round_trip_command(ControlCommand::DebugCrash);
+    }
+
     // ---- Per-event round-trips ---------------------------------------------
 
     #[test]
@@ -526,6 +538,7 @@ mod tests {
             }),
             arb_event_kind().prop_map(|event_kind| ControlCommand::Subscribe { event_kind }),
             Just(ControlCommand::FrameStats),
+            Just(ControlCommand::DebugCrash),
         ]
     }
 
