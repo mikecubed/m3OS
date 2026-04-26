@@ -6855,13 +6855,65 @@ struct HostRegressionTest {
 
 /// Return the list of registered host-only regression tests.
 fn host_regression_tests() -> Vec<HostRegressionTest> {
-    vec![HostRegressionTest {
-        name: "driver-restart",
-        description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
-        package: "kernel-core",
-        test_target: "driver_restart",
-        target: Some("x86_64-unknown-linux-gnu"),
-    }]
+    vec![
+        HostRegressionTest {
+            name: "driver-restart",
+            description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
+            package: "kernel-core",
+            test_target: "driver_restart",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.3 — layer-shell exclusive-zone integration
+        // test against `kernel-core::display::layer`. Pure host logic;
+        // runs in <1s. Wired here so `cargo xtask regression --test
+        // phase56-g3` is a valid invocation for downstream CI scripts
+        // that want to run just the Phase 56 G-track regressions
+        // without the full kernel-core sweep.
+        HostRegressionTest {
+            name: "phase56-g3",
+            description: "Phase 56 G.3: layer-shell exclusive-zone integration test (pure host logic)",
+            package: "kernel-core",
+            test_target: "phase56_g3_layer_integration",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.2 — keybind grab-hook predicate test against
+        // `kernel-core::input::bind_table`. Runtime synthetic-key-injection
+        // is `#[ignore]`d behind the userspace bulk-drain gap; the four
+        // running tests cover the production match-mask invariants.
+        HostRegressionTest {
+            name: "phase56-g2",
+            description: "Phase 56 G.2: keybind grab-hook predicate regression (pure host logic; \
+                 runtime synthetic-key-injection deferred behind bulk-drain gap)",
+            package: "kernel-core",
+            test_target: "phase56_g2_keybind_grab_hook",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.4 — control-socket codec round-trip test
+        // against `kernel-core::display::control`. Runtime list-surfaces /
+        // subscribe / live frame-stats tests are `#[ignore]`d behind the
+        // userspace bulk-drain gap.
+        HostRegressionTest {
+            name: "phase56-g4",
+            description: "Phase 56 G.4: control-socket codec round-trip regression (pure host logic; \
+                 runtime list-surfaces / subscribe / frame-stats live data deferred behind \
+                 bulk-drain gap)",
+            package: "kernel-core",
+            test_target: "phase56_g4_control_socket_roundtrip",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.1 — multi-client coexistence regression
+        // (DEFERRED). Ships a single `#[ignore]`d test so a future
+        // closure-task author cannot miss the deferral; running this
+        // entry exits 0 because the only test is `#[ignore]`d.
+        HostRegressionTest {
+            name: "phase56-g1",
+            description: "Phase 56 G.1: multi-client coexistence regression (DEFERRED behind \
+                 bulk-drain gap; running this exits 0 with one ignored test)",
+            package: "kernel-core",
+            test_target: "phase56_g1_multi_client_coexistence",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+    ]
 }
 
 /// Run a host-only regression test. Returns `Ok(())` on success or
