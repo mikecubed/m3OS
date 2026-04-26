@@ -9,35 +9,73 @@
 //!
 //! Both types are independent — the dispatcher composes them. Storage is
 //! fixed-capacity (no allocator); `register` past [`MAX_BINDS`] returns
-//! [`BindError::TableFull`] and `start_grab` past `MAX_GRABS` is a no-op
+//! [`BindError::TableFull`] and `start_grab` past [`MAX_GRABS`] is a no-op
 //! that returns `false`.
 //!
-//! Spec: `docs/roadmap/tasks/56-display-and-input-architecture-tasks.md` § D.4 and § A.5.
+//! Spec: `docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`
+//! § D.4 (lines ~607–625) and § A.5 (keybind grab semantics).
+//!
+//! ### Double-register contract
+//!
+//! [`BindTable::register`] is **idempotent**: re-registering an existing
+//! `(modifier_mask, keycode)` pair returns the existing [`BindId`] rather
+//! than allocating a new slot or returning an error. This matches the
+//! semantics of X11 `XGrabKey` and most window managers, and it lets the
+//! Phase 56 control socket (E.4) call `register_bind` on every config
+//! reload without extra dedup logic at the call site.
+//!
+//! ### Invariants (also enforced by tests)
+//!
+//! * Every issued [`BindId`] is unique within the lifetime of a single
+//!   [`BindTable`] instance — even after `unregister`, that id is never
+//!   reused for a later registration.
+//! * [`BindTable::match_bind`] only returns ids that are *currently*
+//!   registered; an id observed for an entry that was later unregistered
+//!   is no longer returned.
+//! * After every `start_grab(k) → clear_on_keyup(k)` pair, `is_grabbed(k)`
+//!   is `None`.
 
-// Stub-only file used to commit failing tests before the implementation.
-// Replaced wholesale by the green-test commit.
-
-#![allow(dead_code, unused_variables)]
-
-/// Maximum number of registered binds. Phase 56 chose 64; recorded by H.1.
+/// Maximum number of registered binds. Phase 56 chose 64 so the table fits
+/// in a single CPU cache line's worth of pointers without dynamic memory;
+/// [H.1's bookkeeping](../../../docs/roadmap/tasks/56-display-and-input-architecture-tasks.md)
+/// records the choice for the resource-budget table.
 pub const MAX_BINDS: usize = 64;
 
-/// Maximum number of concurrently active key-down grabs. Far smaller than
-/// `MAX_BINDS` — a user only ever has a handful of keys held at once.
+/// Maximum number of concurrently active key-down grabs. A user only ever
+/// has a handful of keys held at once, and each entry costs 12 bytes, so 8
+/// is generous without being wasteful.
 pub const MAX_GRABS: usize = 8;
 
 /// Registration key — `(modifier_mask, keycode)` pair, where the mask is
 /// the same `MOD_*` bitfield carried on a [`crate::input::events::KeyEvent`].
+///
+/// Matching is exact-mask: pressing `SUPER+SHIFT+Q` does **not** trigger a
+/// bind registered for `SUPER+Q`. This is the A.5 decision and is enforced
+/// by `BindTable::match_bind`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct BindKey {
     pub modifier_mask: u16,
     pub keycode: u32,
 }
 
-/// Opaque, stable handle returned by [`BindTable::register`]. Never reused
-/// across the lifetime of a single [`BindTable`] instance.
+/// Opaque, stable handle returned by [`BindTable::register`].
+///
+/// Within the lifetime of a single [`BindTable`] instance, ids are never
+/// reused — even after `unregister(id)`, the same id will never be issued
+/// to a later registration. The dispatcher (D.3) and the control socket
+/// (E.4) hold these as plain values; nothing they do can forge an id that
+/// later collides with a real registration.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct BindId(u32);
+
+impl BindId {
+    /// Raw monotonic counter value. Useful for logging only — clients must
+    /// **not** synthesize a [`BindId`] from a numeric value they did not
+    /// receive from [`BindTable::register`].
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
 
 /// Errors returned by [`BindTable`]. `#[non_exhaustive]` so future variants
 /// (e.g. invalid modifier bits) can be added without breaking matchers.
@@ -46,13 +84,28 @@ pub struct BindId(u32);
 pub enum BindError {
     /// `register` was called after [`MAX_BINDS`] entries were already live.
     TableFull,
-    /// `unregister` was called with a [`BindId`] that is not present in the table.
+    /// `unregister` was called with a [`BindId`] that is not present in the
+    /// table — either it was never issued, or it was already unregistered.
     UnknownBind,
 }
 
-/// Pure-logic registration table. Independent of [`GrabState`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct BindEntry {
+    id: BindId,
+    key: BindKey,
+}
+
+/// Pure-logic registration table. Independent of [`GrabState`]; the
+/// dispatcher composes them.
+///
+/// Internally a fixed-size `[Option<BindEntry>; MAX_BINDS]` plus a
+/// monotonic id counter. Lookup is a linear scan over occupied slots — at
+/// 64 entries this is on the order of dozens of cache-resident reads,
+/// well below 1 µs even on the slowest target hardware.
 pub struct BindTable {
-    _stub: (),
+    slots: [Option<BindEntry>; MAX_BINDS],
+    next_id: u32,
+    occupied: usize,
 }
 
 impl Default for BindTable {
@@ -62,35 +115,131 @@ impl Default for BindTable {
 }
 
 impl BindTable {
+    /// Construct an empty table.
     pub const fn new() -> Self {
-        Self { _stub: () }
+        Self {
+            slots: [None; MAX_BINDS],
+            next_id: 0,
+            occupied: 0,
+        }
     }
 
+    /// Register a new bind, or return the existing [`BindId`] if the same
+    /// `(modifier_mask, keycode)` pair is already registered (idempotent
+    /// contract — see module docs).
+    ///
+    /// Errors:
+    /// * [`BindError::TableFull`] when [`MAX_BINDS`] entries are live and
+    ///   the key is not already present.
     pub fn register(&mut self, key: BindKey) -> Result<BindId, BindError> {
-        // Stub — fails tests until D.4's green commit lands.
-        Err(BindError::TableFull)
+        // Idempotent: existing key returns its existing id.
+        if let Some(existing) = self.find_by_key(&key) {
+            return Ok(existing);
+        }
+        // Find the first free slot.
+        let free_idx = match self.slots.iter().position(Option::is_none) {
+            Some(i) => i,
+            None => return Err(BindError::TableFull),
+        };
+        // Allocate the next monotonic id. Saturating add prevents wrap on
+        // the (theoretical) 4-billionth registration; we degrade by
+        // refusing further registrations rather than reusing ids.
+        if self.next_id == u32::MAX {
+            return Err(BindError::TableFull);
+        }
+        let id = BindId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        self.slots[free_idx] = Some(BindEntry { id, key });
+        self.occupied = self.occupied.saturating_add(1);
+        Ok(id)
     }
 
+    /// Remove the registration with the given id.
+    ///
+    /// Errors:
+    /// * [`BindError::UnknownBind`] when the id is not currently registered
+    ///   — either it was never issued, or it was already unregistered.
     pub fn unregister(&mut self, id: BindId) -> Result<(), BindError> {
-        Err(BindError::UnknownBind)
+        let idx = match self.find_slot_by_id(id) {
+            Some(i) => i,
+            None => return Err(BindError::UnknownBind),
+        };
+        self.slots[idx] = None;
+        self.occupied = self.occupied.saturating_sub(1);
+        Ok(())
     }
 
+    /// Return the [`BindId`] whose key exactly matches `(modifier_mask,
+    /// keycode)`, or `None` if no registered key matches.
+    ///
+    /// Matching is **exact mask equality**: a registration for `SUPER+Q`
+    /// only fires when the modifier bitmask at event time is exactly
+    /// `MOD_SUPER`; pressing `SUPER+SHIFT+Q` returns `None`.
     pub fn match_bind(&self, modifier_mask: u16, keycode: u32) -> Option<BindId> {
+        let needle = BindKey {
+            modifier_mask,
+            keycode,
+        };
+        self.find_by_key(&needle)
+    }
+
+    /// Number of currently registered binds (`0..=MAX_BINDS`).
+    pub fn len(&self) -> usize {
+        self.occupied
+    }
+
+    /// True when no binds are registered.
+    pub fn is_empty(&self) -> bool {
+        self.occupied == 0
+    }
+
+    fn find_by_key(&self, key: &BindKey) -> Option<BindId> {
+        for slot in &self.slots {
+            if let Some(entry) = slot
+                && entry.key == *key
+            {
+                return Some(entry.id);
+            }
+        }
         None
     }
 
-    pub fn len(&self) -> usize {
-        0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
+    fn find_slot_by_id(&self, id: BindId) -> Option<usize> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(entry) = slot
+                && entry.id == id
+            {
+                return Some(i);
+            }
+        }
+        None
     }
 }
 
-/// Per-keycode grab suppression policy. Independent of [`BindTable`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GrabEntry {
+    keycode: u32,
+    bind: BindId,
+}
+
+/// Per-keycode grab suppression policy. Independent of [`BindTable`]; the
+/// dispatcher composes them.
+///
+/// Intent (D.3 dispatcher):
+/// * On a `KeyDown` event whose `(modifier_mask, keycode)` matches a
+///   registered bind, the dispatcher calls `start_grab(keycode, bind_id)`
+///   *and* delivers the bind to the server-side handler — clients see no
+///   key event for that down.
+/// * On every subsequent `KeyRepeat` for that same keycode, the dispatcher
+///   checks `is_grabbed(keycode).is_some()` and suppresses the event.
+/// * On a `KeyUp` for that keycode the dispatcher calls
+///   `clear_on_keyup(keycode)`; if it returned `true`, the up event is
+///   suppressed (clients never saw the down, so they must not see the up).
+///
+/// Storage is a fixed `[Option<GrabEntry>; MAX_GRABS]` array; `start_grab`
+/// past the cap returns `false` without displacing earlier grabs.
 pub struct GrabState {
-    _stub: (),
+    grabs: [Option<GrabEntry>; MAX_GRABS],
 }
 
 impl Default for GrabState {
@@ -100,19 +249,69 @@ impl Default for GrabState {
 }
 
 impl GrabState {
+    /// Construct an empty grab table.
     pub const fn new() -> Self {
-        Self { _stub: () }
+        Self {
+            grabs: [None; MAX_GRABS],
+        }
     }
 
+    /// Record a new key-down grab. Returns `true` on success.
+    ///
+    /// If `keycode` is already grabbed, the existing grab is **overwritten**
+    /// — see the `re_grab_same_keycode_overwrites_bind` test for the
+    /// rationale (a keycode can only have one outstanding grab at a time;
+    /// the most recent `KeyDown` wins).
+    ///
+    /// If [`MAX_GRABS`] grabs are already active *and* `keycode` is not
+    /// among them, returns `false` and emits no event. The dispatcher must
+    /// treat that as "the grab did not take" and let the event flow
+    /// through normal focus routing.
     pub fn start_grab(&mut self, keycode: u32, bind: BindId) -> bool {
+        // If the keycode is already grabbed, overwrite the bind.
+        for slot in &mut self.grabs {
+            if let Some(entry) = slot
+                && entry.keycode == keycode
+            {
+                entry.bind = bind;
+                return true;
+            }
+        }
+        // Otherwise find the first free slot.
+        for slot in &mut self.grabs {
+            if slot.is_none() {
+                *slot = Some(GrabEntry { keycode, bind });
+                return true;
+            }
+        }
+        // Capacity exceeded.
         false
     }
 
+    /// Returns `Some(bind)` if `keycode` currently has an active grab.
     pub fn is_grabbed(&self, keycode: u32) -> Option<BindId> {
+        for slot in &self.grabs {
+            if let Some(entry) = slot
+                && entry.keycode == keycode
+            {
+                return Some(entry.bind);
+            }
+        }
         None
     }
 
+    /// Clear any grab for `keycode`. Returns `true` if a grab was cleared,
+    /// `false` if the keycode was not grabbed (idempotent on the
+    /// no-grab-exists path).
     pub fn clear_on_keyup(&mut self, keycode: u32) -> bool {
+        for slot in &mut self.grabs {
+            if let Some(entry) = slot
+                && entry.keycode == keycode
+            {
+                *slot = None;
+                return true;
+            }
+        }
         false
     }
 }
@@ -177,10 +376,10 @@ mod tests {
     #[test]
     fn no_modifier_bind_does_not_match_with_any_modifier_pressed() {
         let mut t = BindTable::new();
-        let _id = t.register(key(0, b'a' as u32)).unwrap();
+        let id = t.register(key(0, b'a' as u32)).unwrap();
         assert_eq!(t.match_bind(MOD_SHIFT, b'a' as u32), None);
         assert_eq!(t.match_bind(MOD_SUPER, b'a' as u32), None);
-        assert_eq!(t.match_bind(0, b'a' as u32), Some(_id));
+        assert_eq!(t.match_bind(0, b'a' as u32), Some(id));
     }
 
     // ---- Double-register contract: idempotent ------------------------------
@@ -408,9 +607,9 @@ mod tests {
                         }
                     }
                     Op::UnregisterById(idx) => {
-                        if let Some(&id) = still_present.get(idx as usize % still_present.len().max(1))
-                            .filter(|_| !still_present.is_empty())
-                        {
+                        if !still_present.is_empty() {
+                            let pos = idx as usize % still_present.len();
+                            let id = still_present[pos];
                             t.unregister(id).expect("present in still_present");
                             still_present.retain(|x| *x != id);
                         }
