@@ -344,6 +344,15 @@ fn build_userspace_bins() {
         // kernel-core control codec (which uses Vec for list payloads)
         // and uses `format!` for human-readable output.
         ("m3ctl", "m3ctl", true),
+        // Phase 56 Track F.2: display-service crash-and-restart smoke
+        // client. One-shot binary launched from the post-login shell
+        // by the F.2 regression test; `needs_alloc = true` because it
+        // links the kernel-core control codec (encode_command).
+        (
+            "display-server-crash-smoke",
+            "display-server-crash-smoke",
+            true,
+        ),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {

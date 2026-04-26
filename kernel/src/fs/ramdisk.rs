@@ -211,6 +211,11 @@ static GFX_DEMO_ELF: &[u8] = generated_initrd_asset!("gfx-demo");
 // is not a daemon — the four-step new-binary convention only requires
 // a service config for daemons).
 static M3CTL_ELF: &[u8] = generated_initrd_asset!("m3ctl");
+// Phase 56 Track F.2: display-service crash-and-restart smoke client.
+// Exposed under /bin so the QEMU regression can launch it from the
+// post-login shell. No `.conf` (not a daemon).
+static DISPLAY_SERVER_CRASH_SMOKE_ELF: &[u8] =
+    generated_initrd_asset!("display-server-crash-smoke");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -594,6 +599,15 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     // Phase 56 Track E.4: minimal control-socket CLI. Not a daemon
     // — invoked by the shell or test harness; no `.conf` required.
     ("m3ctl", RamdiskNode::File { content: M3CTL_ELF }),
+    // Phase 56 Track F.2: display-service crash-and-restart smoke
+    // client. Not a daemon; invoked from the post-login shell by the
+    // F.2 regression. No `.conf` required.
+    (
+        "display-server-crash-smoke",
+        RamdiskNode::File {
+            content: DISPLAY_SERVER_CRASH_SMOKE_ELF,
+        },
+    ),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
