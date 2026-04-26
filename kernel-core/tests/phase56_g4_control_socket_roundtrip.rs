@@ -28,33 +28,41 @@
 //! on the host: the codec defines an `UnknownVerb` error variant that
 //! the dispatcher emits without dropping the connection.
 //!
-//! ## What is deferred
+//! ## What is deferred (Phase 56 close-out)
 //!
-//! Bullets 2, 3, and the runtime-frame-stats portion of bullet 4 all
-//! require the userspace bulk-drain syscall to land — without it the
-//! caller cannot decode the kernel-staged reply bulk and must fall
-//! back to `m3ctl`'s `synthetic_reply_for(&cmd)` arm. The
-//! `// TODO(C.5-bulk-drain)` markers in `userspace/m3ctl/src/main.rs`
-//! pin the swap point.
+//! The userspace bulk-drain syscall has now landed
+//! (`SYS_IPC_TAKE_PENDING_BULK = 0x1112` /
+//! `syscall_lib::ipc_take_pending_bulk`) and `m3ctl` decodes real
+//! reply bulk via `decode_event(&reply_buf[..n])` instead of the
+//! `synthetic_reply_for` seam (the synthetic path now only handles
+//! legitimate zero-bulk replies). The remaining deferral is purely
+//! the *integration harness*:
 //!
-//! Bullet 5's *malformed-framing-closes-connection* path also requires
-//! a runtime caller observing a kernel-side close; that lands when
-//! bulk-drain ships and the regression can wire a deliberately-bad
-//! frame through the live socket.
+//! Bullets 2 and 3 (`list-surfaces` after `Toplevel` create,
+//! `subscribe SurfaceCreated` event delivery) need a QEMU-based
+//! regression that drives a multi-process scenario: launch
+//! `display_server`, launch `m3ctl subscribe SurfaceCreated`, launch
+//! a separate test client that creates a `Toplevel`, then assert the
+//! event lands. The host-process `cargo test` cannot orchestrate
+//! that — the codec round-trip tests below pin the wire-format
+//! invariants the runtime path will rely on, but the cross-process
+//! verification belongs in a separate `cargo xtask regression
+//! --test display-control-socket` smoke binary.
 //!
-//! ## How to lift the deferral
+//! Bullet 4's runtime-frame-stats portion is similarly QEMU-only:
+//! it requires actual frames to be composed (clock-driven), which
+//! the host pure-logic harness does not produce.
 //!
-//! When `syscall_lib::ipc_take_pending_bulk` (or equivalent) lands:
+//! Bullet 5's *malformed-framing-closes-connection* path also
+//! belongs in the QEMU smoke since it requires observing a
+//! kernel-side connection close.
 //!
-//! 1. Replace `m3ctl::synthetic_reply_for` with `decode_event(reply_bulk)`.
-//! 2. Add a `cargo xtask regression --test control-socket` that boots
-//!    QEMU, runs `m3ctl version`, asserts the *real* reply path
-//!    (not the synthetic seam) printed the protocol-version string.
-//! 3. Add the `list-surfaces` / `subscribe SurfaceCreated` /
-//!    `frame-stats` runtime checks per the bullets above.
+//! Subscription delivery is still the pull/queue-driven model
+//! (control-socket subscribers poll); a richer event-push design is
+//! deferred to a separate follow-on phase.
 //!
-//! See also `phase56_g1_multi_client_coexistence.rs` for the full
-//! bulk-drain deferral rationale shared across G.1, G.2, and G.4.
+//! See also `phase56_g1_multi_client_coexistence.rs` for the matching
+//! G.1 narrative on the same QEMU-harness gap.
 
 #![cfg(feature = "std")]
 
@@ -155,15 +163,17 @@ fn frame_stats_reply_round_trips_with_strictly_increasing_indices() {
 
 #[test]
 #[ignore = "Phase 56 G.4 runtime control-socket round-trip regression \
-            (list-surfaces / subscribe / frame-stats live data) deferred \
-            behind the userspace bulk-drain gap (TODO(C.5-bulk-drain)); \
-            see file header for the lift plan."]
-fn runtime_list_surfaces_subscribe_and_frame_stats_deferred() {
+            (list-surfaces / subscribe / frame-stats live data) belongs \
+            in a QEMU smoke (`cargo xtask regression --test \
+            display-control-socket`); the bulk-drain transport landed \
+            in this PR but cross-process orchestration is out of scope \
+            for host-process `cargo test`. See file header."]
+fn runtime_list_surfaces_subscribe_and_frame_stats_belongs_in_qemu_smoke() {
     panic!(
-        "G.4 runtime control-socket round-trip regression is deferred \
-         behind the userspace bulk-drain gap. The codec round-trip \
-         tests in this file pin the wire-format invariants the runtime \
-         path will depend on; the runtime-byte-flow portion lifts \
-         when bulk-drain ships."
+        "G.4 runtime control-socket regression belongs in a QEMU smoke. \
+         The bulk-drain transport (ipc_take_pending_bulk) is in place; \
+         the codec round-trip tests in this file pin the wire-format \
+         invariants the smoke depends on. The smoke binary itself is \
+         tracked in the Phase 56 follow-up plan."
     );
 }

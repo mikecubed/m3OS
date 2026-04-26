@@ -14,14 +14,18 @@
 //! 6. A subsequent `KeyDown` for `q` (no modifier) is delivered
 //!    normally to the focused client.
 //!
-//! Steps 3 and 5 require the userspace bulk-drain (cross-reference
-//! `phase56_g1_multi_client_coexistence.rs` for the full deferral
-//! rationale): the test client cannot observe the
-//! `BindTriggered` event without a working drain, and the synthetic-
-//! key-injection control-socket verb stages bytes the dispatcher
-//! cannot read back. Phase 56 G-track therefore ships the *partial*
-//! coverage: the pure-logic match path that production code uses to
-//! decide whether a `KeyEvent` is swallowed or forwarded.
+//! Phase 56 close-out: the userspace bulk-drain syscall has landed
+//! (`ipc_take_pending_bulk` / 0x1112) and the `InjectKey` control-
+//! socket verb is wired, so the runtime grab-hook regression is
+//! testable end-to-end — but only inside QEMU. The runtime
+//! verification ships as a separate guest binary
+//! (`userspace/grab-hook-smoke`, version 0.56.0) which the
+//! supervisor launches against a live `display_server`. The
+//! host-process `cargo test` cannot orchestrate the multi-process
+//! flow (synthetic key injection through the dispatcher + cross-
+//! process focus state + control-socket subscription readback), so
+//! this file pins the *pure-logic* invariants the runtime path
+//! depends on, and the QEMU smoke pins the cross-process behavior.
 //!
 //! ## What this file *does* cover
 //!
@@ -46,17 +50,20 @@
 //! phase56_g2_keybind_grab_hook` sees a named G.2 signal in the
 //! output.
 //!
-//! ## Bulk-drain deferral list (mirrors `phase56_g1_*`)
+//! ## QEMU-only coverage (Phase 56 close-out)
 //!
-//! Until the userspace bulk-drain syscall lands:
+//! Three checks that require a live multi-process compositor + input
+//! pipeline are exercised by `userspace/grab-hook-smoke` and not by
+//! this file:
 //!
-//! * No runtime synthetic-key-injection regression.
-//! * No `BindTriggered` event-stream regression.
-//! * No "focused client receives no `KeyEvent`" cross-process check.
+//! * synthetic key injection through the dispatcher;
+//! * `BindTriggered` event observation on the subscribed control
+//!   stream;
+//! * "focused client receives no `KeyEvent`" cross-process check.
 //!
-//! These three together are what runtime G.2 deferral defers. The lift
-//! plan is the same as G.1's: replace the deferred-runtime portion of
-//! this file when bulk-drain ships.
+//! These all use the bulk-drain syscall (`ipc_take_pending_bulk`)
+//! and the `InjectKey` control verb — both of which landed in this
+//! PR — and verify behavior that pure-logic host tests cannot reach.
 
 #![cfg(feature = "std")]
 
@@ -137,12 +144,15 @@ fn unrelated_modifier_combo_does_not_match() {
 
 #[test]
 #[ignore = "Phase 56 G.2 runtime synthetic-key-injection regression \
-            deferred behind the userspace bulk-drain gap \
-            (TODO(C.5-bulk-drain)); see file header for the lift plan."]
-fn runtime_grab_hook_synthetic_injection_deferred() {
+            ships as a QEMU smoke (userspace/grab-hook-smoke, \
+            version 0.56.0); the host-process `cargo test` cannot \
+            orchestrate the multi-process compositor + input-injection \
+            flow. See file header."]
+fn runtime_grab_hook_synthetic_injection_belongs_in_qemu_smoke() {
     panic!(
-        "G.2 runtime grab-hook regression is deferred behind the \
-         userspace bulk-drain gap. See this file's module-level \
-         docstring for the lift plan."
+        "G.2 runtime grab-hook regression belongs in a QEMU smoke. \
+         The supporting transport (ipc_take_pending_bulk + InjectKey \
+         control verb) landed in this PR; the cross-process \
+         verification is owned by `userspace/grab-hook-smoke`."
     );
 }

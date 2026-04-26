@@ -36,13 +36,21 @@ Phase 56 has **landed** the architectural substrate — the
 [`docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`](../../roadmap/tasks/56-display-and-input-architecture-tasks.md)
 task list is complete, batches 1–5 (Tracks A–H) shipped, and the four
 Goal-A contract points (layout module, keybind grab hook, surface roles,
-control socket) are delivered. The unresolved gap is documented in the
-Phase 56 learning doc's "Deferred follow-ups" section: a userspace
-**bulk-reply drain helper** is required to make the per-event byte flow
-through D.3 (input dispatcher) and E.4 (control-socket subscriber outbound
-queue) end-to-end functional under load. The state machines exist and the
-contract is exercised; runtime byte flow is deferred to a Phase 56
-follow-on (or to Phase 57's session work, if convenient).
+control socket) are delivered. The earlier Phase 56 follow-up around a
+userspace **bulk-reply drain helper** is now closed: the kernel exposes
+`SYS_IPC_TAKE_PENDING_BULK = 0x1112` (`syscall_lib::ipc_take_pending_bulk`)
+and userspace consumers (`m3ctl`, `display-server-crash-smoke`,
+`grab-hook-smoke`, `display-multi-client-smoke`) drain the kernel-staged
+reply bulk in production code paths. The per-event byte flow through D.3
+(input dispatcher) and E.4 (control-socket subscriber outbound queue) is
+no longer documentation-only.
+
+The remaining limitations are higher-level polish rather than basic
+transport: subscription delivery is still a pull/queue-driven control-
+socket model rather than a richer event-push design, and bulk data is
+still not using true zero-copy page-grant handoff end-to-end. Both are
+deferred to the Phase 56 follow-on docket and do not block the R09
+substrate claim.
 
 What Phase 56 explicitly does **not** ship — and what R09 still needs to
 declare release-ready before the broader GUI claim is honest:

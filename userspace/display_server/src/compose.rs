@@ -193,6 +193,27 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     );
 
     let entries = registry.iter_compose(output);
+
+    // Cursor-trail fix (Phase 56 follow-up): when no surfaces are
+    // mapped AND the cursor moved, the surface-blit pass below
+    // produces zero writes, but `blit_cursor` only paints the *new*
+    // cursor position. The old cursor's opaque pixels would remain
+    // on the framebuffer as a stale "arrow trail". Explicitly clear
+    // the union of old + new cursor damage rects with the
+    // framebuffer's background color (opaque black) before
+    // `blit_cursor` runs. With at least one surface mapped, the
+    // surface-blit pass repaints under the old + new cursor rects,
+    // so the explicit clear is unnecessary.
+    if entries.is_empty()
+        && cursor_motion
+        && let (Some(prev_pos), Some(prev_size)) = (ctx.prev_pointer, ctx.prev_cursor_size)
+    {
+        let damage = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+        for rect in damage {
+            clear_rect_to_background(owner, rect)?;
+        }
+    }
+
     if entries.is_empty() && !cursor_motion {
         registry.mark_clean();
         return Ok(0);
@@ -405,6 +426,31 @@ fn blit_cursor<O: FramebufferOwner>(
         }
     }
     Ok(writes)
+}
+
+/// Fill `rect` on the framebuffer with opaque black. Used by the
+/// cursor-trail fix when no surfaces are mapped — the union of old +
+/// new cursor damage rects is cleared before `blit_cursor` paints the
+/// new cursor on top, so the framebuffer doesn't accumulate stale
+/// arrow pixels from the previous frame.
+///
+/// Both Phase 56 pixel formats (BGRA8888 / RGBA8888) put the alpha
+/// byte at the high index of each 32-bit little-endian pixel, so
+/// "opaque black" is `[0, 0, 0, 0xFF]` in both layouts.
+fn clear_rect_to_background<O: FramebufferOwner>(owner: &mut O, rect: Rect) -> Result<(), FbError> {
+    let bpp = bytes_per_pixel(owner.metadata().pixel_format) as usize;
+    let total = (rect.w as usize)
+        .saturating_mul(rect.h as usize)
+        .saturating_mul(bpp);
+    if total == 0 {
+        return Ok(());
+    }
+    let mut buf: Vec<u8> = alloc::vec![0u8; total];
+    for i in (3..total).step_by(bpp) {
+        buf[i] = 0xFF;
+    }
+    let stride = (rect.w as u32).saturating_mul(bpp as u32);
+    owner.write_pixels(rect, &buf, stride)
 }
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named
