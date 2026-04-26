@@ -11,6 +11,7 @@ pub mod buffer;
 pub mod compose;
 pub mod fb_owner;
 pub mod frame_tick;
+pub mod layer;
 pub mod layout;
 pub mod protocol;
 pub mod surface;
