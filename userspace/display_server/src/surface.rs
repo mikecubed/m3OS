@@ -23,6 +23,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use kernel_core::display::compose::ComposeLayer;
+use kernel_core::display::layer::{
+    LayerConflictTracker, LayerError, compute_layer_geometry, derive_exclusive_rect,
+};
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, Layer, Rect, ServerMessage, SurfaceId, SurfaceRole,
 };
@@ -97,6 +100,17 @@ pub enum SurfaceShimError {
         expected: BufferId,
         pending: Vec<BufferId>,
     },
+    /// A `Layer` surface tried to map with
+    /// `keyboard_interactivity == Exclusive` while another `Layer`
+    /// already holds the global exclusive-keyboard claim. Phase 56
+    /// E.2 enforces a single exclusive-keyboard layer.
+    Layer(LayerError),
+}
+
+impl From<LayerError> for SurfaceShimError {
+    fn from(err: LayerError) -> Self {
+        SurfaceShimError::Layer(err)
+    }
 }
 
 /// Registry of all surfaces owned by all connected clients.
@@ -110,6 +124,13 @@ pub struct SurfaceRegistry {
     /// Pending buffer bytes received via the bulk-transport path but not
     /// yet attached to a surface. `AttachBuffer` consumes from here.
     pending_bulk: Vec<CommittedBuffer>,
+    /// Tracks which `Layer` surface (if any) currently holds the
+    /// global exclusive-keyboard claim. Populated on
+    /// `SetSurfaceRole(Layer { keyboard_interactivity == Exclusive })`,
+    /// cleared on the holder's `DestroySurface`. The D.3 input
+    /// dispatcher reads `active_exclusive_layer` to gate keyboard
+    /// routing.
+    layer_conflicts: LayerConflictTracker,
 }
 
 impl SurfaceRegistry {
@@ -117,6 +138,7 @@ impl SurfaceRegistry {
         Self {
             surfaces: BTreeMap::new(),
             pending_bulk: Vec::new(),
+            layer_conflicts: LayerConflictTracker::new(),
         }
     }
 
@@ -168,9 +190,23 @@ impl SurfaceRegistry {
             ClientMessage::DestroySurface { surface_id } => {
                 self.apply_event(*surface_id, SurfaceEvent::DestroySurface, &mut result)?;
                 self.surfaces.remove(surface_id);
+                // Release any exclusive-keyboard claim the destroyed
+                // surface held. `release` is a no-op for surfaces that
+                // never claimed the slot.
+                self.layer_conflicts.release(*surface_id);
                 result.destroyed.push(*surface_id);
             }
             ClientMessage::SetSurfaceRole { surface_id, role } => {
+                // Phase 56 E.2: a Layer surface declaring
+                // `KeyboardInteractivity::Exclusive` is rejected if a
+                // different layer already holds the global slot. We
+                // validate *before* applying the state-machine event
+                // so a conflict leaves the registry untouched. Non-
+                // Layer roles bypass the check (try_claim returns Ok
+                // for non-Exclusive configs).
+                if let SurfaceRole::Layer(cfg) = role {
+                    self.layer_conflicts.try_claim(*surface_id, cfg)?;
+                }
                 self.apply_event(*surface_id, SurfaceEvent::SetRole(*role), &mut result)?;
                 if let Some(s) = self.surfaces.get_mut(surface_id) {
                     s.role = Some(*role);
@@ -347,26 +383,40 @@ impl SurfaceRegistry {
     /// Iterate all live surfaces with their current committed buffer (if
     /// any) and their layer / geometry. The composer wiring (C.4) consumes
     /// this to build `ComposeSurface`s for each frame.
+    ///
+    /// `Layer` surfaces are placed via
+    /// [`kernel_core::display::layer::compute_layer_geometry`] using
+    /// their `LayerConfig` (anchor mask + margins) and the buffer's
+    /// committed dimensions as the intrinsic size. `Toplevel` and
+    /// `Cursor` surfaces still center inside the output here; the
+    /// composer wiring (C.4) overrides toplevel placement with the
+    /// `LayoutPolicy::arrange` result.
     pub fn iter_compose(&self, output: Rect) -> Vec<ComposeEntry<'_>> {
         let mut entries = Vec::new();
         for (id, surface) in self.surfaces.iter() {
             let Some(buf) = surface.committed_buffer.as_ref() else {
                 continue;
             };
-            let role_layer = match surface.role {
-                Some(SurfaceRole::Cursor(_)) => ComposeLayer::Cursor,
-                Some(SurfaceRole::Layer(cfg)) => match cfg.layer {
-                    Layer::Background => ComposeLayer::Background,
-                    Layer::Bottom => ComposeLayer::Bottom,
-                    Layer::Top => ComposeLayer::Top,
-                    Layer::Overlay => ComposeLayer::Overlay,
-                },
-                Some(SurfaceRole::Toplevel) | None => ComposeLayer::Toplevel,
+            let (role_layer, rect) = match surface.role {
+                Some(SurfaceRole::Cursor(_)) => (
+                    ComposeLayer::Cursor,
+                    centre_rect(output, buf.width, buf.height),
+                ),
+                Some(SurfaceRole::Layer(cfg)) => {
+                    let layer_band = match cfg.layer {
+                        Layer::Background => ComposeLayer::Background,
+                        Layer::Bottom => ComposeLayer::Bottom,
+                        Layer::Top => ComposeLayer::Top,
+                        Layer::Overlay => ComposeLayer::Overlay,
+                    };
+                    let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
+                    (layer_band, geometry)
+                }
+                Some(SurfaceRole::Toplevel) | None => (
+                    ComposeLayer::Toplevel,
+                    centre_rect(output, buf.width, buf.height),
+                ),
             };
-            // Centre the surface inside the output by default; layout
-            // policy (E.1 wiring) will override this for `Toplevel` once
-            // C.4 plugs the LayoutPolicy in.
-            let rect = centre_rect(output, buf.width, buf.height);
             entries.push(ComposeEntry {
                 id: *id,
                 layer: role_layer,
@@ -378,6 +428,47 @@ impl SurfaceRegistry {
         // then by surface id for determinism within a layer.
         entries.sort_by(|a, b| (a.layer as u8, a.id.0).cmp(&(b.layer as u8, b.id.0)));
         entries
+    }
+
+    /// Collect the exclusive-zone rectangles to subtract from the
+    /// toplevel band, in output coordinates. The composer (C.4) feeds
+    /// these to `LayoutPolicy::arrange` so toplevels are arranged
+    /// outside any docked panels / taskbars / status bars.
+    ///
+    /// Each `Layer` surface with `exclusive_zone != 0` and a single-
+    /// edge anchor pattern contributes one rectangle. Multi-edge
+    /// anchors and zero `exclusive_zone` are skipped — see
+    /// [`kernel_core::display::layer::derive_exclusive_rect`] for the
+    /// full exclusion table.
+    pub fn exclusive_zones(&self, output: Rect) -> Vec<Rect> {
+        let mut zones = Vec::new();
+        for surface in self.surfaces.values() {
+            let Some(buf) = surface.committed_buffer.as_ref() else {
+                continue;
+            };
+            let Some(SurfaceRole::Layer(cfg)) = surface.role else {
+                continue;
+            };
+            let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
+            if let Some(rect) = derive_exclusive_rect(geometry, &cfg) {
+                zones.push(rect);
+            }
+        }
+        zones
+    }
+
+    /// The surface (if any) currently holding the global exclusive-
+    /// keyboard claim. The D.3 input dispatcher consults this to gate
+    /// `KeyboardInteractivity` routing so an exclusive layer always
+    /// wins focus while mapped.
+    ///
+    /// `#[allow(dead_code)]` because D.3's `CompositorState`
+    /// `active_exclusive_layer` field that consumes this getter has not
+    /// yet merged into the integration branch. Once D.3 plumbs through,
+    /// the allow can drop.
+    #[allow(dead_code)]
+    pub fn active_exclusive_layer(&self) -> Option<SurfaceId> {
+        self.layer_conflicts.active()
     }
 }
 

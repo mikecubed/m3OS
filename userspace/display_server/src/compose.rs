@@ -51,10 +51,13 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         h: meta.height,
     };
 
-    // Inform the layout policy about toplevel surfaces. For Phase 56 the
-    // default `FloatingLayout` centers each toplevel; the result is
-    // currently unused (the surface shim already centres entries) but
-    // keeping the call ensures the seam is exercised on every frame.
+    // Inform the layout policy about toplevel surfaces and the
+    // exclusive zones declared by mapped `Layer` surfaces (E.2). The
+    // result is currently unused (the surface shim still centres
+    // entries) but feeding `arrange` the real exclusive_zones list on
+    // every frame keeps the seam exercised and ensures `FloatingLayout`'s
+    // `usable_rect` shrinking is on for any future tiling layout that
+    // honours `LayoutPolicy::arrange` output.
     let toplevels: Vec<LayoutSurface> = registry
         .iter_compose(output)
         .iter()
@@ -69,7 +72,12 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
             preferred_size: (e.buf.width, e.buf.height),
         })
         .collect();
-    let _arrangement = layout.arrange(&toplevels, OutputGeometry { rect: output }, &[]);
+    let exclusive_zones = registry.exclusive_zones(output);
+    let _arrangement = layout.arrange(
+        &toplevels,
+        OutputGeometry { rect: output },
+        &exclusive_zones,
+    );
 
     let entries = registry.iter_compose(output);
     if entries.is_empty() {

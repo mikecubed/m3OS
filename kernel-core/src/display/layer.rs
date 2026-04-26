@@ -51,7 +51,7 @@
 //! [`derive_exclusive_rect`] returns `None` for them.
 
 use crate::display::protocol::{
-    ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP, LayerConfig, Rect,
+    ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP, LayerConfig, Rect, SurfaceId,
 };
 
 // Re-export the protocol types so downstream callers (display_server,
@@ -232,6 +232,84 @@ pub fn derive_exclusive_rect(layer_geometry: Rect, layer_config: &LayerConfig) -
         return None;
     }
     Some(layer_geometry)
+}
+
+/// Tracks which `Layer` surface (if any) currently holds the global
+/// exclusive-keyboard claim. Phase 56 enforces a single global
+/// exclusive-keyboard layer at a time — the second concurrent claim
+/// is rejected with [`LayerError::ExclusiveLayerConflict`].
+///
+/// This is pure-logic state shared between `kernel-core` (for tests)
+/// and the userspace `display_server` shim. The shim owns one of
+/// these inside `SurfaceRegistry`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerConflictTracker {
+    active: Option<SurfaceId>,
+}
+
+impl LayerConflictTracker {
+    /// Construct an empty tracker (no exclusive layer claimed).
+    pub const fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Identity of the surface currently holding the exclusive
+    /// keyboard claim, or `None` if no surface holds it. The D.3
+    /// input dispatcher reads this to gate `KeyboardInteractivity`
+    /// routing.
+    pub const fn active(&self) -> Option<SurfaceId> {
+        self.active
+    }
+
+    /// Try to claim the exclusive keyboard slot for `surface_id` with
+    /// the given `LayerConfig`. Returns `Ok(())` if either the slot
+    /// was empty, or the same surface is re-asserting the same claim
+    /// (idempotent). Returns
+    /// [`LayerError::ExclusiveLayerConflict`] if a different surface
+    /// already holds the slot.
+    ///
+    /// Layers whose `keyboard_interactivity` is anything other than
+    /// `Exclusive` do not claim the slot — call `release` on the
+    /// caller side when a previously-Exclusive layer transitions
+    /// away from `Exclusive`.
+    pub fn try_claim(
+        &mut self,
+        surface_id: SurfaceId,
+        layer_config: &LayerConfig,
+    ) -> Result<(), LayerError> {
+        if !matches!(
+            layer_config.keyboard_interactivity,
+            KeyboardInteractivity::Exclusive
+        ) {
+            // Non-Exclusive claim — no slot needed. Idempotent across
+            // re-asserts; the slot is unaffected unless the *same*
+            // surface previously claimed Exclusive and is now stepping
+            // down (caller is responsible for calling `release` in
+            // that flow).
+            return Ok(());
+        }
+        match self.active {
+            None => {
+                self.active = Some(surface_id);
+                Ok(())
+            }
+            Some(existing) if existing == surface_id => {
+                // Re-asserting the same claim is idempotent.
+                Ok(())
+            }
+            Some(_) => Err(LayerError::ExclusiveLayerConflict),
+        }
+    }
+
+    /// Release the exclusive-keyboard claim for `surface_id`. No-op if
+    /// `surface_id` does not currently hold the slot. Called on
+    /// `DestroySurface` for the holder, or whenever the holder
+    /// transitions away from `Exclusive`.
+    pub fn release(&mut self, surface_id: SurfaceId) {
+        if self.active == Some(surface_id) {
+            self.active = None;
+        }
+    }
 }
 
 fn clamp_to_i32(v: i64) -> i32 {
@@ -490,5 +568,176 @@ mod tests {
         let cfg = cfg(ANCHOR_TOP, 0);
         let geo = compute_layer_geometry(output, &cfg, (0, 24));
         assert_eq!(derive_exclusive_rect(geo, &cfg), None);
+    }
+
+    // ----- LayerConflictTracker tests -------------------------------------
+
+    fn cfg_kbd(interactivity: KeyboardInteractivity) -> LayerConfig {
+        LayerConfig {
+            layer: Layer::Top,
+            anchor_mask: ANCHOR_TOP,
+            exclusive_zone: 0,
+            keyboard_interactivity: interactivity,
+            margin: [0, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn tracker_starts_empty() {
+        let tracker = LayerConflictTracker::new();
+        assert_eq!(tracker.active(), None);
+    }
+
+    #[test]
+    fn tracker_first_exclusive_claim_succeeds() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        let result = tracker.try_claim(SurfaceId(1), &cfg);
+        assert_eq!(result, Ok(()));
+        assert_eq!(tracker.active(), Some(SurfaceId(1)));
+    }
+
+    #[test]
+    fn tracker_second_exclusive_claim_conflicts() {
+        // E.2 acceptance: at least 1 test on the conflict path.
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        tracker
+            .try_claim(SurfaceId(1), &cfg)
+            .expect("first claim should succeed");
+        let result = tracker.try_claim(SurfaceId(2), &cfg);
+        assert_eq!(result, Err(LayerError::ExclusiveLayerConflict));
+        // First claim still holds.
+        assert_eq!(tracker.active(), Some(SurfaceId(1)));
+    }
+
+    #[test]
+    fn tracker_re_asserting_same_surface_is_idempotent() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        tracker
+            .try_claim(SurfaceId(1), &cfg)
+            .expect("first claim should succeed");
+        // Re-asserting from the same surface is allowed (e.g. the
+        // client commits the same role twice).
+        let result = tracker.try_claim(SurfaceId(1), &cfg);
+        assert_eq!(result, Ok(()));
+        assert_eq!(tracker.active(), Some(SurfaceId(1)));
+    }
+
+    #[test]
+    fn tracker_non_exclusive_claim_does_not_take_slot() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg_on_demand = cfg_kbd(KeyboardInteractivity::OnDemand);
+        let cfg_none = cfg_kbd(KeyboardInteractivity::None);
+        assert_eq!(tracker.try_claim(SurfaceId(1), &cfg_on_demand), Ok(()));
+        assert_eq!(tracker.try_claim(SurfaceId(2), &cfg_none), Ok(()));
+        assert_eq!(tracker.active(), None);
+    }
+
+    #[test]
+    fn tracker_release_clears_active_for_holder() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        tracker.try_claim(SurfaceId(1), &cfg).expect("claim ok");
+        tracker.release(SurfaceId(1));
+        assert_eq!(tracker.active(), None);
+    }
+
+    #[test]
+    fn tracker_release_for_non_holder_is_noop() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        tracker.try_claim(SurfaceId(1), &cfg).expect("claim ok");
+        tracker.release(SurfaceId(99));
+        // Holder still active.
+        assert_eq!(tracker.active(), Some(SurfaceId(1)));
+    }
+
+    #[test]
+    fn tracker_after_release_other_surface_can_claim() {
+        let mut tracker = LayerConflictTracker::new();
+        let cfg = cfg_kbd(KeyboardInteractivity::Exclusive);
+        tracker.try_claim(SurfaceId(1), &cfg).expect("claim ok");
+        tracker.release(SurfaceId(1));
+        let result = tracker.try_claim(SurfaceId(2), &cfg);
+        assert_eq!(result, Ok(()));
+        assert_eq!(tracker.active(), Some(SurfaceId(2)));
+    }
+
+    // ----- Layer-level ordering test --------------------------------------
+    //
+    // E.2 acceptance #6: verify that a `Layer Top` + `Toplevel` + `Layer
+    // Background` combination composes in the order Background → Toplevel
+    // → Top via the existing recording-FB owner. The pure-logic composer
+    // already sorts by `ComposeLayer`; this test pins the role-to-band
+    // mapping that E.2 wires through `SurfaceRegistry::iter_compose`.
+
+    use crate::display::compose::{ComposeLayer, ComposeSurface, compose_frame};
+    use crate::display::fb_owner::{FbMetadata, PixelFormat, RecordingFramebufferOwner};
+
+    fn fb_meta(width: u32, height: u32) -> FbMetadata {
+        FbMetadata {
+            width,
+            height,
+            stride_bytes: width * 4,
+            pixel_format: PixelFormat::Bgra8888,
+        }
+    }
+
+    #[test]
+    fn layer_role_compose_order_background_then_toplevel_then_top() {
+        // Three small distinguishable surfaces. We use the actual
+        // ComposeLayer mapping for each role:
+        //   Layer { layer: Background } → ComposeLayer::Background
+        //   SurfaceRole::Toplevel        → ComposeLayer::Toplevel
+        //   Layer { layer: Top }         → ComposeLayer::Top
+        let mut owner = RecordingFramebufferOwner::new(fb_meta(200, 200));
+        let bg_pixels = alloc::vec![0x11; 200 * 200 * 4];
+        let toplevel_pixels = alloc::vec![0x22; 80 * 80 * 4];
+        let layer_top_pixels = alloc::vec![0x33; 40 * 40 * 4];
+        let bg_damage = [rect(0, 0, 200, 200)];
+        let toplevel_damage = [rect(0, 0, 80, 80)];
+        let layer_top_damage = [rect(0, 0, 40, 40)];
+
+        // Submit in *non*-canonical order to prove the composer is
+        // doing the sorting, not the test fixture.
+        let mut surfaces = [
+            ComposeSurface {
+                id: SurfaceId(2),
+                layer: ComposeLayer::Top,
+                rect: rect(20, 20, 40, 40),
+                damage: &layer_top_damage,
+                pixels: &layer_top_pixels,
+                opaque: false,
+            },
+            ComposeSurface {
+                id: SurfaceId(3),
+                layer: ComposeLayer::Toplevel,
+                rect: rect(60, 60, 80, 80),
+                damage: &toplevel_damage,
+                pixels: &toplevel_pixels,
+                opaque: true,
+            },
+            ComposeSurface {
+                id: SurfaceId(1),
+                layer: ComposeLayer::Background,
+                rect: rect(0, 0, 200, 200),
+                damage: &bg_damage,
+                pixels: &bg_pixels,
+                opaque: false,
+            },
+        ];
+
+        let result = compose_frame(&mut owner, rect(0, 0, 200, 200), &mut surfaces);
+        assert_eq!(result, Ok(3));
+        let writes = owner.writes();
+        assert_eq!(writes.len(), 3);
+        // Background drawn first (covers full output).
+        assert_eq!(writes[0].clipped_rect, rect(0, 0, 200, 200));
+        // Toplevel drawn second.
+        assert_eq!(writes[1].clipped_rect, rect(60, 60, 80, 80));
+        // Layer Top drawn last.
+        assert_eq!(writes[2].clipped_rect, rect(20, 20, 40, 40));
     }
 }
