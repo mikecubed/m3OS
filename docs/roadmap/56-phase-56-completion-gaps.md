@@ -159,7 +159,7 @@ The test asserted `after == before` but observed `after = before + 1` — a *gai
 
 Fix landed in this PR: `reclaim_allocator_local_caches` is called both before sampling `before` and before sampling `after`, so each snapshot sees the same balanced state. The test now asserts the correct contract — *no leaked frames* — without papering over slab-vs-buddy accounting.
 
-**Failure 2 — pre-existing, out-of-scope for Phase 56:**
+**Failure 2 — pre-existing, out-of-scope for Phase 56 (root-cause + fix recipe documented for follow-up):**
 
 ```
 kernel::net::remote::tests::drain_rx_queue_removes_malformed_frames_after_deferred_queueing
@@ -169,7 +169,13 @@ kernel::net::remote::tests::drain_rx_queue_removes_malformed_frames_after_deferr
    right: 1
 ```
 
-`kernel/src/net/remote.rs` last changed in PR #118 (Phase 55c, 2026-04). Phase 56 does not touch the ring-3 NIC driver host; the failure is unrelated to display/input work. Recorded here so a follow-up PR (Phase 55c closeout?) picks it up; not a Phase 56 close-out blocker.
+Root cause: the three RX-path tests in `kernel/src/net/remote.rs` (added in PR #118) call `encode_net_send` to build their payloads, but `encode_net_send` always stamps `kind = NET_SEND_FRAME` over the caller's value (per its docstring). The companion `inject_rx_frame` runs the bytes through `decode_net_rx_notify`, which rejects anything not labeled `NET_RX_FRAME`. The fix is one line per test: swap `encode_net_send` for `encode_net_rx_notify`. Three tests are affected; only the first hits the panic because the xtask harness stops at the first failing test.
+
+This was masked from PR #118 CI because the `frame_allocator::contiguous_alloc_recovers_order0_hoarding` failure (Failure 1 above) panicked first and short-circuited the suite. With Failure 1 fixed in this PR, the latent net::remote bug surfaces.
+
+Full diagnosis + fix recipe: `docs/roadmap/follow-ups/55c-net-remote-rx-test-bug.md`. Estimated follow-up effort: ~20 min.
+
+Phase 56 does not touch `kernel/src/net/remote.rs` or any ring-3 NIC driver host code; the bug is fully contained in Phase 55c (PR #118) test scaffolding. Recorded as out-of-scope for Phase 56 close-out.
 
 ### 5.3 `M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test display-server-crash-recovery`
 
