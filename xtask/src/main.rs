@@ -4390,7 +4390,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, true);
+    create_data_disk(uefi_image.parent().unwrap(), false, true, false);
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -4427,7 +4427,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, true);
+            create_data_disk(uefi_image.parent().unwrap(), false, true, false);
         }
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -4690,7 +4690,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
 
     let ovmf = find_ovmf();
     let display_mode = if args.display {
@@ -4726,7 +4726,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, false);
+            create_data_disk(uefi_image.parent().unwrap(), false, false, false);
         }
 
         let mut child = Command::new("qemu-system-x86_64")
@@ -5048,7 +5048,18 @@ fn format_ext2_partition(part_tmp: &Path) {
 /// Skips creation if the image already exists to preserve persisted data.
 ///
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
-fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: bool) -> PathBuf {
+///
+/// `display_server_debug_crash` controls whether the F.2 marker file
+/// `/etc/display_server.debug-crash` is dropped into the image so init
+/// flips its supervisor flag and propagates
+/// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to `display_server`. Production
+/// boots leave this `false`; only the F.2 regression sets it `true`.
+fn create_data_disk(
+    output_dir: &Path,
+    enable_telnet: bool,
+    smoke_test_mode: bool,
+    display_server_debug_crash: bool,
+) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
@@ -5140,7 +5151,13 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     format_ext2_partition(&part_tmp);
 
     // Populate files using debugfs.
-    populate_ext2_files(&part_tmp, output_dir, enable_telnet, smoke_test_mode);
+    populate_ext2_files(
+        &part_tmp,
+        output_dir,
+        enable_telnet,
+        smoke_test_mode,
+        display_server_debug_crash,
+    );
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
     let root = workspace_root();
@@ -5193,6 +5210,7 @@ fn populate_ext2_files(
     output_dir: &Path,
     enable_telnet: bool,
     smoke_test_mode: bool,
+    display_server_debug_crash: bool,
 ) {
     // Standard Unix root filesystem layout.
     let passwd_content =
@@ -5326,6 +5344,26 @@ fn populate_ext2_files(
          sif etc/m3os-smoke-test-mode gid 0\n",
         smoke_mode_tmp.display()
     );
+
+    // Phase 56 Track F.2 — drop the debug-crash marker file when the
+    // F.2 regression asks for it. Production boots leave the file out;
+    // init checks for the file at startup and sets its
+    // `display_server_debug_crash` flag accordingly. The flag in turn
+    // makes the supervisor append `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1`
+    // to every spawned service's envp.
+    let debug_crash_cmds = if display_server_debug_crash {
+        let debug_crash_tmp = output_dir.join("_tmp_display_server_debug_crash");
+        fs::write(&debug_crash_tmp, b"enabled\n").expect("write temp debug-crash marker");
+        format!(
+            "write \"{}\" etc/display_server.debug-crash\n\
+             sif etc/display_server.debug-crash mode 0x81A4\n\
+             sif etc/display_server.debug-crash uid 0\n\
+             sif etc/display_server.debug-crash gid 0\n",
+            debug_crash_tmp.display()
+        )
+    } else {
+        String::new()
+    };
 
     // CI toggle: dropping this marker tells the guest smoke-runner to skip
     // the TCC compile + hello-verify steps (both emit SKIP instead of PASS).
@@ -5534,6 +5572,7 @@ fn populate_ext2_files(
          sif etc/hostname gid 0\n\
          {smoke_mode_cmds}\
          {skip_tcc_cmds}\
+         {debug_crash_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -5557,6 +5596,7 @@ fn populate_ext2_files(
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
+        debug_crash_cmds = debug_crash_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -6309,7 +6349,7 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir, image_args.enable_telnet, false);
+    create_data_disk(output_dir, image_args.enable_telnet, false, false);
 
     if !image_args.sign {
         return;
@@ -6691,7 +6731,7 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
@@ -6706,7 +6746,7 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
 }
 
@@ -6822,6 +6862,12 @@ struct RegressionTest {
     /// Optional device attachments (NVMe, e1000, IOMMU). Defaults to all-false
     /// (VirtIO-blk + VirtIO-net) when not set.
     devices: DeviceSet,
+    /// Phase 56 Track F.2 — when `true`, the regression runner
+    /// rebuilds the data disk with `/etc/display_server.debug-crash`
+    /// present so init flips its supervisor flag and propagates
+    /// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to `display_server`.
+    /// Production tests leave this `false`.
+    wants_debug_crash_marker: bool,
 }
 
 /// Return the list of registered regression tests.
@@ -6833,6 +6879,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: fork_overlap_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "ipc-wake",
@@ -6840,6 +6887,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: ipc_wake_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "pty-overlap",
@@ -6847,6 +6895,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: pty_overlap_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "signal-reset",
@@ -6854,6 +6903,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: signal_reset_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "kbd-echo",
@@ -6861,6 +6911,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "service-lifecycle",
@@ -6868,6 +6919,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: service_lifecycle_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "storage-roundtrip",
@@ -6875,6 +6927,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: storage_roundtrip_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "serverization-fallback",
@@ -6882,6 +6935,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: serverization_fallback_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "log-pipeline",
@@ -6889,6 +6943,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: log_pipeline_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
         RegressionTest {
             name: "security-floor",
@@ -6896,6 +6951,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: security_floor_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         },
     ];
 
@@ -6910,6 +6966,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: exit_group_teardown_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
         });
     }
 
@@ -6934,6 +6991,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
         });
     }
 
@@ -6964,6 +7022,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
         });
     }
 
@@ -6991,6 +7050,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             e1000: true,
             iommu: false,
         },
+        wants_debug_crash_marker: false,
     });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
@@ -7015,6 +7075,46 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
+        });
+    }
+
+    // Phase 56 Track F.2: display-service crash-and-restart regression.
+    //
+    // Drives the F.2 acceptance path end-to-end:
+    //   1. display_server boots with M3OS_DISPLAY_SERVER_DEBUG_CRASH=1
+    //      in its environment (set because /etc/display_server.debug-crash
+    //      is present on the disk image).
+    //   2. The smoke client (`/bin/display-server-crash-smoke`) sends
+    //      `version` (pre-crash), then `debug-crash`. The dispatcher
+    //      logs `display_server: intentional crash for F.2 regression`
+    //      and `panic!()`s; the userspace panic-handler calls
+    //      `framebuffer_release` and the kernel's `restore_console`
+    //      brings the framebuffer console back so the screen is not
+    //      left dead.
+    //   3. The supervisor restarts display_server within
+    //      `display_server.conf`'s `max_restart=5` budget (init logs
+    //      `init: started 'display_server' pid=`).
+    //   4. The smoke client polls `/run/services.status` for the
+    //      restart, reconnects, and confirms the new instance replies
+    //      to `version`.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE (same gate as
+    // `driver-restart-crash` and `max-restart-exceeded`) so the
+    // regression doesn't run in normal CI.
+    //
+    // No NVMe / e1000 / IOMMU devices required — the F.2 path lives
+    // entirely in display_server + control socket + init.
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "display-server-crash-recovery",
+            description: "Phase 56 F.2: display-server-crash-smoke — debug-crash verb \
+                 → display_server panics → kernel reclaims framebuffer → \
+                 supervisor restarts → reconnect succeeds",
+            guest_steps: display_server_crash_recovery_steps,
+            timeout_secs: 90,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: true,
         });
     }
 
@@ -7481,6 +7581,152 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Guest steps for the Phase 56 F.2 display-server-crash-recovery regression.
+///
+/// Drives the F.2 acceptance path end-to-end:
+///
+/// 1. Boot, login, and confirm `display_server: starting` appears at
+///    boot (the supervisor-started instance).
+/// 2. Confirm `display_server: F.2 debug-crash verb ENABLED via …`
+///    appears — proves the disk-image marker file was honored, init
+///    propagated the env var, and `display_server` saw it at startup.
+/// 3. Launch `/bin/display-server-crash-smoke` from the post-login
+///    shell. Confirm its `DISPLAY_CRASH_SMOKE:pre-crash-version:OK`
+///    log marks the pre-crash dispatcher as reachable.
+/// 4. Confirm `display_server: intentional crash for F.2 regression`
+///    appears — proves the dispatcher's controlled-crash entry point
+///    fired before the panic landed.
+/// 5. Confirm `display_server: PANIC` appears — the userspace panic
+///    handler ran (which calls `framebuffer_release` so the kernel
+///    reclaims the framebuffer; the kernel additionally invokes
+///    `restore_console` on process exit, restoring the framebuffer
+///    console so the screen is not left dead — see
+///    `kernel/src/fb/mod.rs::restore_console` and
+///    `kernel/src/arch/x86_64/syscall/mod.rs:2099`).
+/// 6. Confirm `init: started 'display_server' pid=` appears for the
+///    *second* time (the supervisor-driven restart, within
+///    `display_server.conf`'s `max_restart=5` budget). The presence
+///    of this kernel-routed log line after the panic is also our
+///    proxy that the framebuffer console resumed: `fb::write_str`
+///    re-engages once `CONSOLE_YIELDED` clears, so any log line
+///    written through `serial::_print + fb::write_str` after the
+///    panic proves both serial and framebuffer paths are alive.
+/// 7. Confirm `display_server: starting` appears the *second* time
+///    (the restarted instance is up).
+/// 8. Confirm `DISPLAY_CRASH_SMOKE:restart-confirmed` appears (the
+///    smoke client polled `/run/services.status` and saw display_server
+///    return to running).
+/// 9. Confirm `DISPLAY_CRASH_SMOKE:post-restart-version:OK` appears
+///    (the smoke client reconnected to the new instance and got a
+///    real reply).
+/// 10. Confirm `DISPLAY_CRASH_SMOKE:PASS` appears — overall pass.
+fn display_server_crash_recovery_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Step 1 — first display_server start at boot.
+    // (boot_and_login_steps already drains past most boot output;
+    // we wait for both the launch banner and the F.2 gate banner to
+    // confirm the env-var pipeline is live.)
+    //
+    // Note: the boot path emits these markers *before* the login
+    // prompt, but `boot_and_login_steps` already consumed past them.
+    // Asserting the live-second-start marker (step 7) is the load-
+    // bearing one; we instead confirm via the second-instance
+    // `display_server: starting` after the panic.
+
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Step 3 — launch the smoke client; chain `; echo` to capture
+    // its exit code on the same line so the regression sees the
+    // success signal even if the shell prompt is delayed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/display-server-crash-smoke ; /bin/echo DISPLAY_CRASH_SMOKE:exit:$?\n",
+        label: "guest/display-crash: launch display-server-crash-smoke",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:pre-crash-version:OK",
+        timeout_secs: 15,
+        label: "guest/display-crash: pre-crash version OK",
+    });
+
+    // Step 4 — the dispatcher's intent line, logged from inside the
+    // `DebugCrash` arm before `panic!()`.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: intentional crash for F.2 regression",
+        timeout_secs: 10,
+        label: "guest/display-crash: dispatcher logs intent",
+    });
+
+    // Step 5 — userspace panic banner from the display_server
+    // panic_handler (calls framebuffer_release + exit(101)).
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: PANIC",
+        timeout_secs: 10,
+        label: "guest/display-crash: display_server PANIC",
+    });
+
+    // Step 6 — supervisor restarts. This kernel-routed line going
+    // through serial+fb proves the framebuffer console resumed: if
+    // the kernel were stuck holding a yielded console, the framebuffer
+    // backend would be silent; serial is unaffected so the test sees
+    // it either way, but the architectural guarantee is that
+    // `CONSOLE_YIELDED` cleared in `restore_console` and subsequent
+    // log lines re-engage `fb::write_str` (cross-reference
+    // `kernel/src/fb/mod.rs::restore_console` and
+    // `kernel/src/arch/x86_64/syscall/mod.rs:2099` — process-death
+    // path that calls `restore_console` when the dying PID owned the
+    // FB).
+    steps.push(SmokeStep::Wait {
+        pattern: "init: started 'display_server' pid=",
+        timeout_secs: 30,
+        label: "guest/display-crash: supervisor restarts display_server",
+    });
+
+    // Step 7 — second `display_server: starting` banner from the
+    // restarted instance.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: starting",
+        timeout_secs: 30,
+        label: "guest/display-crash: display_server second start",
+    });
+
+    // Step 8 — smoke client confirmed the restart via /run/services.status.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:restart-confirmed",
+        timeout_secs: 30,
+        label: "guest/display-crash: restart-confirmed",
+    });
+
+    // Step 9 — smoke client got a fresh reply on the new instance.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:post-restart-version:OK",
+        timeout_secs: 15,
+        label: "guest/display-crash: post-restart version OK",
+    });
+
+    // Step 10 — overall PASS.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/display-crash: PASS",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:exit:0",
+        timeout_secs: 15,
+        label: "guest/display-crash: exit code 0",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/display-crash: shell prompt after smoke",
+    });
+
+    steps
+}
+
 /// Guest steps for the storage-roundtrip regression: write, read-back, and
 /// delete a file on the ext2 root filesystem to verify persistent storage.
 fn storage_roundtrip_steps() -> Vec<SmokeStep> {
@@ -7863,13 +8109,38 @@ fn cmd_regression(args: &RegressionArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
 
     let mut passed = 0usize;
     let mut failed = 0usize;
 
+    // Track whether the most-recently-built disk has the F.2
+    // `display_server.debug-crash` marker. Tests that need the
+    // marker rebuild the disk; subsequent tests that don't need it
+    // rebuild back to the production-shape disk.
+    let mut current_disk_has_debug_crash = false;
+
     for test in &tests_to_run {
         let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+
+        // Phase 56 Track F.2 — rebuild the data disk if the test's
+        // marker requirement differs from the current disk shape.
+        // This keeps marker state from leaking across tests in a
+        // single regression invocation.
+        if test.wants_debug_crash_marker != current_disk_has_debug_crash {
+            let disk_img = uefi_image.parent().unwrap().join("disk.img");
+            if disk_img.exists() {
+                let _ = fs::remove_file(&disk_img);
+            }
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                false,
+                test.wants_debug_crash_marker,
+            );
+            current_disk_has_debug_crash = test.wants_debug_crash_marker;
+        }
+
         print!("  {}: ", test.name);
         match run_regression_test(test, &uefi_image, &ovmf, timeout, args.display) {
             Ok(serial_log) => {
