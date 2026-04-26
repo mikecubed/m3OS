@@ -271,7 +271,7 @@ flowchart TD
 | 55a | IOMMU Substrate (ACPI DMAR/IVRS, per-device VT-d/AMD-Vi domains, IOMMU-routed DMA) | Complete | `phase-55a` | [Tasks](./55a-iommu-substrate-tasks.md) |
 | 55b | Ring-3 Driver Host (capability-gated device-host syscalls, supervised userspace NVMe + e1000 drivers) | Complete | `phase-55b` | [Tasks](./55b-ring-3-driver-host-tasks.md) |
 | 55c | Ring-3 Driver Correctness Closure (bound notifications, IOMMU BAR identity coverage, userspace `EAGAIN` visibility) | Planned | `phase-55c` | [Tasks](./55c-ring-3-driver-correctness-closure-tasks.md) |
-| 56 | Display and Input Architecture | In progress (A + B + C complete; D – H pending) | `phase-56` | [Tasks](./56-display-and-input-architecture-tasks.md) |
+| 56 | Display and Input Architecture | Complete | `phase-56` | [Tasks](./56-display-and-input-architecture-tasks.md) |
 
 ### Future Task Docs
 Task docs for Phases **57 and later** are intentionally deferred until closer to implementation time.

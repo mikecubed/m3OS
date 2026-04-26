@@ -508,6 +508,24 @@ Fill colors (fixed so testers know exactly what to look for):
 - `display_server` startup background: `#1a1a2e` (dark indigo).
 - `gfx-demo` toplevel fill: `#f4b400` (goldenrod).
 
+## Resource bounds
+
+Phase 56 sets every collection to a fixed compile-time bound rather than an `alloc`-driven dynamic limit. The bounds are deliberately conservative — small enough that overflow is observable in test, large enough for the protocol-reference demo (`gfx-demo`) and the regression tests in Track G to pass without hitting them. Later phases may revise these upward as real clients land (e.g. a tiling compositor with a status bar, a native terminal, and a launcher all connected at once); the *shape* of "fixed bound, fail-closed when exceeded" is intended to outlive Phase 56 even when the numbers change.
+
+| Bound | Phase 56 default | Where it lives | Exceed behavior |
+|---|---|---|---|
+| `MAX_BINDS` | 64 | `kernel-core::input::bind_table` (D.4) | Bind registration returns a typed error; existing binds keep working. |
+| `MAX_GRABS` | 8 | `kernel-core::input::bind_table` (D.4) | New simultaneous grabs are rejected; existing grabs keep working. |
+| `MAX_PENDING_BULK` | 4 | C.3 / E.2 surface registry | Buffer attachments past this are rejected; client disconnects with `ResourceExhausted`. |
+| Held-key table | 8 | `kbd_server` (D.1) | Additional held-key tracking is dropped at the source; no client visibility. |
+| `EnterLeaveBuf::CAP` | 2 | D.3 dispatcher (`kernel-core::input::dispatch`) | Coalesces the at-most-two enter/leave transitions per dispatch; the dispatcher contract guarantees only ever 0–2 transitions per input event. |
+| `MAX_SUBSCRIBERS_PER_KIND` | 16 | E.4 control socket | Sixteenth-and-later subscribers receive `ResourceExhausted` and the connection is closed. |
+| `MAX_OUTBOUND_PER_SUBSCRIBER` | 32 | E.4 control socket | Slow-subscriber backpressure: the subscriber is dropped with `ResourceExhausted` when the outbound queue fills. |
+| `FrameStatsRing::CAPACITY` | 64 | E.4 frame-stats ring | Oldest sample is overwritten; `frame-stats` always returns at most the last 64 samples. |
+| `MAX_BULK_BYTES` (kernel `MAX_BULK_LEN`) | 4096 | Kernel IPC bulk transport | Per-message bulk payloads larger than this are rejected by the kernel; userspace decoders mirror the limit as `MAX_FRAME_BODY_LEN`. |
+
+These are Phase 56 defaults. Later phases (a tiling compositor in 56b, a native session in 57+, the broader graphical client ecosystem) may revise the numeric values; the spec for revising them is "the bound is still a fixed compile-time constant, the per-client failure mode is still typed, and the regression tests still observe the cap." The bound *names* are stable and intended to be referenced from later phases without renaming.
+
 ## Key Files
 
 | File | Purpose |
@@ -590,3 +608,14 @@ Fill colors (fixed so testers know exactly what to look for):
 - Software-only composition, no hardware acceleration.
 - Single output, single seat.
 - The client protocol is m3OS-native, not Wayland; no adapter in Phase 56.
+
+### Deferred follow-ups
+
+These are concrete gaps that Phase 56 leaves behind. Each is documented inline at the relevant call site (commit message, `TODO` marker, or track report) so a later phase can pick them up without rediscovery work.
+
+- **Userspace bulk-reply drain helper.** Gates the runtime byte-flow on D.3 (input dispatcher) and E.4 (control-socket subscriber outbound queue). Cited in commit messages and `TODO` markers for Track D and Track E. Until the helper lands, the dispatcher and the control socket exercise their state machines but do not pump real bytes through the page-grant path on every dispatch.
+- **True zero-copy via page-grant capabilities.** Track B.4 ships the `SurfaceBuffer` helper but routes the grant through a copy-friendly path during the Phase 56 bring-up. The deferral is documented in B.4's track report; the protocol surface (`AttachBuffer`, `BufferReleased`) is shaped so the later swap to a real zero-copy grant does not change the client-visible wire format.
+- **`mouse_server` dependency direction reversal.** F.1 currently registers `mouse_server` with `depends=display`, which inverts the conceptual ownership: `display_server` is the consumer of pointer events, not the producer. A later session-manifest pass (Phase 57+ or a Phase 56 follow-up) should reverse this so `display_server` depends on `mouse_server`, mirroring `kbd_server`. Cited in `track-report-phase56-f1-manifests.md`.
+- **Distinct `on-restart=` supervisor directive.** F.1 piggybacks restart behavior on the existing service-manifest restart policy. A separate `on-restart=` hook (re-acquire framebuffer with bounded backoff, re-bind control socket) is documented as a Phase 56 deferral and is expected to land alongside the Phase 51 service-model maturity work, not inside Phase 56's surface.
+- **Standalone modifier-key edges on the `kbd_server` pull path.** D.1 emits modifier state inside every `KeyEvent` (the `modifiers` field on the wire) but does not yet emit standalone `Down` / `Up` events for the modifier keys themselves on the pull path. Clients that want to draw a "hold-Super" overlay must use the chord-style approach — push events with the modifier set — until the standalone-edge path is added in 56b or 57+.
+- **L/R modifier chord differentiation.** A.0's `MOD_*` bitmask does not distinguish left- and right-side modifiers (no `MOD_LSHIFT` vs `MOD_RSHIFT`, etc.). Adding L/R differentiation is a wire-format change to the `KeyEvent` modifier byte and is deferred — it would break Phase 56 clients without a versioned wire-format bump.

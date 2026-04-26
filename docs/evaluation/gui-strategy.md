@@ -4,13 +4,44 @@
 
 If the goal is "something like Redox", the right target is **not** "map the framebuffer into apps and stop there." The right target is a **userspace display server/compositor with a small kernel graphics/input substrate**.
 
-The current repo is closer to "graphics-capable kernel substrate" than to "desktop system":
+**Status update (Phase 56):** the userspace-display-server recommendation is **no
+longer hypothetical**. Phase 56 has landed: the
+[`docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`](../roadmap/tasks/56-display-and-input-architecture-tasks.md)
+task list exists, all tracks (A–H) shipped, and the four Goal-A contract points
+are delivered:
 
-- `kernel/src/fb/mod.rs` implements a framebuffer text console
-- `docs/09-framebuffer-and-shell.md` already hints at moving framebuffer ownership to a dedicated display server later
-- `docs/roadmap/47-doom.md` now anchors the shipped single-app graphics proof from Phase 47
-- `docs/roadmap/56-display-and-input-architecture.md` and `docs/roadmap/57-audio-and-local-session.md` define the later display, input, audio, and session work more explicitly
-- Phase 46 now supplies a real service/logging/admin baseline that later display/session services can reuse
+1. **Layout module contract** (Goal-A decision 1) → A.7 / E.1 — `LayoutPolicy` trait
+   plus `FloatingLayout` plus a substitutability contract suite.
+2. **Keybind grab hook** (Goal-A decision 2) → A.5 / D.4 — bind table evaluated
+   before focus routing, with control-socket-driven `register-bind` /
+   `unregister-bind` verbs.
+3. **Layer-shell-equivalent surface roles** (Goal-A decision 3) → A.6 / E.2 —
+   `Toplevel` / `Layer` / `Cursor` roles with anchor / exclusive-zone /
+   keyboard-interactivity semantics.
+4. **Control socket** (Goal-A decision 4) → A.8 / E.4 — separate AF_UNIX socket
+   speaking the same length-prefixed framing as the client protocol, with the
+   minimum verb set (`version`, `list-surfaces`, `focus`, `register-bind`,
+   `unregister-bind`, `subscribe`, `frame-stats`).
+
+The remaining graphical roadmap (tiling-first UX, animation engine, native bar /
+launcher / lockscreen client implementations, native graphical terminal) is
+**Phase 56b / 57 / 57b / 57c work** — additive on top of Phase 56's contract
+surface, not part of Phase 56 itself.
+
+The current repo is now "graphical architecture, no graphical UX" — exactly the
+Phase 56 milestone:
+
+- `kernel/src/fb/mod.rs` keeps the framebuffer text console as a pre-init / panic
+  / failover surface
+- `docs/09-framebuffer-and-shell.md` documents that framebuffer ownership now
+  transfers to `display_server`
+- `docs/roadmap/47-doom.md` anchors the shipped single-app graphics proof from Phase 47
+- `docs/56-display-and-input-architecture.md` is the live learning doc for the
+  Phase 56 architecture (replaces the earlier "later display, input, audio, and
+  session work" placeholder language for Phase 56)
+- `docs/roadmap/57-audio-and-local-session.md` defines the next audio + local-session phase
+- Phase 46 supplies the service/logging/admin baseline that the Phase 56
+  `display_server` is supervised under
 
 ## Why this needs detailed planning
 
@@ -197,11 +228,20 @@ That does **not** mean m3OS needs to clone Redox exactly. It does mean the short
 
 ## Recommendation
 
-The best path is:
+The best path was:
 
-1. treat shipped Phase 47 DOOM/raw-framebuffer work as the **graphics bring-up milestone**
-2. immediately follow with **input abstraction**
-3. then design and build a **userspace display server/compositor**
-4. only after that consider higher-level compatibility layers or larger GUI toolkits
+1. treat shipped Phase 47 DOOM/raw-framebuffer work as the **graphics bring-up milestone** ✅
+2. immediately follow with **input abstraction** ✅ (Phase 56 D.1 / D.2 / D.3 — `kbd_server` typed events, `mouse_server` PS/2 AUX, focus-aware dispatch)
+3. then design and build a **userspace display server/compositor** ✅ (Phase 56 C.1–C.5, E.1–E.4)
+4. only after that consider higher-level compatibility layers or larger GUI toolkits — **Phase 56b / 57 / 57b / 57c**
 
-That path preserves m3OS's architectural clarity, stays close to the repo's own instincts, and gives the project the cleanest route toward a Redox-like GUI without pretending it is one short patch away.
+That path was followed. Phase 56 is the substrate; the graphical UX layer
+(tiling-first compositor, animation engine, native bar / launcher /
+notification daemon / lockscreen, native graphical terminal) is Phase 56b /
+57 / 57b / 57c work, additive on top of Phase 56's four contract points
+without any protocol rework.
+
+For the staging of the additive graphical UX, see
+[`docs/appendix/gui/tiling-compositor-path.md`](../appendix/gui/tiling-compositor-path.md);
+for the deliberate non-Wayland framing, see
+[`docs/appendix/gui/wayland-gap-analysis.md`](../appendix/gui/wayland-gap-analysis.md).
