@@ -50,13 +50,14 @@
 //! Other anchor combinations are floating overlays (no exclusivity);
 //! [`derive_exclusive_rect`] returns `None` for them.
 
-use crate::display::protocol::{LayerConfig, Rect};
+use crate::display::protocol::{
+    ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP, LayerConfig, Rect,
+};
 
 // Re-export the protocol types so downstream callers (display_server,
 // future control-socket consumers, ports, etc.) need only one path.
 pub use crate::display::protocol::{
-    ANCHOR_ALL, ANCHOR_BOTTOM, ANCHOR_CENTER, ANCHOR_EDGES, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP,
-    KeyboardInteractivity, Layer, is_valid_anchor_mask,
+    ANCHOR_ALL, ANCHOR_CENTER, ANCHOR_EDGES, KeyboardInteractivity, Layer, is_valid_anchor_mask,
 };
 
 /// Pure-logic error surfaced when a layer-related operation violates
@@ -98,18 +99,102 @@ pub enum LayerError {
 /// (e.g. `i32::MAX × i32::MAX`) cannot overflow into negative-width
 /// rectangles.
 pub fn compute_layer_geometry(
-    _output: Rect,
-    _layer_config: &LayerConfig,
-    _intrinsic_size: (u32, u32),
+    output: Rect,
+    layer_config: &LayerConfig,
+    intrinsic_size: (u32, u32),
 ) -> Rect {
-    // Stub: returns the zero rect so the test suite is intentionally
-    // red — the implementation lands in a follow-up commit (matching
-    // the Phase 56 D.1 / D.2 / D.4 failing-tests-first precedent).
+    let mask = layer_config.anchor_mask;
+    let m_top = layer_config.margin[0];
+    let m_right = layer_config.margin[1];
+    let m_bottom = layer_config.margin[2];
+    let m_left = layer_config.margin[3];
+
+    // Widen everything to i64 up front.
+    let ox = output.x as i64;
+    let oy = output.y as i64;
+    let ow = output.w as i64;
+    let oh = output.h as i64;
+    let intrinsic_w = intrinsic_size.0 as i64;
+    let intrinsic_h = intrinsic_size.1 as i64;
+    let mt = m_top as i64;
+    let mr = m_right as i64;
+    let mb = m_bottom as i64;
+    let ml = m_left as i64;
+
+    let has_top = (mask & ANCHOR_TOP) != 0;
+    let has_bottom = (mask & ANCHOR_BOTTOM) != 0;
+    let has_left = (mask & ANCHOR_LEFT) != 0;
+    let has_right = (mask & ANCHOR_RIGHT) != 0;
+    // ANCHOR_CENTER is mutually exclusive with edge bits (validated by
+    // the protocol decoder) so checking edge bits alone is sufficient.
+
+    // ----- Width / horizontal placement -----------------------------------
+    //
+    // The wlroots layer-shell rule: width "stretches" when the horizontal
+    // axis is fully constrained (both LEFT+RIGHT) OR when there is a
+    // single horizontal-edge anchor (exactly one of TOP/BOTTOM, no LEFT
+    // and no RIGHT) — a status bar anchored only to TOP, for example.
+    // In every other case the width is intrinsic and the surface centers
+    // or pins along the horizontal axis depending on which (if any)
+    // single horizontal anchor is set.
+    let single_horizontal_axis_anchor = (has_top ^ has_bottom) && !has_left && !has_right;
+    let (x_i64, w_i64) = if has_left && has_right {
+        // Stretched: full output width minus horizontal margins.
+        let avail = (ow - ml - mr).max(0);
+        (ox + ml, avail)
+    } else if single_horizontal_axis_anchor {
+        // Single TOP-only or BOTTOM-only anchor → stretch perpendicular
+        // axis (full width minus horizontal margins).
+        let avail = (ow - ml - mr).max(0);
+        (ox + ml, avail)
+    } else if has_left {
+        // Pinned to the left edge with intrinsic width (margin pushes inward).
+        (ox + ml, intrinsic_w.max(0))
+    } else if has_right {
+        // Pinned to the right edge with intrinsic width.
+        (ox + ow - intrinsic_w - mr, intrinsic_w.max(0))
+    } else {
+        // No horizontal pin and no single-axis stretch trigger → center
+        // horizontally with intrinsic width. Covers (no anchors), CENTER,
+        // and the TOP+BOTTOM "vertical strip" case.
+        let centered_x = ox + (ow - intrinsic_w) / 2;
+        (centered_x, intrinsic_w.max(0))
+    };
+
+    // ----- Height / vertical placement ------------------------------------
+    //
+    // Symmetric to the horizontal rule: height "stretches" when the
+    // vertical axis is fully constrained (both TOP+BOTTOM) OR when there
+    // is a single vertical-edge anchor (exactly one of LEFT/RIGHT, no
+    // TOP and no BOTTOM) — a side rail / dock anchored only to LEFT,
+    // for example.
+    let single_vertical_axis_anchor = (has_left ^ has_right) && !has_top && !has_bottom;
+    let (y_i64, h_i64) = if has_top && has_bottom {
+        // Stretched: full output height minus vertical margins.
+        let avail = (oh - mt - mb).max(0);
+        (oy + mt, avail)
+    } else if single_vertical_axis_anchor {
+        // Single LEFT-only or RIGHT-only anchor → stretch perpendicular
+        // axis (full height minus vertical margins).
+        let avail = (oh - mt - mb).max(0);
+        (oy + mt, avail)
+    } else if has_top {
+        (oy + mt, intrinsic_h.max(0))
+    } else if has_bottom {
+        (oy + oh - intrinsic_h - mb, intrinsic_h.max(0))
+    } else {
+        // No vertical pin and no single-axis stretch trigger → center
+        // vertically with intrinsic height. Covers (no anchors), CENTER,
+        // and the LEFT+RIGHT "horizontal strip" case.
+        let centered_y = oy + (oh - intrinsic_h) / 2;
+        (centered_y, intrinsic_h.max(0))
+    };
+
     Rect {
-        x: 0,
-        y: 0,
-        w: 0,
-        h: 0,
+        x: clamp_to_i32(x_i64),
+        y: clamp_to_i32(y_i64),
+        w: clamp_to_u32(w_i64),
+        h: clamp_to_u32(h_i64),
     }
 }
 
@@ -125,12 +210,48 @@ pub fn compute_layer_geometry(
 /// the *layer's full geometry* as the exclusive rect when the anchor
 /// pattern matches a full-edge tiling — `exclusive_zone` itself is the
 /// "claim" flag, not a separate width.
-pub fn derive_exclusive_rect(
-    _layer_geometry: Rect,
-    _layer_config: &LayerConfig,
-) -> Option<Rect> {
-    // Stub — see compute_layer_geometry stub note.
-    None
+pub fn derive_exclusive_rect(layer_geometry: Rect, layer_config: &LayerConfig) -> Option<Rect> {
+    if layer_config.exclusive_zone == 0 {
+        return None;
+    }
+    let mask = layer_config.anchor_mask;
+    let has_top = (mask & ANCHOR_TOP) != 0;
+    let has_bottom = (mask & ANCHOR_BOTTOM) != 0;
+    let has_left = (mask & ANCHOR_LEFT) != 0;
+    let has_right = (mask & ANCHOR_RIGHT) != 0;
+
+    // Single-edge anchors are the only patterns Phase 56's `usable_rect`
+    // recognises as full-edge tilings. Multi-edge anchors are treated
+    // as floating overlays — they still render, layout just doesn't
+    // route around them.
+    let edge_bits = (has_top as u8) + (has_bottom as u8) + (has_left as u8) + (has_right as u8);
+    if edge_bits != 1 {
+        return None;
+    }
+    if layer_geometry.w == 0 || layer_geometry.h == 0 {
+        return None;
+    }
+    Some(layer_geometry)
+}
+
+fn clamp_to_i32(v: i64) -> i32 {
+    if v > i32::MAX as i64 {
+        i32::MAX
+    } else if v < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        v as i32
+    }
+}
+
+fn clamp_to_u32(v: i64) -> u32 {
+    if v < 0 {
+        0
+    } else if v > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        v as u32
+    }
 }
 
 // ---------------------------------------------------------------------------
