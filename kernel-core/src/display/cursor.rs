@@ -212,14 +212,12 @@ impl ClientCursor {
         if width == 0 || height == 0 {
             return Err(ClientCursorError::ZeroSize);
         }
-        // Width × height widens through `usize::checked_mul`. On a 32-bit
+        // Width × height widens through `saturating_mul`. On a 32-bit
         // host this cannot overflow for any cursor that fits in memory;
         // on a 64-bit host (where `usize` is 64-bit) the saturating-to-
         // `usize::MAX` fallback still produces a length-mismatch error,
         // so a malformed call cannot squeak past validation.
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .unwrap_or(usize::MAX);
+        let expected = (width as usize).saturating_mul(height as usize);
         if pixels.len() != expected {
             return Err(ClientCursorError::PixelLengthMismatch {
                 expected,
@@ -474,7 +472,11 @@ mod tests {
     fn default_cursor_in_bounds_returns_value() {
         let c = DefaultArrowCursor::new();
         // The arrow's tip at (0, 0) is the white outline pixel — opaque.
-        assert_ne!(c.sample(0, 0), 0, "(0,0) is the arrow's tip — should be opaque");
+        assert_ne!(
+            c.sample(0, 0),
+            0,
+            "(0,0) is the arrow's tip — should be opaque"
+        );
     }
 
     #[test]
