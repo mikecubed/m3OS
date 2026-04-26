@@ -1,3 +1,4 @@
+pub mod bind_table;
 pub mod events;
 pub mod mouse;
 
