@@ -353,6 +353,14 @@ fn build_userspace_bins() {
             "display-server-crash-smoke",
             true,
         ),
+        // Phase 56 close-out (G.1) — multi-client coexistence smoke
+        // client. Drives two distinct surfaces and verifies both
+        // colors via ReadBackPixel.
+        (
+            "display-multi-client-smoke",
+            "display-multi-client-smoke",
+            true,
+        ),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -4390,7 +4398,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, true, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, true, false, false);
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -4427,7 +4435,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, true, false);
+            create_data_disk(uefi_image.parent().unwrap(), false, true, false, false);
         }
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -4690,7 +4698,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
 
     let ovmf = find_ovmf();
     let display_mode = if args.display {
@@ -4726,7 +4734,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, false, false);
+            create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
         }
 
         let mut child = Command::new("qemu-system-x86_64")
@@ -5059,6 +5067,7 @@ fn create_data_disk(
     enable_telnet: bool,
     smoke_test_mode: bool,
     display_server_debug_crash: bool,
+    display_server_readback: bool,
 ) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
@@ -5157,6 +5166,7 @@ fn create_data_disk(
         enable_telnet,
         smoke_test_mode,
         display_server_debug_crash,
+        display_server_readback,
     );
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
@@ -5211,6 +5221,7 @@ fn populate_ext2_files(
     enable_telnet: bool,
     smoke_test_mode: bool,
     display_server_debug_crash: bool,
+    display_server_readback: bool,
 ) {
     // Standard Unix root filesystem layout.
     let passwd_content =
@@ -5360,6 +5371,23 @@ fn populate_ext2_files(
              sif etc/display_server.debug-crash uid 0\n\
              sif etc/display_server.debug-crash gid 0\n",
             debug_crash_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 56 close-out (G.1) — drop the readback marker file when
+    // the multi-client-coexistence regression asks for it. Same shape
+    // as the F.2 debug-crash marker.
+    let readback_cmds = if display_server_readback {
+        let readback_tmp = output_dir.join("_tmp_display_server_readback");
+        fs::write(&readback_tmp, b"enabled\n").expect("write temp readback marker");
+        format!(
+            "write \"{}\" etc/display_server.readback\n\
+             sif etc/display_server.readback mode 0x81A4\n\
+             sif etc/display_server.readback uid 0\n\
+             sif etc/display_server.readback gid 0\n",
+            readback_tmp.display()
         )
     } else {
         String::new()
@@ -5601,6 +5629,7 @@ fn populate_ext2_files(
          {skip_tcc_cmds}\
          {disable_display_cmds}\
          {debug_crash_cmds}\
+         {readback_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -5626,6 +5655,7 @@ fn populate_ext2_files(
         skip_tcc_cmds = skip_tcc_cmds,
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
+        readback_cmds = readback_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -6381,7 +6411,7 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir, image_args.enable_telnet, false, false);
+    create_data_disk(output_dir, image_args.enable_telnet, false, false, false);
 
     if !image_args.sign {
         return;
@@ -6763,7 +6793,7 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
@@ -6778,7 +6808,7 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
 }
 
@@ -6952,6 +6982,11 @@ struct RegressionTest {
     /// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to `display_server`.
     /// Production tests leave this `false`.
     wants_debug_crash_marker: bool,
+    /// Phase 56 close-out (G.1) — when `true`, the regression runner
+    /// drops `/etc/display_server.readback` so init propagates
+    /// `M3OS_DISPLAY_SERVER_READBACK=1` and display_server's
+    /// dispatcher honors the test-only `ReadBackPixel` verb.
+    wants_readback_marker: bool,
 }
 
 /// Return the list of registered regression tests.
@@ -6964,6 +6999,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "ipc-wake",
@@ -6972,6 +7008,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "pty-overlap",
@@ -6980,6 +7017,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 90,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "signal-reset",
@@ -6988,6 +7026,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "kbd-echo",
@@ -6996,6 +7035,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "service-lifecycle",
@@ -7004,6 +7044,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "storage-roundtrip",
@@ -7012,6 +7053,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "serverization-fallback",
@@ -7020,6 +7062,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 90,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "log-pipeline",
@@ -7028,6 +7071,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
         RegressionTest {
             name: "security-floor",
@@ -7036,6 +7080,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 90,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         },
     ];
 
@@ -7051,6 +7096,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         });
     }
 
@@ -7076,6 +7122,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         });
     }
 
@@ -7107,6 +7154,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         });
     }
 
@@ -7135,6 +7183,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             iommu: false,
         },
         wants_debug_crash_marker: false,
+        wants_readback_marker: false,
     });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
@@ -7160,6 +7209,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
         });
     }
 
@@ -7200,6 +7250,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 90,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: true,
+            wants_readback_marker: false,
         });
     }
 
@@ -7228,10 +7279,85 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+        });
+    }
+
+    // Phase 56 close-out (G.1) — multi-client coexistence regression.
+    //
+    // Drives two distinct toplevel surfaces (red + blue) end-to-end
+    // through the protocol, then queries `display_server` via the
+    // test-only `ControlCommand::ReadBackPixel` verb to confirm both
+    // colors land on screen at their layout-derived positions.
+    //
+    // Gated behind M3OS_ENABLE_MULTI_CLIENT_SMOKE so the disk-rebuild
+    // (with /etc/display_server.readback marker) does not run in
+    // normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_MULTI_CLIENT_SMOKE=1 cargo xtask regression --test multi-client-coexistence
+    if std::env::var_os("M3OS_ENABLE_MULTI_CLIENT_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "multi-client-coexistence",
+            description: "Phase 56 G.1: two toplevel surfaces (red + blue) coexist; \
+                 ReadBackPixel verifies both colors at layout-derived positions",
+            guest_steps: multi_client_coexistence_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: true,
         });
     }
 
     tests
+}
+
+/// Phase 56 close-out (G.1) — multi-client-coexistence regression
+/// guest steps. Boots, logs in, runs `display-multi-client-smoke`,
+/// asserts the smoke client's PASS signal.
+fn multi_client_coexistence_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/display-multi-client-smoke ; /bin/echo MULTI_CLIENT_SMOKE:exit:$?\n",
+        label: "guest/multi-client: launch display-multi-client-smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:BEGIN",
+        timeout_secs: 15,
+        label: "guest/multi-client: smoke begin",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:surfaces-committed",
+        timeout_secs: 15,
+        label: "guest/multi-client: both surfaces committed",
+    });
+    // The `display_server: G.1 ReadBackPixel verb ENABLED` banner
+    // appears at display_server startup (well before the smoke client
+    // runs); `boot_and_login_steps` already consumed past it. The
+    // smoke client's `PASS` signal below is the load-bearing
+    // assertion that the verb actually worked.
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:red-visible-at",
+        timeout_secs: 15,
+        label: "guest/multi-client: red readback observed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:blue-visible-at",
+        timeout_secs: 15,
+        label: "guest/multi-client: blue readback observed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:PASS",
+        timeout_secs: 5,
+        label: "guest/multi-client: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:exit:0",
+        timeout_secs: 5,
+        label: "guest/multi-client: exit:0",
+    });
+    steps
 }
 
 /// Guest steps for the fork-overlap regression: boot, login, run fork-test.
@@ -8270,7 +8396,7 @@ fn cmd_regression(args: &RegressionArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -8280,21 +8406,26 @@ fn cmd_regression(args: &RegressionArgs) {
     // marker rebuild the disk; subsequent tests that don't need it
     // rebuild back to the production-shape disk.
     let mut current_disk_has_debug_crash = false;
+    let mut current_disk_has_readback = false;
 
     for test in &tests_to_run {
         let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
 
-        // Phase 56 F.2 + F.3 — rebuild the data disk when the test's
-        // marker requirements differ from the current disk shape. F.2
-        // wants `/etc/display_server.debug-crash` (4th arg to
-        // create_data_disk). F.3 wants `/etc/m3os-disable-display-server`
-        // (env var consumed by populate_ext2_files). Both knobs are
-        // independent and orthogonal; rebuild on any mismatch.
+        // Phase 56 F.2 + F.3 + close-out (G.1) — rebuild the data
+        // disk when the test's marker requirements differ from the
+        // current disk shape. F.2 wants `/etc/display_server.debug-crash`,
+        // G.1 wants `/etc/display_server.readback`, F.3 wants
+        // `/etc/m3os-disable-display-server` (env-var-scoped). All
+        // three knobs are independent and orthogonal; rebuild on any
+        // mismatch.
         let needs_disable_display = test.name == "display-fallback";
         let needs_debug_crash = test.wants_debug_crash_marker;
+        let needs_readback = test.wants_readback_marker;
         let disk_shape_changed = needs_debug_crash != current_disk_has_debug_crash
+            || needs_readback != current_disk_has_readback
             || needs_disable_display
-            || (current_disk_has_debug_crash && !needs_debug_crash);
+            || (current_disk_has_debug_crash && !needs_debug_crash)
+            || (current_disk_has_readback && !needs_readback);
         if disk_shape_changed {
             let disk_img = uefi_image.parent().unwrap().join("disk.img");
             if disk_img.exists() {
@@ -8313,6 +8444,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 false,
                 false,
                 needs_debug_crash,
+                needs_readback,
             );
             if needs_disable_display {
                 unsafe {
@@ -8320,6 +8452,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 }
             }
             current_disk_has_debug_crash = needs_debug_crash;
+            current_disk_has_readback = needs_readback;
         }
 
         print!("  {}: ", test.name);
@@ -8351,6 +8484,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 false,
                 false,
                 current_disk_has_debug_crash,
+                current_disk_has_readback,
             );
         }
     }

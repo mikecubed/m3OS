@@ -1,0 +1,15 @@
+[package]
+name = "display-multi-client-smoke"
+version = "0.56.0"
+edition = "2024"
+
+[[bin]]
+name = "display-multi-client-smoke"
+path = "src/main.rs"
+
+[dependencies]
+# `alloc` enabled because the crate links the kernel-core protocol +
+# control-codec, both of which use Vec on some payload paths.
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../kernel-core", default-features = false }
+surface_buffer = { path = "../lib/surface_buffer" }

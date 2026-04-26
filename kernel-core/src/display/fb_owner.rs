@@ -114,6 +114,18 @@ pub trait FramebufferOwner {
     fn present(&mut self) -> Result<(), FbError> {
         Ok(())
     }
+
+    /// Phase 56 close-out (G.1 regression) — read the framebuffer pixel
+    /// at `(x, y)` in screen coordinates as a `u32` (BGRA8888 packed).
+    /// Returns [`FbError::OutOfBounds`] for out-of-range coordinates;
+    /// the default impl returns `Err(FbError::OutOfBounds)` so backends
+    /// that cannot read (e.g. write-only display engines) opt out
+    /// explicitly. Used only by the test-only `ReadBackPixel` control
+    /// verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`; production
+    /// boots leave the verb disabled.
+    fn read_pixel(&self, _x: u32, _y: u32) -> Result<u32, FbError> {
+        Err(FbError::OutOfBounds)
+    }
 }
 
 /// Bytes per pixel for a [`PixelFormat`]. Both Phase 56 formats are 4 bytes;

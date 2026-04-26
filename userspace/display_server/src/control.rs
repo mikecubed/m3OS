@@ -117,6 +117,32 @@ impl DebugCrashPolicy {
     }
 }
 
+/// Phase 56 close-out (G.1 regression) — runtime gate for
+/// `ControlCommand::ReadBackPixel`. Mirror shape of [`DebugCrashPolicy`]:
+/// codec round-trips unconditionally; the dispatcher honors the verb
+/// only when the env var `M3OS_DISPLAY_SERVER_READBACK=1` was set at
+/// startup. Production boots leave this disabled; the multi-client-
+/// coexistence regression flips a marker file (`/etc/display_server.readback`)
+/// in the disk image to enable it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReadBackPolicy {
+    enabled: bool,
+}
+
+impl ReadBackPolicy {
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+}
+
 // `EventKind` lives in protocol.rs and intentionally does not derive
 // `Ord` (it is a stable wire-format enum). The subscription registry
 // maps `EventKind` → `Vec<ClientId>` via a fixed-size array indexed by
@@ -396,7 +422,7 @@ fn event_kind_of(event: &ControlEvent) -> Option<EventKind> {
 /// The reply is encoded into `reply_buf`. The function returns the
 /// number of bytes written (or `None`). The caller is responsible for
 /// staging that slice as the IPC reply bulk.
-pub fn dispatch_command(
+pub fn dispatch_command<F>(
     cmd: &ControlCommand,
     client: ClientId,
     registry: &SurfaceRegistry,
@@ -404,8 +430,13 @@ pub fn dispatch_command(
     subscriptions: &mut ControlSubscriptions,
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
+    readback: ReadBackPolicy,
+    pixel_reader: F,
     reply_buf: &mut [u8],
-) -> Result<Option<usize>, ControlError> {
+) -> Result<Option<usize>, ControlError>
+where
+    F: FnOnce(u32, u32) -> Option<u32>,
+{
     let evt = match cmd {
         ControlCommand::Version => ControlEvent::VersionReply {
             protocol_version: PROTOCOL_VERSION,
@@ -514,6 +545,23 @@ pub fn dispatch_command(
                 #[allow(clippy::panic)]
                 {
                     panic!("F.2 debug-crash verb");
+                }
+            } else {
+                ControlEvent::Error {
+                    code: ControlErrorCode::UnknownVerb,
+                }
+            }
+        }
+        // Phase 56 close-out (G.1 regression) — test-only pixel
+        // readback. Honors the verb only when the runtime debug flag
+        // is set; production boots short-circuit to `UnknownVerb`.
+        ControlCommand::ReadBackPixel { x, y } => {
+            if readback.is_enabled() {
+                match pixel_reader(*x, *y) {
+                    Some(color) => ControlEvent::PixelReply { color },
+                    None => ControlEvent::Error {
+                        code: ControlErrorCode::BadArgs,
+                    },
                 }
             } else {
                 ControlEvent::Error {

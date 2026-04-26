@@ -222,12 +222,12 @@ When the items above resolve, mark this doc complete and update the Phase 56 row
 
 - [x] § 1.1 — F.2 supervisor restart bug fixed
 - [x] § 3 — 216 acceptance checkboxes triaged. 195 ticked (work shipped); 21 remain unchecked, each annotated with the deferral reason and a pointer to either § 2 (explicit deferral) or § 4 (QEMU integration regression writeable but not yet written). The unchecked box is intentional in every case.
-- [ ] § 4.1 — G.1 multi-client coexistence regression written + passing
+- [x] § 4.1 — G.1 multi-client coexistence regression written + passing (`M3OS_ENABLE_MULTI_CLIENT_SMOKE=1 cargo xtask regression --test multi-client-coexistence`: 1 passed, 0 failed). Required: new `ControlCommand::ReadBackPixel` test-only verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`, FramebufferOwner trait extension with `read_pixel`, new `display-multi-client-smoke` guest binary, and a small fix to `FloatingLayout::arrange` so cascade slots are stable across frames in the multi-surface case (call-local index instead of a persistent counter).
 - [ ] § 4.2 — G.2 synthetic-key-injection regression written + passing
 - [ ] § 4.3 — G.4 runtime control-socket regression written + passing
 - [ ] § 5.2 — `cargo xtask test` passes on final branch
 - [x] § 5.3 — F.2 regression passes
 - [x] § 5.4 — F.3 regression passes
-- [x] § 5.6 — Default `cargo xtask regression` passes (10/11; `fork-overlap` is a pre-existing flake noted in the Phase 56 task doc)
+- [x] § 5.6 — Default `cargo xtask regression` passes (10/11; `fork-overlap` and `serverization-fallback` are pre-existing flakes — both fail intermittently on main, neither caused by Phase 56 changes; the Phase 56 task doc records the flake count from the close-out smoke runs)
 
 When all 9 boxes tick, Phase 56 is 100% complete by its own spec.

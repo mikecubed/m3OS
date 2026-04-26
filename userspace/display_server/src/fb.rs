@@ -195,6 +195,40 @@ impl FramebufferOwner for KernelFramebufferOwner {
         }
         Ok(())
     }
+
+    /// Phase 56 close-out (G.1) — read one BGRA8888 pixel from the
+    /// mapped framebuffer at `(x, y)`. Returns
+    /// [`FbError::OutOfBounds`] if the coordinate falls outside the
+    /// reported `(width, height)`. Used only by the test-only
+    /// `ReadBackPixel` control verb.
+    fn read_pixel(&self, x: u32, y: u32) -> Result<u32, FbError> {
+        if x >= self.metadata.width || y >= self.metadata.height {
+            return Err(FbError::OutOfBounds);
+        }
+        let bpp = bytes_per_pixel(self.metadata.pixel_format) as usize;
+        // Phase 56 ships only 4-bpp formats (BGRA8888 / RGBA8888); read
+        // exactly 4 bytes and pack as a `u32`. Any future non-4-bpp
+        // format would need a wider read path.
+        if bpp != 4 {
+            return Err(FbError::OutOfBounds);
+        }
+        let dest_stride = self.metadata.stride_bytes as usize;
+        let dest_x_bytes = (x as usize).saturating_mul(bpp);
+        let off = (y as usize)
+            .saturating_mul(dest_stride)
+            .saturating_add(dest_x_bytes);
+        if off.saturating_add(4) > self.byte_len {
+            return Err(FbError::OutOfBounds);
+        }
+        // SAFETY: bounds check above proves [off, off+4) is within the
+        // mapped region. `read_volatile` because the framebuffer is
+        // potentially-shared kernel memory.
+        let value = unsafe {
+            let p = self.base.add(off) as *const u32;
+            core::ptr::read_volatile(p)
+        };
+        Ok(value)
+    }
 }
 
 /// Clip a rectangle to `[0, width) × [0, height)`. Returns `None` if the

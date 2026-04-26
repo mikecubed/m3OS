@@ -204,12 +204,28 @@ impl LayoutPolicy for FloatingLayout {
     ) -> Vec<(SurfaceId, Rect)> {
         let usable = usable_rect(output.rect, exclusive_zones);
         let mut out = Vec::with_capacity(toplevels.len());
-        for surface in toplevels {
+        // Phase 56 close-out — assign cascade slots based on the
+        // surface's ordinal position within this `arrange` call rather
+        // than a persistent counter. `display_server` calls `arrange`
+        // every frame tick with the same `toplevels` list (sorted by
+        // surface id from `iter_compose`); using the call-local index
+        // makes every surface's position stable across frames, which
+        // is the actual contract the multi-surface compose path
+        // requires. The persistent `self.cascade_slot` is preserved
+        // for the legacy single-surface-per-call entry point exercised
+        // by the contract test suite.
+        let starting_slot = if toplevels.len() <= 1 {
+            self.cascade_slot
+        } else {
+            0
+        };
+        for (i, surface) in toplevels.iter().enumerate() {
             let (w, h) = pick_size(surface.preferred_size, usable);
             // Center the window in the usable rect.
             let center_x = usable.x.saturating_add((usable.w as i32 - w as i32) / 2);
             let center_y = usable.y.saturating_add((usable.h as i32 - h as i32) / 2);
-            let cascade_off = (self.cascade_slot as i32) * CASCADE_OFFSET_PX;
+            let slot = (starting_slot + i as u32) % CASCADE_SLOTS;
+            let cascade_off = (slot as i32) * CASCADE_OFFSET_PX;
             let rect = Rect {
                 x: center_x.saturating_add(cascade_off),
                 y: center_y.saturating_add(cascade_off),
@@ -217,7 +233,12 @@ impl LayoutPolicy for FloatingLayout {
                 h,
             };
             out.push((surface.id, rect));
-            self.cascade_slot = (self.cascade_slot + 1) % CASCADE_SLOTS;
+        }
+        // Only advance the persistent counter when the legacy single-
+        // surface path was used; the multi-surface path uses
+        // call-local indices so the persistent counter stays stable.
+        if toplevels.len() <= 1 {
+            self.cascade_slot = (self.cascade_slot + toplevels.len() as u32) % CASCADE_SLOTS;
         }
         out
     }

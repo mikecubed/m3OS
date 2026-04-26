@@ -62,6 +62,13 @@ const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 const ENV_DISPLAY_SERVER_DEBUG_CRASH: &[u8] = b"M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\0";
 const DEBUG_CRASH_MARKER_PATH: &[u8] = b"/etc/display_server.debug-crash\0";
 
+// Phase 56 close-out (G.1) — readback gate. Same pattern as the F.2
+// debug-crash marker: when `/etc/display_server.readback` is present,
+// init propagates `M3OS_DISPLAY_SERVER_READBACK=1` so display_server's
+// dispatcher honors the test-only `ReadBackPixel` verb.
+const ENV_DISPLAY_SERVER_READBACK: &[u8] = b"M3OS_DISPLAY_SERVER_READBACK=1\0";
+const READBACK_MARKER_PATH: &[u8] = b"/etc/display_server.readback\0";
+
 // Runtime state files live on tmpfs under `/run` — matching the Linux
 // convention where runtime state is tmpfs-backed rather than persistent.
 // Putting them on ext2 caused init's periodic writes (every 10 s) to
@@ -757,6 +764,10 @@ struct ServiceManager {
     /// keeping production builds safe from a hostile or misconfigured
     /// `m3ctl debug-crash` call.
     display_server_debug_crash: bool,
+    /// Phase 56 close-out (G.1) — same shape as
+    /// `display_server_debug_crash`, but for the test-only
+    /// `ReadBackPixel` verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`.
+    display_server_readback: bool,
 }
 
 /// Syslog severity levels.
@@ -788,6 +799,7 @@ impl ServiceManager {
             defer_status_writes: false,
             display_fallback: false,
             display_server_debug_crash: false,
+            display_server_readback: false,
         }
     }
 
@@ -1239,32 +1251,51 @@ impl ServiceManager {
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
 
-            // Phase 56 Track F.2 — when smoke-test mode is enabled,
-            // append `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` so the
-            // display_server's startup gate flips to honor the F.2
-            // crash verb. The fixed-size 6-slot envp (with NULL
-            // terminator) covers both the production and smoke-test
-            // shapes; the smoke-test variant fills slot [4] and
-            // null-terminates at slot [5], the production variant
-            // null-terminates at slot [4].
-            let envp: [*const u8; 6] = if self.display_server_debug_crash {
-                [
+            // Phase 56 Track F.2 / close-out (G.1) — append the
+            // test-only env vars when their respective markers are
+            // set. The fixed-size 7-slot envp (with NULL terminator)
+            // covers both, neither, or either flag; unused slots are
+            // null-padded before the final NULL terminator.
+            let envp: [*const u8; 7] = match (
+                self.display_server_debug_crash,
+                self.display_server_readback,
+            ) {
+                (true, true) => [
+                    ENV_PATH.as_ptr(),
+                    ENV_HOME.as_ptr(),
+                    ENV_TERM.as_ptr(),
+                    ENV_EDITOR.as_ptr(),
+                    ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
+                    ENV_DISPLAY_SERVER_READBACK.as_ptr(),
+                    core::ptr::null(),
+                ],
+                (true, false) => [
                     ENV_PATH.as_ptr(),
                     ENV_HOME.as_ptr(),
                     ENV_TERM.as_ptr(),
                     ENV_EDITOR.as_ptr(),
                     ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
                     core::ptr::null(),
-                ]
-            } else {
-                [
+                    core::ptr::null(),
+                ],
+                (false, true) => [
+                    ENV_PATH.as_ptr(),
+                    ENV_HOME.as_ptr(),
+                    ENV_TERM.as_ptr(),
+                    ENV_EDITOR.as_ptr(),
+                    ENV_DISPLAY_SERVER_READBACK.as_ptr(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                ],
+                (false, false) => [
                     ENV_PATH.as_ptr(),
                     ENV_HOME.as_ptr(),
                     ENV_TERM.as_ptr(),
                     ENV_EDITOR.as_ptr(),
                     core::ptr::null(),
                     core::ptr::null(),
-                ]
+                    core::ptr::null(),
+                ],
             };
 
             // Drop privileges if run_as_uid is set.
@@ -1378,7 +1409,10 @@ impl ServiceManager {
                             STDOUT_FILENO,
                             "\ninit: session ended, respawning login...\n",
                         );
-                        self.login_pid = spawn_login(self.display_server_debug_crash);
+                        self.login_pid = spawn_login(
+                            self.display_server_debug_crash,
+                            self.display_server_readback,
+                        );
                     } else {
                         write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
                         self.login_pid = -1;
@@ -2144,31 +2178,51 @@ fn trim_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-fn spawn_login(debug_crash: bool) -> i32 {
+fn spawn_login(debug_crash: bool, readback: bool) -> i32 {
     let pid = fork();
     if pid == 0 {
-        // Phase 56 Track F.2 — propagate the debug-crash env var to
-        // the login shell so the F.2 regression's
-        // `display-server-crash-smoke` (run from the post-login
-        // shell) can confirm the gate is live.
-        let envp: [*const u8; 6] = if debug_crash {
-            [
+        // Phase 56 Track F.2 / close-out (G.1) — propagate the
+        // test-only env vars to the login shell so smoke clients
+        // launched from the post-login shell see them in their envp.
+        // Fixed-size 7-slot envp covers all combinations of the two
+        // gates.
+        let envp: [*const u8; 7] = match (debug_crash, readback) {
+            (true, true) => [
+                ENV_PATH.as_ptr(),
+                ENV_HOME.as_ptr(),
+                ENV_TERM.as_ptr(),
+                ENV_EDITOR.as_ptr(),
+                ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
+                ENV_DISPLAY_SERVER_READBACK.as_ptr(),
+                core::ptr::null(),
+            ],
+            (true, false) => [
                 ENV_PATH.as_ptr(),
                 ENV_HOME.as_ptr(),
                 ENV_TERM.as_ptr(),
                 ENV_EDITOR.as_ptr(),
                 ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
                 core::ptr::null(),
-            ]
-        } else {
-            [
+                core::ptr::null(),
+            ],
+            (false, true) => [
+                ENV_PATH.as_ptr(),
+                ENV_HOME.as_ptr(),
+                ENV_TERM.as_ptr(),
+                ENV_EDITOR.as_ptr(),
+                ENV_DISPLAY_SERVER_READBACK.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+            ],
+            (false, false) => [
                 ENV_PATH.as_ptr(),
                 ENV_HOME.as_ptr(),
                 ENV_TERM.as_ptr(),
                 ENV_EDITOR.as_ptr(),
                 core::ptr::null(),
                 core::ptr::null(),
-            ]
+                core::ptr::null(),
+            ],
         };
 
         let argv: [*const u8; 2] = [LOGIN_ARGV0.as_ptr(), core::ptr::null()];
@@ -2234,6 +2288,17 @@ fn smoke_test_mode_enabled() -> bool {
 /// the same way as `smoke_test_mode_enabled`.
 fn display_server_debug_crash_enabled() -> bool {
     let fd = open(DEBUG_CRASH_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
+/// Phase 56 close-out (G.1) — check for the readback marker file.
+/// Same shape as `display_server_debug_crash_enabled`.
+fn display_server_readback_enabled() -> bool {
+    let fd = open(READBACK_MARKER_PATH, O_RDONLY, 0);
     if fd < 0 {
         return false;
     }
@@ -2322,6 +2387,13 @@ pub extern "C" fn _start() -> ! {
     // that call) sees `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` in its
     // environment from the very first start.
     mgr.display_server_debug_crash = display_server_debug_crash_enabled();
+    mgr.display_server_readback = display_server_readback_enabled();
+    if mgr.display_server_readback {
+        write_str(
+            STDOUT_FILENO,
+            "init: G.1 readback marker present, propagating M3OS_DISPLAY_SERVER_READBACK=1\n",
+        );
+    }
     if mgr.display_server_debug_crash {
         write_str(
             STDOUT_FILENO,
@@ -2348,7 +2420,7 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
     } else {
-        mgr.login_pid = spawn_login(mgr.display_server_debug_crash);
+        mgr.login_pid = spawn_login(mgr.display_server_debug_crash, mgr.display_server_readback);
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn login\n");
             // Not fatal — services may still be running.

@@ -217,6 +217,12 @@ static M3CTL_ELF: &[u8] = generated_initrd_asset!("m3ctl");
 static DISPLAY_SERVER_CRASH_SMOKE_ELF: &[u8] =
     generated_initrd_asset!("display-server-crash-smoke");
 
+// Phase 56 close-out (G.1): multi-client coexistence smoke client.
+// One-shot binary; no `.conf` (launched from the post-login shell by
+// the QEMU regression).
+static DISPLAY_MULTI_CLIENT_SMOKE_ELF: &[u8] =
+    generated_initrd_asset!("display-multi-client-smoke");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -606,6 +612,15 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "display-server-crash-smoke",
         RamdiskNode::File {
             content: DISPLAY_SERVER_CRASH_SMOKE_ELF,
+        },
+    ),
+    // Phase 56 close-out (G.1): multi-client coexistence smoke client.
+    // One-shot; launched from the post-login shell by the
+    // multi-client-coexistence regression.
+    (
+        "display-multi-client-smoke",
+        RamdiskNode::File {
+            content: DISPLAY_MULTI_CLIENT_SMOKE_ELF,
         },
     ),
 ];

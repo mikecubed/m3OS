@@ -77,6 +77,8 @@ members = [
     "userspace/m3ctl",
     # Phase 56 Track F.2 — display-service crash-and-restart end-to-end smoke client
     "userspace/display-server-crash-smoke",
+    # Phase 56 close-out (G.1) — multi-client coexistence smoke client
+    "userspace/display-multi-client-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

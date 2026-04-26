@@ -175,7 +175,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         })
         .collect();
     let exclusive_zones = registry.exclusive_zones(output);
-    let _arrangement = layout.arrange(
+    let arrangement = layout.arrange(
         &toplevels,
         OutputGeometry { rect: output },
         &exclusive_zones,
@@ -207,10 +207,29 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
     for (entry, dmg) in entries.iter().zip(damages.iter()) {
+        // Phase 56 close-out (G.1) — Toplevel surfaces use the layout
+        // policy's arrangement for placement; Layer / Cursor surfaces
+        // keep their iter_compose-derived rects (anchor-driven for
+        // Layer, hotspot-driven for Cursor). Without this lookup, the
+        // multi-client coexistence regression would render every
+        // Toplevel at the same `centre_rect` position and only the
+        // top-of-z-order surface would be observable.
+        let rect = if matches!(
+            entry.layer,
+            kernel_core::display::compose::ComposeLayer::Toplevel
+        ) {
+            arrangement
+                .iter()
+                .find(|(id, _)| *id == entry.id)
+                .map(|(_, r)| *r)
+                .unwrap_or(entry.rect)
+        } else {
+            entry.rect
+        };
         compose.push(ComposeSurface {
             id: entry.id,
             layer: entry.layer,
-            rect: entry.rect,
+            rect,
             damage: &dmg[..],
             pixels: &entry.buf.pixels,
             opaque: entry.is_opaque(),

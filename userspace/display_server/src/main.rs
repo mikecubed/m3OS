@@ -79,6 +79,11 @@ syscall_lib::entry_point_with_env!(program_main);
 /// is present (see `userspace/init/src/main.rs::ENV_DISPLAY_SERVER_DEBUG_CRASH`).
 const ENV_DEBUG_CRASH: &str = "M3OS_DISPLAY_SERVER_DEBUG_CRASH";
 
+/// Phase 56 close-out (G.1 regression) — env var name. Same gating
+/// pattern as `ENV_DEBUG_CRASH`: production boots leave this unset and
+/// the dispatcher shadows `ReadBackPixel` to `UnknownVerb`.
+const ENV_READBACK: &str = "M3OS_DISPLAY_SERVER_READBACK";
+
 /// Read the debug-crash gate from the process environment. Matches a
 /// strict `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` so a typo or alternate
 /// truthy spelling stays disabled.
@@ -93,6 +98,21 @@ fn debug_crash_policy_from_env(env: &[&str]) -> DebugCrashPolicy {
         }
     }
     DebugCrashPolicy::disabled()
+}
+
+/// Phase 56 close-out (G.1 regression) — read the readback gate from
+/// the process environment. Same shape as `debug_crash_policy_from_env`.
+fn readback_policy_from_env(env: &[&str]) -> control::ReadBackPolicy {
+    for entry in env {
+        if let Some(value) = entry
+            .strip_prefix(ENV_READBACK)
+            .and_then(|rest| rest.strip_prefix('='))
+            && value == "1"
+        {
+            return control::ReadBackPolicy::enabled();
+        }
+    }
+    control::ReadBackPolicy::disabled()
 }
 
 fn program_main(_args: &[&str], env: &[&str]) -> i32 {
@@ -110,6 +130,17 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         syscall_lib::write_str(
             STDOUT_FILENO,
             "display_server: F.2 debug-crash verb ENABLED via M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\n",
+        );
+    }
+
+    // Phase 56 close-out (G.1) — read the readback gate. Same shape:
+    // disabled in production, enabled by the multi-client-coexistence
+    // regression's marker file.
+    let readback = readback_policy_from_env(env);
+    if readback.is_enabled() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: G.1 ReadBackPixel verb ENABLED via M3OS_DISPLAY_SERVER_READBACK=1\n",
         );
     }
 
@@ -543,6 +574,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &mut control_subs,
             &frame_stats,
             debug_crash,
+            readback,
+            &owner,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -578,6 +611,8 @@ fn serve_one_control_request(
     subscriptions: &mut control::ControlSubscriptions,
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
+    readback: control::ReadBackPolicy,
+    fb_owner: &KernelFramebufferOwner,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -615,6 +650,7 @@ fn serve_one_control_request(
 
     let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
     let client = control::ClientId(0); // Phase 56 single-client.
+    let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
     let n = serve_control_iter(
         &req_buf[..bulk_len],
         client,
@@ -623,6 +659,8 @@ fn serve_one_control_request(
         subscriptions,
         frame_stats,
         debug_crash,
+        readback,
+        pixel_reader,
         &mut reply_buf,
     );
     if n > 0 {
@@ -646,7 +684,7 @@ fn serve_one_control_request(
 /// The Phase 56 close-out wires this from `serve_one_control_request`
 /// using the new `SYS_IPC_TRY_RECV_MSG` syscall to multiplex frame-tick
 /// driving and control-endpoint serving in the same single-threaded loop.
-fn serve_control_iter(
+fn serve_control_iter<F>(
     bulk: &[u8],
     client: control::ClientId,
     registry: &SurfaceRegistry,
@@ -654,8 +692,13 @@ fn serve_control_iter(
     subscriptions: &mut control::ControlSubscriptions,
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
+    readback: control::ReadBackPolicy,
+    pixel_reader: F,
     reply_buf: &mut [u8],
-) -> usize {
+) -> usize
+where
+    F: FnOnce(u32, u32) -> Option<u32>,
+{
     use kernel_core::display::control::{
         ControlError, ControlErrorCode, ControlEvent, decode_command,
     };
@@ -706,6 +749,8 @@ fn serve_control_iter(
         subscriptions,
         frame_stats,
         debug_crash,
+        readback,
+        pixel_reader,
         reply_buf,
     ) {
         Ok(Some(n)) => n,

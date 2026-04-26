@@ -98,6 +98,13 @@ const OP_CTL_FRAME_STATS: u16 = 0x0207;
 // stable); the runtime gate that decides whether to honor the verb is
 // a startup env-var check in `display_server::control::dispatch_command`.
 const OP_CTL_DEBUG_CRASH: u16 = 0x0208;
+// Phase 56 close-out (G.1 regression) — test-only framebuffer pixel
+// readback. Same gating shape as `DebugCrash`: codec round-trips
+// unconditionally; runtime honoring is gated by an env-var check at
+// startup. Used by the multi-client-coexistence regression to verify
+// that two distinct surfaces' colors land at their layout-derived
+// positions in the framebuffer.
+const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -109,6 +116,8 @@ const OP_CTL_EVT_SURFACE_CREATED: u16 = 0x0310;
 const OP_CTL_EVT_SURFACE_DESTROYED: u16 = 0x0311;
 const OP_CTL_EVT_FOCUS_CHANGED: u16 = 0x0312;
 const OP_CTL_EVT_BIND_TRIGGERED: u16 = 0x0313;
+// Phase 56 close-out (G.1 regression) — test-only pixel-readback reply.
+const OP_CTL_EVT_PIXEL_REPLY: u16 = 0x0314;
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -380,6 +389,22 @@ pub enum ControlCommand {
     /// close on AF_UNIX). The codec round-trips the verb unconditionally
     /// so the wire format is stable on both debug and production builds.
     DebugCrash,
+    /// Phase 56 close-out (G.1 regression) — test-only pixel readback.
+    ///
+    /// Sample the framebuffer at `(x, y)` in screen coordinates and
+    /// return a `PixelReply { color }` event. Used by the
+    /// `multi-client-coexistence` regression to verify that two
+    /// concurrent surfaces' colors actually land on screen at their
+    /// layout-derived positions.
+    ///
+    /// Gated identically to `DebugCrash`: the codec round-trips the
+    /// verb unconditionally so the wire opcode space is stable, but
+    /// production boots leave the env-var unset and the dispatcher
+    /// shadows the verb back to `Error { UnknownVerb }`.
+    ReadBackPixel {
+        x: u32,
+        y: u32,
+    },
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -415,6 +440,13 @@ pub enum ControlEvent {
     BindTriggered {
         modifier_mask: u16,
         keycode: u32,
+    },
+    /// Phase 56 close-out (G.1 regression) — pixel-readback reply.
+    /// `color` is the framebuffer pixel at the requested `(x, y)` in
+    /// the same encoding the framebuffer uses (e.g. BGRA8888 packed
+    /// into a `u32`). Used by the multi-client-coexistence regression.
+    PixelReply {
+        color: u32,
     },
 }
 
@@ -1018,6 +1050,13 @@ impl ControlCommand {
             Self::FrameStats => encode_fixed_body(buf, OP_CTL_FRAME_STATS, 0, |_| {}),
             // Phase 56 Track F.2 — body-less verb. See `OP_CTL_DEBUG_CRASH`.
             Self::DebugCrash => encode_fixed_body(buf, OP_CTL_DEBUG_CRASH, 0, |_| {}),
+            // Phase 56 close-out (G.1) — `(x, y)` body, see `OP_CTL_READBACK_PIXEL`.
+            Self::ReadBackPixel { x, y } => {
+                encode_fixed_body(buf, OP_CTL_READBACK_PIXEL, 8, |body| {
+                    body[0..4].copy_from_slice(&x.to_le_bytes());
+                    body[4..8].copy_from_slice(&y.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1066,6 +1105,14 @@ impl ControlCommand {
             OP_CTL_DEBUG_CRASH => {
                 expect_body_len(body_len, 0)?;
                 Self::DebugCrash
+            }
+            // Phase 56 close-out (G.1) — `(x, y)` body. See `OP_CTL_READBACK_PIXEL`.
+            OP_CTL_READBACK_PIXEL => {
+                expect_body_len(body_len, 8)?;
+                Self::ReadBackPixel {
+                    x: read_u32(body, 0)?,
+                    y: read_u32(body, 4)?,
+                }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
@@ -1145,6 +1192,12 @@ impl ControlEvent {
                 body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
                 body[2..6].copy_from_slice(&keycode.to_le_bytes());
             }),
+            // Phase 56 close-out (G.1) — see `OP_CTL_EVT_PIXEL_REPLY`.
+            Self::PixelReply { color } => {
+                encode_fixed_body(buf, OP_CTL_EVT_PIXEL_REPLY, 4, |body| {
+                    body[0..4].copy_from_slice(&color.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1237,6 +1290,13 @@ impl ControlEvent {
                 Self::BindTriggered {
                     modifier_mask: read_u16(body, 0)?,
                     keycode: read_u32(body, 2)?,
+                }
+            }
+            // Phase 56 close-out (G.1) — see `OP_CTL_EVT_PIXEL_REPLY`.
+            OP_CTL_EVT_PIXEL_REPLY => {
+                expect_body_len(body_len, 4)?;
+                Self::PixelReply {
+                    color: read_u32(body, 0)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -1663,6 +1723,16 @@ mod tests {
         assert_eq!(body_len, 0);
     }
 
+    // Phase 56 close-out (G.1) — `ReadBackPixel` codec unconditional
+    // round-trip; the dispatcher gate is the env-var check, identical
+    // to `DebugCrash` (above).
+    #[test]
+    fn ctl_cmd_readback_pixel_round_trips() {
+        for (x, y) in [(0u32, 0u32), (1, 2), (1280, 800), (u32::MAX, u32::MAX)] {
+            encode_decode_round_trip_ctl_cmd(ControlCommand::ReadBackPixel { x, y });
+        }
+    }
+
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
@@ -1742,6 +1812,14 @@ mod tests {
             modifier_mask: MOD_SUPER,
             keycode: 0x10,
         });
+    }
+
+    // Phase 56 close-out (G.1) — `PixelReply` codec round-trip.
+    #[test]
+    fn ctl_evt_pixel_reply_round_trips() {
+        for color in [0u32, 0xFFFF_FFFF, 0x002B_5A4B, 0x00FF_8800] {
+            encode_decode_round_trip_ctl_evt(ControlEvent::PixelReply { color });
+        }
     }
 
     #[test]
@@ -2012,6 +2090,7 @@ mod tests {
             arb_event_kind().prop_map(|event_kind| ControlCommand::Subscribe { event_kind }),
             Just(ControlCommand::FrameStats),
             Just(ControlCommand::DebugCrash),
+            (any::<u32>(), any::<u32>()).prop_map(|(x, y)| ControlCommand::ReadBackPixel { x, y }),
         ]
     }
 
@@ -2044,6 +2123,7 @@ mod tests {
                     keycode,
                 }
             }),
+            any::<u32>().prop_map(|color| ControlEvent::PixelReply { color }),
         ]
     }
 
