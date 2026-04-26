@@ -196,20 +196,16 @@ impl Ps2MouseDecoder {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 56 Track D.2 — Pointer button-edge tracker (test-first stubs)
+// Phase 56 Track D.2 — Pointer button-edge tracker
 // ---------------------------------------------------------------------------
-//
-// These declarations exist in their failing-test-friendly form: the type
-// surface compiles so the unit tests can be written against the public API
-// before any behavior lands. `update` returns the empty transition set
-// regardless of input, so every meaningful test in the test module fails
-// at runtime. The follow-up commit replaces these stubs with the real
-// state machine.
 
 /// Three-button state snapshot (left, right, middle).
 ///
 /// Used by [`ButtonTracker`] as both the input (state at the end of a fresh
 /// `MousePacket`) and the cached previous state used to detect transitions.
+/// Keeping this as an explicit struct (rather than a raw bitfield) keeps the
+/// caller-side test surface readable: tests pass `ButtonState { left: true,
+/// .. }` instead of magic numbers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ButtonState {
     /// Left mouse button currently pressed.
@@ -222,12 +218,11 @@ pub struct ButtonState {
 
 impl ButtonState {
     /// Project a freshly decoded [`MousePacket`] onto its 3-button state.
-    pub const fn from_packet(_packet: &MousePacket) -> Self {
-        // Stub: real impl reads packet.{left, right, middle}.
+    pub const fn from_packet(packet: &MousePacket) -> Self {
         Self {
-            left: false,
-            right: false,
-            middle: false,
+            left: packet.left,
+            right: packet.right,
+            middle: packet.middle,
         }
     }
 }
@@ -311,12 +306,36 @@ impl ButtonTracker {
 
     /// Feed the freshly decoded button state and return the resulting edges.
     ///
-    /// Stub returns an empty transition set; tests fail until the real
-    /// state-machine impl lands in the follow-up commit.
-    pub fn update(&mut self, _new_state: ButtonState) -> ButtonTransitions {
-        // Intentional stub: do not mutate self.prev, do not compare states.
-        // The follow-up impl commit makes the pure-logic tests green.
-        ButtonTransitions::default()
+    /// Stable iteration order (left → right → middle); this matters because
+    /// `mouse_server` emits one `PointerEvent` per transition and clients
+    /// rely on a deterministic ordering for chord recognition.
+    pub fn update(&mut self, new_state: ButtonState) -> ButtonTransitions {
+        let mut out = ButtonTransitions::default();
+
+        if new_state.left != self.prev.left {
+            out.transitions[0] = Some(if new_state.left {
+                ButtonTransition::Down(BUTTON_INDEX_LEFT)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_LEFT)
+            });
+        }
+        if new_state.right != self.prev.right {
+            out.transitions[1] = Some(if new_state.right {
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_RIGHT)
+            });
+        }
+        if new_state.middle != self.prev.middle {
+            out.transitions[2] = Some(if new_state.middle {
+                ButtonTransition::Down(BUTTON_INDEX_MIDDLE)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_MIDDLE)
+            });
+        }
+
+        self.prev = new_state;
+        out
     }
 }
 
