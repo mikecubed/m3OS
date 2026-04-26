@@ -307,11 +307,13 @@ fn build_userspace_bins() {
         ("syslogd", "syslogd", false),              // Phase 46: system logger
         ("crond", "crond", false),                  // Phase 46: cron daemon
         ("console_server", "console_server", true), // Phase 52: ring-3 console (alloc for kernel-core dep)
-        ("kbd_server", "kbd_server", false),        // Phase 52: ring-3 keyboard
-        ("stdin_feeder", "stdin_feeder", false),    // Phase 52: ring-3 stdin
-        ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
-        ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
-        ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 56 Track D.1: kbd_server now depends on kernel-core::input::keymap
+        // and emits KeyEvent payloads, so it requires the alloc-enabled build.
+        ("kbd_server", "kbd_server", true), // Phase 52 / 56: ring-3 keyboard (alloc for kernel-core dep)
+        ("stdin_feeder", "stdin_feeder", false), // Phase 52: ring-3 stdin
+        ("fat_server", "fat_server", true), // Phase 54: ring-3 FAT storage (alloc)
+        ("vfs_server", "vfs_server", true), // Phase 54: ring-3 VFS service (alloc)
+        ("net_server", "net_server", true), // Phase 54: ring-3 UDP network service (alloc)
         // Phase 55b Tracks D.1 / E.1: ring-3 device driver scaffolds
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         // Real bring-up lands in D.2/D.3 and E.2/E.3.

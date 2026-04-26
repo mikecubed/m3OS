@@ -847,6 +847,7 @@ dependencies = [
 name = "kbd_server"
 version = "0.53.0"
 dependencies = [
+ "kernel-core",
  "syscall-lib",
 ]
 
