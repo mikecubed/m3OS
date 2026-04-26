@@ -175,14 +175,33 @@ Call Stage 1 achieved only when all of these are true:
 
 ## Stage 2: local desktop substrate
 
+### Phase 56 update
+
+Phase 56 (Display and Input Architecture) lands the **graphical
+architecture** part of Stage 2 — the userspace display server, the
+focus-aware input model, and the documented client and control protocols.
+The companion task list at
+[`docs/roadmap/tasks/56-display-and-input-architecture-tasks.md`](../roadmap/tasks/56-display-and-input-architecture-tasks.md)
+records the work; the live learning doc is at
+[`docs/56-display-and-input-architecture.md`](../56-display-and-input-architecture.md).
+
+What Phase 56 ships is the **substrate**, not the desktop UX. The
+tiling-first compositor, the animation engine, the native bar /
+launcher / notification daemon / lockscreen client implementations,
+and the native graphical terminal emulator are explicitly **Phase 56b /
+57 / 57b / 57c** work, additive on top of Phase 56's contract points
+without protocol rework. Stage 2's full readiness criteria therefore
+require Phase 57 audio + the first real graphical client, not just
+Phase 56.
+
 ### Must-have outcomes
 
 | Work item | Why it matters | Evidence |
 |---|---|---|
-| Replace "graphics = framebuffer console plus one foreground graphical client" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/09-framebuffer-and-shell.md`, `docs/47-doom.md`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
-| Add mouse input and event abstraction | A desktop cannot stay keyboard-only | `docs/roadmap/56-display-and-input-architecture.md` |
+| Replace "graphics = framebuffer console plus one foreground graphical client" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/56-display-and-input-architecture.md` (Phase 56 substrate, complete), `docs/roadmap/tasks/56-display-and-input-architecture-tasks.md` |
+| Add mouse input and event abstraction | A desktop cannot stay keyboard-only | `docs/56-display-and-input-architecture.md` § "Input event protocol" (Phase 56 D.1 / D.2 / D.3, complete) |
 | Add audio output | Even a minimal desktop needs media and UI feedback | `docs/roadmap/57-audio-and-local-session.md` |
-| Add a session/launcher/app model | Desktop usability is more than drawing pixels | `docs/roadmap/46-system-services.md`, GUI gaps in [gui-strategy.md](./gui-strategy.md) |
+| Add a session/launcher/app model | Desktop usability is more than drawing pixels | `docs/roadmap/46-system-services.md`, Phase 56 supervised-service model under `init`, [gui-strategy.md](./gui-strategy.md) |
 
 ### Detailed Stage 2 work breakdown
 
