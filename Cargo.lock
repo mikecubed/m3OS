@@ -455,6 +455,7 @@ name = "display_server"
 version = "0.56.0"
 dependencies = [
  "kernel-core",
+ "surface_buffer",
  "syscall-lib",
 ]
 
@@ -665,6 +666,15 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "gfx-demo"
+version = "0.1.0"
+dependencies = [
+ "kernel-core",
+ "surface_buffer",
+ "syscall-lib",
 ]
 
 [[package]]
@@ -1735,6 +1745,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fe2cd7ddcc98aed78da9ed97bcd2630b761f1ea4377d9922dc4097f76a8bdff"
 dependencies = [
  "virtue",
+]
+
+[[package]]
+name = "surface_buffer"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
 ]
 
 [[package]]

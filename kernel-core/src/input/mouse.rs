@@ -195,6 +195,50 @@ impl Ps2MouseDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wire encoding for `sys_read_mouse_packet` (Phase 56 Track B.2)
+// ---------------------------------------------------------------------------
+
+/// Wire-format size of one [`MousePacket`] returned by the
+/// `sys_read_mouse_packet` syscall (0x1015). 8 bytes, layout documented on
+/// [`encode_packet`].
+pub const MOUSE_PACKET_WIRE_SIZE: usize = 8;
+
+/// Encode a [`MousePacket`] into the 8-byte little-endian wire layout used
+/// by `sys_read_mouse_packet`.
+///
+/// Wire layout (8 bytes total):
+/// * `[0..2]` — `dx: i16` little-endian
+/// * `[2..4]` — `dy: i16` little-endian
+/// * `[4..5]` — `wheel: i8`
+/// * `[5..6]` — buttons bitfield: bit 0 left, bit 1 right, bit 2 middle,
+///   bit 3 x_overflow, bit 4 y_overflow, bits 5..7 reserved
+/// * `[6..8]` — reserved (zero)
+pub fn encode_packet(packet: &MousePacket, out: &mut [u8; MOUSE_PACKET_WIRE_SIZE]) {
+    out[0..2].copy_from_slice(&packet.dx.to_le_bytes());
+    out[2..4].copy_from_slice(&packet.dy.to_le_bytes());
+    out[4] = packet.wheel as u8;
+    let mut buttons: u8 = 0;
+    if packet.left {
+        buttons |= 1 << 0;
+    }
+    if packet.right {
+        buttons |= 1 << 1;
+    }
+    if packet.middle {
+        buttons |= 1 << 2;
+    }
+    if packet.x_overflow {
+        buttons |= 1 << 3;
+    }
+    if packet.y_overflow {
+        buttons |= 1 << 4;
+    }
+    out[5] = buttons;
+    out[6] = 0;
+    out[7] = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +474,34 @@ mod tests {
                 prop_assert!(d.pending_bytes() <= 3);
             }
         }
+    }
+
+    #[test]
+    fn encode_packet_zero_packet_round_trip() {
+        let p = MousePacket::default();
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(buf, [0u8; 8]);
+    }
+
+    #[test]
+    fn encode_packet_motion_and_buttons() {
+        let p = MousePacket {
+            dx: -3,
+            dy: 7,
+            wheel: -1,
+            left: true,
+            right: false,
+            middle: true,
+            x_overflow: false,
+            y_overflow: true,
+        };
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(buf[0..2], [0xFD, 0xFF]);
+        assert_eq!(buf[2..4], [0x07, 0x00]);
+        assert_eq!(buf[4], 0xFF);
+        assert_eq!(buf[5], 0b0001_0101);
+        assert_eq!(buf[6..8], [0u8, 0u8]);
     }
 }

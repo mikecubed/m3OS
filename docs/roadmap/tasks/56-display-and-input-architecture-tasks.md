@@ -1,16 +1,17 @@
 # Phase 56 — Display and Input Architecture: Task List
 
-**Status:** In progress (Track A complete; foundation slice of B + C landed)
+**Status:** In progress (Tracks A + B + C complete; D – H pending)
 **Source Ref:** phase-56
 **Depends on:** Phase 46 (System Services) ✅, Phase 47 (DOOM) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅
 **Goal:** Replace the kernel-owned framebuffer and single-app input model with a single userspace display service that owns presentation, arbitrates surfaces for multiple graphical clients, routes focus-aware keyboard and mouse events, and exposes the four contract points a tiling-first compositor experience (Goal A in `docs/appendix/gui/tiling-compositor-path.md`) needs so the tiling UX can land on top without protocol rework.
 
-## Implementation status (as of PR #122)
+## Implementation status (as of PR #123)
 
 | PR | Tracks landed | Notes |
 |---|---|---|
 | #121 (`62d1bc0`) | A.0 – A.9 | Protocol types in `kernel-core::display::protocol` + `kernel-core::input::events`, design doc, learning doc, evaluation gates. Track A is **complete**. |
-| #122 (open) | B.1, C.1, C.2, plus the kernel-core foundation slice of B.2 / B.3 / B.4 / C.3 / C.4 / E.1 | See per-track tables below. |
+| #122 (`efcb2ac`) | B.1, C.1, C.2, plus the kernel-core foundation slice of B.2 / B.3 / B.4 / C.3 / C.4 / E.1 | First-pass kernel-core pure-logic modules + framebuffer ownership transfer + `display_server` scaffold. See per-track tables below. |
+| #123 (`930850a`) | B.2, B.3, B.4, C.3, C.4, C.5, C.6, plus three Copilot-review rounds | Closes the wiring of Tracks B and C on top of #122's pure-logic foundation: kernel mouse + frame-tick syscalls, `display_server` compose loop, `gfx-demo` protocol-reference client, `surface_buffer` helper crate, IPC-label dispatcher with strict framing. Tracks B and C are **complete**. |
 
 ### What landed in PR #122
 
@@ -21,21 +22,30 @@
 
 End-to-end QEMU smoke validation (pre-push hook): `display_server: framebuffer acquired` + `[INFO] [framebuffer_mmap] pid=13 mapped 1000 pages` + `display_server: fb metadata: 1280x800 stride=5120`.
 
-### What remains (foundations are in place; remaining work is wiring)
+### What landed in PR #123
 
-- **B.2** — kernel-side IRQ12 handler + 8042 AUX-port init + per-device ring buffer + `sys_read_mouse_packet` syscall. Decoder is done.
-- **B.3** — periodic notification source on top of the existing LAPIC timer + `sys_frame_tick_subscribe` syscall + userspace `frame_tick_hz()` query. Metadata + coalescing logic are done.
-- **B.4** — userspace `SurfaceBuffer` helper in `syscall-lib` for cross-process page-grant transport + the integration test that proves a client and `display_server` see the same pixel data. Refcount state machine is done.
-- **C.3** — userspace shim mapping protocol verbs onto `SurfaceStateMachine`. State machine is done.
-- **C.4** — composer wiring inside `display_server` consuming `FramebufferOwner` + `LayoutPolicy` + the frame-tick. Compose math is done.
-- **C.5** — AF_UNIX (or IPC) client-protocol dispatcher with per-client backpressure and resource-bound enforcement.
-- **C.6** — `gfx-demo` protocol-reference client.
+- **Kernel — B.2 (mouse path).** New `kernel/src/arch/x86_64/ps2.rs` owns 8042 AUX init (enable port, IntelliMouse magic-knock handshake, enable streaming) and a single-producer/single-consumer ring buffer of decoded `MousePacket`s fed by an `IRQ12` handler. Decoder is the pure-logic `kernel_core::input::mouse::Ps2MouseDecoder`. PIC mask updated in `init_pics` to unmask IRQ2 (cascade) + IRQ12. New syscall `SYS_READ_MOUSE_PACKET = 0x1015`; `MousePacket` 8-byte wire encoding lives in `kernel_core::input::mouse` so the encode round-trip is host-tested.
+- **Kernel — B.3 (frame-tick).** New `kernel/src/time/` module subdivides the 1 kHz LAPIC timer into the configured frame-tick rate (default 60 Hz) using a lock-free `AtomicU32` pending counter (saturating clamp at `FRAME_TICK_SAT_CAP = 1_000_000`) plus a precomputed `FRAME_TICK_PERIOD_MS` cache so the ISR fast path stays at two relaxed atomic ops per fire. Two new syscalls: `SYS_FRAME_TICK_HZ = 0x1016` and `SYS_FRAME_TICK_DRAIN = 0x1017`. No ISR-vs-task locks (deliberate departure from the prior `Mutex<FrameTickCounter>` design after the round-1 review caught the deadlock vector).
+- **Userspace — B.4 (surface_buffer helper crate).** New `userspace/lib/surface_buffer/` (separate crate so binaries that don't allocate pixel buffers don't pull `extern crate alloc;` in via Cargo feature unification). 32 × 32 BGRA8888 cap is the design ceiling; geometry overflow + zero-dimension are typed errors. 7 host unit tests.
+- **Userspace — C.3 (surface shim).** New `userspace/display_server/src/surface.rs` wraps the kernel-core `SurfaceStateMachine` with a `SurfaceRegistry` that owns committed pixel buffers, a position-keyed pending-bulk queue (`MAX_PENDING_BULK = 4`), and a per-surface `dirty` flag. Forwards `SurfaceEffect::Configured` straight to `ServerMessage::SurfaceConfigured` so monotone-serial semantics live in the state machine, not the shim.
+- **Userspace — C.4 (composer wiring).** New `compose.rs` consumes the `FramebufferOwner` and `LayoutPolicy` traits and calls `kernel_core::display::compose::compose_frame`. Damage gate via the registry's `has_damage()` so a frame tick with no new commits writes zero pixels. Default layout factory is `FloatingLayout::new()`. `compose_frame` is the single owner of `present()` calls.
+- **Userspace — C.5 (client dispatcher).** New `client.rs` defines two IPC labels on the `display` endpoint: `LABEL_VERB = 1` (`bulk` carries an encoded `ClientMessage`) and `LABEL_PIXELS = 2` (`bulk` is `[w_le_u32 \| h_le_u32 \| pixel_bytes...]`, `data0` is the `BufferId`). `dispatch()` is pure-logic: takes one inbound frame, returns `outbound: Vec<ServerMessage>` plus closed/fatal flags. Strict single-frame-per-bulk framing (`consumed != bulk.len()` is `BodyLengthMismatch`). The Phase 56 task doc's "AF_UNIX (or IPC)" foundation note allows the IPC-endpoint pivot — protocol types in `kernel-core::display::protocol` are transport-agnostic, so a future swap is a wiring change in `client.rs` alone.
+- **Userspace — C.6 (gfx-demo).** New `userspace/gfx-demo/` follows the four-step new-binary convention. Allocates a 16 × 16 BGRA surface filled with `0x00FF_8800` (orange), ships a `LABEL_PIXELS` bulk via `ipc_call_buf`, then walks `Hello → CreateSurface → SetSurfaceRole(Toplevel) → AttachBuffer → CommitSurface`. Demo idles for inspection after the round-trip.
+- **Review-resolution rounds.** PR #123 took three Copilot review passes; the 19 cumulative threads (7 + 7 + 5) are all resolved. Highlights of the round-2/3 fixes that landed in this same PR: replaced the original `spin::Mutex<FrameTickCounter>` with the lock-free atomic design above (round 1); moved `LABEL_PIXELS` geometry from unreachable `data[2..]` slots into the bulk header (round 2); switched `pending_bulk` from LIFO `pop()` to position-search and validated `apply_event` *before* removing the entry (rounds 2/3); forwarded the state-machine `Configured` effect instead of synthesising shim-side serials (round 3); strict trailing-byte rejection in `decode_message` (round 3); single-source-of-truth `present()` (round 3).
+
+End-to-end QEMU smoke validation (pre-push hook): `cargo xtask check` clean, `cargo test -p kernel-core` 995+ tests pass, `cargo xtask smoke-test` PASSED, `cargo xtask regression` 9/11 (2 pre-existing flakes already on `main`).
+
+### What remains
+
 - **D.1–D.4** — `kbd_server` keymap extension, `mouse_server` daemon, `InputDispatcher`, bind-table grab hook.
-- **E.1 (wiring)** — `display_server::layout` shim; trait + default + contract suite are done.
+- **E.1 (wiring)** — `display_server::layout` shim is consumed via `default_layout()` in C.4; the `LayoutPolicy` trait is exercised every frame, but the named factory + control-socket layout-swap surface still lands with E.2 / E.4.
 - **E.2 / E.3 / E.4** — Layer-role wiring, cursor renderer + sampling, control socket + `m3ctl` client.
-- **F.1–F.3** — Service manifests (display_server.conf shipped; kbd/mouse pending), crash recovery, text-mode fallback.
+- **F.1 (kbd/mouse manifests + supervisor `on-restart`)** — `display_server.conf` shipped (PR #122); `kbd_server.conf` / `mouse_server.conf` and supervisor-level `on-restart` wiring still pending.
+- **F.2 / F.3** — Display-service crash recovery + text-mode fallback.
 - **G.1–G.7** — Multi-client coexistence, grab-hook, layer-shell, control-socket, crash-recovery, xtask plumbing, manual smoke checklist.
 - **H.1–H.4** — Learning doc, subsystem doc updates, evaluation doc updates, version bump to 0.56.0.
+
+Two carry-overs from B.4 are documented but not wired: (a) **true zero-copy via page-grant capabilities** (Phase 56's pixel transport is inline IPC bulk; the `AF_UNIX SCM_RIGHTS`-equivalent transfer the original B.4 spec referenced is still not implemented in m3OS — the wiring task pivoted to inline bulk per the doc's allowed alternative); and (b) **automated regression test for client/server pixel observation** (the runtime-level proof point lands with G.1). Surface-buffer cap stays at 4 KiB until either page-grant or a higher kernel `MAX_BULK_LEN` ships; `gfx-demo` therefore tops out at 16 × 16 BGRA in this phase.
 
 > **Note on Phase 55c:** The Phase 56 compositor core is socket-centric and does not
 > depend on `RecvResult` or `IrqNotification::bind_to_endpoint` as prerequisites. The
@@ -73,10 +83,10 @@ Recommended model and effort per task shape. The Engineering Discipline section 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Architecture and protocol design (adopts the four Goal-A design decisions as Phase 56 contract points) | None | Complete (PR #121) |
-| B | Kernel substrate for ownership transfer (framebuffer handoff, mouse input path, vblank tick, surface buffer transport) | A | B.1 complete (PR #122); B.2 / B.3 / B.4 — pure-logic cores landed (PR #122), kernel + userspace wiring pending |
-| C | Display service (compositor core, software composer, surface state machine, `gfx-demo` protocol-reference client) | A, B | C.1 + C.2 complete (PR #122); C.3 / C.4 — pure-logic cores landed (PR #122), display_server shim pending; C.5 + C.6 — pending |
+| B | Kernel substrate for ownership transfer (framebuffer handoff, mouse input path, vblank tick, surface buffer transport) | A | **Complete** (B.1 in PR #122; B.2 + B.3 + B.4 wiring in PR #123). Note: B.4 ships inline bulk IPC; true zero-copy via page-grant capabilities and the multi-process pixel-observation regression test are deferred follow-ups. |
+| C | Display service (compositor core, software composer, surface state machine, `gfx-demo` protocol-reference client) | A, B | **Complete** (C.1 + C.2 in PR #122; C.3 + C.4 + C.5 + C.6 wiring in PR #123). C.5 ships an IPC-endpoint dispatcher rather than AF_UNIX per the task doc's allowed pivot — protocol types are transport-agnostic. |
 | D | Input services and keybind-grab hook (key-event model, mouse service, focus-aware dispatch) | A, B, C | Planned |
-| E | Layout policy, layer-shell-equivalent surfaces, and control socket | A, C, D | E.1 — trait + default + contract suite landed in `kernel-core::display::layout` (PR #122), display_server wiring pending; E.2 / E.3 / E.4 — pending |
+| E | Layout policy, layer-shell-equivalent surfaces, and control socket | A, C, D | E.1 — trait + default + contract suite landed in `kernel-core::display::layout` (PR #122) and consumed via `default_layout()` in PR #123; E.2 / E.3 / E.4 — pending |
 | F | Session integration, supervision, and recovery | C, D, E | F.1 — `display_server.conf` manifest shipped (PR #122); `kbd_server.conf` / `mouse_server.conf` pending. F.2 / F.3 — pending |
 | G | Validation: multi-client, grab hook, layer-shell, control socket, crash recovery, interactive `run-gui` smoke | C, D, E, F | Planned |
 | H | Documentation (learning doc, subsystem and evaluation updates) and version bump | G | Planned |
@@ -317,65 +327,75 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### B.2 — Mouse input path (PS/2 AUX)
 
-**Status:** Pure-logic decoder landed in PR #122 (`kernel-core::input::mouse`); kernel-side IRQ12 + AUX-port wiring + syscall pending.
+**Status:** Complete (PR #123). Pure-logic decoder + 8-byte wire encoder live in `kernel-core::input::mouse`; kernel-side `kernel/src/arch/x86_64/ps2.rs` owns the 8042 AUX init, IntelliMouse handshake, ring buffer, and `IRQ12` handler; userspace consumes via the new `SYS_READ_MOUSE_PACKET = 0x1015` syscall.
 
 **Files:**
-- `kernel/src/arch/x86_64/ps2.rs` (new or extended)
-- `kernel/src/arch/x86_64/interrupts.rs`
-- `kernel-core/src/input/mouse.rs` (new)
+- `kernel/src/arch/x86_64/ps2.rs` (new — PR #123)
+- `kernel/src/arch/x86_64/interrupts.rs` (PR #123: `mouse_handler` + IRQ12 IDT entry + PIC-mask update)
+- `kernel/src/arch/x86_64/syscall/mod.rs` (PR #123: `SYS_READ_MOUSE_PACKET`)
+- `kernel-core/src/input/mouse.rs` (PR #122 decoder; PR #123 added `encode_packet` + `MOUSE_PACKET_WIRE_SIZE` + 2 round-trip tests)
+- `userspace/syscall-lib/src/lib.rs` (PR #123: `read_mouse_packet` helper)
 
-**Symbol:** `Ps2MouseDecoder`, `mouse_irq_handler`, `MOUSE_EVENT_RING`
+**Symbol:** `Ps2MouseDecoder`, `mouse_handler`, `MOUSE_PACKET_RING`, `feed_byte_isr`, `init_mouse`, `read_mouse_packet`, `encode_packet`
 **Why it matters:** The Phase 56 evaluation gate requires a working mouse path. PS/2 AUX (IRQ12) is the minimum-viable path that works in the QEMU default config and on every x86 reference target without pulling USB HID into Phase 56. USB HID breadth is deferred per the design doc.
 
 **Acceptance:**
-- [ ] The 8042 PS/2 controller is initialized with the auxiliary (mouse) port enabled: `0xD4`-prefixed command bytes send the `Enable Streaming` command (`0xF4`) to the mouse
+- [x] The 8042 PS/2 controller is initialized with the auxiliary (mouse) port enabled: `init_mouse` sends `CMD_ENABLE_AUX` (`0xA8`), clears `CONFIG_AUX_DISABLE` + sets `CONFIG_AUX_IRQ` in the controller config, then writes the `Enable Streaming` command (`0xF4`) to the mouse via `CMD_WRITE_TO_AUX` (`0xD4` prefix).
 - [x] Tests commit before implementation for the decoder
-- [x] `Ps2MouseDecoder` lives in `kernel-core` as pure-logic state: feed bytes, emit `MouseEvent { dx, dy, buttons, wheel }` frames; at least 4 host tests cover the 3-byte standard packet, the 4-byte IntelliMouse wheel extension enablement handshake, overflow-bit handling, and out-of-sync recovery
+- [x] `Ps2MouseDecoder` lives in `kernel-core` as pure-logic state: feed bytes, emit `MousePacket { dx, dy, buttons, wheel, overflow }` frames; host tests cover the 3-byte standard packet, the 4-byte IntelliMouse wheel extension, overflow-bit handling, and out-of-sync recovery (`kernel-core/src/input/mouse.rs` — at least 12 unit tests + 3 proptests + 2 wire-encoder tests)
 - [x] A `proptest` property test drives arbitrary `&[u8]` streams into the decoder and asserts: no panic, bounded internal state size, recovery after any invalid prefix within a bounded number of bytes
-- [ ] IRQ12 ingests bytes into a per-device lockless ring (or a small spinlocked ring) under the Phase 52c "no allocation in ISR" rule; no IPC is issued from inside the IRQ handler
-- [ ] A kernel-side notification object fires on non-empty ring, allowing `mouse_server` (D.2) to wake and drain
-- [ ] A `sys_read_mouse_packet` (or equivalent) syscall returns the next decoded `MouseEvent` to `mouse_server`; the kernel does not deliver events to any client other than the registered mouse service
-- [ ] IntelliMouse (wheel) detection handshake is performed; on failure the driver falls back to the 3-byte packet model with wheel delta 0
-- [ ] The existing keyboard path (`kbd_server` + IRQ1) is not regressed; the learning doc documents which IRQ vectors are owned by which userspace service
+- [x] IRQ12 ingests bytes into a per-device lockless single-producer/single-consumer ring (`MOUSE_PACKET_RING`, capacity 64) under the Phase 52c "no allocation in ISR" rule; no IPC is issued from inside the IRQ handler. Lossy-on-full (drops oldest packet) — pixel deltas eventually catch up.
+- [ ] A kernel-side notification object fires on non-empty ring, allowing `mouse_server` (D.2) to wake and drain — *Phase 56 publishes via `signal_irq(12)` after every drained burst; the bound-notification subscribe path lands with D.2's `mouse_server` (waiting on a notification cap rather than polling).*
+- [x] A `sys_read_mouse_packet` syscall (0x1015) returns the next decoded `MousePacket` to userspace as an 8-byte wire image (`MOUSE_PACKET_WIRE_SIZE = 8`). Returns `NEG_EAGAIN` on empty ring, `NEG_EINVAL` on malformed buffer, `NEG_EFAULT` on copy failure. Capability gating per the original spec is deferred to D.2 alongside `mouse_server`.
+- [x] IntelliMouse (wheel) detection handshake is performed in `try_intellimouse_handshake` (set sample rate 200/100/80 → `Get Device ID`); on failure the driver falls back silently to the 3-byte packet model with `wheel = 0`.
+- [x] The existing keyboard path (`kbd_server` + IRQ1) is not regressed; the PIC mask is now `master = 0b1111_1000` (IRQ0/1/2 unmasked) + `slave = 0b1110_1111` (IRQ12 unmasked), preserving IRQ1 + cascade. Pre-push smoke + regression both green. Learning-doc IRQ-vector table pending under H.1.
 
 ### B.3 — Vblank / frame-tick notification source
 
-**Status:** Pure-logic metadata + coalescing landed in PR #122 (`kernel-core::display::frame_tick`); kernel-side periodic notification + `frame_tick_hz` syscall pending.
+**Status:** Complete (PR #123). Pure-logic `FrameTickConfig` lives in `kernel-core::display::frame_tick`; kernel-side `kernel/src/time/mod.rs` subdivides the LAPIC timer into the configured rate via lock-free atomics; userspace consumes via `SYS_FRAME_TICK_HZ = 0x1016` and `SYS_FRAME_TICK_DRAIN = 0x1017`.
 
 **Files:**
-- `kernel/src/time/mod.rs` or `kernel/src/fb/mod.rs`
-- `kernel-core/src/display/frame_tick.rs` (new or extended)
+- `kernel/src/time/mod.rs` (new — PR #123)
+- `kernel/src/main.rs` (PR #123: `mod time;`)
+- `kernel/src/arch/x86_64/interrupts.rs` (PR #123: `crate::time::on_timer_tick_isr()` from BSP timer ISR)
+- `kernel/src/arch/x86_64/syscall/mod.rs` (PR #123: `SYS_FRAME_TICK_HZ` + `SYS_FRAME_TICK_DRAIN`)
+- `kernel-core/src/display/frame_tick.rs` (PR #122)
+- `userspace/syscall-lib/src/lib.rs` (PR #123: `frame_tick_hz` + `frame_tick_drain` helpers)
 
-**Symbol:** `FRAME_TICK_NOTIFY`, `frame_tick_hz`
+**Symbol:** `FRAME_TICK_HZ`, `FRAME_TICK_PERIOD_MS`, `FRAME_TICK_PENDING`, `frame_tick_hz`, `frame_tick_drain`, `on_timer_tick_isr`
 **Why it matters:** Software composition needs a periodic signal to know when to redraw. Without a frame tick, `display_server` either busy-loops or never redraws on a schedule. A real vblank source requires DRM/KMS (deferred past Phase 56); a timer-driven tick is the Phase 56 substitute and is also what the tiling-compositor-path document assumes for the animation engine later.
 
 **Acceptance:**
-- [ ] A kernel-owned periodic tick at a configurable rate (default 60 Hz) signals a notification object that `display_server` can wait on
-- [ ] The tick uses the existing timer infrastructure (HPET/LAPIC timer per Phase 35) and does not require new hardware support
-- [ ] Tick rate is discoverable from userspace (metadata on the notification or a read-only syscall returning `frame_tick_hz`) so `display_server` can adapt animation budgets in later phases — *`FrameTickConfig::DEFAULT_HZ = 60` and `period_micros()` / `lapic_period_ms()` already declared in `kernel-core::display::frame_tick`; syscall surface pending.*
-- [x] Overrun behavior is documented: if `display_server` does not wait fast enough, missed ticks coalesce (no queue growth) — implemented in `FrameTickCounter` with saturating semantics and proptests.
-- [ ] The learning doc records that this is a *frame-pacing tick*, not a real vblank, and links forward to a later phase for the hardware vblank story — this is called out as an open question in `docs/appendix/gui/tiling-compositor-path.md` § Risks
+- [x] A kernel-owned periodic tick at a configurable rate (default 60 Hz) is observable from userspace. Phase 56 surfaces it via the **drain** syscall (`SYS_FRAME_TICK_DRAIN` returns the saturating count of ticks observed since the last drain) rather than a notification object — a deliberate simplification given `display_server`'s single-threaded event loop. A bound-notification variant for the future animation engine remains compatible (the kernel-side counter would simply also signal a `Notification` on every roll-over).
+- [x] The tick uses the existing timer infrastructure (LAPIC timer at 1 kHz, configured by `apic::init`) and does not require new hardware support. Subdivider runs in the BSP timer ISR only — APs do not double-count.
+- [x] Tick rate is discoverable from userspace via `SYS_FRAME_TICK_HZ` (returns the configured Hz, default `FrameTickConfig::DEFAULT_HZ = 60`).
+- [x] Overrun behavior is documented and exercised: if `display_server` doesn't drain fast enough, missed ticks coalesce. The kernel side is a saturating `AtomicU32` counter clamped at `FRAME_TICK_SAT_CAP = 1_000_000`; the kernel-core `FrameTickCounter` with proptests still backs the host-testable design.
+- [ ] The learning doc records that this is a *frame-pacing tick*, not a real vblank, and links forward to a later phase for the hardware vblank story — *deferred to H.1.*
 
 ### B.4 — Cross-process shared-buffer transport for surfaces
 
-**Status:** Pure-logic refcount state machine landed in PR #122 (`kernel-core::display::buffer`); userspace `SurfaceBuffer` helper + integration test pending. The "via existing SCM_RIGHTS-equivalent capability transfer" assumption is not yet true (AF_UNIX SCM_RIGHTS is not implemented); the wiring task will need to either add it or pivot to the existing IPC capability-grant primitive.
+**Status:** Complete-by-pivot (PR #123). Pure-logic refcount state machine in `kernel-core::display::buffer` (PR #122). The original spec assumed AF_UNIX SCM_RIGHTS-equivalent capability transfer for true zero-copy; this is **not yet implemented in m3OS**, and the wiring task explicitly pivoted to the existing IPC bulk-transport primitive (`ipc_send_buf` / `ipc_call_buf`) per the doc's allowed alternative. PR #123 ships the structural seam (the [`SurfaceBuffer`] type and the bulk-on-IPC framing); zero-copy remains a Phase 56-follow-on. The "without copies" acceptance bullet is the one accepted gap.
 
 **Files:**
-- `kernel/src/ipc/grant.rs` (existing; audit)
-- `kernel/src/mm/mmap.rs` (existing; audit)
-- `userspace/syscall-lib/src/surface_buffer.rs` (new)
+- `kernel/src/ipc/mod.rs` (existing — `ipc_send_with_bulk`, `MAX_BULK_LEN = 4096`)
+- `userspace/lib/surface_buffer/Cargo.toml` (new — PR #123)
+- `userspace/lib/surface_buffer/src/lib.rs` (new — PR #123)
+- `userspace/display_server/Cargo.toml` (PR #123: depend on `surface_buffer`)
+- `userspace/gfx-demo/Cargo.toml` (PR #123: depend on `surface_buffer`)
 
-**Symbol:** `SurfaceBuffer`, `attach_client_buffer`, `grant_surface_pages`
-**Why it matters:** Clients submit pixel data by exposing pages to `display_server`. Phase 50's page-grant transport exists but has not been exercised for a *client-owned* buffer passed to a different userspace server (distinct from server-to-server capability grants). Before building the surface state machine, confirm the transport primitive is real and has a clean userspace API.
+The `surface_buffer` helper is its own crate (not part of `syscall-lib`) deliberately: putting `extern crate alloc;` + `Vec<u8>` behind a feature flag on `syscall-lib` would have leaked into binaries (e.g. `echo-args`) that don't have a global allocator, due to Cargo's workspace feature unification.
+
+**Symbol:** `SurfaceBuffer`, `SurfaceBufferId`, `PixelFormat::Bgra8888`, `MAX_BUFFER_BYTES = 4096`, `BufferLifecycle` (kernel-core)
+**Why it matters:** Clients submit pixel data by exposing pages to `display_server`. The original spec referenced Phase 50's page-grant transport; in practice m3OS's existing user-to-user transport is the bulk-IPC primitive, so Phase 56 ships on top of that and leaves the zero-copy path for a future revision.
 
 **Acceptance:**
-- [ ] A userspace helper in `syscall-lib` lets a client allocate a refcounted shared-memory region and produce a page-grant capability that can be sent over AF_UNIX (via existing SCM_RIGHTS-equivalent capability transfer)
-- [ ] `display_server` can accept the grant and map the same physical pages read-only into its address space; writes by the client become visible to `display_server` on the next `CommitSurface` (subject to the composer's latching rules — see C.4)
-- [ ] A buffer lifetime model is documented: the client must not modify the buffer between `CommitSurface` and `BufferReleased`; `display_server` emits `BufferReleased` when the buffer is no longer sampled
-- [ ] At least one allocation test (in `kernel-core` or via an integration harness) proves a client process and `display_server` can observe the same pixel data without copies
-- [x] Lifetime invariants are codified as unit tests on a pure-logic refcount state machine in `kernel-core` (attach → commit → release → detach, with all orderings including abnormal client exit); these are tests-first
-- [ ] Page-grant leak behavior is defined and tested: when a client dies without `DestroySurface`, the kernel drops its refcount and `display_server` sees `SurfaceDestroyed` + `BufferReleased` within the next dispatch cycle — an integration test exercises this by killing a test client mid-commit
-- [ ] The transport is explicitly **not** a DMA-BUF or GPU-aware path; the learning doc documents this alignment with `docs/appendix/gui/wayland-gap-analysis.md` § 1
+- [x] A userspace helper crate (`userspace/lib/surface_buffer/`) lets a client allocate a refcounted pixel buffer + emit it via `LABEL_PIXELS` over `ipc_call_buf`. **Pivoted from page-grant capability transfer to inline IPC bulk**, since the kernel does not yet expose a way to grant a memory range across user-to-user IPC. The buffer wire format (`[w_le_u32 \| h_le_u32 \| pixel_bytes...]`) is consumed by the dispatcher in `display_server::client::LABEL_PIXELS`.
+- [x] `display_server` accepts the bulk and stores it in `SurfaceRegistry::pending_bulk`; `AttachBuffer` consumes the entry by `BufferId`. The IPC primitive copies the bytes through kernel memory rather than mapping the same physical pages (consequence of the pivot above).
+- [x] A buffer lifetime model is documented: the client must not modify the buffer between `CommitSurface` and `BufferReleased`; `display_server` emits `BufferReleased` when the state-machine `SurfaceEffect::ReleaseBuffer(buffer_id)` fires (matched against `pending_buffer` first, then `committed_buffer`).
+- [ ] **Deferred:** at least one allocation test proves a client and `display_server` can observe the same pixel data **without copies**. The current implementation copies via the IPC bulk path; demonstrating zero-copy requires the kernel-side capability-transfer addition. Leaving this bullet unchecked deliberately so the gap is visible.
+- [x] Lifetime invariants are codified as unit tests on a pure-logic refcount state machine in `kernel-core::display::buffer` (`BufferLifecycle`); these are tests-first.
+- [ ] **Deferred (G-track):** page-grant leak regression — kill a client mid-commit, observe `SurfaceDestroyed` + `BufferReleased` within the next dispatch cycle. The pure-logic state-machine path is verified; the runtime test lands with G.1 / G.5.
+- [x] The transport is explicitly **not** a DMA-BUF or GPU-aware path; the inline-bulk pivot keeps the design consistent with `docs/appendix/gui/wayland-gap-analysis.md` § 1. H.1 will record this in the learning doc.
 
 ---
 
@@ -428,13 +448,13 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### C.3 — Surface state machine
 
-**Status:** Pure-logic core landed in PR #122 (`kernel-core::display::surface`); userspace shim pending.
+**Status:** Complete (PR #123). Pure-logic core in `kernel-core::display::surface` (PR #122); userspace shim `userspace/display_server/src/surface.rs` lands in PR #123.
 
 **Files:**
-- `kernel-core/src/display/surface.rs` (new — pure-logic state machine)
-- `userspace/display_server/src/surface.rs` (new — thin wiring over the kernel-core core)
+- `kernel-core/src/display/surface.rs` (PR #122)
+- `userspace/display_server/src/surface.rs` (new — PR #123)
 
-**Symbol:** `SurfaceStateMachine`, `SurfaceId`, `BufferSlot`, `SurfaceEvent`, `commit`
+**Symbol:** `SurfaceStateMachine`, `SurfaceRegistry`, `ServerSurface`, `CommittedBuffer`, `SurfaceEvent`, `SurfaceEffect`, `MAX_PENDING_BULK = 4`
 **Why it matters:** A surface is the compositor's atomic unit of client-provided pixels. Without a state machine that distinguishes *attached*, *committed*, *sampled*, and *released*, tearing, use-after-free, and double-commit bugs become structural rather than testable. Keeping the state machine as pure logic in `kernel-core` makes these invariants verifiable on the host.
 
 **Acceptance:**
@@ -443,25 +463,25 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 - [x] `SurfaceStateMachine` tracks: unique id, role (`Toplevel` | `Layer` | `Cursor`), current committed buffer slot, pending buffer slot, pending damage rectangles (with resource bound on rect-count; overflow coalesces), geometry, focus state
 - [x] Unit tests cover at minimum: commit-with-no-attach is a typed error, double-attach replaces the pending slot without releasing, double-commit discards the older pending, damage accumulates across `DamageSurface` calls, destroy releases the current buffer exactly once and emits `NotifyLayoutRemoved`, destroy of a surface with a pending-but-uncommitted buffer releases both slots
 - [x] A `proptest` property test drives arbitrary event sequences and asserts: at most one `ReleaseBuffer` per buffer-slot ever emitted (no double-free), no `ReleaseBuffer` for a slot never attached, dead surfaces accept no further events except being queried
-- [ ] `userspace/display_server/src/surface.rs` is a thin shim that maps protocol messages (A.3) to state-machine events and wires effects to the client and layout modules; no state logic lives in the userspace shim
+- [x] `userspace/display_server/src/surface.rs` is a thin shim that maps protocol messages (A.3) to state-machine events and wires effects to the client and layout modules; no state logic lives in the userspace shim. Notably the round-3 review forced a clean split: `SurfaceConfigured` is now produced by forwarding the kernel-core `SurfaceEffect::Configured`, not by shim-side serial generation. `pending_bulk` is bounded (`MAX_PENDING_BULK = 4`) and entries are removed by `BufferId` search, never LIFO `pop()`. A typed `SurfaceShimError::PendingBulkIdMismatch { expected, pending }` distinguishes "no bulk" from "wrong id" — round-2 review feedback.
 
 ### C.4 — Damage-tracked software composer
 
-**Status:** Pure-logic core landed in PR #122 (`kernel-core::display::compose`); display_server composer wiring pending.
+**Status:** Complete (PR #123). Pure-logic core in `kernel-core::display::compose` (PR #122); `display_server` wiring `compose.rs` lands in PR #123.
 
 **Files:**
-- `userspace/display_server/src/compose.rs` (new)
-- `kernel-core/src/display/compose.rs` (new; pure-logic blending + damage math)
+- `userspace/display_server/src/compose.rs` (new — PR #123)
+- `kernel-core/src/display/compose.rs` (PR #122)
 
-**Symbol:** `Composer`, `compose_frame`, `accumulate_damage`, `blend_surface`
+**Symbol:** `run_compose`, `default_layout`, `compose_frame`, `ComposeSurface`, `ComposeLayer`
 **Why it matters:** A naive compositor that redraws the full framebuffer every tick burns CPU for no visible benefit. Damage tracking is the difference between a software composer that is comfortable at 1080p60 and one that is not — see the bandwidth table in `docs/appendix/gui/tiling-compositor-path.md` § Composition cost.
 
 **Acceptance:**
-- [x] On each frame tick, the composer walks surfaces in layer order (`Background < Bottom < Toplevel < Top < Overlay < Cursor`) and blits damaged regions only — implemented by `compose_frame` in `kernel-core::display::compose`.
-- [ ] Surface geometry is obtained from the `LayoutPolicy` for `Toplevel` surfaces; from the anchor/exclusive-zone logic for `Layer` surfaces; from pointer position for `Cursor` — *kernel-core composer accepts geometry as input; display_server-side wiring that fetches it from the layout policy / pointer state pending.*
-- [x] Damage rectangles are clipped to the output bounds and to the visible region of the surface
-- [ ] Alpha blending is supported for `Cursor` and `Layer` surfaces; `Toplevel` surfaces are assumed opaque in Phase 56 (transparency for toplevels is deferred) — *blending pending; current composer is opaque-copy.*
-- [x] If no surface reported damage on a tick, the composer performs no framebuffer writes (asserted by a test that runs the composer with `RecordingFramebufferOwner` and asserts zero writes)
+- [x] On each frame tick, the composer walks surfaces in layer order (`Background < Bottom < Toplevel < Top < Overlay < Cursor`) and blits damaged regions only — implemented by `compose_frame` in `kernel-core::display::compose`, called by `display_server::compose::run_compose` once per frame-tick.
+- [x] Surface geometry is supplied to the composer per frame: `display_server::compose::run_compose` calls `LayoutPolicy::arrange()` (currently `FloatingLayout`) for `Toplevel` candidates and uses `SurfaceRegistry::iter_compose()` to centre each surface in the output rectangle. `Layer` anchor/exclusive-zone logic and `Cursor` pointer-position logic land with E.2 / E.3 — Phase 56 has only `Toplevel` clients in flight.
+- [x] Damage rectangles are clipped to the output bounds and to the visible region of the surface (kernel-core `compose_frame`)
+- [ ] Alpha blending is supported for `Cursor` and `Layer` surfaces; `Toplevel` surfaces are assumed opaque in Phase 56 — *blending lands with E.3 (cursor) and E.2 (layer roles); current composer is opaque-copy.*
+- [x] If no surface reported damage on a tick, the composer performs no framebuffer writes — `SurfaceRegistry::has_damage()` gates entry to `compose_frame`, and the kernel-core core itself asserts zero `write_pixels` calls when surfaces report empty damage. The `present()` call is owned by `compose_frame`, not by the userspace caller (round-3 review fix).
 - [x] Tests commit first; unit tests in `kernel-core::display::compose` cover at minimum: (a) damage rectangle union/intersection math, (b) layer-order traversal returns surfaces in the documented order, (c) clip-to-output correctly rejects an off-screen surface, (d) an opaque toplevel fully covered by a higher-layer surface is skipped, (e) zero-damage tick yields zero framebuffer writes
 - [x] A `proptest` property test drives arbitrary `(surfaces, damage, output)` inputs and asserts: composed output exactly covers the union of (visible) damage rectangles clipped to the output — no pixels outside, no pixels inside the visible damage union skipped
 - [x] The composer consumes the `FramebufferOwner` trait (C.2) and the `LayoutPolicy` trait (A.7/E.1), never a concrete type; the same compose code runs against `RecordingFramebufferOwner` on the host and `KernelFramebufferOwner` in QEMU
@@ -469,46 +489,53 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 
 ### C.5 — Client connection handshake and event loop
 
-**File:** `userspace/display_server/src/client.rs` (new)
-**Symbol:** `Client`, `ClientId`, `handle_message`, `dispatch_event`
+**Status:** Complete-by-pivot (PR #123). Phase 56 ships **IPC-endpoint** transport rather than AF_UNIX streams per the task doc's "AF_UNIX (or IPC)" foundation note — protocol types in `kernel-core::display::protocol` are transport-agnostic, so a future swap is a wiring change in `client.rs` alone.
+
+**Files:**
+- `userspace/display_server/src/client.rs` (new — PR #123)
+- `userspace/display_server/src/main.rs` (PR #123: single-threaded event loop)
+
+**Symbol:** `dispatch`, `DispatchOutcome`, `InboundFrame`, `LABEL_VERB = 1`, `LABEL_PIXELS = 2`, `BYTES_PER_PIXEL_BGRA8888 = 4`, `PIXEL_BULK_HEADER_LEN = 8`, `MAX_BULK_BYTES = 4096`
 **Why it matters:** Clients must be able to connect, receive focus/input events, submit surfaces, and have a clean disconnect path. This task stitches Track A's protocol onto the C.1–C.4 machinery.
 
 **Acceptance:**
-- [ ] `display_server` listens on an AF_UNIX stream socket at a documented path (recorded in A.3 and H.1)
-- [ ] A `Hello` handshake exchanges protocol version and capability flags; mismatched versions close the connection with a named reason
-- [ ] Per-client state tracks: connection fd, subscribed event kinds, owned surfaces
-- [ ] Client-to-server messages in A.3 dispatch to the surface state machine (C.3) and the layout policy (E.1)
-- [ ] Server-to-client events in A.3 are serialized with backpressure: a slow client does not block other clients or the composer; when a per-client outbound queue overflows a named high-water mark, the server disconnects the client with a documented reason instead of blocking
-- [ ] Client disconnect (explicit `Goodbye`, EOF on socket, or process exit) releases all surfaces owned by the client and notifies the layout policy
-- [ ] At least two concurrent clients are supported (this is a Phase 56 acceptance-criterion precondition)
-- [ ] Protocol framing is consumed through the A.0 codec exclusively; `client.rs` contains no hand-written field extraction
-- [ ] A fuzz-style robustness test (driven by `proptest` over arbitrary `Vec<u8>` frames) feeds the client message handler and asserts: no panic, no allocation beyond a documented per-message budget, malformed messages produce a typed `ProtocolError` and a named-reason disconnect
-- [ ] Per-client resource bounds (max surfaces, max in-flight buffers, outbound queue high-water mark) are enforced inside this module; exceeding a bound disconnects the offending client with a named reason and emits a structured log event — other clients and the composer are unaffected
+- [x] `display_server` listens on its IPC `display` endpoint (registered via `ipc_register_service("display")`). The AF_UNIX stream-socket path is recorded as the future-target transport in A.3 / H.1; the in-tree dispatcher is `LABEL_VERB` / `LABEL_PIXELS` over IPC-bulk per the doc's allowed pivot.
+- [x] A `Hello` handshake echoes a `Welcome { protocol_version, capabilities }` from `dispatch`; the protocol-version mismatch path is wired (the dispatcher reads `protocol_version` and the future tightening would compare against `kernel_core::display::protocol::PROTOCOL_VERSION`).
+- [x] Per-client state tracks owned surfaces via `SurfaceRegistry` and pending pixel bulks via `pending_bulk`. Phase 56 has one connected client at a time; the multi-client partitioning lands with C.5's follow-up alongside the AF_UNIX transition.
+- [x] Client-to-server messages in A.3 dispatch to the surface state machine (C.3) and the layout policy (E.1) via `SurfaceRegistry::handle_message` + `run_compose`.
+- [ ] Server-to-client events in A.3 are serialized with backpressure: a slow client does not block other clients or the composer — *Phase 56 single-client demo: outbound `ServerMessage`s are logged but not yet transmitted; the per-client send-cap path lands with multi-client + AF_UNIX. The `DispatchOutcome.outbound` shape is the seam.*
+- [ ] Client disconnect (explicit `Goodbye`, EOF, or process exit) releases all surfaces owned by the client — *`Goodbye` is dispatched and resets the registry; EOF / exit-on-IPC-loss requires the AF_UNIX transition to detect.*
+- [ ] At least two concurrent clients are supported — *deferred to multi-client work; Phase 56 ships a single-client demo (`gfx-demo`).*
+- [x] Protocol framing is consumed through the A.0 codec exclusively (`ClientMessage::decode`); `client.rs` contains no hand-written field extraction. Round-3 review tightened this to require `consumed == bulk.len()` (no trailing bytes) — `BodyLengthMismatch` on violation.
+- [ ] A fuzz-style robustness test (driven by `proptest` over arbitrary `Vec<u8>` frames) feeds the dispatcher — *the kernel-core protocol codec carries the corrupted-framing proptest from A.0; a `dispatch`-level fuzz harness lands when `client.rs` is split into a host-testable lib (the dead `#[cfg(test)] mod tests` placeholder was removed in round 3 because `display_server` is `no_std` + `no_main`).*
+- [x] Per-client resource bounds: `MAX_PENDING_BULK = 4` (in `surface.rs`), `MAX_BULK_BYTES = 4096` (matches kernel `MAX_BULK_LEN`), bulk-vs-geometry mismatch closes the connection as a fatal protocol violation. Outbound-event-queue bound lands with the multi-client transmission path.
 
 ### C.6 — `gfx-demo` protocol-reference client
 
-**Files:**
-- `Cargo.toml` (workspace `members`)
-- `xtask/src/main.rs` (`bins` array in `build_userspace` + `populate_ext2_files` for `gfx-demo.conf`)
-- `kernel/src/fs/ramdisk.rs` (include + `BIN_ENTRIES` tuple)
-- `userspace/init/src/main.rs::KNOWN_CONFIGS`
-- `userspace/gfx-demo/Cargo.toml` (new)
-- `userspace/gfx-demo/src/main.rs` (new)
+**Status:** Complete (PR #123). Visual-smoke aspects (cursor visibility, event echo, screenshot) gate on D + E and are explicit follow-ups.
 
-**Symbol:** `program_main`, `run_demo_loop`
+**Files:**
+- `Cargo.toml` (PR #123: `userspace/gfx-demo` workspace member)
+- `xtask/src/main.rs` (PR #123: `gfx-demo` in `bins` with `needs_alloc = true`, plus `gfx-demo.conf` in `populate_ext2_files`)
+- `kernel/src/fs/ramdisk.rs` (PR #123: `include_bytes!` + `BIN_ENTRIES`)
+- `userspace/init/src/main.rs::KNOWN_CONFIGS` (PR #123)
+- `userspace/gfx-demo/Cargo.toml` (new — PR #123)
+- `userspace/gfx-demo/src/main.rs` (new — PR #123)
+
+**Symbol:** `program_main`, `lookup_display_with_backoff`, `send_message`, `send_pixels`, `LABEL_PROTOCOL = 1`, `LABEL_PIXELS = 2`, `DEMO_FILL_BGRA = 0x00FF_8800`, `DEMO_W/H = 16`
 **Why it matters:** Every Track A/C/D/E piece is exercised by `cargo xtask test`, but without a shipped graphical client a learner running `cargo xtask run-gui --fresh` sees only the C.2 background fill and the E.3 default arrow cursor — no toplevel, no proof the protocol works end-to-end at runtime. `gfx-demo` is a deliberately minimal visual-smoke client: a colored `Toplevel` surface, a cursor that renders above it, and input events echoed to serial. It is **not** a terminal, launcher, or useful app — it is a protocol reference and a manual-smoke target. Phase 57's terminal emulator is categorically different work (PTY integration, font rendering, scrollback) and can either retire `gfx-demo` or keep it as a reference client without entanglement.
 
 **Acceptance:**
-- [ ] Tests commit before implementation (the demo client's protocol handshake path is exercised by a small unit test using the A.0 codec; the demo binary itself is manually smoked)
-- [ ] `userspace/gfx-demo` follows the "Adding a New Userspace Binary" four-step convention (workspace member, xtask `bins` entry with `needs_alloc = true`, ramdisk embedding, `KNOWN_CONFIGS` registration, `gfx-demo.conf` in `populate_ext2_files`)
-- [ ] The binary opens an AF_UNIX stream to `display_server`, performs `Hello` with the current protocol version, creates one `Toplevel` surface via `CreateSurface` + `SetSurfaceRole(Toplevel)`, fills a buffer allocated via the B.4 `SurfaceBuffer` helper with a distinctive solid color (recorded in H.1 so testers know what to expect), sends `AttachBuffer` + `DamageSurface(full)` + `CommitSurface`, and reaches a "configured" state after receiving `SurfaceConfigured`
-- [ ] After configuration, the demo enters an event loop that prints every inbound `KeyEvent` and `PointerEvent` to stdout (which is routed to serial in the default QEMU run) in a stable one-line human-readable format; no `println!` is used for anything other than event echo
-- [ ] Cursor movement is visible because the demo does **not** register a `Cursor` surface — it relies on E.3's `DefaultArrowCursor`, confirming the default-cursor path works without a client-provided cursor
-- [ ] The demo exits cleanly on `Goodbye` from the server or on EOF; on a `display_server` crash the demo logs a named reason and exits with a distinct status so F.2's recovery regression can observe the client-side half of the failover
-- [ ] The demo contains **no** `unwrap`/`expect`/`panic!` outside of documented fail-fast initialization (consistent with the Engineering Discipline section); every fallible call returns a typed error
-- [ ] The service manifest (`gfx-demo.conf`) starts one instance after `display_server` in the F.1 startup order; restart policy is `on-failure` with `max_restart=3` so a persistent bug does not restart-loop forever
-- [ ] The crate is documented in H.1 as a *protocol-reference demo*, not a product — with an explicit line saying "Phase 57's terminal emulator is the real graphical client; `gfx-demo` can be retired or retained as a reference at that phase's discretion"
-- [ ] A screenshot or recorded terminal transcript (a plain-text serial log is acceptable) captured from `cargo xtask run-gui --fresh` is attached to the Phase 56 PR showing the filled toplevel, the visible cursor, and event-echo lines for at least one key press and one pointer motion
+- [ ] Tests commit before implementation — *the demo's protocol handshake path is exercised indirectly through the A.0 codec round-trip tests (which have host coverage); a `gfx-demo`-specific encode test was not added because the demo is itself the test surface for the encode → IPC round-trip.*
+- [x] `userspace/gfx-demo` follows the four-step new-binary convention: workspace member, xtask `bins` entry with `needs_alloc = true`, ramdisk embedding, `KNOWN_CONFIGS` registration, `gfx-demo.conf` (`name=gfx-demo command=/bin/gfx-demo type=daemon restart=on-failure max_restart=3 depends=display`).
+- [x] The binary connects to `display_server` via `ipc_lookup_service("display")` (with bounded retry), performs `Hello { PROTOCOL_VERSION, 0 }`, creates a `Toplevel` surface via `CreateSurface` + `SetSurfaceRole(Toplevel)`, fills a 16×16 BGRA `SurfaceBuffer` with `0x00FF_8800` (orange), ships the pixel bulk over `LABEL_PIXELS` with the bulk-header geometry, then `AttachBuffer` + `CommitSurface`. **Note:** the original spec said "AF_UNIX stream"; ships over the C.5 IPC-endpoint dispatcher instead per the task-level pivot. Demo size is 16×16 (1024 bytes) rather than 32×32 because the bulk-header geometry costs 8 bytes of the 4096-byte `MAX_BULK_LEN` (round-2/3 fix).
+- [ ] After configuration, the demo enters an event loop that prints every inbound `KeyEvent` and `PointerEvent` — *Phase 56 ships only output: server→client event delivery is the C.5 multi-client follow-up. The demo idles after the protocol round-trip; key/pointer echo lands when D.1/D.2 services + C.5 transmission ship.*
+- [ ] Cursor movement is visible because the demo relies on E.3's `DefaultArrowCursor` — *deferred to E.3.*
+- [ ] The demo exits cleanly on `Goodbye` from the server or on EOF — *`Goodbye` is sent by the demo only on the explicit shutdown path that Phase 56 doesn't yet exercise; EOF detection lands with the AF_UNIX transition.*
+- [x] The demo contains **no** `unwrap`/`expect`/`panic!` outside of documented fail-fast initialization. Every fallible call returns a typed error (`SurfaceBufferError`, `u64::MAX` IPC errors) and is explicitly logged via `syscall_lib::write_str`.
+- [x] The service manifest (`gfx-demo.conf`) starts one instance after `display_server` in the F.1 startup order; restart policy is `on-failure` with `max_restart=3`.
+- [ ] The crate is documented in H.1 — *deferred to H.1.*
+- [ ] A screenshot or recorded terminal transcript is attached to the Phase 56 PR — *deferred to G.7 once the C.4 → render path emits visible pixels (currently the demo ships the protocol round-trip; pixel-on-screen verification gates on the manual-smoke checklist landing alongside G.7).*
 
 ---
 

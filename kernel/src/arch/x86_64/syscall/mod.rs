@@ -1240,6 +1240,20 @@ mod syscall_nr {
     /// kernel console. Pair with [`FRAMEBUFFER_MMAP`]; only callable by the
     /// process that currently owns the framebuffer.
     pub const FRAMEBUFFER_RELEASE: u64 = 0x1014;
+    /// Phase 56 Track B.2: read one decoded PS/2 mouse packet from the
+    /// kernel ring into a userspace 8-byte buffer. Returns 0 on success
+    /// (packet copied), `NEG_EAGAIN` when the ring is empty, `NEG_EINVAL`
+    /// for a malformed buffer pointer/length, and `NEG_EFAULT` on
+    /// `copy_to_user` failure. Wire layout is documented in
+    /// `kernel::arch::x86_64::ps2::encode_packet`.
+    pub const READ_MOUSE_PACKET: u64 = 0x1015;
+    /// Phase 56 Track B.3: query the kernel's frame-tick rate in Hz.
+    /// Returns the configured tick rate (1..=1000) as a positive u64.
+    pub const FRAME_TICK_HZ: u64 = 0x1016;
+    /// Phase 56 Track B.3: drain pending frame-tick events. Returns the
+    /// number of ticks accumulated since the last drain (saturating
+    /// coalesce; never blocks).
+    pub const FRAME_TICK_DRAIN: u64 = 0x1017;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1583,6 +1597,9 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
+        READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
+        FRAME_TICK_HZ => sys_frame_tick_hz(),
+        FRAME_TICK_DRAIN => sys_frame_tick_drain(),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -8873,6 +8890,51 @@ pub(super) fn sys_framebuffer_release() -> u64 {
             NEG_ENOENT
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 56 Track B.2 — read one decoded mouse packet (0x1015)
+//
+// Pops the next `MousePacket` from the kernel-side AUX ring (fed by IRQ12 in
+// `arch::x86_64::interrupts::mouse_handler`) and copies its 8-byte
+// little-endian wire encoding into the user buffer. Returns 0 on a successful
+// copy, `NEG_EAGAIN` when the ring is empty, and `NEG_EINVAL` / `NEG_EFAULT`
+// for invalid pointer / length / copy_to_user failure.
+// ---------------------------------------------------------------------------
+
+pub(super) fn sys_read_mouse_packet(buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_ptr == 0 || (buf_len as usize) < super::ps2::MOUSE_PACKET_WIRE_SIZE {
+        return NEG_EINVAL;
+    }
+    let Some(packet) = super::ps2::read_mouse_packet() else {
+        return NEG_EAGAIN;
+    };
+    let mut wire = [0u8; super::ps2::MOUSE_PACKET_WIRE_SIZE];
+    super::ps2::encode_packet(&packet, &mut wire);
+    if UserSliceWo::new(buf_ptr, wire.len())
+        .and_then(|s| s.copy_from_kernel(&wire))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 56 Track B.3 — frame-tick metadata + drain (0x1016 / 0x1017)
+//
+// `sys_frame_tick_hz` returns the configured tick rate in Hz.
+// `sys_frame_tick_drain` returns the number of ticks accumulated since the
+// last drain — the kernel keeps a saturating counter so userspace polling
+// loops never observe a queue blow-up.
+// ---------------------------------------------------------------------------
+
+pub(super) fn sys_frame_tick_hz() -> u64 {
+    crate::time::frame_tick_hz() as u64
+}
+
+pub(super) fn sys_frame_tick_drain() -> u64 {
+    crate::time::frame_tick_drain() as u64
 }
 
 // ---------------------------------------------------------------------------

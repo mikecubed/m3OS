@@ -428,6 +428,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
     // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
     idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
+    idt[InterruptIndex::Mouse as u8].set_handler_fn(mouse_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
@@ -742,6 +743,9 @@ pub enum InterruptIndex {
     #[allow(dead_code)]
     VirtioNet = 34,
     Serial = 36,
+    /// Phase 56 Track B.2 — PS/2 AUX (mouse) IRQ12. With the standard PIC
+    /// remap (master=32, slave=40), IRQ12 → vector 44.
+    Mouse = 44,
     Spurious = 0xFF,
 }
 
@@ -762,11 +766,17 @@ pub unsafe fn init_pics() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // Mask every IRQ line except IRQ0 (timer) and IRQ1 (keyboard).
-        // A set bit disables the line. Any unmasked line without an IDT handler
-        // would vector into an uninitialized entry and cause a triple fault.
-        // master: bits 2–7 masked (0b1111_1100), slave: all 8 lines masked.
-        pics.write_masks(0b1111_1100, 0b1111_1111);
+        // Mask every IRQ line except: IRQ0 (timer), IRQ1 (keyboard),
+        // IRQ2 (cascade — required to receive any slave IRQ), and IRQ12
+        // (PS/2 AUX / mouse, slave bit 4).
+        //
+        // A set bit disables the line. Any unmasked line without an IDT
+        // handler would vector into an uninitialized entry and cause a
+        // triple fault.
+        //
+        // master: bits 3–7 masked (0b1111_1000) — IRQ0/1/2 unmasked.
+        // slave:  bits 0–3 + 5–7 masked (0b1110_1111) — IRQ12 unmasked.
+        pics.write_masks(0b1111_1000, 0b1110_1111);
     }
 }
 
@@ -791,6 +801,10 @@ extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
     // mapped when the APIC was never initialised.
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Phase 56 Track B.3 — subdivide the 1 kHz timer into the configured
+        // frame-tick rate. Only the BSP drives the counter so AP timers
+        // don't double-count.
+        crate::time::on_timer_tick_isr();
     }
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline(&mut stack_frame);
@@ -977,6 +991,67 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         unsafe {
             PICS.lock()
                 .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PS/2 AUX (mouse) IRQ handler — Phase 56 Track B.2
+// ---------------------------------------------------------------------------
+
+/// IRQ12 handler. Drains pending bytes from the 8042 data port (0x60),
+/// feeding each byte to `kernel-core`'s pure-logic `Ps2MouseDecoder`. When a
+/// complete packet is assembled it is pushed onto the lock-free
+/// `MOUSE_PACKET_RING`; userspace reads via the `sys_read_mouse_packet`
+/// (0x1015) syscall.
+///
+/// The IRQ12 line is shared with the slave PIC; we therefore only consume
+/// bytes whose status byte indicates the AUX port owns them. The 8042
+/// reports this via the AUX-OUTPUT bit (status bit 5).
+extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+
+    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+    const STATUS_AUX_OUTPUT: u8 = 1 << 5;
+    const MAX_DRAIN: usize = 16;
+
+    let mut data_port: Port<u8> = Port::new(super::ps2::PS2_DATA);
+    let mut status_port: Port<u8> = Port::new(super::ps2::PS2_STATUS);
+    let mut produced_packet = false;
+
+    for _ in 0..MAX_DRAIN {
+        let status = unsafe { status_port.read() };
+        if status & STATUS_OUTPUT_FULL == 0 {
+            break;
+        }
+        // Bytes destined for the keyboard (status bit 5 = 0) cannot reach the
+        // mouse decoder cleanly. Read+discard them so we don't strand them in
+        // the buffer; the keyboard ISR will not be re-fired for an already-
+        // consumed byte, but on QEMU this branch should not be taken because
+        // IRQ1 and IRQ12 are routed independently.
+        if status & STATUS_AUX_OUTPUT == 0 {
+            let _ = unsafe { data_port.read() };
+            continue;
+        }
+        let byte = unsafe { data_port.read() };
+        if super::ps2::feed_byte_isr(byte) {
+            produced_packet = true;
+        }
+    }
+
+    // Signal IRQ12 once after draining the whole batch (one notify per
+    // burst, not per byte) so userspace `mouse_server` wakes if blocked on
+    // a notification capability.
+    if produced_packet {
+        crate::ipc::notification::signal_irq(12);
+    }
+
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Mouse as u8);
         }
     }
 }

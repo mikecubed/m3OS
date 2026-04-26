@@ -259,6 +259,15 @@ pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
 /// Phase 56 Track B.1: explicit framebuffer release syscall.
 pub const SYS_FRAMEBUFFER_RELEASE: u64 = 0x1014;
 
+/// Phase 56 Track B.2: read one decoded PS/2 mouse packet.
+pub const SYS_READ_MOUSE_PACKET: u64 = 0x1015;
+
+/// Phase 56 Track B.3: query the kernel frame-tick rate (Hz).
+pub const SYS_FRAME_TICK_HZ: u64 = 0x1016;
+
+/// Phase 56 Track B.3: drain pending frame-tick events (saturating).
+pub const SYS_FRAME_TICK_DRAIN: u64 = 0x1017;
+
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
@@ -1888,6 +1897,47 @@ pub fn framebuffer_mmap() -> u64 {
 /// mapping was found despite the owner flag being set).
 pub fn framebuffer_release() -> isize {
     unsafe { syscall0(SYS_FRAMEBUFFER_RELEASE) as isize }
+}
+
+/// Phase 56 Track B.2: read one decoded PS/2 mouse packet from the kernel.
+///
+/// `buf` must be at least 8 bytes (`MOUSE_PACKET_WIRE_SIZE`). On success the
+/// 8-byte little-endian packet wire image is copied into `buf` and the
+/// helper returns 0. Returns `-EAGAIN` (-11) when no packet is queued,
+/// `-EINVAL` (-22) for a too-small buffer, `-EFAULT` (-14) on copy failure.
+///
+/// Wire layout (8 bytes total):
+/// * `[0..2]` — `dx: i16` little-endian
+/// * `[2..4]` — `dy: i16` little-endian
+/// * `[4..5]` — `wheel: i8`
+/// * `[5..6]` — buttons bitfield: bit 0 left, bit 1 right, bit 2 middle,
+///   bit 3 x_overflow, bit 4 y_overflow, bits 5..7 reserved
+/// * `[6..8]` — reserved (zero)
+pub const MOUSE_PACKET_WIRE_SIZE: usize = 8;
+
+pub fn read_mouse_packet(buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall2(
+            SYS_READ_MOUSE_PACKET,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// Phase 56 Track B.3: query the kernel frame-tick rate in Hz.
+///
+/// Returns the configured tick rate (1..=1000). Default is 60.
+pub fn frame_tick_hz() -> u32 {
+    unsafe { syscall0(SYS_FRAME_TICK_HZ) as u32 }
+}
+
+/// Phase 56 Track B.3: drain pending frame-tick events.
+///
+/// Returns the number of frame-ticks accumulated since the last drain
+/// (saturating coalesce). Never blocks; returns 0 if no ticks elapsed.
+pub fn frame_tick_drain() -> u32 {
+    unsafe { syscall0(SYS_FRAME_TICK_DRAIN) as u32 }
 }
 
 /// Reads one raw PS/2 scancode from the keyboard ring buffer.

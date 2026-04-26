@@ -31,6 +31,7 @@ mod syscall;
 mod task;
 #[cfg(test)]
 mod testing;
+mod time;
 mod trace;
 mod tty;
 
@@ -134,6 +135,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Phase 24: Initialize virtio-blk driver.
     blk::init();
+
+    // Phase 56 Track B.2 — initialise the PS/2 AUX port (mouse) before the
+    // PIC unmasks IRQ12. The init flow polls the 8042 directly via port I/O,
+    // so it is safe to run with the PIC still masked. After
+    // `enable_interrupts()` the IRQ12 line is live and the mouse handler
+    // begins draining packets into the lock-free ring.
+    match unsafe { arch::x86_64::ps2::init_mouse() } {
+        Ok(()) => log::info!("[ps2] mouse initialised (IRQ12 ready)"),
+        Err(e) => log::warn!("[ps2] mouse init failed: {:?} — booting without mouse", e),
+    }
 
     // Enable PIC and unmask IRQs now that all subsystems are initialized.
     unsafe { arch::enable_interrupts() };

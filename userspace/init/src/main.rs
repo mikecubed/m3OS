@@ -76,6 +76,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/e1000_driver.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
+    // Phase 56 Track C.6: protocol-reference client (visual smoke).
+    b"/etc/services.d/gfx-demo.conf\0",
 ];
 
 // ---------------------------------------------------------------------------

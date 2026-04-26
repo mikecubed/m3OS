@@ -330,6 +330,10 @@ fn build_userspace_bins() {
         // `needs_alloc = true` because the daemon depends on `kernel-core`
         // and will use `alloc` types as the protocol surface lands.
         ("display_server", "display_server", true),
+        // Phase 56 Track C.6: protocol-reference client (visual smoke).
+        // `needs_alloc = true` because the demo allocates a SurfaceBuffer
+        // and links the kernel-core protocol codec.
+        ("gfx-demo", "gfx-demo", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1937,6 +1941,8 @@ fn cmd_check() {
         "driver_runtime",
         // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
         "nvme_driver",
+        // Phase 56 Track B.4 — userspace surface-buffer helper
+        "surface_buffer",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -5210,6 +5216,13 @@ fn populate_ext2_files(
     // still under development.
     let display_server_conf = "name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n";
 
+    // Phase 56 Track C.6: protocol-reference client (visual smoke). Started
+    // as a supervised daemon so init brings it up automatically after the
+    // `display` service registers; max_restart=3 is a tighter budget than
+    // `display_server` since this is a smoke client, not a load-bearing
+    // service.
+    let gfx_demo_conf = "name=gfx-demo\ncommand=/bin/gfx-demo\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -5231,6 +5244,7 @@ fn populate_ext2_files(
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
+    let gfx_demo_conf_tmp = output_dir.join("_tmp_gfx_demo_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -5250,6 +5264,7 @@ fn populate_ext2_files(
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
+    fs::write(&gfx_demo_conf_tmp, gfx_demo_conf).expect("write temp gfx-demo.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -5477,6 +5492,10 @@ fn populate_ext2_files(
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
          sif etc/services.d/display_server.conf gid 0\n\
+         write \"{gfx_demo_conf}\" etc/services.d/gfx-demo.conf\n\
+         sif etc/services.d/gfx-demo.conf mode 0x81A4\n\
+         sif etc/services.d/gfx-demo.conf uid 0\n\
+         sif etc/services.d/gfx-demo.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5500,6 +5519,7 @@ fn populate_ext2_files(
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
+        gfx_demo_conf = gfx_demo_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,

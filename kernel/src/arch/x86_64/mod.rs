@@ -3,6 +3,7 @@ use core::arch::global_asm;
 pub mod apic;
 pub mod gdt;
 pub mod interrupts;
+pub mod ps2;
 pub mod syscall;
 
 /// Initialize the GDT/TSS, IDT, and syscall gate.

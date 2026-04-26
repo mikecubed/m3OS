@@ -65,8 +65,12 @@ members = [
     "userspace/max-restart-smoke",
     # Phase 55b Track F.3d-3 — e1000 crash-and-restart end-to-end smoke client
     "userspace/e1000-crash-smoke",
+    # Phase 56 Track B.4 — userspace surface-buffer helper crate
+    "userspace/lib/surface_buffer",
     # Phase 56 Track C — display service (compositor)
     "userspace/display_server",
+    # Phase 56 Track C.6 — protocol-reference client (visual smoke)
+    "userspace/gfx-demo",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
