@@ -9,10 +9,12 @@
 
 pub mod buffer;
 pub mod compose;
+pub mod control;
 pub mod cursor;
 pub mod fb_owner;
 pub mod frame_tick;
 pub mod layer;
 pub mod layout;
 pub mod protocol;
+pub mod stats;
 pub mod surface;
