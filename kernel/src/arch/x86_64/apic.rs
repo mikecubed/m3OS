@@ -282,6 +282,49 @@ fn ioapic_init() {
             }
         }
 
+        // --- Mouse: ISA IRQ 12 → vector 44 (`InterruptIndex::Mouse`) ---
+        //
+        // Phase 56 follow-up: PS/2 AUX (mouse) on the i8042 sits on
+        // ISA IRQ 12. The 8259 PIC was already unmasking this line in
+        // `pic_init_and_unmask` so PIC-only boots worked, but
+        // `disable_legacy_pic()` (called below in `init`) masks the
+        // PIC entirely once APIC takes over. Without an I/O APIC
+        // redirection entry for IRQ 12, mouse interrupts silently
+        // disappear post-handoff: `init_mouse()` (port-I/O only)
+        // succeeds and logs `IRQ12 ready`, but the IRQ never actually
+        // fires, `mouse_handler` never runs, `MOUSE_PACKET_RING`
+        // stays empty, and `mouse_server`'s pull always returns the
+        // timeout sentinel — so the cursor in display_server stays
+        // pinned at (0, 0). Routing IRQ 12 → vector 44 here closes
+        // that gap on QEMU's q35 (which always presents APIC).
+        {
+            let (gsi, active_low, level_triggered) =
+                if let Some(ovr) = crate::acpi::irq_override(12) {
+                    let (al, lt) = decode_override_flags(ovr.flags);
+                    (ovr.global_system_interrupt, al, lt)
+                } else {
+                    (gsi_base + 12, false, false)
+                };
+            if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
+                let low = redir_entry_low(44, active_low, level_triggered, false);
+                ioapic_write_redir(pin, low, bsp_lapic_id);
+                log::info!(
+                    "[apic] I/O APIC: IRQ 12 → GSI {} (pin {}) → vector 44 (active_low={}, level={})",
+                    gsi,
+                    pin,
+                    active_low,
+                    level_triggered
+                );
+            } else {
+                log::warn!(
+                    "[apic] I/O APIC: IRQ 12 GSI {} not routable (base={}, max_pin={}); skipped",
+                    gsi,
+                    gsi_base,
+                    max_redir
+                );
+            }
+        }
+
         // --- Timer: ISA IRQ 0 ---
         // The PIT timer (IRQ 0) may have an override (QEMU maps it to GSI 2).
         // We route it to vector 32 so the existing timer handler works, but the
