@@ -310,6 +310,9 @@ fn build_userspace_bins() {
         // Phase 56 Track D.1: kbd_server now depends on kernel-core::input::keymap
         // and emits KeyEvent payloads, so it requires the alloc-enabled build.
         ("kbd_server", "kbd_server", true), // Phase 52 / 56: ring-3 keyboard (alloc for kernel-core dep)
+        // Phase 56 Track D.2: mouse_server depends on kernel-core
+        // (ButtonTracker, decode_packet, PointerEvent codec) so needs_alloc.
+        ("mouse_server", "mouse_server", true), // Phase 56 D.2: ring-3 mouse (alloc for kernel-core dep)
         ("stdin_feeder", "stdin_feeder", false), // Phase 52: ring-3 stdin
         ("fat_server", "fat_server", true), // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true), // Phase 54: ring-3 VFS service (alloc)
@@ -5196,6 +5199,13 @@ fn populate_ext2_files(
     let kbd_conf = "name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n";
     let stdin_feeder_conf = "name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n";
 
+    // Phase 56 Track D.2: ring-3 mouse service. PS/2 AUX (IRQ 12) producer.
+    // depends=display so display_server is registered and ready to receive
+    // events as soon as mouse_server begins publishing them. Restart shape
+    // mirrors display_server: on-failure with a small budget while the
+    // input-event protocol is still under development.
+    let mouse_server_conf = "name=mouse_server\ncommand=/bin/mouse_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+
     // Phase 54: storage service definitions.
     let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\nuser=200\n";
     let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=fat\nuser=200\n";
@@ -5239,6 +5249,7 @@ fn populate_ext2_files(
     let crond_conf_tmp = output_dir.join("_tmp_crond_conf");
     let console_conf_tmp = output_dir.join("_tmp_console_conf");
     let kbd_conf_tmp = output_dir.join("_tmp_kbd_conf");
+    let mouse_server_conf_tmp = output_dir.join("_tmp_mouse_server_conf");
     let stdin_feeder_conf_tmp = output_dir.join("_tmp_stdin_feeder_conf");
     let fat_server_conf_tmp = output_dir.join("_tmp_fat_server_conf");
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
@@ -5258,6 +5269,8 @@ fn populate_ext2_files(
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
     fs::write(&console_conf_tmp, console_conf).expect("write temp console.conf");
     fs::write(&kbd_conf_tmp, kbd_conf).expect("write temp kbd.conf");
+    fs::write(&mouse_server_conf_tmp, mouse_server_conf)
+        .expect("write temp mouse_server.conf");
     fs::write(&stdin_feeder_conf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
@@ -5466,6 +5479,10 @@ fn populate_ext2_files(
          sif etc/services.d/kbd.conf mode 0x81A4\n\
          sif etc/services.d/kbd.conf uid 0\n\
          sif etc/services.d/kbd.conf gid 0\n\
+         write \"{mouse_server_conf}\" etc/services.d/mouse_server.conf\n\
+         sif etc/services.d/mouse_server.conf mode 0x81A4\n\
+         sif etc/services.d/mouse_server.conf uid 0\n\
+         sif etc/services.d/mouse_server.conf gid 0\n\
          write \"{stdin_feeder_conf}\" etc/services.d/stdin_feeder.conf\n\
          sif etc/services.d/stdin_feeder.conf mode 0x81A4\n\
          sif etc/services.d/stdin_feeder.conf uid 0\n\
@@ -5514,6 +5531,7 @@ fn populate_ext2_files(
         crond_conf = crond_conf_tmp.display(),
         console_conf = console_conf_tmp.display(),
         kbd_conf = kbd_conf_tmp.display(),
+        mouse_server_conf = mouse_server_conf_tmp.display(),
         stdin_feeder_conf = stdin_feeder_conf_tmp.display(),
         fat_server_conf = fat_server_conf_tmp.display(),
         vfs_server_conf = vfs_server_conf_tmp.display(),

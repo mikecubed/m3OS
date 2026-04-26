@@ -181,6 +181,9 @@ static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
 // Phase 52: ring-3 extracted services
 static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
 static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
+// Phase 56 Track D.2: ring-3 mouse service. PS/2 AUX (IRQ 12) producer of
+// PointerEvent messages on the `mouse` IPC service.
+static MOUSE_SERVER_ELF: &[u8] = generated_initrd_asset!("mouse_server");
 static STDIN_FEEDER_ELF: &[u8] = generated_initrd_asset!("stdin_feeder");
 static FAT_SERVER_ELF: &[u8] = generated_initrd_asset!("fat_server");
 static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
@@ -319,6 +322,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "kbd_server",
         RamdiskNode::File {
             content: KBD_SERVER_ELF,
+        },
+    ),
+    // Phase 56 Track D.2: ring-3 mouse service.
+    (
+        "mouse_server",
+        RamdiskNode::File {
+            content: MOUSE_SERVER_ELF,
         },
     ),
     (
