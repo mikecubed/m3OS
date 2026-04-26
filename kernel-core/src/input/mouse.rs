@@ -196,6 +196,131 @@ impl Ps2MouseDecoder {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 56 Track D.2 — Pointer button-edge tracker (test-first stubs)
+// ---------------------------------------------------------------------------
+//
+// These declarations exist in their failing-test-friendly form: the type
+// surface compiles so the unit tests can be written against the public API
+// before any behavior lands. `update` returns the empty transition set
+// regardless of input, so every meaningful test in the test module fails
+// at runtime. The follow-up commit replaces these stubs with the real
+// state machine.
+
+/// Three-button state snapshot (left, right, middle).
+///
+/// Used by [`ButtonTracker`] as both the input (state at the end of a fresh
+/// `MousePacket`) and the cached previous state used to detect transitions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonState {
+    /// Left mouse button currently pressed.
+    pub left: bool,
+    /// Right mouse button currently pressed.
+    pub right: bool,
+    /// Middle mouse button currently pressed.
+    pub middle: bool,
+}
+
+impl ButtonState {
+    /// Project a freshly decoded [`MousePacket`] onto its 3-button state.
+    pub const fn from_packet(_packet: &MousePacket) -> Self {
+        // Stub: real impl reads packet.{left, right, middle}.
+        Self {
+            left: false,
+            right: false,
+            middle: false,
+        }
+    }
+}
+
+/// Stable button index used in [`ButtonTransition`].
+///
+/// Indices follow the m3OS convention agreed in the Phase 56 D.2 design note:
+/// `0 = left`, `1 = right`, `2 = middle`. This mirrors how PS/2 reports the
+/// three buttons in its status byte and is what `display_server` (D.3)
+/// expects when interpreting `PointerButton::Down(idx)` / `Up(idx)`.
+pub const BUTTON_INDEX_LEFT: u8 = 0;
+/// Stable button index for right mouse button. See [`BUTTON_INDEX_LEFT`].
+pub const BUTTON_INDEX_RIGHT: u8 = 1;
+/// Stable button index for middle mouse button. See [`BUTTON_INDEX_LEFT`].
+pub const BUTTON_INDEX_MIDDLE: u8 = 2;
+
+/// A single button-edge transition emitted by [`ButtonTracker::update`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ButtonTransition {
+    /// Button at the given index just transitioned to pressed.
+    Down(u8),
+    /// Button at the given index just transitioned to released.
+    Up(u8),
+}
+
+/// Fixed-capacity holder for button transitions emitted by one packet.
+///
+/// At most three buttons can change per packet (one per left/right/middle).
+/// We surface a `[Option<ButtonTransition>; 3]` array rather than allocating
+/// so `mouse_server` can iterate without touching the heap on the hot path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonTransitions {
+    transitions: [Option<ButtonTransition>; 3],
+}
+
+impl ButtonTransitions {
+    /// Iterate over the present transitions in stable left-right-middle order.
+    pub fn iter(&self) -> impl Iterator<Item = ButtonTransition> + '_ {
+        self.transitions.iter().filter_map(|t| *t)
+    }
+
+    /// Number of present transitions (0..=3).
+    pub fn len(&self) -> usize {
+        self.transitions.iter().filter(|t| t.is_some()).count()
+    }
+
+    /// True when no transitions were emitted on this packet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Pure-logic button-edge state machine for `mouse_server`.
+///
+/// PS/2 packets carry the *current* button-down state, not edges. The
+/// userspace mouse pipeline must compute edges itself so `display_server` and
+/// downstream clients see explicit `PointerButton::Down(idx)` /
+/// `PointerButton::Up(idx)` events instead of having to diff button bits
+/// across packets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonTracker {
+    prev: ButtonState,
+}
+
+impl ButtonTracker {
+    /// Construct a tracker assuming all buttons are released.
+    pub const fn new() -> Self {
+        Self {
+            prev: ButtonState {
+                left: false,
+                right: false,
+                middle: false,
+            },
+        }
+    }
+
+    /// Snapshot of the last observed state.
+    pub const fn state(&self) -> ButtonState {
+        self.prev
+    }
+
+    /// Feed the freshly decoded button state and return the resulting edges.
+    ///
+    /// Stub returns an empty transition set; tests fail until the real
+    /// state-machine impl lands in the follow-up commit.
+    pub fn update(&mut self, _new_state: ButtonState) -> ButtonTransitions {
+        // Intentional stub: do not mutate self.prev, do not compare states.
+        // The follow-up impl commit makes the pure-logic tests green.
+        ButtonTransitions::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wire encoding for `sys_read_mouse_packet` (Phase 56 Track B.2)
 // ---------------------------------------------------------------------------
 
@@ -503,5 +628,170 @@ mod tests {
         assert_eq!(buf[4], 0xFF);
         assert_eq!(buf[5], 0b0001_0101);
         assert_eq!(buf[6..8], [0u8, 0u8]);
+    }
+
+    // ---- Phase 56 D.2 — ButtonTracker -------------------------------------
+
+    fn state(left: bool, right: bool, middle: bool) -> ButtonState {
+        ButtonState {
+            left,
+            right,
+            middle,
+        }
+    }
+
+    #[test]
+    fn button_tracker_starts_with_no_buttons_pressed() {
+        let t = ButtonTracker::new();
+        assert_eq!(t.state(), ButtonState::default());
+    }
+
+    #[test]
+    fn button_tracker_emits_no_transitions_when_state_unchanged() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(false, false, false));
+        assert!(out.is_empty());
+        assert_eq!(out.len(), 0);
+        assert_eq!(out.iter().count(), 0);
+    }
+
+    #[test]
+    fn button_tracker_left_press_emits_down_edge_with_left_index() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(true, false, false));
+        assert_eq!(out.len(), 1);
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_LEFT)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_left_release_emits_up_edge() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, false, false));
+        let out = t.update(state(false, false, false));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![ButtonTransition::Up(BUTTON_INDEX_LEFT)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_holding_emits_no_repeat_edges() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, false, false));
+        let out_a = t.update(state(true, false, false));
+        let out_b = t.update(state(true, false, false));
+        assert!(out_a.is_empty());
+        assert!(out_b.is_empty());
+    }
+
+    #[test]
+    fn button_tracker_right_and_middle_have_distinct_indices() {
+        let mut t = ButtonTracker::new();
+
+        let out_r = t.update(state(false, true, false));
+        let collected_r: alloc::vec::Vec<_> = out_r.iter().collect();
+        assert_eq!(
+            collected_r,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_RIGHT)]
+        );
+
+        let out_m = t.update(state(false, true, true));
+        let collected_m: alloc::vec::Vec<_> = out_m.iter().collect();
+        assert_eq!(
+            collected_m,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_MIDDLE)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_simultaneous_press_emits_in_left_right_middle_order() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(true, true, true));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![
+                ButtonTransition::Down(BUTTON_INDEX_LEFT),
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT),
+                ButtonTransition::Down(BUTTON_INDEX_MIDDLE),
+            ]
+        );
+    }
+
+    #[test]
+    fn button_tracker_mixed_press_release_emits_correct_edges() {
+        let mut t = ButtonTracker::new();
+        // Start with left+middle held.
+        let _ = t.update(state(true, false, true));
+        // Now release left, press right; middle stays held.
+        let out = t.update(state(false, true, true));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![
+                ButtonTransition::Up(BUTTON_INDEX_LEFT),
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT),
+            ]
+        );
+    }
+
+    #[test]
+    fn button_tracker_state_reflects_last_observation() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, true, false));
+        assert_eq!(t.state(), state(true, true, false));
+        let _ = t.update(state(false, true, true));
+        assert_eq!(t.state(), state(false, true, true));
+    }
+
+    #[test]
+    fn button_state_from_packet_extracts_three_button_bits_only() {
+        let p = MousePacket {
+            dx: 5,
+            dy: -2,
+            wheel: 1,
+            left: true,
+            right: false,
+            middle: true,
+            x_overflow: true,
+            y_overflow: false,
+        };
+        assert_eq!(ButtonState::from_packet(&p), state(true, false, true));
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_button_tracker_produces_at_most_three_edges(
+            seq in proptest::collection::vec((any::<bool>(), any::<bool>(), any::<bool>()), 0..256)
+        ) {
+            let mut t = ButtonTracker::new();
+            for (l, r, m) in seq {
+                let out = t.update(state(l, r, m));
+                prop_assert!(out.len() <= 3);
+                prop_assert!(out.iter().count() == out.len());
+                // After update, the cached state must equal the input.
+                prop_assert_eq!(t.state(), state(l, r, m));
+            }
+        }
+
+        #[test]
+        fn proptest_button_tracker_idempotent_under_no_change(
+            initial in (any::<bool>(), any::<bool>(), any::<bool>()),
+            repeats in 1usize..=10
+        ) {
+            let (l, r, m) = initial;
+            let mut t = ButtonTracker::new();
+            // Prime tracker.
+            let _ = t.update(state(l, r, m));
+            for _ in 0..repeats {
+                let out = t.update(state(l, r, m));
+                prop_assert!(out.is_empty());
+            }
+        }
     }
 }
