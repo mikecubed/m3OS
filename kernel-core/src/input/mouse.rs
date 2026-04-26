@@ -383,6 +383,34 @@ pub fn encode_packet(packet: &MousePacket, out: &mut [u8; MOUSE_PACKET_WIRE_SIZE
     out[7] = 0;
 }
 
+/// Decode a [`MousePacket`] from the 8-byte wire image written by
+/// [`encode_packet`].
+///
+/// Phase 56 Track D.2: this is the inverse of [`encode_packet`] and is the
+/// canonical entry point used by `mouse_server` after a successful
+/// `sys_read_mouse_packet` (0x1015) syscall. The 8-byte buffer must have the
+/// exact layout documented on [`encode_packet`].
+///
+/// Decoding cannot fail — every bit pattern in the 8-byte input maps to a
+/// well-formed `MousePacket` (the unused bits 5..7 of the buttons byte and
+/// reserved bytes 6..8 are simply ignored).
+pub fn decode_packet(buf: &[u8; MOUSE_PACKET_WIRE_SIZE]) -> MousePacket {
+    let dx = i16::from_le_bytes([buf[0], buf[1]]);
+    let dy = i16::from_le_bytes([buf[2], buf[3]]);
+    let wheel = buf[4] as i8;
+    let buttons = buf[5];
+    MousePacket {
+        dx,
+        dy,
+        wheel,
+        left: (buttons & (1 << 0)) != 0,
+        right: (buttons & (1 << 1)) != 0,
+        middle: (buttons & (1 << 2)) != 0,
+        x_overflow: (buttons & (1 << 3)) != 0,
+        y_overflow: (buttons & (1 << 4)) != 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +675,99 @@ mod tests {
         assert_eq!(buf[4], 0xFF);
         assert_eq!(buf[5], 0b0001_0101);
         assert_eq!(buf[6..8], [0u8, 0u8]);
+    }
+
+    // ---- Phase 56 D.2 — decode_packet (wire decoder) ----------------------
+
+    #[test]
+    fn decode_packet_zero_round_trips() {
+        let p = MousePacket::default();
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_motion_and_buttons_round_trips() {
+        let p = MousePacket {
+            dx: -3,
+            dy: 7,
+            wheel: -1,
+            left: true,
+            right: false,
+            middle: true,
+            x_overflow: false,
+            y_overflow: true,
+        };
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_extreme_deltas_round_trip() {
+        let p = MousePacket {
+            dx: i16::MIN,
+            dy: i16::MAX,
+            wheel: i8::MIN,
+            left: true,
+            right: true,
+            middle: true,
+            x_overflow: true,
+            y_overflow: true,
+        };
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_ignores_reserved_button_bits_and_reserved_bytes() {
+        // Construct a wire image with reserved bits set; the decoded
+        // packet must match the wire fields exactly and be insensitive
+        // to bits 5..=7 of the buttons byte and bytes 6..8.
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&5i16.to_le_bytes());
+        buf[2..4].copy_from_slice(&(-2i16).to_le_bytes());
+        buf[4] = 1u8; // wheel +1
+        // Buttons: left + middle, plus reserved bit 7 set (should be ignored).
+        buf[5] = (1 << 0) | (1 << 2) | (1 << 7);
+        // Stray reserved bytes 6..8 — must be ignored on decode.
+        buf[6] = 0xAB;
+        buf[7] = 0xCD;
+        let p = decode_packet(&buf);
+        assert_eq!(p.dx, 5);
+        assert_eq!(p.dy, -2);
+        assert_eq!(p.wheel, 1);
+        assert!(p.left);
+        assert!(!p.right);
+        assert!(p.middle);
+        assert!(!p.x_overflow);
+        assert!(!p.y_overflow);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_encode_decode_round_trip(
+            dx in any::<i16>(),
+            dy in any::<i16>(),
+            wheel in any::<i8>(),
+            buttons in any::<u8>(),
+        ) {
+            let p = MousePacket {
+                dx,
+                dy,
+                wheel,
+                left: (buttons & (1 << 0)) != 0,
+                right: (buttons & (1 << 1)) != 0,
+                middle: (buttons & (1 << 2)) != 0,
+                x_overflow: (buttons & (1 << 3)) != 0,
+                y_overflow: (buttons & (1 << 4)) != 0,
+            };
+            let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+            encode_packet(&p, &mut buf);
+            prop_assert_eq!(decode_packet(&buf), p);
+        }
     }
 
     // ---- Phase 56 D.2 — ButtonTracker -------------------------------------
