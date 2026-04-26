@@ -50,11 +50,16 @@
 //! SurfaceDestroyed / FocusChanged / BindTriggered), it iterates the
 //! [`ControlSubscriptions`] registry and pushes a serialized
 //! [`ControlEvent`] onto each subscribed connection's outbound channel.
-//! Real transmission to the client is the same C.5 deferred bulk-drain
-//! gap that blocks D.3's input-event delivery — see the
-//! `TODO(C.5-bulk-drain)` markers below. The subscription registry +
-//! event-push code is structurally complete; runtime delivery is
-//! dormant until the bulk-drain helper lands.
+//!
+//! The Phase 56 close-out resolves the bulk-drain gap so request/reply
+//! verbs (`m3ctl version`, `list-surfaces`, etc.) work end-to-end.
+//! Server-initiated push of subscribed events to a connected client is
+//! a separate deferral — it needs either a polling verb (`drain-events`
+//! that the client periodically calls) or a cap-transfer at subscribe
+//! time so the server holds a send-cap to the subscriber's endpoint.
+//! See the `TODO(subscription-push)` markers on the `publish_*`
+//! helpers. The subscription registry + event-push code is structurally
+//! complete and host-tested; only the wire transmission remains.
 
 extern crate alloc;
 
@@ -552,12 +557,14 @@ pub fn publish_surface_created(
     registry: &SurfaceRegistry,
     surface_id: SurfaceId,
 ) {
-    // TODO(C.5-bulk-drain): runtime transmission of subscribed events
-    // back to the m3ctl client is the same deferred sibling work that
-    // blocks D.3's input-event delivery. The subscription registry
-    // (this module) is structurally complete; runtime drain wires up
-    // when `syscall_lib::ipc_take_pending_bulk` (or the equivalent
-    // userspace bulk-drain helper) lands.
+    // TODO(subscription-push): server-initiated push of subscribed events
+    // back to the m3ctl client. Phase 56 close-out resolved the bulk-
+    // drain gap (replies work end-to-end) but server-initiated push to
+    // a subscriber needs either a polling verb (`drain-events`) or a
+    // cap-transfer at subscribe time so the server holds a send-cap to
+    // the subscriber's endpoint. Distinct from the bulk-drain gap; this
+    // is a separate deferral. The subscription registry below is
+    // structurally complete and exercised by host tests.
     let role_tag = registry
         .surface_role(surface_id)
         .map(role_tag_for)
@@ -570,20 +577,20 @@ pub fn publish_surface_created(
 
 /// Convenience: publish a `SurfaceDestroyed` event.
 pub fn publish_surface_destroyed(subs: &mut ControlSubscriptions, surface_id: SurfaceId) {
-    // TODO(C.5-bulk-drain): see publish_surface_created.
+    // TODO(subscription-push): see publish_surface_created.
     subs.publish(ControlEvent::SurfaceDestroyed { surface_id });
 }
 
 /// Convenience: publish a `FocusChanged` event.
 pub fn publish_focus_changed(subs: &mut ControlSubscriptions, focused: Option<SurfaceId>) {
-    // TODO(C.5-bulk-drain): see publish_surface_created.
+    // TODO(subscription-push): see publish_surface_created.
     subs.publish(ControlEvent::FocusChanged { focused });
 }
 
 /// Convenience: publish a `BindTriggered` event. The `(mask, keycode)`
 /// pair on the wire matches the registration the bind originated from.
 pub fn publish_bind_triggered(subs: &mut ControlSubscriptions, modifier_mask: u16, keycode: u32) {
-    // TODO(C.5-bulk-drain): see publish_surface_created.
+    // TODO(subscription-push): see publish_surface_created.
     subs.publish(ControlEvent::BindTriggered {
         modifier_mask,
         keycode,

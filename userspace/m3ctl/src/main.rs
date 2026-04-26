@@ -121,34 +121,60 @@ fn program_main(args: &[&str]) -> i32 {
         }
     };
 
-    // Send the command + receive the reply. Phase 56's IPC reply
-    // surface returns only the reply *label*; the encoded
-    // `ControlEvent` reply travels in the bulk slot the kernel
-    // staged via `ipc_store_reply_bulk`. The userspace bulk-drain
-    // helper that exposes that slot is the same C.5 follow-up that
-    // gates the display_server's input-event delivery — see
-    // `display_server::input::lookup_with_backoff`'s TODO. Until
-    // then we issue the call and rely on the request side's
-    // round-trip to confirm the dispatcher is reachable.
+    // Send the command + receive the reply. The encoded
+    // `ControlEvent` reply travels in the kernel-staged bulk slot;
+    // `ipc_call_buf` returns the reply *label* and
+    // `ipc_take_pending_bulk` (Phase 56 close-out, syscall 0x1112)
+    // drains the staged bytes into a caller-supplied buffer.
     let reply_label = syscall_lib::ipc_call_buf(handle, LABEL_CTL_CMD, 0, &req_buf[..req_len]);
     if reply_label == u64::MAX {
         print_str("m3ctl: ipc_call_buf failed\n");
         return 1;
     }
 
-    // TODO(C.5-bulk-drain): the `display_server` stages a reply
-    // bulk via `ipc_store_reply_bulk` containing the encoded
-    // `ControlEvent`. Once `syscall_lib::ipc_take_pending_bulk`
-    // (or equivalent) lands, replace the synthetic reply below
-    // with the real decoded event.
-    let synthetic_reply = synthetic_reply_for(&cmd);
-    print_event(&synthetic_reply);
+    // Drain the kernel-staged reply bulk. Buffer sized to
+    // `MAX_BULK_BYTES = 4096` (matches kernel `MAX_BULK_LEN`); the
+    // largest Phase 56 control reply (`SurfaceListReply` /
+    // `FrameStatsReply`) fits well within that.
+    let mut reply_buf = vec![0u8; MAX_BULK_BYTES];
+    let n = syscall_lib::ipc_take_pending_bulk(&mut reply_buf);
+    if n == u64::MAX {
+        print_str("m3ctl: ipc_take_pending_bulk failed\n");
+        return 1;
+    }
+    if n == 0 {
+        // Server replied with no bulk payload. Some verbs are
+        // legitimately void-reply (e.g. Subscribe → Ack via the
+        // event stream, not the response bulk). Fall back to the
+        // synthetic reply for verbs whose ack shape is well-known.
+        let fallback = synthetic_reply_for(&cmd);
+        print_event(&fallback);
+        return 0;
+    }
 
-    // Suppress unused warnings until the real bulk-drain lands —
-    // both `decode_event` and the scratch-buffer constant are
-    // referenced via the `_decode_event_keepalive` /
-    // `_scratch_buf_keepalive` shims at the bottom of this file.
+    let used = n as usize;
+    match decode_event(&reply_buf[..used]) {
+        Ok((ev, _)) => print_event(&ev),
+        Err(err) => {
+            print_str("m3ctl: failed to decode reply: ");
+            print_str(control_error_label(err));
+            print_str("\n");
+            return 1;
+        }
+    }
+
     0
+}
+
+fn control_error_label(err: ControlError) -> &'static str {
+    match err {
+        ControlError::UnknownVerb { .. } => "unknown-verb",
+        ControlError::MalformedFrame => "malformed-frame",
+        ControlError::BadArgs { .. } => "bad-args",
+        // ControlError is `#[non_exhaustive]`; future variants surface
+        // as a generic label rather than panicking.
+        _ => "control-error",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,22 +442,6 @@ fn print_usage() {
            unregister-bind <mask> <keycode> Unregister a keybind\n  \
            subscribe <kind>                Subscribe to event-stream of <kind>\n",
     );
-}
-
-// ---------------------------------------------------------------------------
-// Suppress dead-code warnings on imports that will be consumed once
-// the userspace bulk-drain helper lands and the synthetic-reply path
-// is replaced with real decode_event(reply_bulk).
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-fn _decode_event_keepalive(bytes: &[u8]) -> Result<(ControlEvent, usize), ControlError> {
-    decode_event(bytes)
-}
-
-#[allow(dead_code)]
-fn _scratch_buf_keepalive() -> Vec<u8> {
-    vec![0u8; MAX_BULK_BYTES]
 }
 
 #[panic_handler]

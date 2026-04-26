@@ -134,11 +134,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // Phase 56 Track E.4 — second IPC endpoint for the control socket.
     // The endpoint is registered as `"display-control"` so `m3ctl`
     // (and any future native bar / launcher client) can locate it via
-    // `ipc_lookup_service`. The codec, dispatcher, and subscription
-    // registry are wired below; the per-iteration recv from this
-    // endpoint is gated on the same C.5 bulk-drain seam that gates
-    // D.3's input event delivery (see the `TODO(C.5-bulk-drain)`
-    // marker at the bottom of the loop).
+    // `ipc_lookup_service`. The codec, dispatcher, subscription
+    // registry, and runtime byte-flow are all wired: each loop
+    // iteration `serve_one_control_request` non-blocking-recvs one
+    // pending request via `SYS_IPC_TRY_RECV_MSG` and stages a reply
+    // bulk via `ipc_store_reply_bulk` + `ipc_reply`. Subscription
+    // *event* push (server → client) remains deferred (see
+    // `control::publish_*` TODO markers) — it needs a separate
+    // cap-transfer or polling design.
     let ctl_ep_handle = syscall_lib::create_endpoint();
     if ctl_ep_handle == u64::MAX {
         syscall_lib::write_str(
@@ -518,34 +521,94 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // unable to follow real mouse motion through D.2.
 
         // Track E.4 — service one pending control-endpoint message
-        // per iteration if any has arrived. Phase 56's IPC surface
-        // does not expose a non-blocking try-recv, so until that
-        // helper lands the control-endpoint recv is the same
-        // C.5-bulk-drain seam blocking D.3 input delivery: the
-        // endpoint is registered (so `ipc_lookup_service(
-        // "display-control")` works), the codec + dispatcher +
-        // subscription registry are all complete and exercised by
-        // host tests, and the runtime drain is dormant pending the
-        // bulk-drain follow-up. `serve_control_iter` exists as the
-        // structurally-complete dispatch wrapper so the remaining
-        // change at C.5-drain landing time is a single
-        // call-site flip from "skip" to "serve_control_iter(...)".
-        //
-        // The reference shapes below silence "unused_mut" /
-        // "unused_variables" without invoking any I/O; every binding
-        // is exercised by `serve_control_iter`'s host tests once the
-        // recv path lands.
-        let _ = (
+        // per iteration if any has arrived. Phase 56 close-out wires
+        // the `SYS_IPC_TRY_RECV_MSG` non-blocking recv (kernel syscall
+        // 0x1113) so the main loop can multiplex frame-tick driving
+        // and control-endpoint serving without blocking.
+        serve_one_control_request(
             ctl_ep_handle,
-            &mut control_subs,
+            &registry,
             &mut bind_table,
+            &mut control_subs,
             &frame_stats,
             debug_crash,
         );
-        // TODO(C.5-bulk-drain): replace the above no-op with a
-        // notif-bind multiplex'd recv on the control endpoint.
     }
 }
+
+/// Phase 56 close-out — try-recv one control-endpoint message and serve
+/// it. Returns immediately if no client is waiting (so the main loop
+/// stays responsive to frame ticks).
+///
+/// On a pending request:
+/// 1. `ipc_try_recv_msg` drains the request label + bulk into local
+///    buffers.
+/// 2. `serve_control_iter` decodes the `ControlCommand`, dispatches
+///    against compositor state, encodes the `ControlEvent` reply.
+/// 3. `ipc_store_reply_bulk` stages the reply bytes.
+/// 4. `ipc_reply` with `LABEL_CTL_REPLY` wakes the caller; the kernel
+///    transfers the staged bulk to the caller's `pending_bulk` slot,
+///    where `m3ctl` drains it via `ipc_take_pending_bulk`.
+///
+/// On any decode / dispatch error a structured `ControlEvent::Error`
+/// reply is sent so clients always observe a well-formed frame.
+fn serve_one_control_request(
+    ep_handle: u32,
+    registry: &SurfaceRegistry,
+    bind_table: &mut BindTable,
+    subscriptions: &mut control::ControlSubscriptions,
+    frame_stats: &FrameStatsRing,
+    debug_crash: DebugCrashPolicy,
+) {
+    let mut header = syscall_lib::IpcMessage::new(0);
+    let mut req_buf = [0u8; control::MAX_BULK_BYTES];
+    let label = syscall_lib::ipc_try_recv_msg(ep_handle, &mut header, &mut req_buf);
+    if label == u64::MAX {
+        // No pending request OR transport error. Either way: skip
+        // this iteration; the next frame-tick poll will retry.
+        return;
+    }
+    if label != control::LABEL_CTL_CMD {
+        // Unknown label. Stage an error reply so the client can
+        // observe the protocol violation.
+        let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
+        let n = encode_event_or_drop(
+            &kernel_core::display::control::ControlEvent::Error {
+                code: kernel_core::display::control::ControlErrorCode::UnknownVerb,
+            },
+            &mut reply_buf,
+        );
+        if n > 0 {
+            let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
+        }
+        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, control::LABEL_CTL_REPLY, 0);
+        return;
+    }
+
+    // Bulk size lives in the message's data[1] (set by ipc_send_with_bulk).
+    let bulk_len = header.data[1] as usize;
+    let bulk_len = bulk_len.min(req_buf.len());
+
+    let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
+    let client = control::ClientId(0); // Phase 56 single-client.
+    let n = serve_control_iter(
+        &req_buf[..bulk_len],
+        client,
+        registry,
+        bind_table,
+        subscriptions,
+        frame_stats,
+        debug_crash,
+        &mut reply_buf,
+    );
+    if n > 0 {
+        let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
+    }
+    let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, control::LABEL_CTL_REPLY, 0);
+}
+
+/// Reply-cap slot for `ipc_reply`. Same convention as kbd_server / mouse_server.
+const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Phase 56 Track E.4 — single-iteration control-endpoint dispatch
 /// helper. Decodes one `ControlCommand` from `bulk`, invokes the
@@ -557,11 +620,9 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
 /// On any codec or dispatch error, the helper still produces an
 /// encoded `Error` event so the client always receives a reply.
 ///
-/// Today this is reachable from the dispatcher's host tests; the
-/// `main` loop does not yet wire it because the IPC surface lacks a
-/// non-blocking try-recv. See the `TODO(C.5-bulk-drain)` marker in
-/// `program_main`.
-#[allow(dead_code)]
+/// The Phase 56 close-out wires this from `serve_one_control_request`
+/// using the new `SYS_IPC_TRY_RECV_MSG` syscall to multiplex frame-tick
+/// driving and control-endpoint serving in the same single-threaded loop.
 fn serve_control_iter(
     bulk: &[u8],
     client: control::ClientId,

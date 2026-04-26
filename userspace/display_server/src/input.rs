@@ -40,22 +40,21 @@
 //! legacy `KBD_READ = 1` text-mode label on the same endpoint;
 //! `mouse_server` has no legacy label, so it starts at 1.)
 //!
-//! ## Reply-bulk plumbing (deferred)
+//! ## Reply-bulk drain (Phase 56 close-out)
 //!
-//! The kernel already transfers the typed-event bulk to the caller's
+//! The kernel transfers the typed-event bulk to the caller's
 //! `pending_bulk` slot when the server `ipc_reply`s with
-//! `ipc_store_reply_bulk`. Userspace cannot yet drain that slot; the
-//! existing kernel-side `RemoteBlockDevice` path uses
-//! `scheduler::take_bulk_data` directly, which has no userspace
-//! syscall analogue today.
+//! `ipc_store_reply_bulk`. The Phase 56 close-out adds
+//! `syscall_lib::ipc_take_pending_bulk` (kernel syscall `0x1112`) which
+//! drains that slot into a user-supplied buffer. `KbdInputSource::poll_key`
+//! and `MouseInputSource::poll_pointer` use it: send `KBD_EVENT_PULL` /
+//! `MOUSE_EVENT_PULL` via plain `ipc_call`, observe the reply label, then
+//! drain the bulk into a fixed-size buffer matching the wire layout
+//! (`KEY_EVENT_WIRE_SIZE = 19`, `POINTER_EVENT_WIRE_SIZE = 37`).
 //!
-//! This shim therefore wires the dispatcher correctly but the real
-//! `KbdInputSource::poll_key` / `MouseInputSource::poll_pointer` impls
-//! return `None` until the userspace bulk-reply visibility lands (a
-//! sibling task to C.5's per-client out-of-band send-cap work). The
-//! `MockInputSource` (in `kernel-core::input::dispatch`) drives the
-//! routing tests against the same trait, so the dispatcher exercise is
-//! complete on the host.
+//! `MockInputSource` (in `kernel-core::input::dispatch`) still drives the
+//! host-side dispatcher tests against the same trait. The two impls are
+//! Liskov-substitutable.
 
 extern crate alloc;
 
@@ -66,7 +65,9 @@ use kernel_core::input::dispatch::{
     CompositorState, EnterOrLeave, InputDispatcher, InputSource, PointerRouteDecision,
     RouteDecision, SurfaceGeometry,
 };
-use kernel_core::input::events::{KeyEvent, PointerEvent};
+use kernel_core::input::events::{
+    KEY_EVENT_WIRE_SIZE, KeyEvent, POINTER_EVENT_WIRE_SIZE, PointerEvent,
+};
 
 // ---------------------------------------------------------------------------
 // Service / wire constants
@@ -127,19 +128,29 @@ pub fn lookup_with_backoff(name: &str) -> Option<u32> {
 /// Real keyboard input source. Pulls `KeyEvent`s from `kbd_server` over
 /// the `KBD_EVENT_PULL` label.
 ///
-/// Phase 56 Track D.3: the pull mechanism is wired but the userspace
-/// reply-bulk drain is a deferred sibling to C.5; until that lands,
-/// `poll_key` returns `None` and the dispatcher is exercised by
-/// `MockInputSource` in tests. Documented as a TODO so the integration
-/// PR knows where to plug the real reader.
+/// Phase 56 close-out — the bulk-drain syscall (`SYS_IPC_TAKE_PENDING_BULK
+/// = 0x1112`) makes server→client reply payloads visible to userspace. The
+/// pull pattern is now end-to-end:
+///
+/// 1. `ipc_call(handle, KBD_EVENT_PULL, 0)` — label-only request; the
+///    kernel still transfers any bulk the server staged via
+///    `ipc_store_reply_bulk` to this task's `pending_bulk` slot regardless
+///    of whether the request itself carried a bulk payload.
+/// 2. Inspect the reply label: `KBD_EVENT_PULL` = success (event
+///    pending); `u64::MAX` = kbd_server's bounded-wait timeout sentinel
+///    OR transport error. Both timeout and transport error are returned
+///    as `None` from `poll_key`; the dispatcher just retries next tick.
+/// 3. `ipc_take_pending_bulk(&mut buf)` drains the staged 19-byte
+///    `KeyEvent` wire frame into the caller's buffer.
+/// 4. `KeyEvent::decode(&buf)` parses the wire frame.
 pub struct KbdInputSource {
     handle: Option<u32>,
 }
 
 impl KbdInputSource {
     /// Look up the `"kbd"` service with backoff. Returns a source whose
-    /// `poll_key` will be wired to the real service when the bulk-reply
-    /// drain lands; otherwise returns a source whose `poll_key` always
+    /// `poll_key` will pull `KeyEvent`s from `kbd_server` if the lookup
+    /// succeeds; otherwise returns a source whose `poll_key` always
     /// yields `None`. Either shape keeps the dispatcher loop running.
     pub fn lookup_with_backoff() -> Self {
         Self {
@@ -156,20 +167,33 @@ impl KbdInputSource {
 
 impl InputSource for KbdInputSource {
     fn poll_key(&mut self) -> Option<KeyEvent> {
-        // TODO(C.5-bulk-drain): wire the real KBD_EVENT_PULL → bulk
-        // reply path once userspace can drain its own
-        // `pending_bulk` slot. Today the kernel transfers the
-        // KeyEvent bulk to the caller via `deliver_bulk`, but the
-        // userspace `ipc_call_buf` syscall returns only the reply
-        // label (no bulk-out). The same gap blocks the gfx-demo
-        // server→client reply path; both are sibling work to D.3.
-        //
-        // Minimum acceptable wiring: send a label-only request, await
-        // the reply label, and decode the bulk that the kernel
-        // already delivered to this task's pending slot via a new
-        // `syscall_lib::ipc_take_pending_bulk` (or equivalent).
-        let _ = self.handle;
-        None
+        let handle = self.handle?;
+
+        // Label-only request. kbd_server's `KBD_EVENT_PULL` arm pumps
+        // the keymap pipeline, encodes a `KeyEvent` into the reply
+        // bulk via `ipc_store_reply_bulk`, and replies with this same
+        // label on success or `u64::MAX` on bounded-wait timeout.
+        let label = syscall_lib::ipc_call(handle, KBD_EVENT_PULL, 0);
+        if label != KBD_EVENT_PULL {
+            // u64::MAX = timeout sentinel from kbd_server OR transport
+            // error. Either way: no event this tick.
+            return None;
+        }
+
+        // Drain the kernel-staged reply bulk. Buffer sized to the
+        // exact wire frame so a malformed (oversized) reply is
+        // truncated and rejected by the decoder.
+        let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if n != KEY_EVENT_WIRE_SIZE as u64 {
+            // u64::MAX = drain error; any other mismatch = protocol
+            // violation. Drop the event silently to keep the
+            // dispatcher loop pumping; a future control-socket
+            // observability verb can surface the count.
+            return None;
+        }
+
+        KeyEvent::decode(&buf).ok().map(|(ev, _)| ev)
     }
 
     fn poll_pointer(&mut self) -> Option<PointerEvent> {
@@ -177,9 +201,9 @@ impl InputSource for KbdInputSource {
     }
 }
 
-/// Real pointer input source. Pulls `PointerEvent`s from
-/// `mouse_server` over the `MOUSE_EVENT_PULL` label. Same deferred-wire
-/// note as [`KbdInputSource`].
+/// Real pointer input source. Pulls `PointerEvent`s from `mouse_server`
+/// over the `MOUSE_EVENT_PULL` label. Same drain pattern as
+/// [`KbdInputSource`] — see that type's docs for the four-step pull flow.
 pub struct MouseInputSource {
     handle: Option<u32>,
 }
@@ -204,10 +228,20 @@ impl InputSource for MouseInputSource {
     }
 
     fn poll_pointer(&mut self) -> Option<PointerEvent> {
-        // TODO(C.5-bulk-drain): see KbdInputSource::poll_key; same
-        // gap, same fix lands together.
-        let _ = self.handle;
-        None
+        let handle = self.handle?;
+
+        let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
+        if label != MOUSE_EVENT_PULL {
+            return None;
+        }
+
+        let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if n != POINTER_EVENT_WIRE_SIZE as u64 {
+            return None;
+        }
+
+        PointerEvent::decode(&buf).ok().map(|(ev, _)| ev)
     }
 }
 
