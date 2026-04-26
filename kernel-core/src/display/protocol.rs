@@ -92,6 +92,12 @@ const OP_CTL_REGISTER_BIND: u16 = 0x0204;
 const OP_CTL_UNREGISTER_BIND: u16 = 0x0205;
 const OP_CTL_SUBSCRIBE: u16 = 0x0206;
 const OP_CTL_FRAME_STATS: u16 = 0x0207;
+// Phase 56 Track F.2 — debug-only crash trigger. The wire-format
+// definition lives here unconditionally (so the codec round-trips on
+// both debug and production builds and the wire opcode space stays
+// stable); the runtime gate that decides whether to honor the verb is
+// a startup env-var check in `display_server::control::dispatch_command`.
+const OP_CTL_DEBUG_CRASH: u16 = 0x0208;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -347,11 +353,33 @@ pub enum ServerMessage {
 pub enum ControlCommand {
     Version,
     ListSurfaces,
-    Focus { surface_id: SurfaceId },
-    RegisterBind { modifier_mask: u16, keycode: u32 },
-    UnregisterBind { modifier_mask: u16, keycode: u32 },
-    Subscribe { event_kind: EventKind },
+    Focus {
+        surface_id: SurfaceId,
+    },
+    RegisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    UnregisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    Subscribe {
+        event_kind: EventKind,
+    },
     FrameStats,
+    /// Phase 56 Track F.2 — debug-only crash trigger.
+    ///
+    /// When the dispatcher accepts this verb (gated by a startup env-var
+    /// check in `display_server::control::dispatch_command`), it logs a
+    /// structured "intentional crash for F.2 regression" line and then
+    /// `panic!()`s. The kernel reclaims the framebuffer (Phase 47/56
+    /// console-yield), the supervisor restarts the service within the
+    /// `display_server.conf` `max_restart=5` budget, and clients see
+    /// their IPC reply-cap revoked (the equivalent of a clean socket
+    /// close on AF_UNIX). The codec round-trips the verb unconditionally
+    /// so the wire format is stable on both debug and production builds.
+    DebugCrash,
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -988,6 +1016,8 @@ impl ControlCommand {
                 body[0] = *event_kind as u8;
             }),
             Self::FrameStats => encode_fixed_body(buf, OP_CTL_FRAME_STATS, 0, |_| {}),
+            // Phase 56 Track F.2 — body-less verb. See `OP_CTL_DEBUG_CRASH`.
+            Self::DebugCrash => encode_fixed_body(buf, OP_CTL_DEBUG_CRASH, 0, |_| {}),
         }
     }
 
@@ -1031,6 +1061,11 @@ impl ControlCommand {
             OP_CTL_FRAME_STATS => {
                 expect_body_len(body_len, 0)?;
                 Self::FrameStats
+            }
+            // Phase 56 Track F.2 — body-less verb. See `OP_CTL_DEBUG_CRASH`.
+            OP_CTL_DEBUG_CRASH => {
+                expect_body_len(body_len, 0)?;
+                Self::DebugCrash
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
@@ -1601,6 +1636,33 @@ mod tests {
         encode_decode_round_trip_ctl_cmd(ControlCommand::FrameStats);
     }
 
+    // Phase 56 Track F.2 — debug-only crash verb. Round-trip must
+    // succeed at the codec layer regardless of build flavor; the
+    // dispatcher (display_server::control) is the seam that decides
+    // whether to honor the verb (gated by env var) or short-circuit
+    // it back to `ControlError::UnknownVerb`. Keeping the codec
+    // unconditional avoids a parallel "debug" verb namespace and
+    // matches the F.2 spec.
+    #[test]
+    fn ctl_cmd_debug_crash_round_trips() {
+        encode_decode_round_trip_ctl_cmd(ControlCommand::DebugCrash);
+    }
+
+    #[test]
+    fn ctl_cmd_debug_crash_uses_zero_body() {
+        // F.2 wire-format guard: the verb carries no payload, so the
+        // body_len on the wire must be exactly zero. Encoding into a
+        // buffer that is exactly FRAME_HEADER_SIZE bytes long must
+        // succeed.
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        let n = ControlCommand::DebugCrash
+            .encode(&mut buf)
+            .expect("encode debug-crash into header-only buffer");
+        assert_eq!(n, FRAME_HEADER_SIZE);
+        let body_len = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(body_len, 0);
+    }
+
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
@@ -1949,6 +2011,7 @@ mod tests {
             }),
             arb_event_kind().prop_map(|event_kind| ControlCommand::Subscribe { event_kind }),
             Just(ControlCommand::FrameStats),
+            Just(ControlCommand::DebugCrash),
         ]
     }
 

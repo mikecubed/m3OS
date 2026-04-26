@@ -71,6 +71,47 @@ use kernel_core::input::bind_table::{BindError, BindKey, BindTable};
 
 use crate::surface::SurfaceRegistry;
 
+// ---------------------------------------------------------------------------
+// Phase 56 Track F.2 — debug-crash policy
+// ---------------------------------------------------------------------------
+
+/// Runtime gate for the `ControlCommand::DebugCrash` verb.
+///
+/// `display_server` reads `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` from the
+/// environment once at startup and constructs one of these. Production
+/// boots leave it disabled; the F.2 regression-test boot path (init
+/// passes the env var through when `/etc/m3os-smoke-test-mode` is
+/// present) enables it.
+///
+/// The dispatcher consults this on every `DebugCrash` verb. Disabled
+/// shadows the verb back to `ControlError::UnknownVerb` so a hostile
+/// or misconfigured client cannot crash the compositor on a production
+/// build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DebugCrashPolicy {
+    enabled: bool,
+}
+
+impl DebugCrashPolicy {
+    /// Disabled — the production default. `DebugCrash` short-circuits
+    /// to `UnknownVerb`.
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Enabled — `DebugCrash` is honored: the dispatcher logs a
+    /// structured intent line and `panic!()`s. Used only by the F.2
+    /// regression test.
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Whether the verb is honored.
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+}
+
 // `EventKind` lives in protocol.rs and intentionally does not derive
 // `Ord` (it is a stable wire-format enum). The subscription registry
 // maps `EventKind` → `Vec<ClientId>` via a fixed-size array indexed by
@@ -357,6 +398,7 @@ pub fn dispatch_command(
     bind_table: &mut BindTable,
     subscriptions: &mut ControlSubscriptions,
     frame_stats: &FrameStatsRing,
+    debug_crash: DebugCrashPolicy,
     reply_buf: &mut [u8],
 ) -> Result<Option<usize>, ControlError> {
     let evt = match cmd {
@@ -439,6 +481,41 @@ pub fn dispatch_command(
         ControlCommand::FrameStats => ControlEvent::FrameStatsReply {
             samples: frame_stats.snapshot_newest_first(),
         },
+        // Phase 56 Track F.2 — debug-only crash trigger.
+        //
+        // The codec round-trips this verb unconditionally, but the
+        // dispatcher honors it only when the runtime debug flag is
+        // set (env var `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` checked
+        // once at startup and stored in `DebugCrashPolicy`). When
+        // disabled, the verb shadows back to a typed
+        // `Error { UnknownVerb }` reply so a hostile or misconfigured
+        // client cannot crash the compositor on a production build.
+        // When enabled, the dispatcher logs a structured intent line
+        // and `panic!()`s; the kernel reclaims the framebuffer (the
+        // userspace panic handler calls `framebuffer_release`, and
+        // the kernel additionally invokes `restore_console` on
+        // process death — see kernel/src/fb/mod.rs::restore_console),
+        // and the supervisor restarts the service per
+        // `etc/services.d/display_server.conf`'s `max_restart=5`.
+        ControlCommand::DebugCrash => {
+            if debug_crash.is_enabled() {
+                // Structured intent line so the F.2 regression can
+                // assert the controlled-crash entry point fired
+                // before the panic-handler banner.
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "display_server: intentional crash for F.2 regression\n",
+                );
+                #[allow(clippy::panic)]
+                {
+                    panic!("F.2 debug-crash verb");
+                }
+            } else {
+                ControlEvent::Error {
+                    code: ControlErrorCode::UnknownVerb,
+                }
+            }
+        }
         // `ControlCommand` is `#[non_exhaustive]`; unknown future
         // variants surface as `Error { UnknownVerb }`. The codec layer
         // already rejects unknown opcodes via `ControlError::UnknownVerb`,

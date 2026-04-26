@@ -75,6 +75,8 @@ members = [
     "userspace/gfx-demo",
     # Phase 56 Track E.4 — minimal control-socket client (one-shot CLI)
     "userspace/m3ctl",
+    # Phase 56 Track F.2 — display-service crash-and-restart end-to-end smoke client
+    "userspace/display-server-crash-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

@@ -45,6 +45,22 @@ const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
+// Phase 56 Track F.2 — debug-crash gate.
+//
+// Init checks for `/etc/display_server.debug-crash` at startup; if
+// present, every spawned service (including `display_server`) gets
+// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` appended to its envp. The
+// `display_server::main::debug_crash_policy_from_env` consumes the
+// var, flips its dispatcher policy to `enabled()`, and the F.2
+// regression test can issue the `DebugCrash` verb to drive the
+// crash-and-restart path.
+//
+// The marker-file gate is independent of `/etc/m3os-smoke-test-mode`
+// (used by the guest smoke runner). The F.2 regression boots through
+// the normal login flow, not the smoke runner, so a dedicated marker
+// keeps the two regression styles uncoupled.
+const ENV_DISPLAY_SERVER_DEBUG_CRASH: &[u8] = b"M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\0";
+const DEBUG_CRASH_MARKER_PATH: &[u8] = b"/etc/display_server.debug-crash\0";
 
 // Runtime state files live on tmpfs under `/run` — matching the Linux
 // convention where runtime state is tmpfs-backed rather than persistent.
@@ -731,6 +747,16 @@ struct ServiceManager {
     /// straight into the text-mode fallback (serial login + kernel
     /// framebuffer console).
     display_fallback: bool,
+    /// Phase 56 Track F.2 — when `/etc/display_server.debug-crash`
+    /// was observed at startup, the service manager appends
+    /// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to every spawned service's
+    /// envp. `display_server` then enables its debug-crash verb at
+    /// startup so the F.2 regression test can drive the
+    /// crash-and-restart path. Production boots leave the marker file
+    /// out, this stays `false`, and the env var is never set —
+    /// keeping production builds safe from a hostile or misconfigured
+    /// `m3ctl debug-crash` call.
+    display_server_debug_crash: bool,
 }
 
 /// Syslog severity levels.
@@ -761,6 +787,7 @@ impl ServiceManager {
             syslog_fd: -1,
             defer_status_writes: false,
             display_fallback: false,
+            display_server_debug_crash: false,
         }
     }
 
@@ -1212,13 +1239,33 @@ impl ServiceManager {
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
 
-            let envp: [*const u8; 5] = [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                core::ptr::null(),
-            ];
+            // Phase 56 Track F.2 — when smoke-test mode is enabled,
+            // append `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` so the
+            // display_server's startup gate flips to honor the F.2
+            // crash verb. The fixed-size 6-slot envp (with NULL
+            // terminator) covers both the production and smoke-test
+            // shapes; the smoke-test variant fills slot [4] and
+            // null-terminates at slot [5], the production variant
+            // null-terminates at slot [4].
+            let envp: [*const u8; 6] = if self.display_server_debug_crash {
+                [
+                    ENV_PATH.as_ptr(),
+                    ENV_HOME.as_ptr(),
+                    ENV_TERM.as_ptr(),
+                    ENV_EDITOR.as_ptr(),
+                    ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
+                    core::ptr::null(),
+                ]
+            } else {
+                [
+                    ENV_PATH.as_ptr(),
+                    ENV_HOME.as_ptr(),
+                    ENV_TERM.as_ptr(),
+                    ENV_EDITOR.as_ptr(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                ]
+            };
 
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
@@ -1331,7 +1378,7 @@ impl ServiceManager {
                             STDOUT_FILENO,
                             "\ninit: session ended, respawning login...\n",
                         );
-                        self.login_pid = spawn_login();
+                        self.login_pid = spawn_login(self.display_server_debug_crash);
                     } else {
                         write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
                         self.login_pid = -1;
@@ -2097,16 +2144,32 @@ fn trim_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-fn spawn_login() -> i32 {
+fn spawn_login(debug_crash: bool) -> i32 {
     let pid = fork();
     if pid == 0 {
-        let envp: [*const u8; 5] = [
-            ENV_PATH.as_ptr(),
-            ENV_HOME.as_ptr(),
-            ENV_TERM.as_ptr(),
-            ENV_EDITOR.as_ptr(),
-            core::ptr::null(),
-        ];
+        // Phase 56 Track F.2 — propagate the debug-crash env var to
+        // the login shell so the F.2 regression's
+        // `display-server-crash-smoke` (run from the post-login
+        // shell) can confirm the gate is live.
+        let envp: [*const u8; 6] = if debug_crash {
+            [
+                ENV_PATH.as_ptr(),
+                ENV_HOME.as_ptr(),
+                ENV_TERM.as_ptr(),
+                ENV_EDITOR.as_ptr(),
+                ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
+                core::ptr::null(),
+            ]
+        } else {
+            [
+                ENV_PATH.as_ptr(),
+                ENV_HOME.as_ptr(),
+                ENV_TERM.as_ptr(),
+                ENV_EDITOR.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+            ]
+        };
 
         let argv: [*const u8; 2] = [LOGIN_ARGV0.as_ptr(), core::ptr::null()];
         let ret = execve(LOGIN_PATH, &argv, &envp);
@@ -2161,6 +2224,21 @@ fn smoke_test_mode_enabled() -> bool {
     let n = read(fd as i32, &mut buf);
     close(fd as i32);
     n > 0 && buf[0] == b'1'
+}
+
+/// Phase 56 Track F.2 — check for the debug-crash marker file.
+/// Returns `true` when `/etc/display_server.debug-crash` exists at
+/// startup. Production boots leave the file out; the F.2 regression
+/// xtask harness creates the file in the disk image. The presence of
+/// the file (any content) is the gate; this avoids parsing content
+/// the same way as `smoke_test_mode_enabled`.
+fn display_server_debug_crash_enabled() -> bool {
+    let fd = open(DEBUG_CRASH_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,6 +2315,20 @@ pub extern "C" fn _start() -> ! {
     // avoids.
     let smoke_mode = smoke_test_mode_enabled();
 
+    // Phase 56 Track F.2 — check the debug-crash marker before
+    // booting services. The flag is consulted by `spawn_service` when
+    // it builds each service's envp; setting it before
+    // `boot_services()` is critical so `display_server` (booted by
+    // that call) sees `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` in its
+    // environment from the very first start.
+    mgr.display_server_debug_crash = display_server_debug_crash_enabled();
+    if mgr.display_server_debug_crash {
+        write_str(
+            STDOUT_FILENO,
+            "init: F.2 debug-crash marker present, propagating M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\n",
+        );
+    }
+
     // Boot all services in dependency order.
     mgr.boot_services();
 
@@ -2256,7 +2348,7 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
     } else {
-        mgr.login_pid = spawn_login();
+        mgr.login_pid = spawn_login(mgr.display_server_debug_crash);
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn login\n");
             // Not fatal — services may still be running.

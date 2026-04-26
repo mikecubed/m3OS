@@ -451,6 +451,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-server-crash-smoke"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "display_server"
 version = "0.56.0"
 dependencies = [
