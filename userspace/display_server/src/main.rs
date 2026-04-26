@@ -42,7 +42,7 @@ use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{InboundFrame, dispatch};
-use crate::compose::{default_layout, run_compose};
+use crate::compose::{ComposeContext, default_layout, run_compose};
 use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
 use crate::surface::SurfaceRegistry;
@@ -186,6 +186,7 @@ fn program_main(_args: &[&str]) -> i32 {
     const RESP_FATAL: u64 = u64::MAX;
     let mut registry = SurfaceRegistry::new();
     let mut layout = default_layout();
+    let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
 
     loop {
@@ -226,6 +227,10 @@ fn program_main(_args: &[&str]) -> i32 {
                 "display_server: client closed; resetting registry\n",
             );
             registry = SurfaceRegistry::new();
+            // E.3 — the previous cursor (if any) belonged to that
+            // client. Reset the compose context so the next first-
+            // frame draws the fallback `DefaultArrowCursor` cleanly.
+            compose_ctx = ComposeContext::new();
         }
 
         // 2. Reply to the caller so any `ipc_call*` request unblocks.
@@ -244,8 +249,20 @@ fn program_main(_args: &[&str]) -> i32 {
         //    uses the trait's default no-op, so the duplicate was visible
         //    only to a reviewer reading the code).
         let ticks = syscall_lib::frame_tick_drain();
-        if ticks > 0 && registry.has_damage() {
-            match run_compose(&mut owner, &mut layout, &mut registry) {
+        if ticks > 0 {
+            // E.3 — gate has moved into `run_compose`. The composer
+            // checks both `registry.has_damage()` AND pointer-motion
+            // damage (via `cursor_damage`); a tick with no surface
+            // damage but a moved cursor still composes one frame so
+            // the cursor's old position is overpainted and the new
+            // one shows up.
+            match run_compose(
+                &mut owner,
+                &mut layout,
+                &mut registry,
+                &mut compose_ctx,
+                pointer_position,
+            ) {
                 Ok(0) => {}
                 Ok(writes) => log_compose_writes(writes),
                 Err(_) => {
@@ -304,7 +321,16 @@ fn program_main(_args: &[&str]) -> i32 {
         );
         for effect in effects {
             match effect {
-                InputEffect::Outbound(_msg) => {
+                InputEffect::Outbound(msg) => {
+                    // E.3 seam: extract the pointer's `abs_position`
+                    // from any `Pointer` message the dispatcher
+                    // emitted, and forward it to the next compose
+                    // call's cursor blit.
+                    if let kernel_core::display::protocol::ServerMessage::Pointer(ev) = msg
+                        && let Some(abs) = ev.abs_position
+                    {
+                        pointer_position = abs;
+                    }
                     // TODO(C.5): push onto per-client outbound queue
                     // and flush via the multi-client send-cap path.
                     syscall_lib::write_str(
@@ -328,31 +354,12 @@ fn program_main(_args: &[&str]) -> i32 {
                 }
             }
         }
-        // Track the last pointer position the wiring observed so the
-        // next dispatcher call can hit-test against the current
-        // location even on iterations with no fresh pointer event.
-        // Phase 56 PS/2 mice deliver relative deltas; the userspace
-        // mouse_server is responsible for accumulating absolutes
-        // (per the D.2 spec) and shipping them as `abs_position`.
-        if let Some(last) = last_pointer_position(&input_wiring) {
-            pointer_position = last;
-        }
+        // E.3 — `pointer_position` is now sourced from the
+        // dispatcher's outbound `Pointer` events above. The legacy
+        // `last_pointer_position` helper has been retired: it
+        // returned `None` unconditionally, which made the cursor
+        // unable to follow real mouse motion through D.2.
     }
-}
-
-/// Read the current pointer position from the wiring's last-seen
-/// abs_position. Phase 56 keeps this value at the main-loop level so
-/// the next iteration's hit-test is consistent with the most recent
-/// motion. Returns `None` until at least one pointer event with
-/// `abs_position = Some(_)` arrives.
-fn last_pointer_position(_wiring: &InputWiring) -> Option<(i32, i32)> {
-    // Today the dispatcher's hover tracking already encodes "what
-    // surface the pointer is over". The position itself is currently
-    // tracked at the main-loop level via `pointer_position`. When D.2
-    // wires real motion deltas, this helper will become the obvious
-    // place to fold relative deltas into the running absolute. Until
-    // then it returns `None` so the loop keeps the prior value.
-    None
 }
 
 /// Try to acquire the framebuffer with bounded retry, in case another

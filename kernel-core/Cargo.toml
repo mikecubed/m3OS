@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 spin = "0.9.8"
+heapless = "0.8"
 
 [dev-dependencies]
 proptest = "1"

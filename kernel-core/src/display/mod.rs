@@ -9,6 +9,7 @@
 
 pub mod buffer;
 pub mod compose;
+pub mod cursor;
 pub mod fb_owner;
 pub mod frame_tick;
 pub mod layer;
