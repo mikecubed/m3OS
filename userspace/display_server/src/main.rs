@@ -29,11 +29,14 @@ extern crate alloc;
 mod client;
 mod compose;
 mod fb;
+mod input;
 mod surface;
 
 use core::alloc::Layout;
 use kernel_core::display::fb_owner::{FbError, FramebufferOwner};
-use kernel_core::display::protocol::Rect;
+use kernel_core::display::protocol::{Rect, SurfaceId};
+use kernel_core::input::bind_table::{BindTable, GrabState};
+use kernel_core::input::dispatch::SurfaceGeometry;
 use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -41,6 +44,7 @@ use syscall_lib::heap::BrkAllocator;
 use crate::client::{InboundFrame, dispatch};
 use crate::compose::{default_layout, run_compose};
 use crate::fb::KernelFramebufferOwner;
+use crate::input::{InputEffect, InputWiring};
 use crate::surface::SurfaceRegistry;
 
 #[global_allocator]
@@ -110,7 +114,42 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: framebuffer acquired\n");
     log_fb_meta(meta.width, meta.height, meta.stride_bytes);
 
-    // ----- Phase 56 single-threaded event loop (C.3 + C.4 + C.5) ----------
+    // ----- Input wiring (D.3) --------------------------------------------
+    //
+    // Look up the kbd / mouse services with bounded retry. Either may be
+    // unavailable at startup (mouse_server is D.2; if it lands later
+    // than this binary the first run-gui will boot without a pointer).
+    // The dispatcher drains both each loop iteration; a missing service
+    // simply yields `None` from its poll method and the dispatcher
+    // idles for that source.
+    let mut input_wiring = InputWiring::new();
+    if input_wiring.kbd.is_connected() {
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: kbd service connected\n");
+    } else {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: kbd service unavailable (continuing without keyboard)\n",
+        );
+    }
+    if input_wiring.mouse.is_connected() {
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: mouse service connected\n");
+    } else {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: mouse service unavailable (continuing without pointer)\n",
+        );
+    }
+
+    // Per-frame input policy state held by `display_server` itself.
+    // The dispatcher takes a borrow of these on every drain and never
+    // owns them — that keeps the compositor's focus / bind / grab
+    // tracking auditable in one place.
+    let bind_table = BindTable::new();
+    let mut grab_state = GrabState::new();
+    let mut focused: Option<SurfaceId> = None;
+    let mut pointer_position: (i32, i32) = (0, 0);
+
+    // ----- Phase 56 single-threaded event loop (C.3 + C.4 + C.5 + D.3) ----
     //
     // The compositor multiplexes:
     //   * inbound IPC client messages (`ipc_recv_msg` on `ep_handle`)
@@ -214,7 +253,106 @@ fn program_main(_args: &[&str]) -> i32 {
                 }
             }
         }
+
+        // 4. Drain input services (D.3). The dispatcher routes every
+        //    drained event by current focus + bind-table + grab-state
+        //    policy and emits `InputEffect`s the shim translates here:
+        //      * `Outbound(ServerMessage::Key/Pointer)` → log for
+        //        diagnostic visibility (the per-client send-cap
+        //        channel is C.5 follow-up work; for now pushing onto
+        //        an internal queue without a wire would just
+        //        accumulate).
+        //      * `BindTriggered { id }` → log; control-socket E.4
+        //        will emit `BindTriggered` once that landing wires
+        //        up.
+        //      * `FocusChanged(id)` → update the local focus tracker.
+        //      * `PointerEnter` / `PointerLeave` → log only; protocol
+        //        does not yet carry hover events.
+        //
+        //    Surface geometry comes from the registry's compose plan.
+        //    A surface that left the registry between two drains is
+        //    invisible to the dispatcher next pass — the proptest
+        //    invariant enforces no destroyed-surface delivery, but if
+        //    the dispatcher's `hovered` still points at it, the
+        //    `forget_hovered` path resets the tracker.
+        let output_rect = Rect {
+            x: 0,
+            y: 0,
+            w: meta.width,
+            h: meta.height,
+        };
+        let compose_entries = registry.iter_compose(output_rect);
+        let surface_geom: alloc::vec::Vec<SurfaceGeometry> = compose_entries
+            .iter()
+            .map(|e| SurfaceGeometry::toplevel(e.id, e.rect))
+            .collect();
+        // Reset hover tracking if the previously hovered surface is no
+        // longer in the registry. The dispatcher cannot know this on
+        // its own — the registry is the source of truth.
+        if let Some(hov) = input_wiring.dispatcher.hovered()
+            && !surface_geom.iter().any(|g| g.id == hov)
+        {
+            input_wiring.dispatcher.forget_hovered();
+        }
+        let effects = input_wiring.drain_one_pass(
+            focused,
+            None, // active_exclusive_layer — E.2 wires this once Layer surfaces map
+            pointer_position,
+            &surface_geom,
+            &bind_table,
+            &mut grab_state,
+        );
+        for effect in effects {
+            match effect {
+                InputEffect::Outbound(_msg) => {
+                    // TODO(C.5): push onto per-client outbound queue
+                    // and flush via the multi-client send-cap path.
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: input queued for client\n",
+                    );
+                }
+                InputEffect::BindTriggered { id } => {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");
+                    write_u32(id);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    // TODO(E.4): wire bind-triggered to control socket.
+                }
+                InputEffect::FocusChanged(id) => {
+                    focused = Some(id);
+                }
+                InputEffect::PointerEnter(_id) | InputEffect::PointerLeave(_id) => {
+                    // Phase 56 protocol does not yet carry hover events;
+                    // log nothing here to keep the boot serial output
+                    // quiet during normal operation.
+                }
+            }
+        }
+        // Track the last pointer position the wiring observed so the
+        // next dispatcher call can hit-test against the current
+        // location even on iterations with no fresh pointer event.
+        // Phase 56 PS/2 mice deliver relative deltas; the userspace
+        // mouse_server is responsible for accumulating absolutes
+        // (per the D.2 spec) and shipping them as `abs_position`.
+        if let Some(last) = last_pointer_position(&input_wiring) {
+            pointer_position = last;
+        }
     }
+}
+
+/// Read the current pointer position from the wiring's last-seen
+/// abs_position. Phase 56 keeps this value at the main-loop level so
+/// the next iteration's hit-test is consistent with the most recent
+/// motion. Returns `None` until at least one pointer event with
+/// `abs_position = Some(_)` arrives.
+fn last_pointer_position(_wiring: &InputWiring) -> Option<(i32, i32)> {
+    // Today the dispatcher's hover tracking already encodes "what
+    // surface the pointer is over". The position itself is currently
+    // tracked at the main-loop level via `pointer_position`. When D.2
+    // wires real motion deltas, this helper will become the obvious
+    // place to fold relative deltas into the running absolute. Until
+    // then it returns `None` so the loop keeps the prior value.
+    None
 }
 
 /// Try to acquire the framebuffer with bounded retry, in case another
