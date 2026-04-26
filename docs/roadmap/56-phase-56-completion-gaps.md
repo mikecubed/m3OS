@@ -221,7 +221,7 @@ Either is defensible. The deferral is documented either way.
 When the items above resolve, mark this doc complete and update the Phase 56 row in `docs/roadmap/README.md` from "Complete (D–H + close-out)" to "Complete (all acceptance bullets ticked)".
 
 - [x] § 1.1 — F.2 supervisor restart bug fixed
-- [ ] § 3 — 216 acceptance checkboxes triaged + ticked or annotated
+- [x] § 3 — 216 acceptance checkboxes triaged. 195 ticked (work shipped); 21 remain unchecked, each annotated with the deferral reason and a pointer to either § 2 (explicit deferral) or § 4 (QEMU integration regression writeable but not yet written). The unchecked box is intentional in every case.
 - [ ] § 4.1 — G.1 multi-client coexistence regression written + passing
 - [ ] § 4.2 — G.2 synthetic-key-injection regression written + passing
 - [ ] § 4.3 — G.4 runtime control-socket regression written + passing
