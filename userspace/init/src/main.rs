@@ -59,6 +59,8 @@ const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
     b"/etc/services.d/kbd.conf\0",
+    // Phase 56 Track D.2: ring-3 mouse service.
+    b"/etc/services.d/mouse_server.conf\0",
     b"/etc/services.d/stdin_feeder.conf\0",
     b"/etc/services.d/fat_server.conf\0",
     b"/etc/services.d/vfs_server.conf\0",

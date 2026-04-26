@@ -1012,6 +1012,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mouse_server"
+version = "0.55.3"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "net_server"
 version = "0.55.0"
 dependencies = [

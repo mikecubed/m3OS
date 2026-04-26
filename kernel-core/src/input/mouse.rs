@@ -196,6 +196,150 @@ impl Ps2MouseDecoder {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 56 Track D.2 — Pointer button-edge tracker
+// ---------------------------------------------------------------------------
+
+/// Three-button state snapshot (left, right, middle).
+///
+/// Used by [`ButtonTracker`] as both the input (state at the end of a fresh
+/// `MousePacket`) and the cached previous state used to detect transitions.
+/// Keeping this as an explicit struct (rather than a raw bitfield) keeps the
+/// caller-side test surface readable: tests pass `ButtonState { left: true,
+/// .. }` instead of magic numbers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonState {
+    /// Left mouse button currently pressed.
+    pub left: bool,
+    /// Right mouse button currently pressed.
+    pub right: bool,
+    /// Middle mouse button currently pressed.
+    pub middle: bool,
+}
+
+impl ButtonState {
+    /// Project a freshly decoded [`MousePacket`] onto its 3-button state.
+    pub const fn from_packet(packet: &MousePacket) -> Self {
+        Self {
+            left: packet.left,
+            right: packet.right,
+            middle: packet.middle,
+        }
+    }
+}
+
+/// Stable button index used in [`ButtonTransition`].
+///
+/// Indices follow the m3OS convention agreed in the Phase 56 D.2 design note:
+/// `0 = left`, `1 = right`, `2 = middle`. This mirrors how PS/2 reports the
+/// three buttons in its status byte and is what `display_server` (D.3)
+/// expects when interpreting `PointerButton::Down(idx)` / `Up(idx)`.
+pub const BUTTON_INDEX_LEFT: u8 = 0;
+/// Stable button index for right mouse button. See [`BUTTON_INDEX_LEFT`].
+pub const BUTTON_INDEX_RIGHT: u8 = 1;
+/// Stable button index for middle mouse button. See [`BUTTON_INDEX_LEFT`].
+pub const BUTTON_INDEX_MIDDLE: u8 = 2;
+
+/// A single button-edge transition emitted by [`ButtonTracker::update`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ButtonTransition {
+    /// Button at the given index just transitioned to pressed.
+    Down(u8),
+    /// Button at the given index just transitioned to released.
+    Up(u8),
+}
+
+/// Fixed-capacity holder for button transitions emitted by one packet.
+///
+/// At most three buttons can change per packet (one per left/right/middle).
+/// We surface a `[Option<ButtonTransition>; 3]` array rather than allocating
+/// so `mouse_server` can iterate without touching the heap on the hot path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonTransitions {
+    transitions: [Option<ButtonTransition>; 3],
+}
+
+impl ButtonTransitions {
+    /// Iterate over the present transitions in stable left-right-middle order.
+    pub fn iter(&self) -> impl Iterator<Item = ButtonTransition> + '_ {
+        self.transitions.iter().filter_map(|t| *t)
+    }
+
+    /// Number of present transitions (0..=3).
+    pub fn len(&self) -> usize {
+        self.transitions.iter().filter(|t| t.is_some()).count()
+    }
+
+    /// True when no transitions were emitted on this packet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Pure-logic button-edge state machine for `mouse_server`.
+///
+/// PS/2 packets carry the *current* button-down state, not edges. The
+/// userspace mouse pipeline must compute edges itself so `display_server` and
+/// downstream clients see explicit `PointerButton::Down(idx)` /
+/// `PointerButton::Up(idx)` events instead of having to diff button bits
+/// across packets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ButtonTracker {
+    prev: ButtonState,
+}
+
+impl ButtonTracker {
+    /// Construct a tracker assuming all buttons are released.
+    pub const fn new() -> Self {
+        Self {
+            prev: ButtonState {
+                left: false,
+                right: false,
+                middle: false,
+            },
+        }
+    }
+
+    /// Snapshot of the last observed state.
+    pub const fn state(&self) -> ButtonState {
+        self.prev
+    }
+
+    /// Feed the freshly decoded button state and return the resulting edges.
+    ///
+    /// Stable iteration order (left → right → middle); this matters because
+    /// `mouse_server` emits one `PointerEvent` per transition and clients
+    /// rely on a deterministic ordering for chord recognition.
+    pub fn update(&mut self, new_state: ButtonState) -> ButtonTransitions {
+        let mut out = ButtonTransitions::default();
+
+        if new_state.left != self.prev.left {
+            out.transitions[0] = Some(if new_state.left {
+                ButtonTransition::Down(BUTTON_INDEX_LEFT)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_LEFT)
+            });
+        }
+        if new_state.right != self.prev.right {
+            out.transitions[1] = Some(if new_state.right {
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_RIGHT)
+            });
+        }
+        if new_state.middle != self.prev.middle {
+            out.transitions[2] = Some(if new_state.middle {
+                ButtonTransition::Down(BUTTON_INDEX_MIDDLE)
+            } else {
+                ButtonTransition::Up(BUTTON_INDEX_MIDDLE)
+            });
+        }
+
+        self.prev = new_state;
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wire encoding for `sys_read_mouse_packet` (Phase 56 Track B.2)
 // ---------------------------------------------------------------------------
 
@@ -237,6 +381,34 @@ pub fn encode_packet(packet: &MousePacket, out: &mut [u8; MOUSE_PACKET_WIRE_SIZE
     out[5] = buttons;
     out[6] = 0;
     out[7] = 0;
+}
+
+/// Decode a [`MousePacket`] from the 8-byte wire image written by
+/// [`encode_packet`].
+///
+/// Phase 56 Track D.2: this is the inverse of [`encode_packet`] and is the
+/// canonical entry point used by `mouse_server` after a successful
+/// `sys_read_mouse_packet` (0x1015) syscall. The 8-byte buffer must have the
+/// exact layout documented on [`encode_packet`].
+///
+/// Decoding cannot fail — every bit pattern in the 8-byte input maps to a
+/// well-formed `MousePacket` (the unused bits 5..7 of the buttons byte and
+/// reserved bytes 6..8 are simply ignored).
+pub fn decode_packet(buf: &[u8; MOUSE_PACKET_WIRE_SIZE]) -> MousePacket {
+    let dx = i16::from_le_bytes([buf[0], buf[1]]);
+    let dy = i16::from_le_bytes([buf[2], buf[3]]);
+    let wheel = buf[4] as i8;
+    let buttons = buf[5];
+    MousePacket {
+        dx,
+        dy,
+        wheel,
+        left: (buttons & (1 << 0)) != 0,
+        right: (buttons & (1 << 1)) != 0,
+        middle: (buttons & (1 << 2)) != 0,
+        x_overflow: (buttons & (1 << 3)) != 0,
+        y_overflow: (buttons & (1 << 4)) != 0,
+    }
 }
 
 #[cfg(test)]
@@ -503,5 +675,263 @@ mod tests {
         assert_eq!(buf[4], 0xFF);
         assert_eq!(buf[5], 0b0001_0101);
         assert_eq!(buf[6..8], [0u8, 0u8]);
+    }
+
+    // ---- Phase 56 D.2 — decode_packet (wire decoder) ----------------------
+
+    #[test]
+    fn decode_packet_zero_round_trips() {
+        let p = MousePacket::default();
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_motion_and_buttons_round_trips() {
+        let p = MousePacket {
+            dx: -3,
+            dy: 7,
+            wheel: -1,
+            left: true,
+            right: false,
+            middle: true,
+            x_overflow: false,
+            y_overflow: true,
+        };
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_extreme_deltas_round_trip() {
+        let p = MousePacket {
+            dx: i16::MIN,
+            dy: i16::MAX,
+            wheel: i8::MIN,
+            left: true,
+            right: true,
+            middle: true,
+            x_overflow: true,
+            y_overflow: true,
+        };
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        encode_packet(&p, &mut buf);
+        assert_eq!(decode_packet(&buf), p);
+    }
+
+    #[test]
+    fn decode_packet_ignores_reserved_button_bits_and_reserved_bytes() {
+        // Construct a wire image with reserved bits set; the decoded
+        // packet must match the wire fields exactly and be insensitive
+        // to bits 5..=7 of the buttons byte and bytes 6..8.
+        let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&5i16.to_le_bytes());
+        buf[2..4].copy_from_slice(&(-2i16).to_le_bytes());
+        buf[4] = 1u8; // wheel +1
+        // Buttons: left + middle, plus reserved bit 7 set (should be ignored).
+        buf[5] = (1 << 0) | (1 << 2) | (1 << 7);
+        // Stray reserved bytes 6..8 — must be ignored on decode.
+        buf[6] = 0xAB;
+        buf[7] = 0xCD;
+        let p = decode_packet(&buf);
+        assert_eq!(p.dx, 5);
+        assert_eq!(p.dy, -2);
+        assert_eq!(p.wheel, 1);
+        assert!(p.left);
+        assert!(!p.right);
+        assert!(p.middle);
+        assert!(!p.x_overflow);
+        assert!(!p.y_overflow);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_encode_decode_round_trip(
+            dx in any::<i16>(),
+            dy in any::<i16>(),
+            wheel in any::<i8>(),
+            buttons in any::<u8>(),
+        ) {
+            let p = MousePacket {
+                dx,
+                dy,
+                wheel,
+                left: (buttons & (1 << 0)) != 0,
+                right: (buttons & (1 << 1)) != 0,
+                middle: (buttons & (1 << 2)) != 0,
+                x_overflow: (buttons & (1 << 3)) != 0,
+                y_overflow: (buttons & (1 << 4)) != 0,
+            };
+            let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
+            encode_packet(&p, &mut buf);
+            prop_assert_eq!(decode_packet(&buf), p);
+        }
+    }
+
+    // ---- Phase 56 D.2 — ButtonTracker -------------------------------------
+
+    fn state(left: bool, right: bool, middle: bool) -> ButtonState {
+        ButtonState {
+            left,
+            right,
+            middle,
+        }
+    }
+
+    #[test]
+    fn button_tracker_starts_with_no_buttons_pressed() {
+        let t = ButtonTracker::new();
+        assert_eq!(t.state(), ButtonState::default());
+    }
+
+    #[test]
+    fn button_tracker_emits_no_transitions_when_state_unchanged() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(false, false, false));
+        assert!(out.is_empty());
+        assert_eq!(out.len(), 0);
+        assert_eq!(out.iter().count(), 0);
+    }
+
+    #[test]
+    fn button_tracker_left_press_emits_down_edge_with_left_index() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(true, false, false));
+        assert_eq!(out.len(), 1);
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_LEFT)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_left_release_emits_up_edge() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, false, false));
+        let out = t.update(state(false, false, false));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![ButtonTransition::Up(BUTTON_INDEX_LEFT)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_holding_emits_no_repeat_edges() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, false, false));
+        let out_a = t.update(state(true, false, false));
+        let out_b = t.update(state(true, false, false));
+        assert!(out_a.is_empty());
+        assert!(out_b.is_empty());
+    }
+
+    #[test]
+    fn button_tracker_right_and_middle_have_distinct_indices() {
+        let mut t = ButtonTracker::new();
+
+        let out_r = t.update(state(false, true, false));
+        let collected_r: alloc::vec::Vec<_> = out_r.iter().collect();
+        assert_eq!(
+            collected_r,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_RIGHT)]
+        );
+
+        let out_m = t.update(state(false, true, true));
+        let collected_m: alloc::vec::Vec<_> = out_m.iter().collect();
+        assert_eq!(
+            collected_m,
+            alloc::vec![ButtonTransition::Down(BUTTON_INDEX_MIDDLE)]
+        );
+    }
+
+    #[test]
+    fn button_tracker_simultaneous_press_emits_in_left_right_middle_order() {
+        let mut t = ButtonTracker::new();
+        let out = t.update(state(true, true, true));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![
+                ButtonTransition::Down(BUTTON_INDEX_LEFT),
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT),
+                ButtonTransition::Down(BUTTON_INDEX_MIDDLE),
+            ]
+        );
+    }
+
+    #[test]
+    fn button_tracker_mixed_press_release_emits_correct_edges() {
+        let mut t = ButtonTracker::new();
+        // Start with left+middle held.
+        let _ = t.update(state(true, false, true));
+        // Now release left, press right; middle stays held.
+        let out = t.update(state(false, true, true));
+        let collected: alloc::vec::Vec<_> = out.iter().collect();
+        assert_eq!(
+            collected,
+            alloc::vec![
+                ButtonTransition::Up(BUTTON_INDEX_LEFT),
+                ButtonTransition::Down(BUTTON_INDEX_RIGHT),
+            ]
+        );
+    }
+
+    #[test]
+    fn button_tracker_state_reflects_last_observation() {
+        let mut t = ButtonTracker::new();
+        let _ = t.update(state(true, true, false));
+        assert_eq!(t.state(), state(true, true, false));
+        let _ = t.update(state(false, true, true));
+        assert_eq!(t.state(), state(false, true, true));
+    }
+
+    #[test]
+    fn button_state_from_packet_extracts_three_button_bits_only() {
+        let p = MousePacket {
+            dx: 5,
+            dy: -2,
+            wheel: 1,
+            left: true,
+            right: false,
+            middle: true,
+            x_overflow: true,
+            y_overflow: false,
+        };
+        assert_eq!(ButtonState::from_packet(&p), state(true, false, true));
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_button_tracker_produces_at_most_three_edges(
+            seq in proptest::collection::vec((any::<bool>(), any::<bool>(), any::<bool>()), 0..256)
+        ) {
+            let mut t = ButtonTracker::new();
+            for (l, r, m) in seq {
+                let out = t.update(state(l, r, m));
+                prop_assert!(out.len() <= 3);
+                prop_assert!(out.iter().count() == out.len());
+                // After update, the cached state must equal the input.
+                prop_assert_eq!(t.state(), state(l, r, m));
+            }
+        }
+
+        #[test]
+        fn proptest_button_tracker_idempotent_under_no_change(
+            initial in (any::<bool>(), any::<bool>(), any::<bool>()),
+            repeats in 1usize..=10
+        ) {
+            let (l, r, m) = initial;
+            let mut t = ButtonTracker::new();
+            // Prime tracker.
+            let _ = t.update(state(l, r, m));
+            for _ in 0..repeats {
+                let out = t.update(state(l, r, m));
+                prop_assert!(out.is_empty());
+            }
+        }
     }
 }
