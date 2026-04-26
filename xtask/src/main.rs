@@ -5321,6 +5321,33 @@ fn populate_ext2_files(
         String::new()
     };
 
+    // Phase 56 Track F.3: text-mode-fallback toggle.
+    //
+    // When `M3OS_DISABLE_DISPLAY_SERVER=1` is set on the host, drop a marker
+    // file at `/etc/m3os-disable-display-server`. Init reads this once at
+    // startup and skips loading `display_server.conf` and `gfx-demo.conf`,
+    // emitting `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)`
+    // log lines that the F.3 regression test pattern-matches. The kernel
+    // framebuffer console + serial login remain the only administration
+    // surfaces — the failure-cascade walkthrough lives in
+    // `docs/56-display-and-input-architecture.md` "Text-mode fallback".
+    let disable_display_cmds = if std::env::var("M3OS_DISABLE_DISPLAY_SERVER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        fs::write(output_dir.join("_tmp_disable_display"), b"1\n")
+            .expect("write temp display-fallback marker");
+        format!(
+            "write \"{}\" etc/m3os-disable-display-server\n\
+             sif etc/m3os-disable-display-server mode 0x81A4\n\
+             sif etc/m3os-disable-display-server uid 0\n\
+             sif etc/m3os-disable-display-server gid 0\n",
+            output_dir.join("_tmp_disable_display").display()
+        )
+    } else {
+        String::new()
+    };
+
     // Standard Unix root filesystem directories and files.
     // debugfs mode values: S_IFDIR|perm or S_IFREG|perm
     // S_IFDIR = 0o40000 = 0x4000, S_IFREG = 0o100000 = 0x8000
@@ -5502,6 +5529,7 @@ fn populate_ext2_files(
          sif etc/hostname gid 0\n\
          {smoke_mode_cmds}\
          {skip_tcc_cmds}\
+         {disable_display_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -5524,6 +5552,7 @@ fn populate_ext2_files(
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
+        disable_display_cmds = disable_display_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -5564,6 +5593,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&hostname_tmp);
     let _ = fs::remove_file(&smoke_mode_tmp);
     let _ = fs::remove_file(&empty_tmp);
+    // Phase 56 F.3: silently best-effort; the file only exists when the
+    // M3OS_DISABLE_DISPLAY_SERVER env var was set.
+    let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));
 }
 
 /// Phase 31: Populate TCC, musl headers/libraries, and test files into the
@@ -6985,6 +7017,33 @@ fn regression_tests() -> Vec<RegressionTest> {
         });
     }
 
+    // Phase 56 Track F.3: text-mode-fallback regression.
+    //
+    // Asserts that when `display_server.conf` is gated off via the runtime
+    // marker (`/etc/m3os-disable-display-server`, written by
+    // `populate_ext2_files` when `M3OS_DISABLE_DISPLAY_SERVER=1`), init logs
+    // structured `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)`
+    // lines and the serial login prompt remains reachable. No graphical
+    // surface should be necessary for administration.
+    //
+    // Gated behind M3OS_ENABLE_FALLBACK_SMOKE so the disk-recreation step
+    // (which is required to drop the marker file) does not run in normal CI;
+    // the regression registry stays at zero-side-effect for the default
+    // `cargo xtask regression` invocation.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_FALLBACK_SMOKE=1 cargo xtask regression --test display-fallback
+    if std::env::var_os("M3OS_ENABLE_FALLBACK_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "display-fallback",
+            description: "Phase 56 F.3: display_server.conf gated off → serial login \
+                 prompt still reachable, no kernel panic",
+            guest_steps: display_fallback_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+        });
+    }
+
     tests
 }
 
@@ -7708,6 +7767,48 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 56 Track F.3: text-mode-fallback regression steps.
+///
+/// Asserts that the runtime knob really gates the graphical stack and the
+/// system still reaches a serial-driven login prompt. The disk-image
+/// recreation that drops `/etc/m3os-disable-display-server` happens inside
+/// `cmd_regression` before this test runs (and is restored afterwards) so
+/// the regression registry stays declarative.
+///
+/// Pattern budget rationale: the structured `init: skipped …` lines emit
+/// before the existing `boot_and_login_steps` boot-marker (`net_udp` start),
+/// so we wait for them first; the serial console is the only login surface
+/// here, so reusing `boot_and_login_steps` after the assertions is correct.
+fn display_fallback_steps() -> Vec<SmokeStep> {
+    let mut steps: Vec<SmokeStep> = Vec::new();
+    // 1. The marker file is detected.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: text-mode-fallback marker detected at boot",
+    });
+    // 2. Display server skipped with the structured wording.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: skipped display_server.conf (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: display_server.conf skipped",
+    });
+    // 3. gfx-demo skipped (depends on display, must be filtered out together).
+    steps.push(SmokeStep::Wait {
+        pattern: "init: skipped gfx-demo.conf (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: gfx-demo.conf skipped",
+    });
+    // 4. Reuse the standard login bootstrap so the assertion of "serial
+    //    `login:` prompt is reachable" matches the same baseline every other
+    //    regression uses. If `boot_and_login_steps` succeeds here, the F.3
+    //    acceptance bullet "login prompt is reachable over serial regardless
+    //    of graphical state" holds. Kernel-panic detection is automatic via
+    //    the smoke-engine's KERNEL PANIC / page fault / DOUBLE FAULT scan.
+    steps.extend(boot_and_login_steps());
+    steps
+}
+
 /// Common boot + login steps shared by all regression tests.
 fn boot_and_login_steps() -> Vec<SmokeStep> {
     // Regression runs use the shipped image in snapshot mode. The image already
@@ -7837,8 +7938,32 @@ fn cmd_regression(args: &RegressionArgs) {
 
     for test in &tests_to_run {
         let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+
+        // Phase 56 F.3: the `display-fallback` regression needs a disk image
+        // that contains the `/etc/m3os-disable-display-server` marker so init
+        // can read it at startup. Recreate the disk with the env-gated
+        // `populate_ext2_files` knob set, then restore a clean disk after
+        // the test so subsequent regressions see the default boot. The env
+        // var is scoped via `set_var` / `remove_var` rather than a process
+        // arg so the existing single-call seam (`create_data_disk`) is
+        // reused without a parallel parameter.
+        let needs_disable_display = test.name == "display-fallback";
+        if needs_disable_display {
+            let _ = fs::remove_file(&disk_img);
+            // SAFETY: xtask is single-threaded between regression iterations.
+            unsafe {
+                std::env::set_var("M3OS_DISABLE_DISPLAY_SERVER", "1");
+            }
+            create_data_disk(uefi_image.parent().unwrap(), false, false);
+            unsafe {
+                std::env::remove_var("M3OS_DISABLE_DISPLAY_SERVER");
+            }
+        }
+
         print!("  {}: ", test.name);
-        match run_regression_test(test, &uefi_image, &ovmf, timeout, args.display) {
+        let result = run_regression_test(test, &uefi_image, &ovmf, timeout, args.display);
+
+        match result {
             Ok(serial_log) => {
                 println!("PASS");
                 save_regression_artifact(test.name, &serial_log, "serial.log");
@@ -7850,6 +7975,14 @@ fn cmd_regression(args: &RegressionArgs) {
                 extract_trace_dump(test.name, &serial_log);
                 failed += 1;
             }
+        }
+
+        // Restore the default disk image after a display-fallback run so the
+        // marker file does not leak into later regressions in the same
+        // invocation.
+        if needs_disable_display {
+            let _ = fs::remove_file(&disk_img);
+            create_data_disk(uefi_image.parent().unwrap(), false, false);
         }
     }
 
