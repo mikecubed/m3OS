@@ -196,7 +196,14 @@ fn program_main(_args: &[&str]) -> i32 {
         let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
         let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, reply_label, 0);
 
-        // 3. If a frame-tick has elapsed, drive one compose pass.
+        // 3. If a frame-tick has elapsed, drive one compose pass. The
+        //    pure-logic `compose_frame` already calls
+        //    `FramebufferOwner::present()` once at the end iff at least one
+        //    write succeeded — no extra `owner.present()` here. Calling it
+        //    twice would double-flush on any future backend that uses
+        //    `present` as a real swap point (today `KernelFramebufferOwner`
+        //    uses the trait's default no-op, so the duplicate was visible
+        //    only to a reviewer reading the code).
         let ticks = syscall_lib::frame_tick_drain();
         if ticks > 0 && registry.has_damage() {
             match run_compose(&mut owner, &mut layout, &mut registry) {
@@ -206,7 +213,6 @@ fn program_main(_args: &[&str]) -> i32 {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
                 }
             }
-            let _ = owner.present();
         }
     }
 }

@@ -107,7 +107,6 @@ pub enum SurfaceShimError {
 /// the API would not change shape.
 pub struct SurfaceRegistry {
     surfaces: BTreeMap<SurfaceId, ServerSurface>,
-    next_serial: u32,
     /// Pending buffer bytes received via the bulk-transport path but not
     /// yet attached to a surface. `AttachBuffer` consumes from here.
     pending_bulk: Vec<CommittedBuffer>,
@@ -117,7 +116,6 @@ impl SurfaceRegistry {
     pub fn new() -> Self {
         Self {
             surfaces: BTreeMap::new(),
-            next_serial: 1,
             pending_bulk: Vec::new(),
         }
     }
@@ -191,20 +189,27 @@ impl SurfaceRegistry {
                 // "wrong id pulled by LIFO" — the previous pop()-then-
                 // push-back path could deadlock both: the same older
                 // buffer kept getting re-popped on every attach.
+                //
+                // Validate first (apply_event), then commit the side
+                // effect (remove from pending_bulk). Removing first and
+                // then applying meant an `UnknownSurface` /
+                // `StateMachine` error would silently drain the queue
+                // — a malformed client could deplete pending_bulk
+                // without ever attaching.
                 let pending_index = self
                     .pending_bulk
                     .iter()
                     .position(|b| b.buffer_id == *buffer_id)
-                    .ok_or(SurfaceShimError::PendingBulkIdMismatch {
+                    .ok_or_else(|| SurfaceShimError::PendingBulkIdMismatch {
                         expected: *buffer_id,
                         pending: self.pending_bulk.iter().map(|b| b.buffer_id).collect(),
                     })?;
-                let buf = self.pending_bulk.remove(pending_index);
                 self.apply_event(
                     *surface_id,
                     SurfaceEvent::AttachBuffer(*buffer_id),
                     &mut result,
                 )?;
+                let buf = self.pending_bulk.remove(pending_index);
                 if let Some(s) = self.surfaces.get_mut(surface_id) {
                     s.pending_buffer = Some(buf);
                 }
@@ -213,20 +218,21 @@ impl SurfaceRegistry {
                 self.apply_event(*surface_id, SurfaceEvent::DamageSurface(*rect), &mut result)?;
             }
             ClientMessage::CommitSurface { surface_id } => {
+                // The kernel-core state machine emits `SurfaceEffect::Configured`
+                // with a strictly-monotone (saturating) serial on role /
+                // geometry transitions; the shim used to synthesise its own
+                // wrapping serial here, which (a) duplicated state-machine
+                // logic and (b) could violate the protocol's monotone-serial
+                // contract by wrapping past `u32::MAX`. `apply_event` now
+                // forwards `Configured` straight to
+                // `ServerMessage::SurfaceConfigured` — no shim-side serial
+                // generation needed.
                 self.apply_event(*surface_id, SurfaceEvent::CommitSurface, &mut result)?;
-                if let Some(s) = self.surfaces.get_mut(surface_id) {
-                    if let Some(buf) = s.pending_buffer.take() {
-                        s.committed_buffer = Some(buf);
-                        s.dirty = true;
-                    }
-                    let serial = self.next_serial;
-                    self.next_serial = self.next_serial.wrapping_add(1).max(1);
-                    let geom = s.state.geometry();
-                    result.outbound.push(ServerMessage::SurfaceConfigured {
-                        surface_id: *surface_id,
-                        rect: geom,
-                        serial,
-                    });
+                if let Some(s) = self.surfaces.get_mut(surface_id)
+                    && let Some(buf) = s.pending_buffer.take()
+                {
+                    s.committed_buffer = Some(buf);
+                    s.dirty = true;
                 }
             }
             ClientMessage::AckConfigure { .. }
@@ -302,10 +308,17 @@ impl SurfaceRegistry {
                     // dedicated trait paths; not surfaced to the client
                     // outbound queue.
                 }
-                SurfaceEffect::Configured { .. } => {
-                    // Generated separately on commit; the state machine's
-                    // own `Configured` is not directly forwarded to the
-                    // client.
+                SurfaceEffect::Configured { rect, serial } => {
+                    // Forward the state machine's `Configured` straight to
+                    // the wire as `ServerMessage::SurfaceConfigured`. The
+                    // serial is the source of truth — strictly monotone
+                    // (saturating in the state machine), so the shim does
+                    // not need to track its own counter.
+                    result.outbound.push(ServerMessage::SurfaceConfigured {
+                        surface_id,
+                        rect: *rect,
+                        serial: *serial,
+                    });
                 }
             }
         }
@@ -402,16 +415,8 @@ impl Default for SurfaceRegistry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // Tests live alongside `kernel_core::display::surface` for the pure-
-    // logic invariants. The shim itself is mechanical wiring and is
-    // exercised end-to-end by the QEMU regression suite (G.1).
-    //
-    // The placeholder below ensures the module compiles in test builds
-    // without dragging in the QEMU-only entry-point glue.
-    #[test]
-    fn shim_module_compiles() {
-        let _ = super::SurfaceRegistry::new();
-    }
-}
+// NB: a `#[cfg(test)]` placeholder module was here. `display_server` is
+// `no_std` + `no_main`, so the std `test` harness cannot compile it.
+// The pure-logic invariants of this shim are covered by the
+// kernel-core `surface` state-machine tests; end-to-end verification is
+// the Phase 56 G.1 regression test in QEMU.

@@ -184,186 +184,21 @@ fn decode_message(bulk: &[u8]) -> Result<ClientMessage, ProtocolError> {
     if bulk.len() > MAX_FRAME_BODY_LEN as usize {
         return Err(ProtocolError::BodyTooLarge);
     }
-    let (msg, _consumed) = ClientMessage::decode(bulk)?;
+    let (msg, consumed) = ClientMessage::decode(bulk)?;
+    // Phase 56 wire framing is "exactly one frame per IPC bulk" — trailing
+    // bytes are a protocol violation, not a forward-compatible extension.
+    // Reject so fuzzing / adversarial clients cannot smuggle a half-second
+    // frame past the dispatcher and produce ambiguous framing.
+    if consumed != bulk.len() {
+        return Err(ProtocolError::BodyLengthMismatch);
+    }
     Ok(msg)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kernel_core::display::protocol::{Rect, SurfaceId};
-
-    fn encode_to_vec(msg: &ClientMessage) -> Vec<u8> {
-        let mut buf = alloc::vec![0u8; 256];
-        let n = msg.encode(&mut buf).expect("encode");
-        buf.truncate(n);
-        buf
-    }
-
-    #[test]
-    fn hello_returns_welcome() {
-        let mut reg = SurfaceRegistry::new();
-        let bulk = encode_to_vec(&ClientMessage::Hello {
-            protocol_version: kernel_core::display::protocol::PROTOCOL_VERSION,
-            capabilities: 0,
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let outcome = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        assert!(!outcome.fatal);
-        assert!(!outcome.closed);
-        assert_eq!(outcome.outbound.len(), 1);
-        match outcome.outbound[0] {
-            ServerMessage::Welcome { .. } => {}
-            ref other => panic!("expected Welcome, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn goodbye_sets_closed_flag() {
-        let mut reg = SurfaceRegistry::new();
-        let bulk = encode_to_vec(&ClientMessage::Goodbye);
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let outcome = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        assert!(outcome.closed);
-        assert!(!outcome.fatal);
-    }
-
-    #[test]
-    fn malformed_bulk_is_fatal() {
-        let mut reg = SurfaceRegistry::new();
-        let bulk = [0xFFu8, 0xFE, 0xFD]; // garbage opcode + truncated body
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let outcome = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        assert!(outcome.fatal);
-    }
-
-    #[test]
-    fn create_surface_and_commit_emits_configured() {
-        let mut reg = SurfaceRegistry::new();
-        // 1. Create surface.
-        let bulk = encode_to_vec(&ClientMessage::CreateSurface {
-            surface_id: SurfaceId(1),
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let _ = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        // 2. Set role.
-        let bulk = encode_to_vec(&ClientMessage::SetSurfaceRole {
-            surface_id: SurfaceId(1),
-            role: kernel_core::display::protocol::SurfaceRole::Toplevel,
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let _ = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        // 3. Pixel bulk + AttachBuffer. New wire format:
-        //    `[w_u32_le | h_u32_le | pixels...]`. data0 carries buffer_id.
-        let w: u32 = 16;
-        let h: u32 = 16;
-        let mut bulk_payload = alloc::vec::Vec::with_capacity(
-            PIXEL_BULK_HEADER_LEN + (w * h) as usize * BYTES_PER_PIXEL_BGRA8888,
-        );
-        bulk_payload.extend_from_slice(&w.to_le_bytes());
-        bulk_payload.extend_from_slice(&h.to_le_bytes());
-        bulk_payload.extend(core::iter::repeat_n(
-            0xAAu8,
-            (w * h) as usize * BYTES_PER_PIXEL_BGRA8888,
-        ));
-        let mut hdr = IpcMessage::new(LABEL_PIXELS);
-        hdr.data[0] = 7;
-        hdr.data[1] = bulk_payload.len() as u64;
-        let _ = dispatch(
-            InboundFrame {
-                header: hdr,
-                bulk: &bulk_payload,
-            },
-            &mut reg,
-        );
-        let bulk = encode_to_vec(&ClientMessage::AttachBuffer {
-            surface_id: SurfaceId(1),
-            buffer_id: BufferId(7),
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let _ = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        // 4. Damage + Commit. Commit must produce a SurfaceConfigured.
-        let bulk = encode_to_vec(&ClientMessage::DamageSurface {
-            surface_id: SurfaceId(1),
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: 32,
-                h: 32,
-            },
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let _ = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        let bulk = encode_to_vec(&ClientMessage::CommitSurface {
-            surface_id: SurfaceId(1),
-        });
-        let mut header = IpcMessage::new(LABEL_VERB);
-        header.data[1] = bulk.len() as u64;
-        let outcome = dispatch(
-            InboundFrame {
-                header,
-                bulk: &bulk,
-            },
-            &mut reg,
-        );
-        assert!(!outcome.fatal);
-        let configured = outcome
-            .outbound
-            .iter()
-            .any(|m| matches!(m, ServerMessage::SurfaceConfigured { .. }));
-        assert!(configured, "expected SurfaceConfigured after commit");
-        assert!(
-            reg.has_damage(),
-            "registry should report damage post-commit"
-        );
-    }
-}
+// NB: a `#[cfg(test)]` host-side test module previously lived here, but
+// `display_server` is a `no_std` + `no_main` binary crate and cannot be
+// compiled with the std `test` harness. Future C.5 work that wants
+// host-runnable dispatcher tests should split the pure-logic dispatch
+// surface (this file's `dispatch` + `decode_message`) into a small
+// library crate. Until then, the dispatcher is exercised end-to-end by
+// the Phase 56 G.1 regression test running under QEMU.

@@ -11,8 +11,13 @@
 //!
 //! [`on_timer_tick_isr`] is called from the LAPIC timer ISR every ms.
 //! [`frame_tick_drain`] is called from task / syscall context. They share
-//! state via two atomics:
+//! state via three atomics; the ISR fast path runs **two relaxed atomic
+//! ops in the common case** (subdiv increment + pending-count update on
+//! rollover, plus a one-shot read of a cached period):
 //!
+//! * `FRAME_TICK_PERIOD_MS` — `lapic_period_ms()` for the configured
+//!   rate, precomputed by `set_frame_tick_hz` so the ISR never builds a
+//!   `FrameTickConfig` itself.
 //! * `FRAME_TICK_SUBDIV` — single-producer subdivider; the ISR is the only
 //!   writer (the consumer side resets it via `set_frame_tick_hz` and the
 //!   ISR itself when it rolls over).
@@ -43,13 +48,28 @@ const FRAME_TICK_SAT_CAP: u32 = 1_000_000;
 /// `FrameTickConfig::DEFAULT_HZ`.
 static FRAME_TICK_HZ: AtomicU32 = AtomicU32::new(FrameTickConfig::DEFAULT_HZ);
 
+/// Cached `lapic_period_ms()` for the configured rate. Precomputed when
+/// `set_frame_tick_hz` runs (and at module init via the const default
+/// below) so the ISR fast path stays at "two relaxed atomic operations
+/// per fire" without reconstructing a `FrameTickConfig` each time.
+static FRAME_TICK_PERIOD_MS: AtomicU32 = AtomicU32::new(default_period_ms());
+
 /// Subdivider — counts LAPIC timer fires (1 ms each) and rolls over every
-/// `lapic_period_ms()` ticks to emit one frame-tick. Written by the ISR;
+/// `FRAME_TICK_PERIOD_MS` ticks to emit one frame-tick. Written by the ISR;
 /// read+reset by the ISR (rollover) and by `set_frame_tick_hz`.
 static FRAME_TICK_SUBDIV: AtomicU32 = AtomicU32::new(0);
 
 /// Saturating count of frame-ticks observed since the last drain.
 static FRAME_TICK_PENDING: AtomicU32 = AtomicU32::new(0);
+
+/// Const initializer for [`FRAME_TICK_PERIOD_MS`]. Mirrors
+/// `FrameTickConfig::default_60hz().lapic_period_ms()` but in a `const`
+/// context so the static doesn't need lazy init.
+const fn default_period_ms() -> u32 {
+    let hz = FrameTickConfig::DEFAULT_HZ;
+    // `u32::div_ceil` is `const`-stable on our toolchain.
+    1000u32.div_ceil(hz)
+}
 
 /// Currently configured frame-tick rate in Hz. Returns a value in
 /// `FrameTickConfig::MIN_HZ..=FrameTickConfig::MAX_HZ`.
@@ -60,10 +80,14 @@ pub fn frame_tick_hz() -> u32 {
 /// Set the frame-tick rate (Hz). Returns `Some(())` if the rate is valid;
 /// `None` if it is outside `MIN_HZ..=MAX_HZ`. Provided for future tuning
 /// (e.g. via a control-socket verb); not currently exposed to userspace.
+///
+/// Updates both the live rate and the cached `lapic_period_ms` so the ISR
+/// fast path doesn't have to recompute every fire.
 #[allow(dead_code)]
 pub fn set_frame_tick_hz(hz: u32) -> Option<()> {
-    let _ = FrameTickConfig::new(hz)?;
+    let config = FrameTickConfig::new(hz)?;
     FRAME_TICK_HZ.store(hz, Ordering::Relaxed);
+    FRAME_TICK_PERIOD_MS.store(config.lapic_period_ms(), Ordering::Relaxed);
     FRAME_TICK_SUBDIV.store(0, Ordering::Relaxed);
     Some(())
 }
@@ -84,11 +108,11 @@ pub fn frame_tick_drain() -> u32 {
 /// * Two relaxed atomic operations per fire (subdiv increment + maybe a
 ///   pending increment). Safe to call from any timer firing on any CPU.
 pub fn on_timer_tick_isr() {
-    let hz = FRAME_TICK_HZ.load(Ordering::Relaxed);
-    let Some(config) = FrameTickConfig::new(hz) else {
-        return;
-    };
-    let period_ms = config.lapic_period_ms();
+    // Read the precomputed period; `set_frame_tick_hz` writes both the
+    // hz value and this cache atomically, so the fast path here stays
+    // at one cached load + one fetch_add + (rare) one store + one
+    // saturated fetch_add.
+    let period_ms = FRAME_TICK_PERIOD_MS.load(Ordering::Relaxed);
     if period_ms == 0 {
         return;
     }
