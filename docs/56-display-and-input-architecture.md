@@ -415,6 +415,35 @@ On `display_server` crash (F.2), the kernel reclaims the framebuffer, the kernel
 
 This is the minimum a real graphical architecture requires — not the maximum. Richer session semantics (login-to-graphical flow, user sessions, seat management) are Phase 57 concerns and are not in Phase 56 scope.
 
+### Text-mode fallback
+
+Phase 56 treats "no graphical stack" as a first-class operating mode, not as a degraded one. F.2 covers the recoverable case — `display_server` crashes once, the kernel framebuffer console resumes, init restarts the service. F.3 covers the unrecoverable case where the graphical stack is either intentionally suppressed or has exhausted its restart budget. In both cases the operator must remain able to log in, inspect state, and bring the machine down cleanly.
+
+**Failure cascade** (`display_server` exhausts the restart budget):
+
+1. `display_server` crashes for the `max_restart`-th time (current manifest: `max_restart=5`).
+2. `init`'s reap loop runs `maybe_restart` once more, observes `restart_count >= max_restart`, and emits the existing structured `init: service '<name>' exceeded max restarts, permanently stopped` log line. The service transitions to `permanently-stopped` in `/run/services.status`. (See `userspace/init/src/main.rs::maybe_restart`.)
+3. Because no userspace process holds the framebuffer, the kernel's `CONSOLE_YIELDED` flag stays `false` and `kernel/src/fb/mod.rs::write_str` resumes producing characters on the framebuffer text console. No additional kernel work is required — it is the absence of a `sys_fb_acquire` claim that keeps the kernel console live.
+4. Serial output is unaffected throughout: `serial0` is the kernel's primary debug sink and is independent of any framebuffer ownership state.
+5. The serial `login` prompt remains reachable; the operator authenticates and runs `ion` exactly as in headless mode.
+
+**Administration paths that remain live under graphical failure:**
+
+- Serial-attached `login` -> `ion` (the same path `cargo xtask run` exercises every day).
+- The kernel framebuffer text console for kernel-side messages, panic output, and any future kernel-driven scrollback work. Its scrollback budget and behavior are owned by `kernel/src/fb/mod.rs` and do not depend on the userspace compositor.
+- `/run/services.status` and `/run/init.cmd` for inspecting and steering supervised services from a serial shell (`service status`, `service stop`, `service restart`).
+- SSH (when `sshd` is supervised) and Telnet (when explicitly enabled): both ride the network stack and the PTY subsystem, neither of which depends on the graphical stack.
+
+**Administration paths that are disabled under graphical failure:**
+
+- All graphical clients: `gfx-demo`, future native bar / launcher / lockscreen, and any later terminal emulator client. The `gfx-demo.conf` manifest declares `depends=display`, so init never tries to start it when `display` is `permanently-stopped`.
+- `m3ctl` against the compositor's control socket, since the socket is unbound when `display_server` is not running.
+- The keybind grab-hook surface (`m3ctl register-bind`), for the same reason.
+
+**Direct-suppression knob (F.3 regression).** Setting `M3OS_DISABLE_DISPLAY_SERVER=1` at disk-build time drops `/etc/m3os-disable-display-server`. Init reads the marker once at startup, emits `init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)`, and skips both `display_server.conf` and `gfx-demo.conf` from the `KNOWN_CONFIGS` filter (and from any directory scan), each producing an `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` line. The regression `cargo xtask regression --test display-fallback` (gated behind `M3OS_ENABLE_FALLBACK_SMOKE=1`) asserts those log lines and that the serial `login:` prompt is still reachable. The same recovery surface — serial login, kernel framebuffer console, `service` control — is what an operator gets when the runtime path of F.2 actually empties the restart budget; F.3 just lets the regression harness reach that state deterministically without crashing the compositor on every run.
+
+**Cross-references.** See F.2 (above) for single-crash recovery via the kernel-console resume path, F.1 for the supervisor manifest shape, and `docs/09-framebuffer-and-shell.md` for the underlying framebuffer console that becomes the fallback surface.
+
 ## Manual smoke validation
 
 Phase 56 ships `gfx-demo` (C.6) as a protocol-reference visual smoke client so a learner or reviewer running `cargo xtask run-gui --fresh` sees a filled toplevel, a visible cursor, and input-event echoes from a real graphical client — not just the C.2 background fill.

@@ -55,6 +55,22 @@ const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 const STATUS_FILE: &[u8] = b"/run/services.status\0";
 const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 
+// Phase 56 Track F.3: text-mode-fallback marker.
+//
+// When this file exists, init skips loading the graphical-stack manifests
+// (`display_server.conf` and `gfx-demo.conf`) and emits a structured
+// `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` log line. The
+// kernel framebuffer console + serial console therefore remain the only
+// administration surfaces — see `docs/56-display-and-input-architecture.md`
+// "Text-mode fallback" for the failure-cascade walkthrough.
+const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\0";
+
+/// Conf-file basenames (with the `.conf` suffix and trailing NUL) that are
+/// skipped when `DISABLE_DISPLAY_SERVER_MARKER` is present. Listed centrally
+/// so the dir-scan path and the `KNOWN_CONFIGS` fallback path agree on the
+/// same filter — no parallel "skip these" lists.
+const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0", b"gfx-demo.conf\0"];
+
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
@@ -710,6 +726,11 @@ struct ServiceManager {
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
     defer_status_writes: bool,
+    /// Phase 56 Track F.3: cached at startup. When `true`, init skips
+    /// `display_server.conf` and `gfx-demo.conf` so the system boots
+    /// straight into the text-mode fallback (serial login + kernel
+    /// framebuffer console).
+    display_fallback: bool,
 }
 
 /// Syslog severity levels.
@@ -739,7 +760,66 @@ impl ServiceManager {
             respawn_login: true,
             syslog_fd: -1,
             defer_status_writes: false,
+            display_fallback: false,
         }
+    }
+
+    /// Probe `/etc/m3os-disable-display-server` once at startup. Sets
+    /// `display_fallback = true` if the marker is present and emits a
+    /// structured log line so the regression harness (and post-mortem
+    /// readers of `serial.log`) can correlate the boot with the active
+    /// runtime knob.
+    fn detect_display_fallback(&mut self) {
+        let fd = open(DISABLE_DISPLAY_SERVER_MARKER, O_RDONLY, 0);
+        if fd >= 0 {
+            close(fd as i32);
+            self.display_fallback = true;
+            // Single-line, parser-friendly: keep the `(M3OS_DISABLE_DISPLAY_SERVER=1)`
+            // suffix stable so the F.3 regression test can pattern-match it.
+            write_str(
+                STDOUT_FILENO,
+                "init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)\n",
+            );
+        }
+    }
+
+    /// Whether `name` (a `<svc>.conf\0` byte slice) is in the
+    /// `DISPLAY_FALLBACK_SKIPPED_CONFS` filter. Used by both the dir-scan
+    /// path and the `KNOWN_CONFIGS` fallback path so the two share a single
+    /// source of truth.
+    fn is_display_fallback_skipped(name_with_nul: &[u8]) -> bool {
+        let mut i = 0;
+        while i < DISPLAY_FALLBACK_SKIPPED_CONFS.len() {
+            if DISPLAY_FALLBACK_SKIPPED_CONFS[i] == name_with_nul {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Returns `true` if `path` is one of the display-fallback configs and
+    /// the fallback is currently active. Logs a structured skip line as a
+    /// side effect when true.
+    fn skip_for_display_fallback(&self, path: &[u8]) -> bool {
+        if !self.display_fallback {
+            return false;
+        }
+        // Path shape: /etc/services.d/<base>.conf\0
+        let prefix = b"/etc/services.d/";
+        if path.len() <= prefix.len() {
+            return false;
+        }
+        let basename = &path[prefix.len()..];
+        if !Self::is_display_fallback_skipped(basename) {
+            return false;
+        }
+        // Strip trailing NUL for human-readable logging.
+        let log_name_end = basename.len().saturating_sub(1);
+        write_str(STDOUT_FILENO, "init: skipped ");
+        write(STDOUT_FILENO, &basename[..log_name_end]);
+        write_str(STDOUT_FILENO, " (M3OS_DISABLE_DISPLAY_SERVER=1)\n");
+        true
     }
 
     /// Open a DGRAM socket to `/dev/log` for syslog output.
@@ -894,8 +974,18 @@ impl ServiceManager {
     }
 
     /// Try to open, read, and parse a single service config file.
-    /// Skips services that have a `.disabled` marker file.
+    /// Skips services that have a `.disabled` marker file or that are
+    /// gated off by the Phase 56 F.3 text-mode-fallback runtime knob.
     fn try_load_config(&mut self, path: &[u8]) {
+        // Phase 56 F.3: graphical-stack manifests are skipped wholesale when
+        // the operator (or the regression test) has dropped the
+        // `/etc/m3os-disable-display-server` marker. Both `display_server.conf`
+        // and `gfx-demo.conf` are excluded here so the dependency graph never
+        // sees them — `gfx-demo` depends on `display`, so missing the gate
+        // would leave it stuck waiting for an unresolvable dep.
+        if self.skip_for_display_fallback(path) {
+            return;
+        }
         let fd = open(path, O_RDONLY, 0);
         if fd >= 0 {
             let mut buf = [0u8; BUF_SIZE];
@@ -2118,6 +2208,13 @@ pub extern "C" fn _start() -> ! {
 
     // Initialize service manager.
     let mut mgr = ServiceManager::new();
+
+    // Phase 56 Track F.3: probe the text-mode-fallback marker before loading
+    // service manifests. Both code paths (`load_services_from_dir` and
+    // `load_services_from_known_configs`) consult `mgr.display_fallback` via
+    // `try_load_config`, so this single check covers ext2 directory scans
+    // and the hardcoded fallback list with no per-path duplication.
+    mgr.detect_display_fallback();
 
     // Load service definitions.
     mgr.load_services();
