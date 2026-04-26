@@ -505,6 +505,14 @@ pub fn ipc_send_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u
 /// Like [`ipc_call`] but additionally copies `buf` from this process's
 /// address space and delivers it alongside the message.
 /// Returns the reply label on success, `u64::MAX` on error.
+///
+/// # Reading the reply bulk
+///
+/// If the server stages a reply bulk (via `ipc_store_reply_bulk`), the
+/// kernel deposits it in the caller's `pending_bulk` slot at reply time.
+/// To consume it, call [`ipc_take_pending_bulk`] **immediately after this
+/// function returns** and **before any other IPC recv** — see
+/// [`ipc_take_pending_bulk`] for the ordering constraint.
 pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
     unsafe {
         syscall6(
@@ -648,6 +656,33 @@ pub fn ipc_try_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]
 /// protocol they're consuming (e.g. `KEY_EVENT_WIRE_SIZE = 19`,
 /// `POINTER_EVENT_WIRE_SIZE = 37`, control-socket reply bodies up to
 /// `MAX_BULK_LEN = 4096`).
+///
+/// # Ordering constraint — call immediately after [`ipc_call_buf`]
+///
+/// The `pending_bulk` slot drained by this syscall is the **same**
+/// per-task slot that [`ipc_recv_msg`] / [`ipc_try_recv_msg`] use to
+/// deliver inbound bulk on a recv (kernel-side `take_bulk_data` /
+/// `deliver_bulk` against `Task::pending_bulk`). The slot has only one
+/// value at any time. If a caller interleaves another IPC operation
+/// between `ipc_call_buf` and `ipc_take_pending_bulk`, the staged
+/// reply bulk will either be **lost** (overwritten by the next
+/// `transfer_bulk`) or **misdelivered** as the inbound bulk of an
+/// unrelated `ipc_recv_msg` call.
+///
+/// The supported usage pattern is therefore:
+///
+/// ```text
+/// let label = ipc_call_buf(ep, ..., &request_buf);
+/// if label == u64::MAX { ... }
+/// let n = ipc_take_pending_bulk(&mut reply_buf);   // drain immediately
+/// // now safe to do other IPC work
+/// ```
+///
+/// Do **not** interleave `ipc_recv_msg`, `ipc_try_recv_msg`, or any
+/// other path that touches `pending_bulk` between the call and the
+/// drain. Production callers (`m3ctl`, `display-multi-client-smoke`,
+/// `grab-hook-smoke`, `display-server-crash-smoke`) all observe this
+/// ordering.
 pub fn ipc_take_pending_bulk(buf: &mut [u8]) -> u64 {
     unsafe {
         syscall2(

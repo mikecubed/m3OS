@@ -825,6 +825,30 @@ fn ipc_store_reply_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64
 /// need full payloads must size the buffer to the largest expected wire
 /// frame (e.g. `KEY_EVENT_WIRE_SIZE = 19`, `POINTER_EVENT_WIRE_SIZE = 37`,
 /// `MAX_BULK_LEN = 4096`).
+///
+/// # Caller ordering constraint (single-slot `pending_bulk`)
+///
+/// `Task::pending_bulk` is a single `Option<Vec<u8>>` slot. The same slot
+/// is read by [`ipc_recv_msg`] / [`ipc_try_recv_msg`] (via
+/// `take_bulk_data`) to deliver inbound bulk on a recv, and is written
+/// by `transfer_bulk` whenever bulk crosses task boundaries. Callers
+/// **must** drain the slot via this syscall **immediately after**
+/// `ipc_call_buf` returns and **before any other IPC operation** that
+/// touches the same slot. Interleaving an `ipc_recv_msg` between the
+/// call and the drain will either:
+///
+/// - lose the staged reply bulk (overwritten by the next `transfer_bulk`
+///   from a later sender), or
+/// - misdeliver it as the inbound bulk of an unrelated recv (the recv
+///   path cannot distinguish staged-reply bytes from sender-attached
+///   bytes — they are the same `Vec<u8>` in the same slot).
+///
+/// The kernel cannot enforce this — both reads of the slot are valid
+/// operations on their own. Production callers (`m3ctl`,
+/// `display-multi-client-smoke`, `grab-hook-smoke`,
+/// `display-server-crash-smoke`) all observe the constraint; the
+/// userspace-side docstring on `syscall_lib::ipc_take_pending_bulk`
+/// states the supported usage pattern.
 fn ipc_take_pending_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64) -> u64 {
     use crate::task::scheduler;
 
