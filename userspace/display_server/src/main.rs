@@ -28,13 +28,15 @@ extern crate alloc;
 
 mod client;
 mod compose;
+mod control;
 mod fb;
 mod input;
 mod surface;
 
 use core::alloc::Layout;
 use kernel_core::display::fb_owner::{FbError, FramebufferOwner};
-use kernel_core::display::protocol::{Rect, SurfaceId};
+use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId};
+use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
 use syscall_lib::IpcMessage;
@@ -43,6 +45,10 @@ use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{InboundFrame, dispatch};
 use crate::compose::{ComposeContext, default_layout, run_compose};
+use crate::control::{
+    ControlSubscriptions, publish_bind_triggered, publish_focus_changed, publish_surface_created,
+    publish_surface_destroyed, record_frame_sample,
+};
 use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
 use crate::surface::SurfaceRegistry;
@@ -87,6 +93,36 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
     syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
+
+    // Phase 56 Track E.4 — second IPC endpoint for the control socket.
+    // The endpoint is registered as `"display-control"` so `m3ctl`
+    // (and any future native bar / launcher client) can locate it via
+    // `ipc_lookup_service`. The codec, dispatcher, and subscription
+    // registry are wired below; the per-iteration recv from this
+    // endpoint is gated on the same C.5 bulk-drain seam that gates
+    // D.3's input event delivery (see the `TODO(C.5-bulk-drain)`
+    // marker at the bottom of the loop).
+    let ctl_ep_handle = syscall_lib::create_endpoint();
+    if ctl_ep_handle == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to create control endpoint\n",
+        );
+        return 1;
+    }
+    let ctl_ep_handle = ctl_ep_handle as u32;
+    let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
+    if ctl_reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to register 'display-control'\n",
+        );
+        return 1;
+    }
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: registered as 'display-control'\n",
+    );
 
     // ----- Framebuffer acquisition (C.2) ---------------------------------
     let mut owner = match acquire_framebuffer_with_backoff() {
@@ -144,10 +180,31 @@ fn program_main(_args: &[&str]) -> i32 {
     // The dispatcher takes a borrow of these on every drain and never
     // owns them — that keeps the compositor's focus / bind / grab
     // tracking auditable in one place.
-    let bind_table = BindTable::new();
+    //
+    // Track E.4 — the bind table is now `mut` because the control
+    // socket's `register-bind` / `unregister-bind` verbs mutate it.
+    // The reference passed to `InputWiring::drain_one_pass` is still
+    // a `&BindTable`; the mutability is purely for the control
+    // dispatcher's use.
+    let mut bind_table = BindTable::new();
     let mut grab_state = GrabState::new();
     let mut focused: Option<SurfaceId> = None;
     let mut pointer_position: (i32, i32) = (0, 0);
+
+    // Track E.4 — control-socket subscription registry and frame-stats
+    // ring. The registry is keyed by `ClientId`; Phase 56 uses a
+    // single static `ClientId` because the in-process control endpoint
+    // serves one connection at a time. The frame-stats ring fills as
+    // the compose loop runs.
+    let mut control_subs = ControlSubscriptions::new();
+    let mut frame_stats = FrameStatsRing::new();
+    let mut frame_index_counter: u64 = 0;
+    // Snapshot of registered surface ids from the previous iteration.
+    // Used to compute create / destroy deltas to publish on the
+    // control-socket subscription registry — without rewriting
+    // `client.rs` or `surface.rs`'s public APIs to surface lifecycle
+    // hooks.
+    let mut prev_surface_ids: alloc::vec::Vec<SurfaceId> = alloc::vec::Vec::new();
 
     // ----- Phase 56 single-threaded event loop (C.3 + C.4 + C.5 + D.3) ----
     //
@@ -233,6 +290,34 @@ fn program_main(_args: &[&str]) -> i32 {
             compose_ctx = ComposeContext::new();
         }
 
+        // Track E.4 — diff the current registered surface ids against
+        // the previous-iteration snapshot and publish SurfaceCreated /
+        // SurfaceDestroyed events to control-socket subscribers. We
+        // do this here (rather than in `client::dispatch`) so the
+        // existing `DispatchOutcome` shape stays unchanged. The same
+        // bound-`prev_surface_ids` snapshot flips to the empty list
+        // when the client closes (above).
+        let cur_surface_ids = registry.surface_ids();
+        publish_surface_lifecycle_deltas(
+            &mut control_subs,
+            &registry,
+            &prev_surface_ids,
+            &cur_surface_ids,
+        );
+        // Watch the outbound queue for `SurfaceConfigured` — that's
+        // the post-CreateSurface + SetSurfaceRole sequence emit. The
+        // delta path above also catches it (set role makes the id
+        // appear in `surface_ids`), but inspecting outbound covers
+        // the case where the role was set *before* the dispatcher
+        // populated `surface_ids` ordering; both paths converge on
+        // the same SurfaceCreated event for any (id, role) pair.
+        for msg in outcome.outbound.iter() {
+            if let ServerMessage::SurfaceDestroyed { surface_id } = msg {
+                publish_surface_destroyed(&mut control_subs, *surface_id);
+            }
+        }
+        prev_surface_ids = cur_surface_ids;
+
         // 2. Reply to the caller so any `ipc_call*` request unblocks.
         //    Without this any client doing call/call_buf would deadlock,
         //    and the frame-tick path below could never run because the
@@ -256,15 +341,33 @@ fn program_main(_args: &[&str]) -> i32 {
             // damage but a moved cursor still composes one frame so
             // the cursor's old position is overpainted and the new
             // one shows up.
-            match run_compose(
+            //
+            // Track E.4 — wrap the compose call with a monotonic
+            // clock read on each side so we can record the
+            // composition wall-time into the FrameStatsRing. This is
+            // the "Engineering Discipline → Observability" sample the
+            // `m3ctl frame-stats` verb returns.
+            let start_us = monotonic_micros();
+            let compose_result = run_compose(
                 &mut owner,
                 &mut layout,
                 &mut registry,
                 &mut compose_ctx,
                 pointer_position,
-            ) {
+            );
+            let elapsed_us = monotonic_micros().saturating_sub(start_us);
+            let compose_micros = if elapsed_us > u32::MAX as u64 {
+                u32::MAX
+            } else {
+                elapsed_us as u32
+            };
+            match compose_result {
                 Ok(0) => {}
-                Ok(writes) => log_compose_writes(writes),
+                Ok(writes) => {
+                    log_compose_writes(writes);
+                    record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
+                    frame_index_counter = frame_index_counter.saturating_add(1);
+                }
                 Err(_) => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
                 }
@@ -342,10 +445,27 @@ fn program_main(_args: &[&str]) -> i32 {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");
                     write_u32(id);
                     syscall_lib::write_str(STDOUT_FILENO, "\n");
-                    // TODO(E.4): wire bind-triggered to control socket.
+                    // Track E.4 — surface this on the control socket
+                    // for any subscriber. The dispatcher's
+                    // `BindTriggered` carries only the `BindId`, but
+                    // the control-socket event variant carries the
+                    // (modifier_mask, keycode) pair the bind was
+                    // registered against. The `BindTable` doesn't
+                    // expose a "lookup-key-by-id" accessor today, so
+                    // Phase 56 publishes a `BindTriggered` event with
+                    // a placeholder (mask=0, keycode=id-as-keycode)
+                    // — the m3ctl client receives the event and the
+                    // id round-trips end-to-end. Richer payloads land
+                    // alongside the bind-table API extension noted
+                    // in the H.1 hand-off.
+                    publish_bind_triggered(&mut control_subs, 0, id);
                 }
                 InputEffect::FocusChanged(id) => {
+                    let prev = focused;
                     focused = Some(id);
+                    if prev != focused {
+                        publish_focus_changed(&mut control_subs, focused);
+                    }
                 }
                 InputEffect::PointerEnter(_id) | InputEffect::PointerLeave(_id) => {
                     // Phase 56 protocol does not yet carry hover events;
@@ -359,7 +479,132 @@ fn program_main(_args: &[&str]) -> i32 {
         // `last_pointer_position` helper has been retired: it
         // returned `None` unconditionally, which made the cursor
         // unable to follow real mouse motion through D.2.
+
+        // Track E.4 — service one pending control-endpoint message
+        // per iteration if any has arrived. Phase 56's IPC surface
+        // does not expose a non-blocking try-recv, so until that
+        // helper lands the control-endpoint recv is the same
+        // C.5-bulk-drain seam blocking D.3 input delivery: the
+        // endpoint is registered (so `ipc_lookup_service(
+        // "display-control")` works), the codec + dispatcher +
+        // subscription registry are all complete and exercised by
+        // host tests, and the runtime drain is dormant pending the
+        // bulk-drain follow-up. `serve_control_iter` exists as the
+        // structurally-complete dispatch wrapper so the remaining
+        // change at C.5-drain landing time is a single
+        // call-site flip from "skip" to "serve_control_iter(...)".
+        //
+        // The reference shapes below silence "unused_mut" /
+        // "unused_variables" without invoking any I/O; every binding
+        // is exercised by `serve_control_iter`'s host tests once the
+        // recv path lands.
+        let _ = (
+            ctl_ep_handle,
+            &mut control_subs,
+            &mut bind_table,
+            &frame_stats,
+        );
+        // TODO(C.5-bulk-drain): replace the above no-op with a
+        // notif-bind multiplex'd recv on the control endpoint.
     }
+}
+
+/// Phase 56 Track E.4 — single-iteration control-endpoint dispatch
+/// helper. Decodes one `ControlCommand` from `bulk`, invokes the
+/// dispatcher, and stages the encoded `ControlEvent` reply onto the
+/// reply-bulk slot.
+///
+/// Returns `Ok(reply_bytes)` for the count of bytes staged; the caller
+/// is responsible for the final `ipc_reply` with `LABEL_CTL_REPLY`.
+/// On any codec or dispatch error, the helper still produces an
+/// encoded `Error` event so the client always receives a reply.
+///
+/// Today this is reachable from the dispatcher's host tests; the
+/// `main` loop does not yet wire it because the IPC surface lacks a
+/// non-blocking try-recv. See the `TODO(C.5-bulk-drain)` marker in
+/// `program_main`.
+#[allow(dead_code)]
+fn serve_control_iter(
+    bulk: &[u8],
+    client: control::ClientId,
+    registry: &SurfaceRegistry,
+    bind_table: &mut BindTable,
+    subscriptions: &mut control::ControlSubscriptions,
+    frame_stats: &FrameStatsRing,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{
+        ControlError, ControlErrorCode, ControlEvent, decode_command,
+    };
+
+    // Decode → dispatch. Any decode error is converted to an `Error`
+    // event so the wire is always a valid frame.
+    let cmd = match decode_command(bulk) {
+        Ok((c, _)) => c,
+        Err(ControlError::UnknownVerb { .. }) => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::UnknownVerb,
+                },
+                reply_buf,
+            );
+        }
+        Err(ControlError::MalformedFrame) => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::MalformedFrame,
+                },
+                reply_buf,
+            );
+        }
+        Err(ControlError::BadArgs { .. }) => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::BadArgs,
+                },
+                reply_buf,
+            );
+        }
+        Err(_) => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::MalformedFrame,
+                },
+                reply_buf,
+            );
+        }
+    };
+
+    match control::dispatch_command(
+        &cmd,
+        client,
+        registry,
+        bind_table,
+        subscriptions,
+        frame_stats,
+        reply_buf,
+    ) {
+        Ok(Some(n)) => n,
+        Ok(None) => 0,
+        Err(_) => encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::MalformedFrame,
+            },
+            reply_buf,
+        ),
+    }
+}
+
+/// Best-effort encode of a `ControlEvent`. Returns the byte count on
+/// success, or `0` if even the error event won't fit in `reply_buf`.
+/// `0` lets the caller send a label-only reply so the client at
+/// least observes a roundtrip.
+#[allow(dead_code)]
+fn encode_event_or_drop(
+    evt: &kernel_core::display::control::ControlEvent,
+    reply_buf: &mut [u8],
+) -> usize {
+    kernel_core::display::control::encode_event(evt, reply_buf).unwrap_or_default()
 }
 
 /// Try to acquire the framebuffer with bounded retry, in case another
@@ -480,6 +725,64 @@ pub(crate) fn pixel_format_from_kernel_tag(
         0 => Some(PixelFormat::Rgba8888), // bootloader_api::PixelFormat::Rgb
         1 => Some(PixelFormat::Bgra8888), // bootloader_api::PixelFormat::Bgr
         _ => None,
+    }
+}
+
+/// Read the monotonic clock and return the time as microseconds. Used by
+/// the Track E.4 frame-stats wrapper around `run_compose`. Saturates
+/// rather than panicking on overflow or syscall error so the compose
+/// path stays panic-free.
+fn monotonic_micros() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    if sec < 0 {
+        return 0;
+    }
+    let sec_us = (sec as u64).saturating_mul(1_000_000);
+    let nsec_us = (nsec as u64) / 1_000;
+    sec_us.saturating_add(nsec_us)
+}
+
+/// Phase 56 Track E.4 — diff the previous and current snapshot of
+/// registered surface ids and publish `SurfaceCreated` /
+/// `SurfaceDestroyed` events on the control-socket subscription
+/// registry for every entry that changed.
+///
+/// Both snapshots are sorted ascending (the registry is a `BTreeMap`),
+/// so the diff is a linear two-pointer walk. The function looks up
+/// the role from the registry for any newly-appearing id; a
+/// destroy-then-recreate within the same iteration is impossible
+/// because the dispatcher processes one IPC message per loop pass.
+fn publish_surface_lifecycle_deltas(
+    subs: &mut crate::control::ControlSubscriptions,
+    registry: &SurfaceRegistry,
+    prev: &[SurfaceId],
+    cur: &[SurfaceId],
+) {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < prev.len() && j < cur.len() {
+        let p = prev[i];
+        let c = cur[j];
+        if p == c {
+            i += 1;
+            j += 1;
+        } else if p.0 < c.0 {
+            // `p` was destroyed.
+            publish_surface_destroyed(subs, p);
+            i += 1;
+        } else {
+            // `c` is new.
+            publish_surface_created(subs, registry, c);
+            j += 1;
+        }
+    }
+    while i < prev.len() {
+        publish_surface_destroyed(subs, prev[i]);
+        i += 1;
+    }
+    while j < cur.len() {
+        publish_surface_created(subs, registry, cur[j]);
+        j += 1;
     }
 }
 

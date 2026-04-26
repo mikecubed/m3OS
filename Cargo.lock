@@ -969,6 +969,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "m3ctl"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

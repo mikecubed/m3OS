@@ -206,6 +206,11 @@ static E1000_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("e1000-crash-smoke
 static DISPLAY_SERVER_ELF: &[u8] = generated_initrd_asset!("display_server");
 // Phase 56 Track C.6: protocol-reference client (visual smoke).
 static GFX_DEMO_ELF: &[u8] = generated_initrd_asset!("gfx-demo");
+// Phase 56 Track E.4: minimal control-socket client. One-shot CLI;
+// invoked from the shell or via test harnesses (no `.conf` because it
+// is not a daemon — the four-step new-binary convention only requires
+// a service config for daemons).
+static M3CTL_ELF: &[u8] = generated_initrd_asset!("m3ctl");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -586,6 +591,9 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: GFX_DEMO_ELF,
         },
     ),
+    // Phase 56 Track E.4: minimal control-socket CLI. Not a daemon
+    // — invoked by the shell or test harness; no `.conf` required.
+    ("m3ctl", RamdiskNode::File { content: M3CTL_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
