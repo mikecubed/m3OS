@@ -295,6 +295,14 @@ fn blit_cursor<O: FramebufferOwner>(
     let output_y2 = output_y + (output.h as i64);
 
     let mut writes = 0usize;
+    // Scratch buffer for the contiguous opaque-pixel run currently
+    // being assembled. Hoisted out of the row / run loops so we
+    // allocate at most once per call (the worst case is one full
+    // row of opaque pixels: `cw * bpp_usize`). `clear()` drops the
+    // length without touching capacity, so subsequent runs reuse the
+    // backing storage.
+    let max_run_bytes = (cw as usize).saturating_mul(bpp_usize);
+    let mut run_pixels: Vec<u8> = Vec::with_capacity(max_run_bytes);
     // Walk the cursor bitmap row-by-row. Within a row, batch
     // contiguous opaque pixels into a single `write_pixels` call so
     // a fully-opaque arrow takes one call per row instead of one per
@@ -318,8 +326,8 @@ fn blit_cursor<O: FramebufferOwner>(
                 break;
             }
             let run_start = cx;
-            // Collect contiguous opaque pixels into a buffer.
-            let mut run_pixels: Vec<u8> = Vec::with_capacity(bpp_usize);
+            // Collect contiguous opaque pixels into the scratch buffer.
+            run_pixels.clear();
             while cx < cw {
                 let s = cursor.sample(cx, cy);
                 if s == 0 {

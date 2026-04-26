@@ -594,9 +594,19 @@ pub fn ipc_store_reply_bulk(buf: &[u8]) -> u64 {
 }
 
 /// Non-blocking variant of [`ipc_recv_msg`] (Phase 56 close-out). Returns
-/// immediately with `u64::MAX` if no sender is queued on the endpoint;
-/// otherwise dequeues one pending message, copies the header to `msg`,
-/// the bulk to `buf`, and returns the message label.
+/// immediately if no sender is queued on the endpoint; otherwise dequeues
+/// one pending message, copies the header to `msg`, the bulk to `buf`,
+/// and returns the message label.
+///
+/// # Return value
+///
+/// - the message label on success;
+/// - `u64::MAX` for either of two cases — the endpoint queue is empty
+///   (the normal no-work path) **or** a copy-to-user failure for `msg`
+///   / `buf` (a real fault). The current syscall ABI does not separate
+///   these; callers that need to distinguish them must treat repeated
+///   `u64::MAX` returns combined with otherwise-healthy senders as a
+///   probable copy fault and surface it via their own observability.
 ///
 /// Used by `display_server`'s main loop to serve the control endpoint
 /// alongside the frame-tick poll without blocking on `ipc_recv_msg`.

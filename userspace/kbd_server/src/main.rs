@@ -240,7 +240,7 @@ fn handle_kbd_read() {
 /// On timeout, replies with `label = u64::MAX` and no bulk so the
 /// caller can distinguish a bounded-wait expiry from a real event.
 fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
-    for _ in 0..MAX_PULL_POLLS {
+    for iter in 0..MAX_PULL_POLLS {
         // Drain as many scancode bytes as the kernel has buffered,
         // emitting at most one KeyEvent per pull (the scheduler picks
         // the next due event on subsequent ticks).
@@ -263,7 +263,14 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
             return;
         }
 
-        let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+        // Only sleep if another iteration will follow. With
+        // `MAX_PULL_POLLS == 1` (the Phase 56 close-out value), this
+        // skips the 5 ms sleep entirely so the documented
+        // non-blocking semantic is real and display_server's 1 ms
+        // multiplex is not stalled.
+        if iter + 1 < MAX_PULL_POLLS {
+            let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+        }
     }
 
     // Bounded timeout — surface as a typed error reply (label = u64::MAX,

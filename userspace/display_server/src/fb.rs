@@ -199,7 +199,9 @@ impl FramebufferOwner for KernelFramebufferOwner {
     /// Phase 56 close-out (G.1) — read one BGRA8888 pixel from the
     /// mapped framebuffer at `(x, y)`. Returns
     /// [`FbError::OutOfBounds`] if the coordinate falls outside the
-    /// reported `(width, height)`. Used only by the test-only
+    /// reported `(width, height)`, or [`FbError::Unsupported`] if the
+    /// active pixel format is not 4 bytes per pixel (Phase 56 ships
+    /// only BGRA8888 / RGBA8888). Used only by the test-only
     /// `ReadBackPixel` control verb.
     fn read_pixel(&self, x: u32, y: u32) -> Result<u32, FbError> {
         if x >= self.metadata.width || y >= self.metadata.height {
@@ -207,10 +209,12 @@ impl FramebufferOwner for KernelFramebufferOwner {
         }
         let bpp = bytes_per_pixel(self.metadata.pixel_format) as usize;
         // Phase 56 ships only 4-bpp formats (BGRA8888 / RGBA8888); read
-        // exactly 4 bytes and pack as a `u32`. Any future non-4-bpp
-        // format would need a wider read path.
+        // exactly 4 bytes and pack as a `u32`. A non-4-bpp format is a
+        // backend capability gap, not a bounds error — surface it as
+        // `Unsupported` so callers can distinguish it from a
+        // coordinate fault.
         if bpp != 4 {
-            return Err(FbError::OutOfBounds);
+            return Err(FbError::Unsupported);
         }
         let dest_stride = self.metadata.stride_bytes as usize;
         let dest_x_bytes = (x as usize).saturating_mul(bpp);

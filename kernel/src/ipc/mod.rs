@@ -26,7 +26,7 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1112`;
+//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1113`;
 //!   earlier phases used low numbers 4 and 7, remapped in Phase 50).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
@@ -57,8 +57,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x1112` are translated to internal
-/// dispatch numbers 1–18 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x1113` are translated to internal
+/// dispatch numbers 1–20 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
