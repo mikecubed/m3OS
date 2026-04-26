@@ -170,22 +170,18 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     // ------------------------------------------------------------------
-    // Step 4: Poll service status for `display_server` to re-register.
+    // Step 4 + 5 (combined): Wait for the display-control endpoint to
+    // be reachable on the *new* display_server instance. We test
+    // reachability via `ipc_lookup_service` rather than polling
+    // `/run/services.status` because the supervisor transitions
+    // display_server to `running` at fork time, before the restarted
+    // process re-creates and re-registers its endpoints. The lookup
+    // succeeds only after the new instance has called
+    // `ipc_register_service("display-control")`, which is the actual
+    // signal that the control plane is back. Keep the budget generous
+    // (50 × 100 ms = 5 s) to absorb framebuffer-acquire backoff.
     // ------------------------------------------------------------------
-    if !wait_for_service_running("display_server", RESTART_WAIT_SECONDS) {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "DISPLAY_CRASH_SMOKE:FAIL step=4 restart-timeout\n",
-        );
-        return 4;
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "DISPLAY_CRASH_SMOKE:restart-confirmed\n");
-
-    // ------------------------------------------------------------------
-    // Step 5: Re-look-up the control endpoint (the restart registers
-    // a fresh one).
-    // ------------------------------------------------------------------
-    let handle2 = match lookup_with_backoff(CONTROL_SERVICE_NAME) {
+    let handle2 = match lookup_with_extended_backoff(CONTROL_SERVICE_NAME) {
         Some(h) => h,
         None => {
             syscall_lib::write_str(
@@ -195,6 +191,7 @@ fn program_main(_args: &[&str]) -> i32 {
             return 5;
         }
     };
+    syscall_lib::write_str(STDOUT_FILENO, "DISPLAY_CRASH_SMOKE:restart-confirmed\n");
 
     // ------------------------------------------------------------------
     // Step 6: Send `version` against the new instance — must succeed.
@@ -243,6 +240,27 @@ fn lookup_with_backoff(name: &str) -> Option<u32> {
             return None;
         }
         let _ = syscall_lib::nanosleep_for(0, SERVICE_LOOKUP_BACKOFF_NS);
+    }
+    None
+}
+
+/// Extended-budget lookup for post-restart re-connection. The
+/// supervisor's "running" transition happens at fork time, but the
+/// restarted process still needs to re-acquire the framebuffer
+/// (bounded backoff ~40 ms) and re-register both endpoints. A 5 s
+/// budget absorbs the cascade comfortably.
+fn lookup_with_extended_backoff(name: &str) -> Option<u32> {
+    const ATTEMPTS: u32 = 50;
+    const BACKOFF_NS: u32 = 100_000_000; // 100 ms
+    for attempt in 0..ATTEMPTS {
+        let raw = syscall_lib::ipc_lookup_service(name);
+        if raw != u64::MAX {
+            return Some(raw as u32);
+        }
+        if attempt + 1 == ATTEMPTS {
+            return None;
+        }
+        let _ = syscall_lib::nanosleep_for(0, BACKOFF_NS);
     }
     None
 }

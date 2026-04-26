@@ -7178,7 +7178,8 @@ fn regression_tests() -> Vec<RegressionTest> {
     //      left dead.
     //   3. The supervisor restarts display_server within
     //      `display_server.conf`'s `max_restart=5` budget (init logs
-    //      `init: started 'display_server' pid=`).
+    //      `init: started 'display' pid=` — the service-registration
+    //      name from the manifest, not the binary name).
     //   4. The smoke client polls `/run/services.status` for the
     //      restart, reconnects, and confirms the new instance replies
     //      to `version`.
@@ -7715,9 +7716,11 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
 ///    console so the screen is not left dead — see
 ///    `kernel/src/fb/mod.rs::restore_console` and
 ///    `kernel/src/arch/x86_64/syscall/mod.rs:2099`).
-/// 6. Confirm `init: started 'display_server' pid=` appears for the
-///    *second* time (the supervisor-driven restart, within
-///    `display_server.conf`'s `max_restart=5` budget). The presence
+/// 6. Confirm `init: started 'display' pid=` appears for the *second*
+///    time (the supervisor-driven restart, within
+///    `display_server.conf`'s `max_restart=5` budget — note: init logs
+///    the service-registration name from the manifest, not the binary
+///    name). The presence
 ///    of this kernel-routed log line after the panic is also our
 ///    proxy that the framebuffer console resumed: `fb::write_str`
 ///    re-engages once `CONSOLE_YIELDED` clears, so any log line
@@ -7789,8 +7792,12 @@ fn display_server_crash_recovery_steps() -> Vec<SmokeStep> {
     // `kernel/src/arch/x86_64/syscall/mod.rs:2099` — process-death
     // path that calls `restore_console` when the dying PID owned the
     // FB).
+    // Init logs the *service-registration name* from the manifest's
+    // `name=display` field, not the binary name `display_server`. The
+    // service-name path is the canonical supervisor identifier
+    // (matches `/run/services.status` and the `service` shell verb).
     steps.push(SmokeStep::Wait {
-        pattern: "init: started 'display_server' pid=",
+        pattern: "init: started 'display' pid=",
         timeout_secs: 30,
         label: "guest/display-crash: supervisor restarts display_server",
     });
