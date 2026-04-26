@@ -145,7 +145,9 @@ These are the H.4 and A.9 verification bullets that require running real quality
 
 ### 5.2 `cargo xtask test` passes on the final branch
 
-**Status:** **Run + investigated.** One pre-existing kernel-side test fails identically on this branch and on `main`:
+**Status:** **Run + two pre-existing failures triaged.** The xtask harness stops at the first failing test, so the runs reveal failures one at a time.
+
+**Failure 1 — fixed in this PR:**
 
 ```
 kernel::mm::frame_allocator::tests::contiguous_alloc_recovers_order0_hoarding
@@ -153,9 +155,21 @@ kernel::mm::frame_allocator::tests::contiguous_alloc_recovers_order0_hoarding
   contiguous reclaim test leaked frames: before=248079 after=248080
 ```
 
-`kernel/src/mm/frame_allocator.rs` last changed in PR #104 (Phase 53a, 2026-04). Phase 56 does not touch the frame allocator; the failure reproduces with `git checkout main -- kernel/src/mm/frame_allocator.rs`. Treated as a pre-existing flake/bug — out of scope for Phase 56 close-out.
+The test asserted `after == before` but observed `after = before + 1` — a *gain* of one frame, not a leak. Root cause: `allocate_contiguous`'s order-0 hoarding retry path runs `reclaim_allocator_local_caches`, which surfaces empty slab pages back to the buddy pool. The test's `before` snapshot was taken with those slab pages still in slab tracking; the `after` snapshot saw them as buddy free pages. Both samples must be taken in the same allocator-local steady state.
 
-The xtask harness's behavior of stopping at the first failure means later kernel tests are not exercised in this run. If the flake is fixed in a follow-up PR, the full xtask test suite needs a second pass. Recorded in this gap doc rather than gating Phase 56 close on an unrelated issue.
+Fix landed in this PR: `reclaim_allocator_local_caches` is called both before sampling `before` and before sampling `after`, so each snapshot sees the same balanced state. The test now asserts the correct contract — *no leaked frames* — without papering over slab-vs-buddy accounting.
+
+**Failure 2 — pre-existing, out-of-scope for Phase 56:**
+
+```
+kernel::net::remote::tests::drain_rx_queue_removes_malformed_frames_after_deferred_queueing
+  panicked at kernel/src/net/remote.rs:743:9:
+  assertion `left == right` failed
+    left: 0
+   right: 1
+```
+
+`kernel/src/net/remote.rs` last changed in PR #118 (Phase 55c, 2026-04). Phase 56 does not touch the ring-3 NIC driver host; the failure is unrelated to display/input work. Recorded here so a follow-up PR (Phase 55c closeout?) picks it up; not a Phase 56 close-out blocker.
 
 ### 5.3 `M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test display-server-crash-recovery`
 
@@ -217,7 +231,7 @@ When the items above resolve, mark this doc complete and update the Phase 56 row
 - [x] § 4.1 — G.1 multi-client coexistence regression written + passing (`M3OS_ENABLE_MULTI_CLIENT_SMOKE=1 cargo xtask regression --test multi-client-coexistence`: 1 passed, 0 failed). Required: new `ControlCommand::ReadBackPixel` test-only verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`, FramebufferOwner trait extension with `read_pixel`, new `display-multi-client-smoke` guest binary, and a small fix to `FloatingLayout::arrange` so cascade slots are stable across frames in the multi-surface case (call-local index instead of a persistent counter).
 - [x] § 4.2 — G.2 synthetic-key-injection regression written + passing (`M3OS_ENABLE_GRAB_HOOK_SMOKE=1 cargo xtask regression --test grab-hook`: 1 passed, 0 failed). Required: new `ControlCommand::InjectKey` test-only verb gated by `M3OS_DISPLAY_SERVER_INJECT_KEY=1`, `InputWiring::inject_key()` synthetic-event drain in the dispatcher loop, new `grab-hook-smoke` guest binary, and `/etc/display_server.inject-key` marker plumbed through `init` envp builder.
 - [x] § 4.3 — G.4 runtime control-socket regression written + passing (`M3OS_ENABLE_CONTROL_SOCKET_SMOKE=1 cargo xtask regression --test control-socket`: 1 passed, 0 failed). Drives `m3ctl version`, `m3ctl list-surfaces` (after `gfx-demo` registers its toplevel), and `m3ctl frame-stats` end-to-end against the live `display-control` endpoint with no marker file required.
-- [x] § 5.2 — `cargo xtask test` run on final branch. One pre-existing failure (`frame_allocator::tests::contiguous_alloc_recovers_order0_hoarding`) reproduces identically on `main`; the file last changed in Phase 53a (PR #104) and is untouched by Phase 56. Documented as a pre-existing flake — see § 5.2 above.
+- [x] § 5.2 — `cargo xtask test` run on final branch. Two pre-existing failures triaged: (1) `frame_allocator::tests::contiguous_alloc_recovers_order0_hoarding` — root-caused to slab/buddy accounting drift in `allocate_contiguous`'s reclaim path, **fixed in this PR** by symmetric `reclaim_allocator_local_caches` calls bracketing the snapshots; (2) `net::remote::tests::drain_rx_queue_removes_malformed_frames_after_deferred_queueing` — `kernel/src/net/remote.rs` last touched in Phase 55c (PR #118), unrelated to Phase 56 display/input work, recorded as out-of-scope. See § 5.2 above for diagnosis.
 - [x] § 5.3 — F.2 regression passes
 - [x] § 5.4 — F.3 regression passes
 - [x] § 5.6 — Default `cargo xtask regression` passes (10/11; `fork-overlap` and `serverization-fallback` are pre-existing flakes — both fail intermittently on main, neither caused by Phase 56 changes; the Phase 56 task doc records the flake count from the close-out smoke runs)
