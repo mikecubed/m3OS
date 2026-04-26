@@ -54,6 +54,8 @@ members = [
     "userspace/vfs_server",
     "userspace/fat_server",
     "userspace/net_server",
+    # Phase 56 Track D.2 — userspace mouse service
+    "userspace/mouse_server",
     # Phase 55b Track C.1 — ring-3 driver runtime library
     "userspace/lib/driver_runtime",
     # Phase 55b Tracks D.1 / E.1 — ring-3 driver scaffolds
