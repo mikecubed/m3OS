@@ -713,6 +713,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grab-hook-smoke"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

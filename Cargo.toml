@@ -79,6 +79,8 @@ members = [
     "userspace/display-server-crash-smoke",
     # Phase 56 close-out (G.1) — multi-client coexistence smoke client
     "userspace/display-multi-client-smoke",
+    # Phase 56 close-out (G.2) — keybind grab-hook smoke client
+    "userspace/grab-hook-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

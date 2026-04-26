@@ -105,6 +105,11 @@ const OP_CTL_DEBUG_CRASH: u16 = 0x0208;
 // that two distinct surfaces' colors land at their layout-derived
 // positions in the framebuffer.
 const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
+// Phase 56 close-out (G.2 regression) — test-only synthetic key
+// injection. Same gating shape as the verbs above. Used by the
+// grab-hook regression to drive a chord through the input dispatcher
+// without needing real PS/2 scancode hardware events.
+const OP_CTL_INJECT_KEY: u16 = 0x020A;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -404,6 +409,27 @@ pub enum ControlCommand {
     ReadBackPixel {
         x: u32,
         y: u32,
+    },
+    /// Phase 56 close-out (G.2 regression) — test-only synthetic key
+    /// injection.
+    ///
+    /// Synthesizes a `KeyEvent { modifier_mask, keycode, kind }` and
+    /// pushes it onto the input dispatcher's pending queue. The next
+    /// `drain_one_pass` routes it through the same path as a real
+    /// PS/2 event — bind-table lookup, grab-state suppression, focus
+    /// routing, etc. Used by the grab-hook regression to verify that
+    /// a registered chord swallows the matching `KeyDown`.
+    ///
+    /// `kind`: 0 = `Down`, 1 = `Up`, 2 = `Repeat`. Other values are
+    /// rejected with `BadArgs`.
+    ///
+    /// Same gating shape as the other test-only verbs: codec round-
+    /// trips unconditionally; production boots leave the env-var
+    /// unset and the dispatcher shadows back to `UnknownVerb`.
+    InjectKey {
+        modifier_mask: u16,
+        keycode: u32,
+        kind: u8,
     },
 }
 
@@ -1057,6 +1083,16 @@ impl ControlCommand {
                     body[4..8].copy_from_slice(&y.to_le_bytes());
                 })
             }
+            // Phase 56 close-out (G.2) — see `OP_CTL_INJECT_KEY`.
+            Self::InjectKey {
+                modifier_mask,
+                keycode,
+                kind,
+            } => encode_fixed_body(buf, OP_CTL_INJECT_KEY, 7, |body| {
+                body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
+                body[2..6].copy_from_slice(&keycode.to_le_bytes());
+                body[6] = *kind;
+            }),
         }
     }
 
@@ -1112,6 +1148,16 @@ impl ControlCommand {
                 Self::ReadBackPixel {
                     x: read_u32(body, 0)?,
                     y: read_u32(body, 4)?,
+                }
+            }
+            // Phase 56 close-out (G.2) — `(modifier_mask, keycode, kind)` body.
+            // See `OP_CTL_INJECT_KEY`.
+            OP_CTL_INJECT_KEY => {
+                expect_body_len(body_len, 7)?;
+                Self::InjectKey {
+                    modifier_mask: read_u16(body, 0)?,
+                    keycode: read_u32(body, 2)?,
+                    kind: body[6],
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -1733,6 +1779,28 @@ mod tests {
         }
     }
 
+    // Phase 56 close-out (G.2) — `InjectKey` codec round-trip.
+    #[test]
+    fn ctl_cmd_inject_key_round_trips() {
+        for kind in 0u8..=2 {
+            encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+                modifier_mask: MOD_SUPER,
+                keycode: b'q' as u32,
+                kind,
+            });
+        }
+        encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+            modifier_mask: 0,
+            keycode: 0,
+            kind: 0,
+        });
+        encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+            modifier_mask: u16::MAX,
+            keycode: u32::MAX,
+            kind: 255,
+        });
+    }
+
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
@@ -2091,6 +2159,13 @@ mod tests {
             Just(ControlCommand::FrameStats),
             Just(ControlCommand::DebugCrash),
             (any::<u32>(), any::<u32>()).prop_map(|(x, y)| ControlCommand::ReadBackPixel { x, y }),
+            (any::<u16>(), any::<u32>(), any::<u8>()).prop_map(|(m, k, kind)| {
+                ControlCommand::InjectKey {
+                    modifier_mask: m,
+                    keycode: k,
+                    kind,
+                }
+            }),
         ]
     }
 

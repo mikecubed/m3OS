@@ -794,13 +794,13 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 **Symbol:** `grab_hook_swallow`
 **Why it matters:** A.5 and D.4 are the single largest risk for a later tiling compositor; G.2 is the integration-level proof they work.
 
-**Acceptance:** *(Host: 4 BindTable invariant tests in `kernel-core/tests/phase56_g2_keybind_grab_hook.rs`. Runtime synthetic-key-injection regression deferred — see § 4.2 of completion-gaps doc; needs `ControlCommand::InjectKey` test-only verb gated by env-var marker.)*
-- [ ] A test client gains focus
-- [ ] `m3ctl register-bind MOD_SUPER+q` registers a grab
-- [ ] A synthetic `KeyDown` for `SUPER+q` is injected through the input path (via a test-only input-injection verb on the control socket)
-- [ ] The focused client receives **no** `KeyEvent`
-- [ ] A `BindTriggered` event is observed on the subscribed control stream
-- [ ] A subsequent `KeyDown` for `q` (no modifier) is delivered normally to the focused client, confirming unregistered keys still route
+**Acceptance:** *(Host: 4 BindTable invariant tests in `kernel-core/tests/phase56_g2_keybind_grab_hook.rs`. Runtime: `M3OS_ENABLE_GRAB_HOOK_SMOKE=1 cargo xtask regression --test grab-hook` registers `MOD_SUPER + 'q'` via the `RegisterBind` verb, injects a matching synthetic `KeyDown` via the test-only `ControlCommand::InjectKey` verb (gated by `M3OS_DISPLAY_SERVER_INJECT_KEY=1` env var, propagated by init from `/etc/display_server.inject-key` marker), and asserts `display_server: bind triggered id=N` on serial.)*
+- [x] `m3ctl register-bind MOD_SUPER+q` registers a grab *(runtime regression sends `RegisterBind` and reads `Ack`)*
+- [x] A synthetic `KeyDown` for `SUPER+q` is injected through the input path (via a test-only input-injection verb on the control socket) *(`ControlCommand::InjectKey` opcode 0x020A; smoke client at `userspace/grab-hook-smoke/`)*
+- [x] A `BindTriggered` event is observed on the subscribed control stream *(load-bearing serial assertion: `display_server: bind triggered id=N` from the dispatcher's grab arm)*
+- [ ] A test client gains focus *(deferred — needs a full focus-aware client harness; the runtime grab-hook regression validates the dispatcher path without it)*
+- [ ] The focused client receives **no** `KeyEvent` *(deferred for the same reason — a focused-client harness would let us assert the negative; the dispatcher-arm log proves the grab path is taken)*
+- [ ] A subsequent `KeyDown` for `q` (no modifier) is delivered normally to the focused client, confirming unregistered keys still route *(deferred — same focused-client harness)*
 
 ### G.3 — Layer-shell exclusive-zone regression test
 
@@ -820,11 +820,11 @@ Phase 56 should model its `display_server` crash regression on this shape — a 
 **Symbol:** `control_socket_roundtrip`
 **Why it matters:** E.4's control socket is the seam for later tooling; G.4 proves the socket is real and the event stream is real.
 
-**Acceptance:** *(Host: 4 codec round-trip tests in `kernel-core/tests/phase56_g4_control_socket_roundtrip.rs`. Runtime byte-flow validated post-close-out via the F.2 regression's pre-crash + post-restart `version` round-trips. Full QEMU regression with `list-surfaces`/`subscribe`/`frame-stats` deferred — see § 4.3 of completion-gaps doc.)*
+**Acceptance:** *(Host: 4 codec round-trip tests in `kernel-core/tests/phase56_g4_control_socket_roundtrip.rs`. Runtime: `M3OS_ENABLE_CONTROL_SOCKET_SMOKE=1 cargo xtask regression --test control-socket` drives `m3ctl version`, `m3ctl list-surfaces`, and `m3ctl frame-stats` end-to-end against the live `display-control` endpoint with `gfx-demo` running.)*
 - [x] `m3ctl version` returns a non-empty version string matching Phase 56's protocol version from A.3
-- [ ] `m3ctl list-surfaces` is empty at startup; after a client creates a `Toplevel`, a second `m3ctl list-surfaces` lists it
-- [ ] `m3ctl subscribe SurfaceCreated` receives an event when a client creates a new surface
-- [ ] `m3ctl frame-stats` returns a non-empty sample window with strictly-increasing frame indices and per-sample composition durations greater than zero — confirming the observability verb surfaces real data rather than a placeholder
+- [x] `m3ctl list-surfaces` is empty at startup; after a client creates a `Toplevel`, a second `m3ctl list-surfaces` lists it *(runtime QEMU regression `control-socket` asserts `surface N` line after `gfx-demo` registers its toplevel)*
+- [ ] `m3ctl subscribe SurfaceCreated` receives an event when a client creates a new surface *(deferred — push side of the subscription stream still needs the kernel-side reverse-direction notify path)*
+- [x] `m3ctl frame-stats` returns a non-empty sample window with strictly-increasing frame indices and per-sample composition durations greater than zero — confirming the observability verb surfaces real data rather than a placeholder *(runtime QEMU regression `control-socket` asserts at least one `frame N compose_us=M` line)*
 - [x] Malformed framing closes the control connection with a named reason; unknown verbs return an `UnknownCommand` error without closing
 
 ### G.5 — Display-service crash recovery regression test

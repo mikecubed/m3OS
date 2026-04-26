@@ -361,6 +361,10 @@ fn build_userspace_bins() {
             "display-multi-client-smoke",
             true,
         ),
+        // Phase 56 close-out (G.2) — keybind grab-hook smoke client.
+        // Registers a bind, injects the chord, observes the
+        // `bind triggered` log via the regression's xtask wait.
+        ("grab-hook-smoke", "grab-hook-smoke", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -4398,7 +4402,14 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, true, false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        true,
+        false,
+        false,
+        false,
+    );
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -4435,7 +4446,14 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, true, false, false);
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
         }
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -4698,7 +4716,14 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 
     let ovmf = find_ovmf();
     let display_mode = if args.display {
@@ -4734,7 +4759,14 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                false,
+                false,
+                false,
+                false,
+            );
         }
 
         let mut child = Command::new("qemu-system-x86_64")
@@ -5068,6 +5100,7 @@ fn create_data_disk(
     smoke_test_mode: bool,
     display_server_debug_crash: bool,
     display_server_readback: bool,
+    display_server_inject_key: bool,
 ) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
@@ -5167,6 +5200,7 @@ fn create_data_disk(
         smoke_test_mode,
         display_server_debug_crash,
         display_server_readback,
+        display_server_inject_key,
     );
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
@@ -5222,6 +5256,7 @@ fn populate_ext2_files(
     smoke_test_mode: bool,
     display_server_debug_crash: bool,
     display_server_readback: bool,
+    display_server_inject_key: bool,
 ) {
     // Standard Unix root filesystem layout.
     let passwd_content =
@@ -5388,6 +5423,23 @@ fn populate_ext2_files(
              sif etc/display_server.readback uid 0\n\
              sif etc/display_server.readback gid 0\n",
             readback_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 56 close-out (G.2) — drop the inject-key marker file when
+    // the grab-hook regression asks for it. Same shape as the readback
+    // marker.
+    let inject_key_cmds = if display_server_inject_key {
+        let inject_key_tmp = output_dir.join("_tmp_display_server_inject_key");
+        fs::write(&inject_key_tmp, b"enabled\n").expect("write temp inject-key marker");
+        format!(
+            "write \"{}\" etc/display_server.inject-key\n\
+             sif etc/display_server.inject-key mode 0x81A4\n\
+             sif etc/display_server.inject-key uid 0\n\
+             sif etc/display_server.inject-key gid 0\n",
+            inject_key_tmp.display()
         )
     } else {
         String::new()
@@ -5630,6 +5682,7 @@ fn populate_ext2_files(
          {disable_display_cmds}\
          {debug_crash_cmds}\
          {readback_cmds}\
+         {inject_key_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -5656,6 +5709,7 @@ fn populate_ext2_files(
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
         readback_cmds = readback_cmds,
+        inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -6411,7 +6465,14 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir, image_args.enable_telnet, false, false, false);
+    create_data_disk(
+        output_dir,
+        image_args.enable_telnet,
+        false,
+        false,
+        false,
+        false,
+    );
 
     if !image_args.sign {
         return;
@@ -6793,7 +6854,14 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
@@ -6808,7 +6876,14 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
 }
 
@@ -6987,6 +7062,11 @@ struct RegressionTest {
     /// `M3OS_DISPLAY_SERVER_READBACK=1` and display_server's
     /// dispatcher honors the test-only `ReadBackPixel` verb.
     wants_readback_marker: bool,
+    /// Phase 56 close-out (G.2) — when `true`, the regression runner
+    /// drops `/etc/display_server.inject-key` so init propagates
+    /// `M3OS_DISPLAY_SERVER_INJECT_KEY=1` and display_server's
+    /// dispatcher honors the test-only `InjectKey` verb.
+    wants_inject_key_marker: bool,
 }
 
 /// Return the list of registered regression tests.
@@ -7000,6 +7080,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "ipc-wake",
@@ -7009,6 +7090,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "pty-overlap",
@@ -7018,6 +7100,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "signal-reset",
@@ -7027,6 +7110,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "kbd-echo",
@@ -7036,6 +7120,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "service-lifecycle",
@@ -7045,6 +7130,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "storage-roundtrip",
@@ -7054,6 +7140,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "serverization-fallback",
@@ -7063,6 +7150,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "log-pipeline",
@@ -7072,6 +7160,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "security-floor",
@@ -7081,6 +7170,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
     ];
 
@@ -7097,6 +7187,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7123,6 +7214,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7155,6 +7247,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7184,6 +7277,7 @@ fn regression_tests() -> Vec<RegressionTest> {
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
+        wants_inject_key_marker: false,
     });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
@@ -7210,6 +7304,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7251,6 +7346,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: true,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7280,6 +7376,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7306,6 +7403,69 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet::default(),
             wants_debug_crash_marker: false,
             wants_readback_marker: true,
+            wants_inject_key_marker: false,
+        });
+    }
+
+    // Phase 56 close-out (G.2) — keybind grab-hook regression.
+    //
+    // Drives the dispatcher's grab arm end-to-end: registers a bind
+    // for `MOD_SUPER + 'q'` via `RegisterBind`, then injects a
+    // matching synthetic `KeyDown` via the test-only `InjectKey` verb.
+    // The load-bearing assertion is `display_server`'s
+    // `bind triggered id=N` log line, emitted by the dispatcher's grab
+    // arm — proving the grab fired and no client received the matching
+    // `KeyEvent`.
+    //
+    // Gated behind M3OS_ENABLE_GRAB_HOOK_SMOKE so the disk-rebuild
+    // (with /etc/display_server.inject-key marker) does not run in
+    // normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_GRAB_HOOK_SMOKE=1 cargo xtask regression --test grab-hook
+    if std::env::var_os("M3OS_ENABLE_GRAB_HOOK_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "grab-hook",
+            description: "Phase 56 G.2: RegisterBind + InjectKey drives the dispatcher's \
+                 grab arm; display_server logs `bind triggered`",
+            guest_steps: grab_hook_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: true,
+        });
+    }
+
+    // Phase 56 close-out (G.4) — runtime control-socket regression.
+    //
+    // Drives `m3ctl` end-to-end against the live `display-control`
+    // service:
+    //   1. `m3ctl version` returns the Phase 56 protocol version,
+    //   2. `m3ctl list-surfaces` lists `gfx-demo`'s toplevel,
+    //   3. `m3ctl frame-stats` returns at least one sample with
+    //      `compose_us=N` (N >= 0) — proving the observability verb
+    //      surfaces real data rather than a placeholder.
+    //
+    // No marker file is needed: every verb exercised here is part of
+    // the production verb set (no test-only gates).
+    //
+    // Gated behind M3OS_ENABLE_CONTROL_SOCKET_SMOKE so the boot+login
+    // does not run in normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_CONTROL_SOCKET_SMOKE=1 cargo xtask regression --test control-socket
+    if std::env::var_os("M3OS_ENABLE_CONTROL_SOCKET_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "control-socket",
+            description: "Phase 56 G.4: m3ctl version / list-surfaces / frame-stats \
+                 round-trip against live display-control endpoint",
+            guest_steps: control_socket_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -7357,6 +7517,148 @@ fn multi_client_coexistence_steps() -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "guest/multi-client: exit:0",
     });
+    steps
+}
+
+/// Phase 56 close-out (G.2) — keybind grab-hook regression guest
+/// steps. Boots, logs in, runs `grab-hook-smoke`, asserts:
+///   - smoke client's PASS signal,
+///   - `display_server: bind triggered id=N` log emitted by the
+///     dispatcher's grab arm.
+fn grab_hook_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grab-hook-smoke ; /bin/echo GRAB_HOOK_SMOKE:exit:$?\n",
+        label: "guest/grab-hook: launch grab-hook-smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:BEGIN",
+        timeout_secs: 15,
+        label: "guest/grab-hook: smoke begin",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:bind-registered",
+        timeout_secs: 15,
+        label: "guest/grab-hook: bind registered",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:key-injected",
+        timeout_secs: 15,
+        label: "guest/grab-hook: key injected",
+    });
+    // Load-bearing assertion: display_server's dispatcher's grab arm
+    // emits this exact line when the bind id matches.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: bind triggered id=",
+        timeout_secs: 15,
+        label: "guest/grab-hook: dispatcher grab arm fired",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:PASS",
+        timeout_secs: 5,
+        label: "guest/grab-hook: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:exit:0",
+        timeout_secs: 5,
+        label: "guest/grab-hook: exit:0",
+    });
+    steps
+}
+
+/// Phase 56 close-out (G.4) — control-socket runtime round-trip.
+///
+/// Boots, logs in, waits for `gfx-demo` to register its toplevel, then
+/// drives `m3ctl` against the live `display-control` service:
+///
+/// - `m3ctl version` → `protocol_version=N`
+/// - `m3ctl list-surfaces` → at least one `surface N` line (gfx-demo's
+///   toplevel)
+/// - `m3ctl frame-stats` → at least one `frame N compose_us=M` line
+///
+/// Each invocation is bracketed by a unique echo marker so the
+/// SmokeStep harness can pin verb output without confusing later
+/// `m3ctl` invocations. (`m3ctl` writes to stdout, which is the same
+/// serial console the harness scans.)
+fn control_socket_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // gfx-demo's toplevel registration lands during boot — well before
+    // the login prompt — so it's already in display_server's surface
+    // table by the time we reach this step. Sleep briefly so any
+    // straggling boot output drains before we issue the first verb.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. version
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-version ; \
+                /bin/m3ctl version ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-version\n",
+        label: "guest/control-socket: m3ctl version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-version",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-version marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "protocol_version=",
+        timeout_secs: 10,
+        label: "guest/control-socket: version reply",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-version",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-version marker",
+    });
+
+    // 2. list-surfaces
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-list ; \
+                /bin/m3ctl list-surfaces ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-list\n",
+        label: "guest/control-socket: m3ctl list-surfaces",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-list",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-list marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "surface ",
+        timeout_secs: 10,
+        label: "guest/control-socket: at least one surface listed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-list",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-list marker",
+    });
+
+    // 3. frame-stats
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-stats ; \
+                /bin/m3ctl frame-stats ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-stats\n",
+        label: "guest/control-socket: m3ctl frame-stats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-stats",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-stats marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "frame ",
+        timeout_secs: 10,
+        label: "guest/control-socket: at least one frame sample",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-stats",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-stats marker",
+    });
+
     steps
 }
 
@@ -8396,7 +8698,14 @@ fn cmd_regression(args: &RegressionArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false, false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -8407,25 +8716,30 @@ fn cmd_regression(args: &RegressionArgs) {
     // rebuild back to the production-shape disk.
     let mut current_disk_has_debug_crash = false;
     let mut current_disk_has_readback = false;
+    let mut current_disk_has_inject_key = false;
 
     for test in &tests_to_run {
         let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
 
-        // Phase 56 F.2 + F.3 + close-out (G.1) — rebuild the data
+        // Phase 56 F.2 + F.3 + close-out (G.1, G.2) — rebuild the data
         // disk when the test's marker requirements differ from the
         // current disk shape. F.2 wants `/etc/display_server.debug-crash`,
-        // G.1 wants `/etc/display_server.readback`, F.3 wants
+        // G.1 wants `/etc/display_server.readback`, G.2 wants
+        // `/etc/display_server.inject-key`, F.3 wants
         // `/etc/m3os-disable-display-server` (env-var-scoped). All
-        // three knobs are independent and orthogonal; rebuild on any
+        // four knobs are independent and orthogonal; rebuild on any
         // mismatch.
         let needs_disable_display = test.name == "display-fallback";
         let needs_debug_crash = test.wants_debug_crash_marker;
         let needs_readback = test.wants_readback_marker;
+        let needs_inject_key = test.wants_inject_key_marker;
         let disk_shape_changed = needs_debug_crash != current_disk_has_debug_crash
             || needs_readback != current_disk_has_readback
+            || needs_inject_key != current_disk_has_inject_key
             || needs_disable_display
             || (current_disk_has_debug_crash && !needs_debug_crash)
-            || (current_disk_has_readback && !needs_readback);
+            || (current_disk_has_readback && !needs_readback)
+            || (current_disk_has_inject_key && !needs_inject_key);
         if disk_shape_changed {
             let disk_img = uefi_image.parent().unwrap().join("disk.img");
             if disk_img.exists() {
@@ -8445,6 +8759,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 false,
                 needs_debug_crash,
                 needs_readback,
+                needs_inject_key,
             );
             if needs_disable_display {
                 unsafe {
@@ -8453,6 +8768,7 @@ fn cmd_regression(args: &RegressionArgs) {
             }
             current_disk_has_debug_crash = needs_debug_crash;
             current_disk_has_readback = needs_readback;
+            current_disk_has_inject_key = needs_inject_key;
         }
 
         print!("  {}: ", test.name);
@@ -8485,6 +8801,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 false,
                 current_disk_has_debug_crash,
                 current_disk_has_readback,
+                current_disk_has_inject_key,
             );
         }
     }

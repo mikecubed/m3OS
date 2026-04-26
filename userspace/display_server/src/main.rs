@@ -84,6 +84,10 @@ const ENV_DEBUG_CRASH: &str = "M3OS_DISPLAY_SERVER_DEBUG_CRASH";
 /// the dispatcher shadows `ReadBackPixel` to `UnknownVerb`.
 const ENV_READBACK: &str = "M3OS_DISPLAY_SERVER_READBACK";
 
+/// Phase 56 close-out (G.2 regression) — env var name for the
+/// synthetic-key-injection gate.
+const ENV_INJECT_KEY: &str = "M3OS_DISPLAY_SERVER_INJECT_KEY";
+
 /// Read the debug-crash gate from the process environment. Matches a
 /// strict `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` so a typo or alternate
 /// truthy spelling stays disabled.
@@ -115,6 +119,20 @@ fn readback_policy_from_env(env: &[&str]) -> control::ReadBackPolicy {
     control::ReadBackPolicy::disabled()
 }
 
+/// Phase 56 close-out (G.2 regression) — read the inject-key gate.
+fn inject_key_policy_from_env(env: &[&str]) -> control::InjectKeyPolicy {
+    for entry in env {
+        if let Some(value) = entry
+            .strip_prefix(ENV_INJECT_KEY)
+            .and_then(|rest| rest.strip_prefix('='))
+            && value == "1"
+        {
+            return control::InjectKeyPolicy::enabled();
+        }
+    }
+    control::InjectKeyPolicy::disabled()
+}
+
 fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     syscall_lib::write_str(
         STDOUT_FILENO,
@@ -141,6 +159,15 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         syscall_lib::write_str(
             STDOUT_FILENO,
             "display_server: G.1 ReadBackPixel verb ENABLED via M3OS_DISPLAY_SERVER_READBACK=1\n",
+        );
+    }
+
+    // Phase 56 close-out (G.2) — read the inject-key gate.
+    let inject_key_policy = inject_key_policy_from_env(env);
+    if inject_key_policy.is_enabled() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: G.2 InjectKey verb ENABLED via M3OS_DISPLAY_SERVER_INJECT_KEY=1\n",
         );
     }
 
@@ -575,7 +602,9 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &frame_stats,
             debug_crash,
             readback,
+            inject_key_policy,
             &owner,
+            &mut input_wiring,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -612,7 +641,9 @@ fn serve_one_control_request(
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
     readback: control::ReadBackPolicy,
+    inject_key_policy: control::InjectKeyPolicy,
     fb_owner: &KernelFramebufferOwner,
+    input_wiring: &mut InputWiring,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -651,6 +682,7 @@ fn serve_one_control_request(
     let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
     let client = control::ClientId(0); // Phase 56 single-client.
     let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
+    let inject_key_sink = |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
     let n = serve_control_iter(
         &req_buf[..bulk_len],
         client,
@@ -660,7 +692,9 @@ fn serve_one_control_request(
         frame_stats,
         debug_crash,
         readback,
+        inject_key_policy,
         pixel_reader,
+        inject_key_sink,
         &mut reply_buf,
     );
     if n > 0 {
@@ -684,7 +718,7 @@ fn serve_one_control_request(
 /// The Phase 56 close-out wires this from `serve_one_control_request`
 /// using the new `SYS_IPC_TRY_RECV_MSG` syscall to multiplex frame-tick
 /// driving and control-endpoint serving in the same single-threaded loop.
-fn serve_control_iter<F>(
+fn serve_control_iter<F, I>(
     bulk: &[u8],
     client: control::ClientId,
     registry: &SurfaceRegistry,
@@ -693,11 +727,14 @@ fn serve_control_iter<F>(
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
     readback: control::ReadBackPolicy,
+    inject_key_policy: control::InjectKeyPolicy,
     pixel_reader: F,
+    inject_key_sink: I,
     reply_buf: &mut [u8],
 ) -> usize
 where
     F: FnOnce(u32, u32) -> Option<u32>,
+    I: FnOnce(kernel_core::input::events::KeyEvent),
 {
     use kernel_core::display::control::{
         ControlError, ControlErrorCode, ControlEvent, decode_command,
@@ -750,7 +787,9 @@ where
         frame_stats,
         debug_crash,
         readback,
+        inject_key_policy,
         pixel_reader,
+        inject_key_sink,
         reply_buf,
     ) {
         Ok(Some(n)) => n,

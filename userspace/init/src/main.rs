@@ -69,6 +69,10 @@ const DEBUG_CRASH_MARKER_PATH: &[u8] = b"/etc/display_server.debug-crash\0";
 const ENV_DISPLAY_SERVER_READBACK: &[u8] = b"M3OS_DISPLAY_SERVER_READBACK=1\0";
 const READBACK_MARKER_PATH: &[u8] = b"/etc/display_server.readback\0";
 
+// Phase 56 close-out (G.2) — inject-key gate. Same pattern.
+const ENV_DISPLAY_SERVER_INJECT_KEY: &[u8] = b"M3OS_DISPLAY_SERVER_INJECT_KEY=1\0";
+const INJECT_KEY_MARKER_PATH: &[u8] = b"/etc/display_server.inject-key\0";
+
 // Runtime state files live on tmpfs under `/run` — matching the Linux
 // convention where runtime state is tmpfs-backed rather than persistent.
 // Putting them on ext2 caused init's periodic writes (every 10 s) to
@@ -768,6 +772,10 @@ struct ServiceManager {
     /// `display_server_debug_crash`, but for the test-only
     /// `ReadBackPixel` verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`.
     display_server_readback: bool,
+    /// Phase 56 close-out (G.2) — same shape, for the test-only
+    /// `InjectKey` verb gated by
+    /// `M3OS_DISPLAY_SERVER_INJECT_KEY=1`.
+    display_server_inject_key: bool,
 }
 
 /// Syslog severity levels.
@@ -800,6 +808,7 @@ impl ServiceManager {
             display_fallback: false,
             display_server_debug_crash: false,
             display_server_readback: false,
+            display_server_inject_key: false,
         }
     }
 
@@ -1251,52 +1260,17 @@ impl ServiceManager {
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
 
-            // Phase 56 Track F.2 / close-out (G.1) — append the
+            // Phase 56 Track F.2 / close-out (G.1, G.2) — append the
             // test-only env vars when their respective markers are
-            // set. The fixed-size 7-slot envp (with NULL terminator)
-            // covers both, neither, or either flag; unused slots are
-            // null-padded before the final NULL terminator.
-            let envp: [*const u8; 7] = match (
+            // set. The fixed-size 8-slot envp (4 base + up to 3 gate
+            // vars + final NULL terminator) holds the maximum
+            // possible permutation; unused slots are null-padded
+            // before the terminator.
+            let envp = build_service_envp(
                 self.display_server_debug_crash,
                 self.display_server_readback,
-            ) {
-                (true, true) => [
-                    ENV_PATH.as_ptr(),
-                    ENV_HOME.as_ptr(),
-                    ENV_TERM.as_ptr(),
-                    ENV_EDITOR.as_ptr(),
-                    ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
-                    ENV_DISPLAY_SERVER_READBACK.as_ptr(),
-                    core::ptr::null(),
-                ],
-                (true, false) => [
-                    ENV_PATH.as_ptr(),
-                    ENV_HOME.as_ptr(),
-                    ENV_TERM.as_ptr(),
-                    ENV_EDITOR.as_ptr(),
-                    ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
-                    core::ptr::null(),
-                    core::ptr::null(),
-                ],
-                (false, true) => [
-                    ENV_PATH.as_ptr(),
-                    ENV_HOME.as_ptr(),
-                    ENV_TERM.as_ptr(),
-                    ENV_EDITOR.as_ptr(),
-                    ENV_DISPLAY_SERVER_READBACK.as_ptr(),
-                    core::ptr::null(),
-                    core::ptr::null(),
-                ],
-                (false, false) => [
-                    ENV_PATH.as_ptr(),
-                    ENV_HOME.as_ptr(),
-                    ENV_TERM.as_ptr(),
-                    ENV_EDITOR.as_ptr(),
-                    core::ptr::null(),
-                    core::ptr::null(),
-                    core::ptr::null(),
-                ],
-            };
+                self.display_server_inject_key,
+            );
 
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
@@ -1412,6 +1386,7 @@ impl ServiceManager {
                         self.login_pid = spawn_login(
                             self.display_server_debug_crash,
                             self.display_server_readback,
+                            self.display_server_inject_key,
                         );
                     } else {
                         write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
@@ -2178,52 +2153,51 @@ fn trim_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-fn spawn_login(debug_crash: bool, readback: bool) -> i32 {
+/// Phase 56 Track F.2 / close-out (G.1, G.2) — build the env-pointer
+/// array shared by `spawn_service` and `spawn_login`.
+///
+/// The fixed-size 8-slot layout has 4 base vars + up to 3 test-only
+/// gates + a final NULL terminator. Slots beyond the active set are
+/// null-padded *before* the terminator, so the kernel's envp scan
+/// terminates correctly regardless of which gates are enabled.
+fn build_service_envp(debug_crash: bool, readback: bool, inject_key: bool) -> [*const u8; 8] {
+    let mut envp: [*const u8; 8] = [
+        ENV_PATH.as_ptr(),
+        ENV_HOME.as_ptr(),
+        ENV_TERM.as_ptr(),
+        ENV_EDITOR.as_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+    ];
+    let mut idx: usize = 4;
+    if debug_crash {
+        envp[idx] = ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr();
+        idx += 1;
+    }
+    if readback {
+        envp[idx] = ENV_DISPLAY_SERVER_READBACK.as_ptr();
+        idx += 1;
+    }
+    if inject_key {
+        envp[idx] = ENV_DISPLAY_SERVER_INJECT_KEY.as_ptr();
+        idx += 1;
+    }
+    // The remaining slots are already NULL — that NULL is the envp
+    // terminator the kernel scans for. `idx` is unused after the loop
+    // because the array was pre-padded.
+    let _ = idx;
+    envp
+}
+
+fn spawn_login(debug_crash: bool, readback: bool, inject_key: bool) -> i32 {
     let pid = fork();
     if pid == 0 {
-        // Phase 56 Track F.2 / close-out (G.1) — propagate the
+        // Phase 56 Track F.2 / close-out (G.1, G.2) — propagate the
         // test-only env vars to the login shell so smoke clients
         // launched from the post-login shell see them in their envp.
-        // Fixed-size 7-slot envp covers all combinations of the two
-        // gates.
-        let envp: [*const u8; 7] = match (debug_crash, readback) {
-            (true, true) => [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
-                ENV_DISPLAY_SERVER_READBACK.as_ptr(),
-                core::ptr::null(),
-            ],
-            (true, false) => [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr(),
-                core::ptr::null(),
-                core::ptr::null(),
-            ],
-            (false, true) => [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                ENV_DISPLAY_SERVER_READBACK.as_ptr(),
-                core::ptr::null(),
-                core::ptr::null(),
-            ],
-            (false, false) => [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                core::ptr::null(),
-                core::ptr::null(),
-                core::ptr::null(),
-            ],
-        };
+        let envp = build_service_envp(debug_crash, readback, inject_key);
 
         let argv: [*const u8; 2] = [LOGIN_ARGV0.as_ptr(), core::ptr::null()];
         let ret = execve(LOGIN_PATH, &argv, &envp);
@@ -2299,6 +2273,17 @@ fn display_server_debug_crash_enabled() -> bool {
 /// Same shape as `display_server_debug_crash_enabled`.
 fn display_server_readback_enabled() -> bool {
     let fd = open(READBACK_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
+/// Phase 56 close-out (G.2) — check for the inject-key marker file.
+/// Same shape as `display_server_debug_crash_enabled`.
+fn display_server_inject_key_enabled() -> bool {
+    let fd = open(INJECT_KEY_MARKER_PATH, O_RDONLY, 0);
     if fd < 0 {
         return false;
     }
@@ -2388,6 +2373,7 @@ pub extern "C" fn _start() -> ! {
     // environment from the very first start.
     mgr.display_server_debug_crash = display_server_debug_crash_enabled();
     mgr.display_server_readback = display_server_readback_enabled();
+    mgr.display_server_inject_key = display_server_inject_key_enabled();
     if mgr.display_server_readback {
         write_str(
             STDOUT_FILENO,
@@ -2398,6 +2384,12 @@ pub extern "C" fn _start() -> ! {
         write_str(
             STDOUT_FILENO,
             "init: F.2 debug-crash marker present, propagating M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\n",
+        );
+    }
+    if mgr.display_server_inject_key {
+        write_str(
+            STDOUT_FILENO,
+            "init: G.2 inject-key marker present, propagating M3OS_DISPLAY_SERVER_INJECT_KEY=1\n",
         );
     }
 
@@ -2420,7 +2412,11 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
     } else {
-        mgr.login_pid = spawn_login(mgr.display_server_debug_crash, mgr.display_server_readback);
+        mgr.login_pid = spawn_login(
+            mgr.display_server_debug_crash,
+            mgr.display_server_readback,
+            mgr.display_server_inject_key,
+        );
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn login\n");
             // Not fatal — services may still be running.

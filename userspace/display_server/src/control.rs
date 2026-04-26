@@ -143,6 +143,30 @@ impl ReadBackPolicy {
     }
 }
 
+/// Phase 56 close-out (G.2 regression) — runtime gate for
+/// `ControlCommand::InjectKey`. Same shape as the other test-only
+/// policy gates. Production boots leave this disabled; the grab-hook
+/// regression flips `/etc/display_server.inject-key` so init
+/// propagates `M3OS_DISPLAY_SERVER_INJECT_KEY=1`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct InjectKeyPolicy {
+    enabled: bool,
+}
+
+impl InjectKeyPolicy {
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+}
+
 // `EventKind` lives in protocol.rs and intentionally does not derive
 // `Ord` (it is a stable wire-format enum). The subscription registry
 // maps `EventKind` → `Vec<ClientId>` via a fixed-size array indexed by
@@ -422,7 +446,7 @@ fn event_kind_of(event: &ControlEvent) -> Option<EventKind> {
 /// The reply is encoded into `reply_buf`. The function returns the
 /// number of bytes written (or `None`). The caller is responsible for
 /// staging that slice as the IPC reply bulk.
-pub fn dispatch_command<F>(
+pub fn dispatch_command<F, I>(
     cmd: &ControlCommand,
     client: ClientId,
     registry: &SurfaceRegistry,
@@ -431,11 +455,14 @@ pub fn dispatch_command<F>(
     frame_stats: &FrameStatsRing,
     debug_crash: DebugCrashPolicy,
     readback: ReadBackPolicy,
+    inject_key_policy: InjectKeyPolicy,
     pixel_reader: F,
+    inject_key_sink: I,
     reply_buf: &mut [u8],
 ) -> Result<Option<usize>, ControlError>
 where
     F: FnOnce(u32, u32) -> Option<u32>,
+    I: FnOnce(kernel_core::input::events::KeyEvent),
 {
     let evt = match cmd {
         ControlCommand::Version => ControlEvent::VersionReply {
@@ -560,6 +587,41 @@ where
                 match pixel_reader(*x, *y) {
                     Some(color) => ControlEvent::PixelReply { color },
                     None => ControlEvent::Error {
+                        code: ControlErrorCode::BadArgs,
+                    },
+                }
+            } else {
+                ControlEvent::Error {
+                    code: ControlErrorCode::UnknownVerb,
+                }
+            }
+        }
+        // Phase 56 close-out (G.2 regression) — test-only synthetic
+        // key injection.
+        ControlCommand::InjectKey {
+            modifier_mask,
+            keycode,
+            kind,
+        } => {
+            if inject_key_policy.is_enabled() {
+                use kernel_core::input::events::{KeyEvent, KeyEventKind, ModifierState};
+                match *kind {
+                    0 | 1 | 2 => {
+                        let kind_enum = match *kind {
+                            0 => KeyEventKind::Down,
+                            1 => KeyEventKind::Up,
+                            _ => KeyEventKind::Repeat,
+                        };
+                        inject_key_sink(KeyEvent {
+                            timestamp_ms: 0,
+                            keycode: *keycode,
+                            symbol: *keycode,
+                            modifiers: ModifierState(*modifier_mask),
+                            kind: kind_enum,
+                        });
+                        ControlEvent::Ack
+                    }
+                    _ => ControlEvent::Error {
                         code: ControlErrorCode::BadArgs,
                     },
                 }

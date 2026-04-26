@@ -285,6 +285,13 @@ pub struct InputWiring {
     pub dispatcher: InputDispatcher,
     pub kbd: KbdInputSource,
     pub mouse: MouseInputSource,
+    /// Phase 56 close-out (G.2 regression) — test-only injected key
+    /// queue. Populated by the `ControlCommand::InjectKey` dispatcher
+    /// arm (gated by `M3OS_DISPLAY_SERVER_INJECT_KEY=1`); drained by
+    /// `drain_one_pass` before the real `kbd` source so synthesized
+    /// chord-style events flow through the same routing pipeline as
+    /// real PS/2 input. Production boots leave this empty.
+    injected_keys: Vec<KeyEvent>,
 }
 
 impl Default for InputWiring {
@@ -302,7 +309,17 @@ impl InputWiring {
             dispatcher: InputDispatcher::new(),
             kbd: KbdInputSource::lookup_with_backoff(),
             mouse: MouseInputSource::lookup_with_backoff(),
+            injected_keys: Vec::new(),
         }
+    }
+
+    /// Phase 56 close-out (G.2) — append a synthesized `KeyEvent` to
+    /// the injected-key queue. Used by the `ControlCommand::InjectKey`
+    /// dispatcher arm to drive grab-hook regressions without needing
+    /// real PS/2 hardware events. Production boots leave the verb
+    /// disabled and never call this.
+    pub fn inject_key(&mut self, ev: KeyEvent) {
+        self.injected_keys.push(ev);
     }
 
     /// Drain both sources once and feed every event through the
@@ -325,12 +342,38 @@ impl InputWiring {
         bind_table: &kernel_core::input::bind_table::BindTable,
         grab_state: &mut kernel_core::input::bind_table::GrabState,
     ) -> Vec<InputEffect> {
+        // Phase 56 close-out (G.2) — drain any injected keys *before*
+        // the real input sources so test-driven chords route through
+        // the same dispatcher path as real PS/2 events.
+        let injected = core::mem::take(&mut self.injected_keys);
+        let mut effects = Vec::new();
+        for ev in injected {
+            let mut state = CompositorState {
+                focused,
+                active_exclusive_layer,
+                pointer_position,
+                surface_geometry,
+                bind_table,
+                grab_state,
+            };
+            match self.dispatcher.route_key_event(&ev, &mut state) {
+                RouteDecision::DeliverTo(_id) => {
+                    effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
+                }
+                RouteDecision::Grab(id) => {
+                    effects.push(InputEffect::BindTriggered { id: id.raw() });
+                }
+                RouteDecision::Drop => {}
+                _ => {}
+            }
+        }
+
         // Borrow our two sources through the trait so the body of
         // drain_with is independent of which concrete type we hold.
         // The borrow-checker forbids holding two `&mut dyn` borrows
         // out of `self` at once, so we pass them as separate
         // arguments and swap order between drains internally.
-        Self::drain_inner(
+        let mut source_effects = Self::drain_inner(
             &mut self.dispatcher,
             &mut self.kbd,
             &mut self.mouse,
@@ -340,7 +383,9 @@ impl InputWiring {
             surface_geometry,
             bind_table,
             grab_state,
-        )
+        );
+        effects.append(&mut source_effects);
+        effects
     }
 
     /// Test-shaped variant: drains arbitrary sources (typically a pair

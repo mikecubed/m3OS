@@ -223,6 +223,9 @@ static DISPLAY_SERVER_CRASH_SMOKE_ELF: &[u8] =
 static DISPLAY_MULTI_CLIENT_SMOKE_ELF: &[u8] =
     generated_initrd_asset!("display-multi-client-smoke");
 
+// Phase 56 close-out (G.2): keybind grab-hook smoke client.
+static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -621,6 +624,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "display-multi-client-smoke",
         RamdiskNode::File {
             content: DISPLAY_MULTI_CLIENT_SMOKE_ELF,
+        },
+    ),
+    // Phase 56 close-out (G.2): keybind grab-hook smoke client.
+    (
+        "grab-hook-smoke",
+        RamdiskNode::File {
+            content: GRAB_HOOK_SMOKE_ELF,
         },
     ),
 ];
