@@ -194,18 +194,20 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
     let entries = registry.iter_compose(output);
 
-    // Cursor-trail fix (Phase 56 follow-up): when no surfaces are
-    // mapped AND the cursor moved, the surface-blit pass below
-    // produces zero writes, but `blit_cursor` only paints the *new*
-    // cursor position. The old cursor's opaque pixels would remain
-    // on the framebuffer as a stale "arrow trail". Explicitly clear
-    // the union of old + new cursor damage rects with the
-    // framebuffer's background color (opaque black) before
-    // `blit_cursor` runs. With at least one surface mapped, the
-    // surface-blit pass repaints under the old + new cursor rects,
-    // so the explicit clear is unnecessary.
-    if entries.is_empty()
-        && cursor_motion
+    // Cursor-trail fix (Phase 56 follow-up): when the cursor moved,
+    // `blit_cursor` only paints the *new* cursor position. The old
+    // cursor's opaque pixels would remain on the framebuffer as a
+    // stale "arrow trail" anywhere the underlying surface-blit pass
+    // does not repaint over them — i.e. all background area outside
+    // mapped surfaces. Explicitly clear the union of old + new
+    // cursor damage rects with the framebuffer's background color
+    // (opaque black) before the surface and cursor passes run.
+    //
+    // Inside mapped-surface bounds the clear is overpainted by the
+    // surface-blit pass below; outside, it stays as the cleared
+    // background. Either way the old cursor pixels are gone before
+    // `blit_cursor` paints the new position.
+    if cursor_motion
         && let (Some(prev_pos), Some(prev_size)) = (ctx.prev_pointer, ctx.prev_cursor_size)
     {
         let damage = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
