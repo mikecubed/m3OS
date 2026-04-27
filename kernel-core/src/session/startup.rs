@@ -6,12 +6,6 @@
 //! every transition has a defined behavior, and the test suite at the
 //! bottom of the file exercises them.
 
-// NOTE (F.1, red commit): types and constructors are stubbed. The
-// behavioral implementation (start/retry/rollback/state-transitions)
-// lands in the green commit. Methods that have a value to return use
-// `unimplemented!` so the test suite fails loudly for unimplemented
-// behavior rather than silently returning a default.
-
 /// Lifecycle state of the graphical session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -97,13 +91,16 @@ pub trait SessionStep {
 /// Sequencer that runs a slice of [`SessionStep`]s in declared order.
 /// Borrows the slice — `kernel-core` does not own the supervisor
 /// handle. No allocation in steady state.
-#[allow(dead_code)] // `steps` and `started` are consumed by `run()` in the green commit (F.1).
 pub struct StartupSequence<'a> {
     steps: &'a mut [&'a mut dyn SessionStep],
     state: SessionState,
-    /// Number of steps for which `start()` succeeded (i.e. that need
-    /// rollback on text-fallback). 0 ≤ started ≤ steps.len().
+    /// Number of steps for which `start()` succeeded AND `is_ready()`
+    /// returned `true` (i.e. that need rollback on text-fallback).
+    /// `0 ≤ started ≤ steps.len()`.
     started: usize,
+    /// Most recently attempted step name. Latches across `Running`,
+    /// `Recovering`, and `TextFallback` states; cleared only by `new`.
+    current: Option<&'static str>,
 }
 
 impl<'a> StartupSequence<'a> {
@@ -115,6 +112,7 @@ impl<'a> StartupSequence<'a> {
             steps,
             state: SessionState::Booting,
             started: 0,
+            current: None,
         }
     }
 
@@ -124,11 +122,82 @@ impl<'a> StartupSequence<'a> {
     /// order, already running) is surfaced as a typed error.
     ///
     /// `max_retries_per_step` caps the number of `start()` attempts per
-    /// step. After the cap is reached, the sequencer rolls back every
-    /// already-started step in reverse start order and returns
-    /// `Ok(SessionState::TextFallback)`.
-    pub fn run(&mut self, _max_retries_per_step: u32) -> Result<SessionState, SessionError> {
-        unimplemented!("F.1 green commit lands the run() body")
+    /// step. An attempt that returns `Err` from `start`, or that
+    /// returns `Ok(())` from `start` but reports `is_ready() == false`
+    /// after the call, both consume one attempt: the supervisor
+    /// pattern is "reach a ready endpoint within N tries". Once a
+    /// step's attempts are exhausted without a ready outcome, the
+    /// sequencer rolls back every already-started step in reverse
+    /// start order and returns `Ok(SessionState::TextFallback)`.
+    pub fn run(&mut self, max_retries_per_step: u32) -> Result<SessionState, SessionError> {
+        // Total state-machine entry guard: only `Booting` → run. Any
+        // other state is a caller protocol error.
+        match self.state {
+            SessionState::Booting => {}
+            SessionState::Running => return Err(SessionError::AlreadyRunning),
+            SessionState::Recovering { .. } | SessionState::TextFallback => {
+                return Err(SessionError::OutOfOrder {
+                    expected: "booting",
+                    got: state_name(self.state),
+                });
+            }
+        }
+
+        let total = self.steps.len();
+        let mut idx = 0;
+        while idx < total {
+            let step_name = self.steps[idx].name();
+            self.current = Some(step_name);
+
+            // Per-step attempt loop. attempts == number of `start()`
+            // invocations consumed; we cap at max_retries_per_step.
+            let mut attempts: u32 = 0;
+            let mut ready = false;
+            while attempts < max_retries_per_step {
+                // We are about to consume one attempt. If this is not
+                // the very first attempt for this step, reflect the
+                // mid-flight `Recovering` lifecycle state.
+                if attempts > 0 {
+                    self.state = SessionState::Recovering {
+                        step_name,
+                        retry_count: attempts,
+                    };
+                }
+                attempts = attempts.saturating_add(1);
+                let result = self.steps[idx].start();
+                match result {
+                    Ok(()) => {
+                        if self.steps[idx].is_ready() {
+                            ready = true;
+                            break;
+                        }
+                        // Start succeeded but endpoint is not yet
+                        // ready: another attempt is required.
+                    }
+                    Err(_) => {
+                        // Transient failure; another attempt is
+                        // required.
+                    }
+                }
+            }
+
+            if !ready {
+                // Retry budget exhausted. Roll back every
+                // already-started step in reverse order (best-effort:
+                // stop errors from individual steps are not allowed
+                // to abort the rollback, since the session is being
+                // abandoned anyway).
+                self.escalate_to_text_fallback();
+                return Ok(SessionState::TextFallback);
+            }
+
+            // Step is ready; advance.
+            self.started = self.started.saturating_add(1);
+            idx += 1;
+        }
+
+        self.state = SessionState::Running;
+        Ok(SessionState::Running)
     }
 
     /// Snapshot of the current lifecycle state.
@@ -140,7 +209,37 @@ impl<'a> StartupSequence<'a> {
     /// currently attempting). Returns `None` before the first step has
     /// been touched.
     pub fn current_step(&self) -> Option<&'static str> {
-        unimplemented!("F.1 green commit lands the current_step body")
+        self.current
+    }
+
+    /// Roll back every already-started step in reverse start order and
+    /// transition to [`SessionState::TextFallback`]. Stop errors on
+    /// individual steps are intentionally swallowed: the session is
+    /// being abandoned and surfacing one step's stop failure cannot
+    /// undo any of the others.
+    fn escalate_to_text_fallback(&mut self) {
+        // started counts how many steps successfully reached "ready".
+        // We undo the started prefix in reverse order. The current
+        // (failing) step is NOT in the started prefix, so it is not
+        // stopped.
+        while self.started > 0 {
+            let i = self.started - 1;
+            let _ = self.steps[i].stop();
+            self.started -= 1;
+        }
+        self.state = SessionState::TextFallback;
+    }
+}
+
+/// Stable, allocation-free name for a `SessionState` discriminant —
+/// used in [`SessionError::OutOfOrder`] payloads. Exhaustive: every
+/// variant has a name; no fallback.
+fn state_name(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Booting => "booting",
+        SessionState::Running => "running",
+        SessionState::Recovering { .. } => "recovering",
+        SessionState::TextFallback => "text-fallback",
     }
 }
 
@@ -370,7 +469,12 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, StepCall::Stop(_)))
             .collect();
-        assert_eq!(starts.len(), 3, "expected 3 start attempts, got {:?}", calls);
+        assert_eq!(
+            starts.len(),
+            3,
+            "expected 3 start attempts, got {:?}",
+            calls
+        );
         assert!(stops.is_empty());
     }
 
