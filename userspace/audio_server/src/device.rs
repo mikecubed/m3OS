@@ -309,44 +309,116 @@ pub const BAR_NAM: u8 = 0;
 pub const BAR_NABM: u8 = 1;
 
 // ---------------------------------------------------------------------------
-// AC'97 init / open / close / IRQ — declarations land in D.2-green.
+// AC'97 init / open / close / IRQ — pure register-access helpers exercised
+// by host tests without real hardware.
 // ---------------------------------------------------------------------------
 
-/// Reset the codec, unmute volumes, set rate.  Implementation lands
-/// in D.2-green.
-pub fn init_controller<M: MmioOps>(_mmio: &M) -> Result<(), AudioError> {
-    Err(AudioError::Internal)
+/// Default volume value written to `MASTER_VOLUME` and `PCM_OUT_VOLUME`.
+///
+/// `0x0202` is the AC'97-conventional "low attenuation, both channels
+/// equal, mute clear" value (≈ -3 dB on each side; bit 15 clear).
+/// Phase 57 picks a fixed value rather than expose a verb because
+/// volume control is a Phase 58+ extension; only mute-clear matters
+/// to Phase 57 acceptance.
+const VOLUME_UNMUTED: u16 = 0x0202;
+
+/// Reset the codec (NAM RESET write), unmute master + PCM-out
+/// volumes, enable variable-rate audio, and program the 48 kHz
+/// sample rate.
+///
+/// The exact write order is part of the Phase 57 D.2 acceptance:
+/// `RESET → MASTER_VOLUME → PCM_OUT_VOLUME → EXT_AUDIO_STATUS_CTRL →
+/// PCM_FRONT_DAC_RATE`.
+pub fn init_controller<M: MmioOps>(mmio: &M) -> Result<(), AudioError> {
+    // 1. Cold codec reset — write any value (spec).
+    mmio.write_u16(BAR_NAM, nam::RESET, 0);
+
+    // 2. Unmute master volume.
+    mmio.write_u16(BAR_NAM, nam::MASTER_VOLUME, VOLUME_UNMUTED);
+
+    // 3. Unmute PCM-out volume.
+    mmio.write_u16(BAR_NAM, nam::PCM_OUT_VOLUME, VOLUME_UNMUTED);
+
+    // 4. Enable variable-rate audio (VRA = bit 0). Required before
+    //    PCM_FRONT_DAC_RATE is honored on real ICH silicon.
+    let prev = mmio.read_u16(BAR_NAM, nam::EXT_AUDIO_STATUS_CTRL);
+    mmio.write_u16(BAR_NAM, nam::EXT_AUDIO_STATUS_CTRL, prev | 0x0001);
+
+    // 5. Program the 48 kHz sample rate.
+    mmio.write_u16(BAR_NAM, nam::PCM_FRONT_DAC_RATE, SAMPLE_RATE_HZ);
+
+    Ok(())
 }
 
-/// Open the PCM-out stream.  Implementation lands in D.2-green.
-pub fn open_pcm_out_stream<M: MmioOps>(_mmio: &M, _bdl_iova: u64) -> Result<(), AudioError> {
-    Err(AudioError::Internal)
+/// Open the PCM-out stream by programming `BDBAR → LVI = 0 → CR.RPBM`
+/// in that order. Acceptance pins BDBAR before LVI before CR run-bit.
+pub fn open_pcm_out_stream<M: MmioOps>(mmio: &M, bdl_iova: u64) -> Result<(), AudioError> {
+    // First, halt + reset the per-stream registers in case a prior
+    // session left them dirty. Writing CR.RR is the Intel-recommended
+    // way to clear LVI / CIV / SR.
+    mmio.write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::CR, cr_reset_value());
+
+    // 1. BDBAR — low 32 bits of the BDL IOVA. AC'97's BDBAR is a
+    //    32-bit register; the high half of a 64-bit IOVA is discarded.
+    let bdbar_low = (bdl_iova & 0xFFFF_FFFF) as u32;
+    mmio.write_u32(BAR_NABM, nabm::PCM_OUT_BASE + nabm::BDBAR, bdbar_low);
+
+    // 2. LVI = 0 — empty BDL until SubmitFrames appends the first
+    //    descriptor.
+    mmio.write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::LVI, 0);
+
+    // 3. CR — enable the bus master + every interrupt cause.
+    mmio.write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::CR, cr_run_value());
+
+    Ok(())
 }
 
-/// Close the PCM-out stream.  Implementation lands in D.2-green.
-pub fn close_pcm_out_stream<M: MmioOps>(_mmio: &M) -> Result<(), AudioError> {
-    Err(AudioError::Internal)
+/// Close the PCM-out stream by halting the bus master (CR=0) and
+/// resetting per-stream registers (CR.RR).
+pub fn close_pcm_out_stream<M: MmioOps>(mmio: &M) -> Result<(), AudioError> {
+    // 1. Halt the bus master.
+    mmio.write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::CR, cr_halt_value());
+    // 2. Reset per-stream registers. CR.RR is self-clearing on real
+    //    hardware; we issue the write and trust the bit clears before
+    //    the next stream open.
+    mmio.write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::CR, cr_reset_value());
+    Ok(())
 }
 
-/// Read SR, classify, ack.  Implementation lands in D.2-green.
+/// Read the per-stream status register, classify it via
+/// [`classify_sr`], and acknowledge the W1C bits.
 pub fn handle_pcm_out_irq<M: MmioOps>(
-    _mmio: &M,
-    _ring_was_empty: bool,
+    mmio: &M,
+    ring_was_empty: bool,
 ) -> Result<IrqEvent, AudioError> {
-    Err(AudioError::Internal)
+    let sr = mmio.read_u16(BAR_NABM, nabm::PCM_OUT_BASE + nabm::SR);
+    let event = classify_sr(sr, ring_was_empty);
+    let ack = sr_ack_value(sr);
+    if ack != 0 {
+        mmio.write_u16(BAR_NABM, nabm::PCM_OUT_BASE + nabm::SR, ack);
+    }
+    Ok(event)
 }
 
 // ---------------------------------------------------------------------------
-// Ac97Logic — declaration; implementation lands in D.2-green.
+// Ac97Logic — pure-state companion to `Ac97Backend`
 // ---------------------------------------------------------------------------
 
-/// Pure-logic AC'97 state — declaration only at D.2-red; the
-/// behavior the tests pin lands in D.2-green.
+/// Pure-logic AC'97 state — the BDL ring + cursors + counters,
+/// without the `DeviceHandle` or `DmaBuffer` ownership.  The
+/// production `Ac97Backend` (cfg `not(test)`) wraps an [`Ac97Logic`]
+/// plus the DMA + cap state; host tests construct `Ac97Logic`
+/// directly so the ring-management math is exercisable without a
+/// real kernel.
 #[derive(Debug, Clone)]
 pub struct Ac97Logic {
     pub(crate) bdl: [BufferDescriptor; BDL_ENTRIES],
+    /// Next slot to write — strictly monotonic counter.
     pub(crate) head: usize,
+    /// Next slot hardware will consume — strictly monotonic counter.
     pub(crate) tail: usize,
+    /// Mirror of the LVI register the io loop will program through
+    /// `MmioOps`.
     pub(crate) lvi: u8,
     pub(crate) frames_submitted: u64,
     pub(crate) frames_consumed: u64,
@@ -360,6 +432,7 @@ impl Default for Ac97Logic {
 }
 
 impl Ac97Logic {
+    /// Construct an empty BDL.
     pub const fn new() -> Self {
         Self {
             bdl: [BufferDescriptor {
@@ -376,34 +449,89 @@ impl Ac97Logic {
         }
     }
 
+    /// Borrow the BDL.
     pub fn bdl(&self) -> &[BufferDescriptor; BDL_ENTRIES] {
         &self.bdl
     }
+
+    /// Current LVI mirror.
     pub fn lvi(&self) -> u8 {
         self.lvi
     }
+
+    /// Running `frames_consumed` (samples drained by hardware).
     pub fn frames_consumed(&self) -> u64 {
         self.frames_consumed
     }
+
+    /// Running `underrun_count`.
     pub fn underrun_count(&self) -> u32 {
         self.underrun_count
     }
 
-    /// Submit a buffer to the BDL.  D.2-red stub returns
-    /// `AudioError::Internal`; the real implementation lands next
-    /// commit.
+    /// Append a buffer to the BDL. Returns:
+    ///
+    /// - `Err(InvalidArgument)` if `samples > BDL_MAX_SAMPLES`.
+    /// - `Err(WouldBlock)` if every BDL slot is in flight.
+    /// - `Ok(())` and advances the LVI mirror to the new head index.
     pub fn submit_buffer(
         &mut self,
         _bdl_iova: u64,
-        _phys_addr: u32,
-        _samples: usize,
+        phys_addr: u32,
+        samples: usize,
     ) -> Result<(), AudioError> {
-        Err(AudioError::Internal)
+        if samples > BDL_MAX_SAMPLES {
+            return Err(AudioError::InvalidArgument);
+        }
+        // Ring full when in_flight == BDL_ENTRIES (every slot owned by
+        // hardware). `wrapping_sub` over `usize` correctly handles the
+        // monotonic-counter case provided no overflow has occurred —
+        // for any realistic playback duration this is millennia away.
+        let in_flight = self.head.wrapping_sub(self.tail);
+        if in_flight >= BDL_ENTRIES {
+            return Err(AudioError::WouldBlock);
+        }
+        let idx = self.head % BDL_ENTRIES;
+        self.bdl[idx] = BufferDescriptor {
+            phys_addr,
+            samples: samples as u16,
+            // Bit 15 = IOC: request interrupt on completion so the
+            // io loop wakes for every consumed buffer.
+            flags: 0x8000,
+        };
+        self.head = self.head.wrapping_add(1);
+        self.lvi = (self.head.wrapping_sub(1) % BDL_ENTRIES) as u8;
+        self.frames_submitted = self.frames_submitted.saturating_add(samples as u64);
+        Ok(())
     }
 
-    /// Observe an IRQ.  D.2-red stub returns `IrqEvent::None`.
-    pub fn observe_irq(&mut self, _sr: u16, _new_civ: u8) -> IrqEvent {
-        IrqEvent::None
+    /// Observe an IRQ: classify the status register and update
+    /// `frames_consumed` / `underrun_count` based on `new_civ` (the
+    /// hardware-side current-buffer index).
+    pub fn observe_irq(&mut self, sr: u16, new_civ: u8) -> IrqEvent {
+        let ring_was_empty = self.tail == self.head;
+        let event = classify_sr(sr, ring_was_empty);
+        // Advance the consumed-counter from old `tail` up to `new_civ`.
+        // Bound the loop by BDL_ENTRIES so a misbehaving fake cannot
+        // trap the test or the production io loop.
+        let civ = new_civ as usize;
+        for _ in 0..BDL_ENTRIES {
+            if self.tail % BDL_ENTRIES == civ {
+                break;
+            }
+            let idx = self.tail % BDL_ENTRIES;
+            // BufferDescriptor is `repr(C, packed)`; copy through a
+            // local before reading the field — direct field access is
+            // UB on a packed struct.
+            let entry = self.bdl[idx];
+            let samples = { entry.samples } as u64;
+            self.frames_consumed = self.frames_consumed.saturating_add(samples);
+            self.tail = self.tail.wrapping_add(1);
+        }
+        if matches!(event, IrqEvent::Underrun) {
+            self.underrun_count = self.underrun_count.saturating_add(1);
+        }
+        event
     }
 }
 
@@ -631,7 +759,10 @@ mod tests {
             // bit clears immediately on real hardware once the reset
             // completes; the fake mirrors that so `reset_stream` can
             // converge without spinning.
-            if bar == BAR_NABM && offset == nabm::PCM_OUT_BASE + nabm::CR && value & cr_bits::RR != 0 {
+            if bar == BAR_NABM
+                && offset == nabm::PCM_OUT_BASE + nabm::CR
+                && value & cr_bits::RR != 0
+            {
                 let cleared = value & !cr_bits::RR;
                 self.set_u8(bar, offset, cleared);
             }
@@ -673,12 +804,17 @@ mod tests {
         let pos_reset = positions.iter().position(|&o| o == nam::RESET);
         let pos_master = positions.iter().position(|&o| o == nam::MASTER_VOLUME);
         let pos_pcmout = positions.iter().position(|&o| o == nam::PCM_OUT_VOLUME);
-        let pos_vra = positions.iter().position(|&o| o == nam::EXT_AUDIO_STATUS_CTRL);
+        let pos_vra = positions
+            .iter()
+            .position(|&o| o == nam::EXT_AUDIO_STATUS_CTRL);
         let pos_rate = positions.iter().position(|&o| o == nam::PCM_FRONT_DAC_RATE);
         assert!(pos_reset.is_some(), "RESET write must occur");
         assert!(pos_master.is_some(), "MASTER_VOLUME write must occur");
         assert!(pos_pcmout.is_some(), "PCM_OUT_VOLUME write must occur");
-        assert!(pos_vra.is_some(), "EXT_AUDIO_STATUS_CTRL.VRA write must occur");
+        assert!(
+            pos_vra.is_some(),
+            "EXT_AUDIO_STATUS_CTRL.VRA write must occur"
+        );
         assert!(pos_rate.is_some(), "PCM_FRONT_DAC_RATE write must occur");
         assert!(pos_reset < pos_master);
         assert!(pos_master < pos_pcmout);
@@ -716,27 +852,28 @@ mod tests {
         let bdl_iova: u64 = 0x0000_0001_DEAD_BEEF;
         open_pcm_out_stream(&mmio, bdl_iova).expect("open succeeds");
 
-        // Acceptance: BDBAR before LVI before CR run-bit.
-        let nabm_offsets: Vec<usize> = mmio
-            .writes()
+        // Acceptance: BDBAR before LVI before the CR run-bit write.
+        // (`open_pcm_out_stream` may issue a CR.RR reset write first
+        // to clear stale state from a prior session; the run-bit
+        // write is the *last* CR write and is the one that races
+        // hardware against an unprogrammed BDL or LVI.)
+        let writes = mmio.writes();
+        let nabm_writes: Vec<&(u8, usize, u32, u8)> =
+            writes.iter().filter(|w| w.0 == BAR_NABM).collect();
+        let pos_bdbar = nabm_writes
             .iter()
-            .filter(|w| w.0 == BAR_NABM)
-            .map(|w| w.1)
-            .collect();
-        let pos_bdbar = nabm_offsets
+            .position(|w| w.1 == nabm::PCM_OUT_BASE + nabm::BDBAR);
+        let pos_lvi = nabm_writes
             .iter()
-            .position(|&o| o == nabm::PCM_OUT_BASE + nabm::BDBAR);
-        let pos_lvi = nabm_offsets
+            .position(|w| w.1 == nabm::PCM_OUT_BASE + nabm::LVI);
+        let pos_cr_run = nabm_writes
             .iter()
-            .position(|&o| o == nabm::PCM_OUT_BASE + nabm::LVI);
-        let pos_cr = nabm_offsets
-            .iter()
-            .position(|&o| o == nabm::PCM_OUT_BASE + nabm::CR);
+            .rposition(|w| w.1 == nabm::PCM_OUT_BASE + nabm::CR && (w.2 as u8) == cr_run_value());
         assert!(pos_bdbar.is_some(), "BDBAR write required");
         assert!(pos_lvi.is_some(), "LVI write required");
-        assert!(pos_cr.is_some(), "CR write required");
+        assert!(pos_cr_run.is_some(), "CR run-bit write required");
         assert!(pos_bdbar < pos_lvi, "BDBAR must precede LVI");
-        assert!(pos_lvi < pos_cr, "LVI must precede CR");
+        assert!(pos_lvi < pos_cr_run, "LVI must precede CR run-bit");
     }
 
     #[test]
@@ -796,7 +933,10 @@ mod tests {
             })
             .copied()
             .collect();
-        assert!(!rr_writes.is_empty(), "close must issue at least one CR.RR write");
+        assert!(
+            !rr_writes.is_empty(),
+            "close must issue at least one CR.RR write"
+        );
     }
 
     #[test]
@@ -867,7 +1007,9 @@ mod tests {
         let mut logic = Ac97Logic::new();
         // Fill every BDL slot.
         for _ in 0..BDL_ENTRIES {
-            logic.submit_buffer(0x1000, 0xCAFE_F00D, 64).expect("submit");
+            logic
+                .submit_buffer(0x1000, 0xCAFE_F00D, 64)
+                .expect("submit");
         }
         let err = logic
             .submit_buffer(0x1000, 0xDEAD_BEEF, 64)
