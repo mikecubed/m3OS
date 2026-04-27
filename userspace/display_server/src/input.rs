@@ -80,6 +80,16 @@ pub const KBD_SERVICE_NAME: &str = "kbd";
 /// IPC label `kbd_server` accepts for typed `KeyEvent` pulls (D.1).
 pub const KBD_EVENT_PULL: u64 = 2;
 
+/// Reply label that `kbd_server` returns for the bounded-wait
+/// "no event this tick" path. Phase 56 follow-up: the timeout
+/// reply was previously `u64::MAX`, which collides with the IPC
+/// transport-error sentinel returned by `ipc_call*`. The new
+/// dedicated label keeps polite "no event yet" replies
+/// distinguishable from real syscall failures, so future
+/// observability can count them separately. Must be kept in sync
+/// with `KBD_EVENT_NONE` in `userspace/kbd_server/src/main.rs`.
+pub const KBD_EVENT_NONE: u64 = 3;
+
 /// Service-registry name for the pointer/mouse service. Set by
 /// `mouse_server` (D.2) at startup.
 pub const MOUSE_SERVICE_NAME: &str = "mouse";
@@ -89,6 +99,12 @@ pub const MOUSE_SERVICE_NAME: &str = "mouse";
 /// starts at 1 (vs `kbd_server` which reserves 1 for legacy
 /// `KBD_READ`).
 pub const MOUSE_EVENT_PULL: u64 = 1;
+
+/// Reply label that `mouse_server` returns for the bounded-wait
+/// "no event this tick" path (mirrors `KBD_EVENT_NONE`). Must be
+/// kept in sync with `MOUSE_EVENT_NONE` in
+/// `userspace/mouse_server/src/main.rs`.
+pub const MOUSE_EVENT_NONE: u64 = 2;
 
 /// Service-lookup retry attempts before [`lookup_with_backoff`] gives
 /// up.
@@ -215,12 +231,15 @@ impl InputSource for KbdInputSource {
 
         // Label-only request. kbd_server's `KBD_EVENT_PULL` arm pumps
         // the keymap pipeline, encodes a `KeyEvent` into the reply
-        // bulk via `ipc_store_reply_bulk`, and replies with this same
-        // label on success or `u64::MAX` on bounded-wait timeout.
+        // bulk via `ipc_store_reply_bulk`, and replies with the same
+        // label on success, `KBD_EVENT_NONE` on bounded-wait timeout
+        // (no event this tick), or `u64::MAX` on a real failure
+        // (encode failure, bulk-store failure, or IPC transport
+        // error). All non-success cases yield `None` to the
+        // dispatcher loop; future observability can count them
+        // separately because the labels are now distinct.
         let label = syscall_lib::ipc_call(handle, KBD_EVENT_PULL, 0);
         if label != KBD_EVENT_PULL {
-            // u64::MAX = timeout sentinel from kbd_server OR transport
-            // error. Either way: no event this tick.
             return None;
         }
 
@@ -301,6 +320,13 @@ impl InputSource for MouseInputSource {
         self.try_lazy_reconnect();
         let handle = self.handle?;
 
+        // mouse_server replies with `MOUSE_EVENT_PULL` on success,
+        // `MOUSE_EVENT_NONE` on bounded-wait timeout (no event this
+        // tick), or `u64::MAX` on a real failure (encode failure,
+        // bulk-store failure, or IPC transport error). All
+        // non-success cases yield `None` to the dispatcher loop;
+        // labels are now distinct so future observability can count
+        // them separately.
         let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
         if label != MOUSE_EVENT_PULL {
             return None;

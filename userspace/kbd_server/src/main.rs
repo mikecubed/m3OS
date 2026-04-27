@@ -70,6 +70,17 @@ const KBD_READ: u64 = 1;
 /// the lookup at startup. Documented in the track-D.1 report.
 const KBD_EVENT_PULL: u64 = 2;
 
+/// Phase 56 follow-up — distinct reply label for the bounded-wait
+/// "no event this tick" path. Previously the timeout reply reused
+/// `u64::MAX`, which collides with the IPC transport-error sentinel
+/// returned by `ipc_call*`; callers could not distinguish a polite
+/// "no event yet" reply from a real syscall failure. The new
+/// `KBD_EVENT_NONE` label is reserved for the timeout path; genuine
+/// server-side errors (encode failure, `ipc_store_reply_bulk`
+/// failure) keep `u64::MAX`. Must be kept in sync with the matching
+/// constant in `userspace/display_server/src/input.rs`.
+const KBD_EVENT_NONE: u64 = 3;
+
 /// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
 const REPLY_CAP_HANDLE: u32 = 1;
 
@@ -273,11 +284,12 @@ fn handle_kbd_event_pull(pipeline: &mut KeyboardPipeline) {
         }
     }
 
-    // Bounded timeout — surface as a typed error reply (label = u64::MAX,
-    // matching the convention used by other syscall-lib paths). The bulk
-    // slot is left empty so the caller's recv_msg returns a zero-byte
-    // payload alongside the sentinel label.
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+    // Bounded timeout — surface as the dedicated "no event" label so
+    // the caller can distinguish this from `u64::MAX` (the IPC
+    // transport-error sentinel returned by `ipc_call*` on a real
+    // syscall failure). The bulk slot is left empty so the caller's
+    // recv_msg returns a zero-byte payload alongside the label.
+    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, KBD_EVENT_NONE, 0);
 }
 
 /// Encode the `KeyEvent` and reply with it as bulk data.

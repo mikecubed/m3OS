@@ -75,6 +75,17 @@ fn alloc_error(_layout: Layout) -> ! {
 /// The `display_server` (D.3) is the expected consumer.
 const MOUSE_EVENT_PULL: u64 = 1;
 
+/// Phase 56 follow-up — distinct reply label for the bounded-wait
+/// "no event this tick" path (mirrors `KBD_EVENT_NONE` in
+/// `kbd_server`). Previously the timeout reply reused `u64::MAX`,
+/// which collides with the IPC transport-error sentinel returned
+/// by `ipc_call*`; the new label keeps timeouts and real failures
+/// distinguishable. Genuine server-side errors (encode failure,
+/// `ipc_store_reply_bulk` failure) keep `u64::MAX`. Must be kept
+/// in sync with the matching constant in
+/// `userspace/display_server/src/input.rs`.
+const MOUSE_EVENT_NONE: u64 = 2;
+
 /// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
 const REPLY_CAP_HANDLE: u32 = 1;
 
@@ -360,10 +371,13 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
         }
     }
 
-    // Bounded timeout — surface as a typed error reply (label = u64::MAX),
-    // matching D.1's MAX_PULL_POLLS expiry shape so display_server can
-    // share its bounded-wait machinery across input services.
-    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+    // Bounded timeout — surface as the dedicated "no event" label so
+    // the caller can distinguish this from `u64::MAX` (the IPC
+    // transport-error sentinel returned by `ipc_call*` on a real
+    // syscall failure). Mirrors the D.1 `KBD_EVENT_NONE` shape so
+    // display_server's bounded-wait machinery handles both
+    // services identically.
+    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, MOUSE_EVENT_NONE, 0);
 }
 
 /// Encode the `PointerEvent` and reply with it as bulk data.
