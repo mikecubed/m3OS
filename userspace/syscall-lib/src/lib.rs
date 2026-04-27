@@ -338,6 +338,16 @@ pub const SYS_IPC_STORE_REPLY_BULK: u64 = 0x1110;
 /// Bind a notification capability into the recv loop that services an endpoint.
 pub const SYS_NOTIF_BIND: u64 = 0x1111;
 
+/// Drain the calling task's `pending_bulk` slot into a user buffer (Phase 56
+/// close-out). Used after `ipc_call_buf` to read a reply bulk staged via
+/// the server's `ipc_store_reply_bulk`.
+pub const SYS_IPC_TAKE_PENDING_BULK: u64 = 0x1112;
+
+/// Non-blocking variant of `ipc_recv_msg` — returns immediately with
+/// `u64::MAX` if no sender is pending. Used by display_server's main
+/// loop to multiplex the frame-tick poll + control-endpoint serving.
+pub const SYS_IPC_TRY_RECV_MSG: u64 = 0x1113;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -495,6 +505,14 @@ pub fn ipc_send_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u
 /// Like [`ipc_call`] but additionally copies `buf` from this process's
 /// address space and delivers it alongside the message.
 /// Returns the reply label on success, `u64::MAX` on error.
+///
+/// # Reading the reply bulk
+///
+/// If the server stages a reply bulk (via `ipc_store_reply_bulk`), the
+/// kernel deposits it in the caller's `pending_bulk` slot at reply time.
+/// To consume it, call [`ipc_take_pending_bulk`] **immediately after this
+/// function returns** and **before any other IPC recv** — see
+/// [`ipc_take_pending_bulk`] for the ordering constraint.
 pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
     unsafe {
         syscall6(
@@ -578,6 +596,98 @@ pub fn ipc_store_reply_bulk(buf: &[u8]) -> u64 {
         syscall2(
             SYS_IPC_STORE_REPLY_BULK,
             buf.as_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Non-blocking variant of [`ipc_recv_msg`] (Phase 56 close-out). Returns
+/// immediately if no sender is queued on the endpoint; otherwise dequeues
+/// one pending message, copies the header to `msg`, the bulk to `buf`,
+/// and returns the message label.
+///
+/// # Return value
+///
+/// - the message label on success;
+/// - `u64::MAX` for either of two cases — the endpoint queue is empty
+///   (the normal no-work path) **or** a copy-to-user failure for `msg`
+///   / `buf` (a real fault). The current syscall ABI does not separate
+///   these; callers that need to distinguish them must treat repeated
+///   `u64::MAX` returns combined with otherwise-healthy senders as a
+///   probable copy fault and surface it via their own observability.
+///
+/// Used by `display_server`'s main loop to serve the control endpoint
+/// alongside the frame-tick poll without blocking on `ipc_recv_msg`.
+pub fn ipc_try_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_TRY_RECV_MSG,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Drain the calling task's `pending_bulk` slot into `buf` (Phase 56
+/// close-out — closes the bulk-reply visibility gap from D.3 / E.4).
+///
+/// After a successful [`ipc_call_buf`], the kernel transfers any bulk the
+/// server staged via [`ipc_store_reply_bulk`] into the caller's
+/// `pending_bulk` slot. This call copies that slot's contents into `buf`
+/// and clears the slot.
+///
+/// # Return value
+///
+/// - `0..=buf.len()` on success — the number of bytes copied.
+///   `0` means either no bulk was pending, or a zero-length bulk was
+///   staged. Either way the slot is cleared.
+/// - `u64::MAX` on error: zero-length `buf`, oversized `buf` (> kernel's
+///   `MAX_BULK_LEN`, currently 4096), or user-memory copy failure.
+///
+/// # Truncation
+///
+/// If the pending bulk is larger than `buf.len()`, the call **truncates**
+/// to `buf.len()` and returns `buf.len()`. The remainder is dropped.
+/// Callers must size `buf` to the largest expected wire frame for the
+/// protocol they're consuming (e.g. `KEY_EVENT_WIRE_SIZE = 19`,
+/// `POINTER_EVENT_WIRE_SIZE = 37`, control-socket reply bodies up to
+/// `MAX_BULK_LEN = 4096`).
+///
+/// # Ordering constraint — call immediately after [`ipc_call_buf`]
+///
+/// The `pending_bulk` slot drained by this syscall is the **same**
+/// per-task slot that [`ipc_recv_msg`] / [`ipc_try_recv_msg`] use to
+/// deliver inbound bulk on a recv (kernel-side `take_bulk_data` /
+/// `deliver_bulk` against `Task::pending_bulk`). The slot has only one
+/// value at any time. If a caller interleaves another IPC operation
+/// between `ipc_call_buf` and `ipc_take_pending_bulk`, the staged
+/// reply bulk will either be **lost** (overwritten by the next
+/// `transfer_bulk`) or **misdelivered** as the inbound bulk of an
+/// unrelated `ipc_recv_msg` call.
+///
+/// The supported usage pattern is therefore:
+///
+/// ```text
+/// let label = ipc_call_buf(ep, ..., &request_buf);
+/// if label == u64::MAX { ... }
+/// let n = ipc_take_pending_bulk(&mut reply_buf);   // drain immediately
+/// // now safe to do other IPC work
+/// ```
+///
+/// Do **not** interleave `ipc_recv_msg`, `ipc_try_recv_msg`, or any
+/// other path that touches `pending_bulk` between the call and the
+/// drain. Production callers (`m3ctl`, `display-multi-client-smoke`,
+/// `grab-hook-smoke`, `display-server-crash-smoke`) all observe this
+/// ordering.
+pub fn ipc_take_pending_bulk(buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall2(
+            SYS_IPC_TAKE_PENDING_BULK,
+            buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
     }

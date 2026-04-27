@@ -54,6 +54,8 @@ members = [
     "userspace/vfs_server",
     "userspace/fat_server",
     "userspace/net_server",
+    # Phase 56 Track D.2 — userspace mouse service
+    "userspace/mouse_server",
     # Phase 55b Track C.1 — ring-3 driver runtime library
     "userspace/lib/driver_runtime",
     # Phase 55b Tracks D.1 / E.1 — ring-3 driver scaffolds
@@ -71,6 +73,14 @@ members = [
     "userspace/display_server",
     # Phase 56 Track C.6 — protocol-reference client (visual smoke)
     "userspace/gfx-demo",
+    # Phase 56 Track E.4 — minimal control-socket client (one-shot CLI)
+    "userspace/m3ctl",
+    # Phase 56 Track F.2 — display-service crash-and-restart end-to-end smoke client
+    "userspace/display-server-crash-smoke",
+    # Phase 56 close-out (G.1) — multi-client coexistence smoke client
+    "userspace/display-multi-client-smoke",
+    # Phase 56 close-out (G.2) — keybind grab-hook smoke client
+    "userspace/grab-hook-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

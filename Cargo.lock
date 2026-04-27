@@ -451,6 +451,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-multi-client-smoke"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "surface_buffer",
+ "syscall-lib",
+]
+
+[[package]]
+name = "display-server-crash-smoke"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "display_server"
 version = "0.56.0"
 dependencies = [
@@ -696,6 +713,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grab-hook-smoke"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -847,6 +872,7 @@ dependencies = [
 name = "kbd_server"
 version = "0.53.0"
 dependencies = [
+ "kernel-core",
  "syscall-lib",
 ]
 
@@ -871,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.55.3"
+version = "0.56.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -886,6 +912,7 @@ dependencies = [
 name = "kernel-core"
 version = "0.53.0"
 dependencies = [
+ "heapless",
  "loom",
  "proptest",
  "spin",
@@ -967,6 +994,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "m3ctl"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1008,6 +1043,14 @@ dependencies = [
  "rand_core 0.6.4",
  "sha3",
  "zeroize",
+]
+
+[[package]]
+name = "mouse_server"
+version = "0.56.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
 ]
 
 [[package]]

@@ -181,6 +181,9 @@ static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
 // Phase 52: ring-3 extracted services
 static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
 static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
+// Phase 56 Track D.2: ring-3 mouse service. PS/2 AUX (IRQ 12) producer of
+// PointerEvent messages on the `mouse` IPC service.
+static MOUSE_SERVER_ELF: &[u8] = generated_initrd_asset!("mouse_server");
 static STDIN_FEEDER_ELF: &[u8] = generated_initrd_asset!("stdin_feeder");
 static FAT_SERVER_ELF: &[u8] = generated_initrd_asset!("fat_server");
 static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
@@ -203,6 +206,25 @@ static E1000_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("e1000-crash-smoke
 static DISPLAY_SERVER_ELF: &[u8] = generated_initrd_asset!("display_server");
 // Phase 56 Track C.6: protocol-reference client (visual smoke).
 static GFX_DEMO_ELF: &[u8] = generated_initrd_asset!("gfx-demo");
+// Phase 56 Track E.4: minimal control-socket client. One-shot CLI;
+// invoked from the shell or via test harnesses (no `.conf` because it
+// is not a daemon — the four-step new-binary convention only requires
+// a service config for daemons).
+static M3CTL_ELF: &[u8] = generated_initrd_asset!("m3ctl");
+// Phase 56 Track F.2: display-service crash-and-restart smoke client.
+// Exposed under /bin so the QEMU regression can launch it from the
+// post-login shell. No `.conf` (not a daemon).
+static DISPLAY_SERVER_CRASH_SMOKE_ELF: &[u8] =
+    generated_initrd_asset!("display-server-crash-smoke");
+
+// Phase 56 close-out (G.1): multi-client coexistence smoke client.
+// One-shot binary; no `.conf` (launched from the post-login shell by
+// the QEMU regression).
+static DISPLAY_MULTI_CLIENT_SMOKE_ELF: &[u8] =
+    generated_initrd_asset!("display-multi-client-smoke");
+
+// Phase 56 close-out (G.2): keybind grab-hook smoke client.
+static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -319,6 +341,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "kbd_server",
         RamdiskNode::File {
             content: KBD_SERVER_ELF,
+        },
+    ),
+    // Phase 56 Track D.2: ring-3 mouse service.
+    (
+        "mouse_server",
+        RamdiskNode::File {
+            content: MOUSE_SERVER_ELF,
         },
     ),
     (
@@ -574,6 +603,34 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "gfx-demo",
         RamdiskNode::File {
             content: GFX_DEMO_ELF,
+        },
+    ),
+    // Phase 56 Track E.4: minimal control-socket CLI. Not a daemon
+    // — invoked by the shell or test harness; no `.conf` required.
+    ("m3ctl", RamdiskNode::File { content: M3CTL_ELF }),
+    // Phase 56 Track F.2: display-service crash-and-restart smoke
+    // client. Not a daemon; invoked from the post-login shell by the
+    // F.2 regression. No `.conf` required.
+    (
+        "display-server-crash-smoke",
+        RamdiskNode::File {
+            content: DISPLAY_SERVER_CRASH_SMOKE_ELF,
+        },
+    ),
+    // Phase 56 close-out (G.1): multi-client coexistence smoke client.
+    // One-shot; launched from the post-login shell by the
+    // multi-client-coexistence regression.
+    (
+        "display-multi-client-smoke",
+        RamdiskNode::File {
+            content: DISPLAY_MULTI_CLIENT_SMOKE_ELF,
+        },
+    ),
+    // Phase 56 close-out (G.2): keybind grab-hook smoke client.
+    (
+        "grab-hook-smoke",
+        RamdiskNode::File {
+            content: GRAB_HOOK_SMOKE_ELF,
         },
     ),
 ];

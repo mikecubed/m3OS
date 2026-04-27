@@ -23,8 +23,12 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use kernel_core::display::compose::ComposeLayer;
+use kernel_core::display::cursor::ClientCursor;
+use kernel_core::display::layer::{
+    LayerConflictTracker, LayerError, compute_layer_geometry, derive_exclusive_rect,
+};
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, Layer, Rect, ServerMessage, SurfaceId, SurfaceRole,
+    BufferId, ClientMessage, CursorConfig, Layer, Rect, ServerMessage, SurfaceId, SurfaceRole,
 };
 
 /// High-water mark for the pending-bulk queue. A client that ships
@@ -97,6 +101,17 @@ pub enum SurfaceShimError {
         expected: BufferId,
         pending: Vec<BufferId>,
     },
+    /// A `Layer` surface tried to map with
+    /// `keyboard_interactivity == Exclusive` while another `Layer`
+    /// already holds the global exclusive-keyboard claim. Phase 56
+    /// E.2 enforces a single exclusive-keyboard layer.
+    Layer(LayerError),
+}
+
+impl From<LayerError> for SurfaceShimError {
+    fn from(err: LayerError) -> Self {
+        SurfaceShimError::Layer(err)
+    }
 }
 
 /// Registry of all surfaces owned by all connected clients.
@@ -110,6 +125,24 @@ pub struct SurfaceRegistry {
     /// Pending buffer bytes received via the bulk-transport path but not
     /// yet attached to a surface. `AttachBuffer` consumes from here.
     pending_bulk: Vec<CommittedBuffer>,
+    /// Tracks which `Layer` surface (if any) currently holds the
+    /// global exclusive-keyboard claim. Populated on
+    /// `SetSurfaceRole(Layer { keyboard_interactivity == Exclusive })`,
+    /// cleared on the holder's `DestroySurface`. The D.3 input
+    /// dispatcher reads `active_exclusive_layer` to gate keyboard
+    /// routing.
+    layer_conflicts: LayerConflictTracker,
+    /// Phase 56 Track E.3 — client-supplied cursor (the bytes most
+    /// recently committed against a `SurfaceRole::Cursor` surface).
+    /// `None` means the composer falls back to `DefaultArrowCursor`.
+    /// At most one client cursor is active at a time; a second
+    /// `SetSurfaceRole(Cursor)` + `CommitSurface` overwrites this slot.
+    client_cursor: Option<ClientCursor>,
+    /// `SurfaceId` of the surface that currently owns the
+    /// `client_cursor` slot. Tracked separately so `DestroySurface`
+    /// for that id clears the slot — without this, a destroyed
+    /// cursor surface would leave a stale `ClientCursor` behind.
+    client_cursor_owner: Option<SurfaceId>,
 }
 
 impl SurfaceRegistry {
@@ -117,7 +150,19 @@ impl SurfaceRegistry {
         Self {
             surfaces: BTreeMap::new(),
             pending_bulk: Vec::new(),
+            layer_conflicts: LayerConflictTracker::new(),
+            client_cursor: None,
+            client_cursor_owner: None,
         }
+    }
+
+    /// Phase 56 Track E.3 — the currently active client cursor, if any.
+    /// `None` means the composer falls back to
+    /// [`kernel_core::display::cursor::DefaultArrowCursor`]. The
+    /// composer's wiring (`compose::run_compose`) calls this once per
+    /// frame.
+    pub fn client_cursor(&self) -> Option<&ClientCursor> {
+        self.client_cursor.as_ref()
     }
 
     /// Number of surfaces tracked. Used by tests and the control-socket
@@ -125,6 +170,24 @@ impl SurfaceRegistry {
     #[allow(dead_code)]
     pub fn surface_count(&self) -> usize {
         self.surfaces.len()
+    }
+
+    /// All registered surface ids in ascending order. Used by the
+    /// control-socket `list-surfaces` verb (E.4) and by `main.rs` to
+    /// compute create / destroy deltas for subscription event push.
+    /// Ascending order is stable because the underlying `BTreeMap`
+    /// orders by `SurfaceId(u32)`; a reviewer can rely on it.
+    pub fn surface_ids(&self) -> Vec<SurfaceId> {
+        self.surfaces.keys().copied().collect()
+    }
+
+    /// Lookup the registered role of `surface_id`. Returns `None` if
+    /// the surface is unknown or has not yet had `SetSurfaceRole`
+    /// called on it. Used by the control-socket `SurfaceCreated` event
+    /// emit path (E.4) so the wire-tag (`SurfaceRoleTag`) reflects the
+    /// actual role rather than a default guess.
+    pub fn surface_role(&self, surface_id: SurfaceId) -> Option<SurfaceRole> {
+        self.surfaces.get(&surface_id).and_then(|s| s.role)
     }
 
     /// Receive a bulk-transported pixel buffer and queue it for the next
@@ -168,9 +231,31 @@ impl SurfaceRegistry {
             ClientMessage::DestroySurface { surface_id } => {
                 self.apply_event(*surface_id, SurfaceEvent::DestroySurface, &mut result)?;
                 self.surfaces.remove(surface_id);
+                // Release any exclusive-keyboard claim the destroyed
+                // surface held. `release` is a no-op for surfaces that
+                // never claimed the slot.
+                self.layer_conflicts.release(*surface_id);
+                // Phase 56 E.3 — if the destroyed surface owned the
+                // active client cursor, clear the slot so the
+                // composer falls back to `DefaultArrowCursor` on the
+                // next frame.
+                if self.client_cursor_owner == Some(*surface_id) {
+                    self.client_cursor = None;
+                    self.client_cursor_owner = None;
+                }
                 result.destroyed.push(*surface_id);
             }
             ClientMessage::SetSurfaceRole { surface_id, role } => {
+                // Phase 56 E.2: a Layer surface declaring
+                // `KeyboardInteractivity::Exclusive` is rejected if a
+                // different layer already holds the global slot. We
+                // validate *before* applying the state-machine event
+                // so a conflict leaves the registry untouched. Non-
+                // Layer roles bypass the check (try_claim returns Ok
+                // for non-Exclusive configs).
+                if let SurfaceRole::Layer(cfg) = role {
+                    self.layer_conflicts.try_claim(*surface_id, cfg)?;
+                }
                 self.apply_event(*surface_id, SurfaceEvent::SetRole(*role), &mut result)?;
                 if let Some(s) = self.surfaces.get_mut(surface_id) {
                     s.role = Some(*role);
@@ -231,6 +316,32 @@ impl SurfaceRegistry {
                 if let Some(s) = self.surfaces.get_mut(surface_id)
                     && let Some(buf) = s.pending_buffer.take()
                 {
+                    // Phase 56 E.3 — if the surface holds a `Cursor`
+                    // role, wrap the committed buffer as a
+                    // `ClientCursor` for the composer's renderer
+                    // path. The buffer ALSO populates the
+                    // committed_buffer slot in case the surface is
+                    // later re-rolled (Phase 56 doesn't allow this —
+                    // SurfaceRole transitions are state-machine-
+                    // checked — but storing it costs nothing and
+                    // keeps the destroy-path uniform). The
+                    // `client_cursor` slot wins for cursor sampling.
+                    if let Some(SurfaceRole::Cursor(cfg)) = s.role {
+                        match cursor_from_committed(&buf, cfg) {
+                            Ok(cursor) => {
+                                self.client_cursor = Some(cursor);
+                                self.client_cursor_owner = Some(*surface_id);
+                            }
+                            Err(_) => {
+                                // Malformed cursor buffer (zero size
+                                // or pixel-length mismatch). Phase 56
+                                // logs and ignores; the previous
+                                // cursor (if any) stays active. A
+                                // stricter future revision could emit
+                                // a control-socket protocol error.
+                            }
+                        }
+                    }
                     s.committed_buffer = Some(buf);
                     s.dirty = true;
                 }
@@ -347,26 +458,46 @@ impl SurfaceRegistry {
     /// Iterate all live surfaces with their current committed buffer (if
     /// any) and their layer / geometry. The composer wiring (C.4) consumes
     /// this to build `ComposeSurface`s for each frame.
+    ///
+    /// `Layer` surfaces are placed via
+    /// [`kernel_core::display::layer::compute_layer_geometry`] using
+    /// their `LayerConfig` (anchor mask + margins) and the buffer's
+    /// committed dimensions as the intrinsic size (E.2). `Toplevel`
+    /// surfaces center inside the output here; the composer wiring
+    /// (C.4) overrides toplevel placement with the
+    /// `LayoutPolicy::arrange` result.
+    ///
+    /// Phase 56 E.3 caveat: surfaces with `SurfaceRole::Cursor` are
+    /// **not** returned here. The composer renders them through the
+    /// [`CursorRenderer`](kernel_core::display::cursor::CursorRenderer)
+    /// trait (via `client_cursor()`), not as a regular layered surface.
     pub fn iter_compose(&self, output: Rect) -> Vec<ComposeEntry<'_>> {
         let mut entries = Vec::new();
         for (id, surface) in self.surfaces.iter() {
             let Some(buf) = surface.committed_buffer.as_ref() else {
                 continue;
             };
-            let role_layer = match surface.role {
-                Some(SurfaceRole::Cursor(_)) => ComposeLayer::Cursor,
-                Some(SurfaceRole::Layer(cfg)) => match cfg.layer {
-                    Layer::Background => ComposeLayer::Background,
-                    Layer::Bottom => ComposeLayer::Bottom,
-                    Layer::Top => ComposeLayer::Top,
-                    Layer::Overlay => ComposeLayer::Overlay,
-                },
-                Some(SurfaceRole::Toplevel) | None => ComposeLayer::Toplevel,
+            let (role_layer, rect) = match surface.role {
+                // Cursor-role surfaces render via the CursorRenderer
+                // path (E.3) — `client_cursor()` and the cursor blit
+                // in `compose::run_compose`. Skip them here so the
+                // composer's per-surface blit does not double-draw.
+                Some(SurfaceRole::Cursor(_)) => continue,
+                Some(SurfaceRole::Layer(cfg)) => {
+                    let layer_band = match cfg.layer {
+                        Layer::Background => ComposeLayer::Background,
+                        Layer::Bottom => ComposeLayer::Bottom,
+                        Layer::Top => ComposeLayer::Top,
+                        Layer::Overlay => ComposeLayer::Overlay,
+                    };
+                    let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
+                    (layer_band, geometry)
+                }
+                Some(SurfaceRole::Toplevel) | None => (
+                    ComposeLayer::Toplevel,
+                    centre_rect(output, buf.width, buf.height),
+                ),
             };
-            // Centre the surface inside the output by default; layout
-            // policy (E.1 wiring) will override this for `Toplevel` once
-            // C.4 plugs the LayoutPolicy in.
-            let rect = centre_rect(output, buf.width, buf.height);
             entries.push(ComposeEntry {
                 id: *id,
                 layer: role_layer,
@@ -378,6 +509,47 @@ impl SurfaceRegistry {
         // then by surface id for determinism within a layer.
         entries.sort_by(|a, b| (a.layer as u8, a.id.0).cmp(&(b.layer as u8, b.id.0)));
         entries
+    }
+
+    /// Collect the exclusive-zone rectangles to subtract from the
+    /// toplevel band, in output coordinates. The composer (C.4) feeds
+    /// these to `LayoutPolicy::arrange` so toplevels are arranged
+    /// outside any docked panels / taskbars / status bars.
+    ///
+    /// Each `Layer` surface with `exclusive_zone != 0` and a single-
+    /// edge anchor pattern contributes one rectangle. Multi-edge
+    /// anchors and zero `exclusive_zone` are skipped — see
+    /// [`kernel_core::display::layer::derive_exclusive_rect`] for the
+    /// full exclusion table.
+    pub fn exclusive_zones(&self, output: Rect) -> Vec<Rect> {
+        let mut zones = Vec::new();
+        for surface in self.surfaces.values() {
+            let Some(buf) = surface.committed_buffer.as_ref() else {
+                continue;
+            };
+            let Some(SurfaceRole::Layer(cfg)) = surface.role else {
+                continue;
+            };
+            let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
+            if let Some(rect) = derive_exclusive_rect(geometry, &cfg) {
+                zones.push(rect);
+            }
+        }
+        zones
+    }
+
+    /// The surface (if any) currently holding the global exclusive-
+    /// keyboard claim. The D.3 input dispatcher consults this to gate
+    /// `KeyboardInteractivity` routing so an exclusive layer always
+    /// wins focus while mapped.
+    ///
+    /// `#[allow(dead_code)]` because D.3's `CompositorState`
+    /// `active_exclusive_layer` field that consumes this getter has not
+    /// yet merged into the integration branch. Once D.3 plumbs through,
+    /// the allow can drop.
+    #[allow(dead_code)]
+    pub fn active_exclusive_layer(&self) -> Option<SurfaceId> {
+        self.layer_conflicts.active()
     }
 }
 
@@ -407,6 +579,45 @@ fn centre_rect(output: Rect, w: u32, h: u32) -> Rect {
     let cx = output.x + (output.w as i32 - w as i32) / 2;
     let cy = output.y + (output.h as i32 - h as i32) / 2;
     Rect { x: cx, y: cy, w, h }
+}
+
+/// Phase 56 E.3 — wrap a committed BGRA8888 byte buffer as a
+/// [`ClientCursor`] for the composer's renderer slot. The buffer's
+/// `pixels` field is a packed `Vec<u8>` (BGRA byte order); we
+/// recompose it as a sequence of `u32`s (little-endian on the wire,
+/// matching the framebuffer's pixel format).
+///
+/// Returns the underlying [`ClientCursor::new`] error verbatim so a
+/// future control-socket path can emit a typed protocol error
+/// instead of silently dropping the bind.
+fn cursor_from_committed(
+    buf: &CommittedBuffer,
+    cfg: CursorConfig,
+) -> Result<ClientCursor, kernel_core::display::cursor::ClientCursorError> {
+    let byte_count = (buf.width as usize)
+        .checked_mul(buf.height as usize)
+        .and_then(|wh| wh.checked_mul(4))
+        .unwrap_or(usize::MAX);
+    if buf.pixels.len() != byte_count {
+        return Err(
+            kernel_core::display::cursor::ClientCursorError::PixelLengthMismatch {
+                expected: byte_count,
+                actual: buf.pixels.len(),
+            },
+        );
+    }
+    // Decode the BGRA byte stream into u32 cells. Each cell is one
+    // pixel (BGRA in little-endian wire byte order — `to_le_bytes`
+    // round-trips back to `[B, G, R, A]`). Hand the owned `Vec`
+    // directly to `from_vec` so we don't pay a second alloc + clone
+    // inside `ClientCursor::new`.
+    let pixel_count = byte_count / 4;
+    let mut packed: Vec<u32> = Vec::with_capacity(pixel_count);
+    for chunk in buf.pixels.chunks_exact(4) {
+        let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        packed.push(u32::from_le_bytes(arr));
+    }
+    ClientCursor::from_vec(packed, buf.width, buf.height, cfg)
 }
 
 impl Default for SurfaceRegistry {

@@ -26,7 +26,7 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1111`;
+//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1113`;
 //!   earlier phases used low numbers 4 and 7, remapped in Phase 50).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
@@ -57,8 +57,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x1111` are translated to internal
-/// dispatch numbers 1–18 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x1113` are translated to internal
+/// dispatch numbers 1–20 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
@@ -80,6 +80,8 @@ pub use registry::RegistryError;
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
 /// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
 /// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/NEG_EBADF/u64::MAX |
+/// | 19 | 0x1112 | `ipc_take_pending_bulk(buf_ptr, buf_len)` | `arg0, arg1` → bytes_copied or u64::MAX |
+/// | 20 | 0x1113 | `ipc_try_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, or u64::MAX if no pending message |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -134,6 +136,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 18 {
         return sys_notif_bind(task_id, arg0, arg1);
+    }
+    if number == 19 {
+        return ipc_take_pending_bulk(task_id, arg0, arg1);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -294,6 +299,17 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len) — blocks until a sender arrives.
             match cap {
                 Capability::Endpoint(ep_id) => ipc_recv_msg(task_id, ep_id, arg1, arg2, arg3),
+                _ => u64::MAX,
+            }
+        }
+        20 => {
+            // ipc_try_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len) — non-blocking
+            // variant of ipc_recv_msg. Returns the message label on success,
+            // or u64::MAX if no sender was pending. Used by display_server's
+            // main loop to multiplex frame-tick driving + control-endpoint
+            // serving without blocking.
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_try_recv_msg(task_id, ep_id, arg1, arg2, arg3),
                 _ => u64::MAX,
             }
         }
@@ -625,6 +641,70 @@ fn ipc_recv_msg(
     }
 }
 
+/// Syscall 20 (0x1113): non-blocking variant of [`ipc_recv_msg`].
+///
+/// Phase 56 close-out — closes the second half of the runtime byte-flow gap
+/// (companion to [`ipc_take_pending_bulk`]). The display_server main loop
+/// drives the frame-tick + compose path via polling, so it can't block on
+/// `ipc_recv` for the control endpoint. This syscall returns immediately
+/// with `u64::MAX` if no sender is queued, letting the loop multiplex.
+///
+/// Same arguments and same `msg_ptr` / `buf_ptr` semantics as
+/// [`ipc_recv_msg`] except no notification fast-path: this is purely a
+/// non-blocking peek-and-take of the endpoint queue.
+///
+/// Returns:
+/// - the message label on success (header + bulk copied to user buffers)
+/// - `u64::MAX` if no sender is pending OR on any copy failure
+fn ipc_try_recv_msg(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+) -> u64 {
+    use crate::task::scheduler;
+
+    let msg = match endpoint::recv_msg_nowait(task_id, ep_id) {
+        Some(m) => m,
+        None => return u64::MAX,
+    };
+
+    if msg.label == u64::MAX {
+        return u64::MAX;
+    }
+
+    if msg_ptr != 0 {
+        let mut header = [0u8; 40];
+        header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
+        for (i, &d) in msg.data.iter().enumerate() {
+            let off = 8 + i * 8;
+            header[off..off + 8].copy_from_slice(&d.to_ne_bytes());
+        }
+        if UserSliceWo::new(msg_ptr, header.len())
+            .and_then(|s| s.copy_from_kernel(&header))
+            .is_err()
+        {
+            return u64::MAX;
+        }
+    }
+
+    if buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
+        let copy_len = bulk.len().min(buf_len as usize);
+        if copy_len > 0
+            && UserSliceWo::new(buf_ptr, copy_len)
+                .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+                .is_err()
+        {
+            return u64::MAX;
+        }
+    }
+
+    msg.label
+}
+
 /// Syscall 18 (0x1111): bind a notification object to the calling task's TCB.
 ///
 /// Binding allows `ipc_recv_msg` to consult the notification's pending bits
@@ -714,4 +794,90 @@ fn ipc_store_reply_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64
 
     scheduler::deliver_bulk(task_id, bulk);
     0
+}
+
+/// Syscall 19 (0x1112): drain the calling task's `pending_bulk` slot.
+///
+/// Phase 56 close-out — closes the bulk-reply visibility gap that gated
+/// D.3's input-event delivery, E.4's `m3ctl` reply decoding, and the
+/// G.1 / G.2 / G.4 deferred-runtime regression stubs.
+///
+/// After a successful `ipc_call_buf`, the kernel's `transfer_bulk(server →
+/// caller)` path moves any bulk the server staged via `ipc_store_reply_bulk`
+/// into the caller's `pending_bulk` slot. This syscall copies that slot's
+/// contents into a user-supplied buffer and clears the slot.
+///
+/// # Return value
+///
+/// - `0..=MAX_BULK_LEN` on success: the number of bytes copied. `0` means
+///   either no bulk was pending or a zero-length bulk was staged (the slot
+///   is cleared either way).
+/// - `u64::MAX` on error: zero-length user buffer, oversized buffer
+///   (`buf_len > MAX_BULK_LEN`), or user-memory copy failure. The slot is
+///   left untouched on parameter-validation errors so the caller can retry
+///   with a correctly-sized buffer; on copy-out failure the bulk is already
+///   consumed (reflecting the userspace memory state being broken).
+///
+/// # Truncation behavior
+///
+/// If the pending bulk is larger than `buf_len`, the call **truncates** to
+/// `buf_len` and returns `buf_len`. The remainder is dropped — callers that
+/// need full payloads must size the buffer to the largest expected wire
+/// frame (e.g. `KEY_EVENT_WIRE_SIZE = 19`, `POINTER_EVENT_WIRE_SIZE = 37`,
+/// `MAX_BULK_LEN = 4096`).
+///
+/// # Caller ordering constraint (single-slot `pending_bulk`)
+///
+/// `Task::pending_bulk` is a single `Option<Vec<u8>>` slot. The same slot
+/// is read by [`ipc_recv_msg`] / [`ipc_try_recv_msg`] (via
+/// `take_bulk_data`) to deliver inbound bulk on a recv, and is written
+/// by `transfer_bulk` whenever bulk crosses task boundaries. Callers
+/// **must** drain the slot via this syscall **immediately after**
+/// `ipc_call_buf` returns and **before any other IPC operation** that
+/// touches the same slot. Interleaving an `ipc_recv_msg` between the
+/// call and the drain will either:
+///
+/// - lose the staged reply bulk (overwritten by the next `transfer_bulk`
+///   from a later sender), or
+/// - misdeliver it as the inbound bulk of an unrelated recv (the recv
+///   path cannot distinguish staged-reply bytes from sender-attached
+///   bytes — they are the same `Vec<u8>` in the same slot).
+///
+/// The kernel cannot enforce this — both reads of the slot are valid
+/// operations on their own. Production callers (`m3ctl`,
+/// `display-multi-client-smoke`, `grab-hook-smoke`,
+/// `display-server-crash-smoke`) all observe the constraint; the
+/// userspace-side docstring on `syscall_lib::ipc_take_pending_bulk`
+/// states the supported usage pattern.
+fn ipc_take_pending_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64) -> u64 {
+    use crate::task::scheduler;
+
+    let max_len = buf_len as usize;
+    if max_len == 0 || max_len > MAX_BULK_LEN {
+        return u64::MAX;
+    }
+
+    let bulk = match scheduler::take_bulk_data(task_id) {
+        Some(b) => b,
+        // No bulk pending — caller's most recent reply (if any) carried no
+        // bulk data. Return 0 as a non-error sentinel so callers can use a
+        // single check (`n == u64::MAX`) for true errors.
+        None => return 0,
+    };
+
+    let copy_len = bulk.len().min(max_len);
+    if copy_len == 0 {
+        return 0;
+    }
+
+    if UserSliceWo::new(buf_ptr, copy_len)
+        .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+        .is_err()
+    {
+        // Bulk was already taken from the slot; return error so the caller
+        // observes the broken-userspace-mapping condition.
+        return u64::MAX;
+    }
+
+    copy_len as u64
 }

@@ -45,6 +45,33 @@ const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
+// Phase 56 Track F.2 — debug-crash gate.
+//
+// Init checks for `/etc/display_server.debug-crash` at startup; if
+// present, every spawned service (including `display_server`) gets
+// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` appended to its envp. The
+// `display_server::main::debug_crash_policy_from_env` consumes the
+// var, flips its dispatcher policy to `enabled()`, and the F.2
+// regression test can issue the `DebugCrash` verb to drive the
+// crash-and-restart path.
+//
+// The marker-file gate is independent of `/etc/m3os-smoke-test-mode`
+// (used by the guest smoke runner). The F.2 regression boots through
+// the normal login flow, not the smoke runner, so a dedicated marker
+// keeps the two regression styles uncoupled.
+const ENV_DISPLAY_SERVER_DEBUG_CRASH: &[u8] = b"M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\0";
+const DEBUG_CRASH_MARKER_PATH: &[u8] = b"/etc/display_server.debug-crash\0";
+
+// Phase 56 close-out (G.1) — readback gate. Same pattern as the F.2
+// debug-crash marker: when `/etc/display_server.readback` is present,
+// init propagates `M3OS_DISPLAY_SERVER_READBACK=1` so display_server's
+// dispatcher honors the test-only `ReadBackPixel` verb.
+const ENV_DISPLAY_SERVER_READBACK: &[u8] = b"M3OS_DISPLAY_SERVER_READBACK=1\0";
+const READBACK_MARKER_PATH: &[u8] = b"/etc/display_server.readback\0";
+
+// Phase 56 close-out (G.2) — inject-key gate. Same pattern.
+const ENV_DISPLAY_SERVER_INJECT_KEY: &[u8] = b"M3OS_DISPLAY_SERVER_INJECT_KEY=1\0";
+const INJECT_KEY_MARKER_PATH: &[u8] = b"/etc/display_server.inject-key\0";
 
 // Runtime state files live on tmpfs under `/run` — matching the Linux
 // convention where runtime state is tmpfs-backed rather than persistent.
@@ -55,10 +82,28 @@ const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 const STATUS_FILE: &[u8] = b"/run/services.status\0";
 const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 
+// Phase 56 Track F.3: text-mode-fallback marker.
+//
+// When this file exists, init skips loading the graphical-stack manifests
+// (`display_server.conf` and `gfx-demo.conf`) and emits a structured
+// `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` log line. The
+// kernel framebuffer console + serial console therefore remain the only
+// administration surfaces — see `docs/56-display-and-input-architecture.md`
+// "Text-mode fallback" for the failure-cascade walkthrough.
+const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\0";
+
+/// Conf-file basenames (with the `.conf` suffix and trailing NUL) that are
+/// skipped when `DISABLE_DISPLAY_SERVER_MARKER` is present. Listed centrally
+/// so the dir-scan path and the `KNOWN_CONFIGS` fallback path agree on the
+/// same filter — no parallel "skip these" lists.
+const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0", b"gfx-demo.conf\0"];
+
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
     b"/etc/services.d/kbd.conf\0",
+    // Phase 56 Track D.2: ring-3 mouse service.
+    b"/etc/services.d/mouse_server.conf\0",
     b"/etc/services.d/stdin_feeder.conf\0",
     b"/etc/services.d/fat_server.conf\0",
     b"/etc/services.d/vfs_server.conf\0",
@@ -708,6 +753,29 @@ struct ServiceManager {
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
     defer_status_writes: bool,
+    /// Phase 56 Track F.3: cached at startup. When `true`, init skips
+    /// `display_server.conf` and `gfx-demo.conf` so the system boots
+    /// straight into the text-mode fallback (serial login + kernel
+    /// framebuffer console).
+    display_fallback: bool,
+    /// Phase 56 Track F.2 — when `/etc/display_server.debug-crash`
+    /// was observed at startup, the service manager appends
+    /// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to every spawned service's
+    /// envp. `display_server` then enables its debug-crash verb at
+    /// startup so the F.2 regression test can drive the
+    /// crash-and-restart path. Production boots leave the marker file
+    /// out, this stays `false`, and the env var is never set —
+    /// keeping production builds safe from a hostile or misconfigured
+    /// `m3ctl debug-crash` call.
+    display_server_debug_crash: bool,
+    /// Phase 56 close-out (G.1) — same shape as
+    /// `display_server_debug_crash`, but for the test-only
+    /// `ReadBackPixel` verb gated by `M3OS_DISPLAY_SERVER_READBACK=1`.
+    display_server_readback: bool,
+    /// Phase 56 close-out (G.2) — same shape, for the test-only
+    /// `InjectKey` verb gated by
+    /// `M3OS_DISPLAY_SERVER_INJECT_KEY=1`.
+    display_server_inject_key: bool,
 }
 
 /// Syslog severity levels.
@@ -737,7 +805,69 @@ impl ServiceManager {
             respawn_login: true,
             syslog_fd: -1,
             defer_status_writes: false,
+            display_fallback: false,
+            display_server_debug_crash: false,
+            display_server_readback: false,
+            display_server_inject_key: false,
         }
+    }
+
+    /// Probe `/etc/m3os-disable-display-server` once at startup. Sets
+    /// `display_fallback = true` if the marker is present and emits a
+    /// structured log line so the regression harness (and post-mortem
+    /// readers of `serial.log`) can correlate the boot with the active
+    /// runtime knob.
+    fn detect_display_fallback(&mut self) {
+        let fd = open(DISABLE_DISPLAY_SERVER_MARKER, O_RDONLY, 0);
+        if fd >= 0 {
+            close(fd as i32);
+            self.display_fallback = true;
+            // Single-line, parser-friendly: keep the `(M3OS_DISABLE_DISPLAY_SERVER=1)`
+            // suffix stable so the F.3 regression test can pattern-match it.
+            write_str(
+                STDOUT_FILENO,
+                "init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)\n",
+            );
+        }
+    }
+
+    /// Whether `name` (a `<svc>.conf\0` byte slice) is in the
+    /// `DISPLAY_FALLBACK_SKIPPED_CONFS` filter. Used by both the dir-scan
+    /// path and the `KNOWN_CONFIGS` fallback path so the two share a single
+    /// source of truth.
+    fn is_display_fallback_skipped(name_with_nul: &[u8]) -> bool {
+        let mut i = 0;
+        while i < DISPLAY_FALLBACK_SKIPPED_CONFS.len() {
+            if DISPLAY_FALLBACK_SKIPPED_CONFS[i] == name_with_nul {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Returns `true` if `path` is one of the display-fallback configs and
+    /// the fallback is currently active. Logs a structured skip line as a
+    /// side effect when true.
+    fn skip_for_display_fallback(&self, path: &[u8]) -> bool {
+        if !self.display_fallback {
+            return false;
+        }
+        // Path shape: /etc/services.d/<base>.conf\0
+        let prefix = b"/etc/services.d/";
+        if path.len() <= prefix.len() {
+            return false;
+        }
+        let basename = &path[prefix.len()..];
+        if !Self::is_display_fallback_skipped(basename) {
+            return false;
+        }
+        // Strip trailing NUL for human-readable logging.
+        let log_name_end = basename.len().saturating_sub(1);
+        write_str(STDOUT_FILENO, "init: skipped ");
+        write(STDOUT_FILENO, &basename[..log_name_end]);
+        write_str(STDOUT_FILENO, " (M3OS_DISABLE_DISPLAY_SERVER=1)\n");
+        true
     }
 
     /// Open a DGRAM socket to `/dev/log` for syslog output.
@@ -892,8 +1022,18 @@ impl ServiceManager {
     }
 
     /// Try to open, read, and parse a single service config file.
-    /// Skips services that have a `.disabled` marker file.
+    /// Skips services that have a `.disabled` marker file or that are
+    /// gated off by the Phase 56 F.3 text-mode-fallback runtime knob.
     fn try_load_config(&mut self, path: &[u8]) {
+        // Phase 56 F.3: graphical-stack manifests are skipped wholesale when
+        // the operator (or the regression test) has dropped the
+        // `/etc/m3os-disable-display-server` marker. Both `display_server.conf`
+        // and `gfx-demo.conf` are excluded here so the dependency graph never
+        // sees them — `gfx-demo` depends on `display`, so missing the gate
+        // would leave it stuck waiting for an unresolvable dep.
+        if self.skip_for_display_fallback(path) {
+            return;
+        }
         let fd = open(path, O_RDONLY, 0);
         if fd >= 0 {
             let mut buf = [0u8; BUF_SIZE];
@@ -1120,13 +1260,17 @@ impl ServiceManager {
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
 
-            let envp: [*const u8; 5] = [
-                ENV_PATH.as_ptr(),
-                ENV_HOME.as_ptr(),
-                ENV_TERM.as_ptr(),
-                ENV_EDITOR.as_ptr(),
-                core::ptr::null(),
-            ];
+            // Phase 56 Track F.2 / close-out (G.1, G.2) — append the
+            // test-only env vars when their respective markers are
+            // set. The fixed-size 8-slot envp (4 base + up to 3 gate
+            // vars + final NULL terminator) holds the maximum
+            // possible permutation; unused slots are null-padded
+            // before the terminator.
+            let envp = build_service_envp(
+                self.display_server_debug_crash,
+                self.display_server_readback,
+                self.display_server_inject_key,
+            );
 
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
@@ -1239,7 +1383,11 @@ impl ServiceManager {
                             STDOUT_FILENO,
                             "\ninit: session ended, respawning login...\n",
                         );
-                        self.login_pid = spawn_login();
+                        self.login_pid = spawn_login(
+                            self.display_server_debug_crash,
+                            self.display_server_readback,
+                            self.display_server_inject_key,
+                        );
                     } else {
                         write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
                         self.login_pid = -1;
@@ -2005,16 +2153,51 @@ fn trim_newline(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
-fn spawn_login() -> i32 {
+/// Phase 56 Track F.2 / close-out (G.1, G.2) — build the env-pointer
+/// array shared by `spawn_service` and `spawn_login`.
+///
+/// The fixed-size 8-slot layout has 4 base vars + up to 3 test-only
+/// gates + a final NULL terminator. Slots beyond the active set are
+/// null-padded *before* the terminator, so the kernel's envp scan
+/// terminates correctly regardless of which gates are enabled.
+fn build_service_envp(debug_crash: bool, readback: bool, inject_key: bool) -> [*const u8; 8] {
+    let mut envp: [*const u8; 8] = [
+        ENV_PATH.as_ptr(),
+        ENV_HOME.as_ptr(),
+        ENV_TERM.as_ptr(),
+        ENV_EDITOR.as_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+        core::ptr::null(),
+    ];
+    let mut idx: usize = 4;
+    if debug_crash {
+        envp[idx] = ENV_DISPLAY_SERVER_DEBUG_CRASH.as_ptr();
+        idx += 1;
+    }
+    if readback {
+        envp[idx] = ENV_DISPLAY_SERVER_READBACK.as_ptr();
+        idx += 1;
+    }
+    if inject_key {
+        envp[idx] = ENV_DISPLAY_SERVER_INJECT_KEY.as_ptr();
+        idx += 1;
+    }
+    // The remaining slots are already NULL — that NULL is the envp
+    // terminator the kernel scans for. `idx` is unused after the loop
+    // because the array was pre-padded.
+    let _ = idx;
+    envp
+}
+
+fn spawn_login(debug_crash: bool, readback: bool, inject_key: bool) -> i32 {
     let pid = fork();
     if pid == 0 {
-        let envp: [*const u8; 5] = [
-            ENV_PATH.as_ptr(),
-            ENV_HOME.as_ptr(),
-            ENV_TERM.as_ptr(),
-            ENV_EDITOR.as_ptr(),
-            core::ptr::null(),
-        ];
+        // Phase 56 Track F.2 / close-out (G.1, G.2) — propagate the
+        // test-only env vars to the login shell so smoke clients
+        // launched from the post-login shell see them in their envp.
+        let envp = build_service_envp(debug_crash, readback, inject_key);
 
         let argv: [*const u8; 2] = [LOGIN_ARGV0.as_ptr(), core::ptr::null()];
         let ret = execve(LOGIN_PATH, &argv, &envp);
@@ -2071,6 +2254,43 @@ fn smoke_test_mode_enabled() -> bool {
     n > 0 && buf[0] == b'1'
 }
 
+/// Phase 56 Track F.2 — check for the debug-crash marker file.
+/// Returns `true` when `/etc/display_server.debug-crash` exists at
+/// startup. Production boots leave the file out; the F.2 regression
+/// xtask harness creates the file in the disk image. The presence of
+/// the file (any content) is the gate; this avoids parsing content
+/// the same way as `smoke_test_mode_enabled`.
+fn display_server_debug_crash_enabled() -> bool {
+    let fd = open(DEBUG_CRASH_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
+/// Phase 56 close-out (G.1) — check for the readback marker file.
+/// Same shape as `display_server_debug_crash_enabled`.
+fn display_server_readback_enabled() -> bool {
+    let fd = open(READBACK_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
+/// Phase 56 close-out (G.2) — check for the inject-key marker file.
+/// Same shape as `display_server_debug_crash_enabled`.
+fn display_server_inject_key_enabled() -> bool {
+    let fd = open(INJECT_KEY_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SIGTERM handler — sets a flag checked in the main loop.
 //
@@ -2117,6 +2337,13 @@ pub extern "C" fn _start() -> ! {
     // Initialize service manager.
     let mut mgr = ServiceManager::new();
 
+    // Phase 56 Track F.3: probe the text-mode-fallback marker before loading
+    // service manifests. Both code paths (`load_services_from_dir` and
+    // `load_services_from_known_configs`) consult `mgr.display_fallback` via
+    // `try_load_config`, so this single check covers ext2 directory scans
+    // and the hardcoded fallback list with no per-path duplication.
+    mgr.detect_display_fallback();
+
     // Load service definitions.
     mgr.load_services();
 
@@ -2138,6 +2365,34 @@ pub extern "C" fn _start() -> ! {
     // avoids.
     let smoke_mode = smoke_test_mode_enabled();
 
+    // Phase 56 Track F.2 — check the debug-crash marker before
+    // booting services. The flag is consulted by `spawn_service` when
+    // it builds each service's envp; setting it before
+    // `boot_services()` is critical so `display_server` (booted by
+    // that call) sees `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` in its
+    // environment from the very first start.
+    mgr.display_server_debug_crash = display_server_debug_crash_enabled();
+    mgr.display_server_readback = display_server_readback_enabled();
+    mgr.display_server_inject_key = display_server_inject_key_enabled();
+    if mgr.display_server_readback {
+        write_str(
+            STDOUT_FILENO,
+            "init: G.1 readback marker present, propagating M3OS_DISPLAY_SERVER_READBACK=1\n",
+        );
+    }
+    if mgr.display_server_debug_crash {
+        write_str(
+            STDOUT_FILENO,
+            "init: F.2 debug-crash marker present, propagating M3OS_DISPLAY_SERVER_DEBUG_CRASH=1\n",
+        );
+    }
+    if mgr.display_server_inject_key {
+        write_str(
+            STDOUT_FILENO,
+            "init: G.2 inject-key marker present, propagating M3OS_DISPLAY_SERVER_INJECT_KEY=1\n",
+        );
+    }
+
     // Boot all services in dependency order.
     mgr.boot_services();
 
@@ -2157,7 +2412,11 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
     } else {
-        mgr.login_pid = spawn_login();
+        mgr.login_pid = spawn_login(
+            mgr.display_server_debug_crash,
+            mgr.display_server_readback,
+            mgr.display_server_inject_key,
+        );
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn login\n");
             // Not fatal — services may still be running.

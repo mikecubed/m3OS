@@ -1,0 +1,15 @@
+[package]
+name = "mouse_server"
+version = "0.56.0"
+edition = "2024"
+
+[[bin]]
+name = "mouse_server"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# Phase 56 Track D.2 — pure-logic ButtonTracker, wire decoder, and
+# PointerEvent codec. Re-uses the same kernel-core pure-logic layer that
+# kbd_server (D.1) consumes for the keyboard side.
+kernel-core = { path = "../../kernel-core", default-features = false }

@@ -89,12 +89,35 @@ const MIN_FALLBACK_H: u32 = 150;
 /// exclusive zones), with a small per-surface cascade offset so
 /// successive windows do not perfectly overlap.
 ///
-/// The cascade slot increments per surface placed in a single
-/// `arrange` call and wraps modulo [`CASCADE_SLOTS`] across calls.
+/// # Cascade-slot semantics
+///
+/// `arrange` is called every frame tick with the current toplevel set.
+/// Two distinct slot-assignment policies apply, keyed by the size of
+/// `toplevels`:
+///
+/// - **Single-surface call (`toplevels.len() <= 1`).** The persistent
+///   [`cascade_slot`](Self::cascade_slot) field selects the slot for
+///   the placed surface, then advances modulo [`CASCADE_SLOTS`]. This
+///   keeps the legacy "successive single placements march across the
+///   screen" behavior used by the layout contract suite and by the
+///   single-surface entry path.
+/// - **Multi-surface call (`toplevels.len() >= 2`).** Slots are
+///   assigned by the surface's ordinal position within *this* call
+///   (index 0 → slot 0, index 1 → slot 1, etc.). The persistent
+///   counter is **not** consulted and **not** advanced. This makes
+///   every surface's position stable across frames — the actual
+///   contract the multi-surface compose path requires — and is the
+///   behavior validated by the G.1 multi-client coexistence
+///   regression.
+///
+/// The two policies are intentionally independent so the multi-surface
+/// path's stability does not depend on whether the single-surface
+/// counter has been advanced by an earlier call.
 #[derive(Clone, Debug, Default)]
 pub struct FloatingLayout {
-    /// Wraps modulo `CASCADE_SLOTS`. Persists across `arrange` calls so
-    /// successive single-surface placements still march across the screen.
+    /// Wraps modulo `CASCADE_SLOTS`. Advances only on the
+    /// single-surface `arrange` path; the multi-surface path leaves it
+    /// untouched (see struct-level docs).
     cascade_slot: u32,
 }
 
@@ -204,12 +227,28 @@ impl LayoutPolicy for FloatingLayout {
     ) -> Vec<(SurfaceId, Rect)> {
         let usable = usable_rect(output.rect, exclusive_zones);
         let mut out = Vec::with_capacity(toplevels.len());
-        for surface in toplevels {
+        // Phase 56 close-out — assign cascade slots based on the
+        // surface's ordinal position within this `arrange` call rather
+        // than a persistent counter. `display_server` calls `arrange`
+        // every frame tick with the same `toplevels` list (sorted by
+        // surface id from `iter_compose`); using the call-local index
+        // makes every surface's position stable across frames, which
+        // is the actual contract the multi-surface compose path
+        // requires. The persistent `self.cascade_slot` is preserved
+        // for the legacy single-surface-per-call entry point exercised
+        // by the contract test suite.
+        let starting_slot = if toplevels.len() <= 1 {
+            self.cascade_slot
+        } else {
+            0
+        };
+        for (i, surface) in toplevels.iter().enumerate() {
             let (w, h) = pick_size(surface.preferred_size, usable);
             // Center the window in the usable rect.
             let center_x = usable.x.saturating_add((usable.w as i32 - w as i32) / 2);
             let center_y = usable.y.saturating_add((usable.h as i32 - h as i32) / 2);
-            let cascade_off = (self.cascade_slot as i32) * CASCADE_OFFSET_PX;
+            let slot = (starting_slot + i as u32) % CASCADE_SLOTS;
+            let cascade_off = (slot as i32) * CASCADE_OFFSET_PX;
             let rect = Rect {
                 x: center_x.saturating_add(cascade_off),
                 y: center_y.saturating_add(cascade_off),
@@ -217,7 +256,12 @@ impl LayoutPolicy for FloatingLayout {
                 h,
             };
             out.push((surface.id, rect));
-            self.cascade_slot = (self.cascade_slot + 1) % CASCADE_SLOTS;
+        }
+        // Only advance the persistent counter when the legacy single-
+        // surface path was used; the multi-surface path uses
+        // call-local indices so the persistent counter stays stable.
+        if toplevels.len() <= 1 {
+            self.cascade_slot = (self.cascade_slot + toplevels.len() as u32) % CASCADE_SLOTS;
         }
         out
     }
@@ -488,6 +532,66 @@ mod tests {
                 300,
                 200
             )
+        );
+    }
+
+    /// Phase 56 close-out (G.1) — pins the documented "two policies"
+    /// rule: the multi-surface path is ordinal-only and does not
+    /// consult or advance the persistent counter, so an interleaved
+    /// `single → multi → single` sequence keeps the multi-surface
+    /// placement at slots {0, 1} regardless of how many single-surface
+    /// calls have advanced the counter beforehand.
+    #[test]
+    fn floating_layout_multi_path_ignores_persistent_counter() {
+        let mut layout = FloatingLayout::new();
+        let output = OutputGeometry {
+            rect: rect(0, 0, 1024, 768),
+        };
+
+        // 1. Single-surface call — advances the persistent counter.
+        let single = [LayoutSurface {
+            id: SurfaceId(1),
+            preferred_size: (300, 200),
+        }];
+        let _ = layout.arrange(&single, output, &[]);
+        // Persistent counter is now 1.
+
+        // 2. Multi-surface call — must still place ids 1 and 2 at slots
+        //    0 and 1 (call-local indices), NOT 1 and 2 (counter-shifted).
+        let multi = [
+            LayoutSurface {
+                id: SurfaceId(1),
+                preferred_size: (300, 200),
+            },
+            LayoutSurface {
+                id: SurfaceId(2),
+                preferred_size: (300, 200),
+            },
+        ];
+        let result = layout.arrange(&multi, output, &[]);
+        assert_eq!(result.len(), 2);
+        // Slot 0: centered.
+        assert_eq!(result[0].1, rect(362, 284, 300, 200));
+        // Slot 1: one cascade offset.
+        assert_eq!(
+            result[1].1,
+            rect(362 + CASCADE_OFFSET_PX, 284 + CASCADE_OFFSET_PX, 300, 200)
+        );
+
+        // 3. A second multi-call later in the same sequence is also
+        //    ordinal-only — its placement matches step 2 byte-for-byte
+        //    even though the persistent counter has not changed.
+        let again = layout.arrange(&multi, output, &[]);
+        assert_eq!(again, result);
+
+        // 4. A subsequent single-surface call resumes the persistent
+        //    counter at slot 1 (the value left by step 1), proving the
+        //    multi-surface path did not touch it.
+        let after = layout.arrange(&single, output, &[]);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].1,
+            rect(362 + CASCADE_OFFSET_PX, 284 + CASCADE_OFFSET_PX, 300, 200)
         );
     }
 

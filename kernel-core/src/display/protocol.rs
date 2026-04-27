@@ -92,6 +92,24 @@ const OP_CTL_REGISTER_BIND: u16 = 0x0204;
 const OP_CTL_UNREGISTER_BIND: u16 = 0x0205;
 const OP_CTL_SUBSCRIBE: u16 = 0x0206;
 const OP_CTL_FRAME_STATS: u16 = 0x0207;
+// Phase 56 Track F.2 — debug-only crash trigger. The wire-format
+// definition lives here unconditionally (so the codec round-trips on
+// both debug and production builds and the wire opcode space stays
+// stable); the runtime gate that decides whether to honor the verb is
+// a startup env-var check in `display_server::control::dispatch_command`.
+const OP_CTL_DEBUG_CRASH: u16 = 0x0208;
+// Phase 56 close-out (G.1 regression) — test-only framebuffer pixel
+// readback. Same gating shape as `DebugCrash`: codec round-trips
+// unconditionally; runtime honoring is gated by an env-var check at
+// startup. Used by the multi-client-coexistence regression to verify
+// that two distinct surfaces' colors land at their layout-derived
+// positions in the framebuffer.
+const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
+// Phase 56 close-out (G.2 regression) — test-only synthetic key
+// injection. Same gating shape as the verbs above. Used by the
+// grab-hook regression to drive a chord through the input dispatcher
+// without needing real PS/2 scancode hardware events.
+const OP_CTL_INJECT_KEY: u16 = 0x020A;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -103,6 +121,8 @@ const OP_CTL_EVT_SURFACE_CREATED: u16 = 0x0310;
 const OP_CTL_EVT_SURFACE_DESTROYED: u16 = 0x0311;
 const OP_CTL_EVT_FOCUS_CHANGED: u16 = 0x0312;
 const OP_CTL_EVT_BIND_TRIGGERED: u16 = 0x0313;
+// Phase 56 close-out (G.1 regression) — test-only pixel-readback reply.
+const OP_CTL_EVT_PIXEL_REPLY: u16 = 0x0314;
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -347,11 +367,70 @@ pub enum ServerMessage {
 pub enum ControlCommand {
     Version,
     ListSurfaces,
-    Focus { surface_id: SurfaceId },
-    RegisterBind { modifier_mask: u16, keycode: u32 },
-    UnregisterBind { modifier_mask: u16, keycode: u32 },
-    Subscribe { event_kind: EventKind },
+    Focus {
+        surface_id: SurfaceId,
+    },
+    RegisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    UnregisterBind {
+        modifier_mask: u16,
+        keycode: u32,
+    },
+    Subscribe {
+        event_kind: EventKind,
+    },
     FrameStats,
+    /// Phase 56 Track F.2 — debug-only crash trigger.
+    ///
+    /// When the dispatcher accepts this verb (gated by a startup env-var
+    /// check in `display_server::control::dispatch_command`), it logs a
+    /// structured "intentional crash for F.2 regression" line and then
+    /// `panic!()`s. The kernel reclaims the framebuffer (Phase 47/56
+    /// console-yield), the supervisor restarts the service within the
+    /// `display_server.conf` `max_restart=5` budget, and clients see
+    /// their IPC reply-cap revoked (the equivalent of a clean socket
+    /// close on AF_UNIX). The codec round-trips the verb unconditionally
+    /// so the wire format is stable on both debug and production builds.
+    DebugCrash,
+    /// Phase 56 close-out (G.1 regression) — test-only pixel readback.
+    ///
+    /// Sample the framebuffer at `(x, y)` in screen coordinates and
+    /// return a `PixelReply { color }` event. Used by the
+    /// `multi-client-coexistence` regression to verify that two
+    /// concurrent surfaces' colors actually land on screen at their
+    /// layout-derived positions.
+    ///
+    /// Gated identically to `DebugCrash`: the codec round-trips the
+    /// verb unconditionally so the wire opcode space is stable, but
+    /// production boots leave the env-var unset and the dispatcher
+    /// shadows the verb back to `Error { UnknownVerb }`.
+    ReadBackPixel {
+        x: u32,
+        y: u32,
+    },
+    /// Phase 56 close-out (G.2 regression) — test-only synthetic key
+    /// injection.
+    ///
+    /// Synthesizes a `KeyEvent { modifier_mask, keycode, kind }` and
+    /// pushes it onto the input dispatcher's pending queue. The next
+    /// `drain_one_pass` routes it through the same path as a real
+    /// PS/2 event — bind-table lookup, grab-state suppression, focus
+    /// routing, etc. Used by the grab-hook regression to verify that
+    /// a registered chord swallows the matching `KeyDown`.
+    ///
+    /// `kind`: 0 = `Down`, 1 = `Up`, 2 = `Repeat`. Other values are
+    /// rejected with `BadArgs`.
+    ///
+    /// Same gating shape as the other test-only verbs: codec round-
+    /// trips unconditionally; production boots leave the env-var
+    /// unset and the dispatcher shadows back to `UnknownVerb`.
+    InjectKey {
+        modifier_mask: u16,
+        keycode: u32,
+        kind: u8,
+    },
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -387,6 +466,13 @@ pub enum ControlEvent {
     BindTriggered {
         modifier_mask: u16,
         keycode: u32,
+    },
+    /// Phase 56 close-out (G.1 regression) — pixel-readback reply.
+    /// `color` is the framebuffer pixel at the requested `(x, y)` in
+    /// the same encoding the framebuffer uses (e.g. BGRA8888 packed
+    /// into a `u32`). Used by the multi-client-coexistence regression.
+    PixelReply {
+        color: u32,
     },
 }
 
@@ -988,6 +1074,25 @@ impl ControlCommand {
                 body[0] = *event_kind as u8;
             }),
             Self::FrameStats => encode_fixed_body(buf, OP_CTL_FRAME_STATS, 0, |_| {}),
+            // Phase 56 Track F.2 — body-less verb. See `OP_CTL_DEBUG_CRASH`.
+            Self::DebugCrash => encode_fixed_body(buf, OP_CTL_DEBUG_CRASH, 0, |_| {}),
+            // Phase 56 close-out (G.1) — `(x, y)` body, see `OP_CTL_READBACK_PIXEL`.
+            Self::ReadBackPixel { x, y } => {
+                encode_fixed_body(buf, OP_CTL_READBACK_PIXEL, 8, |body| {
+                    body[0..4].copy_from_slice(&x.to_le_bytes());
+                    body[4..8].copy_from_slice(&y.to_le_bytes());
+                })
+            }
+            // Phase 56 close-out (G.2) — see `OP_CTL_INJECT_KEY`.
+            Self::InjectKey {
+                modifier_mask,
+                keycode,
+                kind,
+            } => encode_fixed_body(buf, OP_CTL_INJECT_KEY, 7, |body| {
+                body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
+                body[2..6].copy_from_slice(&keycode.to_le_bytes());
+                body[6] = *kind;
+            }),
         }
     }
 
@@ -1031,6 +1136,29 @@ impl ControlCommand {
             OP_CTL_FRAME_STATS => {
                 expect_body_len(body_len, 0)?;
                 Self::FrameStats
+            }
+            // Phase 56 Track F.2 — body-less verb. See `OP_CTL_DEBUG_CRASH`.
+            OP_CTL_DEBUG_CRASH => {
+                expect_body_len(body_len, 0)?;
+                Self::DebugCrash
+            }
+            // Phase 56 close-out (G.1) — `(x, y)` body. See `OP_CTL_READBACK_PIXEL`.
+            OP_CTL_READBACK_PIXEL => {
+                expect_body_len(body_len, 8)?;
+                Self::ReadBackPixel {
+                    x: read_u32(body, 0)?,
+                    y: read_u32(body, 4)?,
+                }
+            }
+            // Phase 56 close-out (G.2) — `(modifier_mask, keycode, kind)` body.
+            // See `OP_CTL_INJECT_KEY`.
+            OP_CTL_INJECT_KEY => {
+                expect_body_len(body_len, 7)?;
+                Self::InjectKey {
+                    modifier_mask: read_u16(body, 0)?,
+                    keycode: read_u32(body, 2)?,
+                    kind: body[6],
+                }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
@@ -1110,6 +1238,12 @@ impl ControlEvent {
                 body[0..2].copy_from_slice(&modifier_mask.to_le_bytes());
                 body[2..6].copy_from_slice(&keycode.to_le_bytes());
             }),
+            // Phase 56 close-out (G.1) — see `OP_CTL_EVT_PIXEL_REPLY`.
+            Self::PixelReply { color } => {
+                encode_fixed_body(buf, OP_CTL_EVT_PIXEL_REPLY, 4, |body| {
+                    body[0..4].copy_from_slice(&color.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1202,6 +1336,13 @@ impl ControlEvent {
                 Self::BindTriggered {
                     modifier_mask: read_u16(body, 0)?,
                     keycode: read_u32(body, 2)?,
+                }
+            }
+            // Phase 56 close-out (G.1) — see `OP_CTL_EVT_PIXEL_REPLY`.
+            OP_CTL_EVT_PIXEL_REPLY => {
+                expect_body_len(body_len, 4)?;
+                Self::PixelReply {
+                    color: read_u32(body, 0)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -1601,6 +1742,65 @@ mod tests {
         encode_decode_round_trip_ctl_cmd(ControlCommand::FrameStats);
     }
 
+    // Phase 56 Track F.2 — debug-only crash verb. Round-trip must
+    // succeed at the codec layer regardless of build flavor; the
+    // dispatcher (display_server::control) is the seam that decides
+    // whether to honor the verb (gated by env var) or short-circuit
+    // it back to `ControlError::UnknownVerb`. Keeping the codec
+    // unconditional avoids a parallel "debug" verb namespace and
+    // matches the F.2 spec.
+    #[test]
+    fn ctl_cmd_debug_crash_round_trips() {
+        encode_decode_round_trip_ctl_cmd(ControlCommand::DebugCrash);
+    }
+
+    #[test]
+    fn ctl_cmd_debug_crash_uses_zero_body() {
+        // F.2 wire-format guard: the verb carries no payload, so the
+        // body_len on the wire must be exactly zero. Encoding into a
+        // buffer that is exactly FRAME_HEADER_SIZE bytes long must
+        // succeed.
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        let n = ControlCommand::DebugCrash
+            .encode(&mut buf)
+            .expect("encode debug-crash into header-only buffer");
+        assert_eq!(n, FRAME_HEADER_SIZE);
+        let body_len = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(body_len, 0);
+    }
+
+    // Phase 56 close-out (G.1) — `ReadBackPixel` codec unconditional
+    // round-trip; the dispatcher gate is the env-var check, identical
+    // to `DebugCrash` (above).
+    #[test]
+    fn ctl_cmd_readback_pixel_round_trips() {
+        for (x, y) in [(0u32, 0u32), (1, 2), (1280, 800), (u32::MAX, u32::MAX)] {
+            encode_decode_round_trip_ctl_cmd(ControlCommand::ReadBackPixel { x, y });
+        }
+    }
+
+    // Phase 56 close-out (G.2) — `InjectKey` codec round-trip.
+    #[test]
+    fn ctl_cmd_inject_key_round_trips() {
+        for kind in 0u8..=2 {
+            encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+                modifier_mask: MOD_SUPER,
+                keycode: b'q' as u32,
+                kind,
+            });
+        }
+        encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+            modifier_mask: 0,
+            keycode: 0,
+            kind: 0,
+        });
+        encode_decode_round_trip_ctl_cmd(ControlCommand::InjectKey {
+            modifier_mask: u16::MAX,
+            keycode: u32::MAX,
+            kind: 255,
+        });
+    }
+
     // ---- ControlEvent round-trips, one per variant ---------------------
 
     #[test]
@@ -1680,6 +1880,14 @@ mod tests {
             modifier_mask: MOD_SUPER,
             keycode: 0x10,
         });
+    }
+
+    // Phase 56 close-out (G.1) — `PixelReply` codec round-trip.
+    #[test]
+    fn ctl_evt_pixel_reply_round_trips() {
+        for color in [0u32, 0xFFFF_FFFF, 0x002B_5A4B, 0x00FF_8800] {
+            encode_decode_round_trip_ctl_evt(ControlEvent::PixelReply { color });
+        }
     }
 
     #[test]
@@ -1949,6 +2157,15 @@ mod tests {
             }),
             arb_event_kind().prop_map(|event_kind| ControlCommand::Subscribe { event_kind }),
             Just(ControlCommand::FrameStats),
+            Just(ControlCommand::DebugCrash),
+            (any::<u32>(), any::<u32>()).prop_map(|(x, y)| ControlCommand::ReadBackPixel { x, y }),
+            (any::<u16>(), any::<u32>(), any::<u8>()).prop_map(|(m, k, kind)| {
+                ControlCommand::InjectKey {
+                    modifier_mask: m,
+                    keycode: k,
+                    kind,
+                }
+            }),
         ]
     }
 
@@ -1981,6 +2198,7 @@ mod tests {
                     keycode,
                 }
             }),
+            any::<u32>().prop_map(|color| ControlEvent::PixelReply { color }),
         ]
     }
 

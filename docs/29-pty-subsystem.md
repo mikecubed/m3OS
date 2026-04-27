@@ -333,3 +333,43 @@ These are explicitly out of scope for Phase 29:
 | `userspace/syscall-lib/src/lib.rs` | `openpty()`, `setsid()`, `getsid()` wrappers |
 | `userspace/pty-test/` | **New** — PTY acceptance test program |
 | `kernel/Cargo.toml` | Version bump to 0.29.0 |
+
+## Phase 56 Update: Coexistence with the Graphical Compositor
+
+Phase 56 (Display and Input Architecture) adds a userspace-owned graphical
+compositor (`display_server`), but it does **not** replace or rewire the PTY
+subsystem. PTY-driven text clients continue to work alongside the graphical
+stack:
+
+- **Serial path remains live.** A serial-line login session, telnet (when
+  the build flag is enabled), and SSH (the supported remote-admin path) all
+  continue to allocate PTY pairs through the unchanged `openpty()` /
+  `/dev/ptmx` flow described in this document. Phase 56 introduces no new
+  syscalls or capabilities on the PTY surface.
+- **Text-mode administration during graphical operation.** Even when
+  `display_server` owns the framebuffer, the kernel still services PTY
+  ioctls, line discipline, and session ownership for serial / SSH / telnet
+  consumers. The graphical compositor and the PTY subsystem are independent
+  ring-3 services — neither blocks the other.
+- **Failover to text-mode administration.** Phase 56 F.3 ships a documented
+  text-mode fallback: when `display_server` is intentionally disabled (via
+  the `/etc/m3os-disable-display-server` marker file checked by `init`) or
+  when its restart budget is exhausted, the kernel framebuffer console
+  resumes and serial-line + SSH login remain reachable. The PTY subsystem
+  is the substrate that keeps those text-mode admin paths usable in that
+  fallback mode.
+- **Future graphical terminal.** Phase 57 introduces a native graphical
+  terminal emulator that consumes a PTY slave and renders into a Phase 56
+  `Toplevel` surface. That work bridges the PTY subsystem to the graphical
+  compositor without changing either surface — see
+  [`docs/56-display-and-input-architecture.md`](./56-display-and-input-architecture.md)
+  § "How This Phase Differs From Later GUI Work" for the Phase 57 staging.
+
+The unrecoverable case (display server crashes, restart budget exhausts,
+operator wants no graphical session at all) is covered by the F.3 fallback:
+serial login stays live, kernel framebuffer console handles kernel-side
+output, and `init` logs a named failure reason. PTY-based remote admin via
+SSH / telnet continues to work in that mode.
+
+See [`docs/56-display-and-input-architecture.md`](./56-display-and-input-architecture.md)
+for the full Phase 56 architecture and the F.3 text-mode-fallback documentation.

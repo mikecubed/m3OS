@@ -229,10 +229,46 @@ kernel task will be removed and all rendering will move to userspace.  See
 [docs/52-first-service-extractions.md](./52-first-service-extractions.md) for
 the full extraction design.
 
+## Phase 56 Update: Framebuffer Ownership Transfer to display_server
+
+Phase 56 (Display and Input Architecture) makes framebuffer ownership
+**transferable**. A new `sys_fb_acquire` syscall hands the bootloader-mapped
+linear framebuffer to a single supervised ring-3 owner — the userspace
+`display_server` — which then runs every per-frame compose pass, owns the
+client-protocol surface registry, and routes input through the focus model.
+While `display_server` holds the framebuffer, the kernel framebuffer console
+suspends its own writes via the `CONSOLE_YIELDED` flag set during the
+acquisition: kernel-side log lines continue to flow over the serial path so
+the headless story is unaffected, but no kernel character is drawn over the
+graphical compositor's pixel output.
+
+The kernel framebuffer console of this phase is preserved as the **failover**
+output channel:
+
+- **Pre-init / panic.** Before `init` spawns `display_server`, and after a
+  kernel panic, the kernel console drives the framebuffer directly. The
+  Phase 9 path documented in this file is exactly the pre-init path.
+- **Display-server failover.** When `display_server` exits or the supervisor
+  exhausts its restart budget, the kernel reclaims the framebuffer, clears
+  `CONSOLE_YIELDED`, and the kernel console resumes — the system is never
+  left with a dead screen. The named text-mode-fallback path (Phase 56 F.3)
+  layers on top of this when the operator wants `display_server` disabled
+  entirely (serial login + kernel framebuffer console only).
+
+The Phase 9 framebuffer console code itself is unchanged: same 8×16 font,
+same scroll-by-row, same dual-output routing. What changes is *who owns
+the buffer when*. The Phase 56 design doc captures the syscall surface, the
+Phase 50 page-grant transport for client pixels, and the supervised
+restart contract.
+
+See [docs/56-display-and-input-architecture.md](./56-display-and-input-architecture.md)
+for the full Phase 56 architecture.
+
 ## See Also
 
 - `docs/07-core-servers.md` — console_server, kbd_server (Phase 7 foundation)
 - `docs/08-storage-and-vfs.md` — VFS and fat_server (Phase 8 foundation)
 - `docs/52-first-service-extractions.md` — Phase 52 console and keyboard extraction
+- `docs/56-display-and-input-architecture.md` — Phase 56 ring-3 display server, focus-aware input dispatch, layer-shell-equivalent surface roles, control socket, kernel-console failover
 - `docs/roadmap/09-framebuffer-and-shell.md` — phase milestone and acceptance criteria
 - `docs/roadmap/tasks/09-framebuffer-and-shell-tasks.md` — per-task breakdown

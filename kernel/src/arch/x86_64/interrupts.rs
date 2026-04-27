@@ -1024,14 +1024,24 @@ extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
         if status & STATUS_OUTPUT_FULL == 0 {
             break;
         }
-        // Bytes destined for the keyboard (status bit 5 = 0) cannot reach the
-        // mouse decoder cleanly. Read+discard them so we don't strand them in
-        // the buffer; the keyboard ISR will not be re-fired for an already-
-        // consumed byte, but on QEMU this branch should not be taken because
-        // IRQ1 and IRQ12 are routed independently.
+        // Bytes destined for the keyboard (status bit 5 = 0) belong to
+        // the keyboard ISR. The previous implementation read+discarded
+        // them on the assumption that "IRQ1 and IRQ12 are routed
+        // independently on QEMU", but with APIC mode + IRQ 12 routing
+        // newly enabled (Phase 56 follow-up), this branch IS taken
+        // when the AUX device queues a byte while a keyboard byte is
+        // still in the i8042 output buffer. Discarding it would
+        // silently swallow keyboard input — under load this dropped
+        // tcc/stdin-feeder traffic, breaking the smoke runner.
+        //
+        // The correct behaviour is: leave the byte in the buffer and
+        // bail. The OUTPUT_FULL bit stays asserted, the keyboard ISR
+        // (vector 33) drains the byte the next time it runs, and the
+        // i8042 then forwards the queued AUX byte and re-asserts
+        // IRQ 12. Edge-triggered IRQ 12 will fire again at that
+        // point and this handler will pick up the AUX byte cleanly.
         if status & STATUS_AUX_OUTPUT == 0 {
-            let _ = unsafe { data_port.read() };
-            continue;
+            break;
         }
         let byte = unsafe { data_port.read() };
         if super::ps2::feed_byte_isr(byte) {

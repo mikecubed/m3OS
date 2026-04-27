@@ -1164,6 +1164,23 @@ mod tests {
         // Pre-allocate the bookkeeping Vec so any slab pages it needs are
         // accounted for before we snapshot frame availability.
         let mut held = alloc::vec::Vec::with_capacity(available_count());
+
+        // Snapshot `before` AFTER an allocator-local reclaim so any
+        // empty slab pages held in the heap's slab classes are
+        // surfaced back to the buddy pool first. The reclaim runs
+        // again before sampling `after`, so both snapshots see the
+        // same allocator-local steady state.
+        //
+        // Without these matched reclaim calls, the contiguous-alloc
+        // retry path's `reclaim_allocator_local_caches` (called from
+        // `allocate_contiguous` when the buddy lacks a free block of
+        // the requested order) silently surfaces a slab page that
+        // emptied out during the test's allocate-everything-then-
+        // free-everything sequence — giving `after = before + 1` and
+        // tripping the equality check. The test's actual contract is
+        // "no leaked frames", and balanced reclaims on both sides
+        // make that contract observable.
+        crate::mm::heap::reclaim_allocator_local_caches("test/before-baseline");
         let before = available_count();
 
         let hoarded = allocate_contiguous(2).expect("seed contiguous block");
@@ -1191,7 +1208,13 @@ mod tests {
         for &phys in &held {
             free_frame(phys);
         }
-        drain_per_cpu_caches();
+        // Match the `before` baseline: drain the allocator's per-CPU
+        // caches (which `reclaim_allocator_local_caches` also folds
+        // empty slab pages back into via the underlying allocator
+        // hooks) before sampling `after`. The two-call symmetry is
+        // what keeps the test deterministic — `before` ran the same
+        // helper.
+        crate::mm::heap::reclaim_allocator_local_caches("test/after-baseline");
         let after = available_count();
         assert_eq!(
             after, before,

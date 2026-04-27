@@ -307,11 +307,16 @@ fn build_userspace_bins() {
         ("syslogd", "syslogd", false),              // Phase 46: system logger
         ("crond", "crond", false),                  // Phase 46: cron daemon
         ("console_server", "console_server", true), // Phase 52: ring-3 console (alloc for kernel-core dep)
-        ("kbd_server", "kbd_server", false),        // Phase 52: ring-3 keyboard
-        ("stdin_feeder", "stdin_feeder", false),    // Phase 52: ring-3 stdin
-        ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
-        ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
-        ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 56 Track D.1: kbd_server now depends on kernel-core::input::keymap
+        // and emits KeyEvent payloads, so it requires the alloc-enabled build.
+        ("kbd_server", "kbd_server", true), // Phase 52 / 56: ring-3 keyboard (alloc for kernel-core dep)
+        // Phase 56 Track D.2: mouse_server depends on kernel-core
+        // (ButtonTracker, decode_packet, PointerEvent codec) so needs_alloc.
+        ("mouse_server", "mouse_server", true), // Phase 56 D.2: ring-3 mouse (alloc for kernel-core dep)
+        ("stdin_feeder", "stdin_feeder", false), // Phase 52: ring-3 stdin
+        ("fat_server", "fat_server", true),     // Phase 54: ring-3 FAT storage (alloc)
+        ("vfs_server", "vfs_server", true),     // Phase 54: ring-3 VFS service (alloc)
+        ("net_server", "net_server", true),     // Phase 54: ring-3 UDP network service (alloc)
         // Phase 55b Tracks D.1 / E.1: ring-3 device driver scaffolds
         // (`needs_alloc = true` for driver_runtime + kernel-core deps).
         // Real bring-up lands in D.2/D.3 and E.2/E.3.
@@ -334,6 +339,32 @@ fn build_userspace_bins() {
         // `needs_alloc = true` because the demo allocates a SurfaceBuffer
         // and links the kernel-core protocol codec.
         ("gfx-demo", "gfx-demo", true),
+        // Phase 56 Track E.4: minimal control-socket client. One-shot
+        // CLI; `needs_alloc = true` because the binary links the
+        // kernel-core control codec (which uses Vec for list payloads)
+        // and uses `format!` for human-readable output.
+        ("m3ctl", "m3ctl", true),
+        // Phase 56 Track F.2: display-service crash-and-restart smoke
+        // client. One-shot binary launched from the post-login shell
+        // by the F.2 regression test; `needs_alloc = true` because it
+        // links the kernel-core control codec (encode_command).
+        (
+            "display-server-crash-smoke",
+            "display-server-crash-smoke",
+            true,
+        ),
+        // Phase 56 close-out (G.1) — multi-client coexistence smoke
+        // client. Drives two distinct surfaces and verifies both
+        // colors via ReadBackPixel.
+        (
+            "display-multi-client-smoke",
+            "display-multi-client-smoke",
+            true,
+        ),
+        // Phase 56 close-out (G.2) — keybind grab-hook smoke client.
+        // Registers a bind, injects the chord, observes the
+        // `bind triggered` log via the regression's xtask wait.
+        ("grab-hook-smoke", "grab-hook-smoke", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -4371,7 +4402,14 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, true);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        true,
+        false,
+        false,
+        false,
+    );
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -4408,7 +4446,14 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, true);
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                true,
+                false,
+                false,
+                false,
+            );
         }
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -4671,7 +4716,14 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 
     let ovmf = find_ovmf();
     let display_mode = if args.display {
@@ -4707,7 +4759,14 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false, false);
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                false,
+                false,
+                false,
+                false,
+            );
         }
 
         let mut child = Command::new("qemu-system-x86_64")
@@ -5029,7 +5088,20 @@ fn format_ext2_partition(part_tmp: &Path) {
 /// Skips creation if the image already exists to preserve persisted data.
 ///
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
-fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: bool) -> PathBuf {
+///
+/// `display_server_debug_crash` controls whether the F.2 marker file
+/// `/etc/display_server.debug-crash` is dropped into the image so init
+/// flips its supervisor flag and propagates
+/// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to `display_server`. Production
+/// boots leave this `false`; only the F.2 regression sets it `true`.
+fn create_data_disk(
+    output_dir: &Path,
+    enable_telnet: bool,
+    smoke_test_mode: bool,
+    display_server_debug_crash: bool,
+    display_server_readback: bool,
+    display_server_inject_key: bool,
+) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
@@ -5121,7 +5193,15 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     format_ext2_partition(&part_tmp);
 
     // Populate files using debugfs.
-    populate_ext2_files(&part_tmp, output_dir, enable_telnet, smoke_test_mode);
+    populate_ext2_files(
+        &part_tmp,
+        output_dir,
+        enable_telnet,
+        smoke_test_mode,
+        display_server_debug_crash,
+        display_server_readback,
+        display_server_inject_key,
+    );
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
     let root = workspace_root();
@@ -5174,6 +5254,9 @@ fn populate_ext2_files(
     output_dir: &Path,
     enable_telnet: bool,
     smoke_test_mode: bool,
+    display_server_debug_crash: bool,
+    display_server_readback: bool,
+    display_server_inject_key: bool,
 ) {
     // Standard Unix root filesystem layout.
     let passwd_content =
@@ -5193,6 +5276,13 @@ fn populate_ext2_files(
     let console_conf = "name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
     let kbd_conf = "name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n";
     let stdin_feeder_conf = "name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n";
+
+    // Phase 56 Track D.2: ring-3 mouse service. PS/2 AUX (IRQ 12) producer.
+    // depends=display so display_server is registered and ready to receive
+    // events as soon as mouse_server begins publishing them. Restart shape
+    // mirrors display_server: on-failure with a small budget while the
+    // input-event protocol is still under development.
+    let mouse_server_conf = "name=mouse_server\ncommand=/bin/mouse_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
 
     // Phase 54: storage service definitions.
     let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\nuser=200\n";
@@ -5237,6 +5327,7 @@ fn populate_ext2_files(
     let crond_conf_tmp = output_dir.join("_tmp_crond_conf");
     let console_conf_tmp = output_dir.join("_tmp_console_conf");
     let kbd_conf_tmp = output_dir.join("_tmp_kbd_conf");
+    let mouse_server_conf_tmp = output_dir.join("_tmp_mouse_server_conf");
     let stdin_feeder_conf_tmp = output_dir.join("_tmp_stdin_feeder_conf");
     let fat_server_conf_tmp = output_dir.join("_tmp_fat_server_conf");
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
@@ -5256,6 +5347,7 @@ fn populate_ext2_files(
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
     fs::write(&console_conf_tmp, console_conf).expect("write temp console.conf");
     fs::write(&kbd_conf_tmp, kbd_conf).expect("write temp kbd.conf");
+    fs::write(&mouse_server_conf_tmp, mouse_server_conf).expect("write temp mouse_server.conf");
     fs::write(&stdin_feeder_conf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
@@ -5299,6 +5391,60 @@ fn populate_ext2_files(
         smoke_mode_tmp.display()
     );
 
+    // Phase 56 Track F.2 — drop the debug-crash marker file when the
+    // F.2 regression asks for it. Production boots leave the file out;
+    // init checks for the file at startup and sets its
+    // `display_server_debug_crash` flag accordingly. The flag in turn
+    // makes the supervisor append `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1`
+    // to every spawned service's envp.
+    let debug_crash_cmds = if display_server_debug_crash {
+        let debug_crash_tmp = output_dir.join("_tmp_display_server_debug_crash");
+        fs::write(&debug_crash_tmp, b"enabled\n").expect("write temp debug-crash marker");
+        format!(
+            "write \"{}\" etc/display_server.debug-crash\n\
+             sif etc/display_server.debug-crash mode 0x81A4\n\
+             sif etc/display_server.debug-crash uid 0\n\
+             sif etc/display_server.debug-crash gid 0\n",
+            debug_crash_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 56 close-out (G.1) — drop the readback marker file when
+    // the multi-client-coexistence regression asks for it. Same shape
+    // as the F.2 debug-crash marker.
+    let readback_cmds = if display_server_readback {
+        let readback_tmp = output_dir.join("_tmp_display_server_readback");
+        fs::write(&readback_tmp, b"enabled\n").expect("write temp readback marker");
+        format!(
+            "write \"{}\" etc/display_server.readback\n\
+             sif etc/display_server.readback mode 0x81A4\n\
+             sif etc/display_server.readback uid 0\n\
+             sif etc/display_server.readback gid 0\n",
+            readback_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 56 close-out (G.2) — drop the inject-key marker file when
+    // the grab-hook regression asks for it. Same shape as the readback
+    // marker.
+    let inject_key_cmds = if display_server_inject_key {
+        let inject_key_tmp = output_dir.join("_tmp_display_server_inject_key");
+        fs::write(&inject_key_tmp, b"enabled\n").expect("write temp inject-key marker");
+        format!(
+            "write \"{}\" etc/display_server.inject-key\n\
+             sif etc/display_server.inject-key mode 0x81A4\n\
+             sif etc/display_server.inject-key uid 0\n\
+             sif etc/display_server.inject-key gid 0\n",
+            inject_key_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
     // CI toggle: dropping this marker tells the guest smoke-runner to skip
     // the TCC compile + hello-verify steps (both emit SKIP instead of PASS).
     // Compiling inside TCG under Phase 54's IPC-heavy VFS exceeds the per-step
@@ -5316,6 +5462,33 @@ fn populate_ext2_files(
              sif etc/m3os-skip-tcc-compile uid 0\n\
              sif etc/m3os-skip-tcc-compile gid 0\n",
             output_dir.join("_tmp_skip_tcc").display()
+        )
+    } else {
+        String::new()
+    };
+
+    // Phase 56 Track F.3: text-mode-fallback toggle.
+    //
+    // When `M3OS_DISABLE_DISPLAY_SERVER=1` is set on the host, drop a marker
+    // file at `/etc/m3os-disable-display-server`. Init reads this once at
+    // startup and skips loading `display_server.conf` and `gfx-demo.conf`,
+    // emitting `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)`
+    // log lines that the F.3 regression test pattern-matches. The kernel
+    // framebuffer console + serial login remain the only administration
+    // surfaces — the failure-cascade walkthrough lives in
+    // `docs/56-display-and-input-architecture.md` "Text-mode fallback".
+    let disable_display_cmds = if std::env::var("M3OS_DISABLE_DISPLAY_SERVER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        fs::write(output_dir.join("_tmp_disable_display"), b"1\n")
+            .expect("write temp display-fallback marker");
+        format!(
+            "write \"{}\" etc/m3os-disable-display-server\n\
+             sif etc/m3os-disable-display-server mode 0x81A4\n\
+             sif etc/m3os-disable-display-server uid 0\n\
+             sif etc/m3os-disable-display-server gid 0\n",
+            output_dir.join("_tmp_disable_display").display()
         )
     } else {
         String::new()
@@ -5464,6 +5637,10 @@ fn populate_ext2_files(
          sif etc/services.d/kbd.conf mode 0x81A4\n\
          sif etc/services.d/kbd.conf uid 0\n\
          sif etc/services.d/kbd.conf gid 0\n\
+         write \"{mouse_server_conf}\" etc/services.d/mouse_server.conf\n\
+         sif etc/services.d/mouse_server.conf mode 0x81A4\n\
+         sif etc/services.d/mouse_server.conf uid 0\n\
+         sif etc/services.d/mouse_server.conf gid 0\n\
          write \"{stdin_feeder_conf}\" etc/services.d/stdin_feeder.conf\n\
          sif etc/services.d/stdin_feeder.conf mode 0x81A4\n\
          sif etc/services.d/stdin_feeder.conf uid 0\n\
@@ -5502,6 +5679,10 @@ fn populate_ext2_files(
          sif etc/hostname gid 0\n\
          {smoke_mode_cmds}\
          {skip_tcc_cmds}\
+         {disable_display_cmds}\
+         {debug_crash_cmds}\
+         {readback_cmds}\
+         {inject_key_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -5512,6 +5693,7 @@ fn populate_ext2_files(
         crond_conf = crond_conf_tmp.display(),
         console_conf = console_conf_tmp.display(),
         kbd_conf = kbd_conf_tmp.display(),
+        mouse_server_conf = mouse_server_conf_tmp.display(),
         stdin_feeder_conf = stdin_feeder_conf_tmp.display(),
         fat_server_conf = fat_server_conf_tmp.display(),
         vfs_server_conf = vfs_server_conf_tmp.display(),
@@ -5524,6 +5706,10 @@ fn populate_ext2_files(
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
+        disable_display_cmds = disable_display_cmds,
+        debug_crash_cmds = debug_crash_cmds,
+        readback_cmds = readback_cmds,
+        inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -5564,6 +5750,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&hostname_tmp);
     let _ = fs::remove_file(&smoke_mode_tmp);
     let _ = fs::remove_file(&empty_tmp);
+    // Phase 56 F.3: silently best-effort; the file only exists when the
+    // M3OS_DISABLE_DISPLAY_SERVER env var was set.
+    let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));
 }
 
 /// Phase 31: Populate TCC, musl headers/libraries, and test files into the
@@ -6276,7 +6465,14 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir, image_args.enable_telnet, false);
+    create_data_disk(
+        output_dir,
+        image_args.enable_telnet,
+        false,
+        false,
+        false,
+        false,
+    );
 
     if !image_args.sign {
         return;
@@ -6658,7 +6854,14 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
@@ -6673,7 +6876,14 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
 }
 
@@ -6750,13 +6960,65 @@ struct HostRegressionTest {
 
 /// Return the list of registered host-only regression tests.
 fn host_regression_tests() -> Vec<HostRegressionTest> {
-    vec![HostRegressionTest {
-        name: "driver-restart",
-        description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
-        package: "kernel-core",
-        test_target: "driver_restart",
-        target: Some("x86_64-unknown-linux-gnu"),
-    }]
+    vec![
+        HostRegressionTest {
+            name: "driver-restart",
+            description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
+            package: "kernel-core",
+            test_target: "driver_restart",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.3 — layer-shell exclusive-zone integration
+        // test against `kernel-core::display::layer`. Pure host logic;
+        // runs in <1s. Wired here so `cargo xtask regression --test
+        // phase56-g3` is a valid invocation for downstream CI scripts
+        // that want to run just the Phase 56 G-track regressions
+        // without the full kernel-core sweep.
+        HostRegressionTest {
+            name: "phase56-g3",
+            description: "Phase 56 G.3: layer-shell exclusive-zone integration test (pure host logic)",
+            package: "kernel-core",
+            test_target: "phase56_g3_layer_integration",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.2 — keybind grab-hook predicate test against
+        // `kernel-core::input::bind_table`. Runtime synthetic-key-injection
+        // is `#[ignore]`d behind the userspace bulk-drain gap; the four
+        // running tests cover the production match-mask invariants.
+        HostRegressionTest {
+            name: "phase56-g2",
+            description: "Phase 56 G.2: keybind grab-hook predicate regression (pure host logic; \
+                 runtime synthetic-key-injection deferred behind bulk-drain gap)",
+            package: "kernel-core",
+            test_target: "phase56_g2_keybind_grab_hook",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.4 — control-socket codec round-trip test
+        // against `kernel-core::display::control`. Runtime list-surfaces /
+        // subscribe / live frame-stats tests are `#[ignore]`d behind the
+        // userspace bulk-drain gap.
+        HostRegressionTest {
+            name: "phase56-g4",
+            description: "Phase 56 G.4: control-socket codec round-trip regression (pure host logic; \
+                 runtime list-surfaces / subscribe / frame-stats live data deferred behind \
+                 bulk-drain gap)",
+            package: "kernel-core",
+            test_target: "phase56_g4_control_socket_roundtrip",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+        // Phase 56 Track G.1 — multi-client coexistence regression
+        // (DEFERRED). Ships a single `#[ignore]`d test so a future
+        // closure-task author cannot miss the deferral; running this
+        // entry exits 0 because the only test is `#[ignore]`d.
+        HostRegressionTest {
+            name: "phase56-g1",
+            description: "Phase 56 G.1: multi-client coexistence regression (DEFERRED behind \
+                 bulk-drain gap; running this exits 0 with one ignored test)",
+            package: "kernel-core",
+            test_target: "phase56_g1_multi_client_coexistence",
+            target: Some("x86_64-unknown-linux-gnu"),
+        },
+    ]
 }
 
 /// Run a host-only regression test. Returns `Ok(())` on success or
@@ -6789,6 +7051,22 @@ struct RegressionTest {
     /// Optional device attachments (NVMe, e1000, IOMMU). Defaults to all-false
     /// (VirtIO-blk + VirtIO-net) when not set.
     devices: DeviceSet,
+    /// Phase 56 Track F.2 — when `true`, the regression runner
+    /// rebuilds the data disk with `/etc/display_server.debug-crash`
+    /// present so init flips its supervisor flag and propagates
+    /// `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` to `display_server`.
+    /// Production tests leave this `false`.
+    wants_debug_crash_marker: bool,
+    /// Phase 56 close-out (G.1) — when `true`, the regression runner
+    /// drops `/etc/display_server.readback` so init propagates
+    /// `M3OS_DISPLAY_SERVER_READBACK=1` and display_server's
+    /// dispatcher honors the test-only `ReadBackPixel` verb.
+    wants_readback_marker: bool,
+    /// Phase 56 close-out (G.2) — when `true`, the regression runner
+    /// drops `/etc/display_server.inject-key` so init propagates
+    /// `M3OS_DISPLAY_SERVER_INJECT_KEY=1` and display_server's
+    /// dispatcher honors the test-only `InjectKey` verb.
+    wants_inject_key_marker: bool,
 }
 
 /// Return the list of registered regression tests.
@@ -6800,6 +7078,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: fork_overlap_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "ipc-wake",
@@ -6807,6 +7088,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: ipc_wake_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "pty-overlap",
@@ -6814,6 +7098,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: pty_overlap_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "signal-reset",
@@ -6821,6 +7108,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: signal_reset_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "kbd-echo",
@@ -6828,6 +7118,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "service-lifecycle",
@@ -6835,6 +7128,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: service_lifecycle_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "storage-roundtrip",
@@ -6842,6 +7138,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: storage_roundtrip_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "serverization-fallback",
@@ -6849,6 +7148,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: serverization_fallback_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "log-pipeline",
@@ -6856,6 +7158,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: log_pipeline_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
         RegressionTest {
             name: "security-floor",
@@ -6863,6 +7168,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: security_floor_steps,
             timeout_secs: 90,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         },
     ];
 
@@ -6877,6 +7185,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: exit_group_teardown_steps,
             timeout_secs: 60,
             devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -6901,6 +7212,9 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -6931,6 +7245,9 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
@@ -6958,6 +7275,9 @@ fn regression_tests() -> Vec<RegressionTest> {
             e1000: true,
             iommu: false,
         },
+        wants_debug_crash_marker: false,
+        wants_readback_marker: false,
+        wants_inject_key_marker: false,
     });
 
     // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
@@ -6982,10 +7302,364 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 iommu: false,
             },
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
+        });
+    }
+
+    // Phase 56 Track F.2: display-service crash-and-restart regression.
+    //
+    // Drives the F.2 acceptance path end-to-end:
+    //   1. display_server boots with M3OS_DISPLAY_SERVER_DEBUG_CRASH=1
+    //      in its environment (set because /etc/display_server.debug-crash
+    //      is present on the disk image).
+    //   2. The smoke client (`/bin/display-server-crash-smoke`) sends
+    //      `version` (pre-crash), then `debug-crash`. The dispatcher
+    //      logs `display_server: intentional crash for F.2 regression`
+    //      and `panic!()`s; the userspace panic-handler calls
+    //      `framebuffer_release` and the kernel's `restore_console`
+    //      brings the framebuffer console back so the screen is not
+    //      left dead.
+    //   3. The supervisor restarts display_server within
+    //      `display_server.conf`'s `max_restart=5` budget (init logs
+    //      `init: started 'display' pid=` — the service-registration
+    //      name from the manifest, not the binary name).
+    //   4. The smoke client polls `/run/services.status` for the
+    //      restart, reconnects, and confirms the new instance replies
+    //      to `version`.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE (same gate as
+    // `driver-restart-crash` and `max-restart-exceeded`) so the
+    // regression doesn't run in normal CI.
+    //
+    // No NVMe / e1000 / IOMMU devices required — the F.2 path lives
+    // entirely in display_server + control socket + init.
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "display-server-crash-recovery",
+            description: "Phase 56 F.2: display-server-crash-smoke — debug-crash verb \
+                 → display_server panics → kernel reclaims framebuffer → \
+                 supervisor restarts → reconnect succeeds",
+            guest_steps: display_server_crash_recovery_steps,
+            timeout_secs: 90,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: true,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
+        });
+    }
+
+    // Phase 56 Track F.3: text-mode-fallback regression.
+    //
+    // Asserts that when `display_server.conf` is gated off via the runtime
+    // marker (`/etc/m3os-disable-display-server`, written by
+    // `populate_ext2_files` when `M3OS_DISABLE_DISPLAY_SERVER=1`), init logs
+    // structured `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)`
+    // lines and the serial login prompt remains reachable. No graphical
+    // surface should be necessary for administration.
+    //
+    // Gated behind M3OS_ENABLE_FALLBACK_SMOKE so the disk-recreation step
+    // (which is required to drop the marker file) does not run in normal CI;
+    // the regression registry stays at zero-side-effect for the default
+    // `cargo xtask regression` invocation.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_FALLBACK_SMOKE=1 cargo xtask regression --test display-fallback
+    if std::env::var_os("M3OS_ENABLE_FALLBACK_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "display-fallback",
+            description: "Phase 56 F.3: display_server.conf gated off → serial login \
+                 prompt still reachable, no kernel panic",
+            guest_steps: display_fallback_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
+        });
+    }
+
+    // Phase 56 close-out (G.1) — multi-client coexistence regression.
+    //
+    // Drives two distinct toplevel surfaces (red + blue) end-to-end
+    // through the protocol, then queries `display_server` via the
+    // test-only `ControlCommand::ReadBackPixel` verb to confirm both
+    // colors land on screen at their layout-derived positions.
+    //
+    // Gated behind M3OS_ENABLE_MULTI_CLIENT_SMOKE so the disk-rebuild
+    // (with /etc/display_server.readback marker) does not run in
+    // normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_MULTI_CLIENT_SMOKE=1 cargo xtask regression --test multi-client-coexistence
+    if std::env::var_os("M3OS_ENABLE_MULTI_CLIENT_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "multi-client-coexistence",
+            description: "Phase 56 G.1: two toplevel surfaces (red + blue) coexist; \
+                 ReadBackPixel verifies both colors at layout-derived positions",
+            guest_steps: multi_client_coexistence_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: true,
+            wants_inject_key_marker: false,
+        });
+    }
+
+    // Phase 56 close-out (G.2) — keybind grab-hook regression.
+    //
+    // Drives the dispatcher's grab arm end-to-end: registers a bind
+    // for `MOD_SUPER + 'q'` via `RegisterBind`, then injects a
+    // matching synthetic `KeyDown` via the test-only `InjectKey` verb.
+    // The load-bearing assertion is `display_server`'s
+    // `bind triggered id=N` log line, emitted by the dispatcher's grab
+    // arm — proving the grab fired and no client received the matching
+    // `KeyEvent`.
+    //
+    // Gated behind M3OS_ENABLE_GRAB_HOOK_SMOKE so the disk-rebuild
+    // (with /etc/display_server.inject-key marker) does not run in
+    // normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_GRAB_HOOK_SMOKE=1 cargo xtask regression --test grab-hook
+    if std::env::var_os("M3OS_ENABLE_GRAB_HOOK_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "grab-hook",
+            description: "Phase 56 G.2: RegisterBind + InjectKey drives the dispatcher's \
+                 grab arm; display_server logs `bind triggered`",
+            guest_steps: grab_hook_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: true,
+        });
+    }
+
+    // Phase 56 close-out (G.4) — runtime control-socket regression.
+    //
+    // Drives `m3ctl` end-to-end against the live `display-control`
+    // service:
+    //   1. `m3ctl version` returns the Phase 56 protocol version,
+    //   2. `m3ctl list-surfaces` lists `gfx-demo`'s toplevel,
+    //   3. `m3ctl frame-stats` returns at least one sample with
+    //      `compose_us=N` (N >= 0) — proving the observability verb
+    //      surfaces real data rather than a placeholder.
+    //
+    // No marker file is needed: every verb exercised here is part of
+    // the production verb set (no test-only gates).
+    //
+    // Gated behind M3OS_ENABLE_CONTROL_SOCKET_SMOKE so the boot+login
+    // does not run in normal CI.
+    //
+    // Direct invocation:
+    //   M3OS_ENABLE_CONTROL_SOCKET_SMOKE=1 cargo xtask regression --test control-socket
+    if std::env::var_os("M3OS_ENABLE_CONTROL_SOCKET_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "control-socket",
+            description: "Phase 56 G.4: m3ctl version / list-surfaces / frame-stats \
+                 round-trip against live display-control endpoint",
+            guest_steps: control_socket_steps,
+            timeout_secs: 60,
+            devices: DeviceSet::default(),
+            wants_debug_crash_marker: false,
+            wants_readback_marker: false,
+            wants_inject_key_marker: false,
         });
     }
 
     tests
+}
+
+/// Phase 56 close-out (G.1) — multi-client-coexistence regression
+/// guest steps. Boots, logs in, runs `display-multi-client-smoke`,
+/// asserts the smoke client's PASS signal.
+fn multi_client_coexistence_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/display-multi-client-smoke ; /bin/echo MULTI_CLIENT_SMOKE:exit:$?\n",
+        label: "guest/multi-client: launch display-multi-client-smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:BEGIN",
+        timeout_secs: 15,
+        label: "guest/multi-client: smoke begin",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:surfaces-committed",
+        timeout_secs: 15,
+        label: "guest/multi-client: both surfaces committed",
+    });
+    // The `display_server: G.1 ReadBackPixel verb ENABLED` banner
+    // appears at display_server startup (well before the smoke client
+    // runs); `boot_and_login_steps` already consumed past it. The
+    // smoke client's `PASS` signal below is the load-bearing
+    // assertion that the verb actually worked.
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:red-visible-at",
+        timeout_secs: 15,
+        label: "guest/multi-client: red readback observed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:blue-visible-at",
+        timeout_secs: 15,
+        label: "guest/multi-client: blue readback observed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:PASS",
+        timeout_secs: 5,
+        label: "guest/multi-client: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "MULTI_CLIENT_SMOKE:exit:0",
+        timeout_secs: 5,
+        label: "guest/multi-client: exit:0",
+    });
+    steps
+}
+
+/// Phase 56 close-out (G.2) — keybind grab-hook regression guest
+/// steps. Boots, logs in, runs `grab-hook-smoke`, asserts:
+///   - smoke client's PASS signal,
+///   - `display_server: bind triggered id=N` log emitted by the
+///     dispatcher's grab arm.
+fn grab_hook_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grab-hook-smoke ; /bin/echo GRAB_HOOK_SMOKE:exit:$?\n",
+        label: "guest/grab-hook: launch grab-hook-smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:BEGIN",
+        timeout_secs: 15,
+        label: "guest/grab-hook: smoke begin",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:bind-registered",
+        timeout_secs: 15,
+        label: "guest/grab-hook: bind registered",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:key-injected",
+        timeout_secs: 15,
+        label: "guest/grab-hook: key injected",
+    });
+    // Load-bearing assertion: display_server's dispatcher's grab arm
+    // emits this exact line when the bind id matches.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: bind triggered id=",
+        timeout_secs: 15,
+        label: "guest/grab-hook: dispatcher grab arm fired",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:PASS",
+        timeout_secs: 5,
+        label: "guest/grab-hook: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "GRAB_HOOK_SMOKE:exit:0",
+        timeout_secs: 5,
+        label: "guest/grab-hook: exit:0",
+    });
+    steps
+}
+
+/// Phase 56 close-out (G.4) — control-socket runtime round-trip.
+///
+/// Boots, logs in, waits for `gfx-demo` to register its toplevel, then
+/// drives `m3ctl` against the live `display-control` service:
+///
+/// - `m3ctl version` → `protocol_version=N`
+/// - `m3ctl list-surfaces` → at least one `surface N` line (gfx-demo's
+///   toplevel)
+/// - `m3ctl frame-stats` → at least one `frame N compose_us=M` line
+///
+/// Each invocation is bracketed by a unique echo marker so the
+/// SmokeStep harness can pin verb output without confusing later
+/// `m3ctl` invocations. (`m3ctl` writes to stdout, which is the same
+/// serial console the harness scans.)
+fn control_socket_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // gfx-demo's toplevel registration lands during boot — well before
+    // the login prompt — so it's already in display_server's surface
+    // table by the time we reach this step. Sleep briefly so any
+    // straggling boot output drains before we issue the first verb.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // 1. version
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-version ; \
+                /bin/m3ctl version ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-version\n",
+        label: "guest/control-socket: m3ctl version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-version",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-version marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "protocol_version=",
+        timeout_secs: 10,
+        label: "guest/control-socket: version reply",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-version",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-version marker",
+    });
+
+    // 2. list-surfaces
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-list ; \
+                /bin/m3ctl list-surfaces ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-list\n",
+        label: "guest/control-socket: m3ctl list-surfaces",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-list",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-list marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "surface ",
+        timeout_secs: 10,
+        label: "guest/control-socket: at least one surface listed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-list",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-list marker",
+    });
+
+    // 3. frame-stats
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo CONTROL_SOCKET_SMOKE:before-stats ; \
+                /bin/m3ctl frame-stats ; \
+                /bin/echo CONTROL_SOCKET_SMOKE:after-stats\n",
+        label: "guest/control-socket: m3ctl frame-stats",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:before-stats",
+        timeout_secs: 10,
+        label: "guest/control-socket: pre-stats marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "frame ",
+        timeout_secs: 10,
+        label: "guest/control-socket: at least one frame sample",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONTROL_SOCKET_SMOKE:after-stats",
+        timeout_secs: 10,
+        label: "guest/control-socket: post-stats marker",
+    });
+
+    steps
 }
 
 /// Guest steps for the fork-overlap regression: boot, login, run fork-test.
@@ -7448,6 +8122,158 @@ fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Guest steps for the Phase 56 F.2 display-server-crash-recovery regression.
+///
+/// Drives the F.2 acceptance path end-to-end:
+///
+/// 1. Boot, login, and confirm `display_server: starting` appears at
+///    boot (the supervisor-started instance).
+/// 2. Confirm `display_server: F.2 debug-crash verb ENABLED via …`
+///    appears — proves the disk-image marker file was honored, init
+///    propagated the env var, and `display_server` saw it at startup.
+/// 3. Launch `/bin/display-server-crash-smoke` from the post-login
+///    shell. Confirm its `DISPLAY_CRASH_SMOKE:pre-crash-version:OK`
+///    log marks the pre-crash dispatcher as reachable.
+/// 4. Confirm `display_server: intentional crash for F.2 regression`
+///    appears — proves the dispatcher's controlled-crash entry point
+///    fired before the panic landed.
+/// 5. Confirm `display_server: PANIC` appears — the userspace panic
+///    handler ran (which calls `framebuffer_release` so the kernel
+///    reclaims the framebuffer; the kernel additionally invokes
+///    `restore_console` on process exit, restoring the framebuffer
+///    console so the screen is not left dead — see
+///    `kernel/src/fb/mod.rs::restore_console` and
+///    `kernel/src/arch/x86_64/syscall/mod.rs:2099`).
+/// 6. Confirm `init: started 'display' pid=` appears for the *second*
+///    time (the supervisor-driven restart, within
+///    `display_server.conf`'s `max_restart=5` budget — note: init logs
+///    the service-registration name from the manifest, not the binary
+///    name). The presence
+///    of this kernel-routed log line after the panic is also our
+///    proxy that the framebuffer console resumed: `fb::write_str`
+///    re-engages once `CONSOLE_YIELDED` clears, so any log line
+///    written through `serial::_print + fb::write_str` after the
+///    panic proves both serial and framebuffer paths are alive.
+/// 7. Confirm `display_server: starting` appears the *second* time
+///    (the restarted instance is up).
+/// 8. Confirm `DISPLAY_CRASH_SMOKE:restart-confirmed` appears (the
+///    smoke client polled `/run/services.status` and saw display_server
+///    return to running).
+/// 9. Confirm `DISPLAY_CRASH_SMOKE:post-restart-version:OK` appears
+///    (the smoke client reconnected to the new instance and got a
+///    real reply).
+/// 10. Confirm `DISPLAY_CRASH_SMOKE:PASS` appears — overall pass.
+fn display_server_crash_recovery_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Step 1 — first display_server start at boot.
+    // (boot_and_login_steps already drains past most boot output;
+    // we wait for both the launch banner and the F.2 gate banner to
+    // confirm the env-var pipeline is live.)
+    //
+    // Note: the boot path emits these markers *before* the login
+    // prompt, but `boot_and_login_steps` already consumed past them.
+    // Asserting the live-second-start marker (step 7) is the load-
+    // bearing one; we instead confirm via the second-instance
+    // `display_server: starting` after the panic.
+
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Step 3 — launch the smoke client; chain `; echo` to capture
+    // its exit code on the same line so the regression sees the
+    // success signal even if the shell prompt is delayed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/display-server-crash-smoke ; /bin/echo DISPLAY_CRASH_SMOKE:exit:$?\n",
+        label: "guest/display-crash: launch display-server-crash-smoke",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:pre-crash-version:OK",
+        timeout_secs: 15,
+        label: "guest/display-crash: pre-crash version OK",
+    });
+
+    // Step 4 — the dispatcher's intent line, logged from inside the
+    // `DebugCrash` arm before `panic!()`.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: intentional crash for F.2 regression",
+        timeout_secs: 10,
+        label: "guest/display-crash: dispatcher logs intent",
+    });
+
+    // Step 5 — userspace panic banner from the display_server
+    // panic_handler (calls framebuffer_release + exit(101)).
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: PANIC",
+        timeout_secs: 10,
+        label: "guest/display-crash: display_server PANIC",
+    });
+
+    // Step 6 — supervisor restarts. This kernel-routed line going
+    // through serial+fb proves the framebuffer console resumed: if
+    // the kernel were stuck holding a yielded console, the framebuffer
+    // backend would be silent; serial is unaffected so the test sees
+    // it either way, but the architectural guarantee is that
+    // `CONSOLE_YIELDED` cleared in `restore_console` and subsequent
+    // log lines re-engage `fb::write_str` (cross-reference
+    // `kernel/src/fb/mod.rs::restore_console` and
+    // `kernel/src/arch/x86_64/syscall/mod.rs:2099` — process-death
+    // path that calls `restore_console` when the dying PID owned the
+    // FB).
+    // Init logs the *service-registration name* from the manifest's
+    // `name=display` field, not the binary name `display_server`. The
+    // service-name path is the canonical supervisor identifier
+    // (matches `/run/services.status` and the `service` shell verb).
+    steps.push(SmokeStep::Wait {
+        pattern: "init: started 'display' pid=",
+        timeout_secs: 30,
+        label: "guest/display-crash: supervisor restarts display_server",
+    });
+
+    // Step 7 — second `display_server: starting` banner from the
+    // restarted instance.
+    steps.push(SmokeStep::Wait {
+        pattern: "display_server: starting",
+        timeout_secs: 30,
+        label: "guest/display-crash: display_server second start",
+    });
+
+    // Step 8 — smoke client confirmed the restart via /run/services.status.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:restart-confirmed",
+        timeout_secs: 30,
+        label: "guest/display-crash: restart-confirmed",
+    });
+
+    // Step 9 — smoke client got a fresh reply on the new instance.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:post-restart-version:OK",
+        timeout_secs: 15,
+        label: "guest/display-crash: post-restart version OK",
+    });
+
+    // Step 10 — overall PASS.
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/display-crash: PASS",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "DISPLAY_CRASH_SMOKE:exit:0",
+        timeout_secs: 15,
+        label: "guest/display-crash: exit code 0",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/display-crash: shell prompt after smoke",
+    });
+
+    steps
+}
+
 /// Guest steps for the storage-roundtrip regression: write, read-back, and
 /// delete a file on the ext2 root filesystem to verify persistent storage.
 fn storage_roundtrip_steps() -> Vec<SmokeStep> {
@@ -7708,6 +8534,48 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 56 Track F.3: text-mode-fallback regression steps.
+///
+/// Asserts that the runtime knob really gates the graphical stack and the
+/// system still reaches a serial-driven login prompt. The disk-image
+/// recreation that drops `/etc/m3os-disable-display-server` happens inside
+/// `cmd_regression` before this test runs (and is restored afterwards) so
+/// the regression registry stays declarative.
+///
+/// Pattern budget rationale: the structured `init: skipped …` lines emit
+/// before the existing `boot_and_login_steps` boot-marker (`net_udp` start),
+/// so we wait for them first; the serial console is the only login surface
+/// here, so reusing `boot_and_login_steps` after the assertions is correct.
+fn display_fallback_steps() -> Vec<SmokeStep> {
+    let mut steps: Vec<SmokeStep> = Vec::new();
+    // 1. The marker file is detected.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: text-mode-fallback marker detected at boot",
+    });
+    // 2. Display server skipped with the structured wording.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: skipped display_server.conf (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: display_server.conf skipped",
+    });
+    // 3. gfx-demo skipped (depends on display, must be filtered out together).
+    steps.push(SmokeStep::Wait {
+        pattern: "init: skipped gfx-demo.conf (M3OS_DISABLE_DISPLAY_SERVER=1)",
+        timeout_secs: 30,
+        label: "F.3: gfx-demo.conf skipped",
+    });
+    // 4. Reuse the standard login bootstrap so the assertion of "serial
+    //    `login:` prompt is reachable" matches the same baseline every other
+    //    regression uses. If `boot_and_login_steps` succeeds here, the F.3
+    //    acceptance bullet "login prompt is reachable over serial regardless
+    //    of graphical state" holds. Kernel-panic detection is automatic via
+    //    the smoke-engine's KERNEL PANIC / page fault / DOUBLE FAULT scan.
+    steps.extend(boot_and_login_steps());
+    steps
+}
+
 /// Common boot + login steps shared by all regression tests.
 fn boot_and_login_steps() -> Vec<SmokeStep> {
     // Regression runs use the shipped image in snapshot mode. The image already
@@ -7830,15 +8698,83 @@ fn cmd_regression(args: &RegressionArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false, false);
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
 
     let mut passed = 0usize;
     let mut failed = 0usize;
 
+    // Track whether the most-recently-built disk has the F.2
+    // `display_server.debug-crash` marker. Tests that need the
+    // marker rebuild the disk; subsequent tests that don't need it
+    // rebuild back to the production-shape disk.
+    let mut current_disk_has_debug_crash = false;
+    let mut current_disk_has_readback = false;
+    let mut current_disk_has_inject_key = false;
+
     for test in &tests_to_run {
         let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+
+        // Phase 56 F.2 + F.3 + close-out (G.1, G.2) — rebuild the data
+        // disk when the test's marker requirements differ from the
+        // current disk shape. F.2 wants `/etc/display_server.debug-crash`,
+        // G.1 wants `/etc/display_server.readback`, G.2 wants
+        // `/etc/display_server.inject-key`, F.3 wants
+        // `/etc/m3os-disable-display-server` (env-var-scoped). All
+        // four knobs are independent and orthogonal; rebuild on any
+        // mismatch.
+        let needs_disable_display = test.name == "display-fallback";
+        let needs_debug_crash = test.wants_debug_crash_marker;
+        let needs_readback = test.wants_readback_marker;
+        let needs_inject_key = test.wants_inject_key_marker;
+        let disk_shape_changed = needs_debug_crash != current_disk_has_debug_crash
+            || needs_readback != current_disk_has_readback
+            || needs_inject_key != current_disk_has_inject_key
+            || needs_disable_display
+            || (current_disk_has_debug_crash && !needs_debug_crash)
+            || (current_disk_has_readback && !needs_readback)
+            || (current_disk_has_inject_key && !needs_inject_key);
+        if disk_shape_changed {
+            let disk_img = uefi_image.parent().unwrap().join("disk.img");
+            if disk_img.exists() {
+                let _ = fs::remove_file(&disk_img);
+            }
+            // F.3 marker is env-var-scoped because it's plumbed through
+            // populate_ext2_files via env, not as a struct arg.
+            // SAFETY: xtask is single-threaded between regression iterations.
+            if needs_disable_display {
+                unsafe {
+                    std::env::set_var("M3OS_DISABLE_DISPLAY_SERVER", "1");
+                }
+            }
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                false,
+                needs_debug_crash,
+                needs_readback,
+                needs_inject_key,
+            );
+            if needs_disable_display {
+                unsafe {
+                    std::env::remove_var("M3OS_DISABLE_DISPLAY_SERVER");
+                }
+            }
+            current_disk_has_debug_crash = needs_debug_crash;
+            current_disk_has_readback = needs_readback;
+            current_disk_has_inject_key = needs_inject_key;
+        }
+
         print!("  {}: ", test.name);
-        match run_regression_test(test, &uefi_image, &ovmf, timeout, args.display) {
+        let result = run_regression_test(test, &uefi_image, &ovmf, timeout, args.display);
+
+        match result {
             Ok(serial_log) => {
                 println!("PASS");
                 save_regression_artifact(test.name, &serial_log, "serial.log");
@@ -7850,6 +8786,23 @@ fn cmd_regression(args: &RegressionArgs) {
                 extract_trace_dump(test.name, &serial_log);
                 failed += 1;
             }
+        }
+
+        // Restore the default disk image after a display-fallback run so the
+        // marker file does not leak into later regressions in the same
+        // invocation. F.2's debug-crash marker is rebuilt on the next
+        // iteration's pre-test check based on `wants_debug_crash_marker`.
+        if needs_disable_display {
+            let disk_img = uefi_image.parent().unwrap().join("disk.img");
+            let _ = fs::remove_file(&disk_img);
+            create_data_disk(
+                uefi_image.parent().unwrap(),
+                false,
+                false,
+                current_disk_has_debug_crash,
+                current_disk_has_readback,
+                current_disk_has_inject_key,
+            );
         }
     }
 

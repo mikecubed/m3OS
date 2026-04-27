@@ -415,6 +415,47 @@ On `display_server` crash (F.2), the kernel reclaims the framebuffer, the kernel
 
 This is the minimum a real graphical architecture requires — not the maximum. Richer session semantics (login-to-graphical flow, user sessions, seat management) are Phase 57 concerns and are not in Phase 56 scope.
 
+### Crash recovery
+
+Phase 56 Track F.2 makes the recovery path real and testable rather than rhetorical. The end-to-end story has four moving parts — the dispatcher's controlled-crash entry point, the kernel's framebuffer reclamation, the supervisor's restart policy, and the client's reconnection responsibility — each of which is exercised by the `display-server-crash-recovery` regression.
+
+**The controlled-crash trigger.** A new `ControlCommand::DebugCrash` verb (opcode `0x0208`) is declared once in `kernel-core::display::protocol` and re-exported via `kernel_core::display::control`. The codec round-trips the verb unconditionally so the wire-format opcode space stays stable across production and debug builds. The runtime gate is at the dispatcher: `display_server::control::dispatch_command` consults a `DebugCrashPolicy` constructed at startup from the `M3OS_DISPLAY_SERVER_DEBUG_CRASH=1` environment variable. Production boots leave the env var unset and the verb shadows back to `ControlError::UnknownVerb`, which keeps a hostile or misconfigured `m3ctl debug-crash` call from crashing the compositor. The F.2 regression flips a marker file (`/etc/display_server.debug-crash`) into the disk image; init reads it at startup and propagates the env var to every spawned service. When the verb is honored, the dispatcher logs `display_server: intentional crash for F.2 regression` and `panic!()`s before sending a reply.
+
+**Kernel framebuffer reclamation.** When `display_server` panics, the userspace panic handler calls `framebuffer_release` and then `exit(101)`. The kernel's process-death cleanup path observes that the dying PID was the framebuffer owner and invokes `kernel/src/fb/mod.rs::restore_console`, which clears `CONSOLE_YIELDED` under the console lock and clears `FB_OWNER_PID` last so concurrent `try_yield_console` callers cannot race the restore. From that point on `fb::write_str` re-engages and any subsequent kernel-routed log line (e.g., init's `init: started 'display_server' pid=` restart banner) is mirrored on both serial and the framebuffer. There is no dead screen — the architectural invariant is that the framebuffer console resumes for *any* path that drops the FB-mapped VMA (clean exit, panic exit, or `munmap`-walks-the-VMA-tree fallback). Cross-references: B.1 (`KernelFramebufferOwner::release` and `Drop` both invoke `framebuffer_release`) and F.3 (text-mode fallback covers the orthogonal "graphical stack unavailable" case).
+
+**Supervisor's role.** `etc/services.d/display_server.conf` ships with `restart=on-failure, max_restart=5`. Init reaps the dead PID via SIGCHLD, runs the restart policy, and forks+execve's `display_server` again. Within the budget the cycle completes in well under a second and `display_server` re-acquires the framebuffer with bounded backoff (`acquire_framebuffer_with_backoff`), re-registers under both `display` and `display-control`, and the post-restart `version` verb succeeds. Beyond `max_restart=5` the service transitions to `permanently-stopped` (the same state machine validated by Phase 55b's `max-restart-exceeded` regression), and F.3's text-mode fallback takes over — serial login stays live, the kernel framebuffer console handles kernel-side output, and init logs a named failure reason.
+
+**Client responsibility.** Connected clients see their IPC reply-cap revoked the moment `display_server` exits. Outstanding `ipc_call_buf` calls return `u64::MAX` (the equivalent of a clean socket close on AF_UNIX) and pending requests fail with an `EBUSY`-shaped sentinel propagated through the kernel's IPC engine. Clients reconnect by calling `ipc_lookup_service("display-control")` (or `"display"`) again; the supervisor-driven restart registers a fresh endpoint that the lookup resolves. The smoke client `userspace/display-server-crash-smoke` makes the responsibility concrete: it sends `version` (pre-crash), then `debug-crash` (and accepts either a transport error or a stale-label reply since the panic and reply ordering is timing-dependent), then polls `/run/services.status` for `display_server` to return to `running`, then re-looks-up the endpoint and sends `version` again against the new instance. The total budget is 30 seconds for the restart poll plus the per-step timeouts; on every success path it prints `DISPLAY_CRASH_SMOKE:PASS` and exits 0.
+
+### Text-mode fallback
+
+Phase 56 treats "no graphical stack" as a first-class operating mode, not as a degraded one. F.2 (above) covers the recoverable case — `display_server` crashes once, the kernel framebuffer console resumes, init restarts the service. F.3 covers the unrecoverable case where the graphical stack is either intentionally suppressed or has exhausted its restart budget. In both cases the operator must remain able to log in, inspect state, and bring the machine down cleanly.
+
+**Failure cascade** (`display_server` exhausts the restart budget):
+
+1. `display_server` crashes for the `max_restart`-th time (current manifest: `max_restart=5`).
+2. `init`'s reap loop runs `maybe_restart` once more, observes `restart_count >= max_restart`, and emits the existing structured `init: service '<name>' exceeded max restarts, permanently stopped` log line. The service transitions to `permanently-stopped` in `/run/services.status`. (See `userspace/init/src/main.rs::maybe_restart`.)
+3. Because no userspace process holds the framebuffer, the kernel's `CONSOLE_YIELDED` flag stays `false` and `kernel/src/fb/mod.rs::write_str` resumes producing characters on the framebuffer text console. No additional kernel work is required — it is the absence of a `sys_fb_acquire` claim that keeps the kernel console live.
+4. Serial output is unaffected throughout: `serial0` is the kernel's primary debug sink and is independent of any framebuffer ownership state.
+5. The serial `login` prompt remains reachable; the operator authenticates and runs `ion` exactly as in headless mode.
+
+**Administration paths that remain live under graphical failure:**
+
+- Serial-attached `login` -> `ion` (the same path `cargo xtask run` exercises every day).
+- The kernel framebuffer text console for kernel-side messages, panic output, and any future kernel-driven scrollback work. Its scrollback budget and behavior are owned by `kernel/src/fb/mod.rs` and do not depend on the userspace compositor.
+- `/run/services.status` and `/run/init.cmd` for inspecting and steering supervised services from a serial shell (`service status`, `service stop`, `service restart`).
+- SSH (when `sshd` is supervised) and Telnet (when explicitly enabled): both ride the network stack and the PTY subsystem, neither of which depends on the graphical stack.
+
+**Administration paths that are disabled under graphical failure:**
+
+- All graphical clients: `gfx-demo`, future native bar / launcher / lockscreen, and any later terminal emulator client. The `gfx-demo.conf` manifest declares `depends=display`, so init never tries to start it when `display` is `permanently-stopped`.
+- `m3ctl` against the compositor's control socket, since the socket is unbound when `display_server` is not running.
+- The keybind grab-hook surface (`m3ctl register-bind`), for the same reason.
+
+**Direct-suppression knob (F.3 regression).** Setting `M3OS_DISABLE_DISPLAY_SERVER=1` at disk-build time drops `/etc/m3os-disable-display-server`. Init reads the marker once at startup, emits `init: text-mode fallback active (M3OS_DISABLE_DISPLAY_SERVER=1)`, and skips both `display_server.conf` and `gfx-demo.conf` from the `KNOWN_CONFIGS` filter (and from any directory scan), each producing an `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` line. The regression `cargo xtask regression --test display-fallback` (gated behind `M3OS_ENABLE_FALLBACK_SMOKE=1`) asserts those log lines and that the serial `login:` prompt is still reachable. The same recovery surface — serial login, kernel framebuffer console, `service` control — is what an operator gets when the runtime path of F.2 actually empties the restart budget; F.3 just lets the regression harness reach that state deterministically without crashing the compositor on every run.
+
+**Cross-references.** See "Crash recovery" above for single-crash recovery, F.1 for the supervisor manifest shape, and `docs/09-framebuffer-and-shell.md` for the underlying framebuffer console that becomes the fallback surface.
+
 ## Manual smoke validation
 
 Phase 56 ships `gfx-demo` (C.6) as a protocol-reference visual smoke client so a learner or reviewer running `cargo xtask run-gui --fresh` sees a filled toplevel, a visible cursor, and input-event echoes from a real graphical client — not just the C.2 background fill.
@@ -466,6 +507,24 @@ Fill colors (fixed so testers know exactly what to look for):
 
 - `display_server` startup background: `#1a1a2e` (dark indigo).
 - `gfx-demo` toplevel fill: `#f4b400` (goldenrod).
+
+## Resource bounds
+
+Phase 56 sets every collection to a fixed compile-time bound rather than an `alloc`-driven dynamic limit. The bounds are deliberately conservative — small enough that overflow is observable in test, large enough for the protocol-reference demo (`gfx-demo`) and the regression tests in Track G to pass without hitting them. Later phases may revise these upward as real clients land (e.g. a tiling compositor with a status bar, a native terminal, and a launcher all connected at once); the *shape* of "fixed bound, fail-closed when exceeded" is intended to outlive Phase 56 even when the numbers change.
+
+| Bound | Phase 56 default | Where it lives | Exceed behavior |
+|---|---|---|---|
+| `MAX_BINDS` | 64 | `kernel-core::input::bind_table` (D.4) | Bind registration returns a typed error; existing binds keep working. |
+| `MAX_GRABS` | 8 | `kernel-core::input::bind_table` (D.4) | New simultaneous grabs are rejected; existing grabs keep working. |
+| `MAX_PENDING_BULK` | 4 | C.3 / E.2 surface registry | Buffer attachments past this are rejected; client disconnects with `ResourceExhausted`. |
+| Held-key table | 8 | `kbd_server` (D.1) | Additional held-key tracking is dropped at the source; no client visibility. |
+| `EnterLeaveBuf::CAP` | 2 | D.3 dispatcher (`kernel-core::input::dispatch`) | Coalesces the at-most-two enter/leave transitions per dispatch; the dispatcher contract guarantees only ever 0–2 transitions per input event. |
+| `MAX_SUBSCRIBERS_PER_KIND` | 16 | E.4 control socket | Sixteenth-and-later subscribers receive `ResourceExhausted` and the connection is closed. |
+| `MAX_OUTBOUND_PER_SUBSCRIBER` | 32 | E.4 control socket | Slow-subscriber backpressure: the subscriber is dropped with `ResourceExhausted` when the outbound queue fills. |
+| `FrameStatsRing::CAPACITY` | 64 | E.4 frame-stats ring | Oldest sample is overwritten; `frame-stats` always returns at most the last 64 samples. |
+| `MAX_BULK_BYTES` (kernel `MAX_BULK_LEN`) | 4096 | Kernel IPC bulk transport | Per-message bulk payloads larger than this are rejected by the kernel; userspace decoders mirror the limit as `MAX_FRAME_BODY_LEN`. |
+
+These are Phase 56 defaults. Later phases (a tiling compositor in 56b, a native session in 57+, the broader graphical client ecosystem) may revise the numeric values; the spec for revising them is "the bound is still a fixed compile-time constant, the per-client failure mode is still typed, and the regression tests still observe the cap." The bound *names* are stable and intended to be referenced from later phases without renaming.
 
 ## Key Files
 
@@ -549,3 +608,15 @@ Fill colors (fixed so testers know exactly what to look for):
 - Software-only composition, no hardware acceleration.
 - Single output, single seat.
 - The client protocol is m3OS-native, not Wayland; no adapter in Phase 56.
+
+### Deferred follow-ups
+
+These are concrete gaps that Phase 56 leaves behind. Each is documented inline at the relevant call site (commit message, `TODO` marker, or track report) so a later phase can pick them up without rediscovery work.
+
+- **~~Userspace bulk-reply drain helper.~~** **CLOSED in the Phase 56 close-out.** `SYS_IPC_TAKE_PENDING_BULK = 0x1112` (`syscall_lib::ipc_take_pending_bulk`) drains the caller's `pending_bulk` slot after `ipc_call_buf`. `SYS_IPC_TRY_RECV_MSG = 0x1113` (`syscall_lib::ipc_try_recv_msg`) lets `display_server`'s main loop multiplex the frame-tick poll and the control-endpoint serving without blocking. Together they make D.3's input pull path (`KbdInputSource::poll_key`, `MouseInputSource::poll_pointer`) and E.4's control-socket request/reply (`m3ctl version`, `list-surfaces`, etc.) work end-to-end at runtime. The remaining server-initiated subscription event push is a separate deferral (see next item).
+- **Server-initiated subscription event push.** `display_server::control` records subscription events (SurfaceCreated / SurfaceDestroyed / FocusChanged / BindTriggered) but does not transmit them to subscribed clients. Two viable designs: (a) a polling verb (`m3ctl drain-events`) that the client periodically calls, or (b) a cap-transfer at subscribe time so the server holds a send-cap to the subscriber's endpoint and `ipc_send_buf`s events directly. Marked with `TODO(subscription-push)` on the `control::publish_*` helpers. The subscription registry and event-push code are structurally complete and host-tested.
+- **True zero-copy via page-grant capabilities.** Track B.4 ships the `SurfaceBuffer` helper but routes the grant through a copy-friendly path during the Phase 56 bring-up. The deferral is documented in B.4's track report; the protocol surface (`AttachBuffer`, `BufferReleased`) is shaped so the later swap to a real zero-copy grant does not change the client-visible wire format.
+- **`mouse_server` dependency direction reversal.** F.1 currently registers `mouse_server` with `depends=display`, which inverts the conceptual ownership: `display_server` is the consumer of pointer events, not the producer. A later session-manifest pass (Phase 57+ or a Phase 56 follow-up) should reverse this so `display_server` depends on `mouse_server`, mirroring `kbd_server`. Cited in `track-report-phase56-f1-manifests.md`.
+- **Distinct `on-restart=` supervisor directive.** F.1 piggybacks restart behavior on the existing service-manifest restart policy. A separate `on-restart=` hook (re-acquire framebuffer with bounded backoff, re-bind control socket) is documented as a Phase 56 deferral and is expected to land alongside the Phase 51 service-model maturity work, not inside Phase 56's surface.
+- **Standalone modifier-key edges on the `kbd_server` pull path.** D.1 emits modifier state inside every `KeyEvent` (the `modifiers` field on the wire) but does not yet emit standalone `Down` / `Up` events for the modifier keys themselves on the pull path. Clients that want to draw a "hold-Super" overlay must use the chord-style approach — push events with the modifier set — until the standalone-edge path is added in 56b or 57+.
+- **L/R modifier chord differentiation.** A.0's `MOD_*` bitmask does not distinguish left- and right-side modifiers (no `MOD_LSHIFT` vs `MOD_RSHIFT`, etc.). Adding L/R differentiation is a wire-format change to the `KeyEvent` modifier byte and is deferred — it would break Phase 56 clients without a versioned wire-format bump.

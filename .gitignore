@@ -17,8 +17,12 @@
 # Local agent/orchestration session artifacts
 .agent/
 .workflow-orchestration/artifacts/
+.flow/artifacts/
 .codex/
+.codex
+.copilot/
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 
 # Local debug captures (cargo xtask run > foo.log etc.)
 *.log
