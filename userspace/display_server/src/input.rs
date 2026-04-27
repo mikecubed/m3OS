@@ -97,6 +97,17 @@ pub const SERVICE_LOOKUP_ATTEMPTS: u32 = 8;
 /// Backoff between service-lookup attempts (5 ms).
 pub const SERVICE_LOOKUP_BACKOFF_NS: u32 = 5_000_000;
 
+/// Throttle for the lazy reconnect path inside `KbdInputSource` /
+/// `MouseInputSource`: the source retries `ipc_lookup_service` every
+/// `LAZY_RECONNECT_DRAIN_INTERVAL` drain calls when its handle is
+/// `None` (initial 40 ms boot lookup raced and lost, or the server
+/// has not yet registered, or the server crashed and was restarted by
+/// the supervisor). The display_server main loop drains roughly
+/// 100 times per second when idle (each pull-poll waits up to 5 ms),
+/// so 100 → ~1 lookup/second — cheap, and the reconnect lands within
+/// a second of the service appearing.
+pub const LAZY_RECONNECT_DRAIN_INTERVAL: u32 = 100;
+
 // ---------------------------------------------------------------------------
 // Service-handle lookup
 // ---------------------------------------------------------------------------
@@ -145,28 +156,61 @@ pub fn lookup_with_backoff(name: &str) -> Option<u32> {
 /// 4. `KeyEvent::decode(&buf)` parses the wire frame.
 pub struct KbdInputSource {
     handle: Option<u32>,
+    /// Drain-pass counter used to throttle the lazy reconnect path. Reset
+    /// each time a successful lookup populates `handle`. See
+    /// [`LAZY_RECONNECT_DRAIN_INTERVAL`].
+    drains_since_last_lookup: u32,
 }
 
 impl KbdInputSource {
     /// Look up the `"kbd"` service with backoff. Returns a source whose
     /// `poll_key` will pull `KeyEvent`s from `kbd_server` if the lookup
-    /// succeeds; otherwise returns a source whose `poll_key` always
-    /// yields `None`. Either shape keeps the dispatcher loop running.
+    /// succeeds; otherwise returns a source whose `poll_key` retries
+    /// the lookup lazily (see [`LAZY_RECONNECT_DRAIN_INTERVAL`]) so a
+    /// late-starting / crashed-and-restarted `kbd_server` is picked up
+    /// without a display_server restart.
     pub fn lookup_with_backoff() -> Self {
         Self {
             handle: lookup_with_backoff(KBD_SERVICE_NAME),
+            drains_since_last_lookup: 0,
         }
     }
 
-    /// True iff the service was found at startup. Useful for boot-log
+    /// True iff the service is currently connected. Useful for boot-log
     /// visibility — the wiring's correctness does not depend on this.
     pub fn is_connected(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// Try a single, non-blocking `ipc_lookup_service` to claim the
+    /// service handle if we don't have one yet. Throttled by
+    /// `drains_since_last_lookup` so this does not spam on every drain.
+    /// On success, logs once so the operator can see when the late
+    /// connection landed (the startup log line said "unavailable" if
+    /// we got here).
+    fn try_lazy_reconnect(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        if self.drains_since_last_lookup < LAZY_RECONNECT_DRAIN_INTERVAL {
+            self.drains_since_last_lookup += 1;
+            return;
+        }
+        self.drains_since_last_lookup = 0;
+        let raw = syscall_lib::ipc_lookup_service(KBD_SERVICE_NAME);
+        if raw != u64::MAX {
+            self.handle = Some(raw as u32);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "display_server: kbd service connected (lazy)\n",
+            );
+        }
     }
 }
 
 impl InputSource for KbdInputSource {
     fn poll_key(&mut self) -> Option<KeyEvent> {
+        self.try_lazy_reconnect();
         let handle = self.handle?;
 
         // Label-only request. kbd_server's `KBD_EVENT_PULL` arm pumps
@@ -206,19 +250,45 @@ impl InputSource for KbdInputSource {
 /// [`KbdInputSource`] — see that type's docs for the four-step pull flow.
 pub struct MouseInputSource {
     handle: Option<u32>,
+    /// See [`KbdInputSource::drains_since_last_lookup`].
+    drains_since_last_lookup: u32,
 }
 
 impl MouseInputSource {
-    /// Look up the `"mouse"` service with backoff.
+    /// Look up the `"mouse"` service with backoff. If the initial
+    /// lookup races and loses (mouse_server has `depends=display`, so
+    /// it always starts after display_server), `poll_pointer` retries
+    /// lazily — see [`LAZY_RECONNECT_DRAIN_INTERVAL`].
     pub fn lookup_with_backoff() -> Self {
         Self {
             handle: lookup_with_backoff(MOUSE_SERVICE_NAME),
+            drains_since_last_lookup: 0,
         }
     }
 
-    /// True iff the service was found at startup.
+    /// True iff the service is currently connected.
     pub fn is_connected(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// See [`KbdInputSource::try_lazy_reconnect`].
+    fn try_lazy_reconnect(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        if self.drains_since_last_lookup < LAZY_RECONNECT_DRAIN_INTERVAL {
+            self.drains_since_last_lookup += 1;
+            return;
+        }
+        self.drains_since_last_lookup = 0;
+        let raw = syscall_lib::ipc_lookup_service(MOUSE_SERVICE_NAME);
+        if raw != u64::MAX {
+            self.handle = Some(raw as u32);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "display_server: mouse service connected (lazy)\n",
+            );
+        }
     }
 }
 
@@ -228,6 +298,7 @@ impl InputSource for MouseInputSource {
     }
 
     fn poll_pointer(&mut self) -> Option<PointerEvent> {
+        self.try_lazy_reconnect();
         let handle = self.handle?;
 
         let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
