@@ -27,6 +27,7 @@ pub mod pipe;
 pub mod prng;
 pub mod pty;
 pub mod service;
+pub mod session;
 pub mod size_class;
 pub mod slab;
 pub mod time;
