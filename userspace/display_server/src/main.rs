@@ -584,13 +584,18 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // log nothing here to keep the boot serial output
                     // quiet during normal operation.
                 }
+                InputEffect::CursorMoved(abs) => {
+                    // Always-fired by the wiring's pointer drain; carries
+                    // the compositor-maintained absolute position after
+                    // integrating PS/2 dx/dy. The next compose pass picks
+                    // this up via `cursor_motion` damage and re-blits the
+                    // cursor at the new spot, including when the pointer
+                    // is over no mapped surface (the Outbound branch only
+                    // fires when a surface is under the cursor).
+                    pointer_position = abs;
+                }
             }
         }
-        // E.3 — `pointer_position` is now sourced from the
-        // dispatcher's outbound `Pointer` events above. The legacy
-        // `last_pointer_position` helper has been retired: it
-        // returned `None` unconditionally, which made the cursor
-        // unable to follow real mouse motion through D.2.
 
         // Track E.4 — service one pending control-endpoint message
         // per iteration if any has arrived. Phase 56 close-out wires

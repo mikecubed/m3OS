@@ -365,6 +365,16 @@ pub enum InputEffect {
     /// and test visibility.
     PointerEnter(SurfaceId),
     PointerLeave(SurfaceId),
+    /// New compositor-maintained absolute pointer position after
+    /// integrating a relative `PointerEvent`'s `dx` / `dy` into the
+    /// previous position. Always emitted by `drain_one_pass` for
+    /// every drained `PointerEvent`, independent of whether the
+    /// dispatcher routed the event to a surface — the cursor blit
+    /// in `compose.rs` needs to follow physical motion even when
+    /// the pointer is over no mapped surface (e.g., bare boot
+    /// before any client maps a `Toplevel`). `main.rs` consumes
+    /// this to update its own `pointer_position` local.
+    CursorMoved((i32, i32)),
 }
 
 /// Owns the [`InputDispatcher`] plus the source-side wiring (`kbd`,
@@ -550,9 +560,29 @@ impl InputWiring {
         }
 
         // Drain pointer events. Each event can produce an enter/leave
-        // pair *and* a delivery, plus an optional focus change.
-        while let Some(ev) = mouse.poll_pointer() {
-            let abs = ev.abs_position.unwrap_or(pointer_position);
+        // pair *and* a delivery, plus an optional focus change. We
+        // also always emit a `CursorMoved` effect with the
+        // compositor-integrated absolute position so the framebuffer
+        // cursor follows the pointer even when no surface is under it.
+        let mut current_pointer = pointer_position;
+        while let Some(mut ev) = mouse.poll_pointer() {
+            // Integrate relative `dx` / `dy` into a new absolute
+            // position. Keep `abs_position` if the source already
+            // carries one (future absolute pointer like USB tablet).
+            let abs = match ev.abs_position {
+                Some(p) => p,
+                None => (
+                    current_pointer.0.saturating_add(ev.dx),
+                    current_pointer.1.saturating_add(ev.dy),
+                ),
+            };
+            // Stamp the compositor-maintained absolute position back
+            // into the event so any client that receives it via the
+            // Outbound branch (when a surface is under the cursor)
+            // sees the same coordinates the dispatcher hit-tested
+            // against.
+            ev.abs_position = Some(abs);
+            current_pointer = abs;
             let mut state = CompositorState {
                 focused,
                 active_exclusive_layer,
@@ -562,6 +592,10 @@ impl InputWiring {
                 grab_state,
             };
             let decision: PointerRouteDecision = dispatcher.route_pointer_event(&ev, &mut state);
+            // Emit the new compositor-maintained position regardless
+            // of routing. The cursor blit in `compose.rs` needs this
+            // to follow motion when the pointer is over no surface.
+            effects.push(InputEffect::CursorMoved(abs));
             for (sid, kind) in decision.enter_leave.iter() {
                 effects.push(match kind {
                     EnterOrLeave::Enter => InputEffect::PointerEnter(sid),
