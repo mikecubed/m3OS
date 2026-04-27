@@ -297,26 +297,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         });
     }
 
-    // Phase 56 follow-up diag — log the very first cursor-motion
-    // compose pass that has at least one mapped surface, so we can
-    // see whether `compose_frame` is actually re-painting surface
-    // pixels into the area we just cleared. Removed once cursor
-    // overlay over surfaces is observed working in production GUI.
-    let entries_count = compose.len();
     let surface_writes = compose_frame(owner, output, &mut compose)?;
-    if cursor_motion
-        && entries_count > 0
-        && !COMPOSE_FIRST_CURSOR_MOTION_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
-    {
-        syscall_lib::write_str(
-            syscall_lib::STDOUT_FILENO,
-            "display_server: diag: first cursor-motion compose ",
-        );
-        write_u32_diag(entries_count as u32);
-        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " entries, surface_writes=");
-        write_u32_diag(surface_writes as u32);
-        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-    }
     registry.mark_clean();
 
     // Phase 56 E.3 — blit the cursor on top.
@@ -509,32 +490,6 @@ fn clear_rect_to_background<O: FramebufferOwner>(owner: &mut O, rect: Rect) -> R
     }
     let stride = (rect.w as u32).saturating_mul(bpp as u32);
     owner.write_pixels(rect, &buf, stride)
-}
-
-/// Phase 56 follow-up diagnostic — see usage above the
-/// `compose_frame` call.
-static COMPOSE_FIRST_CURSOR_MOTION_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Tiny u32-to-decimal helper (avoid pulling `format!` into the no_std
-/// crate just for diag prints). Diagnostic-only; remove with the
-/// `COMPOSE_FIRST_CURSOR_MOTION_LOGGED` log.
-fn write_u32_diag(mut value: u32) {
-    let mut buf = [0u8; 10];
-    let mut idx = buf.len();
-    if value == 0 {
-        idx -= 1;
-        buf[idx] = b'0';
-    } else {
-        while value != 0 {
-            idx -= 1;
-            buf[idx] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-    }
-    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
-        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
-    }
 }
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named

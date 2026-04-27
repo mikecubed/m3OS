@@ -144,15 +144,6 @@ pub fn has_mouse_packet() -> bool {
     head != tail
 }
 
-/// Diagnostic flag: set the first time `feed_byte_isr` produces a
-/// complete `MousePacket` and pushes it onto the ring. Phase 56
-/// follow-up — paired with the `MOUSE_HANDLER_FIRST_AUX_BYTE`
-/// log in `interrupts::mouse_handler` to localize where the
-/// pipeline breaks. Remove once the mouse stack is observed
-/// working in production GUI sessions.
-static MOUSE_FIRST_PACKET_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// Feed one byte from the IRQ handler. Pushes a complete packet to the ring
 /// when one assembles. Drops packets silently if the ring is full (prefer
 /// losing motion over blocking the ISR).
@@ -165,16 +156,6 @@ pub fn feed_byte_isr(byte: u8) -> bool {
     let mut decoder = MOUSE_DECODER.lock();
     match decoder.feed(byte) {
         Some(DecoderEvent::Packet(packet)) => {
-            if !MOUSE_FIRST_PACKET_LOGGED.swap(true, Ordering::Relaxed) {
-                log::info!(
-                    "[ps2] feed_byte_isr: first packet assembled dx={} dy={} L={} R={} M={}",
-                    packet.dx,
-                    packet.dy,
-                    packet.left,
-                    packet.right,
-                    packet.middle,
-                );
-            }
             push_packet_isr(packet);
             true
         }

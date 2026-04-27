@@ -99,17 +99,6 @@ const MAX_PULL_POLLS: u32 = 1;
 /// errno cast back to `isize`.
 const ERRNO_EAGAIN: isize = -11;
 
-/// Phase 56 follow-up diagnostic: log once on first successful
-/// `read_mouse_packet`. Removed once the mouse pipeline is observed
-/// working in production GUI sessions.
-static FIRST_PACKET_READ_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Phase 56 follow-up diagnostic: log once on first successful
-/// `pipeline.ingest_packet` lift to a `PointerEvent`.
-static FIRST_EVENT_EMITTED_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 // ---------------------------------------------------------------------------
 // Pending-edge queue
 // ---------------------------------------------------------------------------
@@ -338,29 +327,12 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
         let rc = syscall_lib::read_mouse_packet(&mut buf);
         match rc {
             0 => {
-                // Diagnostic (Phase 56 follow-up) — log the first
-                // successful read so we can confirm mouse_server is
-                // pulling from the kernel ring. Removed after the
-                // mouse stack is observed working.
-                if !FIRST_PACKET_READ_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                    syscall_lib::write_str(
-                        STDOUT_FILENO,
-                        "mouse_server: diag: first read_mouse_packet success\n",
-                    );
-                }
                 // Successful read — decode and lift to PointerEvent. If the
                 // packet carries no meaningful change (idle PS/2 chatter),
                 // continue draining without replying.
                 let packet = decode_packet(&buf);
                 let now = monotonic_ms();
                 if let Some(ev) = pipeline.ingest_packet(packet, now) {
-                    if !FIRST_EVENT_EMITTED_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
-                    {
-                        syscall_lib::write_str(
-                            STDOUT_FILENO,
-                            "mouse_server: diag: first PointerEvent emitted\n",
-                        );
-                    }
                     emit_pointer_event(&ev);
                     return;
                 }
