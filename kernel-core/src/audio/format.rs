@@ -152,10 +152,7 @@ mod tests {
     #[test]
     fn frame_size_bytes_s16le_stereo() {
         // 16 bits = 2 bytes per sample × 2 channels = 4 bytes per frame.
-        assert_eq!(
-            frame_size_bytes(PcmFormat::S16Le, ChannelLayout::Stereo),
-            4
-        );
+        assert_eq!(frame_size_bytes(PcmFormat::S16Le, ChannelLayout::Stereo), 4);
     }
 
     #[test]

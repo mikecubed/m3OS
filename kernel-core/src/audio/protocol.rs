@@ -625,8 +625,7 @@ mod tests {
     fn roundtrip_ctl_cmd(msg: AudioControlCommand) {
         let mut buf = [0u8; 256];
         let written = msg.encode(&mut buf).expect("encode");
-        let (decoded, consumed) =
-            AudioControlCommand::decode(&buf[..written]).expect("decode");
+        let (decoded, consumed) = AudioControlCommand::decode(&buf[..written]).expect("decode");
         assert_eq!(decoded, msg);
         assert_eq!(consumed, written);
     }
@@ -634,8 +633,7 @@ mod tests {
     fn roundtrip_ctl_evt(msg: AudioControlEvent) {
         let mut buf = [0u8; 256];
         let written = msg.encode(&mut buf).expect("encode");
-        let (decoded, consumed) =
-            AudioControlEvent::decode(&buf[..written]).expect("decode");
+        let (decoded, consumed) = AudioControlEvent::decode(&buf[..written]).expect("decode");
         assert_eq!(decoded, msg);
         assert_eq!(consumed, written);
     }
@@ -675,9 +673,7 @@ mod tests {
 
     #[test]
     fn client_control_command_get_stats_roundtrip() {
-        roundtrip_client(ClientMessage::ControlCommand(
-            AudioControlCommand::GetStats,
-        ));
+        roundtrip_client(ClientMessage::ControlCommand(AudioControlCommand::GetStats));
     }
 
     #[test]
@@ -852,8 +848,7 @@ mod tests {
                 layout: ChannelLayout::Stereo,
                 rate: SampleRate::Hz48000,
             }),
-            (0u32..=MAX_SUBMIT_BYTES as u32)
-                .prop_map(|len| ClientMessage::SubmitFrames { len }),
+            (0u32..=MAX_SUBMIT_BYTES as u32).prop_map(|len| ClientMessage::SubmitFrames { len }),
             Just(ClientMessage::Drain),
             Just(ClientMessage::Close),
             any_ctl_command().prop_map(ClientMessage::ControlCommand),
@@ -864,8 +859,7 @@ mod tests {
         prop_oneof![
             any::<u32>().prop_map(|stream_id| ServerMessage::Opened { stream_id }),
             any_audio_error().prop_map(ServerMessage::OpenError),
-            any::<u64>()
-                .prop_map(|frames_consumed| ServerMessage::SubmitAck { frames_consumed }),
+            any::<u64>().prop_map(|frames_consumed| ServerMessage::SubmitAck { frames_consumed }),
             any_audio_error().prop_map(ServerMessage::SubmitError),
             Just(ServerMessage::DrainAck),
             Just(ServerMessage::Closed),

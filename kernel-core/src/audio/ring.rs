@@ -188,11 +188,7 @@ impl<'a> AudioRingState<'a> {
     /// Returns [`RingError::Underrun`] if `n > 0` and the ring is empty.
     /// If the read window crosses the storage boundary, the sink
     /// receives two contiguous chunks back-to-back.
-    pub fn consume(
-        &mut self,
-        sink: &mut dyn AudioSink,
-        n: usize,
-    ) -> Result<usize, RingError> {
+    pub fn consume(&mut self, sink: &mut dyn AudioSink, n: usize) -> Result<usize, RingError> {
         if n == 0 {
             return Ok(0);
         }
@@ -268,7 +264,9 @@ mod tests {
     fn write_advances_head() {
         let mut storage = [0u8; 16];
         let mut ring = AudioRingState::new(&mut storage);
-        let written = ring.write(&[1, 2, 3, 4]).expect("write should accept bytes");
+        let written = ring
+            .write(&[1, 2, 3, 4])
+            .expect("write should accept bytes");
         assert_eq!(written, 4);
         assert_eq!(ring.fill_level(), 4);
     }

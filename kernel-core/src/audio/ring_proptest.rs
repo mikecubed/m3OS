@@ -54,10 +54,7 @@ mod tests {
         ]
     }
 
-    fn op_sequence(
-        max_ops: usize,
-        max_write: usize,
-    ) -> impl Strategy<Value = Vec<Op>> {
+    fn op_sequence(max_ops: usize, max_write: usize) -> impl Strategy<Value = Vec<Op>> {
         proptest::collection::vec(any_op(max_write), 0..=max_ops)
     }
 
