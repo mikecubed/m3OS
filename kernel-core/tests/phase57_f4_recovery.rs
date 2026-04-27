@@ -26,8 +26,8 @@
 //!   resource-bounds rule) but `Recovery::new` accepts an override so
 //!   tests can probe edge values without changing the global.
 
-use kernel_core::session::recover::{Recovery, RecoveryAction};
 use kernel_core::session::MAX_RETRIES_PER_STEP;
+use kernel_core::session::recover::{Recovery, RecoveryAction};
 
 // ---------------------------------------------------------------------------
 // New recovery: every step has the full retry budget.

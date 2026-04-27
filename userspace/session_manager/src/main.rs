@@ -52,6 +52,7 @@ extern crate alloc;
 
 mod boot;
 mod control;
+mod recover;
 
 use core::alloc::Layout;
 

@@ -20,8 +20,10 @@
 //! module enforces and `docs/roadmap/tasks/57-audio-and-local-session-tasks.md`
 //! Track F.1 for the acceptance list.
 
+pub mod recover;
 pub mod startup;
 
+pub use recover::{Recovery, RecoveryAction};
 pub use startup::{SessionError, SessionState, SessionStep, StartupSequence};
 
 /// Default per-step retry cap. Per the Phase 57 A.4 memo, every step in
