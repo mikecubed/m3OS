@@ -1553,6 +1553,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "session_manager"
+version = "0.57.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

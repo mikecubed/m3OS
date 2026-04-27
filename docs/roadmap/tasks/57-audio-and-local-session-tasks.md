@@ -437,22 +437,24 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The session-entry contract from A.4 needs a single supervised daemon that owns it. Without one, ordering decisions live scattered across service manifests and drift over time.
 
 **Acceptance:**
-- [ ] All four-step new-binary convention points updated.
-- [ ] On boot, `session_manager` consumes `kernel-core::session::startup::StartupSequence` and runs the declared graphical session steps in order: `display_server` → `kbd_server` → `mouse_server` → `audio_server` → `term` (exact order matches A.4).
-- [ ] `session_manager` is a Phase 56-style single-threaded event loop multiplexing supervisor events and a control socket.
-- [ ] `cargo xtask check` passes.
+- [x] All four-step new-binary convention points updated.
+- [x] On boot, `session_manager` consumes `kernel-core::session::startup::StartupSequence` and runs the declared graphical session steps in order: `display_server` → `kbd_server` → `mouse_server` → `audio_server` → `term` (exact order matches A.4). The order is declared once in `kernel-core::session_supervisor::DECLARED_SESSION_STEP_NAMES` (DRY rule).
+- [x] `session_manager` is a Phase 56-style single-threaded event loop multiplexing supervisor events and a control socket. `userspace/session_manager/src/main.rs` after the boot sequence enters a steady-state loop polling `control::poll_control_once` (F.5 stub) + idle sleep.
+- [x] `cargo xtask check` passes (release builds clean; clippy `-D warnings` clean for the new crate).
+
+Phase 57 transitional note (per worktree spec): `audio_server` and `term` userspace binaries land in Tracks D and G respectively. Until they exist, `InitSupervisorBackend::start` returns `SupervisorReply::Error(UnknownService)` for those names. The F.1 sequencer counts each as a step failure; after 3 attempts the session escalates cleanly to `SessionState::TextFallback` with reverse rollback. Once D and G land, the same boot path reaches `SessionState::Running` without changing this binary. Documented in `userspace/session_manager/src/main.rs` module-level docs.
 
 ### F.3 — Service-supervisor integration
 
-**File:** `userspace/init/src/main.rs` (touch only the supervision API surface)
+**File:** `userspace/init/src/main.rs` (touch only the supervision API surface) + `kernel-core::session_supervisor` (new pure-logic codec)
 **Symbol:** existing `supervisor` API extended with the smallest interface `session_manager` needs
 **Why it matters:** `session_manager` cannot supervise from outside the supervisor; F.3 surfaces only the verbs `session_manager` actually needs (start, stop, await-ready, on-exit), and no others.
 
 **Acceptance:**
-- [ ] Failing tests commit first.
-- [ ] The new supervision verbs are visible only to processes holding the `session_manager` capability — no broad public surface.
-- [ ] Existing service supervision tests stay green.
-- [ ] No new syscall is added for supervision; `session_manager` consumes existing IPC + capabilities.
+- [x] Failing tests commit first. `kernel-core/tests/phase57_f3_session_supervisor.rs` (17 tests) committed red, then green.
+- [x] The new supervision verbs are visible only to processes holding the `session_manager` capability — no broad public surface. `kernel_core::session_supervisor::SupervisorCap` has a single named constructor `granted_for_session_manager_only`; `dispatch_authenticated` gates on `Option<&SupervisorCap>` and returns `CapabilityMissing` without invoking the backend when absent.
+- [x] Existing service supervision tests stay green. `kernel-core/src/service.rs` is untouched and `kernel-core/src/session/` is untouched (F.1 owns it). Full kernel-core test suite (1264 + integration tests) remains green.
+- [x] No new syscall is added for supervision; `session_manager` consumes existing IPC + capabilities. The transport is init's existing root-only `/run/init.cmd` control channel plus reads of `/run/services.status` for readiness/exit observation. F.4 will issue the first writes; F.2's adapter probes the IPC service registry as the readiness signal.
 
 ### F.4 — Recovery + text-mode fallback
 

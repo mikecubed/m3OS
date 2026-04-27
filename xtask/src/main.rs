@@ -374,6 +374,10 @@ fn build_userspace_bins() {
         // Registers a bind, injects the chord, observes the
         // `bind triggered` log via the regression's xtask wait.
         ("grab-hook-smoke", "grab-hook-smoke", true),
+        // Phase 57 Track F.2 — session_manager daemon. `needs_alloc =
+        // true` because the binary depends on `kernel-core` (session
+        // sequencer + supervisor codec) which uses `alloc` types.
+        ("session_manager", "session_manager", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -5385,6 +5389,17 @@ fn populate_ext2_files(
     // service.
     let gfx_demo_conf = "name=gfx-demo\ncommand=/bin/gfx-demo\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n";
 
+    // Phase 57 Track F.2: session_manager daemon — graphical-session
+    // orchestrator. No `depends=` because session_manager IS the
+    // orchestrator; everything else depends on session_manager being
+    // up. `restart=on-failure max_restart=3` matches the A.4 memo:
+    // "init supervises session_manager with restart=on-failure
+    // max_restart=3". The `on-restart=session_manager.restart` line is
+    // a forward-compatibility hint consumed by F.4's recovery state
+    // machine; init's parser logs an unknown-key warning for it in
+    // F.2 but loads the service unchanged.
+    let session_manager_conf = "name=session_manager\ncommand=/bin/session_manager\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=\non-restart=session_manager.restart\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -5408,6 +5423,7 @@ fn populate_ext2_files(
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let gfx_demo_conf_tmp = output_dir.join("_tmp_gfx_demo_conf");
+    let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -5429,6 +5445,8 @@ fn populate_ext2_files(
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
     fs::write(&gfx_demo_conf_tmp, gfx_demo_conf).expect("write temp gfx-demo.conf");
+    fs::write(&session_manager_conf_tmp, session_manager_conf)
+        .expect("write temp session_manager.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -5745,6 +5763,10 @@ fn populate_ext2_files(
          sif etc/services.d/gfx-demo.conf mode 0x81A4\n\
          sif etc/services.d/gfx-demo.conf uid 0\n\
          sif etc/services.d/gfx-demo.conf gid 0\n\
+         write \"{session_manager_conf}\" etc/services.d/session_manager.conf\n\
+         sif etc/services.d/session_manager.conf mode 0x81A4\n\
+         sif etc/services.d/session_manager.conf uid 0\n\
+         sif etc/services.d/session_manager.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5774,6 +5796,7 @@ fn populate_ext2_files(
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
         gfx_demo_conf = gfx_demo_conf_tmp.display(),
+        session_manager_conf = session_manager_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -5822,6 +5845,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&hostname_tmp);
     let _ = fs::remove_file(&smoke_mode_tmp);
     let _ = fs::remove_file(&empty_tmp);
+    let _ = fs::remove_file(&session_manager_conf_tmp);
     // Phase 56 F.3: silently best-effort; the file only exists when the
     // M3OS_DISABLE_DISPLAY_SERVER env var was set.
     let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));
