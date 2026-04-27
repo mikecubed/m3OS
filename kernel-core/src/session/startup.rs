@@ -143,61 +143,51 @@ impl<'a> StartupSequence<'a> {
             }
         }
 
-        let total = self.steps.len();
-        let mut idx = 0;
-        while idx < total {
+        for idx in 0..self.steps.len() {
             let step_name = self.steps[idx].name();
             self.current = Some(step_name);
-
-            // Per-step attempt loop. attempts == number of `start()`
-            // invocations consumed; we cap at max_retries_per_step.
-            let mut attempts: u32 = 0;
-            let mut ready = false;
-            while attempts < max_retries_per_step {
-                // We are about to consume one attempt. If this is not
-                // the very first attempt for this step, reflect the
-                // mid-flight `Recovering` lifecycle state.
-                if attempts > 0 {
-                    self.state = SessionState::Recovering {
-                        step_name,
-                        retry_count: attempts,
-                    };
-                }
-                attempts = attempts.saturating_add(1);
-                let result = self.steps[idx].start();
-                match result {
-                    Ok(()) => {
-                        if self.steps[idx].is_ready() {
-                            ready = true;
-                            break;
-                        }
-                        // Start succeeded but endpoint is not yet
-                        // ready: another attempt is required.
-                    }
-                    Err(_) => {
-                        // Transient failure; another attempt is
-                        // required.
-                    }
-                }
-            }
-
-            if !ready {
-                // Retry budget exhausted. Roll back every
-                // already-started step in reverse order (best-effort:
-                // stop errors from individual steps are not allowed
-                // to abort the rollback, since the session is being
-                // abandoned anyway).
+            if !self.try_step_until_ready(idx, max_retries_per_step) {
+                // Retry budget exhausted on this step.
+                // `escalate_to_text_fallback` rolls back the started
+                // prefix in reverse order. The failing step is NOT in
+                // that prefix and is not stopped.
                 self.escalate_to_text_fallback();
                 return Ok(SessionState::TextFallback);
             }
-
-            // Step is ready; advance.
             self.started = self.started.saturating_add(1);
-            idx += 1;
         }
 
         self.state = SessionState::Running;
         Ok(SessionState::Running)
+    }
+
+    /// Inner per-step attempt loop. Calls `start()` up to
+    /// `max_retries_per_step` times. An attempt counts as "consumed"
+    /// regardless of whether `start` itself returned `Err` or whether
+    /// it returned `Ok(())` but `is_ready()` reported `false` — the
+    /// supervisor contract is "reach a ready endpoint within N tries".
+    /// Returns `true` if the step reached ready, `false` if the budget
+    /// was exhausted. Updates `self.state` to `Recovering` on retry.
+    fn try_step_until_ready(&mut self, idx: usize, max_retries_per_step: u32) -> bool {
+        let step_name = self.steps[idx].name();
+        let mut attempts: u32 = 0;
+        while attempts < max_retries_per_step {
+            // Reflect the mid-flight `Recovering` lifecycle state on
+            // every attempt after the first.
+            if attempts > 0 {
+                self.state = SessionState::Recovering {
+                    step_name,
+                    retry_count: attempts,
+                };
+            }
+            attempts = attempts.saturating_add(1);
+            // `Err(_)` and `Ok(()) && !is_ready()` both fall through to
+            // another attempt; `Ok(()) && is_ready()` succeeds.
+            if self.steps[idx].start().is_ok() && self.steps[idx].is_ready() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Snapshot of the current lifecycle state.
@@ -516,6 +506,35 @@ mod tests {
         // Rollback: only s0 (the only successfully-started step) was
         // stopped. s1 never reached "started" so it is not stopped.
         assert_eq!(stops, ["display_server"]);
+    }
+
+    #[test]
+    fn current_step_reports_failing_step_after_text_fallback() {
+        // After escalation, `current_step` returns the step that was
+        // being attempted when the retry cap was exhausted — useful for
+        // a supervisor's text-fallback log message.
+        let log = fresh_log();
+        let mut s0 = RecordingStep::new("display_server", log.clone());
+        let mut s1 = RecordingStep::new("kbd_server", log.clone()).fail_forever();
+        let mut steps: [&mut dyn SessionStep; 2] = [&mut s0, &mut s1];
+        let mut seq = StartupSequence::new(&mut steps);
+        let _ = seq.run(MAX_RETRIES_PER_STEP).expect("escalates");
+        assert_eq!(seq.current_step(), Some("kbd_server"));
+        assert_eq!(seq.state(), SessionState::TextFallback);
+    }
+
+    #[test]
+    fn run_after_text_fallback_returns_out_of_order() {
+        let log = fresh_log();
+        let mut s0 = RecordingStep::new("display_server", log.clone()).fail_forever();
+        let mut steps: [&mut dyn SessionStep; 1] = [&mut s0];
+        let mut seq = StartupSequence::new(&mut steps);
+        let outcome = seq.run(MAX_RETRIES_PER_STEP).expect("escalates");
+        assert_eq!(outcome, SessionState::TextFallback);
+        let err = seq
+            .run(MAX_RETRIES_PER_STEP)
+            .expect_err("re-running on TextFallback is rejected");
+        assert!(matches!(err, SessionError::OutOfOrder { .. }));
     }
 
     #[test]
@@ -859,6 +878,39 @@ mod tests {
             }
             // Sanity: total starts ≥ started prefix length.
             prop_assert!(starts_idx_in_log.len() >= started_names.len());
+        }
+
+        /// Positive invariant: if every step's behaviour fits within the
+        /// retry budget (no `FailForever`, no `SucceedAfter(n)` with
+        /// `n >= MAX_RETRIES_PER_STEP`), the sequencer must reach
+        /// `Running`. No sneaky path can produce `TextFallback` without
+        /// at least one step exhausting its budget.
+        #[test]
+        fn proptest_no_failure_implies_running(
+            // Constrain the strategy to behaviors that always succeed
+            // within the cap.
+            successes_after in proptest::collection::vec(0u32..MAX_RETRIES_PER_STEP, 0..6),
+        ) {
+            let names: [&'static str; 6] = [
+                "display_server", "kbd_server", "mouse_server",
+                "audio_server", "term", "extra",
+            ];
+            let log = fresh_log();
+            let mut owned: Vec<RecordingStep> = successes_after
+                .iter()
+                .enumerate()
+                .map(|(i, n)| RecordingStep::new(names[i], log.clone()).fail_starts(*n))
+                .collect();
+            let mut step_refs: Vec<&mut dyn SessionStep> =
+                owned.iter_mut().map(|s| s as &mut dyn SessionStep).collect();
+            let mut seq = StartupSequence::new(&mut step_refs);
+            let outcome = seq.run(MAX_RETRIES_PER_STEP).expect("run is total");
+            prop_assert_eq!(outcome, SessionState::Running);
+            // No stops were issued — Running is reached without rolling
+            // back any started step.
+            let calls = log.borrow();
+            let stops = calls.iter().filter(|c| matches!(c, StepCall::Stop(_))).count();
+            prop_assert_eq!(stops, 0);
         }
     }
 }
