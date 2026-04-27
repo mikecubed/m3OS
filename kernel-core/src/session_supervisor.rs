@@ -55,6 +55,38 @@ use core::convert::TryFrom;
 /// (32) so the codec cannot accept a name init cannot store.
 pub const MAX_SERVICE_NAME_BYTES: usize = 32;
 
+/// Declared graphical-session step order, fixed by the Phase 57 A.4
+/// memo. `session_manager` consumes this to drive the F.1
+/// [`crate::session::StartupSequence`] in declared order. Exposed here
+/// (rather than under `crate::session`) because the order is the
+/// supervisor-facing contract: each name in this slice corresponds to
+/// a service init knows by the same name.
+///
+/// Per the DRY rule in the Phase 57 task list:
+///
+/// > Session-step ordering (display → input → audio → term) lives once
+/// > in `kernel-core::session::startup` as a typed sequence;
+/// > `session_manager` consumes it.
+///
+/// The single declaration site is here. F.2's `session_manager` boot
+/// adapter constructs one [`crate::session::SessionStep`] per name in
+/// this slice; service-manifest authors do not redeclare ordering
+/// separately.
+pub const DECLARED_SESSION_STEP_NAMES: &[&str] = &[
+    "display_server",
+    "kbd_server",
+    "mouse_server",
+    "audio_server",
+    "term",
+];
+
+/// Accessor for [`DECLARED_SESSION_STEP_NAMES`]. Function form so test
+/// suites can intercept it via mock-friendly indirection if needed
+/// without modifying the constant's address.
+pub const fn declared_session_step_names() -> &'static [&'static str] {
+    DECLARED_SESSION_STEP_NAMES
+}
+
 /// Verb tags. Stable; reordering is a wire-incompatible change.
 const TAG_VERB_START: u8 = 0x01;
 const TAG_VERB_STOP: u8 = 0x02;

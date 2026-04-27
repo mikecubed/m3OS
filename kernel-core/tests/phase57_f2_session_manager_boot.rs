@@ -229,12 +229,16 @@ fn run_session<B: SupervisorBackend>(backend: &mut B) -> SessionState {
         },
     ];
 
+    let (s0, rest) = steps.split_at_mut(1);
+    let (s1, rest) = rest.split_at_mut(1);
+    let (s2, rest) = rest.split_at_mut(1);
+    let (s3, s4) = rest.split_at_mut(1);
     let mut step_refs: [&mut dyn SessionStep; 5] = [
-        &mut steps[0],
-        &mut steps[1],
-        &mut steps[2],
-        &mut steps[3],
-        &mut steps[4],
+        &mut s0[0],
+        &mut s1[0],
+        &mut s2[0],
+        &mut s3[0],
+        &mut s4[0],
     ];
     let mut seq = StartupSequence::new(&mut step_refs);
     seq.run(MAX_RETRIES_PER_STEP).expect("run is total")
