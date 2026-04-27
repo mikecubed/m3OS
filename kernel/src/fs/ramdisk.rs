@@ -226,6 +226,12 @@ static DISPLAY_MULTI_CLIENT_SMOKE_ELF: &[u8] =
 // Phase 56 close-out (G.2): keybind grab-hook smoke client.
 static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
 
+// Phase 57 Track F.2: session_manager daemon — graphical-session
+// orchestrator. Drives display_server → kbd_server → mouse_server →
+// audio_server → term in declared order via
+// kernel_core::session::StartupSequence.
+static SESSION_MANAGER_ELF: &[u8] = generated_initrd_asset!("session_manager");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -380,6 +386,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "display_server",
         RamdiskNode::File {
             content: DISPLAY_SERVER_ELF,
+        },
+    ),
+    // Phase 57 Track F.2: session_manager daemon — graphical-session
+    // orchestrator.
+    (
+        "session_manager",
+        RamdiskNode::File {
+            content: SESSION_MANAGER_ELF,
         },
     ),
     // Phase 32: build tools and utilities

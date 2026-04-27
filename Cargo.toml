@@ -81,6 +81,8 @@ members = [
     "userspace/display-multi-client-smoke",
     # Phase 56 close-out (G.2) — keybind grab-hook smoke client
     "userspace/grab-hook-smoke",
+    # Phase 57 Track F.2 — session manager daemon (graphical-session orchestrator)
+    "userspace/session_manager",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
