@@ -17,20 +17,15 @@
 pub const REJECT_LOG_WINDOW_TICKS: u32 = 1;
 
 /// Per-client admission state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClientState {
     /// No client owns the slot.
+    #[default]
     Idle,
     /// A client owns the slot. The `client_id` is the protocol-level
     /// identifier (the IPC reply label or socket fd) the io loop
     /// uses to route subsequent messages to the same `Stream`.
     Owned { client_id: u32 },
-}
-
-impl Default for ClientState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// At-most-one-client admission registry. Owned by the io loop;
