@@ -9,44 +9,87 @@
 //! events emitted from the device-host claim path. A workspace-wide grep
 //! for any of these constants must return exactly one declaration site.
 //!
-//! TDD red-commit stage: the symbols below are declared only so the
-//! Track C.1 tests link; their values are deliberately wrong (or absent)
-//! so the test suite fails until the green commit lands the real
-//! constants.
+//! The kernel-side `sys_device_claim` path itself does **not** filter
+//! claims by PCI ID — any ring-3 driver (process whose `exec_path` lives
+//! under `/drivers/`) may claim any unclaimed BDF, and audio is no
+//! exception. What this module supplies is a classifier the syscall
+//! boundary uses to tag observability events with `subsystem=audio.device`
+//! when the claimed device is the audio controller, so log search and
+//! triage do not need to translate PCI IDs by hand.
+//!
+//! The module is `no_std` + `alloc`-free so the kernel and host tests
+//! compile against it without a heap allocator. All identifiers are
+//! `const` so they participate in `match` arms.
 
-/// Intel PCI vendor identifier — placeholder, real value pinned by the
-/// green commit.
-pub const PCI_VENDOR_INTEL: u16 = 0;
+/// Intel PCI vendor identifier (`0x8086`).
+///
+/// Shared with NVMe, e1000, and AC'97 — the kernel does not select on
+/// vendor alone; the (vendor, device) pair is the key.
+pub const PCI_VENDOR_INTEL: u16 = 0x8086;
 
-/// Intel 82801AA AC'97 audio controller device identifier — placeholder,
-/// real value pinned by the green commit.
-pub const PCI_DEVICE_AC97: u16 = 0;
+/// Intel 82801AA AC'97 audio controller device identifier (`0x2415`).
+///
+/// Phase 57's first supported audio target. Combined with
+/// [`PCI_VENDOR_INTEL`] this names the exact PCI function the
+/// `audio_server` ring-3 driver (Track D) claims via `sys_device_claim`.
+pub const PCI_DEVICE_AC97: u16 = 0x2415;
 
-/// Observability subsystem name for audio device-host events —
-/// placeholder, real value pinned by the green commit.
-pub const SUBSYSTEM_AUDIO_DEVICE: &str = "";
+/// Observability subsystem name for audio device-host events.
+///
+/// Used as the `subsystem=` field in structured log events emitted from
+/// the kernel-side claim path when the claimed BDF resolves to the audio
+/// controller. Phase 57 task list pins this exact string for the
+/// `iommu.missing_bar_coverage` BAR-coverage failure log; the same string
+/// is reused by `audio_server` and the `audio_client` library so a single
+/// grep finds every audio-stack log line.
+pub const SUBSYSTEM_AUDIO_DEVICE: &str = "audio.device";
 
-/// Device class enum — variants and arms land in the green commit.
+/// PCI vendor/device pair tag that classifies a claim as the audio
+/// device class.
+///
+/// Pure data — kept as `(u16, u16)` rather than a custom struct so it
+/// matches the on-the-wire representation used by `pci_config_read_u32`
+/// at offset 0 (which packs vendor in the low 16 bits and device in the
+/// high 16 bits). Variants other than `AudioAc97` are not declared
+/// speculatively per YAGNI; future device classes (e.g. additional
+/// audio controllers if HDA lands later) will gain their own entries
+/// when they have a concrete consumer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum DeviceClass {
-    /// Placeholder discriminant; the green commit replaces this with the
-    /// real `AudioAc97` variant.
+    /// The Intel 82801AA AC'97 audio controller (`0x8086:0x2415`).
     AudioAc97,
 }
 
 impl DeviceClass {
-    /// Subsystem name for the device class — green commit returns the
-    /// real string.
+    /// Subsystem name used in structured log events — see
+    /// [`SUBSYSTEM_AUDIO_DEVICE`].
     pub const fn subsystem(self) -> &'static str {
-        ""
+        match self {
+            DeviceClass::AudioAc97 => SUBSYSTEM_AUDIO_DEVICE,
+        }
     }
 }
 
-/// Classify a PCI `(vendor, device)` pair — red-commit stub returns
-/// `None` for every input.
-pub const fn classify_pci_id(_vendor: u16, _device: u16) -> Option<DeviceClass> {
-    None
+/// Classify a PCI `(vendor, device)` pair into a known device class.
+///
+/// Returns `Some(class)` when the pair matches a recognized device the
+/// kernel emits structured observability events for; returns `None` when
+/// the pair is unknown. An unknown pair is not an error — it just means
+/// the claim path emits the default observability tag (no subsystem
+/// override). The kernel's `sys_device_claim` path is BDF-keyed and does
+/// not gate on this classifier; failure to classify never blocks a
+/// claim.
+///
+/// The `Some(_)` arm intentionally does not exhaust the universe of
+/// audio controllers: HDA, virtio-sound, and other future targets will
+/// be added when Phase 57's first audio target ships and a concrete
+/// consumer exists. Phase 57 lands AC'97 only.
+pub const fn classify_pci_id(vendor: u16, device: u16) -> Option<DeviceClass> {
+    match (vendor, device) {
+        (PCI_VENDOR_INTEL, PCI_DEVICE_AC97) => Some(DeviceClass::AudioAc97),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
