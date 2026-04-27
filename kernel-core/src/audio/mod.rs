@@ -24,6 +24,8 @@
 pub mod format;
 pub mod protocol;
 pub mod ring;
+#[cfg(test)]
+mod ring_proptest;
 
 pub use format::{ChannelLayout, PcmFormat, SampleRate, frame_size_bytes};
 pub use protocol::{
