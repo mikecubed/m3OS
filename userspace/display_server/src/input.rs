@@ -312,9 +312,26 @@ impl InputSource for MouseInputSource {
             return None;
         }
 
-        PointerEvent::decode(&buf).ok().map(|(ev, _)| ev)
+        let decoded = PointerEvent::decode(&buf).ok().map(|(ev, _)| ev);
+        // Phase 56 follow-up diagnostic: log once on first decoded
+        // PointerEvent so we can confirm the pipeline reaches the
+        // dispatcher. Removed once the mouse stack is observed
+        // working.
+        if decoded.is_some()
+            && !MOUSE_FIRST_EVENT_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "display_server: diag: first PointerEvent decoded from mouse_server\n",
+            );
+        }
+        decoded
     }
 }
+
+/// See [`MouseInputSource::poll_pointer`].
+static MOUSE_FIRST_EVENT_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Dispatcher wiring
