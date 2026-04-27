@@ -16,9 +16,18 @@
 //! [`format`] declares the PCM-format value types.
 //! [`ring`] declares the single-producer / single-consumer ring-buffer
 //! state model that the audio_server io loop uses to track DMA progress.
+//! [`protocol`] declares the wire-format codec used between
+//! `audio_server` and `audio_client`. [`AudioError`] (declared in
+//! [`protocol`]) is the single audio-error type consumed by both the
+//! protocol codec and the errno-mapping helper [`errno`].
 
 pub mod format;
+pub mod protocol;
 pub mod ring;
 
 pub use format::{ChannelLayout, PcmFormat, SampleRate, frame_size_bytes};
+pub use protocol::{
+    AudioControlCommand, AudioControlEvent, AudioError, ClientMessage, MAX_SUBMIT_BYTES,
+    ProtocolError, ServerMessage,
+};
 pub use ring::{AudioRingState, AudioSink, RingError};
