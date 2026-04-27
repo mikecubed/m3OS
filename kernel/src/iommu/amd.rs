@@ -862,6 +862,20 @@ impl AmdViUnit {
     /// `AlreadyMapped` is treated as success — the range may have been
     /// pre-installed by `pre_map_reserved`. Any other error is propagated
     /// and the caller should treat the domain as unusable.
+    ///
+    /// Phase 57 Track C.2: this function is reused unchanged for the
+    /// audio device class (Intel AC'97, `0x8086:0x2415`) on AMD-Vi
+    /// platforms. AC'97 ships both BARs in I/O space, so the kernel-
+    /// side claim path filters them before they reach this function and
+    /// the loop is a no-op for the audio claim. The shape of this loop
+    /// is verbatim-mirrored against [`super::intel::VtdUnit::install_bar_identity_maps`]
+    /// — both call `self.map(domain, Iova(aligned_base), PhysAddr(aligned_base),
+    /// aligned_len, READ | WRITE)` with the same 4 KiB-aligned base/len
+    /// computation. Vendor-specific page-table walk lives below `map()`,
+    /// not here, so the two paths are LSP-equivalent at the
+    /// `kernel_core::iommu::bar_coverage` layer. Vendor parity for
+    /// MMIO-bearing audio targets is a documented follow-up tracked in
+    /// the Phase 57 design doc once a second audio backend lands.
     #[allow(dead_code)]
     pub fn install_bar_identity_maps(
         &mut self,

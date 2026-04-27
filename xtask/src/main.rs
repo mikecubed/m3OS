@@ -49,12 +49,20 @@ enum QemuDisplayMode {
 /// Phase 55a Track F.1 adds the `iommu` field, driven by `--iommu`: when set,
 /// [`IOMMU_QEMU_ARGS`] is appended to the QEMU command line so the guest
 /// boots on top of an emulated Intel VT-d unit.
+///
+/// Phase 57 Track C.2 adds the `audio` field, driven by `--device audio`: when
+/// set, `device-smoke` runs the kernel-core BAR-coverage assertions for the
+/// AC'97 audio device class. The full QEMU-side audio smoke (Track H.5) lands
+/// alongside the `audio_server` ring-3 driver (Track D), so this flag is
+/// currently a unit-test-only toggle — see `audio_smoke_kernel_core`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeviceSet {
     /// Attach a QEMU NVMe controller with a 64 MiB backing image.
     nvme: bool,
     /// Replace the default virtio-net NIC with the Intel 82540EM e1000.
     e1000: bool,
+    /// Run the AC'97 BAR-coverage kernel-core assertions (Phase 57 C.2).
+    audio: bool,
     /// Enable the emulated Intel VT-d IOMMU (`--iommu`).
     iommu: bool,
 }
@@ -98,9 +106,10 @@ fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> 
     match name {
         "nvme" => devices.nvme = true,
         "e1000" => devices.e1000 = true,
+        "audio" => devices.audio = true,
         other => {
             return Err(format!(
-                "unknown `--device` value `{other}` (supported: nvme, e1000)"
+                "unknown `--device` value `{other}` (supported: nvme, e1000, audio)"
             ));
         }
     }
@@ -245,7 +254,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000 [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -4516,11 +4525,15 @@ struct DeviceSmokeArgs {
     display: bool,
 }
 
-/// Parse `cargo xtask device-smoke [--device nvme|e1000] [--iommu]
+/// Parse `cargo xtask device-smoke [--device nvme|e1000|audio] [--iommu]
 ///   [--timeout <secs>] [--display]` into a [`DeviceSmokeArgs`].
 ///
 /// Device and IOMMU flags are handled by [`extract_device_flags`]; the
 /// remaining tokens are walked for `--timeout` / `--display`.
+///
+/// Phase 57 Track C.2 added the `audio` device flag — see
+/// [`run_audio_kernel_core_smoke`] for the kernel-core unit-test wrapper
+/// that arm executes.
 fn parse_device_smoke_args(args: &[String]) -> Result<DeviceSmokeArgs, String> {
     let (devices, remaining) = extract_device_flags(args)?;
     let mut timeout_secs = 120u64;
@@ -4689,6 +4702,47 @@ fn device_smoke_steps(devices: DeviceSet) -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 57 Track C.2 — run the kernel-core BAR-coverage smoke for the
+/// AC'97 audio device class.
+///
+/// The full QEMU-side audio smoke (Track H.5) lands alongside the
+/// `audio_server` ring-3 driver (Track D). Until that arrives, the
+/// audio device-smoke is a kernel-core unit-test pass that exercises
+/// `kernel-core/tests/phase57_c2_audio_bar_coverage.rs` — pinning that
+/// AC'97's PIO-only BAR layout produces an empty `BarCoverage` set,
+/// that hypothetical MMIO BARs identity-map via the same primitive,
+/// and that VT-d / AMD-Vi share that primitive.
+///
+/// The runner uses the same kernel-core target the rest of the host
+/// test pipeline uses (`x86_64-unknown-linux-gnu`). Exits non-zero if
+/// the kernel-core test fails so CI can fail closed on a regression.
+fn run_audio_kernel_core_smoke() {
+    println!("device-smoke (audio): running kernel-core AC'97 BAR-coverage assertions");
+    let status = Command::new(env!("CARGO"))
+        .current_dir(workspace_root())
+        .args([
+            "test",
+            "--package",
+            "kernel-core",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+            "--test",
+            "phase57_c2_audio_bar_coverage",
+        ])
+        .status()
+        .expect("failed to run kernel-core audio BAR-coverage test");
+
+    if !status.success() {
+        eprintln!(
+            "device-smoke (audio): FAILED — \
+             rerun with `cargo test -p kernel-core --target {KERNEL_CORE_HOST_TARGET} \
+             --test phase57_c2_audio_bar_coverage` to see the failure"
+        );
+        std::process::exit(1);
+    }
+    println!("device-smoke (audio): kernel-core BAR-coverage PASSED");
+}
+
 /// Run the Phase 55b F.4 device-path data smoke for the requested `devices`.
 ///
 /// Builds the kernel, creates the UEFI image and data disk, then launches QEMU
@@ -4698,11 +4752,29 @@ fn device_smoke_steps(devices: DeviceSet) -> Vec<SmokeStep> {
 ///
 /// When neither `--device nvme` nor `--device e1000` is given the command
 /// prints a helpful diagnostic and exits 1 rather than running a no-op smoke.
+///
+/// Phase 57 Track C.2: `--device audio` runs the kernel-core BAR-coverage
+/// assertions for the AC'97 audio device class. The full QEMU-side audio
+/// smoke (Track H.5) lands alongside the `audio_server` ring-3 driver
+/// (Track D), so the audio arm is currently a unit-test-only wrapper that
+/// exercises `cargo test -p kernel-core --test phase57_c2_audio_bar_coverage`.
 fn cmd_device_smoke(args: &DeviceSmokeArgs) {
-    if !args.devices.nvme && !args.devices.e1000 {
+    if args.devices.audio {
+        run_audio_kernel_core_smoke();
+        // The audio arm composes with other arms below — it does not return
+        // early when nvme or e1000 are also requested. When audio is the
+        // only flag, finish here so we don't fall through into the QEMU
+        // launch path with an empty step list.
+        if !args.devices.nvme && !args.devices.e1000 {
+            return;
+        }
+    }
+
+    if !args.devices.nvme && !args.devices.e1000 && !args.devices.audio {
         eprintln!(
-            "device-smoke: no device selected — pass --device nvme or --device e1000\n\
-             Usage: cargo xtask device-smoke [--device nvme|e1000] [--iommu] \
+            "device-smoke: no device selected — pass --device nvme, --device e1000, \
+             or --device audio\n\
+             Usage: cargo xtask device-smoke [--device nvme|e1000|audio] [--iommu] \
              [--timeout <secs>] [--display]"
         );
         std::process::exit(1);
@@ -7210,6 +7282,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: false,
             },
             wants_debug_crash_marker: false,
@@ -7243,6 +7316,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: false,
             },
             wants_debug_crash_marker: false,
@@ -7273,6 +7347,7 @@ fn regression_tests() -> Vec<RegressionTest> {
         devices: DeviceSet {
             nvme: false,
             e1000: true,
+            audio: false,
             iommu: false,
         },
         wants_debug_crash_marker: false,
@@ -7300,6 +7375,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             devices: DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: false,
             },
             wants_debug_crash_marker: false,
@@ -9631,6 +9707,7 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: true,
+                audio: false,
                 iommu: false,
             },
         );
@@ -9658,6 +9735,7 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: false,
             },
             Some(fake_nvme),
@@ -9697,6 +9775,7 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: true,
             },
             Some(fake_nvme),
@@ -9736,6 +9815,7 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                audio: false,
                 iommu: true,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
@@ -9787,6 +9867,7 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                audio: false,
                 iommu: true,
             },
             None,
@@ -9843,6 +9924,7 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                audio: false,
                 iommu: true,
             },
             None,
@@ -9872,6 +9954,7 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: false,
+                audio: false,
                 iommu: true,
             },
             None,
@@ -10071,11 +10154,13 @@ mod tests {
         let base = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            audio: false,
             iommu: false,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
+            audio: false,
             iommu: true,
         });
 
@@ -10849,6 +10934,84 @@ mod tests {
             "e1000_driver main.rs must NOT contain the deferred `icmp:SKIP` \
              sentinel once the server loop is live — remove it to keep smoke \
              expectations coherent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 57 Track C.3 — buffer-empty notification surface
+    // -----------------------------------------------------------------------
+    //
+    // Per A.3 (pure-userspace IPC choice for audio), C.3 collapses to a
+    // documentation-only deliverable. The audio device's IRQ vector flows
+    // through the same `signal_irq_bit` → `WakeKind::Notification(bits)`
+    // path that e1000 and NVMe use. The C.3 acceptance asks for the touched
+    // module's docs to list audio under the existing ISR-safety
+    // invariants. These tests pin the docs so a refactor cannot silently
+    // drop them.
+
+    /// `kernel/src/ipc/notification.rs`'s module-level docs must name audio
+    /// alongside the existing ISR-safe IRQ consumers (keyboard, e1000,
+    /// NVMe). Per Phase 57 C.3 acceptance: "Module-level docs in the
+    /// touched file list audio under existing ISR-safety invariants."
+    #[test]
+    fn notification_module_docs_list_audio_under_isr_safety() {
+        let source = workspace_file("kernel/src/ipc/notification.rs");
+        // The C.3 acceptance is satisfied by a module-level comment that
+        // names the audio device class as a consumer of the same ISR-safe
+        // signal path.  Assert the literal `audio_server` appears in the
+        // module doc block before the first non-doc item.
+        let module_end = source
+            .find("\nuse ")
+            .or_else(|| source.find("\n#![allow"))
+            .unwrap_or(source.len());
+        let module_docs = &source[..module_end];
+        assert!(
+            module_docs.contains("audio_server"),
+            "kernel/src/ipc/notification.rs module docs must list `audio_server` \
+             alongside e1000/NVMe under the ISR-safe IRQ delivery path \
+             (Phase 57 C.3 acceptance)"
+        );
+    }
+
+    /// `signal_irq_bit` must be reusable for the audio device's IRQ vector
+    /// without modification. Phase 57 C.3 acceptance: the path between an
+    /// audio-device IRQ and userspace is a Phase 55c bound notification
+    /// with documented `WakeKind::Notification(bits)` payload — i.e., the
+    /// same primitive every other ring-3 driver uses.
+    #[test]
+    fn signal_irq_bit_doc_names_audio_alongside_existing_isr_consumers() {
+        let source = workspace_file("kernel/src/ipc/notification.rs");
+        // Find the doc block that precedes the `signal_irq_bit` function
+        // and assert that its examples enumerate audio_server.  This
+        // catches a refactor that drops the audio cross-reference.
+        let fn_start = source
+            .find("pub fn signal_irq_bit")
+            .expect("signal_irq_bit must be defined");
+        // Walk backwards to the start of the preceding doc block — the
+        // last `///` line before the fn signature.
+        let pre = &source[..fn_start];
+        // Find the last sequence of ///-prefixed lines before the fn.
+        let doc_block_start = pre
+            .rfind("\n///")
+            .map(|i| {
+                // Walk further back to capture the *whole* doc block.
+                let mut idx = i;
+                while idx > 0 {
+                    let next_line_start = pre[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let line = &pre[next_line_start..idx];
+                    if !line.trim_start().starts_with("///") {
+                        break;
+                    }
+                    idx = next_line_start.saturating_sub(1);
+                }
+                idx
+            })
+            .unwrap_or(0);
+        let doc_block = &pre[doc_block_start..];
+        assert!(
+            doc_block.contains("audio_server"),
+            "signal_irq_bit doc block must enumerate audio_server alongside \
+             the existing ring-3 driver consumers (Phase 57 C.3 acceptance)"
         );
     }
 }

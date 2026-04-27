@@ -8,6 +8,7 @@
 // The module is `no_std` + `alloc`-only so it compiles for the kernel and is
 // still testable on the host via `cargo test -p kernel-core`.
 
+pub mod audio_class;
 pub mod dma_logic;
 pub mod irq_logic;
 pub mod mmio_bounds;
@@ -15,6 +16,10 @@ pub mod registry_logic;
 pub mod syscalls;
 pub mod types;
 
+pub use audio_class::{
+    AC97_BAR_LAYOUT, BarLayout, DeviceClass, PCI_DEVICE_AC97, PCI_VENDOR_INTEL,
+    SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
+};
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
     validate_size_align,
