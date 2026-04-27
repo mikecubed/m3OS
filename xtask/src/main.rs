@@ -10936,4 +10936,82 @@ mod tests {
              expectations coherent"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 57 Track C.3 — buffer-empty notification surface
+    // -----------------------------------------------------------------------
+    //
+    // Per A.3 (pure-userspace IPC choice for audio), C.3 collapses to a
+    // documentation-only deliverable. The audio device's IRQ vector flows
+    // through the same `signal_irq_bit` → `WakeKind::Notification(bits)`
+    // path that e1000 and NVMe use. The C.3 acceptance asks for the touched
+    // module's docs to list audio under the existing ISR-safety
+    // invariants. These tests pin the docs so a refactor cannot silently
+    // drop them.
+
+    /// `kernel/src/ipc/notification.rs`'s module-level docs must name audio
+    /// alongside the existing ISR-safe IRQ consumers (keyboard, e1000,
+    /// NVMe). Per Phase 57 C.3 acceptance: "Module-level docs in the
+    /// touched file list audio under existing ISR-safety invariants."
+    #[test]
+    fn notification_module_docs_list_audio_under_isr_safety() {
+        let source = workspace_file("kernel/src/ipc/notification.rs");
+        // The C.3 acceptance is satisfied by a module-level comment that
+        // names the audio device class as a consumer of the same ISR-safe
+        // signal path.  Assert the literal `audio_server` appears in the
+        // module doc block before the first non-doc item.
+        let module_end = source
+            .find("\nuse ")
+            .or_else(|| source.find("\n#![allow"))
+            .unwrap_or(source.len());
+        let module_docs = &source[..module_end];
+        assert!(
+            module_docs.contains("audio_server"),
+            "kernel/src/ipc/notification.rs module docs must list `audio_server` \
+             alongside e1000/NVMe under the ISR-safe IRQ delivery path \
+             (Phase 57 C.3 acceptance)"
+        );
+    }
+
+    /// `signal_irq_bit` must be reusable for the audio device's IRQ vector
+    /// without modification. Phase 57 C.3 acceptance: the path between an
+    /// audio-device IRQ and userspace is a Phase 55c bound notification
+    /// with documented `WakeKind::Notification(bits)` payload — i.e., the
+    /// same primitive every other ring-3 driver uses.
+    #[test]
+    fn signal_irq_bit_doc_names_audio_alongside_existing_isr_consumers() {
+        let source = workspace_file("kernel/src/ipc/notification.rs");
+        // Find the doc block that precedes the `signal_irq_bit` function
+        // and assert that its examples enumerate audio_server.  This
+        // catches a refactor that drops the audio cross-reference.
+        let fn_start = source
+            .find("pub fn signal_irq_bit")
+            .expect("signal_irq_bit must be defined");
+        // Walk backwards to the start of the preceding doc block — the
+        // last `///` line before the fn signature.
+        let pre = &source[..fn_start];
+        // Find the last sequence of ///-prefixed lines before the fn.
+        let doc_block_start = pre
+            .rfind("\n///")
+            .map(|i| {
+                // Walk further back to capture the *whole* doc block.
+                let mut idx = i;
+                while idx > 0 {
+                    let next_line_start = pre[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let line = &pre[next_line_start..idx];
+                    if !line.trim_start().starts_with("///") {
+                        break;
+                    }
+                    idx = next_line_start.saturating_sub(1);
+                }
+                idx
+            })
+            .unwrap_or(0);
+        let doc_block = &pre[doc_block_start..];
+        assert!(
+            doc_block.contains("audio_server"),
+            "signal_irq_bit doc block must enumerate audio_server alongside \
+             the existing ring-3 driver consumers (Phase 57 C.3 acceptance)"
+        );
+    }
 }
