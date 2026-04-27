@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod address_space;
+pub mod audio;
 pub mod buddy;
 pub mod cred;
 pub mod cross_cpu_free;

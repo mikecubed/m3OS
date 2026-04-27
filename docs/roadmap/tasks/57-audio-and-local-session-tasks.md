@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Architecture: audio target choice, session topology, capability map, ABI design memos | None | Done |
-| B | `kernel-core` audio pure-logic: PCM format types, ring-buffer state model, protocol codec, property tests | A | Planned |
+| B | `kernel-core` audio pure-logic: PCM format types, ring-buffer state model, protocol codec, property tests | A | Done |
 | C | Kernel substrate: audio device claim path through `device_host`, IOMMU BAR coverage for the audio device, vsync-equivalent buffer-empty notification | A, B | Planned |
 | D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Planned |
 | E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Planned |
@@ -180,12 +180,12 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The PCM contract (sample width, rate, channel count, endianness) is shared by `audio_server`, `audio_client`, `audio-demo`, and `term`'s bell path. Declaring it once in `kernel-core` is the DRY discipline for the phase and lets every consumer compute frame size and buffer math against the same source of truth.
 
 **Acceptance:**
-- [ ] Tests commit first (failing) and pass after implementation lands; `git log --follow kernel-core/src/audio/format.rs` shows red-before-green.
-- [ ] `PcmFormat` enumerates exactly the formats the chosen target supports in Phase 57 (per A.1) — no speculative variants.
-- [ ] `SampleRate` and `ChannelLayout` are typed enums with `pub fn as_hz()` / `pub fn channel_count()` accessors.
-- [ ] `frame_size_bytes(format, layout) -> usize` is total-function and panic-free; an exhaustive unit-test matrix covers every (format, layout) pair.
-- [ ] Visibility is tight: `kernel-core::audio` is the only public surface; private internals stay private.
-- [ ] No new external crate dependencies.
+- [x] Tests commit first (failing) and pass after implementation lands; `git log --follow kernel-core/src/audio/format.rs` shows red-before-green.
+- [x] `PcmFormat` enumerates exactly the formats the chosen target supports in Phase 57 (per A.1) — no speculative variants.
+- [x] `SampleRate` and `ChannelLayout` are typed enums with `pub fn as_hz()` / `pub fn channel_count()` accessors.
+- [x] `frame_size_bytes(format, layout) -> usize` is total-function and panic-free; an exhaustive unit-test matrix covers every (format, layout) pair.
+- [x] Visibility is tight: `kernel-core::audio` is the only public surface; private internals stay private.
+- [x] No new external crate dependencies.
 
 ### B.2 — Audio ring-buffer state model
 
@@ -194,11 +194,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** PCM playback hinges on a single producer (the client) and a single consumer (the device's DMA engine). Locking the ring state machine in pure logic — head, tail, capacity, underrun, fill-level — proves correctness before any DMA-adjacent unsafe code lands.
 
 **Acceptance:**
-- [ ] Failing tests commit first: `write_advances_head`, `consume_advances_tail`, `write_into_full_returns_wouldblock`, `consume_from_empty_returns_underrun`, `wrap_around_preserves_byte_order`, `fill_level_is_consistent_with_head_tail`.
-- [ ] `AudioSink` trait abstracts the consumer side; a `RecordingAudioSink` test double records every byte consumed and the contract-test suite exercises both impls (the recording double + the kernel-core in-memory ring) with the same harness.
-- [ ] `RingError` is a typed enum with `Underrun`, `WouldBlock`, `BufferTooSmall`; no stringly-typed errors.
-- [ ] At least 6 unit tests + 1 contract test commit red before any `AudioRingState` implementation.
-- [ ] The state model carries no allocation; it operates on a caller-supplied byte buffer.
+- [x] Failing tests commit first: `write_advances_head`, `consume_advances_tail`, `write_into_full_returns_wouldblock`, `consume_from_empty_returns_underrun`, `wrap_around_preserves_byte_order`, `fill_level_is_consistent_with_head_tail`.
+- [x] `AudioSink` trait abstracts the consumer side; a `RecordingAudioSink` test double records every byte consumed and the contract-test suite exercises both impls (the recording double + the kernel-core in-memory ring) with the same harness.
+- [x] `RingError` is a typed enum with `Underrun`, `WouldBlock`, `BufferTooSmall`; no stringly-typed errors.
+- [x] At least 6 unit tests + 1 contract test commit red before any `AudioRingState` implementation.
+- [x] The state model carries no allocation; it operates on a caller-supplied byte buffer.
 
 ### B.3 — Audio protocol codec
 
@@ -207,12 +207,12 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Following Phase 56's `kernel-core::display::protocol` pattern, the audio wire format lives once and is consumed by both `audio_server` and every client. Declaring it in `kernel-core` is the DRY discipline and makes the codec host-testable in isolation.
 
 **Acceptance:**
-- [ ] Failing tests commit first; encode/decode are pure functions with no allocation on the hot path.
-- [ ] `encode` writes into a caller-supplied `&mut [u8]` and returns bytes-written; `decode` consumes from `&[u8]` and returns `Result<(Message, bytes_consumed), ProtocolError>`.
-- [ ] Per-variant unit round-trip tests cover every message type.
-- [ ] At least one `proptest`-based round-trip test per family (client, server, control-command, control-event) proves `decode(encode(msg)) == msg` for arbitrary valid messages with at least 1024 cases.
-- [ ] A corrupted-framing property test feeds arbitrary `&[u8]` into `decode` and asserts the decoder returns a typed `ProtocolError` without panicking, looping unboundedly, or allocating unboundedly.
-- [ ] No declaration of any audio-protocol type appears anywhere else in the workspace; a repo-wide grep confirms exactly one definition site.
+- [x] Failing tests commit first; encode/decode are pure functions with no allocation on the hot path.
+- [x] `encode` writes into a caller-supplied `&mut [u8]` and returns bytes-written; `decode` consumes from `&[u8]` and returns `Result<(Message, bytes_consumed), ProtocolError>`.
+- [x] Per-variant unit round-trip tests cover every message type.
+- [x] At least one `proptest`-based round-trip test per family (client, server, control-command, control-event) proves `decode(encode(msg)) == msg` for arbitrary valid messages with at least 1024 cases.
+- [x] A corrupted-framing property test feeds arbitrary `&[u8]` into `decode` and asserts the decoder returns a typed `ProtocolError` without panicking, looping unboundedly, or allocating unboundedly.
+- [x] No declaration of any audio-protocol type appears anywhere else in the workspace; a repo-wide grep confirms exactly one definition site.
 
 ### B.4 — Property tests for ring + protocol interaction
 
@@ -221,9 +221,9 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** B.2's unit tests cover named cases; the property tests prove the ring stays consistent under arbitrary write/consume interleavings, which is how production playback actually exercises the model.
 
 **Acceptance:**
-- [ ] Given an arbitrary sequence of `write(bytes)`, `consume(n)`, and `reset()` operations, the ring's reported `fill_level` always equals `head - tail (mod capacity)`.
-- [ ] No sequence produces negative fill, fill > capacity, or out-of-bounds index access.
-- [ ] `proptest` configured with at least 1024 cases; runs under `cargo test -p kernel-core --release --target x86_64-unknown-linux-gnu` in default CI.
+- [x] Given an arbitrary sequence of `write(bytes)`, `consume(n)`, and `reset()` operations, the ring's reported `fill_level` always equals `head - tail (mod capacity)`.
+- [x] No sequence produces negative fill, fill > capacity, or out-of-bounds index access.
+- [x] `proptest` configured with at least 1024 cases; runs under `cargo test -p kernel-core --release --target x86_64-unknown-linux-gnu` in default CI.
 
 ### B.5 — `audio_error_to_neg_errno` helper
 
@@ -232,10 +232,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Every kernel-side or userspace-side audio path that surfaces a POSIX-style errno (e.g., a syscall, an IPC reply, a smoke binary's exit code) must agree on the mapping. Phase 55c established this pattern with `net_error_to_neg_errno`; Phase 57 follows it.
 
 **Acceptance:**
-- [ ] Failing tests commit first.
-- [ ] Every `AudioError` variant maps to a stable negative-errno value; the mapping is total.
-- [ ] Unit tests cover every variant.
-- [ ] No other file in the workspace performs `AudioError → errno` translation; a workspace-wide grep proves a single call site for each variant's mapping.
+- [x] Failing tests commit first.
+- [x] Every `AudioError` variant maps to a stable negative-errno value; the mapping is total.
+- [x] Unit tests cover every variant.
+- [x] No other file in the workspace performs `AudioError → errno` translation; a workspace-wide grep proves a single call site for each variant's mapping.
 
 ---
 
