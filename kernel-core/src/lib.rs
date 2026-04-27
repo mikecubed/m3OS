@@ -28,6 +28,7 @@ pub mod prng;
 pub mod pty;
 pub mod service;
 pub mod session;
+pub mod session_supervisor;
 pub mod size_class;
 pub mod slab;
 pub mod time;
