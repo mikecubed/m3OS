@@ -1,19 +1,97 @@
 //! PCM format value types — Phase 57 B.1.
 //!
-//! Tests-only module. The implementation lands in the next commit; these
-//! tests are committed first to satisfy the red-before-green TDD rule for
-//! Phase 57 Track B (see `docs/roadmap/tasks/57-audio-and-local-session-tasks.md`).
-//!
 //! The chosen first audio target (AC'97; see
 //! `docs/appendix/phase-57-audio-target-choice.md`) constrains the type
 //! surface to exactly:
 //!
-//! - `PcmFormat::S16Le` — 16-bit signed little-endian (only format AC'97
+//! - [`PcmFormat::S16Le`] — 16-bit signed little-endian (only format AC'97
 //!   exposes in Phase 57 with the variable-rate extension disabled).
-//! - `SampleRate::Hz48000` — 48 kHz fixed (`VRA` disabled).
-//! - `ChannelLayout::{Mono, Stereo}`.
+//! - [`SampleRate::Hz48000`] — 48 kHz fixed (`VRA` disabled).
+//! - [`ChannelLayout::Mono`] / [`ChannelLayout::Stereo`].
 //!
-//! No speculative variants are added.
+//! No speculative variants are added; widening the surface waits on a
+//! later phase and a documented backend change.
+//!
+//! [`frame_size_bytes`] is the total, panic-free function consumers use
+//! to size DMA rings, ring buffers, and submit windows. Adding a new
+//! `PcmFormat` or `ChannelLayout` variant in the future requires
+//! extending the match arms here and the unit-test matrix in the
+//! `tests` module — the compiler enforces that obligation because the
+//! enum match is exhaustive.
+
+/// Sample-encoding for the PCM stream.
+///
+/// The chosen first audio target (AC'97) supports exactly one format in
+/// Phase 57 — see the audio target memo. `S16Le` means: each sample is
+/// a 16-bit signed integer, little-endian on the wire and in the DMA
+/// ring buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum PcmFormat {
+    /// 16-bit signed integer, little-endian.
+    S16Le,
+}
+
+/// Sample rate.
+///
+/// AC'97 with the variable-rate extension (`VRA`) disabled exposes only
+/// the fixed 48 kHz rate in Phase 57. Adding a new variant requires
+/// re-enabling `VRA` and updating both the AC'97 register-program path
+/// (Track D.2) and the format-test matrix below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum SampleRate {
+    /// 48 000 samples per second.
+    Hz48000,
+}
+
+impl SampleRate {
+    /// Numeric sample rate in Hz.
+    pub const fn as_hz(&self) -> u32 {
+        match self {
+            SampleRate::Hz48000 => 48_000,
+        }
+    }
+}
+
+/// Channel layout.
+///
+/// AC'97 PCM-out supports both mono (single channel) and interleaved
+/// stereo (left / right). The driver path uses [`channel_count`] to
+/// compute frame-size and DMA-ring stride.
+///
+/// [`channel_count`]: ChannelLayout::channel_count
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum ChannelLayout {
+    /// Single audio channel.
+    Mono,
+    /// Two interleaved channels (left, right).
+    Stereo,
+}
+
+impl ChannelLayout {
+    /// Number of audio channels in this layout.
+    pub const fn channel_count(&self) -> u8 {
+        match self {
+            ChannelLayout::Mono => 1,
+            ChannelLayout::Stereo => 2,
+        }
+    }
+}
+
+/// Bytes per frame, where a "frame" is one sample per channel.
+///
+/// Total function: every (format, layout) pair has a defined value and
+/// the function never panics. Callers can use this to compute DMA
+/// buffer sizes (`frames * frame_size_bytes(...)`) without unwrapping a
+/// `Result`.
+pub const fn frame_size_bytes(format: PcmFormat, layout: ChannelLayout) -> usize {
+    let bytes_per_sample: usize = match format {
+        PcmFormat::S16Le => 2,
+    };
+    bytes_per_sample * (layout.channel_count() as usize)
+}
 
 #[cfg(test)]
 mod tests {
