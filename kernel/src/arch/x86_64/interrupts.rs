@@ -1008,6 +1008,13 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 /// The IRQ12 line is shared with the slave PIC; we therefore only consume
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
+/// Diagnostic flag: set to `true` the first time `mouse_handler` reads
+/// an AUX-tagged byte from the i8042 data port. A one-shot log fires
+/// at that moment so the operator can confirm IRQ 12 is actually
+/// firing for mouse motion. Phase 56 follow-up — remove once the
+/// mouse pipeline is observed working in production GUI sessions.
+static MOUSE_HANDLER_FIRST_AUX_BYTE: AtomicBool = AtomicBool::new(false);
+
 extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
@@ -1044,6 +1051,17 @@ extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
             break;
         }
         let byte = unsafe { data_port.read() };
+        // One-shot: log the first AUX byte we ever read so the
+        // operator can confirm IRQ 12 is firing for actual mouse
+        // motion (not just for the boot-time AUX init ACKs that
+        // `init_mouse` drained synchronously). See
+        // `MOUSE_HANDLER_FIRST_AUX_BYTE`.
+        if !MOUSE_HANDLER_FIRST_AUX_BYTE.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "[ps2] mouse_handler: first AUX byte 0x{:02x} (IRQ 12 firing)",
+                byte
+            );
+        }
         if super::ps2::feed_byte_isr(byte) {
             produced_packet = true;
         }
