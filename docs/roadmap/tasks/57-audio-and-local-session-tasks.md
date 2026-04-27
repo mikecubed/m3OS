@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Architecture: audio target choice, session topology, capability map, ABI design memos | None | Planned |
+| A | Architecture: audio target choice, session topology, capability map, ABI design memos | None | Done |
 | B | `kernel-core` audio pure-logic: PCM format types, ring-buffer state model, protocol codec, property tests | A | Planned |
 | C | Kernel substrate: audio device claim path through `device_host`, IOMMU BAR coverage for the audio device, vsync-equivalent buffer-empty notification | A, B | Planned |
 | D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Planned |
@@ -114,11 +114,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Three reasonable audio targets exist (Intel HDA, AC'97, virtio-sound). Each has different MMIO complexity, IRQ semantics, and QEMU + real-hardware coverage. The phase needs one chosen target before any kernel-core or driver code is written; the rejected alternatives' tradeoffs must be recorded so a later phase can revisit without re-litigating.
 
 **Acceptance:**
-- [ ] Memo names the chosen target verbatim and the rejected alternatives.
-- [ ] Memo records (a) QEMU device argument(s) needed, (b) real-hardware coverage on commodity x86_64, (c) approximate register/MMIO surface size, (d) DMA model (CORB/RIRB vs BDL vs vring), (e) IRQ shape.
-- [ ] Memo names the userspace API the target implies (open / submit / drain / close) so B.3 can codify it.
-- [ ] Memo cross-links the design doc and Phase 55b's ring-3 driver host pattern as the supervision precedent.
-- [ ] Memo records which `cargo xtask run-gui` flags need to change (e.g., `-audiodev` plus `-machine` device add) and the smallest-impact way to add them.
+- [x] Memo names the chosen target verbatim and the rejected alternatives.
+- [x] Memo records (a) QEMU device argument(s) needed, (b) real-hardware coverage on commodity x86_64, (c) approximate register/MMIO surface size, (d) DMA model (CORB/RIRB vs BDL vs vring), (e) IRQ shape.
+- [x] Memo names the userspace API the target implies (open / submit / drain / close) so B.3 can codify it.
+- [x] Memo cross-links the design doc and Phase 55b's ring-3 driver host pattern as the supervision precedent.
+- [x] Memo records which `cargo xtask run-gui` flags need to change (e.g., `-audiodev` plus `-machine` device add) and the smallest-impact way to add them.
 
 ### A.2 — Service topology and capability map
 
@@ -127,11 +127,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** A graphical local session that never names its processes, endpoints, and capabilities cannot be supervised or audited. Pinning the topology before implementation prevents "one big GUI blob" and prevents the kernel from quietly regaining presentation or audio responsibility later.
 
 **Acceptance:**
-- [ ] `audio_server` is named as the sole userspace owner of the chosen audio device and the only arbiter of the single PCM stream.
-- [ ] `session_manager` is named as the orchestrator of the graphical session lifecycle; it does not own the framebuffer, input devices, or audio device — those belong to Phase 56's display/input services and to `audio_server` respectively.
-- [ ] `term` is named as a regular display-server client plus an `audio_client` consumer (for the bell); it holds no privileged capabilities.
-- [ ] The document records which capability each service holds (`audio_server` → audio device claim + IRQ notification + send-cap to its own listening endpoint; `session_manager` → service-supervisor caps + control-socket cap; `term` → display-server send-cap + audio-server send-cap + PTY fd).
-- [ ] A process-level Mermaid diagram shows data flow: audio_client → audio_server → device for output; session_manager → display_server / kbd_server / mouse_server / audio_server / term for lifecycle; term → display_server for surfaces and input, term → audio_server for bell, term ↔ PTY for shell I/O.
+- [x] `audio_server` is named as the sole userspace owner of the chosen audio device and the only arbiter of the single PCM stream.
+- [x] `session_manager` is named as the orchestrator of the graphical session lifecycle; it does not own the framebuffer, input devices, or audio device — those belong to Phase 56's display/input services and to `audio_server` respectively.
+- [x] `term` is named as a regular display-server client plus an `audio_client` consumer (for the bell); it holds no privileged capabilities.
+- [x] The document records which capability each service holds (`audio_server` → audio device claim + IRQ notification + send-cap to its own listening endpoint; `session_manager` → service-supervisor caps + control-socket cap; `term` → display-server send-cap + audio-server send-cap + PTY fd).
+- [x] A process-level Mermaid diagram shows data flow: audio_client → audio_server → device for output; session_manager → display_server / kbd_server / mouse_server / audio_server / term for lifecycle; term → display_server for surfaces and input, term → audio_server for bell, term ↔ PTY for shell I/O.
 
 ### A.3 — Audio ABI shape
 
@@ -140,10 +140,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The audio surface can be a kernel-mediated set of syscalls (`sys_audio_*`, mirroring `sys_block_*`) or a pure-IPC contract on `audio_server`'s endpoint (mirroring Phase 56 `display_server`). The two shapes have different ABI costs and supervision implications; A.3 picks one and records the rationale before B.3 codifies the wire format.
 
 **Acceptance:**
-- [ ] Memo names the chosen shape (kernel syscall block vs userspace-only IPC) and the rationale.
-- [ ] Memo references the existing precedent that justifies the choice: Phase 56's `display_server` (userspace-only IPC) or Phase 55b's `RemoteBlockDevice` / `RemoteNic` (kernel-mediated facade).
-- [ ] Memo lists the exact files that change under the chosen shape (e.g., `kernel/src/audio/remote.rs` if a kernel facade is added; `userspace/lib/audio_client/src/lib.rs` either way).
-- [ ] Memo records the maximum bulk size for a single PCM submit and the rationale.
+- [x] Memo names the chosen shape (kernel syscall block vs userspace-only IPC) and the rationale.
+- [x] Memo references the existing precedent that justifies the choice: Phase 56's `display_server` (userspace-only IPC) or Phase 55b's `RemoteBlockDevice` / `RemoteNic` (kernel-mediated facade).
+- [x] Memo lists the exact files that change under the chosen shape (e.g., `kernel/src/audio/remote.rs` if a kernel facade is added; `userspace/lib/audio_client/src/lib.rs` either way).
+- [x] Memo records the maximum bulk size for a single PCM submit and the rationale.
 
 ### A.4 — Session-entry contract
 
@@ -152,10 +152,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** "How a user reaches the local graphical session" is the load-bearing local-system question of Phase 57. Without an explicit contract, the graphical-session story is just "init starts a few daemons and hopes."
 
 **Acceptance:**
-- [ ] Memo names the entry trigger: a fixed boot sequence ordered by `session_manager` (the default Phase 57 path, since m3OS has no "console session" UID concept yet), OR the memo proposes an explicit alternative trigger and the new concepts that would have to land first. Document the chosen trigger and the rejected alternative; if the alternative requires concepts not yet in the codebase (e.g., a console-session UID), name the prerequisite phase or memo that would deliver them.
-- [ ] Memo names the explicit ordered startup steps `session_manager` runs and the failure handling for each.
-- [ ] Memo names the failure-recovery contract: which failures escalate to `text-fallback`, which to a single restart attempt, and where the restart cap lives (per F.4).
-- [ ] Memo records how a developer reaches the text-mode admin path from the graphical session (input keychord owned by Phase 56's grab hook, or a `m3ctl session-stop` verb, or both — pick one; record the rejected alternative).
+- [x] Memo names the entry trigger: a fixed boot sequence ordered by `session_manager` (the default Phase 57 path, since m3OS has no "console session" UID concept yet), OR the memo proposes an explicit alternative trigger and the new concepts that would have to land first. Document the chosen trigger and the rejected alternative; if the alternative requires concepts not yet in the codebase (e.g., a console-session UID), name the prerequisite phase or memo that would deliver them.
+- [x] Memo names the explicit ordered startup steps `session_manager` runs and the failure handling for each.
+- [x] Memo names the failure-recovery contract: which failures escalate to `text-fallback`, which to a single restart attempt, and where the restart cap lives (per F.4).
+- [x] Memo records how a developer reaches the text-mode admin path from the graphical session (input keychord owned by Phase 56's grab hook, or a `m3ctl session-stop` verb, or both — pick one; record the rejected alternative).
 
 ### A.5 — Adopt Phase 55b ring-3 driver-host pattern for the audio device
 
@@ -164,10 +164,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The kernel must not regain a custom audio driver in ring 0. Phase 55b's ring-3 driver-host pattern is the precedent; A.5 records that Phase 57 adopts it explicitly so a later phase cannot quietly move audio back into the kernel.
 
 **Acceptance:**
-- [ ] The Phase 57 design doc gains a `Driver hosting and supervision` subsection naming `audio_server` as a Phase 55b-style ring-3 supervised driver, claiming its device through `sys_device_claim`.
-- [ ] The subsection records that audio uses Phase 55c bound notifications + `RecvResult` for IRQ multiplexing (D.4 wires it; A.5 declares the contract).
-- [ ] The subsection cross-links Phase 55b, 55c, and the chosen-target memo (A.1).
-- [ ] The subsection records what is **not** changed in the kernel: the kernel does not learn audio; it only learns "device claim covers the audio BAR(s)."
+- [x] The Phase 57 design doc gains a `Driver hosting and supervision` subsection naming `audio_server` as a Phase 55b-style ring-3 supervised driver, claiming its device through `sys_device_claim`.
+- [x] The subsection records that audio uses Phase 55c bound notifications + `RecvResult` for IRQ multiplexing (D.4 wires it; A.5 declares the contract).
+- [x] The subsection cross-links Phase 55b, 55c, and the chosen-target memo (A.1).
+- [x] The subsection records what is **not** changed in the kernel: the kernel does not learn audio; it only learns "device claim covers the audio BAR(s)."
 
 ---
 
