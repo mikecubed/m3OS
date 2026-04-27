@@ -232,6 +232,11 @@ static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
 // kernel_core::session::StartupSequence.
 static SESSION_MANAGER_ELF: &[u8] = generated_initrd_asset!("session_manager");
 
+// Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
+// Exposed under /bin so `init` can launch it via the standard
+// service-config path (`command=/bin/audio_server`).
+static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -394,6 +399,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "session_manager",
         RamdiskNode::File {
             content: SESSION_MANAGER_ELF,
+        },
+    ),
+    // Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
+    (
+        "audio_server",
+        RamdiskNode::File {
+            content: AUDIO_SERVER_ELF,
         },
     ),
     // Phase 32: build tools and utilities

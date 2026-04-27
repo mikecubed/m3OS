@@ -378,6 +378,11 @@ fn build_userspace_bins() {
         // true` because the binary depends on `kernel-core` (session
         // sequencer + supervisor codec) which uses `alloc` types.
         ("session_manager", "session_manager", true),
+        // Phase 57 Track D.1 — audio_server daemon (AC'97 ring-3
+        // driver).  `needs_alloc = true` because the binary depends
+        // on `kernel-core` (audio types + protocol codec) and
+        // `driver_runtime` (DmaBuffer<T>, IrqNotification).
+        ("audio_server", "audio_server", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -393,6 +398,10 @@ fn build_userspace_bins() {
         // e1000_driver uses "os-binary" to enable its _start entry point.
         let extra_features: &[&str] = match pkg {
             "e1000_driver" => &["--features", "os-binary"],
+            // Phase 57 Track D: audio_server uses the same os-binary
+            // gate so the [[bin]] target is skipped on host-test
+            // builds (where Scrt1.o would otherwise duplicate _start).
+            "audio_server" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -5400,6 +5409,16 @@ fn populate_ext2_files(
     // F.2 but loads the service unchanged.
     let session_manager_conf = "name=session_manager\ncommand=/bin/session_manager\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=\non-restart=session_manager.restart\n";
 
+    // Phase 57 Track D.1: audio_server — ring-3 AC'97 driver.
+    // `restart=on-failure max_restart=3` matches the Phase 56 F.1
+    // `on-restart` precedent and the Phase 57 D.6 acceptance bullet.
+    // `depends=display_server` because the chosen session-startup
+    // ordering brings display up before audio (A.4); the
+    // `on-restart=audio_server.restart` line is consumed by F.4's
+    // recovery state machine; init's parser logs an unknown-key
+    // warning for it but loads the service unchanged.
+    let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display_server\non-restart=audio_server.restart\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -5424,6 +5443,7 @@ fn populate_ext2_files(
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
     let gfx_demo_conf_tmp = output_dir.join("_tmp_gfx_demo_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
+    let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -5447,6 +5467,7 @@ fn populate_ext2_files(
     fs::write(&gfx_demo_conf_tmp, gfx_demo_conf).expect("write temp gfx-demo.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
         .expect("write temp session_manager.conf");
+    fs::write(&audio_server_conf_tmp, audio_server_conf).expect("write temp audio_server.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -5767,6 +5788,10 @@ fn populate_ext2_files(
          sif etc/services.d/session_manager.conf mode 0x81A4\n\
          sif etc/services.d/session_manager.conf uid 0\n\
          sif etc/services.d/session_manager.conf gid 0\n\
+         write \"{audio_server_conf}\" etc/services.d/audio_server.conf\n\
+         sif etc/services.d/audio_server.conf mode 0x81A4\n\
+         sif etc/services.d/audio_server.conf uid 0\n\
+         sif etc/services.d/audio_server.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5797,6 +5822,7 @@ fn populate_ext2_files(
         display_server_conf = display_server_conf_tmp.display(),
         gfx_demo_conf = gfx_demo_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
+        audio_server_conf = audio_server_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
