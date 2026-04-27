@@ -68,53 +68,103 @@ impl StreamRegistry {
         Self { open: None }
     }
 
-    /// Open a new stream — D.3-red stub returns `AudioError::Internal`.
-    /// The real registry behavior lands in D.3-green.
+    /// Open a new stream through `backend`. Returns the new stream id
+    /// on success, [`AudioError::Busy`] if a stream is already open,
+    /// or the backend's typed error otherwise.
+    ///
+    /// Failure modes do not consume the slot: a backend `open_stream`
+    /// error leaves the registry idle so the next call can succeed.
     pub fn try_open(
         &mut self,
-        _backend: &mut dyn AudioBackend,
-        _format: kernel_core::audio::PcmFormat,
-        _layout: kernel_core::audio::ChannelLayout,
-        _rate: kernel_core::audio::SampleRate,
+        backend: &mut dyn AudioBackend,
+        format: kernel_core::audio::PcmFormat,
+        layout: kernel_core::audio::ChannelLayout,
+        rate: kernel_core::audio::SampleRate,
     ) -> Result<u32, AudioError> {
-        Err(AudioError::Internal)
+        if self.open.is_some() {
+            return Err(AudioError::Busy);
+        }
+        let id = backend.open_stream(format, layout, rate)?;
+        self.open = Some(Stream::new(id));
+        Ok(id)
     }
 
-    /// Submit — D.3-red stub.
+    /// Submit `bytes` to the open stream.
+    ///
+    /// On success, advances `frames_submitted` by the number of bytes
+    /// the backend accepted (always `bytes.len()` on success). On
+    /// error, stats are unchanged — the error path must not
+    /// double-count.
     pub fn submit(
         &mut self,
-        _backend: &mut dyn AudioBackend,
-        _stream_id: u32,
-        _bytes: &[u8],
+        backend: &mut dyn AudioBackend,
+        stream_id: u32,
+        bytes: &[u8],
     ) -> Result<usize, AudioError> {
-        Err(AudioError::Internal)
+        let stream = match self.open.as_mut() {
+            Some(s) if s.stream_id == stream_id => s,
+            _ => return Err(AudioError::InvalidArgument),
+        };
+        let n = backend.submit_frames(stream_id, bytes)?;
+        stream.stats.frames_submitted = stream.stats.frames_submitted.saturating_add(n as u64);
+        Ok(n)
     }
 
-    /// Drain — D.3-red stub.
+    /// Drain the open stream.
+    ///
+    /// Phase 57 D.3 contract: `drain` returns `Ok(())` after the
+    /// backend records the drain request; the io loop waits for
+    /// completion via the IRQ. The wall-clock timeout pinned by
+    /// [`DRAIN_TIMEOUT_MS`] is enforced inside the io loop, not here.
     pub fn drain(
         &mut self,
-        _backend: &mut dyn AudioBackend,
-        _stream_id: u32,
+        backend: &mut dyn AudioBackend,
+        stream_id: u32,
     ) -> Result<(), AudioError> {
-        Err(AudioError::Internal)
+        let stream = match self.open.as_ref() {
+            Some(s) if s.stream_id == stream_id => s,
+            _ => return Err(AudioError::InvalidArgument),
+        };
+        let _ = stream;
+        backend.drain(stream_id)
     }
 
-    /// Close — D.3-red stub.
+    /// Close the open stream and release the slot.
+    ///
+    /// On a wrong stream id the slot is preserved; the original
+    /// owner can still close it later.
     pub fn close(
         &mut self,
-        _backend: &mut dyn AudioBackend,
-        _stream_id: u32,
+        backend: &mut dyn AudioBackend,
+        stream_id: u32,
     ) -> Result<(), AudioError> {
-        Err(AudioError::Internal)
+        let was_match = matches!(self.open.as_ref(), Some(s) if s.stream_id == stream_id);
+        if !was_match {
+            return Err(AudioError::InvalidArgument);
+        }
+        backend.close_stream(stream_id)?;
+        self.open = None;
+        Ok(())
     }
 
-    /// D.3-red stub.
-    pub fn record_consumed(&mut self, _frames: u64) {}
+    /// Apply a backend stats update — the io loop calls this after
+    /// every IRQ wake so the per-stream stats stay in sync with the
+    /// device's running counters. Idle no-op so socket-disconnect
+    /// paths can call it without first probing the state.
+    pub fn record_consumed(&mut self, frames: u64) {
+        if let Some(s) = self.open.as_mut() {
+            s.stats.frames_consumed = s.stats.frames_consumed.saturating_add(frames);
+        }
+    }
 
-    /// D.3-red stub.
-    pub fn record_underrun(&mut self) {}
+    /// Bump the underrun counter for the open stream. Idle no-op.
+    pub fn record_underrun(&mut self) {
+        if let Some(s) = self.open.as_mut() {
+            s.stats.underrun_count = s.stats.underrun_count.saturating_add(1);
+        }
+    }
 
-    /// Stats accessor.
+    /// Snapshot the open stream's stats, or zeros if no stream is open.
     pub fn stats(&self) -> StreamStats {
         self.open.as_ref().map(|s| s.stats).unwrap_or_default()
     }
@@ -188,15 +238,13 @@ mod tests {
             *self.next_id.borrow_mut() += 1;
             Ok(id)
         }
-        fn submit_frames(
-            &mut self,
-            stream_id: u32,
-            bytes: &[u8],
-        ) -> Result<usize, AudioError> {
+        fn submit_frames(&mut self, stream_id: u32, bytes: &[u8]) -> Result<usize, AudioError> {
             if let Some(e) = self.force_submit_error.borrow_mut().take() {
                 return Err(e);
             }
-            self.submit_calls.borrow_mut().push((stream_id, bytes.len()));
+            self.submit_calls
+                .borrow_mut()
+                .push((stream_id, bytes.len()));
             // Drive the BDL ring math too so a regression in
             // `Ac97Logic::submit_buffer` surfaces here.
             self.logic
@@ -297,9 +345,7 @@ mod tests {
         let mut b = FakeBackend::new();
         let id = default_open(&mut reg, &mut b).expect("open");
         *b.force_submit_error.borrow_mut() = Some(AudioError::WouldBlock);
-        let err = reg
-            .submit(&mut b, id, &[0u8; 64])
-            .expect_err("would-block");
+        let err = reg.submit(&mut b, id, &[0u8; 64]).expect_err("would-block");
         assert_eq!(err, AudioError::WouldBlock);
         // Stats unchanged on error — the error path must not double-count.
         assert_eq!(reg.stats().frames_submitted, 0);
