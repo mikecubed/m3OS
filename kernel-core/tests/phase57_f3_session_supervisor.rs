@@ -205,10 +205,7 @@ fn dispatch_without_cap_returns_capability_missing() {
         None,
         &mut TestBackend::default(),
     );
-    assert!(matches!(
-        outcome,
-        Err(SupervisorError::CapabilityMissing)
-    ));
+    assert!(matches!(outcome, Err(SupervisorError::CapabilityMissing)));
 }
 
 #[test]
@@ -238,30 +235,14 @@ fn dispatch_with_cap_routes_each_verb_to_backend() {
     let mut buf = [0u8; 64];
 
     // Start
-    let len = encode_verb(
-        &SupervisorVerb::Start { service: "kbd" },
-        &mut buf,
-    )
-    .expect("encode");
-    kernel_core::session_supervisor::dispatch_authenticated(
-        &buf[..len],
-        Some(&cap),
-        &mut backend,
-    )
-    .expect("ok");
+    let len = encode_verb(&SupervisorVerb::Start { service: "kbd" }, &mut buf).expect("encode");
+    kernel_core::session_supervisor::dispatch_authenticated(&buf[..len], Some(&cap), &mut backend)
+        .expect("ok");
 
     // Stop
-    let len = encode_verb(
-        &SupervisorVerb::Stop { service: "kbd" },
-        &mut buf,
-    )
-    .expect("encode");
-    kernel_core::session_supervisor::dispatch_authenticated(
-        &buf[..len],
-        Some(&cap),
-        &mut backend,
-    )
-    .expect("ok");
+    let len = encode_verb(&SupervisorVerb::Stop { service: "kbd" }, &mut buf).expect("encode");
+    kernel_core::session_supervisor::dispatch_authenticated(&buf[..len], Some(&cap), &mut backend)
+        .expect("ok");
 
     // AwaitReady
     let len = encode_verb(
@@ -272,12 +253,8 @@ fn dispatch_with_cap_routes_each_verb_to_backend() {
         &mut buf,
     )
     .expect("encode");
-    kernel_core::session_supervisor::dispatch_authenticated(
-        &buf[..len],
-        Some(&cap),
-        &mut backend,
-    )
-    .expect("ok");
+    kernel_core::session_supervisor::dispatch_authenticated(&buf[..len], Some(&cap), &mut backend)
+        .expect("ok");
 
     // OnExitObserved
     let len = encode_verb(
@@ -285,12 +262,8 @@ fn dispatch_with_cap_routes_each_verb_to_backend() {
         &mut buf,
     )
     .expect("encode");
-    kernel_core::session_supervisor::dispatch_authenticated(
-        &buf[..len],
-        Some(&cap),
-        &mut backend,
-    )
-    .expect("ok");
+    kernel_core::session_supervisor::dispatch_authenticated(&buf[..len], Some(&cap), &mut backend)
+        .expect("ok");
 
     assert_eq!(backend.start_calls, &["kbd"]);
     assert_eq!(backend.stop_calls, &["kbd"]);
@@ -306,20 +279,17 @@ fn dispatch_propagates_backend_error() {
     };
     let cap = SupervisorCap::granted_for_session_manager_only();
     let mut buf = [0u8; 64];
-    let len = encode_verb(
-        &SupervisorVerb::Start {
-            service: "missing",
-        },
-        &mut buf,
-    )
-    .expect("encode");
+    let len = encode_verb(&SupervisorVerb::Start { service: "missing" }, &mut buf).expect("encode");
     let outcome = kernel_core::session_supervisor::dispatch_authenticated(
         &buf[..len],
         Some(&cap),
         &mut backend,
     )
     .expect("dispatch ok");
-    assert_eq!(outcome, SupervisorReply::Error(SupervisorError::UnknownService));
+    assert_eq!(
+        outcome,
+        SupervisorReply::Error(SupervisorError::UnknownService)
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -373,10 +343,7 @@ impl kernel_core::session_supervisor::SupervisorBackend for TestBackend {
             .push((service.to_string(), timeout_ms));
         Ok(SupervisorReply::ReadyState { ready: true })
     }
-    fn on_exit_observed(
-        &mut self,
-        service: &str,
-    ) -> Result<SupervisorReply, SupervisorError> {
+    fn on_exit_observed(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
         self.on_exit_calls.push(service.to_string());
         Ok(SupervisorReply::ExitObserved {
             exit_code: 0,

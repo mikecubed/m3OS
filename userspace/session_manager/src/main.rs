@@ -139,7 +139,10 @@ fn program_main(_args: &[&str]) -> i32 {
         return 0;
     }
 
-    syscall_lib::write_str(STDOUT_FILENO, "session_manager: entering steady-state loop\n");
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "session_manager: entering steady-state loop\n",
+    );
     loop {
         // Poll the control socket non-blocking. F.5 dispatches verbs;
         // F.2 just acks the framing.
@@ -161,13 +164,8 @@ fn run_boot_sequence() -> SessionState {
     let (s1, rest) = rest.split_at_mut(1);
     let (s2, rest) = rest.split_at_mut(1);
     let (s3, s4) = rest.split_at_mut(1);
-    let mut step_refs: [&mut dyn SessionStep; 5] = [
-        &mut s0[0],
-        &mut s1[0],
-        &mut s2[0],
-        &mut s3[0],
-        &mut s4[0],
-    ];
+    let mut step_refs: [&mut dyn SessionStep; 5] =
+        [&mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0]];
     let mut seq = StartupSequence::new(&mut step_refs);
     match seq.run(MAX_RETRIES_PER_STEP) {
         Ok(state) => state,
@@ -234,9 +232,7 @@ mod init_backend {
     //! `Running` when every service is up, and to escalate when one
     //! is missing.
 
-    use kernel_core::session_supervisor::{
-        SupervisorBackend, SupervisorError, SupervisorReply,
-    };
+    use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
 
     /// Names that `init`'s service manifest registers under different
     /// IPC service names than the F.1 step name. The kbd_server, for
@@ -317,10 +313,7 @@ mod init_backend {
             }
         }
 
-        fn on_exit_observed(
-            &mut self,
-            _service: &str,
-        ) -> Result<SupervisorReply, SupervisorError> {
+        fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
             Ok(SupervisorReply::ExitObserved {
                 exit_code: 0,
                 signaled: false,

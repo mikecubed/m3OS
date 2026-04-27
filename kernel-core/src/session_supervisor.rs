@@ -214,10 +214,7 @@ pub trait SupervisorBackend {
         service: &str,
         timeout_ms: u64,
     ) -> Result<SupervisorReply, SupervisorError>;
-    fn on_exit_observed(
-        &mut self,
-        service: &str,
-    ) -> Result<SupervisorReply, SupervisorError>;
+    fn on_exit_observed(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError>;
 }
 
 // ---------------------------------------------------------------------------

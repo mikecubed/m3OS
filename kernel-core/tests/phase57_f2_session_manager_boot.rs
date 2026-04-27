@@ -21,9 +21,7 @@
 //!   missing. Once Tracks D and G land, the steps will succeed.
 
 use kernel_core::session::{MAX_RETRIES_PER_STEP, SessionState};
-use kernel_core::session_supervisor::{
-    SupervisorBackend, SupervisorError, SupervisorReply,
-};
+use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
 
 // ---------------------------------------------------------------------------
 // The shape under test — `BootSession`.
@@ -106,11 +104,7 @@ fn missing_term_escalates_after_audio_succeeds() {
     let outcome = run_session(&mut backend);
     assert_eq!(outcome, SessionState::TextFallback);
     // term was attempted 3 times.
-    let term_attempts = backend
-        .start_calls
-        .iter()
-        .filter(|n| n == &"term")
-        .count();
+    let term_attempts = backend.start_calls.iter().filter(|n| n == &"term").count();
     assert_eq!(term_attempts, 3);
     // Rollback covers everything that started successfully.
     assert_eq!(
@@ -233,13 +227,8 @@ fn run_session<B: SupervisorBackend>(backend: &mut B) -> SessionState {
     let (s1, rest) = rest.split_at_mut(1);
     let (s2, rest) = rest.split_at_mut(1);
     let (s3, s4) = rest.split_at_mut(1);
-    let mut step_refs: [&mut dyn SessionStep; 5] = [
-        &mut s0[0],
-        &mut s1[0],
-        &mut s2[0],
-        &mut s3[0],
-        &mut s4[0],
-    ];
+    let mut step_refs: [&mut dyn SessionStep; 5] =
+        [&mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0]];
     let mut seq = StartupSequence::new(&mut step_refs);
     seq.run(MAX_RETRIES_PER_STEP).expect("run is total")
 }
@@ -273,10 +262,7 @@ impl SupervisorBackend for AlwaysReadyBackend {
     ) -> Result<SupervisorReply, SupervisorError> {
         Ok(SupervisorReply::ReadyState { ready: true })
     }
-    fn on_exit_observed(
-        &mut self,
-        _service: &str,
-    ) -> Result<SupervisorReply, SupervisorError> {
+    fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
         Ok(SupervisorReply::ExitObserved {
             exit_code: 0,
             signaled: false,
@@ -315,10 +301,7 @@ impl SupervisorBackend for MissingAudioBackend {
         }
         Ok(SupervisorReply::ReadyState { ready: true })
     }
-    fn on_exit_observed(
-        &mut self,
-        _service: &str,
-    ) -> Result<SupervisorReply, SupervisorError> {
+    fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
         Ok(SupervisorReply::ExitObserved {
             exit_code: 0,
             signaled: false,
@@ -357,10 +340,7 @@ impl SupervisorBackend for MissingTermBackend {
         }
         Ok(SupervisorReply::ReadyState { ready: true })
     }
-    fn on_exit_observed(
-        &mut self,
-        _service: &str,
-    ) -> Result<SupervisorReply, SupervisorError> {
+    fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
         Ok(SupervisorReply::ExitObserved {
             exit_code: 0,
             signaled: false,
@@ -401,10 +381,7 @@ impl SupervisorBackend for TransientDisplayFailureBackend {
         }
         Ok(SupervisorReply::ReadyState { ready: true })
     }
-    fn on_exit_observed(
-        &mut self,
-        _service: &str,
-    ) -> Result<SupervisorReply, SupervisorError> {
+    fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
         Ok(SupervisorReply::ExitObserved {
             exit_code: 0,
             signaled: false,

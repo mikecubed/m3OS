@@ -57,6 +57,16 @@ impl<'b, B: SupervisorBackend> ServiceStep<'b, B> {
     pub fn new(name: &'static str, backend: &'b core::cell::RefCell<&'b mut B>) -> Self {
         Self { name, backend }
     }
+
+    /// Produce the named `SessionError::StepFailed` carrying this
+    /// step's name. Centralized so the three failure branches in
+    /// `start` use the same shape.
+    fn step_failure(&self) -> SessionError {
+        SessionError::StepFailed {
+            step_name: self.name,
+            retries_exhausted: false,
+        }
+    }
 }
 
 impl<'b, B: SupervisorBackend> SessionStep for ServiceStep<'b, B> {
@@ -68,25 +78,14 @@ impl<'b, B: SupervisorBackend> SessionStep for ServiceStep<'b, B> {
         let mut b = self.backend.borrow_mut();
         match b.start(self.name) {
             Ok(SupervisorReply::Ack) => Ok(()),
-            // Backend reported a typed error (UnknownService, etc.).
-            // Translate to a F.1 step-failure so the sequencer counts
-            // it against the per-step retry budget.
-            Ok(SupervisorReply::Error(_)) => Err(SessionError::StepFailed {
-                step_name: self.name,
-                retries_exhausted: false,
-            }),
-            // Other reply shapes (ReadyState, ExitObserved) are not
-            // expected from `start` — treat as a step failure so the
-            // sequencer surfaces them as a startup error rather than
-            // silently advancing.
-            Ok(_) => Err(SessionError::StepFailed {
-                step_name: self.name,
-                retries_exhausted: false,
-            }),
-            Err(_) => Err(SessionError::StepFailed {
-                step_name: self.name,
-                retries_exhausted: false,
-            }),
+            // Backend reported a typed error (UnknownService, etc.),
+            // an unexpected non-Ack reply (ReadyState / ExitObserved
+            // are not valid start outcomes), or a transport failure.
+            // All three translate to a F.1 step-failure so the
+            // sequencer counts it against the per-step retry budget;
+            // the named error variant is observable via the backend's
+            // log lines.
+            _ => Err(self.step_failure()),
         }
     }
 
