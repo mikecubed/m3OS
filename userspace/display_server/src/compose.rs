@@ -50,7 +50,7 @@ use kernel_core::display::compose::{ComposeError, ComposeSurface, compose_frame}
 use kernel_core::display::cursor::{CursorRenderer, DefaultArrowCursor, cursor_damage};
 use kernel_core::display::fb_owner::{FbError, FramebufferOwner, bytes_per_pixel};
 use kernel_core::display::layout::{FloatingLayout, LayoutPolicy, LayoutSurface, OutputGeometry};
-use kernel_core::display::protocol::Rect;
+use kernel_core::display::protocol::{Rect, SurfaceId};
 
 use crate::surface::SurfaceRegistry;
 
@@ -60,7 +60,7 @@ use crate::surface::SurfaceRegistry;
 /// [`cursor_damage`] knows what to clear; the field is grouped behind
 /// a struct so future per-frame state (frame-stats sample, layout
 /// hash, ...) does not require a new function-arg per frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ComposeContext {
     /// Pointer position at the end of the *previous* compose pass.
     /// `None` on the very first frame — the cursor is drawn at the
@@ -71,6 +71,18 @@ pub struct ComposeContext {
     /// alongside `prev_pointer` so a client-cursor swap (which
     /// changes the bitmap dimensions) computes correct damage.
     prev_cursor_size: Option<(u32, u32)>,
+    /// Cached toplevel id list from the previous compose pass. The
+    /// arrangement is only recomputed when this changes (set of
+    /// surfaces added or removed) — `FloatingLayout::arrange`
+    /// advances its persistent cascade slot on every single-surface
+    /// call, so calling it every frame for the same surface set
+    /// would teleport the surface across the screen each frame.
+    /// Caching here keeps the placement stable for an unchanged
+    /// toplevel set.
+    cached_toplevel_ids: Vec<SurfaceId>,
+    /// Arrangement cached alongside `cached_toplevel_ids`. Empty
+    /// until the first compose pass populates it.
+    cached_arrangement: Vec<(SurfaceId, Rect)>,
 }
 
 impl ComposeContext {
@@ -81,6 +93,8 @@ impl ComposeContext {
         Self {
             prev_pointer: None,
             prev_cursor_size: None,
+            cached_toplevel_ids: Vec::new(),
+            cached_arrangement: Vec::new(),
         }
     }
 }
@@ -186,11 +200,24 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         })
         .collect();
     let exclusive_zones = registry.exclusive_zones(output);
-    let arrangement = layout.arrange(
-        &toplevels,
-        OutputGeometry { rect: output },
-        &exclusive_zones,
-    );
+    // Recompute `arrange` only when the toplevel id set actually
+    // changed. `FloatingLayout` advances its persistent
+    // `cascade_slot` on every single-surface call (a documented
+    // legacy contract pinned by the kernel-core tests), so a
+    // per-frame `arrange` call would cycle a single surface through
+    // 8 cascade slots once per frame — visible as the surface
+    // teleporting across the screen and `compose_frame` painting
+    // its pixels at a moving target instead of a stable spot.
+    let toplevel_ids: Vec<SurfaceId> = toplevels.iter().map(|s| s.id).collect();
+    if toplevel_ids != ctx.cached_toplevel_ids {
+        ctx.cached_arrangement = layout.arrange(
+            &toplevels,
+            OutputGeometry { rect: output },
+            &exclusive_zones,
+        );
+        ctx.cached_toplevel_ids = toplevel_ids;
+    }
+    let arrangement = &ctx.cached_arrangement;
 
     let entries = registry.iter_compose(output);
 
