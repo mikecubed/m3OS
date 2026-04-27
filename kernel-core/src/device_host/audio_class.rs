@@ -71,6 +71,58 @@ impl DeviceClass {
     }
 }
 
+/// PCI BAR layout descriptor for a known device class.
+///
+/// Phase 57 Track C.2: the kernel-side `install_and_verify_bar_coverage`
+/// path filters PIO BARs before they reach `BarCoverage`, so the audio
+/// device class must declare exactly which BARs are PIO and which (if
+/// any) are MMIO. AC'97's two BARs are both I/O-space in real ICH
+/// silicon and in QEMU's emulation — see
+/// `docs/appendix/phase-57-audio-target-choice.md`.
+///
+/// `mmio_bar_count` is the count of MMIO BARs the device exposes, used
+/// by tests to assert the coverage path's expected behavior. PIO BARs
+/// are not represented individually because they are not visible to
+/// the IOMMU — only their absence from the MMIO list matters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BarLayout {
+    /// Total BARs declared by the device.
+    pub total_bar_count: u8,
+    /// BARs that are MMIO (i.e., `raw & 1 == 0` and would reach the
+    /// `BarCoverage` pipeline). PIO BARs are excluded from this count
+    /// because the kernel-side claim path filters them out before they
+    /// reach `BarCoverage`.
+    pub mmio_bar_count_value: u8,
+}
+
+impl BarLayout {
+    /// True when every BAR is I/O-space — the device contributes no
+    /// MMIO range to the IOMMU domain. AC'97 is the canonical example.
+    pub const fn is_pio_only(self) -> bool {
+        self.mmio_bar_count_value == 0
+    }
+
+    /// Number of MMIO BARs the device exposes — direct accessor for
+    /// the field. Kept as a method (rather than a public field) so
+    /// future implementations can compute it from a richer layout
+    /// description without breaking callers.
+    pub const fn mmio_bar_count(self) -> u8 {
+        self.mmio_bar_count_value
+    }
+}
+
+/// Intel AC'97 controller BAR layout: 2 BARs total, both I/O-space.
+///
+/// BAR0 is NAM (mixer registers, ~64 bytes) and BAR1 is NABM (bus
+/// master, ~192 bytes) — both PIO in real ICH silicon and in QEMU's
+/// `-device AC97` emulation. The kernel-side claim path filters these
+/// before they reach `BarCoverage::assert_bar_identity_mapped`, so the
+/// audio device contributes zero MMIO ranges to the IOMMU domain.
+pub const AC97_BAR_LAYOUT: BarLayout = BarLayout {
+    total_bar_count: 2,
+    mmio_bar_count_value: 0,
+};
+
 /// Classify a PCI `(vendor, device)` pair into a known device class.
 ///
 /// Returns `Some(class)` when the pair matches a recognized device the
@@ -172,6 +224,33 @@ mod tests {
             // Audio subsystem is the literal "audio.device".
             assert_eq!(class.subsystem(), "audio.device");
         }
+    }
+
+    // ---- AC'97 BAR layout descriptor (C.2 — IOMMU coverage parity) ------
+
+    #[test]
+    fn ac97_bar_layout_is_pio_only() {
+        // The audio target-choice memo pins both AC'97 BARs as
+        // I/O-space — the BAR layout descriptor must reflect that.
+        assert!(AC97_BAR_LAYOUT.is_pio_only());
+        assert_eq!(AC97_BAR_LAYOUT.mmio_bar_count(), 0);
+        assert_eq!(AC97_BAR_LAYOUT.total_bar_count, 2);
+    }
+
+    #[test]
+    fn bar_layout_is_pio_only_predicate_holds_when_mmio_count_is_zero() {
+        let pio_layout = BarLayout {
+            total_bar_count: 4,
+            mmio_bar_count_value: 0,
+        };
+        assert!(pio_layout.is_pio_only());
+
+        let mixed_layout = BarLayout {
+            total_bar_count: 4,
+            mmio_bar_count_value: 2,
+        };
+        assert!(!mixed_layout.is_pio_only());
+        assert_eq!(mixed_layout.mmio_bar_count(), 2);
     }
 
     // ---- Existing DeviceHostError variants suffice (no new variants) ----

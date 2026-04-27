@@ -17,7 +17,8 @@ pub mod syscalls;
 pub mod types;
 
 pub use audio_class::{
-    DeviceClass, PCI_DEVICE_AC97, PCI_VENDOR_INTEL, SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
+    AC97_BAR_LAYOUT, BarLayout, DeviceClass, PCI_DEVICE_AC97, PCI_VENDOR_INTEL,
+    SUBSYSTEM_AUDIO_DEVICE, classify_pci_id,
 };
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,

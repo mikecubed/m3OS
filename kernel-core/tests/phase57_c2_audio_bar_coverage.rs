@@ -126,8 +126,7 @@ fn audio_class_mmio_bar_missing_coverage_yields_typed_error() {
         base: mmio_base,
         len: mmio_len,
     }];
-    let err =
-        assert_bar_identity_mapped(&bars, &coverage).expect_err("partial coverage must fail");
+    let err = assert_bar_identity_mapped(&bars, &coverage).expect_err("partial coverage must fail");
     assert_eq!(err.bar_index, 0);
     assert_eq!(err.phys_base, mmio_base);
     assert_eq!(err.len, mmio_len);
