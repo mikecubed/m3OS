@@ -14,7 +14,7 @@
 | C | Kernel substrate: audio device claim path through `device_host`, IOMMU BAR coverage for the audio device, vsync-equivalent buffer-empty notification | A, B | Done |
 | D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Planned |
 | E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Planned |
-| F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Planned |
+| F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Done |
 | G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Planned |
 | H | Validation: audio smoke, session entry smoke, recovery smoke, multi-client audio policy, xtask plumbing, manual `run-gui` checklist | D, E, F, G | Planned |
 | I | Documentation + version: learning doc, subsystem doc updates, evaluation doc updates, roadmap README + status flip, version bump to `0.57.0` | H | Planned |
@@ -463,10 +463,10 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** "Returns to a recoverable administration path if the session fails" is in the design doc's Critical Items. Without an explicit recovery path, a single `display_server` crash bricks the local UX.
 
 **Acceptance:**
-- [ ] Failing tests commit first against a fake-supervisor double.
-- [ ] On a step's `start` failure: the recovery state machine retries up to the documented per-service cap (3 by default per the resource-bounds rule); exceeding the cap escalates to `text-fallback`.
-- [ ] On `text-fallback`: `session_manager` stops the graphical services in reverse start order, releases the framebuffer back to the kernel console (the existing Phase 47 `restore_console` path), and surfaces an admin shell on the serial console.
-- [ ] Smoke test (H.3) verifies the kill-display-server → text-fallback path.
+- [x] Failing tests commit first against a fake-supervisor double. (`kernel-core/tests/phase57_f4_recovery.rs`, `kernel-core/tests/phase57_f4_text_fallback_executor.rs` — separate red commits precede the implementation in git history.)
+- [x] On a step's `start` failure: the recovery state machine retries up to the documented per-service cap (3 by default per the resource-bounds rule); exceeding the cap escalates to `text-fallback`. (`kernel_core::session::Recovery::on_step_failure` returns `RecoveryAction::EscalateToTextFallback` on the third failure.)
+- [x] On `text-fallback`: `session_manager` stops the graphical services in reverse start order, releases the framebuffer back to the kernel console (the existing Phase 47 `restore_console` path), and surfaces an admin shell on the serial console. (`kernel_core::session::recover::execute_text_fallback_rollback` issues stops in reverse + invokes the `FramebufferRestorer`; userspace `session_manager::recover::run_text_fallback` wraps it with the syscall-backed `SyscallFramebufferRestorer`. The daemon stays alive after text-fallback so the serial admin shell stays available.)
+- [ ] Smoke test (H.3) verifies the kill-display-server → text-fallback path. *Deferred to Track H.*
 
 ### F.5 — Control socket: `session-state` and `session-stop`
 
@@ -475,11 +475,11 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** Without an out-of-band control verb the local user has no documented way to leave the graphical session for administration. The `m3ctl` client (Phase 56 E.4) gains the verbs in the Phase 56 client; F.5 adds the server side.
 
 **Acceptance:**
-- [ ] Failing tests commit first.
-- [ ] Control socket lives on a separate AF_UNIX path consistent with the Phase 56 control-socket precedent.
-- [ ] Verbs: `session-state` (returns the current `SessionState`), `session-stop` (graceful shutdown, falls through to `text-fallback`), `session-restart` (graceful stop + start).
-- [ ] Access control follows the Phase 56 m3ctl precedent: capability-based — the connecting peer must hold the `session_manager` control-socket cap, granted to `m3ctl` at session-manager startup and to no other process. **No UID-based access control is introduced in Phase 57**; a future "console session UID" concept is a deferred design item with its own memo.
-- [ ] F.5 closes with the server side and an integration test that drives the verbs through a raw `nc -U`-equivalent (or the existing IPC test harness). The typed `m3ctl` client-side commands ship in I.2; the F.5 → I.2 client deferral is explicit and intentional.
+- [x] Failing tests commit first. (`kernel-core/tests/phase57_f5_session_control.rs` — separate red commit precedes the implementation in git history.)
+- [x] Control socket lives on a separate AF_UNIX path consistent with the Phase 56 control-socket precedent. (Service-registry name `"session-control"` distinct from the supervisor channel `"session-manager"`; matches the Phase 56 IPC-pivot transport that consolidated the AF_UNIX path onto the IPC service registry.)
+- [x] Verbs: `session-state` (returns the current `SessionState`), `session-stop` (graceful shutdown, falls through to `text-fallback`), `session-restart` (graceful stop + start). (`kernel_core::session_control::ControlVerb` + `dispatch_authenticated`; userspace `session_manager::control::poll_control_once` wires them to the daemon's `ControlContext` + `SupervisorBackend`.)
+- [x] Access control follows the Phase 56 m3ctl precedent: capability-based — the connecting peer must hold the `session_manager` control-socket cap, granted to `m3ctl` at session-manager startup and to no other process. **No UID-based access control is introduced in Phase 57**; a future "console session UID" concept is a deferred design item with its own memo. (`ControlSocketCap::granted_for_m3ctl_only` is the sole constructor; `dispatch_authenticated` returns `CapabilityMissing` without it.)
+- [x] F.5 closes with the server side and an integration test that drives the verbs through a raw `nc -U`-equivalent (or the existing IPC test harness). The typed `m3ctl` client-side commands ship in I.2; the F.5 → I.2 client deferral is explicit and intentional. (Codec round-trip + dispatcher tests in `kernel-core/tests/phase57_f5_session_control.rs` exercise every verb via the same byte path the userspace dispatcher consumes; the typed client-side `m3ctl session-state` / `session-stop` / `session-restart` commands remain a Track I.2 deliverable.)
 
 ---
 

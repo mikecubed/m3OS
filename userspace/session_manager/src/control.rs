@@ -176,31 +176,38 @@ struct DaemonBackend<'c, 'b, B: SupervisorBackend> {
     supervisor: &'b mut B,
 }
 
+impl<'c, 'b, B: SupervisorBackend> DaemonBackend<'c, 'b, B> {
+    /// Run the F.4 text-fallback motion and transition the daemon
+    /// state. Shared by `session_stop` (terminal) and `session_restart`
+    /// (followed by the event-loop's re-drive). The motion swallows
+    /// individual stop errors per the F.4 contract, so this helper
+    /// cannot itself fail at the protocol level.
+    fn rollback_to_text_fallback(&mut self) {
+        let _outcome = recover::run_text_fallback(self.supervisor);
+        self.ctx.state = SessionState::TextFallback;
+    }
+}
+
 impl<'c, 'b, B: SupervisorBackend> SessionControlBackend for DaemonBackend<'c, 'b, B> {
     fn current_state(&mut self) -> SessionState {
         self.ctx.state
     }
 
     fn session_stop(&mut self) -> Result<(), SessionControlError> {
-        // session-stop is the graceful-shutdown verb: run the F.4
-        // text-fallback motion and transition the daemon to
-        // `TextFallback`. The motion swallows individual stop errors
-        // per the F.4 contract, so this verb cannot itself fail at the
-        // protocol level.
-        let _outcome = recover::run_text_fallback(self.supervisor);
-        self.ctx.state = SessionState::TextFallback;
+        // session-stop is the graceful-shutdown verb. Stay in
+        // TextFallback after the rollback; the operator can still
+        // issue session-restart afterwards.
+        self.rollback_to_text_fallback();
         Ok(())
     }
 
     fn session_restart(&mut self) -> Result<(), SessionControlError> {
-        // session-restart is graceful stop + start. The graceful stop
-        // is the F.4 motion; the start is signaled to `main.rs` via
-        // `restart_requested = true`. The dispatcher cannot itself
-        // re-drive the boot sequence because the boot sequence borrows
-        // the supervisor mutably alongside the F.1 step adapters; the
-        // event loop performs the restart after the dispatch returns.
-        let _outcome = recover::run_text_fallback(self.supervisor);
-        self.ctx.state = SessionState::TextFallback;
+        // session-restart is graceful stop + start. The dispatcher
+        // cannot itself re-drive the boot sequence because the boot
+        // sequence borrows the supervisor mutably alongside the F.1
+        // step adapters; the event loop performs the restart after
+        // dispatch returns.
+        self.rollback_to_text_fallback();
         self.ctx.restart_requested = true;
         Ok(())
     }
@@ -238,11 +245,7 @@ pub fn poll_control_once<B: SupervisorBackend>(
     if label != LABEL_CTL_CMD {
         // Unknown label — F.2 stub used `u64::MAX` as the catch-all
         // sentinel; F.5 keeps that signal so the prior contract holds.
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "session_manager: session.control: unknown label; replying with sentinel\n",
-        );
-        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+        reply_with_sentinel("unknown label");
         return true;
     }
 
@@ -277,22 +280,27 @@ pub fn poll_control_once<B: SupervisorBackend>(
     let len = match encode_reply(&reply, &mut out_buf) {
         Ok(n) => n,
         Err(_) => {
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "session_manager: session.control: reply encode failed; replying with sentinel\n",
-            );
-            let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+            reply_with_sentinel("reply encode failed");
             return true;
         }
     };
     if syscall_lib::ipc_store_reply_bulk(&out_buf[..len]) == u64::MAX {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "session_manager: session.control: store_reply_bulk failed; replying with sentinel\n",
-        );
-        let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+        reply_with_sentinel("store_reply_bulk failed");
         return true;
     }
     let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, LABEL_CTL_REPLY, len as u64);
     true
+}
+
+/// Reply to the connected client with the `u64::MAX` sentinel label
+/// (the prior F.2-stub contract for "verb not honored / transport
+/// failure") and emit a structured `session.control` log line naming
+/// the cause. Centralized so all four error branches (unknown label,
+/// reply-encode failure, store-reply-bulk failure, and any future
+/// branches) emit a consistent log shape and reply atomically.
+fn reply_with_sentinel(cause: &'static str) {
+    syscall_lib::write_str(STDOUT_FILENO, "session_manager: session.control: ");
+    syscall_lib::write_str(STDOUT_FILENO, cause);
+    syscall_lib::write_str(STDOUT_FILENO, "; replying with sentinel\n");
+    let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
 }
