@@ -421,10 +421,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The session lifecycle (booting → running → recovering → text-fallback) is a state machine. Locking it in pure logic before wiring service calls catches ordering bugs (e.g., starting `term` before `display_server` is ready) before any process is spawned.
 
 **Acceptance:**
-- [ ] Failing tests commit first; `SessionState` transitions are total and exercised by a contract suite that runs against a recording double and a fake-supervisor double.
-- [ ] `SessionStep` trait declares `name`, `start`, `stop`, `is_ready`. Each method returns a typed `SessionError`.
-- [ ] `StartupSequence` runs steps in declared order; a step's `start` failure escalates per A.4's contract.
-- [ ] No allocation in steady-state; `proptest` covers arbitrary step-success / step-failure interleavings.
+- [x] Failing tests commit first; `SessionState` transitions are total and exercised by a contract suite that runs against a recording double and a fake-supervisor double.
+- [x] `SessionStep` trait declares `name`, `start`, `stop`, `is_ready`. Each method returns a typed `SessionError`.
+- [x] `StartupSequence` runs steps in declared order; a step's `start` failure escalates per A.4's contract.
+- [x] No allocation in steady-state; `proptest` covers arbitrary step-success / step-failure interleavings.
 
 ### F.2 — `session_manager` daemon scaffold
 
