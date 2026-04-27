@@ -173,6 +173,96 @@ impl Recovery {
 }
 
 // ---------------------------------------------------------------------------
+// Text-fallback rollback executor.
+// ---------------------------------------------------------------------------
+
+use crate::session_supervisor::{SupervisorBackend, declared_session_step_names};
+
+/// Why the framebuffer restorer reported failure. Clippy disallows
+/// `Result<_, ()>` (lossy error type), so the trait surfaces a typed
+/// reason. The variants are intentionally narrow: every restorer this
+/// crate sees in production wraps a single syscall whose only
+/// non-success outcomes are "transport / kernel error".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramebufferRestoreError {
+    /// The underlying restore-console transport reported a failure
+    /// distinguishable from the expected no-op cases (`EPERM` /
+    /// `ENOENT`). The userspace `SyscallFramebufferRestorer` maps any
+    /// non-zero, non-`EPERM`, non-`ENOENT` errno into this variant.
+    TransportFailure,
+}
+
+/// Side-effecting operation the rollback executor performs after the
+/// stop loop: releasing the framebuffer back to the kernel console.
+/// `session_manager` (userspace) implements this via the
+/// `framebuffer_release` syscall; tests substitute a recording fake so
+/// the rollback logic is host-testable without booting QEMU.
+///
+/// SOLID DI: the executor depends on the trait, not on the syscall.
+pub trait FramebufferRestorer {
+    /// Issue the equivalent of `framebuffer_release()`. Returns
+    /// `Ok(())` on a successful release **or** on the expected
+    /// non-owner case (`EPERM`, `ENOENT`) — the caller is
+    /// `session_manager`, which is not the FB owner; surfacing those
+    /// expected-non-owner returns as `Ok` keeps the contract simple.
+    /// Returns `Err(...)` on a transport-level failure that callers
+    /// (and tests) want to observe distinctly from the no-op case.
+    fn restore_console(&mut self) -> Result<(), FramebufferRestoreError>;
+}
+
+/// Outcome of [`execute_text_fallback_rollback`]. Returned for
+/// observability / test assertions; the production caller does not
+/// need to inspect this — the structured log line that
+/// `session_manager`'s wrapper emits is the operational record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextFallbackOutcome {
+    /// Count of `stop()` calls issued during the rollback. Equals the
+    /// length of [`declared_session_step_names()`] (currently 5).
+    pub stops_attempted: u32,
+    /// Whether the [`FramebufferRestorer::restore_console`] call
+    /// reported success (or expected-no-op).
+    pub restorer_ok: bool,
+}
+
+/// Run the text-fallback rollback: stop every declared graphical
+/// service in reverse start order via `backend`, then ask `restorer`
+/// to release the framebuffer back to the kernel console.
+///
+/// The function is total: every [`SupervisorBackend::stop`] error is
+/// observed via the backend's own log surface but never propagated.
+/// F.1's `escalate_to_text_fallback` uses the same swallow-and-continue
+/// rollback policy; reusing it here keeps the contract consistent
+/// across the boot-failure path (F.1 inside `StartupSequence::run`)
+/// and the operator-initiated `session-stop` path (F.5).
+///
+/// Note that this function unconditionally stops **every declared
+/// service**, not just the started prefix. The rationale: a `text-fallback`
+/// triggered by F.5's `session-stop` verb may run while the system is
+/// fully `Running`, and a duplicate stop on a service the boot path
+/// never started is a benign idempotent no-op at the supervisor level
+/// (init reports `NotRunning` and the rollback continues).
+pub fn execute_text_fallback_rollback<B, R>(
+    backend: &mut B,
+    restorer: &mut R,
+) -> TextFallbackOutcome
+where
+    B: SupervisorBackend,
+    R: FramebufferRestorer,
+{
+    let names = declared_session_step_names();
+    let mut stops_attempted: u32 = 0;
+    for i in (0..names.len()).rev() {
+        let _ = backend.stop(names[i]);
+        stops_attempted = stops_attempted.saturating_add(1);
+    }
+    let restorer_ok = restorer.restore_console().is_ok();
+    TextFallbackOutcome {
+        stops_attempted,
+        restorer_ok,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inline tests — the integration test suite at
 // `kernel-core/tests/phase57_f4_recovery.rs` covers the full contract;
 // these unit tests guard the table-full edge case that the integration

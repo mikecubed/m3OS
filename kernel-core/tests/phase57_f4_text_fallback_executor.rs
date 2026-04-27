@@ -22,7 +22,8 @@
 //! QEMU.
 
 use kernel_core::session::recover::{
-    FramebufferRestorer, TextFallbackOutcome, execute_text_fallback_rollback,
+    FramebufferRestoreError, FramebufferRestorer, TextFallbackOutcome,
+    execute_text_fallback_rollback,
 };
 use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
 
@@ -68,9 +69,13 @@ struct RecordingRestorer {
 }
 
 impl FramebufferRestorer for RecordingRestorer {
-    fn restore_console(&mut self) -> Result<(), ()> {
+    fn restore_console(&mut self) -> Result<(), FramebufferRestoreError> {
         self.invoked = true;
-        if self.fail { Err(()) } else { Ok(()) }
+        if self.fail {
+            Err(FramebufferRestoreError::TransportFailure)
+        } else {
+            Ok(())
+        }
     }
 }
 

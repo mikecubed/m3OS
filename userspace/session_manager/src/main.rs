@@ -119,25 +119,18 @@ fn program_main(_args: &[&str]) -> i32 {
     let control_socket = control::bind_control_socket();
 
     // Drive the declared boot sequence.
-    let final_state = run_boot_sequence();
+    let mut backend = init_backend::InitSupervisorBackend::new();
+    let final_state = run_boot_sequence(&mut backend);
     log_final_state(final_state);
 
-    // Steady-state event loop. F.5 will replace the no-op poll body
-    // with a real verb dispatcher. F.4 will replace the boot-sequence
-    // section above with retry / text-fallback policy that consults
-    // the supervisor on a `SessionState::TextFallback` outcome.
+    // F.4: on text-fallback, run the rollback executor and stay alive
+    // so the serial admin shell remains reachable. Per A.4: the
+    // operator does not lose the daemon entirely on a graphical-session
+    // failure; the daemon falls back to "graphical-session offline" but
+    // continues servicing the control socket so an operator can issue
+    // `session-restart` (F.5) once the underlying issue is fixed.
     if matches!(final_state, SessionState::TextFallback) {
-        // Per A.4: on `text-fallback` the daemon exits so init's
-        // supervisor flips it to `permanently-stopped` and the operator
-        // falls back to the serial / kernel framebuffer console.
-        // F.4 will handle the explicit framebuffer release here; for
-        // F.2 the simplest correct behavior is a clean exit code so
-        // init records the failure.
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "session_manager: session.recover: exiting on text-fallback (F.4 will own restore_console)\n",
-        );
-        return 0;
+        let _outcome = recover::run_text_fallback(&mut backend);
     }
 
     syscall_lib::write_str(
@@ -156,9 +149,13 @@ fn program_main(_args: &[&str]) -> i32 {
 /// Run the F.1 sequencer over the declared session steps, using the
 /// init-backed supervisor adapter. Returns the final
 /// [`SessionState`].
-fn run_boot_sequence() -> SessionState {
-    let mut backend = init_backend::InitSupervisorBackend::new();
-    let backend_cell = core::cell::RefCell::new(&mut backend);
+///
+/// `backend` is owned by the caller so the F.4 text-fallback rollback
+/// can reuse the same instance after the boot sequence completes (the
+/// rollback issues stops via the same supervisor surface as the boot
+/// path).
+fn run_boot_sequence(backend: &mut init_backend::InitSupervisorBackend) -> SessionState {
+    let backend_cell = core::cell::RefCell::new(backend);
     let mut steps = boot::build_session_steps(&backend_cell);
 
     let (s0, rest) = steps.split_at_mut(1);
@@ -172,8 +169,8 @@ fn run_boot_sequence() -> SessionState {
         Ok(state) => state,
         Err(_e) => {
             // The F.1 sequencer's `run` only returns Err in
-            // out-of-order paths; treat any err as a fatal escalation
-            // for F.2 (F.4 will refine).
+            // out-of-order paths; treat any err as an escalation so
+            // F.4's rollback runs.
             SessionState::TextFallback
         }
     }
