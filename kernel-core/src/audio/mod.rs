@@ -21,12 +21,14 @@
 //! [`protocol`]) is the single audio-error type consumed by both the
 //! protocol codec and the errno-mapping helper [`errno`].
 
+pub mod errno;
 pub mod format;
 pub mod protocol;
 pub mod ring;
 #[cfg(test)]
 mod ring_proptest;
 
+pub use errno::audio_error_to_neg_errno;
 pub use format::{ChannelLayout, PcmFormat, SampleRate, frame_size_bytes};
 pub use protocol::{
     AudioControlCommand, AudioControlEvent, AudioError, ClientMessage, MAX_SUBMIT_BYTES,
