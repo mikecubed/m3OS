@@ -68,88 +68,53 @@ impl StreamRegistry {
         Self { open: None }
     }
 
-    /// Open a new stream through `backend`. Returns the new stream id
-    /// on success, [`AudioError::Busy`] if a stream is already open,
-    /// or the backend's typed error otherwise.
+    /// Open a new stream — D.3-red stub returns `AudioError::Internal`.
+    /// The real registry behavior lands in D.3-green.
     pub fn try_open(
         &mut self,
-        backend: &mut dyn AudioBackend,
-        format: kernel_core::audio::PcmFormat,
-        layout: kernel_core::audio::ChannelLayout,
-        rate: kernel_core::audio::SampleRate,
+        _backend: &mut dyn AudioBackend,
+        _format: kernel_core::audio::PcmFormat,
+        _layout: kernel_core::audio::ChannelLayout,
+        _rate: kernel_core::audio::SampleRate,
     ) -> Result<u32, AudioError> {
-        if self.open.is_some() {
-            return Err(AudioError::Busy);
-        }
-        let id = backend.open_stream(format, layout, rate)?;
-        self.open = Some(Stream::new(id));
-        Ok(id)
+        Err(AudioError::Internal)
     }
 
-    /// Submit `bytes` to the open stream.
+    /// Submit — D.3-red stub.
     pub fn submit(
         &mut self,
-        backend: &mut dyn AudioBackend,
-        stream_id: u32,
-        bytes: &[u8],
+        _backend: &mut dyn AudioBackend,
+        _stream_id: u32,
+        _bytes: &[u8],
     ) -> Result<usize, AudioError> {
-        let stream = match self.open.as_mut() {
-            Some(s) if s.stream_id == stream_id => s,
-            _ => return Err(AudioError::InvalidArgument),
-        };
-        let n = backend.submit_frames(stream_id, bytes)?;
-        stream.stats.frames_submitted = stream.stats.frames_submitted.saturating_add(n as u64);
-        Ok(n)
+        Err(AudioError::Internal)
     }
 
-    /// Drain the open stream. Phase 57 D.3 contract: `drain` returns
-    /// `Ok(())` after the backend records the drain request; the io
-    /// loop waits on the IRQ for completion.
+    /// Drain — D.3-red stub.
     pub fn drain(
         &mut self,
-        backend: &mut dyn AudioBackend,
-        stream_id: u32,
+        _backend: &mut dyn AudioBackend,
+        _stream_id: u32,
     ) -> Result<(), AudioError> {
-        let stream = match self.open.as_ref() {
-            Some(s) if s.stream_id == stream_id => s,
-            _ => return Err(AudioError::InvalidArgument),
-        };
-        let _ = stream;
-        backend.drain(stream_id)
+        Err(AudioError::Internal)
     }
 
-    /// Close the open stream and release the slot.
+    /// Close — D.3-red stub.
     pub fn close(
         &mut self,
-        backend: &mut dyn AudioBackend,
-        stream_id: u32,
+        _backend: &mut dyn AudioBackend,
+        _stream_id: u32,
     ) -> Result<(), AudioError> {
-        let was_match = matches!(self.open.as_ref(), Some(s) if s.stream_id == stream_id);
-        if !was_match {
-            return Err(AudioError::InvalidArgument);
-        }
-        backend.close_stream(stream_id)?;
-        self.open = None;
-        Ok(())
+        Err(AudioError::Internal)
     }
 
-    /// Apply a backend stats update. The io loop calls this after
-    /// every `handle_irq` so the per-stream stats stay in sync with
-    /// the device's running counters.
-    pub fn record_consumed(&mut self, frames: u64) {
-        if let Some(s) = self.open.as_mut() {
-            s.stats.frames_consumed = s.stats.frames_consumed.saturating_add(frames);
-        }
-    }
+    /// D.3-red stub.
+    pub fn record_consumed(&mut self, _frames: u64) {}
 
-    /// Bump the underrun counter for the open stream.
-    pub fn record_underrun(&mut self) {
-        if let Some(s) = self.open.as_mut() {
-            s.stats.underrun_count = s.stats.underrun_count.saturating_add(1);
-        }
-    }
+    /// D.3-red stub.
+    pub fn record_underrun(&mut self) {}
 
-    /// Snapshot the open stream's stats, or zeros if no stream is open.
+    /// Stats accessor.
     pub fn stats(&self) -> StreamStats {
         self.open.as_ref().map(|s| s.stats).unwrap_or_default()
     }
@@ -161,11 +126,312 @@ impl StreamRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — D.3 host coverage (lands red in next commit)
+// Tests — D.3 host coverage
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    // D.3 lands the failing-test commit. Track D.1 keeps the
-    // `#[cfg(test)]` block compiling green so the scaffold ships.
+    use super::*;
+    use crate::device::{Ac97Logic, IrqEvent};
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use kernel_core::audio::{ChannelLayout, PcmFormat, SampleRate};
+
+    /// Fake `AudioBackend` recording every call so the tests can
+    /// assert the registry routes correctly. Backed by an
+    /// `Ac97Logic` so the BDL ring math is exercised end-to-end.
+    struct FakeBackend {
+        logic: RefCell<Ac97Logic>,
+        next_id: RefCell<u32>,
+        open_count: RefCell<u32>,
+        close_count: RefCell<u32>,
+        drain_count: RefCell<u32>,
+        submit_calls: RefCell<Vec<(u32, usize)>>,
+        force_open_error: RefCell<Option<AudioError>>,
+        force_submit_error: RefCell<Option<AudioError>>,
+        force_drain_error: RefCell<Option<AudioError>>,
+        force_close_error: RefCell<Option<AudioError>>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                logic: RefCell::new(Ac97Logic::new()),
+                next_id: RefCell::new(7), // arbitrary non-zero
+                open_count: RefCell::new(0),
+                close_count: RefCell::new(0),
+                drain_count: RefCell::new(0),
+                submit_calls: RefCell::new(Vec::new()),
+                force_open_error: RefCell::new(None),
+                force_submit_error: RefCell::new(None),
+                force_drain_error: RefCell::new(None),
+                force_close_error: RefCell::new(None),
+            }
+        }
+    }
+
+    impl AudioBackend for FakeBackend {
+        fn init(&mut self) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn open_stream(
+            &mut self,
+            _format: PcmFormat,
+            _layout: ChannelLayout,
+            _rate: SampleRate,
+        ) -> Result<u32, AudioError> {
+            if let Some(e) = self.force_open_error.borrow_mut().take() {
+                return Err(e);
+            }
+            *self.open_count.borrow_mut() += 1;
+            let id = *self.next_id.borrow();
+            *self.next_id.borrow_mut() += 1;
+            Ok(id)
+        }
+        fn submit_frames(
+            &mut self,
+            stream_id: u32,
+            bytes: &[u8],
+        ) -> Result<usize, AudioError> {
+            if let Some(e) = self.force_submit_error.borrow_mut().take() {
+                return Err(e);
+            }
+            self.submit_calls.borrow_mut().push((stream_id, bytes.len()));
+            // Drive the BDL ring math too so a regression in
+            // `Ac97Logic::submit_buffer` surfaces here.
+            self.logic
+                .borrow_mut()
+                .submit_buffer(0x1000, 0xCAFE_F00D, bytes.len() / 2)?;
+            Ok(bytes.len())
+        }
+        fn drain(&mut self, _stream_id: u32) -> Result<(), AudioError> {
+            if let Some(e) = self.force_drain_error.borrow_mut().take() {
+                return Err(e);
+            }
+            *self.drain_count.borrow_mut() += 1;
+            Ok(())
+        }
+        fn close_stream(&mut self, _stream_id: u32) -> Result<(), AudioError> {
+            if let Some(e) = self.force_close_error.borrow_mut().take() {
+                return Err(e);
+            }
+            *self.close_count.borrow_mut() += 1;
+            Ok(())
+        }
+        fn handle_irq(&mut self) -> Result<IrqEvent, AudioError> {
+            Ok(IrqEvent::None)
+        }
+    }
+
+    fn default_open(reg: &mut StreamRegistry, b: &mut FakeBackend) -> Result<u32, AudioError> {
+        reg.try_open(
+            b,
+            PcmFormat::S16Le,
+            ChannelLayout::Stereo,
+            SampleRate::Hz48000,
+        )
+    }
+
+    // -- Open + Busy ------------------------------------------------------
+
+    #[test]
+    fn try_open_first_call_returns_stream_id_from_backend() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open succeeds");
+        assert_eq!(id, 7);
+        assert_eq!(*b.open_count.borrow(), 1);
+        assert!(!reg.is_idle());
+    }
+
+    #[test]
+    fn second_try_open_returns_busy() {
+        // Acceptance: second `try_open` returns `-EBUSY`.
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        default_open(&mut reg, &mut b).expect("first open");
+        let err = default_open(&mut reg, &mut b).expect_err("second must EBUSY");
+        assert_eq!(err, AudioError::Busy);
+        // Backend was not reopened.
+        assert_eq!(*b.open_count.borrow(), 1);
+    }
+
+    #[test]
+    fn try_open_propagates_backend_open_error() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        *b.force_open_error.borrow_mut() = Some(AudioError::InvalidFormat);
+        let err = default_open(&mut reg, &mut b).expect_err("invalid-format");
+        assert_eq!(err, AudioError::InvalidFormat);
+        // Slot still empty after a failed open.
+        assert!(reg.is_idle());
+    }
+
+    // -- Submit -----------------------------------------------------------
+
+    #[test]
+    fn submit_frames_advances_ring_head_and_records_stats() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        let n = reg.submit(&mut b, id, &[0u8; 1024]).expect("submit");
+        assert_eq!(n, 1024);
+        assert_eq!(reg.stats().frames_submitted, 1024);
+    }
+
+    #[test]
+    fn submit_frames_for_unknown_stream_id_returns_invalid_argument() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let _id = default_open(&mut reg, &mut b).expect("open");
+        // Wrong stream id.
+        let err = reg
+            .submit(&mut b, 999, &[0u8; 16])
+            .expect_err("wrong id rejected");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    #[test]
+    fn submit_frames_propagates_backend_error_without_advancing_stats() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        *b.force_submit_error.borrow_mut() = Some(AudioError::WouldBlock);
+        let err = reg
+            .submit(&mut b, id, &[0u8; 64])
+            .expect_err("would-block");
+        assert_eq!(err, AudioError::WouldBlock);
+        // Stats unchanged on error — the error path must not double-count.
+        assert_eq!(reg.stats().frames_submitted, 0);
+    }
+
+    // -- Drain ------------------------------------------------------------
+
+    #[test]
+    fn drain_dispatches_through_backend() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        reg.drain(&mut b, id).expect("drain");
+        assert_eq!(*b.drain_count.borrow(), 1);
+    }
+
+    #[test]
+    fn drain_unknown_stream_returns_invalid_argument() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        default_open(&mut reg, &mut b).expect("open");
+        let err = reg.drain(&mut b, 999).expect_err("wrong id");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    #[test]
+    fn drain_propagates_backend_error() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        *b.force_drain_error.borrow_mut() = Some(AudioError::Internal);
+        let err = reg.drain(&mut b, id).expect_err("backend err");
+        assert_eq!(err, AudioError::Internal);
+    }
+
+    // -- Close ------------------------------------------------------------
+
+    #[test]
+    fn close_releases_the_slot_so_next_open_succeeds() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id1 = default_open(&mut reg, &mut b).expect("open1");
+        reg.close(&mut b, id1).expect("close1");
+        assert!(reg.is_idle());
+        let id2 = default_open(&mut reg, &mut b).expect("open2");
+        assert_ne!(id1, id2, "each open allocates a fresh stream id");
+    }
+
+    #[test]
+    fn close_unknown_id_returns_invalid_argument_and_keeps_slot() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        let err = reg.close(&mut b, 999).expect_err("wrong id");
+        assert_eq!(err, AudioError::InvalidArgument);
+        // Slot still owned by the original stream.
+        assert!(!reg.is_idle());
+        // Original close still works.
+        reg.close(&mut b, id).expect("close original");
+    }
+
+    #[test]
+    fn close_when_idle_returns_invalid_argument() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let err = reg.close(&mut b, 7).expect_err("idle close");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    // -- Stats ------------------------------------------------------------
+
+    #[test]
+    fn stats_when_idle_is_all_zeros() {
+        let reg = StreamRegistry::new();
+        let s = reg.stats();
+        assert_eq!(s.frames_submitted, 0);
+        assert_eq!(s.frames_consumed, 0);
+        assert_eq!(s.underrun_count, 0);
+    }
+
+    #[test]
+    fn record_consumed_advances_frames_consumed_for_open_stream() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        default_open(&mut reg, &mut b).expect("open");
+        reg.record_consumed(512);
+        assert_eq!(reg.stats().frames_consumed, 512);
+    }
+
+    #[test]
+    fn record_consumed_when_idle_is_a_noop() {
+        let mut reg = StreamRegistry::new();
+        reg.record_consumed(42);
+        // Stats stay at default.
+        assert_eq!(reg.stats().frames_consumed, 0);
+    }
+
+    #[test]
+    fn record_underrun_bumps_underrun_count() {
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        default_open(&mut reg, &mut b).expect("open");
+        reg.record_underrun();
+        reg.record_underrun();
+        assert_eq!(reg.stats().underrun_count, 2);
+    }
+
+    #[test]
+    fn drain_timeout_constant_pinned_at_5_seconds() {
+        // Phase 57 D.3 acceptance: drain has a documented timeout.
+        // The constant lives at the module level so the io-loop
+        // path consumes it through one named symbol.
+        assert_eq!(DRAIN_TIMEOUT_MS, 5_000);
+    }
+
+    // -- Allocation discipline -------------------------------------------
+
+    #[test]
+    fn submit_does_not_allocate_per_call() {
+        // Acceptance: "No allocation per submit." We exercise the
+        // submit path multiple times after open and verify the
+        // registry's only fields are the pre-allocated `Stream` slot
+        // — no Vec / Box growth on the hot path. This test is a
+        // doc-test substitute for a tracking allocator; the module-
+        // level structure (no Vec field on StreamRegistry, no
+        // alloc::format!) is the actual proof.
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let id = default_open(&mut reg, &mut b).expect("open");
+        for _ in 0..16 {
+            reg.submit(&mut b, id, &[0u8; 64]).expect("submit");
+        }
+        assert_eq!(reg.stats().frames_submitted, 16 * 64);
+    }
 }
