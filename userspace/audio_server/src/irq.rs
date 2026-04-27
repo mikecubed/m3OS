@@ -298,9 +298,38 @@ pub fn encode_outcome(
 // and consumed by the production io loop.
 // ---------------------------------------------------------------------------
 
-/// Update the stream registry for one IRQ event. D.4-red stub —
-/// the real per-event fan-out lands in D.4-green.
-pub fn apply_irq_event(_event: crate::device::IrqEvent, _streams: &mut StreamRegistry) {}
+/// Update the stream registry for one IRQ event. Pure logic — the
+/// caller still owns the [`AudioBackend`] handle and writes the SR
+/// ack via MMIO.
+///
+/// The fan-out is intentionally narrow: `Underrun` is the only event
+/// that bumps a stats counter at this layer.  `Empty` and
+/// `LastValidIndex` are handled by the io loop reposting BDL
+/// buffers (see `Ac97Logic::observe_irq` for the byte-level state
+/// machine); `FifoError` is logged but not double-counted as an
+/// underrun.
+pub fn apply_irq_event(event: crate::device::IrqEvent, streams: &mut StreamRegistry) {
+    use crate::device::IrqEvent;
+    match event {
+        IrqEvent::Empty => {
+            // BCIS — the consumed counter advanced.  The io loop reads
+            // the backend's stats snapshot and calls `record_consumed`
+            // separately.
+        }
+        IrqEvent::LastValidIndex => {
+            // LVBCI — BDL hit LVI.  The io loop reposts buffers; no
+            // stats update at this layer.
+        }
+        IrqEvent::Underrun => {
+            streams.record_underrun();
+        }
+        IrqEvent::FifoError => {
+            // Programming bug.  The io loop logs and surfaces
+            // `AudioError::Internal` to the open client.
+        }
+        IrqEvent::None => {}
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests — D.4 host coverage
@@ -366,17 +395,18 @@ mod tests {
             Ok(())
         }
         fn handle_irq(&mut self) -> Result<IrqEvent, AudioError> {
-            Ok(self
-                .irq_events
-                .borrow_mut()
-                .pop()
-                .unwrap_or(IrqEvent::None))
+            Ok(self.irq_events.borrow_mut().pop().unwrap_or(IrqEvent::None))
         }
     }
 
     fn open_stereo(reg: &mut StreamRegistry, b: &mut FakeBackend) -> u32 {
-        reg.try_open(b, PcmFormat::S16Le, ChannelLayout::Stereo, SampleRate::Hz48000)
-            .expect("open")
+        reg.try_open(
+            b,
+            PcmFormat::S16Le,
+            ChannelLayout::Stereo,
+            SampleRate::Hz48000,
+        )
+        .expect("open")
     }
 
     // -- decode_message ---------------------------------------------------
