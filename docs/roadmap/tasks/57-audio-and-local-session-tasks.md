@@ -12,7 +12,7 @@
 | A | Architecture: audio target choice, session topology, capability map, ABI design memos | None | Done |
 | B | `kernel-core` audio pure-logic: PCM format types, ring-buffer state model, protocol codec, property tests | A | Done |
 | C | Kernel substrate: audio device claim path through `device_host`, IOMMU BAR coverage for the audio device, vsync-equivalent buffer-empty notification | A, B | Done |
-| D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Planned |
+| D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Done |
 | E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Planned |
 | F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Done |
 | G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Planned |
@@ -299,10 +299,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Adding a userspace binary in m3OS requires updates in **four** places (workspace member, xtask `bins`, ramdisk `BIN_ENTRIES`, service config). D.1 lands all four so subsequent driver tasks can build incrementally.
 
 **Acceptance:**
-- [ ] All four convention points updated; running `cargo xtask check && cargo xtask run` boots the empty `audio_server` and the supervisor logs its start.
-- [ ] `audio_server.conf` records `restart=on-failure max_restart=3 depends=display_server` (audio depends on display only insofar as the session boot order requires display first; D.6 may revise after F.2 is concrete).
-- [ ] `cargo xtask clean` recreates the data disk so the new conf reaches userspace.
-- [ ] The crate uses `syscall_lib::heap::BrkAllocator` per the four-step convention.
+- [x] All four convention points updated; running `cargo xtask check && cargo xtask run` boots the empty `audio_server` and the supervisor logs its start.
+- [x] `audio_server.conf` records `restart=on-failure max_restart=3 depends=display_server` (audio depends on display only insofar as the session boot order requires display first; D.6 may revise after F.2 is concrete).
+- [x] `cargo xtask clean` recreates the data disk so the new conf reaches userspace.
+- [x] The crate uses `syscall_lib::heap::BrkAllocator` per the four-step convention.
 
 ### D.2 — Chosen-target controller init
 
@@ -311,11 +311,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** This is the first chunk of MMIO + DMA work touching real audio hardware. Splitting the trait from the concrete implementation now lets a later phase add a second backend (e.g., HDA after AC'97) by adding a file rather than editing callers.
 
 **Acceptance:**
-- [ ] Failing host tests commit first against a `FakeMmio` (the same shape `userspace/drivers/e1000` uses) covering: reset → status reads → DMA buffer programming.
-- [ ] `AudioBackend` trait declares `init`, `open_stream`, `submit_frames`, `drain`, `close_stream`, `handle_irq`. Each method has a typed error from `kernel-core::audio::AudioError`.
-- [ ] `<ChosenTarget>Backend` implements every method; methods that block on hardware advance use Phase 55c bound notifications via the parent `irq.rs` loop, never `irq.wait()` directly.
-- [ ] Unit tests verify register-write ordering (e.g., reset before stream-base programming) on the `FakeMmio` double.
-- [ ] No `unsafe` outside MMIO read/write helpers; every `unsafe` block has an inline justification comment.
+- [x] Failing host tests commit first against a `FakeMmio` (the same shape `userspace/drivers/e1000` uses) covering: reset → status reads → DMA buffer programming.
+- [x] `AudioBackend` trait declares `init`, `open_stream`, `submit_frames`, `drain`, `close_stream`, `handle_irq`. Each method has a typed error from `kernel-core::audio::AudioError`.
+- [x] `<ChosenTarget>Backend` implements every method; methods that block on hardware advance use Phase 55c bound notifications via the parent `irq.rs` loop, never `irq.wait()` directly.
+- [x] Unit tests verify register-write ordering (e.g., reset before stream-base programming) on the `FakeMmio` double.
+- [x] No `unsafe` outside MMIO read/write helpers; every `unsafe` block has an inline justification comment.
 
 ### D.3 — PCM stream submission path
 
@@ -324,10 +324,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The submission path is where the protocol codec, the ring-buffer state model, and the backend trait meet. Single-stream-only per YAGNI; multiple-stream support is explicitly deferred to a later phase.
 
 **Acceptance:**
-- [ ] Failing tests commit first against an in-memory `RecordingAudioSink` (B.2) and a fake `AudioBackend`.
-- [ ] `Stream::open` returns `-EBUSY` if a stream is already open; the registry guarantees at-most-one-stream.
-- [ ] `Stream::submit_frames(bytes)` advances the ring head; underflow on the device side is observable via the stats verb and never panics.
-- [ ] Drain semantics match the chosen-target memo (A.1): graceful drain blocks on the next IRQ until `frames_consumed >= frames_submitted`, with a documented timeout and a typed error path on timeout.
+- [x] Failing tests commit first against an in-memory `RecordingAudioSink` (B.2) and a fake `AudioBackend`.
+- [x] `Stream::open` returns `-EBUSY` if a stream is already open; the registry guarantees at-most-one-stream.
+- [x] `Stream::submit_frames(bytes)` advances the ring head; underflow on the device side is observable via the stats verb and never panics.
+- [x] Drain semantics match the chosen-target memo (A.1): graceful drain blocks on the next IRQ until `frames_consumed >= frames_submitted`, with a documented timeout and a typed error path on timeout.
 
 ### D.4 — IRQ multiplex via Phase 55c bound notifications
 
@@ -336,10 +336,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** The same loop shape Phase 55c added to e1000 now applies to audio. The dispatch is single-threaded; the loop multiplexes one IRQ source and the client endpoint through `RecvResult`.
 
 **Acceptance:**
-- [ ] Failing integration test commits first; mirrors `userspace/drivers/e1000/tests/bound_notif_smoke.rs`.
-- [ ] `subscribe_and_bind` calls Phase 55c `IrqNotification::bind_to_endpoint`; arms the device's IRQ; returns a typed error on bind-failure.
-- [ ] `run_io_loop` blocks only on `endpoint.recv_multi(&irq_notif)`. On `RecvResult::Notification { bits }` the loop calls the backend's IRQ handler; on `RecvResult::Message(req)` it dispatches to the protocol codec.
-- [ ] `grep "irq.wait" userspace/audio_server/src/` returns no hits in the io loop.
+- [x] Failing integration test commits first; mirrors `userspace/drivers/e1000/tests/bound_notif_smoke.rs`.
+- [x] `subscribe_and_bind` calls Phase 55c `IrqNotification::bind_to_endpoint`; arms the device's IRQ; returns a typed error on bind-failure.
+- [x] `run_io_loop` blocks only on `endpoint.recv_multi(&irq_notif)`. On `RecvResult::Notification { bits }` the loop calls the backend's IRQ handler; on `RecvResult::Message(req)` it dispatches to the protocol codec.
+- [x] `grep "irq.wait" userspace/audio_server/src/` returns no hits in the io loop.
 
 ### D.5 — Single-client policy + queueing
 
@@ -348,11 +348,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Single-client audio per YAGNI is a deliberate Phase 57 boundary. A second client must observe a clear, typed `-EBUSY`; closing the first client must release the slot.
 
 **Acceptance:**
-- [ ] Failing tests commit first.
-- [ ] First connect is admitted; second connect is rejected with `-EBUSY` and the rejection is logged once per second-attempt (rate-limited per the observability rules).
-- [ ] Client disconnect (graceful or fault) releases the stream slot synchronously; the next connect is admitted on the next dispatch tick.
-- [ ] No allocation per dispatch.
-- [ ] Coverage boundary: D.5 covers single-process unit semantics around `ClientRegistry`; cross-process integration coverage (two real client processes against a live `audio_server`) lives in H.4. The two tasks deliberately overlap on the observable `-EBUSY` so a regression in either layer fails CI.
+- [x] Failing tests commit first.
+- [x] First connect is admitted; second connect is rejected with `-EBUSY` and the rejection is logged once per second-attempt (rate-limited per the observability rules).
+- [x] Client disconnect (graceful or fault) releases the stream slot synchronously; the next connect is admitted on the next dispatch tick.
+- [x] No allocation per dispatch.
+- [x] Coverage boundary: D.5 covers single-process unit semantics around `ClientRegistry`; cross-process integration coverage (two real client processes against a live `audio_server`) lives in H.4. The two tasks deliberately overlap on the observable `-EBUSY` so a regression in either layer fails CI.
 
 ### D.6 — Service manifest + supervision wiring
 
@@ -365,10 +365,10 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Audio is a Phase 55b-style ring-3 supervised driver. Crash recovery must be observable; the manifest is the load-bearing contract for that.
 
 **Acceptance:**
-- [ ] Manifest records `restart=on-failure max_restart=3 on-restart=audio_server.restart` consistent with the Phase 56 F.1 supervisor `on-restart` precedent.
-- [ ] On driver restart the prior `audio_server` process exits, the supervisor releases its caps (including the `sys_device_claim` handle), and the new process re-runs `sys_device_claim` and Phase 55c `IrqNotification::bind_to_endpoint` during `init`. **No kernel-side claim persistence across restart is introduced**; the kernel surface is unchanged from Phase 55b.
-- [ ] Manifest's `depends=` reflects the F.2 / A.4 ordering decision exactly (must include every service that has to be ready before `audio_server` accepts clients — at minimum `display_server` and the input services if A.4 places audio downstream of input).
-- [ ] `cargo xtask clean && cargo xtask run` boots the supervisor and `audio_server`; killing `audio_server` from the supervisor's debug verb causes a documented restart and a single `audio.device.claim` re-acquire log line.
+- [x] Manifest records `restart=on-failure max_restart=3 on-restart=audio_server.restart` consistent with the Phase 56 F.1 supervisor `on-restart` precedent.
+- [x] On driver restart the prior `audio_server` process exits, the supervisor releases its caps (including the `sys_device_claim` handle), and the new process re-runs `sys_device_claim` and Phase 55c `IrqNotification::bind_to_endpoint` during `init`. **No kernel-side claim persistence across restart is introduced**; the kernel surface is unchanged from Phase 55b. Inherited from Phase 55b's `Drop` impls on `DeviceHandle`/`DmaBuffer`/`IrqNotification` — process exit releases every cap.
+- [x] Manifest's `depends=` reflects the F.2 / A.4 ordering decision exactly (must include every service that has to be ready before `audio_server` accepts clients — at minimum `display_server` and the input services if A.4 places audio downstream of input). Phase 57 D.6 sets `depends=display_server`; F.2 may extend the dependency list once kbd/mouse-input ordering lands.
+- [x] `cargo xtask clean && cargo xtask run` boots the supervisor and `audio_server`; killing `audio_server` from the supervisor's debug verb causes a documented restart and a single `audio.device.claim` re-acquire log line.
 
 ---
 
