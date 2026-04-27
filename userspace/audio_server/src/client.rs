@@ -45,6 +45,12 @@ pub struct ClientRegistry {
     /// log emission. The rate limiter compares against the current
     /// tick to decide whether to log.
     pub(crate) last_log_tick: u32,
+    /// Set by [`Self::should_log_reject`] after the first emission so
+    /// subsequent calls within the suppression window return `false`.
+    /// Without this, an initial-state `last_log_tick = 0` plus
+    /// `current_tick = 0` would always meet the window threshold and
+    /// emit on every rejection inside the window.
+    pub(crate) has_logged_once: bool,
 }
 
 impl Default for ClientRegistry {
@@ -59,21 +65,71 @@ impl ClientRegistry {
             state: ClientState::Idle,
             rejects_since_last_log: 0,
             last_log_tick: 0,
+            has_logged_once: false,
         }
     }
 
-    /// Admit a client — D.5-red stub always rejects.  The real
-    /// behavior lands in D.5-green.
-    pub fn try_admit(&mut self, _client_id: u32) -> bool {
-        false
+    /// Admit a client into the single slot.
+    ///
+    /// Returns `true` when the slot was empty (or the same client is
+    /// re-asking) and the admission succeeded; returns `false` when
+    /// another client owns the slot.  The caller logs the rejection
+    /// using [`Self::should_log_reject`] for rate-limited output.
+    pub fn try_admit(&mut self, client_id: u32) -> bool {
+        match self.state {
+            ClientState::Idle => {
+                self.state = ClientState::Owned { client_id };
+                true
+            }
+            ClientState::Owned { client_id: owner } if owner == client_id => true,
+            ClientState::Owned { .. } => {
+                self.rejects_since_last_log = self.rejects_since_last_log.saturating_add(1);
+                false
+            }
+        }
     }
 
-    /// Release a client — D.5-red stub no-op.
-    pub fn release(&mut self, _client_id: u32) {}
+    /// Release the slot.  Idempotent — calling `release` on an
+    /// already-idle registry is a no-op so socket-disconnect paths
+    /// can call it without first probing the state.  Releases by a
+    /// non-owning client are silently dropped.
+    pub fn release(&mut self, client_id: u32) {
+        if let ClientState::Owned { client_id: owner } = self.state
+            && owner == client_id
+        {
+            self.state = ClientState::Idle;
+        }
+    }
 
-    /// Rate-limited reject-log gate — D.5-red stub never emits.
-    pub fn should_log_reject(&mut self, _current_tick: u32) -> bool {
-        false
+    /// Returns `true` when the caller should emit a rejection log
+    /// line for the most-recent failed `try_admit`.
+    ///
+    /// `current_tick` is a call-site-supplied monotonic counter
+    /// (typically elapsed seconds).  The rate limiter uses
+    /// [`REJECT_LOG_WINDOW_TICKS`] as the suppression window: at
+    /// most one log per window, regardless of how many rejections
+    /// fired inside it.  On emit, the per-window rejection counter
+    /// is reset so the next call returns `false` until the next
+    /// rejection.
+    pub fn should_log_reject(&mut self, current_tick: u32) -> bool {
+        if self.rejects_since_last_log == 0 {
+            return false;
+        }
+        // First-time emit always succeeds; subsequent emits gate on
+        // the elapsed-tick window.
+        let allow = if !self.has_logged_once {
+            true
+        } else {
+            current_tick.wrapping_sub(self.last_log_tick) >= REJECT_LOG_WINDOW_TICKS
+        };
+        if allow {
+            self.last_log_tick = current_tick;
+            self.rejects_since_last_log = 0;
+            self.has_logged_once = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Snapshot of the current state.
