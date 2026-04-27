@@ -24,6 +24,43 @@
 //! | `InvalidArgument`  | `-EINVAL` (-22)  |
 //! | `Internal`         | `-EIO` (-5)      |
 
+use crate::audio::AudioError;
+
+/// `-EBUSY` — resource is busy (single-client policy collision).
+pub const NEG_EBUSY: i64 = -16;
+/// `-EAGAIN` — caller should retry later (transient ring-full / restart).
+pub const NEG_EAGAIN: i64 = -11;
+/// `-ENODEV` — device claim has not completed.
+pub const NEG_ENODEV: i64 = -19;
+/// `-EPIPE` — client stream has been disconnected.
+pub const NEG_EPIPE: i64 = -32;
+/// `-EINVAL` — protocol argument invalid (format / layout / payload size).
+pub const NEG_EINVAL: i64 = -22;
+/// `-EIO` — hard I/O error (DMA fault, register sequence violation).
+pub const NEG_EIO: i64 = -5;
+
+/// Map an [`AudioError`] to a negative POSIX errno.
+///
+/// Total mapping over the closed [`AudioError`] surface; the match is
+/// exhaustive so adding a new `AudioError` variant requires updating
+/// this function (the compiler enforces the obligation).
+///
+/// This is the **single** workspace site that performs this
+/// translation — `audio_server`, every audio client, and any future
+/// kernel facade share the same mapping. A workspace-wide grep for
+/// `audio_error_to_neg_errno` returns exactly one definition site.
+pub const fn audio_error_to_neg_errno(error: AudioError) -> i64 {
+    match error {
+        AudioError::Busy => NEG_EBUSY,
+        AudioError::WouldBlock => NEG_EAGAIN,
+        AudioError::NoDevice => NEG_ENODEV,
+        AudioError::BrokenPipe => NEG_EPIPE,
+        AudioError::InvalidFormat => NEG_EINVAL,
+        AudioError::InvalidArgument => NEG_EINVAL,
+        AudioError::Internal => NEG_EIO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
