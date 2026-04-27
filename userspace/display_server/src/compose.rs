@@ -430,26 +430,36 @@ fn blit_cursor<O: FramebufferOwner>(
     Ok(writes)
 }
 
-/// Fill `rect` on the framebuffer with opaque black. Used by the
-/// cursor-trail fix when no surfaces are mapped — the union of old +
-/// new cursor damage rects is cleared before `blit_cursor` paints the
-/// new cursor on top, so the framebuffer doesn't accumulate stale
-/// arrow pixels from the previous frame.
+/// Fill `rect` on the framebuffer with the compositor's background
+/// colour ([`crate::BG_PIXEL`]). Used by the cursor-trail fix —
+/// the union of old + new cursor damage rects is cleared before the
+/// surface compose + cursor blit run, so the framebuffer doesn't
+/// accumulate stale arrow pixels from the previous frame.
 ///
-/// Both Phase 56 pixel formats (BGRA8888 / RGBA8888) put the alpha
-/// byte at the high index of each 32-bit little-endian pixel, so
-/// "opaque black" is `[0, 0, 0, 0xFF]` in both layouts.
+/// The colour matches the initial-fill value `display_server` writes
+/// at startup so the cleared region blends seamlessly into the
+/// untouched background. If the two were different, the cursor
+/// would leave coloured rectangles wherever it had been on the
+/// background (e.g. opaque-black squares on a teal background).
+///
+/// Phase 56 ships only 4-bpp pixel formats (BGRA8888 / RGBA8888);
+/// `BG_PIXEL.to_le_bytes()` writes one little-endian u32 per pixel
+/// matching either layout's interpretation of the bytes.
 fn clear_rect_to_background<O: FramebufferOwner>(owner: &mut O, rect: Rect) -> Result<(), FbError> {
     let bpp = bytes_per_pixel(owner.metadata().pixel_format) as usize;
-    let total = (rect.w as usize)
-        .saturating_mul(rect.h as usize)
-        .saturating_mul(bpp);
+    let pixel_count = (rect.w as usize).saturating_mul(rect.h as usize);
+    let total = pixel_count.saturating_mul(bpp);
     if total == 0 {
         return Ok(());
     }
-    let mut buf: Vec<u8> = alloc::vec![0u8; total];
-    for i in (3..total).step_by(bpp) {
-        buf[i] = 0xFF;
+    let pixel_bytes = crate::BG_PIXEL.to_le_bytes();
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    for _ in 0..pixel_count {
+        let take = bpp.min(pixel_bytes.len());
+        buf.extend_from_slice(&pixel_bytes[..take]);
+        for _ in take..bpp {
+            buf.push(0);
+        }
     }
     let stride = (rect.w as u32).saturating_mul(bpp as u32);
     owner.write_pixels(rect, &buf, stride)

@@ -66,7 +66,12 @@ fn alloc_error(_layout: Layout) -> ! {
 /// formats happen to render this byte order as a uniform deep teal). The
 /// expected startup pixel value is `0x002B_5A4B`, recorded here so manual
 /// smoke validation knows what to expect on `cargo xtask run-gui --fresh`.
-const BG_PIXEL: u32 = 0x002B_5A4Bu32;
+///
+/// `pub` so `compose::clear_rect_to_background` (the cursor-trail
+/// damage clear) writes the same value as the initial fill — otherwise
+/// the cursor leaves opaque-black squares wherever it has been on the
+/// teal background.
+pub const BG_PIXEL: u32 = 0x002B_5A4Bu32;
 
 syscall_lib::entry_point_with_env!(program_main);
 
