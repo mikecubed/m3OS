@@ -1851,6 +1851,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "term"
+version = "0.57.0"
+dependencies = [
+ "kernel-core",
+ "surface_buffer",
+ "syscall-lib",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
