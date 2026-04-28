@@ -45,6 +45,10 @@ sudo apt install qemu-system-x86 qemu-utils ovmf e2fsprogs \
 
 ```bash
 sudo pacman -S qemu-base edk2-ovmf e2fsprogs sbsigntools curl
+# Optional: GUI mode (`cargo xtask run-gui`) needs the SDL display plugin
+# plus its OpenGL companion (`ui-sdl.so` has unresolved `egl_fb_*` symbols
+# that live in `qemu-ui-opengl`). Skip both if you only ever run headless.
+sudo pacman -S qemu-ui-sdl qemu-ui-opengl
 # musl cross-compiler comes from the AUR:
 yay -S musl-gcc-cross-bin
 ```
