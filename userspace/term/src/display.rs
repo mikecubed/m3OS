@@ -28,7 +28,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use kernel_core::display::pixel_chunk::{CHUNK_HEADER_LEN, PixelChunkHeader};
+use kernel_core::display::pixel_chunk::{
+    CHUNK_HEADER_LEN, PixelChunkHeader, cell_pixel_offset, chunk_plan,
+};
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
 };
@@ -209,12 +211,11 @@ impl DisplayClient {
     /// 1 MiB buffer.
     fn upload_chunked(&mut self) -> bool {
         let byte_len = self.surface.byte_len() as u32;
-        let mut offset: u32 = 0;
-        // Re-borrow inside the loop so each chunk-write to chunk_buf
-        // doesn't fight the surface's pixels() borrow.
-        while offset < byte_len {
-            let remaining = byte_len - offset;
-            let chunk_len = remaining.min(CHUNK_PAYLOAD_LEN as u32);
+        // `chunk_plan` produces the (offset, chunk_len) sequence and
+        // is host-tested in `kernel_core::display::pixel_chunk` —
+        // the production loop here just translates each pair into
+        // an IPC bulk call.
+        for (offset, chunk_len) in chunk_plan(byte_len, CHUNK_PAYLOAD_LEN as u32) {
             let header = PixelChunkHeader {
                 buffer_id: BUFFER_ID.0,
                 width: SURFACE_WIDTH_PX,
@@ -223,8 +224,6 @@ impl DisplayClient {
                 offset,
                 chunk_len,
             };
-            // Encode the 24-byte header into the chunk buffer's
-            // prefix, then copy the matching pixel slice.
             if header
                 .encode(&mut self.chunk_buf[..CHUNK_HEADER_LEN])
                 .is_err()
@@ -247,7 +246,6 @@ impl DisplayClient {
                 syscall_lib::write_str(STDOUT_FILENO, "term: chunked upload ipc_call_buf failed\n");
                 return false;
             }
-            offset += chunk_len;
         }
         true
     }
@@ -300,26 +298,29 @@ impl FramebufferOwner for DisplayClient {
         };
         let bg = if fg == bg { DEFAULT_BG_BGRA } else { bg };
 
-        let cw = CELL_WIDTH as usize;
-        let ch = CELL_HEIGHT as usize;
-        let cell_x = (col as usize) * cw;
-        let cell_y = (row as usize) * ch;
-        if cell_x + cw > SURFACE_WIDTH_PX as usize || cell_y + ch > SURFACE_HEIGHT_PX as usize {
-            // Out-of-grid request — silently drop.
-            return;
-        }
+        // Resolve the cell's u32-pixel offset within the surface
+        // buffer. Out-of-grid requests are silently dropped — the
+        // helper is host-tested in
+        // `kernel_core::display::pixel_chunk::cell_pixel_offset_*`.
+        let stride_pixels = SURFACE_WIDTH_PX as usize;
+        let cell_offset = match cell_pixel_offset(
+            row,
+            col,
+            CELL_WIDTH,
+            CELL_HEIGHT,
+            SURFACE_WIDTH_PX,
+            SURFACE_HEIGHT_PX,
+        ) {
+            Some(o) => o,
+            None => return,
+        };
 
         // The font's `render_into` writes BGRA8888 pixels into a
         // caller-supplied `&mut [u32]` row-major buffer. We carve
         // a sub-slice of the cell's pixels and pass the surface
         // stride (in u32 pixels) so glyph rows index correctly into
         // the larger surface buffer.
-        let stride_pixels = SURFACE_WIDTH_PX as usize;
         let pixels = self.pixels_mut();
-        // Reinterpret the BGRA byte slice as `[u32]` for the font's
-        // signature. Safe: SurfaceBuffer guarantees 4-byte alignment
-        // (Vec<u8>'s default alignment satisfies u32 alignment on
-        // x86_64) and length is a multiple of 4.
         let pixel_count = pixels.len() / 4;
         // SAFETY: SurfaceBuffer allocates `width * height * 4` bytes
         // with default alignment. `Vec<u8>` is aligned to at least 1
@@ -331,7 +332,6 @@ impl FramebufferOwner for DisplayClient {
         let pixels_u32: &mut [u32] = unsafe {
             core::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u32, pixel_count)
         };
-        let cell_offset = cell_y * stride_pixels + cell_x;
         let cell_view = &mut pixels_u32[cell_offset..];
 
         // Look up the glyph; if missing, paint the cell with bg only.
@@ -341,7 +341,13 @@ impl FramebufferOwner for DisplayClient {
                 let _ = glyph.render_into(cell_view, stride_pixels, fg, bg);
             }
             None => {
-                fill_cell_bg(cell_view, stride_pixels, cw, ch, bg);
+                fill_cell_bg(
+                    cell_view,
+                    stride_pixels,
+                    CELL_WIDTH as usize,
+                    CELL_HEIGHT as usize,
+                    bg,
+                );
             }
         }
     }

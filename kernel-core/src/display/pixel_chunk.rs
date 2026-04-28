@@ -162,6 +162,82 @@ pub enum AddChunkOutcome {
     },
 }
 
+/// Iterator yielding the `(offset, chunk_len)` pairs needed to split
+/// `total_bytes` into IPC-bulk-sized chunks. Pure logic — the
+/// counterpart of the server-side [`ChunkAccumulator`] for the client
+/// path. Yields `None` immediately if `total_bytes == 0` or
+/// `max_chunk_bytes == 0`.
+///
+/// Production callers pass `max_chunk_bytes = MAX_BULK_LEN -
+/// CHUNK_HEADER_LEN` (currently 4096 - 24 = 4072); host tests can
+/// pick smaller values to exercise the boundary cases with shorter
+/// fixtures.
+pub fn chunk_plan(total_bytes: u32, max_chunk_bytes: u32) -> ChunkPlan {
+    ChunkPlan {
+        total: total_bytes,
+        max: max_chunk_bytes,
+        offset: 0,
+    }
+}
+
+/// State for [`chunk_plan`]'s iterator. Carries `(total, max,
+/// offset)` so the iterator stays `Copy`-free but allocation-free.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkPlan {
+    total: u32,
+    max: u32,
+    offset: u32,
+}
+
+impl Iterator for ChunkPlan {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.max == 0 || self.offset >= self.total {
+            return None;
+        }
+        let len = (self.total - self.offset).min(self.max);
+        let cur = self.offset;
+        self.offset += len;
+        Some((cur, len))
+    }
+}
+
+/// Compute the `[u32]`-pixel offset (in BGRA8888 stride units) of a
+/// terminal cell within a row-major surface buffer. Returns `None`
+/// when the (row, col) cell would extend past the surface bounds —
+/// callers must drop the put rather than indexing past the end.
+///
+/// Pure-logic helper used by both the production
+/// `term::display::DisplayClient::put_glyph` and host tests. The
+/// returned offset is in u32 pixels (4 bytes per pixel for
+/// BGRA8888); a u8-byte caller multiplies by 4.
+pub fn cell_pixel_offset(
+    row: u16,
+    col: u16,
+    cell_w: u8,
+    cell_h: u8,
+    surface_w_px: u32,
+    surface_h_px: u32,
+) -> Option<usize> {
+    let cw = cell_w as u32;
+    let ch = cell_h as u32;
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let cell_x = (col as u32).checked_mul(cw)?;
+    let cell_y = (row as u32).checked_mul(ch)?;
+    // Check the cell's far corner stays inside the surface so a
+    // glyph render does not write past the buffer's last row.
+    let far_x = cell_x.checked_add(cw)?;
+    let far_y = cell_y.checked_add(ch)?;
+    if far_x > surface_w_px || far_y > surface_h_px {
+        return None;
+    }
+    let stride = surface_w_px as usize;
+    Some((cell_y as usize) * stride + (cell_x as usize))
+}
+
 /// Per-`BufferId` reassembly state. The server keeps one of these per
 /// in-flight chunked buffer (typically in a `BTreeMap` keyed by
 /// `BufferId`).
@@ -449,5 +525,138 @@ mod tests {
         let h = header(1, 4, 4, 0, 16);
         let body = [0u8; 8]; // body shorter than chunk_len
         assert_eq!(acc.add_chunk(h, &body), Err(ChunkError::HeaderTooShort));
+    }
+
+    /// `chunk_plan(0, _)` and `chunk_plan(_, 0)` yield no chunks.
+    /// Defensive — a caller with a zero-length buffer or zero max
+    /// must not loop forever.
+    #[test]
+    fn chunk_plan_empty_or_zero_max_yields_none() {
+        assert_eq!(chunk_plan(0, 4096).next(), None);
+        assert_eq!(chunk_plan(100, 0).next(), None);
+    }
+
+    /// Single chunk when `total <= max`.
+    #[test]
+    fn chunk_plan_single_chunk_when_total_under_max() {
+        let plan: alloc::vec::Vec<(u32, u32)> = chunk_plan(100, 200).collect();
+        assert_eq!(plan, alloc::vec![(0, 100)]);
+    }
+
+    /// Exact multiple: every chunk is `max` bytes.
+    #[test]
+    fn chunk_plan_exact_multiple() {
+        let plan: alloc::vec::Vec<(u32, u32)> = chunk_plan(100, 50).collect();
+        assert_eq!(plan, alloc::vec![(0, 50), (50, 50)]);
+    }
+
+    /// Partial last chunk: the tail carries the remainder.
+    #[test]
+    fn chunk_plan_partial_last_chunk() {
+        let plan: alloc::vec::Vec<(u32, u32)> = chunk_plan(100, 30).collect();
+        assert_eq!(plan, alloc::vec![(0, 30), (30, 30), (60, 30), (90, 10)]);
+    }
+
+    /// Production sizing: a 1 MiB term surface split through the
+    /// 4072-byte payload cap fits in 257 chunks (256 full + 1
+    /// partial).
+    #[test]
+    fn chunk_plan_term_default_geometry() {
+        let total = 640u32 * 400 * 4; // 1,024,000 bytes
+        let max = 4096 - CHUNK_HEADER_LEN as u32; // 4072
+        let plan: alloc::vec::Vec<(u32, u32)> = chunk_plan(total, max).collect();
+        assert_eq!(plan.len(), 252);
+        // Sum of all chunk lengths matches the total.
+        assert_eq!(plan.iter().map(|(_, n)| *n).sum::<u32>(), total);
+        // First chunk starts at 0 and is full-sized.
+        assert_eq!(plan[0], (0, max));
+        // The last chunk carries the remainder.
+        let (last_offset, last_len) = plan[plan.len() - 1];
+        assert_eq!(last_offset + last_len, total);
+        assert!(last_len <= max);
+    }
+
+    /// Round-trip with `ChunkAccumulator`: planning + reassembly
+    /// produces the original buffer regardless of chunk size. The
+    /// accumulator yields `Complete` exactly once on the final
+    /// chunk; the test captures that outcome and asserts the
+    /// reassembled bytes match the source.
+    #[test]
+    fn chunk_plan_round_trip_with_accumulator() {
+        let total = 200u32;
+        let max = 30u32;
+        let want: alloc::vec::Vec<u8> = (0u8..200).collect();
+        let mut acc = ChunkAccumulator::new();
+        let plan: alloc::vec::Vec<(u32, u32)> = chunk_plan(total, max).collect();
+        let last_idx = plan.len() - 1;
+        for (idx, (offset, chunk_len)) in plan.iter().enumerate() {
+            let h = PixelChunkHeader {
+                buffer_id: 1,
+                width: 50,
+                height: 1,
+                total_bytes: total,
+                offset: *offset,
+                chunk_len: *chunk_len,
+            };
+            let body = &want[*offset as usize..(*offset + *chunk_len) as usize];
+            let outcome = acc.add_chunk(h, body).expect("ok");
+            if idx == last_idx {
+                match outcome {
+                    AddChunkOutcome::Complete { pixels, .. } => {
+                        assert_eq!(pixels, want);
+                    }
+                    AddChunkOutcome::Pending => {
+                        panic!("last plan chunk must complete")
+                    }
+                }
+            } else {
+                assert!(matches!(outcome, AddChunkOutcome::Pending));
+            }
+        }
+    }
+
+    /// Origin cell at `(0, 0)` returns offset zero.
+    #[test]
+    fn cell_pixel_offset_origin() {
+        assert_eq!(cell_pixel_offset(0, 0, 8, 16, 640, 400), Some(0));
+    }
+
+    /// Mid-grid cell offset: `row=2, col=3, 8x16 cell, stride=640`
+    /// → `2*16 * 640 + 3*8 = 20504`.
+    #[test]
+    fn cell_pixel_offset_mid_grid() {
+        assert_eq!(
+            cell_pixel_offset(2, 3, 8, 16, 640, 400),
+            Some(2 * 16 * 640 + 3 * 8)
+        );
+    }
+
+    /// Last legitimate cell `(rows-1, cols-1)`: the cell's far
+    /// corner is at exactly the surface boundary — accepted.
+    #[test]
+    fn cell_pixel_offset_far_corner_inside_grid() {
+        let off = cell_pixel_offset(24, 79, 8, 16, 640, 400).expect("inside grid");
+        // (24*16) * 640 + (79*8) = 384 * 640 + 632 = 246_392
+        assert_eq!(off, 24 * 16 * 640 + 79 * 8);
+    }
+
+    /// One cell past the right edge: rejected so the put is dropped.
+    #[test]
+    fn cell_pixel_offset_past_right_edge_rejects() {
+        assert_eq!(cell_pixel_offset(0, 80, 8, 16, 640, 400), None);
+    }
+
+    /// One cell past the bottom edge: rejected.
+    #[test]
+    fn cell_pixel_offset_past_bottom_edge_rejects() {
+        assert_eq!(cell_pixel_offset(25, 0, 8, 16, 640, 400), None);
+    }
+
+    /// Zero cell dimensions yield `None` — defensive, never produced
+    /// by the bundled font but cheap to bound.
+    #[test]
+    fn cell_pixel_offset_zero_cell_size_rejects() {
+        assert_eq!(cell_pixel_offset(0, 0, 0, 16, 640, 400), None);
+        assert_eq!(cell_pixel_offset(0, 0, 8, 0, 640, 400), None);
     }
 }
