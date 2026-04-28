@@ -335,22 +335,27 @@ fn emit_key_event(ev: &KeyEvent) {
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
-    // PHASE 57 DEBUG: per-step markers so we can pinpoint where the
-    // boot is silently dying on real-machine `cargo xtask run-gui`.
-    // The tail-most marker that lands tells us the last syscall that
-    // succeeded.
-    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K1 enter\n");
+    // PHASE 57 DEBUG: previous run showed pid=6 (kbd_server) producing
+    // ZERO output through `write_str` (which goes through SYS_WRITE +
+    // the fd table). Switch the early markers to `serial_print` —
+    // which uses SYS_DEBUG_PRINT direct to the kernel serial driver,
+    // bypassing the fd table entirely. If THESE markers land but the
+    // `write_str` ones don't, the issue is kbd_server's STDOUT fd
+    // somehow not being writable / not connected at fork.
+    syscall_lib::serial_print("kbd_server: trace.S1 enter (serial_print)\n");
+    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K1 enter (write fd=1)\n");
+    syscall_lib::serial_print("kbd_server: trace.S2 after-K1\n");
     syscall_lib::write_str(
         STDOUT_FILENO,
         "kbd_server: starting (Phase 56 D.1 — KeyEvent pipeline online)\n",
     );
-    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K2 banner-ok\n");
+    syscall_lib::serial_print("kbd_server: trace.S3 after-banner\n");
 
     // 1. Create the IPC endpoint that backs the `kbd` service.
     let ep_handle = syscall_lib::create_endpoint();
-    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K3 create-ep-ok\n");
+    syscall_lib::serial_print("kbd_server: trace.S4 create-ep-ok\n");
     if ep_handle == u64::MAX {
-        syscall_lib::write_str(STDOUT_FILENO, "kbd_server: failed to create endpoint\n");
+        syscall_lib::serial_print("kbd_server: failed to create endpoint\n");
         return 1;
     }
     let ep_handle = ep_handle as u32;
@@ -359,12 +364,13 @@ fn program_main(_args: &[&str]) -> i32 {
     //    via a single service lookup. Label-based dispatch decides the
     //    request shape.
     let ret = syscall_lib::ipc_register_service(ep_handle, "kbd");
-    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K4 register-ok\n");
+    syscall_lib::serial_print("kbd_server: trace.S5 register-ok\n");
     if ret == u64::MAX {
-        syscall_lib::write_str(STDOUT_FILENO, "kbd_server: failed to register 'kbd'\n");
+        syscall_lib::serial_print("kbd_server: failed to register 'kbd'\n");
         return 1;
     }
 
+    syscall_lib::serial_print("kbd_server: trace.S6 ready\n");
     syscall_lib::write_str(STDOUT_FILENO, "kbd_server: ready\n");
 
     let mut pipeline = KeyboardPipeline::new();
