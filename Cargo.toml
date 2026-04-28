@@ -87,6 +87,8 @@ members = [
     "userspace/audio_server",
     # Phase 57 Track E.1 — userspace audio client library
     "userspace/lib/audio_client",
+    # Phase 57 Track E.2 — userspace audio reference demo
+    "userspace/audio-demo",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
