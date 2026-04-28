@@ -194,6 +194,57 @@ without protocol rework. Stage 2's full readiness criteria therefore
 require Phase 57 audio + the first real graphical client, not just
 Phase 56.
 
+### Phase 57 update
+
+Phase 57 (Audio and Local Session) lands the **first audio path**, the
+**graphical session-entry orchestrator**, the **first useful graphical
+client**, and the **recovery contract** that closes the local-system
+gap left open by Phase 56:
+
+- **Audio output.** `audio_server` claims an Intel 82801AA AC'97
+  controller (PCI `0x8086:0x2415`) over the Phase 55b ring-3
+  driver-host primitives and serves single-client PCM-out (`open` /
+  `submit_frames` / `drain` / `close`) over a typed pure-userspace IPC
+  contract on AF_UNIX. The reference client is `audio-demo`; `term`'s
+  bell rides the same `audio_client` library.
+- **Audible bell.** The Phase 22b ANSI parser's BEL byte triggers a
+  short pre-baked PCM tone through `audio_client`, throttled to one
+  tone per ~250 ms. This is the first user-visible audible feedback
+  the system has.
+- **Graphical session entry.** `session_manager` runs a fixed boot
+  sequence (`display_server` → `kbd_server` → `mouse_server` →
+  `audio_server` → `term`) at every boot, with per-step retry budget
+  (3) and a typed `SessionState` machine in `kernel-core`. Phase 57
+  introduces no new UID concepts — the session-entry trigger is a
+  fixed sequence ordered by `init`, and all access-control on the
+  `m3ctl` session control verbs is capability-based per the F.5
+  precedent.
+- **Terminal baseline.** `term` is the first useful graphical client
+  in m3OS — a `display_server` client that allocates a PTY pair
+  (Phase 29), forks the configured shell, parses output through the
+  Phase 22b ANSI engine, and renders into a `Toplevel` surface. UID
+  and group membership are inherited unchanged from the spawn chain.
+- **Recovery to text-mode.** When the boot retry cap exhausts (or the
+  steady-state `max_restart` exhausts after `Running`),
+  `session_manager` escalates to `text-fallback` — graceful stop in
+  reverse start order, the kernel framebuffer console resumes, the
+  serial admin shell stays reachable. The motion is also reachable
+  from any serial / SSH shell via `m3ctl session-stop`.
+- **Multi-client audio policy.** Single-client per the YAGNI rule; a
+  second `OpenStream` returns `-EBUSY` and a structured log event.
+  Multi-client mixing, sample-rate conversion, and capture are
+  deferred to a future audio-mixer phase.
+
+The companion task list is at
+[`docs/roadmap/tasks/57-audio-and-local-session-tasks.md`](../roadmap/tasks/57-audio-and-local-session-tasks.md);
+the live learning doc — including the resource-bound defaults, the
+data-flow diagram, and the manual smoke checklist — is at
+[`docs/57-audio-and-local-session.md`](../57-audio-and-local-session.md).
+
+Stage 2 is now in scope for evaluation: end-to-end session entry,
+audible bell, recovery-to-text-mode, and the multi-client audio
+policy are all documented and host-testable.
+
 ### Must-have outcomes
 
 | Work item | Why it matters | Evidence |

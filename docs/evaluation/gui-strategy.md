@@ -43,6 +43,39 @@ Phase 56 milestone:
 - Phase 46 supplies the service/logging/admin baseline that the Phase 56
   `display_server` is supervised under
 
+**Status update (Phase 57):** the local-system milestone listed in
+"Phase D — desktop usability layer" below is now **landed for the
+audio + session-entry + first-graphical-client part**. Phase 57 ships
+the first audio path (`audio_server` claiming Intel AC'97 over the
+Phase 55b ring-3 driver-host primitives), the graphical session-entry
+orchestrator (`session_manager` running the fixed boot sequence with a
+typed `text-fallback` recovery contract), and the first useful
+graphical client (`term`, a PTY-bridged terminal emulator that
+composes Phase 22b ANSI parsing, Phase 29 PTY pairs, Phase 56
+`Toplevel` surfaces, and the Phase 57 audio bell). The native bar /
+launcher / notification daemon / lockscreen client implementations and
+the animation engine remain Phase 57b / 57c work.
+
+What Phase 57 changes about the evaluation surface:
+
+- **End-to-end session entry is now in scope.** A boot reaches a
+  `term` window with a working shell prompt without operator
+  intervention; the manual smoke checklist in
+  [`docs/57-audio-and-local-session.md`](../57-audio-and-local-session.md)
+  documents the path.
+- **Audible bell is now in scope.** A BEL byte from the slave side of
+  any PTY (`term`, but also serial or SSH if the operator pipes
+  through `term`) produces an audible tone on the host audio sink.
+- **Recovery to text-mode is now in scope.** `session_manager`'s
+  text-fallback motion drops display-server children, the kernel
+  framebuffer console resumes, and serial admin stays reachable. The
+  cap (3 retries per step + 3 steady-state restarts per service) is
+  enforceable and observable through `m3ctl session-state`.
+- **Multi-client audio policy is now in scope.** A second client
+  receives `-EBUSY` deterministically — single-client is a YAGNI
+  boundary, not an accident; the second-client behavior is
+  host-testable.
+
 ## Why this needs detailed planning
 
 A GUI effort here is not "just add windows." A serious desktop path touches multiple layers at once:
