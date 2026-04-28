@@ -240,6 +240,7 @@ impl<const N: usize> FixedStr<N> {
         &self.data[..self.len]
     }
 
+    #[allow(dead_code)]
     fn as_str(&self) -> Option<&str> {
         core::str::from_utf8(self.as_bytes()).ok()
     }
@@ -1299,32 +1300,36 @@ impl ServiceManager {
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
 
             // PHASE 57 DEBUG: granular markers between fork-child
-            // entry and the execve syscall. Previous round confirmed
-            // exactly one child reaches IC1 but never reaches execve;
-            // this set of markers narrows the dying region to a
-            // single line. Each marker uses `serial_print` (direct
-            // kernel serial via SYS_DEBUG_PRINT, bypassing the fd
-            // table). Trailing `*` makes empty/garbage names visible.
-            syscall_lib::serial_print("init: trace.IC1A enter\n");
-            let svc_name_str = svc.name.as_str().unwrap_or("(non-utf8)");
-            syscall_lib::serial_print("init: trace.IC1B name-resolved=*");
-            syscall_lib::serial_print(svc_name_str);
-            syscall_lib::serial_print("*\n");
+            // entry and the execve syscall. Each marker is built as a
+            // SINGLE buffer with name+path inlined so it lands as one
+            // log line — split serial_print calls produce separate
+            // log lines that get filtered out by `trace.IC` greps.
+            let svc_name_bytes = svc.name.as_bytes();
+            let path_bytes = &path[..path.len().saturating_sub(1)];
 
-            // svc.command -> path was already done above; print the
-            // resolved path so we can spot a corrupted command field.
-            let path_str =
-                core::str::from_utf8(&path[..path.len().saturating_sub(1)]).unwrap_or("(non-utf8)");
-            syscall_lib::serial_print("init: trace.IC1C path=*");
-            syscall_lib::serial_print(path_str);
-            syscall_lib::serial_print("*\n");
+            let mut mbuf = [0u8; 192];
+            let mut mp = 0usize;
+            mp += append_to_buf(&mut mbuf, mp, b"init: trace.IC1A enter name=*");
+            mp += append_to_buf(&mut mbuf, mp, svc_name_bytes);
+            mp += append_to_buf(&mut mbuf, mp, b"* path=*");
+            mp += append_to_buf(&mut mbuf, mp, path_bytes);
+            mp += append_to_buf(&mut mbuf, mp, b"*\n");
+            if let Ok(s) = core::str::from_utf8(&mbuf[..mp]) {
+                syscall_lib::serial_print(s);
+            }
 
             syscall_lib::serial_print("init: trace.IC1D about to call execve\n");
             let ret = execve(path, &argv, &envp);
 
-            syscall_lib::serial_print("init: trace.IC2 execve returned name=*");
-            syscall_lib::serial_print(svc_name_str);
-            syscall_lib::serial_print("*\n");
+            // Failure path — only reached if execve returned.
+            let mut fbuf = [0u8; 96];
+            let mut fp = 0usize;
+            fp += append_to_buf(&mut fbuf, fp, b"init: trace.IC2 execve returned name=*");
+            fp += append_to_buf(&mut fbuf, fp, svc_name_bytes);
+            fp += append_to_buf(&mut fbuf, fp, b"*\n");
+            if let Ok(s) = core::str::from_utf8(&fbuf[..fp]) {
+                syscall_lib::serial_print(s);
+            }
 
             write_str(STDOUT_FILENO, "init: execve failed for '");
             write(STDOUT_FILENO, svc.name.as_bytes());
