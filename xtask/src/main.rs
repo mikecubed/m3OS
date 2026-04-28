@@ -5261,37 +5261,35 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
 
 /// Phase 57 H.2 — smoke step list for `cargo xtask session-smoke`.
 ///
-/// Simpler-variant strategy (documented per the H.2 task notes): assert
-/// `session_manager: session.boot: state=running` appears on serial
-/// within the timeout. The full keypress→PTY→term assertion is a
-/// stretch goal because it requires a kbd_server input-injection
-/// surface that is not yet wired to a smoke-runner harness.
-///
-/// ## Why not `state=running`
-///
-/// The original H.2 acceptance — "asserts session_manager reaches
-/// SessionState::Running" — requires the StartupSequence's full chain
+/// Asserts the session_manager daemon reaches `SessionState::Running`,
+/// which only happens once the full StartupSequence chain
 /// (display_server → kbd_server → mouse_server → audio_server → term)
-/// to succeed. The earlier dep-name mismatch (`audio_server.conf`
-/// `depends=display_server` vs `display_server.conf` `name=display`)
-/// has been fixed; `audio_server.conf` and `term.conf` now declare
-/// `depends=display,...` matching the registered service names.
+/// has each registered its IPC service and probed-ready. Each
+/// upstream block has been resolved in this PR's commit chain:
 ///
-/// The minimum-viable assertion is that **session_manager emits a
-/// structured `session.boot:` log line** at all — meaning the daemon
-/// ran and exercised its state-machine code paths. The exact state
-/// (`booting` / `running` / `recovering` / `text-fallback`) is not
-/// pinned in this smoke because deeper integration (full audio_server
-/// device claim + display_server framebuffer ownership) needs the
-/// `cargo xtask test` harness rather than a log-pattern smoke; the
-/// simpler-variant smoke is fast, deterministic, and catches
-/// regressions in the daemon's boot path.
+/// - the `audio_server.conf` / `term.conf` dep-name mismatch
+///   (`depends=display_server` vs the registered name `display`) was
+///   fixed in 793cffe, so `init`'s service-config parser now
+///   resolves the deps and starts the binaries;
+/// - the AC'97 BDF collision with `nvme_driver` at `0:4.0` was fixed
+///   in 793cffe, so `audio_server` actually claims its device;
+/// - the `session_manager` IPC-name mismatch (`audio_server` step
+///   mapped to `"audio"` instead of `audio_server::SERVICE_NAME =
+///   "audio.cmd"`) was fixed in d60f2d7;
+/// - `display_server`'s C.5 outbound-event delivery wire and the
+///   chunked-pixel transport were added in f4a50c9, so `term`'s
+///   event loop can run end-to-end against `/bin/sh0` instead of
+///   exiting from a G.1 scaffold.
 ///
-/// The session_manager daemon emits `session.boot: state=running` once
-/// every supervised step (display, kbd, mouse, audio, term) has reached
-/// the per-step "ready" condition; tightening the assertion to
-/// `state=running` is a future enhancement once the full QEMU device
-/// surface is exercised end-to-end.
+/// With those four upstream fixes the boot sequence is expected to
+/// reach `state=running`. A regression in any of them silently
+/// flipped the simpler-variant assertion to `state=text-fallback`
+/// and the smoke would still pass — which is exactly the regression
+/// signal we now want to catch.
+///
+/// The full keypress→PTY→term assertion remains a stretch goal
+/// because it requires a `kbd_server` input-injection surface that
+/// is not yet wired to a smoke-runner harness.
 fn session_smoke_steps() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -5305,9 +5303,9 @@ fn session_smoke_steps() -> Vec<SmokeStep> {
             label: "guest/session: session_manager daemon starting marker",
         },
         SmokeStep::Wait {
-            pattern: "session_manager: session.boot: state=",
+            pattern: "session_manager: session.boot: state=running",
             timeout_secs: 90,
-            label: "guest/session: session_manager emits structured session.boot state line",
+            label: "guest/session: session_manager reaches state=running",
         },
     ]
 }
@@ -11618,21 +11616,22 @@ mod tests {
     }
 
     #[test]
-    fn session_smoke_steps_wait_for_session_boot_state_line() {
-        // H.2 simpler-variant acceptance: assert the smoke step list
-        // waits for a structured `session_manager: session.boot:
-        // state=` line. The exact state value (`booting` / `running`
-        // / `recovering` / `text-fallback`) is intentionally not pinned
-        // — see `session_smoke_steps`'s function-level docs for the
-        // dep-name issue that currently routes the boot to
-        // `text-fallback` instead of `running`.
+    fn session_smoke_steps_wait_for_session_boot_state_running() {
+        // H.2 final acceptance: assert the smoke step list waits for
+        // the exact `session_manager: session.boot: state=running`
+        // line. The four upstream blocks (dep-name mismatch, AC'97
+        // BDF collision, audio_server IPC-name mismatch in
+        // session_manager, and the C.5 outbound + chunked-pixel
+        // transport for term) are all resolved in this PR's commit
+        // chain, so any regression that silently routes the boot back
+        // to `text-fallback` must now break this assertion.
         let steps = session_smoke_steps();
         let pattern = wait_pattern_for_label(
             &steps,
-            "guest/session: session_manager emits structured session.boot state line",
+            "guest/session: session_manager reaches state=running",
         )
-        .expect("session-smoke step list must wait for the session.boot state line");
-        assert_eq!(pattern, "session_manager: session.boot: state=");
+        .expect("session-smoke step list must wait for state=running");
+        assert_eq!(pattern, "session_manager: session.boot: state=running");
     }
 
     #[test]

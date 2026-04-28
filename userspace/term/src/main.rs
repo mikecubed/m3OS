@@ -36,8 +36,6 @@ use core::alloc::Layout;
 #[cfg(not(test))]
 use kernel_core::display::protocol::ServerMessage;
 #[cfg(not(test))]
-use kernel_core::input::events::KEY_EVENT_WIRE_SIZE;
-#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 #[cfg(not(test))]
 use syscall_lib::{CLOCK_MONOTONIC, STDOUT_FILENO};
@@ -80,13 +78,14 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
-/// Phase 56 C.5 close-out — IPC labels term uses to drain queued
-/// `ServerMessage`s from `display_server`. The values mirror
-/// `display_server::client::LABEL_CLIENT_EVENT_PULL` / `_NONE`.
+/// Phase 56 C.5 close-out — IPC label term sends to drain one
+/// queued `ServerMessage` from `display_server`. Mirrors
+/// `display_server::client::LABEL_CLIENT_EVENT_PULL`. The
+/// complementary `LABEL_CLIENT_EVENT_NONE = 4` is the server's
+/// reply when the queue is empty; term checks against equality with
+/// `LABEL_CLIENT_EVENT_PULL` rather than naming `_NONE` separately.
 #[cfg(not(test))]
 const LABEL_CLIENT_EVENT_PULL: u64 = 3;
-#[cfg(not(test))]
-const LABEL_CLIENT_EVENT_NONE: u64 = 4;
 
 /// Per-iteration sleep when no work was found this tick. Mirrors the
 /// `display_server` main-loop yield (1 ms → ~1000 polls/sec).
@@ -178,7 +177,10 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut render_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
     let mut event_buf = [0u8; 64];
     let mut pty_buf = [0u8; PTY_READ_CHUNK];
-    let mut writer = PrimaryFdWriter { fd: primary_fd };
+    let mut writer = PrimaryFdWriter {
+        fd: primary_fd,
+        warned: false,
+    };
     let clock = MonotonicClock;
 
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
@@ -217,9 +219,16 @@ fn program_main(_args: &[&str]) -> i32 {
         //     The C.5 outbound queue per-client cap is 128; a busy
         //     keyboard cannot starve the renderer because we drain
         //     at most one event per tick.
-        if let Some(ev) = pull_one_event(display_handle, &mut event_buf) {
-            did_work = true;
-            input_handler.translate(&ev, &mut writer);
+        match pull_one_event(display_handle, &mut event_buf) {
+            PulledEvent::Key(ev) => {
+                did_work = true;
+                input_handler.translate(&ev, &mut writer);
+            }
+            PulledEvent::Disconnect => {
+                syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
+                break;
+            }
+            PulledEvent::None => {}
         }
 
         // 5c. Poll shell exit. `Some(_)` ⇒ child exited (cleanly or
@@ -257,18 +266,35 @@ fn program_main(_args: &[&str]) -> i32 {
 }
 
 /// Production [`PtyWriter`] — wraps `syscall_lib::write` against the
-/// PTY primary fd. Errors are swallowed because the input loop has
-/// no good recovery beyond "drop the byte"; a future track may add
-/// metric counters.
+/// PTY primary fd. The input handler has no recovery for a failing
+/// write (the byte is already gone from the input queue), but the
+/// failure is observable through the boot transcript so a developer
+/// can correlate "shell looks deaf" with "term: PTY write error
+/// errno=-X". The `warned` flag rate-limits the log line to once per
+/// "stuck" episode — a chronic write failure (e.g. shell exited and
+/// PTY EOF'd) would otherwise spam the serial console on every
+/// keystroke.
 #[cfg(not(test))]
 struct PrimaryFdWriter {
     fd: i32,
+    warned: bool,
 }
 
 #[cfg(not(test))]
 impl PtyWriter for PrimaryFdWriter {
     fn write(&mut self, bytes: &[u8]) {
-        let _ = syscall_lib::write(self.fd, bytes);
+        let rc = syscall_lib::write(self.fd, bytes);
+        if rc < 0 {
+            if !self.warned {
+                syscall_lib::write_str(STDOUT_FILENO, "term: PTY write error\n");
+                self.warned = true;
+            }
+            return;
+        }
+        // Successful write resets the warned flag so a transient
+        // failure followed by recovery still produces a fresh log
+        // line if the failure recurs.
+        self.warned = false;
     }
 }
 
@@ -316,43 +342,61 @@ fn ring_bell(
     }
 }
 
-/// Pull one queued `ServerMessage::Key` from `display_server`'s C.5
-/// outbound queue. Returns `Some(KeyEvent)` on a successful key
-/// pull, `None` for "no event this tick", "non-Key reply", or
-/// transport errors. The latter is rare and survivable — the next
-/// iteration just retries.
+/// Outcome of one [`pull_one_event`] call. Pure data so the main
+/// loop's match remains exhaustive and a future variant addition
+/// fails to compile rather than silently dropping events.
 #[cfg(not(test))]
-fn pull_one_event(
-    display_handle: u32,
-    buf: &mut [u8],
-) -> Option<kernel_core::input::events::KeyEvent> {
+enum PulledEvent {
+    /// A `KeyEvent` for the input handler to translate.
+    Key(kernel_core::input::events::KeyEvent),
+    /// `display_server` told us the connection is closing — exit
+    /// cleanly so the supervisor can restart per `term.conf`.
+    Disconnect,
+    /// No event this tick (`LABEL_CLIENT_EVENT_NONE`, transport
+    /// error, decode failure, or a `ServerMessage` term doesn't
+    /// consume — `Pointer`, `Welcome`, `SurfaceConfigured`,
+    /// `FocusIn` / `FocusOut`, `BufferReleased`, `SurfaceDestroyed`).
+    /// All of these are non-fatal and the next iteration retries.
+    None,
+}
+
+/// Pull one queued `ServerMessage` from `display_server`'s C.5
+/// outbound queue and classify it for the main loop.
+///
+/// Disconnect is the only non-Key variant that changes behaviour:
+/// it asks term to exit. Every other variant is dropped with no
+/// state change because term's contract today is "Toplevel surface
+/// + keyboard-focused PTY" — pointer events, focus changes, and
+/// buffer-released are not load-bearing for that contract. A
+/// future track that adds e.g. mouse-aware shell selection would
+/// thread `Pointer` into the input handler here.
+#[cfg(not(test))]
+fn pull_one_event(display_handle: u32, buf: &mut [u8]) -> PulledEvent {
     let label = syscall_lib::ipc_call(display_handle, LABEL_CLIENT_EVENT_PULL, 0);
     if label != LABEL_CLIENT_EVENT_PULL {
-        // LABEL_CLIENT_EVENT_NONE or transport error — no event.
-        let _ = label; // silence "unused let result" cargo warnings
-        // Even on the NONE path the kernel may have staged an empty
-        // bulk — drain to keep the slot clean for the next call.
+        // LABEL_CLIENT_EVENT_NONE (= 4) or transport error — no
+        // event. Even on the NONE path the kernel may have staged
+        // an empty bulk; drain to keep the slot clean for the next
+        // call.
         let _ = syscall_lib::ipc_take_pending_bulk(buf);
-        let _ = LABEL_CLIENT_EVENT_NONE; // referenced for documentation
-        return None;
+        return PulledEvent::None;
     }
     let n = syscall_lib::ipc_take_pending_bulk(buf);
     if n == 0 || n == u64::MAX {
-        return None;
+        return PulledEvent::None;
     }
     let len = n as usize;
     if len > buf.len() {
-        return None;
+        return PulledEvent::None;
     }
     match ServerMessage::decode(&buf[..len]) {
-        Ok((ServerMessage::Key(ev), _)) => Some(ev),
-        // Pointer / Welcome / etc. fire-through unhandled; term only
-        // consumes Key today.
-        Ok(_) => {
-            let _ = KEY_EVENT_WIRE_SIZE; // documentation reference
-            None
-        }
-        Err(_) => None,
+        Ok((ServerMessage::Key(ev), _)) => PulledEvent::Key(ev),
+        Ok((ServerMessage::Disconnect { .. }, _)) => PulledEvent::Disconnect,
+        // Pointer / Welcome / FocusIn / FocusOut / SurfaceConfigured /
+        // SurfaceDestroyed / BufferReleased: not load-bearing for
+        // term's contract — drop silently.
+        Ok(_) => PulledEvent::None,
+        Err(_) => PulledEvent::None,
     }
 }
 

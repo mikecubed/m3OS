@@ -31,6 +31,32 @@
 
 use crate::TermError;
 
+/// Decode the `(rc, raw_status)` pair returned by `waitpid(WNOHANG)`
+/// into the [`PtyOps::try_wait`] contract. Pure logic so the
+/// production [`crate::syscall_pty::SyscallPtyOps`] wrapping can stay
+/// trivial while the bit-twiddling around POSIX wait macros gets
+/// host-test coverage.
+///
+/// Mapping:
+/// - `rc < 0`               → `Err(rc as i32)` — `waitpid` errno.
+/// - `rc == 0` (`WNOHANG`)  → `Ok(None)` — child still running.
+/// - `rc > 0` and `WIFEXITED(status)` (`status & 0x7F == 0`) → `Ok(Some((status >> 8) & 0xFF))`.
+/// - `rc > 0` otherwise     → `Ok(Some(status))` — abnormal exit
+///   (signal, etc.); caller logs and treats as exited.
+pub fn decode_wait_status(rc: isize, raw_status: i32) -> Result<Option<i32>, i32> {
+    if rc < 0 {
+        return Err(rc as i32);
+    }
+    if rc == 0 {
+        return Ok(None);
+    }
+    if (raw_status & 0x7F) == 0 {
+        Ok(Some((raw_status >> 8) & 0xFF))
+    } else {
+        Ok(Some(raw_status))
+    }
+}
+
 /// Errors observable on the PTY public surface. Variants are typed
 /// (no string payloads) so callers can match and recover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +357,45 @@ mod tests {
         host.close_primary();
         assert_eq!(host.ops.closed_fds.len(), close_count_before);
         assert_eq!(host.primary_fd(), None);
+    }
+
+    /// `decode_wait_status` rejects negative `rc` as the errno path.
+    #[test]
+    fn decode_wait_status_negative_rc_is_err() {
+        assert_eq!(decode_wait_status(-1, 0), Err(-1));
+        assert_eq!(decode_wait_status(-12, 0), Err(-12));
+    }
+
+    /// `rc == 0` → still running (WNOHANG).
+    #[test]
+    fn decode_wait_status_zero_rc_means_running() {
+        assert_eq!(decode_wait_status(0, 0), Ok(None));
+        // `raw_status` is irrelevant when `rc == 0` (the kernel only
+        // populates status on a state change).
+        assert_eq!(decode_wait_status(0, 0xDEAD_BEEFu32 as i32), Ok(None));
+    }
+
+    /// Standard normal exit: `WIFEXITED(status)` is `(status & 0x7F)
+    /// == 0`; the exit code lives in `(status >> 8) & 0xFF`.
+    #[test]
+    fn decode_wait_status_normal_exit_extracts_exit_code() {
+        assert_eq!(decode_wait_status(42, 0x0000), Ok(Some(0)));
+        assert_eq!(decode_wait_status(42, 0x0100), Ok(Some(1)));
+        assert_eq!(decode_wait_status(42, 0x6500), Ok(Some(0x65)));
+        // High byte beyond 0xFF gets masked away (POSIX convention).
+        assert_eq!(
+            decode_wait_status(42, 0x12_00FF_00u32 as i32),
+            Ok(Some(0xFF))
+        );
+    }
+
+    /// Signal-killed children fall through to the raw-status path —
+    /// callers log and treat as abnormal exit. Phase 57 does not yet
+    /// distinguish signal-kill from a normal exit code.
+    #[test]
+    fn decode_wait_status_signal_killed_returns_raw_status() {
+        // SIGKILL = 9; raw status low byte = 0x09 (no core dump).
+        assert_eq!(decode_wait_status(42, 0x09), Ok(Some(0x09)));
     }
 
     /// `PtyError` lifts cleanly into `TermError` for the binary's

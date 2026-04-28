@@ -36,7 +36,7 @@
 //!   returns the raw status as-is so the caller can log and treat it
 //!   as an abnormal exit.
 
-use crate::pty::PtyOps;
+use crate::pty::{PtyOps, decode_wait_status};
 use syscall_lib::{STDOUT_FILENO, WNOHANG};
 
 /// `/bin/sh0` — the path of the in-tree default shell. Spelled as a
@@ -117,23 +117,6 @@ impl PtyOps for SyscallPtyOps {
     fn try_wait(&mut self, pid: i32) -> Result<Option<i32>, i32> {
         let mut status: i32 = 0;
         let rc = syscall_lib::waitpid(pid, &mut status, WNOHANG);
-        if rc < 0 {
-            return Err(rc as i32);
-        }
-        if rc == 0 {
-            // WNOHANG: no state change yet.
-            return Ok(None);
-        }
-        // Decode the status using the standard POSIX wait macros. If
-        // the child exited normally, return its low-byte exit code
-        // shifted into the canonical position. Otherwise return the
-        // raw status so the caller can log and treat it as abnormal.
-        if (status & 0x7F) == 0 {
-            // WIFEXITED: low 7 bits of status equal 0.
-            let code = (status >> 8) & 0xFF;
-            Ok(Some(code))
-        } else {
-            Ok(Some(status))
-        }
+        decode_wait_status(rc, status)
     }
 }
