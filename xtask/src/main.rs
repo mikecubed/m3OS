@@ -672,7 +672,8 @@ fn build_musl_rust_bins() {
         }
 
         println!("musl-rust: building {name} for x86_64-unknown-linux-musl...");
-        let status = match Command::new(env!("CARGO"))
+        let mut cargo = Command::new(env!("CARGO"));
+        cargo
             .current_dir(&root)
             .args([
                 "build",
@@ -687,9 +688,9 @@ fn build_musl_rust_bins() {
             .env(
                 "RUSTFLAGS",
                 "-C relocation-model=static -C target-feature=+crt-static",
-            )
-            .status()
-        {
+            );
+        apply_musl_cargo_env(&mut cargo);
+        let status = match cargo.status() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("warning: failed to run cargo build for {name}: {e}");
@@ -774,7 +775,8 @@ fn build_ion() {
     }
 
     println!("ion: building for x86_64-unknown-linux-musl (static, non-PIE)...");
-    let status = Command::new(env!("CARGO"))
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
         .current_dir(&ion_src)
         .env(
             "RUSTFLAGS",
@@ -785,9 +787,9 @@ fn build_ion() {
             "--release",
             "--target",
             "x86_64-unknown-linux-musl",
-        ])
-        .status()
-        .expect("failed to build ion");
+        ]);
+    apply_musl_cargo_env(&mut cargo);
+    let status = cargo.status().expect("failed to build ion");
     if !status.success() {
         eprintln!("ion build failed");
         std::process::exit(1);
@@ -1566,11 +1568,16 @@ fn convert_to_vhdx(uefi_image: &Path) {
     }
 }
 
+const MUSL_CC_CANDIDATES: &[&str] = &[
+    "x86_64-linux-musl-gcc",
+    "x86_64-unknown-linux-musl1.2-gcc",
+    "x86_64-unknown-linux-musl-gcc",
+    "musl-gcc",
+];
+
 /// Find a musl cross-compiler on the system.
 ///
-/// Checks for `x86_64-linux-musl-gcc` (Debian/Ubuntu cross-compiler),
-/// `x86_64-unknown-linux-musl1.2-gcc` (Arch `musl-gcc-cross-bin`),
-/// and `musl-gcc` (Debian/Ubuntu `musl-tools` wrapper), in that order.
+/// Checks the candidates in `MUSL_CC_CANDIDATES` in order.
 ///
 /// Some minimal musl cross toolchains (for example a hand-installed raiden or
 /// musl-cross-make toolchain under `/opt/`) omit musl's empty static
@@ -1580,23 +1587,12 @@ fn convert_to_vhdx(uefi_image: &Path) {
 fn find_musl_cc() -> Option<&'static str> {
     static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
     *MUSL_CC.get_or_init(|| {
-        let candidates = [
-            "x86_64-linux-musl-gcc",
-            "x86_64-unknown-linux-musl1.2-gcc",
-            "musl-gcc",
-        ];
-        for cc in candidates {
-            if !Command::new(cc)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-            {
+        for cc in MUSL_CC_CANDIDATES {
+            if !musl_cc_runs(cc) {
                 continue;
             }
             if musl_cc_has_static_compat_stubs(cc) {
-                return Some(cc);
+                return Some(*cc);
             }
             eprintln!(
                 "warning: skipping musl compiler `{cc}` — static link check for \
@@ -1606,6 +1602,50 @@ fn find_musl_cc() -> Option<&'static str> {
         }
         None
     })
+}
+
+/// Find any working musl cross-compiler, ignoring the static stub check.
+///
+/// Used for the Rust cargo path: cc-rs in transitive build scripts compiles
+/// small object files and never links `-ldl`/`-lpthread`/`-lrt`, so a raiden /
+/// musl-cross-make toolchain that lacks musl's empty compat stubs is fine.
+fn find_musl_cc_any() -> Option<&'static str> {
+    static MUSL_CC_ANY: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MUSL_CC_ANY.get_or_init(|| {
+        MUSL_CC_CANDIDATES
+            .iter()
+            .copied()
+            .find(|cc| musl_cc_runs(cc))
+    })
+}
+
+fn musl_cc_runs(cc: &str) -> bool {
+    Command::new(cc)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Stamp `CC_*` / `AR_*` env vars on `cmd` so cc-rs build scripts invoked under
+/// `cargo build --target x86_64-unknown-linux-musl` can find a working musl
+/// cross-toolchain. cc-rs derives `x86_64-linux-musl-{gcc,ar}` from the triple
+/// by default — that matches Debian's `musl-tools` cross compiler but not
+/// Arch's `musl-gcc-cross-bin` (`x86_64-unknown-linux-musl1.2-gcc`).
+fn apply_musl_cargo_env(cmd: &mut Command) {
+    let Some(cc) = find_musl_cc_any() else { return };
+    let ar = match cc {
+        "x86_64-linux-musl-gcc" => "x86_64-linux-musl-ar",
+        "x86_64-unknown-linux-musl1.2-gcc" | "x86_64-unknown-linux-musl-gcc" => {
+            "x86_64-unknown-linux-musl-ar"
+        }
+        // The `musl-gcc` wrapper produces ELF object files indistinguishable
+        // from those of the host gcc, so the system `ar` is sufficient.
+        _ => "ar",
+    };
+    cmd.env("CC_x86_64_unknown_linux_musl", cc);
+    cmd.env("AR_x86_64_unknown_linux_musl", ar);
 }
 
 fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
