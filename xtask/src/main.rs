@@ -38,11 +38,21 @@ pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=o
 /// pair is the chosen first audio target — Intel 82801AA AC'97
 /// (`0x8086:0x2415`).
 ///
+/// `addr=0x5` pins the PCI slot to 0:5.0 so the matching `audio_server`
+/// `SENTINEL_BDF` (in `userspace/audio_server/src/lib.rs`) finds the
+/// device deterministically. Slot 3 is e1000 and slot 4 is nvme, so
+/// 5 is the first free slot and the `audio_server` claim path matches
+/// it exactly.
+///
 /// The constant is referenced from `cmd_run_gui` (default: enabled) and
 /// pinned by xtask unit tests so any future deviation from the memo
 /// surfaces at `cargo test -p xtask` time, not at QEMU launch time.
-pub const AC97_QEMU_AUDIO_FLAGS: &[&str] =
-    &["-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0"];
+pub const AC97_QEMU_AUDIO_FLAGS: &[&str] = &[
+    "-audiodev",
+    "none,id=snd0",
+    "-device",
+    "AC97,audiodev=snd0,addr=0x5",
+];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -5136,34 +5146,28 @@ fn parse_smoke_boot_args(name: &str, args: &[String]) -> Result<SmokeBootArgs, S
 /// - `init`'s service-config parser successfully read the conf and
 ///   registered the service.
 ///
-/// ## Why not the full audio-demo round-trip
+/// ## Why this simpler-variant smoke
 ///
 /// The original H.1 acceptance — "Run audio-demo and check it exits 0"
 /// — requires `audio_server` to actually start, claim the AC'97 device,
-/// and accept connections from `audio-demo`. Two upstream issues block
-/// that path in Track H:
+/// and accept connections from `audio-demo`. Two upstream issues that
+/// previously blocked that path were fixed in the post-Phase-57
+/// follow-up commits:
 ///
-/// 1. **Dependency-name mismatch.** `audio_server.conf` declares
-///    `depends=display_server` but `display_server.conf` registers under
-///    `name=display`. `init` reports the dependency as unresolvable and
-///    permanently stops `audio_server` before it ever runs. The
-///    matching fix lives in Track D.6 (manifest dependency name) or
-///    Track F.2 (display service name); both predate this work.
-/// 2. **BDF collision.** Even with the dep fixed, the audio-target memo
-///    placed AC'97 at sentinel BDF `0:4.0` — the same BDF
-///    `nvme_driver` already claims at boot. Resolving the collision
-///    requires either an `addr=0x?` flag on `-device AC97` or
-///    vendor/device-ID gating on `nvme_driver`'s claim path; both also
-///    sit outside Track H scope.
+/// 1. **Dependency-name mismatch.** The original `audio_server.conf`
+///    declared `depends=display_server` but `display_server.conf`
+///    registers under `name=display`. Fixed: `audio_server.conf` and
+///    `term.conf` now declare `depends=display,...` matching the
+///    registered service names.
+/// 2. **BDF collision.** The original audio-target memo placed AC'97
+///    at sentinel BDF `0:4.0` — the same BDF `nvme_driver` already
+///    claims at boot. Fixed: AC'97 moved to `0:5.0` with an explicit
+///    `addr=0x5` on `-device AC97` so QEMU pins the slot.
 ///
-/// The kernel-core AC'97 BAR-coverage assertions (run via
-/// `cargo xtask device-smoke --device audio`) cover the pure-logic
-/// audio substrate independently of these bring-up issues.
-///
-/// The stretch goals from the task brief — full audio-demo round-trip
-/// + `audio.stream` stats verb readback (frames_consumed >=
-/// frames_submitted) — become reachable once both upstream issues are
-/// resolved.
+/// The simpler-variant smoke is retained because the full `audio-demo`
+/// round-trip requires real audio_server bringup (device claim, IRQ
+/// bind, IPC service registration) which is observable but adds boot
+/// time and noise; the conf-loaded check is fast and deterministic.
 fn audio_smoke_steps() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -5268,25 +5272,26 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
 /// The original H.2 acceptance — "asserts session_manager reaches
 /// SessionState::Running" — requires the StartupSequence's full chain
 /// (display_server → kbd_server → mouse_server → audio_server → term)
-/// to succeed. In the current boot path, `audio_server` is permanently
-/// stopped before it ever runs because `audio_server.conf` declares
-/// `depends=display_server` while `display_server.conf` registers
-/// under `name=display`; init reports the dep as unresolvable. With
-/// audio_server stopped, session_manager exhausts its boot retry
-/// budget and escalates to `state=text-fallback` — never `state=running`.
+/// to succeed. The earlier dep-name mismatch (`audio_server.conf`
+/// `depends=display_server` vs `display_server.conf` `name=display`)
+/// has been fixed; `audio_server.conf` and `term.conf` now declare
+/// `depends=display,...` matching the registered service names.
 ///
-/// The minimum-viable assertion is therefore that **session_manager
-/// emits a structured `session.boot:` log line** at all — meaning the
-/// daemon ran and exercised its state-machine code paths. The exact
-/// state (`booting` / `running` / `recovering` / `text-fallback`) is
-/// not pinned because the upstream dep-name fix would shift it from
-/// `text-fallback` to `running` without changing the Track H surface
-/// being validated.
+/// The minimum-viable assertion is that **session_manager emits a
+/// structured `session.boot:` log line** at all — meaning the daemon
+/// ran and exercised its state-machine code paths. The exact state
+/// (`booting` / `running` / `recovering` / `text-fallback`) is not
+/// pinned in this smoke because deeper integration (full audio_server
+/// device claim + display_server framebuffer ownership) needs the
+/// `cargo xtask test` harness rather than a log-pattern smoke; the
+/// simpler-variant smoke is fast, deterministic, and catches
+/// regressions in the daemon's boot path.
 ///
 /// The session_manager daemon emits `session.boot: state=running` once
 /// every supervised step (display, kbd, mouse, audio, term) has reached
-/// the per-step "ready" condition; that line will be the canonical
-/// signal once the upstream dep fix lands.
+/// the per-step "ready" condition; tightening the assertion to
+/// `state=running` is a future enhancement once the full QEMU device
+/// surface is exercised end-to-end.
 fn session_smoke_steps() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -5948,20 +5953,22 @@ fn populate_ext2_files(
     // Phase 57 Track D.1: audio_server — ring-3 AC'97 driver.
     // `restart=on-failure max_restart=3` matches the Phase 56 F.1
     // `on-restart` precedent and the Phase 57 D.6 acceptance bullet.
-    // `depends=display_server` because the chosen session-startup
-    // ordering brings display up before audio (A.4); the
-    // `on-restart=audio_server.restart` line is consumed by F.4's
+    // `depends=display` (the registered service name from
+    // display_server.conf, NOT the binary name) because the chosen
+    // session-startup ordering brings display up before audio (A.4);
+    // the `on-restart=audio_server.restart` line is consumed by F.4's
     // recovery state machine; init's parser logs an unknown-key
     // warning for it but loads the service unchanged.
-    let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display_server\non-restart=audio_server.restart\n";
+    let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
     // Phase 57 Track G: term — graphical terminal emulator. Per the G.1
-    // acceptance bullet ("term.conf records restart=on-failure
-    // max_restart=3 depends=display_server,kbd_server,session_manager")
-    // the policy is on-failure with a budget of three; the dependency
-    // chain forces display, keyboard, and the session orchestrator up
-    // before term tries to claim a surface.
-    let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display_server,kbd_server,session_manager\n";
+    // acceptance bullet, the policy is on-failure with a budget of three;
+    // the dependency chain forces display, keyboard, and the session
+    // orchestrator up before term tries to claim a surface. The dep
+    // names match REGISTERED service names from each daemon's `.conf`
+    // `name=` field (display, kbd, session_manager), NOT the binary
+    // names (display_server, kbd_server, session_manager).
+    let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,session_manager\n";
 
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
@@ -11722,10 +11729,18 @@ mod tests {
     fn ac97_qemu_audio_flags_pinned_per_a1_memo() {
         // A.1 memo: `-device AC97,audiodev=snd0` plus a paired
         // `-audiodev` line. Headless safety pins the backend to
-        // `none,id=snd0` (no host audio sink required).
+        // `none,id=snd0` (no host audio sink required). `addr=0x5`
+        // pins the PCI slot to 0:5.0 so the matching `audio_server`
+        // `SENTINEL_BDF` finds the device deterministically (slot 3
+        // is e1000, slot 4 is nvme).
         assert_eq!(
             AC97_QEMU_AUDIO_FLAGS,
-            &["-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0",]
+            &[
+                "-audiodev",
+                "none,id=snd0",
+                "-device",
+                "AC97,audiodev=snd0,addr=0x5",
+            ]
         );
     }
 
@@ -11794,8 +11809,8 @@ mod tests {
         );
         // No AC97 device must appear.
         assert!(
-            !args.iter().any(|a| a == "AC97,audiodev=snd0"),
-            "--no-audio run-gui must NOT emit `AC97,audiodev=snd0`"
+            !args.iter().any(|a| a == "AC97,audiodev=snd0,addr=0x5"),
+            "--no-audio run-gui must NOT emit `AC97,audiodev=snd0,addr=0x5`"
         );
         assert!(
             !args.iter().any(|a| a == "none,id=snd0"),

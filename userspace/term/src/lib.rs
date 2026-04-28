@@ -66,17 +66,21 @@ pub const SERVICE_NAME: &str = "term";
 
 /// Service-manifest restart budget — pinned at 3 per the G.1
 /// acceptance ("`restart=on-failure max_restart=3
-/// depends=display_server,kbd_server,session_manager`").
+/// depends=display,kbd,session_manager`"). The dep names match the
+/// REGISTERED service names from each daemon's `.conf` (display_server.conf
+/// `name=display`, kbd.conf `name=kbd`, session_manager.conf
+/// `name=session_manager`), not the binary names.
 pub const SERVICE_MAX_RESTART: u32 = 3;
 
 /// Service-manifest restart policy literal.
 pub const SERVICE_RESTART_POLICY: &str = "on-failure";
 
-/// Service-manifest dependency list.  `term` requires display_server
-/// (compositor), kbd_server (focus-aware key events) and
+/// Service-manifest dependency list.  `term` requires display
+/// (compositor — registered name from display_server.conf), kbd
+/// (focus-aware key events — registered name from kbd.conf) and
 /// session_manager (entry orchestration) to be running before it can
 /// claim a surface.
-pub const SERVICE_DEPENDS: &str = "display_server,kbd_server,session_manager";
+pub const SERVICE_DEPENDS: &str = "display,kbd,session_manager";
 
 /// Fixed scrollback cap in lines.  G.4 acceptance: "Scrollback fixed
 /// at 1000 lines; exceeding the cap drops the oldest line".
@@ -119,14 +123,15 @@ mod tests {
     use super::*;
 
     /// Phase 57 G.1 acceptance: the manifest constants record
-    /// `restart=on-failure max_restart=3
-    /// depends=display_server,kbd_server,session_manager`.  This test
-    /// pins the constants the `populate_ext2_files` helper consumes.
+    /// `restart=on-failure max_restart=3 depends=display,kbd,session_manager`.
+    /// The dep names match the REGISTERED service names (from each
+    /// daemon's `.conf` `name=` field), not the binary names.  This
+    /// test pins the constants the `populate_ext2_files` helper consumes.
     #[test]
     fn service_manifest_constants_match_acceptance() {
         assert_eq!(SERVICE_RESTART_POLICY, "on-failure");
         assert_eq!(SERVICE_MAX_RESTART, 3);
-        assert_eq!(SERVICE_DEPENDS, "display_server,kbd_server,session_manager");
+        assert_eq!(SERVICE_DEPENDS, "display,kbd,session_manager");
     }
 
     /// Default geometry must be the documented fixed grid.

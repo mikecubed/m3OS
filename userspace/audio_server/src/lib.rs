@@ -55,11 +55,14 @@ pub const SERVER_READY_SENTINEL: &str = "AUDIO_SMOKE:server:READY\n";
 /// connect to `audio_server`.
 pub const SERVICE_NAME: &str = "audio.cmd";
 
-/// Sentinel PCI BDF QEMU uses for `-device AC97` under m3OS — bus 0,
-/// device 4, function 0. Slot +4 is the next unused slot after the
-/// e1000 family at +3 and avoids colliding with virtio defaults.
+/// Sentinel PCI BDF QEMU uses for `-device AC97,addr=0x5` under m3OS —
+/// bus 0, device 5, function 0. Slot +3 is e1000_driver, +4 is
+/// nvme_driver, so AC'97 lands at +5 to avoid collisions with both.
+/// The matching `addr=0x5` flag lives on `-device AC97` in
+/// `AC97_QEMU_AUDIO_FLAGS` so QEMU pins the slot rather than auto-
+/// assigning at instantiation order.
 pub const SENTINEL_BUS: u8 = 0x00;
-pub const SENTINEL_DEVICE: u8 = 0x04;
+pub const SENTINEL_DEVICE: u8 = 0x05;
 pub const SENTINEL_FUNCTION: u8 = 0x00;
 
 /// Service-manifest restart budget consumed by the supervisor's
@@ -72,9 +75,11 @@ pub const SERVICE_MAX_RESTART: u32 = 3;
 pub const SERVICE_RESTART_POLICY: &str = "on-failure";
 
 /// Service-manifest dependency list — `audio_server` depends on
-/// `display_server` because the chosen session-startup ordering
-/// brings display up before audio (A.4).
-pub const SERVICE_DEPENDS: &str = "display_server";
+/// `display` (the registered service name in `display_server.conf`)
+/// because the chosen session-startup ordering brings display up
+/// before audio (A.4). Note the dep names the registered service,
+/// not the binary: `display_server.conf` has `name=display`.
+pub const SERVICE_DEPENDS: &str = "display";
 
 /// Supervisor restart-callback hook the F.4 recovery path consumes
 /// to record a single `audio.device.claim` re-acquire log line on
@@ -87,15 +92,17 @@ mod tests {
 
     /// Phase 57 D.6 acceptance: the manifest records
     /// `restart=on-failure max_restart=3 on-restart=audio_server.restart
-    /// depends=display_server`.  This test pins the constants the
-    /// `populate_ext2_files` helper consumes.  A regression that
-    /// silently changed any one of these would surface here before
-    /// the supervisor saw the wrong shape at runtime.
+    /// depends=display`.  The dep names the REGISTERED service from
+    /// `display_server.conf` (`name=display`), not the binary.  This
+    /// test pins the constants the `populate_ext2_files` helper
+    /// consumes.  A regression that silently changed any one of these
+    /// would surface here before the supervisor saw the wrong shape
+    /// at runtime.
     #[test]
     fn service_manifest_constants_match_acceptance() {
         assert_eq!(SERVICE_RESTART_POLICY, "on-failure");
         assert_eq!(SERVICE_MAX_RESTART, 3);
-        assert_eq!(SERVICE_DEPENDS, "display_server");
+        assert_eq!(SERVICE_DEPENDS, "display");
         assert_eq!(SERVICE_ON_RESTART, "audio_server.restart");
     }
 
@@ -137,12 +144,14 @@ mod tests {
         );
     }
 
-    /// Sentinel BDF must match the PCI device the AC'97 emulation
-    /// presents under QEMU's `-device AC97` flag.
+    /// Sentinel BDF must match the PCI slot QEMU's `-device AC97,addr=0x5`
+    /// instantiates. Slot 5 is the first slot after e1000 (slot 3) and
+    /// nvme (slot 4); both pre-existing drivers claim those slots so
+    /// AC'97 must avoid both.
     #[test]
     fn sentinel_bdf_matches_chosen_target_doc() {
         assert_eq!(SENTINEL_BUS, 0x00);
-        assert_eq!(SENTINEL_DEVICE, 0x04);
+        assert_eq!(SENTINEL_DEVICE, 0x05);
         assert_eq!(SENTINEL_FUNCTION, 0x00);
     }
 }
