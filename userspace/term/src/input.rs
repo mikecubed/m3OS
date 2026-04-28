@@ -1,11 +1,30 @@
 //! Phase 57 Track G.5 — `KeyEvent` → PTY byte translation.
 //!
-//! Red commit: declares the public seam (`InputHandler::translate`)
-//! returning a stub byte slice; the green commit fills in the keymap.
+//! `InputHandler` consumes typed [`KeyEvent`]s from
+//! `display_server`'s focus-aware dispatcher (which receives them
+//! from `kbd_server`), applies the keymap, and writes shell-relevant
+//! byte sequences to the PTY:
+//!
+//! - Printable ASCII flows through verbatim.
+//! - Ctrl + letter produces the corresponding control code (Ctrl-A =
+//!   0x01, Ctrl-C = 0x03, Ctrl-D = 0x04, ...).
+//! - Arrow keys produce CSI sequences (`ESC [ A/B/C/D`).
+//! - Backspace produces 0x7F (DEL) so the shell's cooked-mode line
+//!   editor erases.
+//! - Carriage return produces 0x0D so the PTY's line discipline can
+//!   translate it to LF in cooked mode.
+//! - Unknown private-use keysyms write nothing.  No worker threads —
+//!   the binary's main loop drives this synchronously.
 
-use alloc::vec::Vec;
+use kernel_core::input::events::{KEY_EVENT_WIRE_SIZE, KeyEvent, KeyEventKind, MOD_CTRL};
+use kernel_core::input::keymap::{KEYSYM_DOWN, KEYSYM_LEFT, KEYSYM_RIGHT, KEYSYM_UP};
 
-use kernel_core::input::events::{KeyEvent, KeyEventKind};
+const _ASSERT_KEY_EVENT_WIRE_SIZE_USED: () = {
+    // KEY_EVENT_WIRE_SIZE is referenced here so the import is not
+    // dropped if the codec ever moves; the binary's main loop reads
+    // KEY_EVENT_WIRE_SIZE bytes per event from the kbd dispatcher.
+    let _ = KEY_EVENT_WIRE_SIZE;
+};
 
 /// Pluggable PTY-write seam. Production wraps `syscall_lib::write`;
 /// host tests record byte slices.
@@ -15,18 +34,87 @@ pub trait PtyWriter {
 
 /// Input handler.  Consumes `KeyEvent`s, applies the keymap, writes
 /// shell-relevant byte sequences to the PTY.
+///
+/// Stateless — every event is translated independently.  Future
+/// tracks may add modal state (e.g. dead keys, IME) here.
 pub struct InputHandler;
 
 impl InputHandler {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
     /// Translate one event into PTY bytes; the writer is called once
     /// per event with the bytes (or not at all for events that do not
-    /// produce output, such as key-up events or unhandled symbols).
-    pub fn translate<W: PtyWriter>(&mut self, _event: &KeyEvent, _writer: &mut W) {
-        unimplemented!("G.5 green commit lands this")
+    /// produce output).
+    pub fn translate<W: PtyWriter>(&mut self, event: &KeyEvent, writer: &mut W) {
+        // Only down / repeat events produce input.  Up events update
+        // modifier state in `kbd_server`; clients see the latched
+        // snapshot on the next down event.
+        match event.kind {
+            KeyEventKind::Down | KeyEventKind::Repeat => {}
+            KeyEventKind::Up => return,
+        }
+
+        let symbol = event.symbol;
+        let modifiers = event.modifiers;
+
+        // Special keys live in the private-use area (0xE000+);
+        // printable ASCII in [0x20..=0x7E] flows through verbatim.
+        if let Some(seq) = special_key_sequence(symbol) {
+            writer.write(seq);
+            return;
+        }
+
+        // Backspace (0x08) → DEL (0x7F).
+        if symbol == 0x08 {
+            writer.write(&[0x7F]);
+            return;
+        }
+
+        // Ctrl + letter → control code.
+        if modifiers.contains(MOD_CTRL) {
+            // Ctrl maps the printable letter range A..Z / a..z to
+            // 0x01..0x1A.  Other Ctrl-combinations (Ctrl-Space,
+            // Ctrl-[, etc.) are deferred — Phase 57 only ships the
+            // shell-essential subset.
+            if let Some(c) = ctrl_byte(symbol) {
+                writer.write(&[c]);
+                return;
+            }
+        }
+
+        // Printable ASCII or control bytes that flow through.
+        if symbol <= 0x7F {
+            writer.write(&[symbol as u8]);
+        }
+    }
+}
+
+/// Map an arrow / function-key keysym to its CSI escape sequence.
+fn special_key_sequence(symbol: u32) -> Option<&'static [u8]> {
+    if symbol == KEYSYM_UP.0 {
+        Some(b"\x1b[A")
+    } else if symbol == KEYSYM_DOWN.0 {
+        Some(b"\x1b[B")
+    } else if symbol == KEYSYM_RIGHT.0 {
+        Some(b"\x1b[C")
+    } else if symbol == KEYSYM_LEFT.0 {
+        Some(b"\x1b[D")
+    } else {
+        None
+    }
+}
+
+/// Map an ASCII letter codepoint to its Ctrl-modifier byte.
+/// `'a' / 'A'` → 0x01, `'b' / 'B'` → 0x02, ..., `'z' / 'Z'` → 0x1A.
+fn ctrl_byte(symbol: u32) -> Option<u8> {
+    let c = symbol as u8;
+    let lower = c.to_ascii_lowercase();
+    if lower.is_ascii_lowercase() {
+        Some(lower - b'a' + 1)
+    } else {
+        None
     }
 }
 
@@ -39,6 +127,7 @@ impl Default for InputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use kernel_core::input::events::{MOD_CTRL, ModifierState};
     use kernel_core::input::keymap::{KEYSYM_DOWN, KEYSYM_LEFT, KEYSYM_RIGHT, KEYSYM_UP};
 

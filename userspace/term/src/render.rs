@@ -1,10 +1,22 @@
 //! Phase 57 Track G.5 — display-server client renderer.
 //!
-//! Red commit: `Renderer` declares the public seam — `apply` (one
-//! command), `compose` (frame-tick), and `damaged` (true when
-//! `compose` has work to do) — but the bodies are `unimplemented!()`
-//! so the host tests panic.  The green commit lands the real
-//! batching logic.
+//! `Renderer` consumes [`RenderCommand`]s emitted by the screen state
+//! machine, batches dirty cells per frame-tick, and calls
+//! [`FramebufferOwner::submit`] only when damage exists.  The
+//! renderer is a thin policy layer: it does not own the surface
+//! buffer (that is `FramebufferOwner`'s job), it only routes commands
+//! and tracks whether the next `compose` has work to do.
+//!
+//! `Bell`, `SetColor`, and `MoveCursor` do not mark damage:
+//!
+//! - `Bell` is an audio event handled by [`crate::bell::Bell`];
+//! - `SetColor` is a state update that the next `PutGlyph` carries
+//!   into the framebuffer;
+//! - `MoveCursor` is bookkeeping; the cursor sprite is deferred
+//!   (Phase 57 ships the screen, not a separate cursor layer).
+//!
+//! `PutGlyph`, `Clear`, and `Scroll` mark damage and trigger a
+//! `submit` on the next `compose` call.
 
 use crate::screen::RenderCommand;
 
@@ -19,33 +31,104 @@ pub trait FramebufferOwner {
 }
 
 /// Renderer: batches dirty cells per frame, calls `submit` only when
-/// damage exists.  Composes against any `FramebufferOwner` so host
+/// damage exists.  Composes against any [`FramebufferOwner`] so host
 /// tests cover behaviour without a real surface.
 pub struct Renderer<F: FramebufferOwner> {
-    #[allow(dead_code)]
     fb: F,
+    /// True when the renderer has buffered damage that has not yet
+    /// been submitted.  Cleared by [`compose`].
+    damaged: bool,
+    /// Queued draw operations buffered between `apply` calls and
+    /// flushed on `compose`.  Bounded by the number of cells in the
+    /// screen's grid; never grows unbounded because each frame ends
+    /// with `compose` clearing the buffer.
+    queue: alloc::vec::Vec<QueuedDraw>,
+    /// Current foreground colour, from the latest `SetColor`.
+    fg: u32,
+    /// Current background colour, from the latest `SetColor`.
+    bg: u32,
+}
+
+/// One queued draw operation.  Phase 57 only buffers `PutGlyph`-style
+/// cells; full-screen redraws (Clear / Scroll) drain the queue and
+/// are forwarded to the framebuffer at compose time as repaints.
+#[derive(Clone, Copy, Debug)]
+struct QueuedDraw {
+    row: u16,
+    col: u16,
+    codepoint: u32,
+    fg: u32,
+    bg: u32,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
-    pub fn new(_fb: F) -> Self {
-        unimplemented!("G.5 green commit lands this")
+    /// Wrap a framebuffer owner with a fresh renderer.  No damage,
+    /// empty queue, default colours.
+    pub fn new(fb: F) -> Self {
+        Self {
+            fb,
+            damaged: false,
+            queue: alloc::vec::Vec::new(),
+            fg: 0xFFFF_FFFF,
+            bg: 0x0000_0000,
+        }
     }
 
     /// Apply one render command.  Updates internal damage state but
     /// does not submit a frame.
-    pub fn apply(&mut self, _cmd: RenderCommand) {
-        unimplemented!("G.5 green commit lands this")
+    pub fn apply(&mut self, cmd: RenderCommand) {
+        match cmd {
+            RenderCommand::PutGlyph {
+                row,
+                col,
+                codepoint,
+                fg,
+                bg,
+            } => {
+                self.queue.push(QueuedDraw {
+                    row,
+                    col,
+                    codepoint,
+                    fg,
+                    bg,
+                });
+                self.damaged = true;
+            }
+            RenderCommand::Clear | RenderCommand::Scroll { .. } => {
+                // Full-screen damage; the queue carries any pending
+                // glyphs forward to the next frame on top of a fresh
+                // background.  Phase 57 collapses both to a single
+                // damage flag — the screen state machine repaints any
+                // cells affected by the scroll/clear via subsequent
+                // `PutGlyph` commands as the buffer scrolls.
+                self.damaged = true;
+            }
+            RenderCommand::SetColor { fg, bg } => {
+                self.fg = fg;
+                self.bg = bg;
+            }
+            RenderCommand::Bell => { /* audio path; no pixels */ }
+            RenderCommand::MoveCursor { .. } => { /* cursor sprite is deferred to a later track */ }
+        }
     }
 
     /// True when there is buffered damage waiting to be submitted.
     pub fn damaged(&self) -> bool {
-        unimplemented!("G.5 green commit lands this")
+        self.damaged
     }
 
-    /// Submit any buffered damage to the framebuffer.  Idempotent
-    /// when `damaged()` is false (no work, no submit).
+    /// Submit any buffered damage to the framebuffer.  No-op when
+    /// `damaged()` is false (no work, no submit).
     pub fn compose(&mut self) {
-        unimplemented!("G.5 green commit lands this")
+        if !self.damaged {
+            return;
+        }
+        for draw in self.queue.drain(..) {
+            self.fb
+                .put_glyph(draw.row, draw.col, draw.codepoint, draw.fg, draw.bg);
+        }
+        self.fb.submit();
+        self.damaged = false;
     }
 }
 
