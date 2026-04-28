@@ -15,18 +15,28 @@
 //! deliberately short (~50 ms) so user-paced BEL still rings, but
 //! tight loops collapse to one event.
 //!
-//! # Production stub — pending Track E merge
+//! # Production sinks
 //!
-//! Track E (`audio_client` library) is in flight in a parallel
-//! worktree and has not yet merged.  Until it does, the production
-//! [`AudioUnavailableBellSink`] writes one warn marker
-//! (`term.bell.audio_unavailable`) on the first call and otherwise
-//! no-ops.  The full `audio_client` wiring lands in a tiny follow-up
-//! commit on the integration branch after Track E merges:
-//! cross-references the design at `docs/roadmap/57-audio-and-local-session.md`
-//! Track E (E.1) — that follow-up swaps in the real
-//! `AudioClientBellSink` that opens a stream, submits the documented
-//! short tone, drains, and closes within the timeout.
+//! Two production sinks are available:
+//!
+//! - [`AudioClientBellSink`] (preferred when `audio_server` is up):
+//!   wraps an [`audio_client::AudioClient`] with a cached AC'97 stream
+//!   and a precomputed 30 ms 880 Hz square-wave tone. `play()` submits
+//!   the tone bytes fire-and-forget so the audio device plays the
+//!   tone asynchronously while term continues rendering. On any
+//!   transport error the sink invalidates its client and surfaces
+//!   `BellError::AudioUnavailable`; the next ring re-attempts open.
+//! - [`AudioUnavailableBellSink`] (fallback): writes a single
+//!   `term.bell.audio_unavailable` warn marker and no-ops on every
+//!   subsequent ring. Used when `audio_server` is not registered or
+//!   has crashed.
+//!
+//! The `term` binary is expected to construct an
+//! `AudioClientBellSink` first; on `BellError::AudioUnavailable` it
+//! falls back to `AudioUnavailableBellSink` for the remainder of the
+//! process lifetime. The `Bell<S>` coalescing wrapper is generic over
+//! the sink so this fallback is a simple type swap, not a runtime
+//! dispatch.
 //!
 //! # Module-level test discipline
 //!
@@ -111,6 +121,146 @@ impl BellSink for AudioUnavailableBellSink {
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "term.bell.audio_unavailable\n");
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioClientBellSink — production sink that talks to audio_server
+// ---------------------------------------------------------------------------
+
+/// Bell tone frequency in Hz. 880 Hz is one octave above the 440 Hz
+/// audio-demo tone; the higher pitch is conventional for terminal
+/// "ding" sounds and is easy to distinguish from other system audio.
+pub const BELL_TONE_FREQ_HZ: u32 = 880;
+
+/// Bell tone duration in milliseconds. Pinned at 30 ms — well below
+/// the documented ~50 ms `Bell::ring` budget so the submit_frames
+/// call never blocks the render loop past the coalescing window.
+pub const BELL_DURATION_MS: u32 = 30;
+
+/// Bell sample count per channel.  At the AC'97 fixed rate (48 kHz)
+/// and 30 ms duration: `48000 * 30 / 1000 = 1440` samples per channel.
+const BELL_SAMPLES_PER_CHANNEL: usize = (48_000 * BELL_DURATION_MS as usize) / 1_000;
+
+/// Bell tone buffer size in bytes. Stereo (2 channels) × 16-bit
+/// (2 bytes per sample) × `BELL_SAMPLES_PER_CHANNEL`.
+pub const BELL_TONE_BYTES: usize = BELL_SAMPLES_PER_CHANNEL * 2 * 2;
+
+/// Bell tone amplitude as a fraction of `i16::MAX`. 0.4 keeps the
+/// tone audible without clipping when mixed with other audio.
+const BELL_AMPLITUDE_NUM: i32 = 4;
+const BELL_AMPLITUDE_DEN: i32 = 10;
+
+/// Build the bell tone bytes — a 30 ms square wave at
+/// [`BELL_TONE_FREQ_HZ`] in 16-bit signed LE stereo. Square wave is
+/// chosen over sine because it is `no_std`-friendly (no floating-
+/// point math, no `libm`) and sounds appropriately bell-like for a
+/// terminal beep. Mirrors the audio-demo tone-generation pattern
+/// from `userspace/audio-demo/src/main.rs` minus the LUT.
+///
+/// The buffer is computed eagerly into a fixed-size array so the
+/// production sink does not allocate on the hot path.
+pub fn build_bell_tone_bytes() -> [u8; BELL_TONE_BYTES] {
+    let mut buf = [0u8; BELL_TONE_BYTES];
+    // Period in samples for the chosen frequency. At 48 kHz / 880 Hz
+    // this is ~54.5; we use integer division so the wave is a hair
+    // sharp of 880 Hz — close enough for a 30 ms beep, no listener
+    // would hear the difference.
+    let period_samples = 48_000 / BELL_TONE_FREQ_HZ as usize;
+    let half_period = period_samples / 2;
+    let amplitude = (i16::MAX as i32 * BELL_AMPLITUDE_NUM / BELL_AMPLITUDE_DEN) as i16;
+
+    for sample_idx in 0..BELL_SAMPLES_PER_CHANNEL {
+        let phase = sample_idx % period_samples;
+        let sample: i16 = if phase < half_period {
+            amplitude
+        } else {
+            -amplitude
+        };
+        let bytes = sample.to_le_bytes();
+        // Stereo: same sample on both channels.
+        let base = sample_idx * 4;
+        buf[base] = bytes[0];
+        buf[base + 1] = bytes[1];
+        buf[base + 2] = bytes[0];
+        buf[base + 3] = bytes[1];
+    }
+    buf
+}
+
+/// Production [`BellSink`] backed by `audio_client`. Lazily opens an
+/// AC'97 PCM stream on the first `play()` call and caches it; on
+/// every subsequent call submits the precomputed tone bytes
+/// fire-and-forget. On any transport error the sink invalidates its
+/// cached client and surfaces [`BellError::AudioUnavailable`]; the
+/// caller can either retry (next ring re-attempts open) or swap to
+/// [`AudioUnavailableBellSink`] permanently.
+///
+/// The cached client holds the single Phase 57 audio slot for the
+/// process lifetime — `audio_server` rejects subsequent client
+/// connections with `-EBUSY` (per Track D's single-client policy)
+/// while term holds the slot. This is acceptable because Phase 57's
+/// only other audio consumer is `audio-demo`, a one-shot binary
+/// that exits after submitting its tone.
+#[cfg(all(not(test), feature = "os-binary"))]
+pub struct AudioClientBellSink {
+    client: Option<audio_client::AudioClient<audio_client::SyscallSocket>>,
+    tone_bytes: [u8; BELL_TONE_BYTES],
+}
+
+#[cfg(all(not(test), feature = "os-binary"))]
+impl AudioClientBellSink {
+    /// Construct a fresh sink with no open client. The first
+    /// `play()` call opens the stream lazily; tone bytes are
+    /// precomputed up front so the hot path is allocation-free.
+    pub fn new() -> Self {
+        Self {
+            client: None,
+            tone_bytes: build_bell_tone_bytes(),
+        }
+    }
+
+    /// Lazily open the AudioClient if it is not already open.
+    /// Returns `Err(BellError::AudioUnavailable)` if `audio_server`
+    /// is not registered or refused the connection.
+    fn ensure_open(&mut self) -> Result<(), BellError> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+        let client = audio_client::AudioClient::open(
+            kernel_core::audio::PcmFormat::S16Le,
+            kernel_core::audio::ChannelLayout::Stereo,
+            kernel_core::audio::SampleRate::Hz48000,
+        )
+        .map_err(|_| BellError::AudioUnavailable)?;
+        self.client = Some(client);
+        Ok(())
+    }
+}
+
+#[cfg(all(not(test), feature = "os-binary"))]
+impl Default for AudioClientBellSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(not(test), feature = "os-binary"))]
+impl BellSink for AudioClientBellSink {
+    fn play(&mut self) -> Result<(), BellError> {
+        self.ensure_open()?;
+        let client = self.client.as_mut().expect("ensure_open populated client");
+        match client.submit_frames(&self.tone_bytes) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // Drop the cached client so the next ring re-opens.
+                // The server may have crashed; restart-aware behavior
+                // lives in audio_server's supervisor manifest, not
+                // here.
+                self.client = None;
+                Err(BellError::AudioUnavailable)
+            }
+        }
     }
 }
 
@@ -285,5 +435,44 @@ mod tests {
         bell.ring(1_000).expect("first ring");
         let played = bell.ring(500).expect("regressed clock ring");
         assert!(!played, "regressed clock must coalesce, not panic");
+    }
+
+    #[test]
+    fn bell_tone_buffer_size_matches_duration() {
+        // 30 ms at 48 kHz stereo 16-bit:
+        //   48000 * 30 / 1000 = 1440 samples per channel
+        //   * 2 channels = 2880 samples total
+        //   * 2 bytes / sample = 5760 bytes
+        assert_eq!(BELL_SAMPLES_PER_CHANNEL, 1440);
+        assert_eq!(BELL_TONE_BYTES, 5760);
+    }
+
+    #[test]
+    fn bell_tone_within_50ms_budget() {
+        // G.6 acceptance: bell must not block the render loop for
+        // more than ~50 ms. The tone duration drives the worst-case
+        // submit/drain time, so pin it under the budget.
+        assert!(
+            BELL_DURATION_MS < 50,
+            "bell tone duration {} ms must be < 50 ms",
+            BELL_DURATION_MS
+        );
+    }
+
+    #[test]
+    fn bell_tone_bytes_alternate_polarity_per_half_period() {
+        // Square wave at 880 Hz / 48 kHz: period = 54 samples,
+        // half-period = 27 samples. The first 27 samples are
+        // +amplitude, the next 27 are -amplitude. We sample sample
+        // 0 (positive) and sample 27 (negative) to verify the
+        // generator produced a square wave, not silence.
+        let buf = build_bell_tone_bytes();
+        let sample_0 = i16::from_le_bytes([buf[0], buf[1]]);
+        let sample_27 = i16::from_le_bytes([buf[27 * 4], buf[27 * 4 + 1]]);
+        assert!(sample_0 > 0, "first sample must be +amplitude");
+        assert!(sample_27 < 0, "sample at half-period must be -amplitude");
+        // Stereo: left and right channels carry the same sample.
+        let sample_0_right = i16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(sample_0, sample_0_right, "stereo channels must match");
     }
 }

@@ -1871,6 +1871,7 @@ dependencies = [
 name = "term"
 version = "0.57.0"
 dependencies = [
+ "audio_client",
  "kernel-core",
  "surface_buffer",
  "syscall-lib",
