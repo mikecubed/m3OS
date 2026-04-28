@@ -27,6 +27,23 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// one and silently drop settings.
 pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
+/// Phase 57 H.5 — verbatim audio command-line surface from the A.1
+/// audio-target memo (`docs/appendix/phase-57-audio-target-choice.md`).
+///
+/// Headless safety: `-audiodev none,id=snd0` does not bind a host audio
+/// sink, so `cargo xtask run-gui` works in CI environments without
+/// PulseAudio. A developer who wants audible output can override the
+/// backend at runtime via `QEMU_AUDIO_DRV=pa cargo xtask run-gui`
+/// (QEMU env-var precedence rules apply). The `-device AC97,audiodev=snd0`
+/// pair is the chosen first audio target — Intel 82801AA AC'97
+/// (`0x8086:0x2415`).
+///
+/// The constant is referenced from `cmd_run_gui` (default: enabled) and
+/// pinned by xtask unit tests so any future deviation from the memo
+/// surfaces at `cargo test -p xtask` time, not at QEMU launch time.
+pub const AC97_QEMU_AUDIO_FLAGS: &[&str] =
+    &["-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0"];
+
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
 /// and kernel writing 0x11 → exit 0x23.
@@ -170,7 +187,12 @@ fn main() {
                 std::process::exit(1);
             });
             let fresh = remaining.iter().any(|a| a == "--fresh");
-            cmd_run_gui(fresh, devices);
+            // Phase 57 H.5: audio is on by default; `--no-audio` opts
+            // out while preserving the legacy `pcspk-audiodev=noaudio`
+            // PC-speaker binding so non-audio runs match historical
+            // behavior byte-for-byte.
+            let no_audio = remaining.iter().any(|a| a == "--no-audio");
+            cmd_run_gui(fresh, devices, !no_audio);
         }
         Some("check") => cmd_check(),
         Some("fmt") => {
@@ -254,7 +276,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -1923,6 +1945,49 @@ fn launch_qemu_with_devices(uefi_image: &Path, display_mode: QemuDisplayMode, de
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
+/// Phase 57 H.5: GUI launcher that optionally appends [`AC97_QEMU_AUDIO_FLAGS`]
+/// for `cargo xtask run-gui` (default: audio enabled, `--no-audio` opts out).
+///
+/// The audio flags are appended to the arg list assembled by
+/// [`qemu_run_args_with_devices`]; the existing
+/// `pcspk-audiodev=noaudio` machine option and `-audiodev none,id=noaudio`
+/// PC-speaker binding are preserved verbatim so non-audio runs continue to
+/// match today's behavior byte-for-byte.
+fn launch_qemu_with_devices_audio(
+    uefi_image: &Path,
+    display_mode: QemuDisplayMode,
+    devices: DeviceSet,
+    with_audio: bool,
+) {
+    let ovmf = find_ovmf();
+    let mut args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
+    if with_audio {
+        append_ac97_audio_flags(&mut args);
+    }
+
+    if display_mode == QemuDisplayMode::Gui {
+        println!(
+            "QEMU GUI mode: click the window to grab the keyboard, then press Ctrl+Alt+G to release it."
+        );
+    }
+
+    let status = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .status()
+        .expect("failed to launch QEMU");
+
+    std::process::exit(normalize_run_qemu_exit(status.code()));
+}
+
+/// Append the Phase 57 [`AC97_QEMU_AUDIO_FLAGS`] to a QEMU arg vector.
+///
+/// Centralised so the production launcher and the xtask unit tests
+/// share one definition — see `run_gui_with_audio_emits_ac97_device_flags`
+/// for the contract assertion.
+fn append_ac97_audio_flags(args: &mut Vec<String>) {
+    args.extend(AC97_QEMU_AUDIO_FLAGS.iter().map(|s| (*s).to_string()));
+}
+
 #[cfg(test)]
 fn qemu_run_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
     qemu_run_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default())
@@ -1940,6 +2005,25 @@ fn qemu_run_args_with_devices(
         "-device".to_string(),
         QEMU_ISA_DEBUG_EXIT_DEVICE.to_string(),
     ]);
+    args
+}
+
+/// Phase 57 H.5 unit-test helper: assemble the exact arg vector the
+/// `cmd_run_gui` launcher would hand to QEMU for a given `with_audio`
+/// flag. Using a hermetic helper keeps the assertions free of I/O —
+/// the `find_ovmf` call inside `launch_qemu_with_devices_audio` would
+/// otherwise force tests to depend on the host's OVMF install.
+#[cfg(test)]
+fn qemu_run_gui_args_for_test(
+    uefi_image: &Path,
+    ovmf: &Path,
+    devices: DeviceSet,
+    with_audio: bool,
+) -> Vec<String> {
+    let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Gui, devices);
+    if with_audio {
+        append_ac97_audio_flags(&mut args);
+    }
     args
 }
 
@@ -7017,7 +7101,7 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
     launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
-fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
+fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -7036,7 +7120,7 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
         false,
         false,
     );
-    launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
+    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Gui, devices, with_audio);
 }
 
 fn cmd_runner(kernel_binary: PathBuf) {
@@ -11078,12 +11162,7 @@ mod tests {
         // `none,id=snd0` (no host audio sink required).
         assert_eq!(
             AC97_QEMU_AUDIO_FLAGS,
-            &[
-                "-audiodev",
-                "none,id=snd0",
-                "-device",
-                "AC97,audiodev=snd0",
-            ]
+            &["-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0",]
         );
     }
 
