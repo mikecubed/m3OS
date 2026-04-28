@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "m3ctl"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
