@@ -157,6 +157,13 @@ pub struct PerCoreData {
     pub apic_id: u8,
     /// Set to `true` once this core has completed initialization.
     pub is_online: AtomicBool,
+    /// Phase 57 DEBUG: countdown for the per-core "reschedule IPI
+    /// received" INFO log. Initialized to 4 in both BSP and AP
+    /// per-core data constructors; the IPI handler decrements with
+    /// `fetch_sub(1, Relaxed)` and logs while the pre-decrement value
+    /// is positive. Caps the log to the first 4 IPIs each core
+    /// receives so the transcript stays readable.
+    pub ipi_recv_log_budget: core::sync::atomic::AtomicI32,
     /// Pointer to this core's TSS (for runtime RSP0 updates).
     tss_ptr: *mut TaskStateSegment,
     /// Pointer to this core's GDT (pre-allocated on BSP, loaded on AP).
@@ -511,6 +518,7 @@ pub fn init_bsp_per_core() {
         core_id: 0,
         apic_id: bsp_apic_id,
         is_online: AtomicBool::new(true),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
         tss_ptr: core::ptr::null_mut(), // BSP uses existing gdt.rs TSS
         gdt_ptr: core::ptr::null(),     // BSP uses existing gdt.rs GDT
         gdt_code: SegmentSelector(0),
@@ -623,6 +631,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         core_id,
         apic_id,
         is_online: AtomicBool::new(false),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
         tss_ptr: tss,
         gdt_ptr: gdt,
         gdt_code,

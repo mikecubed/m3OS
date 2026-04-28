@@ -1083,6 +1083,18 @@ extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
 /// Sets the reschedule flag on the receiving core, causing the scheduler to
 /// pick the next ready task on the next opportunity.
 extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStackFrame) {
+    // Phase 57 DEBUG: count IPIs received per core so we can tell
+    // if any core is being silently starved of reschedule signals.
+    // Throttled to first 4 per core so the boot transcript stays
+    // readable.
+    if let Some(pc) = crate::smp::try_per_core() {
+        let n = pc
+            .ipi_recv_log_budget
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::info!("[ipi] reschedule received core={}", pc.core_id);
+        }
+    }
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline(&mut stack_frame);
     super::apic::lapic_eoi();
