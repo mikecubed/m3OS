@@ -914,8 +914,26 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
     unsafe { *PENDING_SAVED_RSP[core_id].get() }
 }
 
+/// Phase 57 DEBUG: per-core countdown for yield_now log markers.
+/// Atomic so the IPI-context observer doesn't trip race detection
+/// in case a yield races with another path.
+static YIELD_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
+    [const { core::sync::atomic::AtomicI32::new(4) }; crate::smp::MAX_CORES];
+
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
+    // Phase 57 DEBUG: log entry and exit of yield_now per core. If
+    // we see "yield-enter core=3" but no "yield-handoff core=3" or
+    // a missing "resume core=3" pair, we'll know the yield itself is
+    // hanging vs the switch_context call site is hanging.
+    {
+        let core_id = crate::smp::per_core().core_id;
+        let n =
+            YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::info!("[sched] yield-enter core={}", core_id);
+        }
+    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
@@ -957,6 +975,19 @@ pub fn yield_now() {
         task_idx: idx as u32,
         core: my_core as u8,
     });
+    // Phase 57 DEBUG: log right before the switch_context handoff so
+    // we can spot a yield that reaches here but doesn't hand off.
+    {
+        let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
+        if n >= 0 {
+            log::info!(
+                "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
+                my_core,
+                sched_rsp,
+                idx
+            );
+        }
+    }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
