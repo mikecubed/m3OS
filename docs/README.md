@@ -65,6 +65,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Hardware Substrate](./55-hardware-substrate.md) | 55 | PCIe MCFG + MSI/MSI-X, reusable hardware-access layer (BAR mapping, DMA, device IRQ), NVMe storage driver, Intel 82540EM classic e1000 network driver, reference hardware matrix |
 | [Ring-3 Driver Host](./55b-ring-3-driver-host.md) | 55b | Device-host capability primitives, MMIO bounds-checking, IOMMU-gated DMA, notification-forwarded IRQs, NVMe and e1000 extracted to supervised ring-3 processes |
 | [Display and Input Architecture](./56-display-and-input-architecture.md) | 56 | Ring-3 `display_server` owns the framebuffer; focus-aware input dispatch via `kbd_server` / `mouse_server`; layer-shell-equivalent surface roles; control socket for `m3ctl`-style tooling; supervised crash recovery and text-mode fallback |
+| [Audio and Local Session](./57-audio-and-local-session.md) | 57 | First audio path (Intel AC'97 ring-3 driver, single-client PCM-out via `audio_server`); fixed-boot graphical session orchestrator (`session_manager`) with `text-fallback` recovery contract and `m3ctl` control-socket verbs; first useful graphical client (`term`) composing PTY + ANSI parser + Phase 56 display-server client + audio bell |
 
 ### Roadmap
 

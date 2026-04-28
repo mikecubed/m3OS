@@ -1011,6 +1011,18 @@ impl VtdUnit {
     /// `install_and_verify_bar_coverage`; also directly accessible for
     /// integration tests under `cargo xtask device-smoke --device nvme
     /// --iommu`.
+    ///
+    /// Phase 57 Track C.2: this function is reused unchanged for the
+    /// audio device class (Intel AC'97, `0x8086:0x2415`). AC'97 ships
+    /// both BARs in I/O space — the kernel-side claim path filters PIO
+    /// BARs before they reach this function, so the audio claim sees an
+    /// empty `bars` slice and the loop is a no-op. Kernel-core unit
+    /// tests pin that contract (see
+    /// `kernel-core/tests/phase57_c2_audio_bar_coverage.rs`). A future
+    /// MMIO-bearing audio target (e.g. Intel HDA) will hit this loop
+    /// with no per-class branching needed; the
+    /// `kernel_core::device_host::audio_class::BarLayout` descriptor
+    /// records each target's MMIO BAR count alongside its PCI ID.
     #[allow(dead_code)]
     pub fn install_bar_identity_maps(
         &mut self,

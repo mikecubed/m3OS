@@ -50,7 +50,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use kernel_core::device_host::{
     DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, IrqBinding, IrqBindingRegistryCore,
-    IrqRegistryError, MmioBoundsError, RegistryError, build_mmio_window,
+    IrqRegistryError, MmioBoundsError, RegistryError, build_mmio_window, classify_pci_id,
 };
 use kernel_core::ipc::Capability;
 use kernel_core::ipc::capability::CapHandle;
@@ -877,6 +877,41 @@ fn capacity_exceeded_errno() -> isize {
 // D.3 — BAR identity-coverage validation helper
 // ---------------------------------------------------------------------------
 
+/// BDF + PCI vendor/device identifier bundle used by the BAR-coverage
+/// helpers and the `iommu.missing_bar_coverage` log emitters.
+///
+/// Bundling these six fields in one struct keeps each helper's argument
+/// list under clippy's `too_many_arguments` threshold and gives a single
+/// place to read out the `subsystem=` log suffix for the audio device
+/// class — see [`ClaimContext::subsystem_log_suffix`].
+#[derive(Clone, Copy, Debug)]
+struct ClaimContext {
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    vendor: u16,
+    device: u16,
+}
+
+impl ClaimContext {
+    /// Subsystem name to splice into `iommu.missing_bar_coverage` log
+    /// events for known device classes. Returns `None` when the
+    /// `(vendor, device)` pair is unknown so the existing log layout
+    /// for non-classified devices is preserved verbatim.
+    ///
+    /// Phase 57 Track C.1: when the claimed device is the AC'97 audio
+    /// controller (`0x8086:0x2415`), this returns `Some("audio.device")`
+    /// so log search for `subsystem=audio.device` finds every audio-stack
+    /// observability event without having to translate PCI IDs by hand.
+    /// Other device classes will gain their own variants in
+    /// [`kernel_core::device_host::audio_class::DeviceClass`] when
+    /// concrete consumers exist.
+    fn subsystem_log_suffix(self) -> Option<&'static str> {
+        classify_pci_id(self.vendor, self.device).map(|class| class.subsystem())
+    }
+}
+
 /// Guard the IOMMU domain presence for a new device claim.
 ///
 /// This function contains the no-domain logic that was previously inlined at
@@ -896,28 +931,136 @@ fn capacity_exceeded_errno() -> isize {
 ///   structured `iommu.missing_bar_coverage error=no_domain` warn event is
 ///   emitted before returning. At the `sys_device_claim` syscall gate this
 ///   maps to `NEG_EIO`.
+///
+/// `ctx` carries the BDF and the PCI vendor/device IDs read from
+/// config space at claim time; they tag the log event with
+/// `subsystem=audio.device` when the classifier recognizes the pair.
 fn validate_domain_presence(
     domain: Option<crate::pci::DomainSnapshot>,
     iommu_active: bool,
-    segment: u16,
-    bus: u8,
-    dev: u8,
-    func: u8,
+    ctx: ClaimContext,
 ) -> Result<Option<crate::pci::DomainSnapshot>, DeviceHostError> {
     match domain {
         Some(s) => Ok(Some(s)),
         None if iommu_active => {
-            log::warn!(
-                "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
-                 error=no_domain",
-                segment,
-                bus,
-                dev,
-                func,
-            );
+            log_missing_bar_coverage_no_domain(ctx);
             Err(DeviceHostError::Internal)
         }
         None => Ok(None),
+    }
+}
+
+/// Emit the structured `iommu.missing_bar_coverage error=no_domain`
+/// warn event.
+///
+/// Kept as a small dedicated helper so the log layout (and the
+/// `subsystem=audio.device` tag for the audio device class) stays in
+/// one place. The call sites in [`validate_domain_presence`] and the
+/// related coverage helpers build the same event shape.
+fn log_missing_bar_coverage_no_domain(ctx: ClaimContext) {
+    match ctx.subsystem_log_suffix() {
+        Some(subsystem) => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+             error=no_domain subsystem={}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            subsystem,
+        ),
+        None => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} error=no_domain",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+        ),
+    }
+}
+
+/// Emit the `iommu.missing_bar_coverage error=bar_decode_failure` warn
+/// event with optional `subsystem=` tagging — see
+/// [`log_missing_bar_coverage_no_domain`] for the shape rationale.
+fn log_missing_bar_coverage_decode_failure(ctx: ClaimContext, bar_index: u8) {
+    match ctx.subsystem_log_suffix() {
+        Some(subsystem) => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+             bar_index={} error=bar_decode_failure subsystem={}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+            subsystem,
+        ),
+        None => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+             bar_index={} error=bar_decode_failure",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+        ),
+    }
+}
+
+/// Emit the `iommu.missing_bar_coverage` warn event for an IOMMU map
+/// failure during BAR coverage installation. The `error={:?}` field
+/// records the underlying [`kernel_core::iommu::contract::DomainError`]
+/// debug form so triage can find the failure mode without crawling the
+/// kernel source.
+fn log_missing_bar_coverage_map_error(
+    ctx: ClaimContext,
+    bar_index: u8,
+    err: kernel_core::iommu::contract::DomainError,
+) {
+    match ctx.subsystem_log_suffix() {
+        Some(subsystem) => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+             bar_index={} error={:?} subsystem={}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+            err,
+            subsystem,
+        ),
+        None => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
+             bar_index={} error={:?}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+            err,
+        ),
+    }
+}
+
+/// Emit the `iommu.missing_bar_coverage` warn event for a coverage gap
+/// after every BAR mapping completed — the assertion failure path.
+fn log_missing_bar_coverage_assertion(ctx: ClaimContext, bar_index: u8) {
+    match ctx.subsystem_log_suffix() {
+        Some(subsystem) => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} bar_index={} subsystem={}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+            subsystem,
+        ),
+        None => log::warn!(
+            "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} bar_index={}",
+            ctx.segment,
+            ctx.bus,
+            ctx.dev,
+            ctx.func,
+            bar_index,
+        ),
     }
 }
 
@@ -962,17 +1105,23 @@ fn install_and_verify_bar_coverage(
     use crate::pci::bar::{BarMapping, map_bar};
     use kernel_core::iommu::bar_coverage::Bar;
 
-    let snap = match validate_domain_presence(
-        handle.domain_snapshot(),
-        crate::iommu::active(),
+    // Read PCI IDs once at the top of the function so every log site
+    // below tags structured events with the matching `subsystem=` field
+    // (Phase 57 Track C.1: `subsystem=audio.device` for `0x8086:0x2415`).
+    let ctx = ClaimContext {
         segment,
         bus,
         dev,
         func,
-    )? {
-        Some(s) => s,
-        None => return Ok(()),
+        vendor: handle.vendor_id(),
+        device: handle.device_id(),
     };
+
+    let snap =
+        match validate_domain_presence(handle.domain_snapshot(), crate::iommu::active(), ctx)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
 
     // Collect MMIO BARs. Use the raw BAR value to detect 64-bit BAR
     // pairs and skip the high slot, avoiding a spurious sizing-dance
@@ -1009,15 +1158,7 @@ fn install_and_verify_bar_coverage(
                     // Unexpected: raw says MMIO but decode returned a PIO
                     // mapping or failed entirely. Fail closed so the gap
                     // cannot slip through coverage verification unnoticed.
-                    log::warn!(
-                        "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
-                         bar_index={} error=bar_decode_failure",
-                        segment,
-                        bus,
-                        dev,
-                        func,
-                        i,
-                    );
+                    log_missing_bar_coverage_decode_failure(ctx, i);
                     return Err(DeviceHostError::Internal);
                 }
             }
@@ -1027,7 +1168,7 @@ fn install_and_verify_bar_coverage(
         i += if is_64bit { 2 } else { 1 };
     }
 
-    verify_bar_coverage_for_domain(&bars, snap, segment, bus, dev, func)
+    verify_bar_coverage_for_domain(&bars, snap, ctx)
 }
 
 /// Inner logic shared by [`install_and_verify_bar_coverage`] and the
@@ -1041,10 +1182,7 @@ fn install_and_verify_bar_coverage(
 fn verify_bar_coverage_for_domain(
     bars: &[kernel_core::iommu::bar_coverage::Bar],
     snap: crate::pci::DomainSnapshot,
-    segment: u16,
-    bus: u8,
-    dev: u8,
-    func: u8,
+    ctx: ClaimContext,
 ) -> Result<(), DeviceHostError> {
     use kernel_core::iommu::bar_coverage::{BarCoverage, assert_bar_identity_mapped};
     use kernel_core::iommu::contract::{DomainError, Iova, MapFlags, PhysAddr};
@@ -1073,16 +1211,7 @@ fn verify_bar_coverage_for_domain(
                 coverage.record_mapped(aligned_base, aligned_len);
             }
             Err(e) => {
-                log::warn!(
-                    "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} \
-                     bar_index={} error={:?}",
-                    segment,
-                    bus,
-                    dev,
-                    func,
-                    bar.index,
-                    e,
-                );
+                log_missing_bar_coverage_map_error(ctx, bar.index, e);
                 return Err(DeviceHostError::Internal);
             }
         }
@@ -1094,14 +1223,7 @@ fn verify_bar_coverage_for_domain(
     match assert_bar_identity_mapped(bars, &coverage) {
         Ok(()) => Ok(()),
         Err(err) => {
-            log::warn!(
-                "iommu.missing_bar_coverage bdf={:#06x}:{:02x}:{:02x}.{} bar_index={}",
-                segment,
-                bus,
-                dev,
-                func,
-                err.bar_index,
-            );
+            log_missing_bar_coverage_assertion(ctx, err.bar_index);
             Err(DeviceHostError::Internal)
         }
     }
@@ -2749,9 +2871,15 @@ fn bar_coverage_iommu_map_error_returns_internal() {
         len: 0x1000,
     }];
 
-    let result = verify_bar_coverage_for_domain(
-        &bars, snap, /*segment=*/ 0, /*bus=*/ 0, /*dev=*/ 1, /*func=*/ 0,
-    );
+    let ctx = ClaimContext {
+        segment: 0,
+        bus: 0,
+        dev: 1,
+        func: 0,
+        vendor: 0,
+        device: 0,
+    };
+    let result = verify_bar_coverage_for_domain(&bars, snap, ctx);
     assert_eq!(
         result,
         Err(DeviceHostError::Internal),
@@ -2795,7 +2923,15 @@ fn bar_coverage_iommu_map_error_maps_to_neg_eio_at_syscall_gate() {
 
     // 1. Drive the same helper sys_device_claim reaches via
     //    install_and_verify_bar_coverage.
-    let coverage_err = verify_bar_coverage_for_domain(&bars, snap, 0, 0, 1, 0)
+    let ctx = ClaimContext {
+        segment: 0,
+        bus: 0,
+        dev: 1,
+        func: 0,
+        vendor: 0,
+        device: 0,
+    };
+    let coverage_err = verify_bar_coverage_for_domain(&bars, snap, ctx)
         .expect_err("IOMMU map failure must return Err(DeviceHostError::Internal)");
     assert_eq!(
         coverage_err,
@@ -2831,11 +2967,17 @@ fn bar_coverage_iommu_map_error_maps_to_neg_eio_at_syscall_gate() {
 #[cfg(test)]
 #[test_case]
 fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
+    let ctx = ClaimContext {
+        segment: 0,
+        bus: 0,
+        dev: 1,
+        func: 0,
+        vendor: 0,
+        device: 0,
+    };
+
     // Fail-closed path: active IOMMU + no domain → reject the claim.
-    let fail_result = validate_domain_presence(
-        None, /*iommu_active=*/ true, /*segment=*/ 0, /*bus=*/ 0, /*dev=*/ 1,
-        /*func=*/ 0,
-    );
+    let fail_result = validate_domain_presence(None, /*iommu_active=*/ true, ctx);
     // DomainSnapshot does not derive PartialEq; assert on the error variant directly.
     assert!(
         fail_result.is_err(),
@@ -2850,7 +2992,7 @@ fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
     // Verify syscall-gate errno translation through the shared seam that
     // sys_device_claim itself now uses.
     let errno = device_claim_error_to_errno(
-        validate_domain_presence(None, /*iommu_active=*/ true, 0, 0, 1, 0).unwrap_err(),
+        validate_domain_presence(None, /*iommu_active=*/ true, ctx).unwrap_err(),
         0,
         0,
         1,
@@ -2863,7 +3005,7 @@ fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
     );
 
     // Identity-fallback path: no domain, no active IOMMU → accept.
-    let fallback_result = validate_domain_presence(None, /*iommu_active=*/ false, 0, 0, 1, 0);
+    let fallback_result = validate_domain_presence(None, /*iommu_active=*/ false, ctx);
     assert!(
         fallback_result.is_ok(),
         "no domain with inactive IOMMU must return Ok (identity-fallback)"

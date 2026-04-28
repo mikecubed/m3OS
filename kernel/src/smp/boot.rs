@@ -329,15 +329,24 @@ pub fn boot_aps() {
         delay_us(200);
         send_sipi(entry.apic_id, SIPI_VECTOR);
 
-        // Wait for AP to signal via is_online.
+        // Phase 57 fix: wait for the AP to flip `is_online` against a
+        // wall-clock deadline (1 s) instead of a 10M-iteration spin
+        // counter. The previous spin counter was sensitive to QEMU
+        // TCG variance — on a busy host the AP could fail to make it
+        // through the real-mode → long-mode trampoline before the
+        // counter expired, leaving its `PerCoreData` populated but
+        // never running. Polling every 1 ms gives the AP up to 1000
+        // chances over a full second, which comfortably covers TCG
+        // worst case while still failing fast on a hard hang.
+        const AP_BOOT_TIMEOUT_MS: u64 = 1_000;
         let mut started = false;
         let online_flag = unsafe { &(*per_core_ptr).is_online };
-        for _ in 0..10_000_000u64 {
+        for _ in 0..AP_BOOT_TIMEOUT_MS {
             if online_flag.load(Ordering::Acquire) {
                 started = true;
                 break;
             }
-            core::hint::spin_loop();
+            delay_us(1_000);
         }
 
         if started {
@@ -349,10 +358,24 @@ pub fn boot_aps() {
             );
         } else {
             log::warn!("[smp] AP APIC ID={} did not start (timeout)", entry.apic_id);
+            // Phase 57 fix: drop the dead AP's `PerCoreData` so
+            // `get_core_data(core_id)` returns `None`. Without this,
+            // the scheduler's load balancer happily queued
+            // fork-children onto the dead core's runqueue and they
+            // were never dispatched.
+            unsafe {
+                super::release_failed_ap(core_id);
+            }
         }
     }
 
     log::info!("[smp] {} AP(s) booted successfully", booted);
+    // Phase 57 fix: shrink CORE_COUNT to reflect the APs that
+    // actually came online. With the per-slot release above this is
+    // belt-and-suspenders, but it also keeps `least_loaded_core`'s
+    // iteration tight (0..booted+1) so we never even consider a
+    // freed slot.
+    super::set_core_count(booted + 1);
     remove_trampoline_identity_map();
 }
 
@@ -410,8 +433,22 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
 /// Idle task for AP cores — halts until an interrupt wakes the core,
 /// then yields back to the scheduler so newly ready tasks can run.
 fn ap_idle_task() -> ! {
+    use core::sync::atomic::{AtomicI32, Ordering};
+    static AP_IDLE_LOG_BUDGET: [AtomicI32; crate::smp::MAX_CORES] =
+        [const { AtomicI32::new(4) }; crate::smp::MAX_CORES];
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+        // Phase 57 DEBUG: log right after the AP idle's hlt wakes.
+        // If we see this for core=3 but never `yield-enter core=3`,
+        // execution survives iretq but never reaches the
+        // `yield_now()` call site below.
+        {
+            let core_id = crate::smp::per_core().core_id;
+            let n = AP_IDLE_LOG_BUDGET[core_id as usize].fetch_sub(1, Ordering::Relaxed);
+            if n > 0 {
+                log::info!("[sched] ap-idle post-hlt core={}", core_id);
+            }
+        }
         crate::task::yield_now();
     }
 }

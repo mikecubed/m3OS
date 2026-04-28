@@ -15,6 +15,7 @@ pub mod fb_owner;
 pub mod frame_tick;
 pub mod layer;
 pub mod layout;
+pub mod pixel_chunk;
 pub mod protocol;
 pub mod stats;
 pub mod surface;

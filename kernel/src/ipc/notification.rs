@@ -7,6 +7,19 @@
 //! blocks until at least one bit is set, then atomically clears and returns
 //! the pending bits.
 //!
+//! # Phase 57 — audio reuses the same path
+//!
+//! `audio_server` (the AC'97 ring-3 driver, Phase 57 Track D) consumes
+//! IRQs through this module's [`signal_irq_bit`] entry point exactly the
+//! way the existing `e1000_driver` and `nvme_driver` do — bind a
+//! `Notification` to the device IRQ via `sys_device_irq_subscribe`
+//! (Phase 55b Track B.4), then `recv_msg_with_notif` returns
+//! `WakeKind::Notification(bits)` when the audio controller fires its
+//! buffer-empty IRQ. The kernel does not learn AC'97 specifics; the path
+//! described here covers every ring-3 driver. See Phase 57 Track C.3
+//! acceptance and `docs/appendix/phase-57-audio-abi.md` for the
+//! pure-userspace IPC choice that makes this collapse possible.
+//!
 //! # Pool capacity and ISR-safety constraint
 //!
 //! The notification pool is **fixed-size** (`MAX_NOTIFS = 64`).  This is a
@@ -431,6 +444,14 @@ pub fn signal_irq(irq: u8) {
 /// IRQ subscription path (`sys_device_irq_subscribe` → MSI / MSI-X / INTx
 /// → this function) where the kernel needs to deliver to an arbitrary
 /// `NotifId` rather than the legacy IRQ-line indirection in `IRQ_MAP`.
+///
+/// Callers (existing): `nvme_driver`, `e1000_driver`, and (Phase 57)
+/// `audio_server` — every ring-3 driver consumes its IRQ vector through
+/// this entry point. The function is device-class agnostic; the audio
+/// path adds no new code, only a new caller. The IRQ handler installed by
+/// `sys_device_irq_subscribe` does the minimum (read status, signal the
+/// bit, EOI) — no allocation, no IPC, no blocking. See the module-level
+/// docs for the Phase 57 audio reuse note.
 ///
 /// `bit` must be < 64 — callers validate at the syscall boundary so the
 /// ISR path is branchless past the allocation. An out-of-range bit is

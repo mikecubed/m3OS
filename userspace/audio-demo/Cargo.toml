@@ -1,0 +1,14 @@
+[package]
+name = "audio-demo"
+version = "0.57.0"
+edition = "2024"
+description = "Phase 57 Track E.2 — userspace audio reference client. Generates a 440 Hz sine wave and submits it through `audio_client` to prove the audio path end-to-end."
+
+[[bin]]
+name = "audio-demo"
+path = "src/main.rs"
+
+[dependencies]
+audio_client = { path = "../lib/audio_client" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../kernel-core", default-features = false }

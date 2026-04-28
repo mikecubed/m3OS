@@ -1,14 +1,30 @@
 [package]
 name = "m3ctl"
-version = "0.56.0"
+version = "0.57.0"
 edition = "2024"
+
+# Phase 57 Track I.2: a `[lib]` target lets `cargo test -p m3ctl
+# --target x86_64-unknown-linux-gnu` exercise the verb-construction
+# parser on the host without the OS binary's `_start` symbol. The
+# binary keeps `entry_point!` behind the `os-binary` feature so
+# host-test builds skip it (same pattern as `term` and
+# `audio_server`).
+[lib]
+name = "m3ctl"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
 
 [[bin]]
 name = "m3ctl"
 path = "src/main.rs"
+required-features = ["os-binary"]
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
 # Phase 56 Track E.4 — control-socket codec lives in kernel-core; the
-# m3ctl client links against it for `encode_command` / `decode_event`.
+# m3ctl client links against it for `encode_command` / `decode_event`
+# (display) and `encode_verb` / `decode_reply` (session — Phase 57
+# I.2).
 kernel-core = { path = "../../kernel-core", default-features = false }

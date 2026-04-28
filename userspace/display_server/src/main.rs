@@ -350,6 +350,21 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut layout = default_layout();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 56 C.5 close-out — per-client outbound queue. The
+    // dispatcher's `InputEffect::Outbound(ServerMessage::Key|Pointer)`
+    // fires on focused-client key/pointer events; we accumulate the
+    // resulting `ServerMessage`s here and the client drains them one
+    // at a time via `LABEL_CLIENT_EVENT_PULL`. Capped at
+    // `client::MAX_CLIENT_EVENT_QUEUE` per the Phase 56 resource
+    // bounds; oldest is dropped when the cap is reached.
+    let mut client_event_queue: alloc::collections::VecDeque<ServerMessage> =
+        alloc::collections::VecDeque::with_capacity(client::MAX_CLIENT_EVENT_QUEUE);
+    // Reusable encode buffer for the `LABEL_CLIENT_EVENT_PULL` reply
+    // bulk. The largest `ServerMessage` body is `Pointer` at
+    // `FRAME_HEADER_SIZE + POINTER_EVENT_WIRE_SIZE` ≈ 50 bytes; 128
+    // bytes leaves ample headroom while staying well below
+    // `MAX_BULK_BYTES`.
+    let mut event_reply_buf = [0u8; 128];
 
     loop {
         // 1. Try to receive one graphical-endpoint message non-blocking.
@@ -363,7 +378,56 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         let mut header = IpcMessage::new(0);
         let recv_ret = syscall_lib::ipc_try_recv_msg(ep_handle, &mut header, &mut bulk_buf);
         let had_graphical = recv_ret != u64::MAX;
-        let outcome = if had_graphical {
+
+        // Phase 56 C.5 close-out — `LABEL_CLIENT_EVENT_PULL` is an
+        // out-of-band drain verb. Handle it here so it does not flow
+        // through `dispatch`/`SurfaceRegistry`; the queue is a
+        // main-loop concern and the verb's reply shape is not
+        // `RESP_OK` / `RESP_FATAL`. We still let the rest of the loop
+        // iterate so input drain, control-socket service, and the
+        // compose pass are not starved by a pulling client.
+        let pull_handled = had_graphical && header.label == client::LABEL_CLIENT_EVENT_PULL;
+        if pull_handled {
+            let reply_cap = header.data[3] as u32;
+            match client_event_queue.pop_front() {
+                Some(msg) => match msg.encode(&mut event_reply_buf) {
+                    Ok(n) => {
+                        let _ = syscall_lib::ipc_store_reply_bulk(&event_reply_buf[..n]);
+                        if reply_cap != 0 {
+                            let _ = syscall_lib::ipc_reply(
+                                reply_cap,
+                                client::LABEL_CLIENT_EVENT_PULL,
+                                0,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Encode failure means the queued message was
+                        // somehow malformed. Drop it, reply NONE so the
+                        // caller recovers, log so a developer notices.
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: outbound encode failed; dropping event\n",
+                        );
+                        if reply_cap != 0 {
+                            let _ = syscall_lib::ipc_reply(
+                                reply_cap,
+                                client::LABEL_CLIENT_EVENT_NONE,
+                                0,
+                            );
+                        }
+                    }
+                },
+                None => {
+                    if reply_cap != 0 {
+                        let _ =
+                            syscall_lib::ipc_reply(reply_cap, client::LABEL_CLIENT_EVENT_NONE, 0);
+                    }
+                }
+            }
+        }
+
+        let outcome = if had_graphical && !pull_handled {
             let bulk_len = header.data[1] as usize;
             let bulk_slice = if bulk_len <= bulk_buf.len() {
                 &bulk_buf[..bulk_len]
@@ -433,8 +497,11 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         //    Phase 56 close-out — the kernel populates `header.data[3]`
         //    with the reply-cap handle so userspace doesn't have to
         //    guess. Skip reply when there's no graphical message this
-        //    iteration or no cap (fire-and-forget sender).
-        if had_graphical {
+        //    iteration or no cap (fire-and-forget sender). Also skip
+        //    when `LABEL_CLIENT_EVENT_PULL` was already handled above —
+        //    that verb has its own reply shape and replying here would
+        //    panic the kernel on a double-reply.
+        if had_graphical && !pull_handled {
             let reply_label = if outcome.fatal { RESP_FATAL } else { RESP_OK };
             let reply_cap = header.data[3] as u32;
             if reply_cap != 0 {
@@ -480,8 +547,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             };
             match compose_result {
                 Ok(0) => {}
-                Ok(writes) => {
-                    log_compose_writes(writes);
+                Ok(_writes) => {
+                    // Per-frame `composed writes=N` log was retired in
+                    // Phase 57: at 60 Hz with a graphical client doing
+                    // chunked uploads it produced ~60 lines/sec on the
+                    // serial console, drowning real signal. The
+                    // frame-stats ring still records the sample so a
+                    // future control-socket query can surface compose
+                    // throughput on demand.
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
                 }
@@ -551,12 +624,22 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     {
                         pointer_position = abs;
                     }
-                    // TODO(C.5): push onto per-client outbound queue
-                    // and flush via the multi-client send-cap path.
-                    syscall_lib::write_str(
-                        STDOUT_FILENO,
-                        "display_server: input queued for client\n",
-                    );
+                    // Phase 56 C.5 close-out — push the dispatcher's
+                    // `Outbound` message onto the per-client queue.
+                    // The client drains it via `LABEL_CLIENT_EVENT_PULL`
+                    // (handled at the top of the loop). When the queue
+                    // is at the documented cap, drop the OLDEST event
+                    // and emit a structured log line — preserving
+                    // recent input is more useful than blocking forever
+                    // because a client stopped pulling.
+                    if client_event_queue.len() >= client::MAX_CLIENT_EVENT_QUEUE {
+                        client_event_queue.pop_front();
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: outbound queue full; oldest dropped\n",
+                        );
+                    }
+                    client_event_queue.push_back(msg);
                 }
                 InputEffect::BindTriggered { id } => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");
@@ -897,12 +980,6 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
 fn log_outbound_count(n: u32) {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: outbound queued n=");
     write_u32(n);
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-}
-
-fn log_compose_writes(writes: usize) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: composed writes=");
-    write_u32(writes as u32);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 

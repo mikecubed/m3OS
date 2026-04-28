@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod address_space;
+pub mod audio;
 pub mod buddy;
 pub mod cred;
 pub mod cross_cpu_free;
@@ -26,6 +27,9 @@ pub mod pipe;
 pub mod prng;
 pub mod pty;
 pub mod service;
+pub mod session;
+pub mod session_control;
+pub mod session_supervisor;
 pub mod size_class;
 pub mod slab;
 pub mod time;

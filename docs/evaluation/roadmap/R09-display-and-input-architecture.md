@@ -1,6 +1,6 @@
 # Release Phase R09 — Display and Input Architecture
 
-**Status:** In Progress (Phase 56 substrate complete; Phase 57 + 56b / 57b / 57c additive UX work pending)
+**Status:** In Progress (Phase 56 substrate + Phase 57 audio/session/term complete; Phase 56b / 57b / 57c additive UX work pending)
 **Depends on:** [R05 — First Service Extractions](./R05-first-service-extractions.md),
 [R08 — Hardware Substrate](./R08-hardware-substrate.md)
 **Official roadmap phases covered:** [Phase 9](../../roadmap/09-framebuffer-and-shell.md),
@@ -52,8 +52,29 @@ still not using true zero-copy page-grant handoff end-to-end. Both are
 deferred to the Phase 56 follow-on docket and do not block the R09
 substrate claim.
 
-What Phase 56 explicitly does **not** ship — and what R09 still needs to
-declare release-ready before the broader GUI claim is honest:
+What Phase 57 has now **shipped** on top of the Phase 56 substrate:
+
+- A **native graphical terminal emulator** (`term`) integrated with the
+  existing PTY work — composes Phase 22b ANSI parsing + Phase 29 PTY
+  pairs + Phase 56 `Toplevel` surfaces + the new audio bell. **Done.**
+- **Audio output** — `audio_server` claims Intel 82801AA AC'97
+  (`0x8086:0x2415`) over the Phase 55b ring-3 driver-host primitives;
+  single-client PCM-out via the typed `audio_client` library; the
+  Phase 22b ANSI BEL byte produces an audible tone. **Done.**
+- **Graphical session entry** — `session_manager` runs the fixed boot
+  sequence with a typed `SessionState` machine in `kernel-core` and a
+  per-step retry budget; `m3ctl` gains `session-state` /
+  `session-stop` / `session-restart` verbs gated by capability per the
+  F.5 precedent. **Done.**
+- **Recovery to text-mode** — `text-fallback` motion drops the
+  display-server children; the kernel framebuffer console resumes;
+  serial admin stays reachable. Reachable from any serial / SSH shell
+  via `m3ctl session-stop`. **Done.**
+- **Multi-client audio policy** — single-client per the YAGNI rule; a
+  second `OpenStream` returns `-EBUSY` deterministically. **Done.**
+
+What R09 still needs before the broader GUI claim is honest (Phase 58+
+candidates — additive on top of the Phase 56/57 contract surfaces):
 
 - A **tiling-first compositor UX** with workspaces, gaps, layouts, and a
   chord engine — Phase 56b.
@@ -62,9 +83,17 @@ declare release-ready before the broader GUI claim is honest:
 - **Native bar / launcher / notification daemon / lockscreen** client
   implementations consuming the Phase 56 `Layer` role and control-socket
   event stream — Phase 57b.
-- A **native graphical terminal emulator** integrated with the existing
-  PTY work — Phase 57.
-- **Audio output** — Phase 57.
+- **Login manager** (graphical login screen tied to a per-login
+  `session_manager` instance) — future "console sessions" phase.
+- **Multi-client audio mixing**, sample-rate conversion, audio capture,
+  audio routing — future audio-mixer phase that talks to `audio_server`
+  as the single device owner.
+- **Configurable fonts** in `term` (multiple bitmap fonts behind the
+  existing `FontProvider` trait, scrollback beyond 1000 lines,
+  transparency, tab support beyond ANSI HT) — future `term`-extension
+  phase or Phase 57b polish.
+- **Intel HDA** as a second `AudioBackend` impl behind the existing
+  trait — future hardware-substrate extension.
 
 ```mermaid
 flowchart TB
@@ -82,7 +111,9 @@ flowchart TB
 | Display | **Phase 56 complete:** ring-3 `display_server` owns composition and presentation; kernel framebuffer console retained for pre-init / panic / failover | One userspace process owns composition and presentation ✅ | Richer desktop polish (Phase 56b tiling), animations (Phase 57c), graphics acceleration (deferred indefinitely) |
 | Input | **Phase 56 complete:** typed `KeyEvent` / `PointerEvent` routed through `kbd_server` / `mouse_server` to `display_server`'s focus model | Unified keyboard/mouse event model routed through userspace ✅ | USB HID, touch, tablet (later phase, likely through `driver_runtime`-style ring-3 driver) |
 | Application model | **Phase 56 complete:** AF_UNIX client protocol with documented wire format; multiple clients can coexist; reference smoke client ships as `gfx-demo` | Multiple clients can coexist under a compositor ✅ | Toolkit (Phase 57+), richer apps (Phase 57b), session polish (Phase 57) |
-| Audio | Planned, not yet shipped | Phase 57 scope (next phase after 56) | Full audio server and richer media behavior (post-1.0) |
+| Audio | **Phase 57 complete:** `audio_server` claims Intel AC'97 (`0x8086:0x2415`) via Phase 55b device-host primitives; single-client PCM-out via typed `audio_client` library; `term` BEL produces an audible bell | Single-client audio output to a real device ✅ | Multi-client mixing, sample-rate conversion, audio capture and routing (post-1.0); Intel HDA backend behind the existing `AudioBackend` trait |
+| Session | **Phase 57 complete:** `session_manager` runs fixed boot sequence (`display_server` → `kbd_server` → `mouse_server` → `audio_server` → `term`); `text-fallback` recovery contract; `m3ctl session-state` / `session-stop` / `session-restart` verbs gated by capability | Graphical session entry + recovery contract ✅ | Login manager / per-login session UID model (deferred to future "console sessions" phase) |
+| Terminal | **Phase 57 complete:** `term` is the first useful graphical client — PTY-bridged + ANSI parser + bitmap font render + audio bell | First useful local graphical client ✅ | Configurable fonts, scrollback beyond 1000 lines, transparency (future polish phase) |
 
 ## Detailed workstreams
 
@@ -96,7 +127,9 @@ flowchart TB
 | Tiling UX | Tiling layouts, workspace state machine, chord engine, default keybinds | **Phase 56b — additive on top of Phase 56's `LayoutPolicy` trait, no protocol rework** |
 | Animation engine | Timing curves, vblank-aligned scheduling, damage output | **Phase 57c — deferred until a real vblank source exists** |
 | Native UX clients | Bar, launcher, notification daemon, lockscreen | **Phase 57b — consume the Phase 56 `Layer` role and control-socket event stream** |
-| Native graphical terminal | PTY-bridged terminal emulator with font rendering | **Phase 57 — consumes a PTY slave and renders into a Phase 56 `Toplevel`** |
+| Native graphical terminal | PTY-bridged terminal emulator with font rendering | Phase 57 ✅ — `term` consumes a PTY slave and renders into a Phase 56 `Toplevel` (PTY + ANSI + audio bell) |
+| Audio output | First audio path with single-client PCM-out | Phase 57 ✅ — `audio_server` claims Intel AC'97 via Phase 55b primitives; typed `audio_client` library |
+| Session orchestration | Fixed boot sequence + recovery to text-mode | Phase 57 ✅ — `session_manager` daemon, capability-gated `m3ctl` verbs, `text-fallback` motion |
 
 ## How This Differs from Linux, Redox, and production systems
 
@@ -145,8 +178,15 @@ strong headless release and any Redox-like desktop ambition.
   mode is at least explicitly documented as the next issue to solve — **Phase 56
   ✅** (F.2 supervised crash recovery; F.3 text-mode fallback when restart budget
   is exhausted; both documented in the learning doc).
-- Audio + first real graphical-client UX (terminal emulator, native bar /
-  launcher / lockscreen, login flow) — **Phase 57 / 57b pending**.
+- Audio + first real graphical-client UX (terminal emulator) — **Phase
+  57 ✅** (`term` ships as the first useful local graphical client;
+  `audio_server` ships as the first audio path; `session_manager`
+  ships the fixed-boot session orchestrator with the `text-fallback`
+  recovery contract).
+- Native bar / launcher / lockscreen, login flow — **Phase 57b / 58+
+  pending** (deferred per the design doc; additive on top of the
+  Phase 56 `Layer` role and Phase 57 `session_manager` lifecycle —
+  no protocol rework required).
 
 ## Key Cross-Links
 

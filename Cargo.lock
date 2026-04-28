@@ -94,6 +94,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-demo"
+version = "0.57.0"
+dependencies = [
+ "audio_client",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
+name = "audio_client"
+version = "0.57.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
+name = "audio_server"
+version = "0.57.0"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -995,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "m3ctl"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
@@ -1553,6 +1579,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "session_manager"
+version = "0.57.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1831,6 +1865,16 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "term"
+version = "0.57.0"
+dependencies = [
+ "audio_client",
+ "kernel-core",
+ "surface_buffer",
+ "syscall-lib",
 ]
 
 [[package]]

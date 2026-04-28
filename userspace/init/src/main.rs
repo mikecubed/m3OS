@@ -84,19 +84,24 @@ const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 
 // Phase 56 Track F.3: text-mode-fallback marker.
 //
-// When this file exists, init skips loading the graphical-stack manifests
-// (`display_server.conf` and `gfx-demo.conf`) and emits a structured
+// When this file exists, init skips loading the graphical-stack manifest
+// (`display_server.conf`) and emits a structured
 // `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` log line. The
 // kernel framebuffer console + serial console therefore remain the only
 // administration surfaces — see `docs/56-display-and-input-architecture.md`
 // "Text-mode fallback" for the failure-cascade walkthrough.
+//
+// Phase 57 promotes `term` to the production graphical client. Because
+// `gfx-demo.conf` is no longer staged into the data disk (the binary
+// remains under `/bin/gfx-demo` for manual protocol testing), the
+// fallback skip-list shrinks to `display_server.conf` alone.
 const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\0";
 
 /// Conf-file basenames (with the `.conf` suffix and trailing NUL) that are
 /// skipped when `DISABLE_DISPLAY_SERVER_MARKER` is present. Listed centrally
 /// so the dir-scan path and the `KNOWN_CONFIGS` fallback path agree on the
 /// same filter — no parallel "skip these" lists.
-const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0", b"gfx-demo.conf\0"];
+const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0"];
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
@@ -121,8 +126,12 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/e1000_driver.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
-    // Phase 56 Track C.6: protocol-reference client (visual smoke).
-    b"/etc/services.d/gfx-demo.conf\0",
+    // Phase 57 Track F.2: session_manager daemon.
+    b"/etc/services.d/session_manager.conf\0",
+    // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
+    b"/etc/services.d/audio_server.conf\0",
+    // Phase 57 Track G: term — graphical terminal emulator.
+    b"/etc/services.d/term.conf\0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -229,6 +238,11 @@ impl<const N: usize> FixedStr<N> {
 
     fn as_bytes(&self) -> &[u8] {
         &self.data[..self.len]
+    }
+
+    #[allow(dead_code)]
+    fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.as_bytes()).ok()
     }
 
     fn eq_bytes(&self, other: &[u8]) -> bool {
@@ -754,9 +768,8 @@ struct ServiceManager {
     syslog_fd: i32,
     defer_status_writes: bool,
     /// Phase 56 Track F.3: cached at startup. When `true`, init skips
-    /// `display_server.conf` and `gfx-demo.conf` so the system boots
-    /// straight into the text-mode fallback (serial login + kernel
-    /// framebuffer console).
+    /// `display_server.conf` so the system boots straight into the
+    /// text-mode fallback (serial login + kernel framebuffer console).
     display_fallback: bool,
     /// Phase 56 Track F.2 — when `/etc/display_server.debug-crash`
     /// was observed at startup, the service manager appends
@@ -1025,12 +1038,12 @@ impl ServiceManager {
     /// Skips services that have a `.disabled` marker file or that are
     /// gated off by the Phase 56 F.3 text-mode-fallback runtime knob.
     fn try_load_config(&mut self, path: &[u8]) {
-        // Phase 56 F.3: graphical-stack manifests are skipped wholesale when
-        // the operator (or the regression test) has dropped the
-        // `/etc/m3os-disable-display-server` marker. Both `display_server.conf`
-        // and `gfx-demo.conf` are excluded here so the dependency graph never
-        // sees them — `gfx-demo` depends on `display`, so missing the gate
-        // would leave it stuck waiting for an unresolvable dep.
+        // Phase 56 F.3: the graphical-stack manifest is skipped wholesale
+        // when the operator (or the regression test) has dropped the
+        // `/etc/m3os-disable-display-server` marker. `display_server.conf`
+        // is excluded here so the dependency graph never sees it. (Phase
+        // 57 retired `gfx-demo.conf` from the auto-start set; the binary
+        // remains under `/bin/gfx-demo` for manual protocol testing.)
         if self.skip_for_display_fallback(path) {
             return;
         }
@@ -1255,10 +1268,31 @@ impl ServiceManager {
         }
 
         if pid == 0 {
+            // PHASE 57 DEBUG: very first marker in the child path —
+            // before reading svc data, before any allocation, before
+            // any function call. Two services (kbd, fat) are reaching
+            // init's parent "started 'name' pid=N" log but never
+            // reach IC1A. This marker tells us whether the fork-child
+            // task is even running for those pids. We bake the idx
+            // into the marker so we can map it back to the service
+            // even with svc reads being suspect.
+            {
+                let mut idx_buf = [0u8; 64];
+                let mut ip = 0usize;
+                ip += append_to_buf(&mut idx_buf, ip, b"init: trace.IC0 fork-child entered idx=");
+                ip += append_u64_to_buf(&mut idx_buf, ip, idx as u64);
+                ip += append_to_buf(&mut idx_buf, ip, b"\n");
+                if let Ok(s) = core::str::from_utf8(&idx_buf[..ip]) {
+                    syscall_lib::serial_print(s);
+                }
+            }
+
             // Child: build path with null terminator and exec.
             let mut path_buf = [0u8; MAX_CMD + 1];
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
+
+            syscall_lib::serial_print("init: trace.IC0B path-built\n");
 
             // Phase 56 Track F.2 / close-out (G.1, G.2) — append the
             // test-only env vars when their respective markers are
@@ -1272,9 +1306,13 @@ impl ServiceManager {
                 self.display_server_inject_key,
             );
 
+            syscall_lib::serial_print("init: trace.IC0C envp-built\n");
+
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
+                syscall_lib::serial_print("init: trace.IC0D before-setuid\n");
                 let ret = setuid(svc.run_as_uid);
+                syscall_lib::serial_print("init: trace.IC0E after-setuid\n");
                 if ret < 0 {
                     write_str(STDOUT_FILENO, "init: setuid failed for '");
                     write(STDOUT_FILENO, svc.name.as_bytes());
@@ -1285,7 +1323,38 @@ impl ServiceManager {
 
             // Build argv: argv[0] = command path.
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+
+            // PHASE 57 DEBUG: granular markers between fork-child
+            // entry and the execve syscall. Each marker is built as a
+            // SINGLE buffer with name+path inlined so it lands as one
+            // log line — split serial_print calls produce separate
+            // log lines that get filtered out by `trace.IC` greps.
+            let svc_name_bytes = svc.name.as_bytes();
+            let path_bytes = &path[..path.len().saturating_sub(1)];
+
+            let mut mbuf = [0u8; 192];
+            let mut mp = 0usize;
+            mp += append_to_buf(&mut mbuf, mp, b"init: trace.IC1A enter name=*");
+            mp += append_to_buf(&mut mbuf, mp, svc_name_bytes);
+            mp += append_to_buf(&mut mbuf, mp, b"* path=*");
+            mp += append_to_buf(&mut mbuf, mp, path_bytes);
+            mp += append_to_buf(&mut mbuf, mp, b"*\n");
+            if let Ok(s) = core::str::from_utf8(&mbuf[..mp]) {
+                syscall_lib::serial_print(s);
+            }
+
+            syscall_lib::serial_print("init: trace.IC1D about to call execve\n");
             let ret = execve(path, &argv, &envp);
+
+            // Failure path — only reached if execve returned.
+            let mut fbuf = [0u8; 96];
+            let mut fp = 0usize;
+            fp += append_to_buf(&mut fbuf, fp, b"init: trace.IC2 execve returned name=*");
+            fp += append_to_buf(&mut fbuf, fp, svc_name_bytes);
+            fp += append_to_buf(&mut fbuf, fp, b"*\n");
+            if let Ok(s) = core::str::from_utf8(&fbuf[..fp]) {
+                syscall_lib::serial_print(s);
+            }
 
             write_str(STDOUT_FILENO, "init: execve failed for '");
             write(STDOUT_FILENO, svc.name.as_bytes());

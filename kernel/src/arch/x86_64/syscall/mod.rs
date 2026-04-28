@@ -192,6 +192,23 @@ fn is_interactive_debug_exec_path(path: &str) -> bool {
             | "/bin/vfs_server"
             | "/bin/console_server"
             | "/bin/ls"
+            // Phase 57 DEBUG: surface every supervised service's execve at
+            // INFO so we can diagnose pid=6 (kbd_server) silent-fail.
+            | "/bin/kbd_server"
+            | "/bin/mouse_server"
+            | "/bin/display_server"
+            | "/bin/audio_server"
+            | "/bin/term"
+            | "/bin/ion"
+            | "/bin/exit0"
+            | "/bin/syslogd"
+            | "/bin/crond"
+            | "/bin/stdin_feeder"
+            | "/bin/fat_server"
+            | "/bin/net_server"
+            | "/bin/nvme_driver"
+            | "/bin/e1000_driver"
+            | "/bin/session_manager"
     )
 }
 

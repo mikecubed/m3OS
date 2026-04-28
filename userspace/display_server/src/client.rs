@@ -38,6 +38,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use kernel_core::display::pixel_chunk::{CHUNK_HEADER_LEN, PixelChunkHeader};
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage,
 };
@@ -49,7 +50,46 @@ use crate::surface::{CommittedBuffer, SurfaceRegistry};
 pub const LABEL_VERB: u64 = 1;
 /// IPC label indicating raw pixel bytes follow in the bulk; `data0` is
 /// the [`BufferId`] the next `AttachBuffer` will reference.
+///
+/// Bulk wire: `[w: u32 LE | h: u32 LE | pixel_bytes...]`. The whole
+/// buffer travels in one IPC bulk and must fit in the kernel's
+/// `MAX_BULK_LEN` (4 KB). For surfaces larger than ~32×32 BGRA, use
+/// [`LABEL_PIXELS_CHUNK`] instead.
 pub const LABEL_PIXELS: u64 = 2;
+/// IPC label indicating one chunk of a multi-chunk surface buffer
+/// follows in the bulk; `data0` is the [`BufferId`] the chunk
+/// contributes to. Once the server has received chunks whose
+/// cumulative `chunk_len` reaches the header's `total_bytes`, the
+/// completed buffer is moved into the same `pending_bulk` slot the
+/// `LABEL_PIXELS` path uses, and the next `AttachBuffer { buffer_id
+/// }` consumes it. See
+/// [`kernel_core::display::pixel_chunk`] for the wire format and the
+/// `ChunkAccumulator` reassembly contract.
+pub const LABEL_PIXELS_CHUNK: u64 = 5;
+/// IPC label a client sends to drain one queued `ServerMessage` from
+/// `display_server`'s per-client outbound queue. The reply carries the
+/// next pending message in its reply-bulk slot, or replies with
+/// [`LABEL_CLIENT_EVENT_NONE`] when the queue is empty.
+///
+/// Phase 56 C.5 close-out: the dispatcher routes `KeyEvent` /
+/// `PointerEvent` deliveries into `ServerMessage::Key` / `Pointer`
+/// outbound entries; the per-client queue accumulates them between
+/// frame ticks; the client pulls them one at a time by sending a
+/// `LABEL_CLIENT_EVENT_PULL` `ipc_call` (no bulk).
+pub const LABEL_CLIENT_EVENT_PULL: u64 = 3;
+/// Reply label used by the server when the client's pull request finds
+/// the per-client outbound queue empty. Distinct from `u64::MAX` so the
+/// caller can distinguish "no events this tick" from a transport-level
+/// error. Mirrors the `KBD_EVENT_NONE` / `MOUSE_EVENT_NONE` convention
+/// established by the input services in Phase 56 D.3.
+pub const LABEL_CLIENT_EVENT_NONE: u64 = 4;
+/// Per-client outbound event-queue cap, per the documented Phase 56
+/// resource bounds (`docs/56-display-and-input-architecture.md`:180
+/// "Outbound event-queue depth per client | 128"). Once the queue is
+/// full the oldest event is dropped and a `display_server: outbound
+/// queue full; oldest dropped` log line is emitted; the design favours
+/// timely-but-lossy delivery over open-ended growth.
+pub const MAX_CLIENT_EVENT_QUEUE: usize = 128;
 
 /// Maximum bulk size accepted by the dispatcher (matches the kernel's
 /// `MAX_BULK_LEN`).
@@ -136,6 +176,35 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 height,
                 pixels: pixels.to_vec(),
             }) {
+                out.fatal = true;
+                return out;
+            }
+        }
+        LABEL_PIXELS_CHUNK => {
+            // Bulk wire: 24-byte `PixelChunkHeader` + `chunk_len`
+            // bytes of pixel data. The accumulator owns the
+            // reassembly state; the dispatcher just decodes the
+            // header, splits the body, and forwards.
+            if frame.bulk.len() < CHUNK_HEADER_LEN {
+                out.fatal = true;
+                return out;
+            }
+            let header = match PixelChunkHeader::decode(&frame.bulk[..CHUNK_HEADER_LEN]) {
+                Ok(h) => h,
+                Err(_) => {
+                    out.fatal = true;
+                    return out;
+                }
+            };
+            // The IPC `data0` carries the BufferId; cross-check
+            // against the in-bulk header so a confused client cannot
+            // accidentally race two buffers' chunks together.
+            if frame.header.data[0] as u32 != header.buffer_id {
+                out.fatal = true;
+                return out;
+            }
+            let body = &frame.bulk[CHUNK_HEADER_LEN..];
+            if registry.receive_chunk(header, body).is_err() {
                 out.fatal = true;
                 return out;
             }

@@ -591,6 +591,18 @@ fn core_load(sched: &Scheduler, core_id: u8) -> usize {
         return usize::MAX;
     };
 
+    // Phase 57 fix: an AP whose `INIT-SIPI-SIPI` boot timed out still
+    // has its `PerCoreData` allocated (`init_ap_per_core` runs before
+    // we wait for `is_online`), so `get_core_data` returns `Some` for
+    // it. Its run queue is empty, which previously made it look like
+    // the "least loaded" core to `least_loaded_core` — fork-children
+    // got queued onto a core whose scheduler never runs and were lost
+    // forever. Treat an offline core as fully saturated so it is
+    // never selected by the load balancer.
+    if !data.is_online.load(Ordering::Acquire) {
+        return usize::MAX;
+    }
+
     let mut load = data.run_queue.lock().len();
     let current = data.current_task_idx.load(Ordering::Relaxed);
     if current >= 0 {
@@ -759,6 +771,19 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task_idx: idx as u32,
         core: target_core,
     });
+    // PHASE 57 DEBUG: log every fork-child task spawn at INFO so the
+    // boot transcript shows the (pid, task_idx, target_core) tuple
+    // for every fork. Two pids (kbd at 6, fat at 10) never reach
+    // their userspace child path; this trace tells us whether they
+    // even get enqueued, and to which core.
+    log::info!(
+        "[sched] fork-task-spawn pid={} task_idx={} target_core={} rip={:#x} rsp={:#x}",
+        fork_pid,
+        idx,
+        target_core,
+        fork_rip,
+        fork_rsp,
+    );
     enqueue_to_core(target_core, idx);
 
     target_core
@@ -889,8 +914,26 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
     unsafe { *PENDING_SAVED_RSP[core_id].get() }
 }
 
+/// Phase 57 DEBUG: per-core countdown for yield_now log markers.
+/// Atomic so the IPI-context observer doesn't trip race detection
+/// in case a yield races with another path.
+static YIELD_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
+    [const { core::sync::atomic::AtomicI32::new(4) }; crate::smp::MAX_CORES];
+
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
+    // Phase 57 DEBUG: log entry and exit of yield_now per core. If
+    // we see "yield-enter core=3" but no "yield-handoff core=3" or
+    // a missing "resume core=3" pair, we'll know the yield itself is
+    // hanging vs the switch_context call site is hanging.
+    {
+        let core_id = crate::smp::per_core().core_id;
+        let n =
+            YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::info!("[sched] yield-enter core={}", core_id);
+        }
+    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
@@ -932,6 +975,19 @@ pub fn yield_now() {
         task_idx: idx as u32,
         core: my_core as u8,
     });
+    // Phase 57 DEBUG: log right before the switch_context handoff so
+    // we can spot a yield that reaches here but doesn't hand off.
+    {
+        let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
+        if n >= 0 {
+            log::info!(
+                "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
+                my_core,
+                sched_rsp,
+                idx
+            );
+        }
+    }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -1697,6 +1753,13 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
 /// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
+    // Phase 57 DEBUG: log the first few scheduler-loop iterations
+    // per core so we can tell whether a "stuck" core is actually
+    // executing the loop at all. Limited to the first 4 wake-ups
+    // so the boot transcript doesn't drown.
+    let mut wake_log_budget: u32 = 4;
+    let mut dispatch_log_budget: u32 = 4;
+    let mut resume_log_budget: u32 = 4;
 
     loop {
         let reschedule = per_core_reschedule();
@@ -1707,6 +1770,11 @@ pub fn run() -> ! {
             continue;
         }
         interrupts::enable();
+
+        if wake_log_budget > 0 {
+            log::info!("[sched] run-loop wake core={}", core_id);
+            wake_log_budget -= 1;
+        }
 
         debug_assert!(
             per_core_scheduler_rsp() != 0,
@@ -2002,12 +2070,29 @@ pub fn run() -> ! {
             }
         }
 
+        // Phase 57 DEBUG: log per-core dispatches just before
+        // switch_context. Pairs with `resume` log below to detect a
+        // dispatch that hangs / never returns to the scheduler.
+        if dispatch_log_budget > 0 {
+            log::info!(
+                "[sched] dispatch core={} task_idx={} task_rsp={:#x}",
+                core_id,
+                _task_idx,
+                task_rsp
+            );
+            dispatch_log_budget -= 1;
+        }
+
         // Switch to the task.
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
 
         // --- Scheduler resumes here after the task yields back ---
+        if resume_log_budget > 0 {
+            log::info!("[sched] resume core={}", core_id);
+            resume_log_budget -= 1;
+        }
         // The task's RSP has now been saved by switch_context. Clear the
         // switching-out flag before honoring deferred wakes or yields.
         let switched = PENDING_SWITCH_OUT[core_id as usize].swap(-1, Ordering::Acquire);

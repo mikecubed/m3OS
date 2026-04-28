@@ -1,6 +1,6 @@
 # Phase 57 - Audio and Local Session
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57
 **Depends on:** Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅, Phase 56 (Display and Input Architecture) ✅
 **Builds on:** Extends the first graphical architecture into a minimally complete local-system story by adding audio output and a coherent graphical session flow
@@ -79,6 +79,37 @@ The first useful local client is the difference between a graphical stack and a 
 - Extends Phase 56's display/input model into a minimally complete local-session experience.
 - Prepares the optional local-system branch that the release gate can either include or defer explicitly.
 
+## Driver hosting and supervision
+
+`audio_server` is a **Phase 55b-style ring-3 supervised driver**, claiming the audio device through `sys_device_claim` and operating it through the existing Phase 55b device-host primitive set (`sys_device_mmio_map`, `sys_device_dma_alloc`, `sys_device_irq_subscribe`). The kernel does not regain a custom audio driver in ring 0 under any circumstance; this subsection records that discipline so a later phase cannot quietly move audio back into the kernel.
+
+The supervision shape is identical to the existing ring-3 NVMe and e1000 drivers:
+
+- **Claim path.** `audio_server` calls `sys_device_claim` on the chosen target's PCI BDF (Intel 82801AA AC'97, vendor `0x8086` device `0x2415` per [`docs/appendix/phase-57-audio-target-choice.md`](../appendix/phase-57-audio-target-choice.md) — the chosen-target memo). The kernel verifies IOMMU BAR identity-coverage per Phase 55c R2 before the claim succeeds; a coverage failure is a hard error, not a warning. The audio device's BARs ride the same `BarCoverage::assert_bar_identity_mapped` check that NVMe and e1000 already exercise — see Phase 55b's claim-path documentation in [`docs/55b-ring-3-driver-host.md`](../55b-ring-3-driver-host.md).
+- **MMIO and DMA.** BAR0 (the AC'97 mixer block) and BAR1 (the AC'97 bus-master block) map through `sys_device_mmio_map`. The Buffer Descriptor List (BDL) page and the PCM data ring allocate through `sys_device_dma_alloc`, which routes them through the per-device IOMMU domain established at claim time. **No new kernel DMA helper is introduced**; the existing Phase 55a `DmaBuffer<T>` primitive carries the audio buffers exactly as it carries NVMe submission queues and e1000 descriptor rings today.
+- **IRQ multiplexing via Phase 55c bound notifications.** The audio IRQ binds to a `Notification` object via `sys_device_irq_subscribe`, and `audio_server`'s single-threaded io loop multiplexes the IRQ source and the client listening endpoint through the same `RecvResult` machinery the e1000 driver introduced in Phase 55c. The contract is **declared here** and **wired in D.4** (`userspace/audio_server/src/irq.rs`): `subscribe_and_bind` calls `IrqNotification::bind_to_endpoint`; `run_io_loop` blocks only on `endpoint.recv_multi(&irq_notif)`; on `RecvResult::Notification { bits }` the loop calls the backend's IRQ handler; on `RecvResult::Message(req)` it dispatches to the protocol codec. No `irq.wait()` calls in the io loop. Cross-reference: Phase 55c bound-notification design notes at [`docs/appendix/phase-55c-net-send-shape.md`](../appendix/phase-55c-net-send-shape.md).
+- **Service manifest and restart policy.** `etc/services.d/audio_server.conf` declares `restart=on-failure max_restart=3` (matching the Phase 56 F.1 supervisor `on-restart` precedent). On crash the supervisor reaps `audio_server`, releases its capabilities (including the `sys_device_claim` handle), and forks a new instance which re-runs `sys_device_claim` and `IrqNotification::bind_to_endpoint` during its `init` step. **No kernel-side claim persistence across restart is introduced.** The kernel's syscall surface is byte-identical to Phase 55b — `audio_server` is a new caller of existing primitives, not a new kernel feature.
+
+### What is **not** changed in the kernel
+
+The kernel does **not** learn audio. It only learns "device claim covers the audio BAR(s)." Specifically:
+
+- **No `sys_audio_*` syscalls.** Per [`docs/appendix/phase-57-audio-abi.md`](../appendix/phase-57-audio-abi.md) (the Phase 57 ABI memo), audio is a pure-userspace IPC contract on `audio_server`'s endpoint. The kernel gains no new audio syscall arms in `sys_dispatch`.
+- **No kernel-side audio facade.** No `RemoteAudio` analogous to Phase 55b's `RemoteBlockDevice` / `RemoteNic`. There are no legacy kernel callers for audio; the facade pattern does not apply.
+- **No new IRQ-handler logic in ring 0.** The kernel's MSI ISR continues to do the minimum (read status, set a notification bit, EOI). All AC'97-specific status-register interpretation lives in `userspace/audio_server/src/device.rs`.
+- **No audio-specific DMA helper.** `sys_device_dma_alloc` is unchanged. The IOMMU domain machinery is unchanged. The Phase 55a `DmaBuffer<T>` primitive is unchanged. Audio buffers ride the existing path.
+- **No new entry in `kernel-core::driver_ipc`.** The audio wire format lives in `kernel-core::audio::protocol` (Track B.3), consumed by `audio_server` and `audio_client` directly without a kernel-side IPC dispatch helper.
+
+The single concrete change in `kernel/` for Phase 57 audio is one line of widening: `kernel/src/device_host/mod.rs`'s claim path recognizes `0x8086:0x2415` (Intel AC'97) as a valid claim target alongside the existing NVMe and e1000 IDs (Track C.1). That is the entire kernel-side audio surface.
+
+### Cross-references
+
+- Chosen-target memo: [`docs/appendix/phase-57-audio-target-choice.md`](../appendix/phase-57-audio-target-choice.md) — Intel 82801AA AC'97, BDL DMA model, IRQ shape.
+- Audio ABI memo: [`docs/appendix/phase-57-audio-abi.md`](../appendix/phase-57-audio-abi.md) — pure-userspace IPC, no kernel facade.
+- Phase 55b ring-3 driver host pattern: [`docs/55b-ring-3-driver-host.md`](../55b-ring-3-driver-host.md) — `sys_device_claim` and the five device-host primitives.
+- Phase 55a IOMMU substrate: [`docs/55a-iommu-substrate.md`](../55a-iommu-substrate.md) — VT-d / AMD-Vi domains and `DmaBuffer<T>` routing.
+- Phase 55c bound-notification + `RecvResult` shape: [`docs/appendix/phase-55c-net-send-shape.md`](../appendix/phase-55c-net-send-shape.md) — io-loop multiplexing pattern that D.4 reuses verbatim for audio.
+
 ## Implementation Outline
 
 1. Choose the first supported audio target and userspace-facing API.
@@ -111,7 +142,8 @@ The first useful local client is the difference between a graphical stack and a 
 
 ## Companion Task List
 
-- Phase 57 task list — defer until implementation planning begins.
+- [Phase 57 Task List](./tasks/57-audio-and-local-session-tasks.md)
+- [Phase 57 Learning Doc](../57-audio-and-local-session.md) — covers the audio contract, session flow, terminal baseline, manual smoke checklist, and the deferred boundary between Phase 57 and a later media/desktop phase.
 
 ## How Real OS Implementations Differ
 

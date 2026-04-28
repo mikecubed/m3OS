@@ -141,6 +141,7 @@ These targets are validated in the project's CI / xtask harness and are the prim
 | Block storage (NVMe) | QEMU NVMe controller | `0x1b36:0x0010` | `-drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0` | none at this time | QEMU emulation validated (Phase 55); physical target deferred |
 | Network (VirtIO) | VirtIO-net (existing baseline) | `0x1af4:0x1000` | `-netdev user,id=net0 -device virtio-net,netdev=net0` (default) | none at this time | QEMU emulation validated (baseline, pre-Phase 55) |
 | Network (Intel e1000) | Intel 82540EM classic e1000 | `0x8086:0x100E` | `-device e1000,netdev=net0 -netdev user,id=net0` | none at this time | QEMU emulation validated (Phase 55); physical target deferred |
+| Audio (Intel AC'97) | Intel 82801AA AC'97 (Phase 57) | `0x8086:0x2415` | `-device AC97,audiodev=snd0 -audiodev pa,id=snd0` (or `-audiodev none,id=snd0` for headless smoke) | none at this time | QEMU emulation validated (Phase 57); IOMMU coverage status: ✅ via Phase 55c R2 (BAR identity coverage check runs unchanged); physical target deferred |
 
 Notes on the QEMU entries:
 

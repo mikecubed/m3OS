@@ -1,0 +1,34 @@
+[package]
+name = "term"
+version = "0.57.0"
+edition = "2024"
+description = "Phase 57 Track G — graphical terminal emulator (display_server client + PTY host)."
+
+# Phase 57 Track G: a `[lib]` target lets `cargo test -p term --target
+# x86_64-unknown-linux-gnu` exercise pure-logic modules (screen state
+# machine, bell coalescing, font rendering glue, input keymap) on the
+# host without the OS binary's `_start` symbol.  The binary keeps
+# `entry_point!` behind the `os-binary` feature so host-test builds skip
+# it.
+[lib]
+name = "term"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
+
+[[bin]]
+name = "term"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../kernel-core", default-features = false }
+surface_buffer = { path = "../lib/surface_buffer" }
+
+# audio_client is a hard dep so the bell module can construct an
+# AudioClientBellSink for production. Host tests do not exercise the
+# AudioClient transport (the bell tests use MockBellSink); the prod
+# sink is gated behind `cfg(all(not(test), feature = "os-binary"))`.
+audio_client = { path = "../lib/audio_client" }
