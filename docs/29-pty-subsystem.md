@@ -365,6 +365,33 @@ stack:
   [`docs/56-display-and-input-architecture.md`](./56-display-and-input-architecture.md)
   § "How This Phase Differs From Later GUI Work" for the Phase 57 staging.
 
+## Phase 57 Update: First Graphical PTY Consumer (`term`)
+
+Phase 57 lands `term`, the first **graphical** PTY consumer in m3OS. It
+is a regular `display_server` client (Phase 56 `Toplevel` role) that
+allocates a PTY pair via the unchanged `openpty()` syscall, forks the
+configured shell on the slave side, reads bytes from the master into a
+Phase 22b ANSI-parser-backed `Screen` state machine, and renders dirty
+rows through `kernel-core::session::font` into a Phase 56 page-grant
+surface buffer. Keystrokes from `display_server`'s focus-aware input
+dispatcher translate to UTF-8 + Ctrl-letter mappings (`Ctrl-C` →
+`0x03`) and write back to the master side, so the PTY line discipline,
+session/process-group ownership, and signal generation work exactly as
+they do for any other PTY master (serial console, telnetd, sshd).
+
+This makes `term` the **first graphical PTY consumer** while the
+existing serial-console / SSH / telnet flows remain the **secondary-side
+default** — the PTY pair pool, line discipline, and signal generation
+are unchanged, and the slave side does not know whether the master is a
+graphical surface, a serial line, or a network socket. Phase 57
+introduces no new PTY syscalls, no new line-discipline modes, and no
+new session-management behavior; the only addition on the PTY surface
+is one more master-side consumer process.
+
+The `term` learning doc lives at
+[`docs/57-audio-and-local-session.md`](./57-audio-and-local-session.md) —
+section "Terminal composition (`term`)".
+
 The unrecoverable case (display server crashes, restart budget exhausts,
 operator wants no graphical session at all) is covered by the F.3 fallback:
 serial login stays live, kernel framebuffer console handles kernel-side

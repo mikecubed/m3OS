@@ -310,3 +310,35 @@ Phase 27's permission model enables:
 - **Phase 30 (Telnet)** — remote login uses the same login/passwd
   infrastructure
 - **Phase 35 (SSH)** — secure remote access with per-user authentication
+
+## Phase 57 Note: Local Graphical Session Entry
+
+Phase 57 introduces a userspace daemon, `session_manager`, that runs
+the graphical-session boot sequence
+(`display_server` → `kbd_server` → `mouse_server` → `audio_server` →
+`term`) at startup. The session-entry trigger is a **fixed boot
+sequence** — `init` forks `session_manager` once at boot per the
+`/etc/services.d/session_manager.conf` manifest, and the daemon runs
+the same ordered sequence every boot regardless of who is logged in.
+
+**Phase 57 introduces no new UID concepts.** There is no
+"console-session UID," no per-login `session_manager` instance, no
+graphical login screen, and no UID-based gate on who can reach the
+graphical surface. The `term` window opens on top of whichever shell
+the daemon launched (currently the same shell `init` would have spawned
+on the serial console). UID and group membership inside `term` are
+inherited from the spawn chain in the usual way — Phase 27's
+`/etc/passwd` / `/etc/shadow` model is reused unchanged.
+
+The `m3ctl session-state` / `session-stop` / `session-restart` control
+verbs added in Phase 57 I.2 are gated by **capability**, not UID — the
+control-socket cap is minted at session-manager startup and granted
+only to the `m3ctl` binary, matching the Phase 56 m3ctl precedent
+(F.5 capability-based access decision). Multi-user graphical sessions,
+fast user switching, and a UID-aware login manager are explicit
+[Phase 57 deferrals](./57-audio-and-local-session.md#deferred-or-later-phase-topics)
+parked under a future "console sessions" phase.
+
+See [`docs/appendix/phase-57-session-entry.md`](./appendix/phase-57-session-entry.md)
+for the full session-entry contract and the rejected console-session-UID
+alternative.
