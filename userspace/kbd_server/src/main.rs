@@ -335,13 +335,20 @@ fn emit_key_event(ev: &KeyEvent) {
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
+    // PHASE 57 DEBUG: per-step markers so we can pinpoint where the
+    // boot is silently dying on real-machine `cargo xtask run-gui`.
+    // The tail-most marker that lands tells us the last syscall that
+    // succeeded.
+    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K1 enter\n");
     syscall_lib::write_str(
         STDOUT_FILENO,
         "kbd_server: starting (Phase 56 D.1 — KeyEvent pipeline online)\n",
     );
+    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K2 banner-ok\n");
 
     // 1. Create the IPC endpoint that backs the `kbd` service.
     let ep_handle = syscall_lib::create_endpoint();
+    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K3 create-ep-ok\n");
     if ep_handle == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "kbd_server: failed to create endpoint\n");
         return 1;
@@ -352,6 +359,7 @@ fn program_main(_args: &[&str]) -> i32 {
     //    via a single service lookup. Label-based dispatch decides the
     //    request shape.
     let ret = syscall_lib::ipc_register_service(ep_handle, "kbd");
+    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K4 register-ok\n");
     if ret == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "kbd_server: failed to register 'kbd'\n");
         return 1;
