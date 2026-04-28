@@ -1,11 +1,24 @@
 //! Phase 57 Track G.4 — screen state machine + ANSI-parser consumer.
 //!
-//! Red commit: this file declares the public types so the tests
-//! compile.  Method bodies that need to produce typed results return
-//! a sentinel so the tests fail; the green commit lands the real
-//! state machine.
+//! `Screen` owns the cell buffer (fixed `cols * rows` cells), the
+//! cursor, the active colours, the ANSI parser ([`kernel_core::fb::AnsiParser`]
+//! reused per the G.4 acceptance "Reuse Phase 22b's parser"), and a
+//! ring of evicted lines capped at [`SCROLLBACK_LINES`].
+//!
+//! Each call to [`Screen::feed`] passes one byte through the parser,
+//! interprets the resulting [`ConsoleCmd`], updates the cell buffer,
+//! and pushes one or more typed [`RenderCommand`] values into the
+//! caller-supplied output `Vec`.  No allocation per character — only
+//! scrollback growth allocates, and only when a row evicts.
+//!
+//! BEL (0x07) is intercepted *before* the parser so it does not become
+//! a `PutChar('\x07')`; it maps directly to [`RenderCommand::Bell`].
+//! All other control bytes (CR, LF, BS, TAB) flow through the parser
+//! and are handled via the parser's [`ConsoleCmd`] vocabulary.
 
 use alloc::vec::Vec;
+
+use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
 
 use crate::{DEFAULT_COLS, DEFAULT_ROWS, SCROLLBACK_LINES};
 
@@ -22,6 +35,19 @@ pub const DEFAULT_FG: u32 = 0xFFFF_FFFF;
 
 /// Default background colour (black, BGRA8888 packed).
 pub const DEFAULT_BG: u32 = 0x0000_0000;
+
+/// 8-entry SGR colour palette (BGRA8888).  Index `n` corresponds to
+/// SGR 30+`n` (foreground) and 40+`n` (background).
+const SGR_PALETTE: [u32; 8] = [
+    0x0000_0000, // 0 black
+    0xFFAA_0000, // 1 red
+    0xFF00_AA00, // 2 green
+    0xFFAA_5500, // 3 yellow / brown
+    0xFF00_00AA, // 4 blue
+    0xFFAA_00AA, // 5 magenta
+    0xFF00_AAAA, // 6 cyan
+    0xFFAA_AAAA, // 7 light grey
+];
 
 /// Output of the screen state machine.  Each command is a single typed
 /// hint to the renderer; the renderer batches commands per frame.
@@ -81,14 +107,15 @@ pub struct Screen {
     scrollback: Vec<Vec<Cell>>,
     /// Cursor row, 0-based.
     cursor_row: u16,
-    /// Cursor col, 0-based.
+    /// Cursor col, 0-based.  May equal `cols` to mean "past the right
+    /// edge"; the next printable byte triggers a wrap.
     cursor_col: u16,
     /// Active foreground colour.
     fg: u32,
     /// Active background colour.
     bg: u32,
     /// ANSI parser state.
-    parser: kernel_core::fb::AnsiParser,
+    parser: AnsiParser,
 }
 
 impl Screen {
@@ -112,7 +139,7 @@ impl Screen {
             cursor_col: 0,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
-            parser: kernel_core::fb::AnsiParser::new(),
+            parser: AnsiParser::new(),
         }
     }
 
@@ -151,12 +178,208 @@ impl Screen {
     }
 
     /// Feed one byte through the ANSI parser and update the screen
-    /// state.  Returns the typed render command(s) produced; callers
-    /// pass each command to the renderer in order.  The function
-    /// allocates only when scrollback grows, never per character.
+    /// state.  Push the typed render commands produced into `out`.
+    /// The function allocates only when scrollback grows, never per
+    /// character.
     pub fn feed(&mut self, byte: u8, out: &mut Vec<RenderCommand>) {
-        unimplemented!("G.4 green commit lands this");
-        let _ = (byte, out);
+        // BEL is intercepted before the parser so it does not become a
+        // `PutChar('\x07')`.  The G.4 acceptance pins this mapping.
+        if byte == 0x07 {
+            out.push(RenderCommand::Bell);
+            return;
+        }
+        let ch = byte as char;
+        let cmd = self.parser.process_char(ch);
+        match cmd {
+            ConsoleCmd::Nop => {}
+            ConsoleCmd::PutChar(c) => self.put_char(c as u32, out),
+            ConsoleCmd::CarriageReturn => {
+                self.cursor_col = 0;
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::Newline => self.line_feed(out),
+            ConsoleCmd::Backspace => {
+                if self.cursor_col > 0 {
+                    self.cursor_col -= 1;
+                    out.push(RenderCommand::MoveCursor {
+                        row: self.cursor_row,
+                        col: self.cursor_col,
+                    });
+                }
+            }
+            ConsoleCmd::Tab => {
+                let next = ((self.cursor_col / 8) + 1) * 8;
+                self.cursor_col = next.min(self.cols);
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorUp(n) => {
+                self.cursor_row = self.cursor_row.saturating_sub(n);
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorDown(n) => {
+                self.cursor_row = (self.cursor_row + n).min(self.rows.saturating_sub(1));
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorForward(n) => {
+                self.cursor_col = (self.cursor_col + n).min(self.cols);
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorBack(n) => {
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorHorizontalAbsolute(col_1based) => {
+                let col = col_1based
+                    .saturating_sub(1)
+                    .min(self.cols.saturating_sub(1));
+                self.cursor_col = col;
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::CursorPosition(r_1based, c_1based) => {
+                let r = r_1based.saturating_sub(1).min(self.rows.saturating_sub(1));
+                let c = c_1based.saturating_sub(1).min(self.cols.saturating_sub(1));
+                self.cursor_row = r;
+                self.cursor_col = c;
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::EraseDisplay(2) => {
+                self.clear_buffer();
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+                out.push(RenderCommand::Clear);
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::EraseDisplay(_) => { /* not yet — keep the screen */ }
+            ConsoleCmd::EraseLine(_) => { /* not yet — keep the line */ }
+            ConsoleCmd::SetCursorVisible(_) => { /* renderer policy */ }
+            ConsoleCmd::Sgr(sgr) => self.apply_sgr(&sgr, out),
+        }
+    }
+
+    fn put_char(&mut self, codepoint: u32, out: &mut Vec<RenderCommand>) {
+        if self.cursor_col >= self.cols {
+            self.line_feed(out);
+            self.cursor_col = 0;
+        }
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let idx = row as usize * self.cols as usize + col as usize;
+        self.buf[idx] = Cell {
+            codepoint,
+            fg: self.fg,
+            bg: self.bg,
+        };
+        out.push(RenderCommand::PutGlyph {
+            row,
+            col,
+            codepoint,
+            fg: self.fg,
+            bg: self.bg,
+        });
+        self.cursor_col += 1;
+    }
+
+    fn line_feed(&mut self, out: &mut Vec<RenderCommand>) {
+        self.cursor_col = 0;
+        if self.cursor_row + 1 >= self.rows {
+            self.scroll_up(out);
+        } else {
+            self.cursor_row += 1;
+        }
+        out.push(RenderCommand::MoveCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+        });
+    }
+
+    fn scroll_up(&mut self, out: &mut Vec<RenderCommand>) {
+        let cols = self.cols as usize;
+        // Evict the top row into scrollback (capped).
+        let evicted: Vec<Cell> = self.buf[0..cols].to_vec();
+        if self.scrollback.len() >= SCROLLBACK_LINES {
+            self.scrollback.remove(0);
+        }
+        self.scrollback.push(evicted);
+        // Shift every other row up by one.
+        let total = self.cols as usize * self.rows as usize;
+        for i in 0..(total - cols) {
+            self.buf[i] = self.buf[i + cols];
+        }
+        // Blank the new bottom row.
+        for i in (total - cols)..total {
+            self.buf[i] = Cell::blank(self.fg, self.bg);
+        }
+        out.push(RenderCommand::Scroll { amount: 1 });
+    }
+
+    fn clear_buffer(&mut self) {
+        for cell in &mut self.buf {
+            *cell = Cell::blank(self.fg, self.bg);
+        }
+    }
+
+    fn apply_sgr(&mut self, sgr: &SgrParams, out: &mut Vec<RenderCommand>) {
+        let mut changed = false;
+        for i in 0..sgr.count {
+            let n = sgr.params[i];
+            match n {
+                0 => {
+                    if self.fg != DEFAULT_FG || self.bg != DEFAULT_BG {
+                        self.fg = DEFAULT_FG;
+                        self.bg = DEFAULT_BG;
+                        changed = true;
+                    }
+                }
+                30..=37 => {
+                    let idx = (n - 30) as usize;
+                    if self.fg != SGR_PALETTE[idx] {
+                        self.fg = SGR_PALETTE[idx];
+                        changed = true;
+                    }
+                }
+                40..=47 => {
+                    let idx = (n - 40) as usize;
+                    if self.bg != SGR_PALETTE[idx] {
+                        self.bg = SGR_PALETTE[idx];
+                        changed = true;
+                    }
+                }
+                _ => { /* ignore unsupported SGR codes */ }
+            }
+        }
+        if changed {
+            out.push(RenderCommand::SetColor {
+                fg: self.fg,
+                bg: self.bg,
+            });
+        }
     }
 }
 
