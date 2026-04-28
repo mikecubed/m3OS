@@ -745,6 +745,57 @@ pub fn get_core_data(core_id: u8) -> Option<&'static PerCoreData> {
     }
 }
 
+/// Phase 57 fix: drop the per-core data for an AP whose
+/// `INIT-SIPI-SIPI` boot timed out. Called by `boot_aps` after the
+/// online-flag wait expires. Without this, the dead AP's
+/// `PerCoreData` slot stays populated (it was allocated by
+/// `init_ap_per_core` *before* the boot wait) and `get_core_data`
+/// returns `Some(_)` — which silently misleads the scheduler's load
+/// balancer into queuing tasks onto a runqueue nothing drains.
+///
+/// # Safety
+///
+/// Caller must guarantee that the AP at `core_id` never came online,
+/// so no other core holds a live reference to its `PerCoreData`.
+/// `boot_aps` enforces this by polling `is_online` to false before
+/// calling.
+pub(super) unsafe fn release_failed_ap(core_id: u8) {
+    if (core_id as usize) >= MAX_CORES {
+        return;
+    }
+    let dead_ptr = unsafe { PER_CORE_DATA[core_id as usize] };
+    if dead_ptr.is_null() {
+        return;
+    }
+    // Reclaim the Box that `init_ap_per_core` allocated.
+    drop(unsafe { Box::from_raw(dead_ptr) });
+    unsafe {
+        PER_CORE_DATA[core_id as usize] = core::ptr::null_mut();
+    }
+    // Clear the APIC → core mapping so a stray IPI cannot aim at
+    // the freed slot. Use raw pointer indexing to avoid taking a
+    // mutable reference to the `static mut` array (Rust 2024
+    // compat: `static_mut_refs` is now a hard deny).
+    let map_ptr = &raw mut APIC_TO_CORE;
+    for i in 0..MAX_CORES {
+        unsafe {
+            if (*map_ptr)[i] == core_id {
+                (*map_ptr)[i] = 0xFF;
+            }
+        }
+    }
+}
+
+/// Phase 57 fix: shrink `CORE_COUNT` to reflect APs that actually
+/// booted. Called by `boot_aps` once all AP boot attempts have run.
+/// `count` is `1 + number_of_online_APs` (BSP plus successful APs);
+/// `least_loaded_core` only iterates `0..CORE_COUNT`, so a smaller
+/// value keeps the load balancer from even considering dead slots
+/// — defense in depth alongside `release_failed_ap`.
+pub(super) fn set_core_count(count: u8) {
+    CORE_COUNT.store(count, Ordering::Release);
+}
+
 /// Return the BSP's LAPIC ID.
 pub fn bsp_apic_id() -> u8 {
     BSP_APIC_ID.load(Ordering::Relaxed)
