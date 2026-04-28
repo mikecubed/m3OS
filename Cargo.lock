@@ -94,6 +94,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_client"
+version = "0.57.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "audio_server"
 version = "0.57.0"
 dependencies = [

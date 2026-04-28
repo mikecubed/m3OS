@@ -1,0 +1,20 @@
+[package]
+name = "audio_client"
+version = "0.57.0"
+edition = "2024"
+description = "Phase 57 Track E.1 — userspace audio client library (consumes kernel-core::audio protocol; talks to audio_server)."
+
+[lib]
+name = "audio_client"
+path = "src/lib.rs"
+
+[features]
+# Default off — the library is `#![no_std]`. Enabling `alloc` unlocks
+# the convenience helpers (and brings in syscall_lib's alloc feature)
+# for callers that want to hand the client a `Vec`-shaped buffer.
+default = []
+alloc = ["syscall-lib/alloc"]
+
+[dependencies]
+syscall-lib = { path = "../../syscall-lib" }
+kernel-core = { path = "../../../kernel-core", default-features = false }
