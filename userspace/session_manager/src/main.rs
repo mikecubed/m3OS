@@ -301,13 +301,27 @@ mod init_backend {
         }
     }
 
+    /// Polling interval for [`InitSupervisorBackend::await_ready`].
+    /// Mirrors `kernel_core::session::RETRY_BACKOFF_MS` (200 ms) but
+    /// quoted directly here so this module is the single sleep site.
+    const AWAIT_POLL_MS: u32 = 200;
+
     impl SupervisorBackend for InitSupervisorBackend {
-        fn start(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
-            if is_service_registered(service) {
-                Ok(SupervisorReply::Ack)
-            } else {
-                Ok(SupervisorReply::Error(SupervisorError::UnknownService))
-            }
+        fn start(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Phase 57 F.2 transitional: init drives the actual
+            // service spawn through its `KNOWN_CONFIGS` manifest
+            // walker; `session_manager` is a passive observer that
+            // reports the step as Ack here and waits for the service
+            // to register in [`Self::await_ready`]. Returning Ack
+            // unconditionally means the F.1 sequencer's per-step
+            // attempt becomes "wait for ready" rather than "wait for
+            // already-registered" — which is the correct semantic
+            // for an observer that doesn't itself spawn the
+            // processes.
+            //
+            // F.4 replaces this with a `/run/init.cmd` start verb so
+            // session_manager can drive the lifecycle directly.
+            Ok(SupervisorReply::Ack)
         }
 
         fn stop(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
@@ -335,13 +349,30 @@ mod init_backend {
         fn await_ready(
             &mut self,
             service: &str,
-            _timeout_ms: u64,
+            timeout_ms: u64,
         ) -> Result<SupervisorReply, SupervisorError> {
-            if is_service_registered(service) {
-                Ok(SupervisorReply::ReadyState { ready: true })
-            } else {
-                Ok(SupervisorReply::ReadyState { ready: false })
+            // Poll the IPC service registry up to `timeout_ms` waiting
+            // for the named service to register. `init` spawns the
+            // session services in parallel based on dependency-graph
+            // order; session_manager has to wait patiently because we
+            // are racing init's manifest walker. Each poll sleeps
+            // `AWAIT_POLL_MS` before re-probing, so the worst-case
+            // runtime is `timeout_ms + AWAIT_POLL_MS`.
+            //
+            // `timeout_ms == 0` reverts to the original nonblocking-
+            // probe shape — useful for callers that just want a
+            // snapshot.
+            let deadline_polls = (timeout_ms / (AWAIT_POLL_MS as u64)).saturating_add(1);
+            for _ in 0..deadline_polls {
+                if is_service_registered(service) {
+                    return Ok(SupervisorReply::ReadyState { ready: true });
+                }
+                if timeout_ms == 0 {
+                    break;
+                }
+                let _ = syscall_lib::nanosleep_for(0, (AWAIT_POLL_MS as u32) * 1_000_000);
             }
+            Ok(SupervisorReply::ReadyState { ready: false })
         }
 
         fn on_exit_observed(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {

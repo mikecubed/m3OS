@@ -33,6 +33,16 @@ use kernel_core::session_supervisor::{
     SupervisorBackend, SupervisorReply, declared_session_step_names,
 };
 
+/// Per-step `await_ready` budget, in milliseconds. Each F.1 sequencer
+/// attempt waits up to this many ms for the service to register before
+/// counting the attempt as failed. Sized to comfortably cover init's
+/// dependency-graph walk plus per-daemon fork+exec+register on a cold
+/// boot — empirical observation under `cargo xtask run-gui` shows the
+/// full chain coming up in well under a second on QEMU; 5 s gives a 5×
+/// safety margin without delaying text-fallback noticeably when a
+/// daemon is genuinely missing.
+pub const STEP_READY_TIMEOUT_MS: u64 = 5_000;
+
 /// Number of declared session steps (mirrors the length of
 /// [`declared_session_step_names`]). Hard-coded so the array shape is
 /// known at compile time; the runtime check below asserts the constant
@@ -100,8 +110,13 @@ impl<'b, B: SupervisorBackend> SessionStep for ServiceStep<'b, B> {
 
     fn is_ready(&self) -> bool {
         let mut b = self.backend.borrow_mut();
+        // `STEP_READY_TIMEOUT_MS` lets `await_ready` poll the IPC
+        // registry patiently while init finishes spawning the
+        // service. Without this each F.1 sequencer attempt would be
+        // a microsecond-scale tight-loop probe and the boot would
+        // race ahead of init's manifest walker.
         matches!(
-            b.await_ready(self.name, 0),
+            b.await_ready(self.name, STEP_READY_TIMEOUT_MS),
             Ok(SupervisorReply::ReadyState { ready: true })
         )
     }
