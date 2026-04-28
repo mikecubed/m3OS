@@ -237,6 +237,12 @@ static SESSION_MANAGER_ELF: &[u8] = generated_initrd_asset!("session_manager");
 // service-config path (`command=/bin/audio_server`).
 static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 
+// Phase 57 Track E.2: audio-demo one-shot — generates a 440 Hz sine
+// wave and submits it through `audio_client`. Exposed under /bin so
+// it is reachable via the shell and via the H.1 smoke harness.
+// Intentionally not registered as a service (one-shot, not daemon).
+static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -406,6 +412,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "audio_server",
         RamdiskNode::File {
             content: AUDIO_SERVER_ELF,
+        },
+    ),
+    // Phase 57 Track E.2: audio-demo one-shot reference client.
+    (
+        "audio-demo",
+        RamdiskNode::File {
+            content: AUDIO_DEMO_ELF,
         },
     ),
     // Phase 32: build tools and utilities

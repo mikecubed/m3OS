@@ -383,6 +383,11 @@ fn build_userspace_bins() {
         // on `kernel-core` (audio types + protocol codec) and
         // `driver_runtime` (DmaBuffer<T>, IrqNotification).
         ("audio_server", "audio_server", true),
+        // Phase 57 Track E.2 — audio reference demo.  `needs_alloc =
+        // true` because the binary depends on `audio_client`, which
+        // pulls in `kernel-core` (audio protocol codec) at the alloc
+        // feature level for shared types.
+        ("audio-demo", "audio-demo", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {

@@ -13,7 +13,7 @@
 | B | `kernel-core` audio pure-logic: PCM format types, ring-buffer state model, protocol codec, property tests | A | Done |
 | C | Kernel substrate: audio device claim path through `device_host`, IOMMU BAR coverage for the audio device, vsync-equivalent buffer-empty notification | A, B | Done |
 | D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Done |
-| E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Planned |
+| E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Done |
 | F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Done |
 | G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Planned |
 | H | Validation: audio smoke, session entry smoke, recovery smoke, multi-client audio policy, xtask plumbing, manual `run-gui` checklist | D, E, F, G | Planned |
@@ -384,11 +384,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** Every userspace consumer of audio (the demo, `term`'s bell, future media clients) goes through this library. Carrying the protocol concerns once here keeps consumer crates small and keeps the wire format private to `kernel-core::audio`.
 
 **Acceptance:**
-- [ ] Failing host tests commit first against a mock IPC backend.
-- [ ] The library's public surface is exactly: `open`, `submit_frames`, `drain`, `close`, plus a typed `AudioClientError`. No protocol bytes are exposed.
-- [ ] The library reuses `kernel-core::audio::protocol` for encode/decode — no parallel definitions.
-- [ ] Cargo features: `alloc` (default off — the library is `#![no_std]`); enabling `alloc` unlocks the convenience helpers that allocate buffers for callers.
-- [ ] Unit tests cover open → submit → drain → close happy path, every error variant, and the second-open `EBUSY` path.
+- [x] Failing host tests commit first against a mock IPC backend. (Commit `e9c8b39` — "Phase 57 E.1: tests for AudioClient (red)" — lands the 20-test suite + stub before the green implementation in commit `37b80bb`.)
+- [x] The library's public surface is exactly: `open`, `submit_frames`, `drain`, `close`, plus a typed `AudioClientError`. No protocol bytes are exposed. (`AudioSocket` trait is `pub(crate)`; the `private_bounds` lint is silenced explicitly so the surface stays exactly the four verbs + `AudioClientError`.)
+- [x] The library reuses `kernel-core::audio::protocol` for encode/decode — no parallel definitions. (Every encoder / decoder call routes through `kernel_core::audio::{ClientMessage, ServerMessage}`; the `library_only_consumes_kernel_core_protocol_no_parallel_definitions` test asserts the symbol presence.)
+- [x] Cargo features: `alloc` (default off — the library is `#![no_std]`); enabling `alloc` unlocks the convenience helpers that allocate buffers for callers. (`Cargo.toml` declares `default = []` and `alloc = ["syscall-lib/alloc"]`; the library compiles for `x86_64-unknown-none` with no heap.)
+- [x] Unit tests cover open → submit → drain → close happy path, every error variant, and the second-open `EBUSY` path. (20/20 tests pass: happy path, every server error variant for open / submit / drain, oversize-payload protocol error, corrupt-reply protocol error, before-open guards, and the second-open `AlreadyOpen` arm.)
 
 ### E.2 — `userspace/audio-demo` reference client
 
@@ -401,11 +401,11 @@ Pure logic belongs in `kernel-core`. Hardware and IPC wiring belongs in `kernel/
 **Why it matters:** A protocol-reference demo is the only credible way to show "audio works." It also doubles as the audio smoke harness for H.1.
 
 **Acceptance:**
-- [ ] All four-step new-binary convention points updated.
-- [ ] On run, the demo opens a stream, submits a known sine-wave PCM buffer (frequency, sample rate, and duration recorded in source as named constants), drains, closes, and exits zero.
-- [ ] On failure (any `AudioClientError`), the demo prints a structured log line with the variant name and exits non-zero.
-- [ ] Source includes a comment explaining how the test tone was generated (so a reader can regenerate it without reading binary blobs).
-- [ ] No external crate dependencies beyond the workspace.
+- [x] All four-step new-binary convention points updated. (Workspace `members` adds `userspace/audio-demo`; xtask `bins` array adds `("audio-demo", "audio-demo", true)`; `BIN_ENTRIES` in `kernel/src/fs/ramdisk.rs` adds the `audio-demo` entry. Service-config step is intentionally skipped — `audio-demo` is a one-shot, not a daemon; the module-level docs spell out why.)
+- [x] On run, the demo opens a stream, submits a known sine-wave PCM buffer (frequency, sample rate, and duration recorded in source as named constants), drains, closes, and exits zero. (`TONE_FREQ_HZ = 440`, `SAMPLE_RATE_HZ = 48_000`, `DURATION_S = 1`, `AMPLITUDE_NUM = 19_661`, `AMPLITUDE_DEN = 65_536` — all named constants at the top of `userspace/audio-demo/src/main.rs`. The demo emits `AUDIO_DEMO:opened`, `AUDIO_DEMO:submitted`, `AUDIO_DEMO:drained`, `AUDIO_DEMO:closed`, `AUDIO_DEMO:PASS` on the happy path and exits 0.)
+- [x] On failure (any `AudioClientError`), the demo prints a structured log line with the variant name and exits non-zero. (`log_error` writes `AUDIO_DEMO:FAIL stage=<verb> variant=<name>` for every variant; the exit codes 2 / 3 / 4 / 5 distinguish open / submit / drain / close.)
+- [x] Source includes a comment explaining how the test tone was generated (so a reader can regenerate it without reading binary blobs). (Module-level docs spell out the algorithm: a 256-entry quarter-sine LUT computed via 7th-order Taylor in Q16.16 fixed-point, plus a 32-bit phase accumulator with quadrant-fold lookup.)
+- [x] No external crate dependencies beyond the workspace. (Cargo.toml lists only `audio_client`, `syscall-lib`, and `kernel-core` — all path-relative workspace crates.)
 
 ---
 

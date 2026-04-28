@@ -85,6 +85,10 @@ members = [
     "userspace/session_manager",
     # Phase 57 Track D — ring-3 audio driver (AC'97)
     "userspace/audio_server",
+    # Phase 57 Track E.1 — userspace audio client library
+    "userspace/lib/audio_client",
+    # Phase 57 Track E.2 — userspace audio reference demo
+    "userspace/audio-demo",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
