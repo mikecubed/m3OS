@@ -1,8 +1,33 @@
 //! Phase 57 Track G.3 — PTY pair host + shell spawn.
 //!
-//! Red commit: this file declares the trait + types so the tests
-//! compile.  Every method body is `unimplemented!()` so the tests fail
-//! at runtime.  The green commit (next) lands the real bodies.
+//! `PtyHost` opens the primary/secondary PTY pair via the Phase 29
+//! syscalls (`syscall_lib::openpty`), spawns the in-tree shell on the
+//! secondary side with stdin/stdout/stderr wired up, and exposes an
+//! `Option<i32>` shell exit-status surface so the binary's main loop
+//! observes the shell quitting and shuts down cleanly.
+//!
+//! ## Why a trait?
+//!
+//! Production `term` runs against the real kernel: it forks, calls
+//! `dup2` to wire the secondary side, then `execve`s `/bin/sh0`. None
+//! of that compiles on the host, so the [`PtyOps`] trait abstracts the
+//! syscalls behind a seam. Host tests run [`PtyHost`] against
+//! `MockPtyOps` to exercise the bring-up flow without touching the
+//! kernel.
+//!
+//! ## Lifecycle (per the G.3 acceptance)
+//!
+//! 1. `PtyHost::new(ops)` constructs an unattached host.
+//! 2. `PtyHost::open_and_spawn` opens the PTY pair, forks; child wires
+//!    the secondary side as stdio and `execve`s the shell; parent
+//!    records the child pid, closes the secondary fd, and keeps the
+//!    primary for I/O.
+//! 3. `PtyHost::poll_shell_exit` checks via `waitpid(WNOHANG)` whether
+//!    the shell exited; returns `Ok(Some(status))` on exit, `Ok(None)`
+//!    while still running.
+//! 4. The binary's main loop calls `poll_shell_exit` between read /
+//!    render passes; on `Some(_)` it closes the primary fd and exits
+//!    zero so the supervisor restarts per `term.conf`.
 
 use crate::TermError;
 
@@ -20,49 +45,127 @@ pub enum PtyError {
 }
 
 impl From<PtyError> for TermError {
-    fn from(_err: PtyError) -> Self {
-        unimplemented!("G.3 green commit lands this")
+    fn from(err: PtyError) -> Self {
+        match err {
+            PtyError::OpenFailed(e) => TermError::PtyOpen(e),
+            PtyError::ForkFailed(e) | PtyError::ExecFailed(e) => TermError::ShellSpawn(e),
+        }
     }
 }
 
-/// Syscall seam for the PTY host.
+/// Syscall seam for the PTY host. The production impl wraps
+/// `syscall_lib::openpty`, `fork`, `dup2`, `execve`, and
+/// `waitpid(WNOHANG)`. Host tests provide a recording mock.
 pub trait PtyOps {
+    /// Open a PTY pair. Returns `(primary_fd, secondary_fd)` on
+    /// success; negative errno on failure.
     fn openpty(&mut self) -> Result<(i32, i32), i32>;
+
+    /// Fork the calling process. Returns the child pid (>0) in the
+    /// parent, 0 in the child, negative errno on failure.
     fn fork(&mut self) -> i32;
+
+    /// Wire `secondary_fd` as stdin/stdout/stderr in the child and
+    /// replace the process image with the shell. Only the child path
+    /// reaches this method; the parent never calls it. The function
+    /// does not return — on success the process image is replaced; on
+    /// failure the implementation aborts the child.
     fn exec_shell(&mut self, secondary_fd: i32) -> !;
+
+    /// Close a file descriptor.  Returns the underlying close errno.
     fn close(&mut self, fd: i32) -> i32;
+
+    /// `waitpid(pid, WNOHANG)` — returns `Ok(Some(status))` if the
+    /// child exited, `Ok(None)` if still running, `Err(errno)` on
+    /// error.  Implementations decode the raw status into the exit
+    /// code (or signal) before returning.
     fn try_wait(&mut self, pid: i32) -> Result<Option<i32>, i32>;
 }
 
 /// Shell-process lifecycle owner.
+///
+/// `PtyHost` is the only owner of the primary fd and the shell pid;
+/// the binary's main loop borrows them through the public accessors.
+/// On `Drop` the primary fd is closed; the shell is *not* killed by
+/// `Drop` because the supervisor handles the lifecycle of the term
+/// process itself.
 pub struct PtyHost<O: PtyOps> {
-    #[allow(dead_code)]
     ops: O,
+    primary_fd: Option<i32>,
+    shell_pid: Option<i32>,
 }
 
 impl<O: PtyOps> PtyHost<O> {
-    pub fn new(_ops: O) -> Self {
-        unimplemented!("G.3 green commit lands this")
+    /// Wrap a fresh `PtyOps` with no PTY open and no shell spawned.
+    pub fn new(ops: O) -> Self {
+        Self {
+            ops,
+            primary_fd: None,
+            shell_pid: None,
+        }
     }
 
+    /// Open the PTY pair and spawn the shell. On success returns the
+    /// shell pid; both `primary_fd` and `shell_pid` are now `Some(_)`.
+    /// On failure the partial state (e.g. open primary fd) is
+    /// rolled back so the caller observes a clean, unattached host.
     pub fn open_and_spawn(&mut self) -> Result<i32, PtyError> {
-        unimplemented!("G.3 green commit lands this")
+        let (primary_fd, secondary_fd) = self.ops.openpty().map_err(PtyError::OpenFailed)?;
+        self.primary_fd = Some(primary_fd);
+        let pid = self.ops.fork();
+        if pid < 0 {
+            // Roll back the open PTY pair so the caller sees no
+            // partial state.
+            self.ops.close(primary_fd);
+            self.ops.close(secondary_fd);
+            self.primary_fd = None;
+            return Err(PtyError::ForkFailed(pid));
+        }
+        if pid == 0 {
+            // Child path: never returns.  The implementation `dup2`s
+            // the secondary fd onto stdin/stdout/stderr and `execve`s
+            // the shell; failure aborts the child.
+            self.ops.exec_shell(secondary_fd);
+        }
+        // Parent path: close the secondary side and record the pid.
+        self.ops.close(secondary_fd);
+        self.shell_pid = Some(pid);
+        Ok(pid)
     }
 
+    /// Primary fd. `None` until [`open_and_spawn`] returns `Ok(_)`.
     pub fn primary_fd(&self) -> Option<i32> {
-        unimplemented!("G.3 green commit lands this")
+        self.primary_fd
     }
 
+    /// Shell pid. `None` until [`open_and_spawn`] returns `Ok(_)`.
     pub fn shell_pid(&self) -> Option<i32> {
-        unimplemented!("G.3 green commit lands this")
+        self.shell_pid
     }
 
+    /// Poll for shell exit. Returns:
+    /// - `Ok(Some(status))` on shell exit (status decoded by the
+    ///   `PtyOps` implementation).
+    /// - `Ok(None)` while the shell is still running.
+    /// - `Err(errno)` on a `waitpid` error (caller must decide whether
+    ///   to retry or shut down).
+    ///
+    /// Returns `Ok(None)` if no shell has been spawned yet — the
+    /// host's main loop calls this unconditionally and only acts on
+    /// `Some(_)`.
     pub fn poll_shell_exit(&mut self) -> Result<Option<i32>, i32> {
-        unimplemented!("G.3 green commit lands this")
+        match self.shell_pid {
+            None => Ok(None),
+            Some(pid) => self.ops.try_wait(pid),
+        }
     }
 
+    /// Close the primary fd, if open. Idempotent: a second call after
+    /// the fd has been taken is a no-op.
     pub fn close_primary(&mut self) {
-        unimplemented!("G.3 green commit lands this")
+        if let Some(fd) = self.primary_fd.take() {
+            self.ops.close(fd);
+        }
     }
 }
 
@@ -71,6 +174,9 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
 
+    /// Recording mock that emulates a successful PTY pair allocation
+    /// and a parent-side `fork`.  Tests configure `next_*` to inject
+    /// failures.
     struct MockPtyOps {
         next_openpty: Result<(i32, i32), i32>,
         next_fork_pid: i32,
@@ -101,6 +207,9 @@ mod tests {
         }
 
         fn exec_shell(&mut self, secondary_fd: i32) -> ! {
+            // Record that we got here, then "exit" the child path by
+            // panicking.  In tests we never take the child path
+            // because `next_fork_pid` is non-zero.
             self.exec_called_with = Some(secondary_fd);
             panic!("MockPtyOps::exec_shell called from parent path");
         }
@@ -128,8 +237,14 @@ mod tests {
         assert_eq!(pid, 42);
         assert_eq!(host.primary_fd(), Some(10));
         assert_eq!(host.shell_pid(), Some(42));
+        // Secondary fd (11) must have been closed by the parent.
+        assert!(host.ops.closed_fds.contains(&11));
+        // Primary fd (10) is still open.
+        assert!(!host.ops.closed_fds.contains(&10));
     }
 
+    /// Phase 57 G.3 acceptance: openpty failure surfaces as
+    /// `PtyError::OpenFailed` and leaves no partial state.
     #[test]
     fn open_failure_surfaces_typed_error() {
         let mut ops = MockPtyOps::new();
@@ -141,6 +256,7 @@ mod tests {
         assert_eq!(host.shell_pid(), None);
     }
 
+    /// Phase 57 G.3 acceptance: fork failure rolls back the PTY pair.
     #[test]
     fn fork_failure_rolls_back_open_fds() {
         let mut ops = MockPtyOps::new();
@@ -148,10 +264,15 @@ mod tests {
         let mut host = PtyHost::new(ops);
         let err = host.open_and_spawn().expect_err("fork err must surface");
         assert_eq!(err, PtyError::ForkFailed(-12));
+        // Both fds must have been closed.
+        assert!(host.ops.closed_fds.contains(&10));
+        assert!(host.ops.closed_fds.contains(&11));
         assert_eq!(host.primary_fd(), None);
         assert_eq!(host.shell_pid(), None);
     }
 
+    /// Phase 57 G.3 acceptance: poll_shell_exit returns None before
+    /// the shell exits and Some(status) after.
     #[test]
     fn poll_shell_exit_observes_running_then_exited() {
         let mut ops = MockPtyOps::new();
@@ -162,21 +283,29 @@ mod tests {
         assert_eq!(host.poll_shell_exit(), Ok(Some(0)));
     }
 
+    /// Phase 57 G.3 acceptance: poll_shell_exit returns None when no
+    /// shell has been spawned yet.
     #[test]
     fn poll_shell_exit_without_spawn_returns_none() {
         let mut host = PtyHost::new(MockPtyOps::new());
         assert_eq!(host.poll_shell_exit(), Ok(None));
     }
 
+    /// Close-primary is idempotent.
     #[test]
     fn close_primary_is_idempotent() {
         let mut host = PtyHost::new(MockPtyOps::new());
         host.open_and_spawn().expect("spawn ok");
         host.close_primary();
+        // Calling again should not call close on a stale fd.
+        let close_count_before = host.ops.closed_fds.len();
         host.close_primary();
+        assert_eq!(host.ops.closed_fds.len(), close_count_before);
         assert_eq!(host.primary_fd(), None);
     }
 
+    /// `PtyError` lifts cleanly into `TermError` for the binary's
+    /// top-level error surface.
     #[test]
     fn pty_error_lifts_into_term_error() {
         let from_open: TermError = PtyError::OpenFailed(-5).into();
