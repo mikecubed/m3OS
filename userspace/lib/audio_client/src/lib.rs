@@ -90,8 +90,11 @@ impl From<ProtocolError> for AudioClientError {
 /// that ride the same call (currently only `SubmitFrames` uses this
 /// — the PCM bytes follow the frame on the wire).
 pub(crate) trait AudioSocket {
-    fn call(&mut self, frame: &[u8], bulk: &[u8])
-    -> Result<heapless_buf::ReplyBuf, AudioClientError>;
+    fn call(
+        &mut self,
+        frame: &[u8],
+        bulk: &[u8],
+    ) -> Result<heapless_buf::ReplyBuf, AudioClientError>;
 }
 
 mod heapless_buf {

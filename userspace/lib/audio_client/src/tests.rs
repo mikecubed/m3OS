@@ -172,8 +172,7 @@ fn submit_frames_carries_pcm_bytes_in_bulk() {
     let sock = client.socket;
     assert_eq!(sock.sent.len(), 2);
     assert_eq!(sock.sent[1].bulk, pcm.to_vec());
-    let (decoded, _) =
-        ClientMessage::decode(&sock.sent[1].frame).expect("decode submit frame");
+    let (decoded, _) = ClientMessage::decode(&sock.sent[1].frame).expect("decode submit frame");
     assert_eq!(decoded, ClientMessage::SubmitFrames { len: 8 });
 }
 

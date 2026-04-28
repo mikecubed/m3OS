@@ -109,17 +109,14 @@ fn program_main(_args: &[&str]) -> i32 {
     let lut = build_quarter_sine_lut();
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:lut-ready\n");
 
-    let mut client = match AudioClient::open(
-        PcmFormat::S16Le,
-        ChannelLayout::Stereo,
-        SampleRate::Hz48000,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            log_error("open", err);
-            return 2;
-        }
-    };
+    let mut client =
+        match AudioClient::open(PcmFormat::S16Le, ChannelLayout::Stereo, SampleRate::Hz48000) {
+            Ok(c) => c,
+            Err(err) => {
+                log_error("open", err);
+                return 2;
+            }
+        };
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:opened\n");
 
     if let Err(err) = submit_tone(&mut client, &lut) {
