@@ -9,8 +9,8 @@
 //! 2. Connect to `display_server` (Hello + `CreateSurface` +
 //!    `SetSurfaceRole(Toplevel)`) via [`DisplayClient`].
 //! 3. Open a PTY pair via the production [`SyscallPtyOps`], fork +
-//!    `execve` `/bin/sh0` on the secondary side, set the primary
-//!    nonblocking.
+//!    `execve` `/bin/ion` (with `/bin/sh0` fallback) on the secondary
+//!    side, set the primary nonblocking.
 //! 4. Loop: drain PTY reads → ANSI parser → screen state → render
 //!    commands; pull `KeyEvent`s from `display_server`'s C.5 outbound
 //!    queue → input handler → PTY writes; ring the bell on `Bell`
@@ -143,8 +143,12 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
-    // 3. Open the PTY pair and spawn `/bin/sh0` on the secondary
-    //    side. `SyscallPtyOps` is the production wiring of the
+    // 3. Open the PTY pair and spawn the production shell on the
+    //    secondary side. `SyscallPtyOps::exec_shell` execve's
+    //    `/bin/ion` first (matching `/etc/passwd`'s default and the
+    //    path `login` exec's), falling back to `/bin/sh0` if ion
+    //    is missing or broken.
+    //    `SyscallPtyOps` is the production wiring of the
     //    `PtyOps` trait the lib already exercises against
     //    `MockPtyOps`.
     let mut pty = PtyHost::new(SyscallPtyOps::new());

@@ -9,8 +9,9 @@
 //! ## Why a trait?
 //!
 //! Production `term` runs against the real kernel: it forks, calls
-//! `dup2` to wire the secondary side, then `execve`s `/bin/sh0`. None
-//! of that compiles on the host, so the [`PtyOps`] trait abstracts the
+//! `dup2` to wire the secondary side, then `execve`s the production
+//! shell (`/bin/ion`, falling back to `/bin/sh0`). None of that
+//! compiles on the host, so the [`PtyOps`] trait abstracts the
 //! syscalls behind a seam. Host tests run [`PtyHost`] against
 //! `MockPtyOps` to exercise the bring-up flow without touching the
 //! kernel.

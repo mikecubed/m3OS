@@ -23,10 +23,15 @@
 //! - `exec_shell` is the production child path. It dup2's the
 //!   secondary fd onto stdin / stdout / stderr (fds 0 / 1 / 2),
 //!   closes the original secondary fd (it has been duplicated
-//!   wherever it needs to live), and `execve`s the in-tree shell at
-//!   `/bin/sh0`. On any failure inside the child the function
-//!   `syscall_lib::exit`s the child with a distinct code so the
-//!   supervisor's restart path records a clean failure.
+//!   wherever it needs to live), and `execve`s the production shell
+//!   at `/bin/ion` — the same default `login` exec's after reading
+//!   `/etc/passwd`. On exec failure we fall through to `/bin/sh0`
+//!   (the in-tree minimal shell), mirroring `login`'s
+//!   "ion-first, sh0-fallback" shape so a broken / missing ion does
+//!   not leave the user staring at a blank surface. On both paths
+//!   failing the function `syscall_lib::exit`s the child with a
+//!   distinct code so the supervisor's restart path records a
+//!   clean failure.
 //! - `close` wraps [`syscall_lib::close`] and returns its raw errno.
 //! - `try_wait` calls [`syscall_lib::waitpid`] with `WNOHANG`. The
 //!   raw status is decoded into the exit code using the standard
@@ -39,10 +44,17 @@
 use crate::pty::{PtyOps, decode_wait_status};
 use syscall_lib::{STDOUT_FILENO, WNOHANG};
 
-/// `/bin/sh0` — the path of the in-tree default shell. Spelled as a
-/// null-terminated byte string so it can travel through `execve`
-/// without any per-call allocation.
-const SHELL_PATH: &[u8] = b"/bin/sh0\0";
+/// Production default shell. Matches the `/etc/passwd` `:/bin/ion`
+/// entries and the path `login` exec's after authenticating. Spelled
+/// as a null-terminated byte string so it can travel through
+/// `execve` without any per-call allocation.
+const SHELL_PATH_ION: &[u8] = b"/bin/ion\0";
+
+/// Fallback shell — minimal in-tree shell that ships unconditionally.
+/// Matches `login`'s "ion-first, sh0-fallback" recovery shape so a
+/// broken or missing ion does not leave the user staring at a blank
+/// surface.
+const SHELL_PATH_SH0: &[u8] = b"/bin/sh0\0";
 
 /// Distinct exit codes for the child path's failure modes. The
 /// supervisor uses these to distinguish "shell binary missing" from
@@ -100,12 +112,36 @@ impl PtyOps for SyscallPtyOps {
         // file table slot at 0/1/2; close the original handle so the
         // child sees only the canonical stdio fds.
         let _ = syscall_lib::close(secondary_fd);
-        // Build a null-terminated argv with just the program name.
-        // Phase 57 does not yet thread through user-supplied argv.
-        let argv: [*const u8; 2] = [SHELL_PATH.as_ptr(), core::ptr::null()];
-        let envp: [*const u8; 1] = [core::ptr::null()];
-        let _rc = syscall_lib::execve(SHELL_PATH, &argv, &envp);
-        // execve only returns on failure.
+        // Production env. Mirrors the `login` baseline so an
+        // interactive shell sees a familiar PATH / TERM / EDITOR /
+        // HOME triple. `term` does not yet thread per-user
+        // settings; HOME is hard-coded to `/root` because Phase 57
+        // term inherits init's uid (root) — the graphical-login
+        // story is a future-phase concern.
+        let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+        let env_term: &[u8] = b"TERM=m3os\0";
+        let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
+        let env_home: &[u8] = b"HOME=/root\0";
+        let envp: [*const u8; 5] = [
+            env_path.as_ptr(),
+            env_term.as_ptr(),
+            env_editor.as_ptr(),
+            env_home.as_ptr(),
+            core::ptr::null(),
+        ];
+        // Try ion (the production default). argv is just the program
+        // name — Phase 57 does not yet thread through user-supplied
+        // argv.
+        let argv_ion: [*const u8; 2] = [SHELL_PATH_ION.as_ptr(), core::ptr::null()];
+        let _rc = syscall_lib::execve(SHELL_PATH_ION, &argv_ion, &envp);
+        // execve only returns on failure. Fall back to sh0, mirroring
+        // `login`'s recovery shape.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: execve(/bin/ion) failed; falling back to /bin/sh0\n",
+        );
+        let argv_sh0: [*const u8; 2] = [SHELL_PATH_SH0.as_ptr(), core::ptr::null()];
+        let _rc = syscall_lib::execve(SHELL_PATH_SH0, &argv_sh0, &envp);
         syscall_lib::write_str(STDOUT_FILENO, "term: execve(/bin/sh0) failed\n");
         syscall_lib::exit(CHILD_EXIT_EXECVE)
     }
