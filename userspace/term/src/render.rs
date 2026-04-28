@@ -33,6 +33,12 @@ pub trait FramebufferOwner {
 /// Renderer: batches dirty cells per frame, calls `submit` only when
 /// damage exists.  Composes against any [`FramebufferOwner`] so host
 /// tests cover behaviour without a real surface.
+///
+/// `SetColor` updates the screen state machine's active colours; the
+/// renderer does not need to track them separately because the screen
+/// emits colours per `PutGlyph`.  This decouples colour selection
+/// from frame composition: the renderer is purely a damage-tracking
+/// queue flusher.
 pub struct Renderer<F: FramebufferOwner> {
     fb: F,
     /// True when the renderer has buffered damage that has not yet
@@ -43,10 +49,6 @@ pub struct Renderer<F: FramebufferOwner> {
     /// screen's grid; never grows unbounded because each frame ends
     /// with `compose` clearing the buffer.
     queue: alloc::vec::Vec<QueuedDraw>,
-    /// Current foreground colour, from the latest `SetColor`.
-    fg: u32,
-    /// Current background colour, from the latest `SetColor`.
-    bg: u32,
 }
 
 /// One queued draw operation.  Phase 57 only buffers `PutGlyph`-style
@@ -63,14 +65,12 @@ struct QueuedDraw {
 
 impl<F: FramebufferOwner> Renderer<F> {
     /// Wrap a framebuffer owner with a fresh renderer.  No damage,
-    /// empty queue, default colours.
+    /// empty queue.
     pub fn new(fb: F) -> Self {
         Self {
             fb,
             damaged: false,
             queue: alloc::vec::Vec::new(),
-            fg: 0xFFFF_FFFF,
-            bg: 0x0000_0000,
         }
     }
 
@@ -103,9 +103,10 @@ impl<F: FramebufferOwner> Renderer<F> {
                 // `PutGlyph` commands as the buffer scrolls.
                 self.damaged = true;
             }
-            RenderCommand::SetColor { fg, bg } => {
-                self.fg = fg;
-                self.bg = bg;
+            RenderCommand::SetColor { .. } => {
+                // Colour state lives on the screen state machine; the
+                // renderer receives the chosen colours per PutGlyph.
+                // SetColor alone is not a damage event.
             }
             RenderCommand::Bell => { /* audio path; no pixels */ }
             RenderCommand::MoveCursor { .. } => { /* cursor sprite is deferred to a later track */ }

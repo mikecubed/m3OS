@@ -16,15 +16,8 @@
 //! - Unknown private-use keysyms write nothing.  No worker threads —
 //!   the binary's main loop drives this synchronously.
 
-use kernel_core::input::events::{KEY_EVENT_WIRE_SIZE, KeyEvent, KeyEventKind, MOD_CTRL};
+use kernel_core::input::events::{KeyEvent, KeyEventKind, MOD_CTRL};
 use kernel_core::input::keymap::{KEYSYM_DOWN, KEYSYM_LEFT, KEYSYM_RIGHT, KEYSYM_UP};
-
-const _ASSERT_KEY_EVENT_WIRE_SIZE_USED: () = {
-    // KEY_EVENT_WIRE_SIZE is referenced here so the import is not
-    // dropped if the codec ever moves; the binary's main loop reads
-    // KEY_EVENT_WIRE_SIZE bytes per event from the kbd dispatcher.
-    let _ = KEY_EVENT_WIRE_SIZE;
-};
 
 /// Pluggable PTY-write seam. Production wraps `syscall_lib::write`;
 /// host tests record byte slices.
