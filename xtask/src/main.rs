@@ -477,6 +477,11 @@ fn build_userspace_bins() {
             // pattern as `audio_server`.  The xtask drops the gate to
             // build the OS binary; host tests compile the lib only.
             "term" => &["--features", "os-binary"],
+            // Phase 57 Track I.2: `m3ctl` adopts the same lib + bin
+            // split so verb-construction is host-testable. The xtask
+            // sets `os-binary` to build the `_start`-bearing OS
+            // binary; host tests compile the lib only.
+            "m3ctl" => &["--features", "os-binary"],
             _ => &[],
         };
 
