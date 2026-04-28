@@ -1727,6 +1727,8 @@ pub fn run() -> ! {
     // executing the loop at all. Limited to the first 4 wake-ups
     // so the boot transcript doesn't drown.
     let mut wake_log_budget: u32 = 4;
+    let mut dispatch_log_budget: u32 = 4;
+    let mut resume_log_budget: u32 = 4;
 
     loop {
         let reschedule = per_core_reschedule();
@@ -2037,12 +2039,29 @@ pub fn run() -> ! {
             }
         }
 
+        // Phase 57 DEBUG: log per-core dispatches just before
+        // switch_context. Pairs with `resume` log below to detect a
+        // dispatch that hangs / never returns to the scheduler.
+        if dispatch_log_budget > 0 {
+            log::info!(
+                "[sched] dispatch core={} task_idx={} task_rsp={:#x}",
+                core_id,
+                _task_idx,
+                task_rsp
+            );
+            dispatch_log_budget -= 1;
+        }
+
         // Switch to the task.
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
 
         // --- Scheduler resumes here after the task yields back ---
+        if resume_log_budget > 0 {
+            log::info!("[sched] resume core={}", core_id);
+            resume_log_budget -= 1;
+        }
         // The task's RSP has now been saved by switch_context. Clear the
         // switching-out flag before honoring deferred wakes or yields.
         let switched = PENDING_SWITCH_OUT[core_id as usize].swap(-1, Ordering::Acquire);
