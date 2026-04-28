@@ -102,12 +102,18 @@ pub enum ParseError {
 /// Parse `verb` + `args` into a typed [`ParsedVerb`].
 ///
 /// Phase 57 I.2 adds the three `session-*` verbs alongside the existing
-/// Phase 56 `display-control` verbs. The implementation lands in the
-/// follow-on commit; this stub returns `UnknownVerb` for the session
-/// names so the RED tests fail until the GREEN commit fills in the
-/// arms.
+/// Phase 56 `display-control` verbs. The session arms produce
+/// [`ParsedVerb::Session`] payloads carrying the matching
+/// [`ControlVerb`] discriminant; the binary's session dispatcher
+/// encodes via [`kernel_core::session_control::encode_verb`].
 pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
     match verb {
+        // Phase 57 I.2 — session control verbs. The three verbs carry
+        // no arguments; extra args are tolerated (the parser is
+        // permissive — argument parsing is per-verb).
+        "session-state" => Ok(ParsedVerb::Session(ControlVerb::SessionState)),
+        "session-stop" => Ok(ParsedVerb::Session(ControlVerb::SessionStop)),
+        "session-restart" => Ok(ParsedVerb::Session(ControlVerb::SessionRestart)),
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),
@@ -172,9 +178,6 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                 event_kind: kind,
             }))
         }
-        // Phase 57 I.2: the session-* verbs are intentionally NOT
-        // matched here yet so the RED tests fail. The GREEN commit
-        // adds the three arms.
         other => Err(ParseError::UnknownVerb(String::from(other))),
     }
 }
