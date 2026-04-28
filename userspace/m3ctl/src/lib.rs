@@ -123,9 +123,8 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                 .first()
                 .copied()
                 .ok_or(ParseError::MissingArgument("focus requires <surface-id>"))?;
-            let id = parse_u32(id_str).ok_or(ParseError::BadArgument(
-                "focus: surface-id must be a u32",
-            ))?;
+            let id = parse_u32(id_str)
+                .ok_or(ParseError::BadArgument("focus: surface-id must be a u32"))?;
             Ok(ParsedVerb::Display(ControlCommand::Focus {
                 surface_id: SurfaceId(id),
             }))

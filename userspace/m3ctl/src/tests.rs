@@ -190,8 +190,8 @@ fn display_subscribe_parses_event_kind() {
 
 #[test]
 fn display_subscribe_unknown_kind_returns_unknown_event_kind() {
-    let err = parse_verb("subscribe", &["bogus"])
-        .expect_err("subscribe with unknown kind should fail");
+    let err =
+        parse_verb("subscribe", &["bogus"]).expect_err("subscribe with unknown kind should fail");
     assert!(matches!(err, ParseError::UnknownEventKind(_)));
 }
 

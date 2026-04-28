@@ -57,8 +57,7 @@ mod os_binary {
     use core::alloc::Layout;
 
     use kernel_core::display::control::{
-        ControlError, ControlErrorCode, ControlEvent, SurfaceRoleTag, decode_event,
-        encode_command,
+        ControlError, ControlErrorCode, ControlEvent, SurfaceRoleTag, decode_event, encode_command,
     };
     use kernel_core::session::SessionState;
     use kernel_core::session_control::{
@@ -140,9 +139,7 @@ mod os_binary {
     // Phase 56 — display-control dispatch
     // -----------------------------------------------------------------------
 
-    fn dispatch_display(
-        cmd: kernel_core::display::control::ControlCommand,
-    ) -> i32 {
+    fn dispatch_display(cmd: kernel_core::display::control::ControlCommand) -> i32 {
         let handle = match lookup_with_backoff(DISPLAY_CONTROL_SERVICE_NAME) {
             Some(h) => h,
             None => {
