@@ -86,9 +86,13 @@ pub trait PtyOps {
 ///
 /// `PtyHost` is the only owner of the primary fd and the shell pid;
 /// the binary's main loop borrows them through the public accessors.
-/// On `Drop` the primary fd is closed; the shell is *not* killed by
-/// `Drop` because the supervisor handles the lifecycle of the term
-/// process itself.
+/// The primary fd is *not* closed automatically — `PtyHost` does not
+/// implement `Drop` because the close path is part of the
+/// `PtyOps`-visible lifecycle (the syscall seam owns the fd table).
+/// Callers must invoke [`PtyHost::close_primary`] explicitly when
+/// shutting down (the binary's main loop calls it on shell exit).
+/// The shell process itself is not killed by `PtyHost`; the
+/// supervisor handles the lifecycle of the `term` process.
 pub struct PtyHost<O: PtyOps> {
     ops: O,
     primary_fd: Option<i32>,
@@ -124,7 +128,10 @@ impl<O: PtyOps> PtyHost<O> {
         if pid == 0 {
             // Child path: never returns.  The implementation `dup2`s
             // the secondary fd onto stdin/stdout/stderr and `execve`s
-            // the shell; failure aborts the child.
+            // the shell; failure aborts the child.  Close the primary
+            // fd before `exec_shell` so it is not inherited by the
+            // shell process — the primary belongs to the parent.
+            self.ops.close(primary_fd);
             self.ops.exec_shell(secondary_fd);
         }
         // Parent path: close the secondary side and record the pid.
@@ -254,6 +261,28 @@ mod tests {
         assert_eq!(err, PtyError::OpenFailed(-5));
         assert_eq!(host.primary_fd(), None);
         assert_eq!(host.shell_pid(), None);
+    }
+
+    /// Child path closes the primary fd before `exec_shell` so the
+    /// shell process does not inherit it. The mock's `exec_shell`
+    /// panics, so we observe the close order via `closed_fds` and
+    /// catch the unwind here in the test thread.
+    #[test]
+    fn child_path_closes_primary_before_exec_shell() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let mut ops = MockPtyOps::new();
+        ops.next_fork_pid = 0;
+        let mut host = PtyHost::new(ops);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = host.open_and_spawn();
+        }));
+        // Primary fd (10) was closed before exec_shell.
+        assert_eq!(host.ops.closed_fds, alloc::vec![10]);
+        // exec_shell saw the secondary fd (11), and the secondary fd
+        // was *not* closed by the parent before exec (the child owns
+        // the secondary side now).
+        assert_eq!(host.ops.exec_called_with, Some(11));
+        assert!(!host.ops.closed_fds.contains(&11));
     }
 
     /// Phase 57 G.3 acceptance: fork failure rolls back the PTY pair.

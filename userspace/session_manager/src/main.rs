@@ -256,13 +256,24 @@ mod init_backend {
 
     /// Names that `init`'s service manifest registers under different
     /// IPC service names than the F.1 step name. The kbd_server, for
-    /// instance, registers as `"kbd"`.
+    /// instance, registers as `"kbd"`. The values here MUST match the
+    /// `SERVICE_NAME` constant in each daemon's `lib.rs` (or the
+    /// equivalent `ipc_register_service` call) — the binary names on
+    /// the left come from
+    /// [`kernel_core::session_supervisor::DECLARED_SESSION_STEP_NAMES`].
+    ///
+    /// Keep this list in sync with:
+    /// - `display_server::SERVICE_NAME` = `"display"`
+    /// - `kbd_server::SERVICE_NAME`     = `"kbd"`
+    /// - `mouse_server::SERVICE_NAME`   = `"mouse"`
+    /// - `audio_server::SERVICE_NAME`   = `"audio.cmd"`
+    /// - `term::SERVICE_NAME`           = `"term"`
     fn ipc_service_name(step_name: &str) -> &'static str {
         match step_name {
             "display_server" => "display",
             "kbd_server" => "kbd",
             "mouse_server" => "mouse",
-            "audio_server" => "audio",
+            "audio_server" => "audio.cmd",
             "term" => "term",
             _ => "",
         }

@@ -1,80 +1,95 @@
 //! Phase 57 Track G.5 — display-server client renderer.
 //!
 //! `Renderer` consumes [`RenderCommand`]s emitted by the screen state
-//! machine, batches dirty cells per frame-tick, and calls
-//! [`FramebufferOwner::submit`] only when damage exists.  The
-//! renderer is a thin policy layer: it does not own the surface
-//! buffer (that is `FramebufferOwner`'s job), it only routes commands
-//! and tracks whether the next `compose` has work to do.
+//! machine, batches damage per frame-tick, and drives the
+//! [`FramebufferOwner`] only when damage exists. The renderer is a
+//! thin policy layer: it does not own the surface buffer (that is
+//! `FramebufferOwner`'s job), it only routes commands and tracks
+//! buffered work.
 //!
-//! `Bell`, `SetColor`, and `MoveCursor` do not mark damage:
+//! Damage is recorded as an ordered queue of framebuffer operations:
+//! `PutGlyph`, `Clear`, and `Scroll`. The queue replays in the same
+//! order on `compose` so a `Clear` followed by `PutGlyph` paints the
+//! new cells on a cleared frame, and a `Scroll` shifts existing
+//! pixels before any post-scroll `PutGlyph` lands. This keeps the
+//! framebuffer in sync with the screen state machine after full-screen
+//! operations.
+//!
+//! `Bell`, `SetColor`, and `MoveCursor` do not enqueue any operation:
 //!
 //! - `Bell` is an audio event handled by [`crate::bell::Bell`];
 //! - `SetColor` is a state update that the next `PutGlyph` carries
 //!   into the framebuffer;
 //! - `MoveCursor` is bookkeeping; the cursor sprite is deferred
 //!   (Phase 57 ships the screen, not a separate cursor layer).
-//!
-//! `PutGlyph`, `Clear`, and `Scroll` mark damage and trigger a
-//! `submit` on the next `compose` call.
 
 use crate::screen::RenderCommand;
 
-/// Pluggable framebuffer-owner seam.  Production wraps the Phase 56
+/// Pluggable framebuffer-owner seam. Production wraps the Phase 56
 /// `surface_buffer` crate; host tests record draw calls.
 pub trait FramebufferOwner {
     /// Paint a glyph cell at `(row, col)` with the given colours.
     fn put_glyph(&mut self, row: u16, col: u16, codepoint: u32, fg: u32, bg: u32);
 
+    /// Clear the entire surface to the current background colour.
+    /// Called when the screen state machine emits
+    /// `RenderCommand::Clear` (e.g., from `ESC [ 2 J`). The
+    /// framebuffer must drop any prior contents.
+    fn clear(&mut self);
+
+    /// Shift content vertically by `amount` rows. `amount > 0`
+    /// scrolls UP (top rows lost, bottom rows blanked); `amount < 0`
+    /// would scroll DOWN. Phase 57's screen state machine only emits
+    /// `amount = 1` from `scroll_up`.
+    fn scroll(&mut self, amount: i16);
+
     /// Submit the current frame to the display server.
     fn submit(&mut self);
 }
 
-/// Renderer: batches dirty cells per frame, calls `submit` only when
-/// damage exists.  Composes against any [`FramebufferOwner`] so host
-/// tests cover behaviour without a real surface.
+/// One queued framebuffer op buffered between `apply` calls and
+/// flushed in order on `compose`. Bounded by the screen's command
+/// throughput per tick; never grows unbounded because each frame ends
+/// with `compose` draining the queue.
+#[derive(Clone, Copy, Debug)]
+enum QueuedOp {
+    Put {
+        row: u16,
+        col: u16,
+        codepoint: u32,
+        fg: u32,
+        bg: u32,
+    },
+    Clear,
+    Scroll {
+        amount: i16,
+    },
+}
+
+/// Renderer: batches framebuffer ops per frame, calls `submit` only
+/// when damage exists. Composes against any [`FramebufferOwner`] so
+/// host tests cover behaviour without a real surface.
 ///
 /// `SetColor` updates the screen state machine's active colours; the
 /// renderer does not need to track them separately because the screen
-/// emits colours per `PutGlyph`.  This decouples colour selection
-/// from frame composition: the renderer is purely a damage-tracking
-/// queue flusher.
+/// emits colours per `PutGlyph`. This decouples colour selection
+/// from frame composition: the renderer is purely an ordered queue
+/// flusher.
 pub struct Renderer<F: FramebufferOwner> {
     fb: F,
-    /// True when the renderer has buffered damage that has not yet
-    /// been submitted.  Cleared by [`compose`].
-    damaged: bool,
-    /// Queued draw operations buffered between `apply` calls and
-    /// flushed on `compose`.  Bounded by the number of cells in the
-    /// screen's grid; never grows unbounded because each frame ends
-    /// with `compose` clearing the buffer.
-    queue: alloc::vec::Vec<QueuedDraw>,
-}
-
-/// One queued draw operation.  Phase 57 only buffers `PutGlyph`-style
-/// cells; full-screen redraws (Clear / Scroll) drain the queue and
-/// are forwarded to the framebuffer at compose time as repaints.
-#[derive(Clone, Copy, Debug)]
-struct QueuedDraw {
-    row: u16,
-    col: u16,
-    codepoint: u32,
-    fg: u32,
-    bg: u32,
+    queue: alloc::vec::Vec<QueuedOp>,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
-    /// Wrap a framebuffer owner with a fresh renderer.  No damage,
-    /// empty queue.
+    /// Wrap a framebuffer owner with a fresh renderer. Empty queue.
     pub fn new(fb: F) -> Self {
         Self {
             fb,
-            damaged: false,
             queue: alloc::vec::Vec::new(),
         }
     }
 
-    /// Apply one render command.  Updates internal damage state but
+    /// Apply one render command. Updates the queued op stream but
     /// does not submit a frame.
     pub fn apply(&mut self, cmd: RenderCommand) {
         match cmd {
@@ -85,28 +100,23 @@ impl<F: FramebufferOwner> Renderer<F> {
                 fg,
                 bg,
             } => {
-                self.queue.push(QueuedDraw {
+                self.queue.push(QueuedOp::Put {
                     row,
                     col,
                     codepoint,
                     fg,
                     bg,
                 });
-                self.damaged = true;
             }
-            RenderCommand::Clear | RenderCommand::Scroll { .. } => {
-                // Full-screen damage; the queue carries any pending
-                // glyphs forward to the next frame on top of a fresh
-                // background.  Phase 57 collapses both to a single
-                // damage flag — the screen state machine repaints any
-                // cells affected by the scroll/clear via subsequent
-                // `PutGlyph` commands as the buffer scrolls.
-                self.damaged = true;
+            RenderCommand::Clear => {
+                self.queue.push(QueuedOp::Clear);
+            }
+            RenderCommand::Scroll { amount } => {
+                self.queue.push(QueuedOp::Scroll { amount });
             }
             RenderCommand::SetColor { .. } => {
                 // Colour state lives on the screen state machine; the
                 // renderer receives the chosen colours per PutGlyph.
-                // SetColor alone is not a damage event.
             }
             RenderCommand::Bell => { /* audio path; no pixels */ }
             RenderCommand::MoveCursor { .. } => { /* cursor sprite is deferred to a later track */ }
@@ -115,21 +125,31 @@ impl<F: FramebufferOwner> Renderer<F> {
 
     /// True when there is buffered damage waiting to be submitted.
     pub fn damaged(&self) -> bool {
-        self.damaged
+        !self.queue.is_empty()
     }
 
-    /// Submit any buffered damage to the framebuffer.  No-op when
+    /// Submit any buffered damage to the framebuffer. No-op when
     /// `damaged()` is false (no work, no submit).
     pub fn compose(&mut self) {
-        if !self.damaged {
+        if self.queue.is_empty() {
             return;
         }
-        for draw in self.queue.drain(..) {
-            self.fb
-                .put_glyph(draw.row, draw.col, draw.codepoint, draw.fg, draw.bg);
+        for op in self.queue.drain(..) {
+            match op {
+                QueuedOp::Put {
+                    row,
+                    col,
+                    codepoint,
+                    fg,
+                    bg,
+                } => {
+                    self.fb.put_glyph(row, col, codepoint, fg, bg);
+                }
+                QueuedOp::Clear => self.fb.clear(),
+                QueuedOp::Scroll { amount } => self.fb.scroll(amount),
+            }
         }
         self.fb.submit();
-        self.damaged = false;
     }
 }
 
@@ -141,6 +161,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum FakeOp {
         Put { row: u16, col: u16, codepoint: u32 },
+        Clear,
+        Scroll { amount: i16 },
         Submit,
     }
 
@@ -161,6 +183,14 @@ mod tests {
                 col,
                 codepoint,
             });
+        }
+
+        fn clear(&mut self) {
+            self.ops.push(FakeOp::Clear);
+        }
+
+        fn scroll(&mut self, amount: i16) {
+            self.ops.push(FakeOp::Scroll { amount });
         }
 
         fn submit(&mut self) {
@@ -187,6 +217,7 @@ mod tests {
         let mut r = Renderer::new(FakeFb::new());
         // No damage → no submit.
         r.compose();
+        assert!(r.fb.ops.is_empty());
         // After damage, exactly one submit.
         r.apply(RenderCommand::PutGlyph {
             row: 0,
@@ -232,11 +263,91 @@ mod tests {
         assert!(r.damaged());
     }
 
+    /// Compose drives a real `clear` op on the framebuffer for a
+    /// `RenderCommand::Clear`, followed by submit. Without this the
+    /// framebuffer would silently keep stale pixels.
+    #[test]
+    fn compose_emits_fb_clear_for_render_clear() {
+        let mut r = Renderer::new(FakeFb::new());
+        r.apply(RenderCommand::Clear);
+        r.compose();
+        assert_eq!(r.fb.ops, alloc::vec![FakeOp::Clear, FakeOp::Submit]);
+    }
+
     #[test]
     fn scroll_marks_damage() {
         let mut r = Renderer::new(FakeFb::new());
         r.apply(RenderCommand::Scroll { amount: 1 });
         assert!(r.damaged());
+    }
+
+    /// Compose drives a real `scroll` op on the framebuffer for a
+    /// `RenderCommand::Scroll`, followed by submit. Without this the
+    /// framebuffer would silently keep the unscrolled content.
+    #[test]
+    fn compose_emits_fb_scroll_for_render_scroll() {
+        let mut r = Renderer::new(FakeFb::new());
+        r.apply(RenderCommand::Scroll { amount: 1 });
+        r.compose();
+        assert_eq!(
+            r.fb.ops,
+            alloc::vec![FakeOp::Scroll { amount: 1 }, FakeOp::Submit]
+        );
+    }
+
+    /// Order is preserved across mixed commands: PutGlyph before Clear
+    /// is overwritten by Clear; PutGlyph after Clear paints the
+    /// already-cleared frame.
+    #[test]
+    fn compose_preserves_order_around_clear_and_scroll() {
+        let mut r = Renderer::new(FakeFb::new());
+        r.apply(RenderCommand::PutGlyph {
+            row: 0,
+            col: 0,
+            codepoint: b'A' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.apply(RenderCommand::Clear);
+        r.apply(RenderCommand::PutGlyph {
+            row: 0,
+            col: 0,
+            codepoint: b'B' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.apply(RenderCommand::Scroll { amount: 1 });
+        r.apply(RenderCommand::PutGlyph {
+            row: 24,
+            col: 0,
+            codepoint: b'C' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(
+            r.fb.ops,
+            alloc::vec![
+                FakeOp::Put {
+                    row: 0,
+                    col: 0,
+                    codepoint: b'A' as u32
+                },
+                FakeOp::Clear,
+                FakeOp::Put {
+                    row: 0,
+                    col: 0,
+                    codepoint: b'B' as u32
+                },
+                FakeOp::Scroll { amount: 1 },
+                FakeOp::Put {
+                    row: 24,
+                    col: 0,
+                    codepoint: b'C' as u32
+                },
+                FakeOp::Submit,
+            ]
+        );
     }
 
     #[test]

@@ -101,7 +101,14 @@ fn special_key_sequence(symbol: u32) -> Option<&'static [u8]> {
 
 /// Map an ASCII letter codepoint to its Ctrl-modifier byte.
 /// `'a' / 'A'` → 0x01, `'b' / 'B'` → 0x02, ..., `'z' / 'Z'` → 0x1A.
+///
+/// Returns `None` for any non-ASCII keysym (`symbol > 0x7F`) so a
+/// private-use codepoint with Ctrl held does not silently truncate
+/// to an ASCII control code.
 fn ctrl_byte(symbol: u32) -> Option<u8> {
+    if symbol > 0x7F {
+        return None;
+    }
     let c = symbol as u8;
     let lower = c.to_ascii_lowercase();
     if lower.is_ascii_lowercase() {
@@ -261,6 +268,21 @@ mod tests {
         let mut w = FakeWriter::new();
         // Random private-use codepoint.
         h.translate(&key_down(0xE000 + 0xFF, 0), &mut w);
+        assert!(w.bytes.is_empty());
+    }
+
+    /// Ctrl + non-ASCII keysym must not emit a truncated control byte.
+    /// A private-use codepoint whose low byte happens to land in the
+    /// ASCII letter range (`0xE061` → low byte `0x61` = `'a'`) used
+    /// to silently produce `Ctrl-A` (0x01) before the bound was added.
+    #[test]
+    fn ctrl_with_non_ascii_keysym_writes_nothing() {
+        let mut h = InputHandler::new();
+        let mut w = FakeWriter::new();
+        h.translate(&key_down(0xE061, MOD_CTRL), &mut w);
+        assert!(w.bytes.is_empty());
+        // Same shape with a high codepoint whose low byte is `'c'`.
+        h.translate(&key_down(0xE063, MOD_CTRL), &mut w);
         assert!(w.bytes.is_empty());
     }
 
