@@ -591,6 +591,18 @@ fn core_load(sched: &Scheduler, core_id: u8) -> usize {
         return usize::MAX;
     };
 
+    // Phase 57 fix: an AP whose `INIT-SIPI-SIPI` boot timed out still
+    // has its `PerCoreData` allocated (`init_ap_per_core` runs before
+    // we wait for `is_online`), so `get_core_data` returns `Some` for
+    // it. Its run queue is empty, which previously made it look like
+    // the "least loaded" core to `least_loaded_core` — fork-children
+    // got queued onto a core whose scheduler never runs and were lost
+    // forever. Treat an offline core as fully saturated so it is
+    // never selected by the load balancer.
+    if !data.is_online.load(Ordering::Acquire) {
+        return usize::MAX;
+    }
+
     let mut load = data.run_queue.lock().len();
     let current = data.current_task_idx.load(Ordering::Relaxed);
     if current >= 0 {
