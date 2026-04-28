@@ -1619,6 +1619,15 @@ pub fn fork_child_trampoline() -> ! {
         pid: ctx.pid,
         task_idx,
     });
+    // PHASE 57 DEBUG: pair with the [sched] fork-task-spawn INFO log
+    // so we can see "spawned vs trampoline-entered" per pid. If a
+    // pid is spawned but never trampolined, the scheduler queued it
+    // and never dispatched it.
+    log::info!(
+        "[proc] fork-trampoline pid={} task_idx={}",
+        ctx.pid,
+        task_idx
+    );
 
     debug_assert!(
         ctx.user_rip != 0,

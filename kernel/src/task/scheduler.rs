@@ -759,6 +759,19 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task_idx: idx as u32,
         core: target_core,
     });
+    // PHASE 57 DEBUG: log every fork-child task spawn at INFO so the
+    // boot transcript shows the (pid, task_idx, target_core) tuple
+    // for every fork. Two pids (kbd at 6, fat at 10) never reach
+    // their userspace child path; this trace tells us whether they
+    // even get enqueued, and to which core.
+    log::info!(
+        "[sched] fork-task-spawn pid={} task_idx={} target_core={} rip={:#x} rsp={:#x}",
+        fork_pid,
+        idx,
+        target_core,
+        fork_rip,
+        fork_rsp,
+    );
     enqueue_to_core(target_core, idx);
 
     target_core
