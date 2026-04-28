@@ -736,22 +736,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     let now = crate::arch::x86_64::interrupts::tick_count();
-    // Phase 57 fix: fresh fork-children always queue on the spawning
-    // core. This matches `try_steal`'s explicit pin (fork_ctx-bearing
-    // tasks are excluded from work-stealing) and the comment's
-    // rationale ("Keep them on the spawning core so the parent's
-    // immediate wait/read-yield loop can't starve them behind
-    // background work"). The previous code load-balanced fresh forks
-    // across all cores via `least_loaded_core`, which contradicted
-    // the steal policy: a task could land on a "least loaded" core
-    // that was actually halted (e.g. core 3 missed a wake-IPI), and
-    // because steal can't move it, the task got stuck forever.
-    //
-    // After the first dispatch through `fork_child_trampoline`,
-    // `fork_ctx` becomes `None` and the task is eligible for normal
-    // work-stealing migration — so global load is still balanced over
-    // time, just not at first-dispatch time.
-    let target_core = current_core;
+    let target_core = if fork_pid == 1 {
+        current_core
+    } else {
+        least_loaded_core(&sched)
+    };
     task.assigned_core = target_core;
     task.last_migrated_tick = now;
     task.last_ready_tick = now;
