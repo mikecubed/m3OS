@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",

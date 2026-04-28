@@ -10,9 +10,11 @@ display server with focus-aware input dispatch and layer-shell-equivalent
 surface roles, and a roadmap toward stronger service isolation and broader
 platform support.
 
-**Current kernel version:** v0.56.0 (Phase 55 hardware substrate + Phase 55a
+**Current kernel version:** v0.57.0 (Phase 55 hardware substrate + Phase 55a
 IOMMU substrate + Phase 55b ring-3 driver host + Phase 55c ring-3 driver correctness
-closure + Phase 56 display and input architecture).
+closure + Phase 56 display and input architecture + Phase 57 audio and local
+session — `audio_server` AC'97 driver, `session_manager` graphical-session
+orchestrator, `term` graphical terminal emulator).
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # Phase 57 — Audio and Local Session: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57
 **Depends on:** Phase 22b (ANSI Escape) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY Subsystem) ✅, Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 56 (Display and Input Architecture) ✅
 **Goal:** Turn the Phase 56 graphical architecture into a coherent local-system milestone by adding (1) the first supported PCM audio output path on a chosen target, exposed as a typed userspace contract; (2) a defined graphical session entry flow with an explicit recovery path back to a text-mode administration shell; and (3) at least one genuinely useful graphical client — a `term` emulator wired to the existing PTY subsystem — so the local session feels like a system, not a demo. Kernel version bumps to `v0.57.0` once the phase lands.
@@ -16,8 +16,8 @@
 | E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Done |
 | F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Done |
 | G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Done |
-| H | Validation: audio smoke, session entry smoke, recovery smoke, multi-client audio policy, xtask plumbing, manual `run-gui` checklist | D, E, F, G | Done (H.1–H.5; H.6 is drafted in I.1) |
-| I | Documentation + version: learning doc, subsystem doc updates, evaluation doc updates, roadmap README + status flip, version bump to `0.57.0` | H | Planned |
+| H | Validation: audio smoke, session entry smoke, recovery smoke, multi-client audio policy, xtask plumbing, manual `run-gui` checklist | D, E, F, G | Done |
+| I | Documentation + version: learning doc, subsystem doc updates, evaluation doc updates, roadmap README + status flip, version bump to `0.57.0` | H | Done |
 
 ---
 
