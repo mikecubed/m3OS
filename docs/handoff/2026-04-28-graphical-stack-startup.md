@@ -4,9 +4,52 @@ branch: feat/phase-57-impl
 last-known-good-commit: 3729a69
 date: 2026-04-28
 component: scheduler / display_server / serial-stdin / session_manager
+related: docs/handoffs/2026-04-25-scheduler-design-comparison.md
 ---
 
 # Handoff — Phase 57 graphical-stack startup regression
+
+## ⚠ Read this companion doc first
+
+**`docs/handoffs/2026-04-25-scheduler-design-comparison.md`** describes
+a lost-wake bug class in m3OS's `block_current_unless_woken*` machinery
+that almost certainly **is the same root cause** as the cursor-stuck-
+at-(0, 0) symptom this doc catalogs. Specifically, that doc's signature:
+
+> A task ends up in some Blocked-or-equivalent state that the scheduler
+> never wakes, with no fault, no signal, no panic, no `cpu-hog`, no
+> `stale-ready` warning.
+
+…matches exactly what we see when `display_server` lands on an AP and
+its `MouseInputSource::poll_pointer` calls `ipc_call(mouse_handle,
+MOUSE_EVENT_PULL, 0)`. `ipc_call` is blocking → display_server enters
+`BlockedOnReply` → if mouse_server's reply hits the `switching_out` /
+`wake_after_switch` race window, display_server is stuck in
+`BlockedOnReply` forever. The teal background + cursor at (0, 0)
+visible to the user is consistent with exactly one compose pass having
+completed (initial fill + cursor sprite at the initial `(0, 0)`)
+before the next-iteration `poll_mouse` hung.
+
+The eight remediation attempts catalogued in this doc were all
+adjusting the *placement* that exposes the lost-wake. They couldn't
+work — the underlying primitive itself is broken in a way that
+manifests only when display_server is on a not-BSP core under
+sufficient cross-core IPC pressure. **Fixing the lost-wake primitive
+(per the recommendation in the 2026-04-25 doc) is almost certainly
+the correct path forward**, and the 8 placement-tweak attempts in
+this doc are essentially wasted motion that should not be repeated.
+
+The 2026-04-25 doc proposed a "single state word + condition recheck
+after state write" rewrite (Linux `try_to_wake_up` pattern, single
+state CAS, no `switching_out` / `wake_after_switch` flags). That is
+a substantial dedicated phase of work, but it is the smallest
+viable fix that closes this entire bug class.
+
+A smaller intermediate also suggested in the 2026-04-25 doc — a
+**per-task spinlock** around the block/wake transition mirroring
+Linux's `p->pi_lock` — would give most of the benefit without the
+global rewrite. Worth considering as the next concrete step before
+committing to a full state-machine rewrite.
 
 ## TL;DR
 
@@ -362,35 +405,43 @@ introduced regressions. Brief notes on each, in attempt order:
 
 ## Hypotheses ranked
 
-1. **(High confidence) The framebuffer regression after `e1eb5e7` is
-   due to display_server migrating off BSP** to an AP, and *something*
-   about display_server on an AP fails. Either:
-   - The frame_tick BSP-only producer in
-     `kernel/src/time/mod.rs::on_timer_tick_isr` doesn't propagate
-     well when BSP is contested. Test this by adding a short log
-     in `display_server` main loop showing `frame_tick_drain()`
-     return values, then check on AP placement: if it returns 0
-     repeatedly, frame_ticks aren't reaching the AP.
-   - There is a real IPC-on-AP bug we haven't seen elsewhere.
-     `mouse_server` runs fine on cores 1 and 2 at `3729a69`, so a
-     blanket "AP is broken" hypothesis is wrong. The bug is more
-     likely something display_server-specific, e.g. how it polls
-     mouse — the `try_lazy_reconnect` path might have a state-machine
-     bug when mouse registers after display does.
+1. **(Highest confidence — see `docs/handoffs/2026-04-25-scheduler-design-comparison.md`)
+   The cursor-at-(0, 0) symptom is the lost-wake bug class identified
+   in the 2026-04-25 doc.** `display_server.poll_mouse` calls
+   `ipc_call(mouse_handle, MOUSE_EVENT_PULL, 0)`, which blocks
+   display_server in `BlockedOnReply`. When mouse_server's reply
+   races with display_server's switch-out under the
+   `switching_out` / `wake_after_switch` protocol, the wake is lost
+   and display_server is stuck in Blocked forever. The teal +
+   stuck-cursor framebuffer is consistent with exactly one compose
+   pass having run (initial BG_PIXEL fill + cursor sprite at the
+   initial `(0, 0)`) before the next-iteration `poll_mouse` hung.
+   The bug is masked at `3729a69` because display_server happens to
+   land on BSP and the race window is much narrower there; the
+   `parks_scheduler` change exposed it by shifting display_server to
+   an AP under more cross-core IPC pressure.
 
-2. **(Medium confidence) The cursor-at-(0,0) symptom is the binary
-   failure of `MouseInputSource`'s lazy reconnect.** When display_server
-   forks first and looks up `"mouse"` before mouse_server registers,
-   `KbdInputSource`'s lazy reconnect succeeds (we saw `display_server:
-   kbd service connected (lazy)` in the broken run logs). The mouse
-   counterpart may have a subtly different code path that does NOT
-   reconnect. Add a one-shot log in
-   `MouseInputSource::try_lazy_reconnect` to confirm.
+   Resolution: per the 2026-04-25 doc's recommendation, rewrite the
+   block/wake protocol to Linux's "single state word + condition
+   recheck after state write" pattern, deleting `switching_out` and
+   `wake_after_switch`. Or, as an intermediate, add a per-task
+   spinlock around the block/wake transition.
 
-3. **(Medium confidence) Even if mouse events were delivered, the
-   syslogd cpu-hog (~500 ms / sshd ~480 ms / userspace-init ~590 ms)
-   would make framebuffer updates stutter visibly.** This is a real
-   bug too, but secondary to the cursor-doesn't-move-AT-ALL issue.
+2. **(Lower than I previously thought) The frame_tick BSP-only
+   producer issue** — frame_tick is a global atomic readable from
+   any core, so display_server-on-AP can drain it the same as on
+   BSP. The earlier ranking that made this a top suspect was wrong;
+   the lost-wake is a much better fit for the binary-failure shape.
+
+3. **(Lower than I previously thought) `MouseInputSource::try_lazy_reconnect`
+   state-machine bug** — possible but less likely than the lost-wake.
+   Worth a one-line log to rule out, but don't spend a session on it
+   before testing the lost-wake hypothesis.
+
+4. **(Real bug, but secondary)** Even if mouse events were delivered,
+   the syslogd cpu-hog (~500 ms / sshd ~480 ms / userspace-init
+   ~590 ms) would make framebuffer updates stutter visibly. Not the
+   cause of the cursor-doesn't-move-AT-ALL issue.
 
 ## What I would NOT do
 
@@ -414,31 +465,51 @@ introduced regressions. Brief notes on each, in attempt order:
 
 ## Recommended next session opening move
 
-1. **Verify branch state.** `git log -1 --format=%H` should print
-   `3729a69...`. Run `cargo xtask run-gui --fresh` on the test machine
-   and confirm: terminal visible, mouse moves, can't type — that's
-   the baseline. If it doesn't match, stop and figure out why before
-   any code change.
+1. **Read `docs/handoffs/2026-04-25-scheduler-design-comparison.md`
+   first.** The lost-wake bug class it documents is the top-ranked
+   hypothesis for this issue. Skipping that doc means re-discovering
+   the protocol bug on the back of yet another shotgun debugging
+   session.
 
-2. **Add observation logs to `display_server`** that survive the
-   re-test cycle. In `userspace/display_server/src/input.rs`,
-   `MouseInputSource::try_lazy_reconnect`, log on the **first** successful
-   `ipc_lookup_service("mouse")` (the lazy-reconnect branch):
-   ```rust
-   if raw != u64::MAX {
-       self.handle = Some(raw as u32);
-       syscall_lib::write_str(STDOUT_FILENO, "display_server: mouse service connected (lazy)\n");
-   }
-   ```
-   Confirm this line appears in the broken-state log. If it doesn't,
-   the lazy reconnect itself is the bug. If it does, the mouse
-   handle is set but `poll_pointer` is still returning `None`.
+2. **Verify branch state.** `git log -1 --format=%H` should print
+   `3729a69...`. Run `cargo xtask run-gui --fresh` on the test
+   machine and confirm: terminal visible, mouse moves, can't type —
+   that's the baseline. If it doesn't match, stop and figure out why
+   before any code change.
 
-3. **Hypothesis-test on real hardware**, not headless QEMU. The
+3. **Falsify the lost-wake hypothesis** before committing to a
+   protocol rewrite. Add one log inside
+   `kernel/src/task/scheduler.rs::wake_task` printing "wake-task pid
+   state switching_out wake_after_switch" on every wake. Then in
+   `block_current_unless_woken_inner` (and the `_until` variant),
+   log on entry and on the post-switch_context resume. With those
+   two logs, a broken-state run will reveal:
+   - whether display_server actually enters BlockedOnReply (yes →
+     wake-side issue; no → IPC send-side issue)
+   - whether the wake fires (yes → handler issue; no → wake-side
+     code path didn't run, mouse_server's reply is somehow not
+     reaching display_server's endpoint)
+   - whether `switching_out=true` was observed at wake time (yes →
+     classic lost-wake; the `wake_after_switch=true` deferred-enqueue
+     handshake is the bug)
+
+4. **If the lost-wake hypothesis is confirmed**, the recommendation
+   in the 2026-04-25 doc is to rewrite the block/wake protocol to the
+   Linux pattern. The intermediate suggested there — a per-task
+   spinlock around the block/wake transition — is a smaller, lower-
+   risk change and is worth attempting first.
+
+5. **If the lost-wake hypothesis is falsified**, fall back to
+   investigating `MouseInputSource::try_lazy_reconnect` (hypothesis
+   3 in the ranked list above). Add a one-shot log on first
+   successful `ipc_lookup_service("mouse")` in the lazy-reconnect
+   branch.
+
+6. **Hypothesis-test on real hardware**, not headless QEMU. The
    regression is only visible with a real display + real PS/2 mouse
    movement. Headless cannot reproduce it.
 
-4. **One change at a time.** This bug ate two whole sessions of
+7. **One change at a time.** This bug ate two whole sessions of
    shotgun fixes. The branch already has 8 attempts that didn't
    converge. Make one hypothesis, write one log, run one test,
    read the result, and only then consider a code change.
@@ -446,8 +517,9 @@ introduced regressions. Brief notes on each, in attempt order:
 ## Open issues NOT directly on the path
 
 These are real bugs surfaced during the investigation but not on the
-critical path for the kbd-and-mouse-and-term story. File them for
-later phases:
+critical path for the kbd-and-mouse-and-term story (which is now
+believed to be the lost-wake protocol bug per the 2026-04-25 doc).
+File them for later phases:
 
 - **`audio_server` exits without registering `audio.cmd`**
   when no AC'97 hardware. session_manager's boot sequence treats it as
