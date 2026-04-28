@@ -127,6 +127,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/session_manager.conf\0",
     // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
     b"/etc/services.d/audio_server.conf\0",
+    // Phase 57 Track G: term — graphical terminal emulator.
+    b"/etc/services.d/term.conf\0",
 ];
 
 // ---------------------------------------------------------------------------

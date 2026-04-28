@@ -243,6 +243,11 @@ static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 // Intentionally not registered as a service (one-shot, not daemon).
 static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
 
+// Phase 57 Track G: term — graphical terminal emulator. Exposed under
+// /bin so `session_manager` (and `init` via `term.conf`) can launch it
+// via the standard service-config path (`command=/bin/term`).
+static TERM_ELF: &[u8] = generated_initrd_asset!("term");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -421,6 +426,9 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: AUDIO_DEMO_ELF,
         },
     ),
+    // Phase 57 Track G: term — graphical terminal emulator (the first
+    // non-demo display_server client).
+    ("term", RamdiskNode::File { content: TERM_ELF }),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),

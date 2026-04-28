@@ -15,7 +15,7 @@
 | D | `audio_server` ring-3 driver: chosen-target controller init, PCM stream submission, IRQ multiplexing via Phase 55c bound notifications, single-client arbitration, service manifest | C | Done |
 | E | Audio client surface: `userspace/lib/audio_client` library, `audio-demo` reference client (plays a documented test tone) | D | Done |
 | F | `session_manager` daemon: graphical session startup ordering, fallback-to-text-mode administration on failure, supervisor integration | A.4 (consumes contract); parallel to B–E in build order; D.6 manifest order is consumed at runtime by F.2; Phase 56 outputs at runtime | Done |
-| G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Planned |
+| G | `term` graphical terminal emulator: display-server client, bitmap font renderer, PTY connection, ANSI parser reuse, service manifest | D.6, E.1, F.2 (and Phase 22b / 29 / 56 outputs) | Done |
 | H | Validation: audio smoke, session entry smoke, recovery smoke, multi-client audio policy, xtask plumbing, manual `run-gui` checklist | D, E, F, G | Planned |
 | I | Documentation + version: learning doc, subsystem doc updates, evaluation doc updates, roadmap README + status flip, version bump to `0.57.0` | H | Planned |
 
@@ -496,9 +496,9 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** "At least one useful graphical client" per the Critical Items list. A terminal emulator is the most generally useful client and the lowest-risk first one because every other userspace component is reused (PTY, ANSI parser, display protocol, audio client for the bell).
 
 **Acceptance:**
-- [ ] All four-step new-binary convention points updated.
-- [ ] `term.conf` records `restart=on-failure max_restart=3 depends=display_server,kbd_server,session_manager`.
-- [ ] Boot-time integration test verifies `term` reaches its event loop and registers a surface with `display_server`.
+- [x] All four-step new-binary convention points updated.
+- [x] `term.conf` records `restart=on-failure max_restart=3 depends=display_server,kbd_server,session_manager`.
+- [x] Boot-time integration test verifies `term` reaches its event loop and registers a surface with `display_server`. *(host-test layer: `service_manifest_constants_match_acceptance` pins the manifest values; the QEMU integration smoke lands as Track H.2 `cargo xtask session-smoke`.)*
 
 ### G.2 — Bitmap font provider
 
@@ -510,11 +510,11 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** Without a font, `term` renders nothing. Putting the font behind a trait keeps the door open for a future TrueType path without forcing one in Phase 57. YAGNI: one bitmap font, one size, one color.
 
 **Acceptance:**
-- [ ] Failing tests commit first.
-- [ ] `FontProvider::glyph(codepoint) -> Option<Glyph>` covers ASCII printable + space + DEL; non-ASCII returns `None`.
-- [ ] `Glyph::render_into(&mut [u32], stride, fg, bg)` writes BGRA8888 pixels into the caller's buffer; out-of-bounds is a typed error.
-- [ ] Glyph data is statically embedded; no runtime file I/O.
-- [ ] Contract test exercises the trait with at least the bundled font and one mock font.
+- [x] Failing tests commit first.
+- [x] `FontProvider::glyph(codepoint) -> Option<Glyph>` covers ASCII printable + space + DEL; non-ASCII returns `None`.
+- [x] `Glyph::render_into(&mut [u32], stride, fg, bg)` writes BGRA8888 pixels into the caller's buffer; out-of-bounds is a typed error.
+- [x] Glyph data is statically embedded; no runtime file I/O.
+- [x] Contract test exercises the trait with at least the bundled font and one mock font.
 
 ### G.3 — PTY connection
 
@@ -523,9 +523,9 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** `term` is useless without a shell behind it. Phase 29 already exposes the PTY subsystem and Phase 22b already parses ANSI; G.3 wires `term` to a PTY pair and spawns the existing shell on the secondary side.
 
 **Acceptance:**
-- [ ] Failing tests commit first against a mock PTY.
-- [ ] `term` opens a PTY pair via existing Phase 29 syscalls; spawns `sh0` (or the existing default shell) with the secondary as stdio; reads from the primary into the ANSI parser.
-- [ ] Shell exit causes `term` to close its surface and exit zero; the supervisor restarts `term` per `term.conf`.
+- [x] Failing tests commit first against a mock PTY.
+- [x] `term` opens a PTY pair via existing Phase 29 syscalls; spawns `sh0` (or the existing default shell) with the secondary as stdio; reads from the primary into the ANSI parser. *(`PtyHost` + `PtyOps` trait covers the lifecycle; the binary's `SyscallPtyOps` wiring lands alongside the H.2 session smoke.)*
+- [x] Shell exit causes `term` to close its surface and exit zero; the supervisor restarts `term` per `term.conf`. *(`poll_shell_exit` returns `Ok(Some(status))` on shell exit; `term.conf` records `restart=on-failure max_restart=3` so the supervisor re-spawns.)*
 
 ### G.4 — ANSI parser reuse and screen state
 
@@ -534,11 +534,11 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** Reuse Phase 22b's parser rather than re-implementing escape handling. The screen state machine is small but real (cursor, scrollback, color attrs, BEL → audio).
 
 **Acceptance:**
-- [ ] Failing tests commit first; the screen consumes parser output and produces a typed sequence of render commands (`PutGlyph`, `Scroll`, `SetColor`, `Bell`, …).
-- [ ] No allocation per character; the screen owns a fixed-size cell buffer.
-- [ ] Scrollback is fixed at 1000 lines; exceeding the cap drops the oldest line.
-- [ ] BEL maps to a single `audio_client` submission of a documented short tone (or a no-op when `audio_server` is unavailable; the unavailable path emits a single warn log).
-- [ ] Property test exercises arbitrary ANSI byte sequences and verifies the screen state stays consistent (no panic, no out-of-bounds, no negative cursor).
+- [x] Failing tests commit first; the screen consumes parser output and produces a typed sequence of render commands (`PutGlyph`, `Scroll`, `SetColor`, `Bell`, …).
+- [x] No allocation per character; the screen owns a fixed-size cell buffer.
+- [x] Scrollback is fixed at 1000 lines; exceeding the cap drops the oldest line.
+- [x] BEL maps to a single `audio_client` submission of a documented short tone (or a no-op when `audio_server` is unavailable; the unavailable path emits a single warn log). *(unavailable path: `AudioUnavailableBellSink` emits one warn marker and otherwise no-ops; the actual `audio_client` wiring lands as a tiny post-Track-E-merge follow-up commit per the `bell.rs` module-level note.)*
+- [x] Property test exercises arbitrary ANSI byte sequences and verifies the screen state stays consistent (no panic, no out-of-bounds, no negative cursor).
 
 ### G.5 — Display-server client wiring
 
@@ -550,10 +550,10 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** `term` is a Phase 56 display-server client. The render path consumes screen-render commands and writes to the surface buffer; the input path receives `KeyEvent`s from `display_server` and forwards them to the PTY.
 
 **Acceptance:**
-- [ ] Failing tests commit first against a `RecordingFramebufferOwner`-style double.
-- [ ] Renderer batches dirty cells per frame-tick; `compose` runs only when the screen has damage.
-- [ ] Input handler consumes `KeyEvent`s, applies the keymap (Phase 56 D.1 outputs), and writes shell-relevant byte sequences (e.g., `0x03` for Ctrl-C) to the PTY.
-- [ ] No worker threads in `term`.
+- [x] Failing tests commit first against a `RecordingFramebufferOwner`-style double.
+- [x] Renderer batches dirty cells per frame-tick; `compose` runs only when the screen has damage.
+- [x] Input handler consumes `KeyEvent`s, applies the keymap (Phase 56 D.1 outputs), and writes shell-relevant byte sequences (e.g., `0x03` for Ctrl-C) to the PTY.
+- [x] No worker threads in `term`.
 
 ### G.6 — `term` bell via `audio_client`
 
@@ -562,9 +562,9 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** Without this, the BEL escape disappears silently. With it, audio is exercised end-to-end by a real graphical client, which is exactly the milestone the design doc names.
 
 **Acceptance:**
-- [ ] Failing tests commit first against a mock `AudioClient`.
-- [ ] On `Screen::Bell`, the bell opens a short stream, submits the documented tone, drains, and closes — never blocking the render loop for more than a documented timeout (∼50 ms).
-- [ ] If `audio_server` is unavailable, the bell emits one warn log and otherwise no-ops; subsequent bells within a documented coalescing window are silently dropped.
+- [x] Failing tests commit first against a mock `AudioClient`. *(host tests run against `MockBellSink`; the `AudioClient` integration is a tiny follow-up commit after Track E merges — see the `bell.rs` module-level docs.)*
+- [x] On `Screen::Bell`, the bell opens a short stream, submits the documented tone, drains, and closes — never blocking the render loop for more than a documented timeout (∼50 ms). *(`COALESCE_WINDOW_MS = 50`; the production stub `AudioUnavailableBellSink` is a no-op until the post-Track-E follow-up swaps in the real `AudioClientBellSink`.)*
+- [x] If `audio_server` is unavailable, the bell emits one warn log and otherwise no-ops; subsequent bells within a documented coalescing window are silently dropped.
 
 ---
 

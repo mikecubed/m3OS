@@ -89,6 +89,8 @@ members = [
     "userspace/lib/audio_client",
     # Phase 57 Track E.2 — userspace audio reference demo
     "userspace/audio-demo",
+    # Phase 57 Track G — graphical terminal emulator
+    "userspace/term",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

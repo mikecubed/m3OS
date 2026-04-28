@@ -20,9 +20,12 @@
 //! module enforces and `docs/roadmap/tasks/57-audio-and-local-session-tasks.md`
 //! Track F.1 for the acceptance list.
 
+pub mod font;
+pub mod font_data;
 pub mod recover;
 pub mod startup;
 
+pub use font::{BasicBitmapFont, FontError, FontProvider, Glyph};
 pub use recover::{Recovery, RecoveryAction};
 pub use startup::{SessionError, SessionState, SessionStep, StartupSequence};
 

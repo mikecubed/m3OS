@@ -388,6 +388,11 @@ fn build_userspace_bins() {
         // pulls in `kernel-core` (audio protocol codec) at the alloc
         // feature level for shared types.
         ("audio-demo", "audio-demo", true),
+        // Phase 57 Track G — graphical terminal emulator. `needs_alloc
+        // = true` because the binary links `kernel-core` (font
+        // provider, ANSI parser) and uses `alloc` types in the screen
+        // and renderer paths.
+        ("term", "term", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -407,6 +412,11 @@ fn build_userspace_bins() {
             // gate so the [[bin]] target is skipped on host-test
             // builds (where Scrt1.o would otherwise duplicate _start).
             "audio_server" => &["--features", "os-binary"],
+            // Phase 57 Track G: `term` ships a `[lib]` for host tests
+            // and a `[[bin]]` gated on the `os-binary` feature, same
+            // pattern as `audio_server`.  The xtask drops the gate to
+            // build the OS binary; host tests compile the lib only.
+            "term" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -5424,6 +5434,14 @@ fn populate_ext2_files(
     // warning for it but loads the service unchanged.
     let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display_server\non-restart=audio_server.restart\n";
 
+    // Phase 57 Track G: term — graphical terminal emulator. Per the G.1
+    // acceptance bullet ("term.conf records restart=on-failure
+    // max_restart=3 depends=display_server,kbd_server,session_manager")
+    // the policy is on-failure with a budget of three; the dependency
+    // chain forces display, keyboard, and the session orchestrator up
+    // before term tries to claim a surface.
+    let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display_server,kbd_server,session_manager\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -5449,6 +5467,7 @@ fn populate_ext2_files(
     let gfx_demo_conf_tmp = output_dir.join("_tmp_gfx_demo_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
+    let term_conf_tmp = output_dir.join("_tmp_term_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -5473,6 +5492,7 @@ fn populate_ext2_files(
     fs::write(&session_manager_conf_tmp, session_manager_conf)
         .expect("write temp session_manager.conf");
     fs::write(&audio_server_conf_tmp, audio_server_conf).expect("write temp audio_server.conf");
+    fs::write(&term_conf_tmp, term_conf).expect("write temp term.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -5797,6 +5817,10 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf mode 0x81A4\n\
          sif etc/services.d/audio_server.conf uid 0\n\
          sif etc/services.d/audio_server.conf gid 0\n\
+         write \"{term_conf}\" etc/services.d/term.conf\n\
+         sif etc/services.d/term.conf mode 0x81A4\n\
+         sif etc/services.d/term.conf uid 0\n\
+         sif etc/services.d/term.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5828,6 +5852,7 @@ fn populate_ext2_files(
         gfx_demo_conf = gfx_demo_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
+        term_conf = term_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
