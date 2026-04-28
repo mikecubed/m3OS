@@ -1722,6 +1722,11 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
 /// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
+    // Phase 57 DEBUG: log the first few scheduler-loop iterations
+    // per core so we can tell whether a "stuck" core is actually
+    // executing the loop at all. Limited to the first 4 wake-ups
+    // so the boot transcript doesn't drown.
+    let mut wake_log_budget: u32 = 4;
 
     loop {
         let reschedule = per_core_reschedule();
@@ -1732,6 +1737,11 @@ pub fn run() -> ! {
             continue;
         }
         interrupts::enable();
+
+        if wake_log_budget > 0 {
+            log::info!("[sched] run-loop wake core={}", core_id);
+            wake_log_budget -= 1;
+        }
 
         debug_assert!(
             per_core_scheduler_rsp() != 0,
