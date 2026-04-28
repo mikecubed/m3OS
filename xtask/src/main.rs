@@ -11053,6 +11053,123 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Phase 57 H.5: `cargo xtask run-gui` audio plumbing tests (RED).
+    //
+    // The constant `AC97_QEMU_AUDIO_FLAGS` pins the Phase 57 audio
+    // command-line surface verbatim per the A.1 audio-target memo
+    // (`docs/appendix/phase-57-audio-target-choice.md`). A single
+    // named constant keeps the contract auditable: any deviation from
+    // the documented flags will surface here before reaching CI.
+    //
+    // Headless smoke uses `none,id=snd0` so the smoke harness does not
+    // require a host audio sink. `run-gui` reuses the same flags so a
+    // developer who explicitly wants audible output can override via
+    // `QEMU_AUDIO_DRV=pa cargo xtask run-gui` (QEMU env-var override).
+    // The `--no-audio` opt-out skips the AC97 device entirely while
+    // preserving the legacy `pcspk-audiodev=noaudio` PC-speaker binding
+    // so non-audio runs match today's behavior byte-for-byte.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn ac97_qemu_audio_flags_pinned_per_a1_memo() {
+        // A.1 memo: `-device AC97,audiodev=snd0` plus a paired
+        // `-audiodev` line. Headless safety pins the backend to
+        // `none,id=snd0` (no host audio sink required).
+        assert_eq!(
+            AC97_QEMU_AUDIO_FLAGS,
+            &[
+                "-audiodev",
+                "none,id=snd0",
+                "-device",
+                "AC97,audiodev=snd0",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_gui_with_audio_emits_ac97_device_flags() {
+        // Acceptance H.5: `run-gui` adds the chosen-target's QEMU
+        // `-audiodev` and `-device` flags by default.
+        let args = qemu_run_gui_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ true,
+        );
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Every audio-flag entry must appear in argv, in order.
+        let mut i = 0;
+        for &want in AC97_QEMU_AUDIO_FLAGS {
+            let rel = strs[i..]
+                .iter()
+                .position(|a| *a == want)
+                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from run-gui argv"));
+            i += rel + 1;
+        }
+    }
+
+    #[test]
+    fn run_gui_with_audio_preserves_pcspk_audiodev_binding() {
+        // Acceptance H.5: existing `pcspk-audiodev=noaudio` PC-speaker
+        // binding stays unchanged when audio is enabled.
+        let args = qemu_run_gui_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ true,
+        );
+        // The consolidated `-machine` flag must still carry the
+        // pcspk-audiodev=noaudio property.
+        let machine_idx = args
+            .iter()
+            .position(|a| a == "-machine")
+            .expect("run-gui must emit a `-machine` flag");
+        assert!(
+            args[machine_idx + 1].contains("pcspk-audiodev=noaudio"),
+            "with-audio run-gui must preserve `pcspk-audiodev=noaudio` on -machine, \
+             got {value}",
+            value = args[machine_idx + 1]
+        );
+        // The legacy `-audiodev none,id=noaudio` line for the PC
+        // speaker must also remain so QEMU can resolve `id=noaudio`.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-audiodev", "none,id=noaudio"]),
+            "with-audio run-gui must keep `-audiodev none,id=noaudio` for the PC speaker"
+        );
+    }
+
+    #[test]
+    fn run_gui_without_audio_skips_ac97_flags_but_keeps_pcspk_noaudio() {
+        // Acceptance H.5: `--no-audio` skips the new flags but
+        // preserves the existing `pcspk-audiodev=noaudio` binding.
+        let args = qemu_run_gui_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ false,
+        );
+        // No AC97 device must appear.
+        assert!(
+            !args.iter().any(|a| a == "AC97,audiodev=snd0"),
+            "--no-audio run-gui must NOT emit `AC97,audiodev=snd0`"
+        );
+        assert!(
+            !args.iter().any(|a| a == "none,id=snd0"),
+            "--no-audio run-gui must NOT emit `-audiodev none,id=snd0`"
+        );
+        // pcspk binding must remain.
+        let machine_idx = args
+            .iter()
+            .position(|a| a == "-machine")
+            .expect("run-gui must emit a `-machine` flag");
+        assert!(
+            args[machine_idx + 1].contains("pcspk-audiodev=noaudio"),
+            "--no-audio run-gui must preserve `pcspk-audiodev=noaudio` on -machine"
+        );
+    }
+
     /// `signal_irq_bit` must be reusable for the audio device's IRQ vector
     /// without modification. Phase 57 C.3 acceptance: the path between an
     /// audio-device IRQ and userspace is a Phase 55c bound notification
