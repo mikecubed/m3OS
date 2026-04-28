@@ -1298,28 +1298,33 @@ impl ServiceManager {
             // Build argv: argv[0] = command path.
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
 
-            // PHASE 57 DEBUG: serial_print marker right before execve.
-            // Some pids (kbd=6, fat=10) reach init's parent "started"
-            // log but never appear in the kernel's `[proc] execve`
-            // trace, which means the child path is dying before this
-            // syscall. The marker uses serial_print (SYS_DEBUG_PRINT,
-            // direct kernel serial) so it bypasses the fd table.
-            syscall_lib::serial_print("init: trace.IC1 child about to execve name=");
-            // svc.name.as_bytes() is null-padded fixed-size; trim at
-            // first zero by using its `as_str` via FixedStr
-            // (best-effort — if str conversion fails we still print
-            // the marker so the boot transcript shows the
-            // before-execve point).
-            syscall_lib::serial_print(svc.name.as_str().unwrap_or("(non-utf8)"));
-            syscall_lib::serial_print("\n");
+            // PHASE 57 DEBUG: granular markers between fork-child
+            // entry and the execve syscall. Previous round confirmed
+            // exactly one child reaches IC1 but never reaches execve;
+            // this set of markers narrows the dying region to a
+            // single line. Each marker uses `serial_print` (direct
+            // kernel serial via SYS_DEBUG_PRINT, bypassing the fd
+            // table). Trailing `*` makes empty/garbage names visible.
+            syscall_lib::serial_print("init: trace.IC1A enter\n");
+            let svc_name_str = svc.name.as_str().unwrap_or("(non-utf8)");
+            syscall_lib::serial_print("init: trace.IC1B name-resolved=*");
+            syscall_lib::serial_print(svc_name_str);
+            syscall_lib::serial_print("*\n");
 
+            // svc.command -> path was already done above; print the
+            // resolved path so we can spot a corrupted command field.
+            let path_str =
+                core::str::from_utf8(&path[..path.len().saturating_sub(1)]).unwrap_or("(non-utf8)");
+            syscall_lib::serial_print("init: trace.IC1C path=*");
+            syscall_lib::serial_print(path_str);
+            syscall_lib::serial_print("*\n");
+
+            syscall_lib::serial_print("init: trace.IC1D about to call execve\n");
             let ret = execve(path, &argv, &envp);
 
-            // serial_print also for the failure path so the
-            // post-execve marker is unambiguous.
-            syscall_lib::serial_print("init: trace.IC2 execve returned name=");
-            syscall_lib::serial_print(svc.name.as_str().unwrap_or("(non-utf8)"));
-            syscall_lib::serial_print("\n");
+            syscall_lib::serial_print("init: trace.IC2 execve returned name=*");
+            syscall_lib::serial_print(svc_name_str);
+            syscall_lib::serial_print("*\n");
 
             write_str(STDOUT_FILENO, "init: execve failed for '");
             write(STDOUT_FILENO, svc.name.as_bytes());
