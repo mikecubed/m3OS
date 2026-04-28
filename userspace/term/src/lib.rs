@@ -51,6 +51,11 @@ pub mod pty;
 pub mod render;
 pub mod screen;
 
+#[cfg(all(not(test), feature = "os-binary"))]
+pub mod display;
+#[cfg(all(not(test), feature = "os-binary"))]
+pub mod syscall_pty;
+
 /// Boot-log marker written when the terminal starts.  Used by smoke
 /// scripts to confirm the binary spawned.
 pub const BOOT_LOG_MARKER: &str = "term: spawned\n";

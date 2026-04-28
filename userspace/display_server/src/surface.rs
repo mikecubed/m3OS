@@ -27,6 +27,9 @@ use kernel_core::display::cursor::ClientCursor;
 use kernel_core::display::layer::{
     LayerConflictTracker, LayerError, compute_layer_geometry, derive_exclusive_rect,
 };
+use kernel_core::display::pixel_chunk::{
+    AddChunkOutcome, ChunkAccumulator, ChunkError, PixelChunkHeader,
+};
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, CursorConfig, Layer, Rect, ServerMessage, SurfaceId, SurfaceRole,
 };
@@ -38,6 +41,16 @@ use kernel_core::display::protocol::{
 /// the compositor's memory unboundedly. Recorded in the H.1 learning doc
 /// alongside the per-client surface and outbound-event-queue caps.
 pub const MAX_PENDING_BULK: usize = 4;
+
+/// High-water mark for in-flight chunked-buffer accumulators. Each
+/// open accumulator can hold up to
+/// `kernel_core::display::pixel_chunk::MAX_TOTAL_BYTES` (4 MiB) of
+/// pending pixel data, so the per-client cap on simultaneously open
+/// chunked uploads is the primary defence against memory exhaustion
+/// from a misbehaving client. Sized to comfortably exceed the typical
+/// "double-buffered terminal" pattern (one buffer being attached, one
+/// being uploaded) without any practical legitimate need to go higher.
+pub const MAX_PENDING_CHUNK_BUFFERS: usize = 4;
 use kernel_core::display::surface::{
     SurfaceEffect, SurfaceError, SurfaceEvent, SurfaceStateMachine,
 };
@@ -125,6 +138,12 @@ pub struct SurfaceRegistry {
     /// Pending buffer bytes received via the bulk-transport path but not
     /// yet attached to a surface. `AttachBuffer` consumes from here.
     pending_bulk: Vec<CommittedBuffer>,
+    /// Phase 57 — in-flight chunked-buffer reassembly state, keyed by
+    /// `BufferId`. The first `LABEL_PIXELS_CHUNK` for a buffer creates
+    /// the entry; subsequent chunks append; on completion the buffer
+    /// moves into `pending_bulk` and the entry is removed. Capped at
+    /// [`MAX_PENDING_CHUNK_BUFFERS`].
+    chunk_accumulators: BTreeMap<BufferId, ChunkAccumulator>,
     /// Tracks which `Layer` surface (if any) currently holds the
     /// global exclusive-keyboard claim. Populated on
     /// `SetSurfaceRole(Layer { keyboard_interactivity == Exclusive })`,
@@ -150,6 +169,7 @@ impl SurfaceRegistry {
         Self {
             surfaces: BTreeMap::new(),
             pending_bulk: Vec::new(),
+            chunk_accumulators: BTreeMap::new(),
             layer_conflicts: LayerConflictTracker::new(),
             client_cursor: None,
             client_cursor_owner: None,
@@ -203,6 +223,56 @@ impl SurfaceRegistry {
         }
         self.pending_bulk.push(buf);
         true
+    }
+
+    /// Phase 57 — apply one chunk of a chunked surface upload. The
+    /// dispatcher decodes the [`PixelChunkHeader`] from the bulk and
+    /// hands header + body here. Returns:
+    ///
+    /// - `Ok(())` on a `Pending` chunk (buffer not yet complete) or on
+    ///   `Complete` (the assembled buffer is automatically pushed onto
+    ///   `pending_bulk` so the next `AttachBuffer { buffer_id }`
+    ///   consumes it).
+    /// - `Err(_)` on geometry mismatch, body-length mismatch, or
+    ///   capacity exhaustion. The caller should treat this as a
+    ///   protocol violation.
+    pub fn receive_chunk(
+        &mut self,
+        header: PixelChunkHeader,
+        body: &[u8],
+    ) -> Result<(), ChunkError> {
+        let buffer_id = BufferId(header.buffer_id);
+        // Refuse to open a NEW accumulator if we're already at the cap.
+        // Refresh on existing accumulator is fine; only the open-count
+        // is capped.
+        if !self.chunk_accumulators.contains_key(&buffer_id)
+            && self.chunk_accumulators.len() >= MAX_PENDING_CHUNK_BUFFERS
+        {
+            return Err(ChunkError::TotalTooLarge);
+        }
+        let acc = self.chunk_accumulators.entry(buffer_id).or_default();
+        let outcome = acc.add_chunk(header, body)?;
+        if let AddChunkOutcome::Complete {
+            width,
+            height,
+            pixels,
+        } = outcome
+        {
+            // Buffer is whole — drop the accumulator and queue the
+            // completed buffer for `AttachBuffer`. Apply the same
+            // pending-bulk cap as the single-shot LABEL_PIXELS path.
+            self.chunk_accumulators.remove(&buffer_id);
+            if self.pending_bulk.len() >= MAX_PENDING_BULK {
+                return Err(ChunkError::TotalTooLarge);
+            }
+            self.pending_bulk.push(CommittedBuffer {
+                buffer_id,
+                width,
+                height,
+                pixels,
+            });
+        }
+        Ok(())
     }
 
     /// Forward a [`ClientMessage`] into the appropriate surface. Returns

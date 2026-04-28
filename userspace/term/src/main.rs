@@ -1,11 +1,22 @@
-//! `term` binary entry point — Phase 57 Track G.1 scaffold.
+//! `term` binary entry point — Phase 57 Track G end-to-end wiring.
 //!
-//! G.1 only wires the four-step new-binary convention so the binary is
-//! built, embedded in the ramdisk, and described by `term.conf`. The
-//! event loop, surface registration, PTY host, screen state machine,
-//! and input handler land in G.2..G.6 in order. Until then, the
-//! binary writes its boot marker, signals readiness, and exits zero
-//! so the supervisor records a clean start.
+//! `term` is the Phase 57 graphical terminal emulator. The binary
+//! composes the lib pieces (`PtyHost`, `Screen`, `Renderer`,
+//! `InputHandler`, `Bell`) into a single-threaded event loop:
+//!
+//! 1. Open an IPC endpoint and register `"term"` so `session_manager`
+//!    can observe the boot step.
+//! 2. Connect to `display_server` (Hello + `CreateSurface` +
+//!    `SetSurfaceRole(Toplevel)`) via [`DisplayClient`].
+//! 3. Open a PTY pair via the production [`SyscallPtyOps`], fork +
+//!    `execve` `/bin/sh0` on the secondary side, set the primary
+//!    nonblocking.
+//! 4. Loop: drain PTY reads → ANSI parser → screen state → render
+//!    commands; pull `KeyEvent`s from `display_server`'s C.5 outbound
+//!    queue → input handler → PTY writes; ring the bell on `Bell`
+//!    commands; compose dirty frames.
+//! 5. Exit zero on shell exit so the supervisor restarts per
+//!    `term.conf`.
 //!
 //! `cfg(not(test))` gates protect the OS-only entry point so
 //! `cargo test -p term --target x86_64-unknown-linux-gnu --lib`
@@ -23,12 +34,30 @@ extern crate std;
 use core::alloc::Layout;
 
 #[cfg(not(test))]
-use syscall_lib::STDOUT_FILENO;
+use kernel_core::display::protocol::ServerMessage;
+#[cfg(not(test))]
+use kernel_core::input::events::KEY_EVENT_WIRE_SIZE;
 #[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
+#[cfg(not(test))]
+use syscall_lib::{CLOCK_MONOTONIC, STDOUT_FILENO};
 
 #[cfg(not(test))]
-use term::{BOOT_LOG_MARKER, READY_SENTINEL};
+use term::bell::{AudioClientBellSink, AudioUnavailableBellSink, Bell, BellError};
+#[cfg(not(test))]
+use term::display::DisplayClient;
+#[cfg(not(test))]
+use term::input::{InputHandler, PtyWriter};
+#[cfg(not(test))]
+use term::pty::PtyHost;
+#[cfg(not(test))]
+use term::render::Renderer;
+#[cfg(not(test))]
+use term::screen::{RenderCommand, Screen};
+#[cfg(not(test))]
+use term::syscall_pty::SyscallPtyOps;
+#[cfg(not(test))]
+use term::{BOOT_LOG_MARKER, READY_SENTINEL, SERVICE_NAME};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -51,13 +80,291 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
+/// Phase 56 C.5 close-out — IPC labels term uses to drain queued
+/// `ServerMessage`s from `display_server`. The values mirror
+/// `display_server::client::LABEL_CLIENT_EVENT_PULL` / `_NONE`.
+#[cfg(not(test))]
+const LABEL_CLIENT_EVENT_PULL: u64 = 3;
+#[cfg(not(test))]
+const LABEL_CLIENT_EVENT_NONE: u64 = 4;
+
+/// Per-iteration sleep when no work was found this tick. Mirrors the
+/// `display_server` main-loop yield (1 ms → ~1000 polls/sec).
+#[cfg(not(test))]
+const IDLE_SLEEP_NS: u32 = 1_000_000;
+
+/// Bytes-per-iteration drain cap on the PTY primary fd. Big enough to
+/// cover a typical shell prompt + output line; small enough that one
+/// noisy program cannot starve the input + render passes.
+#[cfg(not(test))]
+const PTY_READ_CHUNK: usize = 256;
+
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
-    // G.1 scaffold: post-G.5 lands the surface registration, focus
-    // dispatch, PTY host, and renderer. Until then we just signal
-    // readiness so the supervisor records a clean spawn and exit-zero
-    // so the supervisor's restart budget is not consumed.
+
+    // 1. Open an IPC endpoint and register so `session_manager`
+    //    observes this step. `term` does not yet accept inbound IPC
+    //    traffic on this endpoint; it is a presence beacon.
+    let ep = syscall_lib::create_endpoint();
+    if ep == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "term: create_endpoint failed\n");
+        return 2;
+    }
+    let ep_u32 = match u32::try_from(ep) {
+        Ok(v) => v,
+        Err(_) => {
+            syscall_lib::write_str(STDOUT_FILENO, "term: endpoint id out of u32 range\n");
+            return 3;
+        }
+    };
+    let rc = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+    if rc == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "term: ipc_register_service failed\n");
+        return 4;
+    }
+
+    // 2. Connect to display_server. Without it term has nothing to
+    //    paint to; surface DisplayServerUnavailable cleanly.
+    let display = match DisplayClient::connect() {
+        Ok(d) => d,
+        Err(_) => {
+            syscall_lib::write_str(STDOUT_FILENO, "term: display_server unavailable\n");
+            return 5;
+        }
+    };
+    // Capture the display endpoint handle for the C.5 event-pull
+    // path. `DisplayClient` did the lookup; we re-look-up here so
+    // term can hold its own borrow without aliasing.
+    let display_handle = match lookup_display_for_input() {
+        Some(h) => h,
+        None => {
+            syscall_lib::write_str(STDOUT_FILENO, "term: display lookup for input failed\n");
+            return 5;
+        }
+    };
+
+    // 3. Open the PTY pair and spawn `/bin/sh0` on the secondary
+    //    side. `SyscallPtyOps` is the production wiring of the
+    //    `PtyOps` trait the lib already exercises against
+    //    `MockPtyOps`.
+    let mut pty = PtyHost::new(SyscallPtyOps::new());
+    if let Err(_e) = pty.open_and_spawn() {
+        syscall_lib::write_str(STDOUT_FILENO, "term: PTY open / shell spawn failed\n");
+        return 6;
+    }
+    let primary_fd = match pty.primary_fd() {
+        Some(fd) => fd,
+        None => {
+            syscall_lib::write_str(STDOUT_FILENO, "term: PtyHost has no primary fd\n");
+            return 6;
+        }
+    };
+    if syscall_lib::set_nonblocking(primary_fd) < 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "term: set_nonblocking failed\n");
+        return 6;
+    }
+
+    // 4. Compose the screen state machine, the renderer, the input
+    //    translator, and the bell. Bell starts on the production
+    //    AudioClientBellSink; on first AudioUnavailable we swap
+    //    permanently to the warn-once stub so noisy bell-loops do
+    //    not retry the audio path forever.
+    let mut screen = Screen::new();
+    let mut renderer = Renderer::new(display);
+    let mut input_handler = InputHandler::new();
+    let mut bell_audio = Some(Bell::new(AudioClientBellSink::new()));
+    let mut bell_unavail: Option<Bell<AudioUnavailableBellSink>> = None;
+    let mut render_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
+    let mut event_buf = [0u8; 64];
+    let mut pty_buf = [0u8; PTY_READ_CHUNK];
+    let mut writer = PrimaryFdWriter { fd: primary_fd };
+    let clock = MonotonicClock;
+
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
+
+    // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
+    //    display_server outbound-event drain, the bell, the shell-exit
+    //    poll, and the renderer's per-tick compose.
+    loop {
+        let mut did_work = false;
+
+        // 5a. Drain the PTY primary fd. Nonblocking: -EAGAIN means
+        //     no data this tick. 0 means the shell closed its end.
+        let n = syscall_lib::read(primary_fd, &mut pty_buf);
+        if n > 0 {
+            did_work = true;
+            for &byte in &pty_buf[..n as usize] {
+                screen.feed(byte, &mut render_cmds);
+            }
+            for cmd in render_cmds.drain(..) {
+                if matches!(cmd, RenderCommand::Bell) {
+                    ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
+                } else {
+                    renderer.apply(cmd);
+                }
+            }
+        } else if n == 0 {
+            // EOF on primary — the shell closed the slave; treat it
+            // as shell exit and break.
+            syscall_lib::write_str(STDOUT_FILENO, "term: PTY EOF; shell closed\n");
+            break;
+        }
+        // n < 0 path: either -EAGAIN (no data) or a hard error. We
+        // do not distinguish today; the next iteration retries.
+
+        // 5b. Drain one queued ServerMessage from display_server.
+        //     The C.5 outbound queue per-client cap is 128; a busy
+        //     keyboard cannot starve the renderer because we drain
+        //     at most one event per tick.
+        if let Some(ev) = pull_one_event(display_handle, &mut event_buf) {
+            did_work = true;
+            input_handler.translate(&ev, &mut writer);
+        }
+
+        // 5c. Poll shell exit. `Some(_)` ⇒ child exited (cleanly or
+        //     not); break out of the loop.
+        match pty.poll_shell_exit() {
+            Ok(Some(_status)) => {
+                syscall_lib::write_str(STDOUT_FILENO, "term: shell exited\n");
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                syscall_lib::write_str(STDOUT_FILENO, "term: poll_shell_exit error\n");
+                break;
+            }
+        }
+
+        // 5d. Compose dirty frame, if any.
+        if renderer.damaged() {
+            renderer.compose();
+            did_work = true;
+        }
+
+        // 5e. Yield briefly when nothing happened so we don't burn CPU.
+        if !did_work {
+            let _ = syscall_lib::nanosleep_for(0, IDLE_SLEEP_NS);
+        }
+    }
+
+    // Shell exited (or PTY EOF / unrecoverable error). Close the
+    // primary fd cleanly so the kernel reclaims the slot, then exit
+    // zero — the supervisor's `restart=on-failure` policy lets it
+    // re-spawn term once the shell or display state recovers.
+    pty.close_primary();
     0
+}
+
+/// Production [`PtyWriter`] — wraps `syscall_lib::write` against the
+/// PTY primary fd. Errors are swallowed because the input loop has
+/// no good recovery beyond "drop the byte"; a future track may add
+/// metric counters.
+#[cfg(not(test))]
+struct PrimaryFdWriter {
+    fd: i32,
+}
+
+#[cfg(not(test))]
+impl PtyWriter for PrimaryFdWriter {
+    fn write(&mut self, bytes: &[u8]) {
+        let _ = syscall_lib::write(self.fd, bytes);
+    }
+}
+
+/// Monotonic clock for [`Bell::ring`]. Tiny wrapper around
+/// `clock_gettime(CLOCK_MONOTONIC)` so the bell call site is
+/// self-documenting without spending a trait abstraction on a
+/// single-method type.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct MonotonicClock;
+
+#[cfg(not(test))]
+impl MonotonicClock {
+    fn now_ms(self) -> u64 {
+        let (sec, nsec) = syscall_lib::clock_gettime(CLOCK_MONOTONIC);
+        let sec = sec.max(0) as u64;
+        let nsec = nsec.max(0) as u64;
+        sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
+    }
+}
+
+/// Ring the bell using whichever sink is currently active. On the
+/// first `AudioUnavailable` from `AudioClientBellSink`, swap the
+/// `Bell` permanently to the warn-once stub so a tight bell loop
+/// does not re-attempt the audio path on every ring.
+#[cfg(not(test))]
+fn ring_bell(
+    audio: &mut Option<Bell<AudioClientBellSink>>,
+    unavail: &mut Option<Bell<AudioUnavailableBellSink>>,
+    now_ms: u64,
+) {
+    if let Some(b) = audio.as_mut() {
+        match b.ring(now_ms) {
+            Ok(_) => return,
+            Err(BellError::AudioUnavailable) => {
+                // Permanently downgrade.
+                *audio = None;
+                *unavail = Some(Bell::new(AudioUnavailableBellSink::new()));
+            }
+            Err(_) => return,
+        }
+    }
+    if let Some(b) = unavail.as_mut() {
+        let _ = b.ring(now_ms);
+    }
+}
+
+/// Pull one queued `ServerMessage::Key` from `display_server`'s C.5
+/// outbound queue. Returns `Some(KeyEvent)` on a successful key
+/// pull, `None` for "no event this tick", "non-Key reply", or
+/// transport errors. The latter is rare and survivable — the next
+/// iteration just retries.
+#[cfg(not(test))]
+fn pull_one_event(
+    display_handle: u32,
+    buf: &mut [u8],
+) -> Option<kernel_core::input::events::KeyEvent> {
+    let label = syscall_lib::ipc_call(display_handle, LABEL_CLIENT_EVENT_PULL, 0);
+    if label != LABEL_CLIENT_EVENT_PULL {
+        // LABEL_CLIENT_EVENT_NONE or transport error — no event.
+        let _ = label; // silence "unused let result" cargo warnings
+        // Even on the NONE path the kernel may have staged an empty
+        // bulk — drain to keep the slot clean for the next call.
+        let _ = syscall_lib::ipc_take_pending_bulk(buf);
+        let _ = LABEL_CLIENT_EVENT_NONE; // referenced for documentation
+        return None;
+    }
+    let n = syscall_lib::ipc_take_pending_bulk(buf);
+    if n == 0 || n == u64::MAX {
+        return None;
+    }
+    let len = n as usize;
+    if len > buf.len() {
+        return None;
+    }
+    match ServerMessage::decode(&buf[..len]) {
+        Ok((ServerMessage::Key(ev), _)) => Some(ev),
+        // Pointer / Welcome / etc. fire-through unhandled; term only
+        // consumes Key today.
+        Ok(_) => {
+            let _ = KEY_EVENT_WIRE_SIZE; // documentation reference
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Mirror of `DisplayClient`'s lookup-with-backoff so the input loop
+/// can hold its own handle on the `"display"` service. `connect`
+/// already paid the boot-time backoff cost; this call is expected to
+/// resolve on the first attempt.
+#[cfg(not(test))]
+fn lookup_display_for_input() -> Option<u32> {
+    let raw = syscall_lib::ipc_lookup_service("display");
+    if raw == u64::MAX {
+        return None;
+    }
+    Some(raw as u32)
 }

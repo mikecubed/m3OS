@@ -54,10 +54,15 @@ impl PixelFormat {
     }
 }
 
-/// Maximum bytes carried by a single bulk-IPC message (matches the kernel's
-/// `MAX_BULK_LEN`). Userspace callers can use this constant to size their
-/// surfaces; allocations exceeding this fail with [`SurfaceBufferError::TooLarge`].
-pub const MAX_BUFFER_BYTES: usize = 4096;
+/// Maximum bytes a single [`SurfaceBuffer`] may hold. Sized to match
+/// `kernel_core::display::pixel_chunk::MAX_TOTAL_BYTES` so callers can
+/// upload buffers of any allowed surface size via the chunked-bulk
+/// path (`LABEL_PIXELS_CHUNK`) regardless of the per-IPC-bulk cap
+/// `MAX_BULK_LEN`. Pre-Phase-57 single-bulk callers (e.g. `gfx-demo`)
+/// continue to keep their surfaces under the 4 KB IPC bulk cap on
+/// their own; this constant only governs local allocation, not wire
+/// transport.
+pub const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Errors returned by [`SurfaceBuffer`] constructors and accessors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,12 +208,12 @@ mod tests {
 
     #[test]
     fn too_large_is_typed_error() {
-        // 64 × 64 = 4096 pixels = 16384 bytes > MAX_BUFFER_BYTES.
+        // 1025 × 1024 = 1,049,600 pixels × 4 bytes = 4,198,400 > MAX_BUFFER_BYTES (4 MiB).
         let err =
-            SurfaceBuffer::new(SurfaceBufferId(0), 64, 64, PixelFormat::Bgra8888).unwrap_err();
+            SurfaceBuffer::new(SurfaceBufferId(0), 1025, 1024, PixelFormat::Bgra8888).unwrap_err();
         match err {
             SurfaceBufferError::TooLarge { requested, limit } => {
-                assert_eq!(requested, 64 * 64 * 4);
+                assert_eq!(requested, 1025 * 1024 * 4);
                 assert_eq!(limit, MAX_BUFFER_BYTES);
             }
             _ => panic!("expected TooLarge, got {err:?}"),
@@ -241,10 +246,13 @@ mod tests {
     }
 
     #[test]
-    fn max_buffer_size_is_exactly_4kb() {
-        // 32 × 32 BGRA = 4096 bytes (the IPC bulk limit). Largest Phase 56 demo.
-        let buf = SurfaceBuffer::new(SurfaceBufferId(0), 32, 32, PixelFormat::Bgra8888).unwrap();
-        assert_eq!(buf.byte_len(), 4096);
+    fn max_buffer_size_matches_chunk_total_cap() {
+        // Phase 57 raises the local-allocation cap to match the
+        // chunked-bulk transport ceiling. A 1024 × 1024 BGRA surface
+        // is exactly 4 MiB and exercises the boundary.
+        let buf =
+            SurfaceBuffer::new(SurfaceBufferId(0), 1024, 1024, PixelFormat::Bgra8888).unwrap();
+        assert_eq!(buf.byte_len(), 1024 * 1024 * 4);
         assert_eq!(buf.byte_len(), MAX_BUFFER_BYTES);
     }
 }
