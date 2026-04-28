@@ -84,19 +84,24 @@ const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 
 // Phase 56 Track F.3: text-mode-fallback marker.
 //
-// When this file exists, init skips loading the graphical-stack manifests
-// (`display_server.conf` and `gfx-demo.conf`) and emits a structured
+// When this file exists, init skips loading the graphical-stack manifest
+// (`display_server.conf`) and emits a structured
 // `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` log line. The
 // kernel framebuffer console + serial console therefore remain the only
 // administration surfaces — see `docs/56-display-and-input-architecture.md`
 // "Text-mode fallback" for the failure-cascade walkthrough.
+//
+// Phase 57 promotes `term` to the production graphical client. Because
+// `gfx-demo.conf` is no longer staged into the data disk (the binary
+// remains under `/bin/gfx-demo` for manual protocol testing), the
+// fallback skip-list shrinks to `display_server.conf` alone.
 const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\0";
 
 /// Conf-file basenames (with the `.conf` suffix and trailing NUL) that are
 /// skipped when `DISABLE_DISPLAY_SERVER_MARKER` is present. Listed centrally
 /// so the dir-scan path and the `KNOWN_CONFIGS` fallback path agree on the
 /// same filter — no parallel "skip these" lists.
-const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0", b"gfx-demo.conf\0"];
+const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0"];
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
@@ -121,8 +126,6 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/e1000_driver.conf\0",
     // Phase 56 Track C: display server (compositor).
     b"/etc/services.d/display_server.conf\0",
-    // Phase 56 Track C.6: protocol-reference client (visual smoke).
-    b"/etc/services.d/gfx-demo.conf\0",
     // Phase 57 Track F.2: session_manager daemon.
     b"/etc/services.d/session_manager.conf\0",
     // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
@@ -760,9 +763,8 @@ struct ServiceManager {
     syslog_fd: i32,
     defer_status_writes: bool,
     /// Phase 56 Track F.3: cached at startup. When `true`, init skips
-    /// `display_server.conf` and `gfx-demo.conf` so the system boots
-    /// straight into the text-mode fallback (serial login + kernel
-    /// framebuffer console).
+    /// `display_server.conf` so the system boots straight into the
+    /// text-mode fallback (serial login + kernel framebuffer console).
     display_fallback: bool,
     /// Phase 56 Track F.2 — when `/etc/display_server.debug-crash`
     /// was observed at startup, the service manager appends
@@ -1031,12 +1033,12 @@ impl ServiceManager {
     /// Skips services that have a `.disabled` marker file or that are
     /// gated off by the Phase 56 F.3 text-mode-fallback runtime knob.
     fn try_load_config(&mut self, path: &[u8]) {
-        // Phase 56 F.3: graphical-stack manifests are skipped wholesale when
-        // the operator (or the regression test) has dropped the
-        // `/etc/m3os-disable-display-server` marker. Both `display_server.conf`
-        // and `gfx-demo.conf` are excluded here so the dependency graph never
-        // sees them — `gfx-demo` depends on `display`, so missing the gate
-        // would leave it stuck waiting for an unresolvable dep.
+        // Phase 56 F.3: the graphical-stack manifest is skipped wholesale
+        // when the operator (or the regression test) has dropped the
+        // `/etc/m3os-disable-display-server` marker. `display_server.conf`
+        // is excluded here so the dependency graph never sees it. (Phase
+        // 57 retired `gfx-demo.conf` from the auto-start set; the binary
+        // remains under `/bin/gfx-demo` for manual protocol testing.)
         if self.skip_for_display_fallback(path) {
             return;
         }

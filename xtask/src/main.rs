@@ -5930,12 +5930,13 @@ fn populate_ext2_files(
     // still under development.
     let display_server_conf = "name=display\ncommand=/bin/display_server\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=kbd\n";
 
-    // Phase 56 Track C.6: protocol-reference client (visual smoke). Started
-    // as a supervised daemon so init brings it up automatically after the
-    // `display` service registers; max_restart=3 is a tighter budget than
-    // `display_server` since this is a smoke client, not a load-bearing
-    // service.
-    let gfx_demo_conf = "name=gfx-demo\ncommand=/bin/gfx-demo\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\n";
+    // Phase 56 Track C.6: `gfx-demo` is a protocol-reference client used
+    // for Phase 56 visual smoke during display_server bring-up. Phase 57
+    // ships `term` as the production graphical client, so gfx-demo is no
+    // longer auto-started — both binaries claim `SurfaceId(1)` Toplevel
+    // and a simultaneous boot would race for the surface. The binary
+    // remains installed under `/bin/gfx-demo` so a developer can launch
+    // it manually for protocol verification.
 
     // Phase 57 Track F.2: session_manager daemon — graphical-session
     // orchestrator. No `depends=` because session_manager IS the
@@ -5990,7 +5991,6 @@ fn populate_ext2_files(
     let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
     let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let display_server_conf_tmp = output_dir.join("_tmp_display_server_conf");
-    let gfx_demo_conf_tmp = output_dir.join("_tmp_gfx_demo_conf");
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
     let term_conf_tmp = output_dir.join("_tmp_term_conf");
@@ -6014,7 +6014,6 @@ fn populate_ext2_files(
     fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&display_server_conf_tmp, display_server_conf)
         .expect("write temp display_server.conf");
-    fs::write(&gfx_demo_conf_tmp, gfx_demo_conf).expect("write temp gfx-demo.conf");
     fs::write(&session_manager_conf_tmp, session_manager_conf)
         .expect("write temp session_manager.conf");
     fs::write(&audio_server_conf_tmp, audio_server_conf).expect("write temp audio_server.conf");
@@ -6133,12 +6132,15 @@ fn populate_ext2_files(
     //
     // When `M3OS_DISABLE_DISPLAY_SERVER=1` is set on the host, drop a marker
     // file at `/etc/m3os-disable-display-server`. Init reads this once at
-    // startup and skips loading `display_server.conf` and `gfx-demo.conf`,
-    // emitting `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)`
-    // log lines that the F.3 regression test pattern-matches. The kernel
-    // framebuffer console + serial login remain the only administration
-    // surfaces — the failure-cascade walkthrough lives in
+    // startup and skips loading `display_server.conf`, emitting
+    // `init: skipped <name>.conf (M3OS_DISABLE_DISPLAY_SERVER=1)` log lines
+    // that the F.3 regression test pattern-matches. The kernel framebuffer
+    // console + serial login remain the only administration surfaces — the
+    // failure-cascade walkthrough lives in
     // `docs/56-display-and-input-architecture.md` "Text-mode fallback".
+    //
+    // (Phase 57 retired `gfx-demo.conf` from the auto-start set; the
+    // binary remains under `/bin/gfx-demo` for manual protocol testing.)
     let disable_display_cmds = if std::env::var("M3OS_DISABLE_DISPLAY_SERVER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -6331,10 +6333,6 @@ fn populate_ext2_files(
          sif etc/services.d/display_server.conf mode 0x81A4\n\
          sif etc/services.d/display_server.conf uid 0\n\
          sif etc/services.d/display_server.conf gid 0\n\
-         write \"{gfx_demo_conf}\" etc/services.d/gfx-demo.conf\n\
-         sif etc/services.d/gfx-demo.conf mode 0x81A4\n\
-         sif etc/services.d/gfx-demo.conf uid 0\n\
-         sif etc/services.d/gfx-demo.conf gid 0\n\
          write \"{session_manager_conf}\" etc/services.d/session_manager.conf\n\
          sif etc/services.d/session_manager.conf mode 0x81A4\n\
          sif etc/services.d/session_manager.conf uid 0\n\
@@ -6375,7 +6373,6 @@ fn populate_ext2_files(
         nvme_driver_conf = nvme_driver_conf_tmp.display(),
         e1000_driver_conf = e1000_driver_conf_tmp.display(),
         display_server_conf = display_server_conf_tmp.display(),
-        gfx_demo_conf = gfx_demo_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
         term_conf = term_conf_tmp.display(),

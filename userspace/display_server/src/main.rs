@@ -547,8 +547,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             };
             match compose_result {
                 Ok(0) => {}
-                Ok(writes) => {
-                    log_compose_writes(writes);
+                Ok(_writes) => {
+                    // Per-frame `composed writes=N` log was retired in
+                    // Phase 57: at 60 Hz with a graphical client doing
+                    // chunked uploads it produced ~60 lines/sec on the
+                    // serial console, drowning real signal. The
+                    // frame-stats ring still records the sample so a
+                    // future control-socket query can surface compose
+                    // throughput on demand.
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
                 }
@@ -974,12 +980,6 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
 fn log_outbound_count(n: u32) {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: outbound queued n=");
     write_u32(n);
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-}
-
-fn log_compose_writes(writes: usize) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: composed writes=");
-    write_u32(writes as u32);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
