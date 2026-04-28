@@ -142,7 +142,8 @@ The single concrete change in `kernel/` for Phase 57 audio is one line of wideni
 
 ## Companion Task List
 
-- Phase 57 task list — defer until implementation planning begins.
+- [Phase 57 Task List](./tasks/57-audio-and-local-session-tasks.md)
+- [Phase 57 Learning Doc](../57-audio-and-local-session.md) — covers the audio contract, session flow, terminal baseline, manual smoke checklist, and the deferred boundary between Phase 57 and a later media/desktop phase.
 
 ## How Real OS Implementations Differ
 
