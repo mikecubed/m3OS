@@ -1268,10 +1268,31 @@ impl ServiceManager {
         }
 
         if pid == 0 {
+            // PHASE 57 DEBUG: very first marker in the child path —
+            // before reading svc data, before any allocation, before
+            // any function call. Two services (kbd, fat) are reaching
+            // init's parent "started 'name' pid=N" log but never
+            // reach IC1A. This marker tells us whether the fork-child
+            // task is even running for those pids. We bake the idx
+            // into the marker so we can map it back to the service
+            // even with svc reads being suspect.
+            {
+                let mut idx_buf = [0u8; 64];
+                let mut ip = 0usize;
+                ip += append_to_buf(&mut idx_buf, ip, b"init: trace.IC0 fork-child entered idx=");
+                ip += append_u64_to_buf(&mut idx_buf, ip, idx as u64);
+                ip += append_to_buf(&mut idx_buf, ip, b"\n");
+                if let Ok(s) = core::str::from_utf8(&idx_buf[..ip]) {
+                    syscall_lib::serial_print(s);
+                }
+            }
+
             // Child: build path with null terminator and exec.
             let mut path_buf = [0u8; MAX_CMD + 1];
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
+
+            syscall_lib::serial_print("init: trace.IC0B path-built\n");
 
             // Phase 56 Track F.2 / close-out (G.1, G.2) — append the
             // test-only env vars when their respective markers are
@@ -1285,9 +1306,13 @@ impl ServiceManager {
                 self.display_server_inject_key,
             );
 
+            syscall_lib::serial_print("init: trace.IC0C envp-built\n");
+
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
+                syscall_lib::serial_print("init: trace.IC0D before-setuid\n");
                 let ret = setuid(svc.run_as_uid);
+                syscall_lib::serial_print("init: trace.IC0E after-setuid\n");
                 if ret < 0 {
                     write_str(STDOUT_FILENO, "init: setuid failed for '");
                     write(STDOUT_FILENO, svc.name.as_bytes());
