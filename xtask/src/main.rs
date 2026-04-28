@@ -50,6 +50,15 @@ pub const AC97_QEMU_AUDIO_FLAGS: &[&str] =
 const QEMU_EXIT_SUCCESS: i32 = 0x21;
 const QEMU_EXIT_FAILURE: i32 = 0x23;
 
+// Phase 57 Track H — distinct exit codes per smoke failure mode so CI can
+// distinguish "audio not playing" from "session never reached Running"
+// from "recovery path stalled". The codes live in the 60s range to avoid
+// colliding with `cargo`/`make`-style 1, 2, 64, 65, 70 conventions and
+// the existing `QEMU_EXIT_*` codes around 0x21/0x23.
+const SMOKE_EXIT_AUDIO_DEMO_FAILED: i32 = 60;
+const SMOKE_EXIT_SESSION_NOT_RUNNING: i32 = 61;
+const SMOKE_EXIT_SESSION_RECOVERY_FAILED: i32 = 62;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -230,6 +239,35 @@ fn main() {
                 std::process::exit(1);
             });
             cmd_ssh_e1000_banner_check(&banner_args);
+        }
+        // Phase 57 Track H smoke commands — distinct exit codes per
+        // failure mode so CI can route regressions to the right tracker.
+        Some("audio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("audio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_audio_smoke(&smoke_args);
+        }
+        Some("session-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("session-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_session_smoke(&smoke_args);
+        }
+        Some("session-recover-smoke") => {
+            let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_session_recover_smoke(&smoke_args);
         }
         Some("runner") => {
             let kernel_binary = args
@@ -5024,6 +5062,365 @@ fn cmd_ssh_e1000_banner_check(args: &SshE1000BannerCheckArgs) {
         .unwrap_or_else(|err| panic!("failed to launch {}: {err}", script.display()));
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57 Track H — audio / session / session-recover smoke harnesses.
+//
+// These three commands compose `boot_and_login_steps` with an audio /
+// session entry / recovery script tail. Each emits a distinct exit code
+// on failure so CI lanes can route a regression to the right tracker.
+// They mirror the shape of `cmd_device_smoke`: the smoke runs under
+// `qemu-system-x86_64` with the chosen `DeviceSet`, and `run_smoke_script`
+// drives the expect-style assertions.
+//
+// Per H.1 acceptance the simpler variant is acceptable: run audio-demo,
+// assert it exits 0 (demoted to: assert `AUDIO_DEMO:PASS` appears on
+// serial). The full stats-verb readback is documented as a stretch goal.
+// Per H.2 acceptance the simpler variant is acceptable: assert
+// `session.boot: state=running` within timeout. Per H.3 the simpler
+// variant is acceptable: assert `state=text-fallback` after the
+// display_server crash.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SmokeBootArgs {
+    timeout_secs: u64,
+    display: bool,
+}
+
+fn parse_smoke_boot_args(name: &str, args: &[String]) -> Result<SmokeBootArgs, String> {
+    let mut timeout_secs = 240u64;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--display" => display = true,
+            "--timeout" => {
+                index += 1;
+                timeout_secs = args
+                    .get(index)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            other => return Err(format!("unknown {name} flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(SmokeBootArgs {
+        timeout_secs,
+        display,
+    })
+}
+
+/// Phase 57 H.1 — smoke step list for `cargo xtask audio-smoke`.
+///
+/// Simpler-variant strategy (documented in the function comment per the
+/// H.1 task notes): run `/bin/audio-demo` after a successful login and
+/// wait for the `AUDIO_DEMO:PASS` sentinel. `audio-demo`'s contract is
+/// that it exits 0 only after a clean open / submit / drain / close,
+/// which means the AC'97 driver's BDL ring math, the Phase 55c bound-
+/// notification IRQ multiplex, and the single-client admission gate
+/// have all worked end-to-end. Any failure produces an
+/// `AUDIO_DEMO:FAIL stage=… variant=…` line per E.2's structured-error
+/// contract.
+///
+/// The full stats-verb readback (frames_consumed >= frames_submitted)
+/// would assert the same property at a finer grain; it is documented as
+/// a stretch goal because it requires a stats RPC client harness that
+/// does not exist yet at the audio_server's control endpoint.
+fn audio_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Wait for audio_server to spawn so audio-demo's connect doesn't
+    // race the IPC service registration.
+    steps.push(SmokeStep::Wait {
+        pattern: "audio_server: spawned",
+        timeout_secs: 30,
+        label: "guest/audio: audio_server daemon spawned",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "AUDIO_SMOKE:server:READY",
+        timeout_secs: 30,
+        label: "guest/audio: audio_server entered IRQ/IPC server loop",
+    });
+    // Run audio-demo; chain `; echo` to capture exit code on the same
+    // line so the regression sees the success signal even if the shell
+    // prompt is delayed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/audio-demo ; /bin/echo AUDIO_DEMO:exit:$?\n",
+        label: "guest/audio: launch audio-demo",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "AUDIO_DEMO:PASS",
+        timeout_secs: 60,
+        label: "guest/audio: audio-demo PASS sentinel",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "AUDIO_DEMO:exit:0",
+        timeout_secs: 15,
+        label: "guest/audio: audio-demo exited 0",
+    });
+    steps
+}
+
+/// Build the QEMU arg vector for the audio smoke. Hostfwd is stripped
+/// the same way `cmd_device_smoke` strips it so parallel CI lanes do
+/// not collide on host ports 2222/2323. The Phase 57 audio flags
+/// ([`AC97_QEMU_AUDIO_FLAGS`]) are appended so the AC'97 emulation is
+/// live for the duration of the boot.
+fn audio_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    append_ac97_audio_flags(&mut qemu_args);
+    qemu_args
+}
+
+fn cmd_audio_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = audio_smoke_steps();
+
+    println!(
+        "audio-smoke: launching QEMU with AC'97 audio device (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("audio-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("audio-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
+        }
+    }
+}
+
+/// Phase 57 H.2 — smoke step list for `cargo xtask session-smoke`.
+///
+/// Simpler-variant strategy (documented per the H.2 task notes): assert
+/// `session_manager: session.boot: state=running` appears on serial
+/// within the timeout. The full keypress→PTY→term assertion is a
+/// stretch goal because it requires a kbd_server input-injection
+/// surface that is not yet wired to a smoke-runner harness.
+///
+/// The session_manager daemon emits `session.boot: state=running` once
+/// every supervised step (display, kbd, mouse, audio, term) has reached
+/// the per-step "ready" condition; that line is the canonical signal
+/// the graphical session has booted cleanly.
+fn session_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Wait {
+        pattern: "session_manager: session.boot: state=running",
+        timeout_secs: 60,
+        label: "guest/session: session_manager reached SessionState::Running",
+    });
+    steps
+}
+
+fn cmd_session_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = session_smoke_steps();
+
+    println!(
+        "session-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "session-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("session-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SESSION_NOT_RUNNING);
+        }
+    }
+}
+
+/// Phase 57 H.3 — smoke step list for `cargo xtask session-recover-smoke`.
+///
+/// Simpler-variant strategy (documented per the H.3 task notes): boot
+/// a graphical session, kill `display_server` from the shell via a
+/// `kill -9` against the supervisor-tracked PID, and assert
+/// `session.recover.text_fallback` appears on serial within the
+/// timeout. The serial admin shell reachability check is a stretch goal
+/// because it requires a serial-side echo loop the smoke runner doesn't
+/// currently expose.
+///
+/// The acceptance shape (Running → kill display_server → retries cap →
+/// text-fallback escalation) maps to the F.4 recovery contract: when
+/// the supervisor exhausts the restart budget for `display_server`,
+/// `session_manager` advances to `SessionState::Recovering`, then to
+/// `text-fallback` once the rollback completes.
+fn session_recover_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Step 1 — graphical session reaches Running.
+    steps.push(SmokeStep::Wait {
+        pattern: "session_manager: session.boot: state=running",
+        timeout_secs: 60,
+        label: "guest/session-recover: session_manager reached Running",
+    });
+    // Step 2 — kill display_server via the supervisor's debug crash
+    // verb. The smoke client runs the existing `display-server-crash-smoke`
+    // helper (which emits a `DebugCrash` request via the dispatcher),
+    // then loops to exhaust the restart budget. After the budget is
+    // exhausted, the supervisor stops restarting and `session_manager`
+    // advances to `SessionState::Recovering`.
+    steps.push(SmokeStep::Send {
+        input: "/bin/display-server-crash-smoke ; /bin/echo SESSION_RECOVER_SMOKE:crash:$?\n",
+        label: "guest/session-recover: trigger display_server crash via debug verb",
+    });
+    // Step 3 — text-fallback escalation observed.
+    steps.push(SmokeStep::Wait {
+        pattern: "session.recover.text_fallback",
+        timeout_secs: 90,
+        label: "guest/session-recover: text-fallback escalation",
+    });
+    steps
+}
+
+fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = session_recover_smoke_steps();
+
+    println!(
+        "session-recover-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "session-recover-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("session-recover-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SESSION_RECOVERY_FAILED);
+        }
     }
 }
 
@@ -11135,6 +11532,123 @@ mod tests {
              alongside e1000/NVMe under the ISR-safe IRQ delivery path \
              (Phase 57 C.3 acceptance)"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 57 H.1 / H.2 / H.3 — smoke step list shape assertions.
+    //
+    // The smoke step lists ride the same `run_smoke_script` engine
+    // every other regression uses; pinning the patterns and labels
+    // catches drift between the smoke script and the daemon log
+    // surface before a CI-only smoke run uncovers it. The shape
+    // assertions are pure-logic and run in `cargo test -p xtask`.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn audio_smoke_steps_assert_audio_demo_pass_sentinel() {
+        // H.1 acceptance: smoke harness asserts the AUDIO_DEMO:PASS
+        // sentinel after running /bin/audio-demo. The pattern must
+        // appear in the smoke step list under a labelled wait.
+        let steps = audio_smoke_steps();
+        let pattern = wait_pattern_for_label(&steps, "guest/audio: audio-demo PASS sentinel")
+            .expect("audio-smoke step list must wait for the AUDIO_DEMO:PASS sentinel");
+        assert_eq!(pattern, "AUDIO_DEMO:PASS");
+    }
+
+    #[test]
+    fn audio_smoke_steps_assert_audio_demo_exit_zero() {
+        // H.1 acceptance: audio-demo exits 0 only after a clean
+        // open/submit/drain/close sequence; the smoke step list pins
+        // the AUDIO_DEMO:exit:0 line so a non-zero exit fails CI.
+        let steps = audio_smoke_steps();
+        let pattern = wait_pattern_for_label(&steps, "guest/audio: audio-demo exited 0")
+            .expect("audio-smoke step list must wait for AUDIO_DEMO:exit:0");
+        assert_eq!(pattern, "AUDIO_DEMO:exit:0");
+    }
+
+    #[test]
+    fn audio_smoke_steps_send_audio_demo_command() {
+        // H.1 acceptance: the smoke step list sends `/bin/audio-demo`
+        // to the shell (chained with an `echo` to capture exit code).
+        let steps = audio_smoke_steps();
+        let input = send_input_for_label(&steps, "guest/audio: launch audio-demo")
+            .expect("audio-smoke step list must send /bin/audio-demo");
+        assert!(
+            input.contains("/bin/audio-demo"),
+            "expected /bin/audio-demo in step input; got `{input}`"
+        );
+        assert!(
+            input.contains("AUDIO_DEMO:exit:"),
+            "expected AUDIO_DEMO:exit: chain marker in step input; got `{input}`"
+        );
+    }
+
+    #[test]
+    fn session_smoke_steps_wait_for_running_state() {
+        // H.2 acceptance (simpler variant): assert
+        // `session_manager: session.boot: state=running` appears
+        // within the timeout.
+        let steps = session_smoke_steps();
+        let pattern = wait_pattern_for_label(
+            &steps,
+            "guest/session: session_manager reached SessionState::Running",
+        )
+        .expect("session-smoke step list must wait for the Running state line");
+        assert_eq!(pattern, "session_manager: session.boot: state=running");
+    }
+
+    #[test]
+    fn session_recover_smoke_steps_wait_for_text_fallback() {
+        // H.3 acceptance (simpler variant): assert
+        // `session.recover.text_fallback` appears within the timeout
+        // after a display_server crash.
+        let steps = session_recover_smoke_steps();
+        let pattern =
+            wait_pattern_for_label(&steps, "guest/session-recover: text-fallback escalation")
+                .expect("session-recover-smoke step list must wait for the text_fallback log line");
+        assert_eq!(pattern, "session.recover.text_fallback");
+    }
+
+    #[test]
+    fn audio_smoke_qemu_args_include_ac97_flags() {
+        // H.5 acceptance: the same AC97 audio device flags reused by
+        // the audio-smoke command via the centralised constant. This
+        // pins that audio-smoke does not silently drop the AC97 flags.
+        let args = audio_smoke_qemu_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            /* display */ false,
+        );
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut i = 0;
+        for &want in AC97_QEMU_AUDIO_FLAGS {
+            let rel = strs[i..]
+                .iter()
+                .position(|a| *a == want)
+                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from audio-smoke argv"));
+            i += rel + 1;
+        }
+    }
+
+    #[test]
+    fn smoke_exit_codes_are_distinct() {
+        // H.1 / H.2 / H.3 acceptance: each smoke fails with a distinct
+        // exit code so CI can route a regression to the right tracker.
+        let codes = [
+            SMOKE_EXIT_AUDIO_DEMO_FAILED,
+            SMOKE_EXIT_SESSION_NOT_RUNNING,
+            SMOKE_EXIT_SESSION_RECOVERY_FAILED,
+        ];
+        for (i, &a) in codes.iter().enumerate() {
+            for &b in &codes[i + 1..] {
+                assert_ne!(a, b, "smoke exit codes must be distinct");
+            }
+        }
+        // Distinct from the QEMU exit codes too.
+        for &a in &codes {
+            assert_ne!(a, QEMU_EXIT_SUCCESS);
+            assert_ne!(a, QEMU_EXIT_FAILURE);
+        }
     }
 
     // ----------------------------------------------------------------
