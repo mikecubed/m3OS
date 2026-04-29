@@ -453,6 +453,7 @@ impl Scheduler {
                     self.tasks[idx].pid,
                     self.tasks[idx].name
                 );
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 self.tasks[idx].state = TaskState::Dead;
                 q.remove(i);
                 continue;
@@ -1108,6 +1109,7 @@ fn block_current(state: TaskState) {
             sched.tasks[idx].state
         );
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1148,6 +1150,7 @@ fn block_current_unless_message(state: TaskState) {
             return;
         }
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1191,6 +1194,7 @@ pub fn block_current_on_send_unless_completed() {
             return;
         }
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnSend;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1250,6 +1254,7 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
             None => return,
         };
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1313,6 +1318,7 @@ fn block_current_unless_woken_inner(
             None => return,
         };
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
         // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
@@ -1323,6 +1329,7 @@ fn block_current_unless_woken_inner(
         } else if wake_deadline.is_none() && sched.tasks[idx].wake_deadline.is_some() {
             ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
         }
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].wake_deadline = wake_deadline;
         save_user_return_state(
             &mut sched.tasks[idx],
@@ -1349,6 +1356,7 @@ pub fn mark_current_dead() -> ! {
                 x86_64::instructions::hlt();
             },
         };
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::Dead;
         sched.tasks[idx].switching_out = true;
         set_current_task_idx(None);
@@ -1374,6 +1382,7 @@ pub fn mark_task_dead_by_pid(pid: u32) -> bool {
         if task.pid == pid {
             task.group_exit_pending = false;
             if task.state != TaskState::Dead {
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 task.state = TaskState::Dead;
             }
             return true;
@@ -1418,6 +1427,7 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
     if sched.task_current_on_any_core(idx) || sched.tasks[idx].switching_out {
         return false;
     }
+    // TODO(57a-C/D): route through pi_lock + with_block_state
     sched.tasks[idx].state = TaskState::Dead;
     sched.tasks[idx].group_exit_pending = false;
     true
@@ -1476,6 +1486,7 @@ pub fn wake_task(id: TaskId) -> bool {
                         (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
+                        // TODO(57a-C/D): route through pi_lock + with_block_state
                         sched.tasks[idx].state = TaskState::Ready;
                         sched.tasks[idx].last_ready_tick = now;
                         (
@@ -1704,12 +1715,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
     let mut sched = SCHEDULER.lock();
     while sched.tasks.len() <= idx {
         let mut filler = Task::new(test_task_entry, "test-filler");
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         filler.state = TaskState::Dead;
         sched.tasks.push(filler);
     }
 
     let mut task = Task::new(test_task_entry, "test-cleanup");
     task.id = task_id;
+    // TODO(57a-C/D): route through pi_lock + with_block_state
     task.state = TaskState::Ready;
     sched.tasks[idx] = task;
 }
@@ -1792,6 +1805,7 @@ pub fn run() -> ! {
                     if task_idx < sched.tasks.len() {
                         let task = &mut sched.tasks[task_idx];
                         if task.state == TaskState::BlockedOnNotif && !task.switching_out {
+                            // TODO(57a-C/D): route through pi_lock + with_block_state
                             task.state = TaskState::Ready;
                             task.last_ready_tick = crate::arch::x86_64::interrupts::tick_count();
                             Some((task.assigned_core, task_idx))
@@ -1863,6 +1877,7 @@ pub fn run() -> ! {
                 if stale_ticks >= 50 && !is_idle {
                     stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
                 }
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 task.state = TaskState::Running;
                 task.start_tick = now;
                 debug_assert!(
@@ -2169,6 +2184,7 @@ pub fn run() -> ! {
                     task.wake_after_switch = false;
 
                     if (wake_after_switch && blocked) || reenqueue_after_yield {
+                        // TODO(57a-C/D): route through pi_lock + with_block_state
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
                         if reenqueue_after_yield {
@@ -2276,6 +2292,7 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
             task.last_migrated_tick = now;
             continue;
         }
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         task.state = TaskState::Ready;
         task.last_ready_tick = now;
         task.last_migrated_tick = now;

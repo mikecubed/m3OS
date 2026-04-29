@@ -273,6 +273,25 @@ pub struct Task {
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
     _stack: Option<Box<[u8]>>,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.2 — per-task pi_lock (shadow lock, migration window)
+    // ---------------------------------------------------------------------------
+    /// Per-task spinlock guarding [`TaskBlockState`].
+    ///
+    /// # Lock ordering
+    ///
+    /// `pi_lock` is **OUTER**, `SCHEDULER.lock` is **INNER** (Linux's
+    /// `p->pi_lock` → `rq->lock` pattern).  A code path may hold `pi_lock`
+    /// while acquiring `SCHEDULER.lock`; the reverse is forbidden and panics
+    /// in debug builds (see [`Task::with_block_state`]).
+    ///
+    /// # Migration window
+    ///
+    /// During Tracks C/D, writes go to **both** this field and to the legacy
+    /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
+    /// Track E removes the legacy fields once all callers migrate.
+    pub pi_lock: spin::Mutex<TaskBlockState>,
 }
 
 impl Task {
@@ -312,6 +331,14 @@ impl Task {
             fork_ctx: None,
             wake_deadline: None,
             _stack: Some(stack),
+            // Phase 57a B.2: initialize pi_lock with the same initial state as
+            // Task::state so the shadow lock is consistent from construction.
+            // Writes during the migration window (Tracks C/D) go to both v1
+            // fields and pi_lock; Track E removes the v1 fields.
+            pi_lock: spin::Mutex::new(TaskBlockState {
+                state: TaskState::Ready,
+                wake_deadline: None,
+            }),
         }
     }
 
