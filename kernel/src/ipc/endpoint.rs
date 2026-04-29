@@ -793,6 +793,18 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         task_idx: caller.0 as u32,
         ep: ep_id.0 as u32,
     });
+    // Track C.4: migrate IPC call path to v2 block primitive (sched-v2 gate).
+    //
+    // Under sched-v2, block_current_on_reply_v2 wraps block_current_until with
+    // a local AtomicBool, following the four-step Linux do_nanosleep recipe.
+    // Under v1, the legacy block_current_on_reply_unless_message is used.
+    //
+    // Note: The woken-flag fast-path (step 3 self-revert) requires Track D's
+    // wake_task rewrite to set the AtomicBool on the wake side. Until then the
+    // function always yields (step 4), but the outcome is semantically correct.
+    #[cfg(feature = "sched-v2")]
+    let _ = scheduler::block_current_on_reply_v2(caller);
+    #[cfg(not(feature = "sched-v2"))]
     scheduler::block_current_on_reply_unless_message();
     // Woken by reply() — reply message was delivered into our slot.
     match scheduler::take_message(caller) {

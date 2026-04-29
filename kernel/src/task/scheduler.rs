@@ -1701,6 +1701,79 @@ pub fn block_current_until(
     }
 }
 
+/// v2 helper: block the current task (as `BlockedOnReply`) until a message is
+/// delivered into its pending slot.
+///
+/// This is the v2 replacement for `block_current_on_reply_unless_message`.
+/// It wraps [`block_current_until`] using a **local** `AtomicBool` as the
+/// `woken` flag. The flag starts `false`; the caller is responsible for the
+/// condition being rechecked via `take_message` after this returns.
+///
+/// **Why a local `AtomicBool`?** During the Track C migration window the wake
+/// side (`wake_task`) still uses the v1 path and does not set any per-call
+/// flag.  The self-revert path in [`block_current_until`] checks
+/// `pending_msg.is_some()` via the `woken` flag — but because the wake side
+/// has not been migrated to the v2 protocol (Track D), the flag will always
+/// be `false` at the step-3 recheck.  The function therefore always goes to
+/// step 4 (yield) unless `pending_msg` is already set at entry (the early
+/// `AlreadyTrue` return).  Once Track D migrates `wake_task`, wakers will set
+/// the flag, enabling the no-yield fast path.
+///
+/// Returns `true` if the task was woken with a message (`Woken` or
+/// `AlreadyTrue`), `false` on a spurious or deadline wake (the latter is not
+/// possible on this path since no deadline is set, but is included for
+/// type-safety).
+///
+/// # Call-site migration contract
+///
+/// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
+/// function instead of `block_current_on_reply_unless_message`.  The semantic
+/// outcome is identical: the caller resumes when a reply is delivered.
+#[cfg(feature = "sched-v2")]
+pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
+    use core::sync::atomic::AtomicBool;
+
+    // Check if a message was already delivered before we even try to block.
+    {
+        let sched = scheduler_lock();
+        if sched
+            .find(caller)
+            .map(|idx| sched.tasks[idx].pending_msg.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    // Use a stack-allocated AtomicBool as the v2 woken flag.
+    // Track D will set this from wake_task; for now it stays false until
+    // the block side self-reverts (which cannot happen without Track D waking it).
+    let woken = AtomicBool::new(false);
+
+    let outcome = block_current_until(&woken, None);
+
+    // Regardless of the outcome, the caller (call_msg) will call take_message()
+    // to confirm message delivery. We report true for Woken/AlreadyTrue, false
+    // for DeadlineExpired (no deadline set, so this branch is dead code for now).
+    match outcome {
+        BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
+        BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+/// Check whether a task has a pending message (for use by v2 wakers and
+/// condition checks without holding the scheduler lock long-term).
+///
+/// Acquires `SCHEDULER.lock` momentarily.
+#[cfg(feature = "sched-v2")]
+pub fn has_pending_message(id: TaskId) -> bool {
+    let sched = scheduler_lock();
+    sched
+        .find(id)
+        .map(|idx| sched.tasks[idx].pending_msg.is_some())
+        .unwrap_or(false)
+}
+
 /// Permanently mark the current task as dead and switch back to the scheduler.
 pub fn mark_current_dead() -> ! {
     let idx = {
