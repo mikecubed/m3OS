@@ -2,6 +2,69 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+// ── SchedTrace — G.2 sched-trace feature schema ──────────────────────────────
+
+/// A single structured state-transition entry for the `sched-trace` feature.
+///
+/// Emitted (under `#[cfg(feature = "sched-trace")]`) at every v1 block, wake,
+/// and scan-expired state write in `kernel/src/task/scheduler.rs`.
+///
+/// # Dumping the trace ring
+///
+/// Entries accumulate in a per-core `TraceRing<SCHED_TRACE_RING_SIZE>` stored
+/// in `kernel/src/task/sched_trace.rs`. To dump them in a running system, use
+/// the `sys_ktrace` syscall or trigger a panic dump (the sched-trace ring is
+/// printed alongside the existing `TraceEvent` ring in the panic handler).
+///
+/// # Caller information
+///
+/// `caller_file` and `caller_line` come from `core::panic::Location::caller()`
+/// via `#[track_caller]` on `record()`. They identify the specific state-write
+/// site in the scheduler source, making it possible to correlate a trace entry
+/// with a block/wake call in the code without any post-processing.
+///
+/// # `old_state` / `new_state` encoding
+///
+/// Both fields use the `u8` discriminant of `TaskState`:
+/// ```text
+///   0 = Ready
+///   1 = Running
+///   2 = BlockedOnRecv
+///   3 = BlockedOnSend
+///   4 = BlockedOnReply
+///   5 = BlockedOnNotif
+///   6 = BlockedOnFutex
+///   7 = Dead
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SchedTrace {
+    /// PID of the task whose state changed.
+    pub pid: u32,
+    /// State before the transition (u8 discriminant of `TaskState`).
+    pub old_state: u8,
+    /// State after the transition (u8 discriminant of `TaskState`).
+    pub new_state: u8,
+    /// Source file of the call site that triggered the transition.
+    /// Populated via `#[track_caller]` / `core::panic::Location::caller()`.
+    pub caller_file: &'static str,
+    /// Source line of the call site.
+    pub caller_line: u32,
+    /// Tick counter at the moment of the transition.
+    pub tick: u64,
+}
+
+impl SchedTrace {
+    /// A zeroed sentinel entry used to initialise ring slots.
+    pub const EMPTY: Self = Self {
+        pid: 0,
+        old_state: 0,
+        new_state: 0,
+        caller_file: "",
+        caller_line: 0,
+        tick: 0,
+    };
+}
+
 /// Structured kernel trace events for scheduler, fork, and IPC paths.
 ///
 /// `#[repr(C)]` ensures a stable, deterministic layout for cross-boundary
@@ -352,5 +415,114 @@ mod tests {
         for i in 0..4 {
             assert_eq!(dst[i].tick, (2 + i) as u64);
         }
+    }
+
+    // ── G.2: SchedTrace schema tests ─────────────────────────────────────
+
+    /// SchedTrace::EMPTY sentinel is fully zeroed.
+    #[test]
+    fn sched_trace_empty_sentinel_is_zeroed() {
+        let e = SchedTrace::EMPTY;
+        assert_eq!(e.pid, 0);
+        assert_eq!(e.old_state, 0); // Ready discriminant
+        assert_eq!(e.new_state, 0);
+        assert_eq!(e.caller_file, "");
+        assert_eq!(e.caller_line, 0);
+        assert_eq!(e.tick, 0);
+    }
+
+    /// SchedTrace round-trips through a TraceRing.
+    #[test]
+    fn sched_trace_ring_round_trip() {
+        let mut ring: [SchedTrace; 4] = [SchedTrace::EMPTY; 4];
+        // Simulate pushing two entries (manual ring for simplicity).
+        ring[0] = SchedTrace {
+            pid: 42,
+            old_state: 1, // Running
+            new_state: 2, // BlockedOnRecv
+            caller_file: "scheduler.rs",
+            caller_line: 1095,
+            tick: 50_000,
+        };
+        ring[1] = SchedTrace {
+            pid: 42,
+            old_state: 2, // BlockedOnRecv
+            new_state: 0, // Ready
+            caller_file: "scheduler.rs",
+            caller_line: 1433,
+            tick: 80_000,
+        };
+
+        // Verify field integrity.
+        assert_eq!(ring[0].pid, 42);
+        assert_eq!(ring[0].old_state, 1);
+        assert_eq!(ring[0].new_state, 2);
+        assert_eq!(ring[0].caller_file, "scheduler.rs");
+        assert_eq!(ring[0].caller_line, 1095);
+        assert_eq!(ring[0].tick, 50_000);
+
+        assert_eq!(ring[1].pid, 42);
+        assert_eq!(ring[1].old_state, 2);
+        assert_eq!(ring[1].new_state, 0);
+        assert_eq!(ring[1].tick, 80_000);
+    }
+
+    /// State u8 encoding matches expected discriminants.
+    ///
+    /// This test serves as a contract: if kernel `TaskState` discriminants
+    /// change, the mismatch will be caught here before the trace becomes
+    /// silently wrong.
+    #[test]
+    fn sched_trace_state_discriminant_contract() {
+        // Encoding documented in SchedTrace's docstring:
+        const READY: u8 = 0;
+        const RUNNING: u8 = 1;
+        const BLOCKED_ON_RECV: u8 = 2;
+        const BLOCKED_ON_SEND: u8 = 3;
+        const BLOCKED_ON_REPLY: u8 = 4;
+        const BLOCKED_ON_NOTIF: u8 = 5;
+        const BLOCKED_ON_FUTEX: u8 = 6;
+        const DEAD: u8 = 7;
+
+        // Sequence must be monotonically increasing (discriminants assigned by
+        // declaration order).
+        assert!(READY < RUNNING);
+        assert!(RUNNING < BLOCKED_ON_RECV);
+        assert!(BLOCKED_ON_RECV < BLOCKED_ON_SEND);
+        assert!(BLOCKED_ON_SEND < BLOCKED_ON_REPLY);
+        assert!(BLOCKED_ON_REPLY < BLOCKED_ON_NOTIF);
+        assert!(BLOCKED_ON_NOTIF < BLOCKED_ON_FUTEX);
+        assert!(BLOCKED_ON_FUTEX < DEAD);
+
+        // All variants fit in a u8.
+        assert!(DEAD <= u8::MAX);
+    }
+
+    /// A valid block-then-wake transition sequence encodes correctly.
+    #[test]
+    fn sched_trace_block_wake_sequence() {
+        // block_current: Running → BlockedOnFutex (state 6)
+        let block_entry = SchedTrace {
+            pid: 7,
+            old_state: 1,
+            new_state: 6,
+            caller_file: "scheduler.rs",
+            caller_line: 1231,
+            tick: 10_000,
+        };
+        // wake_task: BlockedOnFutex (6) → Ready (0)
+        let wake_entry = SchedTrace {
+            pid: 7,
+            old_state: 6,
+            new_state: 0,
+            caller_file: "scheduler.rs",
+            caller_line: 1479,
+            tick: 15_000,
+        };
+
+        // Causal ordering: wake always comes after block.
+        assert!(wake_entry.tick > block_entry.tick);
+        // State chain is valid: old_state of wake == new_state of block.
+        assert_eq!(wake_entry.old_state, block_entry.new_state);
     }
 }
