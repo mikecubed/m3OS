@@ -573,11 +573,40 @@ impl Scheduler {
         let mut i = 0;
         while i < q.len() {
             let idx = q[i];
-            if idx >= self.tasks.len()
-                || self.tasks[idx].state != TaskState::Ready
-                || self.idle_tasks.contains(&Some(idx))
-                || self.tasks[idx].affinity_mask & core_bit == 0
-            {
+            // Phase 57a follow-up DEBUG: log the SPECIFIC filter reason when
+            // dropping a queue entry — without this, a task that's queued
+            // but never dispatched is invisible (the silent `continue` was
+            // hiding a per-core dispatch regression).  Budgeted in caller
+            // via DEQUEUE_FILTER_LOG_BUDGET to avoid drowning the log.
+            if idx >= self.tasks.len() {
+                log_dequeue_filter_drop(core_id, idx, "idx-out-of-bounds", 0, 0);
+                q.remove(i);
+                continue;
+            }
+            if self.tasks[idx].state != TaskState::Ready {
+                log_dequeue_filter_drop(
+                    core_id,
+                    idx,
+                    "state-not-ready",
+                    self.tasks[idx].pid,
+                    self.tasks[idx].state as u64,
+                );
+                q.remove(i);
+                continue;
+            }
+            if self.idle_tasks.contains(&Some(idx)) {
+                log_dequeue_filter_drop(core_id, idx, "is-idle", self.tasks[idx].pid, 0);
+                q.remove(i);
+                continue;
+            }
+            if self.tasks[idx].affinity_mask & core_bit == 0 {
+                log_dequeue_filter_drop(
+                    core_id,
+                    idx,
+                    "affinity-mismatch",
+                    self.tasks[idx].pid,
+                    self.tasks[idx].affinity_mask,
+                );
                 q.remove(i);
                 continue;
             }
@@ -1043,8 +1072,36 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
+// Phase 57a follow-up: bumped from 4 to 1024 so the per-core dispatch
+// regression (tasks queued on core 1 silently never dispatching after the
+// first wave) is visible in the boot transcript instead of being budgeted
+// out after the first 4 yields.
 static YIELD_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
-    [const { core::sync::atomic::AtomicI32::new(4) }; crate::smp::MAX_CORES];
+    [const { core::sync::atomic::AtomicI32::new(1024) }; crate::smp::MAX_CORES];
+
+// Phase 57a follow-up DEBUG: per-core budget for the dequeue filter-drop
+// trace.  Each filter rejection in `dequeue_local` consumes one slot.
+// Bounded so a permanently-stuck task that the queue scanner repeatedly
+// rejects doesn't drown the log; large enough to surface the *first*
+// time a previously-running task gets filtered out.
+static DEQUEUE_FILTER_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
+    [const { core::sync::atomic::AtomicI32::new(64) }; crate::smp::MAX_CORES];
+
+#[cold]
+fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extra: u64) {
+    let n = DEQUEUE_FILTER_LOG_BUDGET[core_id as usize]
+        .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        log::warn!(
+            "[sched] dequeue-drop core={} idx={} pid={} reason={} extra={:#x}",
+            core_id,
+            idx,
+            pid,
+            reason,
+            extra,
+        );
+    }
+}
 
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
@@ -2290,13 +2347,15 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
 /// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
-    // Phase 57 DEBUG: log the first few scheduler-loop iterations
-    // per core so we can tell whether a "stuck" core is actually
-    // executing the loop at all. Limited to the first 4 wake-ups
-    // so the boot transcript doesn't drown.
-    let mut wake_log_budget: u32 = 4;
-    let mut dispatch_log_budget: u32 = 4;
-    let mut resume_log_budget: u32 = 4;
+    // Phase 57 DEBUG: log scheduler-loop iterations per core so we can
+    // tell whether a "stuck" core is actually executing the loop at all.
+    // Bumped from 4 to 1024 (Phase 57a follow-up) so a per-core dispatch
+    // failure that emerges AFTER the initial 4 events is still visible
+    // in the boot transcript.  Once the per-core dispatch regression is
+    // root-caused, restore the smaller budget.
+    let mut wake_log_budget: u32 = 1024;
+    let mut dispatch_log_budget: u32 = 1024;
+    let mut resume_log_budget: u32 = 1024;
 
     loop {
         let reschedule = per_core_reschedule();

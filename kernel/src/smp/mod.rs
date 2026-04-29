@@ -529,7 +529,7 @@ pub fn init_bsp_per_core() {
         core_id: 0,
         apic_id: bsp_apic_id,
         is_online: AtomicBool::new(true),
-        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(1024),
         tss_ptr: core::ptr::null_mut(), // BSP uses existing gdt.rs TSS
         gdt_ptr: core::ptr::null(),     // BSP uses existing gdt.rs GDT
         gdt_code: SegmentSelector(0),
@@ -643,7 +643,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         core_id,
         apic_id,
         is_online: AtomicBool::new(false),
-        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(1024),
         tss_ptr: tss,
         gdt_ptr: gdt,
         gdt_code,
