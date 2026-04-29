@@ -1074,6 +1074,162 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
     unsafe { *PENDING_SAVED_RSP[core_id].get() }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57b C.2 — `current_preempt_count_ptr` switch-out retarget
+// ---------------------------------------------------------------------------
+//
+// Every `IrqSafeMutex` guard (Phase 57b F.1, future wave) must decrement the
+// **same pointee** it incremented.  The scheduler dispatches between two
+// disjoint contexts:
+//
+//   1. **Scheduler context** (this `run` loop's stack) — between
+//      `switch_context` returning and the next `switch_context` call.  Here
+//      `IrqSafeMutex` acquire/release pairs (e.g. inside `pick_next` or
+//      `drain_dead`) must charge a single per-core pointee — the
+//      [`crate::smp::SCHED_PREEMPT_COUNT_DUMMY`] slot.
+//   2. **Task context** — anywhere the chosen task executes after
+//      `switch_context` jumps in.  Acquire/release pairs there must charge
+//      that task's `Task::preempt_count` (wired in C.3).
+//
+// C.2 covers the switch-out retarget: immediately after `switch_context`
+// returns onto the scheduler stack, and **before** any new lock is acquired
+// on that stack, the pointer is restored to the per-core dummy.
+
+/// Phase 57b C.2 — switch-out retarget helper.
+///
+/// Stores `&SCHED_PREEMPT_COUNT_DUMMY[core_id]` into
+/// [`crate::smp::PerCoreData::current_preempt_count_ptr`] with `Release`
+/// ordering, inside an interrupt-masked window.  Called from the dispatch
+/// path immediately after `switch_context` returns onto the scheduler stack
+/// and before any new `IrqSafeMutex` is acquired.
+///
+/// `cli`s itself rather than relying on the surrounding state: `switch_context`
+/// `popf`s the scheduler's saved RFLAGS on resume (typically IF=1), so the
+/// switch-out path cannot assume IRQs are masked.  IF is restored on exit if
+/// it was enabled on entry.
+///
+/// Lock-free by mandate: no `IrqSafeMutex::lock`, no `scheduler_lock()`.
+/// Phase 57b F.1's `IrqSafeMutex::lock` will call `preempt_disable()`
+/// (which reads this pointer); if this helper acquired a lock, the wiring
+/// would recurse.
+#[inline]
+fn retarget_preempt_count_to_dummy(core_id: u8) {
+    let saved_if = interrupts::are_enabled();
+    interrupts::disable();
+    let dummy_ptr = &crate::smp::SCHED_PREEMPT_COUNT_DUMMY[core_id as usize]
+        as *const core::sync::atomic::AtomicI32
+        as *mut core::sync::atomic::AtomicI32;
+    let pc = crate::smp::per_core();
+    let _old = pc
+        .current_preempt_count_ptr
+        .swap(dummy_ptr, core::sync::atomic::Ordering::Release);
+    #[cfg(feature = "sched-trace")]
+    record_preempt_ptr_update(_old, dummy_ptr, core_id, None, PreemptPtrPhase::SwitchOut);
+    if saved_if {
+        interrupts::enable();
+    }
+}
+
+/// Phase 57b C.3 — switch-in retarget helper.
+///
+/// Stores the chosen task's `&Task::preempt_count` into
+/// [`crate::smp::PerCoreData::current_preempt_count_ptr`] with `Release`
+/// ordering and **leaves IRQs disabled** on return.  The caller must invoke
+/// `switch_context` while IRQs remain disabled; `switch_context` will
+/// `popf` the chosen task's saved RFLAGS and so restore that task's own IF
+/// state.  Between the retarget and the chosen task's first instruction,
+/// IF must never be 1 — otherwise an IRQ-context `preempt_disable` could
+/// observe the new pointer before the task's own context is in place.
+///
+/// Any IRQ that fires *before* this retarget (i.e. while the pointer
+/// still targets the per-core dummy after the prior switch-out) is safe
+/// by construction: its `preempt_disable` / `preempt_enable` pair both
+/// hit the dummy, leaving the dummy at zero.
+///
+/// # Safety
+///
+/// `task_preempt_count` must point at a stable [`AtomicI32`] that lives
+/// for at least as long as the chosen task is on-CPU.  Track B's
+/// `Vec<Box<Task>>` storage (in [`Scheduler::tasks`]) provides that
+/// guarantee: the boxed task lives as long as its slot is occupied.
+///
+/// Lock-free by mandate: no `IrqSafeMutex::lock`, no `scheduler_lock()`.
+#[inline]
+fn retarget_preempt_count_to_task(
+    _core_id: u8,
+    task_preempt_count: *const core::sync::atomic::AtomicI32,
+    _task_idx: usize,
+) {
+    interrupts::disable();
+    let pc = crate::smp::per_core();
+    let task_ptr = task_preempt_count as *mut core::sync::atomic::AtomicI32;
+    let _old = pc
+        .current_preempt_count_ptr
+        .swap(task_ptr, core::sync::atomic::Ordering::Release);
+    #[cfg(feature = "sched-trace")]
+    record_preempt_ptr_update(
+        _old,
+        task_ptr,
+        _core_id,
+        Some(_task_idx),
+        PreemptPtrPhase::SwitchIn,
+    );
+}
+
+/// Phase 57b C.5 — `current_preempt_count_ptr` retarget tracepoint.
+///
+/// Distinguishes switch-out from switch-in retargets in the
+/// `sched-trace` ring.  Encoded as synthetic `old_state` / `new_state`
+/// values so the existing per-core `SchedTrace` schema does not need a
+/// breaking change.
+#[cfg(feature = "sched-trace")]
+#[derive(Clone, Copy)]
+enum PreemptPtrPhase {
+    SwitchOut,
+    SwitchIn,
+}
+
+/// Phase 57b C.5 — emit a `preempt_ptr_update` record into the
+/// `sched-trace` ring.
+///
+/// Compiled in only under `cfg(feature = "sched-trace")` so default
+/// builds carry zero overhead.  The existing
+/// [`kernel_core::trace_ring::SchedTrace`] schema is fixed
+/// (`pid` / `old_state` / `new_state` / `caller_file` / `caller_line` /
+/// `tick`); rather than restructure that struct, this helper encodes the
+/// retarget event by:
+///
+/// - `pid` — task index when known (switch-in only); switch-out passes
+///   `0xFFFF_FFFF` to mark "no live task" since the outgoing task is
+///   already losing CPU at this point (the preceding `Dispatch`
+///   `TraceEvent` correlates the switch-out with the prior task).
+/// - `old_state` / `new_state` — synthetic phase codes:
+///   - `0xF0` = switch-out retarget (pointer → dummy)
+///   - `0xF1` = switch-in retarget (pointer → `Task::preempt_count`)
+/// - `caller_file` / `caller_line` — auto-populated via
+///   `#[track_caller]` to identify the call site in `scheduler.rs`.
+///
+/// The raw old/new pointer values are intentionally not encoded.  In
+/// practice the (`Dispatch`, `SwitchOut`) `TraceEvent` pair plus the
+/// retarget phase code is enough to reconstruct the per-core pointer
+/// history and identify any acquire/release that straddled a retarget.
+#[cfg(feature = "sched-trace")]
+#[track_caller]
+fn record_preempt_ptr_update(
+    _old_ptr: *mut core::sync::atomic::AtomicI32,
+    _new_ptr: *mut core::sync::atomic::AtomicI32,
+    _core_id: u8,
+    task_idx: Option<usize>,
+    phase: PreemptPtrPhase,
+) {
+    let phase_code: u8 = match phase {
+        PreemptPtrPhase::SwitchOut => 0xF0,
+        PreemptPtrPhase::SwitchIn => 0xF1,
+    };
+    let pid_field = task_idx.map(|i| i as u32).unwrap_or(u32::MAX);
+    crate::task::sched_trace::record(pid_field, phase_code, phase_code);
+}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
@@ -2695,22 +2851,32 @@ pub fn run() -> ! {
         }
 
         // F.1: Validate saved_rsp falls within the task's kernel stack.
-        {
+        // Phase 57b C.3: while we hold scheduler_lock, also capture the
+        // pointer to the chosen task's `preempt_count`.  Track B's
+        // `Vec<Box<Task>>` storage guarantees this address remains valid
+        // for the task's lifetime, so it is safe to use after the lock is
+        // dropped.  The retarget itself happens further below — after every
+        // scheduler-context lock guard has been released — so that the
+        // pointer transition does not straddle a lock acquire/release.
+        let task_preempt_count_ptr: *const core::sync::atomic::AtomicI32 = {
             let sched = scheduler_lock();
-            if let Some(task) = sched.get_task(_task_idx)
-                && let Some((base, top)) = task.stack_bounds()
-            {
-                debug_assert!(
-                    task_rsp >= base && task_rsp < top,
-                    "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
-                    _task_idx,
-                    task_rsp,
-                    base,
-                    top,
-                    core_id
-                );
+            if let Some(task) = sched.get_task(_task_idx) {
+                if let Some((base, top)) = task.stack_bounds() {
+                    debug_assert!(
+                        task_rsp >= base && task_rsp < top,
+                        "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
+                        _task_idx,
+                        task_rsp,
+                        base,
+                        top,
+                        core_id
+                    );
+                }
+                &task.preempt_count as *const core::sync::atomic::AtomicI32
+            } else {
+                core::ptr::null()
             }
-        }
+        };
 
         // Phase 57 DEBUG: log per-core dispatches just before
         // switch_context. Pairs with `resume` log below to detect a
@@ -2725,10 +2891,48 @@ pub fn run() -> ! {
             dispatch_log_budget -= 1;
         }
 
+        // Phase 57b C.3 — switch-in retarget.
+        //
+        // After every scheduler-context `IrqSafeMutex` guard has dropped
+        // and immediately before the `switch_context` call, retarget
+        // `current_preempt_count_ptr` to the chosen task's
+        // `Task::preempt_count` and leave IRQs disabled.  `switch_context`
+        // will `popf` the chosen task's saved RFLAGS and so restore that
+        // task's own IF state — between the retarget and the chosen
+        // task's first instruction IF must never become 1.
+        //
+        // Any IRQ that fires *before* this retarget (i.e. while the
+        // pointer still targets the per-core dummy after the prior
+        // switch-out) is safe by construction: its `preempt_disable` /
+        // `preempt_enable` pair both hit the dummy.
+        if !task_preempt_count_ptr.is_null() {
+            retarget_preempt_count_to_task(core_id, task_preempt_count_ptr, _task_idx);
+        } else {
+            // Belt-and-braces: if the task vanished between pick_next and
+            // here (should be impossible — we hold `set_current_task_idx`),
+            // mask IRQs anyway so `switch_context` jumps in with IF
+            // observably whatever the chosen task's saved RFLAGS dictates.
+            interrupts::disable();
+        }
+
         // Switch to the task.
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
+
+        // Phase 57b C.2 — switch-out retarget.
+        //
+        // `switch_context` has just returned onto this scheduler stack.  It
+        // `popf`d the scheduler's saved RFLAGS, typically restoring IF=1 — so
+        // we cannot assume IRQs are masked here.  Retarget back to the
+        // per-core dummy *before* any scheduler-context `IrqSafeMutex::lock`
+        // call (the next one is inside the `pending >= 0` block below) so
+        // that scheduler-context lock acquire/release pairs charge the same
+        // pointee.
+        //
+        // C.3 (next commit) will wire the matching switch-in retarget that
+        // pivots the pointer to the chosen task's `Task::preempt_count`.
+        retarget_preempt_count_to_dummy(core_id);
 
         // --- Scheduler resumes here after the task yields back ---
         if resume_log_budget > 0 {
