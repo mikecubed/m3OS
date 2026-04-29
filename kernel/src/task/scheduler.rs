@@ -2011,6 +2011,230 @@ fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static st
     None
 }
 
+// ---------------------------------------------------------------------------
+// D.1 + D.2 — v2 wake primitive (sched-v2 feature gate)
+// ---------------------------------------------------------------------------
+//
+// `wake_task_v2` is the CAS-style wake primitive for the v2 scheduler
+// protocol.  It replaces the v1 `wake_task` incrementally, gated behind
+// `cfg(feature = "sched-v2")`.
+//
+// During the C–F migration window, `wake_task_v2` performs a **dual write**:
+// it mutates `TaskBlockState` (under `pi_lock`) AND the legacy `Task::state`
+// / `Task::wake_deadline` fields (under `SCHEDULER.lock`).  Track E removes
+// the legacy fields once all call sites are migrated.
+//
+// # Linux citation
+//
+// The implementation mirrors Linux's `try_to_wake_up` in
+// `kernel/sched/core.c`:
+// - CAS `p->__state` from TASK_INTERRUPTIBLE/UNINTERRUPTIBLE to TASK_RUNNING
+//   under `p->pi_lock`.
+// - `smp_cond_load_acquire`-style spin-wait on `p->on_cpu == 0` before
+//   `ttwu_queue` (enqueue to the task's home run queue).
+// - `ttwu_queue` sends a reschedule IPI when the task is on a different CPU.
+//
+// See also: m3OS handoff 2026-04-25,
+// `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side steps
+// 1–5).
+
+/// Outcome of a [`wake_task_v2`] call.
+#[cfg(feature = "sched-v2")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeOutcome {
+    /// CAS `Blocked* → Ready` succeeded; the task has been enqueued on its
+    /// assigned core's run queue.  A reschedule IPI was sent if the target
+    /// core differs from the caller's core.
+    Woken,
+    /// CAS failed because the task's canonical state was not `Blocked*`
+    /// (it was `Ready`, `Running`, or `Dead`).  The caller may treat this
+    /// as a silent no-op — the task will recheck its condition on resume.
+    AlreadyAwake,
+}
+
+/// v2 wake primitive — CAS `Blocked* → Ready` under `pi_lock`.
+///
+/// # Protocol (five steps, mirroring Linux `try_to_wake_up`)
+///
+/// 1. **Find the task index** from the `TaskId` via `SCHEDULER.lock`; then
+///    release `SCHEDULER.lock` to preserve lock-ordering (pi_lock OUTER).
+/// 2. **Acquire `pi_lock`**; CAS `state` from any `Blocked*` to `Ready`;
+///    clear `wake_deadline` (`ACTIVE_WAKE_DEADLINES--` if `Some`); release
+///    `pi_lock`.  Returns `AlreadyAwake` if the CAS fails.
+/// 3. **Mirror to v1 fields** under `SCHEDULER.lock` (shadow-lock dual write,
+///    required until Track E.3 removes `Task::state` / `Task::wake_deadline`).
+/// 4. **Spin-wait** on `Task::on_cpu == false` before enqueuing (Linux
+///    `p->on_cpu` `smp_cond_load_acquire` pattern, `kernel/sched/core.c`,
+///    `try_to_wake_up`).  This replaces v1's `PENDING_SWITCH_OUT[core]`
+///    RSP-publication guard.
+/// 5. **Enqueue** to `assigned_core` run queue via [`enqueue_to_core`].
+///    If the assigned core differs from the caller's core, [`enqueue_to_core`]
+///    already sends a reschedule IPI (`IPI_RESCHEDULE` vector, `smp::ipi`),
+///    satisfying the D.2 cross-core IPI requirement.
+///
+/// # Lock ordering
+///
+/// `pi_lock` is OUTER; `SCHEDULER.lock` is INNER (Linux's `p->pi_lock` →
+/// `rq->lock` pattern).  Step 1 releases `SCHEDULER.lock` before step 2
+/// acquires `pi_lock`.  Step 3 re-acquires `SCHEDULER.lock` after
+/// `pi_lock` is released.  The two locks are NEVER held simultaneously.
+///
+/// The task-slot pointer obtained in step 1 remains valid throughout steps
+/// 2–5 because dead-slot recycling only runs under `SCHEDULER.lock`; no
+/// task can be removed from `tasks[idx]` while we are executing outside
+/// of that lock.
+///
+/// # Constraints
+///
+/// - Does NOT touch `wake_after_switch` or read `switching_out` (v1 fields).
+/// - Safe to call from interrupt context (all locks are `IrqSafeMutex` or
+///   `spin::Mutex`).
+///
+/// # References
+///
+/// - Linux `try_to_wake_up`, `kernel/sched/core.c` — `p->on_cpu`
+///   `smp_cond_load_acquire` spin-wait before `ttwu_queue`; cross-core
+///   IPI via `smp_send_reschedule` inside `ttwu_queue`.
+/// - m3OS handoff 2026-04-25:
+///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
+///   steps 1–5).
+#[cfg(feature = "sched-v2")]
+pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
+    // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
+    //
+    // We need the raw address of `tasks[idx].pi_lock` so we can acquire it
+    // outside of `SCHEDULER.lock` (lock-ordering: pi_lock OUTER).  The Vec
+    // never shrinks — slots only go Dead and are recycled, but the `Task`
+    // object at position `idx` is stable in memory for the task's lifetime.
+    // Dead-slot recycling (which writes a new task into the slot) only runs
+    // under `SCHEDULER.lock`; since we drop `SCHEDULER.lock` before the
+    // pi_lock CAS and re-acquire it only in step 3, no recycling can happen
+    // between steps 1 and 5.
+    let (idx, pi_lock_ptr, on_cpu_ptr, assigned_core) = {
+        let sched = scheduler_lock();
+        let idx = match sched.find(id) {
+            Some(i) => i,
+            None => return WakeOutcome::AlreadyAwake,
+        };
+        // Capture stable pointers to the atomic fields — safe because the
+        // Task at `tasks[idx]` is not moved or freed between now and step 5
+        // (see lock-ordering invariant above).
+        let pi_lock_ptr: *const spin::Mutex<super::TaskBlockState> =
+            &raw const sched.tasks[idx].pi_lock;
+        let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
+        let assigned = sched.tasks[idx].assigned_core;
+        // SCHEDULER.lock is dropped at end of this block.
+        (idx, pi_lock_ptr, on_cpu_ptr, assigned)
+    };
+    // SCHEDULER.lock released.  Now pi_lock_ptr and on_cpu_ptr are raw
+    // pointers into the stable Task struct.
+
+    // ── Step 2: CAS Blocked* → Ready under pi_lock ───────────────────────────
+    //
+    // The spin::Mutex acquire barrier on pi_lock pairs with the Release on
+    // the block side's pi_lock store (step 1 of `block_current_until`),
+    // eliminating the lost-wake window (Linux `smp_store_mb` /
+    // `set_current_state` ↔ `try_to_wake_up` acquire pair).
+    //
+    // SAFETY: `pi_lock_ptr` is a valid, aligned pointer to a
+    // `spin::Mutex<TaskBlockState>` embedded in a `Task` that lives for the
+    // duration of this call (see step 1 comment).  We are NOT holding
+    // SCHEDULER.lock here, satisfying the lock-ordering invariant.
+    let prev_state_u8 = {
+        let pi_lock_ref = unsafe { &*pi_lock_ptr };
+        let mut guard = pi_lock_ref.lock();
+        let prev = guard.state as u8;
+        if !matches!(
+            guard.state,
+            TaskState::BlockedOnRecv
+                | TaskState::BlockedOnSend
+                | TaskState::BlockedOnReply
+                | TaskState::BlockedOnNotif
+                | TaskState::BlockedOnFutex
+        ) {
+            // CAS failed — task is Ready, Running, or Dead.
+            return WakeOutcome::AlreadyAwake;
+        }
+        guard.state = TaskState::Ready;
+        if guard.wake_deadline.take().is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        }
+        prev
+        // pi_lock released here (guard dropped).
+    };
+
+    // ── Step 3: Mirror to v1 fields under SCHEDULER.lock ─────────────────────
+    //
+    // The v1 dispatch loop and `pick_next` still read `Task::state` and
+    // `Task::wake_deadline` directly until Track E.3 removes those fields.
+    // Dual-write (shadow-lock pattern, B.2): same transition written to both
+    // canonical (pi_lock) and legacy (Task::state) fields.
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    {
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            // v1 shadow-lock dual write.
+            sched.tasks[idx].state = TaskState::Ready;
+            sched.tasks[idx].last_ready_tick = now;
+            sched.tasks[idx].blocked_since_tick = 0;
+            // Sync the legacy wake_deadline field (already cleared in pi_lock
+            // CAS above; clearing here avoids a stale `scan_expired` hit).
+            // Counter was already decremented in step 2; do NOT decrement again.
+            sched.tasks[idx].wake_deadline = None;
+            #[cfg(feature = "sched-trace")]
+            crate::task::sched_trace::record(
+                sched.tasks[idx].pid,
+                prev_state_u8,
+                TaskState::Ready as u8,
+            );
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
+                task_idx: idx as u32,
+                state_before: prev_state_u8,
+                core: sched.tasks[idx].assigned_core,
+            });
+        }
+        // SCHEDULER.lock released here.
+    }
+
+    // ── Step 4: Spin-wait on Task::on_cpu == false ────────────────────────────
+    //
+    // The arch-level switch-out epilogue clears `on_cpu` only after
+    // `saved_rsp` is durably written to the task struct (with Release
+    // ordering, Track E.1).  Spinning here with Acquire ordering guarantees
+    // that our subsequent `enqueue_to_core` observes the published `saved_rsp`
+    // so the dispatch path does not jump to a stale RSP.
+    //
+    // Linux analog: `smp_cond_load_acquire(&p->on_cpu, !VAL)` in
+    // `try_to_wake_up` (`kernel/sched/core.c`).
+    //
+    // SAFETY: `on_cpu_ptr` is a valid pointer to an `AtomicBool` in the
+    // same stable Task struct as `pi_lock_ptr` (step 1 invariant).
+    {
+        let on_cpu_ref = unsafe { &*on_cpu_ptr };
+        while on_cpu_ref.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    // ── Step 5: Enqueue to assigned_core run queue + reschedule IPI ──────────
+    //
+    // D.2: `enqueue_to_core` already sends a reschedule IPI when the target
+    // core differs from the caller's core (Phase 54, ~line 780 in this file):
+    //
+    //     if current != core_id {
+    //         smp::ipi::send_ipi_to_core(core_id, smp::ipi::IPI_RESCHEDULE);
+    //     }
+    //
+    // No additional IPI logic is required here — the existing mechanism is
+    // reused exactly as the D.2 acceptance criterion specifies.
+    //
+    // Linux analog: `ttwu_queue` calls `resched_curr` (same-core) or
+    // `smp_send_reschedule` / `send_call_function_single_ipi` (cross-core).
+    enqueue_to_core(assigned_core, idx);
+
+    WakeOutcome::Woken
+}
+
 /// Store a [`Message`] in a task's pending slot.
 pub fn deliver_message(id: TaskId, msg: Message) {
     let mut sched = scheduler_lock();
