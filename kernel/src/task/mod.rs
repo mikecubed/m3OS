@@ -167,9 +167,7 @@ pub enum TaskState {
 /// `SCHEDULER.lock`; the reverse is forbidden and panics in debug builds
 /// (see [`Task::with_block_state`]).
 pub struct TaskBlockState {
-    /// Canonical block state.  Mirrors the v1 `Task::state` field; will become
-    /// the sole arbiter of "is this task blocked?" once Track F migrates all
-    /// callers and Track E.3 deletes `Task::switching_out`.
+    /// Canonical block state.  Mirrors the v1 `Task::state` field.
     ///
     /// Invariant: only mutated while `pi_lock` is held.
     pub state: TaskState,
@@ -241,29 +239,17 @@ pub struct Task {
     /// True while the task is mid-context-switch and its `saved_rsp` may not
     /// yet be published.
     ///
-    /// Set under `SCHEDULER.lock` alongside `switching_out = true`, before
-    /// `switch_context`. Cleared by the dispatch handler immediately after
-    /// `saved_rsp` is durably written to this struct (arch-level switch-out
-    /// epilogue, around `scheduler.rs:2279`).
+    /// Set before `switch_context` (in the block/yield/dead path). Cleared by
+    /// the dispatch handler immediately after `saved_rsp` is durably written
+    /// to this struct (arch-level switch-out epilogue).
     ///
-    /// Replaces the RSP-publication aspect of v1's `PENDING_SWITCH_OUT[core]`
-    /// (Linux `p->on_cpu` `smp_cond_load_acquire` pattern in
-    /// `try_to_wake_up`). D.1's wake-side spin-wait reads this flag with
-    /// `Acquire` ordering; the epilogue clear uses `Release`. This
-    /// Release/Acquire pair guarantees that a waker observing
-    /// `on_cpu == false` is guaranteed to see the published `saved_rsp`.
-    ///
-    /// Track E.3 deletes `switching_out` once all v1 call sites are migrated
-    /// (Track F). During the F.1–F.6 migration window, both fields are set
-    /// and cleared together so `pick_next`'s dual guard (`!switching_out &&
-    /// !on_cpu.load(Acquire)`) agrees with both paths.
+    /// Replaces v1's `PENDING_SWITCH_OUT[core]` RSP-publication guard
+    /// (Linux `p->on_cpu` `smp_cond_load_acquire` pattern, `try_to_wake_up`).
+    /// The wake-side spin-wait (`wake_task_v2`) reads this flag with `Acquire`
+    /// ordering; the epilogue clear uses `Release`, guaranteeing a waker
+    /// observing `on_cpu == false` sees the published `saved_rsp`.
     pub on_cpu: core::sync::atomic::AtomicBool,
-    /// True while the task is returning to the scheduler and its kernel stack
-    /// pointer has not been safely published yet.
-    pub switching_out: bool,
-    /// Set by a wakeup that arrives while `switching_out` is true so the
-    /// scheduler can enqueue the task after `switch_context` completes.
-    pub wake_after_switch: bool,
+
     /// Set once per-task IPC teardown has run so deferred dead-task cleanup
     /// can avoid double-cleaning the same task.
     pub ipc_cleaned: bool,
@@ -279,22 +265,15 @@ pub struct Task {
     fork_ctx: Option<crate::process::ForkChildCtx>,
     /// Optional tick deadline at which a `Blocked*` task should be force-woken.
     ///
-    /// `Some(deadline)` when set by `block_current_unless_woken_until`. The
-    /// scheduler's dispatch path (`pick_next`'s caller) scans for blocked
-    /// tasks whose `wake_deadline` is in the past and transitions them to
-    /// `Ready`. `None` for tasks that have no timeout, which is the default.
-    ///
-    /// This is the safe replacement for a timer-ISR wake: the expiry check
-    /// runs inside the scheduler dispatch loop (already holding
-    /// `SCHEDULER.lock`), not from the timer ISR, so there is no same-core
-    /// re-entrance hazard.
+    /// `Some(deadline)` when set by `block_current_until` with a deadline.
+    /// The scheduler's dispatch path scans blocked tasks whose `wake_deadline`
+    /// is in the past and transitions them to `Ready`. `None` means no timeout.
     pub wake_deadline: Option<u64>,
     /// Tick at which this task most recently entered a `Blocked*` state.
     ///
-    /// Set by `block_current` (and its variants) immediately before writing
-    /// the new `Blocked*` state. Reset to 0 when the task transitions back to
-    /// `Ready` via `wake_task` or `scan_expired_wake_deadlines`. Used by the
-    /// G.1 stuck-task watchdog to compute how long a task has been blocked.
+    /// Set by `block_current_until` before yielding.
+    /// Reset to 0 when the task transitions back to `Ready`.
+    /// Used by the G.1 stuck-task watchdog to compute how long a task has been blocked.
     pub blocked_since_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
@@ -351,8 +330,6 @@ impl Task {
             last_migrated_tick: 0,
             last_ready_tick: 0,
             on_cpu: core::sync::atomic::AtomicBool::new(false),
-            switching_out: false,
-            wake_after_switch: false,
             ipc_cleaned: false,
             group_exit_pending: false,
             user_return: None,
@@ -539,22 +516,22 @@ mod tests {
         assert!(!flag.load(Ordering::Acquire));
     }
 
-    /// Verify pick_next dual-guard semantics: a task with `on_cpu == true`
-    /// must be excluded from dispatch even if `switching_out` already covers it.
+    /// Verify pick_next on_cpu guard: a task with `on_cpu == true` must be
+    /// excluded from dispatch until the switch-out epilogue clears it.
     #[test_case]
-    fn on_cpu_and_switching_out_dual_guard() {
+    fn on_cpu_guard_excludes_switching_task() {
         let on_cpu = core::sync::atomic::AtomicBool::new(false);
 
-        // Neither flag set → eligible for dispatch.
+        // Initially false → task is eligible for dispatch.
         let eligible = !on_cpu.load(Ordering::Acquire);
         assert!(eligible);
 
-        // on_cpu set → ineligible (dual guard).
+        // on_cpu set (mid switch-out) → ineligible.
         on_cpu.store(true, Ordering::Release);
         let eligible = !on_cpu.load(Ordering::Acquire);
         assert!(!eligible);
 
-        // on_cpu cleared → eligible again.
+        // Epilogue clears on_cpu → eligible again.
         on_cpu.store(false, Ordering::Release);
         let eligible = !on_cpu.load(Ordering::Acquire);
         assert!(eligible);
