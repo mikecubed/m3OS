@@ -150,6 +150,38 @@ pub enum TaskState {
 }
 
 // ---------------------------------------------------------------------------
+// TaskBlockState (Phase 57a B.1)
+// ---------------------------------------------------------------------------
+
+/// State protected by [`Task::pi_lock`].
+///
+/// All mutations to these fields go through [`Task::with_block_state`] (B.4).
+/// Readers outside the `pi_lock` critical section MUST NOT inspect these
+/// fields directly — Tracks C/D enforce this contract by routing every
+/// read through the helper.
+///
+/// # Lock-ordering invariant
+///
+/// `pi_lock` is OUTER, `SCHEDULER.lock` is INNER (Linux's `p->pi_lock` →
+/// `rq->lock` pattern).  A code path may hold `pi_lock` while acquiring
+/// `SCHEDULER.lock`; the reverse is forbidden and panics in debug builds
+/// (see [`Task::with_block_state`]).
+pub struct TaskBlockState {
+    /// Canonical block state.  Mirrors the v1 `Task::state` field; will become
+    /// the sole arbiter of "is this task blocked?" once Track F migrates all
+    /// callers and Track E.3 deletes `Task::switching_out`.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub state: TaskState,
+
+    /// Absolute tick deadline at which `scan_expired_wake_deadlines` will
+    /// force-wake the task to `Ready`.  `None` for indefinite-timeout blocks.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub wake_deadline: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // Task structure
 // ---------------------------------------------------------------------------
 
