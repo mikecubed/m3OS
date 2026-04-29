@@ -51,36 +51,62 @@ Replace the conditional `wake_task` (which branches on `switching_out`) with a C
 
 1. Acquire per-task spinlock.
 2. If `state ∈ {BlockedOnRecv, BlockedOnSend, BlockedOnReply, BlockedOnNotif, BlockedOnFutex}`, set `state = Ready` and clear `wake_deadline`. Otherwise no-op (silent drop, mirroring Linux semantics).
-3. Release per-task lock; acquire scheduler lock; enqueue the task on its home core; if home core ≠ current core, send a reschedule IPI.
+3. Release per-task lock; acquire scheduler lock; if the target is already in a run queue, no-op (idempotent against scheduler-driven re-runs); else if `target.on_cpu == true`, spin-wait (`smp_cond_load_acquire`-style) until it becomes false (the outgoing context's `saved_rsp` must be durably published before another core can dispatch it); then enqueue on the home core and, if home core ≠ current core, send a reschedule IPI.
 
-A wake to a Running or already-Ready task is a no-op. Spurious wakes become harmless dead-letters automatically.
+A wake to a Running or already-Ready task is a no-op. Spurious wakes become harmless dead-letters automatically. The `on_cpu` spin-wait replaces the v1 `PENDING_SWITCH_OUT[core]` RSP-publication marker (see "Dispatch switch-out handler simplification and `on_cpu` marker" below).
 
-### Per-task spinlock (`pi_lock`)
+### Per-task spinlock (`pi_lock`) and state ownership model
 
-Each `Task` gains a `Spinlock<TaskBlockState>` named `pi_lock`. Held only for the state-transition fast path. Strict lock-ordering rule, asserted in debug builds: `pi_lock` is the innermost lock; it is never acquired while `SCHEDULER.lock()` is held.
+Each `Task` gains a `Spinlock<TaskBlockState>` named `pi_lock` that guards the *canonical* block state. The v2 design splits what v1 calls `task.state` into two distinct concepts:
+
+- **Canonical block state** (`TaskBlockState.state`, `TaskBlockState.wake_deadline`) — guarded by `pi_lock`. Source of truth for "is this task logically blocked, and on what deadline".
+- **Runnable / dispatchable state** (run-queue membership, `Task::on_cpu`) — guarded by `SCHEDULER.lock`. Source of truth for "should the scheduler dispatch this task" and "is the task currently saving context on a CPU".
+
+This split is the SOLID Single-Responsibility decomposition that makes the lock ordering work: the scheduler-side reads (`pick_next`, dispatch, cleanup, the deadline scan) consult run-queue membership and `on_cpu`, never `pi_lock`-protected fields. The wake / block primitives are responsible for keeping the two views consistent.
+
+**Lock-ordering rule (v2).** `pi_lock` is *outer*; `SCHEDULER.lock()` is *inner*. A code path may hold `pi_lock` while acquiring `SCHEDULER.lock`; the reverse — taking `pi_lock` while `SCHEDULER.lock` is already held — is forbidden. A debug assertion fires on violation.
+
+This matches Linux's `p->pi_lock` (outer) → `rq->lock` (inner) pattern, adapted to a single global scheduler lock.
 
 ### Wake deadline tracking simplification
 
 `ACTIVE_WAKE_DEADLINES` becomes a debug-only counter; the scan path iterates the task table directly under the scheduler lock and uses the new wake primitive (CAS) to transition expired tasks. No batch-enqueue path that bypasses the CAS, no `wake_after_switch=true` set during the scan.
 
-### Dispatch switch-out handler simplification
+### Dispatch switch-out handler simplification and `on_cpu` marker
 
-Delete `PENDING_SWITCH_OUT[core]`. Delete `wake_after_switch` consumption. The handler does timeslice accounting and run-queue manipulation only — no state-flag mutation.
+`PENDING_SWITCH_OUT[core]` in v1 is *dual-purpose*: it is both the deferred-wake hand-off (the wake-side concern this phase removes) *and* an RSP-publication marker (the dispatch-side concern: it signals that `switch_context` is still saving the outgoing task's stack pointer; see `kernel/src/task/scheduler.rs:880-881` doc comment, `:954-966` set sites, and the `pick_next` consumers at `:351-352, :371-372, :2098`). The wake-deferral semantics are deleted in v2; the RSP-publication semantic is preserved as a renamed, single-purpose field — `Task::on_cpu: AtomicBool` — that the v2 wake primitive checks before allowing cross-core enqueue.
+
+Flow:
+
+1. **Block-side.** Under `pi_lock`, write `state = Blocked*`. Release `pi_lock`. Set `on_cpu = true` (Release ordering). Call `switch_context` (saves RSP into `Task::saved_rsp`). The arch-level switch-out epilogue clears `on_cpu = false` (Release) *after* `saved_rsp` is durably published.
+2. **Wake-side.** Under `pi_lock`, CAS `state` to `Ready`. Release `pi_lock`. Take `SCHEDULER.lock`. If the target task is already in a run queue, no-op. Else if `on_cpu == true`, spin-wait (`smp_cond_load_acquire`-style) on `on_cpu` becoming false. Then enqueue + IPI.
+
+This mirrors Linux's `try_to_wake_up` behaviour with `p->on_cpu`: a wake on a task that has not yet finished publishing its saved RSP must wait for that publication, or the dispatched task will resume from a stale RSP — the same hazard `pick_next` currently guards against with the `!switching_out && saved_rsp != 0` check.
+
+`wake_after_switch` and the wake-deferral semantics of `PENDING_SWITCH_OUT[core]` are deleted entirely. The RSP-publication aspect is replaced by `Task::on_cpu` with a `smp_cond_load_acquire` pattern on the wake side. The v1 `pick_next` guards on `!switching_out && saved_rsp != 0` become guards on `!on_cpu && saved_rsp != 0` — same hazard, single-purpose field.
+
+The dispatch handler itself reduces to timeslice accounting and run-queue manipulation; it no longer mutates state-flags.
 
 ### Affected call sites — full migration
 
-- IPC: `sys_ipc_send`, `sys_ipc_recv`, `sys_ipc_call`, `sys_ipc_reply_recv`.
-- Notifications: `sys_notif_wait`, `sys_notif_wait_timeout`.
-- Futex: `sys_futex_wait`, `sys_futex_wait_until`, `sys_futex_wake`.
-- Sleep: `sys_nanosleep` ≥ 1 ms branch (the < 1 ms branch retains its TSC busy-spin since the cost of context switch exceeds the sleep).
-- Internal kernel waits: `serial_stdin_feeder_task` (replaces `enable_and_hlt` halt-loop with a notification-based wait).
+- **IPC syscalls.** `sys_ipc_send`, `sys_ipc_recv`, `sys_ipc_call`, `sys_ipc_reply_recv`.
+- **Notification syscalls.** `sys_notif_wait`, `sys_notif_wait_timeout`.
+- **Futex syscalls.** `sys_futex_wait`, `sys_futex_wait_until`, `sys_futex_wake`.
+- **I/O multiplexing syscalls.** `sys_poll`, `sys_select` / `select_inner`, `sys_epoll_wait` (each currently embeds a 100 Hz tick assumption; see Diagnostic infrastructure below).
+- **Sleep syscalls.** `sys_nanosleep` ≥ 1 ms branch (the < 1 ms branch retains its TSC busy-spin since the cost of context switch exceeds the sleep).
+- **Kernel-internal waits.** `net_task` at `kernel/src/main.rs:648` (calls `block_current_unless_woken(&NIC_WOKEN)` directly), `WaitQueue::sleep` at `kernel/src/task/wait_queue.rs:56` (the generic kernel wait-queue primitive used by other subsystems), and `serial_stdin_feeder_task` at `kernel/src/main.rs:486` (Track H.1 migrates this from `enable_and_hlt` to notification-based wait, which then bottoms out in `block_current_until`). Track A.1 produces the exhaustive inventory; Track F.6 migrates these callers.
 
 ### Diagnostic infrastructure
 
 - Periodic `[WARN] [sched]` watchdog dump for any task in `Blocked*` for more than M seconds with no wake_deadline registered.
 - Optional state-transition tracepoint gated on `--features sched-trace`, recording every block/wake with caller and timestamp (default off, no overhead).
-- Fix the `cpu-hog` log 10× multiplier bug at `kernel/src/task/scheduler.rs:2191` (`ran_ticks * 10` → `ran_ticks`; `TICKS_PER_SEC = 1000` already makes 1 tick = 1 ms).
-- Fix the `sys_poll` 10× multiplier bug at `kernel/src/arch/x86_64/syscall/mod.rs:14647` (`(timeout_i as u64).div_ceil(10)` → `(timeout_i as u64)`).
+- **Sweep stale 100 Hz tick-multiplier assumptions.** Multiple sites convert ticks ↔ milliseconds with a `× 10` or `÷ 10` factor that assumes `TICKS_PER_SEC = 100`, but the actual rate is 1000 (1 tick = 1 ms). Every such site is corrected:
+  - `kernel/src/task/scheduler.rs:1892` — `stale-ready` log message: `stale_ticks * 10` → `stale_ticks`.
+  - `kernel/src/task/scheduler.rs:2191` — `cpu-hog` log message: `ran_ticks * 10` → `ran_ticks`.
+  - `kernel/src/arch/x86_64/syscall/mod.rs:14647` — `sys_poll`: `(timeout_i as u64).div_ceil(10)` → `(timeout_i as u64)`.
+  - `kernel/src/arch/x86_64/syscall/mod.rs:14894` — `select_inner`: `ms.div_ceil(10)` → `ms`.
+  - `kernel/src/arch/x86_64/syscall/mod.rs:15304` — `sys_epoll_wait`: `(timeout_i as u64).div_ceil(10)` → `(timeout_i as u64)`.
+  After the sweep, every reported timeout and duration matches wall-clock observation.
 
 ### Secondary bug fixes (carried in this phase)
 
@@ -103,7 +129,7 @@ This phase is intentionally a teaching opportunity for disciplined work on a con
   - *Dependency Inversion.* Subsystems depend on `block_current_until` and `wake_task`, not on direct `Task` field access.
 - **DRY.** A single block primitive replaces four variants; a single wake primitive replaces three wake paths. Test helpers for state-machine assertions are factored out of `kernel-core::sched_model` and reused across all transition tests.
 - **Documented invariants.** Every state transition in the v2 protocol carries a one-line invariant statement in code (doc comment) and in the v2 transition table. Reviewers reject changes that mutate state without a corresponding invariant update.
-- **Lock-ordering hierarchy.** Defined in a top-of-file doc block in `scheduler.rs`: `pi_lock` (innermost) → `SCHEDULER.lock()` (outer). A debug assertion catches violations at runtime; host tests confirm the invariant on every transition path.
+- **Lock-ordering hierarchy.** Defined in a top-of-file doc block in `scheduler.rs`: `pi_lock` is *outer*, `SCHEDULER.lock()` is *inner* (Linux's `p->pi_lock` → `rq->lock` pattern adapted to a single global scheduler lock). A code path may hold `pi_lock` while acquiring `SCHEDULER.lock`; the reverse is forbidden. A debug assertion catches violations at runtime; host tests confirm the invariant on every transition path.
 - **Migration safety.** The `sched-v2` Cargo feature gate keeps v1 and v2 coexisting until every call site is migrated; rollback is a single feature-flip until Track F.5 deletes v1 entirely.
 - **Observability.** Every state transition is reachable from a tracepoint when `--features sched-trace` is enabled; a periodic watchdog logs any task stuck in `Blocked*` without a registered waker.
 
@@ -135,15 +161,23 @@ Always acquired for state mutation. Never nested inside `SCHEDULER.lock()`. Repl
 
 ### Block primitive (`block_current_until`)
 
-Located at `kernel/src/task/scheduler.rs::block_current_until` (renamed from `block_current_unless_woken_inner` and its three siblings; the four variants collapse to one with an `Option<u64>` deadline). The implementation follows Linux's `do_nanosleep` recipe: state write → condition recheck → yield → resume recheck. It is the entire fix for the lost-wake bug class.
+Located at `kernel/src/task/scheduler.rs::block_current_until` (renamed from `block_current_unless_woken_inner` and its three siblings; the four variants collapse to one). Signature:
+
+```rust
+fn block_current_until(woken: &AtomicBool, deadline_ticks: Option<u64>) -> BlockOutcome;
+```
+
+`deadline_ticks` is an *absolute* deadline expressed in scheduler ticks. With `TICKS_PER_SEC = 1000`, one tick equals one millisecond. Callers convert their native units (`Duration`, `timespec`, TSC) to a tick deadline at the boundary; the primitive itself never sees nanoseconds. For `sys_nanosleep`, the conversion is `now_ticks + sleep_ns.div_ceil(1_000_000)`.
+
+The implementation follows Linux's `do_nanosleep` recipe: state write under `pi_lock` → release `pi_lock` → condition recheck → yield (which goes through `SCHEDULER.lock`) → resume recheck. It is the entire fix for the lost-wake bug class.
 
 ### Wake primitive (`wake_task`, rewrite)
 
-Located at `kernel/src/task/scheduler.rs::wake_task`. CAS over `state`. Returns whether the wake landed (so callers know whether to send a reschedule IPI). A wake to a Running or already-Ready task is a no-op — spurious wakes become harmless.
+Located at `kernel/src/task/scheduler.rs::wake_task`. CAS over canonical `state` under `pi_lock`. After releasing `pi_lock`, takes `SCHEDULER.lock` and (idempotency) checks run-queue membership; (RSP-publication safety) spin-waits on `Task::on_cpu` becoming false; then enqueues and optionally sends a reschedule IPI. Returns whether the wake landed (so callers know whether to send the IPI). A wake to a Running or already-Ready task is a no-op — spurious wakes become harmless.
 
 ### Dispatch switch-out handler
 
-Located at `kernel/src/task/scheduler.rs::dispatch_switch_out`. Strips the `PENDING_SWITCH_OUT[core]` consumption and the `wake_after_switch` clear. Becomes a pure bookkeeping function (timeslice accounting, run-queue manipulation, frame counter accounting).
+Located at `kernel/src/task/scheduler.rs::dispatch_switch_out`. Strips the v1 `PENDING_SWITCH_OUT[core]` and `wake_after_switch` clears. Becomes a pure bookkeeping function (timeslice accounting, run-queue manipulation, frame counter accounting). The arch-level switch-out epilogue (separate from this handler) clears `Task::on_cpu = false` after `saved_rsp` is durably published — this is the only state mutation left on the switch-out path.
 
 ### `scan_expired_wake_deadlines` (rewrite)
 
@@ -175,9 +209,9 @@ The rewrite is split across nine tracks. Tracks A and B are the foundation (must
 2. **Track B — Per-task `pi_lock` infrastructure.** Add `pi_lock` to `Task`, `TaskBlockState` struct, helper functions, lock-ordering doc and `debug_assert!` guards.
 3. **Track C — New block primitive (behind `sched-v2` flag).** Implement `block_current_until` alongside the existing four variants; gate per-call-site migration on `cfg(feature = "sched-v2")`.
 4. **Track D — New wake primitive.** Implement CAS-style `wake_task`; convert `notify_one`/`notify_all`/`signal_*`/`scan_expired` paths.
-5. **Track E — Dispatch handler + field removal.** Delete `PENDING_SWITCH_OUT`, `wake_after_switch`, `switching_out`. Verify no readers remain.
-6. **Track F — Migrate remaining call sites and remove v1.** Convert remaining call sites; delete v1 functions and the `sched-v2` gate.
-7. **Track G — Diagnostic infrastructure.** Stuck-task watchdog, optional tracepoint, `cpu-hog` and `sys_poll` 10× multiplier fixes.
+5. **Track E — Dispatch handler + `on_cpu` marker + field removal.** Add `Task::on_cpu` and switch-out epilogue clear (replaces the RSP-publication aspect of `PENDING_SWITCH_OUT`); delete `PENDING_SWITCH_OUT`, `wake_after_switch`, `switching_out`. Update `pick_next` guards from `!switching_out && saved_rsp != 0` to `!on_cpu && saved_rsp != 0`.
+6. **Track F — Migrate remaining call sites and remove v1.** Convert IPC, notification, futex, I/O multiplexing (poll/select/epoll), nanosleep, and kernel-internal (`net_task`, `WaitQueue::sleep`, etc.) call sites; delete v1 functions and the `sched-v2` gate.
+7. **Track G — Diagnostic infrastructure.** Stuck-task watchdog, optional tracepoint, full sweep of 100 Hz tick-multiplier assumptions across scheduler logs and I/O-multiplexing syscalls.
 8. **Track H — Secondary bug fixes.** `serial_stdin_feeder` notification migration, `audio_server` stub registration, `syslogd` cpu-hog investigation.
 9. **Track I — Validation.** Real-hardware graphical stack regression test; SSH disconnect/reconnect soak; multi-core fuzz; long-soak.
 
@@ -185,11 +219,13 @@ The rewrite is split across nine tracks. Tracks A and B are the foundation (must
 
 ### Primary (scheduler rewrite)
 
-- All `block_current_unless_woken*` callers use the v2 primitive. The four legacy variants are deleted.
+- All `block_current_unless_woken*` callers (syscalls *and* kernel-internal callers `net_task`, `WaitQueue::sleep`, etc.) use the v2 primitive. The four legacy variants are deleted.
 - `Task` no longer contains `switching_out` or `wake_after_switch` fields. `PENDING_SWITCH_OUT[core]` is deleted.
-- Each `Task` has a `pi_lock` field acquired around every state transition. A debug assertion fails if `pi_lock` is acquired while `SCHEDULER.lock()` is held.
+- Each `Task` has a `pi_lock` field acquired around every canonical-state transition. The v2 lock ordering is `pi_lock` *outer*, `SCHEDULER.lock` *inner*. A debug assertion fails if `pi_lock` is acquired while `SCHEDULER.lock` is already held.
+- Each `Task` has an `on_cpu: AtomicBool` field set by the block path before `switch_context` and cleared by the arch-level switch-out epilogue after `saved_rsp` is published. The wake primitive `smp_cond_load_acquire`-spins on `on_cpu == false` before cross-core enqueue, replacing the v1 `PENDING_SWITCH_OUT[core]` RSP-publication marker. `pick_next` guards on `!on_cpu && saved_rsp != 0` (replacing the v1 `!switching_out && saved_rsp != 0` guard).
 - `kernel-core::sched_model` host tests cover every transition in the new state machine and pass on `cargo test -p kernel-core`.
 - A property-based fuzz test with at least 10,000 random block/wake/scan interleavings produces no lost wakes and no double-wakes.
+- The 100 Hz tick-multiplier assumption is removed from every site that currently embeds it: `cpu-hog` log message, `stale-ready` log message, `sys_poll`, `select_inner`, `sys_epoll_wait`. After the sweep, all reported timeouts and durations match wall-clock observation (no 10× discrepancy at any site).
 - `cargo xtask check` clean (clippy `-D warnings`, rustfmt).
 - `cargo xtask test` passes (all in-QEMU kernel tests).
 

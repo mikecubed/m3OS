@@ -12,14 +12,16 @@
 | A | Audit + transition tables + host tests (TDD foundation) | — | Planned |
 | B | Per-task `pi_lock` infrastructure | A | Planned |
 | C | New block primitive (`block_current_until`) behind `sched-v2` flag | A, B | Planned |
-| D | New wake primitive (`wake_task` CAS rewrite) | C | Planned |
-| E | Dispatch handler + field removal | D | Planned |
-| F | Migrate all call sites and remove v1 + feature gate | C, D, E | Planned |
-| G | Diagnostics: stuck-task watchdog, tracepoint, multiplier fixes | A | Planned |
+| D | New wake primitive (`wake_task` CAS rewrite + `on_cpu` spin-wait) | C, E.1 | Planned |
+| E | Dispatch handler, `on_cpu` marker, field removal | E.1 after B; E.2–E.5 after F.1–F.6 | Planned |
+| F | Migrate all call sites (syscalls + kernel-internal); remove v1 + feature gate | C, D, E.1; F.7 after E.5 | Planned |
+| G | Diagnostics: stuck-task watchdog, tracepoint, 100 Hz multiplier sweep | A | Planned |
 | H | Secondary bug fixes (serial-stdin, audio_server, syslogd) | F | Planned |
 | I | Validation gate (real hardware, soak, fuzz) | F, G, H | Planned |
 
-Tracks A and B are the foundation — they must complete before C/D/E/F. Tracks G and H may run in parallel with C–F. Track I is the final gate before merge.
+E is split: E.1 (`Task::on_cpu` foundation) lands early — D.1's wake-side spin-wait depends on it. E.2–E.5 (deleting `PENDING_SWITCH_OUT`, `switching_out`, `wake_after_switch` and simplifying the dispatch handler) require all v1 callers migrated, so they land after F.1–F.6. F.7 (delete v1 functions and `sched-v2` gate) is the final cleanup, after E.5.
+
+Tracks A and B are the foundation — they must complete before C/D/E/F. Track G may run in parallel with C–F (it is independent of the protocol rewrite). Track H waits for F (full call-site migration) to land — H.1 in particular depends on the v2 primitive being the only protocol so the migrated `serial_stdin_feeder_task` blocks via `block_current_until` rather than v1. Track I is the final gate before merge.
 
 ## Engineering Practice Gates (apply to every track)
 
@@ -29,7 +31,7 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 - **SOLID.** No new flag fields on `Task` for the block/wake transition; new wait kinds plug in through the existing `block_current_until` primitive. State-mutation helpers do not expose `Task` internals to callers.
 - **DRY.** No copy-pasted variant of `block_current_until` for new wait shapes; pass an `Option<u64>` deadline and an `&AtomicBool` condition. No copy-pasted variant of `wake_task` for new wake sources.
 - **Documented invariants.** Every state transition in v2 has a one-line invariant comment at the transition site and a matching row in the v2 transition table.
-- **Lock ordering.** `pi_lock` is innermost; never acquired while `SCHEDULER.lock()` is held. A debug assertion fails the kernel build's tests on violation.
+- **Lock ordering.** `pi_lock` is *outer*, `SCHEDULER.lock()` is *inner* (Linux's `p->pi_lock` → `rq->lock` pattern). A code path may hold `pi_lock` while acquiring `SCHEDULER.lock`; the reverse — taking `pi_lock` while `SCHEDULER.lock` is already held — is forbidden. Scheduler-side iterations (`pick_next`, dispatch, `scan_expired`) read scheduler-visible state (run-queue membership, `Task::on_cpu`) — never `pi_lock`-protected fields. A debug assertion fires on ordering violations and fails the kernel build's tests.
 - **Observability.** Every state transition is reachable from the optional `sched-trace` tracepoint; the watchdog logs any task stuck in `Blocked*` without a registered waker.
 
 ---
@@ -48,8 +50,9 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 **Why it matters:** Without a complete inventory of call sites, a partial migration leaves a mix of v1 and v2 protocol that produces the same race class. The catalogue is the source of truth for Track F's migration progress.
 
 **Acceptance:**
-- [ ] Markdown table at `docs/handoffs/57a-scheduler-rewrite-call-sites.md` listing every callee (function name), every caller (file:line), the kind of block (recv / send / reply / notif / futex / nanosleep), and the wake side responsible for delivering it.
-- [ ] Every entry in the table is mapped to a Track F task (F.1, F.2, F.3, or F.4); no orphans.
+- [ ] Markdown table at `docs/handoffs/57a-scheduler-rewrite-call-sites.md` listing every callee (function name), every caller (file:line), the kind of block (recv / send / reply / notif / futex / poll / select / epoll / nanosleep / wait_queue / driver-irq), and the wake side responsible for delivering it.
+- [ ] The table includes the kernel-internal callers explicitly: `net_task` at `kernel/src/main.rs:648`, `WaitQueue::sleep` at `kernel/src/task/wait_queue.rs:56`, `serial_stdin_feeder_task` at `kernel/src/main.rs:486`, and any other in-kernel callers of `block_current_unless_woken*`.
+- [ ] Every entry in the table is mapped to a Track F task (F.1 IPC, F.2 notification, F.3 futex, F.4 I/O multiplexing, F.5 nanosleep, or F.6 kernel-internal); no orphans. If a caller does not fit any bucket, A.1 must propose a new F.x bucket before C/D/E/F begin.
 
 ### A.2 — Build the v1 protocol transition table
 
@@ -156,8 +159,9 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 **Why it matters:** Lock-ordering bugs are hard to detect at runtime; a debug assertion catches the most common mistake (acquiring pi_lock while holding SCHEDULER.lock).
 
 **Acceptance:**
-- [ ] Top-of-file doc block in `scheduler.rs` defines the lock hierarchy: `pi_lock` (innermost) → `SCHEDULER.lock()` (outer). Acquiring inner while holding outer is a panic in debug builds.
-- [ ] Debug assertion in `pi_lock.lock()` checks `!SCHEDULER.is_locked_by_current_cpu()` (helper added if necessary; may use a per-CPU `holds_scheduler_lock: AtomicBool`).
+- [ ] Top-of-file doc block in `scheduler.rs` defines the lock hierarchy: `pi_lock` is *outer*, `SCHEDULER.lock()` is *inner* (Linux's `p->pi_lock` → `rq->lock` pattern). A code path may hold `pi_lock` while acquiring `SCHEDULER.lock`; the reverse is forbidden.
+- [ ] Doc block also documents the SOLID Single-Responsibility split: `pi_lock` guards canonical block state (`TaskBlockState.state`, `wake_deadline`); `SCHEDULER.lock` guards scheduler-visible state (run-queue membership, `Task::on_cpu`). Scheduler-side reads consult the latter, never the former.
+- [ ] Debug assertion in `pi_lock.lock()` checks that `SCHEDULER.lock` is *not* currently held by this CPU; on violation, panic in debug builds (helper added if necessary; may use a per-CPU `holds_scheduler_lock: AtomicBool` toggled in `SCHEDULER.lock()`/`unlock()`).
 - [ ] Host test in `kernel-core` (or a kernel test) exercising the lock-ordering invariant via a controlled sequence; the test panics on violation in debug builds.
 
 ### B.4 — Helper API on `Task`
@@ -192,10 +196,10 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 **Why it matters:** This is the core new primitive — Linux's pattern verbatim, the entire fix for the lost-wake bug class.
 
 **Acceptance:**
-- [ ] Signature: `fn block_current_until(woken: &AtomicBool, deadline: Option<u64>) -> BlockOutcome`.
-- [ ] Body follows the four-step Linux recipe: state write under `pi_lock` → condition recheck → yield → resume recheck.
+- [ ] Signature: `fn block_current_until(woken: &AtomicBool, deadline_ticks: Option<u64>) -> BlockOutcome`. `deadline_ticks` is an *absolute* tick count, not a duration. `TICKS_PER_SEC = 1000` so 1 tick = 1 ms; callers convert from `Duration` / `timespec` / TSC at the boundary (no nanoseconds inside the primitive).
+- [ ] Body follows the four-step Linux recipe: state write under `pi_lock` → release `pi_lock` → condition recheck → yield (which goes through `SCHEDULER.lock`) → resume recheck.
 - [ ] No reference to `switching_out`, `wake_after_switch`, or `PENDING_SWITCH_OUT`.
-- [ ] Doc comment cites the Linux `do_nanosleep` source line and the 2026-04-25 handoff for context.
+- [ ] Doc comment cites the Linux `do_nanosleep` source pattern and the 2026-04-25 handoff for context.
 - [ ] Matching host tests in `kernel-core::sched_model` exist and pass.
 
 ### C.3 — Self-revert path
@@ -232,10 +236,11 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 
 **Acceptance:**
 - [ ] Signature: `fn wake_task(idx: TaskIdx) -> WakeOutcome`.
-- [ ] Body: take `pi_lock`; CAS `state` from any `Blocked*` to `Ready`; clear `wake_deadline`; release `pi_lock`; acquire `SCHEDULER.lock`; enqueue.
+- [ ] Body: take `pi_lock`; CAS `state` from any `Blocked*` to `Ready`; clear `wake_deadline`; release `pi_lock`; acquire `SCHEDULER.lock`; if target is already in a run queue, return `Woken` without further work (idempotency); else if `target.on_cpu == true`, spin-wait (`smp_cond_load_acquire`-style) until it becomes false (RSP-publication safety; replaces v1 `PENDING_SWITCH_OUT[core]` guard); then enqueue.
 - [ ] Returns `WakeOutcome::Woken` if the CAS succeeded, `WakeOutcome::AlreadyAwake` otherwise.
 - [ ] No reference to `switching_out` or `wake_after_switch`.
-- [ ] Doc comment cites Linux's `try_to_wake_up` and the 2026-04-25 handoff.
+- [ ] Doc comment cites Linux's `try_to_wake_up` (specifically the `p->on_cpu` `smp_cond_load_acquire` pattern) and the 2026-04-25 handoff.
+- [ ] Depends on E.1 (`Task::on_cpu` field exists) — if E.1 has not landed, the on_cpu spin-wait is a stub `debug_assert!(!task.on_cpu, "E.1 not landed")` to keep the v1 protocol unbroken until E.1 ships.
 
 ### D.2 — Cross-core IPI on wake
 
@@ -271,48 +276,70 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 
 ---
 
-## Track E — Dispatch Handler and Field Removal
+## Track E — Dispatch Handler, `on_cpu` Marker, and Field Removal
 
-### E.1 — Delete `PENDING_SWITCH_OUT[core]`
+Track E introduces `Task::on_cpu` as a single-purpose RSP-publication marker (E.1) before deleting the v1 fields (E.2–E.5). Order matters: deleting `PENDING_SWITCH_OUT[core]` without the `on_cpu` replacement risks reintroducing stale-RSP dispatch — the very thing `pick_next` currently guards against at `kernel/src/task/scheduler.rs:351-352, :371-372`. E.1 lands before D.1 (D.1's wake-side spin-wait depends on `on_cpu` existing). E.2–E.5 wait until F.1–F.6 have migrated every v1 caller.
+
+### E.1 — Add `Task::on_cpu` and switch-out epilogue clear
+
+**Files:**
+- `kernel/src/task/mod.rs` (new field)
+- `kernel/src/task/scheduler.rs` (block-side set, `pick_next` guard update)
+- `kernel/src/arch/x86_64/asm/switch.S` or the Rust shim wrapping `switch_context` (epilogue clear)
+
+**Symbol:** `Task::on_cpu`, switch-out epilogue, `pick_next` guard
+**Why it matters:** `PENDING_SWITCH_OUT[core]` in v1 is dual-purpose: deferred-wake hand-off AND RSP-publication marker (`scheduler.rs:880-881` doc comment, `:954-966` set sites, `:351-352, :371-372, :2098` consumers). E.2 deletes the deferred-wake hand-off; without an `on_cpu` replacement, cross-core wakes can dispatch a task whose `saved_rsp` has not yet been published. `Task::on_cpu` is the single-purpose replacement for the RSP-publication aspect.
+
+**Acceptance:**
+- [ ] `Task::on_cpu: AtomicBool` field, initialised false.
+- [ ] Block-side path (after releasing `pi_lock`, before `switch_context`): `task.on_cpu.store(true, Ordering::Release)`.
+- [ ] Arch-level switch-out epilogue, immediately after `saved_rsp` is durably written (around `scheduler.rs:2102` per the handoff): `task.on_cpu.store(false, Ordering::Release)`. The clear happens after `saved_rsp` is committed so a concurrent waker that observes `on_cpu == false` is guaranteed to see a published `saved_rsp`.
+- [ ] `pick_next` guards updated from `!switching_out && saved_rsp != 0` (at `scheduler.rs:351-352, :371-372`) to `!on_cpu && saved_rsp != 0`. Both guards co-exist while the v1 fields still exist (during F.1–F.6 migration); E.3 removes the v1 half once `switching_out` is deleted.
+- [ ] D.1's wake-side spin-wait (`smp_cond_load_acquire`-style on `on_cpu == false`) becomes reachable; the D.1 fallback stub is replaced with the real spin-wait.
+- [ ] Host test in `kernel-core::sched_model`: a model run where wake fires concurrent with `on_cpu == true` — the wake side stalls until `on_cpu` becomes false, never enqueues a task whose RSP has not yet been published.
+- [ ] Stress test in QEMU on 4 cores: 5 minutes of cross-core wakes during heavy yield activity; no panic, no stale-RSP dispatch.
+
+### E.2 — Delete the wake-deferral semantics of `PENDING_SWITCH_OUT[core]`
 
 **File:** `kernel/src/task/scheduler.rs`
-**Symbol:** `PENDING_SWITCH_OUT`, dispatch switch-out handler (around `kernel/src/task/scheduler.rs:2013-2129` per the handoff)
-**Why it matters:** This array and its consumer in the dispatch handler are the v1 deferred-enqueue mechanism. They are dead under v2.
+**Symbol:** `PENDING_SWITCH_OUT`, dispatch switch-out handler (around `:2013-2129`, including the `swap(-1, Acquire)` at `:2098` and the `wake_after_switch` consumption at `:2155-2167`)
+**Why it matters:** With E.1's `on_cpu` covering RSP-publication, the wake-deferral aspect of `PENDING_SWITCH_OUT` is dead.
 
 **Acceptance:**
 - [ ] Static `PENDING_SWITCH_OUT` removed.
 - [ ] Dispatch switch-out handler no longer reads `PENDING_SWITCH_OUT[core]`.
-- [ ] At this point `cfg(feature = "sched-v2")` is implicit — all migrating call sites have flipped (Track F.1–F.4 must be complete before E.1 lands; the gate on E.1 is "no remaining v1 callers exist").
+- [ ] All `PENDING_SWITCH_OUT[core_id].store(...)` sites in the v1 block primitives (around `scheduler.rs:966, :1122, :1161, :1204, :1263, :1335, :1357`) removed in lockstep with the v1 functions in F.7 to keep the build green.
+- [ ] At this point all migrating call sites have flipped (Track F.1–F.6 must be complete before E.2 lands; the gate on E.2 is "no remaining v1 callers exist").
 
-### E.2 — Delete `switching_out` field from `Task`
+### E.3 — Delete `switching_out` field from `Task`
 
 **File:** `kernel/src/task/mod.rs` and all readers
 **Symbol:** `Task::switching_out`
-**Why it matters:** The flag is the v1 hand-off; it has no role in v2.
+**Why it matters:** With E.1 (`on_cpu`) covering RSP-publication and E.2 deleting wake-deferral, `switching_out` has no role in v2.
 
 **Acceptance:**
 - [ ] Field deleted from `Task`.
-- [ ] All readers (in scheduler.rs, ipc/, syscall/) removed.
+- [ ] All readers (around `scheduler.rs:351, :371, :955, :1112, :1152, :1195, :1254, :1317, :1353, :1418, :1474-1475, :1794, :2137`, plus any in `ipc/`, `syscall/`) removed or migrated to `on_cpu` (for the `pick_next` guards) or deleted (for the wake-deferral conditionals).
 - [ ] `cargo xtask check` clean.
 
-### E.3 — Delete `wake_after_switch` field from `Task`
+### E.4 — Delete `wake_after_switch` field from `Task`
 
 **File:** `kernel/src/task/mod.rs` and all readers
 **Symbol:** `Task::wake_after_switch`
-**Why it matters:** The flag is the v1 latched-wake; it has no role in v2 and was the source of the race.
+**Why it matters:** The flag is the v1 latched-wake; it has no role in v2 and was the source of the lost-wake race.
 
 **Acceptance:**
 - [ ] Field deleted from `Task`.
-- [ ] All readers removed.
+- [ ] All readers (around `scheduler.rs:1475, :2155-2167`) removed.
 
-### E.4 — Simplify dispatch switch-out handler
+### E.5 — Simplify dispatch switch-out handler
 
 **File:** `kernel/src/task/scheduler.rs`
 **Symbol:** `dispatch_switch_out` (or whatever the post-switch_context handler is named in current source)
-**Why it matters:** With the v1 fields gone, the handler reduces to bookkeeping (timeslice accounting, run-queue manipulation, frame counter accounting).
+**Why it matters:** With v1 fields gone and `on_cpu` cleared by the arch-level epilogue, the handler reduces to bookkeeping (timeslice accounting, run-queue manipulation, frame counter accounting).
 
 **Acceptance:**
-- [ ] Handler body has no `wake_after_switch` consumption, no `switching_out` clear.
+- [ ] Handler body has no `wake_after_switch` consumption, no `switching_out` clear, no `PENDING_SWITCH_OUT` swap.
 - [ ] Existing in-QEMU scheduler tests pass.
 - [ ] Doc comment on the handler now reads as a pure bookkeeping function (no state-machine commentary).
 
@@ -352,25 +379,56 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 - [ ] Wake-side calls `wake_task` directly (no intermediate v1 path).
 - [ ] Futex test suite passes.
 
-### F.4 — Migrate `sys_nanosleep` (≥ 1 ms branch)
+### F.4 — Migrate I/O multiplexing syscalls (poll, select, epoll)
+
+**Files:**
+- `kernel/src/arch/x86_64/syscall/mod.rs:14638-14786` (`sys_poll`)
+- `kernel/src/arch/x86_64/syscall/mod.rs:14860-14895` (`sys_select` / `select_inner`)
+- `kernel/src/arch/x86_64/syscall/mod.rs:15280-15308` (`sys_epoll_wait`)
+
+**Symbol:** `sys_poll`, `sys_select`, `select_inner`, `sys_epoll_wait`
+**Why it matters:** Each syscall computes a deadline as `start_tick + ms.div_ceil(10)` (or the equivalent), which both embeds the 100 Hz tick assumption (corrected in G.3) and currently hands a v1-style deadline to `block_current_unless_woken*`. They must migrate to `block_current_until(deadline_ticks)` and the deadline computation must drop the `× 10` / `÷ 10` factor. F.4 and G.3 land together: the v2 migration and the multiplier fix are inseparable for these sites.
+
+**Acceptance:**
+- [ ] All three syscalls block via `block_current_until` with an absolute tick deadline (no `÷ 10` factor; 1 tick = 1 ms).
+- [ ] `poll(fd, 2000)` returns after ~2000 ms ± 50 ms; `select` and `epoll_wait` likewise observe their configured timeout in real wall clock.
+- [ ] I/O multiplexing test suite passes (existing test-fixture timeouts re-validated after the multiplier fix; tests that relied on the 1/10 timing get explicit fix-ups in this task).
+
+### F.5 — Migrate `sys_nanosleep` (≥ 1 ms branch)
 
 **File:** `kernel/src/arch/x86_64/syscall/mod.rs:3162-3232`
 **Symbol:** `sys_nanosleep`
-**Why it matters:** The current `< 5 ms` busy-spin branch saturates a core when a userspace daemon does `nanosleep(0, 1_000_000)`. Migrating sleeps ≥ 1 ms to `block_current_until` with a deadline is the obvious win.
+**Why it matters:** The current `< 5 ms` busy-spin branch saturates a core when a userspace daemon does `nanosleep(0, 1_000_000)`. Migrating sleeps ≥ 1 ms to `block_current_until` with an absolute tick deadline is the obvious win.
 
 **Acceptance:**
-- [ ] Sleeps ≥ 1 ms use `block_current_until(deadline = now + sleep_ns)`.
-- [ ] Sleeps < 1 ms retain the TSC busy-spin (cost of context switch is higher than the sleep).
+- [ ] Sleeps ≥ 1 ms compute `deadline_ticks = now_ticks + sleep_ns.div_ceil(1_000_000)` (1 tick = 1 ms; `div_ceil` rounds up partial milliseconds) and call `block_current_until(woken, Some(deadline_ticks))`. The conversion happens at the syscall boundary; the primitive itself never sees nanoseconds.
+- [ ] Sleeps < 1 ms retain the TSC busy-spin (cost of context switch exceeds the sleep).
 - [ ] `cargo xtask run-gui --fresh` shows `userspace/syslogd` and `userspace/display_server` no longer cpu-hogging at 100% on their cores during idle.
 
-### F.5 — Delete v1 functions and `sched-v2` feature gate
+### F.6 — Migrate kernel-internal callers
+
+**Files:**
+- `kernel/src/task/wait_queue.rs:56` — `WaitQueue::sleep`
+- `kernel/src/main.rs:648` — `net_task` calling `block_current_unless_woken(&NIC_WOKEN)`
+- Any other in-kernel caller surfaced by Track A.1's audit
+
+**Symbol:** `WaitQueue::sleep`, `net_task`, all in-kernel `block_current_unless_woken*` callers identified in A.1
+**Why it matters:** F.7's "delete v1" gate fails if any in-kernel caller is still on v1. The audit produced by A.1 is the source of truth for what F.6 must cover. (`serial_stdin_feeder_task` is *not* in this bucket — H.1 migrates it from `enable_and_hlt` to a notification-based wait, which then bottoms out in `block_current_until`.)
+
+**Acceptance:**
+- [ ] `WaitQueue::sleep` calls `block_current_until(&woken, None)` (or `Some(deadline_ticks)` if a timeout variant exists; verify with A.1 audit).
+- [ ] `net_task` calls `block_current_until(&net::NIC_WOKEN, None)`.
+- [ ] Every caller listed in A.1's call-site catalogue under "kernel-internal" is migrated.
+- [ ] `git grep block_current_unless_woken` outside `kernel/src/task/scheduler.rs` returns zero results before F.7 lands.
+
+### F.7 — Delete v1 functions and `sched-v2` feature gate
 
 **Files:**
 - `kernel/src/task/scheduler.rs`
 - `kernel/Cargo.toml`
 
 **Symbol:** `block_current_unless_woken_inner`, `block_current_unless_woken_until`, `block_current_unless_woken`, `block_current_unless_woken_with_recv`
-**Why it matters:** Cleanup. The v1 protocol is the bug; leaving it as dead code invites accidental re-use.
+**Why it matters:** Cleanup. The v1 protocol is the bug; leaving it as dead code invites accidental re-use. Lands after E.5 (the v1 fields and `PENDING_SWITCH_OUT` are already gone, so the v1 functions are unreferenced).
 
 **Acceptance:**
 - [ ] All four v1 functions deleted.
@@ -404,25 +462,38 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 - [ ] Default off (no overhead in default build).
 - [ ] Manual smoke: enable feature, reproduce a wake, dump the trace ring, see the transition entries.
 
-### G.3 — Fix `cpu-hog` log 10× multiplier bug
+### G.3 — Sweep stale 100 Hz tick-multiplier assumptions
 
-**File:** `kernel/src/task/scheduler.rs:2191`
-**Symbol:** the `ran_ticks * 10` expression in the cpu-hog log message
-**Why it matters:** All `[WARN] [sched] cpu-hog: pid=X ran~Yms` values are 10× the truth because the formula assumes 100 Hz timer but `TICKS_PER_SEC = 1000`. Active misinformation; misled the 2026-04-28 investigation.
+**Files:**
+- `kernel/src/task/scheduler.rs:1892` — `stale-ready` log message (`stale_ticks * 10`)
+- `kernel/src/task/scheduler.rs:2191` — `cpu-hog` log message (`ran_ticks * 10`)
+- `kernel/src/arch/x86_64/syscall/mod.rs:14647` — `sys_poll` (`(timeout_i as u64).div_ceil(10)`)
+- `kernel/src/arch/x86_64/syscall/mod.rs:14894` — `select_inner` (`ms.div_ceil(10)`)
+- `kernel/src/arch/x86_64/syscall/mod.rs:15304` — `sys_epoll_wait` (`(timeout_i as u64).div_ceil(10)`)
 
-**Acceptance:**
-- [ ] `ran_ticks * 10` replaced with `ran_ticks` (since `TICKS_PER_SEC = 1000` makes 1 tick = 1 ms).
-- [ ] One regression test demonstrating the corrected value.
-
-### G.4 — Fix `sys_poll` 10× multiplier bug
-
-**File:** `kernel/src/arch/x86_64/syscall/mod.rs:14647`
-**Symbol:** `sys_poll` (the `(timeout_i as u64).div_ceil(10)` expression)
-**Why it matters:** `poll(2000)` currently times out at 200 ms because the conversion divides by 10 assuming 100 Hz. Every `poll`-using userspace daemon observes 1/10 the configured timeout — a silent correctness bug.
+**Symbol:** every site that uses a `× 10` or `÷ 10` factor to convert ticks ↔ ms
+**Why it matters:** `TICKS_PER_SEC = 1000` (1 tick = 1 ms). The `× 10` / `÷ 10` factors assume a 100 Hz timer that does not exist. Active misinformation: `cpu-hog` and `stale-ready` log values are 10× the truth (which misled the 2026-04-28 investigation), and `poll` / `select` / `epoll_wait` time out at 1/10 the configured timeout (which silently affects every userspace daemon using these primitives). F.4 changes the I/O-multiplexing call sites to use `block_current_until`; G.3 ensures the deadline arithmetic is correct. The two land together for the I/O-multiplexing sites.
 
 **Acceptance:**
-- [ ] `(timeout_i as u64).div_ceil(10)` replaced with `(timeout_i as u64)`.
-- [ ] Userspace test: `poll(fd, 2000)` returns after ~2000 ms ± 50 ms.
+- [ ] `scheduler.rs:1892` — `stale_ticks * 10` → `stale_ticks`.
+- [ ] `scheduler.rs:2191` — `ran_ticks * 10` → `ran_ticks`.
+- [ ] `syscall/mod.rs:14647` — `(timeout_i as u64).div_ceil(10)` → `(timeout_i as u64)`.
+- [ ] `syscall/mod.rs:14894` — `ms.div_ceil(10)` → `ms`.
+- [ ] `syscall/mod.rs:15304` — `(timeout_i as u64).div_ceil(10)` → `(timeout_i as u64)`.
+- [ ] One regression test per site demonstrating the corrected value.
+- [ ] After the sweep, `git grep -E "div_ceil\(10\)|\* 10$"` across `kernel/src/task/scheduler.rs` and `kernel/src/arch/x86_64/syscall/mod.rs` returns zero results that touch tick conversion (matches in unrelated arithmetic are allowed but reviewed).
+
+### G.4 — Userspace timeout regression test
+
+**File:** new `userspace/tests/timeouts/` (or extend an existing test fixture)
+**Symbol:** —
+**Why it matters:** G.3 fixes the kernel-side arithmetic; this task validates the user-visible behaviour with a regression test that fails on regression.
+
+**Acceptance:**
+- [ ] Userspace test: `poll(fd, 2000)` returns after ~2000 ms ± 50 ms (no events).
+- [ ] Userspace test: `select(...)` with 1500 ms timeout returns after ~1500 ms ± 50 ms.
+- [ ] Userspace test: `epoll_wait(...)` with 3000 ms timeout returns after ~3000 ms ± 50 ms.
+- [ ] Tests run in CI; failures block merge.
 
 ---
 
@@ -529,4 +600,8 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 - The transition tables produced in Track A (v1 and v2) live at `docs/handoffs/57a-scheduler-rewrite-v1-transitions.md` and `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`. They serve as both the test contract and the durable reference for any future work in this area.
 - The two source handoff docs (`docs/handoffs/2026-04-25-scheduler-design-comparison.md` and `docs/handoff/2026-04-28-graphical-stack-startup.md`) are the input specification for this phase; they are not modified.
 - Engineering practice gates (top of this file) are enforced by review and CI; tasks that fail them block the phase from closing.
-- Lock ordering (recapped from B.3): `pi_lock` is innermost; `SCHEDULER.lock()` is outer. Acquiring inner while holding outer is a panic in debug builds.
+- Lock ordering (recapped from B.3): `pi_lock` is *outer*, `SCHEDULER.lock()` is *inner* (Linux's `p->pi_lock` → `rq->lock` pattern). A code path may hold `pi_lock` while acquiring `SCHEDULER.lock`; the reverse is forbidden and panics in debug builds.
+- State ownership (recapped from B.3): `pi_lock` guards canonical block state (`TaskBlockState.state`, `wake_deadline`); `SCHEDULER.lock` guards scheduler-visible state (run-queue membership, `Task::on_cpu`). Scheduler-side reads (`pick_next`, dispatch, `scan_expired`) consult the latter, never the former — this is the SOLID Single-Responsibility split that makes the lock ordering work.
+- `Task::on_cpu` (introduced in E.1) replaces the RSP-publication aspect of v1's `PENDING_SWITCH_OUT[core]`. The wake side spin-waits on `on_cpu == false` before cross-core enqueue (Linux `p->on_cpu` `smp_cond_load_acquire` pattern). E.1 lands before D.1 to satisfy this dependency; until E.1 lands, D.1's spin-wait is a fallback stub.
+- Track F's call-site migration covers six buckets: F.1 IPC, F.2 notification, F.3 futex, F.4 I/O multiplexing (poll/select/epoll), F.5 nanosleep, F.6 kernel-internal (`net_task`, `WaitQueue::sleep`, ...). Track A.1's audit is the source of truth for assigning callers to buckets; new buckets must be proposed in A.1 before any code lands in C/D/E/F.
+- F.4 and G.3 land together for the I/O-multiplexing sites: the v2 migration replaces `block_current_unless_woken*` with `block_current_until(deadline_ticks)`, and the multiplier sweep removes the `÷ 10` factor in the deadline computation. Splitting them would leave a window where the migrated syscall has the wrong deadline arithmetic.
