@@ -758,6 +758,52 @@ name-to-endpoint table inside `init_task`.
 
 ---
 
+## Block/Wake Protocol (v2 — Phase 57a)
+
+> **Current protocol as of kernel v0.57.1.** Phase 57a rewrote the block/wake
+> primitive used by all IPC block paths (`block_current_on_recv`,
+> `block_current_on_send`, `block_current_on_reply`, `block_current_on_notif`)
+> to eliminate the lost-wake bug class. The v1 intermediate-state flags
+> (`switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT`) are deleted.
+> See [`docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md`](./roadmap/tasks/57a-scheduler-rewrite-tasks.md)
+> for the full rewrite reference, and
+> [`docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`](./handoffs/57a-scheduler-rewrite-v2-transitions.md)
+> for the v2 state-transition table spec.
+
+### What changed for IPC block primitives
+
+All four IPC block primitives now delegate to `block_current_until`, which
+follows the Linux `do_nanosleep` four-step recipe:
+
+1. **State write under `pi_lock`.** `task.state ← Blocked*` under `pi_lock`
+   (outer lock). The Release barrier on the write pairs with the Acquire on the
+   wake side's CAS, closing the lost-wake window.
+2. **Release `pi_lock`** before the condition recheck.
+3. **Condition recheck** (IPC case: read `pending_msg.is_some()` or
+   `notif.pending_bits != 0`) after the state write. If already satisfied,
+   self-revert without yielding.
+4. **Yield via `SCHEDULER.lock`** (inner lock). Resume after context-switch;
+   recheck; re-enter step 1 on spurious wake.
+
+### `wake_task` from IPC paths
+
+IPC reply/send paths call `wake_task(task_id)`, which:
+
+1. Acquires `pi_lock`; CAS `Blocked* → Ready`; releases `pi_lock`.
+2. If CAS fails (task already awake): returns `AlreadyAwake` — safe no-op.
+3. Acquires `SCHEDULER.lock`; idempotency guard if already enqueued.
+4. Spin-waits on `Task::on_cpu` until the switch-out epilogue publishes
+   `saved_rsp` (replaces v1's `PENDING_SWITCH_OUT` deferred-enqueue).
+5. Enqueues task; sends reschedule IPI if cross-core.
+
+### Lock ordering for IPC code paths
+
+`pi_lock` is *outer*, `SCHEDULER.lock` is *inner*. IPC code must never
+acquire `SCHEDULER.lock` before `pi_lock` on a code path that will subsequently
+acquire `pi_lock`; doing so deadlocks in debug builds (assertion panic).
+
+---
+
 ## See Also
 
 - `docs/05-userspace-entry.md` — ring-3 execution model (Phase 5)
@@ -766,6 +812,8 @@ name-to-endpoint table inside `init_task`.
 - `docs/appendix/testing.md` — how to test IPC paths in QEMU
 - `docs/roadmap/06-ipc-core.md` — roadmap phase doc
 - `docs/roadmap/tasks/06-ipc-core-tasks.md` — task list
+- `docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md` — Phase 57a block/wake rewrite
+- `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` — v2 state-transition spec
 - `kernel/src/ipc/mod.rs` — module overview and syscall dispatcher
 - `kernel/src/ipc/endpoint.rs` — rendezvous endpoint implementation
 - `kernel/src/ipc/notification.rs` — async notification objects
