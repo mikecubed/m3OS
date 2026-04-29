@@ -55,6 +55,7 @@ pub(crate) const MAX_TASKS: usize = 256;
 pub use kernel_core::types::TaskId;
 
 pub mod blocking_mutex;
+pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
 pub mod watchdog;

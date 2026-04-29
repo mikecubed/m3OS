@@ -1095,7 +1095,7 @@ pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
 fn block_current(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1107,6 +1107,7 @@ fn block_current(state: TaskState) {
             idx,
             sched.tasks[idx].state
         );
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -1117,7 +1118,7 @@ fn block_current(state: TaskState) {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     let core = crate::smp::per_core().core_id;
     PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
@@ -1133,13 +1134,17 @@ fn block_current(state: TaskState) {
         core,
         new_state: state as u8,
     });
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
 fn block_current_unless_message(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1148,6 +1153,7 @@ fn block_current_unless_message(state: TaskState) {
         if sched.tasks[idx].pending_msg.is_some() {
             return;
         }
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -1158,12 +1164,16 @@ fn block_current_unless_message(state: TaskState) {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -1182,7 +1192,7 @@ pub fn block_current_on_send() {
 pub fn block_current_on_send_unless_completed() {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1192,6 +1202,7 @@ pub fn block_current_on_send_unless_completed() {
             sched.tasks[idx].send_completed = false;
             return;
         }
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnSend;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -1202,12 +1213,20 @@ pub fn block_current_on_send_unless_completed() {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(
+        pid_for_trace,
+        TaskState::Running as u8,
+        TaskState::BlockedOnSend as u8,
+    );
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
     let mut sched = SCHEDULER.lock();
     if idx < sched.tasks.len() {
@@ -1299,7 +1318,7 @@ fn block_current_unless_woken_inner(
 ) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = SCHEDULER.lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
             return;
@@ -1315,6 +1334,7 @@ fn block_current_unless_woken_inner(
             Some(i) => i,
             None => return,
         };
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -1334,12 +1354,20 @@ fn block_current_unless_woken_inner(
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(
+        pid_for_trace,
+        TaskState::Running as u8,
+        TaskState::BlockedOnRecv as u8,
+    );
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -1511,6 +1539,8 @@ pub fn wake_task(id: TaskId) -> bool {
             last_ready_tick,
             last_migrated_tick,
         ) = snapshot;
+        #[cfg(feature = "sched-trace")]
+        crate::task::sched_trace::record(pid_for_log, prev_state, TaskState::Ready as u8);
         if let Some(label) = label {
             log::debug!(
                 "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
@@ -2289,10 +2319,13 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
             task.last_migrated_tick = now;
             continue;
         }
+        let _old_state_u8 = task.state as u8;
         task.state = TaskState::Ready;
         task.last_ready_tick = now;
         task.last_migrated_tick = now;
         task.blocked_since_tick = 0;
+        #[cfg(feature = "sched-trace")]
+        crate::task::sched_trace::record(task.pid, _old_state_u8, TaskState::Ready as u8);
         if n < expired.len() {
             expired[n] = (task.assigned_core, idx);
             n += 1;
