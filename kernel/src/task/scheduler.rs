@@ -1385,15 +1385,6 @@ pub fn block_current_until(
             sched.tasks[idx].state = kind;
             sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
             sched.tasks[idx].wake_deadline = deadline_ticks;
-            // E.1: mark RSP-publication window.  on_cpu=true tells any
-            // concurrent `wake_task_v2` to spin-wait before reading
-            // `saved_rsp`; the dispatch epilogue clears it AFTER `saved_rsp`
-            // is durably committed.  Without this, a waker that fires
-            // between the state write and `switch_context` could enqueue the
-            // task with stale `saved_rsp` and have pick_next dispatch it to
-            // a garbage stack pointer.  Mirrors the equivalent set in
-            // `yield_now` (scheduler.rs:1081) and `mark_current_dead`.
-            sched.tasks[idx].on_cpu.store(true, Ordering::Release);
             save_user_return_state(
                 &mut sched.tasks[idx],
                 addr_space_snapshot.0,
@@ -1431,12 +1422,6 @@ pub fn block_current_until(
     if already_woken || already_expired {
         // Self-revert under pi_lock OUTER + scheduler_lock INNER, atomic with
         // respect to wake_task_v2.
-        //
-        // Also clear on_cpu (set during the block-side write above): the task
-        // is staying on this CPU and will NOT go through the dispatch
-        // epilogue that normally clears it.  Leaving on_cpu=true here would
-        // stall any subsequent waker until the task's next real switch_context,
-        // which could be milliseconds away.
         {
             let pi_lock_ref = unsafe { &*pi_lock_ptr };
             let mut bs = pi_lock_ref.lock();
@@ -1449,7 +1434,6 @@ pub fn block_current_until(
                     }
                     sched.tasks[idx].state = TaskState::Running;
                     sched.tasks[idx].wake_deadline = None;
-                    sched.tasks[idx].on_cpu.store(false, Ordering::Release);
                 }
                 // scheduler_lock released.
             }
