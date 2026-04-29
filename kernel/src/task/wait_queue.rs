@@ -55,12 +55,9 @@ impl WaitQueue {
             // The woken flag is set by wake_one/wake_all before calling
             // wake_task/wake_task_v2, so the TOCTOU window is closed in both
             // cases by the flag check inside block_current_until / pi_lock.
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = scheduler::block_current_until(&woken, None);
             }
-            #[cfg(not(feature = "sched-v2"))]
-            scheduler::block_current_unless_woken(&woken);
         }
     }
 
@@ -86,13 +83,8 @@ impl WaitQueue {
         if let Some(entry) = self.waiters.lock().pop_front() {
             entry.woken.store(true, Ordering::Release);
             // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = scheduler::wake_task_v2(entry.id);
-            }
-            #[cfg(not(feature = "sched-v2"))]
-            {
-                let _ = scheduler::wake_task(entry.id);
             }
         }
     }
@@ -106,13 +98,8 @@ impl WaitQueue {
         for entry in waiters {
             entry.woken.store(true, Ordering::Release);
             // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = scheduler::wake_task_v2(entry.id);
-            }
-            #[cfg(not(feature = "sched-v2"))]
-            {
-                let _ = scheduler::wake_task(entry.id);
             }
         }
     }

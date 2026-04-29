@@ -93,27 +93,18 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
         let _ = scheduler::take_bulk_data(stranded.task);
         scheduler::deliver_message(stranded.task, error_msg);
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        #[cfg(feature = "sched-v2")]
         let _ = crate::task::scheduler::wake_task_v2(stranded.task);
-        #[cfg(not(feature = "sched-v2"))]
-        let _ = scheduler::wake_task(stranded.task);
     }
     for task in stranded_receivers {
         scheduler::deliver_message(task, error_msg);
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        #[cfg(feature = "sched-v2")]
         let _ = crate::task::scheduler::wake_task_v2(task);
-        #[cfg(not(feature = "sched-v2"))]
-        let _ = scheduler::wake_task(task);
     }
 
     for caller in reply_waiters {
         scheduler::deliver_message(caller, error_msg);
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        #[cfg(feature = "sched-v2")]
         let _ = crate::task::scheduler::wake_task_v2(caller);
-        #[cfg(not(feature = "sched-v2"))]
-        let _ = scheduler::wake_task(caller);
     }
 
     let reclaimable: alloc::vec::Vec<_> = reclaim_candidates

@@ -648,12 +648,9 @@ fn net_task() -> ! {
         //
         // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
         // with no deadline; under v1 retain block_current_unless_woken.
-        #[cfg(feature = "sched-v2")]
         {
             let _ = task::scheduler::block_current_until(&net::NIC_WOKEN, None);
         }
-        #[cfg(not(feature = "sched-v2"))]
-        task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
 }
 

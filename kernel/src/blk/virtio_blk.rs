@@ -26,8 +26,6 @@ use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
 use crate::task::scheduler::current_task_id;
-#[cfg(not(feature = "sched-v2"))]
-use crate::task::scheduler::wake_task;
 
 // ===========================================================================
 // PCI device IDs
@@ -362,13 +360,10 @@ impl Virtqueue {
             {
                 waiter.woken.store(true, Ordering::Release);
                 // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
-                #[cfg(feature = "sched-v2")]
                 {
                     use crate::task::scheduler::wake_task_v2;
                     let _ = wake_task_v2(waiter.task);
                 }
-                #[cfg(not(feature = "sched-v2"))]
-                wake_task(waiter.task);
                 // status_virt is read by the task after wake; no IRQ
                 // work needed here.
                 let _ = waiter.status_virt;

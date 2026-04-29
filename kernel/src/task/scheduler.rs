@@ -1503,7 +1503,6 @@ fn block_current_unless_woken_inner(
 /// Callers use this to distinguish why the block ended: a successful wake,
 /// deadline expiry, or an early return because the condition was already
 /// satisfied when the function was called.
-#[cfg(feature = "sched-v2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockOutcome {
     /// A waker wrote `true` to the `woken` flag; the task resumed normally.
@@ -1571,7 +1570,6 @@ pub enum BlockOutcome {
 /// - Linux `do_nanosleep` (`kernel/time/hrtimer.c`) — four-step block recipe.
 /// - Linux `try_to_wake_up` (`kernel/sched/core.c`) — CAS wake side.
 /// - m3OS handoff 2026-04-25: `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`.
-#[cfg(feature = "sched-v2")]
 pub fn block_current_until(
     woken: &core::sync::atomic::AtomicBool,
     deadline_ticks: Option<u64>,
@@ -1750,7 +1748,6 @@ pub fn block_current_until(
 /// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
 /// function instead of `block_current_on_reply_unless_message`.  The semantic
 /// outcome is identical: the caller resumes when a reply is delivered.
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1786,7 +1783,6 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
 /// condition checks without holding the scheduler lock long-term).
 ///
 /// Acquires `SCHEDULER.lock` momentarily.
-#[cfg(feature = "sched-v2")]
 pub fn has_pending_message(id: TaskId) -> bool {
     let sched = scheduler_lock();
     sched
@@ -1810,7 +1806,6 @@ pub fn has_pending_message(id: TaskId) -> bool {
 ///
 /// Returns `true` if woken (`Woken` or `AlreadyTrue`), `false` on deadline
 /// (no deadline is set for IPC recv, so this is dead code for now).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1846,7 +1841,6 @@ pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
 /// block/yield/resume protocol under `block_current_until`.
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline set → dead code).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1882,7 +1876,6 @@ pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
 /// only the block/yield/resume protocol.
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline → dead code).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_send_v2(sender: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -2159,7 +2152,6 @@ fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static st
 // 1–5).
 
 /// Outcome of a [`wake_task_v2`] call.
-#[cfg(feature = "sched-v2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
     /// CAS `Blocked* → Ready` succeeded; the task has been enqueued on its
@@ -2218,7 +2210,6 @@ pub enum WakeOutcome {
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
-#[cfg(feature = "sched-v2")]
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
@@ -3112,46 +3103,6 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
     let mut n = 0usize;
 
     // ── v1 path ──────────────────────────────────────────────────────────────
-    #[cfg(not(feature = "sched-v2"))]
-    for (idx, task) in sched.tasks.iter_mut().enumerate() {
-        if task.wake_deadline.is_none_or(|d| d > now) {
-            continue;
-        }
-        if !matches!(
-            task.state,
-            TaskState::BlockedOnRecv
-                | TaskState::BlockedOnSend
-                | TaskState::BlockedOnReply
-                | TaskState::BlockedOnNotif
-                | TaskState::BlockedOnFutex
-        ) {
-            // Not actually blocked (e.g. race between a real wake and the
-            // deadline scan) — clear the stale deadline and move on.
-            if task.wake_deadline.take().is_some() {
-                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-            }
-            continue;
-        }
-        if task.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-        }
-        if task.switching_out {
-            task.wake_after_switch = true;
-            task.last_migrated_tick = now;
-            continue;
-        }
-        let _old_state_u8 = task.state as u8;
-        task.state = TaskState::Ready;
-        task.last_ready_tick = now;
-        task.last_migrated_tick = now;
-        task.blocked_since_tick = 0;
-        #[cfg(feature = "sched-trace")]
-        crate::task::sched_trace::record(task.pid, _old_state_u8, TaskState::Ready as u8);
-        if n < expired.len() {
-            expired[n] = (task.assigned_core, idx);
-            n += 1;
-        }
-    }
 
     // ── v2 path ──────────────────────────────────────────────────────────────
     //
@@ -3181,7 +3132,6 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
     //    because the scan runs under `SCHEDULER.lock`, which is also held
     //    during `pick_next` — the dispatch path cannot read a stale `saved_rsp`
     //    for a task we just marked Ready, because both paths hold the same lock.
-    #[cfg(feature = "sched-v2")]
     for (idx, task) in sched.tasks.iter_mut().enumerate() {
         if task.wake_deadline.is_none_or(|d| d > now) {
             continue;

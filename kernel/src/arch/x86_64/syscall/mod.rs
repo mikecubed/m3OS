@@ -2043,13 +2043,8 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
         };
         for tid in to_wake {
             // F.3: route through wake_task_v2 under sched-v2 (CAS-based wake).
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = crate::task::scheduler::wake_task_v2(tid);
-            }
-            #[cfg(not(feature = "sched-v2"))]
-            {
-                let _ = crate::task::wake_task(tid);
             }
         }
     }
@@ -3201,7 +3196,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
     // the task is woken solely by scan_expired_wake_deadlines when the
     // deadline tick arrives. Sleeps < 1 ms retain the TSC busy-spin (the
     // cost of a context switch exceeds the sleep duration).
-    #[cfg(feature = "sched-v2")]
     if sleep_us >= 1_000 {
         // deadline_ticks = now + ceil(sleep_us / 1000) = now + ceil(sleep_ns / 1_000_000)
         let sleep_ms = sleep_us.div_ceil(1_000);
@@ -12480,12 +12474,9 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // instead of block_current_on_futex_unless_woken (v1). The
             // woken_flag is shared with the wake side; the Arc clone above
             // ensures it lives until the waiter is removed from FUTEX_TABLE.
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = crate::task::scheduler::block_current_until(&woken_flag, None);
             }
-            #[cfg(not(feature = "sched-v2"))]
-            crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
             0
         }
@@ -12538,19 +12529,12 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // use wake_task (deferred-enqueue path).
             let mut actual_woken = 0usize;
             for tid in to_wake {
-                #[cfg(feature = "sched-v2")]
                 {
                     use crate::task::scheduler::WakeOutcome;
                     if matches!(
                         crate::task::scheduler::wake_task_v2(tid),
                         WakeOutcome::Woken
                     ) {
-                        actual_woken += 1;
-                    }
-                }
-                #[cfg(not(feature = "sched-v2"))]
-                {
-                    if crate::task::wake_task(tid) {
                         actual_woken += 1;
                     }
                 }
@@ -14817,17 +14801,8 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         //   wakes us when the timeout expires (no yield_now() spin needed).
         // - Indefinite timeout: pass None; wake comes from WaitQueue.
         // Under v1, retain the original yield_now() / block_current_unless_woken paths.
-        #[cfg(feature = "sched-v2")]
         {
             let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
-        }
-        #[cfg(not(feature = "sched-v2"))]
-        {
-            if deadline_tick.is_some() {
-                crate::task::yield_now();
-            } else {
-                crate::task::scheduler::block_current_unless_woken(&woken);
-            }
         }
     };
 
@@ -15075,7 +15050,6 @@ fn select_inner(
         // positive timeout passes deadline_tick; indefinite passes None.
         // Under v1, retain yield_now() for positive timeout and
         // block_current_unless_woken for indefinite timeout.
-        #[cfg(feature = "sched-v2")]
         {
             let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for fd in 0..nfds {
@@ -15083,30 +15057,6 @@ fn select_inner(
                     && combined & (1 << fd) != 0
                 {
                     fd_deregister_waiter(entry, task_id);
-                }
-            }
-        }
-        #[cfg(not(feature = "sched-v2"))]
-        {
-            if deadline_tick.is_some() {
-                // Positive timeout: yield to let timer ticks advance.
-                for fd in 0..nfds {
-                    if let Some(entry) = &entries[fd]
-                        && combined & (1 << fd) != 0
-                    {
-                        fd_deregister_waiter(entry, task_id);
-                    }
-                }
-                crate::task::yield_now();
-            } else {
-                // Indefinite timeout (NULL): block on wait queues.
-                crate::task::scheduler::block_current_unless_woken(&woken);
-                for fd in 0..nfds {
-                    if let Some(entry) = &entries[fd]
-                        && combined & (1 << fd) != 0
-                    {
-                        fd_deregister_waiter(entry, task_id);
-                    }
                 }
             }
         }
@@ -15510,32 +15460,11 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         // positive timeout passes deadline_tick; indefinite passes None.
         // Under v1, retain yield_now() for positive timeout and
         // block_current_unless_woken for indefinite timeout.
-        #[cfg(feature = "sched-v2")]
         {
             let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);
-                }
-            }
-        }
-        #[cfg(not(feature = "sched-v2"))]
-        {
-            if deadline_tick.is_some() {
-                // Positive timeout: yield to let timer ticks advance.
-                for interest in &interests {
-                    if let Some(entry) = current_fd_entry(interest.fd) {
-                        fd_deregister_waiter(&entry, task_id);
-                    }
-                }
-                crate::task::yield_now();
-            } else {
-                // Indefinite timeout (-1): block on wait queues.
-                crate::task::scheduler::block_current_unless_woken(&woken);
-                for interest in &interests {
-                    if let Some(entry) = current_fd_entry(interest.fd) {
-                        fd_deregister_waiter(&entry, task_id);
-                    }
                 }
             }
         }
