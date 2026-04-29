@@ -78,9 +78,8 @@ pub use scheduler::{
 ///
 /// Returns `None` if the lock is already held (e.g. during a panic while
 /// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
-pub(crate) fn try_lock_scheduler() -> Option<scheduler::IrqSafeGuard<'static, scheduler::Scheduler>>
-{
-    scheduler::SCHEDULER.try_lock()
+pub(crate) fn try_lock_scheduler() -> Option<scheduler::SchedulerGuard<'static>> {
+    scheduler::try_scheduler_lock()
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +348,41 @@ impl Task {
             let top = base + s.len() as u64;
             (base, top)
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.4 — canonical pi_lock reader/writer
+    // ---------------------------------------------------------------------------
+
+    /// Acquire `pi_lock`, run `f` with mutable access to the protected
+    /// [`TaskBlockState`], release, and return the result.
+    ///
+    /// This is the **only** entry point Tracks C/D use to read or write
+    /// `TaskBlockState` fields.  Using this helper exclusively is the SOLID
+    /// Single-Responsibility boundary: all lock-acquire/transition/release
+    /// boilerplate lives here, not at call sites.
+    ///
+    /// # Lock ordering
+    ///
+    /// In debug builds, panics if `SCHEDULER.lock` is already held by this
+    /// CPU (Linux's `p->pi_lock` → `rq->lock` ordering — `pi_lock` is the
+    /// OUTER lock; see the `scheduler.rs` module doc for the full hierarchy).
+    #[inline]
+    pub fn with_block_state<R>(&self, f: impl FnOnce(&mut TaskBlockState) -> R) -> R {
+        // Phase 57a B.3: lock-ordering assertion.
+        // Acquiring pi_lock while already holding SCHEDULER.lock violates the
+        // Linux p->pi_lock → rq->lock invariant and can deadlock.
+        debug_assert!(
+            !crate::smp::try_per_core()
+                .map(|c| c
+                    .holds_scheduler_lock
+                    .load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false),
+            "pi_lock acquisition while SCHEDULER.lock is held — \
+             Linux p->pi_lock → rq->lock ordering violated"
+        );
+        let mut guard = self.pi_lock.lock();
+        f(&mut guard)
     }
 }
 
