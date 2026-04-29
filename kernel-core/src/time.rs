@@ -1,6 +1,17 @@
 //! Pure-logic time conversion library for kernel timekeeping.
 //! No hardware access — suitable for host testing.
 
+/// Expected scheduler tick rate for m3OS.
+///
+/// The actual constant lives in `kernel/src/arch/x86_64/syscall/mod.rs`
+/// (`pub(crate) const TICKS_PER_SEC: u64 = 1000`). This sentinel mirrors it in
+/// the host-testable `kernel-core` crate so that regression tests can assert the
+/// 1 tick = 1 ms invariant without pulling in kernel internals.
+///
+/// If you change the kernel's `TICKS_PER_SEC`, update this constant and all call
+/// sites that relied on the old rate.
+pub const TICKS_PER_SEC_EXPECTED: u64 = 1_000;
+
 /// A date-time representation with weekday.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateTime {
