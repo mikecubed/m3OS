@@ -1870,14 +1870,30 @@ pub enum WakeOutcome {
 /// # Lock ordering
 ///
 /// `pi_lock` is OUTER; `SCHEDULER.lock` is INNER (Linux's `p->pi_lock` →
-/// `rq->lock` pattern).  Step 1 releases `SCHEDULER.lock` before step 2
-/// acquires `pi_lock`.  Step 3 re-acquires `SCHEDULER.lock` after
-/// `pi_lock` is released.  The two locks are NEVER held simultaneously.
+/// `rq->lock` pattern).  Step 1 captures `idx` + `pi_lock_ptr` under a
+/// brief `SCHEDULER.lock` and drops it.  Steps 2+3 acquire `pi_lock` OUTER
+/// and then `SCHEDULER.lock` INNER **simultaneously** so the canonical CAS
+/// and the scheduler-visible mirror are atomic with respect to a racing
+/// `block_current_until` self-revert.  Step 4's `on_cpu` spin-wait and
+/// step 5's enqueue run with both locks dropped (Linux pattern); a
+/// self-revert that interleaves there is harmless — `pick_next`'s
+/// `state != Ready` filter silently drops any stale queue entry.
 ///
-/// The task-slot pointer obtained in step 1 remains valid throughout steps
-/// 2–5 because dead-slot recycling only runs under `SCHEDULER.lock`; no
-/// task can be removed from `tasks[idx]` while we are executing outside
-/// of that lock.
+/// # Identity revalidation
+///
+/// `idx` and the captured raw pointers persist across the SCHEDULER.lock
+/// drop in step 1; if the slot was recycled (Dead → free list →
+/// allocate_task at e.g. scheduler.rs:821) before we re-acquire
+/// SCHEDULER.lock in step 3, the slot now holds a DIFFERENT task at the
+/// same memory address.  Step 3 therefore revalidates
+/// `sched.tasks[idx].id == id` BEFORE writing — on mismatch we return
+/// `AlreadyAwake` and never mutate the (recycled) task.  Briefly locking
+/// the recycled task's pi_lock for the validation read is benign: we read
+/// state, find identity mismatch, release without writing.
+///
+/// `assigned_core` and `on_cpu_ptr` are also re-read inside the validated
+/// critical section so step 4's spin-wait and step 5's enqueue use values
+/// fresh from the validated slot, not stale values from step 1's snapshot.
 ///
 /// # Constraints
 ///
@@ -1896,58 +1912,55 @@ pub enum WakeOutcome {
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
-    // We need the raw address of `tasks[idx].pi_lock` so we can acquire it
-    // outside of `SCHEDULER.lock` (lock-ordering: pi_lock OUTER).  The Vec
-    // never shrinks — slots only go Dead and are recycled, but the `Task`
-    // object at position `idx` is stable in memory for the task's lifetime.
-    // Dead-slot recycling (which writes a new task into the slot) only runs
-    // under `SCHEDULER.lock`; since we drop `SCHEDULER.lock` before the
-    // pi_lock CAS and re-acquire it only in step 3, no recycling can happen
-    // between steps 1 and 5.
-    let (idx, pi_lock_ptr, on_cpu_ptr, assigned_core) = {
+    // The Vec never shrinks; slots are Dead-recycled but the memory at
+    // `tasks[idx]` is stable.  We capture only `idx` and `pi_lock_ptr` here
+    // because everything else (`assigned_core`, `on_cpu_ptr`) MUST be re-read
+    // inside the validated critical section after revalidating the slot's
+    // identity — otherwise a recycle between step 1 and step 3 would let
+    // us spin / enqueue using stale values from the previous task in the
+    // slot.
+    let (idx, pi_lock_ptr) = {
         let sched = scheduler_lock();
         let idx = match sched.find(id) {
             Some(i) => i,
             None => return WakeOutcome::AlreadyAwake,
         };
-        // Capture stable pointers to the atomic fields — safe because the
-        // Task at `tasks[idx]` is not moved or freed between now and step 5
-        // (see lock-ordering invariant above).
         let pi_lock_ptr: *const IrqSafeMutex<super::TaskBlockState> =
             &raw const sched.tasks[idx].pi_lock;
-        let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        let assigned = sched.tasks[idx].assigned_core;
-        // SCHEDULER.lock is dropped at end of this block.
-        (idx, pi_lock_ptr, on_cpu_ptr, assigned)
+        (idx, pi_lock_ptr)
+        // SCHEDULER.lock dropped.
     };
-    // SCHEDULER.lock released.  Now pi_lock_ptr and on_cpu_ptr are raw
-    // pointers into the stable Task struct.
 
-    // ── Step 2+3: Atomic CAS + scheduler-visible mirror ──────────────────────
+    // ── Step 2+3: Atomic CAS + scheduler-visible mirror under both locks ────
     //
-    // pi_lock OUTER + SCHEDULER.lock INNER held together so the canonical
-    // and scheduler-visible writes are atomic with respect to
-    // `block_current_until`'s self-revert path (which acquires pi_lock OUTER
-    // + scheduler_lock INNER for the same Blocked*→Running transition).
-    // Without this atomicity, a self-revert could interleave between our
-    // pi_lock CAS and our Task::state mirror, leaving the task running
-    // (current_task_idx restored) but Task::state=Ready and idx queued —
-    // pick_next on another core would dispatch the live task again.
+    // Acquire pi_lock OUTER, then SCHEDULER.lock INNER.  Both writes
+    // (canonical TaskBlockState.state and Task::state) happen with both
+    // locks held — atomic with respect to `block_current_until`'s
+    // self-revert path.
     //
-    // The pi_lock acquire barrier pairs with the Release on the block side's
-    // pi_lock store (step 1 of `block_current_until`), eliminating the
-    // lost-wake window (Linux `smp_store_mb` / `set_current_state` ↔
-    // `try_to_wake_up` acquire pair).
+    // Identity revalidation: between step 1's SCHEDULER.lock drop and our
+    // re-acquisition here, the slot may have been Dead-recycled into a
+    // different task (allocate_task pushes into the same `tasks[idx]`
+    // memory; pi_lock_ptr now references the NEW task's pi_lock).  We
+    // briefly lock that pi_lock (harmless), then under SCHEDULER.lock
+    // verify `tasks[idx].id == id`.  On mismatch we return AlreadyAwake
+    // and never mutate the recycled task.
     //
-    // SAFETY: `pi_lock_ptr` is a valid, aligned pointer to an
-    // `IrqSafeMutex<TaskBlockState>` embedded in a `Task` that lives for the
-    // duration of this call (see step 1 comment).  We are NOT holding
-    // SCHEDULER.lock when we acquire pi_lock here.
+    // SAFETY: `pi_lock_ptr` points into the stable `tasks[idx]` memory.
+    // SCHEDULER.lock is NOT held when we acquire pi_lock.
     let now = crate::arch::x86_64::interrupts::tick_count();
-    let prev_state_u8 = {
+    let post_lock = {
         let pi_lock_ref = unsafe { &*pi_lock_ptr };
         let mut guard = pi_lock_ref.lock();
-        let prev = guard.state as u8;
+        let mut sched = scheduler_lock();
+
+        // Identity revalidation — slot may have been recycled.
+        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
+            return WakeOutcome::AlreadyAwake;
+        }
+
+        // CAS check (canonical state).
+        let prev_state_u8 = guard.state as u8;
         if !matches!(
             guard.state,
             TaskState::BlockedOnRecv
@@ -1956,41 +1969,38 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
         ) {
-            // CAS failed — task is Ready, Running, or Dead.
             return WakeOutcome::AlreadyAwake;
         }
-        // Inner scheduler_lock — both writes happen with both locks held.
-        {
-            let mut sched = scheduler_lock();
-            if idx < sched.tasks.len() {
-                // Canonical (pi_lock-protected) write.
-                guard.state = TaskState::Ready;
-                if guard.wake_deadline.take().is_some() {
-                    ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-                }
-                // Scheduler-visible mirror — same critical section, no race.
-                sched.tasks[idx].state = TaskState::Ready;
-                sched.tasks[idx].last_ready_tick = now;
-                sched.tasks[idx].blocked_since_tick = 0;
-                sched.tasks[idx].wake_deadline = None;
-                #[cfg(feature = "sched-trace")]
-                crate::task::sched_trace::record(
-                    sched.tasks[idx].pid,
-                    prev,
-                    TaskState::Ready as u8,
-                );
-                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
-                    task_idx: idx as u32,
-                    state_before: prev,
-                    core: sched.tasks[idx].assigned_core,
-                });
-            }
-            // SCHEDULER.lock released.
+
+        // Atomic canonical + scheduler-visible writes.
+        guard.state = TaskState::Ready;
+        if guard.wake_deadline.take().is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
         }
-        prev
-        // pi_lock released here (guard dropped).
+        sched.tasks[idx].state = TaskState::Ready;
+        sched.tasks[idx].last_ready_tick = now;
+        sched.tasks[idx].blocked_since_tick = 0;
+        sched.tasks[idx].wake_deadline = None;
+        #[cfg(feature = "sched-trace")]
+        crate::task::sched_trace::record(
+            sched.tasks[idx].pid,
+            prev_state_u8,
+            TaskState::Ready as u8,
+        );
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
+            task_idx: idx as u32,
+            state_before: prev_state_u8,
+            core: sched.tasks[idx].assigned_core,
+        });
+
+        // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
+        // for use after both locks drop.
+        let assigned: u8 = sched.tasks[idx].assigned_core;
+        let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
+        (assigned, on_cpu_ptr)
+        // SCHEDULER.lock released, then pi_lock released.
     };
-    let _ = prev_state_u8;
+    let (assigned_core, on_cpu_ptr) = post_lock;
 
     // ── Step 4: Spin-wait on Task::on_cpu == false ────────────────────────────
     //
