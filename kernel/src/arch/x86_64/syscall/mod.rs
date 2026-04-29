@@ -14641,10 +14641,12 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
-    // Convert ms timeout to tick deadline. ~100 Hz timer → 10ms/tick.
+    // Convert ms timeout to tick deadline.
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `(timeout_i as u64).div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
     let deadline_tick = if timeout_i > 0 {
-        Some(start_tick + (timeout_i as u64).div_ceil(10)) // round up
+        Some(start_tick + (timeout_i as u64)) // 1 tick = 1 ms; no divisor needed
     } else {
         None // 0 = non-blocking, -1 = indefinite
     };
@@ -14889,9 +14891,9 @@ fn select_inner(
         Err(e) => return e,
     };
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
-    let deadline_tick = timeout_ms
-        .filter(|&ms| ms > 0)
-        .map(|ms| start_tick + ms.div_ceil(10));
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `ms.div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
+    let deadline_tick = timeout_ms.filter(|&ms| ms > 0).map(|ms| start_tick + ms); // 1 tick = 1 ms; no divisor needed
     let nonblocking = timeout_ms == Some(0);
 
     let combined = read_mask | write_mask | except_mask;
@@ -15300,8 +15302,10 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
     }
     let timeout_i = timeout as i64;
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `(timeout_i as u64).div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
     let deadline_tick = if timeout_i > 0 {
-        Some(start_tick + (timeout_i as u64).div_ceil(10))
+        Some(start_tick + (timeout_i as u64)) // 1 tick = 1 ms; no divisor needed
     } else {
         None
     };
