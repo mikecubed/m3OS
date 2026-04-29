@@ -1138,4 +1138,186 @@ mod tests {
             );
         }
     }
+
+    // ── D.1 — wake_task CAS rewrite TDD gate ─────────────────────────────
+    //
+    // These consolidating tests document the D.1 acceptance criteria for
+    // `wake_task_v2` in `kernel/src/task/scheduler.rs`.  The actual
+    // per-variant assertions live in the individual per-row tests above;
+    // the tests below provide named entry points matching the task list so
+    // reviewers can locate the gate at a glance.
+    //
+    // Acceptance criteria (from 57a-scheduler-rewrite-tasks.md D.1):
+    // - From each Blocked*, Wake → Ready with enqueue_to_run_queue=true,
+    //   deadline_cleared=true, on_cpu_wait_required=true.
+    // - From Ready, Wake is a no-op (idempotent; already covered by
+    //   `test_ready_wake_noop`).
+    // - From Running, Wake is a no-op (idempotent; already covered by
+    //   `test_running_wake_noop`).
+    //
+    // The individual row tests (`test_blocked_on_*_wake_to_ready`) and the
+    // cross-row sweep (`all_blocked_wake_transitions_require_on_cpu_wait`)
+    // already verify every cell.  This test provides a single named gate
+    // that CI can filter on: `cargo test wake_task_cas`.
+
+    /// D.1 TDD gate — `wake_task` CAS from every `Blocked*` state succeeds.
+    ///
+    /// Consolidates: `test_blocked_on_{recv,send,reply,notif,futex}_wake_to_ready`
+    /// and `all_blocked_wake_transitions_require_on_cpu_wait`.
+    ///
+    /// For each `Blocked*` state, `Wake` must produce:
+    /// - next state = `Ready`
+    /// - `enqueue_to_run_queue = true`
+    /// - `deadline_cleared = true`
+    /// - `on_cpu_wait_required = true` (Linux `p->on_cpu` spin-wait gate)
+    #[test]
+    fn wake_task_cas_succeeds_from_blocked() {
+        let blocked_states = [
+            BlockState::BlockedOnRecv,
+            BlockState::BlockedOnSend,
+            BlockState::BlockedOnReply,
+            BlockState::BlockedOnNotif,
+            BlockState::BlockedOnFutex,
+        ];
+        for &s in &blocked_states {
+            let (new_state, fx) = apply_event(s, Event::Wake);
+            assert_eq!(
+                new_state,
+                BlockState::Ready,
+                "wake_task CAS must produce Ready for state={:?}",
+                s
+            );
+            assert!(
+                fx.enqueue_to_run_queue,
+                "wake_task must enqueue task for state={:?}",
+                s
+            );
+            assert!(
+                fx.deadline_cleared,
+                "wake_task must clear wake_deadline for state={:?}",
+                s
+            );
+            assert!(
+                fx.on_cpu_wait_required,
+                "wake_task must set on_cpu_wait_required for state={:?} \
+                 (Linux p->on_cpu smp_cond_load_acquire pattern)",
+                s
+            );
+        }
+    }
+
+    /// D.1 TDD gate — `wake_task` is idempotent when the task is already Ready.
+    ///
+    /// Consolidates: `test_ready_wake_noop`.
+    ///
+    /// A CAS from `Ready → Ready` fails (not a `Blocked*` state); the wake
+    /// primitive returns `AlreadyAwake` without touching the run queue.
+    #[test]
+    fn wake_task_idempotent_when_already_ready() {
+        let (new_state, fx) = apply_event(BlockState::Ready, Event::Wake);
+        assert_eq!(
+            new_state,
+            BlockState::Ready,
+            "wake to Ready task must be a no-op"
+        );
+        assert!(!fx.enqueue_to_run_queue, "idempotent wake must not enqueue");
+        assert!(
+            !fx.deadline_cleared,
+            "idempotent wake must not clear deadline"
+        );
+        assert!(
+            !fx.on_cpu_wait_required,
+            "idempotent wake must not require on_cpu spin-wait"
+        );
+    }
+
+    /// D.1 TDD gate — `wake_task` is idempotent when the task is Running.
+    ///
+    /// Consolidates: `test_running_wake_noop`.
+    ///
+    /// A CAS from `Running → Ready` fails (not a `Blocked*` state); the wake
+    /// primitive returns `AlreadyAwake`.  The Running task will recheck its
+    /// condition on resume from `block_current_until`.
+    #[test]
+    fn wake_task_idempotent_when_running() {
+        let (new_state, fx) = apply_event(BlockState::Running, Event::Wake);
+        assert_eq!(
+            new_state,
+            BlockState::Running,
+            "wake to Running task must be a no-op"
+        );
+        assert!(!fx.enqueue_to_run_queue, "idempotent wake must not enqueue");
+        assert!(
+            !fx.deadline_cleared,
+            "idempotent wake must not clear deadline"
+        );
+        assert!(
+            !fx.on_cpu_wait_required,
+            "idempotent wake must not require on_cpu spin-wait"
+        );
+    }
+
+    /// D.2 TDD gate — `Wake` then `ScanExpired` on the same task does not
+    /// double-enqueue.
+    ///
+    /// Once `Wake` transitions the task to `Ready`, the subsequent
+    /// `ScanExpired` sees a non-`Blocked*` state and is a no-op.  This
+    /// models the idempotency guard in `scan_expired_wake_deadlines` v2:
+    /// the `pi_lock` CAS from `Blocked*→Ready` in `wake_task_v2` happens
+    /// first; the scan's state check then skips the already-Ready task.
+    #[test]
+    fn wake_then_scan_expired_does_not_double_enqueue() {
+        // Step 1: Wake arrives first (e.g. notification signal) — Blocked* → Ready.
+        let (s1, fx1) = apply_event(BlockState::BlockedOnRecv, Event::Wake);
+        assert_eq!(s1, BlockState::Ready, "wake must produce Ready");
+        assert!(fx1.enqueue_to_run_queue, "first wake must enqueue");
+
+        // Step 2: Deadline scan fires after the wake — Ready × ScanExpired is a no-op.
+        let (s2, fx2) = apply_event(s1, Event::ScanExpired { now: 5000 });
+        assert_eq!(s2, BlockState::Ready, "scan on Ready task must be no-op");
+        assert!(
+            !fx2.enqueue_to_run_queue,
+            "scan after wake must NOT re-enqueue (idempotency guard)"
+        );
+    }
+
+    /// D.4 TDD gate — scan-expires-during-block-window race.
+    ///
+    /// A task writes `Blocked*` under `pi_lock` (step 1 of the four-step
+    /// recipe) and then `scan_expired_wake_deadlines` fires before the
+    /// task yields (step 4).  The scan sees `Blocked*` with an expired
+    /// deadline and transitions to `Ready` — the same result as a normal
+    /// `Wake` but without the `on_cpu_wait_required` flag (the scan runs
+    /// under `SCHEDULER.lock` so the epilogue cannot race).
+    ///
+    /// Consolidates: `block_current_until_deadline_expired_path` and
+    /// `scan_expired_wake_does_not_require_on_cpu_wait`.
+    #[test]
+    fn scan_expired_during_block_window_race() {
+        // Step 1: task writes Running → Blocked* under pi_lock with a deadline.
+        let (blocked_state, block_fx) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: Some(100),
+            },
+        );
+        assert_eq!(blocked_state, BlockState::BlockedOnRecv);
+        assert_eq!(block_fx.deadline_set, Some(100));
+
+        // Race: scan fires while task is in the switch-out window (before yield).
+        // At tick 101, deadline 100 has elapsed.
+        let (s2, fx2) = apply_event(blocked_state, Event::ScanExpired { now: 101 });
+        assert_eq!(
+            s2,
+            BlockState::Ready,
+            "scan must transition to Ready even in block-window race"
+        );
+        assert!(fx2.deadline_cleared, "scan must clear the expired deadline");
+        assert!(fx2.enqueue_to_run_queue, "scan must enqueue the task");
+        assert!(
+            !fx2.on_cpu_wait_required,
+            "scan does NOT need on_cpu spin-wait (runs under SCHEDULER.lock)"
+        );
+    }
 }
