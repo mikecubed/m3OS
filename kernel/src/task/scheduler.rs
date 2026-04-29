@@ -1699,8 +1699,10 @@ pub fn mark_current_dead() -> ! {
 /// Used by `exit_group()` to kill sibling threads.  Returns `true` if the
 /// task was found and marked dead, `false` otherwise.
 pub fn mark_task_dead_by_pid(pid: u32) -> bool {
-    // Lock-order: pi_lock OUTER, scheduler_lock INNER.
-    // Step 1: brief scheduler_lock to find task and capture pi_lock pointer.
+    // Lock-order: pi_lock OUTER, scheduler_lock INNER, BOTH HELD ATOMICALLY
+    // for the canonical + mirror writes. Splitting them allows the
+    // scheduler-visible identity check to fail after canonical state is
+    // already Dead, leaving the task dead in pi_lock but live in Task::state.
     let captured = {
         let sched = scheduler_lock();
         sched
@@ -1713,28 +1715,26 @@ pub fn mark_task_dead_by_pid(pid: u32) -> bool {
         Some(x) => x,
         None => return false,
     };
-    // Step 2: take pi_lock (OUTER) and write canonical Dead state.
-    // SAFETY: tasks[idx] is stable while idx remains valid; we re-verify
-    // identity inside the inner scheduler_lock below.
-    {
-        let pi_lock_ref = unsafe { &*pi_lock_ptr };
-        let mut bs = pi_lock_ref.lock();
-        bs.state = TaskState::Dead;
-        if bs.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        }
+    // Acquire pi_lock OUTER + scheduler_lock INNER for atomic write.
+    // SAFETY: tasks[idx] is stable while idx remains valid (the Vec only
+    // grows; dead-slot recycling runs under SCHEDULER.lock, which we hold).
+    let pi_lock_ref = unsafe { &*pi_lock_ptr };
+    let mut bs = pi_lock_ref.lock();
+    let mut sched = scheduler_lock();
+    if idx >= sched.tasks.len() || sched.tasks[idx].pid != pid {
+        // Task identity changed between collection and lock — refuse, leaving
+        // both canonical and scheduler-visible state untouched.
+        return false;
     }
-    // Step 3: scheduler_lock (INNER) to mirror to v1 fields.
-    {
-        let mut sched = scheduler_lock();
-        if idx < sched.tasks.len() && sched.tasks[idx].pid == pid {
-            sched.tasks[idx].group_exit_pending = false;
-            sched.tasks[idx].state = TaskState::Dead;
-            sched.tasks[idx].wake_deadline = None;
-            return true;
-        }
+    bs.state = TaskState::Dead;
+    if bs.wake_deadline.take().is_some() {
+        ACTIVE_WAKE_DEADLINES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
-    false
+    sched.tasks[idx].group_exit_pending = false;
+    sched.tasks[idx].state = TaskState::Dead;
+    sched.tasks[idx].wake_deadline = None;
+    true
+    // Both locks released as the guards drop on return.
 }
 
 /// Request that the task with `pid` stop itself on its own core.
@@ -1766,31 +1766,26 @@ pub fn take_current_group_exit_request() -> bool {
 /// Atomically confirm that a sibling is off-core and mark it dead so it can
 /// be reaped by another thread in the same group.
 pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
-    // Step 1: brief scheduler_lock — verify quiescent + capture pi_lock pointer.
+    // Lock-order: pi_lock OUTER, scheduler_lock INNER, BOTH HELD ATOMICALLY
+    // for the quiescence check + canonical/mirror write.  Splitting them
+    // means the task could become non-quiescent (current/on-CPU again)
+    // between the canonical Dead write and the scheduler_lock check —
+    // we'd then return false while pi_lock state is already Dead.
     let captured = {
         let sched = scheduler_lock();
-        let Some(idx) = sched.find_by_pid(pid) else {
-            return false;
-        };
-        if sched.task_current_on_any_core(idx) || sched.tasks[idx].on_cpu.load(Ordering::Acquire) {
-            return false;
-        }
-        Some((idx, &raw const sched.tasks[idx].pi_lock))
+        sched
+            .find_by_pid(pid)
+            .map(|idx| (idx, &raw const sched.tasks[idx].pi_lock))
     };
     let (idx, pi_lock_ptr) = match captured {
         Some(x) => x,
         None => return false,
     };
-    // Step 2: pi_lock (OUTER) — canonical Dead.
-    {
-        let pi_lock_ref = unsafe { &*pi_lock_ptr };
-        let mut bs = pi_lock_ref.lock();
-        bs.state = TaskState::Dead;
-        if bs.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-    // Step 3: scheduler_lock (INNER) — re-verify quiescent and mirror.
+    // Acquire both locks before any mutation; verify quiescence with both held.
+    // SAFETY: tasks[idx] is stable while idx remains valid (scheduler_lock
+    // gates dead-slot recycling).
+    let pi_lock_ref = unsafe { &*pi_lock_ptr };
+    let mut bs = pi_lock_ref.lock();
     let mut sched = scheduler_lock();
     let Some(check_idx) = sched.find_by_pid(pid) else {
         return false;
@@ -1800,6 +1795,11 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
         || sched.tasks[idx].on_cpu.load(Ordering::Acquire)
     {
         return false;
+    }
+    // Atomic Dead write under both locks.
+    bs.state = TaskState::Dead;
+    if bs.wake_deadline.take().is_some() {
+        ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
     }
     sched.tasks[idx].state = TaskState::Dead;
     sched.tasks[idx].wake_deadline = None;
@@ -1923,17 +1923,27 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     // SCHEDULER.lock released.  Now pi_lock_ptr and on_cpu_ptr are raw
     // pointers into the stable Task struct.
 
-    // ── Step 2: CAS Blocked* → Ready under pi_lock ───────────────────────────
+    // ── Step 2+3: Atomic CAS + scheduler-visible mirror ──────────────────────
     //
-    // The spin::Mutex acquire barrier on pi_lock pairs with the Release on
-    // the block side's pi_lock store (step 1 of `block_current_until`),
-    // eliminating the lost-wake window (Linux `smp_store_mb` /
-    // `set_current_state` ↔ `try_to_wake_up` acquire pair).
+    // pi_lock OUTER + SCHEDULER.lock INNER held together so the canonical
+    // and scheduler-visible writes are atomic with respect to
+    // `block_current_until`'s self-revert path (which acquires pi_lock OUTER
+    // + scheduler_lock INNER for the same Blocked*→Running transition).
+    // Without this atomicity, a self-revert could interleave between our
+    // pi_lock CAS and our Task::state mirror, leaving the task running
+    // (current_task_idx restored) but Task::state=Ready and idx queued —
+    // pick_next on another core would dispatch the live task again.
     //
-    // SAFETY: `pi_lock_ptr` is a valid, aligned pointer to a
-    // `spin::Mutex<TaskBlockState>` embedded in a `Task` that lives for the
+    // The pi_lock acquire barrier pairs with the Release on the block side's
+    // pi_lock store (step 1 of `block_current_until`), eliminating the
+    // lost-wake window (Linux `smp_store_mb` / `set_current_state` ↔
+    // `try_to_wake_up` acquire pair).
+    //
+    // SAFETY: `pi_lock_ptr` is a valid, aligned pointer to an
+    // `IrqSafeMutex<TaskBlockState>` embedded in a `Task` that lives for the
     // duration of this call (see step 1 comment).  We are NOT holding
-    // SCHEDULER.lock here, satisfying the lock-ordering invariant.
+    // SCHEDULER.lock when we acquire pi_lock here.
+    let now = crate::arch::x86_64::interrupts::tick_count();
     let prev_state_u8 = {
         let pi_lock_ref = unsafe { &*pi_lock_ptr };
         let mut guard = pi_lock_ref.lock();
@@ -1949,46 +1959,38 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
             // CAS failed — task is Ready, Running, or Dead.
             return WakeOutcome::AlreadyAwake;
         }
-        guard.state = TaskState::Ready;
-        if guard.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        // Inner scheduler_lock — both writes happen with both locks held.
+        {
+            let mut sched = scheduler_lock();
+            if idx < sched.tasks.len() {
+                // Canonical (pi_lock-protected) write.
+                guard.state = TaskState::Ready;
+                if guard.wake_deadline.take().is_some() {
+                    ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+                }
+                // Scheduler-visible mirror — same critical section, no race.
+                sched.tasks[idx].state = TaskState::Ready;
+                sched.tasks[idx].last_ready_tick = now;
+                sched.tasks[idx].blocked_since_tick = 0;
+                sched.tasks[idx].wake_deadline = None;
+                #[cfg(feature = "sched-trace")]
+                crate::task::sched_trace::record(
+                    sched.tasks[idx].pid,
+                    prev,
+                    TaskState::Ready as u8,
+                );
+                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
+                    task_idx: idx as u32,
+                    state_before: prev,
+                    core: sched.tasks[idx].assigned_core,
+                });
+            }
+            // SCHEDULER.lock released.
         }
         prev
         // pi_lock released here (guard dropped).
     };
-
-    // ── Step 3: Mirror to v1 fields under SCHEDULER.lock ─────────────────────
-    //
-    // The v1 dispatch loop and `pick_next` still read `Task::state` and
-    // `Task::wake_deadline` directly until Track E.3 removes those fields.
-    // Dual-write (shadow-lock pattern, B.2): same transition written to both
-    // canonical (pi_lock) and legacy (Task::state) fields.
-    let now = crate::arch::x86_64::interrupts::tick_count();
-    {
-        let mut sched = scheduler_lock();
-        if idx < sched.tasks.len() {
-            // v1 shadow-lock dual write.
-            sched.tasks[idx].state = TaskState::Ready;
-            sched.tasks[idx].last_ready_tick = now;
-            sched.tasks[idx].blocked_since_tick = 0;
-            // Sync the legacy wake_deadline field (already cleared in pi_lock
-            // CAS above; clearing here avoids a stale `scan_expired` hit).
-            // Counter was already decremented in step 2; do NOT decrement again.
-            sched.tasks[idx].wake_deadline = None;
-            #[cfg(feature = "sched-trace")]
-            crate::task::sched_trace::record(
-                sched.tasks[idx].pid,
-                prev_state_u8,
-                TaskState::Ready as u8,
-            );
-            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
-                task_idx: idx as u32,
-                state_before: prev_state_u8,
-                core: sched.tasks[idx].assigned_core,
-            });
-        }
-        // SCHEDULER.lock released here.
-    }
+    let _ = prev_state_u8;
 
     // ── Step 4: Spin-wait on Task::on_cpu == false ────────────────────────────
     //
