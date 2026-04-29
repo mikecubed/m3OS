@@ -1339,14 +1339,10 @@ mod syscall_nr {
 /// that enters but never exits localises the busy-wait to a specific
 /// kernel-side call site.
 ///
-/// Default 0 = disabled.  Was set to 2 during the Phase 57a syslogd-on-
-/// core-1 hang investigation (which localised the bug to virtio_blk's
-/// `do_request` busy-spin).  Now temporarily set to 11 (vfs_server) for
-/// the next investigation — multiple daemons (sshd/crond/vfs/etc.) still
-/// hang their cores after the virtio_blk fix; vfs_server's startup is
-/// the most likely shared dependency.  Flip to 0 once root-caused.
-pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(11);
+/// Default 0 = disabled.  Available at runtime via gdb for future
+/// daemon-monopolisation investigations: `set
+/// crate::arch::x86_64::syscall::STRACE_PID = N`.
+pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
@@ -14844,26 +14840,33 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             break NEG_EINTR;
         }
 
-        // If no FDs could be registered (all non-pollable), yield to avoid
-        // spinning at full CPU with no wake source.
-        if !registered_any {
-            crate::task::yield_now();
-            continue;
-        }
-
-        // Block until woken by an FD event.
+        // Block until woken by an FD event or timeout.
         //
         // F.4: Under sched-v2, use block_current_until for both branches:
         // - Positive timeout: pass deadline_tick so the deadline scanner
         //   wakes us when the timeout expires (no yield_now() spin needed).
         // - Indefinite timeout: pass None; wake comes from WaitQueue.
-        // Under v1, retain the original yield_now() / block_current_unless_woken paths.
-        {
+        //
+        // Even when no FDs could be registered (all non-pollable), we
+        // still park instead of yield-looping.  yield_now() in this
+        // branch made `poll(non_pollable_fd, 1000ms)` busy-yield for the
+        // entire 1-second timeout, monopolising the calling core because
+        // m3OS is cooperatively scheduled — every queued task on the
+        // same core was starved.  block_current_until with the deadline
+        // wakes us at the right time without burning CPU.  If no
+        // waiters AND no deadline, we'd never wake; fall back to a
+        // single yield_now() so the syscall makes progress on its next
+        // top-of-loop scan (this is the legitimate "non-pollable FD,
+        // indefinite timeout" case — better to round-robin than to
+        // hang forever).
+        if registered_any || deadline_tick.is_some() {
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
                 &woken,
                 deadline_tick,
             );
+        } else {
+            crate::task::yield_now();
         }
     };
 
