@@ -88,17 +88,18 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 **Why it matters:** Without this, the Rust handler body has already clobbered caller-saved GPRs by the time `preempt_to_scheduler` runs — saving them at that point would capture the *handler's* state, not the interrupted task's.
 
 **Acceptance:**
-- [ ] `timer_entry` saves all 15 GPRs in `PreemptTrapFrame.gprs` order on entry.
-- [ ] Stub passes `rsp` (which now points to the bottom of the saved frame) as the first argument to `timer_handler_with_frame`.
-- [ ] On Rust handler return, stub pops the GPRs in reverse order and `iretq`s.
-- [ ] Stub handles both ring-3-interrupted and ring-0-interrupted cases (the GPR push count is identical; the CPU-pushed frame size differs but is at a known offset).
-- [ ] **System V AMD64 ABI invariants preserved across the `extern "C"` call:**
-  - RSP is 16-byte aligned at the call instruction's boundary (after the call's own implicit `push rip` that brings it to `≡ 8 (mod 16)` — i.e., 16-byte aligned *before* the call).  Because the stub pushes 15 × 8 = 120 bytes of GPRs onto the CPU-pushed iretq frame (40 bytes for ring-3-interrupted, 24 bytes for ring-0-interrupted with the 2 missing slots accounted for by the entry-stub padding established in 57e Track C.0), the stub adds an explicit `sub rsp, 8` pad before the call when needed and undoes it after.  Misalignment crashes any SSE-using Rust function — verified by a regression test that calls into a Rust function known to use `movaps`.
+- [ ] **Ring-0 frame normalization (self-contained in 57d).**  On entry, branch on `(cs & 3)`.  For ring-3-interrupted code (rpl=3), use the CPU-pushed 5-field iretq frame as-is.  For ring-0-interrupted code (rpl=0), the CPU pushed only `rip, cs, rflags` (3 fields); the stub *synthesizes* the missing `ss` and `rsp` slots in `PreemptTrapFrame` order, with both initialised to zero in 57d.  The synthetic `rsp` slot becomes load-bearing in 57e (Track C.0 changes the value from zero to the captured pre-stub kernel RSP); 57e does *not* add the slots themselves.  On the non-preempting return path, the matching ring-test pops the synthetic slots before `iretq` so the CPU sees the original 3-field frame.
+- [ ] After normalization, `timer_entry` saves all 15 GPRs in `PreemptTrapFrame.gprs` order onto the now-uniform 5-field-iretq stack.
+- [ ] Stub passes `rsp` (which points to the bottom of the saved frame) as the first argument to `timer_handler_with_frame`.
+- [ ] **System V AMD64 ABI invariants preserved across the `extern "C"` call (self-contained in 57d, no cross-phase dependency):**
+  - RSP is 16-byte aligned at the call instruction's boundary (i.e., 16-byte aligned *before* the call; the call's implicit `push rip` brings it to `≡ 8 (mod 16)` inside the callee).  Math: after ring-0 normalization the stack always carries a 5-field iretq frame (40 bytes) plus 15 × 8 = 120 GPR bytes.  Total 160 bytes pushed since CPU entry.  At CPU entry RSP was 16-byte aligned (Intel SDM Vol 3A §6.14.1 guarantees this for the iretq frame slot).  160 mod 16 == 0, so the stub does *not* need an extra pad — but it must `cld` and avoid clobbering the alignment with any unbalanced subsequent operation.  If the GPR layout ever changes such that the total no longer divides cleanly by 16, the stub adds an explicit `sub rsp, 8` pad and undoes it after `call`.
   - All caller-saved registers above what the stub already pushed are clobbered freely by the Rust handler; the stub does not re-save them.
   - Direction flag (`DF`) is cleared on entry to the Rust call (per ABI) — the stub `cld`s before the `call`.
-  - The Rust handler returns normally (i.e., when *not* preempting); the stub pops the GPRs in reverse order and `iretq`s.  When preempting, `preempt_to_scheduler` is `-> !` and the pop/iretq epilogue is unreachable on that path.
-- [ ] In-QEMU test: a synthetic interrupt fired with known register values reaches the Rust handler with all 15 GPRs preserved in the trap frame.
-- [ ] In-QEMU test (alignment regression): a Rust handler that contains `movaps` against an aligned local does not fault — proves the stub's stack alignment is correct.
+  - The Rust handler returns normally (i.e., when *not* preempting); the stub pops the GPRs in reverse order, undoes synthetic slots if applicable, and `iretq`s.  When preempting, `preempt_to_scheduler` is `-> !` and the pop/iretq epilogue is unreachable on that path.
+- [ ] In-QEMU test: a synthetic *ring-3* interrupt fired with known register values reaches the Rust handler with all 15 GPRs preserved in the trap frame; the iretq frame fields match the CPU-pushed values.
+- [ ] In-QEMU test: a synthetic *ring-0* interrupt produces a `PreemptTrapFrame` whose layout is byte-identical to the ring-3 case (same offsets), with the synthetic `ss` and `rsp` slots both zero.
+- [ ] In-QEMU test (alignment regression): a Rust handler that contains `movaps` against an aligned local does not fault — proves the stub's stack alignment is correct in both ring-0 and ring-3 entry paths.
+- [ ] In-QEMU test (round-trip): non-preempting return from a ring-0 interrupt restores the original 3-field iretq frame so the CPU's `iretq` consumes the right number of bytes.
 
 ### B.3 — Implement `reschedule_ipi_entry` naked-asm stub
 
@@ -124,10 +125,11 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 
 **Acceptance:**
 - [ ] `timer_entry` and `reschedule_ipi_entry` are exposed as `extern "C"` symbols whose addresses can be read in Rust.
-- [ ] IDT install path uses the `x86_64` crate's raw-handler-address API: build an `Entry` via `Entry::new(...).set_handler_addr(VirtAddr::new(timer_entry as usize as u64))` (or equivalent — confirm the exact API call that bypasses the `extern "x86-interrupt"` signature requirement).
+- [ ] IDT install path mutates the `InterruptDescriptorTable` entry directly and calls `unsafe { idt[InterruptIndex::Timer as u8].set_handler_addr(VirtAddr::new(timer_entry as usize as u64)) }` (the `x86_64` crate at version 0.15.4 exposes `Entry::set_handler_addr(&mut self, VirtAddr)` as `unsafe`; this is the canonical raw-handler path that bypasses the `extern "x86-interrupt"` signature requirement).  The same shape applies to `reschedule_ipi_entry` at the reschedule-IPI vector.
+- [ ] Existing IDT options from the current `set_handler_fn` path (IST index, present bit, DPL) are preserved by reading them from the prior entry before overwriting, or by re-setting them explicitly after `set_handler_addr`.
 - [ ] Rationale documented in code: the stub *is* the IRQ handler; no Rust-side `extern "x86-interrupt"` wrapper exists, by design.
-- [ ] Regression test: the IDT entry's `handler_addr` matches `timer_entry as usize`.
-- [ ] If the `x86_64` crate's IDT API does not directly support raw handler addresses on the version in use, document the alternative (e.g., a hand-rolled IDT entry constructor) before any other Track B task lands; this is a B.4 prerequisite.
+- [ ] Regression test: the IDT entry's `handler_addr` matches `timer_entry as usize`; the entry is `present=1`, IST index matches the prior `timer_handler` entry's IST index.
+- [ ] If a future `x86_64` crate upgrade changes the API shape, this task's example is updated in lockstep with the upgrade PR; the asm symbol contract (`extern "C"` global symbol whose address is the IRQ entry point) does not change.
 
 ---
 

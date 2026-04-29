@@ -144,19 +144,20 @@ Tracks A through D are the foundation — they must complete before F/G.  Track 
 
 **Acceptance:**
 - [ ] Immediately after `switch_context` returns onto the scheduler stack — and before any `IrqSafeMutex::lock` runs on that stack — the dispatch path retargets `current_preempt_count_ptr` to `&SCHED_PREEMPT_COUNT_DUMMY[core_id]` with `Release` ordering.
-- [ ] Retarget runs in an interrupts-disabled window (the dispatch path inherits `IF=0` from `switch_context`'s `cli`/`popf` window) so no IRQ can fire `preempt_disable` against an in-flight retarget.
+- [ ] Retarget runs inside an explicit `interrupts::disable()` / `interrupts::enable()` window (or `without_interrupts(|| ...)` wrapper).  Do **not** assume `switch_context` left IF=0: `switch_context` `popf`s the scheduler's saved RFLAGS on resume, restoring whatever IF the scheduler had when it dispatched the task (typically IF=1).  The retarget must `cli` itself.
 - [ ] `cargo xtask test` passes; no scheduler-context lock-acquire/release pair straddles the retarget.
 
 ### C.3 — Switch-in handoff retargets pointer to the incoming task
 
 **File:** `kernel/src/task/scheduler.rs`
 **Symbol:** the dispatch path immediately before the next `switch_context` call (entering the chosen task)
-**Why it matters:** Mirror of C.2.  The retarget must happen *after* the scheduler has released every lock it acquired against the dummy and *before* `switch_context` transfers to the chosen task — and before IRQs are re-enabled, so that no IRQ-context `preempt_disable` reads a half-updated pointer.
+**Why it matters:** Mirror of C.2.  The retarget must happen *after* the scheduler has released every lock it acquired against the dummy and *before* `switch_context` transfers to the chosen task — and IRQs must remain disabled across the retarget *and* the call to `switch_context`, so that no IRQ-context `preempt_disable` reads a half-updated pointer or runs between retarget and dispatch.
 
 **Acceptance:**
-- [ ] After the scheduler has released every `IrqSafeMutex` guard it acquired in scheduler context, and before calling `switch_context` to enter the chosen task, dispatch retargets `current_preempt_count_ptr` to `&next_task.preempt_count` with `Release` ordering.
-- [ ] Retarget runs in an interrupts-disabled window — `switch_context` itself disables IF before swapping RSP, but the retarget happens *before* `switch_context`, so the dispatch path explicitly masks interrupts (or relies on the existing dispatch IF=0 invariant; see scheduler.rs top-of-file doc) for this window.
+- [ ] After the scheduler has released every `IrqSafeMutex` guard it acquired in scheduler context, the dispatch path explicitly disables interrupts (`interrupts::disable()`) before retargeting `current_preempt_count_ptr` to `&next_task.preempt_count` with `Release` ordering, and then calls `switch_context` while IRQs remain disabled.
+- [ ] `switch_context` then `popf`s the chosen task's saved RFLAGS, restoring its IF state — between the retarget and the chosen task's first instruction IF is never 1.
 - [ ] When `switch_context` returns into the chosen task, that task's `IrqSafeMutex::lock` / `Drop` pairs charge its own `preempt_count` — symmetric.
+- [ ] Document in the dispatch path that any IRQ that fires *before* this retarget (i.e. while the pointer still targets the dummy) is safe by construction: its `preempt_disable` / `preempt_enable` pair both hit the dummy.
 
 ### C.4 — Pointer-lifecycle regression test
 

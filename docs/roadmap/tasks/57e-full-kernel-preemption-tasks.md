@@ -103,16 +103,18 @@ For each "annotate" entry in 57c that requires `preempt_disable` under `PREEMPT_
 
 ## Track C — `preempt_resume_to_kernel` (Same-CPL `iretq` Frame)
 
-### C.0 — Capture interrupted kernel RSP in 57d's asm entry stub
+### C.0 — Make 57d's synthetic ring-0 `rsp` slot load-bearing
 
-**File:** `kernel/src/arch/x86_64/asm/preempt_entry.S` (extends 57d Track B)
+**File:** `kernel/src/arch/x86_64/asm/preempt_entry.S` (extends 57d Track B.2's already-present synthetic slots)
 **Symbol:** `timer_entry`, `reschedule_ipi_entry`
-**Why it matters:** When an IRQ arrives while running in ring 0, the CPU pushes only 3 of the 5 iretq fields (`rip, cs, rflags`); `rsp` and `ss` are *not* on the IRQ stack.  The interrupted task's kernel RSP is whatever the stack pointer was at the moment the asm stub started running.  57d's stub does not currently capture this; 57e's resume routine cannot reconstruct the kernel RSP without it.
+**Why it matters:** 57d Track B.2 already synthesizes `rsp` and `ss` slots in the ring-0 branch (initialised to zero) so `PreemptTrapFrame` has a uniform layout for the Rust handler.  57d does not preempt ring-0 code, so the zero values are harmless.  57e *does* preempt ring-0 code and the `_kernel` resume routine sets RSP to `preempt_frame.rsp` — so this slot must contain the actual interrupted kernel RSP, not zero.  C.0 is therefore a value change, not a layout change.
 
 **Acceptance:**
-- [ ] The asm entry stub branches on `cs & 3` immediately after CPU entry.  If `(cs & 3) == 0` (interrupted in ring 0), the stub captures the pre-stub RSP into `PreemptTrapFrame.rsp` explicitly (using `lea` from the saved CPU-pushed iretq frame's location).  If `(cs & 3) == 3`, it leaves the slot for the CPU-pushed `rsp`.
-- [ ] `PreemptTrapFrame.ss` slot is populated with the kernel SS for ring-0-interrupted (zero is acceptable; same-CPL `iretq` does not consume it).
-- [ ] In-QEMU test: a synthetic ring-0 interrupt produces a `PreemptTrapFrame` whose `rsp` matches the kernel-stack pointer at the moment of entry.
+- [ ] In the ring-0 entry branch in `timer_entry` and `reschedule_ipi_entry`, replace the `mov qword ptr [rsp + 8], 0` synthetic-slot initialisation with code that captures the pre-stub kernel RSP into the slot.  The capture uses `lea rax, [rsp + 24]` (or whatever offset addresses the byte just past the CPU-pushed 3-field iretq frame, equivalent to RSP at the moment immediately before CPU dispatch) before the `sub rsp, 16` that creates the slots — the captured value is the interrupted kernel-stack RSP.
+- [ ] `PreemptTrapFrame.ss` slot remains zero (same-CPL `iretq` does not pop it; setting it to a kernel SS value is harmless but unnecessary).
+- [ ] On the non-preempting return path, the synthetic slots are still popped before `iretq` (unchanged from 57d Track B.2).
+- [ ] In-QEMU test: a synthetic ring-0 interrupt produces a `PreemptTrapFrame` whose `rsp` matches the kernel-stack pointer at the moment of CPU entry.
+- [ ] No layout or offset change to `PreemptTrapFrame` — only the value written into the synthetic `rsp` slot changes from zero to the captured RSP.
 
 ### C.1 — Implement `preempt_resume_to_kernel` (assembly, same-CPL `iretq`)
 

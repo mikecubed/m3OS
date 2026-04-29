@@ -39,44 +39,50 @@ A Rust `extern "x86-interrupt"` function is **too late** to capture the interrup
 
 57d replaces the timer and reschedule-IPI handlers with **naked-asm entry stubs** that:
 
-1. Push all 15 GPRs onto the IRQ stack on entry, in a fixed layout that matches the `PreemptFrame` GPR slots.
-2. Pass a pointer to the saved-GPR area + the CPU-pushed iretq frame as a single `&mut PreemptTrapFrame` to a Rust handler.
-3. The Rust handler does the existing tick / EOI / reschedule-flag work and then runs the preemption check.
-4. If preempting: the Rust handler does *not* return; it transfers to the scheduler via `preempt_to_scheduler`.
-5. If not preempting: the Rust handler returns; the asm stub pops the GPRs and `iretq`s to the interrupted task.
+1. Branch on `cs & 3` to detect ring-0-interrupted vs ring-3-interrupted code.
+2. **Normalize the iretq frame** — for ring-0-interrupted, the CPU pushes only 3 fields (`rip, cs, rflags`); the stub synthesizes the missing `rsp` and `ss` slots in a uniform layout so the Rust handler always sees a complete `PreemptTrapFrame`.  In 57d the synthetic `rsp` slot is set to zero (it's not used — kernel-mode preemption is skipped under `PREEMPT_VOLUNTARY`); 57e Track C.0 changes the synthetic value to the captured pre-stub kernel RSP and makes that slot load-bearing for the `_kernel` resume routine.
+3. Push all 15 GPRs onto the IRQ stack in `PreemptTrapFrame.gprs` order, with explicit padding to satisfy the Sys V AMD64 16-byte stack-alignment requirement at the `call` instruction.
+4. Pass a pointer to the resulting `PreemptTrapFrame` as a single `&mut PreemptTrapFrame` to a Rust handler.
+5. The Rust handler does the existing tick / EOI / reschedule-flag work and then runs the preemption check.
+6. If preempting: the Rust handler does *not* return; it transfers to the scheduler via `preempt_to_scheduler`.
+7. If not preempting: the Rust handler returns; the asm stub pops the GPRs, undoes any synthetic slots, and `iretq`s to the interrupted task.
 
 ```asm
 .global timer_entry
 timer_entry:
-    // CPU has pushed: ss, rsp, rflags, cs, rip (ring-3-interrupted)
-    //              or:        rflags, cs, rip (ring-0-interrupted; same-CPL).
-    // Save GPRs into a layout that matches PreemptFrame.gprs.
+    // Branch on ring of interrupted code.
+    // Ring-3-interrupted: CPU pushed ss, rsp, rflags, cs, rip (5 fields, 40 bytes).
+    // Ring-0-interrupted: CPU pushed rflags, cs, rip          (3 fields, 24 bytes).
+    test qword ptr [rsp + 8], 3      // (cs & 3) — 0 for ring-0, 3 for ring-3
+    jnz .Lfrom_user
+.Lfrom_kernel:
+    // Synthesize missing ss / rsp slots in the order PreemptTrapFrame expects.
+    // (ss = 0, rsp = 0 in 57d; 57e Track C.0 sets rsp to the captured kernel RSP.)
+    sub  rsp, 16                     // reserve two qwords
+    mov  qword ptr [rsp + 8], 0      // synthetic rsp slot (57d: 0; 57e: captured)
+    mov  qword ptr [rsp + 0], 0      // synthetic ss slot (always 0 — same-CPL iretq doesn't pop it)
+.Lfrom_user:
+    // Common path — uniform 5-field iretq frame is now on top of stack.
     push r15
     push r14
-    push r13
-    push r12
-    push r11
-    push r10
-    push r9
-    push r8
-    push rbp
-    push rdi
-    push rsi
-    push rdx
-    push rcx
-    push rbx
+    // ... r13..r8, rbp, rdi, rsi, rdx, rcx, rbx, rax ...
     push rax
+    cld                              // Sys V: DF clear at call boundary
     mov  rdi, rsp                    // &PreemptTrapFrame as first arg
+    // Stack alignment: 15 * 8 GPRs + 5 * 8 iretq frame = 160 bytes pushed since CPU entry.
+    // CPU entry was 16-byte aligned at the iretq-frame slot; +120 bytes (15 GPRs) lands at
+    // 16-byte alignment for the call boundary because 120 + 8 (the call's implicit push rip)
+    // mod 16 == 0.  No additional pad required.  For ring-0 entry the synthetic 16-byte
+    // pad above keeps the math identical.
     call timer_handler_with_frame    // Rust; may not return if preempting
     pop  rax
-    pop  rbx
-    pop  rcx
-    pop  rdx
-    pop  rsi
-    pop  rdi
-    pop  rbp
-    pop  r8
-    // ... and r9..r15 ...
+    // ... rbx, rcx, rdx, rsi, rdi, rbp, r8..r15 ...
+    pop  r15
+    // Test ring of return frame; undo synthetic slots if returning to ring 0.
+    test qword ptr [rsp + 8], 3
+    jnz  .Liretq_user
+    add  rsp, 16                     // pop synthetic ss/rsp slots
+.Liretq_user:
     iretq
 ```
 
@@ -208,9 +214,9 @@ A new in-QEMU integration test (`kernel/tests/preempt_user_loop.rs`):
 
 ### Naked-asm entry stubs (`timer_entry`, `reschedule_ipi_entry`)
 
-Located at `kernel/src/arch/x86_64/asm/preempt_entry.S` (new).  Each replaces the corresponding `extern "x86-interrupt"` function.  On entry: save all 15 GPRs in `PreemptTrapFrame.gprs` order; pass a pointer to the resulting frame as the first argument to the Rust handler; on Rust handler return, pop the GPRs and `iretq`.
+Located at `kernel/src/arch/x86_64/asm/preempt_entry.S` (new).  Each replaces the corresponding `extern "x86-interrupt"` function.  On entry: branch on `(cs & 3)` and *normalize the iretq frame* so a uniform 5-field layout is on the stack regardless of the interrupted ring.  For ring-3-interrupted, use the CPU-pushed 5 fields as-is.  For ring-0-interrupted, synthesize the missing `ss` and `rsp` slots (both set to zero in 57d; 57e Track C.0 changes the `rsp` value to the captured pre-stub kernel RSP).  Then save all 15 GPRs in `PreemptTrapFrame.gprs` order, `cld`, `call` the Rust handler with `&mut PreemptTrapFrame`.  On Rust return, pop GPRs, branch on the saved `cs & 3` again to undo any synthetic slots, and `iretq`.
 
-The stubs handle both ring-3-interrupted (5-field CPU frame) and ring-0-interrupted (3-field CPU frame) cases uniformly: they always push the same number of GPRs.  The Rust handler reads `frame.cpu_frame.cs.rpl()` to distinguish.  `Task::preempt_frame` (from 57b E.1) is the `PreemptFrame` layout the asm stubs and the Rust handler agree on; `PreemptTrapFrame` is its on-IRQ-stack synonym.
+Frame normalization is **owned by 57d** so the Rust handler can always treat `PreemptTrapFrame` as a fully-populated struct.  57e does not change the layout — it only changes the value written into the synthetic `rsp` slot from zero to the captured kernel RSP.  `Task::preempt_frame` (from 57b E.1) is the `PreemptFrame` layout the asm stubs and the Rust handler agree on; `PreemptTrapFrame` is its on-IRQ-stack synonym, structurally identical at the same offsets.
 
 ### `preempt_to_scheduler` (Rust)
 
