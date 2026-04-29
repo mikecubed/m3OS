@@ -1385,6 +1385,14 @@ pub fn block_current_until(
             sched.tasks[idx].state = kind;
             sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
             sched.tasks[idx].wake_deadline = deadline_ticks;
+            // E.1: mark RSP-publication window for cross-core wakers.
+            // `wake_task_v2` only spin-waits on this when the waker's core is
+            // DIFFERENT from `assigned_core` (see same-core escape in
+            // wake_task_v2's step 4 spin) — a same-core IRQ that wakes the
+            // very task it interrupted MUST NOT spin on `on_cpu==false`
+            // because `on_cpu` clears only at the dispatch epilogue, which
+            // can't run until the ISR returns; that would deadlock.
+            sched.tasks[idx].on_cpu.store(true, Ordering::Release);
             save_user_return_state(
                 &mut sched.tasks[idx],
                 addr_space_snapshot.0,
@@ -1422,6 +1430,12 @@ pub fn block_current_until(
     if already_woken || already_expired {
         // Self-revert under pi_lock OUTER + scheduler_lock INNER, atomic with
         // respect to wake_task_v2.
+        //
+        // Also clear on_cpu (set by the block-side write above): the task is
+        // staying on this CPU and will NOT reach the dispatch epilogue that
+        // normally clears it.  Leaving on_cpu=true would stall every
+        // subsequent CROSS-CORE waker until the task's next real
+        // switch_context (could be milliseconds away).
         {
             let pi_lock_ref = unsafe { &*pi_lock_ptr };
             let mut bs = pi_lock_ref.lock();
@@ -1434,6 +1448,7 @@ pub fn block_current_until(
                     }
                     sched.tasks[idx].state = TaskState::Running;
                     sched.tasks[idx].wake_deadline = None;
+                    sched.tasks[idx].on_cpu.store(false, Ordering::Release);
                 }
                 // scheduler_lock released.
             }
@@ -2002,20 +2017,38 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     };
     let (assigned_core, on_cpu_ptr) = post_lock;
 
-    // ── Step 4: Spin-wait on Task::on_cpu == false ────────────────────────────
+    // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
     //
     // The arch-level switch-out epilogue clears `on_cpu` only after
     // `saved_rsp` is durably written to the task struct (with Release
     // ordering, Track E.1).  Spinning here with Acquire ordering guarantees
-    // that our subsequent `enqueue_to_core` observes the published `saved_rsp`
-    // so the dispatch path does not jump to a stale RSP.
+    // that our subsequent `enqueue_to_core` observes the published
+    // `saved_rsp` so the dispatch path does not jump to a stale RSP.
     //
     // Linux analog: `smp_cond_load_acquire(&p->on_cpu, !VAL)` in
     // `try_to_wake_up` (`kernel/sched/core.c`).
     //
+    // # Same-core escape
+    //
+    // If the waker is running on the task's `assigned_core`, we skip the
+    // spin entirely.  Same-core wake is dispatch-safe by construction:
+    //   1. `pick_next` on this core consumes this core's local queue, so
+    //      our enqueue cannot be picked up until WE return.
+    //   2. The interrupted (or blocking) task can't reach the dispatch
+    //      epilogue — and therefore can't clear `on_cpu` — until WE
+    //      return.  Spinning would be a guaranteed deadlock for
+    //      same-core IRQ wakes (e.g. COM1 RX → wake_feeder_task →
+    //      wake_task_v2 for the very task whose `block_current_until`
+    //      the IRQ interrupted).
+    //   3. After we return, the task either self-reverts (state=Running,
+    //      our queue entry is silently filtered by dequeue_local's
+    //      state==Ready check) or proceeds to switch_context (saved_rsp
+    //      committed before pick_next can run on this core).
+    //
     // SAFETY: `on_cpu_ptr` is a valid pointer to an `AtomicBool` in the
     // same stable Task struct as `pi_lock_ptr` (step 1 invariant).
-    {
+    let waker_core = crate::smp::per_core().core_id;
+    if assigned_core != waker_core {
         let on_cpu_ref = unsafe { &*on_cpu_ptr };
         while on_cpu_ref.load(Ordering::Acquire) {
             core::hint::spin_loop();
