@@ -1,7 +1,7 @@
 # TUI and Neovim Roadmap
 
 **Date:** 2026-04-29
-**Baseline:** `main` at `449fc05165868a22e756038b50ccc55981291fcd`
+**Baseline:** `main` at `4c72e34` (`Phase 57a: scheduler block/wake protocol rewrite`, merged 2026-04-29)
 **Question:** What would it take to support Omarchy-like TUI workflows and Neovim?
 
 ## Short answer
@@ -22,13 +22,19 @@ Neovim is still not "easy." It requires a mature terminal contract, a staged C t
 | Ports system | BSD-style source ports exist. | Good model, but current ports are small and TCC-oriented. |
 | Large toolchains | Planned in Phase 59. | Needed for Neovim-class software. |
 
-## Phase 57a impact
+## Phase 57a and 57b impact
 
-The active/planned Phase 57a scheduler rewrite is directly relevant to TUI readiness. Neovim, tmux, shells, fuzzy finders, and log viewers spend most of their time blocked in PTY reads, timers, poll/select/epoll, child waits, and IPC. The planned v2 block/wake path should make those waits reliable by replacing the old lost-wake machinery with `block_current_until`, a rewritten `wake_task`, and full call-site migration.
+Phase 57a is now merged and is directly relevant to TUI readiness. Neovim, tmux, shells, fuzzy finders, and log viewers spend most of their time blocked in PTY reads, timers, poll/select/epoll, child waits, and IPC. The v2 block/wake path makes those waits more reliable by replacing the old lost-wake machinery with `block_current_until`, CAS-style `wake_task_v2`, timeout-unit fixes, and full call-site migration.
 
-If 57a lands as planned, this roadmap can assume terminal apps are debugging terminal semantics and POSIX gaps, not an underlying scheduler liveness bug. If it does not, Neovim-class work should stay behind a "demo only" label because editor event loops can appear flaky for reasons unrelated to Neovim or `term`.
+That moves TUI work forward, but it does not close the scheduler story. `docs/handoffs/57a-validation-gate.md` records that the remaining real-hardware GUI failure is cooperative-scheduling starvation, and `docs/appendix/preemptive-multitasking.md` scopes the follow-up as Phase 57b/57c. Without user-mode preemption, a CPU-bound user task or kernel busy-wait can still monopolize its core until it voluntarily yields or blocks.
 
-The expected timeout-unit fixes also matter: TUI event loops rely on short sleeps and poll timeouts for cursor blink, redraw coalescing, process monitoring, and responsiveness. Getting those units right is part of making `term` feel usable.
+For TUI apps this means:
+
+- blocking waits, poll/select/epoll timeouts, and PTY-driven event loops are in better shape after 57a;
+- CPU-heavy tools such as `ripgrep`, indexing, syntax parsing, build jobs, or a busy plugin can still make the desktop feel stuck until 57c-style user-mode preemption exists;
+- kernel busy-waits should still be converted to block/wake pairs where practical, because 57b foundation alone does not change behavior.
+
+The timeout-unit fixes also matter: TUI event loops rely on short sleeps and poll timeouts for cursor blink, redraw coalescing, process monitoring, and responsiveness. Getting those units right is part of making `term` feel usable.
 
 ## Terminal compatibility gaps
 

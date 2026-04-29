@@ -1,7 +1,7 @@
 # Usable GUI Roadmap: Omarchy / Hyprland Style
 
 **Date:** 2026-04-29
-**Baseline:** `main` at `449fc05165868a22e756038b50ccc55981291fcd`
+**Baseline:** `main` at `4c72e34` (`Phase 57a: scheduler block/wake protocol rewrite`, merged 2026-04-29)
 **Goal:** Define what remains to turn the Phase 56/57 graphical session into a usable, keyboard-driven tiled desktop experience.
 
 ## Product target
@@ -52,21 +52,22 @@ m3OS should copy the **shape and defaults**, not Hyprland's implementation or ex
 | Control socket | `display-control` and `m3ctl` exist. | Add workspace/window/layout verbs and event push. |
 | Layer clients | `Layer` role is defined. | Build actual bar, launcher, notifications, lockscreen, overlays. |
 | Terminal app | `term` exists. | Make it robust enough for TUI workflows. |
-| Audio | `audio_client` and `audio_server` exist. | Finish real audio or no-op fallback policy. |
+| Audio | `audio_client` and `audio_server` exist; `audio_server` now has a no-hardware silent `audio.cmd` stub. | Finish real AC'97 playback and driver-level smoke coverage. |
 | Session manager | `session_manager` exists. | Make it a real lifecycle owner and add keyboard recovery path. |
 
-## Phase 57a impact
+## Phase 57a and 57b impact
 
-Phase 57a is the expected scheduler foundation for making this roadmap usable instead of just visually plausible. Its planned runtime changes remove the known v1 lost-wake class by introducing `block_current_until`, rewriting `wake_task`, adding `Task::on_cpu` publication safety, migrating all wait call sites, and deleting `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT`.
+Phase 57a is now merged and materially improves the scheduler foundation for this roadmap. It removes the known v1 lost-wake class by introducing `block_current_until`, CAS-style `wake_task_v2`, `Task::on_cpu` publication safety, wait-call-site migration, watchdog/trace diagnostics, and timeout-unit fixes. It also lands user-visible secondary fixes: no-hardware `audio.cmd` registration, `serial_stdin_feeder_task` migration, and `syslogd` drain chunking.
 
-If that work lands and validates cleanly, Stage 0 can treat scheduler liveness as a closed foundation and move its acceptance focus to compositor behavior: window lifecycle, input delivery, frame pacing, restart recovery, and end-to-end session smokes. If it does not land, tiling/keybinding work can still be prototyped, but it should not be presented as a usable desktop because graphical startup and blocking waits can still freeze.
+However, the Phase 57a validation gate records that the real-hardware GUI startup test still fails. The diagnosis changed: it is no longer the old lost-wake protocol, but cooperative-scheduling starvation. Timer IRQs and reschedule IPIs set the per-core reschedule flag, yet IRQ return resumes the interrupted user code; the scheduler only runs when the task voluntarily yields, blocks, or enters a yielding syscall path. That can starve `display_server`, `term`, storage, logging, or input work queued on the same core.
 
-The planned 57a secondary fixes also affect the user experience directly:
+The follow-up listed in `docs/appendix/preemptive-multitasking.md` is therefore part of the GUI reliability floor:
 
-- The no-hardware `audio.cmd` stub would let GUI sessions boot without AC'97 instead of falling back to text solely because audio hardware is absent.
-- `serial_stdin_feeder_task` migration should remove a scheduler-core parking hazard during graphical startup.
-- Poll/select/epoll timeout fixes improve terminal apps, launchers, service monitors, and any future event-loop-driven GUI client.
-- The validation gate should include a watchdog-clean idle GUI session, because Omarchy-like workflows spend most of their life waiting for keyboard, IPC, and timer events.
+- 57b: preemption foundation, full register-save state, `preempt_count`, and lock discipline, with no behavior change yet.
+- 57c: user-mode timer/IPI preemption so CPU-bound user tasks cannot monopolize a core.
+- 57d: full kernel preemption after spin-wait and lock audits.
+
+Tiling/keybinding work can still be prototyped now, but it should not be presented as a usable desktop until the post-57a starvation path is closed. Stage 0 should treat scheduler acceptance as: watchdog-clean GUI boot, terminal input, compositor restart recovery, and an idle session that stays live even while another user process burns CPU.
 
 ## Native tiling policy layer
 
@@ -192,10 +193,10 @@ Hyprland's visible identity is not only blur. Workspaces, keyboard flow, scratch
 
 ### Stage 0: Stabilize Phase 57
 
-- Finish real audio or implement the Phase 57a no-hardware `audio.cmd` stub.
+- Finish real audio; keep the Phase 57a no-hardware `audio.cmd` stub as the hardware-absent policy.
 - Make session manager lifecycle control real.
 - Replace shallow smokes with end-to-end smokes.
-- Land and validate Phase 57a scheduler fixes, including v2 block/wake migration and deletion of the old lost-wake machinery.
+- Close post-57a scheduler starvation via Phase 57b/57c or equivalent targeted fixes.
 - Finish display event push and keybinding payload correctness.
 
 ### Stage 1: Tiling core

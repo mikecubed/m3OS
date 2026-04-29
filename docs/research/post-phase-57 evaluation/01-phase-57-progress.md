@@ -1,7 +1,7 @@
 # Phase 57 Progress Ledger
 
 **Date:** 2026-04-29
-**Baseline:** `main` at `449fc05165868a22e756038b50ccc55981291fcd`
+**Baseline:** `main` at `4c72e34` (`Phase 57a: scheduler block/wake protocol rewrite`, merged 2026-04-29)
 **Question:** What has Phase 57 actually delivered, and what remains before it can be treated as a stable local GUI baseline?
 
 ## Executive assessment
@@ -13,8 +13,9 @@ Phase 57 has landed the main process and protocol boundaries:
 - `kernel-core` has host-testable display, input, audio, and session model modules.
 - `xtask` builds and stages the new userspace binaries, and `run-gui` now has AC'97 QEMU flags.
 - The docs describe the intended local-session topology and the deferred desktop boundary clearly.
+- Phase 57a has now rewritten the scheduler block/wake protocol around `block_current_until`, per-task `pi_lock`, CAS-style `wake_task_v2`, `Task::on_cpu`, watchdog/trace diagnostics, and timeout-unit cleanup.
 
-The problem is that several "complete" labels are ahead of the runtime. The Phase 57 code on `main` still has production stubs and shallow smoke checks. Treat it as a platform checkpoint, not as a finished GUI/audio/session product.
+The problem is that several "complete" labels are ahead of the runtime. The Phase 57/57a code on `main` still has production stubs, shallow smoke checks, and one major scheduler-latency gap: the kernel is still cooperative at IRQ return, so CPU-bound user code or kernel busy-waits can monopolize a core until a voluntary yield/block/syscall boundary. Treat it as a platform checkpoint, not as a finished GUI/audio/session product.
 
 ## Delivered surfaces
 
@@ -25,6 +26,7 @@ The problem is that several "complete" labels are ahead of the runtime. The Phas
 | Session manager | `userspace/session_manager` exists, registers `session-manager`, owns a control context, runs the ordered startup sequence, and reports `running` or `text-fallback`. | Its `init` integration is still mostly observe-and-log rather than direct lifecycle ownership. |
 | Terminal | `userspace/term` exists with PTY, ANSI screen state, renderer, input handler, and bell path. | First useful graphical client shape is present. It still needs terminal compatibility hardening before Neovim/tmux-class apps are credible. |
 | Audio protocol | `kernel-core::audio`, `userspace/lib/audio_client`, `audio-demo`, and `audio_server` protocol/stream/client registries exist. | The production AC'97 backend is not yet a real device driver. |
+| Scheduler block/wake | Phase 57a adds `TaskBlockState`, per-task `pi_lock`, `block_current_until`, `wake_task_v2`, `Task::on_cpu`, v2 transition tests, watchdog/trace hooks, timeout-unit fixes, and removes the old v1 lost-wake machinery from live code. | This closes the v1 lost-wake class, but not CPU starvation from cooperative scheduling. |
 | Build and image wiring | `Cargo.toml`, `xtask`, ramdisk entries, and service configs know about the Phase 57 crates. | Four-place userspace binary convention is mostly followed. |
 | Documentation | Phase 57 design, task, audio target, audio ABI, session entry, and learning docs exist. | These docs are useful, but some acceptance claims now need a reality-status addendum. |
 
@@ -42,6 +44,8 @@ The problem is that several "complete" labels are ahead of the runtime. The Phas
 `userspace/audio_server/src/irq.rs` also decodes `SubmitFrames { len }` without passing the trailing PCM payload into `StreamRegistry::submit`. That means the current `audio_client` can send frame bytes, but the server path does not yet feed them to hardware.
 
 **Consequence:** audible PCM output is not a closed acceptance item on `main`, despite the Phase 57 docs marking the phase complete.
+
+Phase 57a did improve the boot story here: `audio_server` now registers `audio.cmd` even when AC'97 is absent and falls back to a silent stub loop. That prevents `session_manager` from taking text fallback solely because no audio controller exists. It does not make real PCM playback work.
 
 ### 2. Audio smoke does not prove audio
 
@@ -65,22 +69,29 @@ It explicitly does not run `audio-demo` and does not assert `frames_consumed` pr
 
 **Consequence:** the session manager can observe a happy path and expose a control surface, but it does not yet own the complete start/stop/restart contract described by the Phase 57 docs.
 
-### 4. GUI reliability depends on active Phase 57a work
+### 4. Phase 57a fixed lost-wake, but not pre-emption
 
-`docs/roadmap/57a-scheduler-rewrite.md` exists because display startup can hang under lost-wake races. The active `feat/57a-scheduler-rewrite` work changes the risk profile: scheduler modeling, transition-table work, per-task `pi_lock` infrastructure, watchdog/trace diagnostics, and timeout-unit cleanup are already being addressed off `main`.
+`docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md` now marks Phase 57a complete in-tree. The meaningful runtime changes have landed:
 
-Those foundations matter, but the runtime-changing work is still the decisive part for this evaluation. The planned 57a closure needs to:
+- `block_current_until` is the unified condition-recheck blocking primitive.
+- `wake_task_v2` performs CAS-style blocked-to-ready transitions under per-task block state.
+- `Task::on_cpu` replaces the RSP-publication part of the old `PENDING_SWITCH_OUT` scheme.
+- IPC, notifications, futexes, I/O multiplexing, sleeps, wait queues, and internal waiters migrated to the v2 protocol.
+- The old `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT` lost-wake machinery is absent from live code.
+- Poll/select/epoll timeout units now match the 1 kHz scheduler tick.
+- `serial_stdin_feeder_task`, `audio_server` no-hardware registration, and `syslogd` drain chunking received secondary fixes.
 
-- Add the v2 block primitive, `block_current_until`, with the condition recheck protocol.
-- Rewrite `wake_task` around per-task block state and `Task::on_cpu` publication safety.
-- Migrate IPC, notifications, futexes, poll/select/epoll, sleeps, wait queues, and kernel-internal callers away from v1 blocking.
-- Delete the old `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` machinery once migration is complete.
-- Fix secondary GUI blockers, including `serial_stdin_feeder_task`, no-hardware `audio.cmd` registration, and the `syslogd` CPU-hog investigation.
-- Pass the validation gate: GUI boot, real-hardware runs, scheduler soak, watchdog-clean idle sessions, and relevant host/property tests.
+That is a real foundation improvement. It changes the scheduler risk from "known lost-wake protocol bug" to "known cooperative-scheduling starvation bug."
 
-**Expected impact if it lands:** the evaluation should stop treating lost-wake scheduler behavior as a known GUI correctness blocker. Instead, it becomes a validation requirement for the desktop stack: prove graphical startup, terminal input, session recovery, and TUI-style blocking workloads stay live under the new protocol.
+`docs/handoffs/57a-validation-gate.md` records the important result: the real-hardware graphical stack gate still fails. The root cause is not the old v1 lost-wake class; it is that timer IRQs and reschedule IPIs set `reschedule`, but IRQ return goes back to the interrupted user code. The scheduler only runs when the task voluntarily yields, blocks, or reaches a syscall path that yields. A CPU-bound user task or kernel busy-wait can therefore monopolize its core.
 
-**What it does not change:** 57a does not create tiling workflows, launchers, bars, app compatibility, browser runtime support, real AC'97 playback, or full `session_manager` lifecycle ownership. Those remain separate GUI/product work after the scheduler foundation is stable.
+The follow-up is tracked in `docs/appendix/preemptive-multitasking.md` as Phase 57b/57c/57d:
+
+- 57b: full register-save/preemption state and `preempt_count` foundation, no behavior change.
+- 57c: user-mode timer/IPI preemption so CPU-bound user code cannot starve its core.
+- 57d: full kernel preemption after spin-wait and lock discipline audits.
+
+**What 57a does not change:** it does not create tiling workflows, launchers, bars, app compatibility, browser runtime support, real AC'97 playback, full `session_manager` lifecycle ownership, or pre-emptive multitasking. Those remain separate GUI/product work after the scheduler foundation is stable.
 
 ### 5. Display server still has Phase 56 follow-throughs
 
@@ -99,10 +110,10 @@ These are acceptable for a milestone compositor, but not for an Omarchy-class wo
 | Dimension | Grade | Rationale |
 |---|---|---|
 | Architecture | High | The service split, protocols, capability boundaries, and documentation are directionally right. |
-| Runtime completeness | Medium-low | Several production paths still stub out the load-bearing behavior. |
-| Validation strength | Low-medium | Host tests exist, but the smoke gates do not yet prove the full user-facing contract. |
+| Runtime completeness | Medium-low | Several production paths still stub out the load-bearing behavior, and preemption is not implemented. |
+| Validation strength | Low-medium | Host tests and scheduler models exist, but the smoke gates do not yet prove the full user-facing contract; the 57a real-hardware GUI gate currently fails. |
 | Usable GUI readiness | Low | No tiling policy, launcher, bar, clipboard, notifications, lockscreen, app ecosystem, or stable key workflow yet. |
-| Best next action | Close correctness gaps before adding polish | Finish real audio or a no-op audio fallback, complete session lifecycle control, land and validate Phase 57a scheduler fixes, then build the tiling policy layer. |
+| Best next action | Close correctness gaps before adding polish | Resolve post-57a scheduler starvation via 57b/57c or targeted busy-wait fixes, finish real audio, complete session lifecycle control, then build the tiling policy layer. |
 
 ## Immediate closure checklist
 
@@ -123,12 +134,12 @@ These are acceptable for a milestone compositor, but not for an Omarchy-class wo
    - Poll `/run/services.status` in addition to IPC registry.
    - Make `session-stop` and `session-restart` observable from `m3ctl`.
 
-4. Land and validate the Phase 57a scheduler rewrite or an equivalent fix:
-   - `block_current_until` and the rewritten `wake_task` should be the only block/wake path for migrated callers.
-   - `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` should be gone or provably unreachable.
-   - No known display/input lost-wake hang should remain in `run-gui`.
-   - Poll/select/epoll timeouts should match wall clock.
-   - `audio_server` should not force text fallback when AC'97 is absent unless the chosen product policy requires audio.
+4. Resolve the post-57a scheduler starvation gap:
+   - Implement the Phase 57b preemption foundation from `docs/appendix/preemptive-multitasking.md` or close the specific busy-wait/syscall monopolies that block GUI boot.
+   - Add a user-mode preemption gate in the 57c shape before claiming desktop reliability.
+   - Keep `block_current_until` / `wake_task_v2` as the only scheduler wait/wake path for migrated callers.
+   - No known display/input starvation or stuck-task warning should remain in `run-gui`.
+   - Poll/select/epoll timeouts should continue matching wall clock.
 
 5. Update Phase 57 docs with a reality-status section:
    - Keep the design docs as the intended architecture.

@@ -1,7 +1,7 @@
 # Real Applications and Browser Roadmap
 
 **Date:** 2026-04-29
-**Baseline:** `main` at `449fc05165868a22e756038b50ccc55981291fcd`
+**Baseline:** `main` at `4c72e34` (`Phase 57a: scheduler block/wake protocol rewrite`, merged 2026-04-29)
 **Question:** What would it take to run real applications, including browsers, on top of the post-Phase 57 system?
 
 ## Short answer
@@ -162,7 +162,8 @@ Define the target before implementation:
 
 | Roadmap area | Relevance |
 |---|---|
-| Phase 57a | In progress. Expected to stabilize graphical startup and scheduler waits by replacing the v1 block/wake protocol, deleting the lost-wake machinery, fixing timeout units, and adding a validation gate. Required before GUI app work can be treated as reliable. |
+| Phase 57a | Merged. It stabilizes blocked waits by replacing the v1 lost-wake protocol, deleting the lost-wake machinery, fixing timeout units, adding watchdog/trace diagnostics, and improving `audio_server`, `serial_stdin_feeder`, and `syslogd` behavior. It is necessary but not sufficient for reliable apps: the real-hardware GUI gate still fails from cooperative-scheduling starvation. |
+| Phase 57b / 57c | Planned in `docs/appendix/preemptive-multitasking.md`. Needed before GUI apps or browser-class workloads can assume that CPU-bound user code, logging bursts, or kernel busy-waits will not monopolize a core and starve event loops. |
 | Phase 59 | Brings git, Python, Clang/LLD, and larger staged toolchains. This is a prerequisite for serious third-party ports. |
 | Phase 60 | DNS, HTTPS trust, git remote, GitHub CLI. Browser networking builds on the same trust and resolver story. |
 | Phase 61 | Node.js and npm. Useful for Electron/JS ecosystem understanding, but Electron itself is browser-stack sized. |
