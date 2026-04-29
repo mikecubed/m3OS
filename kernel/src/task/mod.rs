@@ -54,6 +54,22 @@ pub(crate) const MAX_TASKS: usize = 256;
 
 pub use kernel_core::types::TaskId;
 
+// Phase 57b E.1 — re-export the PreemptFrame layout constants pinned by
+// `kernel_core::preempt_frame`.  The Phase 57d assembly entry stub will
+// dereference these offsets relative to a `Task` base pointer to write
+// every saved register into [`Task::preempt_frame`].  Re-exporting the
+// constants here (rather than redefining them) keeps a single source of
+// truth for the layout (DRY): if `PreemptFrame` ever shifts, the kernel-core
+// const _: () = assert!(...) gates fail the build before any caller can
+// pick up the wrong offset.  The constants are unused inside the kernel
+// in 57b — Phase 57d's assembly stub is the first consumer — so an
+// explicit `unused_imports` allowance keeps `cargo xtask check` clean.
+#[allow(unused_imports)]
+pub use kernel_core::preempt_frame::{
+    PREEMPT_FRAME_OFFSET_CS, PREEMPT_FRAME_OFFSET_RAX, PREEMPT_FRAME_OFFSET_RFLAGS,
+    PREEMPT_FRAME_OFFSET_RIP, PREEMPT_FRAME_OFFSET_RSP, PREEMPT_FRAME_OFFSET_SS,
+};
+
 pub mod blocking_mutex;
 pub mod sched_trace;
 pub mod scheduler;
@@ -309,6 +325,16 @@ pub struct Task {
     /// storage guarantees the heap address does not move; Track C caches a
     /// raw pointer into this field on `PerCoreData::current_preempt_count_ptr`.
     pub preempt_count: core::sync::atomic::AtomicI32,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57b E.1 — preemption save area
+    // ---------------------------------------------------------------------------
+    /// Phase 57b infrastructure. Written by 57d's assembly entry stub; read
+    /// by 57d/57e's preempt-resume routines. Unused in 57b. Layout pinned by
+    /// `kernel_core::preempt_frame::PreemptFrame` and the
+    /// `PREEMPT_FRAME_OFFSET_*` constants exported from that module — the
+    /// assembly stub uses those offsets directly.
+    pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
 }
 
 impl Task {
@@ -360,6 +386,11 @@ impl Task {
             // Track F will wire IrqSafeMutex::lock to fetch_add this counter
             // in 57b; in 57b proper the counter is never read by 57d/57e gates.
             preempt_count: core::sync::atomic::AtomicI32::new(0),
+            // Phase 57b E.1: zero-initialised save area. Untouched in 57b;
+            // 57d's assembly entry stub will populate this on every preempt
+            // entry, and 57d/57e's resume routines read it back to issue
+            // `iretq` to the preempted instruction.
+            preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
         }
     }
 
