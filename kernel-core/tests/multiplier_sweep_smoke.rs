@@ -13,8 +13,7 @@ use kernel_core::time::TICKS_PER_SEC_EXPECTED;
 #[test]
 fn ticks_per_sec_is_1000() {
     assert_eq!(
-        TICKS_PER_SEC_EXPECTED,
-        1_000,
+        TICKS_PER_SEC_EXPECTED, 1_000,
         "TICKS_PER_SEC must be 1000 (1 tick = 1 ms); do not regress to 100 Hz"
     );
 }
@@ -44,7 +43,10 @@ fn ms_to_ticks_is_one_to_one() {
     //                  = n * 1_000 / 1_000
     //                  = n   (not n / 10)
     let ticks_per_ms = TICKS_PER_SEC_EXPECTED / 1_000_u64;
-    assert_eq!(ticks_per_ms, 1, "each millisecond must equal exactly 1 tick");
+    assert_eq!(
+        ticks_per_ms, 1,
+        "each millisecond must equal exactly 1 tick"
+    );
 }
 
 /// Regression: the stale-ready and cpu-hog log messages reported `ticks * 10`
@@ -76,13 +78,11 @@ fn deadline_ticks_are_not_divided_by_ten() {
         "sanity: the two formulas must differ so the test is meaningful"
     );
     assert_eq!(
-        correct_deadline,
-        12_000,
+        correct_deadline, 12_000,
         "deadline should be start(10000) + 2000 ms = 12000 ticks"
     );
     assert_eq!(
-        stale_deadline,
-        10_200,
+        stale_deadline, 10_200,
         "the old formula gives start(10000) + 200 ticks (10x too short)"
     );
 }

@@ -1884,12 +1884,14 @@ pub fn run() -> ! {
         };
 
         if let Some((pid, name, last_ready, stale_ticks)) = stale_info {
+            // stale_ticks is already in ms: TICKS_PER_SEC = 1000, so 1 tick = 1 ms.
+            // The old `stale_ticks * 10` assumed a 100 Hz timer (10 ms/tick) — G.3 fix.
             log::warn!(
-                "[sched] stale-ready: pid={} name={} core={} stale~{}ms (ready_at_tick={})",
+                "[sched] stale-ready: pid={} name={} core={} stale~{} ms (ready_at_tick={})",
                 pid,
                 name,
                 core_id,
-                stale_ticks * 10,
+                stale_ticks,
                 last_ready
             );
         }
@@ -2182,13 +2184,15 @@ pub fn run() -> ! {
             };
 
             if let Some((pid, name, ran_ticks, final_state, exec_path)) = hog_info {
+                // ran_ticks is already in ms: TICKS_PER_SEC = 1000, so 1 tick = 1 ms.
+                // The old `ran_ticks * 10` assumed a 100 Hz timer (10 ms/tick) — G.3 fix.
                 log::warn!(
-                    "[sched] cpu-hog: pid={} name={} exec_path={} core={} ran~{}ms final_state={:?}",
+                    "[sched] cpu-hog: pid={} name={} exec_path={} core={} ran~{} ms final_state={:?}",
                     pid,
                     name,
                     exec_path.as_deref().unwrap_or("-"),
                     core_id,
-                    ran_ticks * 10,
+                    ran_ticks,
                     final_state
                 );
             }
