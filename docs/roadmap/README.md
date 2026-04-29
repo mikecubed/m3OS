@@ -170,9 +170,11 @@ flowchart TD
     P47 --> P56["Phase 56<br/>Display and Input Architecture"]
     P55b --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
+    P57 --> P57a["Phase 57a<br/>Scheduler Rewrite"]
     P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
     P55c --> P58
     P57 -.->|optional local-system branch| P58
+    P57a -.->|graphical-stack readiness| P58
 
     %% Post-1.0 platform growth
     P58 --> P59["Phase 59<br/>Cross-Compiled Toolchains"]
@@ -297,6 +299,7 @@ flowchart TD
 | 55c | Ring-3 Driver Correctness Closure | Bound-notification event multiplexing (closes SSH-over-e1000 deadlock), IOMMU BAR identity coverage (closes `--iommu` device-smoke timeouts), userspace `EAGAIN` visibility during driver restart — closes the three correctness residuals Phase 55b left behind | **Complete** | `phase-55c` | [Phase 55c](./55c-ring-3-driver-correctness-closure.md) | [Tasks](./tasks/55c-ring-3-driver-correctness-closure-tasks.md) / [Learning](./55c-ring-3-driver-correctness-closure-learning.md) |
 | 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Complete | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | [Tasks](./tasks/56-display-and-input-architecture-tasks.md) |
 | 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Complete | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | [Tasks](./tasks/57-audio-and-local-session-tasks.md) |
+| 57a | Scheduler Block/Wake Protocol Rewrite | Linux-style single-state-word + condition-recheck protocol with per-task `pi_lock`; eliminates lost-wake bug class and restores the Phase 56/57 graphical stack on real hardware | Planned | `phase-57a` | [Phase 57a](./57a-scheduler-rewrite.md) | [Tasks](./tasks/57a-scheduler-rewrite-tasks.md) |
 | 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |
 
 ### Post-1.0 Platform Growth (planned)
@@ -405,6 +408,7 @@ gantt
     Ring-3 Driver Correctness Closure :p55c, after p55b, 1
     Display and Input       :p56, after p55b, 1
     Audio and Local Session :p57, after p56, 1
+    Scheduler Rewrite       :p57a, after p57, 1
     Release 1.0 Gate        :p58, after p55c, 1
 
     section Post-1.0 Platform Growth (planned)
