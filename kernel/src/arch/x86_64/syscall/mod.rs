@@ -1331,6 +1331,20 @@ mod syscall_nr {
 /// |     231 | exit_group  | ✓ kills all threads   |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
+/// Phase 57a follow-up DEBUG: per-pid syscall trace.
+///
+/// When set to a non-zero PID, every `syscall_handler` entry/exit for that
+/// PID emits an INFO-level `[strace]` log line (number, args, return value,
+/// core).  Used to diagnose tasks that monopolise their core — a syscall
+/// that enters but never exits localises the busy-wait to a specific
+/// kernel-side call site.
+///
+/// Default 0 = disabled.  Set to 2 (syslogd's expected PID) by default
+/// during the Phase 57a syslogd-on-core-1 hang investigation; flip to 0
+/// once the bug is fixed.  Can also be flipped at runtime via gdb:
+/// `set crate::arch::x86_64::syscall::STRACE_PID = N`.
+pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     number: u64,
@@ -1348,6 +1362,25 @@ pub extern "C" fn syscall_handler(
     // scheduler's restore path — block/yield sites no longer need to be
     // the primary save point.
     snapshot_user_return_state();
+
+    // Phase 57a follow-up DEBUG: per-pid syscall trace.
+    let strace_match = {
+        let trace_pid = STRACE_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pid = crate::process::current_pid();
+        trace_pid != 0 && pid == trace_pid
+    };
+    if strace_match {
+        let core_id = crate::smp::try_per_core().map(|c| c.core_id).unwrap_or(255);
+        log::info!(
+            "[strace] pid={} core={} enter syscall={} args=({:#x}, {:#x}, {:#x})",
+            crate::process::current_pid(),
+            core_id,
+            number,
+            arg0,
+            arg1,
+            arg2,
+        );
+    }
 
     // Phase 52b: debug-assert that per-core current_addrspace matches the
     // calling process's addr_space (catches stale CR3 / process mismatch).
@@ -1744,6 +1777,19 @@ pub extern "C" fn syscall_handler(
     };
 
     maybe_quiesce_current_group_exit();
+
+    // Phase 57a follow-up DEBUG: per-pid syscall trace exit side.
+    if strace_match {
+        let core_id = crate::smp::try_per_core().map(|c| c.core_id).unwrap_or(255);
+        log::info!(
+            "[strace] pid={} core={} exit  syscall={} ret={:#x} ({})",
+            crate::process::current_pid(),
+            core_id,
+            number,
+            result,
+            result as i64,
+        );
+    }
 
     // Phase 14/19: check pending signals before returning to userspace.
     // If a user handler is delivered, this diverges and never returns.
