@@ -22,7 +22,7 @@
 
 - **TDD.**  Every implementation commit references a test commit landed earlier.  Latency benchmarks land before the headline change so the "before" baseline is captured.
 - **SOLID.**  `preempt_resume_to_kernel` only restores kernel-mode tasks; `preempt_resume_to_user` only restores user-mode.  No code branches on ring inside a single routine.
-- **DRY.**  `_user` and `_kernel` resume variants share an `iretq` core via a macro / helper.
+- **DRY.**  `_user` and `_kernel` resume variants share **only the GPR-restore portion** via a `_preempt_resume_common` macro.  The iretq frame layout and RSP handling are variant-specific.
 - **Documented invariants.**  The `from_user` check is the *only* difference between 57d and 57e in the preemption decision; documented at the IRQ handler.  Every kernel busy-spin in 57c's catalogue is annotated with whether `preempt_disable` is required under `PREEMPT_FULL`.
 - **Lock ordering.**  Unchanged from 57d.
 - **Migration safety.**  Headline change gated on `cfg(feature = "preempt-full")`.  Default off until G validates; flip in H.
@@ -246,16 +246,29 @@ Each benchmark establishes a 57d baseline first (run with `preempt-full` *off*) 
 
 ## Track F — Drop the `from_user` Check
 
-### F.1 — Headline change
+### F.1 — Headline decision change
 
 **File:** `kernel/src/arch/x86_64/interrupts.rs`
-**Symbol:** `timer_handler`, `reschedule_ipi_handler`
-**Why it matters:** The single line that makes kernel-mode preemption possible.
+**Symbol:** `timer_handler_with_frame`, `reschedule_ipi_handler_with_frame` (Rust handlers introduced in 57d Track B)
+**Why it matters:** Drops the `from_user` early-return that kept kernel mode non-preemptible under `PREEMPT_VOLUNTARY`.  The decision-side change is one conditional removed; the rest of 57e (Tracks A–E and the kernel-mode `preempt_enable` immediacy in Track F.x) is what makes the change safe to ship.
 
 **Acceptance:**
-- [ ] In `timer_handler` and `reschedule_ipi_handler`, replace `if from_user && ...` with `if ...` (drop the `from_user` term).
+- [ ] In both Rust handlers, drop the `if !from_user { return; }` early-exit.
+- [ ] The remaining checks (`preempt_count == 0`, `reschedule` flag swap) are unchanged.
 - [ ] Gated on `cfg(feature = "preempt-full")`; default off.
 - [ ] In-QEMU test: a kernel-mode CPU-bound task (one without `preempt_disable`) is preempted within 1 ms.
+
+### F.2 — Kernel-mode `preempt_enable` immediate zero-crossing
+
+**File:** `kernel/src/task/scheduler.rs`
+**Symbol:** `preempt_enable`
+**Why it matters:** Under 57d, `preempt_enable` zero-crossings record `preempt_resched_pending` and consume it at the next user-mode return — because kernel mode is non-preemptible.  Under 57e, kernel mode is preemptible, so `preempt_enable` may fire the scheduler immediately when the post-decrement count is 0 *and* `reschedule` is set *and* the calling context is preempt-safe (no scheduler lock held, IF state is sane).
+
+**Acceptance:**
+- [ ] `preempt_enable` post-decrement: if previous count == 1 *and* `per_core().reschedule` is set, *and* the call is gated by a "kernel preempt-safe" precondition, call into the scheduler immediately rather than only setting `preempt_resched_pending`.
+- [ ] The deferred-record path from 57d Track E remains as a fallback for contexts where immediate switch is unsafe.
+- [ ] Gated on `cfg(feature = "preempt-full")`; under `preempt-voluntary` only, the 57d behaviour is preserved.
+- [ ] Latency benchmark E.4 (preempt_enable zero-crossing) under 57e measures the immediate-switch latency floor, not the deferred-to-user-return floor.
 
 ### F.2 — Tracepoint update
 
@@ -350,6 +363,6 @@ Each benchmark establishes a 57d baseline first (run with `preempt-full` *off*) 
 ## Documentation Notes
 
 - This phase is the **stretch goal** of the 57b/57c/57d/57e programme.  Whether to land 57e depends on m3OS's release goals and the soak data from 57c/57d.  A credible release-1.0 plateau exists at 57d (PREEMPT_VOLUNTARY parity with Linux desktop default).
-- The headline change is a single line; the rest of the phase is audit and validation that makes that line safe.  Reviewers should treat the audit catalogue at `docs/handoffs/57e-kernel-preempt-audit.md` as the source of truth for completeness.
+- The decision-side change is a single conditional removed (Track F.1).  The full 57e implementation surface is larger: same-CPL `iretq` resume routine and matching kernel-RSP capture (Track C), per-CPU access audit (Track B.3), kernel-mode `preempt_enable` immediate zero-crossing (Track F.2).  Reviewers should treat the audit catalogue at `docs/handoffs/57e-kernel-preempt-audit.md` as the source of truth for completeness across all of these.
 - Every Track B `preempt_disable` wrapper corresponds to an "annotate" decision in 57c.  Reviewers should cross-check 57c's audit for any missed annotations before approving 57e Track B.
 - The 24-hour soak gate (G) is the most important checkpoint.  Until G passes, the feature flag stays off in production.  H.3 (flag removal) is the final cleanup after H.2 (post-flip soak) confirms stability.

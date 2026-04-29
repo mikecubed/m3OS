@@ -38,12 +38,26 @@ Before `preempt_disable` / `preempt_enable` can be wired into `IrqSafeMutex::loc
 
 ### Per-CPU `current_preempt_count_ptr` (lock-free access)
 
-`preempt_disable` / `preempt_enable` must run without acquiring `SCHEDULER.lock`.  Once Track E wires those functions into `IrqSafeMutex::lock`, taking the scheduler lock would itself call `preempt_disable`, which would in turn try to take the scheduler lock — recursive deadlock.  The fix is per-CPU pointer access:
+`preempt_disable` / `preempt_enable` must run without acquiring `SCHEDULER.lock`.  Once Track F wires those functions into `IrqSafeMutex::lock`, taking the scheduler lock would itself call `preempt_disable`, which would in turn try to take the scheduler lock — recursive deadlock.  The fix is per-CPU pointer access:
 
-- New field `PerCoreData::current_preempt_count_ptr: AtomicPtr<AtomicI32>`.  Updated by the dispatch path on every context switch (with `Release` ordering) immediately after the chosen task's index is known and before `switch_context` runs.  Read by `preempt_disable` / `preempt_enable` with `Acquire` ordering.
-- Per-core dummy: a `static AtomicI32 BOOT_PREEMPT_COUNT_DUMMY[MAX_CORES]` is the initial pointee.  `preempt_disable` calls during early boot or while running scheduler/idle code increment the dummy; nothing reads it, so the increment is a harmless no-op.
-- Dispatch path invariant: `current_preempt_count_ptr` is updated *between* `pick_next` and `switch_context`, while `SCHEDULER.lock` is still held (which keeps `preempt_count > 0` on the still-current task).  The lock release lowers the *outgoing* task's count; the pointer update then re-aims at the incoming task's `preempt_count`.  IF=0 across `switch_context`'s `cli`/`popf` window prevents any IRQ from observing a torn state.
-- The `Vec<Box<Task>>` storage from the previous section is what makes this safe: the address embedded in the pointer is stable for the task's lifetime.
+- New field `PerCoreData::current_preempt_count_ptr: AtomicPtr<AtomicI32>`.  Read by `preempt_disable` / `preempt_enable` with `Acquire` ordering.  Written by the dispatch / switch-out / switch-in paths with `Release` ordering, in the lifecycle described below.
+- Per-core dummy: a `static SCHED_PREEMPT_COUNT_DUMMY: [AtomicI32; MAX_CORES]` is the initial pointee at boot and the canonical "scheduler-context" pointee at every dispatch boundary.  Increments on the dummy are observable nowhere — they cancel correctly at unlock and never overflow because each dummy is per-core.
+- The `Vec<Box<Task>>` storage from the previous section is what makes the per-task pointee safe: the address embedded in the pointer is stable for the task's lifetime.
+
+#### Pointer lifecycle (load-bearing invariant)
+
+The hard rule: **every `IrqSafeMutex` guard must decrement the same preempt-count pointee it incremented.**  Violating this drives the wrong task's `preempt_count` negative and leaves the right task's count permanently elevated, neither of which 57d preemption tolerates.
+
+The four phases of the dispatch path:
+
+1. **Running-task context.**  Pointer targets `current_task().preempt_count`.  Every `IrqSafeMutex::lock` / `Drop` pair increments and decrements the running task's count — symmetric.
+2. **Switch-out epilogue (interrupt-masked).**  Immediately after `switch_context` *returns* to the scheduler stack — i.e. on the path that runs *after* the outgoing task's RSP has been saved but *before* any code on the scheduler stack acquires another lock — retarget the pointer to `SCHED_PREEMPT_COUNT_DUMMY[core_id]` with `Release`.  This is done in an interrupts-disabled window so no IRQ can fire `preempt_disable` against a stale pointer.  Once retargeted, the scheduler-context code that follows (e.g. `pick_next`, run-queue manipulation) charges its lock acquisitions to the dummy.
+3. **Scheduler/idle context.**  Pointer targets the per-core dummy.  `IrqSafeMutex::lock` / `Drop` pairs in `pick_next`, the deadline scanner, the watchdog, and the per-core idle loop all increment and decrement the dummy — symmetric.
+4. **Switch-in handoff (interrupt-masked).**  After the scheduler has chosen the next task and has *released every lock it acquired under the dummy*, but *before* it calls `switch_context` to enter the chosen task, retarget the pointer from the dummy to `next_task.preempt_count` with `Release`.  Again interrupt-masked.  When `switch_context` returns into the chosen task, that task's `IrqSafeMutex::lock` / `Drop` pairs charge its own count — symmetric.
+
+The fundamental property phases 2 and 4 enforce: when a lock is acquired in scheduler context and released in scheduler context, both ops hit the dummy.  When a lock is acquired in task context and released in task context, both hit the same `Task::preempt_count`.  No `IrqSafeMutex::lock` may straddle a pointer retarget — that is the failure mode the reviewer flagged.
+
+Tasks B/C of 57b's task list pin this invariant in code (B.4 retarget at switch-out, C.4 retarget at switch-in) plus a regression test that asserts the invariant by construction.
 
 ### `preempt_count` infrastructure (Piece 2 from the appendix)
 
@@ -124,7 +138,7 @@ Located at `kernel/src/task/scheduler.rs::preempt_disable` / `::preempt_enable`.
 #[inline]
 pub fn preempt_disable() {
     let ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
-    // SAFETY: ptr is either a per-core BOOT_PREEMPT_COUNT_DUMMY or points to a
+    // SAFETY: ptr is either a per-core SCHED_PREEMPT_COUNT_DUMMY or points to a
     // live Task::preempt_count.  Tasks are stored in Vec<Box<Task>> so the
     // address is stable for the task's lifetime.  Dispatch updates the pointer
     // atomically with respect to switch_context's IF=0 window, so no IRQ can

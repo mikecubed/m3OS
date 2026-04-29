@@ -21,7 +21,7 @@ The 57b/57d/57e programme (preemption infrastructure + IRQ-return preemption che
 This phase delivers Piece 5 as a self-contained body of work that:
 
 1. Provides **immediate, behaviour-changing user-pain relief** without requiring the 57b foundation.
-2. **Composes** with 57b/57d when those land — every audited site is annotated with whether it requires preempt-disable wrapping (for 57d safety) or stays as block+wake (preempt-safe by construction).
+2. **Composes** with 57b/57e when those land — every audited site is annotated with whether it requires preempt-disable wrapping (for 57e safety, since 57d's `PREEMPT_VOLUNTARY` keeps kernel mode non-preemptible) or stays as block+wake (preempt-safe by construction).
 3. Makes 57e (full kernel preemption) safe by default — without this audit, dropping the `from_user` check in 57d/e risks lockups every time a kernel busy-spin holds the condition the spinner waits on.
 
 The phase is large but mechanical: each callsite is reviewed in isolation, classified as one of {block+wake, hardware-bounded, deferred}, and converted or annotated accordingly.
@@ -67,7 +67,7 @@ The candidate set the audit will likely surface (subject to confirmation):
 
 For sites that stay as spins because the critical section is hardware- or context-bounded.  **Track C only adds annotation comments**; the actual `preempt_disable` / `preempt_enable` wrappers around these spins are load-bearing for **57e** (full kernel preemption), not 57d.  Under 57d's `PREEMPT_VOLUNTARY` model, kernel-mode is non-preemptible by construction (the `from_user` check at the IRQ-return preemption point), so kernel busy-spins are safe regardless of whether `preempt_count` is held.  The wrappers are added as part of 57e Track B.
 
-- **`wait_icr_idle()` (`kernel/src/smp/ipi.rs:46`)** — LAPIC ICR delivery is bounded by IPI latency.  Annotate with a comment citing Intel SDM Vol 3A §10.6.  Wrap in `preempt_disable` (a 57b primitive) when 57b lands so a 57d preemption point does not interrupt the spin.
+- **`wait_icr_idle()` (`kernel/src/smp/ipi.rs:46`)** — LAPIC ICR delivery is bounded by IPI latency.  Annotate with a comment citing Intel SDM Vol 3A §10.6.  57e Track B adds the `preempt_disable` wrapper when `PREEMPT_FULL` makes them load-bearing; under 57d (`PREEMPT_VOLUNTARY`) kernel mode is non-preemptible by construction and the wrapper is harmless but unnecessary.
 - **`tlb_shootdown` ack wait (`kernel/src/smp/tlb.rs:102, 190`)** — bounded by IPI delivery + remote-CPU IRQ-handler runtime, which is bounded itself.  Annotate.
 - **IOMMU command-queue waits (`kernel/src/iommu/intel.rs:247, 368, 390`, `iommu/amd.rs:339`)** — hardware-bounded by IOMMU register update latency.  Annotate.
 - **PS/2 controller wait (`kernel/src/arch/x86_64/ps2.rs:207, 220`)** — bounded by PS/2 controller response time, microseconds.  Annotate.
@@ -182,7 +182,7 @@ The pattern: drive a stimulus, wait for the syscall to return, verify `ran_ticks
 - **Reuses Phase 57a's `block_current_until` primitive** as the canonical block primitive.  Every Track B conversion calls into it.
 - **Reuses Phase 6 / 50 `Notification` objects** as the canonical wake source for IRQ-driven wakes.
 - **Reuses Phase 43c (Regression and Stress)** infrastructure for the per-callsite regression tests and the soak test.
-- **Independent of Phase 57b** — the audit annotations land before 57b's `preempt_disable` exists.  The 57b/57c integration commit adds the wrappers in lockstep with the 57b foundation.
+- **Independent of Phase 57b** — the audit annotations land before 57b's `preempt_disable` exists.  57e Track B adds the wrappers when `PREEMPT_FULL` makes them load-bearing; 57c only adds the bound comments.
 - **Closes the residual Phase 57a graphical-stack regression** (the cursor-stuck-at-(0,0) symptom catalogued in the validation gate handoff) without requiring 57d preemption to land.
 
 ## Implementation Outline

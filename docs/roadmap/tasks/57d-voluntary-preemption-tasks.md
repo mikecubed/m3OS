@@ -92,7 +92,13 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 - [ ] Stub passes `rsp` (which now points to the bottom of the saved frame) as the first argument to `timer_handler_with_frame`.
 - [ ] On Rust handler return, stub pops the GPRs in reverse order and `iretq`s.
 - [ ] Stub handles both ring-3-interrupted and ring-0-interrupted cases (the GPR push count is identical; the CPU-pushed frame size differs but is at a known offset).
+- [ ] **System V AMD64 ABI invariants preserved across the `extern "C"` call:**
+  - RSP is 16-byte aligned at the call instruction's boundary (after the call's own implicit `push rip` that brings it to `≡ 8 (mod 16)` — i.e., 16-byte aligned *before* the call).  Because the stub pushes 15 × 8 = 120 bytes of GPRs onto the CPU-pushed iretq frame (40 bytes for ring-3-interrupted, 24 bytes for ring-0-interrupted with the 2 missing slots accounted for by the entry-stub padding established in 57e Track C.0), the stub adds an explicit `sub rsp, 8` pad before the call when needed and undoes it after.  Misalignment crashes any SSE-using Rust function — verified by a regression test that calls into a Rust function known to use `movaps`.
+  - All caller-saved registers above what the stub already pushed are clobbered freely by the Rust handler; the stub does not re-save them.
+  - Direction flag (`DF`) is cleared on entry to the Rust call (per ABI) — the stub `cld`s before the `call`.
+  - The Rust handler returns normally (i.e., when *not* preempting); the stub pops the GPRs in reverse order and `iretq`s.  When preempting, `preempt_to_scheduler` is `-> !` and the pop/iretq epilogue is unreachable on that path.
 - [ ] In-QEMU test: a synthetic interrupt fired with known register values reaches the Rust handler with all 15 GPRs preserved in the trap frame.
+- [ ] In-QEMU test (alignment regression): a Rust handler that contains `movaps` against an aligned local does not fault — proves the stub's stack alignment is correct.
 
 ### B.3 — Implement `reschedule_ipi_entry` naked-asm stub
 
@@ -104,8 +110,24 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 **Why it matters:** Cross-core wakes deliver via the reschedule IPI; the same preemption check must fire on the receiving core.  Same correctness reasoning as B.2.
 
 **Acceptance:**
-- [ ] Mirror of B.2 for the reschedule IPI vector.
+- [ ] Mirror of B.2 for the reschedule IPI vector — same GPR layout, same ABI invariants, same alignment regression test.
 - [ ] Shares the GPR save/restore macro with `timer_entry` to satisfy DRY.
+
+### B.4 — IDT installation for naked-asm entry symbols
+
+**Files:**
+- `kernel/src/arch/x86_64/interrupts.rs` (IDT init)
+- `kernel/src/arch/x86_64/asm/preempt_entry.S`
+
+**Symbol:** IDT timer + reschedule-IPI entry installation
+**Why it matters:** The current IDT init uses `idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler)`, which only accepts an `extern "x86-interrupt" fn(InterruptStackFrame)` symbol.  A raw assembly symbol (`timer_entry`) does not have that Rust signature.  Without explicit guidance, an implementer might wrap the asm in a thin `extern "x86-interrupt"` shim — defeating the entire point of B.2 by re-introducing the Rust-side caller-saved-clobber window the stub is designed to avoid.
+
+**Acceptance:**
+- [ ] `timer_entry` and `reschedule_ipi_entry` are exposed as `extern "C"` symbols whose addresses can be read in Rust.
+- [ ] IDT install path uses the `x86_64` crate's raw-handler-address API: build an `Entry` via `Entry::new(...).set_handler_addr(VirtAddr::new(timer_entry as usize as u64))` (or equivalent — confirm the exact API call that bypasses the `extern "x86-interrupt"` signature requirement).
+- [ ] Rationale documented in code: the stub *is* the IRQ handler; no Rust-side `extern "x86-interrupt"` wrapper exists, by design.
+- [ ] Regression test: the IDT entry's `handler_addr` matches `timer_entry as usize`.
+- [ ] If the `x86_64` crate's IDT API does not directly support raw handler addresses on the version in use, document the alternative (e.g., a hand-rolled IDT entry constructor) before any other Track B task lands; this is a B.4 prerequisite.
 
 ---
 

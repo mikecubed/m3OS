@@ -36,24 +36,27 @@ This is why the design notes recommend deferring 57e until 57c/57d have been run
 
 ## Feature Scope
 
-### Drop the `from_user` check (the headline change)
+### Drop the `from_user` check (the headline decision change)
 
-In `kernel/src/arch/x86_64/interrupts.rs::timer_handler`:
+In `kernel/src/arch/x86_64/interrupts.rs::timer_handler_with_frame` (and the matching reschedule-IPI handler — both built in 57d Track B as Rust handlers receiving `&mut PreemptTrapFrame`):
 
 ```rust
-// 57d:
-if from_user
-    && let Some(idx) = current_task_idx_fast()
-    && get_task_preempt_count_fast(idx) == 0
-    && per_core().reschedule.load(Relaxed) { ... }
+// 57d (PREEMPT_VOLUNTARY): kernel-mode skips preemption entirely.
+let from_user = (frame.cpu_frame.cs & 3) == 3;
+if !from_user { return; }
+let pc = unsafe { (*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) };
+if pc != 0 { return; }
+if !per_core().reschedule.swap(false, AcqRel) { return; }
+unsafe { preempt_to_scheduler(frame); }
 
-// 57e:
-if let Some(idx) = current_task_idx_fast()
-    && get_task_preempt_count_fast(idx) == 0
-    && per_core().reschedule.load(Relaxed) { ... }
+// 57e (PREEMPT_FULL): kernel-mode preemption fires whenever preempt_count == 0.
+let pc = unsafe { (*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) };
+if pc != 0 { return; }
+if !per_core().reschedule.swap(false, AcqRel) { return; }
+unsafe { preempt_to_scheduler(frame); }
 ```
 
-A single line.  The rest of 57e is the audit and validation that makes this single line safe.
+The decision-side change is a single conditional removed.  The full set of 57e changes is larger: same-CPL `iretq` resume routine and matching kernel-RSP capture (Track C), per-CPU access audit (Track B.3), kernel-mode `preempt_enable` immediate zero-crossing semantics (Track F.x — the 57d deferred record becomes a direct schedule under `PREEMPT_FULL`).  The audit and validation that make this set safe is the bulk of the phase work.
 
 ### Kernel-mode preempt invariant audit
 
@@ -124,7 +127,7 @@ A 24-hour soak with `PREEMPT_FULL` enabled, running the standard graphical-stack
   - *Liskov.*  Kernel-mode and user-mode preempted tasks are interchangeable from the scheduler's perspective.
   - *Interface Segregation.*  Same as 57d.
   - *Dependency Inversion.*  Same as 57d.
-- **DRY.**  The `_user` and `_kernel` variants of `preempt_resume` share an `iretq` core; the difference is the segment selectors.  Factor the shared part into a macro / helper.
+- **DRY.**  The `_user` and `_kernel` variants of `preempt_resume` share **only the GPR-restore portion** via a `_preempt_resume_common` macro.  The iretq frame layout (5-field privilege-changing for `_user`, 3-field same-CPL for `_kernel`) and the RSP handling (CPU-pushed `rsp` for `_user`, explicit `mov rsp, preempt_frame.rsp` for `_kernel`) are variant-specific and *not* shared.
 - **Documented invariants.**
   - The `from_user` check is the *only* difference between 57d and 57e in the preemption decision.  Documented at the IRQ handler.
   - Every kernel busy-spin in `docs/handoffs/57c-busy-wait-audit.md` is annotated with whether it requires `preempt_disable` under `PREEMPT_FULL`.  Reviewers reject changes that add new spins without an annotation.
@@ -136,7 +139,7 @@ A 24-hour soak with `PREEMPT_FULL` enabled, running the standard graphical-stack
 
 ### IRQ-handler preemption check (modified)
 
-The single line change.  Documented at the IRQ handler.
+The decision-side change (drop the `from_user` check); documented at the IRQ handler.  The full implementation surface area is larger — see Track B.3 (per-CPU access audit), Track C (same-CPL resume + kernel-RSP capture), and the kernel-mode `preempt_enable` zero-crossing immediacy that 57e adds.
 
 ### `preempt_resume_to_kernel` (new assembly)
 
@@ -169,7 +172,7 @@ Property tests for the kernel-mode preemption transition:
 
 ## How This Builds on Earlier Phases
 
-- **Drops a single check from Phase 57d's IRQ-handler preemption point.**  Everything else 57e adds is audit + validation.
+- **Drops the `from_user` early-return from Phase 57d's IRQ-handler preemption decision.**  In addition, 57e adds: same-CPL `iretq` resume routine + matching kernel-RSP capture (because the CPU pushes a different frame shape for ring-0-interrupted vs ring-3-interrupted), per-CPU access audit (because a kernel-mode preemption can migrate the running task between cores), and kernel-mode `preempt_enable` immediate zero-crossing semantics (replacing 57d's deferred-record path for kernel-mode-safe call sites).  The audit + validation that makes all of this safe is the bulk of the phase work.
 - **Reuses Phase 57b's `preempt_count`** discipline — now load-bearing for kernel-mode safety.
 - **Reuses Phase 57c's busy-wait audit** as the input to the kernel-preempt invariant audit.  Every "annotate" entry in 57c gains a `preempt_disable` wrapper in 57e.
 - **Reuses Phase 57d's `preempt_to_scheduler`** routine — unchanged.  Adds a `_kernel` variant of `preempt_resume`.

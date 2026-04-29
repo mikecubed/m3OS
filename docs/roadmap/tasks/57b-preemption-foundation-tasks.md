@@ -127,35 +127,57 @@ Tracks A through D are the foundation — they must complete before F/G.  Track 
 ### C.1 — Add `current_preempt_count_ptr` to `PerCoreData`
 
 **File:** `kernel/src/smp/mod.rs`
-**Symbol:** `PerCoreData::current_preempt_count_ptr`, `BOOT_PREEMPT_COUNT_DUMMY`
+**Symbol:** `PerCoreData::current_preempt_count_ptr`, `SCHED_PREEMPT_COUNT_DUMMY`
 **Why it matters:** This is the lock-free entry point for `preempt_disable` / `preempt_enable`.  Without it, the helpers must reach `Task::preempt_count` through the scheduler lock, which `IrqSafeMutex::lock` would then try to take while already inside `IrqSafeMutex::lock` — recursive deadlock.
 
 **Acceptance:**
 - [ ] `PerCoreData::current_preempt_count_ptr: AtomicPtr<AtomicI32>`.
-- [ ] `static BOOT_PREEMPT_COUNT_DUMMY: [AtomicI32; MAX_CORES]` initialised to all zero.
-- [ ] During `init_per_core` and `init_ap_per_core`, `current_preempt_count_ptr` is initialised to `&BOOT_PREEMPT_COUNT_DUMMY[core_id] as *const _ as *mut _`.
-- [ ] Doc comment on the field documents the invariants: pointer is always valid (boot dummy or live `Task::preempt_count`); updated by dispatch with `Release`; read by `preempt_disable` / `preempt_enable` with `Acquire`; `Vec<Box<Task>>` storage from Track B is what makes the cached `Task::preempt_count` address stable.
+- [ ] `static SCHED_PREEMPT_COUNT_DUMMY: [AtomicI32; MAX_CORES]` initialised to all zero.  Used both as the boot pointee and as the canonical scheduler-context pointee at every dispatch boundary.
+- [ ] During `init_per_core` and `init_ap_per_core`, `current_preempt_count_ptr` is initialised to `&SCHED_PREEMPT_COUNT_DUMMY[core_id] as *const _ as *mut _`.
+- [ ] Doc comment on the field documents the invariants: pointer is always valid (per-core dummy or live `Task::preempt_count`); updated only by C.2 (switch-out retarget) and C.3 (switch-in retarget) in interrupt-masked windows; read by `preempt_disable` / `preempt_enable` with `Acquire`; `Vec<Box<Task>>` storage from Track B is what makes the cached `Task::preempt_count` address stable.
 
-### C.2 — Dispatch updates `current_preempt_count_ptr`
+### C.2 — Switch-out epilogue retargets pointer to the per-core dummy
 
 **File:** `kernel/src/task/scheduler.rs`
-**Symbol:** the dispatch path (around the `pick_next` → `switch_context` boundary), `dispatch_switch_in`, idle-context restore
-**Why it matters:** The pointer must always reflect the currently-running task on this core.  An IRQ that fires while the pointer is stale would update the wrong task's `preempt_count`.
+**Symbol:** the dispatch path immediately after `switch_context` returns to the scheduler stack
+**Why it matters:** The hard rule is **every `IrqSafeMutex` guard must decrement the same pointee it incremented.**  If the pointer still targets the outgoing task when scheduler-context code (e.g. `pick_next`) takes its first lock, the lock acquisition charges the outgoing task; the corresponding release would then *also* hit the outgoing task — fine.  But if the retarget happens between acquire and release, the release lands on the wrong pointee.  The fix: retarget *before* the scheduler takes any new lock and *after* every existing scheduler-stack guard has released.
 
 **Acceptance:**
-- [ ] Dispatch path updates `current_preempt_count_ptr` between `pick_next` (which selects the next task) and `switch_context` (which transfers control).  Update happens while `SCHEDULER.lock` is still held — keeping the still-current task's count > 0 across the swap.
-- [ ] When dispatch runs the per-core idle task or stays in scheduler context, the pointer is set to `BOOT_PREEMPT_COUNT_DUMMY[core_id]`.
-- [ ] Update uses `Release` ordering; reads in `preempt_disable` / `preempt_enable` use `Acquire`.
-- [ ] Lock-ordering doc updated to note: "the pointer update is the *only* observable side-effect of dispatch that crosses task boundaries; everything else (run-queue manipulation, `on_cpu` toggle) is task-local."
+- [ ] Immediately after `switch_context` returns onto the scheduler stack — and before any `IrqSafeMutex::lock` runs on that stack — the dispatch path retargets `current_preempt_count_ptr` to `&SCHED_PREEMPT_COUNT_DUMMY[core_id]` with `Release` ordering.
+- [ ] Retarget runs in an interrupts-disabled window (the dispatch path inherits `IF=0` from `switch_context`'s `cli`/`popf` window) so no IRQ can fire `preempt_disable` against an in-flight retarget.
+- [ ] `cargo xtask test` passes; no scheduler-context lock-acquire/release pair straddles the retarget.
 
-### C.3 — Pointer update tracepoint
+### C.3 — Switch-in handoff retargets pointer to the incoming task
+
+**File:** `kernel/src/task/scheduler.rs`
+**Symbol:** the dispatch path immediately before the next `switch_context` call (entering the chosen task)
+**Why it matters:** Mirror of C.2.  The retarget must happen *after* the scheduler has released every lock it acquired against the dummy and *before* `switch_context` transfers to the chosen task — and before IRQs are re-enabled, so that no IRQ-context `preempt_disable` reads a half-updated pointer.
+
+**Acceptance:**
+- [ ] After the scheduler has released every `IrqSafeMutex` guard it acquired in scheduler context, and before calling `switch_context` to enter the chosen task, dispatch retargets `current_preempt_count_ptr` to `&next_task.preempt_count` with `Release` ordering.
+- [ ] Retarget runs in an interrupts-disabled window — `switch_context` itself disables IF before swapping RSP, but the retarget happens *before* `switch_context`, so the dispatch path explicitly masks interrupts (or relies on the existing dispatch IF=0 invariant; see scheduler.rs top-of-file doc) for this window.
+- [ ] When `switch_context` returns into the chosen task, that task's `IrqSafeMutex::lock` / `Drop` pairs charge its own `preempt_count` — symmetric.
+
+### C.4 — Pointer-lifecycle regression test
+
+**File:** `kernel/tests/preempt_pointer_lifecycle.rs` (new)
+**Symbol:** —
+**Why it matters:** The lifecycle invariant ("acquire and release hit the same pointee") is subtle enough that an explicit regression test is required.  Without it, a future refactor that moves a scheduler-internal lock relative to the retarget could silently regress.
+
+**Acceptance:**
+- [ ] Test that drives a dispatch handoff and asserts: an `IrqSafeMutex` taken in task context and released in task context cycles `Task::preempt_count` exactly once and ends at 0.
+- [ ] Test that drives a dispatch handoff and asserts: an `IrqSafeMutex` taken in scheduler context (during `pick_next`) and released in scheduler context cycles `SCHED_PREEMPT_COUNT_DUMMY[core_id]` exactly once and ends at 0.
+- [ ] Test that asserts: across N dispatch cycles, no task's `preempt_count` ever goes negative or accumulates a non-zero residual.
+- [ ] Test runs in QEMU as part of `cargo xtask test`.
+
+### C.5 — Pointer update tracepoint
 
 **File:** `kernel/src/task/scheduler.rs`
 **Symbol:** dispatch path
-**Why it matters:** Phase 57a's `sched-trace` feature emits state-transition records.  Adding a `(old_ptr, new_ptr, core, task_id)` record under the same gate makes future debug sessions trivially able to reconstruct the per-CPU pointer history.
+**Why it matters:** Phase 57a's `sched-trace` feature emits state-transition records.  Adding a `(old_ptr, new_ptr, core, task_id, phase)` record under the same gate (where `phase ∈ {switch_out, switch_in}`) makes future debug sessions trivially able to reconstruct the per-CPU pointer history and identify any acquire/release that straddled a retarget.
 
 **Acceptance:**
-- [ ] Under `cfg(feature = "sched-trace")`, dispatch emits a `preempt_ptr_update` record on every switch.
+- [ ] Under `cfg(feature = "sched-trace")`, both C.2 and C.3 emit a `preempt_ptr_update` record.
 - [ ] Default off (no overhead).
 
 ---

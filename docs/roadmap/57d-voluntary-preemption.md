@@ -155,26 +155,6 @@ struct Task {
 
 The dispatch path reads `resume_mode` and selects the restore routine.  This is a small additive change — and one that is permissible despite 57b's "no new flag fields" gate because `resume_mode` is a discriminant (single source of truth for *how* the task is restored), not a flag.
 
-### `Task` state additions
-
-`Task` gains a discriminant identifying the resume mode:
-
-```rust
-enum ResumeMode {
-    Cooperative,  // restore via switch_context (saved_rsp), ret
-    Preempted,    // restore via preempt_resume_to_user (preempt_frame), iretq
-    Initial,      // freshly spawned; init_stack layout
-}
-
-struct Task {
-    // ... existing fields ...
-    resume_mode: AtomicU8,  // ResumeMode encoded
-    preempt_frame: PreemptFrame,  // 57b — load-bearing in 57d
-}
-```
-
-The dispatch path reads `resume_mode` and selects the restore routine.  This is a small additive change.
-
 ### Scheduler integration
 
 The scheduler's `pick_next` and `dispatch` routines must accept a preempted task:
