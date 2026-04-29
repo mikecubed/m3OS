@@ -216,3 +216,16 @@ they no longer exhibit the bug: v2's CAS under `pi_lock` is atomic with the
 state write, so there is no v1-style intermediate flag for a concurrent
 waker to observe. The `on_cpu` spin-wait in step 4 of the wake side handles
 the RSP-publication window without a deferred-enqueue hand-off.
+
+---
+
+## Deferred
+
+**A.7 — Loom exhaustive interleaving harness** (`kernel-core/tests/sched_loom.rs`):
+The loom skeleton (two tests, `#[cfg(loom)]`) was landed in the Track A.4–A.7
+commit. Full wiring of the two-thread exhaustive (block, wake) search with
+N=4 events to the actual `pi_lock` / `SCHEDULER` loom atomics is deferred to
+a follow-up PR. The full wiring requires Track B (`Task::pi_lock` as a
+`loom::sync::Mutex`) and Track C (`block_current_until`) to land first so the
+loom model has real primitives to exercise. The skeleton documents the
+intended test structure and runs as a no-op without the `--cfg loom` flag.
