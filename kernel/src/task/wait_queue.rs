@@ -56,7 +56,11 @@ impl WaitQueue {
             // wake_task/wake_task_v2, so the TOCTOU window is closed in both
             // cases by the flag check inside block_current_until / pi_lock.
             {
-                let _ = scheduler::block_current_until(&woken, None);
+                let _ = scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
             }
         }
     }

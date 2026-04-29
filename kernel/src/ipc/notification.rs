@@ -822,7 +822,11 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         {
             use core::sync::atomic::AtomicBool;
             let woken = AtomicBool::new(false);
-            let _ = scheduler::block_current_until(&woken, None);
+            let _ = scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnNotif,
+                &woken,
+                None,
+            );
         }
         // On wake, loop back to drain pending bits.
     }

@@ -1,6 +1,6 @@
 # Phase 57a — Scheduler Block/Wake Protocol Rewrite: Task List
 
-**Status:** Planned
+**Status:** Complete (in-tree); user-driven validation gates I.1/I.2/I.4 pending — see `docs/handoffs/57a-validation-gate.md`.
 **Source Ref:** phase-57a
 **Depends on:** Phase 4 ✅, Phase 6 ✅, Phase 35 ✅, Phase 50 ✅, Phase 56 ✅, Phase 57 ✅
 **Goal:** Rewrite m3OS's task-blocking primitive to a Linux-style single-state-word + condition-recheck protocol with a per-task spinlock. Delete the `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT[core]` machinery that produced the lost-wake bug class catalogued in `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and `docs/handoff/2026-04-28-graphical-stack-startup.md`. Restore the Phase 56/57 graphical stack to a working state on real hardware.
@@ -9,15 +9,15 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit + transition tables + host tests (TDD foundation) | — | Planned |
-| B | Per-task `pi_lock` infrastructure | A | Planned |
-| C | New block primitive (`block_current_until`) behind `sched-v2` flag | A, B | Planned |
-| D | New wake primitive (`wake_task` CAS rewrite + `on_cpu` spin-wait) | C, E.1 | Planned |
-| E | Dispatch handler, `on_cpu` marker, field removal | E.1 after B; E.2–E.5 after F.1–F.6 | Planned |
-| F | Migrate all call sites (syscalls + kernel-internal); remove v1 + feature gate | C, D, E.1; F.7 after E.5 | Planned |
-| G | Diagnostics: stuck-task watchdog, tracepoint, 100 Hz multiplier sweep | A | Planned |
-| H | Secondary bug fixes (serial-stdin, audio_server, syslogd) | F | Planned |
-| I | Validation gate (real hardware, soak, fuzz) | F, G, H | Planned |
+| A | Audit + transition tables + host tests (TDD foundation) | — | ✅ Complete |
+| B | Per-task `pi_lock` infrastructure | A | ✅ Complete |
+| C | New block primitive (`block_current_until`) behind `sched-v2` flag | A, B | ✅ Complete |
+| D | New wake primitive (`wake_task` CAS rewrite + `on_cpu` spin-wait) | C, E.1 | ✅ Complete |
+| E | Dispatch handler, `on_cpu` marker, field removal | E.1 after B; E.2–E.5 after F.1–F.6 | ✅ Complete |
+| F | Migrate all call sites (syscalls + kernel-internal); remove v1 + feature gate | C, D, E.1; F.7 after E.5 | ✅ Complete |
+| G | Diagnostics: stuck-task watchdog, tracepoint, 100 Hz multiplier sweep | A | ✅ Complete |
+| H | Secondary bug fixes (serial-stdin, audio_server, syslogd) | F | ✅ Complete |
+| I | Validation gate (real hardware, soak, fuzz) | F, G, H | ⚠️ I.3/I.5 in-tree; I.1/I.2/I.4 user-driven (handoff doc has procedures) |
 
 E is split: E.1 (`Task::on_cpu` foundation) lands early — D.1's wake-side spin-wait depends on it. E.2–E.5 (deleting `PENDING_SWITCH_OUT`, `switching_out`, `wake_after_switch` and simplifying the dispatch handler) require all v1 callers migrated, so they land after F.1–F.6. F.7 (delete v1 functions and `sched-v2` gate) is the final cleanup, after E.5.
 

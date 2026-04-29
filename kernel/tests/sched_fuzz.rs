@@ -6,21 +6,37 @@
 
 //! In-QEMU smoke fixture for Phase 57a Track I.3 — multi-core scheduler fuzz.
 //!
-//! # What this tests (in-QEMU scope)
+//! # ⚠️ Scope: model-level only — this is NOT a live-scheduler test
 //!
-//! This fixture runs inside QEMU as a bare-metal kernel test.  It exercises the
-//! `kernel_core::sched_model` pure state machine — the same logic that the full
-//! kernel's `block_current_until` / `wake_task_v2` / `scan_expired_wake_deadlines`
-//! implement — in a **deterministic**, **no-QEMU-scheduler-required** scenario.
+//! This fixture exercises the `kernel_core::sched_model` pure state machine
+//! ONLY.  It does NOT call `block_current_until` / `wake_task_v2` /
+//! `scan_expired_wake_deadlines` from `kernel/src/task/scheduler.rs` — those
+//! live-scheduler primitives are not exercised here.
+//!
+//! Concretely, this fixture will NOT catch:
+//!   - lock-ordering violations between `pi_lock` and `SCHEDULER.lock`
+//!   - hardcoded block-kind bugs in `block_current_until`'s `kind` parameter
+//!   - dual-source-of-truth divergence between `Task::state` and
+//!     `TaskBlockState.state` on the various scheduler paths
+//!   - ISR wake-drain bugs, remote dead/reap paths, dispatch-handler races
+//!   - any race between real CPU cores in the live scheduler
+//!
+//! Catching those requires either: (a) a real multi-core in-QEMU integration
+//! test that spawns kernel tasks and exercises the live primitives, or
+//! (b) `cargo xtask run-gui --fresh` on the user's hardware (Track I.1 in
+//! `docs/handoffs/57a-validation-gate.md`).
+//!
+//! # What this DOES test
 //!
 //! The four deterministic scenarios from `kernel-core/tests/sched_fuzz_multicore.rs`
-//! are replayed here so that the in-QEMU path exercises the same seams as the
-//! model-level fuzz test.  This gives CI two validation layers:
+//! are replayed here so that the in-QEMU build target compiles and links the
+//! model.  This gives CI two complementary checks:
 //!
 //!   1. **Property-based depth** (kernel-core host tests): `sched_fuzz_multicore`
 //!      runs 5 000 random rounds × 32 cross-core actions each — fast, shrinkable.
-//!   2. **QEMU smoke** (this file): 4 deterministic scenarios boot and pass on
-//!      the same hardware target that the real kernel runs on.
+//!   2. **QEMU build smoke** (this file): the 4 deterministic scenarios boot
+//!      on the kernel target without panic, confirming the model compiles for
+//!      `x86_64-unknown-none`.
 //!
 //! # Why deterministic only in-QEMU?
 //!

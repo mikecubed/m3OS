@@ -591,7 +591,11 @@ fn serial_stdin_feeder_task() -> ! {
         // scheduler is free to dispatch other tasks (e.g. kbd_server) on this
         // core.  On wake the ISR will have set STDIN_FEEDER_WOKEN = true and
         // issued a cross-core IPI if necessary.
-        let _ = task::scheduler::block_current_until(&crate::serial::STDIN_FEEDER_WOKEN, None);
+        let _ = task::scheduler::block_current_until(
+            task::TaskState::BlockedOnRecv,
+            &crate::serial::STDIN_FEEDER_WOKEN,
+            None,
+        );
     }
 }
 
@@ -673,7 +677,11 @@ fn net_task() -> ! {
         // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
         // with no deadline; under v1 retain block_current_unless_woken.
         {
-            let _ = task::scheduler::block_current_until(&net::NIC_WOKEN, None);
+            let _ = task::scheduler::block_current_until(
+                task::TaskState::BlockedOnRecv,
+                &net::NIC_WOKEN,
+                None,
+            );
         }
     }
 }

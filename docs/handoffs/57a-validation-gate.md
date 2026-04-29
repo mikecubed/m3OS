@@ -143,6 +143,28 @@ Any such line during the soak is a failure.  Capture:
 
 ## I.3 — Multi-core in-QEMU fuzz
 
+> ### ⚠️ Known limitation: model-only coverage
+>
+> Both layers below exercise `kernel_core::sched_model` (the pure state
+> machine), **not** the live scheduler in `kernel/src/task/scheduler.rs`.
+> The in-QEMU binary does not call `block_current_until` / `wake_task_v2` /
+> `scan_expired_wake_deadlines` from the real kernel — it replays the model
+> on the kernel target.
+>
+> Bugs that the model-level fuzz **will not** catch:
+>
+> - Lock-ordering violations between `pi_lock` and `SCHEDULER.lock`.
+> - Hardcoded block-kind bugs in the live primitive's `kind` parameter.
+> - Dual-source-of-truth divergence between `Task::state` (scheduler-visible)
+>   and `TaskBlockState.state` (pi_lock-protected) on remote dead/reap paths
+>   or the ISR wake-drain.
+> - Real cross-core races in the live scheduler.
+>
+> Catching those requires **I.1** (real-hardware run-gui regression) or a
+> future live-scheduler integration test that spawns kernel tasks and
+> exercises the real primitives.  The model-level fuzz is necessary but not
+> sufficient — treat I.1 as the authoritative gate for the rewrite.
+
 **Why this matters:**
 Property-based host tests (`sched_fuzz_multicore`) exercise the v2 model in
 isolation.  This test exercises the same `kernel_core::sched_model` state

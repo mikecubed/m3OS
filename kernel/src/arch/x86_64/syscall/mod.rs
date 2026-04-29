@@ -3202,7 +3202,11 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         let now_ticks = crate::arch::x86_64::interrupts::tick_count();
         let deadline_ticks = now_ticks.saturating_add(sleep_ms);
         let woken = core::sync::atomic::AtomicBool::new(false);
-        let _ = crate::task::scheduler::block_current_until(&woken, Some(deadline_ticks));
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            Some(deadline_ticks),
+        );
         if has_pending_signal() {
             return NEG_EINTR;
         }
@@ -12475,7 +12479,11 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // woken_flag is shared with the wake side; the Arc clone above
             // ensures it lives until the waiter is removed from FUTEX_TABLE.
             {
-                let _ = crate::task::scheduler::block_current_until(&woken_flag, None);
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnFutex,
+                    &woken_flag,
+                    None,
+                );
             }
 
             0
@@ -14802,7 +14810,11 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         // - Indefinite timeout: pass None; wake comes from WaitQueue.
         // Under v1, retain the original yield_now() / block_current_unless_woken paths.
         {
-            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
         }
     };
 
@@ -15051,7 +15063,11 @@ fn select_inner(
         // Under v1, retain yield_now() for positive timeout and
         // block_current_unless_woken for indefinite timeout.
         {
-            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -15461,7 +15477,11 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         // Under v1, retain yield_now() for positive timeout and
         // block_current_unless_woken for indefinite timeout.
         {
-            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);
