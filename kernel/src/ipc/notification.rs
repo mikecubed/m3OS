@@ -535,7 +535,16 @@ pub fn signal(notif_id: NotifId, bits: u64) {
         w
     };
     if let Some(task) = waiter {
-        let _ = scheduler::wake_task(task);
+        // D.3: route through wake_task_v2 under sched-v2 so all wake paths
+        // use the CAS primitive and no v1 deferred-enqueue flag is set.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = scheduler::wake_task_v2(task);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            let _ = scheduler::wake_task(task);
+        }
     }
     // Also trigger reschedule in case the waiter wasn't in WAITERS yet
     // (it may be between the swap(0) check and the waiter registration).
@@ -739,7 +748,17 @@ pub fn drain_pending_waiters() {
             }
         };
         if let Some(task) = waiter {
-            let _ = scheduler::wake_task(task);
+            // D.3: route through wake_task_v2 under sched-v2 so all wake
+            // paths use the CAS primitive and no v1 deferred-enqueue flag
+            // is set.  Under the default (v1) build, use the existing path.
+            #[cfg(feature = "sched-v2")]
+            {
+                let _ = scheduler::wake_task_v2(task);
+            }
+            #[cfg(not(feature = "sched-v2"))]
+            {
+                let _ = scheduler::wake_task(task);
+            }
         }
     }
 }
