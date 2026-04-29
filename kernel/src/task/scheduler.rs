@@ -142,10 +142,29 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 // frame allocator's `with_frame_alloc_irq_safe` helper. Root cause analysis
 // is in `docs/appendix/scheduler-fairness-regression.md` (early-wedge).
 //
-// The guard's fields are dropped in declaration order: the inner spin
-// guard releases the lock *before* [`InterruptRestore`] re-enables IF,
-// so an ISR cannot fire during the unlock window and reach a just-freed
-// lock with stale `was_enabled` state.
+// # Phase 57b F.1 — preempt-discipline wiring
+//
+// `IrqSafeMutex::lock` raises the per-task `preempt_count` via
+// [`preempt_disable`] *before* masking interrupts; `IrqSafeGuard::Drop`
+// drops the count via [`preempt_enable`] *after* the spin guard has
+// released the lock and IF has been restored.  The drop order is
+// load-bearing:
+//
+//   1. Inner spin guard releases the lock (Phase 57a invariant — preserves
+//      the unlock-before-IF-restore window so an ISR cannot reach a
+//      just-freed lock with stale `was_enabled` state).
+//   2. [`InterruptRestore`] restores IF.
+//   3. [`PreemptRestore`] decrements `preempt_count` last.
+//
+// Lock-acquire order is the inverse: raise `preempt_count` first, mask IF,
+// take the spin lock.  See Phase 57b F.1 in
+// `docs/roadmap/tasks/57b-preemption-foundation-tasks.md` and the
+// recursion-safety regression test below.
+//
+// `try_lock` mirrors the same pattern: it raises `preempt_count` *before*
+// the inner `try_lock` call and undoes the raise (paired
+// [`preempt_enable`]) iff the inner `try_lock` returned `None`.  No raise
+// leaks on a failed acquire.
 pub struct IrqSafeMutex<T: ?Sized> {
     inner: Mutex<T>,
 }
@@ -153,11 +172,20 @@ pub struct IrqSafeMutex<T: ?Sized> {
 pub struct IrqSafeGuard<'a, T: ?Sized + 'a> {
     guard: spin::MutexGuard<'a, T>,
     _restore: InterruptRestore,
+    _preempt: PreemptRestore,
 }
 
 struct InterruptRestore {
     was_enabled: bool,
 }
+
+/// Phase 57b F.1 — RAII drop hook that calls [`preempt_enable`] last in the
+/// `IrqSafeGuard` drop chain.
+///
+/// Field order in [`IrqSafeGuard`] guarantees the drop sequence
+/// (spin guard → [`InterruptRestore`] → [`PreemptRestore`]); see the
+/// module-level F.1 commentary above.
+struct PreemptRestore;
 
 impl<T> IrqSafeMutex<T> {
     pub const fn new(value: T) -> Self {
@@ -169,6 +197,10 @@ impl<T> IrqSafeMutex<T> {
 
 impl<T: ?Sized> IrqSafeMutex<T> {
     pub fn lock(&self) -> IrqSafeGuard<'_, T> {
+        // Phase 57b F.1 — raise `preempt_count` *before* masking IRQs.  The
+        // helper is lock-free by mandate (Phase 57b D.2) so it cannot
+        // recurse through this very call.
+        preempt_disable();
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -177,6 +209,7 @@ impl<T: ?Sized> IrqSafeMutex<T> {
         IrqSafeGuard {
             guard,
             _restore: InterruptRestore { was_enabled },
+            _preempt: PreemptRestore,
         }
     }
 
@@ -184,7 +217,13 @@ impl<T: ?Sized> IrqSafeMutex<T> {
     /// already held. Used by the panic-diagnostic path so it can inspect
     /// task state without deadlocking if the scheduler was holding the lock
     /// at the moment the panic fired.
+    ///
+    /// Phase 57b F.1 — raises `preempt_count` *before* the inner
+    /// `try_lock`; on `None` (acquire failed) the raise is undone with a
+    /// paired [`preempt_enable`] before returning, so a failed `try_lock`
+    /// has zero net effect on the per-task counter.
     pub fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
+        preempt_disable();
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -193,11 +232,16 @@ impl<T: ?Sized> IrqSafeMutex<T> {
             Some(guard) => Some(IrqSafeGuard {
                 guard,
                 _restore: InterruptRestore { was_enabled },
+                _preempt: PreemptRestore,
             }),
             None => {
                 if was_enabled {
                     interrupts::enable();
                 }
+                // Undo the raise: a failed `try_lock` must have zero net
+                // effect on `preempt_count` (no guard means no future
+                // `Drop` will pair the raise).
+                preempt_enable();
                 None
             }
         }
@@ -225,6 +269,12 @@ impl Drop for InterruptRestore {
     }
 }
 
+impl Drop for PreemptRestore {
+    fn drop(&mut self) {
+        preempt_enable();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 57a B.3 — SCHEDULER lock sentinel
 // ---------------------------------------------------------------------------
@@ -233,9 +283,20 @@ impl Drop for InterruptRestore {
 /// `holds_scheduler_lock` flag for the lock-ordering assertion in
 /// [`Task::with_block_state`].
 ///
-/// Drop order: inner `IrqSafeGuard` releases the spin lock, then
+/// Drop order: inner `IrqSafeGuard` releases the spin lock, restores IF,
+/// and decrements `preempt_count` (Phase 57b F.1 wiring), then
 /// [`SchedulerLockSentinel`] clears the flag — so the flag is cleared after
 /// the lock is released, which is the safe ordering.
+///
+/// # Phase 57b F.2 — preempt-discipline inheritance
+///
+/// `SchedulerGuard` inherits Phase 57b F.1's preempt-discipline through its
+/// inner [`IrqSafeGuard`].  Acquire/release pairs cycle `preempt_count`
+/// exactly once: [`preempt_disable`] runs as part of the inner
+/// `IrqSafeMutex::lock` (Phase 57b F.1), and [`preempt_enable`] runs when
+/// [`IrqSafeGuard`]'s `Drop` runs as part of `SchedulerGuard::Drop` (drop
+/// order: spin-unlock → IF restore → `preempt_enable` → sentinel clears
+/// `holds_scheduler_lock`).
 pub(crate) struct SchedulerGuard<'a> {
     inner: IrqSafeGuard<'a, Scheduler>,
     _sentinel: SchedulerLockSentinel,
@@ -276,6 +337,15 @@ static SCHEDULER_INNER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::n
 /// flag for the Phase 57a B.3 lock-ordering assertion.
 ///
 /// Use this in place of `SCHEDULER_INNER.lock()` everywhere inside this module.
+///
+/// # Phase 57b F.2 — preempt-discipline
+///
+/// Acquire/release pairs cycle `preempt_count` exactly once:
+/// [`preempt_disable`] runs as part of the inner `IrqSafeMutex::lock`
+/// (Phase 57b F.1), and [`preempt_enable`] runs when [`IrqSafeGuard`]'s
+/// `Drop` runs as part of [`SchedulerGuard`]'s `Drop`.  No callsite in this
+/// module needs to call `preempt_disable` / `preempt_enable` explicitly —
+/// the discipline is inherited from the inner `IrqSafeMutex`.
 #[inline]
 pub(super) fn scheduler_lock() -> SchedulerGuard<'static> {
     let guard = SCHEDULER_INNER.lock();
@@ -1292,7 +1362,17 @@ fn record_preempt_ptr_update(
 /// the counter.
 #[inline]
 pub fn preempt_disable() {
-    let ptr = crate::smp::per_core()
+    // Phase 57b F.1 — `IrqSafeMutex::lock` now calls this helper on every
+    // lock acquisition, including a few callsites reachable before per-core
+    // data is initialised (early boot, the `#[cfg(test)]` harness, panic
+    // paths).  Use [`crate::smp::try_per_core`] so the helper degrades to a
+    // no-op until the per-core pointer is live; the user-mode-return
+    // assertion (D.3) reads the same pointee through `try_per_core` so the
+    // round trip stays observable once the core comes up.
+    let Some(pc) = crate::smp::try_per_core() else {
+        return;
+    };
+    let ptr = pc
         .current_preempt_count_ptr
         .load(core::sync::atomic::Ordering::Acquire);
     // The pointer is always valid by C.1 / C.2 / C.3 invariants — at boot
@@ -1331,7 +1411,13 @@ pub fn preempt_disable() {
 /// design and the eventual zero-crossing wiring point.
 #[inline]
 pub fn preempt_enable() {
-    let ptr = crate::smp::per_core()
+    // Mirrors [`preempt_disable`]'s defensive `try_per_core` guard so the
+    // F.1 wiring through `IrqSafeMutex::Drop` cannot panic on a path where
+    // per-core data is not yet live.
+    let Some(pc) = crate::smp::try_per_core() else {
+        return;
+    };
+    let ptr = pc
         .current_preempt_count_ptr
         .load(core::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
