@@ -624,4 +624,122 @@ mod tests {
         let eligible = !on_cpu.load(Ordering::Acquire);
         assert!(eligible);
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 57b B.2 — stable-address regression test
+    //
+    // The address of a `Task` heap allocation must remain fixed for the
+    // entire lifetime of the task, even as the outer `Vec<Box<Task>>` grows
+    // and reallocates.  Track C will cache a raw pointer to
+    // `Task::preempt_count` on `PerCoreData::current_preempt_count_ptr`;
+    // without `Vec<Box<Task>>` storage that pointer would dangle on the
+    // first scheduler `push` past the current capacity.
+    //
+    // This test does not exercise the live `Scheduler::tasks` field
+    // (avoiding any `scheduler_lock()` interaction in test context).  It
+    // instead drives a private `Vec<Box<Task>>` through enough `push`
+    // operations to force ≥ 3 reallocations of the outer `Vec`, then
+    // confirms a cached pointer to an early task's `preempt_count` still
+    // resolves to the same address and the same value the original task
+    // wrote.  This pins the property — `Box` keeps each `Task` at a fixed
+    // heap address regardless of `Vec` growth — without depending on the
+    // scheduler harness.
+    //
+    // Lives in `kernel/src/task/mod.rs` rather than
+    // `kernel/tests/task_storage_stable.rs` because the `kernel` crate is a
+    // binary with no `lib` target — integration tests cannot import `Task`.
+    // A `#[cfg(test)] #[test_case]` here runs inside the kernel test
+    // harness alongside the rest of `cargo xtask test`.
+    // -----------------------------------------------------------------------
+
+    use super::Task;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    /// Dummy entry function for synthetic `Task` instances created in tests.
+    ///
+    /// Real tasks point `entry` at a function the scheduler would dispatch;
+    /// this stub is never actually executed because the test never inserts
+    /// the task into the scheduler.  It exists only so [`Task::new`] can
+    /// build a complete kernel stack frame.
+    fn dummy_task_entry() -> ! {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Address-stability of `Task::preempt_count` across `Vec` reallocations.
+    ///
+    /// Phase 57b Track C caches a raw pointer to a live task's
+    /// `preempt_count`.  That pointer must remain valid while the outer
+    /// `Vec<Box<Task>>` grows (e.g., as new tasks `spawn`).  This test
+    /// pushes 32 boxed tasks into a freshly-constructed `Vec`, forcing the
+    /// `Vec` to reallocate multiple times (typical `Vec` growth from
+    /// capacity 0 walks 0 → 4 → 8 → 16 → 32, which is 4 reallocations —
+    /// strictly more than the 3 required by the spec).
+    ///
+    /// Steps:
+    ///   1. Push 3 sentinel boxed tasks; cache a raw pointer to `tasks[2]`'s
+    ///      `preempt_count` and write a known sentinel value into it.
+    ///   2. Push 29 additional boxed tasks (32 total) — forces multiple
+    ///      `Vec` reallocations.
+    ///   3. Re-read the cached pointer (without going through `tasks[2]`).
+    ///      Assert the address still matches `&tasks[2].preempt_count` and
+    ///      that the sentinel value is intact.
+    ///
+    /// A failure here means `Vec<Box<Task>>` is no longer the storage shape
+    /// (e.g., a refactor accidentally reverted to `Vec<Task>`) or `Box`
+    /// itself stopped guaranteeing heap-address stability.  Either case
+    /// regresses the Track C invariant and breaks `preempt_disable` /
+    /// `preempt_enable` after the next `spawn`.
+    #[test_case]
+    fn task_preempt_count_address_stable_across_vec_growth() {
+        const SENTINEL: i32 = 0x5A5A_5A5A;
+        const EARLY_IDX: usize = 2;
+        const TOTAL_TASKS: usize = 32;
+
+        // Start with empty (cap=0) Vec to maximise reallocation pressure.
+        let mut tasks: Vec<Box<Task>> = Vec::new();
+
+        // Phase 1: push enough tasks to reach EARLY_IDX, then cache a raw
+        // pointer to that task's `preempt_count` and write a sentinel.
+        for _ in 0..=EARLY_IDX {
+            tasks.push(Box::new(Task::new(dummy_task_entry, "stable-addr-early")));
+        }
+        let cached_ptr: *const core::sync::atomic::AtomicI32 = &tasks[EARLY_IDX].preempt_count;
+        tasks[EARLY_IDX]
+            .preempt_count
+            .store(SENTINEL, Ordering::Release);
+
+        // Phase 2: push remaining tasks to force several Vec reallocations.
+        // Vec<Box<Task>> typically grows 0 → 4 → 8 → 16 → 32 → … — pushing
+        // 32 total entries forces at least 4 reallocations (well over the
+        // ≥ 3 the B.2 acceptance criterion requires).
+        while tasks.len() < TOTAL_TASKS {
+            tasks.push(Box::new(Task::new(dummy_task_entry, "stable-addr-filler")));
+        }
+
+        // Phase 3: assert the cached pointer still points to the same heap
+        // address as `tasks[EARLY_IDX].preempt_count` (Box keeps the
+        // allocation pinned even though the outer Vec moved its slot
+        // pointer) AND the sentinel value is intact.
+        let live_ptr: *const core::sync::atomic::AtomicI32 = &tasks[EARLY_IDX].preempt_count;
+        assert_eq!(
+            cached_ptr, live_ptr,
+            "Box<Task> must keep `Task::preempt_count` at a fixed heap \
+             address across Vec reallocations (Phase 57b Track C invariant)",
+        );
+
+        // Read through the cached pointer (the path Track C will use in
+        // production) and confirm the sentinel survived.
+        // Safety: `cached_ptr` originated from a `&` borrow into `tasks[EARLY_IDX]`
+        // earlier in this function; `tasks` is still alive in this scope and
+        // `Box<Task>` guarantees the pointee has not moved.
+        let observed = unsafe { (*cached_ptr).load(Ordering::Acquire) };
+        assert_eq!(
+            observed, SENTINEL,
+            "value written through the cached pointer must survive \
+             ≥ 3 Vec reallocations (got {observed:#x}, want {SENTINEL:#x})",
+        );
+    }
 }
