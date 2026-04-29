@@ -537,13 +537,8 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     if let Some(task) = waiter {
         // D.3: route through wake_task_v2 under sched-v2 so all wake paths
         // use the CAS primitive and no v1 deferred-enqueue flag is set.
-        #[cfg(feature = "sched-v2")]
         {
             let _ = scheduler::wake_task_v2(task);
-        }
-        #[cfg(not(feature = "sched-v2"))]
-        {
-            let _ = scheduler::wake_task(task);
         }
     }
     // Also trigger reschedule in case the waiter wasn't in WAITERS yet
@@ -751,13 +746,8 @@ pub fn drain_pending_waiters() {
             // D.3: route through wake_task_v2 under sched-v2 so all wake
             // paths use the CAS primitive and no v1 deferred-enqueue flag
             // is set.  Under the default (v1) build, use the existing path.
-            #[cfg(feature = "sched-v2")]
             {
                 let _ = scheduler::wake_task_v2(task);
-            }
-            #[cfg(not(feature = "sched-v2"))]
-            {
-                let _ = scheduler::wake_task(task);
             }
         }
     }
@@ -829,14 +819,11 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         // No deadline is passed (notifications have no built-in timeout).
         //
         // Under v1 the original `block_current_on_notif()` path is retained.
-        #[cfg(feature = "sched-v2")]
         {
             use core::sync::atomic::AtomicBool;
             let woken = AtomicBool::new(false);
             let _ = scheduler::block_current_until(&woken, None);
         }
-        #[cfg(not(feature = "sched-v2"))]
-        scheduler::block_current_on_notif();
         // On wake, loop back to drain pending bits.
     }
 }

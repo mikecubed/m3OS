@@ -11,11 +11,11 @@
 //!   per-core `Mutex<VecDeque>` inside `PerCoreData`) and validates task
 //!   state/saved_rsp from the global `tasks` vec.
 //! - **State transitions**: marking the selected task `Running`, marking
-//!   yielded/blocked tasks, and handling `switching_out` / `wake_after_switch`.
+//!   yielded/blocked tasks.
 //! - **ISR wake drain**: waking tasks pushed to the per-core `IsrWakeQueue`
 //!   by `signal_irq()`.
-//! - **Post-switch bookkeeping**: saving the outgoing task's RSP, clearing
-//!   `switching_out`, and re-enqueueing yielded tasks.
+//! - **Post-switch bookkeeping**: saving the outgoing task's RSP and
+//!   re-enqueueing yielded tasks.
 //! - **Lifecycle**: spawn, exit, drain-dead, capability/IPC operations.
 //!
 //! The per-core infrastructure (run queues, `IsrWakeQueue`, reschedule
@@ -443,12 +443,6 @@ impl Scheduler {
             .filter(|(idx, task)| {
                 task.state == TaskState::Dead
                     && !task.ipc_cleaned
-                    // E.1 dual guard (v1 + v2 co-exist during F.1–F.6 window).
-                    // switching_out is the v1 RSP-publication guard; on_cpu is
-                    // the E.1 replacement. Both must be false for the task to
-                    // be considered off-CPU with a durable saved_rsp. E.3 will
-                    // remove the switching_out half once all v1 callers migrate.
-                    && !task.switching_out
                     && !task.on_cpu.load(Ordering::Acquire)
                     && task.saved_rsp != 0
                     && !self.task_current_on_any_core(*idx)
@@ -469,8 +463,6 @@ impl Scheduler {
             let task = &mut self.tasks[i];
             if task.state == TaskState::Dead
                 && task.ipc_cleaned
-                // E.1 dual guard (v1 + v2 co-exist during F.1–F.6 window).
-                && !task.switching_out
                 && !task.on_cpu.load(Ordering::Acquire)
                 && task.saved_rsp != 0
                 && !task_current
@@ -980,16 +972,6 @@ static PENDING_REENQUEUE: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES]
     [INIT; crate::smp::MAX_CORES]
 };
 
-/// Per-core task index currently switching back to the scheduler. The
-/// scheduler clears `Task::switching_out` for this task after `switch_context`
-/// has stored its up-to-date `saved_rsp`.
-#[allow(clippy::declare_interior_mutable_const)]
-static PENDING_SWITCH_OUT: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
-    [INIT; crate::smp::MAX_CORES]
-};
-
 struct SavedRspCell(UnsafeCell<u64>);
 
 unsafe impl Sync for SavedRspCell {}
@@ -1054,9 +1036,7 @@ pub fn yield_now() {
         );
         accumulate_ticks(&mut sched, idx);
         // Keep state as Running — the scheduler will set Ready + enqueue AFTER
-        // switch_context saves the RSP. This prevents the global fallback from
-        // picking up the task with a stale saved_rsp on another core.
-        sched.tasks[idx].switching_out = true;
+        // switch_context saves the RSP.
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
@@ -1067,9 +1047,8 @@ pub fn yield_now() {
         set_current_task_idx(None);
         idx
     };
-    // Store pending re-enqueue for the scheduler to process after switch_context.
+    // Store idx so the dispatch handler can save RSP and re-enqueue after switch_context.
     let my_core = crate::smp::per_core().core_id as usize;
-    PENDING_SWITCH_OUT[my_core].store(idx as i32, Ordering::Release);
     PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
     let sched_rsp = per_core_scheduler_rsp();
     debug_assert!(
@@ -1197,303 +1176,6 @@ pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
     sched.pending_dead_ipc_cleanup()
 }
 
-/// Helper: block the current task with the given state.
-fn block_current(state: TaskState) {
-    let addr_space_snapshot =
-        current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let (idx, pid_for_trace) = {
-        let mut sched = scheduler_lock();
-        let idx = match get_current_task_idx() {
-            Some(i) => i,
-            None => return,
-        };
-        debug_assert!(
-            sched.tasks[idx].state == TaskState::Running,
-            "block_current: task idx={} was {:?} before block, expected Running",
-            idx,
-            sched.tasks[idx].state
-        );
-        let pid = sched.tasks[idx].pid;
-        accumulate_ticks(&mut sched, idx);
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].state = state;
-        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
-        sched.tasks[idx].switching_out = true;
-        // E.1: mark RSP-publication window so D.1's wake-side spin-wait
-        // can stall until saved_rsp is durably written by the epilogue.
-        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        (idx, pid)
-    };
-    let core = crate::smp::per_core().core_id;
-    PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
-    per_core_reschedule().store(true, Ordering::Relaxed);
-    let sched_rsp = per_core_scheduler_rsp();
-    debug_assert!(
-        sched_rsp != 0,
-        "block_current: scheduler RSP is zero on core {}",
-        core
-    );
-    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::BlockCurrent {
-        task_idx: idx as u32,
-        core,
-        new_state: state as u8,
-    });
-    #[cfg(feature = "sched-trace")]
-    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
-    #[cfg(not(feature = "sched-trace"))]
-    let _ = pid_for_trace;
-    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-}
-
-fn block_current_unless_message(state: TaskState) {
-    let addr_space_snapshot =
-        current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let (idx, pid_for_trace) = {
-        let mut sched = scheduler_lock();
-        let idx = match get_current_task_idx() {
-            Some(i) => i,
-            None => return,
-        };
-        if sched.tasks[idx].pending_msg.is_some() {
-            return;
-        }
-        let pid = sched.tasks[idx].pid;
-        accumulate_ticks(&mut sched, idx);
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].state = state;
-        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
-        sched.tasks[idx].switching_out = true;
-        // E.1: mark RSP-publication window.
-        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        (idx, pid)
-    };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
-    per_core_reschedule().store(true, Ordering::Relaxed);
-    let sched_rsp = per_core_scheduler_rsp();
-    #[cfg(feature = "sched-trace")]
-    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
-    #[cfg(not(feature = "sched-trace"))]
-    let _ = pid_for_trace;
-    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-}
-
-pub fn block_current_on_recv() {
-    block_current(TaskState::BlockedOnRecv);
-}
-
-pub fn block_current_on_recv_unless_message() {
-    block_current_unless_message(TaskState::BlockedOnRecv);
-}
-
-pub fn block_current_on_send() {
-    block_current(TaskState::BlockedOnSend);
-}
-
-pub fn block_current_on_send_unless_completed() {
-    let addr_space_snapshot =
-        current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let (idx, pid_for_trace) = {
-        let mut sched = scheduler_lock();
-        let idx = match get_current_task_idx() {
-            Some(i) => i,
-            None => return,
-        };
-        if sched.tasks[idx].pending_msg.is_some() || sched.tasks[idx].send_completed {
-            sched.tasks[idx].send_completed = false;
-            return;
-        }
-        let pid = sched.tasks[idx].pid;
-        accumulate_ticks(&mut sched, idx);
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].state = TaskState::BlockedOnSend;
-        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
-        sched.tasks[idx].switching_out = true;
-        // E.1: mark RSP-publication window.
-        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        (idx, pid)
-    };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
-    per_core_reschedule().store(true, Ordering::Relaxed);
-    let sched_rsp = per_core_scheduler_rsp();
-    #[cfg(feature = "sched-trace")]
-    crate::task::sched_trace::record(
-        pid_for_trace,
-        TaskState::Running as u8,
-        TaskState::BlockedOnSend as u8,
-    );
-    #[cfg(not(feature = "sched-trace"))]
-    let _ = pid_for_trace;
-    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-    let mut sched = scheduler_lock();
-    if idx < sched.tasks.len() {
-        sched.tasks[idx].send_completed = false;
-    }
-}
-
-pub fn block_current_on_notif() {
-    block_current(TaskState::BlockedOnNotif);
-}
-
-pub fn block_current_on_reply() {
-    block_current(TaskState::BlockedOnReply);
-}
-
-pub fn block_current_on_reply_unless_message() {
-    block_current_unless_message(TaskState::BlockedOnReply);
-}
-
-pub fn block_current_on_notif_unless_message() {
-    block_current_unless_message(TaskState::BlockedOnNotif);
-}
-
-pub fn block_current_on_futex() {
-    block_current(TaskState::BlockedOnFutex);
-}
-
-/// Block the current task on a futex unless the woken flag is already set.
-///
-/// The check is performed under the scheduler lock so that a concurrent
-/// `wake_task()` call cannot slip between the flag check and the state
-/// transition, which would cause a missed wakeup.
-pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBool) {
-    let addr_space_snapshot =
-        current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
-        let mut sched = scheduler_lock();
-        if woken.load(core::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        let idx = match get_current_task_idx() {
-            Some(i) => i,
-            None => return,
-        };
-        accumulate_ticks(&mut sched, idx);
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].state = TaskState::BlockedOnFutex;
-        sched.tasks[idx].switching_out = true;
-        // E.1: mark RSP-publication window.
-        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        idx
-    };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
-    per_core_reschedule().store(true, Ordering::Relaxed);
-    let sched_rsp = per_core_scheduler_rsp();
-    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-}
-
-/// Block the current task unless `woken` is already set.
-/// The check is performed under the SCHEDULER lock to be atomic with wake_task.
-pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
-    block_current_unless_woken_inner(woken, None);
-}
-
-/// Block the current task until `woken` is set OR `deadline_tick` passes.
-///
-/// The scheduler's dispatch loop scans blocked tasks on each pick_next and
-/// force-wakes any whose `wake_deadline` has elapsed. This is the safe
-/// alternative to waking `net_task` (or any IRQ-driven task) from the
-/// `timer_handler` ISR — the expiry check runs in task context, already
-/// inside `SCHEDULER.lock`, so there is no same-core re-entrance hazard.
-///
-/// `deadline_tick` is an absolute tick count (see `tick_count()`), not a
-/// duration. Pass `tick_count() + N` to sleep at most N ticks.
-pub fn block_current_unless_woken_until(
-    woken: &core::sync::atomic::AtomicBool,
-    deadline_tick: u64,
-) {
-    block_current_unless_woken_inner(woken, Some(deadline_tick));
-}
-
-fn block_current_unless_woken_inner(
-    woken: &core::sync::atomic::AtomicBool,
-    wake_deadline: Option<u64>,
-) {
-    let addr_space_snapshot =
-        current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let (idx, pid_for_trace) = {
-        let mut sched = scheduler_lock();
-        if woken.load(core::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        // Deadline already in the past: don't block. Callers use this path
-        // to implement "poll now if timeout has already expired."
-        if let Some(d) = wake_deadline
-            && crate::arch::x86_64::interrupts::tick_count() >= d
-        {
-            return;
-        }
-        let idx = match get_current_task_idx() {
-            Some(i) => i,
-            None => return,
-        };
-        let pid = sched.tasks[idx].pid;
-        accumulate_ticks(&mut sched, idx);
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].state = TaskState::BlockedOnRecv;
-        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
-        sched.tasks[idx].switching_out = true;
-        // E.1: mark RSP-publication window.
-        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
-        // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
-        // hot-path `scan_expired_wake_deadlines` can skip the O(n) scan
-        // when no task has a deadline set.
-        if wake_deadline.is_some() && sched.tasks[idx].wake_deadline.is_none() {
-            ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
-        } else if wake_deadline.is_none() && sched.tasks[idx].wake_deadline.is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-        }
-        // TODO(57a-C/D): route through pi_lock + with_block_state
-        sched.tasks[idx].wake_deadline = wake_deadline;
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        (idx, pid)
-    };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
-    per_core_reschedule().store(true, Ordering::Relaxed);
-    let sched_rsp = per_core_scheduler_rsp();
-    #[cfg(feature = "sched-trace")]
-    crate::task::sched_trace::record(
-        pid_for_trace,
-        TaskState::Running as u8,
-        TaskState::BlockedOnRecv as u8,
-    );
-    #[cfg(not(feature = "sched-trace"))]
-    let _ = pid_for_trace;
-    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-}
-
 // ---------------------------------------------------------------------------
 // v2 block primitive (Phase 57a Track C) — feature-gated behind `sched-v2`
 // ---------------------------------------------------------------------------
@@ -1503,7 +1185,6 @@ fn block_current_unless_woken_inner(
 /// Callers use this to distinguish why the block ended: a successful wake,
 /// deadline expiry, or an early return because the condition was already
 /// satisfied when the function was called.
-#[cfg(feature = "sched-v2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockOutcome {
     /// A waker wrote `true` to the `woken` flag; the task resumed normally.
@@ -1554,10 +1235,7 @@ pub enum BlockOutcome {
 /// # v1 compatibility (transition window)
 ///
 /// During the Track C–F migration window, this function also writes the v1
-/// `Task::state` field and sets `switching_out = true` (the "shadow lock"
-/// dual-write pattern). The dispatch handler (`run()`) still consults those
-/// fields until Track E.5 simplifies it. Once all callers are migrated and
-/// Track E removes the v1 fields, the dual writes disappear.
+/// The v1 shadow-lock dual-write pattern is no longer needed after Track E.
 ///
 /// # Wake-side `on_cpu` spin-wait
 ///
@@ -1571,7 +1249,6 @@ pub enum BlockOutcome {
 /// - Linux `do_nanosleep` (`kernel/time/hrtimer.c`) — four-step block recipe.
 /// - Linux `try_to_wake_up` (`kernel/sched/core.c`) — CAS wake side.
 /// - m3OS handoff 2026-04-25: `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`.
-#[cfg(feature = "sched-v2")]
 pub fn block_current_until(
     woken: &core::sync::atomic::AtomicBool,
     deadline_ticks: Option<u64>,
@@ -1632,9 +1309,6 @@ pub fn block_current_until(
         }
         sched.tasks[idx].wake_deadline = deadline_ticks;
 
-        // v1 RSP-publication guard (still needed until Track E.5 removes it).
-        sched.tasks[idx].switching_out = true;
-
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1670,13 +1344,9 @@ pub fn block_current_until(
             // v1 dual-write.
             sched.tasks[idx].state = TaskState::Running;
             sched.tasks[idx].wake_deadline = None;
-            // switching_out was set in step 1; clear it since we won't yield.
-            sched.tasks[idx].switching_out = false;
-            sched.tasks[idx].wake_after_switch = false;
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
-        // Do NOT store to PENDING_SWITCH_OUT; no switch_context call.
         return if already_expired {
             BlockOutcome::DeadlineExpired
         } else {
@@ -1686,9 +1356,8 @@ pub fn block_current_until(
 
     // ── Step 4: Yield via SCHEDULER.lock → switch_context ────────────────────
     //
-    // PENDING_SWITCH_OUT tells the scheduler dispatch loop which task to
-    // clear `switching_out` on after switch_context has published the RSP.
-    PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
+    // Store task idx so the dispatch handler can save RSP after switch_context.
+    PENDING_REENQUEUE[core as usize].store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
     #[cfg(feature = "sched-trace")]
@@ -1750,7 +1419,6 @@ pub fn block_current_until(
 /// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
 /// function instead of `block_current_on_reply_unless_message`.  The semantic
 /// outcome is identical: the caller resumes when a reply is delivered.
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1786,7 +1454,6 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
 /// condition checks without holding the scheduler lock long-term).
 ///
 /// Acquires `SCHEDULER.lock` momentarily.
-#[cfg(feature = "sched-v2")]
 pub fn has_pending_message(id: TaskId) -> bool {
     let sched = scheduler_lock();
     sched
@@ -1810,7 +1477,6 @@ pub fn has_pending_message(id: TaskId) -> bool {
 ///
 /// Returns `true` if woken (`Woken` or `AlreadyTrue`), `false` on deadline
 /// (no deadline is set for IPC recv, so this is dead code for now).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1846,7 +1512,6 @@ pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
 /// block/yield/resume protocol under `block_current_until`.
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline set → dead code).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1882,7 +1547,6 @@ pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
 /// only the block/yield/resume protocol.
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline → dead code).
-#[cfg(feature = "sched-v2")]
 pub fn block_current_on_send_v2(sender: TaskId) -> bool {
     use core::sync::atomic::AtomicBool;
 
@@ -1925,16 +1589,13 @@ pub fn mark_current_dead() -> ! {
                 x86_64::instructions::hlt();
             },
         };
-        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::Dead;
-        sched.tasks[idx].switching_out = true;
         // E.1: mark RSP-publication window.
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
         idx
     };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
+    PENDING_REENQUEUE[crate::smp::per_core().core_id as usize].store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
@@ -1995,140 +1656,15 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
     let Some(idx) = sched.find_by_pid(pid) else {
         return false;
     };
-    // E.1 dual guard: task is still in the switch-out window if either the
-    // v1 switching_out flag is set OR the v2 on_cpu flag is set (Acquire
-    // pairs with the Release in the block-side store). E.3 removes the
-    // switching_out half after all v1 callers migrate.
-    if sched.task_current_on_any_core(idx)
-        || sched.tasks[idx].switching_out
-        || sched.tasks[idx].on_cpu.load(Ordering::Acquire)
-    {
+    // v2 guard: task is still in the switch-out window if on_cpu is set.
+    // The Release on the block side and Acquire here form the ordering pair.
+    if sched.task_current_on_any_core(idx) || sched.tasks[idx].on_cpu.load(Ordering::Acquire) {
         return false;
     }
     // TODO(57a-C/D): route through pi_lock + with_block_state
     sched.tasks[idx].state = TaskState::Dead;
     sched.tasks[idx].group_exit_pending = false;
     true
-}
-
-/// Wake a blocked task, making it `Ready` for the next scheduler tick.
-///
-/// ISR-safe. The critical section below runs under `scheduler_lock()` which
-/// now masks interrupts for its duration; the follow-up `enqueue_to_core`
-/// call does the same for the per-core run queue. Callers from interrupt
-/// context (virtio-net, virtio-blk) therefore cannot re-enter a task-context
-/// holder on the same core — see the root-cause note at [`IrqSafeMutex`].
-pub fn wake_task(id: TaskId) -> bool {
-    // Capture everything we need for the optional diagnostic log in the
-    // same critical section so we don't need a second `scheduler_lock()` —
-    // a second acquisition on this path formerly re-entered a
-    // PROCESS_TABLE lookup via `task_log_label`, reintroducing the ISR
-    // deadlock class this primitive exists to prevent.
-    let (enqueue, woke, snapshot) = {
-        let mut sched = scheduler_lock();
-        if let Some(idx) = sched.find(id) {
-            debug_assert!(
-                idx < sched.tasks.len(),
-                "wake_task: idx={} out of bounds (len={})",
-                idx,
-                sched.tasks.len()
-            );
-            let pid_for_log = sched.tasks[idx].pid;
-            let name_for_log = sched.tasks[idx].name;
-            let cur_state = sched.tasks[idx].state;
-            let label = label_from_name_only(name_for_log, pid_for_log);
-            let snapshot_tuple = (
-                label,
-                pid_for_log,
-                name_for_log,
-                sched.tasks[idx].assigned_core,
-                sched.tasks[idx].affinity_mask,
-                sched.tasks[idx].last_ready_tick,
-                sched.tasks[idx].last_migrated_tick,
-            );
-            match cur_state {
-                TaskState::BlockedOnRecv
-                | TaskState::BlockedOnSend
-                | TaskState::BlockedOnReply
-                | TaskState::BlockedOnNotif
-                | TaskState::BlockedOnFutex => {
-                    let prev_state = cur_state as u8;
-                    // Clear any pending timeout-wake deadline — this wake
-                    // beat the deadline, so the scheduler's expiry scan
-                    // should not double-wake us.
-                    if sched.tasks[idx].wake_deadline.take().is_some() {
-                        ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    if sched.tasks[idx].switching_out {
-                        sched.tasks[idx].wake_after_switch = true;
-                        (None, true, snapshot_tuple)
-                    } else {
-                        let now = crate::arch::x86_64::interrupts::tick_count();
-                        // TODO(57a-C/D): route through pi_lock + with_block_state
-                        sched.tasks[idx].state = TaskState::Ready;
-                        sched.tasks[idx].last_ready_tick = now;
-                        sched.tasks[idx].blocked_since_tick = 0;
-                        (
-                            Some((sched.tasks[idx].assigned_core, idx, prev_state)),
-                            true,
-                            snapshot_tuple,
-                        )
-                    }
-                }
-                _ => (None, false, snapshot_tuple),
-            }
-        } else {
-            (None, false, (None, 0, "<missing>", 0, 0, 0, 0))
-        }
-    };
-    if let Some((core, idx, prev_state)) = enqueue {
-        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
-            task_idx: idx as u32,
-            state_before: prev_state,
-            core,
-        });
-        let (
-            label,
-            pid_for_log,
-            name_for_log,
-            assigned_core,
-            affinity_mask,
-            last_ready_tick,
-            last_migrated_tick,
-        ) = snapshot;
-        #[cfg(feature = "sched-trace")]
-        crate::task::sched_trace::record(pid_for_log, prev_state, TaskState::Ready as u8);
-        if let Some(label) = label {
-            log::debug!(
-                "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
-                id.0,
-                pid_for_log,
-                name_for_log,
-                label,
-                prev_state,
-                assigned_core,
-                affinity_mask,
-                last_ready_tick,
-                last_migrated_tick
-            );
-        }
-        enqueue_to_core(core, idx);
-        true
-    } else {
-        woke
-    }
-}
-
-/// ISR-safe label lookup: classifies kernel tasks (pid == 0) by name so
-/// the `[sched] wake_task` diagnostic log can fire for `net`, `console`,
-/// and `serial-stdin` without touching `PROCESS_TABLE.lock()` — doing
-/// that would reintroduce the ISR-deadlock class the `IrqSafeMutex`
-/// refactor just eliminated. Userspace tasks are not labelled here.
-fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static str> {
-    if pid == 0 {
-        return matches!(task_name, "net" | "console" | "serial-stdin").then_some(task_name);
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,7 +1695,6 @@ fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static st
 // 1–5).
 
 /// Outcome of a [`wake_task_v2`] call.
-#[cfg(feature = "sched-v2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
     /// CAS `Blocked* → Ready` succeeded; the task has been enqueued on its
@@ -2218,7 +1753,6 @@ pub enum WakeOutcome {
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
-#[cfg(feature = "sched-v2")]
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
@@ -2609,7 +2143,7 @@ pub fn run() -> ! {
                     let mut sched = scheduler_lock();
                     if task_idx < sched.tasks.len() {
                         let task = &mut sched.tasks[task_idx];
-                        if task.state == TaskState::BlockedOnNotif && !task.switching_out {
+                        if task.state == TaskState::BlockedOnNotif {
                             // TODO(57a-C/D): route through pi_lock + with_block_state
                             task.state = TaskState::Ready;
                             task.last_ready_tick = crate::arch::x86_64::interrupts::tick_count();
@@ -2923,12 +2457,10 @@ pub fn run() -> ! {
             log::info!("[sched] resume core={}", core_id);
             resume_log_budget -= 1;
         }
-        // The task's RSP has now been saved by switch_context. Clear the
-        // switching-out flag before honoring deferred wakes or yields.
-        let switched = PENDING_SWITCH_OUT[core_id as usize].swap(-1, Ordering::Acquire);
+        // The task's RSP has now been saved by switch_context. Commit bookkeeping.
         let pending = PENDING_REENQUEUE[core_id as usize].swap(-1, Ordering::Acquire);
-        if switched >= 0 {
-            let sidx = switched as usize;
+        if pending >= 0 {
+            let sidx = pending as usize;
             let saved_rsp = take_per_core_switch_save_rsp(core_id as usize);
             // `hog_info` carries (pid, name, ran_ticks, final_state) when the
             // task held the CPU for longer than the diagnostic threshold;
@@ -2952,16 +2484,11 @@ pub fn run() -> ! {
                 if sidx < sched.tasks.len() {
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
-                    // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably
-                    // written. The Release ordering ensures that a concurrent
-                    // waker on another core that observes on_cpu == false
-                    // (via Acquire load in D.1's spin-wait) is guaranteed to
-                    // see the freshly published saved_rsp. This replaces the
-                    // RSP-publication aspect of v1's PENDING_SWITCH_OUT[core]
-                    // guard (Linux p->on_cpu smp_cond_load_acquire pattern in
-                    // try_to_wake_up). Cleared here (after saved_rsp commit)
-                    // not at the top of the if-block to preserve the ordering
-                    // invariant.
+                    // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably written.
+                    // The Release ordering ensures that a concurrent waker observing
+                    // on_cpu == false (via Acquire load in wake_task_v2's spin-wait)
+                    // is guaranteed to see the published saved_rsp
+                    // (Linux p->on_cpu smp_cond_load_acquire pattern, try_to_wake_up).
                     task.on_cpu.store(false, Ordering::Release);
                     // F.2: Validate saved_rsp after yield/block save.
                     if let Some((base, top)) = task.stack_bounds() {
@@ -2975,7 +2502,6 @@ pub fn run() -> ! {
                             core_id
                         );
                     }
-                    task.switching_out = false;
 
                     // Phase 54 diagnostic: detect CPU-hog patterns. If a task
                     // held the CPU for >= 20 ticks (~200 ms) before yielding,
@@ -2993,27 +2519,12 @@ pub fn run() -> ! {
                         };
                         hog_info = Some((task.pid, task.name, ran_ticks, task.state, exec_path));
                     }
-                    let wake_after_switch = task.wake_after_switch;
-                    let blocked = matches!(
-                        task.state,
-                        TaskState::BlockedOnRecv
-                            | TaskState::BlockedOnSend
-                            | TaskState::BlockedOnReply
-                            | TaskState::BlockedOnNotif
-                            | TaskState::BlockedOnFutex
-                    );
-                    let reenqueue_after_yield =
-                        pending == switched && task.state == TaskState::Running;
-
-                    task.wake_after_switch = false;
-
-                    if (wake_after_switch && blocked) || reenqueue_after_yield {
-                        // TODO(57a-C/D): route through pi_lock + with_block_state
+                    // Re-enqueue if the task yielded (still Running); blocked/dead
+                    // tasks will be re-enqueued by wake_task_v2 after their waker fires.
+                    if task.state == TaskState::Running {
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
-                        if reenqueue_after_yield {
-                            task.last_migrated_tick = now;
-                        }
+                        task.last_migrated_tick = now;
                         Some((task.assigned_core, sidx))
                     } else {
                         None
@@ -3112,46 +2623,6 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
     let mut n = 0usize;
 
     // ── v1 path ──────────────────────────────────────────────────────────────
-    #[cfg(not(feature = "sched-v2"))]
-    for (idx, task) in sched.tasks.iter_mut().enumerate() {
-        if task.wake_deadline.is_none_or(|d| d > now) {
-            continue;
-        }
-        if !matches!(
-            task.state,
-            TaskState::BlockedOnRecv
-                | TaskState::BlockedOnSend
-                | TaskState::BlockedOnReply
-                | TaskState::BlockedOnNotif
-                | TaskState::BlockedOnFutex
-        ) {
-            // Not actually blocked (e.g. race between a real wake and the
-            // deadline scan) — clear the stale deadline and move on.
-            if task.wake_deadline.take().is_some() {
-                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-            }
-            continue;
-        }
-        if task.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-        }
-        if task.switching_out {
-            task.wake_after_switch = true;
-            task.last_migrated_tick = now;
-            continue;
-        }
-        let _old_state_u8 = task.state as u8;
-        task.state = TaskState::Ready;
-        task.last_ready_tick = now;
-        task.last_migrated_tick = now;
-        task.blocked_since_tick = 0;
-        #[cfg(feature = "sched-trace")]
-        crate::task::sched_trace::record(task.pid, _old_state_u8, TaskState::Ready as u8);
-        if n < expired.len() {
-            expired[n] = (task.assigned_core, idx);
-            n += 1;
-        }
-    }
 
     // ── v2 path ──────────────────────────────────────────────────────────────
     //
@@ -3181,7 +2652,6 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
     //    because the scan runs under `SCHEDULER.lock`, which is also held
     //    during `pick_next` — the dispatch path cannot read a stale `saved_rsp`
     //    for a task we just marked Ready, because both paths hold the same lock.
-    #[cfg(feature = "sched-v2")]
     for (idx, task) in sched.tasks.iter_mut().enumerate() {
         if task.wake_deadline.is_none_or(|d| d > now) {
             continue;
