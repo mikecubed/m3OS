@@ -2042,7 +2042,15 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
             wake_ids
         };
         for tid in to_wake {
-            let _ = crate::task::wake_task(tid);
+            // F.3: route through wake_task_v2 under sched-v2 (CAS-based wake).
+            #[cfg(feature = "sched-v2")]
+            {
+                let _ = crate::task::scheduler::wake_task_v2(tid);
+            }
+            #[cfg(not(feature = "sched-v2"))]
+            {
+                let _ = crate::task::wake_task(tid);
+            }
         }
     }
 }
@@ -12446,6 +12454,16 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
+            //
+            // F.3: Under sched-v2 use block_current_until (v2 CAS primitive)
+            // instead of block_current_on_futex_unless_woken (v1). The
+            // woken_flag is shared with the wake side; the Arc clone above
+            // ensures it lives until the waiter is removed from FUTEX_TABLE.
+            #[cfg(feature = "sched-v2")]
+            {
+                let _ = crate::task::scheduler::block_current_until(&woken_flag, None);
+            }
+            #[cfg(not(feature = "sched-v2"))]
             crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
             0
@@ -12494,10 +12512,26 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Wake the tasks outside the FUTEX_TABLE lock.
             // Only count tasks that were actually transitioned to Ready
             // (skip Dead or already-woken tasks).
+            //
+            // F.3: under sched-v2 use wake_task_v2 (CAS-based); under v1
+            // use wake_task (deferred-enqueue path).
             let mut actual_woken = 0usize;
             for tid in to_wake {
-                if crate::task::wake_task(tid) {
-                    actual_woken += 1;
+                #[cfg(feature = "sched-v2")]
+                {
+                    use crate::task::scheduler::WakeOutcome;
+                    if matches!(
+                        crate::task::scheduler::wake_task_v2(tid),
+                        WakeOutcome::Woken
+                    ) {
+                        actual_woken += 1;
+                    }
+                }
+                #[cfg(not(feature = "sched-v2"))]
+                {
+                    if crate::task::wake_task(tid) {
+                        actual_woken += 1;
+                    }
                 }
             }
 
