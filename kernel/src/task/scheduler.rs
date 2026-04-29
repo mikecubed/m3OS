@@ -75,6 +75,46 @@
 //! `holds_scheduler_lock: AtomicBool` (set/cleared in [`scheduler_lock`] /
 //! [`SchedulerLockSentinel::drop`]) that [`Task::with_block_state`] reads
 //! before acquiring `pi_lock`.
+//!
+//! # Phase 57a v2 Block/Wake Protocol
+//!
+//! The v2 protocol (Phase 57a) eliminates the lost-wake bug class that arose
+//! from v1's intermediate-state flags. `Task::state` under `pi_lock` is the
+//! sole source of truth for block state. See
+//! `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` for the full
+//! state-transition spec; `docs/04-tasking.md` for the narrative description.
+//!
+//! ## `block_current_until` — four-step Linux recipe
+//!
+//! 1. **State write under `pi_lock`.** Write `task.state ← Blocked*` and
+//!    `task.wake_deadline`; release `pi_lock`. (Linux `set_current_state` /
+//!    `smp_store_mb` pattern.)
+//! 2. **Release `pi_lock`** so a concurrent waker can CAS without deadlock.
+//! 3. **Condition recheck.** If condition already satisfied, self-revert:
+//!    `pi_lock` → CAS `Blocked* → Running` → clear deadline → return.
+//! 4. **Yield via `SCHEDULER.lock`.** Remove task from run queue;
+//!    `switch_context`. On resume, recheck; re-enter step 1 on spurious wake.
+//!
+//! ## `wake_task` CAS rewrite
+//!
+//! 1. Acquire `pi_lock`; CAS any `Blocked*` → `Ready`; clear `wake_deadline`;
+//!    release `pi_lock`. If CAS fails: return `AlreadyAwake`.
+//! 2. Acquire `SCHEDULER.lock`; idempotency guard (already enqueued?).
+//! 3. Spin-wait if `task.on_cpu == true` until switch-out epilogue publishes
+//!    `saved_rsp` (Linux `p->on_cpu` `smp_cond_load_acquire` pattern).
+//! 4. Enqueue task; send reschedule IPI if cross-core.
+//!
+//! ## `Task::on_cpu` RSP-publication marker
+//!
+//! Set to `true` on dispatch; cleared in the arch-level switch-out epilogue
+//! once `saved_rsp` is committed. Replaces v1's `PENDING_SWITCH_OUT[core]`
+//! deferred-enqueue hand-off (deleted in Phase 57a Track E).
+//!
+//! ## v1 fields deleted
+//!
+//! `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` are absent
+//! from this codebase (removed in Phase 57a Tracks E–F). Any reference to
+//! these names is a bug.
 #![allow(dead_code)]
 
 extern crate alloc;
