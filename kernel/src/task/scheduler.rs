@@ -1074,6 +1074,59 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
     unsafe { *PENDING_SAVED_RSP[core_id].get() }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57b C.2 — `current_preempt_count_ptr` switch-out retarget
+// ---------------------------------------------------------------------------
+//
+// Every `IrqSafeMutex` guard (Phase 57b F.1, future wave) must decrement the
+// **same pointee** it incremented.  The scheduler dispatches between two
+// disjoint contexts:
+//
+//   1. **Scheduler context** (this `run` loop's stack) — between
+//      `switch_context` returning and the next `switch_context` call.  Here
+//      `IrqSafeMutex` acquire/release pairs (e.g. inside `pick_next` or
+//      `drain_dead`) must charge a single per-core pointee — the
+//      [`crate::smp::SCHED_PREEMPT_COUNT_DUMMY`] slot.
+//   2. **Task context** — anywhere the chosen task executes after
+//      `switch_context` jumps in.  Acquire/release pairs there must charge
+//      that task's `Task::preempt_count` (wired in C.3).
+//
+// C.2 covers the switch-out retarget: immediately after `switch_context`
+// returns onto the scheduler stack, and **before** any new lock is acquired
+// on that stack, the pointer is restored to the per-core dummy.
+
+/// Phase 57b C.2 — switch-out retarget helper.
+///
+/// Stores `&SCHED_PREEMPT_COUNT_DUMMY[core_id]` into
+/// [`crate::smp::PerCoreData::current_preempt_count_ptr`] with `Release`
+/// ordering, inside an interrupt-masked window.  Called from the dispatch
+/// path immediately after `switch_context` returns onto the scheduler stack
+/// and before any new `IrqSafeMutex` is acquired.
+///
+/// `cli`s itself rather than relying on the surrounding state: `switch_context`
+/// `popf`s the scheduler's saved RFLAGS on resume (typically IF=1), so the
+/// switch-out path cannot assume IRQs are masked.  IF is restored on exit if
+/// it was enabled on entry.
+///
+/// Lock-free by mandate: no `IrqSafeMutex::lock`, no `scheduler_lock()`.
+/// Phase 57b F.1's `IrqSafeMutex::lock` will call `preempt_disable()`
+/// (which reads this pointer); if this helper acquired a lock, the wiring
+/// would recurse.
+#[inline]
+fn retarget_preempt_count_to_dummy(core_id: u8) {
+    let saved_if = interrupts::are_enabled();
+    interrupts::disable();
+    let dummy_ptr = &crate::smp::SCHED_PREEMPT_COUNT_DUMMY[core_id as usize]
+        as *const core::sync::atomic::AtomicI32
+        as *mut core::sync::atomic::AtomicI32;
+    let pc = crate::smp::per_core();
+    pc.current_preempt_count_ptr
+        .store(dummy_ptr, core::sync::atomic::Ordering::Release);
+    if saved_if {
+        interrupts::enable();
+    }
+}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
@@ -2729,6 +2782,20 @@ pub fn run() -> ! {
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
+
+        // Phase 57b C.2 — switch-out retarget.
+        //
+        // `switch_context` has just returned onto this scheduler stack.  It
+        // `popf`d the scheduler's saved RFLAGS, typically restoring IF=1 — so
+        // we cannot assume IRQs are masked here.  Retarget back to the
+        // per-core dummy *before* any scheduler-context `IrqSafeMutex::lock`
+        // call (the next one is inside the `pending >= 0` block below) so
+        // that scheduler-context lock acquire/release pairs charge the same
+        // pointee.
+        //
+        // C.3 (next commit) will wire the matching switch-in retarget that
+        // pivots the pointer to the chosen task's `Task::preempt_count`.
+        retarget_preempt_count_to_dummy(core_id);
 
         // --- Scheduler resumes here after the task yields back ---
         if resume_log_budget > 0 {
