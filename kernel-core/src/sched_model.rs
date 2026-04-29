@@ -1320,4 +1320,130 @@ mod tests {
             "scan does NOT need on_cpu spin-wait (runs under SCHEDULER.lock)"
         );
     }
+
+    // ── H.1 — serial_stdin_feeder_task wake-flag protocol (Phase 57a H.1) ────
+    //
+    // These tests verify the `STDIN_FEEDER_WOKEN` / `block_current_until`
+    // notification protocol for the serial feeder task migration.  They mirror
+    // the C.2/C.3 tests but are named to match the H.1 acceptance criteria so
+    // reviewers can match each test to a spec line.
+
+    /// H.1 acceptance: ISR sets the wake flag → `block_current_until` returns
+    /// `Woken`.
+    ///
+    /// Models the common path where the COM1 RX ISR fires, sets
+    /// `STDIN_FEEDER_WOKEN = true`, and issues a `wake_task_v2` IPI.  The
+    /// model represents this as `BlockedOnRecv × Wake → Ready`.
+    #[test]
+    fn serial_feeder_isr_wake_transitions_blocked_to_ready() {
+        // Feeder parks: Running → BlockedOnRecv (block_current_until step 1+4).
+        let (s1, fx1) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv);
+        assert!(fx1.yielded, "feeder must yield when ring buffer is empty");
+
+        // COM1 RX ISR fires: wake_task_v2 → BlockedOnRecv → Ready.
+        let (s2, fx2) = apply_event(s1, Event::Wake);
+        assert_eq!(
+            s2,
+            BlockState::Ready,
+            "ISR wake must transition feeder to Ready"
+        );
+        assert!(fx2.enqueue_to_run_queue, "woken feeder must be enqueued");
+        assert!(
+            fx2.on_cpu_wait_required,
+            "cross-core wake requires on_cpu spin-wait before IPI"
+        );
+    }
+
+    /// H.1 acceptance: wake flag already `true` when feeder rechecks (step 3
+    /// self-revert) — `block_current_until` returns `AlreadyTrue` without
+    /// yielding.
+    ///
+    /// Models the race where the COM1 RX ISR fires between the feeder's state
+    /// write (step 1) and the condition recheck (step 3): `STDIN_FEEDER_WOKEN`
+    /// is already set, so the feeder self-reverts to `Running` without
+    /// descending into `switch_context`.
+    #[test]
+    fn serial_feeder_self_revert_when_flag_already_set() {
+        // Step 1: feeder writes Running → BlockedOnRecv under pi_lock.
+        let (s1, _fx1) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv);
+
+        // Step 3: condition recheck — ISR already set STDIN_FEEDER_WOKEN.
+        let (s2, fx2) = apply_event(s1, Event::ConditionTrue);
+        assert_eq!(
+            s2,
+            BlockState::Running,
+            "feeder self-reverts to Running when flag already true"
+        );
+        assert!(!fx2.yielded, "self-revert must NOT yield");
+        assert!(
+            fx2.deadline_cleared,
+            "self-revert must clear wake_deadline even on indefinite block"
+        );
+        assert!(
+            !fx2.enqueue_to_run_queue,
+            "self-revert must not enqueue (task is still on CPU)"
+        );
+    }
+
+    /// H.1 acceptance: feeder drains bytes, re-clears the flag, and can park
+    /// again (idempotency — two consecutive park/wake cycles succeed).
+    ///
+    /// Verifies that after being woken and re-dispatched to `Running`, the
+    /// feeder can park again for the next COM1 RX IRQ without any state
+    /// corruption.  The test uses `Block` from `Running` for the second cycle
+    /// because the model only has `Running` as a valid entry for `Block`; the
+    /// scheduler dispatch (Ready → Running) is an arch detail outside the model.
+    #[test]
+    fn serial_feeder_two_consecutive_wake_cycles() {
+        // --- Cycle 1 ---
+        // Feeder parks (block_current_until, ring buffer empty).
+        let (s1, _) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv, "first park");
+
+        // COM1 RX ISR fires — wake_task_v2 → BlockedOnRecv → Ready.
+        let (s2, fx2) = apply_event(s1, Event::Wake);
+        assert_eq!(s2, BlockState::Ready, "first ISR wake");
+        assert!(fx2.enqueue_to_run_queue, "first wake must enqueue feeder");
+
+        // Model the scheduler redispatching the feeder: treat as Running for
+        // the next block call.  The state machine only models the transition
+        // table; `Ready → Running` is the scheduler dispatch step.
+        // We re-enter the model from `Running` to represent the next iteration.
+
+        // --- Cycle 2 ---
+        // Feeder drains the byte, re-clears STDIN_FEEDER_WOKEN, ring empty → park.
+        let (s3, _) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s3, BlockState::BlockedOnRecv, "second park must succeed");
+
+        // Second COM1 RX ISR wake.
+        let (s4, fx4) = apply_event(s3, Event::Wake);
+        assert_eq!(s4, BlockState::Ready, "second ISR wake must produce Ready");
+        assert!(fx4.enqueue_to_run_queue, "second wake must enqueue feeder");
+    }
 }
