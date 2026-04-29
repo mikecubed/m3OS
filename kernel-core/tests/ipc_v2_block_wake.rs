@@ -39,7 +39,10 @@ use kernel_core::sched_model::{BlockKind, BlockState, Event, apply_event};
 fn simulate_block_then_wake(kind: BlockKind) -> (BlockState, BlockState) {
     let (after_block, block_fx) = apply_event(
         BlockState::Running,
-        Event::Block { kind, deadline: None },
+        Event::Block {
+            kind,
+            deadline: None,
+        },
     );
     assert!(block_fx.yielded, "block must yield for kind {:?}", kind);
     assert!(
@@ -81,7 +84,10 @@ fn simulate_block_then_wake(kind: BlockKind) -> (BlockState, BlockState) {
 fn test_recv_block_produces_blocked_on_recv() {
     let (after_block, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Recv, deadline: None },
+        Event::Block {
+            kind: BlockKind::Recv,
+            deadline: None,
+        },
     );
     assert_eq!(
         after_block,
@@ -95,7 +101,10 @@ fn test_recv_block_produces_blocked_on_recv() {
 fn test_send_block_produces_blocked_on_send() {
     let (after_block, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Send, deadline: None },
+        Event::Block {
+            kind: BlockKind::Send,
+            deadline: None,
+        },
     );
     assert_eq!(
         after_block,
@@ -109,7 +118,10 @@ fn test_send_block_produces_blocked_on_send() {
 fn test_notif_block_produces_blocked_on_notif() {
     let (after_block, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Notif, deadline: None },
+        Event::Block {
+            kind: BlockKind::Notif,
+            deadline: None,
+        },
     );
     assert_eq!(
         after_block,
@@ -190,7 +202,10 @@ fn test_recv_self_revert_condition_true() {
     // Block: Running → BlockedOnRecv (state write, step 1).
     let (after_block, block_fx) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Recv, deadline: None },
+        Event::Block {
+            kind: BlockKind::Recv,
+            deadline: None,
+        },
     );
     assert_eq!(after_block, BlockState::BlockedOnRecv);
     assert!(block_fx.yielded, "first block must yield (step 4 path)");
@@ -221,7 +236,10 @@ fn test_recv_self_revert_condition_true() {
 fn test_send_self_revert_condition_true() {
     let (after_block, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Send, deadline: None },
+        Event::Block {
+            kind: BlockKind::Send,
+            deadline: None,
+        },
     );
     assert_eq!(after_block, BlockState::BlockedOnSend);
 
@@ -236,7 +254,10 @@ fn test_send_self_revert_condition_true() {
 fn test_notif_self_revert_condition_true() {
     let (after_block, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Notif, deadline: None },
+        Event::Block {
+            kind: BlockKind::Notif,
+            deadline: None,
+        },
     );
     assert_eq!(after_block, BlockState::BlockedOnNotif);
 
@@ -266,7 +287,10 @@ fn test_recv_no_lost_wake_racing_condition_true() {
     // Block (step 1 state write).
     let (blocked, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Recv, deadline: None },
+        Event::Block {
+            kind: BlockKind::Recv,
+            deadline: None,
+        },
     );
     assert_eq!(blocked, BlockState::BlockedOnRecv);
 
@@ -277,7 +301,10 @@ fn test_recv_no_lost_wake_racing_condition_true() {
         BlockState::Running,
         "racing wake via ConditionTrue must leave task Running, not Blocked*"
     );
-    assert!(!reverted.is_blocked(), "task must not remain in any Blocked* state");
+    assert!(
+        !reverted.is_blocked(),
+        "task must not remain in any Blocked* state"
+    );
 }
 
 /// Sequence: Block(Send) → Wake (external wake on BlockedOnSend) → not blocked.
@@ -285,7 +312,10 @@ fn test_recv_no_lost_wake_racing_condition_true() {
 fn test_send_no_lost_wake() {
     let (blocked, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Send, deadline: None },
+        Event::Block {
+            kind: BlockKind::Send,
+            deadline: None,
+        },
     );
     let (woken, _) = apply_event(blocked, Event::Wake);
     assert!(!woken.is_blocked(), "woken send task must not be Blocked*");
@@ -297,7 +327,10 @@ fn test_send_no_lost_wake() {
 fn test_notif_no_lost_wake() {
     let (blocked, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Notif, deadline: None },
+        Event::Block {
+            kind: BlockKind::Notif,
+            deadline: None,
+        },
     );
     let (woken, _) = apply_event(blocked, Event::Wake);
     assert!(!woken.is_blocked(), "woken notif task must not be Blocked*");
@@ -322,7 +355,10 @@ fn test_full_recv_round_trip() {
     // Step 1: Receiver blocks.
     let (recv_blocked, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Recv, deadline: None },
+        Event::Block {
+            kind: BlockKind::Recv,
+            deadline: None,
+        },
     );
     assert_eq!(recv_blocked, BlockState::BlockedOnRecv);
 
@@ -336,7 +372,10 @@ fn test_full_recv_round_trip() {
     // (Modeled as: Ready is the observable post-wake state; Running would be
     // the state after dispatch. The model stops at Ready — kernel dispatch
     // is outside the pure state machine.)
-    assert!(!recv_ready.is_blocked(), "receiver must not be blocked after wake");
+    assert!(
+        !recv_ready.is_blocked(),
+        "receiver must not be blocked after wake"
+    );
 }
 
 /// Model a complete send-block cycle: sender blocks, receiver picks up and wakes.
@@ -350,7 +389,10 @@ fn test_full_send_round_trip() {
     // Step 1: Sender blocks.
     let (send_blocked, _) = apply_event(
         BlockState::Running,
-        Event::Block { kind: BlockKind::Send, deadline: None },
+        Event::Block {
+            kind: BlockKind::Send,
+            deadline: None,
+        },
     );
     assert_eq!(send_blocked, BlockState::BlockedOnSend);
 
