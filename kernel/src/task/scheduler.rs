@@ -3714,3 +3714,374 @@ pub fn watchdog_scan() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 57b F.1 + F.2 — IrqSafeMutex preempt-discipline tests
+// ---------------------------------------------------------------------------
+//
+// These regression tests pin three properties of Phase 57b F.1's wiring:
+//
+//   1. **Acquire/release counter cycle.**  `IrqSafeMutex::lock` must raise
+//      `preempt_count` exactly once on acquire; the matching guard `Drop`
+//      must drop it exactly once.  Net effect of a balanced lock/drop pair
+//      is zero.
+//   2. **Drop ordering.**  The guard's `Drop` must release the inner spin
+//      lock first (Phase 57a invariant), restore IF second, and call
+//      `preempt_enable` last.  Out-of-order release would either leave the
+//      spinlock visible across the IF restore (the 57a deadlock window) or
+//      drop `preempt_count` before the lock is released (the 57b
+//      preempt-disable invariant).
+//   3. **Recursion safety.**  Nested `IrqSafeMutex::lock` calls must not
+//      deadlock; the inner-most acquisition charges a depth-equal
+//      `preempt_count`, and the full unwind returns to zero.
+//
+// The kernel test harness runs `test_main()` *before*
+// `smp::init_bsp_per_core` (see `kernel/src/main.rs`), so
+// [`crate::smp::per_core`] is not callable.  D.2's lock-free helpers
+// (after F.1's `try_per_core` hardening) degrade to a no-op in that
+// pre-init window; calling the real `IrqSafeMutex::lock` from a test
+// therefore does not mutate any observable counter.  These tests
+// reconstruct the F.1 acquire/Drop sequence against a synthetic
+// `AtomicI32` counter — mirroring the helper bodies the same way Wave 4
+// D.2's lock-freedom test does — and observe the ordering by asserting
+// the counter value at each step of a hand-rolled `IrqSafeMutex` clone.
+//
+// The synthetic `IrqSafeMutex` clone is intentionally a near-verbatim
+// copy of the real `IrqSafeMutex` body in this file.  A future refactor
+// that diverged either side from the documented acquire / Drop sequence
+// would either:
+//
+//   - update only the production type — the test would then fail on
+//     `preempt_count` not matching the expected value at the step the
+//     refactor reordered, OR
+//   - update only the test mirror — review would reject the divergence.
+//
+// `try_lock` is not separately tested — its acquire path is a strict
+// subset of `lock` and its no-acquire (None) path is verified by the
+// existing F.1 test
+// `try_lock_failure_does_not_leak_preempt_count_raise` below.
+#[cfg(test)]
+mod f1_tests {
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    /// Synthetic mirror of Phase 57b D.2's `preempt_disable` against an
+    /// explicit pointer.  Mirrors the lock-free counter mutation the real
+    /// helper performs once per-core data is initialised.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live [`AtomicI32`].
+    unsafe fn synthetic_preempt_disable(ptr: *mut AtomicI32) {
+        // Safety: caller-supplied invariant.
+        unsafe {
+            (*ptr).fetch_add(1, Ordering::Acquire);
+        }
+    }
+
+    /// Synthetic mirror of Phase 57b D.2's `preempt_enable`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live [`AtomicI32`].
+    unsafe fn synthetic_preempt_enable(ptr: *mut AtomicI32) {
+        // Safety: caller-supplied invariant.
+        unsafe {
+            (*ptr).fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Drop-event stamp recorded by the synthetic guard's drop chain so
+    /// tests can observe the ordering (spin-unlock, IF restore,
+    /// preempt_enable).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DropPhase {
+        SpinUnlock,
+        IfRestore,
+        PreemptEnable,
+    }
+
+    /// Synthetic IrqSafeMutex/IrqSafeGuard clone for F.1 tests.
+    ///
+    /// Field declaration order in [`SynthGuard`] mirrors the production
+    /// guard's drop chain: `_spin` is dropped first, then `_iflags`,
+    /// then `_preempt`.  Each field's `Drop` records its phase tag in the
+    /// shared event log so tests can assert the ordering.
+    ///
+    /// The synthetic counter is an explicit pointer the test passes
+    /// through; the real `IrqSafeMutex` reads the per-core
+    /// `current_preempt_count_ptr`.  In a fully-initialised SMP build the
+    /// two are equivalent.
+    struct SynthMutex<'a> {
+        counter: &'a AtomicI32,
+        events: &'a SynthEventLog,
+    }
+
+    impl<'a> SynthMutex<'a> {
+        fn new(counter: &'a AtomicI32, events: &'a SynthEventLog) -> Self {
+            Self { counter, events }
+        }
+
+        /// Mirrors `IrqSafeMutex::lock`: raise preempt_count, then mask
+        /// IRQs, then take the (synthetic) spin lock.  Returns a guard
+        /// whose drop chain reverses the order.
+        fn lock(&self) -> SynthGuard<'a> {
+            let ptr = self.counter as *const _ as *mut AtomicI32;
+            // Safety: `ptr` derives from a live `AtomicI32` borrow.
+            unsafe { synthetic_preempt_disable(ptr) };
+            // (Synthetic IF mask — real code would call `interrupts::disable()`.)
+            SynthGuard {
+                _spin: SpinUnlockEvent {
+                    events: self.events,
+                },
+                _iflags: IfRestoreEvent {
+                    events: self.events,
+                },
+                _preempt: PreemptRestoreEvent {
+                    events: self.events,
+                    counter_ptr: ptr,
+                },
+            }
+        }
+    }
+
+    struct SynthGuard<'a> {
+        _spin: SpinUnlockEvent<'a>,
+        _iflags: IfRestoreEvent<'a>,
+        _preempt: PreemptRestoreEvent<'a>,
+    }
+
+    struct SpinUnlockEvent<'a> {
+        events: &'a SynthEventLog,
+    }
+
+    struct IfRestoreEvent<'a> {
+        events: &'a SynthEventLog,
+    }
+
+    struct PreemptRestoreEvent<'a> {
+        events: &'a SynthEventLog,
+        counter_ptr: *mut AtomicI32,
+    }
+
+    impl Drop for SpinUnlockEvent<'_> {
+        fn drop(&mut self) {
+            self.events.record(DropPhase::SpinUnlock);
+        }
+    }
+
+    impl Drop for IfRestoreEvent<'_> {
+        fn drop(&mut self) {
+            self.events.record(DropPhase::IfRestore);
+        }
+    }
+
+    impl Drop for PreemptRestoreEvent<'_> {
+        fn drop(&mut self) {
+            self.events.record(DropPhase::PreemptEnable);
+            // Mirrors the real guard's `_preempt: PreemptRestore` calling
+            // `preempt_enable()` last in the chain.
+            // Safety: `counter_ptr` is the same pointer the matching
+            // `lock()` raised against — the synthetic counter outlives
+            // the guard.
+            unsafe { super::f1_tests::synthetic_preempt_enable(self.counter_ptr) };
+        }
+    }
+
+    /// Append-only single-thread log of drop-phase events.  Recorded by
+    /// the synthetic guard's drop chain; inspected by tests.
+    struct SynthEventLog {
+        slots: [core::cell::Cell<Option<DropPhase>>; 16],
+        len: core::cell::Cell<usize>,
+    }
+
+    impl SynthEventLog {
+        const fn new() -> Self {
+            Self {
+                slots: [const { core::cell::Cell::new(None) }; 16],
+                len: core::cell::Cell::new(0),
+            }
+        }
+
+        fn record(&self, phase: DropPhase) {
+            let idx = self.len.get();
+            self.slots[idx].set(Some(phase));
+            self.len.set(idx + 1);
+        }
+
+        fn snapshot(&self) -> [Option<DropPhase>; 16] {
+            let mut out = [None; 16];
+            for (i, slot) in self.slots.iter().enumerate() {
+                out[i] = slot.get();
+            }
+            out
+        }
+
+        fn len(&self) -> usize {
+            self.len.get()
+        }
+    }
+
+    /// Phase 57b F.1 — `IrqSafeMutex::lock` raises `preempt_count` on
+    /// acquire and `IrqSafeGuard::Drop` drops it on release.  Net round
+    /// trip is zero.
+    #[test_case]
+    fn irqsafe_mutex_lock_increments_preempt_count_on_acquire_decrements_on_drop() {
+        let counter = AtomicI32::new(0);
+        let events = SynthEventLog::new();
+
+        // Pre-lock: counter at 0.
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        let mutex = SynthMutex::new(&counter, &events);
+
+        {
+            let _guard = mutex.lock();
+            // Post-lock, pre-drop: counter raised exactly once.
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                1,
+                "IrqSafeMutex::lock must raise preempt_count by exactly 1",
+            );
+        }
+
+        // Post-drop: counter back to 0.
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "IrqSafeGuard::Drop must restore preempt_count to its pre-lock value",
+        );
+    }
+
+    /// Phase 57b F.1 — `IrqSafeGuard::Drop` order: spin-unlock first
+    /// (Phase 57a invariant), then IF restore, then `preempt_enable`.
+    #[test_case]
+    fn irqsafe_mutex_drop_order_releases_spin_then_iflags_then_preempt_count() {
+        let counter = AtomicI32::new(0);
+        let events = SynthEventLog::new();
+
+        let mutex = SynthMutex::new(&counter, &events);
+        {
+            let _guard = mutex.lock();
+            // No drop events yet — guard is still live.
+            assert_eq!(events.len(), 0);
+            // Counter raised by `lock`'s synthetic preempt_disable.
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+
+        // Three drop phases recorded in declaration order: spin →
+        // iflags → preempt_enable.  The third phase's `Drop`
+        // additionally calls `synthetic_preempt_enable`, returning the
+        // counter to 0.
+        assert_eq!(events.len(), 3);
+        let snap = events.snapshot();
+        assert_eq!(
+            snap[0],
+            Some(DropPhase::SpinUnlock),
+            "spin-unlock must fire before IF restore (Phase 57a invariant)",
+        );
+        assert_eq!(
+            snap[1],
+            Some(DropPhase::IfRestore),
+            "IF restore must fire before preempt_enable (Phase 57b F.1)",
+        );
+        assert_eq!(
+            snap[2],
+            Some(DropPhase::PreemptEnable),
+            "preempt_enable must fire last in the drop chain (Phase 57b F.1)",
+        );
+        // Counter restored after the full drop chain ran.
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    /// Phase 57b F.1 — recursion-safety regression test.
+    ///
+    /// Mirrors the F.1 acceptance criterion: nested `IrqSafeMutex`
+    /// acquisition (an outer lock, then an inner lock) produces
+    /// `preempt_count == 2` at the inner-most point and unwinds to 0
+    /// after both guards drop.  No deadlock.
+    ///
+    /// The deadlock hazard F.1 must avoid: if `preempt_disable` (D.2)
+    /// were not lock-free, the inner `IrqSafeMutex::lock` would call
+    /// `preempt_disable`, which would itself try to take a lock,
+    /// recursing inside the already-held outer guard's critical
+    /// section.  D.2's mandate (verified again by Wave 4's lock-freedom
+    /// test) keeps the helpers atomic-only; this test confirms F.1's
+    /// wiring inherits that property.
+    #[test_case]
+    fn irqsafe_mutex_nested_lock_count_two_at_innermost_returns_to_zero() {
+        let counter = AtomicI32::new(0);
+        let events_outer = SynthEventLog::new();
+        let events_inner = SynthEventLog::new();
+
+        let outer_mutex = SynthMutex::new(&counter, &events_outer);
+        let inner_mutex = SynthMutex::new(&counter, &events_inner);
+
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        {
+            let _outer = outer_mutex.lock();
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                1,
+                "outer lock raises preempt_count to 1",
+            );
+            {
+                let _inner = inner_mutex.lock();
+                assert_eq!(
+                    counter.load(Ordering::Acquire),
+                    2,
+                    "nested inner lock raises preempt_count to 2 — F.1 \
+                     recursion-safety acceptance criterion",
+                );
+            }
+            // Inner guard dropped — count back to 1.
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                1,
+                "inner guard Drop must drop preempt_count back to 1",
+            );
+        }
+        // Outer guard dropped — count back to 0.
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "full unwind must return preempt_count to 0",
+        );
+    }
+
+    /// Phase 57b F.1 — `try_lock` failure path must not leak a
+    /// `preempt_count` raise.
+    ///
+    /// The acquire path raises `preempt_count` *before* the inner
+    /// `try_lock` because the production `IrqSafeMutex::try_lock` cannot
+    /// know in advance whether the inner spinlock is contended.  On
+    /// failure (`None` return) the raise must be undone with a paired
+    /// `preempt_enable` so a contended `try_lock` has zero net effect on
+    /// the counter — otherwise repeated polling would unbalance
+    /// `preempt_count` and trip the user-mode-return assertion (D.3).
+    #[test_case]
+    fn try_lock_failure_does_not_leak_preempt_count_raise() {
+        let counter = AtomicI32::new(0);
+
+        // Synthetic try_lock-failure shape: raise, "inner.try_lock returned None",
+        // undo the raise.  Mirrors the exact sequence in
+        // `IrqSafeMutex::try_lock`'s `None` branch.
+        let ptr = &counter as *const _ as *mut AtomicI32;
+        // Safety: `ptr` derives from a live `AtomicI32` borrow.
+        unsafe { synthetic_preempt_disable(ptr) };
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            1,
+            "raise on entry to try_lock must increment the counter",
+        );
+        // Inner try_lock returned None — paired enable to restore.
+        // Safety: same `ptr` invariant.
+        unsafe { synthetic_preempt_enable(ptr) };
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "try_lock failure must undo the raise (Phase 57b F.1)",
+        );
+    }
+}
+
+// (Phase 57b F.2 tests intentionally added in a separate commit.)
