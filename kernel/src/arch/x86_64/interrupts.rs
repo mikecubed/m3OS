@@ -65,6 +65,42 @@ use super::gdt;
 pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
+// Phase 57b D.3 — IRQ-return-to-ring-3 preempt_count assertion
+// ---------------------------------------------------------------------------
+
+/// Phase 57b D.3 — IRQ-return-to-ring-3 wrapper around
+/// [`crate::task::scheduler::assert_preempt_count_zero_at_user_return`].
+///
+/// Called at the end of every `extern "x86-interrupt"` handler that may
+/// have interrupted ring 3 — the body returns via `iretq` to user mode
+/// when this branch is taken, and we want the same `preempt_count == 0`
+/// invariant the syscall-return path enforces.
+///
+/// The assertion is gated on `stack_frame.code_segment.rpl() ==
+/// PrivilegeLevel::Ring3` because under Phase 57d kernel-mode will hold
+/// `preempt_count > 0` while inside spinlock-protected critical
+/// sections — an IPI / IRQ that interrupted such a section would
+/// (correctly) see a non-zero count and must not panic.  The "return to
+/// ring 3" check distinguishes the two cases.
+///
+/// In Phase 57b nothing raises `preempt_count` yet (Tracks F and G are
+/// future waves), so even unconditionally checking would pass — the
+/// gate is in place from day one to keep the assertion future-correct
+/// once F.1 wires `IrqSafeMutex::lock` into `preempt_disable`.
+///
+/// The check itself is a `debug_assert!` inside the helper; release
+/// builds compile out the entire body via `cfg(debug_assertions)`.
+#[inline]
+fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
+    #[cfg(debug_assertions)]
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = stack_frame;
+}
+
+// ---------------------------------------------------------------------------
 // Two-phase fault kill path (T001)
 // ---------------------------------------------------------------------------
 
@@ -479,6 +515,7 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     // Use _panic_print to avoid deadlocking on the serial mutex if the exception
     // fires while normal code holds the lock.
     _panic_print(format_args!("[int] breakpoint: {:?}\n", stack_frame));
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -503,6 +540,7 @@ extern "x86-interrupt" fn page_fault_handler(
             // the CoW path serializes its page-table mutation under the
             // current address-space lock before issuing TLB shootdowns.
             if resolve_cow_fault(fault_addr_u64) {
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }
             // OOM or no-longer-CoW mapping — fall through to other handlers / kill.
@@ -527,6 +565,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 && demand_map_user_page(fault_addr_u64, 0x3)
             // PROT_READ|PROT_WRITE
             {
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }
         }
@@ -536,6 +575,7 @@ extern "x86-interrupt" fn page_fault_handler(
         if !is_present && let Ok(fault_vaddr) = addr {
             let fault_addr_u64 = fault_vaddr.as_u64();
             if demand_map_vma_page(fault_addr_u64, is_write) {
+                assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }
         }
@@ -816,6 +856,7 @@ extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +958,7 @@ unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte
     // over blocking an interrupt handler).
 }
 
-extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
     let mut data_port: Port<u8> = Port::new(0x60);
@@ -993,6 +1034,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
         }
     }
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,7 +1050,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 /// The IRQ12 line is shared with the slave PIC; we therefore only consume
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
-extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
     const STATUS_OUTPUT_FULL: u8 = 1 << 0;
@@ -1064,14 +1106,16 @@ extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Mouse as u8);
         }
     }
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
 // APIC spurious interrupt handler
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
     // Spurious interrupt (vector 0xFF) — no EOI must be sent.
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,15 +1142,17 @@ extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStack
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline(&mut stack_frame);
     super::apic::lapic_eoi();
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).
 ///
 /// Invalidates a specific page on this core's TLB. The target address and
 /// synchronization are managed by the TLB shootdown request in `smp::tlb`.
-extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackFrame) {
     crate::smp::tlb::handle_tlb_shootdown_ipi();
     super::apic::lapic_eoi();
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 /// Allocator-local cache drain IPI handler (vector 0xFC).
@@ -1115,16 +1161,17 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
 /// active and also services slab-local reclaim handshakes when requested. The
 /// handler always runs on the owning core, so mutating CPU-local cache state is
 /// safe.
-extern "x86-interrupt" fn cache_drain_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn cache_drain_ipi_handler(stack_frame: InterruptStackFrame) {
     crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
 // Serial (COM1) IRQ handler — vector 36
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn serial_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn serial_handler(stack_frame: InterruptStackFrame) {
     crate::serial::handle_serial_irq();
 
     if USING_APIC.load(Ordering::Relaxed) {
@@ -1135,6 +1182,7 @@ extern "x86-interrupt" fn serial_handler(_stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Serial as u8);
         }
     }
+    assert_preempt_count_zero_on_return_to_user(&stack_frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,8 +1283,14 @@ pub fn unregister_device_irq(vector: u8) {
 /// Snapshots the handler pointer under the lock, then releases the lock
 /// before invoking so the handler itself can (for example) call
 /// `register_device_irq` for a sibling queue without reentering.
+///
+/// Phase 57b D.3: also runs the user-mode-return preempt_count assertion
+/// when `iretq` will return to ring 3 (i.e. the IRQ interrupted user
+/// mode).  All 16 device-IRQ stubs share this dispatch path, so a single
+/// gate here covers every device IRQ — DRY-clean per the Engineering
+/// Practice Gates.
 #[inline(always)]
-fn dispatch_device_irq(vector: u8) {
+fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
     let snapshot: Option<(fn(), DeviceIrqKind)> = {
         let tbl = DEVICE_IRQ_TABLE.lock();
@@ -1250,6 +1304,7 @@ fn dispatch_device_irq(vector: u8) {
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     }
+    assert_preempt_count_zero_on_return_to_user(stack_frame);
 }
 
 /// Test-only entry point into the device-IRQ dispatcher.
@@ -1261,60 +1316,77 @@ fn dispatch_device_irq(vector: u8) {
 /// deliver a synthetic IRQ and observe the same `notification::signal_irq_bit`
 /// side effect. The function is `#[cfg(test)]`-gated so it does not ship in
 /// release builds.
+///
+/// Synthesises a fresh `InterruptStackFrame` on the stack so the
+/// dispatch helper has a real reference to forward.  Tests run in ring 0
+/// (the kernel test harness boots before any userspace task), so the
+/// frame's CS naturally reflects ring 0 and the user-mode-return
+/// assertion is a no-op for the test path.
 #[cfg(test)]
 pub fn dispatch_device_irq_for_test(vector: u8) {
-    dispatch_device_irq(vector);
+    // Build a synthetic `InterruptStackFrame` whose CS encodes ring 0 —
+    // the user-mode-return assertion gate will skip it.  We never
+    // `iretq` through this frame; it exists only to satisfy
+    // `dispatch_device_irq`'s signature.
+    let frame = InterruptStackFrame::new(
+        VirtAddr::new(0),
+        gdt::kernel_code_selector(),
+        x86_64::registers::rflags::RFlags::empty(),
+        VirtAddr::new(0),
+        gdt::kernel_data_selector(),
+    );
+    dispatch_device_irq(vector, &frame);
 }
 
 // Stubs — one per vector slot. The IDT requires a real
 // `extern "x86-interrupt"` function at each vector; we cannot generate them
 // at runtime. Each stub thunks to `dispatch_device_irq` with a compile-time
 // vector number.
-extern "x86-interrupt" fn device_irq_stub_0(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE);
+extern "x86-interrupt" fn device_irq_stub_0(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_1(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 1);
+extern "x86-interrupt" fn device_irq_stub_1(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 1, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_2(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 2);
+extern "x86-interrupt" fn device_irq_stub_2(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 2, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_3(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 3);
+extern "x86-interrupt" fn device_irq_stub_3(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 3, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_4(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 4);
+extern "x86-interrupt" fn device_irq_stub_4(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 4, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_5(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 5);
+extern "x86-interrupt" fn device_irq_stub_5(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 5, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_6(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 6);
+extern "x86-interrupt" fn device_irq_stub_6(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 6, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_7(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 7);
+extern "x86-interrupt" fn device_irq_stub_7(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 7, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_8(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 8);
+extern "x86-interrupt" fn device_irq_stub_8(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 8, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_9(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 9);
+extern "x86-interrupt" fn device_irq_stub_9(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 9, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_10(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 10);
+extern "x86-interrupt" fn device_irq_stub_10(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 10, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_11(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 11);
+extern "x86-interrupt" fn device_irq_stub_11(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 11, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_12(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 12);
+extern "x86-interrupt" fn device_irq_stub_12(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 12, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_13(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 13);
+extern "x86-interrupt" fn device_irq_stub_13(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 13, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_14(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 14);
+extern "x86-interrupt" fn device_irq_stub_14(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 14, &stack_frame);
 }
-extern "x86-interrupt" fn device_irq_stub_15(_: InterruptStackFrame) {
-    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 15);
+extern "x86-interrupt" fn device_irq_stub_15(stack_frame: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 15, &stack_frame);
 }

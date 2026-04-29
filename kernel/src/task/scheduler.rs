@@ -1343,6 +1343,74 @@ pub fn preempt_enable() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57b D.3 — user-mode-return preempt_count assertion
+// ---------------------------------------------------------------------------
+
+/// Phase 57b D.3 — assert that `preempt_count == 0` at the user-mode
+/// return boundary.
+///
+/// Invariant: every spinlock callsite must have released its preempt-
+/// disable counter before the kernel returns to ring 3.  A non-zero
+/// `preempt_count` here indicates a forgotten `preempt_enable` somewhere
+/// in the kernel path the task just executed; under Phase 57d preemption
+/// would fire inside the held lock and deadlock the kernel.  Catching
+/// the bug at the boundary (instead of waiting for the deadlock) is the
+/// cheapest detection available.
+///
+/// The check itself is a `debug_assert!` — compiled out in release
+/// builds where `debug_assertions` is `false`.  In release builds the
+/// Phase 57a stuck-task watchdog catches the symptom (a task that never
+/// returns to user mode) as the coarse signal.
+///
+/// Both Track D.3 callers — the syscall-return path
+/// (`kernel/src/arch/x86_64/syscall/mod.rs`) and every IRQ-return-to-
+/// ring-3 path (`kernel/src/arch/x86_64/interrupts.rs`) — call this
+/// single helper; DRY-clean per the Engineering Practice Gates.
+///
+/// In 57b no spinlock callsite has been migrated to raise
+/// `preempt_count` yet (Tracks F and G are future waves), so the count
+/// stays at 0 throughout and the assertion never trips.  Once Track F
+/// wires `IrqSafeMutex::lock` into `preempt_disable`, this assertion
+/// becomes the earliest possible detection of a missed
+/// `preempt_enable`.
+#[cfg(debug_assertions)]
+#[inline]
+pub(crate) fn assert_preempt_count_zero_at_user_return() {
+    // Per-core data may not be initialised in some early-boot panic paths
+    // or in test context (test_main runs before init_bsp_per_core); skip
+    // the assertion if so.
+    let Some(pc) = crate::smp::try_per_core() else {
+        return;
+    };
+    let ptr = pc
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: same pointee invariant as [`preempt_disable`] /
+    // [`preempt_enable`] — the pointer targets a `'static` per-core
+    // dummy or a `Box<Task>::preempt_count` whose address is stable for
+    // the task's lifetime.
+    let count = unsafe { (*ptr).load(core::sync::atomic::Ordering::Relaxed) };
+    debug_assert!(
+        count == 0,
+        "preempt_count != 0 at user-mode return: {} (forgotten preempt_enable?)",
+        count,
+    );
+}
+
+/// Release-build no-op stub for
+/// [`assert_preempt_count_zero_at_user_return`].
+///
+/// In release builds the assertion is compiled out so user-mode return
+/// adds zero overhead.  Callers always invoke through the same name; the
+/// `cfg(debug_assertions)` selects between the live check and this stub.
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+pub(crate) fn assert_preempt_count_zero_at_user_return() {}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.

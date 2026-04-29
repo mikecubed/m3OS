@@ -1794,6 +1794,17 @@ pub extern "C" fn syscall_handler(
     // If a user handler is delivered, this diverges and never returns.
     check_pending_signals(result);
 
+    // Phase 57b D.3: assert preempt_count == 0 at the syscall-return
+    // boundary.  Every spinlock callsite must release its preempt-disable
+    // before the kernel returns to ring 3; under Phase 57d a non-zero
+    // count here would deadlock the kernel the first time preemption
+    // fired inside a held lock.  Compiled out in release builds; in
+    // release builds the Phase 57a stuck-task watchdog catches the
+    // symptom.  Lives in `kernel/src/task/scheduler.rs` so the syscall-
+    // return and IRQ-return-to-ring-3 paths share a single helper
+    // (DRY-clean per the Engineering Practice Gates).
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+
     result
 }
 
@@ -2582,6 +2593,11 @@ pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
 ///
 /// `regs` must contain valid userspace addresses for RIP and RSP.
 unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! {
+    // Phase 57b D.3: assert preempt_count == 0 before the signal-delivery
+    // iretq path returns to ring 3.  Same invariant as the syscall fast
+    // path; see
+    // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`.
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     unsafe {
         use core::arch::asm;
         // We need to restore all GPRs.  The simplest approach: push the iretq
