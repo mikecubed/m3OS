@@ -3194,6 +3194,28 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
     }
 
     let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+
+    // F.5: Under sched-v2, sleeps ≥ 1 ms use block_current_until with an
+    // absolute tick deadline (1 tick = 1 ms, TICKS_PER_SEC = 1000).
+    // The woken flag is a dummy local AtomicBool that is never set externally;
+    // the task is woken solely by scan_expired_wake_deadlines when the
+    // deadline tick arrives. Sleeps < 1 ms retain the TSC busy-spin (the
+    // cost of a context switch exceeds the sleep duration).
+    #[cfg(feature = "sched-v2")]
+    if sleep_us >= 1_000 {
+        // deadline_ticks = now + ceil(sleep_us / 1000) = now + ceil(sleep_ns / 1_000_000)
+        let sleep_ms = sleep_us.div_ceil(1_000);
+        let now_ticks = crate::arch::x86_64::interrupts::tick_count();
+        let deadline_ticks = now_ticks.saturating_add(sleep_ms);
+        let woken = core::sync::atomic::AtomicBool::new(false);
+        let _ = crate::task::scheduler::block_current_until(&woken, Some(deadline_ticks));
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        return 0;
+    }
+
+    // v1 path (all durations) and sched-v2 path for < 1 ms:
     if tsc_per_ms == 0 {
         // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
         let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
@@ -3205,21 +3227,20 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
                 return NEG_EINTR;
             }
         }
-    } else if sleep_us < 5_000 {
-        // Short sleep (< 5 ms): TSC busy-spin without yielding.
+    } else if sleep_us < 1_000 {
+        // Short sleep (< 1 ms): TSC busy-spin without yielding.
         //
         // APs have a 10 ms timer granularity, so a single yield_now() would
-        // sleep ~10 ms — far too coarse for the 1 ms sleeps that DOOM's game
-        // loop relies on for accurate 35 Hz tic timing.  A brief busy-spin is
-        // acceptable here: the sleep completes in < 5 ms and the cost is a
-        // small window of raised interrupt latency on this core.
+        // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
+        // busy-spin is acceptable here: the sleep completes in < 1 ms and the
+        // cost of a context switch would exceed the sleep duration.
         let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
             core::hint::spin_loop();
         }
     } else {
-        // Long sleep (≥ 5 ms): yield-based sleep.
+        // Long sleep (≥ 1 ms, v1 path only): yield-based sleep.
         // TSC is invariant across cores, so this is accurate regardless of
         // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
         // granularity, which is acceptable for multi-millisecond sleeps.
