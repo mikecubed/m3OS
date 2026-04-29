@@ -22,7 +22,9 @@ pub mod tlb;
 extern crate alloc;
 
 use alloc::{boxed::Box, collections::VecDeque};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use x86_64::{
     VirtAddr,
@@ -42,6 +44,24 @@ use crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX;
 
 /// Maximum number of cores supported.
 pub const MAX_CORES: usize = 16;
+
+/// Phase 57b C.1 — per-core boot/scheduler-context dummy `preempt_count`.
+///
+/// Every core's [`PerCoreData::current_preempt_count_ptr`] starts pointing at
+/// `&SCHED_PREEMPT_COUNT_DUMMY[core_id]` and is retargeted to the dummy again
+/// at every dispatch's switch-out epilogue (Phase 57b C.2).  The retarget
+/// guarantees that scheduler-context `IrqSafeMutex::lock` / `Drop` pairs
+/// (Phase 57b F.1, future wave) charge the same pointee on acquire and
+/// release — the dummy.
+///
+/// The dummy is `pub` because [`crate::task::scheduler`] dereferences it from
+/// the dispatch path's retarget block.  Only the owning core's scheduler
+/// stack writes to its slot via `preempt_disable` / `preempt_enable`; reads
+/// from other cores are never expected.  All accesses use atomic
+/// `fetch_add` / `fetch_sub` so concurrent writes from a self-IPI handler are
+/// well-defined.
+pub static SCHED_PREEMPT_COUNT_DUMMY: [AtomicI32; MAX_CORES] =
+    [const { AtomicI32::new(0) }; MAX_CORES];
 
 /// Size of the dedicated double-fault stack per core (same as BSP).
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5; // 20 KiB
@@ -273,6 +293,33 @@ pub struct PerCoreData {
     /// not cross-core visibility, since both the set/clear and the check occur
     /// on the same core.
     pub holds_scheduler_lock: AtomicBool,
+
+    // ----- Phase 57b C.1: per-CPU preempt_count pointer -----
+    /// Pointer to the `AtomicI32` that `preempt_disable` / `preempt_enable`
+    /// must mutate on this core right now.
+    ///
+    /// # Invariants
+    ///
+    /// - The pointer is **always** valid (non-null and pointing at live
+    ///   memory).  At boot it targets `&SCHED_PREEMPT_COUNT_DUMMY[core_id]`,
+    ///   which is `'static`.  During task execution it targets the running
+    ///   task's `Task::preempt_count`.  Track B's `Vec<Box<Task>>` storage
+    ///   keeps the cached `Task::preempt_count` address stable across
+    ///   `Vec` reallocations.
+    /// - The pointer is updated **only** by Phase 57b C.2 (switch-out
+    ///   retarget — back to the dummy) and Phase 57b C.3 (switch-in
+    ///   retarget — to the incoming task) on the dispatch path.  Both
+    ///   updates run inside an interrupt-masked window so no IRQ-context
+    ///   `preempt_disable` can observe a half-updated pointer.
+    /// - Future helpers (`preempt_disable` / `preempt_enable`, Phase 57b
+    ///   D.2) read this pointer with `Acquire` and never take any lock.
+    ///   That lock-freedom is what lets Phase 57b F.1 wire
+    ///   `preempt_disable` into `IrqSafeMutex::lock` without recursion.
+    ///
+    /// Stored as an `AtomicPtr<AtomicI32>` rather than a plain pointer so
+    /// that retarget store / counter-helper load can use `Release` / `Acquire`
+    /// ordering for cross-core visibility on retarget boundaries.
+    pub current_preempt_count_ptr: AtomicPtr<AtomicI32>,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -570,6 +617,13 @@ pub fn init_bsp_per_core() {
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
         holds_scheduler_lock: AtomicBool::new(false),
+        // Phase 57b C.1: pointer starts at this core's dummy slot.  The
+        // dispatch path (C.2 / C.3) retargets it to the running task's
+        // `preempt_count` while the task executes and back to the dummy
+        // on switch-out.
+        current_preempt_count_ptr: AtomicPtr::new(
+            &SCHED_PREEMPT_COUNT_DUMMY[0] as *const AtomicI32 as *mut AtomicI32,
+        ),
     }));
 
     // Fill self-pointer and store in global array.
@@ -687,6 +741,13 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
         holds_scheduler_lock: AtomicBool::new(false),
+        // Phase 57b C.1: pointer starts at this AP's dummy slot.  The
+        // dispatch path (C.2 / C.3) retargets it to the running task's
+        // `preempt_count` while the task executes and back to the dummy
+        // on switch-out.
+        current_preempt_count_ptr: AtomicPtr::new(
+            &SCHED_PREEMPT_COUNT_DUMMY[core_id as usize] as *const AtomicI32 as *mut AtomicI32,
+        ),
     }));
 
     unsafe {
