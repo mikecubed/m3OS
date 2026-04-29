@@ -1325,16 +1325,19 @@ pub fn block_current_until(
 
     // ── Lock-order discipline (Linux p->pi_lock → rq->lock) ───────────────────
     //
-    // pi_lock is OUTER, SCHEDULER.lock is INNER.  We MUST acquire pi_lock
-    // BEFORE acquiring scheduler_lock for the state write.  The pattern:
+    // pi_lock is OUTER, SCHEDULER.lock is INNER.  Both writes (canonical
+    // `TaskBlockState.state` and scheduler-visible `Task::state`) MUST happen
+    // under pi_lock to be atomic with respect to `wake_task_v2`, which holds
+    // pi_lock during its CAS.  Pattern:
     //
     //   1. Brief scheduler_lock to capture idx + pi_lock_ptr (raw).
     //   2. Drop scheduler_lock.
-    //   3. Acquire pi_lock via raw pointer; write canonical state; release.
-    //   4. Re-acquire scheduler_lock; mirror to v1 fields + bookkeeping; drop.
-    //
-    // This mirrors `wake_task_v2`'s lock dance and prevents the debug_assert in
-    // `Task::with_block_state` from firing.
+    //   3. Acquire pi_lock (OUTER).
+    //   4. Inside pi_lock, acquire scheduler_lock (INNER) and write BOTH
+    //      `TaskBlockState.state` and `Task::state` atomically (waker is
+    //      blocked on pi_lock for the duration).  Mirror bookkeeping
+    //      (accumulate_ticks, save_user_return_state, set_current_task_idx).
+    //   5. Drop scheduler_lock; drop pi_lock.
     //
     // SAFETY of the raw pointer: the Task at `tasks[idx]` is stable in memory
     // for its lifetime (the Vec only grows; dead-slot recycling runs under
@@ -1352,69 +1355,89 @@ pub fn block_current_until(
         // scheduler_lock dropped here.
     };
 
-    // ── Step 1: State write under pi_lock (OUTER) ────────────────────────────
+    // ── Step 1: Atomic state write under pi_lock (OUTER) → scheduler_lock (INNER)
     //
     // SAFETY: pi_lock_ptr points into the stable Task struct captured above.
-    // SCHEDULER.lock is NOT held here (released at end of previous block),
-    // satisfying the lock-ordering invariant.
+    // SCHEDULER.lock is NOT held when we acquire pi_lock here, satisfying the
+    // lock-ordering invariant.  The waker (`wake_task_v2`) will spin on pi_lock
+    // until we release, so its CAS cannot interleave with our writes.
     {
         let pi_lock_ref = unsafe { &*pi_lock_ptr };
         let mut bs = pi_lock_ref.lock();
-        bs.state = kind;
-        if deadline_ticks.is_some() && bs.wake_deadline.is_none() {
-            ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
-        } else if deadline_ticks.is_none() && bs.wake_deadline.is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+
+        // Inner scheduler_lock — both writes happen with both locks held.
+        {
+            let mut sched = scheduler_lock();
+            if idx >= sched.tasks.len() {
+                return BlockOutcome::AlreadyTrue;
+            }
+            // Canonical (pi_lock-protected) write.
+            bs.state = kind;
+            if deadline_ticks.is_some() && bs.wake_deadline.is_none() {
+                ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
+            } else if deadline_ticks.is_none() && bs.wake_deadline.is_some() {
+                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+            }
+            bs.wake_deadline = deadline_ticks;
+
+            // Scheduler-visible mirror — same critical section, no race window.
+            accumulate_ticks(&mut sched, idx);
+            sched.tasks[idx].state = kind;
+            sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
+            sched.tasks[idx].wake_deadline = deadline_ticks;
+            save_user_return_state(
+                &mut sched.tasks[idx],
+                addr_space_snapshot.0,
+                addr_space_snapshot.1,
+            );
+            set_current_task_idx(None);
+            // scheduler_lock released.
         }
-        bs.wake_deadline = deadline_ticks;
         // pi_lock released.
     }
 
-    // ── Step 1b: Mirror to v1 (scheduler-visible) fields + bookkeeping ──────
-    {
-        let mut sched = scheduler_lock();
-        if idx >= sched.tasks.len() {
-            return BlockOutcome::AlreadyTrue;
-        }
-        accumulate_ticks(&mut sched, idx);
-        sched.tasks[idx].state = kind;
-        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
-        sched.tasks[idx].wake_deadline = deadline_ticks;
-        save_user_return_state(
-            &mut sched.tasks[idx],
-            addr_space_snapshot.0,
-            addr_space_snapshot.1,
-        );
-        set_current_task_idx(None);
-        // scheduler_lock dropped.
-    }
-
-    // ── Step 2: pi_lock is released (and so is SCHEDULER.lock) ───────────────
+    // ── Step 2: pi_lock + SCHEDULER.lock both released ───────────────────────
 
     // ── Step 3: Condition recheck before yielding ─────────────────────────────
     //
-    // If the waker wrote `true` between step 1 and here, we self-revert.
+    // Two cases when `woken || expired` is observed:
+    //   (a) Waker is racing — woken set, but `wake_task_v2`'s pi_lock CAS has
+    //       not run yet.  Canonical state is still Blocked*.
+    //   (b) Waker already won — CAS'd to Ready, mirrored Task::state = Ready,
+    //       and enqueued the task.
+    //
+    // The self-revert below handles BOTH cases atomically by overwriting
+    // canonical and scheduler-visible state to Running under pi_lock + sched.
+    //   - Case (a): waker is still spinning on pi_lock; when it finally CAS's,
+    //     it sees Running and returns AlreadyAwake.  No enqueue happens.
+    //   - Case (b): waker already enqueued.  After we restore current_task_idx
+    //     and return, the queue has a stale entry pointing at our idx; pick_next
+    //     sees `state != Ready` (Running) and silently removes it (`dequeue_local`
+    //     filter at scheduler.rs:577).  No double-dispatch.
     let already_woken = woken.load(Ordering::Acquire);
     let already_expired = deadline_ticks
         .map(|d| crate::arch::x86_64::interrupts::tick_count() >= d)
         .unwrap_or(false);
 
     if already_woken || already_expired {
-        // Self-revert (lock-order: pi_lock outer, scheduler_lock inner).
+        // Self-revert under pi_lock OUTER + scheduler_lock INNER, atomic with
+        // respect to wake_task_v2.
         {
             let pi_lock_ref = unsafe { &*pi_lock_ptr };
             let mut bs = pi_lock_ref.lock();
-            bs.state = TaskState::Running;
-            if bs.wake_deadline.take().is_some() {
-                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+            {
+                let mut sched = scheduler_lock();
+                if idx < sched.tasks.len() {
+                    bs.state = TaskState::Running;
+                    if bs.wake_deadline.take().is_some() {
+                        ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    sched.tasks[idx].state = TaskState::Running;
+                    sched.tasks[idx].wake_deadline = None;
+                }
+                // scheduler_lock released.
             }
-        }
-        {
-            let mut sched = scheduler_lock();
-            if idx < sched.tasks.len() {
-                sched.tasks[idx].state = TaskState::Running;
-                sched.tasks[idx].wake_deadline = None;
-            }
+            // pi_lock released.
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
