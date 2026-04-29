@@ -297,7 +297,7 @@ pub struct Task {
     /// During Tracks C/D, writes go to **both** this field and to the legacy
     /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
     /// Track E removes the legacy fields once all callers migrate.
-    pub pi_lock: spin::Mutex<TaskBlockState>,
+    pub pi_lock: crate::task::scheduler::IrqSafeMutex<TaskBlockState>,
 }
 
 impl Task {
@@ -341,7 +341,7 @@ impl Task {
             // Task::state so the shadow lock is consistent from construction.
             // Writes during the migration window (Tracks C/D) go to both v1
             // fields and pi_lock; Track E removes the v1 fields.
-            pi_lock: spin::Mutex::new(TaskBlockState {
+            pi_lock: crate::task::scheduler::IrqSafeMutex::new(TaskBlockState {
                 state: TaskState::Ready,
                 wake_deadline: None,
             }),

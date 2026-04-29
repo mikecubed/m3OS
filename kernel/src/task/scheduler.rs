@@ -145,11 +145,11 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 // guard releases the lock *before* [`InterruptRestore`] re-enables IF,
 // so an ISR cannot fire during the unlock window and reach a just-freed
 // lock with stale `was_enabled` state.
-pub(crate) struct IrqSafeMutex<T: ?Sized> {
+pub struct IrqSafeMutex<T: ?Sized> {
     inner: Mutex<T>,
 }
 
-pub(crate) struct IrqSafeGuard<'a, T: ?Sized + 'a> {
+pub struct IrqSafeGuard<'a, T: ?Sized + 'a> {
     guard: spin::MutexGuard<'a, T>,
     _restore: InterruptRestore,
 }
@@ -159,7 +159,7 @@ struct InterruptRestore {
 }
 
 impl<T> IrqSafeMutex<T> {
-    pub(crate) const fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             inner: Mutex::new(value),
         }
@@ -167,7 +167,7 @@ impl<T> IrqSafeMutex<T> {
 }
 
 impl<T: ?Sized> IrqSafeMutex<T> {
-    pub(crate) fn lock(&self) -> IrqSafeGuard<'_, T> {
+    pub fn lock(&self) -> IrqSafeGuard<'_, T> {
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -183,7 +183,7 @@ impl<T: ?Sized> IrqSafeMutex<T> {
     /// already held. Used by the panic-diagnostic path so it can inspect
     /// task state without deadlocking if the scheduler was holding the lock
     /// at the moment the panic fired.
-    pub(crate) fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
+    pub fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -1348,7 +1348,7 @@ pub fn block_current_until(
             Some(i) => i,
             None => return BlockOutcome::AlreadyTrue, // no current task — bail
         };
-        let pi_lock_ptr: *const spin::Mutex<super::TaskBlockState> =
+        let pi_lock_ptr: *const IrqSafeMutex<super::TaskBlockState> =
             &raw const sched.tasks[idx].pi_lock;
         let core = crate::smp::per_core().core_id;
         (idx, core, pi_lock_ptr)
@@ -1913,7 +1913,7 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         // Capture stable pointers to the atomic fields — safe because the
         // Task at `tasks[idx]` is not moved or freed between now and step 5
         // (see lock-ordering invariant above).
-        let pi_lock_ptr: *const spin::Mutex<super::TaskBlockState> =
+        let pi_lock_ptr: *const IrqSafeMutex<super::TaskBlockState> =
             &raw const sched.tasks[idx].pi_lock;
         let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
         let assigned = sched.tasks[idx].assigned_core;
@@ -2338,13 +2338,11 @@ pub fn run() -> ! {
         // Enqueue is deferred until after the lock is released because
         // `enqueue_to_core` sends a cross-core reschedule IPI that must
         // not run with `SCHEDULER.lock` held.
-        let (expired, n_expired) = {
-            let mut sched = scheduler_lock();
-            scan_expired_wake_deadlines(&mut sched)
-        };
-        for (core, idx) in &expired[..n_expired] {
-            enqueue_to_core(*core, *idx);
-        }
+        // Phase 57a follow-up: collect expired-deadline candidates under
+        // SCHEDULER.lock, then drive each through `wake_task_v2` with
+        // SCHEDULER.lock dropped.  Restores the pi_lock-outer / SCHEDULER.lock-
+        // inner invariant that the previous in-place scan violated.
+        drive_expired_wake_deadlines();
 
         // Pick the next ready task and atomically mark it Running.
         // `stale_info` carries (pid, name, last_ready_tick, ticks_stale) when
@@ -2717,81 +2715,38 @@ const MIGRATE_COOLDOWN: u64 = 100;
 pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
-/// Transition tasks whose `wake_deadline` has elapsed back to `Ready`.
+/// Collect TaskIds whose `wake_deadline` has expired.
 ///
-/// Must be called with `SCHEDULER.lock` already held. Returns a small list
-/// of `(assigned_core, task_idx)` pairs that the caller must pass to
-/// `enqueue_to_core` AFTER releasing `SCHEDULER.lock` — `enqueue_to_core`
-/// sends the cross-core reschedule IPI that wakes halted APs, and that
-/// IPI path must not run under `SCHEDULER.lock`.
+/// **Lock-ordering invariant (Phase 57a B.3): pi_lock is OUTER, SCHEDULER.lock
+/// is INNER.** This function runs under SCHEDULER.lock and therefore MUST NOT
+/// touch any `pi_lock`.  The caller drops SCHEDULER.lock and then calls
+/// `wake_task_v2` for each candidate — `wake_task_v2` does the proper
+/// pi_lock-outer / scheduler_lock-inner CAS dance.
 ///
-/// The returned count is capped at 8 per call; if more tasks expired in
-/// the same scheduler tick, they are left for the next dispatch pass.
-///
-/// Fast path: if `ACTIVE_WAKE_DEADLINES` is zero, returns `(_, 0)` without
-/// scanning. Keeps the dispatch hot path ~O(1) when no task has set a
-/// deadline — i.e. always, under the current net_task default of
-/// indefinite block.
-///
-/// # v2 path (`cfg(feature = "sched-v2")`)
-///
-/// Under `sched-v2`, the body:
-/// - Checks `task.state` (consistent under `SCHEDULER.lock`).
-/// - Sets `task.state = Ready` under `SCHEDULER.lock` (same as v1).
-/// - Performs a dual-write to `task.pi_lock`'s `TaskBlockState.state`
-///   using a direct `pi_lock.lock()` acquisition.  This is safe in this
-///   context because the task is provably off-CPU (it is in a `Blocked*`
-///   state with a past-due deadline) and cannot hold `pi_lock` itself.
-///   The dual-write keeps the canonical and shadow fields consistent for
-///   any concurrent `wake_task_v2` that might race with the scan; the
-///   first writer (scan or wake) wins; the second sees `Ready` and skips.
-/// - Does NOT check `switching_out` / set `wake_after_switch` (v1 fields).
-/// - Does NOT use the batch-enqueue array (`wake_task_v2` handles enqueue
-///   itself after the caller releases `SCHEDULER.lock`... but because the
-///   scan runs under `SCHEDULER.lock` and `wake_task_v2` re-acquires it,
-///   we cannot call `wake_task_v2` directly here without deadlocking).
-///   Instead the v2 path returns the same `(core, idx)` array as v1 for
-///   the caller to enqueue post-lock; the pi_lock dual-write above ensures
-///   the canonical state is Ready before enqueue.
-fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usize) {
+/// Why scheduler-lock-only is sufficient for collection:
+///   - We read `Task::state` (the scheduler-visible mirror).  If a concurrent
+///     `wake_task_v2` is in flight and racing with us, it has already CAS'd
+///     `TaskBlockState.state` to Ready under pi_lock and is about to mirror
+///     to `Task::state` under scheduler_lock.  At collection time we are
+///     holding scheduler_lock so the waker is blocked on it — which means
+///     either (a) the waker hasn't started its INNER scheduler_lock yet
+///     (Task::state is still Blocked*) and we collect, then call
+///     wake_task_v2 ourselves — its CAS sees Ready (set by the other waker
+///     before our outer lookup) or Blocked* (we win) and behaves
+///     idempotently; or (b) the waker already ran (Task::state == Ready)
+///     and we skip.
+///   - Spurious wakes (collecting a task whose deadline was just cleared) are
+///     harmless: `wake_task_v2`'s pi_lock CAS only succeeds for Blocked*; if
+///     the task already woke, we get `AlreadyAwake` (no-op).
+fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
     if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
-        return ([(0, 0); 8], 0);
+        return ([TaskId(0); 8], 0);
     }
     let now = crate::arch::x86_64::interrupts::tick_count();
-    let mut expired: [(u8, usize); 8] = [(0, 0); 8];
+    let mut expired: [TaskId; 8] = [TaskId(0); 8];
     let mut n = 0usize;
 
-    // ── v1 path ──────────────────────────────────────────────────────────────
-
-    // ── v2 path ──────────────────────────────────────────────────────────────
-    //
-    // D.4: CAS-style scan.  `SCHEDULER.lock` is already held by the caller;
-    // `wake_task_v2` cannot be called directly (it re-acquires
-    // `scheduler_lock()`), so we perform the equivalent transition inline:
-    //
-    // 1. Check `task.state` under `SCHEDULER.lock` (consistent).
-    // 2. Clear `task.wake_deadline` + ACTIVE_WAKE_DEADLINES.
-    // 3. Set `task.state = Ready` + bookkeeping under `SCHEDULER.lock`.
-    // 4. Dual-write to `task.pi_lock`'s canonical `TaskBlockState.state`.
-    //    The direct `pi_lock.lock()` acquisition is safe here because:
-    //    a. The task is provably off-CPU (Blocked* with expired deadline).
-    //    b. `wake_task_v2` (which also holds `pi_lock`) checks `Task::state`
-    //       (legacy, under SCHEDULER.lock) in step 3 after the pi_lock CAS;
-    //       if we set `Task::state = Ready` here first, any concurrent
-    //       `wake_task_v2` will see `Ready` in step 3 and not set
-    //       `wake_after_switch` — the idempotency guard works.
-    //    c. The B.3 lock-ordering assertion (`with_block_state`) fires only
-    //       if the per-CPU `holds_scheduler_lock` flag is set; in this path
-    //       we bypass `with_block_state` and lock `pi_lock` directly so no
-    //       debug_assert fires.  Track E.3 will remove this dual-write once
-    //       the legacy fields are deleted.
-    // 5. No `switching_out`/`wake_after_switch` check (v1 only).
-    // 6. Add to expired array for post-lock enqueue (same as v1).
-    //    The on_cpu spin-wait (step 4 of `wake_task_v2`) is NOT needed here
-    //    because the scan runs under `SCHEDULER.lock`, which is also held
-    //    during `pick_next` — the dispatch path cannot read a stale `saved_rsp`
-    //    for a task we just marked Ready, because both paths hold the same lock.
-    for (idx, task) in sched.tasks.iter_mut().enumerate() {
+    for task in sched.tasks.iter() {
         if task.wake_deadline.is_none_or(|d| d > now) {
             continue;
         }
@@ -2803,61 +2758,42 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
         ) {
-            // Not Blocked* — stale deadline; clean up and skip.
-            if task.wake_deadline.take().is_some() {
-                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-            }
-            // Also sync pi_lock's deadline if stale.
-            {
-                let mut bs = task.pi_lock.lock();
-                if bs.wake_deadline.take().is_some() {
-                    // Counter already decremented above; do not double-count.
-                }
-            }
+            // Not Blocked* — stale deadline.  Don't touch it here; the next
+            // state transition (or the next scan after wake_task_v2 clears
+            // the deadline) will cover it.  Counters may temporarily lag but
+            // are eventually consistent.
             continue;
         }
-
-        // Deadline expired on a Blocked* task.
-        let old_state_u8 = task.state as u8;
-
-        // Step 2: clear legacy wake_deadline + counter.
-        if task.wake_deadline.take().is_some() {
-            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Step 3: update legacy Task::state fields under SCHEDULER.lock.
-        task.state = TaskState::Ready;
-        task.last_ready_tick = now;
-        task.last_migrated_tick = now;
-        task.blocked_since_tick = 0;
-        #[cfg(feature = "sched-trace")]
-        crate::task::sched_trace::record(task.pid, old_state_u8, TaskState::Ready as u8);
-
-        // Step 4: dual-write to pi_lock's canonical TaskBlockState.
-        // Direct lock acquisition (not via with_block_state) to avoid the
-        // B.3 debug_assert on holds_scheduler_lock — see comment above.
-        {
-            let mut bs = task.pi_lock.lock();
-            bs.state = TaskState::Ready;
-            if bs.wake_deadline.take().is_some() {
-                // Counter already decremented in step 2; do NOT decrement again.
-            }
-        }
-
-        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
-            task_idx: idx as u32,
-            state_before: old_state_u8,
-            core: task.assigned_core,
-        });
-
-        // Step 6: add to expired array for post-lock enqueue.
         if n < expired.len() {
-            expired[n] = (task.assigned_core, idx);
+            expired[n] = task.id;
             n += 1;
         }
     }
 
     (expired, n)
+}
+
+/// Drive deadline expiry for all tasks whose `wake_deadline` has passed.
+///
+/// Phase 1: collect candidate TaskIds under SCHEDULER.lock (no pi_lock touch).
+/// Phase 2: drop SCHEDULER.lock, then call `wake_task_v2` for each candidate —
+/// the canonical pi_lock-outer / scheduler_lock-inner wake path.
+///
+/// This replaces the previous `scan_expired_wake_deadlines` which violated
+/// the lock-ordering invariant by acquiring pi_lock while holding
+/// SCHEDULER.lock.
+fn drive_expired_wake_deadlines() {
+    let (expired, n) = {
+        let sched = scheduler_lock();
+        collect_expired_wake_deadlines(&sched)
+        // SCHEDULER.lock dropped here.
+    };
+    for id in &expired[..n] {
+        // wake_task_v2 acquires pi_lock OUTER, then scheduler_lock INNER.
+        // CAS only succeeds for Blocked*; spurious calls (state already
+        // Ready) return AlreadyAwake and are no-ops.
+        let _ = wake_task_v2(*id);
+    }
 }
 
 /// (~500ms at 100 Hz).
