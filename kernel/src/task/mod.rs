@@ -337,6 +337,48 @@ pub struct Task {
     pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57b E.2 — Task::preempt_frame layout regression gate
+// ---------------------------------------------------------------------------
+//
+// Phase 57d's assembly entry stub will store every saved register into
+// `Task.preempt_frame` using literal `[task_ptr + EXPECTED_TASK_PREEMPT_FRAME_OFFSET + PREEMPT_FRAME_OFFSET_*]`
+// addressing.  If the offset of `preempt_frame` inside `Task` ever drifts
+// (e.g., a new field is inserted before it) the assembly will write to the
+// wrong slot — silently corrupting the saved register set, and on resume
+// jumping to garbage.
+//
+// The two assertions below pin the offset at build time:
+//
+//   1. `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` records the value at the time
+//      this gate was added (Phase 57b E.2).  Treat it as the canonical
+//      "what 57d's assembly was written against" anchor.
+//   2. The `const _: () = assert!` cross-checks `offset_of!(Task,
+//      preempt_frame)` against that anchor; a mismatch fails the build with
+//      a load-bearing message that points future contributors at this gate.
+//
+// To intentionally rebase the offset (e.g., after a deliberate `Task` field
+// reorder), update both `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` and the
+// matching offset references in 57d's assembly stub in the same commit.
+//
+// This assertion lives in the kernel crate (rather than `kernel/tests/`
+// integration-test land) because the `kernel` crate is a binary and has no
+// `lib` target — integration tests cannot import `Task`.  A const assertion
+// on the type definition itself is the strongest guard available and runs
+// on every kernel build (including `cargo xtask check` clippy passes).
+
+/// Documented byte offset of [`Task::preempt_frame`] inside [`Task`].  Pins
+/// the value at the time Phase 57b E.2 landed (448).  Treat as the source
+/// of truth that Phase 57d's assembly entry stub is written against.
+pub const EXPECTED_TASK_PREEMPT_FRAME_OFFSET: usize = 448;
+
+const _: () = assert!(
+    core::mem::offset_of!(Task, preempt_frame) == EXPECTED_TASK_PREEMPT_FRAME_OFFSET,
+    "Task::preempt_frame offset drift will break Phase 57d assembly: \
+     reorder Task fields or update EXPECTED_TASK_PREEMPT_FRAME_OFFSET \
+     plus 57d's assembly offsets in the same commit",
+);
+
 impl Task {
     /// Allocate a new task with its own kernel stack, initialized to enter
     /// `entry` when first scheduled.
