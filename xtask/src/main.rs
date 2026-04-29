@@ -1740,14 +1740,38 @@ fn musl_cc_runs(cc: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Whether `name` resolves to an executable on PATH.
+///
+/// We don't care about exit code — only reachability — because some archivers
+/// (e.g. BSD `ar`) don't accept `--version` and return non-zero even though
+/// they're installed.  `Command::status()` returns `Err` only when the
+/// executable can't be spawned at all.
+fn tool_exists(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
 /// Stamp `CC_*` / `AR_*` env vars on `cmd` so cc-rs build scripts invoked under
 /// `cargo build --target x86_64-unknown-linux-musl` can find a working musl
 /// cross-toolchain. cc-rs derives `x86_64-linux-musl-{gcc,ar}` from the triple
 /// by default — that matches Debian's `musl-tools` cross compiler but not
 /// Arch's `musl-gcc-cross-bin` (`x86_64-unknown-linux-musl1.2-gcc`).
+///
+/// AR fallback policy: the table below pairs each known cross-`gcc` with the
+/// cross-`ar` that ships in the SAME upstream toolchain.  Some installs ship
+/// only the gcc (e.g. a partial `musl-tools` install, or a hand-built
+/// musl-cross where ar wasn't added to PATH).  In that case we fall back to
+/// the host `ar` from binutils — a static archiver is target-agnostic for
+/// ELF (it concatenates relocatable object files; no opinion about their
+/// machine type) so the resulting `.a` is fine for cc-rs's downstream link.
+/// The fallback emits a one-shot warning so the user sees what happened.
 fn apply_musl_cargo_env(cmd: &mut Command) {
     let Some(cc) = find_musl_cc_any() else { return };
-    let ar = match cc {
+    let preferred_ar = match cc {
         "x86_64-linux-musl-gcc" => "x86_64-linux-musl-ar",
         "x86_64-unknown-linux-musl1.2-gcc" | "x86_64-unknown-linux-musl-gcc" => {
             "x86_64-unknown-linux-musl-ar"
@@ -1756,8 +1780,28 @@ fn apply_musl_cargo_env(cmd: &mut Command) {
         // from those of the host gcc, so the system `ar` is sufficient.
         _ => "ar",
     };
+    let ar = if tool_exists(preferred_ar) {
+        preferred_ar
+    } else {
+        warn_ar_fallback_once(cc, preferred_ar);
+        "ar"
+    };
     cmd.env("CC_x86_64_unknown_linux_musl", cc);
     cmd.env("AR_x86_64_unknown_linux_musl", ar);
+}
+
+fn warn_ar_fallback_once(cc: &str, missing_ar: &str) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "warning: musl cross-`ar` `{missing_ar}` not found on PATH \
+             (paired with `{cc}` by xtask).  Falling back to host `ar` from \
+             binutils — static archives are target-agnostic for ELF, so this \
+             is correct for the cc-rs build-script path.  Install the matching \
+             cross-ar (e.g. `gcc-x86-64-linux-musl` on Debian, \
+             `musl-gcc-cross-bin` on Arch) to silence this warning."
+        );
+    });
 }
 
 fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {

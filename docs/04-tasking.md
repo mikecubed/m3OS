@@ -257,8 +257,81 @@ real inter-task communication will require tasks to block on endpoint receive.
 
 ---
 
+## Block/Wake Protocol (v2 — Phase 57a)
+
+> **Current protocol as of kernel v0.57.1.** Phase 57a rewrote the block/wake
+> primitive to eliminate the lost-wake bug class that arose from v1's use of
+> multiple boolean flags (`switching_out`, `wake_after_switch`,
+> `PENDING_SWITCH_OUT`) as intermediate state. See
+> [`docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md`](./roadmap/tasks/57a-scheduler-rewrite-tasks.md)
+> for the full rewrite reference, and
+> [`docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`](./handoffs/57a-scheduler-rewrite-v2-transitions.md)
+> for the v2 state-transition table that forms the formal spec.
+
+### Lock ordering
+
+`pi_lock` is *outer*, `SCHEDULER.lock` is *inner* (Linux's `p->pi_lock` →
+`rq->lock` pattern). A code path may hold `pi_lock` while acquiring
+`SCHEDULER.lock`; the reverse is forbidden and panics in debug builds.
+
+**State ownership:**
+- `pi_lock` owns canonical block state: `TaskBlockState.state`, `wake_deadline`.
+- `SCHEDULER.lock` owns scheduler-visible state: run-queue membership, `Task::on_cpu`.
+
+### `block_current_until` — four-step Linux recipe
+
+Mirrors Linux's `do_nanosleep` / `set_current_state` pattern
+(`kernel/time/hrtimer.c`):
+
+1. **State write under `pi_lock`.** Acquire `pi_lock`; write `task.state ←
+   Blocked*`; set `task.wake_deadline`; release `pi_lock`. The Release barrier
+   pairs with the Acquire barrier in the wake side's CAS, closing the lost-wake
+   window.
+2. **Release `pi_lock`** before the condition recheck so a concurrent waker
+   can acquire `pi_lock` and CAS without deadlock.
+3. **Condition recheck.** Read the `woken` `AtomicBool` (or compare
+   `tick_count()` against `deadline_ticks`) *after* the state write. If the
+   condition is already true, self-revert: acquire `pi_lock`; CAS `Blocked* →
+   Running`; clear `wake_deadline`; release `pi_lock`; return without yielding.
+4. **Yield via `SCHEDULER.lock`.** Acquire `SCHEDULER.lock`; remove task from
+   run queue; call `switch_context` to the scheduler RSP. On resume, recheck
+   the condition; if false (spurious wake), re-enter step 1.
+
+### `wake_task` CAS rewrite
+
+1. Acquire `pi_lock`; CAS `state` from any `Blocked*` to `Ready`; clear
+   `wake_deadline`; release `pi_lock`.
+2. If CAS failed (task was not `Blocked*`): return `AlreadyAwake`.
+3. Acquire `SCHEDULER.lock`; if task is already enqueued (concurrent waker),
+   return `Woken` (idempotency guard).
+4. If `task.on_cpu == true` (RSP not yet published by the arch-level switch-out
+   epilogue): spin-wait (`smp_cond_load_acquire`-style) until `on_cpu` becomes
+   false. Replaces v1's `PENDING_SWITCH_OUT[core]` deferred-enqueue hand-off.
+5. Enqueue task to its `assigned_core` run queue; if cross-core, send reschedule
+   IPI.
+
+### `Task::on_cpu` RSP-publication marker
+
+`Task::on_cpu` (introduced in Phase 57a Track E.1) is set to `true` when a
+task is dispatched (its RSP is live in hardware) and cleared in the arch-level
+switch-out epilogue once `saved_rsp` is committed. The wake side spin-waits on
+this field before enqueueing, replacing the v1 `PENDING_SWITCH_OUT[core]`
+deferred-enqueue mechanism.
+
+### v1 fields removed
+
+The following v1 intermediate-state fields and their supporting infrastructure
+are **absent** from the current codebase (deleted in Phase 57a Tracks E–F):
+`switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT`. Any reference to
+these names in source code is a bug; the v2 protocol uses `Task::on_cpu` and
+`TaskBlockState.state` under `pi_lock` exclusively.
+
+---
+
 ## See Also
 
 - `docs/03-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers
 - `docs/06-ipc.md` — IPC model that will require `Blocked` state in Phase 6
 - `docs/roadmap/README.md` — per-phase scope and milestones
+- `docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md` — Phase 57a block/wake rewrite
+- `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` — v2 state-transition spec

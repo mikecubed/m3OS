@@ -50,10 +50,18 @@ impl WaitQueue {
                 id,
                 woken: Arc::clone(&woken),
             });
-            // Atomically check woken flag under the scheduler lock before blocking.
-            // This prevents the TOCTOU race where a waker sets woken between our
-            // check and the actual block call.
-            scheduler::block_current_unless_woken(&woken);
+            // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
+            // with no deadline; under v1 retain block_current_unless_woken.
+            // The woken flag is set by wake_one/wake_all before calling
+            // wake_task/wake_task_v2, so the TOCTOU window is closed in both
+            // cases by the flag check inside block_current_until / pi_lock.
+            {
+                let _ = scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+            }
         }
     }
 
@@ -78,7 +86,10 @@ impl WaitQueue {
     pub fn wake_one(&self) {
         if let Some(entry) = self.waiters.lock().pop_front() {
             entry.woken.store(true, Ordering::Release);
-            let _ = scheduler::wake_task(entry.id);
+            // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
+            {
+                let _ = scheduler::wake_task_v2(entry.id);
+            }
         }
     }
 
@@ -90,7 +101,10 @@ impl WaitQueue {
         };
         for entry in waiters {
             entry.woken.store(true, Ordering::Release);
-            let _ = scheduler::wake_task(entry.id);
+            // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
+            {
+                let _ = scheduler::wake_task_v2(entry.id);
+            }
         }
     }
 

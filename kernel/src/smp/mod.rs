@@ -262,6 +262,17 @@ pub struct PerCoreData {
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
     #[cfg(feature = "trace")]
     pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<256>>,
+
+    // ----- Phase 57a B.3: lock-ordering guard -----
+    /// Set to `true` while this core holds `SCHEDULER.lock`.
+    ///
+    /// Read by [`Task::with_block_state`] to enforce the pi_lock-is-outer
+    /// invariant: acquiring `pi_lock` while holding `SCHEDULER.lock` is
+    /// forbidden (Linux `p->pi_lock` → `rq->lock` ordering).  Only accessed
+    /// with `Relaxed` ordering — correctness relies on the CPU's program order,
+    /// not cross-core visibility, since both the set/clear and the check occur
+    /// on the same core.
+    pub holds_scheduler_lock: AtomicBool,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -518,7 +529,7 @@ pub fn init_bsp_per_core() {
         core_id: 0,
         apic_id: bsp_apic_id,
         is_online: AtomicBool::new(true),
-        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(1024),
         tss_ptr: core::ptr::null_mut(), // BSP uses existing gdt.rs TSS
         gdt_ptr: core::ptr::null(),     // BSP uses existing gdt.rs GDT
         gdt_code: SegmentSelector(0),
@@ -558,6 +569,7 @@ pub fn init_bsp_per_core() {
         cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
+        holds_scheduler_lock: AtomicBool::new(false),
     }));
 
     // Fill self-pointer and store in global array.
@@ -631,7 +643,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         core_id,
         apic_id,
         is_online: AtomicBool::new(false),
-        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(4),
+        ipi_recv_log_budget: core::sync::atomic::AtomicI32::new(1024),
         tss_ptr: tss,
         gdt_ptr: gdt,
         gdt_code,
@@ -674,6 +686,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
+        holds_scheduler_lock: AtomicBool::new(false),
     }));
 
     unsafe {

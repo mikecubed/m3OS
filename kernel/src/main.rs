@@ -479,95 +479,123 @@ fn idle_task() -> ! {
 
 // ---------------------------------------------------------------------------
 // Phase 21 — serial stdin feeder
+// Phase 57a H.1 — migrated to notification-based wait (block_current_until)
 // ---------------------------------------------------------------------------
 
 /// Read bytes from the IRQ-driven serial ring buffer and feed them into the
 /// kernel stdin buffer with canonical editing, echo, and signal support.
+///
+/// # Phase 57a H.1 — notification-based park
+///
+/// The previous implementation used an `enable_and_hlt` halt-loop to wait for
+/// the next COM1 RX IRQ.  This parks the **entire CPU core** until any
+/// interrupt arrives, which prevented co-scheduled tasks (notably `kbd_server`
+/// when both were placed on AP3 by the scheduler) from running.
+///
+/// The new implementation mirrors `net_task`:
+///
+/// 1. Register this task's [`TaskId`] with [`serial::set_feeder_task_id`] so
+///    the COM1 RX ISR can wake it via [`task::scheduler::wake_task_v2`].
+/// 2. At the top of each drain loop, clear `STDIN_FEEDER_WOKEN` with a `swap`
+///    (edge-triggered, same as `NIC_WOKEN` in `net_task`).
+/// 3. Drain all pending bytes from the ring buffer.
+/// 4. If no bytes were available, park via
+///    `block_current_until(&STDIN_FEEDER_WOKEN, None)`.  The scheduler can now
+///    dispatch other tasks on this core while the feeder is blocked.
+/// 5. On wake (ISR set the flag + IPI'd us), loop back to step 2.
 fn serial_stdin_feeder_task() -> ! {
     // Enable UART Receive Data Available interrupt (IER bit 0).
     unsafe {
         x86_64::instructions::port::Port::new(0x3F9u16).write(0x01u8);
     }
 
-    log::info!("[serial-stdin] feeder ready (IRQ-driven, echo + signals)");
+    // H.1: register our TaskId so the COM1 RX ISR can issue wake_task_v2.
+    let my_id = task::scheduler::current_task_id()
+        .expect("[serial-stdin] no task id — feeder must run inside the scheduler");
+    crate::serial::set_feeder_task_id(my_id);
+
+    log::info!("[serial-stdin] feeder ready (notification-based, echo + signals)");
 
     loop {
-        // Read from the lock-free ring buffer. If empty, disable interrupts,
-        // re-check, and halt until the next IRQ — this closes the lost-wakeup
-        // window without busy-polling.
-        let byte = match crate::serial::serial_rx_pop() {
-            Some(b) => b,
-            None => {
-                loop {
-                    x86_64::instructions::interrupts::disable();
-                    // Clear the pending flag and re-check the buffer while
-                    // interrupts are disabled. If the IRQ fired between our
-                    // pop() and disable(), the flag/buffer will be non-empty
-                    // and we retry immediately instead of halting.
-                    crate::serial::SERIAL_RX_PENDING
-                        .store(false, core::sync::atomic::Ordering::SeqCst);
-                    if let Some(b) = crate::serial::serial_rx_pop() {
-                        x86_64::instructions::interrupts::enable();
-                        break b;
-                    }
-                    // Atomically re-enable interrupts and halt. The next IRQ
-                    // (serial or otherwise) will wake us.
-                    x86_64::instructions::interrupts::enable_and_hlt();
-                }
-            }
-        };
+        // Edge-triggered drain gate: clear the wake flag up-front so any IRQ
+        // that fires during draining is still observed on the next iteration.
+        // This is the same swap pattern used by net_task on NIC_WOKEN.
+        crate::serial::STDIN_FEEDER_WOKEN.store(false, core::sync::atomic::Ordering::Release);
 
-        // Delegate to the unified LineDiscipline in TTY0.
-        let mut eof_signal = false;
-        let result = {
-            let mut t = tty::TTY0.lock();
-            t.ldisc.process_byte(byte, &mut |data| {
-                if data.is_empty() {
-                    eof_signal = true;
-                } else {
-                    for &b in data {
-                        stdin::push_char(b);
-                    }
-                }
-            })
-        };
-        if eof_signal {
-            stdin::signal_eof();
-        }
+        // Drain all bytes currently in the ring buffer.
+        let mut drained = false;
+        while let Some(byte) = crate::serial::serial_rx_pop() {
+            drained = true;
 
-        // Handle the result.
-        match result {
-            kernel_core::tty::LdiscResult::Consumed => {}
-            kernel_core::tty::LdiscResult::Signal(sig) => {
-                let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
-                if fg != 0 {
-                    let name = match sig {
-                        2 => "^C",
-                        20 => "^Z",
-                        3 => "^\\",
-                        _ => "",
-                    };
-                    serial_echo(name);
-                    serial_echo("\n");
-                    process::send_signal_to_group(fg, sig as u32);
-                } else {
-                    stdin::push_char(byte);
-                }
-            }
-            kernel_core::tty::LdiscResult::Pushed { ref echo }
-            | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
-                if let Some(count) = echo.erase_count() {
-                    for _ in 0..count {
-                        serial_echo("\x08 \x08");
+            // Delegate to the unified LineDiscipline in TTY0.
+            let mut eof_signal = false;
+            let result = {
+                let mut t = tty::TTY0.lock();
+                t.ldisc.process_byte(byte, &mut |data| {
+                    if data.is_empty() {
+                        eof_signal = true;
+                    } else {
+                        for &b in data {
+                            stdin::push_char(b);
+                        }
                     }
-                } else if !echo.is_empty() {
-                    let echo_bytes = echo.as_slice();
-                    if let Ok(s) = core::str::from_utf8(echo_bytes) {
-                        serial_echo(s);
+                })
+            };
+            if eof_signal {
+                stdin::signal_eof();
+            }
+
+            // Handle the result.
+            match result {
+                kernel_core::tty::LdiscResult::Consumed => {}
+                kernel_core::tty::LdiscResult::Signal(sig) => {
+                    let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+                    if fg != 0 {
+                        let name = match sig {
+                            2 => "^C",
+                            20 => "^Z",
+                            3 => "^\\",
+                            _ => "",
+                        };
+                        serial_echo(name);
+                        serial_echo("\n");
+                        process::send_signal_to_group(fg, sig as u32);
+                    } else {
+                        stdin::push_char(byte);
+                    }
+                }
+                kernel_core::tty::LdiscResult::Pushed { ref echo }
+                | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
+                    if let Some(count) = echo.erase_count() {
+                        for _ in 0..count {
+                            serial_echo("\x08 \x08");
+                        }
+                    } else if !echo.is_empty() {
+                        let echo_bytes = echo.as_slice();
+                        if let Ok(s) = core::str::from_utf8(echo_bytes) {
+                            serial_echo(s);
+                        }
                     }
                 }
             }
         }
+
+        // If we drained at least one byte this iteration, loop immediately to
+        // catch any bytes that arrived during processing before parking.
+        if drained {
+            continue;
+        }
+
+        // Ring buffer was empty — park until the COM1 RX ISR signals us.
+        // block_current_until removes this task from the run queue; the
+        // scheduler is free to dispatch other tasks (e.g. kbd_server) on this
+        // core.  On wake the ISR will have set STDIN_FEEDER_WOKEN = true and
+        // issued a cross-core IPI if necessary.
+        let _ = task::scheduler::block_current_until(
+            task::TaskState::BlockedOnRecv,
+            &crate::serial::STDIN_FEEDER_WOKEN,
+            None,
+        );
     }
 }
 
@@ -645,7 +673,16 @@ fn net_task() -> ! {
         // Park on the unified flag: the virtio-net ISR, RemoteNic, and the
         // ingress pending-send hook all set it, so a wake from any path
         // reliably unblocks the task.
-        task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
+        //
+        // F.6: under sched-v2 use block_current_until (v2 CAS primitive)
+        // with no deadline; under v1 retain block_current_unless_woken.
+        {
+            let _ = task::scheduler::block_current_until(
+                task::TaskState::BlockedOnRecv,
+                &net::NIC_WOKEN,
+                None,
+            );
+        }
     }
 }
 

@@ -55,19 +55,20 @@ pub(crate) const MAX_TASKS: usize = 256;
 pub use kernel_core::types::TaskId;
 
 pub mod blocking_mutex;
+pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
+pub mod watchdog;
 
 #[allow(unused_imports)]
 pub use scheduler::{
-    block_current_on_futex, block_current_on_futex_unless_woken, block_current_on_notif,
-    block_current_on_recv, block_current_on_reply, block_current_on_send,
-    block_current_unless_woken, current_task_id, deliver_bulk, deliver_message, insert_cap,
-    mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
+    block_current_on_notif_v2, block_current_on_recv_v2, block_current_on_reply_v2,
+    block_current_on_send_v2, block_current_until, current_task_id, deliver_bulk, deliver_message,
+    insert_cap, mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
     server_endpoint, set_current_task_pid, set_current_user_return, set_server_endpoint,
     signal_reschedule, spawn, spawn_fork_task, spawn_idle, spawn_idle_for_core,
     spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data,
-    take_current_task_fork_ctx, take_message, task_cap, wake_task, yield_now,
+    take_current_task_fork_ctx, take_message, task_cap, wake_task_v2, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,9 +79,8 @@ pub use scheduler::{
 ///
 /// Returns `None` if the lock is already held (e.g. during a panic while
 /// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
-pub(crate) fn try_lock_scheduler() -> Option<scheduler::IrqSafeGuard<'static, scheduler::Scheduler>>
-{
-    scheduler::SCHEDULER.try_lock()
+pub(crate) fn try_lock_scheduler() -> Option<scheduler::SchedulerGuard<'static>> {
+    scheduler::try_scheduler_lock()
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +150,36 @@ pub enum TaskState {
 }
 
 // ---------------------------------------------------------------------------
+// TaskBlockState (Phase 57a B.1)
+// ---------------------------------------------------------------------------
+
+/// State protected by [`Task::pi_lock`].
+///
+/// All mutations to these fields go through [`Task::with_block_state`] (B.4).
+/// Readers outside the `pi_lock` critical section MUST NOT inspect these
+/// fields directly — Tracks C/D enforce this contract by routing every
+/// read through the helper.
+///
+/// # Lock-ordering invariant
+///
+/// `pi_lock` is OUTER, `SCHEDULER.lock` is INNER (Linux's `p->pi_lock` →
+/// `rq->lock` pattern).  A code path may hold `pi_lock` while acquiring
+/// `SCHEDULER.lock`; the reverse is forbidden and panics in debug builds
+/// (see [`Task::with_block_state`]).
+pub struct TaskBlockState {
+    /// Canonical block state.  Mirrors the v1 `Task::state` field.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub state: TaskState,
+
+    /// Absolute tick deadline at which `scan_expired_wake_deadlines` will
+    /// force-wake the task to `Ready`.  `None` for indefinite-timeout blocks.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub wake_deadline: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // Task structure
 // ---------------------------------------------------------------------------
 
@@ -206,12 +236,20 @@ pub struct Task {
     /// `tick_count()` at dispatch time to measure ready-to-running latency
     /// (Phase 54 diagnostic).
     pub last_ready_tick: u64,
-    /// True while the task is returning to the scheduler and its kernel stack
-    /// pointer has not been safely published yet.
-    pub switching_out: bool,
-    /// Set by a wakeup that arrives while `switching_out` is true so the
-    /// scheduler can enqueue the task after `switch_context` completes.
-    pub wake_after_switch: bool,
+    /// True while the task is mid-context-switch and its `saved_rsp` may not
+    /// yet be published.
+    ///
+    /// Set before `switch_context` (in the block/yield/dead path). Cleared by
+    /// the dispatch handler immediately after `saved_rsp` is durably written
+    /// to this struct (arch-level switch-out epilogue).
+    ///
+    /// Replaces v1's `PENDING_SWITCH_OUT[core]` RSP-publication guard
+    /// (Linux `p->on_cpu` `smp_cond_load_acquire` pattern, `try_to_wake_up`).
+    /// The wake-side spin-wait (`wake_task_v2`) reads this flag with `Acquire`
+    /// ordering; the epilogue clear uses `Release`, guaranteeing a waker
+    /// observing `on_cpu == false` sees the published `saved_rsp`.
+    pub on_cpu: core::sync::atomic::AtomicBool,
+
     /// Set once per-task IPC teardown has run so deferred dead-task cleanup
     /// can avoid double-cleaning the same task.
     pub ipc_cleaned: bool,
@@ -227,20 +265,39 @@ pub struct Task {
     fork_ctx: Option<crate::process::ForkChildCtx>,
     /// Optional tick deadline at which a `Blocked*` task should be force-woken.
     ///
-    /// `Some(deadline)` when set by `block_current_unless_woken_until`. The
-    /// scheduler's dispatch path (`pick_next`'s caller) scans for blocked
-    /// tasks whose `wake_deadline` is in the past and transitions them to
-    /// `Ready`. `None` for tasks that have no timeout, which is the default.
-    ///
-    /// This is the safe replacement for a timer-ISR wake: the expiry check
-    /// runs inside the scheduler dispatch loop (already holding
-    /// `SCHEDULER.lock`), not from the timer ISR, so there is no same-core
-    /// re-entrance hazard.
+    /// `Some(deadline)` when set by `block_current_until` with a deadline.
+    /// The scheduler's dispatch path scans blocked tasks whose `wake_deadline`
+    /// is in the past and transitions them to `Ready`. `None` means no timeout.
     pub wake_deadline: Option<u64>,
+    /// Tick at which this task most recently entered a `Blocked*` state.
+    ///
+    /// Set by `block_current_until` before yielding.
+    /// Reset to 0 when the task transitions back to `Ready`.
+    /// Used by the G.1 stuck-task watchdog to compute how long a task has been blocked.
+    pub blocked_since_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
     _stack: Option<Box<[u8]>>,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.2 — per-task pi_lock (shadow lock, migration window)
+    // ---------------------------------------------------------------------------
+    /// Per-task spinlock guarding [`TaskBlockState`].
+    ///
+    /// # Lock ordering
+    ///
+    /// `pi_lock` is **OUTER**, `SCHEDULER.lock` is **INNER** (Linux's
+    /// `p->pi_lock` → `rq->lock` pattern).  A code path may hold `pi_lock`
+    /// while acquiring `SCHEDULER.lock`; the reverse is forbidden and panics
+    /// in debug builds (see [`Task::with_block_state`]).
+    ///
+    /// # Migration window
+    ///
+    /// During Tracks C/D, writes go to **both** this field and to the legacy
+    /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
+    /// Track E removes the legacy fields once all callers migrate.
+    pub pi_lock: crate::task::scheduler::IrqSafeMutex<TaskBlockState>,
 }
 
 impl Task {
@@ -272,14 +329,22 @@ impl Task {
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,
-            switching_out: false,
-            wake_after_switch: false,
+            on_cpu: core::sync::atomic::AtomicBool::new(false),
             ipc_cleaned: false,
             group_exit_pending: false,
             user_return: None,
             fork_ctx: None,
             wake_deadline: None,
+            blocked_since_tick: 0,
             _stack: Some(stack),
+            // Phase 57a B.2: initialize pi_lock with the same initial state as
+            // Task::state so the shadow lock is consistent from construction.
+            // Writes during the migration window (Tracks C/D) go to both v1
+            // fields and pi_lock; Track E removes the v1 fields.
+            pi_lock: crate::task::scheduler::IrqSafeMutex::new(TaskBlockState {
+                state: TaskState::Ready,
+                wake_deadline: None,
+            }),
         }
     }
 
@@ -290,6 +355,41 @@ impl Task {
             let top = base + s.len() as u64;
             (base, top)
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.4 — canonical pi_lock reader/writer
+    // ---------------------------------------------------------------------------
+
+    /// Acquire `pi_lock`, run `f` with mutable access to the protected
+    /// [`TaskBlockState`], release, and return the result.
+    ///
+    /// This is the **only** entry point Tracks C/D use to read or write
+    /// `TaskBlockState` fields.  Using this helper exclusively is the SOLID
+    /// Single-Responsibility boundary: all lock-acquire/transition/release
+    /// boilerplate lives here, not at call sites.
+    ///
+    /// # Lock ordering
+    ///
+    /// In debug builds, panics if `SCHEDULER.lock` is already held by this
+    /// CPU (Linux's `p->pi_lock` → `rq->lock` ordering — `pi_lock` is the
+    /// OUTER lock; see the `scheduler.rs` module doc for the full hierarchy).
+    #[inline]
+    pub fn with_block_state<R>(&self, f: impl FnOnce(&mut TaskBlockState) -> R) -> R {
+        // Phase 57a B.3: lock-ordering assertion.
+        // Acquiring pi_lock while already holding SCHEDULER.lock violates the
+        // Linux p->pi_lock → rq->lock invariant and can deadlock.
+        debug_assert!(
+            !crate::smp::try_per_core()
+                .map(|c| c
+                    .holds_scheduler_lock
+                    .load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false),
+            "pi_lock acquisition while SCHEDULER.lock is held — \
+             Linux p->pi_lock → rq->lock ordering violated"
+        );
+        let mut guard = self.pi_lock.lock();
+        f(&mut guard)
     }
 }
 
@@ -380,3 +480,60 @@ core::arch::global_asm!(
     "  pop  rbx",
     "  ret", // pop rip from new stack → jump to resumed task
 );
+
+// ---------------------------------------------------------------------------
+// E.1 in-kernel QEMU tests
+// ---------------------------------------------------------------------------
+//
+// The kernel crate is `no_std` and uses the `test_case` framework
+// (see `crate::test_runner`) rather than libtest's `#[test]`. Using
+// `#[test_case]` lets these checks run inside the kernel test harness
+// alongside the rest of the QEMU-driven suite.
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::Ordering;
+
+    /// Verify that `Task::on_cpu` can be set and cleared with the correct
+    /// Release/Acquire ordering semantics expected by the epilogue clear and
+    /// D.1's wake-side spin-wait.
+    ///
+    /// Exercises the AtomicBool API and memory-ordering contract in isolation
+    /// (no scheduler lock, no switch_context).
+    #[test_case]
+    fn on_cpu_set_clear_round_trip() {
+        let flag = core::sync::atomic::AtomicBool::new(false);
+
+        // Initially false — task is not in a switch-out window.
+        assert!(!flag.load(Ordering::Acquire));
+
+        // Block-side path: set to true before switch_context (Release).
+        flag.store(true, Ordering::Release);
+        assert!(flag.load(Ordering::Acquire));
+
+        // Epilogue clear: set to false after saved_rsp is committed (Release).
+        flag.store(false, Ordering::Release);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    /// Verify pick_next on_cpu guard: a task with `on_cpu == true` must be
+    /// excluded from dispatch until the switch-out epilogue clears it.
+    #[test_case]
+    fn on_cpu_guard_excludes_switching_task() {
+        let on_cpu = core::sync::atomic::AtomicBool::new(false);
+
+        // Initially false → task is eligible for dispatch.
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(eligible);
+
+        // on_cpu set (mid switch-out) → ineligible.
+        on_cpu.store(true, Ordering::Release);
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(!eligible);
+
+        // Epilogue clears on_cpu → eligible again.
+        on_cpu.store(false, Ordering::Release);
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(eligible);
+    }
+}

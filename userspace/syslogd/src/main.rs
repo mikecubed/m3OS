@@ -133,10 +133,30 @@ fn setup_socket() -> Option<i32> {
 // Main loop
 // ---------------------------------------------------------------------------
 
-/// Poll timeout in milliseconds -- also controls how often we drain /dev/kmsg.
+/// Poll timeout in milliseconds.
+///
+/// H.3 root-cause note: before G.3 the kernel's `sys_poll` divided the
+/// timeout by 10 (a stale 100 Hz assumption), so `POLL_TIMEOUT_MS = 2000`
+/// actually timed out after only 200 ms — causing syslogd to loop 5× per
+/// second and burn ~10–15 % CPU even when idle.  G.3 removed the `÷10`
+/// divisor; `poll(2000)` now correctly sleeps for 2 s.
 const POLL_TIMEOUT_MS: i32 = 2000;
+
+/// Maximum syslog-socket datagrams to process per poll wakeup before yielding.
+/// Prevents any single burst from starving other tasks.
 const MAX_SOCKET_DRAIN_PER_LOOP: usize = 4;
-const MAX_KMSG_DRAIN_PER_LOOP: usize = 4;
+
+/// Maximum kernel-log messages per *chunk* inside `drain_kmsg`.
+///
+/// H.3 secondary defence (Hypothesis B): `drain_kmsg` processes messages in
+/// chunks of this size, yielding (`nanosleep(0)` → kernel `yield_now()`) after
+/// each full chunk so other tasks on the same core can run.  The outer while
+/// loop in `drain_kmsg` continues draining until the fd returns EAGAIN, so a
+/// large burst of kmsg messages is handled without waiting for the next 2 s
+/// poll timeout — but never in one uninterrupted stretch.
+///
+/// 32 messages per chunk × ~128 B average → ~4 KiB of log work between yields.
+pub const KMSG_DRAIN_CHUNK: usize = 32;
 
 fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
     let mut recv_buf = [0u8; 2048];
@@ -144,16 +164,41 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
     let mut line_buf = [0u8; 2560];
 
     loop {
-        // Poll the datagram socket for incoming messages.
-        let mut fds = [PollFd {
-            fd: sock_fd,
-            events: POLLIN,
-            revents: 0,
-        }];
+        // Build the poll set.  Include kmsg_fd (when open) so that a kernel
+        // log burst does not sit unread for the full 2 s poll window.
+        let have_kmsg = kmsg_fd >= 0;
+        let poll_ret = if have_kmsg {
+            let mut fds = [
+                PollFd {
+                    fd: sock_fd,
+                    events: POLLIN,
+                    revents: 0,
+                },
+                PollFd {
+                    fd: kmsg_fd,
+                    events: POLLIN,
+                    revents: 0,
+                },
+            ];
+            let r = syscall_lib::poll(&mut fds, POLL_TIMEOUT_MS);
+            // Drain kmsg reactively when it is readable.
+            if r > 0 && (fds[1].revents & POLLIN) != 0 {
+                drain_kmsg(kmsg_fd, kern_fd, msg_fd, &mut kmsg_buf, &mut line_buf);
+            }
+            (r, fds[0].revents)
+        } else {
+            let mut fds = [PollFd {
+                fd: sock_fd,
+                events: POLLIN,
+                revents: 0,
+            }];
+            let r = syscall_lib::poll(&mut fds, POLL_TIMEOUT_MS);
+            (r, fds[0].revents)
+        };
 
-        let n = syscall_lib::poll(&mut fds, POLL_TIMEOUT_MS);
+        let (n, sock_revents) = poll_ret;
 
-        if n > 0 && (fds[0].revents & POLLIN) != 0 {
+        if n > 0 && (sock_revents & POLLIN) != 0 {
             // Drain all pending datagrams.
             let mut drained = 0usize;
             loop {
@@ -175,14 +220,16 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
                 }
                 drained += 1;
                 if drained >= MAX_SOCKET_DRAIN_PER_LOOP {
+                    // Cooperative yield: let other tasks run before the next chunk.
                     let _ = syscall_lib::nanosleep(0);
                     break;
                 }
             }
         }
 
-        // Periodically drain kernel messages.
-        if kmsg_fd >= 0 {
+        // On poll timeout (no kmsg readable event), still drain kmsg to catch
+        // any messages that arrived since the last reactive drain.
+        if n <= 0 && have_kmsg {
             drain_kmsg(kmsg_fd, kern_fd, msg_fd, &mut kmsg_buf, &mut line_buf);
         }
     }
@@ -192,11 +239,18 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 // Kernel message drain
 // ---------------------------------------------------------------------------
 
+/// Drain all available messages from `kmsg_fd` in chunks of [`KMSG_DRAIN_CHUNK`].
+///
+/// After each full chunk a cooperative yield (`nanosleep(0)`) is issued so
+/// that other tasks on the same core can run.  The loop continues until
+/// `read()` returns ≤ 0 (EAGAIN on a non-blocking fd), so a large burst is
+/// consumed without relying on the 2 s poll timeout to re-enter this function.
 fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
-    let mut drained = 0usize;
+    let mut chunk_count = 0usize;
     loop {
         let nr = syscall_lib::read(kmsg_fd, buf);
         if nr <= 0 {
+            // EAGAIN or EOF: fd is drained.
             break;
         }
         let msg = &buf[..nr as usize];
@@ -207,10 +261,12 @@ fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf:
             // Also write to messages for unified viewing.
             syscall_lib::write(msg_fd, &line_buf[..len]);
         }
-        drained += 1;
-        if drained >= MAX_KMSG_DRAIN_PER_LOOP {
+        chunk_count += 1;
+        if chunk_count >= KMSG_DRAIN_CHUNK {
+            // Yield cooperatively between chunks so we do not monopolise the
+            // CPU during a burst.  nanosleep(0) → kernel yield_now().
             let _ = syscall_lib::nanosleep(0);
-            break;
+            chunk_count = 0;
         }
     }
 }

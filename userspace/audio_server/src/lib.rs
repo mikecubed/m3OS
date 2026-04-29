@@ -39,6 +39,7 @@ pub mod client;
 pub mod device;
 pub mod irq;
 pub mod stream;
+pub mod stub;
 
 /// Boot-log marker written when the driver starts. Used by xtask smoke
 /// scripts to confirm the daemon spawned.

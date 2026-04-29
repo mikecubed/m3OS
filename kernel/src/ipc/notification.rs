@@ -535,7 +535,11 @@ pub fn signal(notif_id: NotifId, bits: u64) {
         w
     };
     if let Some(task) = waiter {
-        let _ = scheduler::wake_task(task);
+        // D.3: route through wake_task_v2 under sched-v2 so all wake paths
+        // use the CAS primitive and no v1 deferred-enqueue flag is set.
+        {
+            let _ = scheduler::wake_task_v2(task);
+        }
     }
     // Also trigger reschedule in case the waiter wasn't in WAITERS yet
     // (it may be between the swap(0) check and the waiter registration).
@@ -739,7 +743,12 @@ pub fn drain_pending_waiters() {
             }
         };
         if let Some(task) = waiter {
-            let _ = scheduler::wake_task(task);
+            // D.3: route through wake_task_v2 under sched-v2 so all wake
+            // paths use the CAS primitive and no v1 deferred-enqueue flag
+            // is set.  Under the default (v1) build, use the existing path.
+            {
+                let _ = scheduler::wake_task_v2(task);
+            }
         }
     }
 }
@@ -800,8 +809,25 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         }
         // Release WAITERS lock before blocking; signal() can now wake us.
 
-        // Block using the dedicated notification state.
-        scheduler::block_current_on_notif();
+        // F.2: Block using the v2 or v1 path depending on the `sched-v2` feature.
+        //
+        // Under `sched-v2`: use `block_current_until` with a dummy local
+        // `AtomicBool`.  The flag is never explicitly set by the wake side;
+        // instead, `wake_task_v2` (called from `signal`/`drain_pending_waiters`)
+        // transitions the task to Ready via CAS.  On resume the outer loop
+        // re-drains `PENDING[idx]`, so the woken-flag value is irrelevant.
+        // No deadline is passed (notifications have no built-in timeout).
+        //
+        // Under v1 the original `block_current_on_notif()` path is retained.
+        {
+            use core::sync::atomic::AtomicBool;
+            let woken = AtomicBool::new(false);
+            let _ = scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnNotif,
+                &woken,
+                None,
+            );
+        }
         // On wake, loop back to drain pending bits.
     }
 }

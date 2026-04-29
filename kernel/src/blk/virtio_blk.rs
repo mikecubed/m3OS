@@ -25,7 +25,7 @@ use x86_64::instructions::interrupts;
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
-use crate::task::scheduler::{current_task_id, wake_task};
+use crate::task::scheduler::current_task_id;
 
 // ===========================================================================
 // PCI device IDs
@@ -359,7 +359,11 @@ impl Virtqueue {
                 && let Some(waiter) = self.waiters[head as usize].take()
             {
                 waiter.woken.store(true, Ordering::Release);
-                wake_task(waiter.task);
+                // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
+                {
+                    use crate::task::scheduler::wake_task_v2;
+                    let _ = wake_task_v2(waiter.task);
+                }
                 // status_virt is read by the task after wake; no IRQ
                 // work needed here.
                 let _ = waiter.status_virt;
@@ -593,25 +597,37 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
         Ok(unsafe { scratch_virt.add(64) })
     });
     let status_virt = status_virt_result?;
-    // Phase 2: poll the used ring for the completion. The IRQ handler
-    // also drains the used ring (and is still wired up for any future
-    // async consumer), but we deliberately do not park on `REQ_WOKEN`
-    // here: the scheduler-park path round-trips a context switch and an
+    // Phase 2: park on `REQ_WOKEN` until the IRQ handler's
+    // `drain_used_from_irq` drains the completion and releases us.
+    //
+    // History: a previous incarnation of this loop busy-spun on
+    // `REQ_WOKEN` instead of parking, with the rationale that
+    // "the scheduler-park path round-trips a context switch and an
     // optional cross-core wake on every sector, which makes boot-time
-    // readdir / inode walks take minutes under SMP. Polling matches the
-    // pre-Phase-55 virtio-blk performance profile and is safe because
-    // the completion arrives in well under a scheduler tick.
-    while !REQ_WOKEN.load(Ordering::Acquire) {
-        interrupts::without_interrupts(|| {
-            if let Some(ref mut d) = *DRIVER.lock() {
-                d.request_queue.drain_used_from_irq();
-            }
-        });
-        if REQ_WOKEN.load(Ordering::Acquire) {
-            break;
-        }
-        core::hint::spin_loop();
-    }
+    // readdir / inode walks take minutes under SMP."  That assumption
+    // held a single CPU in kernel mode until the IRQ fired — fine on
+    // BSP-only or when the IRQ comes back fast, but on multi-core boots
+    // where this CPU's task list contains other daemons (term,
+    // stdin_feeder, console, etc.) it monopolised the core for the
+    // entire duration of every disk I/O.  In Phase 57a's syslogd-on-
+    // core-1 hang, syslogd's `WRITE` to /var/log/kern.log hit this
+    // spin on its first sector, and core 1 never dispatched another
+    // task again — `term` never started, `session_manager` text-fell-
+    // back, the cursor froze.  Cooperative scheduling means a busy-
+    // wait in any kernel syscall is a denial-of-service for everything
+    // queued on the same core.
+    //
+    // Park is cheap enough now that the original SMP perf concern is
+    // dominated by the cost of NOT parking.  block_current_until's
+    // self-revert path handles the "IRQ fired before we parked" race:
+    // if `REQ_WOKEN` is already true at entry, the function returns
+    // without yielding.  No deadline because the IRQ is the only wake
+    // source.
+    let _ = crate::task::scheduler::block_current_until(
+        crate::task::TaskState::BlockedOnRecv,
+        &REQ_WOKEN,
+        None,
+    );
     // Phase 3: read the status byte (driver lock re-acquired to ensure
     // memory ordering). Same IF-off rule as the submit side.
     let status = interrupts::without_interrupts(|| {

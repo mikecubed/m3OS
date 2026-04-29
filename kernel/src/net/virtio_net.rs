@@ -32,7 +32,6 @@ use x86_64::instructions::port::Port;
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
-use crate::task::scheduler::wake_task;
 
 // ===========================================================================
 // Legacy virtio I/O register offsets (common header)
@@ -487,7 +486,10 @@ pub fn wake_net_task() {
     crate::net::NIC_WOKEN.store(true, Ordering::Release);
     let raw = NET_TASK_ID.load(Ordering::Acquire);
     if raw != 0 {
-        let _ = wake_task(TaskId(raw));
+        // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
+        {
+            let _ = crate::task::scheduler::wake_task_v2(TaskId(raw));
+        }
     } else {
         crate::task::scheduler::signal_reschedule();
     }

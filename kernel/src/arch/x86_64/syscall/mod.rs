@@ -1331,6 +1331,19 @@ mod syscall_nr {
 /// |     231 | exit_group  | ✓ kills all threads   |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
+/// Phase 57a follow-up DEBUG: per-pid syscall trace.
+///
+/// When set to a non-zero PID, every `syscall_handler` entry/exit for that
+/// PID emits an INFO-level `[strace]` log line (number, args, return value,
+/// core).  Used to diagnose tasks that monopolise their core — a syscall
+/// that enters but never exits localises the busy-wait to a specific
+/// kernel-side call site.
+///
+/// Default 0 = disabled.  Available at runtime via gdb for future
+/// daemon-monopolisation investigations: `set
+/// crate::arch::x86_64::syscall::STRACE_PID = N`.
+pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     number: u64,
@@ -1348,6 +1361,25 @@ pub extern "C" fn syscall_handler(
     // scheduler's restore path — block/yield sites no longer need to be
     // the primary save point.
     snapshot_user_return_state();
+
+    // Phase 57a follow-up DEBUG: per-pid syscall trace.
+    let strace_match = {
+        let trace_pid = STRACE_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pid = crate::process::current_pid();
+        trace_pid != 0 && pid == trace_pid
+    };
+    if strace_match {
+        let core_id = crate::smp::try_per_core().map(|c| c.core_id).unwrap_or(255);
+        log::info!(
+            "[strace] pid={} core={} enter syscall={} args=({:#x}, {:#x}, {:#x})",
+            crate::process::current_pid(),
+            core_id,
+            number,
+            arg0,
+            arg1,
+            arg2,
+        );
+    }
 
     // Phase 52b: debug-assert that per-core current_addrspace matches the
     // calling process's addr_space (catches stale CR3 / process mismatch).
@@ -1745,6 +1777,19 @@ pub extern "C" fn syscall_handler(
 
     maybe_quiesce_current_group_exit();
 
+    // Phase 57a follow-up DEBUG: per-pid syscall trace exit side.
+    if strace_match {
+        let core_id = crate::smp::try_per_core().map(|c| c.core_id).unwrap_or(255);
+        log::info!(
+            "[strace] pid={} core={} exit  syscall={} ret={:#x} ({})",
+            crate::process::current_pid(),
+            core_id,
+            number,
+            result,
+            result as i64,
+        );
+    }
+
     // Phase 14/19: check pending signals before returning to userspace.
     // If a user handler is delivered, this diverges and never returns.
     check_pending_signals(result);
@@ -2042,7 +2087,10 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
             wake_ids
         };
         for tid in to_wake {
-            let _ = crate::task::wake_task(tid);
+            // F.3: route through wake_task_v2 under sched-v2 (CAS-based wake).
+            {
+                let _ = crate::task::scheduler::wake_task_v2(tid);
+            }
         }
     }
 }
@@ -3186,6 +3234,31 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
     }
 
     let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+
+    // F.5: Under sched-v2, sleeps ≥ 1 ms use block_current_until with an
+    // absolute tick deadline (1 tick = 1 ms, TICKS_PER_SEC = 1000).
+    // The woken flag is a dummy local AtomicBool that is never set externally;
+    // the task is woken solely by scan_expired_wake_deadlines when the
+    // deadline tick arrives. Sleeps < 1 ms retain the TSC busy-spin (the
+    // cost of a context switch exceeds the sleep duration).
+    if sleep_us >= 1_000 {
+        // deadline_ticks = now + ceil(sleep_us / 1000) = now + ceil(sleep_ns / 1_000_000)
+        let sleep_ms = sleep_us.div_ceil(1_000);
+        let now_ticks = crate::arch::x86_64::interrupts::tick_count();
+        let deadline_ticks = now_ticks.saturating_add(sleep_ms);
+        let woken = core::sync::atomic::AtomicBool::new(false);
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            Some(deadline_ticks),
+        );
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        return 0;
+    }
+
+    // v1 path (all durations) and sched-v2 path for < 1 ms:
     if tsc_per_ms == 0 {
         // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
         let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
@@ -3197,21 +3270,20 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
                 return NEG_EINTR;
             }
         }
-    } else if sleep_us < 5_000 {
-        // Short sleep (< 5 ms): TSC busy-spin without yielding.
+    } else if sleep_us < 1_000 {
+        // Short sleep (< 1 ms): TSC busy-spin without yielding.
         //
         // APs have a 10 ms timer granularity, so a single yield_now() would
-        // sleep ~10 ms — far too coarse for the 1 ms sleeps that DOOM's game
-        // loop relies on for accurate 35 Hz tic timing.  A brief busy-spin is
-        // acceptable here: the sleep completes in < 5 ms and the cost is a
-        // small window of raised interrupt latency on this core.
+        // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
+        // busy-spin is acceptable here: the sleep completes in < 1 ms and the
+        // cost of a context switch would exceed the sleep duration.
         let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
             core::hint::spin_loop();
         }
     } else {
-        // Long sleep (≥ 5 ms): yield-based sleep.
+        // Long sleep (≥ 1 ms, v1 path only): yield-based sleep.
         // TSC is invariant across cores, so this is accurate regardless of
         // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
         // granularity, which is acceptable for multi-millisecond sleeps.
@@ -12446,7 +12518,18 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
-            crate::task::block_current_on_futex_unless_woken(&woken_flag);
+            //
+            // F.3: Under sched-v2 use block_current_until (v2 CAS primitive)
+            // instead of block_current_on_futex_unless_woken (v1). The
+            // woken_flag is shared with the wake side; the Arc clone above
+            // ensures it lives until the waiter is removed from FUTEX_TABLE.
+            {
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnFutex,
+                    &woken_flag,
+                    None,
+                );
+            }
 
             0
         }
@@ -12494,10 +12577,19 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Wake the tasks outside the FUTEX_TABLE lock.
             // Only count tasks that were actually transitioned to Ready
             // (skip Dead or already-woken tasks).
+            //
+            // F.3: under sched-v2 use wake_task_v2 (CAS-based); under v1
+            // use wake_task (deferred-enqueue path).
             let mut actual_woken = 0usize;
             for tid in to_wake {
-                if crate::task::wake_task(tid) {
-                    actual_woken += 1;
+                {
+                    use crate::task::scheduler::WakeOutcome;
+                    if matches!(
+                        crate::task::scheduler::wake_task_v2(tid),
+                        WakeOutcome::Woken
+                    ) {
+                        actual_woken += 1;
+                    }
                 }
             }
 
@@ -14641,10 +14733,12 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
-    // Convert ms timeout to tick deadline. ~100 Hz timer → 10ms/tick.
+    // Convert ms timeout to tick deadline.
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `(timeout_i as u64).div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
     let deadline_tick = if timeout_i > 0 {
-        Some(start_tick + (timeout_i as u64).div_ceil(10)) // round up
+        Some(start_tick + (timeout_i as u64)) // 1 tick = 1 ms; no divisor needed
     } else {
         None // 0 = non-blocking, -1 = indefinite
     };
@@ -14746,21 +14840,33 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             break NEG_EINTR;
         }
 
-        // If no FDs could be registered (all non-pollable), yield to avoid
-        // spinning at full CPU with no wake source.
-        if !registered_any {
-            crate::task::yield_now();
-            continue;
-        }
-
-        // Block until woken by an FD event. For positive timeouts, yield
-        // so the tick counter advances and the deadline check at the top
-        // of the loop can fire; for indefinite timeouts, fully block.
-        // In both cases, waiters remain registered across the suspend.
-        if deadline_tick.is_some() {
-            crate::task::yield_now();
+        // Block until woken by an FD event or timeout.
+        //
+        // F.4: Under sched-v2, use block_current_until for both branches:
+        // - Positive timeout: pass deadline_tick so the deadline scanner
+        //   wakes us when the timeout expires (no yield_now() spin needed).
+        // - Indefinite timeout: pass None; wake comes from WaitQueue.
+        //
+        // Even when no FDs could be registered (all non-pollable), we
+        // still park instead of yield-looping.  yield_now() in this
+        // branch made `poll(non_pollable_fd, 1000ms)` busy-yield for the
+        // entire 1-second timeout, monopolising the calling core because
+        // m3OS is cooperatively scheduled — every queued task on the
+        // same core was starved.  block_current_until with the deadline
+        // wakes us at the right time without burning CPU.  If no
+        // waiters AND no deadline, we'd never wake; fall back to a
+        // single yield_now() so the syscall makes progress on its next
+        // top-of-loop scan (this is the legitimate "non-pollable FD,
+        // indefinite timeout" case — better to round-robin than to
+        // hang forever).
+        if registered_any || deadline_tick.is_some() {
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
         } else {
-            crate::task::scheduler::block_current_unless_woken(&woken);
+            crate::task::yield_now();
         }
     };
 
@@ -14889,9 +14995,9 @@ fn select_inner(
         Err(e) => return e,
     };
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
-    let deadline_tick = timeout_ms
-        .filter(|&ms| ms > 0)
-        .map(|ms| start_tick + ms.div_ceil(10));
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `ms.div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
+    let deadline_tick = timeout_ms.filter(|&ms| ms > 0).map(|ms| start_tick + ms); // 1 tick = 1 ms; no divisor needed
     let nonblocking = timeout_ms == Some(0);
 
     let combined = read_mask | write_mask | except_mask;
@@ -15004,19 +15110,16 @@ fn select_inner(
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
-            for fd in 0..nfds {
-                if let Some(entry) = &entries[fd]
-                    && combined & (1 << fd) != 0
-                {
-                    fd_deregister_waiter(entry, task_id);
-                }
-            }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (NULL): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        {
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -15300,8 +15403,10 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
     }
     let timeout_i = timeout as i64;
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    // TICKS_PER_SEC = 1000, so 1 tick = 1 ms: deadline = start + timeout_ms (no ÷10).
+    // The old `(timeout_i as u64).div_ceil(10)` assumed a 100 Hz timer — G.3 fix.
     let deadline_tick = if timeout_i > 0 {
-        Some(start_tick + (timeout_i as u64).div_ceil(10))
+        Some(start_tick + (timeout_i as u64)) // 1 tick = 1 ms; no divisor needed
     } else {
         None
     };
@@ -15419,17 +15524,16 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
-            for interest in &interests {
-                if let Some(entry) = current_fd_entry(interest.fd) {
-                    fd_deregister_waiter(&entry, task_id);
-                }
-            }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (-1): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        {
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                deadline_tick,
+            );
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);

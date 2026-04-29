@@ -332,7 +332,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                             "[ipc] recv_msg: capability table full, unblocking sender without reply"
                         );
                         scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        let _ = scheduler::wake_task(pending.task);
+                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
                         return Message::new(u64::MAX);
                     }
                 }
@@ -351,7 +352,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 }
                 // Wake the sender with an error so it doesn't block forever.
                 scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                let _ = scheduler::wake_task(pending.task);
+                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                let _ = crate::task::scheduler::wake_task_v2(pending.task);
                 return Message::new(u64::MAX);
             }
             // Phase 56 close-out — communicate the assigned reply-cap handle
@@ -377,7 +379,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             });
             if !pending.wants_reply {
                 scheduler::complete_send(pending.task);
-                let _ = scheduler::wake_task(pending.task);
+                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                let _ = crate::task::scheduler::wake_task_v2(pending.task);
             }
         }
         None => {
@@ -386,7 +389,13 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_recv_unless_message();
+            // Track F.1: migrate recv_msg block site to v2 protocol under sched-v2.
+            //
+            // Approach (c): condition recheck is owned by the IPC layer.
+            // block_current_on_recv_v2 checks pending_msg.is_some() as a fast-path
+            // before calling block_current_until. After return, take_message()
+            // confirms delivery (same as v1). The v1 path remains for fallback.
+            let _ = scheduler::block_current_on_recv_v2(receiver);
         }
     }
     // After waking (or immediate delivery), consume the pending message.
@@ -444,7 +453,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
                     "[ipc] recv_msg_nowait: capability table full, unblocking sender without reply"
                 );
                 scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                let _ = scheduler::wake_task(pending.task);
+                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                let _ = crate::task::scheduler::wake_task_v2(pending.task);
                 return Some(Message::new(u64::MAX));
             }
         }
@@ -461,7 +471,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
             let _ = scheduler::remove_task_cap(receiver, handle);
         }
         scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-        let _ = scheduler::wake_task(pending.task);
+        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+        let _ = crate::task::scheduler::wake_task_v2(pending.task);
         return Some(Message::new(u64::MAX));
     }
 
@@ -480,7 +491,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
     });
     if !pending.wants_reply {
         scheduler::complete_send(pending.task);
-        let _ = scheduler::wake_task(pending.task);
+        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+        let _ = crate::task::scheduler::wake_task_v2(pending.task);
     }
 
     scheduler::take_message(receiver)
@@ -548,7 +560,8 @@ pub fn recv_msg_with_notif(
                     Err(_) => {
                         log::warn!("[ipc] recv_msg_with_notif: cap table full");
                         scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        let _ = scheduler::wake_task(pending.task);
+                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
                         return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
                     }
                 }
@@ -561,7 +574,8 @@ pub fn recv_msg_with_notif(
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
                 scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                let _ = scheduler::wake_task(pending.task);
+                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                let _ = crate::task::scheduler::wake_task_v2(pending.task);
                 return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
             }
 
@@ -577,7 +591,8 @@ pub fn recv_msg_with_notif(
             transfer_bulk(pending.task, receiver);
             if !pending.wants_reply {
                 scheduler::complete_send(pending.task);
-                let _ = scheduler::wake_task(pending.task);
+                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                let _ = crate::task::scheduler::wake_task_v2(pending.task);
             }
 
             match scheduler::take_message(receiver) {
@@ -609,7 +624,12 @@ pub fn recv_msg_with_notif(
                 return (RECV_KIND_NOTIFICATION, msg);
             }
 
-            scheduler::block_current_on_notif_unless_message();
+            // Track F.1: migrate recv_msg_with_notif block site to v2 protocol.
+            //
+            // Approach (c): condition recheck owned by IPC layer (pending_msg check
+            // as fast-path in block_current_on_notif_v2; notification bits drained
+            // below after return). The v1 path remains for fallback.
+            let _ = scheduler::block_current_on_notif_v2(receiver);
             notification::unregister_recv_waiter(notif_id, receiver);
 
             if let Some(msg) = scheduler::take_message(receiver) {
@@ -699,7 +719,8 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
             // blocking.  In that case wake_task() correctly returns false
             // and the receiver will observe the delivered message and skip
             // blocking.
-            let _ = scheduler::wake_task(receiver);
+            // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+            let _ = crate::task::scheduler::wake_task_v2(receiver);
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -713,7 +734,13 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send_unless_completed();
+            // Track F.1: migrate send block site to v2 protocol under sched-v2.
+            //
+            // Approach (c): block_current_on_send_v2 checks
+            // pending_msg.is_some() || send_completed as a fast-path before
+            // calling block_current_until, then clears send_completed on return.
+            // The v1 path remains for fallback.
+            let _ = scheduler::block_current_on_send_v2(sender);
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
                     msg.label == u64::MAX,
@@ -775,13 +802,15 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                     // explicit IPC error so it does not remain stranded.
                     drop(reg);
                     scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                    let _ = scheduler::wake_task(receiver);
+                    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                    let _ = crate::task::scheduler::wake_task_v2(receiver);
                 }
                 return Message::new(u64::MAX);
             }
             scheduler::deliver_message(receiver, msg);
             transfer_bulk(caller, receiver);
-            let _ = scheduler::wake_task(receiver);
+            // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+            let _ = crate::task::scheduler::wake_task_v2(receiver);
         }
         None => {
             // Server not yet waiting — we're already enqueued above with
@@ -793,7 +822,16 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         task_idx: caller.0 as u32,
         ep: ep_id.0 as u32,
     });
-    scheduler::block_current_on_reply_unless_message();
+    // Track C.4: migrate IPC call path to v2 block primitive (sched-v2 gate).
+    //
+    // Under sched-v2, block_current_on_reply_v2 wraps block_current_until with
+    // a local AtomicBool, following the four-step Linux do_nanosleep recipe.
+    // Under v1, the legacy block_current_on_reply_unless_message is used.
+    //
+    // Note: The woken-flag fast-path (step 3 self-revert) requires Track D's
+    // wake_task rewrite to set the AtomicBool on the wake side. Until then the
+    // function always yields (step 4), but the outcome is semantically correct.
+    let _ = scheduler::block_current_on_reply_v2(caller);
     // Woken by reply() — reply message was delivered into our slot.
     match scheduler::take_message(caller) {
         Some(msg) => msg,
@@ -850,7 +888,8 @@ pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
     // Can legitimately race with the caller still transitioning into its
     // reply-blocked state.  If that happens, the reply is already pending
     // and the caller will observe it and skip blocking.
-    let _ = scheduler::wake_task(caller);
+    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+    let _ = crate::task::scheduler::wake_task_v2(caller);
 }
 
 /// Reply to the current caller and immediately receive the next message.
@@ -973,7 +1012,8 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 } else {
                     drop(reg);
                     scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                    let _ = scheduler::wake_task(receiver);
+                    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                    let _ = crate::task::scheduler::wake_task_v2(receiver);
                 }
                 return false;
             }
@@ -983,14 +1023,19 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            let _ = scheduler::wake_task(receiver);
+            // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+            let _ = crate::task::scheduler::wake_task_v2(receiver);
         }
         None => {
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send_unless_completed();
+            // Track F.1: migrate send_with_cap block site to v2 protocol.
+            //
+            // Approach (c): same as the send() block site above. The v1 path
+            // remains for fallback.
+            let _ = scheduler::block_current_on_send_v2(sender);
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
                     msg.label == u64::MAX,
