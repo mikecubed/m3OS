@@ -819,7 +819,23 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
         }
         // Release WAITERS lock before blocking; signal() can now wake us.
 
-        // Block using the dedicated notification state.
+        // F.2: Block using the v2 or v1 path depending on the `sched-v2` feature.
+        //
+        // Under `sched-v2`: use `block_current_until` with a dummy local
+        // `AtomicBool`.  The flag is never explicitly set by the wake side;
+        // instead, `wake_task_v2` (called from `signal`/`drain_pending_waiters`)
+        // transitions the task to Ready via CAS.  On resume the outer loop
+        // re-drains `PENDING[idx]`, so the woken-flag value is irrelevant.
+        // No deadline is passed (notifications have no built-in timeout).
+        //
+        // Under v1 the original `block_current_on_notif()` path is retained.
+        #[cfg(feature = "sched-v2")]
+        {
+            use core::sync::atomic::AtomicBool;
+            let woken = AtomicBool::new(false);
+            let _ = scheduler::block_current_until(&woken, None);
+        }
+        #[cfg(not(feature = "sched-v2"))]
         scheduler::block_current_on_notif();
         // On wake, loop back to drain pending bits.
     }
