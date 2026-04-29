@@ -2114,19 +2114,51 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
 
     // ── Step 5: Enqueue to assigned_core run queue + reschedule IPI ──────────
     //
-    // D.2: `enqueue_to_core` already sends a reschedule IPI when the target
-    // core differs from the caller's core (Phase 54, ~line 780 in this file):
+    // SLOT-RECYCLE GUARD: between dropping pi_lock+SCHEDULER.lock at end of
+    // step 3 and reaching here, the task we just CAS'd to Ready could have
+    // been:
+    //   1. Marked Dead by another path (e.g. `mark_task_dead_by_pid`).
+    //   2. Drained to the free list by BSP cleanup (scheduler.rs:~496),
+    //      which only requires `state == Dead`, `ipc_cleaned`, `!on_cpu`,
+    //      `saved_rsp != 0`, `!task_current` — all of which become true
+    //      shortly after Dead.
+    //   3. Have its slot reused by `alloc_task_slot` (scheduler.rs:~821)
+    //      for a brand-new task with a different `TaskId`.
     //
-    //     if current != core_id {
-    //         smp::ipi::send_ipi_to_core(core_id, smp::ipi::IPI_RESCHEDULE);
-    //     }
+    // If we naively `enqueue_to_core(assigned_core, idx)` after that
+    // sequence, we'd push the NEW task's idx onto a queue using the
+    // OLD task's `assigned_core` — duplicate-enqueueing the new task
+    // and possibly placing it on the wrong core's run queue.
     //
-    // No additional IPI logic is required here — the existing mechanism is
-    // reused exactly as the D.2 acceptance criterion specifies.
+    // Take SCHEDULER.lock for the enqueue and revalidate `tasks[idx].id`.
+    // SCHEDULER.lock is the gate for both Dead-state mirror writes and
+    // alloc_task_slot, so holding it serialises us against recycle.
+    // Re-read `assigned_core` under the lock too, since load-balance
+    // could have migrated the (still-our) task between step 3 and now.
     //
-    // Linux analog: `ttwu_queue` calls `resched_curr` (same-core) or
-    // `smp_send_reschedule` / `send_call_function_single_ipi` (cross-core).
-    enqueue_to_core(assigned_core, idx);
+    // D.2: `enqueue_to_core` already sends a reschedule IPI when the
+    // target differs from the caller's core; `wait_icr_idle()` is
+    // bounded so spinning on it under SCHEDULER.lock is safe.
+    //
+    // Linux analog: `ttwu_queue` runs under `rq->lock`; `try_to_wake_up`
+    // re-checks `p->state` after the on_cpu spin before the actual
+    // enqueue.
+    {
+        let sched = scheduler_lock();
+        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
+            // Slot recycled or task vanished — abandon the enqueue.  The
+            // new task occupying this slot (if any) has its own enqueue
+            // path via `spawn_fork_task`.
+            return WakeOutcome::AlreadyAwake;
+        }
+        let live_assigned_core = sched.tasks[idx].assigned_core;
+        // Drop the lock before enqueue_to_core (which takes the per-core
+        // run_queue lock and may send an IPI — both safe outside
+        // SCHEDULER.lock).  We've now confirmed the slot identity and
+        // captured the live `assigned_core`.
+        drop(sched);
+        enqueue_to_core(live_assigned_core, idx);
+    }
 
     WakeOutcome::Woken
 }
