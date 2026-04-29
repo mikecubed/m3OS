@@ -1339,11 +1339,14 @@ mod syscall_nr {
 /// that enters but never exits localises the busy-wait to a specific
 /// kernel-side call site.
 ///
-/// Default 0 = disabled.  Set to 2 (syslogd's expected PID) by default
-/// during the Phase 57a syslogd-on-core-1 hang investigation; flip to 0
-/// once the bug is fixed.  Can also be flipped at runtime via gdb:
-/// `set crate::arch::x86_64::syscall::STRACE_PID = N`.
-pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+/// Default 0 = disabled.  Was set to 2 during the Phase 57a syslogd-on-
+/// core-1 hang investigation (which localised the bug to virtio_blk's
+/// `do_request` busy-spin).  Now temporarily set to 11 (vfs_server) for
+/// the next investigation — multiple daemons (sshd/crond/vfs/etc.) still
+/// hang their cores after the virtio_blk fix; vfs_server's startup is
+/// the most likely shared dependency.  Flip to 0 once root-caused.
+pub(crate) static STRACE_PID: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(11);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
