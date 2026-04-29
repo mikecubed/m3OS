@@ -1039,4 +1039,103 @@ mod tests {
         assert!(!fx2.yielded, "self-revert must NOT yield");
         assert!(fx2.deadline_cleared, "self-revert must clear wake_deadline");
     }
+
+    // ── E.1 — on_cpu_wait_required invariant ─────────────────────────────
+    //
+    // When a wake fires while a task is in any Blocked* state, the model
+    // requires the wake side to spin-wait on `Task::on_cpu == false` before
+    // enqueuing.  This is the RSP-publication barrier: the arch-level
+    // switch-out epilogue clears `on_cpu` only after `saved_rsp` is durably
+    // written to the task struct.  A waker that skips the spin-wait can
+    // observe a published `Ready` state but a stale `saved_rsp`, causing the
+    // dispatch path to jump to garbage.
+    //
+    // The model encodes this requirement as `SideEffects::on_cpu_wait_required`
+    // on every `(Blocked*, Wake) → Ready` transition.  The kernel translates
+    // it into a `while task.on_cpu.load(Acquire) { core::hint::spin_loop() }`
+    // in D.1's `wake_task` implementation.
+
+    /// `BlockedOnRecv × Wake → Ready` sets `on_cpu_wait_required`.
+    ///
+    /// After `(Running, Block{Recv})` the arch-level epilogue has not yet
+    /// cleared `Task::on_cpu`.  A concurrent waker must stall until it does.
+    #[test]
+    fn wake_during_switch_out_window_requires_on_cpu_wait() {
+        // Step 1: Running → BlockedOnRecv (task entered switch-out window).
+        let (blocked_state, block_fx) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(blocked_state, BlockState::BlockedOnRecv);
+        assert!(block_fx.yielded, "block must yield");
+
+        // Step 2: Concurrent wake fires while the task is in the switch-out
+        // window (on_cpu == true at the kernel level; model-level: the task
+        // is in Blocked*).
+        let (wake_state, wake_fx) = apply_event(blocked_state, Event::Wake);
+        assert_eq!(
+            wake_state,
+            BlockState::Ready,
+            "wake must transition to Ready"
+        );
+        assert!(
+            wake_fx.on_cpu_wait_required,
+            "wake side MUST spin-wait on on_cpu == false before enqueue \
+             (RSP-publication barrier, Linux p->on_cpu pattern)"
+        );
+        assert!(wake_fx.enqueue_to_run_queue, "wake must request enqueue");
+        assert!(wake_fx.deadline_cleared, "wake must clear deadline");
+    }
+
+    /// All Blocked* variants × Wake produce `on_cpu_wait_required`.
+    ///
+    /// The RSP-publication window exists for every block kind, not just Recv.
+    /// This test exhaustively checks every (Blocked*, Wake) row.
+    #[test]
+    fn all_blocked_wake_transitions_require_on_cpu_wait() {
+        let blocked_states = [
+            BlockState::BlockedOnRecv,
+            BlockState::BlockedOnSend,
+            BlockState::BlockedOnReply,
+            BlockState::BlockedOnNotif,
+            BlockState::BlockedOnFutex,
+        ];
+        for &s in &blocked_states {
+            let (new_state, fx) = apply_event(s, Event::Wake);
+            assert_eq!(new_state, BlockState::Ready, "state={:?}", s);
+            assert!(
+                fx.on_cpu_wait_required,
+                "on_cpu_wait_required must be true for state={:?} × Wake",
+                s
+            );
+        }
+    }
+
+    /// `Blocked* × ScanExpired → Ready` does NOT set `on_cpu_wait_required`.
+    ///
+    /// The deadline scanner runs inside `SCHEDULER.lock`; enqueue is deferred
+    /// to after lock release.  The scan cannot race with the epilogue because
+    /// both paths hold `SCHEDULER.lock` — no spin-wait is needed.
+    #[test]
+    fn scan_expired_wake_does_not_require_on_cpu_wait() {
+        let blocked_states = [
+            BlockState::BlockedOnRecv,
+            BlockState::BlockedOnSend,
+            BlockState::BlockedOnReply,
+            BlockState::BlockedOnNotif,
+            BlockState::BlockedOnFutex,
+        ];
+        for &s in &blocked_states {
+            let (new_state, fx) = apply_event(s, Event::ScanExpired { now: 9999 });
+            assert_eq!(new_state, BlockState::Ready, "state={:?}", s);
+            assert!(
+                !fx.on_cpu_wait_required,
+                "scan_expired must NOT set on_cpu_wait_required for state={:?}",
+                s
+            );
+        }
+    }
 }

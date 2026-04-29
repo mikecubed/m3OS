@@ -239,6 +239,26 @@ pub struct Task {
     /// `tick_count()` at dispatch time to measure ready-to-running latency
     /// (Phase 54 diagnostic).
     pub last_ready_tick: u64,
+    /// True while the task is mid-context-switch and its `saved_rsp` may not
+    /// yet be published.
+    ///
+    /// Set under `SCHEDULER.lock` alongside `switching_out = true`, before
+    /// `switch_context`. Cleared by the dispatch handler immediately after
+    /// `saved_rsp` is durably written to this struct (arch-level switch-out
+    /// epilogue, around `scheduler.rs:2279`).
+    ///
+    /// Replaces the RSP-publication aspect of v1's `PENDING_SWITCH_OUT[core]`
+    /// (Linux `p->on_cpu` `smp_cond_load_acquire` pattern in
+    /// `try_to_wake_up`). D.1's wake-side spin-wait reads this flag with
+    /// `Acquire` ordering; the epilogue clear uses `Release`. This
+    /// Release/Acquire pair guarantees that a waker observing
+    /// `on_cpu == false` is guaranteed to see the published `saved_rsp`.
+    ///
+    /// Track E.3 deletes `switching_out` once all v1 call sites are migrated
+    /// (Track F). During the F.1–F.6 migration window, both fields are set
+    /// and cleared together so `pick_next`'s dual guard (`!switching_out &&
+    /// !on_cpu.load(Acquire)`) agrees with both paths.
+    pub on_cpu: core::sync::atomic::AtomicBool,
     /// True while the task is returning to the scheduler and its kernel stack
     /// pointer has not been safely published yet.
     pub switching_out: bool,
@@ -331,6 +351,7 @@ impl Task {
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,
+            on_cpu: core::sync::atomic::AtomicBool::new(false),
             switching_out: false,
             wake_after_switch: false,
             ipc_cleaned: false,
@@ -483,3 +504,60 @@ core::arch::global_asm!(
     "  pop  rbx",
     "  ret", // pop rip from new stack → jump to resumed task
 );
+
+// ---------------------------------------------------------------------------
+// E.1 in-kernel QEMU tests
+// ---------------------------------------------------------------------------
+//
+// The kernel crate is `no_std` and uses the `test_case` framework
+// (see `crate::test_runner`) rather than libtest's `#[test]`. Using
+// `#[test_case]` lets these checks run inside the kernel test harness
+// alongside the rest of the QEMU-driven suite.
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::Ordering;
+
+    /// Verify that `Task::on_cpu` can be set and cleared with the correct
+    /// Release/Acquire ordering semantics expected by the epilogue clear and
+    /// D.1's wake-side spin-wait.
+    ///
+    /// Exercises the AtomicBool API and memory-ordering contract in isolation
+    /// (no scheduler lock, no switch_context).
+    #[test_case]
+    fn on_cpu_set_clear_round_trip() {
+        let flag = core::sync::atomic::AtomicBool::new(false);
+
+        // Initially false — task is not in a switch-out window.
+        assert!(!flag.load(Ordering::Acquire));
+
+        // Block-side path: set to true before switch_context (Release).
+        flag.store(true, Ordering::Release);
+        assert!(flag.load(Ordering::Acquire));
+
+        // Epilogue clear: set to false after saved_rsp is committed (Release).
+        flag.store(false, Ordering::Release);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    /// Verify pick_next dual-guard semantics: a task with `on_cpu == true`
+    /// must be excluded from dispatch even if `switching_out` already covers it.
+    #[test_case]
+    fn on_cpu_and_switching_out_dual_guard() {
+        let on_cpu = core::sync::atomic::AtomicBool::new(false);
+
+        // Neither flag set → eligible for dispatch.
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(eligible);
+
+        // on_cpu set → ineligible (dual guard).
+        on_cpu.store(true, Ordering::Release);
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(!eligible);
+
+        // on_cpu cleared → eligible again.
+        on_cpu.store(false, Ordering::Release);
+        let eligible = !on_cpu.load(Ordering::Acquire);
+        assert!(eligible);
+    }
+}

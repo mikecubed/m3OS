@@ -443,7 +443,13 @@ impl Scheduler {
             .filter(|(idx, task)| {
                 task.state == TaskState::Dead
                     && !task.ipc_cleaned
+                    // E.1 dual guard (v1 + v2 co-exist during F.1–F.6 window).
+                    // switching_out is the v1 RSP-publication guard; on_cpu is
+                    // the E.1 replacement. Both must be false for the task to
+                    // be considered off-CPU with a durable saved_rsp. E.3 will
+                    // remove the switching_out half once all v1 callers migrate.
                     && !task.switching_out
+                    && !task.on_cpu.load(Ordering::Acquire)
                     && task.saved_rsp != 0
                     && !self.task_current_on_any_core(*idx)
             })
@@ -463,7 +469,9 @@ impl Scheduler {
             let task = &mut self.tasks[i];
             if task.state == TaskState::Dead
                 && task.ipc_cleaned
+                // E.1 dual guard (v1 + v2 co-exist during F.1–F.6 window).
                 && !task.switching_out
+                && !task.on_cpu.load(Ordering::Acquire)
                 && task.saved_rsp != 0
                 && !task_current
             {
@@ -1049,6 +1057,8 @@ pub fn yield_now() {
         // switch_context saves the RSP. This prevents the global fallback from
         // picking up the task with a stale saved_rsp on another core.
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window (cleared by dispatch epilogue).
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1209,6 +1219,9 @@ fn block_current(state: TaskState) {
         sched.tasks[idx].state = state;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window so D.1's wake-side spin-wait
+        // can stall until saved_rsp is durably written by the epilogue.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1256,6 +1269,8 @@ fn block_current_unless_message(state: TaskState) {
         sched.tasks[idx].state = state;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1306,6 +1321,8 @@ pub fn block_current_on_send_unless_completed() {
         sched.tasks[idx].state = TaskState::BlockedOnSend;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1374,6 +1391,8 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1440,6 +1459,8 @@ fn block_current_unless_woken_inner(
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
         // hot-path `scan_expired_wake_deadlines` can skip the O(n) scan
         // when no task has a deadline set.
@@ -1787,6 +1808,8 @@ pub fn mark_current_dead() -> ! {
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::Dead;
         sched.tasks[idx].switching_out = true;
+        // E.1: mark RSP-publication window.
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
         idx
     };
@@ -1852,7 +1875,14 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
     let Some(idx) = sched.find_by_pid(pid) else {
         return false;
     };
-    if sched.task_current_on_any_core(idx) || sched.tasks[idx].switching_out {
+    // E.1 dual guard: task is still in the switch-out window if either the
+    // v1 switching_out flag is set OR the v2 on_cpu flag is set (Acquire
+    // pairs with the Release in the block-side store). E.3 removes the
+    // switching_out half after all v1 callers migrate.
+    if sched.task_current_on_any_core(idx)
+        || sched.tasks[idx].switching_out
+        || sched.tasks[idx].on_cpu.load(Ordering::Acquire)
+    {
         return false;
     }
     // TODO(57a-C/D): route through pi_lock + with_block_state
@@ -2578,6 +2608,17 @@ pub fn run() -> ! {
                 if sidx < sched.tasks.len() {
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
+                    // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably
+                    // written. The Release ordering ensures that a concurrent
+                    // waker on another core that observes on_cpu == false
+                    // (via Acquire load in D.1's spin-wait) is guaranteed to
+                    // see the freshly published saved_rsp. This replaces the
+                    // RSP-publication aspect of v1's PENDING_SWITCH_OUT[core]
+                    // guard (Linux p->on_cpu smp_cond_load_acquire pattern in
+                    // try_to_wake_up). Cleared here (after saved_rsp commit)
+                    // not at the top of the if-block to preserve the ordering
+                    // invariant.
+                    task.on_cpu.store(false, Ordering::Release);
                     // F.2: Validate saved_rsp after yield/block save.
                     if let Some((base, top)) = task.stack_bounds() {
                         debug_assert!(
