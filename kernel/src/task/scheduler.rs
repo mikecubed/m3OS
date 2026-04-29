@@ -56,6 +56,25 @@
 //!
 //! The timer ISR calls [`signal_reschedule`], which sets the calling core's
 //! reschedule flag. The scheduler loop checks this flag before halting.
+//!
+//! # Lock hierarchy (Phase 57a v2 protocol)
+//!
+//! `pi_lock` is *outer*, `SCHEDULER.lock` is *inner* (Linux's `p->pi_lock` →
+//! `rq->lock` pattern).  A code path may hold `pi_lock` while acquiring
+//! `SCHEDULER.lock`; the reverse is forbidden.
+//!
+//! **State ownership (SOLID Single-Responsibility split):**
+//! - `pi_lock` guards canonical block state: `TaskBlockState.state`,
+//!   `wake_deadline`.
+//! - `SCHEDULER.lock` guards scheduler-visible state: run-queue membership,
+//!   `Task::on_cpu` (introduced in E.1).
+//! - Scheduler-side iterations (`pick_next`, dispatch, `scan_expired`) read
+//!   scheduler-visible state — never `pi_lock`-protected fields.
+//!
+//! The lock-ordering invariant is enforced in debug builds by a per-CPU
+//! `holds_scheduler_lock: AtomicBool` (set/cleared in [`scheduler_lock`] /
+//! [`SchedulerLockSentinel::drop`]) that [`Task::with_block_state`] reads
+//! before acquiring `pi_lock`.
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -76,7 +95,7 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 // ---------------------------------------------------------------------------
 //
 // A same-core interrupt that calls `wake_task` can deadlock a task-context
-// holder of `SCHEDULER.lock()`. [`IrqSafeMutex`] prevents that by masking
+// holder of `scheduler_lock()`. [`IrqSafeMutex`] prevents that by masking
 // interrupts for the duration of the critical section — the same pattern
 // used by `virtio_net::DRIVER` (wrapped in `without_interrupts`) and the
 // frame allocator's `with_frame_alloc_irq_safe` helper. Root cause analysis
@@ -166,10 +185,86 @@ impl Drop for InterruptRestore {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57a B.3 — SCHEDULER lock sentinel
+// ---------------------------------------------------------------------------
+
+/// RAII guard that wraps [`IrqSafeGuard`] and sets/clears the per-CPU
+/// `holds_scheduler_lock` flag for the lock-ordering assertion in
+/// [`Task::with_block_state`].
+///
+/// Drop order: inner `IrqSafeGuard` releases the spin lock, then
+/// [`SchedulerLockSentinel`] clears the flag — so the flag is cleared after
+/// the lock is released, which is the safe ordering.
+pub(crate) struct SchedulerGuard<'a> {
+    inner: IrqSafeGuard<'a, Scheduler>,
+    _sentinel: SchedulerLockSentinel,
+}
+
+struct SchedulerLockSentinel;
+
+impl Drop for SchedulerLockSentinel {
+    fn drop(&mut self) {
+        // Clear the flag when the scheduler lock is released.
+        if let Some(core) = crate::smp::try_per_core() {
+            core.holds_scheduler_lock
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl core::ops::Deref for SchedulerGuard<'_> {
+    type Target = Scheduler;
+    fn deref(&self) -> &Scheduler {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for SchedulerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Scheduler {
+        &mut self.inner
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Statics
 // ---------------------------------------------------------------------------
 
-pub(super) static SCHEDULER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
+static SCHEDULER_INNER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
+
+/// Acquire the global scheduler lock, setting the per-CPU `holds_scheduler_lock`
+/// flag for the Phase 57a B.3 lock-ordering assertion.
+///
+/// Use this in place of `SCHEDULER_INNER.lock()` everywhere inside this module.
+#[inline]
+pub(super) fn scheduler_lock() -> SchedulerGuard<'static> {
+    let guard = SCHEDULER_INNER.lock();
+    // Set the flag *after* acquiring the lock so that any contention spin
+    // before acquisition does not falsely assert "holding" the lock.
+    if let Some(core) = crate::smp::try_per_core() {
+        core.holds_scheduler_lock
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    SchedulerGuard {
+        inner: guard,
+        _sentinel: SchedulerLockSentinel,
+    }
+}
+
+/// Non-blocking scheduler lock attempt.  Returns `None` if already held.
+/// Sets `holds_scheduler_lock` on success; does NOT set it when returning
+/// `None` (the caller does not hold the lock in that case).
+#[inline]
+pub(super) fn try_scheduler_lock() -> Option<SchedulerGuard<'static>> {
+    let guard = SCHEDULER_INNER.try_lock()?;
+    if let Some(core) = crate::smp::try_per_core() {
+        core.holds_scheduler_lock
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    Some(SchedulerGuard {
+        inner: guard,
+        _sentinel: SchedulerLockSentinel,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Per-core helpers
@@ -389,7 +484,7 @@ impl Scheduler {
     /// attempts work-stealing from other cores, then falls back to the
     /// idle task.
     ///
-    /// NOTE: this method is called while the caller holds `SCHEDULER.lock()`,
+    /// NOTE: this method is called while the caller holds `scheduler_lock()`,
     /// so it has access to the full `tasks` vec for state validation. True
     /// lock-free per-core dispatch is deferred (see module-level doc).
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
@@ -453,6 +548,7 @@ impl Scheduler {
                     self.tasks[idx].pid,
                     self.tasks[idx].name
                 );
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 self.tasks[idx].state = TaskState::Dead;
                 q.remove(i);
                 continue;
@@ -699,7 +795,7 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
 /// and enqueued to that core's run queue.
 pub fn spawn(entry: fn() -> !, name: &'static str) {
     let mut task = Task::new(entry, name);
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let target = least_loaded_core(&sched);
     let now = crate::arch::x86_64::interrupts::tick_count();
     task.assigned_core = target;
@@ -720,7 +816,7 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     task.assigned_core = core;
     task.last_migrated_tick = now;
     task.last_ready_tick = now;
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(core, idx);
@@ -734,7 +830,7 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let fork_rip = ctx.user_rip;
     let fork_rsp = ctx.user_rsp;
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let now = crate::arch::x86_64::interrupts::tick_count();
     let target_core = if fork_pid == 1 {
         current_core
@@ -798,7 +894,7 @@ pub fn spawn_idle_for_core(entry: fn() -> !, core_id: u8) {
     let mut task = Task::new(entry, "idle");
     task.assigned_core = core_id;
     task.priority = 30; // Idle priority
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let idx = alloc_task_slot(&mut sched, task);
     sched.idle_tasks[core_id as usize] = Some(idx);
 }
@@ -937,7 +1033,7 @@ pub fn yield_now() {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
@@ -999,7 +1095,7 @@ pub fn yield_now() {
 /// process context on re-dispatch.
 pub fn set_current_task_pid(pid: u32) {
     if let Some(idx) = get_current_task_idx() {
-        SCHEDULER.lock().tasks[idx].pid = pid;
+        scheduler_lock().tasks[idx].pid = pid;
     }
 }
 
@@ -1008,13 +1104,13 @@ pub fn set_current_task_pid(pid: u32) {
 /// `arch/x86_64/syscall/mod.rs`.
 pub fn set_current_user_return(urs: crate::task::UserReturnState) {
     if let Some(idx) = get_current_task_idx() {
-        SCHEDULER.lock().tasks[idx].user_return = Some(urs);
+        scheduler_lock().tasks[idx].user_return = Some(urs);
     }
 }
 
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let task = &mut sched.tasks[idx];
     let ctx = task.fork_ctx.take()?;
     task.priority = 20;
@@ -1023,7 +1119,7 @@ pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
 
 /// Return the PID associated with the given task index.
 fn task_pid(idx: usize) -> u32 {
-    SCHEDULER.lock().tasks[idx].pid
+    scheduler_lock().tasks[idx].pid
 }
 
 /// Resolve a [`TaskId`] to its owning process PID, if the task exists.
@@ -1034,28 +1130,28 @@ fn task_pid(idx: usize) -> u32 {
 /// process, not an arbitrary ring-3 task that grabbed the name first).
 /// Returns `None` if no task with the given id exists.
 pub fn pid_for_task_id(task_id: TaskId) -> Option<u32> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.tasks.iter().find(|t| t.id == task_id).map(|t| t.pid)
 }
 
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     Some((sched.tasks[idx].user_ticks, sched.tasks[idx].system_ticks))
 }
 
 /// Return the [`TaskId`] of the task currently running on this core.
 pub fn current_task_id() -> Option<TaskId> {
     let idx = get_current_task_idx()?;
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     Some(sched.tasks[idx].id)
 }
 
 /// Best-effort debug snapshot for the task currently running on this core.
 pub fn current_task_debug_snapshot() -> Option<CurrentTaskDebugSnapshot> {
     let idx = get_current_task_idx()?;
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     let task = sched.tasks.get(idx)?;
     Some((
         task.id,
@@ -1071,7 +1167,7 @@ pub fn current_task_debug_snapshot() -> Option<CurrentTaskDebugSnapshot> {
 
 /// Best-effort debug snapshot for an arbitrary task id.
 pub fn task_debug_snapshot(id: TaskId) -> Option<TaskDebugSnapshot> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     let idx = sched.find(id)?;
     let task = sched.tasks.get(idx)?;
     Some((
@@ -1087,7 +1183,7 @@ pub fn task_debug_snapshot(id: TaskId) -> Option<TaskDebugSnapshot> {
 
 /// Return dead tasks whose IPC state still needs deferred cleanup.
 pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.pending_dead_ipc_cleanup()
 }
 
@@ -1096,7 +1192,7 @@ fn block_current(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
@@ -1108,6 +1204,7 @@ fn block_current(state: TaskState) {
             sched.tasks[idx].state
         );
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1139,7 +1236,7 @@ fn block_current_unless_message(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
@@ -1148,6 +1245,7 @@ fn block_current_unless_message(state: TaskState) {
             return;
         }
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1181,7 +1279,7 @@ pub fn block_current_on_send_unless_completed() {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
@@ -1191,6 +1289,7 @@ pub fn block_current_on_send_unless_completed() {
             return;
         }
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnSend;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1206,7 +1305,7 @@ pub fn block_current_on_send_unless_completed() {
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if idx < sched.tasks.len() {
         sched.tasks[idx].send_completed = false;
     }
@@ -1241,7 +1340,7 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -1250,6 +1349,7 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
             None => return,
         };
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
@@ -1297,7 +1397,7 @@ fn block_current_unless_woken_inner(
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -1313,6 +1413,7 @@ fn block_current_unless_woken_inner(
             None => return,
         };
         accumulate_ticks(&mut sched, idx);
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
         // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
@@ -1323,6 +1424,7 @@ fn block_current_unless_woken_inner(
         } else if wake_deadline.is_none() && sched.tasks[idx].wake_deadline.is_some() {
             ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
         }
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].wake_deadline = wake_deadline;
         save_user_return_state(
             &mut sched.tasks[idx],
@@ -1342,13 +1444,14 @@ fn block_current_unless_woken_inner(
 /// Permanently mark the current task as dead and switch back to the scheduler.
 pub fn mark_current_dead() -> ! {
     let idx = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => loop {
                 x86_64::instructions::hlt();
             },
         };
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::Dead;
         sched.tasks[idx].switching_out = true;
         set_current_task_idx(None);
@@ -1369,11 +1472,12 @@ pub fn mark_current_dead() -> ! {
 /// Used by `exit_group()` to kill sibling threads.  Returns `true` if the
 /// task was found and marked dead, `false` otherwise.
 pub fn mark_task_dead_by_pid(pid: u32) -> bool {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     for task in sched.tasks.iter_mut() {
         if task.pid == pid {
             task.group_exit_pending = false;
             if task.state != TaskState::Dead {
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 task.state = TaskState::Dead;
             }
             return true;
@@ -1384,7 +1488,7 @@ pub fn mark_task_dead_by_pid(pid: u32) -> bool {
 
 /// Request that the task with `pid` stop itself on its own core.
 pub fn request_group_exit_by_pid(pid: u32) -> bool {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find_by_pid(pid) {
         sched.tasks[idx].group_exit_pending = true;
         true
@@ -1399,7 +1503,7 @@ pub fn take_current_group_exit_request() -> bool {
         Some(idx) => idx,
         None => return false,
     };
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if idx >= sched.tasks.len() {
         return false;
     }
@@ -1411,13 +1515,14 @@ pub fn take_current_group_exit_request() -> bool {
 /// Atomically confirm that a sibling is off-core and mark it dead so it can
 /// be reaped by another thread in the same group.
 pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let Some(idx) = sched.find_by_pid(pid) else {
         return false;
     };
     if sched.task_current_on_any_core(idx) || sched.tasks[idx].switching_out {
         return false;
     }
+    // TODO(57a-C/D): route through pi_lock + with_block_state
     sched.tasks[idx].state = TaskState::Dead;
     sched.tasks[idx].group_exit_pending = false;
     true
@@ -1425,19 +1530,19 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
 ///
-/// ISR-safe. The critical section below runs under `SCHEDULER.lock()` which
+/// ISR-safe. The critical section below runs under `scheduler_lock()` which
 /// now masks interrupts for its duration; the follow-up `enqueue_to_core`
 /// call does the same for the per-core run queue. Callers from interrupt
 /// context (virtio-net, virtio-blk) therefore cannot re-enter a task-context
 /// holder on the same core — see the root-cause note at [`IrqSafeMutex`].
 pub fn wake_task(id: TaskId) -> bool {
     // Capture everything we need for the optional diagnostic log in the
-    // same critical section so we don't need a second `SCHEDULER.lock()` —
+    // same critical section so we don't need a second `scheduler_lock()` —
     // a second acquisition on this path formerly re-entered a
     // PROCESS_TABLE lookup via `task_log_label`, reintroducing the ISR
     // deadlock class this primitive exists to prevent.
     let (enqueue, woke, snapshot) = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = scheduler_lock();
         if let Some(idx) = sched.find(id) {
             debug_assert!(
                 idx < sched.tasks.len(),
@@ -1476,6 +1581,7 @@ pub fn wake_task(id: TaskId) -> bool {
                         (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
+                        // TODO(57a-C/D): route through pi_lock + with_block_state
                         sched.tasks[idx].state = TaskState::Ready;
                         sched.tasks[idx].last_ready_tick = now;
                         (
@@ -1541,7 +1647,7 @@ fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static st
 
 /// Store a [`Message`] in a task's pending slot.
 pub fn deliver_message(id: TaskId, msg: Message) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_msg = Some(msg);
     }
@@ -1554,7 +1660,7 @@ pub fn deliver_message(id: TaskId, msg: Message) {
 /// clobbered by the EINTR sentinel — the signal simply remains pending and
 /// fires on the next syscall boundary.
 pub fn try_deliver_message(id: TaskId, msg: Message) -> bool {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id)
         && sched.tasks[idx].pending_msg.is_none()
     {
@@ -1573,7 +1679,7 @@ pub fn try_deliver_message(id: TaskId, msg: Message) -> bool {
 /// `ipc_call` would consume as its own reply. Dropping the reply caps makes
 /// the stale `ipc_reply` fail fast (with `u64::MAX`) instead.
 pub fn revoke_reply_caps_for(target: TaskId) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     for task in sched.tasks.iter_mut() {
         task.caps
             .revoke_matching(|cap| matches!(cap, Capability::Reply(t) if *t == target));
@@ -1582,7 +1688,7 @@ pub fn revoke_reply_caps_for(target: TaskId) {
 
 /// Remove and return the pending message for a task.
 pub fn take_message(id: TaskId) -> Option<Message> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_msg.take()
     } else {
@@ -1592,7 +1698,7 @@ pub fn take_message(id: TaskId) -> Option<Message> {
 
 /// Store bulk data alongside a pending message (Phase 52).
 pub fn deliver_bulk(id: TaskId, data: alloc::vec::Vec<u8>) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_bulk = Some(data);
     }
@@ -1600,7 +1706,7 @@ pub fn deliver_bulk(id: TaskId, data: alloc::vec::Vec<u8>) {
 
 /// Mark that a blocked or soon-to-block sender has had its message consumed.
 pub fn complete_send(id: TaskId) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].send_completed = true;
     }
@@ -1608,7 +1714,7 @@ pub fn complete_send(id: TaskId) {
 
 /// Remove and return the pending bulk data for a task (Phase 52).
 pub fn take_bulk_data(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_bulk.take()
     } else {
@@ -1618,7 +1724,7 @@ pub fn take_bulk_data(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
 
 /// Insert a capability into a task's capability table.
 pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].caps.insert(cap)
     } else {
@@ -1628,7 +1734,7 @@ pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
 
 /// Insert a capability into a task's capability table at a specific slot.
 pub fn insert_cap_at(id: TaskId, handle: CapHandle, cap: Capability) -> Result<(), CapError> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].caps.insert_at(handle, cap)
     } else {
@@ -1638,13 +1744,13 @@ pub fn insert_cap_at(id: TaskId, handle: CapHandle, cap: Capability) -> Result<(
 
 /// Look up a capability in a task's capability table.
 pub fn task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.cap(id, handle)
 }
 
 /// Remove a capability from a task's capability table.
 pub fn remove_task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     sched.remove_cap(id, handle)
 }
 
@@ -1654,13 +1760,13 @@ pub fn grant_task_cap(
     source_handle: CapHandle,
     target_id: TaskId,
 ) -> Result<CapHandle, CapError> {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     sched.grant_cap(source_id, source_handle, target_id)
 }
 
 /// Register the endpoint this task acts as server for.
 pub fn set_server_endpoint(id: TaskId, ep_id: EndpointId) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].server_endpoint = Some(ep_id);
     }
@@ -1668,25 +1774,25 @@ pub fn set_server_endpoint(id: TaskId, ep_id: EndpointId) {
 
 /// Return the server endpoint for a task.
 pub fn server_endpoint(id: TaskId) -> Option<EndpointId> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.server_endpoint(id)
 }
 
 /// Return the notification capabilities currently held by `id`.
 pub fn task_notification_caps(id: TaskId) -> alloc::vec::Vec<NotifId> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.notification_caps(id)
 }
 
 /// Return the scheduler task-vec index for `id`, if it is still live.
 pub fn task_idx_for_task_id(id: TaskId) -> Option<usize> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.find(id)
 }
 
 /// Mark that per-task IPC teardown has completed for `id`.
 pub fn mark_ipc_cleaned(id: TaskId) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].ipc_cleaned = true;
     }
@@ -1701,15 +1807,17 @@ fn test_task_entry() -> ! {
 
 #[cfg(test)]
 pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     while sched.tasks.len() <= idx {
         let mut filler = Task::new(test_task_entry, "test-filler");
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         filler.state = TaskState::Dead;
         sched.tasks.push(filler);
     }
 
     let mut task = Task::new(test_task_entry, "test-cleanup");
     task.id = task_id;
+    // TODO(57a-C/D): route through pi_lock + with_block_state
     task.state = TaskState::Ready;
     sched.tasks[idx] = task;
 }
@@ -1717,20 +1825,20 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
 /// Return whether any live task other than `excluding` still holds a cap to
 /// `ep_id`.
 pub fn other_task_holds_endpoint_cap(excluding: TaskId, ep_id: EndpointId) -> bool {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.other_task_holds_endpoint_cap(excluding, ep_id)
 }
 
 /// Return the callers currently waiting on reply capabilities held by `id`.
 pub fn reply_waiters(id: TaskId) -> alloc::vec::Vec<TaskId> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched.reply_waiters(id)
 }
 
 /// Return blocked task ids that belong to `pid` and are currently sleeping in
 /// IPC wait states.
 pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     sched
         .tasks
         .iter()
@@ -1788,10 +1896,11 @@ pub fn run() -> ! {
         if let Some(data) = crate::smp::get_core_data(core_id) {
             for task_idx in data.isr_wake_queue.drain() {
                 let enqueue = {
-                    let mut sched = SCHEDULER.lock();
+                    let mut sched = scheduler_lock();
                     if task_idx < sched.tasks.len() {
                         let task = &mut sched.tasks[task_idx];
                         if task.state == TaskState::BlockedOnNotif && !task.switching_out {
+                            // TODO(57a-C/D): route through pi_lock + with_block_state
                             task.state = TaskState::Ready;
                             task.last_ready_tick = crate::arch::x86_64::interrupts::tick_count();
                             Some((task.assigned_core, task_idx))
@@ -1821,7 +1930,7 @@ pub fn run() -> ! {
             for task_id in dead_tasks_needing_ipc_cleanup() {
                 crate::ipc::cleanup::cleanup_task_ipc(task_id);
             }
-            let mut sched = SCHEDULER.lock();
+            let mut sched = scheduler_lock();
             sched.drain_dead();
         }
 
@@ -1839,7 +1948,7 @@ pub fn run() -> ! {
         // `enqueue_to_core` sends a cross-core reschedule IPI that must
         // not run with `SCHEDULER.lock` held.
         let (expired, n_expired) = {
-            let mut sched = SCHEDULER.lock();
+            let mut sched = scheduler_lock();
             scan_expired_wake_deadlines(&mut sched)
         };
         for (core, idx) in &expired[..n_expired] {
@@ -1852,7 +1961,7 @@ pub fn run() -> ! {
         // after the lock is dropped (Phase 54 diagnostic).
         let mut stale_info: Option<(u32, &'static str, u64, u64)> = None;
         let next = {
-            let mut sched = SCHEDULER.lock();
+            let mut sched = scheduler_lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
                 let now = crate::arch::x86_64::interrupts::tick_count();
                 let is_idle = sched.idle_tasks.contains(&Some(idx));
@@ -1863,6 +1972,7 @@ pub fn run() -> ! {
                 if stale_ticks >= 50 && !is_idle {
                     stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
                 }
+                // TODO(57a-C/D): route through pi_lock + with_block_state
                 task.state = TaskState::Running;
                 task.start_tick = now;
                 debug_assert!(
@@ -1930,7 +2040,7 @@ pub fn run() -> ! {
             if pid != 0 {
                 // Read the task's UserReturnState (authoritative source).
                 let urs = {
-                    let sched = SCHEDULER.lock();
+                    let sched = scheduler_lock();
                     sched.get_task(_task_idx).and_then(|t| t.user_return)
                 };
                 // Read the address-space pointer for TLB tracking — still
@@ -2056,7 +2166,7 @@ pub fn run() -> ! {
 
         // F.1: Validate saved_rsp falls within the task's kernel stack.
         {
-            let sched = SCHEDULER.lock();
+            let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx)
                 && let Some((base, top)) = task.stack_bounds()
             {
@@ -2113,7 +2223,7 @@ pub fn run() -> ! {
                 Option<alloc::string::String>,
             )> = None;
             let enqueue = {
-                let mut sched = SCHEDULER.lock();
+                let mut sched = scheduler_lock();
                 debug_assert!(
                     sidx < sched.tasks.len(),
                     "dispatch: switched task sidx={} out of bounds (len={}) on core {}",
@@ -2169,6 +2279,7 @@ pub fn run() -> ! {
                     task.wake_after_switch = false;
 
                     if (wake_after_switch && blocked) || reenqueue_after_yield {
+                        // TODO(57a-C/D): route through pi_lock + with_block_state
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
                         if reenqueue_after_yield {
@@ -2276,6 +2387,7 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
             task.last_migrated_tick = now;
             continue;
         }
+        // TODO(57a-C/D): route through pi_lock + with_block_state
         task.state = TaskState::Ready;
         task.last_ready_tick = now;
         task.last_migrated_tick = now;
@@ -2326,7 +2438,7 @@ pub fn maybe_load_balance() {
     // Migrate one task from longest to shortest.
     // Lock ordering: SCHEDULER first, then run_queue (matches pick_next).
     if let Some(src) = crate::smp::get_core_data(longest_core) {
-        let sched = SCHEDULER.lock();
+        let sched = scheduler_lock();
         let mut q = src.run_queue.lock();
         // Find a migratable task: affinity-compatible, not pinned by fork_ctx,
         // and not recently assigned/woken/yielded on its current core.
@@ -2350,7 +2462,7 @@ pub fn maybe_load_balance() {
             drop(sched);
             // Update assigned_core and migration timestamp.
             {
-                let mut sched = SCHEDULER.lock();
+                let mut sched = scheduler_lock();
                 if idx < sched.tasks.len() {
                     sched.tasks[idx].assigned_core = shortest_core;
                     sched.tasks[idx].last_migrated_tick = current_tick;
@@ -2375,7 +2487,7 @@ pub fn maybe_load_balance() {
 /// Returns the new priority. Non-root users are clamped to the lowest normal
 /// priority (10) if the result would fall into the real-time range (0-9).
 pub fn sys_nice(increment: i32, uid: u32) -> i64 {
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let idx = match get_current_task_idx() {
         Some(i) => i,
         None => return -1,
@@ -2407,7 +2519,7 @@ pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
     if effective == 0 {
         return -22; // -EINVAL
     }
-    let mut sched = SCHEDULER.lock();
+    let mut sched = scheduler_lock();
     let idx = if pid == 0 {
         match get_current_task_idx() {
             Some(i) => i,
@@ -2461,7 +2573,7 @@ pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
 /// Get the CPU affinity mask for a task identified by PID.
 /// `pid == 0` means current task.
 pub fn sys_sched_getaffinity(pid: u32) -> i64 {
-    let sched = SCHEDULER.lock();
+    let sched = scheduler_lock();
     let idx = if pid == 0 {
         match get_current_task_idx() {
             Some(i) => i,

@@ -78,9 +78,8 @@ pub use scheduler::{
 ///
 /// Returns `None` if the lock is already held (e.g. during a panic while
 /// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
-pub(crate) fn try_lock_scheduler() -> Option<scheduler::IrqSafeGuard<'static, scheduler::Scheduler>>
-{
-    scheduler::SCHEDULER.try_lock()
+pub(crate) fn try_lock_scheduler() -> Option<scheduler::SchedulerGuard<'static>> {
+    scheduler::try_scheduler_lock()
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +146,38 @@ pub enum TaskState {
     BlockedOnFutex,
     /// Task has permanently exited; the scheduler will remove it on next pass.
     Dead,
+}
+
+// ---------------------------------------------------------------------------
+// TaskBlockState (Phase 57a B.1)
+// ---------------------------------------------------------------------------
+
+/// State protected by [`Task::pi_lock`].
+///
+/// All mutations to these fields go through [`Task::with_block_state`] (B.4).
+/// Readers outside the `pi_lock` critical section MUST NOT inspect these
+/// fields directly — Tracks C/D enforce this contract by routing every
+/// read through the helper.
+///
+/// # Lock-ordering invariant
+///
+/// `pi_lock` is OUTER, `SCHEDULER.lock` is INNER (Linux's `p->pi_lock` →
+/// `rq->lock` pattern).  A code path may hold `pi_lock` while acquiring
+/// `SCHEDULER.lock`; the reverse is forbidden and panics in debug builds
+/// (see [`Task::with_block_state`]).
+pub struct TaskBlockState {
+    /// Canonical block state.  Mirrors the v1 `Task::state` field; will become
+    /// the sole arbiter of "is this task blocked?" once Track F migrates all
+    /// callers and Track E.3 deletes `Task::switching_out`.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub state: TaskState,
+
+    /// Absolute tick deadline at which `scan_expired_wake_deadlines` will
+    /// force-wake the task to `Ready`.  `None` for indefinite-timeout blocks.
+    ///
+    /// Invariant: only mutated while `pi_lock` is held.
+    pub wake_deadline: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +272,25 @@ pub struct Task {
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
     _stack: Option<Box<[u8]>>,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.2 — per-task pi_lock (shadow lock, migration window)
+    // ---------------------------------------------------------------------------
+    /// Per-task spinlock guarding [`TaskBlockState`].
+    ///
+    /// # Lock ordering
+    ///
+    /// `pi_lock` is **OUTER**, `SCHEDULER.lock` is **INNER** (Linux's
+    /// `p->pi_lock` → `rq->lock` pattern).  A code path may hold `pi_lock`
+    /// while acquiring `SCHEDULER.lock`; the reverse is forbidden and panics
+    /// in debug builds (see [`Task::with_block_state`]).
+    ///
+    /// # Migration window
+    ///
+    /// During Tracks C/D, writes go to **both** this field and to the legacy
+    /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
+    /// Track E removes the legacy fields once all callers migrate.
+    pub pi_lock: spin::Mutex<TaskBlockState>,
 }
 
 impl Task {
@@ -280,6 +330,14 @@ impl Task {
             fork_ctx: None,
             wake_deadline: None,
             _stack: Some(stack),
+            // Phase 57a B.2: initialize pi_lock with the same initial state as
+            // Task::state so the shadow lock is consistent from construction.
+            // Writes during the migration window (Tracks C/D) go to both v1
+            // fields and pi_lock; Track E removes the v1 fields.
+            pi_lock: spin::Mutex::new(TaskBlockState {
+                state: TaskState::Ready,
+                wake_deadline: None,
+            }),
         }
     }
 
@@ -290,6 +348,41 @@ impl Task {
             let top = base + s.len() as u64;
             (base, top)
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 57a B.4 — canonical pi_lock reader/writer
+    // ---------------------------------------------------------------------------
+
+    /// Acquire `pi_lock`, run `f` with mutable access to the protected
+    /// [`TaskBlockState`], release, and return the result.
+    ///
+    /// This is the **only** entry point Tracks C/D use to read or write
+    /// `TaskBlockState` fields.  Using this helper exclusively is the SOLID
+    /// Single-Responsibility boundary: all lock-acquire/transition/release
+    /// boilerplate lives here, not at call sites.
+    ///
+    /// # Lock ordering
+    ///
+    /// In debug builds, panics if `SCHEDULER.lock` is already held by this
+    /// CPU (Linux's `p->pi_lock` → `rq->lock` ordering — `pi_lock` is the
+    /// OUTER lock; see the `scheduler.rs` module doc for the full hierarchy).
+    #[inline]
+    pub fn with_block_state<R>(&self, f: impl FnOnce(&mut TaskBlockState) -> R) -> R {
+        // Phase 57a B.3: lock-ordering assertion.
+        // Acquiring pi_lock while already holding SCHEDULER.lock violates the
+        // Linux p->pi_lock → rq->lock invariant and can deadlock.
+        debug_assert!(
+            !crate::smp::try_per_core()
+                .map(|c| c
+                    .holds_scheduler_lock
+                    .load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false),
+            "pi_lock acquisition while SCHEDULER.lock is held — \
+             Linux p->pi_lock → rq->lock ordering violated"
+        );
+        let mut guard = self.pi_lock.lock();
+        f(&mut guard)
     }
 }
 
