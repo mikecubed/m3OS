@@ -31,6 +31,7 @@ pub mod session;
 pub mod session_control;
 pub mod session_supervisor;
 pub mod size_class;
+pub mod sched_model;
 pub mod slab;
 pub mod time;
 pub mod trace_ring;
