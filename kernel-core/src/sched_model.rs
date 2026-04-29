@@ -167,11 +167,194 @@ pub struct SideEffects {
 /// "Not reachable" cells (e.g. `Block` on an off-CPU task) result in a
 /// `panic!` because they represent a kernel invariant violation.
 pub fn apply_event(state: BlockState, event: Event) -> (BlockState, SideEffects) {
-    // Stub implementation — returns unimplemented!() so red-phase tests fail.
-    // The full implementation lands in the green-phase commit (A.4).
-    unimplemented!(
-        "apply_event stub — green-phase commit will implement the v2 transition table"
-    )
+    match (state, event) {
+        // ── Ready × block ─────────────────────────────────────────────────
+        //
+        // Invariant: a `Ready` task is not executing; it cannot call
+        // `block_current_until`. This cell is reached only if the primitive is
+        // called with an already-true condition from a just-dispatched task
+        // before any state write — the function returns without a state change.
+        (BlockState::Ready, Event::Block { .. }) => {
+            (BlockState::Ready, SideEffects::default())
+        }
+
+        // ── Ready × wake ─────────────────────────────────────────────────
+        //
+        // Invariant: CAS Blocked*→Ready fails; a wake to a Ready task is a
+        // silent no-op (idempotent).
+        (BlockState::Ready, Event::Wake) => (BlockState::Ready, SideEffects::default()),
+
+        // ── Ready × scan_expired ─────────────────────────────────────────
+        //
+        // Invariant: state is not Blocked*; stale deadline (if any) is cleared
+        // by the scanner as a clean-up, but no state change occurs.
+        (BlockState::Ready, Event::ScanExpired { .. }) => {
+            (BlockState::Ready, SideEffects::default())
+        }
+
+        // ── Ready × condition_true ────────────────────────────────────────
+        //
+        // ConditionTrue from a non-blocked state: no-op.
+        (BlockState::Ready, Event::ConditionTrue) => {
+            (BlockState::Ready, SideEffects::default())
+        }
+
+        // ── Running × block ───────────────────────────────────────────────
+        //
+        // Invariant: a Running task writes state → Blocked* under `pi_lock`,
+        // then yields via `SCHEDULER.lock` / `switch_context`. The condition
+        // recheck (step 3 of the four-step recipe) happens AFTER the state
+        // write; if true, `ConditionTrue` fires instead (self-revert path).
+        // This arm represents the case where the recheck is false — the task
+        // yields.
+        (BlockState::Running, Event::Block { kind, deadline }) => {
+            let next = match kind {
+                BlockKind::Recv => BlockState::BlockedOnRecv,
+                BlockKind::Send => BlockState::BlockedOnSend,
+                BlockKind::Reply => BlockState::BlockedOnReply,
+                BlockKind::Notif => BlockState::BlockedOnNotif,
+                BlockKind::Futex => BlockState::BlockedOnFutex,
+            };
+            (
+                next,
+                SideEffects {
+                    deadline_set: deadline,
+                    yielded: true,
+                    ..SideEffects::default()
+                },
+            )
+        }
+
+        // ── Running × wake ────────────────────────────────────────────────
+        //
+        // Invariant: CAS Blocked*→Ready fails (state is Running). A wake to a
+        // Running task is idempotent; the task will recheck its condition in
+        // the `block_current_until` loop on resume.
+        (BlockState::Running, Event::Wake) => (BlockState::Running, SideEffects::default()),
+
+        // ── Running × scan_expired ────────────────────────────────────────
+        //
+        // Invariant: state is Running (not Blocked*); scan is a no-op.
+        (BlockState::Running, Event::ScanExpired { .. }) => {
+            (BlockState::Running, SideEffects::default())
+        }
+
+        // ── Running × condition_true ──────────────────────────────────────
+        //
+        // ConditionTrue from Running: the task is already running; no-op.
+        (BlockState::Running, Event::ConditionTrue) => {
+            (BlockState::Running, SideEffects::default())
+        }
+
+        // ── Blocked* × block ─────────────────────────────────────────────
+        //
+        // Invariant violation: a Blocked* task is off-CPU and cannot call
+        // `block_current_until`. Panic immediately.
+        (s, Event::Block { .. }) if s.is_blocked() => {
+            panic!(
+                "apply_event: Block event on off-CPU task in state {:?} — kernel invariant violated",
+                s
+            )
+        }
+
+        // ── Blocked* × wake → Ready ───────────────────────────────────────
+        //
+        // Invariant: CAS Blocked*→Ready succeeds; wake_deadline cleared;
+        // task enqueued to assigned_core run queue; on_cpu spin-wait required
+        // before enqueue (Linux p->on_cpu smp_cond_load_acquire pattern).
+        // IPI is required when the enqueue target is a different core — the
+        // model marks it as potentially needed; the actual decision depends on
+        // runtime core assignment which is outside the pure model.
+        (s, Event::Wake) if s.is_blocked() => (
+            BlockState::Ready,
+            SideEffects {
+                deadline_cleared: true,
+                enqueue_to_run_queue: true,
+                on_cpu_wait_required: true,
+                ..SideEffects::default()
+            },
+        ),
+
+        // ── Blocked* × scan_expired → Ready ──────────────────────────────
+        //
+        // Invariant: deadline scanner fires under SCHEDULER.lock; CAS
+        // Blocked*→Ready; wake_deadline cleared; enqueued after lock release.
+        // No on_cpu spin-wait because scan runs under SCHEDULER.lock and the
+        // enqueue is deferred to after lock release (scan adds to an expired
+        // array, not inline enqueue under the lock).
+        (s, Event::ScanExpired { .. }) if s.is_blocked() => (
+            BlockState::Ready,
+            SideEffects {
+                deadline_cleared: true,
+                enqueue_to_run_queue: true,
+                ..SideEffects::default()
+            },
+        ),
+
+        // ── Blocked* × condition_true → Running (self-revert) ────────────
+        //
+        // Invariant: condition recheck in step 3 of the four-step recipe
+        // observed true before yielding. The task re-acquires `pi_lock`,
+        // CAS Blocked*→Running, clears wake_deadline, and returns without
+        // yielding. This closes the lost-wake race window between the state
+        // write (step 1) and the yield (step 4).
+        (s, Event::ConditionTrue) if s.is_blocked() => (
+            BlockState::Running,
+            SideEffects {
+                deadline_cleared: true,
+                // yielded is false: the self-revert path avoids switch_context.
+                ..SideEffects::default()
+            },
+        ),
+
+        // ── Dead × block ─────────────────────────────────────────────────
+        //
+        // Invariant violation: a Dead task must not re-enter any block
+        // primitive.
+        (BlockState::Dead, Event::Block { .. }) => {
+            panic!(
+                "apply_event: Block event on Dead task — kernel invariant violated"
+            )
+        }
+
+        // ── Dead × wake → Dead (no-op) ────────────────────────────────────
+        //
+        // Invariant: CAS Blocked*→Ready fails (state is Dead). A wake to a
+        // Dead task is a silent no-op; the reaper (drain_dead) handles cleanup
+        // independently.
+        (BlockState::Dead, Event::Wake) => (BlockState::Dead, SideEffects::default()),
+
+        // ── Dead × scan_expired → Dead (no-op) ───────────────────────────
+        //
+        // Invariant: state is Dead (not Blocked*); stale deadline cleaned up
+        // without any state change.
+        (BlockState::Dead, Event::ScanExpired { .. }) => {
+            (BlockState::Dead, SideEffects::default())
+        }
+
+        // ── Dead × condition_true → Dead (no-op) ─────────────────────────
+        //
+        // ConditionTrue on a Dead task: unreachable in practice but safe to
+        // treat as a no-op so the model remains total.
+        (BlockState::Dead, Event::ConditionTrue) => (BlockState::Dead, SideEffects::default()),
+
+        // ── Explicit Blocked* arms (required for exhaustiveness) ──────────
+        //
+        // Rust does not count guard-qualified arms (e.g. `if s.is_blocked()`)
+        // toward exhaustiveness, so we enumerate the remaining Blocked* ×
+        // event combinations explicitly. All of these are handled by the
+        // guard arms above; the unreachable!() is a safety net.
+        (
+            BlockState::BlockedOnRecv
+            | BlockState::BlockedOnSend
+            | BlockState::BlockedOnReply
+            | BlockState::BlockedOnNotif
+            | BlockState::BlockedOnFutex,
+            _,
+        ) => unreachable!(
+            "apply_event: unhandled Blocked* × event — this is a bug in the match ordering"
+        ),
+    }
 }
 
 // ── Tests (A.5) ──────────────────────────────────────────────────────────────
