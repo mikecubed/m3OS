@@ -298,6 +298,17 @@ pub struct Task {
     /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
     /// Track E removes the legacy fields once all callers migrate.
     pub pi_lock: crate::task::scheduler::IrqSafeMutex<TaskBlockState>,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57b D.1 — per-task preempt-disable counter
+    // ---------------------------------------------------------------------------
+    /// Per-task preempt-disable counter. Incremented by `preempt_disable()`,
+    /// decremented by `preempt_enable()`. Must be 0 at every user-mode return.
+    /// Phase 57d/57e gate preemption on this == 0. The address of this field
+    /// is stable across the task's lifetime — Track B's `Vec<Box<Task>>`
+    /// storage guarantees the heap address does not move; Track C caches a
+    /// raw pointer into this field on `PerCoreData::current_preempt_count_ptr`.
+    pub preempt_count: core::sync::atomic::AtomicI32,
 }
 
 impl Task {
@@ -345,6 +356,10 @@ impl Task {
                 state: TaskState::Ready,
                 wake_deadline: None,
             }),
+            // Phase 57b D.1: counter starts at 0 — no preempt_disable held.
+            // Track F will wire IrqSafeMutex::lock to fetch_add this counter
+            // in 57b; in 57b proper the counter is never read by 57d/57e gates.
+            preempt_count: core::sync::atomic::AtomicI32::new(0),
         }
     }
 
