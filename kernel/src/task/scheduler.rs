@@ -1120,8 +1120,11 @@ fn retarget_preempt_count_to_dummy(core_id: u8) {
         as *const core::sync::atomic::AtomicI32
         as *mut core::sync::atomic::AtomicI32;
     let pc = crate::smp::per_core();
-    pc.current_preempt_count_ptr
-        .store(dummy_ptr, core::sync::atomic::Ordering::Release);
+    let _old = pc
+        .current_preempt_count_ptr
+        .swap(dummy_ptr, core::sync::atomic::Ordering::Release);
+    #[cfg(feature = "sched-trace")]
+    record_preempt_ptr_update(_old, dummy_ptr, core_id, None, PreemptPtrPhase::SwitchOut);
     if saved_if {
         interrupts::enable();
     }
@@ -1155,12 +1158,76 @@ fn retarget_preempt_count_to_dummy(core_id: u8) {
 fn retarget_preempt_count_to_task(
     _core_id: u8,
     task_preempt_count: *const core::sync::atomic::AtomicI32,
+    _task_idx: usize,
 ) {
     interrupts::disable();
     let pc = crate::smp::per_core();
     let task_ptr = task_preempt_count as *mut core::sync::atomic::AtomicI32;
-    pc.current_preempt_count_ptr
-        .store(task_ptr, core::sync::atomic::Ordering::Release);
+    let _old = pc
+        .current_preempt_count_ptr
+        .swap(task_ptr, core::sync::atomic::Ordering::Release);
+    #[cfg(feature = "sched-trace")]
+    record_preempt_ptr_update(
+        _old,
+        task_ptr,
+        _core_id,
+        Some(_task_idx),
+        PreemptPtrPhase::SwitchIn,
+    );
+}
+
+/// Phase 57b C.5 — `current_preempt_count_ptr` retarget tracepoint.
+///
+/// Distinguishes switch-out from switch-in retargets in the
+/// `sched-trace` ring.  Encoded as synthetic `old_state` / `new_state`
+/// values so the existing per-core `SchedTrace` schema does not need a
+/// breaking change.
+#[cfg(feature = "sched-trace")]
+#[derive(Clone, Copy)]
+enum PreemptPtrPhase {
+    SwitchOut,
+    SwitchIn,
+}
+
+/// Phase 57b C.5 — emit a `preempt_ptr_update` record into the
+/// `sched-trace` ring.
+///
+/// Compiled in only under `cfg(feature = "sched-trace")` so default
+/// builds carry zero overhead.  The existing
+/// [`kernel_core::trace_ring::SchedTrace`] schema is fixed
+/// (`pid` / `old_state` / `new_state` / `caller_file` / `caller_line` /
+/// `tick`); rather than restructure that struct, this helper encodes the
+/// retarget event by:
+///
+/// - `pid` — task index when known (switch-in only); switch-out passes
+///   `0xFFFF_FFFF` to mark "no live task" since the outgoing task is
+///   already losing CPU at this point (the preceding `Dispatch`
+///   `TraceEvent` correlates the switch-out with the prior task).
+/// - `old_state` / `new_state` — synthetic phase codes:
+///   - `0xF0` = switch-out retarget (pointer → dummy)
+///   - `0xF1` = switch-in retarget (pointer → `Task::preempt_count`)
+/// - `caller_file` / `caller_line` — auto-populated via
+///   `#[track_caller]` to identify the call site in `scheduler.rs`.
+///
+/// The raw old/new pointer values are intentionally not encoded.  In
+/// practice the (`Dispatch`, `SwitchOut`) `TraceEvent` pair plus the
+/// retarget phase code is enough to reconstruct the per-core pointer
+/// history and identify any acquire/release that straddled a retarget.
+#[cfg(feature = "sched-trace")]
+#[track_caller]
+fn record_preempt_ptr_update(
+    _old_ptr: *mut core::sync::atomic::AtomicI32,
+    _new_ptr: *mut core::sync::atomic::AtomicI32,
+    _core_id: u8,
+    task_idx: Option<usize>,
+    phase: PreemptPtrPhase,
+) {
+    let phase_code: u8 = match phase {
+        PreemptPtrPhase::SwitchOut => 0xF0,
+        PreemptPtrPhase::SwitchIn => 0xF1,
+    };
+    let pid_field = task_idx.map(|i| i as u32).unwrap_or(u32::MAX);
+    crate::task::sched_trace::record(pid_field, phase_code, phase_code);
 }
 
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
@@ -2839,7 +2906,7 @@ pub fn run() -> ! {
         // switch-out) is safe by construction: its `preempt_disable` /
         // `preempt_enable` pair both hit the dummy.
         if !task_preempt_count_ptr.is_null() {
-            retarget_preempt_count_to_task(core_id, task_preempt_count_ptr);
+            retarget_preempt_count_to_task(core_id, task_preempt_count_ptr, _task_idx);
         } else {
             // Belt-and-braces: if the task vanished between pick_next and
             // here (should be impossible — we hold `set_current_task_idx`),
