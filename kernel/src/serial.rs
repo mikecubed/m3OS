@@ -143,7 +143,7 @@ pub fn init_logger() {
 // single-consumer (serial feeder task).
 // ---------------------------------------------------------------------------
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const SERIAL_BUF_SIZE: usize = 256; // must be power of 2
 const SERIAL_BUF_MASK: usize = SERIAL_BUF_SIZE - 1;
@@ -151,6 +151,58 @@ const SERIAL_BUF_MASK: usize = SERIAL_BUF_SIZE - 1;
 static mut SERIAL_RX_RAW: [u8; SERIAL_BUF_SIZE] = [0u8; SERIAL_BUF_SIZE];
 static SERIAL_RX_HEAD: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_RX_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// Notification-based feeder wake infrastructure (Phase 57a H.1)
+// ---------------------------------------------------------------------------
+//
+// Mirrors the pattern used by `net::virtio_net` for the network task:
+//   - `STDIN_FEEDER_TASK_ID` stores the TaskId of the feeder so the ISR can
+//     call `wake_task_v2` without taking any lock.
+//   - `STDIN_FEEDER_WOKEN` is the `AtomicBool` that `serial_stdin_feeder_task`
+//     parks on via `block_current_until`.  The ISR sets it; the feeder clears
+//     it (via `swap`) at the top of each drain iteration.
+//
+// Using 0 as the "not yet registered" sentinel is safe because Task IDs are
+// allocated starting at 1 in `Task::new`.
+
+/// TaskId of the serial-stdin feeder task.  Registered by the task itself
+/// before it first parks.  The COM1 RX ISR reads this to issue a
+/// `wake_task_v2` after writing bytes to the ring buffer.
+pub static STDIN_FEEDER_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Unified wake flag for the serial-stdin feeder task.
+///
+/// The COM1 RX ISR sets this (via [`wake_feeder_task`]) when it drains at
+/// least one byte into `SERIAL_RX_RAW`.  The feeder task parks on it via
+/// `block_current_until(&STDIN_FEEDER_WOKEN, None)` and clears it with a
+/// `swap(false, …)` at the top of each drain loop — identical to the
+/// `net::NIC_WOKEN` pattern in `net_task`.
+pub static STDIN_FEEDER_WOKEN: AtomicBool = AtomicBool::new(false);
+
+/// Register the feeder task's [`TaskId`] so the COM1 RX ISR can wake it.
+///
+/// Called once from `serial_stdin_feeder_task` before it first parks.
+pub fn set_feeder_task_id(id: crate::task::TaskId) {
+    STDIN_FEEDER_TASK_ID.store(id.0, Ordering::Release);
+    log::info!("[serial-stdin] registered feeder task id={}", id.0);
+}
+
+/// Set `STDIN_FEEDER_WOKEN` and issue a `wake_task_v2` IPI to the feeder.
+///
+/// Called from the COM1 RX ISR after bytes have been pushed into the ring
+/// buffer.  Must be ISR-safe: no allocation, no mutex, no blocking.
+pub fn wake_feeder_task() {
+    STDIN_FEEDER_WOKEN.store(true, Ordering::Release);
+    let raw = STDIN_FEEDER_TASK_ID.load(Ordering::Acquire);
+    if raw != 0 {
+        let _ = crate::task::scheduler::wake_task_v2(crate::task::TaskId(raw));
+    } else {
+        // Task not yet registered — fall back to a generic reschedule hint so
+        // other cores notice the flag on their next tick.
+        crate::task::scheduler::signal_reschedule();
+    }
+}
 
 /// Pop one byte from the serial RX ring buffer, or `None` if empty.
 /// Single-consumer: only called from the serial feeder task.
@@ -188,10 +240,13 @@ pub fn handle_serial_irq() {
         got_data = true;
     }
     if got_data {
-        // Set a flag so the consumer knows data arrived. The feeder task
-        // checks this after re-enabling interrupts to close the lost-wakeup
-        // window.
+        // Set the legacy pending flag (still read during feeder startup before
+        // the task ID is registered, and harmless to keep for diagnostics).
         SERIAL_RX_PENDING.store(true, Ordering::Release);
+        // H.1: wake the feeder task via the notification-based protocol.
+        // This calls wake_task_v2 which issues a cross-core IPI if the feeder
+        // is parked on another CPU — same mechanism as virtio-net.
+        wake_feeder_task();
     }
 }
 
