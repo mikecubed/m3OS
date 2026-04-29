@@ -14,7 +14,7 @@
 | C | `preempt_resume_to_kernel` assembly + Rust shim | 57d B ✅ | Planned |
 | D | Dispatch reentrancy audit | A, C | Planned |
 | E | Latency benchmarks (round-trip IPC, syscall wakeup) | 57d ✅ | Planned |
-| F | Drop the `from_user` check | A–E | Planned |
+| F | Activate kernel-mode preemption (kernel-handler body, immediate zero-crossing) | A–E | Planned |
 | G | 24-hour soak | F | Planned |
 | H | Default-on flip and feature-flag removal | G | Planned |
 
@@ -103,18 +103,18 @@ For each "annotate" entry in 57c that requires `preempt_disable` under `PREEMPT_
 
 ## Track C — `preempt_resume_to_kernel` (Same-CPL `iretq` Frame)
 
-### C.0 — Make 57d's synthetic ring-0 `rsp` slot load-bearing
+### C.0 — Wire the captured kernel RSP from the kernel handler into `Task::preempt_frame.rsp`
 
-**File:** `kernel/src/arch/x86_64/asm/preempt_entry.S` (extends 57d Track B.2's already-present synthetic slots)
-**Symbol:** `timer_entry`, `reschedule_ipi_entry`
-**Why it matters:** 57d Track B.2 already synthesizes `rsp` and `ss` slots in the ring-0 branch (initialised to zero) so `PreemptTrapFrame` has a uniform layout for the Rust handler.  57d does not preempt ring-0 code, so the zero values are harmless.  57e *does* preempt ring-0 code and the `_kernel` resume routine sets RSP to `preempt_frame.rsp` — so this slot must contain the actual interrupted kernel RSP, not zero.  C.0 is therefore a value change, not a layout change.
+**File:** `kernel/src/task/scheduler.rs` (`preempt_to_scheduler_kernel`)
+**Symbol:** `preempt_to_scheduler_kernel`
+**Why it matters:** 57d's kernel-path asm stub already captures the interrupted kernel RSP and passes it as the second argument to `timer_handler_kernel(&mut PreemptTrapFrameKernel, captured_kernel_rsp: u64)`.  In 57d the kernel handler returns early without using the value (kernel mode is non-preemptible).  57e *does* preempt kernel-mode tasks, and the `_kernel` resume routine sets RSP to `Task::preempt_frame.rsp` before its 3-field `iretq` — so `preempt_to_scheduler_kernel` must write the captured RSP into that slot when it copies `PreemptTrapFrameKernel` into `Task::preempt_frame`.
 
 **Acceptance:**
-- [ ] In the ring-0 entry branch in `timer_entry` and `reschedule_ipi_entry`, replace the `mov qword ptr [rsp + 8], 0` synthetic-slot initialisation with code that captures the pre-stub kernel RSP into the slot.  The capture uses `lea rax, [rsp + 24]` (or whatever offset addresses the byte just past the CPU-pushed 3-field iretq frame, equivalent to RSP at the moment immediately before CPU dispatch) before the `sub rsp, 16` that creates the slots — the captured value is the interrupted kernel-stack RSP.
-- [ ] `PreemptTrapFrame.ss` slot remains zero (same-CPL `iretq` does not pop it; setting it to a kernel SS value is harmless but unnecessary).
-- [ ] On the non-preempting return path, the synthetic slots are still popped before `iretq` (unchanged from 57d Track B.2).
-- [ ] In-QEMU test: a synthetic ring-0 interrupt produces a `PreemptTrapFrame` whose `rsp` matches the kernel-stack pointer at the moment of CPU entry.
-- [ ] No layout or offset change to `PreemptTrapFrame` — only the value written into the synthetic `rsp` slot changes from zero to the captured RSP.
+- [ ] `preempt_to_scheduler_kernel(frame: &mut PreemptTrapFrameKernel, captured_kernel_rsp: u64) -> !` copies `frame.gprs` into `Task::preempt_frame.gprs`, copies `frame.{rip, cs, rflags}` into `Task::preempt_frame.{rip, cs, rflags}`, writes `captured_kernel_rsp` into `Task::preempt_frame.rsp`, and writes 0 into `Task::preempt_frame.ss` (same-CPL `iretq` doesn't pop ss; the value doesn't matter but documenting the zero is helpful).
+- [ ] Marks the task `state = Ready`, `on_cpu = false`, `resume_mode = Preempted` (same as `preempt_to_scheduler_user`).
+- [ ] `-> !` — does not return; transfers to the per-core scheduler dispatch entry.
+- [ ] In-QEMU test: a synthetic ring-0 preemption produces a `Task::preempt_frame` whose `rsp` matches the kernel-stack pointer at the moment of CPU entry; on dispatch, `preempt_resume_to_kernel` reads that slot and sets RSP correctly.
+- [ ] No change to 57d's asm stub layout or argument convention — C.0 is a *Rust-side* change to consume an argument that 57d already provides.
 
 ### C.1 — Implement `preempt_resume_to_kernel` (assembly, same-CPL `iretq`)
 
@@ -246,19 +246,19 @@ Each benchmark establishes a 57d baseline first (run with `preempt-full` *off*) 
 
 ---
 
-## Track F — Drop the `from_user` Check
+## Track F — Activate Kernel-Mode Preemption
 
-### F.1 — Headline decision change
+### F.1 — Replace 57d's kernel-handler early-return with the user-handler body
 
-**File:** `kernel/src/arch/x86_64/interrupts.rs`
-**Symbol:** `timer_handler_with_frame`, `reschedule_ipi_handler_with_frame` (Rust handlers introduced in 57d Track B)
-**Why it matters:** Drops the `from_user` early-return that kept kernel mode non-preemptible under `PREEMPT_VOLUNTARY`.  The decision-side change is one conditional removed; the rest of 57e (Tracks A–E and the kernel-mode `preempt_enable` immediacy in Track F.x) is what makes the change safe to ship.
+**Files:** `kernel/src/arch/x86_64/interrupts.rs`
+**Symbols:** `timer_handler_kernel`, `reschedule_ipi_handler_kernel` (Rust handlers introduced in 57d Track B)
+**Why it matters:** Under 57d, the kernel handlers run only the tick / EOI / reschedule-flag work and return — kernel-mode preemption is structurally absent.  57e replaces the early-return body with the same preempt check the user handlers run, plus a call to `preempt_to_scheduler_kernel` (Track C.0) that consumes the captured kernel RSP that 57d's asm stub already passes as a second argument.  The decision-side change is structural (kernel handler body becomes the same shape as user handler), not a single-line drop; the rest of 57e (Tracks A–E and the kernel-mode `preempt_enable` immediacy in F.2) is what makes the change safe to ship.
 
 **Acceptance:**
-- [ ] In both Rust handlers, drop the `if !from_user { return; }` early-exit.
-- [ ] The remaining checks (`preempt_count == 0`, `reschedule` flag swap) are unchanged.
-- [ ] Gated on `cfg(feature = "preempt-full")`; default off.
+- [ ] In `timer_handler_kernel` and `reschedule_ipi_handler_kernel`, replace the early-return with: lapic_eoi; `let pc = unsafe { (*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) }; if pc != 0 { return; } if !per_core().reschedule.swap(false, AcqRel) { return; } unsafe { preempt_to_scheduler_kernel(frame, captured_kernel_rsp); }`.
+- [ ] Gated on `cfg(feature = "preempt-full")`; default off.  Under `preempt-voluntary` only, the 57d body (early-return) remains.
 - [ ] In-QEMU test: a kernel-mode CPU-bound task (one without `preempt_disable`) is preempted within 1 ms.
+- [ ] In-QEMU test: a kernel-mode task holding an `IrqSafeMutex` (i.e., `preempt_count > 0`) is *not* preempted; the mutex unlock and subsequent `preempt_enable` zero-crossing path (F.2) handles the wake.
 
 ### F.2 — Kernel-mode `preempt_enable` immediate zero-crossing
 

@@ -67,52 +67,57 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 
 ## Track B — Naked-Asm Entry Stubs
 
-### B.1 — Define `PreemptTrapFrame` layout
+### B.1 — Define `PreemptTrapFrameUser` and `PreemptTrapFrameKernel` layouts
 
 **File:** `kernel/src/arch/x86_64/preempt_trap_frame.rs` (new)
-**Symbol:** `PreemptTrapFrame`
-**Why it matters:** The asm stubs and the Rust handlers must agree on the on-stack layout exactly.  A `#[repr(C)]` struct with explicit ordering plus `core::mem::offset_of!` constants pins the agreement.
+**Symbol:** `PreemptTrapFrameUser`, `PreemptTrapFrameKernel`
+**Why it matters:** The asm stubs and the Rust handlers must agree on the on-stack layout exactly.  Two ring-typed structs avoid the synthesis problem that any "uniform layout" forced on the IRQ stack would create — synthetic slots cannot be inserted *above* the CPU-pushed iretq frame because that memory belongs to the interrupted kernel stack, and inserting them *below* puts them at the wrong offset relative to the declared `gprs, rip, cs, rflags, rsp, ss` shape.  Each ring-typed frame matches exactly what the CPU pushes for that ring.
 
 **Acceptance:**
-- [ ] `#[repr(C)]` struct: `gprs: [u64; 15]` (rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15) followed by the CPU-pushed iretq frame (`rip, cs, rflags, rsp, ss` for ring-3-interrupted, or `rip, cs, rflags` for ring-0-interrupted with `rsp/ss` slots zeroed).
-- [ ] Compile-time test pinning every field offset.
-- [ ] Doc comment cites the Intel SDM Vol 3A §6.14 reference for IRQ stack frame layout.
+- [ ] `#[repr(C)] PreemptTrapFrameUser { gprs: [u64; 15], rip, cs, rflags, rsp, ss }` — used when `(cs & 3) == 3` at IRQ entry.
+- [ ] `#[repr(C)] PreemptTrapFrameKernel { gprs: [u64; 15], rip, cs, rflags }` — used when `(cs & 3) == 0` at IRQ entry.
+- [ ] GPR slot order identical between the two: `[rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15]`.
+- [ ] Compile-time tests pinning every field offset for both structs.
+- [ ] Doc comment cites Intel SDM Vol 3A §6.14 reference for IRQ stack frame layout and explains why two types are used (the unsoundness of in-place synthesis).
+- [ ] Conversion helpers: a `From<&PreemptTrapFrameUser>` for `PreemptFrame` (the 57b `Task::preempt_frame` shape) that copies all 5 trailing fields; a `from_kernel_frame(&PreemptTrapFrameKernel, captured_kernel_rsp: u64) -> PreemptFrame` that copies the 3 trailing fields and writes the captured kernel RSP into the `rsp` slot, leaving `ss = 0`.
 
-### B.2 — Implement `timer_entry` naked-asm stub
+### B.2 — Implement `timer_entry` naked-asm stub (two-path ring-aware dispatch)
 
 **Files:**
 - `kernel/src/arch/x86_64/asm/preempt_entry.S` (new)
-- `kernel/src/arch/x86_64/interrupts.rs` (replace `timer_handler` with a stub that calls `timer_entry`; the Rust body becomes `timer_handler_with_frame(&mut PreemptTrapFrame)`)
+- `kernel/src/arch/x86_64/interrupts.rs` (replace `timer_handler` with the asm symbol `timer_entry`; the Rust body becomes two functions: `timer_handler_user(&mut PreemptTrapFrameUser)` and `timer_handler_kernel(&mut PreemptTrapFrameKernel, captured_kernel_rsp: u64)`)
 
-**Symbol:** `timer_entry`, `timer_handler_with_frame`
-**Why it matters:** Without this, the Rust handler body has already clobbered caller-saved GPRs by the time `preempt_to_scheduler` runs — saving them at that point would capture the *handler's* state, not the interrupted task's.
+**Symbol:** `timer_entry`, `timer_handler_user`, `timer_handler_kernel`
+**Why it matters:** Without an asm entry stub, the Rust handler body has already clobbered caller-saved GPRs by the time `preempt_to_scheduler_user` runs — saving them at that point would capture the *handler's* state, not the interrupted task's.  And without the two-path ring-aware dispatch, the asm cannot construct a `PreemptTrapFrame` whose declared layout actually matches the bytes on the IRQ stack (synthetic `rsp`/`ss` slots cannot be inserted above the CPU-pushed iretq frame because those bytes are interrupted-kernel-stack data).
 
 **Acceptance:**
-- [ ] **Ring-0 frame normalization (self-contained in 57d).**  On entry, branch on `(cs & 3)`.  For ring-3-interrupted code (rpl=3), use the CPU-pushed 5-field iretq frame as-is.  For ring-0-interrupted code (rpl=0), the CPU pushed only `rip, cs, rflags` (3 fields); the stub *synthesizes* the missing `ss` and `rsp` slots in `PreemptTrapFrame` order, with both initialised to zero in 57d.  The synthetic `rsp` slot becomes load-bearing in 57e (Track C.0 changes the value from zero to the captured pre-stub kernel RSP); 57e does *not* add the slots themselves.  On the non-preempting return path, the matching ring-test pops the synthetic slots before `iretq` so the CPU sees the original 3-field frame.
-- [ ] After normalization, `timer_entry` saves all 15 GPRs in `PreemptTrapFrame.gprs` order onto the now-uniform 5-field-iretq stack.
-- [ ] Stub passes `rsp` (which points to the bottom of the saved frame) as the first argument to `timer_handler_with_frame`.
-- [ ] **System V AMD64 ABI invariants preserved across the `extern "C"` call (self-contained in 57d, no cross-phase dependency):**
-  - RSP is 16-byte aligned at the call instruction's boundary (i.e., 16-byte aligned *before* the call; the call's implicit `push rip` brings it to `≡ 8 (mod 16)` inside the callee).  Math: after ring-0 normalization the stack always carries a 5-field iretq frame (40 bytes) plus 15 × 8 = 120 GPR bytes.  Total 160 bytes pushed since CPU entry.  At CPU entry RSP was 16-byte aligned (Intel SDM Vol 3A §6.14.1 guarantees this for the iretq frame slot).  160 mod 16 == 0, so the stub does *not* need an extra pad — but it must `cld` and avoid clobbering the alignment with any unbalanced subsequent operation.  If the GPR layout ever changes such that the total no longer divides cleanly by 16, the stub adds an explicit `sub rsp, 8` pad and undoes it after `call`.
+- [ ] **Ring-aware dispatch.**  On entry, the stub branches on `(cs & 3)` *before any GPR push*.  Ring-3-interrupted (rpl=3) goes to the user path; ring-0-interrupted (rpl=0) goes to the kernel path.
+- [ ] **User path.**  Push 15 GPRs in `PreemptTrapFrameUser.gprs` order.  The CPU-pushed 5-field iretq frame already sits at the trailing offsets after the GPR block, completing the `PreemptTrapFrameUser` shape.  `cld`; `mov rdi, rsp`; `call timer_handler_user`.  On return, pop GPRs in reverse order and `iretq`.
+- [ ] **Kernel path.**  Capture the interrupted kernel RSP via `lea rsi, [rsp + 24]` *before* the GPR push (the address immediately above the CPU's 3-field iretq frame).  Push 15 GPRs in `PreemptTrapFrameKernel.gprs` order.  The CPU-pushed 3-field iretq frame already sits at the trailing offsets, completing the `PreemptTrapFrameKernel` shape.  Pass the trap-frame pointer as `rdi` and the captured kernel RSP as `rsi`.  `cld`; `call timer_handler_kernel`.  On return, pop GPRs and `iretq`.
+- [ ] **System V AMD64 ABI invariants preserved across the `extern "C"` call:**
+  - RSP is 16-byte aligned at the call instruction's boundary (16-aligned before `call`; the call's implicit `push rip` brings it to `≡ 8 mod 16` inside the callee).
+  - **User path:** alignment is satisfied by construction.  TSS.RSP0 is 16-byte aligned by convention; CPU pushes 40 bytes (≡ 8 mod 16) for the 5-field frame; 15 × 8 = 120 GPR bytes (≡ 8 mod 16) are pushed; total 160 bytes ≡ 0 mod 16 below the original RSP.  A debug-build `test rsp, 0xF; jnz panic_misaligned` confirms.
+  - **Kernel path:** the interrupted-kernel-stack alignment is **unspecified** — IRQs can arrive at arbitrary kernel instruction boundaries.  The stub MUST enforce alignment explicitly before the `call`.  Approved mechanisms: (a) conditional pad — `test rsp, 0xF; jz aligned; sub rsp, 8` plus a marker so the return path can undo; (b) save original RSP in a callee-saved register, `and rsp, ~0xF` before call, restore from the saved register after.  The acceptance criterion is the `movaps` regression test below; the implementer chooses the mechanism.
   - All caller-saved registers above what the stub already pushed are clobbered freely by the Rust handler; the stub does not re-save them.
   - Direction flag (`DF`) is cleared on entry to the Rust call (per ABI) — the stub `cld`s before the `call`.
-  - The Rust handler returns normally (i.e., when *not* preempting); the stub pops the GPRs in reverse order, undoes synthetic slots if applicable, and `iretq`s.  When preempting, `preempt_to_scheduler` is `-> !` and the pop/iretq epilogue is unreachable on that path.
-- [ ] In-QEMU test: a synthetic *ring-3* interrupt fired with known register values reaches the Rust handler with all 15 GPRs preserved in the trap frame; the iretq frame fields match the CPU-pushed values.
-- [ ] In-QEMU test: a synthetic *ring-0* interrupt produces a `PreemptTrapFrame` whose layout is byte-identical to the ring-3 case (same offsets), with the synthetic `ss` and `rsp` slots both zero.
-- [ ] In-QEMU test (alignment regression): a Rust handler that contains `movaps` against an aligned local does not fault — proves the stub's stack alignment is correct in both ring-0 and ring-3 entry paths.
-- [ ] In-QEMU test (round-trip): non-preempting return from a ring-0 interrupt restores the original 3-field iretq frame so the CPU's `iretq` consumes the right number of bytes.
+  - The Rust handler returns normally when *not* preempting; the stub pops GPRs and `iretq`s.  When preempting, `preempt_to_scheduler_user` (or `_kernel` in 57e) is `-> !` and the pop/iretq epilogue is unreachable on that path.
+- [ ] In-QEMU test: a synthetic *ring-3* interrupt fired with known register values reaches `timer_handler_user` with all 15 GPRs preserved in the trap frame; the iretq frame fields match the CPU-pushed values.
+- [ ] In-QEMU test: a synthetic *ring-0* interrupt reaches `timer_handler_kernel` with all 15 GPRs preserved in the trap frame; the 3-field iretq frame matches the CPU-pushed values; the captured kernel RSP equals the interrupted-code RSP at the moment of CPU entry.
+- [ ] In-QEMU test (alignment regression): a Rust handler that contains `movaps` against an aligned local does not fault — exercised on both the user and kernel entry paths, proving the stub's stack alignment is correct regardless of interrupted-kernel-stack alignment.
+- [ ] In-QEMU test (round-trip): non-preempting return from a ring-0 interrupt restores all GPRs and `iretq`s with the original 3-field iretq frame intact (the CPU pops the right number of bytes).
 
 ### B.3 — Implement `reschedule_ipi_entry` naked-asm stub
 
 **Files:**
 - `kernel/src/arch/x86_64/asm/preempt_entry.S`
-- `kernel/src/arch/x86_64/interrupts.rs` (replace `reschedule_ipi_handler` similarly)
+- `kernel/src/arch/x86_64/interrupts.rs` (replace `reschedule_ipi_handler` similarly; the Rust body splits into `reschedule_ipi_handler_user` and `reschedule_ipi_handler_kernel`)
 
-**Symbol:** `reschedule_ipi_entry`, `reschedule_ipi_handler_with_frame`
+**Symbol:** `reschedule_ipi_entry`, `reschedule_ipi_handler_user`, `reschedule_ipi_handler_kernel`
 **Why it matters:** Cross-core wakes deliver via the reschedule IPI; the same preemption check must fire on the receiving core.  Same correctness reasoning as B.2.
 
 **Acceptance:**
-- [ ] Mirror of B.2 for the reschedule IPI vector — same GPR layout, same ABI invariants, same alignment regression test.
-- [ ] Shares the GPR save/restore macro with `timer_entry` to satisfy DRY.
+- [ ] Mirror of B.2 for the reschedule IPI vector — same two-path ring-aware dispatch, same trap-frame types, same ABI invariants, same alignment regression test.
+- [ ] Shares the GPR save/restore macro and the alignment-enforcement macro with `timer_entry` to satisfy DRY.
 
 ### B.4 — IDT installation for naked-asm entry symbols
 

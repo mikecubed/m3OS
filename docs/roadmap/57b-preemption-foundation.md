@@ -140,9 +140,13 @@ pub fn preempt_disable() {
     let ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
     // SAFETY: ptr is either a per-core SCHED_PREEMPT_COUNT_DUMMY or points to a
     // live Task::preempt_count.  Tasks are stored in Vec<Box<Task>> so the
-    // address is stable for the task's lifetime.  Dispatch updates the pointer
-    // atomically with respect to switch_context's IF=0 window, so no IRQ can
-    // observe a torn pointer.
+    // address is stable for the task's lifetime.  The pointer is changed only
+    // by the C.2 switch-out and C.3 switch-in retargets, each wrapped in an
+    // explicit cli/interrupts-restore window — no IRQ can observe a torn
+    // pointer because each retarget is a single AtomicPtr store with Release
+    // ordering and the IRQ handler reads with Acquire.  This function does NOT
+    // assume any IF=0 window inherited from switch_context (switch_context
+    // restores the scheduler's saved RFLAGS via popf, which may be IF=1).
     unsafe { (*ptr).fetch_add(1, Acquire); }
 }
 

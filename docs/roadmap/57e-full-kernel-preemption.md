@@ -4,11 +4,18 @@
 **Source Ref:** phase-57e
 **Depends on:** Phase 57b (Preemption Foundation) ✅, Phase 57c (Kernel Busy-Wait Audit and Conversion) ✅, Phase 57d (Voluntary Preemption) ✅
 **Builds on:** Drops the `from_user` check from the IRQ-return preemption point introduced in 57d.  Once dropped, every kernel-mode IRQ-return becomes a potential preemption point — and the 57b `preempt_count` discipline becomes load-bearing for kernel-mode safety, not just user-mode.
-**Primary Components:** `kernel/src/arch/x86_64/interrupts.rs` (drop `from_user` from the preemption check), `kernel/src/task/scheduler.rs` (kernel-mode preempt invariants), `kernel/src/arch/x86_64/asm/switch.S` (kernel-mode `preempt_resume` variant)
+**Primary Components:** `kernel/src/arch/x86_64/interrupts.rs` (replace 57d's early-return in `timer_handler_kernel` / `reschedule_ipi_handler_kernel` with the same preempt check the user handlers run), `kernel/src/task/scheduler.rs` (`preempt_to_scheduler_kernel`, kernel-mode preempt invariants, kernel-mode `preempt_enable` immediate zero-crossing), `kernel/src/arch/x86_64/asm/preempt_entry.S` (`preempt_resume_to_kernel` same-CPL `iretq` resume routine)
 
 ## Milestone Goal
 
-Kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Round-trip latency for IPC and syscall wake-up improves over the 57d baseline by a measured factor whose floor is set by the IRQ-handler runtime rather than the timer-tick period.  Every previously-bounded busy-spin in the kernel either remains bounded (preempt-disable wrapped) or becomes preemptible (the holder may be paused mid-spin and the spinner makes no progress until the holder resumes — but the spinner does not block forward progress on its core).
+Kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Latency improves **per trigger path**, not uniformly:
+
+- **Cross-core reschedule-IPI wakeup** improves to IRQ-handler runtime (~µs) because the receiver core, even if running kernel-mode, is now interrupted and switched.
+- **`preempt_enable` zero-crossing** in a kernel-mode preempt-safe context fires the scheduler immediately (~µs) instead of recording the deferred-trigger and waiting for the next user-mode return.
+- **Same-core wakeup** still relies on the next timer tick, voluntary yield, or local `preempt_enable` zero-crossing — `PREEMPT_FULL` does not add a self-IPI; this path is benchmarked separately and must not regress.
+- **Timer-only preemption** of a kernel-mode CPU loop still fires at the next timer tick (~1 ms) — the same bound as 57d's user-mode-only preemption, now extended to kernel mode.
+
+Every previously-bounded busy-spin in the kernel either remains bounded (preempt-disable wrapped) or becomes preemptible (the holder may be paused mid-spin and the spinner makes no progress until the holder resumes — but the spinner does not block forward progress on its core).
 
 **This is the stretch goal of the 57b/c/d/e programme.**  After 57b/57c/57d, m3OS is at `PREEMPT_VOLUNTARY` parity with Linux's desktop default — a credible plateau, and the realistic 1.0 release target.  57e is the upgrade to `PREEMPT_FULL` (Linux's "low-latency desktop" or "real-time" config), which trades debuggability for latency.  Whether to land 57e depends on m3OS's release goals and the soak data from 57c/57d.
 
@@ -31,32 +38,35 @@ This is why the design notes recommend deferring 57e until 57c/57d have been run
 - How dropping a single conditional in the IRQ handler converts a "user-mode preemption" model to a "full kernel preemption" model — and what invariants must hold across every kernel codepath for the change to be safe.
 - Why `preempt_disable` correctness is the gate: every spin-on-condition where the holder may be on a different core must hold the spinner's `preempt_count > 0` so the spinner is not preempted while the holder is also preempted (a livelock).
 - How the per-CPU runqueue model (deferred from 57b) becomes more important under `PREEMPT_FULL`: a preempted kernel-mode task may need to migrate cores during dispatch, and global-lock contention becomes a measurable bottleneck.
-- Why latency benchmarks (round-trip IPC, syscall wakeup) drop into the microsecond range only after 57e: in `PREEMPT_VOLUNTARY` the kernel-mode timeslice is the floor; in `PREEMPT_FULL` the floor is the IRQ-handler runtime.
+- Why latency improvements are per-trigger rather than uniform: cross-core reschedule-IPI wakeup and safe `preempt_enable` zero-crossing paths can drop into the microsecond range under `PREEMPT_FULL` because they fire an immediate switch when kernel mode is preemptible; same-core wakeups remain bounded by the next timer tick (no self-IPI exists), and timer-only preemption is naturally tick-bounded.
 - How to incrementally validate `PREEMPT_FULL`: enable the flag, run the regression suite, soak for 24 hours, then enable it for a release.
 
 ## Feature Scope
 
-### Drop the `from_user` check (the headline decision change)
+### Make the kernel handlers preemptible (the headline decision change)
 
-In `kernel/src/arch/x86_64/interrupts.rs::timer_handler_with_frame` (and the matching reschedule-IPI handler — both built in 57d Track B as Rust handlers receiving `&mut PreemptTrapFrame`):
+In `kernel/src/arch/x86_64/interrupts.rs::timer_handler_kernel` and `::reschedule_ipi_handler_kernel` (both built in 57d Track B as Rust handlers reached only when `(cs & 3) == 0` at IRQ entry):
 
 ```rust
-// 57d (PREEMPT_VOLUNTARY): kernel-mode skips preemption entirely.
-let from_user = (frame.cpu_frame.cs & 3) == 3;
-if !from_user { return; }
-let pc = unsafe { (*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) };
-if pc != 0 { return; }
-if !per_core().reschedule.swap(false, AcqRel) { return; }
-unsafe { preempt_to_scheduler(frame); }
+// 57d (PREEMPT_VOLUNTARY): kernel handler returns early without firing preemption.
+extern "C" fn timer_handler_kernel(frame: &mut PreemptTrapFrameKernel, captured_kernel_rsp: u64) {
+    // Tick / EOI / reschedule-flag work.
+    crate::arch::x86_64::apic::lapic_eoi();
+    let _ = (frame, captured_kernel_rsp);  // unused: kernel mode is non-preemptible.
+}
 
-// 57e (PREEMPT_FULL): kernel-mode preemption fires whenever preempt_count == 0.
-let pc = unsafe { (*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) };
-if pc != 0 { return; }
-if !per_core().reschedule.swap(false, AcqRel) { return; }
-unsafe { preempt_to_scheduler(frame); }
+// 57e (PREEMPT_FULL): kernel handler runs the same preempt check as the user handler.
+extern "C" fn timer_handler_kernel(frame: &mut PreemptTrapFrameKernel, captured_kernel_rsp: u64) {
+    // Tick / EOI / reschedule-flag work.
+    crate::arch::x86_64::apic::lapic_eoi();
+    let pc = unsafe { (*crate::smp::per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed) };
+    if pc != 0 { return; }
+    if !crate::smp::per_core().reschedule.swap(false, AcqRel) { return; }
+    unsafe { preempt_to_scheduler_kernel(frame, captured_kernel_rsp); }
+}
 ```
 
-The decision-side change is a single conditional removed.  The full set of 57e changes is larger: same-CPL `iretq` resume routine and matching kernel-RSP capture (Track C), per-CPU access audit (Track B.3), kernel-mode `preempt_enable` immediate zero-crossing semantics (Track F.x — the 57d deferred record becomes a direct schedule under `PREEMPT_FULL`).  The audit and validation that make this set safe is the bulk of the phase work.
+The decision-side change is structural rather than a single-line drop: the kernel-handler body becomes the same shape as the user handler.  The full set of 57e changes is larger: `preempt_to_scheduler_kernel` Rust shim (Track C.0), `preempt_resume_to_kernel` asm routine (Track C.1) with the same-CPL 3-field `iretq` frame, dispatch-path branch on `cs.rpl()` (Track C.2), per-CPU access audit (Track B.3), kernel-mode `preempt_enable` immediate zero-crossing semantics (Track F.2).  The audit and validation that make this set safe is the bulk of the phase work.
 
 ### Kernel-mode preempt invariant audit
 
