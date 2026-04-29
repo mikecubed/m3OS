@@ -28,3 +28,11 @@ sched-trace = []
 # EAGAIN observation from the kernel facade path during integration testing.
 # Enable this feature for production / secure-boot images.
 hardened = []
+# When `sched-v2` is enabled, the new per-task pi_lock block/wake primitives
+# are used instead of the v1 global-scheduler-lock path. Phase 57a Track C
+# introduces `block_current_until`; Tracks D–F migrate all call sites.
+# Default OFF — v1 remains active until every call site is migrated.
+# A single feature-flip rolls back to v1 if a regression appears mid-track.
+# Enable with: cargo xtask check --features sched-v2
+# (or pass --features kernel/sched-v2 to direct cargo invocations)
+sched-v2 = []

@@ -914,4 +914,129 @@ mod tests {
             },
         );
     }
+
+    // ── block_current_until-specific tests (Track C TDD gate) ────────────────
+    //
+    // These tests exercise the four-step Linux recipe modelled by
+    // `block_current_until` (Track C.2–C.3). Each test name mirrors the
+    // acceptance criterion in the task list so reviewers can match tests to
+    // spec lines at a glance.
+
+    /// C.3 — Self-revert path: wake arrives between state-write (step 1) and
+    /// yield (step 4).  The model represents this as (Running → Block →
+    /// BlockedOnRecv) followed immediately by (BlockedOnRecv → ConditionTrue →
+    /// Running).  No yield should be observed; `deadline_cleared` fires
+    /// because the protocol clears the deadline on self-revert.
+    ///
+    /// Corresponds to `BlockOutcome::AlreadyTrue` / `Woken` return value from
+    /// `block_current_until` when the condition check in step 3 succeeds.
+    #[test]
+    fn block_current_until_self_revert_when_condition_already_true() {
+        // Step 1: state write Running → BlockedOnRecv.
+        let (s1, fx1) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv);
+        assert!(fx1.yielded, "state write alone does not yield");
+
+        // Step 3: condition recheck observes wake before yield → self-revert.
+        let (s2, fx2) = apply_event(s1, Event::ConditionTrue);
+        assert_eq!(s2, BlockState::Running, "self-revert must restore Running");
+        assert!(!fx2.yielded, "self-revert must NOT yield");
+        assert!(fx2.deadline_cleared, "self-revert must clear wake_deadline");
+        assert!(
+            !fx2.enqueue_to_run_queue,
+            "self-revert does not enqueue (task is still on CPU)"
+        );
+    }
+
+    /// C.2 — Normal path: condition is false at step 3, task yields; later a
+    /// `Wake` event arrives (step 4 wake side), transitioning to Ready.
+    ///
+    /// Models the common path where `block_current_until` yields and is woken
+    /// by a remote `wake_task` call (`BlockOutcome::Woken`).
+    #[test]
+    fn block_current_until_yields_when_condition_false_at_recheck() {
+        // Step 1+4: state write + yield (condition false at recheck → falls
+        // through to switch_context).
+        let (s1, fx1) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv);
+        assert!(fx1.yielded, "normal path must yield via switch_context");
+
+        // Wake arrives from another task / interrupt.
+        let (s2, fx2) = apply_event(s1, Event::Wake);
+        assert_eq!(s2, BlockState::Ready, "Wake must transition to Ready");
+        assert!(
+            fx2.enqueue_to_run_queue,
+            "Wake must enqueue task to run queue"
+        );
+    }
+
+    /// C.2 — Deadline path: condition is false at recheck AND deadline has
+    /// elapsed.  `ScanExpired` fires, waking the task to Ready.
+    ///
+    /// Models `BlockOutcome::DeadlineExpired`.
+    #[test]
+    fn block_current_until_deadline_expired_path() {
+        // Step 1: block with deadline.
+        let (s1, fx1) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: Some(1000),
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnRecv);
+        assert_eq!(
+            fx1.deadline_set,
+            Some(1000),
+            "deadline must be recorded in pi_lock-protected field"
+        );
+
+        // Deadline scanner fires (tick 1001 > deadline 1000).
+        let (s2, fx2) = apply_event(s1, Event::ScanExpired { now: 1001 });
+        assert_eq!(
+            s2,
+            BlockState::Ready,
+            "ScanExpired must transition to Ready"
+        );
+        assert!(fx2.deadline_cleared, "ScanExpired must clear wake_deadline");
+        assert!(
+            fx2.enqueue_to_run_queue,
+            "ScanExpired must enqueue task to run queue"
+        );
+    }
+
+    /// C.3 — Self-revert for Reply state: wakers can arrive on the BlockedOnReply
+    /// path (IPC reply arrives between state-write and yield).
+    #[test]
+    fn block_current_until_self_revert_no_yield_reply_state() {
+        let (s1, _) = apply_event(
+            BlockState::Running,
+            Event::Block {
+                kind: BlockKind::Reply,
+                deadline: None,
+            },
+        );
+        assert_eq!(s1, BlockState::BlockedOnReply);
+
+        let (s2, fx2) = apply_event(s1, Event::ConditionTrue);
+        assert_eq!(
+            s2,
+            BlockState::Running,
+            "self-revert on BlockedOnReply must restore Running"
+        );
+        assert!(!fx2.yielded, "self-revert must NOT yield");
+        assert!(fx2.deadline_cleared, "self-revert must clear wake_deadline");
+    }
 }

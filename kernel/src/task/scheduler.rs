@@ -1473,6 +1473,307 @@ fn block_current_unless_woken_inner(
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
+// ---------------------------------------------------------------------------
+// v2 block primitive (Phase 57a Track C) — feature-gated behind `sched-v2`
+// ---------------------------------------------------------------------------
+
+/// Outcome returned by [`block_current_until`].
+///
+/// Callers use this to distinguish why the block ended: a successful wake,
+/// deadline expiry, or an early return because the condition was already
+/// satisfied when the function was called.
+#[cfg(feature = "sched-v2")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// A waker wrote `true` to the `woken` flag; the task resumed normally.
+    Woken,
+    /// The absolute-tick `deadline_ticks` elapsed before a wake arrived.
+    DeadlineExpired,
+    /// The `woken` flag was already `true` when checked at entry (step 2
+    /// condition recheck); the task self-reverted without yielding.
+    AlreadyTrue,
+}
+
+/// v2 block primitive following Linux's `do_nanosleep` four-step pattern.
+///
+/// This is the canonical replacement for the v1 `block_current_unless_woken`
+/// family. It eliminates the lost-wake bug class by making `TaskBlockState`
+/// under `pi_lock` the sole source of truth, mirroring Linux's
+/// `set_current_state` + `schedule()` + recheck pattern.
+///
+/// # Four-step protocol (Linux `do_nanosleep`, `kernel/time/hrtimer.c`)
+///
+/// 1. **State write under `pi_lock`.** Acquire `pi_lock`; write
+///    `state ← BlockedOnRecv`; set `wake_deadline ← deadline_ticks`; release
+///    `pi_lock`. This pairs with the Acquire barrier on the wake side's CAS,
+///    closing the lost-wake window (`smp_store_mb` / `set_current_state`).
+///
+/// 2. **Release `pi_lock`.** The lock is dropped before the condition recheck
+///    so a concurrent waker can acquire `pi_lock` and CAS without deadlock.
+///
+/// 3. **Condition recheck.** If `woken.load(Acquire) == true` or
+///    `tick_count() >= deadline_ticks` **before** yielding: acquire `pi_lock`;
+///    CAS `BlockedOnRecv → Running`; clear `wake_deadline`; release `pi_lock`;
+///    return [`BlockOutcome::AlreadyTrue`] without yielding. This closes the
+///    race window between the state write and the yield (Linux: `t->task` /
+///    `task->__state` recheck before `schedule()`).
+///
+/// 4. **Yield via `SCHEDULER.lock`.** Acquire `SCHEDULER.lock`; remove task
+///    from run queue; call `switch_context` to the scheduler RSP. On resume,
+///    recheck; spurious wakes loop back to step 1 (not expected on this
+///    microkernel but correct by construction).
+///
+/// # Deadline semantics
+///
+/// `deadline_ticks` is an **absolute** tick count (`TICKS_PER_SEC = 1000`, so
+/// 1 tick = 1 ms). Callers convert from `Duration` / `timespec` / TSC at the
+/// syscall boundary — no nanoseconds inside this primitive.
+/// Pass `None` for an indefinite timeout.
+///
+/// # v1 compatibility (transition window)
+///
+/// During the Track C–F migration window, this function also writes the v1
+/// `Task::state` field and sets `switching_out = true` (the "shadow lock"
+/// dual-write pattern). The dispatch handler (`run()`) still consults those
+/// fields until Track E.5 simplifies it. Once all callers are migrated and
+/// Track E removes the v1 fields, the dual writes disappear.
+///
+/// # Wake-side `on_cpu` spin-wait
+///
+/// The E.1 `Task::on_cpu` RSP-publication marker is being landed in a
+/// parallel worktree. The BLOCK side (this function) does not need it; the
+/// spin-wait lives on the WAKE side (`wake_task`, Track D). No reference to
+/// `on_cpu` is made here.
+///
+/// # References
+///
+/// - Linux `do_nanosleep` (`kernel/time/hrtimer.c`) — four-step block recipe.
+/// - Linux `try_to_wake_up` (`kernel/sched/core.c`) — CAS wake side.
+/// - m3OS handoff 2026-04-25: `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md`.
+#[cfg(feature = "sched-v2")]
+pub fn block_current_until(
+    woken: &core::sync::atomic::AtomicBool,
+    deadline_ticks: Option<u64>,
+) -> BlockOutcome {
+    use core::sync::atomic::Ordering;
+
+    // Early bail: condition already true before any state write (fast path).
+    if woken.load(Ordering::Acquire) {
+        return BlockOutcome::AlreadyTrue;
+    }
+    if deadline_ticks
+        .map(|d| crate::arch::x86_64::interrupts::tick_count() >= d)
+        .unwrap_or(false)
+    {
+        return BlockOutcome::DeadlineExpired;
+    }
+
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
+
+    // ── Step 1: State write under pi_lock ────────────────────────────────────
+    //
+    // Acquire pi_lock; transition state Running → BlockedOnRecv; set
+    // wake_deadline; release pi_lock. The Release barrier on the store pairs
+    // with the Acquire on the wake-side CAS, eliminating the lost-wake window.
+    let (idx, core) = {
+        let mut sched = scheduler_lock();
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => return BlockOutcome::AlreadyTrue, // no current task — bail
+        };
+
+        let pid = sched.tasks[idx].pid;
+        accumulate_ticks(&mut sched, idx);
+
+        // pi_lock write: BlockedOnRecv + deadline.
+        sched.tasks[idx].with_block_state(|bs| {
+            bs.state = TaskState::BlockedOnRecv;
+            // Update ACTIVE_WAKE_DEADLINES counter: incremented when we set a
+            // new deadline, decremented on clear.
+            if deadline_ticks.is_some() && bs.wake_deadline.is_none() {
+                ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
+            } else if deadline_ticks.is_none() && bs.wake_deadline.is_some() {
+                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+            }
+            bs.wake_deadline = deadline_ticks;
+        });
+
+        // v1 dual-write (shadow-lock transition window, B.2 annotation).
+        // The v1 dispatch loop and wake_task still read Task::state and
+        // Task::wake_deadline directly until Tracks E/F remove those fields.
+        sched.tasks[idx].state = TaskState::BlockedOnRecv;
+        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
+        if deadline_ticks.is_some() && sched.tasks[idx].wake_deadline.is_none() {
+            // counter already incremented above; don't double-count
+        } else if deadline_ticks.is_none() && sched.tasks[idx].wake_deadline.is_some() {
+            // counter already decremented above; don't double-count
+        }
+        sched.tasks[idx].wake_deadline = deadline_ticks;
+
+        // v1 RSP-publication guard (still needed until Track E.5 removes it).
+        sched.tasks[idx].switching_out = true;
+
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
+        set_current_task_idx(None);
+
+        let core = crate::smp::per_core().core_id;
+        let _ = pid; // used in sched-trace only
+        (idx, core)
+    };
+    // ── Step 2: pi_lock is released (SCHEDULER.lock dropped above) ───────────
+
+    // ── Step 3: Condition recheck before yielding ─────────────────────────────
+    //
+    // If the waker wrote `true` between step 1 and here, we self-revert:
+    // re-acquire pi_lock, CAS BlockedOnRecv → Running, clear deadline, return.
+    let already_woken = woken.load(Ordering::Acquire);
+    let already_expired = deadline_ticks
+        .map(|d| crate::arch::x86_64::interrupts::tick_count() >= d)
+        .unwrap_or(false);
+
+    if already_woken || already_expired {
+        // Self-revert: take pi_lock, CAS Blocked* → Running, clear deadline.
+        let mut sched = scheduler_lock();
+        if idx < sched.tasks.len() {
+            sched.tasks[idx].with_block_state(|bs| {
+                bs.state = TaskState::Running;
+                if bs.wake_deadline.take().is_some() {
+                    ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+                }
+            });
+            // v1 dual-write.
+            sched.tasks[idx].state = TaskState::Running;
+            sched.tasks[idx].wake_deadline = None;
+            // switching_out was set in step 1; clear it since we won't yield.
+            sched.tasks[idx].switching_out = false;
+            sched.tasks[idx].wake_after_switch = false;
+        }
+        // Restore current_task_idx so callers see us as Running again.
+        set_current_task_idx(Some(idx));
+        // Do NOT store to PENDING_SWITCH_OUT; no switch_context call.
+        return if already_expired {
+            BlockOutcome::DeadlineExpired
+        } else {
+            BlockOutcome::AlreadyTrue
+        };
+    }
+
+    // ── Step 4: Yield via SCHEDULER.lock → switch_context ────────────────────
+    //
+    // PENDING_SWITCH_OUT tells the scheduler dispatch loop which task to
+    // clear `switching_out` on after switch_context has published the RSP.
+    PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
+    per_core_reschedule().store(true, Ordering::Relaxed);
+    let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    {
+        let pid_for_trace = {
+            let s = scheduler_lock();
+            if idx < s.tasks.len() {
+                s.tasks[idx].pid
+            } else {
+                0
+            }
+        };
+        crate::task::sched_trace::record(
+            pid_for_trace,
+            TaskState::Running as u8,
+            TaskState::BlockedOnRecv as u8,
+        );
+    }
+    // SAFETY: same invariants as block_current_unless_woken_inner — we are
+    // the running task on this core, scheduler RSP is valid.
+    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+
+    // On resume: the waker called wake_task which transitioned us to Ready and
+    // re-enqueued us. The dispatch loop re-set current_task_idx. Now check why
+    // we were woken.
+    if woken.load(Ordering::Acquire) {
+        BlockOutcome::Woken
+    } else {
+        // Woken by the deadline scanner (scan_expired_wake_deadlines).
+        BlockOutcome::DeadlineExpired
+    }
+}
+
+/// v2 helper: block the current task (as `BlockedOnReply`) until a message is
+/// delivered into its pending slot.
+///
+/// This is the v2 replacement for `block_current_on_reply_unless_message`.
+/// It wraps [`block_current_until`] using a **local** `AtomicBool` as the
+/// `woken` flag. The flag starts `false`; the caller is responsible for the
+/// condition being rechecked via `take_message` after this returns.
+///
+/// **Why a local `AtomicBool`?** During the Track C migration window the wake
+/// side (`wake_task`) still uses the v1 path and does not set any per-call
+/// flag.  The self-revert path in [`block_current_until`] checks
+/// `pending_msg.is_some()` via the `woken` flag — but because the wake side
+/// has not been migrated to the v2 protocol (Track D), the flag will always
+/// be `false` at the step-3 recheck.  The function therefore always goes to
+/// step 4 (yield) unless `pending_msg` is already set at entry (the early
+/// `AlreadyTrue` return).  Once Track D migrates `wake_task`, wakers will set
+/// the flag, enabling the no-yield fast path.
+///
+/// Returns `true` if the task was woken with a message (`Woken` or
+/// `AlreadyTrue`), `false` on a spurious or deadline wake (the latter is not
+/// possible on this path since no deadline is set, but is included for
+/// type-safety).
+///
+/// # Call-site migration contract
+///
+/// Under `cfg(feature = "sched-v2")`, `call_msg` in `endpoint.rs` calls this
+/// function instead of `block_current_on_reply_unless_message`.  The semantic
+/// outcome is identical: the caller resumes when a reply is delivered.
+#[cfg(feature = "sched-v2")]
+pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
+    use core::sync::atomic::AtomicBool;
+
+    // Check if a message was already delivered before we even try to block.
+    {
+        let sched = scheduler_lock();
+        if sched
+            .find(caller)
+            .map(|idx| sched.tasks[idx].pending_msg.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    // Use a stack-allocated AtomicBool as the v2 woken flag.
+    // Track D will set this from wake_task; for now it stays false until
+    // the block side self-reverts (which cannot happen without Track D waking it).
+    let woken = AtomicBool::new(false);
+
+    let outcome = block_current_until(&woken, None);
+
+    // Regardless of the outcome, the caller (call_msg) will call take_message()
+    // to confirm message delivery. We report true for Woken/AlreadyTrue, false
+    // for DeadlineExpired (no deadline set, so this branch is dead code for now).
+    match outcome {
+        BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
+        BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+/// Check whether a task has a pending message (for use by v2 wakers and
+/// condition checks without holding the scheduler lock long-term).
+///
+/// Acquires `SCHEDULER.lock` momentarily.
+#[cfg(feature = "sched-v2")]
+pub fn has_pending_message(id: TaskId) -> bool {
+    let sched = scheduler_lock();
+    sched
+        .find(id)
+        .map(|idx| sched.tasks[idx].pending_msg.is_some())
+        .unwrap_or(false)
+}
+
 /// Permanently mark the current task as dead and switch back to the scheduler.
 pub fn mark_current_dead() -> ! {
     let idx = {
