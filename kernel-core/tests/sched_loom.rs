@@ -20,9 +20,9 @@
 
 #[cfg(loom)]
 mod loom_tests {
-    use kernel_core::sched_model::{apply_event, BlockKind, BlockState, Event};
-    use loom::sync::atomic::{AtomicU8, Ordering};
+    use kernel_core::sched_model::{BlockKind, BlockState, Event, apply_event};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU8, Ordering};
 
     /// Encode BlockState as a u8 for loom atomic storage.
     fn encode(s: BlockState) -> u8 {
@@ -74,7 +74,10 @@ mod loom_tests {
                 if current == BlockState::Running {
                     let (next, _) = apply_event(
                         current,
-                        Event::Block { kind: BlockKind::Recv, deadline: None },
+                        Event::Block {
+                            kind: BlockKind::Recv,
+                            deadline: None,
+                        },
                     );
                     shared_a.store(encode(next), Ordering::Release);
                 }
@@ -106,7 +109,8 @@ mod loom_tests {
             let final_state = decode(shared.load(Ordering::Acquire));
             assert!(
                 !final_state.is_blocked(),
-                "lost wake: final state is {:?}", final_state
+                "lost wake: final state is {:?}",
+                final_state
             );
         });
     }

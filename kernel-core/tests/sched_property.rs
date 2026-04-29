@@ -12,7 +12,7 @@
 //!
 //! The harness is automatically picked up by `cargo test -p kernel-core`.
 
-use kernel_core::sched_model::{apply_event, BlockKind, BlockState, Event, SideEffects};
+use kernel_core::sched_model::{BlockKind, BlockState, Event, SideEffects, apply_event};
 use proptest::prelude::*;
 
 // ── Arbitrary strategies ──────────────────────────────────────────────────────
@@ -28,10 +28,7 @@ fn arb_block_kind() -> impl Strategy<Value = BlockKind> {
 }
 
 fn arb_deadline() -> impl Strategy<Value = Option<u64>> {
-    prop_oneof![
-        Just(None),
-        (1u64..10_000u64).prop_map(Some),
-    ]
+    prop_oneof![Just(None), (1u64..10_000u64).prop_map(Some),]
 }
 
 /// Generate a single event that is valid from any state.
@@ -92,9 +89,7 @@ fn expected_transition(state: BlockState, event: &Event) -> Option<(BlockState, 
                 },
             ))
         }
-        (BlockState::Running, Event::Wake) => {
-            Some((BlockState::Running, SideEffects::default()))
-        }
+        (BlockState::Running, Event::Wake) => Some((BlockState::Running, SideEffects::default())),
         (BlockState::Running, Event::ScanExpired { .. }) => {
             Some((BlockState::Running, SideEffects::default()))
         }

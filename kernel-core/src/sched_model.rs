@@ -1,23 +1,24 @@
-/// v2 Scheduler Block/Wake State Machine Model
-///
-/// This module encodes the v2 protocol transition table from
-/// `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` as a pure,
-/// allocation-free function. It compiles in both `no_std` (kernel) and `std`
-/// (host test) contexts via `kernel-core`'s feature flag.
-///
-/// # Why this exists
-///
-/// The v2 protocol eliminates the v1 lost-wake bug class by making
-/// `TaskState` the sole source of truth for block state. All mutations are
-/// serialized under a per-task `pi_lock`. This model is the TDD red-phase
-/// foundation (Track A.4); every kernel implementation in Tracks C/D/E must
-/// satisfy the contract encoded here.
-///
-/// # A.7 — DEFERRED:
-/// Loom interleaving harness (`kernel-core/tests/sched_loom.rs`) is included
-/// as a `#[cfg(loom)]`-gated skeleton. Full wiring of the two-thread
-/// exhaustive search can land in a follow-up PR once the loom model of the
-/// actual primitives (Task::pi_lock, SCHEDULER) is available.
+//! v2 Scheduler Block/Wake State Machine Model
+//!
+//! This module encodes the v2 protocol transition table from
+//! `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` as a pure,
+//! allocation-free function. It compiles in both `no_std` (kernel) and `std`
+//! (host test) contexts via `kernel-core`'s feature flag.
+//!
+//! # Why this exists
+//!
+//! The v2 protocol eliminates the v1 lost-wake bug class by making
+//! `TaskState` the sole source of truth for block state. All mutations are
+//! serialized under a per-task `pi_lock`. This model is the TDD red-phase
+//! foundation (Track A.4); every kernel implementation in Tracks C/D/E must
+//! satisfy the contract encoded here.
+//!
+//! # A.7 — DEFERRED
+//!
+//! Loom interleaving harness (`kernel-core/tests/sched_loom.rs`) is included
+//! as a `#[cfg(loom)]`-gated skeleton. Full wiring of the two-thread
+//! exhaustive search can land in a follow-up PR once the loom model of the
+//! actual primitives (Task::pi_lock, SCHEDULER) is available.
 
 // ── Block state ──────────────────────────────────────────────────────────────
 
@@ -102,7 +103,10 @@ pub enum Event {
     /// Only valid from the `Running` state. The `kind` field selects which
     /// `Blocked*` variant the task transitions to. `deadline` is an optional
     /// absolute tick value after which `scan_expired` will fire a wake.
-    Block { kind: BlockKind, deadline: Option<u64> },
+    Block {
+        kind: BlockKind,
+        deadline: Option<u64>,
+    },
 
     /// An external caller (ISR, another task, the notification path) calls
     /// `wake_task`. Under `pi_lock`, performs a CAS from any `Blocked*` to
@@ -174,9 +178,7 @@ pub fn apply_event(state: BlockState, event: Event) -> (BlockState, SideEffects)
         // `block_current_until`. This cell is reached only if the primitive is
         // called with an already-true condition from a just-dispatched task
         // before any state write — the function returns without a state change.
-        (BlockState::Ready, Event::Block { .. }) => {
-            (BlockState::Ready, SideEffects::default())
-        }
+        (BlockState::Ready, Event::Block { .. }) => (BlockState::Ready, SideEffects::default()),
 
         // ── Ready × wake ─────────────────────────────────────────────────
         //
@@ -195,9 +197,7 @@ pub fn apply_event(state: BlockState, event: Event) -> (BlockState, SideEffects)
         // ── Ready × condition_true ────────────────────────────────────────
         //
         // ConditionTrue from a non-blocked state: no-op.
-        (BlockState::Ready, Event::ConditionTrue) => {
-            (BlockState::Ready, SideEffects::default())
-        }
+        (BlockState::Ready, Event::ConditionTrue) => (BlockState::Ready, SideEffects::default()),
 
         // ── Running × block ───────────────────────────────────────────────
         //
@@ -312,9 +312,7 @@ pub fn apply_event(state: BlockState, event: Event) -> (BlockState, SideEffects)
         // Invariant violation: a Dead task must not re-enter any block
         // primitive.
         (BlockState::Dead, Event::Block { .. }) => {
-            panic!(
-                "apply_event: Block event on Dead task — kernel invariant violated"
-            )
+            panic!("apply_event: Block event on Dead task — kernel invariant violated")
         }
 
         // ── Dead × wake → Dead (no-op) ────────────────────────────────────
@@ -328,9 +326,7 @@ pub fn apply_event(state: BlockState, event: Event) -> (BlockState, SideEffects)
         //
         // Invariant: state is Dead (not Blocked*); stale deadline cleaned up
         // without any state change.
-        (BlockState::Dead, Event::ScanExpired { .. }) => {
-            (BlockState::Dead, SideEffects::default())
-        }
+        (BlockState::Dead, Event::ScanExpired { .. }) => (BlockState::Dead, SideEffects::default()),
 
         // ── Dead × condition_true → Dead (no-op) ─────────────────────────
         //
@@ -420,7 +416,10 @@ mod tests {
     fn test_ready_block_noop() {
         assert_transition(
             BlockState::Ready,
-            Event::Block { kind: BlockKind::Recv, deadline: None },
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
             BlockState::Ready,
             SideEffects::default(),
         );
@@ -456,7 +455,10 @@ mod tests {
     fn test_running_block_to_blocked_on_recv_with_deadline() {
         assert_transition(
             BlockState::Running,
-            Event::Block { kind: BlockKind::Recv, deadline: Some(500) },
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: Some(500),
+            },
             BlockState::BlockedOnRecv,
             SideEffects {
                 deadline_set: Some(500),
@@ -471,7 +473,10 @@ mod tests {
     fn test_running_block_to_blocked_on_send_no_deadline() {
         assert_transition(
             BlockState::Running,
-            Event::Block { kind: BlockKind::Send, deadline: None },
+            Event::Block {
+                kind: BlockKind::Send,
+                deadline: None,
+            },
             BlockState::BlockedOnSend,
             SideEffects {
                 yielded: true,
@@ -485,7 +490,10 @@ mod tests {
     fn test_running_block_to_blocked_on_reply() {
         assert_transition(
             BlockState::Running,
-            Event::Block { kind: BlockKind::Reply, deadline: None },
+            Event::Block {
+                kind: BlockKind::Reply,
+                deadline: None,
+            },
             BlockState::BlockedOnReply,
             SideEffects {
                 yielded: true,
@@ -499,7 +507,10 @@ mod tests {
     fn test_running_block_to_blocked_on_notif() {
         assert_transition(
             BlockState::Running,
-            Event::Block { kind: BlockKind::Notif, deadline: Some(999) },
+            Event::Block {
+                kind: BlockKind::Notif,
+                deadline: Some(999),
+            },
             BlockState::BlockedOnNotif,
             SideEffects {
                 deadline_set: Some(999),
@@ -514,7 +525,10 @@ mod tests {
     fn test_running_block_to_blocked_on_futex() {
         assert_transition(
             BlockState::Running,
-            Event::Block { kind: BlockKind::Futex, deadline: None },
+            Event::Block {
+                kind: BlockKind::Futex,
+                deadline: None,
+            },
             BlockState::BlockedOnFutex,
             SideEffects {
                 yielded: true,
@@ -755,7 +769,10 @@ mod tests {
     fn test_blocked_on_recv_block_unreachable() {
         apply_event(
             BlockState::BlockedOnRecv,
-            Event::Block { kind: BlockKind::Recv, deadline: None },
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
         );
     }
 
@@ -765,7 +782,10 @@ mod tests {
     fn test_blocked_on_send_block_unreachable() {
         apply_event(
             BlockState::BlockedOnSend,
-            Event::Block { kind: BlockKind::Send, deadline: None },
+            Event::Block {
+                kind: BlockKind::Send,
+                deadline: None,
+            },
         );
     }
 
@@ -775,7 +795,10 @@ mod tests {
     fn test_blocked_on_reply_block_unreachable() {
         apply_event(
             BlockState::BlockedOnReply,
-            Event::Block { kind: BlockKind::Reply, deadline: None },
+            Event::Block {
+                kind: BlockKind::Reply,
+                deadline: None,
+            },
         );
     }
 
@@ -785,7 +808,10 @@ mod tests {
     fn test_blocked_on_notif_block_unreachable() {
         apply_event(
             BlockState::BlockedOnNotif,
-            Event::Block { kind: BlockKind::Notif, deadline: None },
+            Event::Block {
+                kind: BlockKind::Notif,
+                deadline: None,
+            },
         );
     }
 
@@ -795,7 +821,10 @@ mod tests {
     fn test_blocked_on_futex_block_unreachable() {
         apply_event(
             BlockState::BlockedOnFutex,
-            Event::Block { kind: BlockKind::Futex, deadline: None },
+            Event::Block {
+                kind: BlockKind::Futex,
+                deadline: None,
+            },
         );
     }
 
@@ -805,7 +834,10 @@ mod tests {
     fn test_dead_block_unreachable() {
         apply_event(
             BlockState::Dead,
-            Event::Block { kind: BlockKind::Recv, deadline: None },
+            Event::Block {
+                kind: BlockKind::Recv,
+                deadline: None,
+            },
         );
     }
 
