@@ -14789,14 +14789,24 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             continue;
         }
 
-        // Block until woken by an FD event. For positive timeouts, yield
-        // so the tick counter advances and the deadline check at the top
-        // of the loop can fire; for indefinite timeouts, fully block.
-        // In both cases, waiters remain registered across the suspend.
-        if deadline_tick.is_some() {
-            crate::task::yield_now();
-        } else {
-            crate::task::scheduler::block_current_unless_woken(&woken);
+        // Block until woken by an FD event.
+        //
+        // F.4: Under sched-v2, use block_current_until for both branches:
+        // - Positive timeout: pass deadline_tick so the deadline scanner
+        //   wakes us when the timeout expires (no yield_now() spin needed).
+        // - Indefinite timeout: pass None; wake comes from WaitQueue.
+        // Under v1, retain the original yield_now() / block_current_unless_woken paths.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                crate::task::yield_now();
+            } else {
+                crate::task::scheduler::block_current_unless_woken(&woken);
+            }
         }
     };
 
@@ -15040,8 +15050,13 @@ fn select_inner(
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -15049,15 +15064,28 @@ fn select_inner(
                     fd_deregister_waiter(entry, task_id);
                 }
             }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (NULL): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
-            for fd in 0..nfds {
-                if let Some(entry) = &entries[fd]
-                    && combined & (1 << fd) != 0
-                {
-                    fd_deregister_waiter(entry, task_id);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                // Positive timeout: yield to let timer ticks advance.
+                for fd in 0..nfds {
+                    if let Some(entry) = &entries[fd]
+                        && combined & (1 << fd) != 0
+                    {
+                        fd_deregister_waiter(entry, task_id);
+                    }
+                }
+                crate::task::yield_now();
+            } else {
+                // Indefinite timeout (NULL): block on wait queues.
+                crate::task::scheduler::block_current_unless_woken(&woken);
+                for fd in 0..nfds {
+                    if let Some(entry) = &entries[fd]
+                        && combined & (1 << fd) != 0
+                    {
+                        fd_deregister_waiter(entry, task_id);
+                    }
                 }
             }
         }
@@ -15457,20 +15485,36 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);
                 }
             }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (-1): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
-            for interest in &interests {
-                if let Some(entry) = current_fd_entry(interest.fd) {
-                    fd_deregister_waiter(&entry, task_id);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                // Positive timeout: yield to let timer ticks advance.
+                for interest in &interests {
+                    if let Some(entry) = current_fd_entry(interest.fd) {
+                        fd_deregister_waiter(&entry, task_id);
+                    }
+                }
+                crate::task::yield_now();
+            } else {
+                // Indefinite timeout (-1): block on wait queues.
+                crate::task::scheduler::block_current_unless_woken(&woken);
+                for interest in &interests {
+                    if let Some(entry) = current_fd_entry(interest.fd) {
+                        fd_deregister_waiter(&entry, task_id);
+                    }
                 }
             }
         }
