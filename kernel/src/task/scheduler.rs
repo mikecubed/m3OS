@@ -1230,6 +1230,119 @@ fn record_preempt_ptr_update(
     crate::task::sched_trace::record(pid_field, phase_code, phase_code);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57b D.2 — lock-free `preempt_disable` / `preempt_enable`
+// ---------------------------------------------------------------------------
+//
+// These are the canonical entry points every spinlock callsite will use to
+// raise / drop the per-task preempt-disable counter.  They **must not**
+// acquire any lock — Phase 57b F.1 wires `preempt_disable` into
+// `IrqSafeMutex::lock`; if either helper acquired a lock here, that wiring
+// would recurse and deadlock the first task that took an `IrqSafeMutex`.
+//
+// The lock-free property is mechanical:
+//
+//   1. Read [`crate::smp::PerCoreData::current_preempt_count_ptr`] with
+//      `Acquire`.  The pointer is **always** valid (the C.1 boot dummy and
+//      C.2/C.3 retargets keep it non-null and pointing at live `'static` or
+//      `Box<Task>` memory).
+//   2. Issue `(*ptr).fetch_add(1, Acquire)` (raise) or
+//      `(*ptr).fetch_sub(1, Release)` (drop).  No mutex, no scheduler lock.
+//
+// Step 2's atomic read-modify-write is the only operation that touches the
+// counter; step 1's pointer load is `Acquire`-paired with the `Release`-
+// store in C.2 / C.3 so a retarget that landed *before* this load is fully
+// visible — the helper either reads the post-retarget pointer or the pre-
+// retarget pointer, never a torn value.
+//
+// **Boot-dummy tolerance.**  At early boot (before any task is dispatched)
+// the pointer targets `&SCHED_PREEMPT_COUNT_DUMMY[core_id]`, a `'static`
+// `AtomicI32` initialised to 0.  A stray `preempt_disable` before the first
+// dispatch lands on the dummy and is harmless: the dummy's count rises and
+// falls in step with paired enables, and the user-mode-return assertion
+// (D.3) reads the same pointee, so the round trip is observable.  Track
+// C.1 documents the dummy invariant in `kernel/src/smp/mod.rs`.
+//
+// **No zero-crossing scheduler trigger.**  Linux wires the `preempt_enable
+// → schedule()` deferred-reschedule pattern into its counter drop.  In
+// Phase 57b, `preempt_enable` is a pure decrement — the deferred-reschedule
+// on zero-crossing is **explicitly deferred to Phase 57d**, see
+// `docs/roadmap/57d-voluntary-preemption.md`.
+
+/// Phase 57b D.2 — increment the per-task preempt-disable counter.
+///
+/// Reads [`crate::smp::PerCoreData::current_preempt_count_ptr`] with
+/// `Acquire` ordering and atomically adds 1 to the pointee with `Acquire`
+/// ordering.  Lock-free by mandate: this helper does **not** call
+/// `scheduler_lock()` and does **not** call `IrqSafeMutex::lock()`.  Track
+/// F.1 wires this helper into `IrqSafeMutex::lock`; any lock acquisition
+/// inside `preempt_disable` would recurse the moment that wiring lands.
+///
+/// At early boot the pointer targets the per-core dummy (Phase 57b C.1),
+/// so a stray `preempt_disable` before the first task is dispatched is
+/// harmless — the dummy's count is paired with a corresponding
+/// `preempt_enable` and never observed elsewhere.
+///
+/// In debug builds, panics if the post-increment value exceeds 32 — caps
+/// the documented maximum nesting depth (see the Engineering Practice
+/// Gates of `docs/roadmap/tasks/57b-preemption-foundation-tasks.md` and
+/// the `nesting_to_max_depth_round_trips_to_zero` test in
+/// `kernel-core/src/preempt_model.rs`).  Catches "preempt_disable in a
+/// loop" bugs at the boundary instead of letting them silently overflow
+/// the counter.
+#[inline]
+pub fn preempt_disable() {
+    let ptr = crate::smp::per_core()
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    // The pointer is always valid by C.1 / C.2 / C.3 invariants — at boot
+    // it targets `SCHED_PREEMPT_COUNT_DUMMY[core_id]` and during task
+    // execution it targets a live `Task::preempt_count`.  Defensive null
+    // check for the truly-uninitialised window before C.1 has run on this
+    // core (the helper is `pub` and could in principle be called that
+    // early).
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: the pointee is a `'static` `AtomicI32` (per-core dummy) or a
+    // `Box<Task>::preempt_count` whose address Track B's `Vec<Box<Task>>`
+    // storage keeps stable for the task's lifetime.  In both cases the
+    // pointee outlives this load.
+    let new_value = unsafe { (*ptr).fetch_add(1, core::sync::atomic::Ordering::Acquire) } + 1;
+    debug_assert!(
+        new_value <= 32,
+        "preempt_disable depth exceeded the documented maximum of 32 \
+         (post-increment count = {new_value}); likely a preempt_disable \
+         in a loop without paired preempt_enable",
+    );
+}
+
+/// Phase 57b D.2 — decrement the per-task preempt-disable counter.
+///
+/// Reads [`crate::smp::PerCoreData::current_preempt_count_ptr`] with
+/// `Acquire` ordering and atomically subtracts 1 from the pointee with
+/// `Release` ordering.  Lock-free by mandate (same rationale as
+/// [`preempt_disable`]): no `scheduler_lock()`, no `IrqSafeMutex::lock()`.
+///
+/// In Phase 57b the post-decrement value is **not** inspected — the
+/// deferred-reschedule on zero-crossing (Linux's
+/// `preempt_enable() → schedule()` pattern) is explicitly deferred to
+/// Phase 57d.  See `docs/roadmap/57d-voluntary-preemption.md` for the
+/// design and the eventual zero-crossing wiring point.
+#[inline]
+pub fn preempt_enable() {
+    let ptr = crate::smp::per_core()
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: identical pointee invariant as [`preempt_disable`].
+    unsafe {
+        (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
