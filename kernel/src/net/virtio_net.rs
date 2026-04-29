@@ -487,7 +487,15 @@ pub fn wake_net_task() {
     crate::net::NIC_WOKEN.store(true, Ordering::Release);
     let raw = NET_TASK_ID.load(Ordering::Acquire);
     if raw != 0 {
-        let _ = wake_task(TaskId(raw));
+        // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::wake_task_v2(TaskId(raw));
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            let _ = wake_task(TaskId(raw));
+        }
     } else {
         crate::task::scheduler::signal_reschedule();
     }
