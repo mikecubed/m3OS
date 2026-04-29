@@ -119,6 +119,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::{cell::UnsafeCell, sync::atomic::Ordering};
 use spin::Mutex;
@@ -350,7 +351,9 @@ fn set_current_task_idx(idx: Option<usize>) {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct Scheduler {
-    tasks: Vec<Task>,
+    /// Addresses of `Task` instances are stable for the task's lifetime. Per-CPU dispatch state (`current_preempt_count_ptr`) caches raw pointers into `Task::preempt_count` and relies on this stability. The outer `Vec` may reallocate when growing; the inner `Box` keeps each `Task` at a fixed heap address regardless.
+    #[allow(clippy::vec_box)]
+    tasks: Vec<Box<Task>>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
@@ -375,7 +378,7 @@ impl Scheduler {
     ///
     /// Used by `panic_diag` to inspect the current task without panicking.
     pub(crate) fn get_task(&self, idx: usize) -> Option<&Task> {
-        self.tasks.get(idx)
+        self.tasks.get(idx).map(|b| &**b)
     }
 
     fn find_by_pid(&self, pid: u32) -> Option<usize> {
@@ -848,14 +851,16 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
 /// Allocate a slot for a new task, reusing a dead slot from the free list
 /// if available, otherwise appending to the task vec.
 fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
+    let boxed = Box::new(task);
     if let Some(idx) = sched.free_list.pop() {
-        // Reuse a dead slot.
+        // Reuse a dead slot. Overwriting the slot drops the prior `Box<Task>`
+        // and installs a fresh stable heap address for the new task.
         crate::ipc::notification::clear_bound_task(idx);
-        sched.tasks[idx] = task;
+        sched.tasks[idx] = boxed;
         idx
     } else {
         let idx = sched.tasks.len();
-        sched.tasks.push(task);
+        sched.tasks.push(boxed);
         idx
     }
 }
@@ -2330,14 +2335,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
         let mut filler = Task::new(test_task_entry, "test-filler");
         // TODO(57a-C/D): route through pi_lock + with_block_state
         filler.state = TaskState::Dead;
-        sched.tasks.push(filler);
+        sched.tasks.push(Box::new(filler));
     }
 
     let mut task = Task::new(test_task_entry, "test-cleanup");
     task.id = task_id;
     // TODO(57a-C/D): route through pi_lock + with_block_state
     task.state = TaskState::Ready;
-    sched.tasks[idx] = task;
+    sched.tasks[idx] = Box::new(task);
 }
 
 /// Return whether any live task other than `excluding` still holds a cap to
