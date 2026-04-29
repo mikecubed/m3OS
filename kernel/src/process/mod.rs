@@ -1379,6 +1379,10 @@ fn interrupt_ipc_waits(pid: Pid) {
         // surface a spurious error; the signal stays pending and fires at
         // the next syscall boundary.
         crate::task::scheduler::try_deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
+        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+        #[cfg(feature = "sched-v2")]
+        let _ = crate::task::scheduler::wake_task_v2(task_id);
+        #[cfg(not(feature = "sched-v2"))]
         let _ = crate::task::scheduler::wake_task(task_id);
     }
 }

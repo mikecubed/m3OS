@@ -1795,6 +1795,126 @@ pub fn has_pending_message(id: TaskId) -> bool {
         .unwrap_or(false)
 }
 
+/// v2 helper: block the current task (as `BlockedOnRecv`) until a message is
+/// delivered into its pending slot.
+///
+/// This is the v2 replacement for `block_current_on_recv_unless_message` used
+/// in `recv_msg`. It wraps [`block_current_until`] using a stack-allocated
+/// `AtomicBool` as the `woken` flag, mirroring the pattern established by
+/// [`block_current_on_reply_v2`] (Track C.4).
+///
+/// **Condition recheck (approach c):** The pending_msg pre-check is performed
+/// in the IPC layer (endpoint.rs) before calling this function, and
+/// `take_message` is called after return — the IPC layer owns the condition
+/// logic. This helper only owns the block/yield/resume protocol.
+///
+/// Returns `true` if woken (`Woken` or `AlreadyTrue`), `false` on deadline
+/// (no deadline is set for IPC recv, so this is dead code for now).
+#[cfg(feature = "sched-v2")]
+pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
+    use core::sync::atomic::AtomicBool;
+
+    // Fast path: message already delivered before we even try to block.
+    {
+        let sched = scheduler_lock();
+        if sched
+            .find(receiver)
+            .map(|idx| sched.tasks[idx].pending_msg.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    let woken = AtomicBool::new(false);
+    let outcome = block_current_until(&woken, None);
+    match outcome {
+        BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
+        BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+/// v2 helper: block the current task (as `BlockedOnNotif`) until a message or
+/// notification is delivered.
+///
+/// This is the v2 replacement for `block_current_on_notif_unless_message` used
+/// in `recv_msg_with_notif`. Follows the same pattern as
+/// [`block_current_on_reply_v2`] (Track C.4) and [`block_current_on_recv_v2`].
+///
+/// **Condition recheck (approach c):** The IPC layer (endpoint.rs) owns the
+/// condition check (pending_msg / notification bits); this helper owns only the
+/// block/yield/resume protocol under `block_current_until`.
+///
+/// Returns `true` if woken, `false` on deadline (no deadline set → dead code).
+#[cfg(feature = "sched-v2")]
+pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
+    use core::sync::atomic::AtomicBool;
+
+    // Fast path: message already delivered.
+    {
+        let sched = scheduler_lock();
+        if sched
+            .find(receiver)
+            .map(|idx| sched.tasks[idx].pending_msg.is_some())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    let woken = AtomicBool::new(false);
+    let outcome = block_current_until(&woken, None);
+    match outcome {
+        BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
+        BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+/// v2 helper: block the current task (as `BlockedOnSend`) until the send
+/// operation is accepted by a receiver.
+///
+/// This is the v2 replacement for `block_current_on_send_unless_completed` used
+/// in `send` and `send_with_cap`. Follows the same pattern as
+/// [`block_current_on_reply_v2`] (Track C.4).
+///
+/// **Condition recheck (approach c):** The IPC layer owns the
+/// `pending_msg.is_some() || send_completed` pre-check; this helper owns
+/// only the block/yield/resume protocol.
+///
+/// Returns `true` if woken, `false` on deadline (no deadline → dead code).
+#[cfg(feature = "sched-v2")]
+pub fn block_current_on_send_v2(sender: TaskId) -> bool {
+    use core::sync::atomic::AtomicBool;
+
+    // Fast path: send already completed (receiver picked us up) or error
+    // message delivered.
+    {
+        let mut sched = scheduler_lock();
+        if let Some(idx) = sched.find(sender)
+            && (sched.tasks[idx].pending_msg.is_some() || sched.tasks[idx].send_completed)
+        {
+            sched.tasks[idx].send_completed = false;
+            return true;
+        }
+    }
+
+    let woken = AtomicBool::new(false);
+    let outcome = block_current_until(&woken, None);
+
+    // Clear send_completed flag after waking (mirrors v1 block_current_on_send_unless_completed).
+    {
+        let mut sched = scheduler_lock();
+        if let Some(idx) = sched.find(sender) {
+            sched.tasks[idx].send_completed = false;
+        }
+    }
+
+    match outcome {
+        BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
+        BlockOutcome::DeadlineExpired => false,
+    }
+}
+
 /// Permanently mark the current task as dead and switch back to the scheduler.
 pub fn mark_current_dead() -> ! {
     let idx = {
