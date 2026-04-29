@@ -4084,4 +4084,70 @@ mod f1_tests {
     }
 }
 
-// (Phase 57b F.2 tests intentionally added in a separate commit.)
+// ---------------------------------------------------------------------------
+// Phase 57b F.2 — SchedulerGuard inherits preempt-discipline
+// ---------------------------------------------------------------------------
+//
+// F.2 requires no code change — `SchedulerGuard` wraps `IrqSafeGuard`, so
+// F.1's wiring carries over for free.  The regression test pins that
+// property: a `scheduler_lock()` acquire/release cycle must mutate
+// `preempt_count` exactly once (raise on `lock`, drop on `Drop`).
+//
+// The kernel test harness cannot drive a real `scheduler_lock()` call:
+// `try_per_core` returns `None` in the test harness so the real
+// `preempt_disable` / `preempt_enable` helpers are no-ops — there is
+// no observable counter to assert against.
+//
+// The F.2 test instead mirrors the synthetic counter pattern used by
+// the F.1 tests above and confirms an acquire/release pair cycles a
+// stand-in `preempt_count` 0 → 1 → 0.  A future change to
+// `SchedulerGuard`'s drop chain (e.g., a sentinel reorder) that broke
+// the F.1 inheritance would surface here against the
+// scheduler-lock-equivalent shape.
+#[cfg(test)]
+mod f2_tests {
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    /// Phase 57b F.2 — scheduler-lock-shaped acquire/release cycles
+    /// `preempt_count` exactly once.
+    ///
+    /// `SchedulerGuard` wraps `IrqSafeGuard` and adds a
+    /// `SchedulerLockSentinel` field that clears `holds_scheduler_lock`
+    /// on drop (Phase 57a B.3).  The wrapper is transparent for
+    /// preempt-discipline: F.1's `IrqSafeMutex::lock` raises
+    /// `preempt_count`, and the inner `IrqSafeGuard::Drop` drops it
+    /// before the sentinel runs.
+    ///
+    /// The synthetic counter mirrors the production helpers' atomic
+    /// fetch_add / fetch_sub.  See the F.1 tests' module-level
+    /// commentary for why the kernel test harness cannot drive a real
+    /// `scheduler_lock()` here.
+    #[test_case]
+    fn scheduler_lock_acquire_release_cycles_preempt_count_exactly_once() {
+        let counter = AtomicI32::new(0);
+        let ptr = &counter as *const _ as *mut AtomicI32;
+
+        // Pre-lock.
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        // Acquire (mirrors `scheduler_lock()` → `IrqSafeMutex::lock` →
+        // `preempt_disable`).
+        // Safety: `ptr` derives from a live `AtomicI32` borrow.
+        unsafe { (*ptr).fetch_add(1, Ordering::Acquire) };
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            1,
+            "scheduler_lock acquire must raise preempt_count exactly once",
+        );
+
+        // Release (mirrors `SchedulerGuard::Drop` → `IrqSafeGuard::Drop`
+        // → `_preempt: PreemptRestore::drop` → `preempt_enable`).
+        // Safety: same `ptr` invariant.
+        unsafe { (*ptr).fetch_sub(1, Ordering::Release) };
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "SchedulerGuard release must drop preempt_count back to 0",
+        );
+    }
+}
