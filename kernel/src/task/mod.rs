@@ -55,8 +55,10 @@ pub(crate) const MAX_TASKS: usize = 256;
 pub use kernel_core::types::TaskId;
 
 pub mod blocking_mutex;
+pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
+pub mod watchdog;
 
 #[allow(unused_imports)]
 pub use scheduler::{
@@ -268,6 +270,13 @@ pub struct Task {
     /// `SCHEDULER.lock`), not from the timer ISR, so there is no same-core
     /// re-entrance hazard.
     pub wake_deadline: Option<u64>,
+    /// Tick at which this task most recently entered a `Blocked*` state.
+    ///
+    /// Set by `block_current` (and its variants) immediately before writing
+    /// the new `Blocked*` state. Reset to 0 when the task transitions back to
+    /// `Ready` via `wake_task` or `scan_expired_wake_deadlines`. Used by the
+    /// G.1 stuck-task watchdog to compute how long a task has been blocked.
+    pub blocked_since_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
@@ -329,6 +338,7 @@ impl Task {
             user_return: None,
             fork_ctx: None,
             wake_deadline: None,
+            blocked_since_tick: 0,
             _stack: Some(stack),
             // Phase 57a B.2: initialize pi_lock with the same initial state as
             // Task::state so the shadow lock is consistent from construction.

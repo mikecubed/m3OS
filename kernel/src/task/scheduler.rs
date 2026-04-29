@@ -1191,7 +1191,7 @@ pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
 fn block_current(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1203,9 +1203,11 @@ fn block_current(state: TaskState) {
             idx,
             sched.tasks[idx].state
         );
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
+        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
             &mut sched.tasks[idx],
@@ -1213,7 +1215,7 @@ fn block_current(state: TaskState) {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     let core = crate::smp::per_core().core_id;
     PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
@@ -1229,13 +1231,17 @@ fn block_current(state: TaskState) {
         core,
         new_state: state as u8,
     });
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
 fn block_current_unless_message(state: TaskState) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1244,9 +1250,11 @@ fn block_current_unless_message(state: TaskState) {
         if sched.tasks[idx].pending_msg.is_some() {
             return;
         }
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = state;
+        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
             &mut sched.tasks[idx],
@@ -1254,12 +1262,16 @@ fn block_current_unless_message(state: TaskState) {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(pid_for_trace, TaskState::Running as u8, state as u8);
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -1278,7 +1290,7 @@ pub fn block_current_on_send() {
 pub fn block_current_on_send_unless_completed() {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1288,9 +1300,11 @@ pub fn block_current_on_send_unless_completed() {
             sched.tasks[idx].send_completed = false;
             return;
         }
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnSend;
+        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
         save_user_return_state(
             &mut sched.tasks[idx],
@@ -1298,12 +1312,20 @@ pub fn block_current_on_send_unless_completed() {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(
+        pid_for_trace,
+        TaskState::Running as u8,
+        TaskState::BlockedOnSend as u8,
+    );
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
     let mut sched = scheduler_lock();
     if idx < sched.tasks.len() {
@@ -1396,7 +1418,7 @@ fn block_current_unless_woken_inner(
 ) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
-    let idx = {
+    let (idx, pid_for_trace) = {
         let mut sched = scheduler_lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
             return;
@@ -1412,9 +1434,11 @@ fn block_current_unless_woken_inner(
             Some(i) => i,
             None => return,
         };
+        let pid = sched.tasks[idx].pid;
         accumulate_ticks(&mut sched, idx);
         // TODO(57a-C/D): route through pi_lock + with_block_state
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
+        sched.tasks[idx].blocked_since_tick = crate::arch::x86_64::interrupts::tick_count();
         sched.tasks[idx].switching_out = true;
         // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
         // hot-path `scan_expired_wake_deadlines` can skip the O(n) scan
@@ -1432,12 +1456,20 @@ fn block_current_unless_woken_inner(
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
-        idx
+        (idx, pid)
     };
     PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    #[cfg(feature = "sched-trace")]
+    crate::task::sched_trace::record(
+        pid_for_trace,
+        TaskState::Running as u8,
+        TaskState::BlockedOnRecv as u8,
+    );
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = pid_for_trace;
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -1584,6 +1616,7 @@ pub fn wake_task(id: TaskId) -> bool {
                         // TODO(57a-C/D): route through pi_lock + with_block_state
                         sched.tasks[idx].state = TaskState::Ready;
                         sched.tasks[idx].last_ready_tick = now;
+                        sched.tasks[idx].blocked_since_tick = 0;
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
                             true,
@@ -1612,6 +1645,8 @@ pub fn wake_task(id: TaskId) -> bool {
             last_ready_tick,
             last_migrated_tick,
         ) = snapshot;
+        #[cfg(feature = "sched-trace")]
+        crate::task::sched_trace::record(pid_for_log, prev_state, TaskState::Ready as u8);
         if let Some(label) = label {
             log::debug!(
                 "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
@@ -1937,6 +1972,14 @@ pub fn run() -> ! {
         // Periodic load balancing with per-task cooldown (Phase 52c A.4).
         if core_id == 0 {
             maybe_load_balance();
+        }
+
+        // G.1: Periodic stuck-task watchdog scan (BSP only, same convention as
+        // drain_dead / maybe_load_balance). Every WATCHDOG_SCAN_INTERVAL_TICKS
+        // ticks, logs WARN for any Blocked* task with no pending waker or with
+        // an expired deadline. See kernel/src/task/watchdog.rs.
+        if core_id == 0 {
+            crate::task::watchdog::watchdog_scan();
         }
 
         // Before picking next, wake any tasks whose `wake_deadline` has
@@ -2387,10 +2430,14 @@ fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usiz
             task.last_migrated_tick = now;
             continue;
         }
+        let _old_state_u8 = task.state as u8;
         // TODO(57a-C/D): route through pi_lock + with_block_state
         task.state = TaskState::Ready;
         task.last_ready_tick = now;
         task.last_migrated_tick = now;
+        task.blocked_since_tick = 0;
+        #[cfg(feature = "sched-trace")]
+        crate::task::sched_trace::record(task.pid, _old_state_u8, TaskState::Ready as u8);
         if n < expired.len() {
             expired[n] = (task.assigned_core, idx);
             n += 1;
@@ -2593,4 +2640,115 @@ pub fn sys_sched_getaffinity(pid: u32) -> i64 {
         }
     };
     sched.tasks[idx].affinity_mask as i64
+}
+
+// ---------------------------------------------------------------------------
+// G.1 — Stuck-task watchdog
+// ---------------------------------------------------------------------------
+//
+// `watchdog_scan` is placed here (rather than in the sibling `watchdog.rs`
+// module) because `SCHEDULER` is `pub(super)` — accessible within the `task`
+// module but not from child modules of `task`. The `task::watchdog` module
+// re-exports this symbol via `pub use super::scheduler::watchdog_scan`.
+//
+// Integration: called from the BSP's scheduler dispatch loop (core_id == 0),
+// matching the existing pattern for `drain_dead`, `drain_pending_waiters`,
+// and `maybe_load_balance`. The `WATCHDOG_COUNTER` gates the O(n) scan so
+// the dispatch hot path sees only a single atomic increment on most calls.
+
+/// Tick counter gating watchdog scans (BSP-only, matches `BALANCE_COUNTER`).
+static WATCHDOG_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Periodic stuck-task watchdog scan.
+///
+/// Called from the BSP's scheduler dispatch loop on every iteration.
+/// On most calls returns immediately after incrementing `WATCHDOG_COUNTER`
+/// (O(1)). Every [`kernel_core::watchdog_policy::WATCHDOG_SCAN_INTERVAL_TICKS`]
+/// ticks, acquires `SCHEDULER.lock` and iterates the task table (O(n_tasks)),
+/// logging a structured WARN for any `Blocked*` task that has exceeded the
+/// stuck threshold.
+///
+/// # Logging format
+///
+/// ```text
+/// [WARN] [sched] task pid=X name=Y state=Z stuck-since=Wms (no waker registered)
+/// [WARN] [sched] task pid=X name=Y state=Z stuck-since=Wms (deadline expired Dms ago — scanner may be stuck)
+/// ```
+pub fn watchdog_scan() {
+    use kernel_core::watchdog_policy::{
+        WATCHDOG_SCAN_INTERVAL_TICKS, WatchdogVerdict, watchdog_verdict,
+    };
+
+    let cnt = WATCHDOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // WATCHDOG_SCAN_INTERVAL_TICKS (10_000) fits in u32.
+    let interval = WATCHDOG_SCAN_INTERVAL_TICKS as u32;
+    if !cnt.is_multiple_of(interval) {
+        return;
+    }
+
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    // Acquire lock and scan. Release before any logging (log macros may
+    // allocate internally; holding SCHEDULER.lock during alloc is safe but
+    // keeping the critical section short is good practice).
+    let mut warnings: [(u32, &'static str, super::TaskState, u64, Option<u64>); 8] =
+        [(0, "", super::TaskState::Dead, 0, None); 8];
+    let mut n_warn = 0usize;
+    {
+        let sched = scheduler_lock();
+        for task in sched.tasks.iter() {
+            let is_blocked = matches!(
+                task.state,
+                super::TaskState::BlockedOnRecv
+                    | super::TaskState::BlockedOnSend
+                    | super::TaskState::BlockedOnReply
+                    | super::TaskState::BlockedOnNotif
+                    | super::TaskState::BlockedOnFutex
+            );
+            if !is_blocked {
+                continue;
+            }
+            let verdict = watchdog_verdict(now, task.blocked_since_tick, task.wake_deadline);
+            if verdict != WatchdogVerdict::Ok && n_warn < warnings.len() {
+                warnings[n_warn] = (
+                    task.pid,
+                    task.name,
+                    task.state,
+                    task.blocked_since_tick,
+                    task.wake_deadline,
+                );
+                n_warn += 1;
+            }
+        }
+        // SCHEDULER.lock released here.
+    }
+
+    // Log after releasing the lock.
+    for (pid, name, state, blocked_since, wake_deadline) in &warnings[..n_warn] {
+        let verdict = watchdog_verdict(now, *blocked_since, *wake_deadline);
+        match verdict {
+            WatchdogVerdict::Ok => {}
+            WatchdogVerdict::StuckNoWaker => {
+                let stuck_ms = now.saturating_sub(*blocked_since);
+                log::warn!(
+                    "[sched] task pid={} name={} state={:?} stuck-since={}ms (no waker registered)",
+                    pid,
+                    name,
+                    state,
+                    stuck_ms,
+                );
+            }
+            WatchdogVerdict::StuckDeadlineExpired => {
+                let stuck_ms = now.saturating_sub(*blocked_since);
+                let deadline_age_ms = wake_deadline.map(|d| now.saturating_sub(d)).unwrap_or(0);
+                log::warn!(
+                    "[sched] task pid={} name={} state={:?} stuck-since={}ms (deadline expired {}ms ago — scanner may be stuck)",
+                    pid,
+                    name,
+                    state,
+                    stuck_ms,
+                    deadline_age_ms,
+                );
+            }
+        }
+    }
 }

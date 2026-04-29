@@ -38,3 +38,4 @@ pub mod trace_ring;
 pub mod tty;
 pub mod types;
 pub mod user_range;
+pub mod watchdog_policy;
