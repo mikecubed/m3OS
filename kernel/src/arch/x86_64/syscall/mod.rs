@@ -2042,7 +2042,15 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
             wake_ids
         };
         for tid in to_wake {
-            let _ = crate::task::wake_task(tid);
+            // F.3: route through wake_task_v2 under sched-v2 (CAS-based wake).
+            #[cfg(feature = "sched-v2")]
+            {
+                let _ = crate::task::scheduler::wake_task_v2(tid);
+            }
+            #[cfg(not(feature = "sched-v2"))]
+            {
+                let _ = crate::task::wake_task(tid);
+            }
         }
     }
 }
@@ -3186,6 +3194,28 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
     }
 
     let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+
+    // F.5: Under sched-v2, sleeps ≥ 1 ms use block_current_until with an
+    // absolute tick deadline (1 tick = 1 ms, TICKS_PER_SEC = 1000).
+    // The woken flag is a dummy local AtomicBool that is never set externally;
+    // the task is woken solely by scan_expired_wake_deadlines when the
+    // deadline tick arrives. Sleeps < 1 ms retain the TSC busy-spin (the
+    // cost of a context switch exceeds the sleep duration).
+    #[cfg(feature = "sched-v2")]
+    if sleep_us >= 1_000 {
+        // deadline_ticks = now + ceil(sleep_us / 1000) = now + ceil(sleep_ns / 1_000_000)
+        let sleep_ms = sleep_us.div_ceil(1_000);
+        let now_ticks = crate::arch::x86_64::interrupts::tick_count();
+        let deadline_ticks = now_ticks.saturating_add(sleep_ms);
+        let woken = core::sync::atomic::AtomicBool::new(false);
+        let _ = crate::task::scheduler::block_current_until(&woken, Some(deadline_ticks));
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        return 0;
+    }
+
+    // v1 path (all durations) and sched-v2 path for < 1 ms:
     if tsc_per_ms == 0 {
         // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
         let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
@@ -3197,21 +3227,20 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
                 return NEG_EINTR;
             }
         }
-    } else if sleep_us < 5_000 {
-        // Short sleep (< 5 ms): TSC busy-spin without yielding.
+    } else if sleep_us < 1_000 {
+        // Short sleep (< 1 ms): TSC busy-spin without yielding.
         //
         // APs have a 10 ms timer granularity, so a single yield_now() would
-        // sleep ~10 ms — far too coarse for the 1 ms sleeps that DOOM's game
-        // loop relies on for accurate 35 Hz tic timing.  A brief busy-spin is
-        // acceptable here: the sleep completes in < 5 ms and the cost is a
-        // small window of raised interrupt latency on this core.
+        // sleep ~10 ms — far too coarse for sub-millisecond sleeps.  A brief
+        // busy-spin is acceptable here: the sleep completes in < 1 ms and the
+        // cost of a context switch would exceed the sleep duration.
         let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
             core::hint::spin_loop();
         }
     } else {
-        // Long sleep (≥ 5 ms): yield-based sleep.
+        // Long sleep (≥ 1 ms, v1 path only): yield-based sleep.
         // TSC is invariant across cores, so this is accurate regardless of
         // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
         // granularity, which is acceptable for multi-millisecond sleeps.
@@ -12446,6 +12475,16 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
+            //
+            // F.3: Under sched-v2 use block_current_until (v2 CAS primitive)
+            // instead of block_current_on_futex_unless_woken (v1). The
+            // woken_flag is shared with the wake side; the Arc clone above
+            // ensures it lives until the waiter is removed from FUTEX_TABLE.
+            #[cfg(feature = "sched-v2")]
+            {
+                let _ = crate::task::scheduler::block_current_until(&woken_flag, None);
+            }
+            #[cfg(not(feature = "sched-v2"))]
             crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
             0
@@ -12494,10 +12533,26 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             // Wake the tasks outside the FUTEX_TABLE lock.
             // Only count tasks that were actually transitioned to Ready
             // (skip Dead or already-woken tasks).
+            //
+            // F.3: under sched-v2 use wake_task_v2 (CAS-based); under v1
+            // use wake_task (deferred-enqueue path).
             let mut actual_woken = 0usize;
             for tid in to_wake {
-                if crate::task::wake_task(tid) {
-                    actual_woken += 1;
+                #[cfg(feature = "sched-v2")]
+                {
+                    use crate::task::scheduler::WakeOutcome;
+                    if matches!(
+                        crate::task::scheduler::wake_task_v2(tid),
+                        WakeOutcome::Woken
+                    ) {
+                        actual_woken += 1;
+                    }
+                }
+                #[cfg(not(feature = "sched-v2"))]
+                {
+                    if crate::task::wake_task(tid) {
+                        actual_woken += 1;
+                    }
                 }
             }
 
@@ -14755,14 +14810,24 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             continue;
         }
 
-        // Block until woken by an FD event. For positive timeouts, yield
-        // so the tick counter advances and the deadline check at the top
-        // of the loop can fire; for indefinite timeouts, fully block.
-        // In both cases, waiters remain registered across the suspend.
-        if deadline_tick.is_some() {
-            crate::task::yield_now();
-        } else {
-            crate::task::scheduler::block_current_unless_woken(&woken);
+        // Block until woken by an FD event.
+        //
+        // F.4: Under sched-v2, use block_current_until for both branches:
+        // - Positive timeout: pass deadline_tick so the deadline scanner
+        //   wakes us when the timeout expires (no yield_now() spin needed).
+        // - Indefinite timeout: pass None; wake comes from WaitQueue.
+        // Under v1, retain the original yield_now() / block_current_unless_woken paths.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                crate::task::yield_now();
+            } else {
+                crate::task::scheduler::block_current_unless_woken(&woken);
+            }
         }
     };
 
@@ -15006,8 +15071,13 @@ fn select_inner(
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -15015,15 +15085,28 @@ fn select_inner(
                     fd_deregister_waiter(entry, task_id);
                 }
             }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (NULL): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
-            for fd in 0..nfds {
-                if let Some(entry) = &entries[fd]
-                    && combined & (1 << fd) != 0
-                {
-                    fd_deregister_waiter(entry, task_id);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                // Positive timeout: yield to let timer ticks advance.
+                for fd in 0..nfds {
+                    if let Some(entry) = &entries[fd]
+                        && combined & (1 << fd) != 0
+                    {
+                        fd_deregister_waiter(entry, task_id);
+                    }
+                }
+                crate::task::yield_now();
+            } else {
+                // Indefinite timeout (NULL): block on wait queues.
+                crate::task::scheduler::block_current_unless_woken(&woken);
+                for fd in 0..nfds {
+                    if let Some(entry) = &entries[fd]
+                        && combined & (1 << fd) != 0
+                    {
+                        fd_deregister_waiter(entry, task_id);
+                    }
                 }
             }
         }
@@ -15423,20 +15506,36 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
             continue;
         }
 
-        if deadline_tick.is_some() {
-            // Positive timeout: yield to let timer ticks advance.
+        // F.4: Under sched-v2, use block_current_until for both timeout branches:
+        // positive timeout passes deadline_tick; indefinite passes None.
+        // Under v1, retain yield_now() for positive timeout and
+        // block_current_unless_woken for indefinite timeout.
+        #[cfg(feature = "sched-v2")]
+        {
+            let _ = crate::task::scheduler::block_current_until(&woken, deadline_tick);
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);
                 }
             }
-            crate::task::yield_now();
-        } else {
-            // Indefinite timeout (-1): block on wait queues.
-            crate::task::scheduler::block_current_unless_woken(&woken);
-            for interest in &interests {
-                if let Some(entry) = current_fd_entry(interest.fd) {
-                    fd_deregister_waiter(&entry, task_id);
+        }
+        #[cfg(not(feature = "sched-v2"))]
+        {
+            if deadline_tick.is_some() {
+                // Positive timeout: yield to let timer ticks advance.
+                for interest in &interests {
+                    if let Some(entry) = current_fd_entry(interest.fd) {
+                        fd_deregister_waiter(&entry, task_id);
+                    }
+                }
+                crate::task::yield_now();
+            } else {
+                // Indefinite timeout (-1): block on wait queues.
+                crate::task::scheduler::block_current_unless_woken(&woken);
+                for interest in &interests {
+                    if let Some(entry) = current_fd_entry(interest.fd) {
+                        fd_deregister_waiter(&entry, task_id);
+                    }
                 }
             }
         }
