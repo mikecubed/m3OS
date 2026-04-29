@@ -24,6 +24,7 @@ pub mod net;
 pub mod nvme;
 pub mod pci;
 pub mod pipe;
+pub mod preempt_model;
 pub mod prng;
 pub mod pty;
 pub mod sched_model;
