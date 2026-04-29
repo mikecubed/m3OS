@@ -28,13 +28,31 @@ The phase is intentionally **behaviour-neutral**.  No IRQ handler invokes the ne
 
 ## Feature Scope
 
+### Stable per-task storage (prerequisite for lock-free preempt access)
+
+Before `preempt_disable` / `preempt_enable` can be wired into `IrqSafeMutex::lock`, `Task` storage must allow a stable raw pointer into a task's `preempt_count` field.  The current `Scheduler::tasks: Vec<Task>` reallocates on `push`, so any pointer into a task is invalidated by a later `spawn`.  Without stable storage, the lock-free preempt-disable path described below has no safe address to work from.
+
+- Convert `Scheduler::tasks` from `Vec<Task>` to `Vec<Box<Task>>`.  Indices are unchanged; only the in-place storage moves to the heap.  The free-list reuse path from Phase 52c works unchanged.
+- The cost is one extra allocation per `spawn` and an extra pointer-dereference per `pick_next` access.  Both are negligible at this scale.
+- Doc comment on `Scheduler::tasks` explicitly states: "addresses of `Task` instances are stable for the task's lifetime; raw pointers into `Task` fields may be cached by per-CPU dispatch state".
+
+### Per-CPU `current_preempt_count_ptr` (lock-free access)
+
+`preempt_disable` / `preempt_enable` must run without acquiring `SCHEDULER.lock`.  Once Track E wires those functions into `IrqSafeMutex::lock`, taking the scheduler lock would itself call `preempt_disable`, which would in turn try to take the scheduler lock — recursive deadlock.  The fix is per-CPU pointer access:
+
+- New field `PerCoreData::current_preempt_count_ptr: AtomicPtr<AtomicI32>`.  Updated by the dispatch path on every context switch (with `Release` ordering) immediately after the chosen task's index is known and before `switch_context` runs.  Read by `preempt_disable` / `preempt_enable` with `Acquire` ordering.
+- Per-core dummy: a `static AtomicI32 BOOT_PREEMPT_COUNT_DUMMY[MAX_CORES]` is the initial pointee.  `preempt_disable` calls during early boot or while running scheduler/idle code increment the dummy; nothing reads it, so the increment is a harmless no-op.
+- Dispatch path invariant: `current_preempt_count_ptr` is updated *between* `pick_next` and `switch_context`, while `SCHEDULER.lock` is still held (which keeps `preempt_count > 0` on the still-current task).  The lock release lowers the *outgoing* task's count; the pointer update then re-aims at the incoming task's `preempt_count`.  IF=0 across `switch_context`'s `cli`/`popf` window prevents any IRQ from observing a torn state.
+- The `Vec<Box<Task>>` storage from the previous section is what makes this safe: the address embedded in the pointer is stable for the task's lifetime.
+
 ### `preempt_count` infrastructure (Piece 2 from the appendix)
 
 Add a per-task counter that gates preemption.
 
 - New field `Task::preempt_count: AtomicI32`, initialised to `0`.
-- New free functions `preempt_disable()` / `preempt_enable()` on the current task.  `preempt_disable` is a fetch-add 1 with `Acquire` ordering.  `preempt_enable` is a fetch-sub 1 with `Release` ordering; in 57b it never inspects the result.  In 57d the post-decrement value is checked against `0` and a deferred reschedule fires if `reschedule` is set.
-- `preempt_count` is on the **task**, not the core.  This matches Linux's `preempt_count` location post-2003 (it lives in `thread_info` / `current_thread_info()`).  Per-CPU storage is faster but requires careful migration handling at context-switch time; per-task is correct and simpler for a first landing.
+- New free functions `preempt_disable()` / `preempt_enable()` that read the per-CPU `current_preempt_count_ptr` (Acquire) and `fetch_add` / `fetch_sub` directly.  No scheduler lock, no `current_task_idx` lookup on the hot path.
+- `preempt_disable` is a fetch-add 1 with `Acquire` ordering.  `preempt_enable` is a fetch-sub 1 with `Release` ordering; in 57b it never inspects the result.  The "deferred reschedule on `preempt_enable` zero-crossing" mechanism described in `docs/appendix/preemptive-multitasking.md` is **deferred to 57d** (where it can fire `signal_reschedule()` plus the IRQ-return preemption path); 57b's `preempt_enable` never inspects the post-decrement value.
+- `preempt_count` is on the **task**, not the core.  This matches Linux's `preempt_count` location post-2003 (it lives in `thread_info` / `current_thread_info()`).  Per-CPU storage of the *value* is faster but requires careful migration handling at context-switch time; we keep per-task storage of the value and per-CPU storage of a *pointer* to that value, which is the common Linux/BSD pattern.
 - The counter has a documented maximum nesting depth (16 plus a slack of 16 for diagnostic frames = 32).  A `debug_assert!` panics if exceeded — this catches "preempt_disable in a loop" bugs.
 
 ### Spinlock-raises-`preempt_count` discipline (Piece 3 from the appendix)
@@ -42,19 +60,21 @@ Add a per-task counter that gates preemption.
 Every existing spinlock acquire must increment `preempt_count`; every release must decrement it.
 
 - `IrqSafeMutex::lock()` calls `preempt_disable()` before disabling interrupts; `Drop` calls `preempt_enable()` after re-enabling interrupts.  The order matters: the interrupt-disable must outlive the preempt-disable so an IRQ that arrives in the unlock window cannot fire preemption while still holding the lock.
-- `SCHEDULER_INNER.lock()` (already wrapped via the `scheduler_lock()` helper) inherits this for free.
+- `SCHEDULER_INNER.lock()` (already wrapped via the `scheduler_lock()` helper) inherits this for free — and only because `preempt_disable` is lock-free per the previous section.
 - Every other `spin::Mutex` / `spin::RwLock` callsite in the kernel either:
   1. Migrates to `IrqSafeMutex` (preferred — most are already implicitly IRQ-safe via `without_interrupts` wrappers), or
   2. Adds an explicit `preempt_disable()` / `preempt_enable()` wrapper at the lock boundary.
+- **IRQ-shared locks (any `spin::Mutex` taken in both task and ISR context) are classified separately** during the audit.  `preempt_disable` is *not* a substitute for masking same-core interrupts; an IRQ-shared `spin::Mutex` either migrates to `IrqSafeMutex` (which masks IRQs and raises preempt) or stays as a plain `spin::Mutex` wrapped in `without_interrupts(|| ...)` plus `preempt_disable` / `preempt_enable`.
 
-The audit covers `kernel/src/`, `kernel-core/src/` (kernel build only), and the in-kernel uses in `kernel/initrd/` if any.  Track A.1 produces the full callsite catalogue.
+The audit covers `kernel/src/`, `kernel-core/src/` (kernel build only), and the in-kernel uses in `kernel/initrd/` if any.  Track A.1 produces the full callsite catalogue using both declaration and acquisition scans.
 
 ### Full-register-save area on `Task` (Piece 1 from the appendix)
 
 Add the storage required for an `iretq`-driven preemption return.
 
-- New field `Task::preempt_frame: PreemptFrame` (zero-initialised).  `PreemptFrame` is a `#[repr(C)]` struct with the 15 GPRs (no `rsp`), `RFLAGS`, segment selectors (`cs`, `ss`), `rip`, and the user-mode `rsp` — i.e. exactly what `iretq` consumes when returning from an IRQ.
-- A `preempt_frame_offset_*` block in `kernel/src/task/mod.rs` exposes `core::mem::offset_of!` constants for the assembly path so `preempt_to_scheduler` (introduced in 57d) can use literal offsets rather than computing them in Rust.
+- New field `Task::preempt_frame: PreemptFrame` (zero-initialised).  `PreemptFrame` is a `#[repr(C)]` struct with the 15 GPRs (no `rsp`), `RFLAGS`, `cs`, `ss`, `rip`, and the saved `rsp` — populated by 57d's assembly entry stub from the CPU-pushed IRQ frame *plus* explicit GPR captures.
+- The same `PreemptFrame` is used for both ring-3-interrupted and ring-0-interrupted preemption.  The CPU pushes a different frame shape in each case (5 fields for ring-3 → ring-0 transitions, 3 fields for ring-0 → ring-0); 57d's entry stub captures both shapes uniformly into the `PreemptFrame` slots, and 57e's resume routine selects the right `iretq` epilogue based on the saved `cs.rpl`.  See Phase 57e for the same-CPL `iretq` frame-shape detail.
+- A `preempt_frame_offset_*` block in `kernel/src/task/mod.rs` exposes `core::mem::offset_of!` constants for the assembly path so 57d's `preempt_to_scheduler` can use literal offsets rather than computing them in Rust.
 - The frame is **not used in 57b** — no code reads or writes it.  Adding it now lets 57d be a pure additive change with no `Task` layout churn.
 - The existing cooperative `switch_context` path is unchanged.  `PreemptFrame` is a parallel save-area used only by the preempt path.
 
@@ -98,27 +118,30 @@ The new field on `Task`.  Initialised to `0` on task construction.  Only the tas
 
 ### `preempt_disable()` and `preempt_enable()`
 
-Located at `kernel/src/task/scheduler.rs::preempt_disable` / `::preempt_enable`.  Free functions that operate on `current_task().preempt_count`.
+Located at `kernel/src/task/scheduler.rs::preempt_disable` / `::preempt_enable`.  Lock-free free functions that operate on the per-CPU `current_preempt_count_ptr`:
 
 ```rust
 #[inline]
 pub fn preempt_disable() {
-    if let Some(idx) = get_current_task_idx() {
-        let sched = scheduler_lock();
-        sched.tasks[idx].preempt_count.fetch_add(1, Acquire);
-    }
+    let ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
+    // SAFETY: ptr is either a per-core BOOT_PREEMPT_COUNT_DUMMY or points to a
+    // live Task::preempt_count.  Tasks are stored in Vec<Box<Task>> so the
+    // address is stable for the task's lifetime.  Dispatch updates the pointer
+    // atomically with respect to switch_context's IF=0 window, so no IRQ can
+    // observe a torn pointer.
+    unsafe { (*ptr).fetch_add(1, Acquire); }
 }
 
 #[inline]
 pub fn preempt_enable() {
-    if let Some(idx) = get_current_task_idx() {
-        let sched = scheduler_lock();
-        sched.tasks[idx].preempt_count.fetch_sub(1, Release);
-    }
+    let ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
+    unsafe { (*ptr).fetch_sub(1, Release); }
+    // 57b: never inspects the post-decrement value.
+    // 57d: extends this with a deferred-reschedule check (Track on `preempt_enable` zero-crossing).
 }
 ```
 
-The simplest implementation acquires the scheduler lock to read `current_task_idx`.  This is acceptable in 57b because the preempt path is not yet hot; 57d optimises this to a per-CPU pointer that is updated on dispatch.
+This shape is mandatory: any version that calls `scheduler_lock()` recurses through `IrqSafeMutex::lock` once Track E wires `preempt_disable` into the lock path.  The lock-free design eliminates that hazard at the source.  The pointer is updated by the dispatch path between `pick_next` and `switch_context` while `SCHEDULER.lock` is still held; the IF=0 window across `switch_context`'s `cli`/`popf` keeps the read-pointer + `fetch_add` pair coherent against IRQ-context observers.
 
 ### `IrqSafeMutex::lock()` (modified)
 
@@ -167,15 +190,20 @@ The top-of-file doc block (currently documenting the `pi_lock`/`SCHEDULER.lock` 
 
 ## Implementation Outline
 
-1. **Track A — Audit and TDD foundation.**  Catalogue every spinlock callsite in `kernel/`.  Build the `preempt_model` host tests *before* any kernel change.
-2. **Track B — `Task::preempt_count` field and helpers.**  Add the field; implement `preempt_disable` / `preempt_enable`; add the user-mode-return debug assertion.
-3. **Track C — `PreemptFrame` save-area.**  Add the struct, the offset-of constants, and the zero-init.  No code path uses it.
-4. **Track D — `IrqSafeMutex` migration.**  Wire `preempt_disable` / `preempt_enable` into `IrqSafeMutex::lock` / `Drop`.
-5. **Track E — Per-callsite migration.**  For every non-`IrqSafeMutex` lock in the kernel, either migrate to `IrqSafeMutex` or wrap with explicit `preempt_disable` / `preempt_enable`.
-6. **Track F — Documentation, invariants, and validation gate.**  Update `scheduler.rs` top-of-file doc; bump kernel version; soak test.
+1. **Track A — Audit and TDD foundation.**  Catalogue every spinlock declaration *and* every acquisition site (`.lock()`, `.try_lock()`, `.read()`, `.write()`) in `kernel/`.  Classify each as task-only, IRQ-only, or IRQ-shared.  Build the `preempt_model` host tests *before* any kernel change.
+2. **Track B — Stable per-task storage.**  Convert `Scheduler::tasks` from `Vec<Task>` to `Vec<Box<Task>>` so raw pointers into `Task::preempt_count` are stable for the task's lifetime.  No behaviour change.  **Must complete before D / E.**
+3. **Track C — Per-CPU `current_preempt_count_ptr`.**  Add the per-core pointer and the boot dummy.  Update on every dispatch.  **Must complete before D / E.**
+4. **Track D — `Task::preempt_count` field and lock-free helpers.**  Add the field; implement `preempt_disable` / `preempt_enable` against the per-CPU pointer (no scheduler lock); add the user-mode-return debug assertion.
+5. **Track E — `PreemptFrame` save-area.**  Add the struct, the offset-of constants, and the zero-init.  No code path uses it.
+6. **Track F — `IrqSafeMutex` migration.**  Wire `preempt_disable` / `preempt_enable` into `IrqSafeMutex::lock` / `Drop`.
+7. **Track G — Per-callsite migration.**  For every non-`IrqSafeMutex` lock in the kernel, either migrate to `IrqSafeMutex`, wrap with explicit `preempt_disable` / `preempt_enable`, or (for IRQ-shared `spin::Mutex` callsites that cannot migrate) wrap with `without_interrupts` plus `preempt_disable` / `preempt_enable`.
+8. **Track H — Documentation, invariants, and validation gate.**  Update `scheduler.rs` top-of-file doc; bump kernel version; soak test.
 
 ## Acceptance Criteria
 
+- `Scheduler::tasks` is `Vec<Box<Task>>`; addresses of `Task` instances are stable for the task's lifetime.  Existing `cargo xtask test` passes (no behaviour change relative to `Vec<Task>`).
+- `PerCoreData` carries `current_preempt_count_ptr: AtomicPtr<AtomicI32>`, initialised to a per-core boot dummy and updated by the dispatch path between `pick_next` and `switch_context`.
+- `preempt_disable()` / `preempt_enable()` read the per-CPU pointer with `Acquire` and `fetch_add` / `fetch_sub` directly — no scheduler lock acquisition on the hot path.  Recursion-safety regression test: an `IrqSafeMutex` acquisition inside another `IrqSafeMutex` does not deadlock.
 - All `Task` instances carry `preempt_count: AtomicI32` initialised to `0`.
 - All `Task` instances carry `preempt_frame: PreemptFrame` zero-initialised; the layout matches the `iretq` frame on x86-64.
 - `IrqSafeMutex::lock()` raises `preempt_count` exactly once on acquire; `Drop` lowers it exactly once on release.  Property test in `kernel-core::preempt_model` covers random nested sequences and asserts the count returns to 0.

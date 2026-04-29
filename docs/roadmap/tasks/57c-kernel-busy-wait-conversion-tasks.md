@@ -120,7 +120,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** SMP busy-spins are bounded by IPI / hardware latency.  The bound must be documented so a future reviewer does not "fix" the spin.
 
 **Acceptance:**
-- [ ] Each site has a comment of the form: `// HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery'). preempt_disable wrapper added in 57b/57c integration commit.`
+- [ ] Each site has a comment of the form: `// HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery'). preempt_disable wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).`
 - [ ] Citations are accurate and verifiable.
 
 ### C.2 — `kernel/src/iommu/`
@@ -271,7 +271,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 
 ## Documentation Notes
 
-- This phase **delivers user-pain relief without depending on the 57b foundation**.  The Track C `preempt_disable` wrappers are added in a 57b/57c integration commit *after* 57b lands; 57c itself only adds the bound comments.
+- This phase **delivers user-pain relief without depending on the 57b foundation**.  The Track C `preempt_disable` wrappers around hardware-bounded busy-spins are load-bearing only for **57e** (`PREEMPT_FULL`), not 57d (`PREEMPT_VOLUNTARY`); under 57d, kernel-mode is non-preemptible by construction so the wrappers do not change behaviour.  57c only adds the bound comments; 57e Track B adds the wrappers.
 - The audit catalogue at `docs/handoffs/57c-busy-wait-audit.md` is the durable artefact — future reviewers can find the audit decision for any kernel spin in one lookup.
 - Track B's regression test pattern (`ran_ticks < 5 ms across the wait window`) is a reusable template for any future block+wake conversion.
 - The Phase 57c row in `docs/roadmap/README.md`'s milestone summary should note that 57c can land in parallel with or before 57b.

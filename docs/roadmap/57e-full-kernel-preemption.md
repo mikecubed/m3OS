@@ -1,6 +1,6 @@
 # Phase 57e — Full Kernel Preemption (PREEMPT_FULL)
 
-**Status:** Planned (Stretch)
+**Status:** Planned
 **Source Ref:** phase-57e
 **Depends on:** Phase 57b (Preemption Foundation) ✅, Phase 57c (Kernel Busy-Wait Audit and Conversion) ✅, Phase 57d (Voluntary Preemption) ✅
 **Builds on:** Drops the `from_user` check from the IRQ-return preemption point introduced in 57d.  Once dropped, every kernel-mode IRQ-return becomes a potential preemption point — and the 57b `preempt_count` discipline becomes load-bearing for kernel-mode safety, not just user-mode.
@@ -8,9 +8,9 @@
 
 ## Milestone Goal
 
-Kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Round-trip latency for IPC and syscall wake-up drops into the microsecond range.  Every previously-bounded busy-spin in the kernel either remains bounded (preempt-disable wrapped) or becomes preemptible (the holder may be paused mid-spin and the spinner makes no progress until the holder resumes — but the spinner does not block forward progress on its core).
+Kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Round-trip latency for IPC and syscall wake-up improves over the 57d baseline by a measured factor whose floor is set by the IRQ-handler runtime rather than the timer-tick period.  Every previously-bounded busy-spin in the kernel either remains bounded (preempt-disable wrapped) or becomes preemptible (the holder may be paused mid-spin and the spinner makes no progress until the holder resumes — but the spinner does not block forward progress on its core).
 
-This is the **stretch goal**.  After 57b/57c/57d, m3OS is at `PREEMPT_VOLUNTARY` parity with Linux's desktop default — a credible plateau.  57e is the upgrade to `PREEMPT_FULL` (Linux's "low-latency desktop" or "real-time" config), which trades debuggability for latency.  Whether to land 57e depends on m3OS's release goals and the soak data from 57c/57d.
+**This is the stretch goal of the 57b/c/d/e programme.**  After 57b/57c/57d, m3OS is at `PREEMPT_VOLUNTARY` parity with Linux's desktop default — a credible plateau, and the realistic 1.0 release target.  57e is the upgrade to `PREEMPT_FULL` (Linux's "low-latency desktop" or "real-time" config), which trades debuggability for latency.  Whether to land 57e depends on m3OS's release goals and the soak data from 57c/57d.
 
 ## Why This Phase Exists
 
@@ -67,12 +67,24 @@ A second pass over the 57c audit catalogue, classifying every kernel-mode codepa
 
 The audit produces `docs/handoffs/57e-kernel-preempt-audit.md`, listing every call path that may now be preempted and the discipline applied.
 
-### Kernel-mode `preempt_resume` variant
+### Kernel-mode `preempt_resume` variant (different `iretq` frame shape)
 
-When a kernel-mode task is preempted, the resume must `iretq` back to ring 0 (not ring 3).  The `preempt_resume_to_user` routine introduced in 57d resumes to ring 3 specifically.  57e adds:
+When a kernel-mode task is preempted, the save and resume paths are **structurally different** from the user-mode case — not just a selector change.
 
-- `preempt_resume_to_kernel` — same routine but with `cs:ss` reflecting kernel selectors.
-- The dispatch path inspects `Task::preempt_frame.cs.rpl()` to choose between `_user` and `_kernel` resume routines.
+On x86-64, an `iretq` that **changes privilege level** (ring 0 → ring 3) pops five fields: `rip, cs, rflags, rsp, ss`.  An `iretq` that **stays at the same privilege level** (ring 0 → ring 0) pops only three: `rip, cs, rflags`.  The interrupted code's `rsp` is implicit — it's whatever the kernel stack ends up at after the iretq frame has been popped.
+
+This means:
+
+- **Save side (in 57d's asm entry stub):** when the CPU dispatches an IRQ from ring 0, it pushes only 3 of the 5 iretq fields.  The interrupted task's `rsp` is *not* on the IRQ frame; it is the kernel-stack RSP at the moment of the trap.  The 57d entry stub already saves all 15 GPRs into `PreemptTrapFrame.gprs` — but the `rsp` slot in the trap frame must be populated explicitly with the kernel-stack RSP that *was current at the moment the GPR pushes started* (i.e., before the asm stub's own `push` adjusted it).  The same `PreemptTrapFrame` layout suffices because `rsp` is always at the same offset; the difference is *who writes it*: the CPU for ring-3-interrupted, the asm stub for ring-0-interrupted.
+- **Resume side:** `preempt_resume_to_kernel` restores GPRs from `Task::preempt_frame.gprs`, *sets RSP to `preempt_frame.rsp`* (re-aligning the kernel stack to where the interrupted code was running), then pushes only 3 fields (`rip, cs, rflags`) and `iretq`s.  The CPU pops only those 3 fields; RSP stays at the value just set.
+
+57e adds:
+
+- `preempt_resume_to_kernel` (asm) — restores GPRs from `preempt_frame`, sets RSP to `preempt_frame.rsp`, pushes the 3-field iretq frame, and `iretq`s.  Distinct entry from `preempt_resume_to_user`, which pushes the 5-field iretq frame.
+- 57d's asm entry stub gains a small adjustment: when `(cs & 3) == 0` (interrupted in ring 0), it captures the pre-stub kernel RSP into `PreemptTrapFrame.rsp` explicitly, since the CPU did not provide it.
+- The dispatch path inspects `Task::preempt_frame.cs & 3` to choose between `_user` (rpl == 3) and `_kernel` (rpl == 0) resume routines.
+
+A shared `_preempt_resume_common` macro factors the GPR-restore + segment-load steps that *are* identical between the two variants; only the final iretq frame layout and RSP handling differ.
 
 ### Per-CPU dispatch reentrancy
 
@@ -85,13 +97,16 @@ The dispatch path itself becomes a possible preemption point under `PREEMPT_FULL
 
 The audit confirms each window.
 
-### Latency benchmarks
+### Latency benchmarks (per trigger path)
 
-A new in-QEMU test (`kernel/tests/preempt_latency.rs`):
+A new in-QEMU test suite (`kernel/tests/preempt_latency.rs`) measures **four distinct trigger paths** because dropping the `from_user` check changes their behaviour by very different amounts:
 
-- Round-trip IPC: send a request, time the round-trip.  Under `PREEMPT_VOLUNTARY` the floor is ~1 ms (timer tick); under `PREEMPT_FULL` the floor is the IRQ-handler runtime, expected ~10 µs.
-- Syscall wakeup: a task blocks on a futex; another task wakes it; time the wakeup.  Same expected drop.
-- The benchmarks gate the merge: 57e is accepted only if the latency floor drops by ≥10×.
+- **Cross-core reschedule-IPI wakeup.**  Task A on core 0 wakes task B blocked on core 1; the IPI delivers, the IRQ-return preemption check fires.  *Largest expected improvement* — under `PREEMPT_VOLUNTARY` the IPI is ignored if the receiver is in kernel mode; under `PREEMPT_FULL` it preempts immediately.  Target: floor drops measurably below the 57d baseline; aim for IRQ-handler runtime (~10 µs) but acceptance is "improves over 57d baseline by a measured factor".
+- **Same-core wakeup.**  Task A on core 0 wakes task B *also on core 0* via futex; A continues running until the next scheduler entry.  *Smallest expected improvement* — `PREEMPT_FULL` does not add a self-IPI; the wake side still relies on the next timer / `preempt_enable` zero-crossing / voluntary yield.  Target: matches the 57d baseline (no regression) plus the `preempt_enable` zero-crossing latency closes faster — but no order-of-magnitude improvement is claimed here.
+- **Timer-only preemption.**  A kernel-mode CPU-bound loop is preempted at the next timer tick.  Target: floor at ~1 ms (timer period) — equal to 57d's user-mode bound, but now applies to kernel mode.
+- **`preempt_enable` zero-crossing.**  An IRQ sets `reschedule` while a lock is held; the lock is released; the next `preempt_enable` zero-crossing fires the scheduler.  Under 57d this records `preempt_resched_pending` and consumes it at the next user-mode return; under 57e it can fire immediately if the calling context is preempt-safe.  Target: floor drops to lock-release-to-scheduler-entry runtime (~µs).
+
+Acceptance is **per-trigger**: each benchmark is rejected if its measured floor regresses against the 57d baseline.  No single "≥10× drop" claim is made; the cross-core IPI path is the only one where that magnitude is realistic.
 
 ### Soak gate
 
@@ -125,7 +140,9 @@ The single line change.  Documented at the IRQ handler.
 
 ### `preempt_resume_to_kernel` (new assembly)
 
-Mirrors `preempt_resume_to_user` but pushes kernel-mode `cs:ss` selectors.  Located alongside the user-mode variant in `kernel/src/arch/x86_64/asm/switch.S`.
+A genuinely different routine from `preempt_resume_to_user`, not just a selector swap.  Restores GPRs from `Task::preempt_frame.gprs`, sets RSP to `preempt_frame.rsp` (placing the stack pointer at the kernel-stack location the interrupted task was using), pushes only the 3-field iretq frame (`rip, cs, rflags`), and `iretq`s.  Same-CPL `iretq` does not pop `rsp`/`ss` — those are not present in the pushed frame.
+
+Shared assembly with `preempt_resume_to_user` is factored into a `_preempt_resume_common` macro that handles the GPR-restore portion; the iretq frame layout and RSP handling are variant-specific.
 
 ### Kernel-mode preempt invariant audit (artefact)
 
@@ -137,9 +154,9 @@ Mirrors `preempt_resume_to_user` but pushes kernel-mode `cs:ss` selectors.  Loca
 | `kernel/src/blk/virtio_blk.rs` | `do_request` | wake on completion | no | converted to block+wake in 57c; preemption at any point is safe |
 | ... | ... | ... | ... | ... |
 
-### Latency benchmarks
+### Latency benchmarks (per-trigger)
 
-A new in-QEMU integration test that boots the kernel, runs the standard workload, and measures latency floors.  Asserts the floor is ≥10× lower than the 57d baseline.
+A new in-QEMU integration test suite that runs four separate benchmarks (cross-core IPI, same-core, timer, `preempt_enable` zero-crossing) — see "Latency benchmarks (per trigger path)" in the Feature Scope above.  Each benchmark is asserted independently against a per-trigger floor; the cross-core IPI path is the only one expected to drop into the microsecond range, and the rest are required not to regress against the 57d baseline.
 
 ### `kernel-core::preempt_model` (extended)
 
@@ -179,11 +196,13 @@ Property tests for the kernel-mode preemption transition:
 - `kernel-core::preempt_model` property tests cover kernel-mode preemption; `cargo test -p kernel-core` passes.
 - 24-hour soak with the standard graphical-stack workload + synthetic IPC + futex + notification load: no `[WARN] [sched]` lines, no `[WARN] [preempt]` lines, no panics, no deadlocks.
 
-### Secondary (latency wins)
+### Secondary (latency wins, per trigger)
 
-- Round-trip IPC latency floor drops from ~1 ms (57d) to ~10 µs (57e), measured by the new latency benchmark.
-- Syscall wakeup latency floor drops similarly.
-- Audio latency (frame-to-output) drops below the 57d baseline; the audio_server's local soak no longer reports buffer underruns under load.
+- **Cross-core reschedule-IPI wakeup floor** drops measurably below the 57d baseline; benchmark reports a numeric improvement factor (target ≥10×; merge-blocking only if the measured factor is ≤1×).
+- **Same-core wakeup floor** does *not* regress against the 57d baseline (no negative-direction movement).  An order-of-magnitude improvement is *not* claimed because `PREEMPT_FULL` does not add a self-IPI; see the per-trigger discussion in the Feature Scope.
+- **Timer-only kernel-mode preemption** fires within one timer tick (~1 ms) on a kernel-mode CPU-bound task.
+- **`preempt_enable` zero-crossing** fires immediately (within microseconds) when the calling context is preempt-safe.  Under 57d this trigger was deferred to the next user-mode return; 57e removes the deferral for kernel-mode-safe call sites.
+- Audio latency (frame-to-output) does not regress; the audio_server's local soak does not report buffer underruns under load.
 
 ### Engineering practice
 

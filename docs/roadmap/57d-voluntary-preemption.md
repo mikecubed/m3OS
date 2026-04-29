@@ -33,46 +33,127 @@ The phase is small in lines-of-code but high in ceremony: every register the IRQ
 
 ## Feature Scope
 
-### IRQ-return preemption check
+### Assembly entry stub for timer + reschedule IPI (replaces the Rust `extern "x86-interrupt"` shape)
 
-In `kernel/src/arch/x86_64/interrupts.rs::timer_handler` and `::reschedule_ipi_handler`, after the existing tick + EOI work:
+A Rust `extern "x86-interrupt"` function is **too late** to capture the interrupted task's full GPR state.  By the time the Rust handler body runs, the compiler is free to use any caller-saved register (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8..r11`) — calling `preempt_to_scheduler(&stack_frame, idx)` from Rust would only capture the Rust handler's transient state, not what the task held when the timer fired.  Resuming such a task would corrupt its register file.
+
+57d replaces the timer and reschedule-IPI handlers with **naked-asm entry stubs** that:
+
+1. Push all 15 GPRs onto the IRQ stack on entry, in a fixed layout that matches the `PreemptFrame` GPR slots.
+2. Pass a pointer to the saved-GPR area + the CPU-pushed iretq frame as a single `&mut PreemptTrapFrame` to a Rust handler.
+3. The Rust handler does the existing tick / EOI / reschedule-flag work and then runs the preemption check.
+4. If preempting: the Rust handler does *not* return; it transfers to the scheduler via `preempt_to_scheduler`.
+5. If not preempting: the Rust handler returns; the asm stub pops the GPRs and `iretq`s to the interrupted task.
+
+```asm
+.global timer_entry
+timer_entry:
+    // CPU has pushed: ss, rsp, rflags, cs, rip (ring-3-interrupted)
+    //              or:        rflags, cs, rip (ring-0-interrupted; same-CPL).
+    // Save GPRs into a layout that matches PreemptFrame.gprs.
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+    mov  rdi, rsp                    // &PreemptTrapFrame as first arg
+    call timer_handler_with_frame    // Rust; may not return if preempting
+    pop  rax
+    pop  rbx
+    pop  rcx
+    pop  rdx
+    pop  rsi
+    pop  rdi
+    pop  rbp
+    pop  r8
+    // ... and r9..r15 ...
+    iretq
+```
+
+The Rust side becomes:
 
 ```rust
-extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
+#[unsafe(no_mangle)]
+extern "C" fn timer_handler_with_frame(frame: &mut PreemptTrapFrame) {
     // ... existing tick + reschedule-flag work ...
-    super::apic::lapic_eoi();
+    crate::arch::x86_64::apic::lapic_eoi();
 
-    // NEW (57d): preemption check.
-    let from_user = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
-    if from_user
-        && let Some(idx) = current_task_idx()
-        && SCHEDULER.tasks[idx].preempt_count.load(Relaxed) == 0
-        && per_core().reschedule.load(Relaxed)
-    {
-        // Switch to scheduler RSP; scheduler will pick next task.
-        unsafe { preempt_to_scheduler(&stack_frame, idx) };
-        // Returns via iretq to whatever the scheduler picked next.
+    // 57d preemption check.
+    let from_user = (frame.cpu_frame.cs & 3) == 3;
+    if !from_user { return; }   // PREEMPT_VOLUNTARY: kernel-mode skips preemption (57e drops this).
+    let pc_ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
+    let pc = unsafe { (*pc_ptr).load(Relaxed) };
+    if pc != 0 { return; }
+    if !crate::smp::per_core().reschedule.swap(false, AcqRel) { return; }
+
+    // Hand off to the scheduler; preempt_to_scheduler does not return through here.
+    unsafe { preempt_to_scheduler(frame); }
+}
+```
+
+`preempt_to_scheduler` consumes the populated `PreemptTrapFrame`, copies it into `current_task().preempt_frame`, performs the run-queue insertion (state = Ready, on_cpu = false, resume_mode = Preempted), swaps RSP to the scheduler RSP, and jumps to the dispatch entry — it does **not** return up through the asm stub's `pop`/`iretq` epilogue.
+
+`PreemptTrapFrame` is the asm-stub's saved-GPR layout plus the CPU-pushed iretq frame.  It is the load-bearing source-of-truth for the interrupted register state; `Task::preempt_frame` (from 57b) is its destination on preempt.
+
+### `preempt_enable()` deferred-reschedule (zero-crossing path)
+
+The IRQ-return preemption check above only fires when the next timer / reschedule-IPI arrives.  If a wake sets `reschedule` while the running task is holding a lock (`preempt_count > 0`), the IRQ handler observes `pc != 0` and skips preemption — but nothing in 57d so far re-checks when the lock is later released.  The result: preemption latency is bounded by the next timer tick (~1 ms) regardless of how soon the lock drops.
+
+The Linux pattern that closes this gap is `preempt_enable() → schedule()` on the zero-crossing post-decrement.  57d adds the corresponding behaviour:
+
+```rust
+#[inline]
+pub fn preempt_enable() {
+    let pc_ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
+    let prev = unsafe { (*pc_ptr).fetch_sub(1, Release) };
+
+    // 57d zero-crossing path.
+    if prev == 1 && crate::smp::per_core().reschedule.load(Relaxed) {
+        // Caller is now preemptible; reschedule is pending.  Fire the
+        // scheduler at the next safe point.  In PREEMPT_VOLUNTARY this
+        // is restricted: kernel-mode `preempt_enable` does NOT switch
+        // tasks because kernel-mode must reach user-mode return first.
+        // The trigger is recorded in per_core().preempt_resched_pending
+        // and consumed at the next syscall / IRQ user-mode return boundary
+        // (which already debug-asserts preempt_count == 0).
+        crate::smp::per_core().preempt_resched_pending.store(true, Release);
     }
 }
 ```
 
-Same logic mirrored in `reschedule_ipi_handler` (which is the cross-core wake delivery path).
+This is **deferred-reschedule under `PREEMPT_VOLUNTARY` semantics**: the trigger is set, but the actual scheduler switch happens at the next user-mode return boundary (which already runs the IRQ-return preemption check).  This keeps the kernel-mode non-preemptibility invariant intact while still closing the worst-case latency gap.
 
-### `preempt_to_scheduler` routine
+57e drops the kernel-mode restriction; under `PREEMPT_FULL`, `preempt_enable` may switch tasks immediately if it is being called from a kernel-mode preemption-safe context.
 
-A new arch-specific routine that:
+### `Task` state additions
 
-1. Saves the full `iretq` frame from the IRQ stack (which already contains `rip`, `cs`, `rflags`, `rsp`, `ss`) plus all GPRs into `Task::preempt_frame`.
-2. Stores the preempted-task state: `task.state = Ready`, `task.on_cpu = false`, run-queue insertion at home-core tail.
-3. Switches RSP to the scheduler RSP for this core.
-4. Calls into the scheduler's `pick_next` and dispatches the chosen task.
-5. The dispatched task resumes via the existing cooperative `switch_context` path — *unless* it too was preempted, in which case the scheduler reads its `preempt_frame` and uses an `iretq`-restore path.
+`Task` gains a discriminant identifying the resume mode:
 
-The dispatch path gains a third arm:
+```rust
+enum ResumeMode {
+    Cooperative,  // restore via switch_context (saved_rsp), ret
+    Preempted,    // restore via preempt_resume_to_user (preempt_frame), iretq
+    Initial,      // freshly spawned; init_stack layout
+}
 
-- **Cooperative resume** (existing): saved by `switch_context`, restored by `switch_context` via `ret`.
-- **Preempted resume** (new): saved by `preempt_to_scheduler` to `preempt_frame`, restored by a new `preempt_resume_to_user` routine via `iretq`.
-- **Initial dispatch** (existing): a freshly-spawned task starts via the cooperative path.
+struct Task {
+    // ... existing fields ...
+    resume_mode: AtomicU8,  // ResumeMode encoded
+    preempt_frame: PreemptFrame,  // 57b — load-bearing in 57d
+}
+```
+
+The dispatch path reads `resume_mode` and selects the restore routine.  This is a small additive change — and one that is permissible despite 57b's "no new flag fields" gate because `resume_mode` is a discriminant (single source of truth for *how* the task is restored), not a flag.
 
 ### `Task` state additions
 
@@ -101,12 +182,16 @@ The scheduler's `pick_next` and `dispatch` routines must accept a preempted task
 - `pick_next` already returns the next runnable task; no change needed (the preempted task is enqueued before `pick_next` runs).
 - `dispatch` reads `resume_mode` and selects between `switch_context` (cooperative) and `preempt_resume_to_user` (preempted).  Both routines end up at user mode; the difference is the register-restore mechanism.
 
-### Per-CPU `current_task_idx` fast path
+### Lock-free `preempt_count` access (re-uses 57b's `current_preempt_count_ptr`)
 
-The IRQ handler reads `current_task_idx` and `preempt_count` on every timer tick.  In 57b the read goes through the scheduler lock; in 57d this becomes a hot path and must be lock-free.
+The IRQ handler reads `preempt_count` on every timer tick.  This must be lock-free.  57b already added `PerCoreData::current_preempt_count_ptr` for this purpose (it is the foundation that lets `IrqSafeMutex::lock` call `preempt_disable` non-recursively); the IRQ handler reuses it directly:
 
-- Add a per-CPU `AtomicI32 current_task_idx_fast` (Relaxed) updated by the dispatch path on every context switch.  The IRQ handler reads it directly.
-- The lock-acquired version remains for non-hot paths; the fast version is read-only and may be momentarily stale (which is acceptable because a stale read in the IRQ handler simply skips preemption this tick — the next tick will catch it).
+```rust
+let pc_ptr = crate::smp::per_core().current_preempt_count_ptr.load(Acquire);
+let pc = unsafe { (*pc_ptr).load(Relaxed) };
+```
+
+No new per-CPU `current_task_idx_fast` is required — that would be a duplicate of `PerCoreData::current_task_idx` (which already exists from Phase 35 / 57a) and would still need a separate stable-storage story.  The `current_preempt_count_ptr` is the right primitive: it gives the IRQ handler exactly what it needs (the count) without requiring a `Task` lookup.
 
 ### Stress test
 
@@ -141,55 +226,31 @@ A new in-QEMU integration test (`kernel/tests/preempt_user_loop.rs`):
 
 ## Important Components and How They Work
 
-### `preempt_to_scheduler` (assembly + Rust)
+### Naked-asm entry stubs (`timer_entry`, `reschedule_ipi_entry`)
 
-Located at `kernel/src/arch/x86_64/asm/switch.S` (Rust shim in `kernel/src/task/scheduler.rs`).  Called from the IRQ handler with the `InterruptStackFrame` reference and the current task index.
+Located at `kernel/src/arch/x86_64/asm/preempt_entry.S` (new).  Each replaces the corresponding `extern "x86-interrupt"` function.  On entry: save all 15 GPRs in `PreemptTrapFrame.gprs` order; pass a pointer to the resulting frame as the first argument to the Rust handler; on Rust handler return, pop the GPRs and `iretq`.
 
-```asm
-preempt_to_scheduler:
-    // rdi = pointer to Task::preempt_frame
-    // rsi = scheduler RSP for this core
-    //
-    // Save GPRs into preempt_frame (rax..r15 except rsp).
-    // Save iretq fields from the IRQ stack (rip, cs, rflags, rsp, ss) into preempt_frame.
-    // Set Task::on_cpu = false (Release).  Set Task::resume_mode = Preempted.
-    // Switch RSP to scheduler RSP.
-    // Jump to scheduler dispatch entry point.
-```
+The stubs handle both ring-3-interrupted (5-field CPU frame) and ring-0-interrupted (3-field CPU frame) cases uniformly: they always push the same number of GPRs.  The Rust handler reads `frame.cpu_frame.cs.rpl()` to distinguish.  `Task::preempt_frame` (from 57b E.1) is the `PreemptFrame` layout the asm stubs and the Rust handler agree on; `PreemptTrapFrame` is its on-IRQ-stack synonym.
 
-The Rust shim handles run-queue insertion of the preempted task and the `pick_next` call.
+### `preempt_to_scheduler` (Rust)
+
+Located at `kernel/src/task/scheduler.rs`.  Called from the Rust handler when the preemption check passes.  Does not return through the asm stub — instead, it copies `PreemptTrapFrame` into `current_task().preempt_frame`, marks the task `state = Ready`, `on_cpu = false`, `resume_mode = Preempted`, run-queues it, and jumps to the per-core scheduler dispatch entry.  The dispatch entry's epilogue is the cooperative `switch_context` for the next-chosen task (or `preempt_resume_to_user` if that task was previously preempted).
 
 ### `preempt_resume_to_user` (assembly)
 
-Located at `kernel/src/arch/x86_64/asm/switch.S`.  Called by the dispatch path when the chosen task's `resume_mode == Preempted`.
+Located at `kernel/src/arch/x86_64/asm/preempt_entry.S`.  Called by the dispatch path when the chosen task's `resume_mode == Preempted` and `preempt_frame.cs.rpl() == 3`.
 
 ```asm
 preempt_resume_to_user:
-    // rdi = pointer to Task::preempt_frame
-    //
-    // Restore GPRs.  Push iretq frame (ss, rsp, rflags, cs, rip) onto current stack.
-    // iretq.
+    // rdi = &Task::preempt_frame
+    // 1. Restore GPRs from preempt_frame.gprs.
+    // 2. Push iretq frame (ss, rsp, rflags, cs, rip) onto current stack from preempt_frame.{ss,rsp,rflags,cs,rip}.
+    // 3. iretq — privilege level changes to ring 3; CPU pops all five fields.
 ```
 
-### IRQ-handler preemption check
+### `preempt_enable` zero-crossing record
 
-Located at `kernel/src/arch/x86_64/interrupts.rs::timer_handler` and `::reschedule_ipi_handler`.  After the existing EOI:
-
-```rust
-let from_user = stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3;
-if from_user
-    && let Some(idx) = current_task_idx_fast()
-{
-    let pc = get_task_preempt_count_fast(idx);
-    if pc == 0 && per_core().reschedule.load(Relaxed) {
-        per_core().reschedule.store(false, Relaxed);
-        unsafe { preempt_to_scheduler(&stack_frame, idx); }
-        // does not return
-    }
-}
-```
-
-`current_task_idx_fast` reads the per-CPU `current_task_idx_fast` atomic (Relaxed).  `get_task_preempt_count_fast` is a similarly relaxed read on `Task::preempt_count`.  Neither acquires the scheduler lock.
+Located at `kernel/src/task/scheduler.rs::preempt_enable`.  On `fetch_sub`, if the post-decrement count is 0 *and* `per_core().reschedule` is set, record `per_core().preempt_resched_pending = true`.  The actual scheduler entry is deferred to the next user-mode return boundary, where the IRQ-return preemption check (or the syscall-return path's debug assertion) consumes the record and switches.  Under `PREEMPT_VOLUNTARY`, kernel-mode `preempt_enable` does *not* immediately switch — that would violate the kernel-mode-non-preemptibility invariant.  57e drops this restriction.
 
 ### `Task::resume_mode`
 
@@ -218,12 +279,14 @@ The 57b model gains:
 ## Implementation Outline
 
 1. **Track A — TDD foundation.**  Extend `kernel-core::preempt_model` with the preemption transition and property tests.  Write the IRQ-return check test stubs in `kernel/tests/`.
-2. **Track B — `preempt_to_scheduler` and `preempt_resume_to_user`.**  Implement the assembly + Rust shim.  Verify the model.
-3. **Track C — Dispatch integration.**  Add `Task::resume_mode`; route the dispatch path to either `switch_context` or `preempt_resume_to_user` based on the mode.
-4. **Track D — Per-CPU fast path.**  Add `current_task_idx_fast` and `preempt_count_fast` atomic reads.  Update on every dispatch.
-5. **Track E — IRQ-return check.**  Wire the check into `timer_handler` and `reschedule_ipi_handler`.  Gate on `cfg(feature = "preempt-voluntary")` for initial roll-out.
-6. **Track F — Stress test and validation.**  Run user-loop stress.  Run the I.1 acceptance gate.  Confirm `[WARN] [sched]` lines do not appear.
-7. **Track G — Default-on flip.**  Flip the feature default to on.  Run the soak gate.  Remove the feature flag in a follow-up commit.
+2. **Track B — Asm entry stubs.**  Replace `timer_handler` and `reschedule_ipi_handler` with naked-asm stubs that save all GPRs into a `PreemptTrapFrame` before calling Rust.  The Rust handler receives `&mut PreemptTrapFrame`.
+3. **Track C — `preempt_to_scheduler` and `preempt_resume_to_user`.**  Implement `preempt_to_scheduler` (Rust) that copies `PreemptTrapFrame` into `Task::preempt_frame` and transfers to the scheduler.  Implement `preempt_resume_to_user` (asm) that restores from `preempt_frame` and `iretq`s to ring 3.
+4. **Track D — Dispatch integration.**  Add `Task::resume_mode`; route the dispatch path to either `switch_context` or `preempt_resume_to_user` based on the mode.
+5. **Track E — `preempt_enable` deferred-reschedule (zero-crossing).**  On `fetch_sub`, if the post-decrement count is 0 *and* `per_core().reschedule` is set, record `preempt_resched_pending`.  The user-mode return boundary consumes the record and runs the IRQ-return preemption check inline.  Closes the latency-bound-by-next-timer-tick gap promised by 57b.
+6. **Track F — Lock-free preempt-count read in IRQ.**  Reuse 57b's `current_preempt_count_ptr` for the in-IRQ read.  No new per-CPU index field.
+7. **Track G — IRQ-return check.**  Wire the check into the new Rust `timer_handler_with_frame` / `reschedule_ipi_handler_with_frame`.  Gate on `cfg(feature = "preempt-voluntary")` for initial roll-out.
+8. **Track H — Stress test and validation.**  Run user-loop stress.  Run the I.1 acceptance gate.  Confirm `[WARN] [sched]` lines do not appear.
+9. **Track I — Default-on flip.**  Flip the feature default to on.  Run the soak gate.  Remove the feature flag in a follow-up commit.
 
 ## Acceptance Criteria
 

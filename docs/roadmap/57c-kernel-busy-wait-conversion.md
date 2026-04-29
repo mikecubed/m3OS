@@ -53,7 +53,7 @@ The convert set known a priori, subject to expansion by the audit:
 
 - **`virtio_blk` request poll** (already converted ad hoc — re-validated under the audit).
 - **`sys_poll` no-waiter yield-loop** (already converted ad hoc — re-validated under the audit).
-- **`net_task` NIC IRQ wake-up** — currently uses `block_current_unless_woken`; verify the 57a migration is complete and the wake source is the e1000 RX IRQ.
+- **`net_task` NIC IRQ wake-up** — currently uses `block_current_until`; verify the 57a migration is complete and the wake source is the e1000 RX IRQ.
 - **`WaitQueue::sleep`** generic wait-queue primitive — verify it bottoms out in `block_current_until`.
 - **NVMe completion polling** in the userspace driver — already off-kernel; verify it does not hot-loop in the device-host syscall on the kernel side.
 - **`futex_wait` on a contended condition** — uses `block_current_until` already; verify.
@@ -65,7 +65,7 @@ The candidate set the audit will likely surface (subject to confirmation):
 
 ### Preempt-disable annotations (Track C)
 
-For sites that stay as spins because the critical section is hardware- or context-bounded:
+For sites that stay as spins because the critical section is hardware- or context-bounded.  **Track C only adds annotation comments**; the actual `preempt_disable` / `preempt_enable` wrappers around these spins are load-bearing for **57e** (full kernel preemption), not 57d.  Under 57d's `PREEMPT_VOLUNTARY` model, kernel-mode is non-preemptible by construction (the `from_user` check at the IRQ-return preemption point), so kernel busy-spins are safe regardless of whether `preempt_count` is held.  The wrappers are added as part of 57e Track B.
 
 - **`wait_icr_idle()` (`kernel/src/smp/ipi.rs:46`)** — LAPIC ICR delivery is bounded by IPI latency.  Annotate with a comment citing Intel SDM Vol 3A §10.6.  Wrap in `preempt_disable` (a 57b primitive) when 57b lands so a 57d preemption point does not interrupt the spin.
 - **`tlb_shootdown` ack wait (`kernel/src/smp/tlb.rs:102, 190`)** — bounded by IPI delivery + remote-CPU IRQ-handler runtime, which is bounded itself.  Annotate.
@@ -78,7 +78,7 @@ For sites that stay as spins because the critical section is hardware- or contex
 - **Slab allocator spins (`kernel/src/mm/slab.rs:442, 604`)** — bounded.  Annotate.
 - **Boot-time signal_reschedule wait (`kernel/src/main.rs:185`)** — debug-build only; bounded by 10M iterations × spin_loop hint, used only during init.  Annotate.
 
-The 57c phase **does not** require 57b's `preempt_disable` to land before this annotation; the comment can be added now and the actual `preempt_disable` wrapper added when 57b lands.  Track C lands the comments; the wrappers are added in a 57b/57c integration commit.
+The 57c phase is fully independent of 57b: the comments are pure documentation and require nothing from `preempt_disable` to compile.  The actual wrappers land in 57e Track B, which is the phase where they become load-bearing.
 
 ### Documented-bound annotations (Track D)
 
@@ -149,13 +149,13 @@ For each Track C site, the annotation is:
 
 ```rust
 // HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery').
-// preempt_disable() wrapper added in Phase 57b/57c integration.
+// preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
 while ICR.read() & ICR_DELIVERED != 0 {
     core::hint::spin_loop();
 }
 ```
 
-When 57b lands, the wrapper becomes:
+When 57e lands, the wrapper becomes:
 
 ```rust
 preempt_disable();
@@ -165,7 +165,7 @@ while ICR.read() & ICR_DELIVERED != 0 {
 preempt_enable();
 ```
 
-The 57c phase only adds the comment; the wrapper is a 57b integration concern.
+The 57c phase only adds the comment.  Under 57d's `PREEMPT_VOLUNTARY`, kernel-mode is non-preemptible by construction; the wrapper is harmless but unnecessary.  Under 57e's `PREEMPT_FULL`, the wrapper is required to keep the spinner from being preempted while the holder is also preempted — a livelock.
 
 ### Per-callsite regression test
 
