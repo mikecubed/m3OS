@@ -32,6 +32,43 @@
 
 64 commits total on the feature branch.
 
+## Post-merge follow-up fixes (2026-04-29 review pass)
+
+Five rounds of post-merge review caught additional bugs in the v2
+protocol primitives.  All fixed and pushed to the same feature branch:
+
+| Commit | Fix | Reviewer finding |
+|---|---|---|
+| `1e57025` | Lock-order, hardcoded `BlockedOnRecv`, dual-source-of-truth in death paths, validation honesty, roadmap reconciliation | 5 issues |
+| `4828ab6` | Lost-wake window between pi_lock state write and v1 mirror | block side dropped pi_lock before mirror |
+| `ecb90ac` | Same-core ISR deadlock + scan_expired lock-order inversion | pi_lock now `IrqSafeMutex`; scan splits collect/drive |
+| `b4c31d0` | Atomic pi_lock+scheduler_lock in wake_v2 + remote reap paths | self-revert race + Dead-write race |
+| `2accf47` | wake_task_v2 revalidate slot identity after SCHEDULER.lock drop | slot recycle race |
+| `e78953f` | wake_task_v2 revalidate slot before final enqueue | post-spin slot recycle race |
+| `c9febe4` | Re-arm `on_cpu` in block path with same-core escape in wake_v2 | RSP-publication window not armed for block path |
+| `dbcfa74` | virtio_blk park instead of busy-spin in `do_request` | cooperative-starvation: WRITE to ext2 hung core 1 |
+| `cafdaac` | sys_poll: park on registered_any OR deadline_tick (no yield-loop) | cooperative-starvation: poll yield-spun for full timeout |
+
+The first 7 are in the v2 protocol family — race conditions exposed by
+careful multi-pass review.  The last 2 are a different bug class:
+**cooperative-starvation in cooperative scheduling**.  Phase 57a fixed
+the v1 lost-wake protocol; it did NOT make m3OS preemptive.  Any
+busy-wait or yield-loop in the kernel syscall path is a denial-of-
+service for everything else queued on the same core.
+
+After all 9 follow-up fixes, the boot still does not reach a working
+graphical terminal on the user's test hardware.  Multiple kernel
+syscalls still busy-wait or yield-loop on conditions that depend on
+other userspace daemons running — exactly the cooperative-starvation
+class that Phase 57b will remove.  The system DOES boot to text-
+fallback (session_manager rolls back to serial console after the 3×5s
+graphical-step retry budget); services run; the kernel itself is
+healthy.  The remaining symptoms are upstream of the rewrite.
+
+**Next step:** Phase 57b (foundational preemption work).  See
+`docs/appendix/preemptive-multitasking.md` for the design and phasing.
+That phase is what unblocks the cursor regression for real.
+
 ## Tracks retained / abandoned / blocked
 
 None. All 18 planned tracks merged. No tracks abandoned.

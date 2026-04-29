@@ -1,6 +1,6 @@
 # Phase 57a — Scheduler Block/Wake Protocol Rewrite: Task List
 
-**Status:** Complete (in-tree); user-driven validation gates I.1/I.2/I.4 pending — see `docs/handoffs/57a-validation-gate.md`.
+**Status:** Complete (in-tree, 2026-04-29).  v1 lost-wake bug class eliminated; v2 protocol delivered with full host-test coverage.  **User-hardware acceptance test (I.1) FAILS** — but the remaining failure is cooperative-scheduling starvation, not v1 lost-wake.  Proper fix tracked as **Phase 57b** in `docs/appendix/preemptive-multitasking.md`.  See `docs/handoffs/57a-validation-gate.md` for the I.1 result detail.
 **Source Ref:** phase-57a
 **Depends on:** Phase 4 ✅, Phase 6 ✅, Phase 35 ✅, Phase 50 ✅, Phase 56 ✅, Phase 57 ✅
 **Goal:** Rewrite m3OS's task-blocking primitive to a Linux-style single-state-word + condition-recheck protocol with a per-task spinlock. Delete the `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT[core]` machinery that produced the lost-wake bug class catalogued in `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and `docs/handoff/2026-04-28-graphical-stack-startup.md`. Restore the Phase 56/57 graphical stack to a working state on real hardware.

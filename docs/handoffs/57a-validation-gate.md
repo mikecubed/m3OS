@@ -68,10 +68,24 @@ The v2 `wake_task_v2` CAS protocol (Track D) eliminates this race.
 - File a bug against `kernel/src/task/scheduler.rs` (`wake_task_v2`) if the
   stuck-task is any of `display_server`, `mouse_server`, or `kbd_server`.
 
-**Status:** ⬜ Pending user run.
-**Last run:** (date — to be filled in by user)
-**Result:** (pass / fail — to be filled in by user)
-**Notes:** (observations — to be filled in by user)
+**Status:** ⚠️ Tested 2026-04-29 — **FAIL: cursor stuck, no graphical terminal**.
+**Last run:** 2026-04-29 (user test hardware).
+**Result:** Boot reaches text-fallback (session_manager retry budget exhausted
+waiting for `term` to register); framebuffer shows the kernel console; cursor
+movement does not reach the framebuffer compositor.
+**Root cause:** NOT a v1-protocol lost-wake bug (Phase 57a fixed those).  The
+remaining failure is **cooperative-scheduling starvation**: kernel syscalls
+that busy-spin or yield-loop monopolise their core, blocking everything else
+queued on the same core.  Three rounds of fixes during 2026-04-29 closed the
+two most severe (`virtio_blk::do_request` busy-spin, `sys_poll`
+no-waiter yield-loop) but more remain in the syscall path.  The proper fix
+is **Phase 57b — kernel preemption** (see
+`docs/appendix/preemptive-multitasking.md`), which makes busy-waits become
+inefficiency rather than correctness bugs.
+**Notes:** Phase 57a did successfully eliminate the v1 lost-wake bug class
+(28 v1 cells → 24 v2 cells, no `switching_out` / `wake_after_switch` /
+`PENDING_SWITCH_OUT` references in live code).  The cursor regression
+predates 57a and persists because it is upstream of the protocol rewrite.
 
 ---
 
