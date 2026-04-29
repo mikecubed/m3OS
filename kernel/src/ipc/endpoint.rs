@@ -386,6 +386,15 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
+            // Track F.1: migrate recv_msg block site to v2 protocol under sched-v2.
+            //
+            // Approach (c): condition recheck is owned by the IPC layer.
+            // block_current_on_recv_v2 checks pending_msg.is_some() as a fast-path
+            // before calling block_current_until. After return, take_message()
+            // confirms delivery (same as v1). The v1 path remains for fallback.
+            #[cfg(feature = "sched-v2")]
+            let _ = scheduler::block_current_on_recv_v2(receiver);
+            #[cfg(not(feature = "sched-v2"))]
             scheduler::block_current_on_recv_unless_message();
         }
     }
@@ -609,6 +618,14 @@ pub fn recv_msg_with_notif(
                 return (RECV_KIND_NOTIFICATION, msg);
             }
 
+            // Track F.1: migrate recv_msg_with_notif block site to v2 protocol.
+            //
+            // Approach (c): condition recheck owned by IPC layer (pending_msg check
+            // as fast-path in block_current_on_notif_v2; notification bits drained
+            // below after return). The v1 path remains for fallback.
+            #[cfg(feature = "sched-v2")]
+            let _ = scheduler::block_current_on_notif_v2(receiver);
+            #[cfg(not(feature = "sched-v2"))]
             scheduler::block_current_on_notif_unless_message();
             notification::unregister_recv_waiter(notif_id, receiver);
 
@@ -713,6 +730,15 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
+            // Track F.1: migrate send block site to v2 protocol under sched-v2.
+            //
+            // Approach (c): block_current_on_send_v2 checks
+            // pending_msg.is_some() || send_completed as a fast-path before
+            // calling block_current_until, then clears send_completed on return.
+            // The v1 path remains for fallback.
+            #[cfg(feature = "sched-v2")]
+            let _ = scheduler::block_current_on_send_v2(sender);
+            #[cfg(not(feature = "sched-v2"))]
             scheduler::block_current_on_send_unless_completed();
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
@@ -1002,6 +1028,13 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
+            // Track F.1: migrate send_with_cap block site to v2 protocol.
+            //
+            // Approach (c): same as the send() block site above. The v1 path
+            // remains for fallback.
+            #[cfg(feature = "sched-v2")]
+            let _ = scheduler::block_current_on_send_v2(sender);
+            #[cfg(not(feature = "sched-v2"))]
             scheduler::block_current_on_send_unless_completed();
             if let Some(msg) = scheduler::take_message(sender) {
                 debug_assert!(
