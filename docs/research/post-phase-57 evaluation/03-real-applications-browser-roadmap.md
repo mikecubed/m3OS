@@ -162,7 +162,7 @@ Define the target before implementation:
 
 | Roadmap area | Relevance |
 |---|---|
-| Phase 57a | Stabilizes graphical startup and scheduler waits. Required for GUI reliability. |
+| Phase 57a | In progress. Expected to stabilize graphical startup and scheduler waits by replacing the v1 block/wake protocol, deleting the lost-wake machinery, fixing timeout units, and adding a validation gate. Required before GUI app work can be treated as reliable. |
 | Phase 59 | Brings git, Python, Clang/LLD, and larger staged toolchains. This is a prerequisite for serious third-party ports. |
 | Phase 60 | DNS, HTTPS trust, git remote, GitHub CLI. Browser networking builds on the same trust and resolver story. |
 | Phase 61 | Node.js and npm. Useful for Electron/JS ecosystem understanding, but Electron itself is browser-stack sized. |
@@ -179,4 +179,3 @@ Define the target before implementation:
 - Existing roadmap: `docs/roadmap/59-cross-compiled-toolchains.md`
 - Existing roadmap: `docs/roadmap/60-networking-and-github.md`
 - Existing roadmap: `docs/roadmap/61-nodejs.md`
-

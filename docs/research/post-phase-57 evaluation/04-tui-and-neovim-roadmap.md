@@ -22,6 +22,14 @@ Neovim is still not "easy." It requires a mature terminal contract, a staged C t
 | Ports system | BSD-style source ports exist. | Good model, but current ports are small and TCC-oriented. |
 | Large toolchains | Planned in Phase 59. | Needed for Neovim-class software. |
 
+## Phase 57a impact
+
+The active/planned Phase 57a scheduler rewrite is directly relevant to TUI readiness. Neovim, tmux, shells, fuzzy finders, and log viewers spend most of their time blocked in PTY reads, timers, poll/select/epoll, child waits, and IPC. The planned v2 block/wake path should make those waits reliable by replacing the old lost-wake machinery with `block_current_until`, a rewritten `wake_task`, and full call-site migration.
+
+If 57a lands as planned, this roadmap can assume terminal apps are debugging terminal semantics and POSIX gaps, not an underlying scheduler liveness bug. If it does not, Neovim-class work should stay behind a "demo only" label because editor event loops can appear flaky for reasons unrelated to Neovim or `term`.
+
+The expected timeout-unit fixes also matter: TUI event loops rely on short sleeps and poll timeouts for cursor blink, redraw coalescing, process monitoring, and responsiveness. Getting those units right is part of making `term` feel usable.
+
 ## Terminal compatibility gaps
 
 Before `nvim`, `tmux`, `btop`, or `lazygit` feel good, `term` needs a stronger contract:
@@ -220,4 +228,3 @@ Add smokes for:
 - Existing local docs: `docs/29-pty-subsystem.md`
 - Existing local docs: `docs/22b-ansi-escape.md`
 - Existing local docs: `docs/57-audio-and-local-session.md`
-

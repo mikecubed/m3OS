@@ -55,6 +55,19 @@ m3OS should copy the **shape and defaults**, not Hyprland's implementation or ex
 | Audio | `audio_client` and `audio_server` exist. | Finish real audio or no-op fallback policy. |
 | Session manager | `session_manager` exists. | Make it a real lifecycle owner and add keyboard recovery path. |
 
+## Phase 57a impact
+
+Phase 57a is the expected scheduler foundation for making this roadmap usable instead of just visually plausible. Its planned runtime changes remove the known v1 lost-wake class by introducing `block_current_until`, rewriting `wake_task`, adding `Task::on_cpu` publication safety, migrating all wait call sites, and deleting `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT`.
+
+If that work lands and validates cleanly, Stage 0 can treat scheduler liveness as a closed foundation and move its acceptance focus to compositor behavior: window lifecycle, input delivery, frame pacing, restart recovery, and end-to-end session smokes. If it does not land, tiling/keybinding work can still be prototyped, but it should not be presented as a usable desktop because graphical startup and blocking waits can still freeze.
+
+The planned 57a secondary fixes also affect the user experience directly:
+
+- The no-hardware `audio.cmd` stub would let GUI sessions boot without AC'97 instead of falling back to text solely because audio hardware is absent.
+- `serial_stdin_feeder_task` migration should remove a scheduler-core parking hazard during graphical startup.
+- Poll/select/epoll timeout fixes improve terminal apps, launchers, service monitors, and any future event-loop-driven GUI client.
+- The validation gate should include a watchdog-clean idle GUI session, because Omarchy-like workflows spend most of their life waiting for keyboard, IPC, and timer events.
+
 ## Native tiling policy layer
 
 Add a compositor policy module, tentatively `m3wm`, inside or alongside `display_server`.
@@ -182,7 +195,7 @@ Hyprland's visible identity is not only blur. Workspaces, keyboard flow, scratch
 - Finish real audio or implement the Phase 57a no-hardware `audio.cmd` stub.
 - Make session manager lifecycle control real.
 - Replace shallow smokes with end-to-end smokes.
-- Land Phase 57a scheduler fixes.
+- Land and validate Phase 57a scheduler fixes, including v2 block/wake migration and deletion of the old lost-wake machinery.
 - Finish display event push and keybinding payload correctness.
 
 ### Stage 1: Tiling core
@@ -243,4 +256,3 @@ Add QEMU-level GUI regressions for:
 - Hyprland dispatchers: <https://wiki.hypr.land/Configuring/Dispatchers/>
 - Hyprland dwindle layout: <https://wiki.hypr.land/Configuring/Layouts/Dwindle-Layout/>
 - Hyprland animations: <https://wiki.hypr.land/Configuring/Advanced-and-Cool/Animations/>
-

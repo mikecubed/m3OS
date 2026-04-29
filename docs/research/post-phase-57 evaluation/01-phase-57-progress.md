@@ -65,16 +65,22 @@ It explicitly does not run `audio-demo` and does not assert `frames_consumed` pr
 
 **Consequence:** the session manager can observe a happy path and expose a control surface, but it does not yet own the complete start/stop/restart contract described by the Phase 57 docs.
 
-### 4. GUI reliability is blocked by Phase 57a
+### 4. GUI reliability depends on active Phase 57a work
 
-`docs/roadmap/57a-scheduler-rewrite.md` is planned and explicitly says it exists because display startup can hang under lost-wake races. The same doc lists secondary fixes needed for a stable graphical stack, including:
+`docs/roadmap/57a-scheduler-rewrite.md` exists because display startup can hang under lost-wake races. The active `feat/57a-scheduler-rewrite` work changes the risk profile: scheduler modeling, transition-table work, per-task `pi_lock` infrastructure, watchdog/trace diagnostics, and timeout-unit cleanup are already being addressed off `main`.
 
-- `audio_server` registering a no-op `audio.cmd` when AC'97 is absent.
-- `serial_stdin_feeder_task` migration so it does not park a scheduler core.
-- `syslogd` CPU-hog investigation.
-- `sys_poll` / `select` / `epoll` timeout unit fixes.
+Those foundations matter, but the runtime-changing work is still the decisive part for this evaluation. The planned 57a closure needs to:
 
-**Consequence:** a usable GUI cannot be claimed before Phase 57a or equivalent scheduler fixes land on `main`.
+- Add the v2 block primitive, `block_current_until`, with the condition recheck protocol.
+- Rewrite `wake_task` around per-task block state and `Task::on_cpu` publication safety.
+- Migrate IPC, notifications, futexes, poll/select/epoll, sleeps, wait queues, and kernel-internal callers away from v1 blocking.
+- Delete the old `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` machinery once migration is complete.
+- Fix secondary GUI blockers, including `serial_stdin_feeder_task`, no-hardware `audio.cmd` registration, and the `syslogd` CPU-hog investigation.
+- Pass the validation gate: GUI boot, real-hardware runs, scheduler soak, watchdog-clean idle sessions, and relevant host/property tests.
+
+**Expected impact if it lands:** the evaluation should stop treating lost-wake scheduler behavior as a known GUI correctness blocker. Instead, it becomes a validation requirement for the desktop stack: prove graphical startup, terminal input, session recovery, and TUI-style blocking workloads stay live under the new protocol.
+
+**What it does not change:** 57a does not create tiling workflows, launchers, bars, app compatibility, browser runtime support, real AC'97 playback, or full `session_manager` lifecycle ownership. Those remain separate GUI/product work after the scheduler foundation is stable.
 
 ### 5. Display server still has Phase 56 follow-throughs
 
@@ -96,7 +102,7 @@ These are acceptable for a milestone compositor, but not for an Omarchy-class wo
 | Runtime completeness | Medium-low | Several production paths still stub out the load-bearing behavior. |
 | Validation strength | Low-medium | Host tests exist, but the smoke gates do not yet prove the full user-facing contract. |
 | Usable GUI readiness | Low | No tiling policy, launcher, bar, clipboard, notifications, lockscreen, app ecosystem, or stable key workflow yet. |
-| Best next action | Close correctness gaps before adding polish | Finish real audio or a no-op audio fallback, complete session lifecycle control, land Phase 57a scheduler fixes, then build the tiling policy layer. |
+| Best next action | Close correctness gaps before adding polish | Finish real audio or a no-op audio fallback, complete session lifecycle control, land and validate Phase 57a scheduler fixes, then build the tiling policy layer. |
 
 ## Immediate closure checklist
 
@@ -117,7 +123,9 @@ These are acceptable for a milestone compositor, but not for an Omarchy-class wo
    - Poll `/run/services.status` in addition to IPC registry.
    - Make `session-stop` and `session-restart` observable from `m3ctl`.
 
-4. Land the Phase 57a scheduler rewrite or an equivalent fix:
+4. Land and validate the Phase 57a scheduler rewrite or an equivalent fix:
+   - `block_current_until` and the rewritten `wake_task` should be the only block/wake path for migrated callers.
+   - `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` should be gone or provably unreachable.
    - No known display/input lost-wake hang should remain in `run-gui`.
    - Poll/select/epoll timeouts should match wall clock.
    - `audio_server` should not force text fallback when AC'97 is absent unless the chosen product policy requires audio.
@@ -125,4 +133,3 @@ These are acceptable for a milestone compositor, but not for an Omarchy-class wo
 5. Update Phase 57 docs with a reality-status section:
    - Keep the design docs as the intended architecture.
    - Add an explicit implementation-status table to avoid future readers mistaking scaffolded paths for closed runtime behavior.
-

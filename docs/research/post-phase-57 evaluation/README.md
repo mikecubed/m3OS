@@ -14,7 +14,11 @@ The current `main` branch is best described as **architecture-complete and smoke
 - `audio_server` has the protocol and pure AC'97 helper logic, but the production `Ac97Backend` still does accounting-only submission and reports no IRQ events.
 - `audio-smoke` verifies that `audio_server.conf` loads, not that `audio-demo` produces PCM that the device consumes.
 - `session_manager` observes service registration and owns a control surface, but direct start/stop/restart integration with `init` is still passive or logged as future F.4 work.
-- The GUI stack still depends on the planned Phase 57a scheduler rewrite to eliminate known lost-wake freezes in graphical startup.
+- The GUI stack still depends on the active Phase 57a scheduler rewrite to eliminate known lost-wake freezes in graphical startup.
+
+Phase 57a changes the near-term outlook, but not the current `main` verdict. The active branch has foundation work in flight: transition tables and host models, `TaskBlockState` / per-task `pi_lock`, scheduler watchdog and trace work, and timeout-unit cleanup. The planned runtime changes are the pieces that would materially change GUI readiness: `block_current_until`, a rewritten `wake_task` with `on_cpu` publication safety, call-site migration away from v1 blocking, deletion of `switching_out` / `wake_after_switch` / `PENDING_SWITCH_OUT`, the no-hardware `audio.cmd` fallback, and a validation gate covering real hardware and GUI soak runs.
+
+If 57a lands as planned, the evaluation should be revised from "GUI startup has a known scheduler blocker" to "GUI startup has a scheduler fix that must be validated under desktop workflows." It would not by itself deliver tiling, session lifecycle ownership, real AC'97 playback, a launcher/bar, application compatibility, or browser support.
 
 For a usable Omarchy-like GUI, the realistic path is still the one documented in `docs/appendix/gui/tiling-compositor-path.md`: build a **native m3OS tiling compositor policy layer** on top of the Phase 56 display server, rather than porting Hyprland itself.
 
@@ -31,7 +35,7 @@ For a usable Omarchy-like GUI, the realistic path is still the one documented in
 |---|---|
 | Is Phase 57 done enough to build on? | Yes for architecture and protocols; no for product-level reliability. Close the stubs and validation gaps first. |
 | Should m3OS port Hyprland? | Not now. Hyprland implies the Linux Wayland, DRM/KMS, EGL/GLES, Mesa, libinput, and C++ runtime stack. A native tiling compositor gives most visible value at far lower cost. |
-| What is the next GUI milestone? | Stabilize Phase 57 + Phase 57a, then add a native tiling workspace/layout/keybind policy layer, default Omarchy-like keybindings, and native bar/launcher/notification/lock clients. |
+| What is the next GUI milestone? | Stabilize Phase 57 + land/validate Phase 57a, then add a native tiling workspace/layout/keybind policy layer, default Omarchy-like keybindings, and native bar/launcher/notification/lock clients. |
 | What is the first real app strategy? | Native m3OS apps and TUI apps first; simple software Wayland clients later via a `wl_shm` adapter; full browsers much later. |
 | Can Neovim happen before a browser? | Yes. It is still non-trivial, but it is a much smaller target than Chromium or Firefox and aligns with the existing PTY/terminal work. |
 
@@ -48,4 +52,3 @@ For a usable Omarchy-like GUI, the realistic path is still the one documented in
 - Chromium Linux build requirements: <https://chromium.googlesource.com/chromium/src/+/main/docs/linux/build_instructions.md>
 - Firefox Linux build requirements: <https://firefox-source-docs.mozilla.org/setup/linux_build.html>
 - Neovim build docs: <https://neovim.io/doc/build/>
-
