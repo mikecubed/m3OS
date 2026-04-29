@@ -32,6 +32,7 @@ use x86_64::instructions::port::Port;
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
+#[cfg(not(feature = "sched-v2"))]
 use crate::task::scheduler::wake_task;
 
 // ===========================================================================

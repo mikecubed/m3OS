@@ -25,7 +25,9 @@ use x86_64::instructions::interrupts;
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
-use crate::task::scheduler::{current_task_id, wake_task};
+use crate::task::scheduler::current_task_id;
+#[cfg(not(feature = "sched-v2"))]
+use crate::task::scheduler::wake_task;
 
 // ===========================================================================
 // PCI device IDs
