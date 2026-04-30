@@ -43,11 +43,11 @@
 
 extern crate alloc;
 
+use crate::task::scheduler::IrqSafeMutex;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use kernel_core::buddy::BuddyAllocator;
-use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
@@ -454,10 +454,19 @@ impl FrameAllocator {
     }
 }
 
-struct LockedFrameAllocator(Mutex<FrameAllocator>);
+/// Phase 57b G.4 — `FRAME_ALLOCATOR.0` is an [`IrqSafeMutex`] so it inherits
+/// Track F.1's preempt-discipline.  The audit
+/// (docs/handoffs/57b-spinlock-callsite-audit.md, G.4 row) classifies the
+/// frame allocator as `convert-to-irqsafe`: the lock is taken from the CoW
+/// page-fault path, which is exception (task) context, not a hard IRQ.
+/// `IrqSafeMutex::lock` masks IRQs internally, so the explicit
+/// `without_interrupts` in `with_frame_alloc_irq_safe` is now redundant but
+/// retained as belt-and-suspenders for callers that read the helper's name
+/// to reason about ordering.
+struct LockedFrameAllocator(IrqSafeMutex<FrameAllocator>);
 
 static FRAME_ALLOCATOR: LockedFrameAllocator =
-    LockedFrameAllocator(Mutex::new(FrameAllocator::new()));
+    LockedFrameAllocator(IrqSafeMutex::new(FrameAllocator::new()));
 
 /// Acquire the global frame allocator lock with interrupts masked.
 ///
@@ -786,7 +795,18 @@ pub fn free_contiguous(phys: u64, order: usize) {
 static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
 /// Serializes initiators so concurrent memory-pressure drains cannot stomp the
 /// shared pending counter or IPI handshake.
-static CACHE_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b — **preempt-only** migration shape.  The lock holder broadcasts
+/// `IPI_CACHE_DRAIN` to every other online core and spins on `DRAIN_PENDING`
+/// until each acks via [`handle_cache_drain_ipi`].  IF MUST stay enabled
+/// across the lock-held region: a contender that takes this lock with IF=0
+/// cannot service the drain IPI from the holder, deadlocking both cores.
+/// `handle_cache_drain_ipi` does not touch this lock, so re-entry of an IRQ
+/// handler on the holder's core during the spin-wait is safe.
+///
+/// `preempt_disable` is still required around acquisition (Phase 57b F
+/// semantic) so 57d/57e cannot preempt the holder mid-handshake.
+static CACHE_DRAIN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// Whether the current `IPI_CACHE_DRAIN` round should also service page-cache
 /// drains on the remote cores.
 static CACHE_DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -839,48 +859,96 @@ pub fn drain_per_cpu_caches() {
         return;
     }
 
-    let _drain_guard = CACHE_DRAIN_LOCK.lock();
-    let core_count = crate::smp::core_count();
+    // Phase 57b post-review fix — if IF is already masked on entry, the
+    // caller is inside an `IrqSafeMutex` critical section, an ISR, or an
+    // explicit `without_interrupts(...)` block.  Two hazards apply:
+    //
+    //   1. Broadcasting `IPI_CACHE_DRAIN` from this context is unsafe — a
+    //      contender on the outer IF-masking lock cannot service this
+    //      core's drain IPI, so the holder waits forever for the ack.
+    //   2. **Contending** on `CACHE_DRAIN_LOCK` itself is unsafe — if
+    //      another core already holds it and is waiting for this core's
+    //      IPI ack, we would spin here with IF=0 and never service that
+    //      IPI, deadlocking both cores.
+    //
+    // The fix:
+    //
+    //   - IF=1 caller: take the lock with `.lock()` (waits if contended,
+    //     safe because we can service incoming IPIs while spinning), then
+    //     broadcast as usual.
+    //   - IF=0 caller: take the lock with `.try_lock()`.  On `None`
+    //     (contended) bail out completely — no local drain either, since
+    //     even bare local work isn't worth a deadlock window.  Allocation
+    //     surfaces OOM and the caller retries or returns a null pointer.
+    //
+    // Local drain still runs in the IF=0 path *if* `try_lock` succeeded,
+    // which is the common case under non-pathological pressure.
+    let if_enabled = x86_64::instructions::interrupts::are_enabled();
 
-    // Drain local cache.
-    let _ = drain_local_page_cache_to_pool();
-
-    if core_count <= 1 {
+    // Phase 57b — preempt-only migration.  Raise `preempt_count` so 57d/57e
+    // cannot preempt the holder mid-IPI-handshake; do NOT mask IF, since the
+    // holder spins on `DRAIN_PENDING` while remote cores ack via the
+    // `IPI_CACHE_DRAIN` handler — and another core entering this routine
+    // would block on `CACHE_DRAIN_LOCK`, so any contender that masked IF
+    // would fail to service the holder's drain IPI and deadlock both cores.
+    crate::task::scheduler::preempt_disable();
+    let guard = if if_enabled {
+        Some(CACHE_DRAIN_LOCK.lock())
+    } else {
+        CACHE_DRAIN_LOCK.try_lock()
+    };
+    let Some(_drain_guard) = guard else {
+        crate::task::scheduler::preempt_enable();
         return;
-    }
+    };
+    'critical: {
+        let core_count = crate::smp::core_count();
 
-    // Count online remote cores.
-    let my_core = crate::smp::per_core().core_id;
-    let mut remote_count: u8 = 0;
-    for cid in 0..core_count {
-        if cid == my_core {
-            continue;
+        // Drain local cache (always — pure local work, no IPI required).
+        let _ = drain_local_page_cache_to_pool();
+
+        if core_count <= 1 || !if_enabled {
+            // Either single-core (nothing to broadcast) or caller has IF
+            // masked (broadcast would deadlock — see comment above).
+            break 'critical;
         }
-        if let Some(data) = crate::smp::get_core_data(cid)
-            && data.is_online.load(Ordering::Acquire)
-        {
-            remote_count += 1;
+
+        // Count online remote cores.
+        let my_core = crate::smp::per_core().core_id;
+        let mut remote_count: u8 = 0;
+        for cid in 0..core_count {
+            if cid == my_core {
+                continue;
+            }
+            if let Some(data) = crate::smp::get_core_data(cid)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                remote_count += 1;
+            }
         }
+
+        if remote_count == 0 {
+            break 'critical;
+        }
+
+        DRAIN_PENDING.store(remote_count, Ordering::Release);
+        CACHE_DRAIN_ACTIVE.store(true, Ordering::Release);
+        crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+
+        // Spin-wait for all remote cores to complete their drain.  IF is
+        // enabled here so this core can still service its own IRQs (and
+        // remote cores' IPIs cannot deadlock the holder).
+        while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+        CACHE_DRAIN_ACTIVE.store(false, Ordering::Release);
+
+        log::debug!(
+            "[mm] drained per-CPU page caches on {} remote core(s)",
+            remote_count
+        );
     }
-
-    if remote_count == 0 {
-        return;
-    }
-
-    DRAIN_PENDING.store(remote_count, Ordering::Release);
-    CACHE_DRAIN_ACTIVE.store(true, Ordering::Release);
-    crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
-
-    // Spin-wait for all remote cores to complete their drain.
-    while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
-    }
-    CACHE_DRAIN_ACTIVE.store(false, Ordering::Release);
-
-    log::debug!(
-        "[mm] drained per-CPU page caches on {} remote core(s)",
-        remote_count
-    );
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Handle a cache-drain IPI on the receiving core.

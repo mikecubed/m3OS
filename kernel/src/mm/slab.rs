@@ -51,6 +51,7 @@
 //! magazines and takes the per-size-class slab lock, but it never holds a slab
 //! lock while requesting another CPU to mutate its local caches.
 
+use crate::task::scheduler::IrqSafeMutex;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use kernel_core::cross_cpu_free::CrossCpuFreeList;
 use kernel_core::magazine::{Magazine, MagazineDepot};
@@ -58,7 +59,6 @@ use kernel_core::magazine::{Magazine, MagazineDepot};
 use kernel_core::size_class::size_to_class;
 use kernel_core::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES};
 use kernel_core::slab::SlabCache;
-use spin::Mutex;
 
 // ---------------------------------------------------------------------------
 // Per-CPU magazine layer (B.3)
@@ -231,10 +231,16 @@ unsafe impl Sync for CrossCpuFreeLists {}
 // ---------------------------------------------------------------------------
 
 /// Per-size-class global state: a magazine depot and a backing slab cache.
+///
+/// Phase 57b G.4 — `slab` is an [`IrqSafeMutex`] so the per-size-class slab
+/// cache inherits Track F.1's preempt-discipline.  Acquired only from task
+/// context; the magazine layer wraps callsites in `without_interrupts`
+/// already, so the additional IRQ-mask in `IrqSafeMutex::lock` is a no-op
+/// inside those scopes.
 #[allow(dead_code)]
 struct SizeClassState {
     depot: MagazineDepot,
-    slab: Mutex<SlabCache>,
+    slab: IrqSafeMutex<SlabCache>,
 }
 
 /// Global array of per-size-class depots and slab caches.
@@ -261,18 +267,21 @@ fn size_class_state_ready() -> bool {
 ///
 /// These caches are infrastructure for future migration of kernel object
 /// allocations (Phase 33, Track C.4 — deferred).
+///
+/// Phase 57b G.4 — each cache is wrapped in [`IrqSafeMutex`] so it inherits
+/// Track F.1's preempt-discipline.  Task-context only.
 #[allow(dead_code)]
 pub struct KernelSlabCaches {
     /// 512-byte objects (e.g. task control blocks).
-    pub task_cache: Mutex<SlabCache>,
+    pub task_cache: IrqSafeMutex<SlabCache>,
     /// 64-byte objects (e.g. file descriptors).
-    pub fd_cache: Mutex<SlabCache>,
+    pub fd_cache: IrqSafeMutex<SlabCache>,
     /// 128-byte objects (e.g. IPC endpoints).
-    pub endpoint_cache: Mutex<SlabCache>,
+    pub endpoint_cache: IrqSafeMutex<SlabCache>,
     /// 4096-byte objects (e.g. pipe buffers).
-    pub pipe_cache: Mutex<SlabCache>,
+    pub pipe_cache: IrqSafeMutex<SlabCache>,
     /// 256-byte objects (e.g. socket structures).
-    pub socket_cache: Mutex<SlabCache>,
+    pub socket_cache: IrqSafeMutex<SlabCache>,
 }
 
 static SLAB_CACHES: spin::Once<KernelSlabCaches> = spin::Once::new();
@@ -315,17 +324,17 @@ pub fn init() {
         // Build each element; core::array::from_fn isn't const but works here.
         core::array::from_fn(|i| SizeClassState {
             depot: MagazineDepot::new(),
-            slab: Mutex::new(SlabCache::new(SIZE_CLASSES[i], 4096)),
+            slab: IrqSafeMutex::new(SlabCache::new(SIZE_CLASSES[i], 4096)),
         })
     });
 
     // Named caches (backward compatibility).
     SLAB_CACHES.call_once(|| KernelSlabCaches {
-        task_cache: Mutex::new(SlabCache::new(512, 4096)),
-        fd_cache: Mutex::new(SlabCache::new(64, 4096)),
-        endpoint_cache: Mutex::new(SlabCache::new(128, 4096)),
-        pipe_cache: Mutex::new(SlabCache::new(4096, 4096)),
-        socket_cache: Mutex::new(SlabCache::new(256, 4096)),
+        task_cache: IrqSafeMutex::new(SlabCache::new(512, 4096)),
+        fd_cache: IrqSafeMutex::new(SlabCache::new(64, 4096)),
+        endpoint_cache: IrqSafeMutex::new(SlabCache::new(128, 4096)),
+        pipe_cache: IrqSafeMutex::new(SlabCache::new(4096, 4096)),
+        socket_cache: IrqSafeMutex::new(SlabCache::new(256, 4096)),
     });
     log::info!("[mm] slab caches initialized (13 size classes + depots)");
 }
@@ -346,7 +355,15 @@ static SLAB_RECLAIM_PENDING: AtomicU8 = AtomicU8::new(0);
 /// magazines / cross-CPU free lists on the receiving cores.
 static SLAB_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Serializes initiators so the reclaim IPI handshake cannot race.
-static SLAB_RECLAIM_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b — **preempt-only** migration shape.  The lock holder broadcasts
+/// `IPI_CACHE_DRAIN` to every other online core and spins on
+/// `SLAB_RECLAIM_PENDING` until each acks via [`handle_reclaim_ipi`].  IF
+/// MUST stay enabled across the lock-held region: a contender that takes
+/// this lock with IF=0 cannot service the holder's reclaim IPI, deadlocking
+/// both cores.  `handle_reclaim_ipi` does not touch this lock, so re-entry
+/// of an IRQ handler on the holder's core during the spin-wait is safe.
+static SLAB_RECLAIM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 fn drain_local_reclaimable_objects() -> super::heap::AllocatorLocalReclaimStats {
     let mut stats = super::heap::AllocatorLocalReclaimStats::default();
@@ -417,35 +434,74 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
         return super::heap::AllocatorLocalReclaimStats::default();
     }
 
-    let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
-    let mut stats = drain_local_reclaimable_objects();
+    // Phase 57b post-review fix — if IF is already masked on entry, the
+    // caller is inside an `IrqSafeMutex` critical section (or an ISR /
+    // `without_interrupts`).  Two hazards apply:
+    //
+    //   1. Broadcasting `IPI_CACHE_DRAIN` from this context is unsafe —
+    //      a contender on the outer IF-masking lock cannot service this
+    //      core's drain IPI, so the holder waits forever for the ack.
+    //   2. **Contending** on `SLAB_RECLAIM_LOCK` itself is unsafe — if
+    //      another core already holds it and is waiting for this core's
+    //      IPI ack, we would spin here with IF=0 and never service that
+    //      IPI, deadlocking both cores.
+    //
+    // The fix:
+    //
+    //   - IF=1 caller: take the lock with `.lock()` (waits if contended,
+    //     safe because we can service incoming IPIs while spinning), then
+    //     broadcast as usual.
+    //   - IF=0 caller: take the lock with `.try_lock()`.  On `None`
+    //     (contended) bail out completely — even bare local + depot
+    //     drains aren't worth a deadlock window.  Allocation surfaces
+    //     OOM and the caller retries or returns a null pointer.
+    let if_enabled = x86_64::instructions::interrupts::are_enabled();
 
-    if crate::smp::is_per_core_ready() {
-        let my_core = crate::smp::per_core().core_id;
-        let mut remote_count: u8 = 0;
-        for cid in 0..crate::smp::core_count() {
-            if cid == my_core {
-                continue;
+    // Phase 57b — preempt-only.  IF stays enabled because the holder
+    // broadcasts `IPI_CACHE_DRAIN` and spins on remote acks; a contender
+    // that masked IF would block both cores.
+    crate::task::scheduler::preempt_disable();
+    let guard = if if_enabled {
+        Some(SLAB_RECLAIM_LOCK.lock())
+    } else {
+        SLAB_RECLAIM_LOCK.try_lock()
+    };
+    let Some(_reclaim_guard) = guard else {
+        crate::task::scheduler::preempt_enable();
+        return super::heap::AllocatorLocalReclaimStats::default();
+    };
+    let stats = {
+        let mut stats = drain_local_reclaimable_objects();
+
+        if if_enabled && crate::smp::is_per_core_ready() {
+            let my_core = crate::smp::per_core().core_id;
+            let mut remote_count: u8 = 0;
+            for cid in 0..crate::smp::core_count() {
+                if cid == my_core {
+                    continue;
+                }
+                if let Some(data) = crate::smp::get_core_data(cid)
+                    && data.is_online.load(Ordering::Acquire)
+                {
+                    remote_count += 1;
+                }
             }
-            if let Some(data) = crate::smp::get_core_data(cid)
-                && data.is_online.load(Ordering::Acquire)
-            {
-                remote_count += 1;
+
+            if remote_count != 0 {
+                SLAB_RECLAIM_PENDING.store(remote_count, Ordering::Release);
+                SLAB_RECLAIM_ACTIVE.store(true, Ordering::Release);
+                crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+                while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
+                    core::hint::spin_loop();
+                }
+                SLAB_RECLAIM_ACTIVE.store(false, Ordering::Release);
             }
         }
 
-        if remote_count != 0 {
-            SLAB_RECLAIM_PENDING.store(remote_count, Ordering::Release);
-            SLAB_RECLAIM_ACTIVE.store(true, Ordering::Release);
-            crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
-            while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
-                core::hint::spin_loop();
-            }
-            SLAB_RECLAIM_ACTIVE.store(false, Ordering::Release);
-        }
-    }
-
-    drain_depot_magazines(&mut stats);
+        drain_depot_magazines(&mut stats);
+        stats
+    };
+    crate::task::scheduler::preempt_enable();
     stats
 }
 

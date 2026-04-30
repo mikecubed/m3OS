@@ -92,7 +92,10 @@ const TMPFS_TOTAL_BLOCKS: u64 =
 const TMPFS_TOTAL_FILES: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_BLOCKS: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_FILES: u64 = 1024;
-static MOUNT_OP_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (sys_mount / sys_umount).
+static MOUNT_OP_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
+    crate::task::scheduler::IrqSafeMutex::new(());
 
 #[repr(C)]
 struct Statfs {
@@ -1794,6 +1797,17 @@ pub extern "C" fn syscall_handler(
     // If a user handler is delivered, this diverges and never returns.
     check_pending_signals(result);
 
+    // Phase 57b D.3: assert preempt_count == 0 at the syscall-return
+    // boundary.  Every spinlock callsite must release its preempt-disable
+    // before the kernel returns to ring 3; under Phase 57d a non-zero
+    // count here would deadlock the kernel the first time preemption
+    // fired inside a held lock.  Compiled out in release builds; in
+    // release builds the Phase 57a stuck-task watchdog catches the
+    // symptom.  Lives in `kernel/src/task/scheduler.rs` so the syscall-
+    // return and IRQ-return-to-ring-3 paths share a single helper
+    // (DRY-clean per the Engineering Practice Gates).
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+
     result
 }
 
@@ -2582,6 +2596,11 @@ pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
 ///
 /// `regs` must contain valid userspace addresses for RIP and RSP.
 unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! {
+    // Phase 57b D.3: assert preempt_count == 0 before the signal-delivery
+    // iretq path returns to ring 3.  Same invariant as the syscall fast
+    // path; see
+    // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`.
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     unsafe {
         use core::arch::asm;
         // We need to restore all GPRs.  The simplest approach: push the iretq
@@ -4389,13 +4408,23 @@ unsafe fn cow_clone_user_pages(
 
         // SMP shootdown: ensure remote cores that have the parent's address
         // space loaded also see the cleared WRITABLE bits on CoW pages.
+        //
+        // Phase 57b post-review fix: PROCESS_TABLE is now an `IrqSafeMutex`
+        // (G.6.c).  Holding it across `tlb_shootdown_range` would mask IF
+        // on this core for the duration of the IPI handshake; a remote
+        // core that contends on `PROCESS_TABLE` would spin with IF=0 and
+        // fail to service this core's TLB-shootdown IPI, deadlocking
+        // both.  Clone the `Arc<AddressSpace>` under the lock, drop the
+        // guard, then call shootdown outside any IF-masking critical
+        // section.
         if cow_range_start < cow_range_end {
             let parent_pid = crate::process::current_pid();
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table.find(parent_pid)
-                && let Some(ref addr_space) = p.addr_space
-            {
-                crate::smp::tlb::tlb_shootdown_range(addr_space, cow_range_start, cow_range_end);
+            let addr_space = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(parent_pid).and_then(|p| p.addr_space.clone())
+            };
+            if let Some(addr_space) = addr_space {
+                crate::smp::tlb::tlb_shootdown_range(&addr_space, cow_range_start, cow_range_end);
             }
         }
 
@@ -11977,7 +12006,10 @@ fn sys_clone_thread(
             let child_pid = crate::process::alloc_pid_pub();
             let tg = Arc::new(ThreadGroup {
                 leader_tid: parent_tgid,
-                members: spin::Mutex::new(alloc::vec![parent_tgid, child_pid]),
+                members: crate::task::scheduler::IrqSafeMutex::new(alloc::vec![
+                    parent_tgid,
+                    child_pid
+                ]),
                 exit_owner: core::sync::atomic::AtomicU32::new(0),
             });
             // Set the parent's thread_group under lock.
@@ -12000,7 +12032,7 @@ fn sys_clone_thread(
         Some(match parent_shared_fd {
             Some(arc) => arc,
             None => {
-                let arc = Arc::new(spin::Mutex::new(parent_fds));
+                let arc = Arc::new(crate::task::scheduler::IrqSafeMutex::new(parent_fds));
                 // Update parent to use shared fd table.
                 {
                     let mut table = PROCESS_TABLE.lock();
@@ -12021,7 +12053,9 @@ fn sys_clone_thread(
         Some(match parent_shared_sig {
             Some(arc) => arc,
             None => {
-                let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
+                let arc = Arc::new(crate::task::scheduler::IrqSafeMutex::new(
+                    parent_signal_actions,
+                ));
                 {
                     let mut table = PROCESS_TABLE.lock();
                     if let Some(p) = table.find_mut(parent_pid) {
@@ -15210,9 +15244,13 @@ impl EpollInstance {
     }
 }
 
-static EPOLL_TABLE: spin::Mutex<[Option<EpollInstance>; MAX_EPOLL_INSTANCES]> = {
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (epoll_create/ctl/wait + close-on-exec).
+static EPOLL_TABLE: crate::task::scheduler::IrqSafeMutex<
+    [Option<EpollInstance>; MAX_EPOLL_INSTANCES],
+> = {
     const NONE: Option<EpollInstance> = None;
-    spin::Mutex::new([NONE; MAX_EPOLL_INSTANCES])
+    crate::task::scheduler::IrqSafeMutex::new([NONE; MAX_EPOLL_INSTANCES])
 };
 
 /// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).

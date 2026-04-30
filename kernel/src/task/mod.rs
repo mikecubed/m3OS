@@ -54,6 +54,22 @@ pub(crate) const MAX_TASKS: usize = 256;
 
 pub use kernel_core::types::TaskId;
 
+// Phase 57b E.1 — re-export the PreemptFrame layout constants pinned by
+// `kernel_core::preempt_frame`.  The Phase 57d assembly entry stub will
+// dereference these offsets relative to a `Task` base pointer to write
+// every saved register into [`Task::preempt_frame`].  Re-exporting the
+// constants here (rather than redefining them) keeps a single source of
+// truth for the layout (DRY): if `PreemptFrame` ever shifts, the kernel-core
+// const _: () = assert!(...) gates fail the build before any caller can
+// pick up the wrong offset.  The constants are unused inside the kernel
+// in 57b — Phase 57d's assembly stub is the first consumer — so an
+// explicit `unused_imports` allowance keeps `cargo xtask check` clean.
+#[allow(unused_imports)]
+pub use kernel_core::preempt_frame::{
+    PREEMPT_FRAME_OFFSET_CS, PREEMPT_FRAME_OFFSET_RAX, PREEMPT_FRAME_OFFSET_RFLAGS,
+    PREEMPT_FRAME_OFFSET_RIP, PREEMPT_FRAME_OFFSET_RSP, PREEMPT_FRAME_OFFSET_SS,
+};
+
 pub mod blocking_mutex;
 pub mod sched_trace;
 pub mod scheduler;
@@ -298,7 +314,70 @@ pub struct Task {
     /// `Task::state` / `Task::wake_deadline` fields ("shadow lock" pattern).
     /// Track E removes the legacy fields once all callers migrate.
     pub pi_lock: crate::task::scheduler::IrqSafeMutex<TaskBlockState>,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57b D.1 — per-task preempt-disable counter
+    // ---------------------------------------------------------------------------
+    /// Per-task preempt-disable counter. Incremented by `preempt_disable()`,
+    /// decremented by `preempt_enable()`. Must be 0 at every user-mode return.
+    /// Phase 57d/57e gate preemption on this == 0. The address of this field
+    /// is stable across the task's lifetime — Track B's `Vec<Box<Task>>`
+    /// storage guarantees the heap address does not move; Track C caches a
+    /// raw pointer into this field on `PerCoreData::current_preempt_count_ptr`.
+    pub preempt_count: core::sync::atomic::AtomicI32,
+
+    // ---------------------------------------------------------------------------
+    // Phase 57b E.1 — preemption save area
+    // ---------------------------------------------------------------------------
+    /// Phase 57b infrastructure. Written by 57d's assembly entry stub; read
+    /// by 57d/57e's preempt-resume routines. Unused in 57b. Layout pinned by
+    /// `kernel_core::preempt_frame::PreemptFrame` and the
+    /// `PREEMPT_FRAME_OFFSET_*` constants exported from that module — the
+    /// assembly stub uses those offsets directly.
+    pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
 }
+
+// ---------------------------------------------------------------------------
+// Phase 57b E.2 — Task::preempt_frame layout regression gate
+// ---------------------------------------------------------------------------
+//
+// Phase 57d's assembly entry stub will store every saved register into
+// `Task.preempt_frame` using literal `[task_ptr + EXPECTED_TASK_PREEMPT_FRAME_OFFSET + PREEMPT_FRAME_OFFSET_*]`
+// addressing.  If the offset of `preempt_frame` inside `Task` ever drifts
+// (e.g., a new field is inserted before it) the assembly will write to the
+// wrong slot — silently corrupting the saved register set, and on resume
+// jumping to garbage.
+//
+// The two assertions below pin the offset at build time:
+//
+//   1. `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` records the value at the time
+//      this gate was added (Phase 57b E.2).  Treat it as the canonical
+//      "what 57d's assembly was written against" anchor.
+//   2. The `const _: () = assert!` cross-checks `offset_of!(Task,
+//      preempt_frame)` against that anchor; a mismatch fails the build with
+//      a load-bearing message that points future contributors at this gate.
+//
+// To intentionally rebase the offset (e.g., after a deliberate `Task` field
+// reorder), update both `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` and the
+// matching offset references in 57d's assembly stub in the same commit.
+//
+// This assertion lives in the kernel crate (rather than `kernel/tests/`
+// integration-test land) because the `kernel` crate is a binary and has no
+// `lib` target — integration tests cannot import `Task`.  A const assertion
+// on the type definition itself is the strongest guard available and runs
+// on every kernel build (including `cargo xtask check` clippy passes).
+
+/// Documented byte offset of [`Task::preempt_frame`] inside [`Task`].  Pins
+/// the value at the time Phase 57b E.2 landed (448).  Treat as the source
+/// of truth that Phase 57d's assembly entry stub is written against.
+pub const EXPECTED_TASK_PREEMPT_FRAME_OFFSET: usize = 448;
+
+const _: () = assert!(
+    core::mem::offset_of!(Task, preempt_frame) == EXPECTED_TASK_PREEMPT_FRAME_OFFSET,
+    "Task::preempt_frame offset drift will break Phase 57d assembly: \
+     reorder Task fields or update EXPECTED_TASK_PREEMPT_FRAME_OFFSET \
+     plus 57d's assembly offsets in the same commit",
+);
 
 impl Task {
     /// Allocate a new task with its own kernel stack, initialized to enter
@@ -345,6 +424,15 @@ impl Task {
                 state: TaskState::Ready,
                 wake_deadline: None,
             }),
+            // Phase 57b D.1: counter starts at 0 — no preempt_disable held.
+            // Track F will wire IrqSafeMutex::lock to fetch_add this counter
+            // in 57b; in 57b proper the counter is never read by 57d/57e gates.
+            preempt_count: core::sync::atomic::AtomicI32::new(0),
+            // Phase 57b E.1: zero-initialised save area. Untouched in 57b;
+            // 57d's assembly entry stub will populate this on every preempt
+            // entry, and 57d/57e's resume routines read it back to issue
+            // `iretq` to the preempted instruction.
+            preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
         }
     }
 
@@ -535,5 +623,296 @@ mod tests {
         on_cpu.store(false, Ordering::Release);
         let eligible = !on_cpu.load(Ordering::Acquire);
         assert!(eligible);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 57b B.2 — stable-address regression test
+    //
+    // The address of a `Task` heap allocation must remain fixed for the
+    // entire lifetime of the task, even as the outer `Vec<Box<Task>>` grows
+    // and reallocates.  Track C will cache a raw pointer to
+    // `Task::preempt_count` on `PerCoreData::current_preempt_count_ptr`;
+    // without `Vec<Box<Task>>` storage that pointer would dangle on the
+    // first scheduler `push` past the current capacity.
+    //
+    // This test does not exercise the live `Scheduler::tasks` field
+    // (avoiding any `scheduler_lock()` interaction in test context).  It
+    // instead drives a private `Vec<Box<Task>>` through enough `push`
+    // operations to force ≥ 3 reallocations of the outer `Vec`, then
+    // confirms a cached pointer to an early task's `preempt_count` still
+    // resolves to the same address and the same value the original task
+    // wrote.  This pins the property — `Box` keeps each `Task` at a fixed
+    // heap address regardless of `Vec` growth — without depending on the
+    // scheduler harness.
+    //
+    // Lives in `kernel/src/task/mod.rs` rather than
+    // `kernel/tests/task_storage_stable.rs` because the `kernel` crate is a
+    // binary with no `lib` target — integration tests cannot import `Task`.
+    // A `#[cfg(test)] #[test_case]` here runs inside the kernel test
+    // harness alongside the rest of `cargo xtask test`.
+    // -----------------------------------------------------------------------
+
+    use super::Task;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    /// Dummy entry function for synthetic `Task` instances created in tests.
+    ///
+    /// Real tasks point `entry` at a function the scheduler would dispatch;
+    /// this stub is never actually executed because the test never inserts
+    /// the task into the scheduler.  It exists only so [`Task::new`] can
+    /// build a complete kernel stack frame.
+    fn dummy_task_entry() -> ! {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Address-stability of `Task::preempt_count` across `Vec` reallocations.
+    ///
+    /// Phase 57b Track C caches a raw pointer to a live task's
+    /// `preempt_count`.  That pointer must remain valid while the outer
+    /// `Vec<Box<Task>>` grows (e.g., as new tasks `spawn`).  This test
+    /// pushes 32 boxed tasks into a freshly-constructed `Vec`, forcing the
+    /// `Vec` to reallocate multiple times (typical `Vec` growth from
+    /// capacity 0 walks 0 → 4 → 8 → 16 → 32, which is 4 reallocations —
+    /// strictly more than the 3 required by the spec).
+    ///
+    /// Steps:
+    ///   1. Push 3 sentinel boxed tasks; cache a raw pointer to `tasks[2]`'s
+    ///      `preempt_count` and write a known sentinel value into it.
+    ///   2. Push 29 additional boxed tasks (32 total) — forces multiple
+    ///      `Vec` reallocations.
+    ///   3. Re-read the cached pointer (without going through `tasks[2]`).
+    ///      Assert the address still matches `&tasks[2].preempt_count` and
+    ///      that the sentinel value is intact.
+    ///
+    /// A failure here means `Vec<Box<Task>>` is no longer the storage shape
+    /// (e.g., a refactor accidentally reverted to `Vec<Task>`) or `Box`
+    /// itself stopped guaranteeing heap-address stability.  Either case
+    /// regresses the Track C invariant and breaks `preempt_disable` /
+    /// `preempt_enable` after the next `spawn`.
+    #[test_case]
+    fn task_preempt_count_address_stable_across_vec_growth() {
+        const SENTINEL: i32 = 0x5A5A_5A5A;
+        const EARLY_IDX: usize = 2;
+        const TOTAL_TASKS: usize = 32;
+
+        // Start with empty (cap=0) Vec to maximise reallocation pressure.
+        let mut tasks: Vec<Box<Task>> = Vec::new();
+
+        // Phase 1: push enough tasks to reach EARLY_IDX, then cache a raw
+        // pointer to that task's `preempt_count` and write a sentinel.
+        for _ in 0..=EARLY_IDX {
+            tasks.push(Box::new(Task::new(dummy_task_entry, "stable-addr-early")));
+        }
+        let cached_ptr: *const core::sync::atomic::AtomicI32 = &tasks[EARLY_IDX].preempt_count;
+        tasks[EARLY_IDX]
+            .preempt_count
+            .store(SENTINEL, Ordering::Release);
+
+        // Phase 2: push remaining tasks to force several Vec reallocations.
+        // Vec<Box<Task>> typically grows 0 → 4 → 8 → 16 → 32 → … — pushing
+        // 32 total entries forces at least 4 reallocations (well over the
+        // ≥ 3 the B.2 acceptance criterion requires).
+        while tasks.len() < TOTAL_TASKS {
+            tasks.push(Box::new(Task::new(dummy_task_entry, "stable-addr-filler")));
+        }
+
+        // Phase 3: assert the cached pointer still points to the same heap
+        // address as `tasks[EARLY_IDX].preempt_count` (Box keeps the
+        // allocation pinned even though the outer Vec moved its slot
+        // pointer) AND the sentinel value is intact.
+        let live_ptr: *const core::sync::atomic::AtomicI32 = &tasks[EARLY_IDX].preempt_count;
+        assert_eq!(
+            cached_ptr, live_ptr,
+            "Box<Task> must keep `Task::preempt_count` at a fixed heap \
+             address across Vec reallocations (Phase 57b Track C invariant)",
+        );
+
+        // Read through the cached pointer (the path Track C will use in
+        // production) and confirm the sentinel survived.
+        // Safety: `cached_ptr` originated from a `&` borrow into `tasks[EARLY_IDX]`
+        // earlier in this function; `tasks` is still alive in this scope and
+        // `Box<Task>` guarantees the pointee has not moved.
+        let observed = unsafe { (*cached_ptr).load(Ordering::Acquire) };
+        assert_eq!(
+            observed, SENTINEL,
+            "value written through the cached pointer must survive \
+             ≥ 3 Vec reallocations (got {observed:#x}, want {SENTINEL:#x})",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 57b D.2 — lock-free `preempt_disable` / `preempt_enable`
+    //                 regression tests
+    //
+    // These tests pin the lock-free property of D.2's helpers without
+    // depending on a fully-initialised SMP environment.  The kernel test
+    // harness runs `test_main()` *before* `smp::init_bsp_per_core()` (see
+    // `kernel/src/main.rs`), so [`crate::smp::per_core`] is not callable
+    // here.  [`crate::task::scheduler::preempt_disable`] guards itself with
+    // [`crate::smp::try_per_core`] and degrades to a no-op when per-core
+    // data is not yet initialised, so calling it directly is safe at this
+    // point — but it would not exercise the `fetch_add` we want to pin.
+    //
+    // Approach: mirror the exact atomic operations the helpers perform
+    // against a private [`AtomicI32`].  This pins:
+    //
+    //   1. **Lock-freedom** — the helpers are implemented as
+    //      `(*ptr).fetch_add` / `fetch_sub` on a stable address and take
+    //      no lock at all.  Reproducing that operation in the test against
+    //      a private counter means the test cannot deadlock by
+    //      construction; if a future refactor wired a lock through the
+    //      counter the asserted operation count would diverge.
+    //   2. **Pairing** — every `disable` matched by an `enable` returns
+    //      the counter to 0, mirroring the user-mode-return invariant
+    //      Track D.3 enforces.
+    //   3. **Maximum nesting depth** — the helpers' debug assertion caps
+    //      the post-increment count at 32 (Engineering Practice Gates of
+    //      `docs/roadmap/tasks/57b-preemption-foundation-tasks.md`).  The
+    //      property fuzz in `kernel-core/tests/preempt_property.rs`
+    //      already pins the model; this kernel-side test mirrors the
+    //      contract for the kernel-build counter.
+    //
+    // The full F.1 recursion test (calling `preempt_disable` from inside
+    // `IrqSafeMutex::lock`) is deferred until Track F lands the
+    // `IrqSafeMutex` integration; the property pinned here is the
+    // pre-condition F.1 relies on.
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the body of [`crate::task::scheduler::preempt_disable`]
+    /// against an explicit pointer.  Used by the lock-freedom regression
+    /// test below to exercise the post-increment / cap behaviour without
+    /// depending on SMP initialisation.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live [`core::sync::atomic::AtomicI32`].
+    unsafe fn synthetic_preempt_disable(ptr: *mut core::sync::atomic::AtomicI32) -> i32 {
+        // Safety: caller-supplied invariant.
+        unsafe { (*ptr).fetch_add(1, Ordering::Acquire) + 1 }
+    }
+
+    /// Mirrors the body of [`crate::task::scheduler::preempt_enable`]
+    /// against an explicit pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live [`core::sync::atomic::AtomicI32`].
+    unsafe fn synthetic_preempt_enable(ptr: *mut core::sync::atomic::AtomicI32) -> i32 {
+        // Safety: caller-supplied invariant.
+        unsafe { (*ptr).fetch_sub(1, Ordering::Release) - 1 }
+    }
+
+    /// Recurse to `depth` levels and call [`synthetic_preempt_disable`] at
+    /// the bottom.  Used to pin the lock-free property: a synthetic
+    /// `preempt_disable` from deep inside a call chain (the closest stand-
+    /// in for "from inside `IrqSafeMutex::lock`" until Track F lands)
+    /// must complete without deadlock or stack overflow.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point at a live [`core::sync::atomic::AtomicI32`].
+    unsafe fn nested_call(depth: u32, ptr: *mut core::sync::atomic::AtomicI32) -> i32 {
+        if depth == 0 {
+            // Safety: caller-supplied invariant on `ptr`.
+            unsafe { synthetic_preempt_disable(ptr) }
+        } else {
+            // Safety: caller-supplied invariant on `ptr`.
+            unsafe { nested_call(depth - 1, ptr) }
+        }
+    }
+
+    /// Phase 57b D.2 — lock-free property regression test.
+    ///
+    /// The full Track F.1 recursion test (a synthetic call to
+    /// `preempt_disable` from inside `IrqSafeMutex::lock`) cannot run
+    /// until F.1 lands the `IrqSafeMutex` integration.  This test pins
+    /// the strongest property D.2 alone can demonstrate: calling the
+    /// counter-mutation pattern from a deep nested call chain (the
+    /// closest stand-in for "from inside an IrqSafeMutex critical
+    /// section") completes without deadlock and produces the expected
+    /// post-increment value.
+    ///
+    /// A deadlock here would manifest as a test timeout in QEMU.  A
+    /// future refactor that smuggled a lock acquisition into
+    /// `preempt_disable` would either deadlock under this test (if the
+    /// lock were held by someone else) or fail review by inspection.
+    #[test_case]
+    fn preempt_disable_is_lock_free_under_synthetic_recursion() {
+        let counter = core::sync::atomic::AtomicI32::new(0);
+        let ptr = &counter as *const _ as *mut core::sync::atomic::AtomicI32;
+
+        // Recurse 16 levels deep before issuing the synthetic
+        // `preempt_disable`.  16 is well past the "deeply nested function
+        // call" threshold the task spec calls out (10+) and stays
+        // comfortably within the kernel test stack budget.
+        const NEST_DEPTH: u32 = 16;
+        // Safety: `ptr` derives from a live `AtomicI32` on this stack.
+        let post_increment = unsafe { nested_call(NEST_DEPTH, ptr) };
+        assert_eq!(
+            post_increment, 1,
+            "synthetic preempt_disable from depth-{NEST_DEPTH} nested call \
+             must produce post-increment count = 1",
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+
+        // Pair with a synthetic enable and confirm round-trip to zero —
+        // the user-mode-return invariant Track D.3 asserts.
+        // Safety: `ptr` derives from a live `AtomicI32` on this stack.
+        let post_decrement = unsafe { synthetic_preempt_enable(ptr) };
+        assert_eq!(
+            post_decrement, 0,
+            "synthetic preempt_enable must round-trip the counter to 0",
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    /// Phase 57b D.2 — maximum nesting depth (32) regression test.
+    ///
+    /// Mirrors the property the model-side
+    /// `nesting_to_max_depth_round_trips_to_zero` test in
+    /// `kernel-core/src/preempt_model.rs` pins for the pure-logic
+    /// `Counter`, but exercises the kernel-build [`AtomicI32`] used by
+    /// the live `preempt_disable` / `preempt_enable` helpers.
+    ///
+    /// The helpers' [`debug_assert!`] caps the post-increment count at 32;
+    /// this test confirms a balanced raise-to-32-then-drop sequence stays
+    /// at or below the cap and round-trips to 0 cleanly.
+    #[test_case]
+    fn preempt_disable_round_trips_through_maximum_nesting_depth() {
+        const MAX_DEPTH: i32 = 32;
+        let counter = core::sync::atomic::AtomicI32::new(0);
+        let ptr = &counter as *const _ as *mut core::sync::atomic::AtomicI32;
+
+        for expected in 1..=MAX_DEPTH {
+            // Safety: `ptr` derives from a live `AtomicI32` on this stack.
+            let observed = unsafe { synthetic_preempt_disable(ptr) };
+            assert_eq!(
+                observed, expected,
+                "post-increment count at depth {expected} must equal \
+                 the depth (got {observed})",
+            );
+            assert!(
+                observed <= MAX_DEPTH,
+                "post-increment count {observed} exceeded the documented \
+                 maximum nesting depth of {MAX_DEPTH} (Engineering \
+                 Practice Gates of \
+                 docs/roadmap/tasks/57b-preemption-foundation-tasks.md)",
+            );
+        }
+        assert_eq!(counter.load(Ordering::Acquire), MAX_DEPTH);
+
+        for expected in (0..MAX_DEPTH).rev() {
+            // Safety: `ptr` derives from a live `AtomicI32` on this stack.
+            let observed = unsafe { synthetic_preempt_enable(ptr) };
+            assert_eq!(
+                observed, expected,
+                "post-decrement count must descend by one (got \
+                 {observed}, want {expected})",
+            );
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }

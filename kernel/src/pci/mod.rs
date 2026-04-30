@@ -12,8 +12,9 @@ pub mod bar;
 
 use core::ptr;
 use kernel_core::pci as kpci;
-use spin::Mutex;
 use x86_64::instructions::{interrupts, port::Port};
+
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // PCI Configuration Space I/O (P15-T033, P15-T034)
@@ -554,8 +555,11 @@ impl PciDeviceRegistry {
     }
 }
 
-pub(crate) static PCI_DEVICE_REGISTRY: Mutex<PciDeviceRegistry> =
-    Mutex::new(PciDeviceRegistry::new());
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// PCI_DEVICE_REGISTRY is only acquired from task context (PCI enumeration
+/// and device-host registry); no ISR reaches it.
+pub(crate) static PCI_DEVICE_REGISTRY: IrqSafeMutex<PciDeviceRegistry> =
+    IrqSafeMutex::new(PciDeviceRegistry::new());
 
 /// Claim a PCI function matching `(vendor_id, device_id)`.  Returns an
 /// exclusive [`PciDeviceHandle`], or an error if no match is found or the
@@ -790,7 +794,8 @@ impl PciDeviceList {
     }
 }
 
-static PCI_DEVICES: Mutex<PciDeviceList> = Mutex::new(PciDeviceList::new());
+/// Phase 57b G.7 — IrqSafeMutex (task-context only).
+static PCI_DEVICES: IrqSafeMutex<PciDeviceList> = IrqSafeMutex::new(PciDeviceList::new());
 
 // ---------------------------------------------------------------------------
 // Read-only accessors (P15-T039)
@@ -1288,10 +1293,11 @@ const _: () = assert!(
             + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT
 );
 
-static MSI_POOL: Mutex<kpci::MsiVectorAllocator> = Mutex::new(kpci::MsiVectorAllocator::new(
-    MSI_VECTOR_BASE,
-    MSI_VECTOR_TOP,
-));
+/// Phase 57b G.7 — IrqSafeMutex (task-context only; MSI vector
+/// allocation runs from PCI driver init paths).
+static MSI_POOL: IrqSafeMutex<kpci::MsiVectorAllocator> = IrqSafeMutex::new(
+    kpci::MsiVectorAllocator::new(MSI_VECTOR_BASE, MSI_VECTOR_TOP),
+);
 
 /// Reserve `count` consecutive MSI vectors.  `count` must be a power of two.
 #[allow(dead_code)]
@@ -1607,7 +1613,9 @@ impl DriverRegistry {
     }
 }
 
-static DRIVER_REGISTRY: Mutex<DriverRegistry> = Mutex::new(DriverRegistry::new());
+/// Phase 57b G.7 — IrqSafeMutex (task-context only; driver
+/// registration / lookup all happen from kernel init / probe paths).
+static DRIVER_REGISTRY: IrqSafeMutex<DriverRegistry> = IrqSafeMutex::new(DriverRegistry::new());
 
 /// Register a driver for PCI discovery. Returns `Err` if the registry is full.
 #[allow(dead_code)]

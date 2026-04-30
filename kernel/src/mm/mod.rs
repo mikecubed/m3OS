@@ -14,7 +14,7 @@ pub mod user_space;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, MutexGuard, Once};
+use spin::Once;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
@@ -28,11 +28,48 @@ use x86_64::{
 ///
 /// Wraps the PML4 physical address with metadata for TLB shootdown
 /// optimization (generation counter) and multi-core tracking.
+///
+/// Phase 57b — `page_table_lock` is a plain [`spin::Mutex`] with the
+/// **preempt-only** discipline applied via [`PageTableGuard`].  An
+/// `IrqSafeMutex` would mask IF inside the lock-held region, but several
+/// existing consumers (notably PCI BAR map/unmap in
+/// [`crate::pci::bar`]) hold the guard alive across
+/// [`crate::smp::tlb::tlb_shootdown_range`] — a contender on the same
+/// address-space lock would then spin with IF=0 and fail to service the
+/// holder's TLB shootdown IPI, deadlocking both cores.  Keeping IF
+/// enabled while the lock is held closes that hazard; `preempt_disable`
+/// still pins the holder against 57d/57e voluntary or full preemption.
 pub struct AddressSpace {
     pml4_phys: PhysAddr,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
-    page_table_lock: Mutex<()>,
+    page_table_lock: spin::Mutex<()>,
+}
+
+/// RAII guard returned by [`AddressSpace::lock_page_tables`].
+///
+/// On `Drop` the inner spin guard releases first, then `preempt_enable`
+/// runs — same shape as [`crate::task::scheduler::IrqSafeGuard`] but
+/// without the IF-masking step (see the doc-comment on
+/// [`AddressSpace::page_table_lock`] for why IF must stay enabled).
+pub struct PageTableGuard<'a> {
+    _guard: spin::MutexGuard<'a, ()>,
+    _preempt: PageTablePreemptRestore,
+}
+
+/// Drop hook that pairs the `preempt_disable` in
+/// [`AddressSpace::lock_page_tables`] with a matching `preempt_enable`.
+///
+/// Field declaration order in [`PageTableGuard`] is load-bearing: the
+/// inner spin guard drops first (releasing the lock), then this drops
+/// (decrementing `preempt_count`).  Mirrors `IrqSafeGuard`'s drop chain
+/// with the IF-restore step deliberately omitted.
+struct PageTablePreemptRestore;
+
+impl Drop for PageTablePreemptRestore {
+    fn drop(&mut self) {
+        crate::task::scheduler::preempt_enable();
+    }
 }
 
 #[allow(dead_code)]
@@ -42,7 +79,7 @@ impl AddressSpace {
             pml4_phys,
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
-            page_table_lock: Mutex::new(()),
+            page_table_lock: spin::Mutex::new(()),
         }
     }
 
@@ -72,8 +109,23 @@ impl AddressSpace {
         self.active_on_cores.load(Ordering::Acquire)
     }
 
-    pub fn lock_page_tables(&self) -> MutexGuard<'_, ()> {
-        self.page_table_lock.lock()
+    /// Acquire the page-table lock with **preempt-only** discipline.
+    ///
+    /// Raises `preempt_count` *before* acquiring the inner spin lock so
+    /// that 57d/57e cannot preempt the holder, but does NOT mask
+    /// interrupts: holders may invoke [`crate::smp::tlb::tlb_shootdown_range`]
+    /// while the guard is alive, and that path requires IF=1 to receive
+    /// the remote ack IPIs.  See the doc-comment on
+    /// [`AddressSpace::page_table_lock`].
+    pub fn lock_page_tables(&self) -> PageTableGuard<'_> {
+        crate::task::scheduler::preempt_disable();
+        // The spin lock is acquired with IF in whatever state the caller
+        // had on entry; we never disable interrupts here.
+        let guard = self.page_table_lock.lock();
+        PageTableGuard {
+            _guard: guard,
+            _preempt: PageTablePreemptRestore,
+        }
     }
 }
 

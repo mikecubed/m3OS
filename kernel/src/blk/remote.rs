@@ -33,11 +33,18 @@ use kernel_core::driver_ipc::block::{
 use crate::ipc::EndpointId;
 use crate::ipc::{endpoint, message::Message, registry};
 use crate::task::scheduler;
+use crate::task::scheduler::IrqSafeMutex;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::{Lazy, Mutex};
+use spin::Lazy;
 
-static REMOTE_BLOCK: Lazy<Mutex<RemoteBlockInner>> =
-    Lazy::new(|| Mutex::new(RemoteBlockInner::new()));
+// Phase 57b G.1.b — `IrqSafeMutex` so the F.1 wiring raises
+// `preempt_count` on acquire and the matching guard `Drop` lowers it on
+// release. `REMOTE_BLOCK` is task-context-only (the ring-3 NVMe driver
+// facade has no kernel ISR), so no explicit-preempt-and-cli wrapper is
+// needed at the callsites — the auto-deref through `IrqSafeGuard`
+// preserves the existing call shapes.
+static REMOTE_BLOCK: Lazy<IrqSafeMutex<RemoteBlockInner>> =
+    Lazy::new(|| IrqSafeMutex::new(RemoteBlockInner::new()));
 
 /// Lock-free fast-path mirror of `REMOTE_BLOCK.lock().endpoint.is_some()`.
 /// Allows `on_endpoint_closed` (called from `cleanup_task_ipc` for every

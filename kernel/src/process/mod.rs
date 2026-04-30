@@ -31,7 +31,7 @@ use core::{
 };
 
 use crate::mm::AddressSpace;
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 // Re-export VMA types from kernel-core for host-testability.
 pub use kernel_core::mm::{MemoryMapping, VmaTree};
@@ -659,7 +659,11 @@ pub struct ThreadGroup {
     /// TID of the thread group leader (equals the TGID).
     pub leader_tid: u32,
     /// All TIDs that belong to this group (including the leader).
-    pub members: Mutex<Vec<u32>>,
+    ///
+    /// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's
+    /// preempt-discipline.  Acquired only from task context (clone,
+    /// exit, signal delivery walks).
+    pub members: IrqSafeMutex<Vec<u32>>,
     /// PID of the thread currently performing `exit_group()` teardown.
     /// 0 means no teardown is in progress.
     pub exit_owner: AtomicU32,
@@ -762,10 +766,17 @@ pub struct Process {
     pub thread_group: Option<Arc<ThreadGroup>>,
     /// Shared fd table for threads created with CLONE_FILES (Phase 40).
     /// `None` for single-threaded processes (uses `fd_table` directly).
-    pub shared_fd_table: Option<Arc<Mutex<[Option<FdEntry>; MAX_FDS]>>>,
+    ///
+    /// Phase 57b G.6 — `Arc<IrqSafeMutex<...>>`.  Inherits Track F.1's
+    /// preempt-discipline; clone semantics on the `Arc` are preserved
+    /// (callers `.clone()` the `Arc`, child shares the same lock).
+    pub shared_fd_table: Option<Arc<IrqSafeMutex<[Option<FdEntry>; MAX_FDS]>>>,
     /// Shared signal actions for threads created with CLONE_SIGHAND (Phase 40).
     /// `None` for single-threaded processes (uses `signal_actions` directly).
-    pub shared_signal_actions: Option<Arc<Mutex<[SignalAction; 32]>>>,
+    ///
+    /// Phase 57b G.6 — same `Arc<IrqSafeMutex<...>>` shape as
+    /// `shared_fd_table`.
+    pub shared_signal_actions: Option<Arc<IrqSafeMutex<[SignalAction; 32]>>>,
 }
 
 // `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
@@ -991,7 +1002,14 @@ pub(crate) fn alloc_kernel_stack_pub() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Global process table.  All modifications go through `PROCESS_TABLE.lock()`.
-pub static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  `PROCESS_TABLE` is taken
+/// from task context including the page-fault exception handler
+/// (`terminate_current_process_segv`).  Pure type swap — every callsite
+/// (in process/, fs/procfs.rs, syscall/, scheduler/, blk/, arch/) compiles
+/// unchanged via auto-deref.
+pub static PROCESS_TABLE: IrqSafeMutex<ProcessTable> = IrqSafeMutex::new(ProcessTable::new());
 
 fn canonical_mm_index(processes: &[Process], tgid: u32) -> Option<usize> {
     processes

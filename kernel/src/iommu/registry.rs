@@ -23,12 +23,13 @@
 //! dependency on the kernel-side `reserved_regions()` accessor.
 
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use kernel_core::iommu::contract::{
     DmaDomain, DomainError, DomainId, IommuError, IommuUnit, Iova, MapFlags, PhysAddr,
 };
 use kernel_core::iommu::identity::IdentityUnit;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 use super::amd::AmdViUnit;
 use super::intel::VtdUnit;
@@ -171,7 +172,13 @@ impl IommuUnit for RegisteredUnit {
 /// Live unit list indexed by `unit_index`. Populated during boot by
 /// [`install_identity_fallback`] or [`install_units`]; read every time a
 /// PCI device is claimed so its domain can be created on the right unit.
-static REGISTRY: Mutex<Vec<RegisteredUnit>> = Mutex::new(Vec::new());
+///
+/// Phase 57b G.5 — converted from `spin::Mutex` to [`IrqSafeMutex`] per the
+/// Track A.1 audit (`docs/handoffs/57b-spinlock-callsite-audit.md` row
+/// `kernel/src/iommu/registry.rs:174`). All callsites run in task context;
+/// the migration inherits Track F's `preempt_disable` discipline
+/// automatically.
+static REGISTRY: IrqSafeMutex<Vec<RegisteredUnit>> = IrqSafeMutex::new(Vec::new());
 
 /// `true` once any unit has been installed. Used by [`active`] to answer
 /// the "is IOMMU translation really running?" question without taking
@@ -180,11 +187,22 @@ static REGISTRY: Mutex<Vec<RegisteredUnit>> = Mutex::new(Vec::new());
 /// An [`IdentityUnit`] registration sets this to `true` too, because a
 /// registered unit exists — callers check [`translating`] when they need
 /// the stricter "real IOMMU hardware is on" query.
-static REGISTERED: spin::RwLock<bool> = spin::RwLock::new(false);
+///
+/// Phase 57b G.5 — converted from `spin::RwLock<bool>` to
+/// [`IrqSafeMutex<bool>`] per the Track A.1 audit. The bool is read once
+/// per device map and written once during init, so the loss of concurrent
+/// readers is irrelevant; converting to `IrqSafeMutex` inherits Track F's
+/// preempt-discipline without the bookkeeping of an explicit
+/// `preempt_disable` / `preempt_enable` pair around every `.read()` /
+/// `.write()` callsite.
+static REGISTERED: IrqSafeMutex<bool> = IrqSafeMutex::new(false);
 
 /// `true` when the installed units are real hardware (VT-d or AMD-Vi);
 /// `false` when only an [`IdentityUnit`] was installed as fallback.
-static TRANSLATING: spin::RwLock<bool> = spin::RwLock::new(false);
+///
+/// Phase 57b G.5 — converted from `spin::RwLock<bool>` to
+/// [`IrqSafeMutex<bool>`]; same rationale as [`REGISTERED`] above.
+static TRANSLATING: IrqSafeMutex<bool> = IrqSafeMutex::new(false);
 
 /// Install the full vendor-unit set the kernel discovered at boot.
 ///
@@ -198,8 +216,8 @@ pub fn install_units(units: Vec<RegisteredUnit>) {
         .any(|u| !matches!(u, RegisteredUnit::Identity(_)));
     let have_any = !units.is_empty();
     *REGISTRY.lock() = units;
-    *REGISTERED.write() = have_any;
-    *TRANSLATING.write() = translating;
+    *REGISTERED.lock() = have_any;
+    *TRANSLATING.lock() = translating;
 }
 
 /// Install a single [`IdentityUnit`] as the sole registered unit. Used
@@ -223,7 +241,7 @@ pub fn install_identity_fallback() {
 /// into the registry at all.
 #[allow(dead_code)]
 pub fn registered() -> bool {
-    *REGISTERED.read()
+    *REGISTERED.lock()
 }
 
 /// `true` when the active set is real hardware (VT-d or AMD-Vi);
@@ -231,7 +249,7 @@ pub fn registered() -> bool {
 /// `iommu.active` boolean surfaced to diagnostic output.
 #[allow(dead_code)]
 pub fn translating() -> bool {
-    *TRANSLATING.read()
+    *TRANSLATING.lock()
 }
 
 /// Count of registered units. Diagnostic only.

@@ -47,7 +47,8 @@ use kernel_core::driver_ipc::net::{
     NetDriverError, NetLinkEvent, decode_net_link_event, decode_net_rx_notify,
 };
 use kernel_core::types::{EndpointId, MacAddr};
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Tunable — TX queue depth cap
@@ -82,7 +83,11 @@ struct NicEntry {
 
 /// Global slot for the registered `RemoteNic`. `None` while no ring-3 NIC
 /// driver has registered; `Some(…)` once `RemoteNic::register` completes.
-static REMOTE_NIC: Mutex<Option<NicEntry>> = Mutex::new(None);
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// `RemoteNic` is the userspace-driver facade; every callsite is task
+// context (register, send_frame, drain_*, inject_rx_frame).  No ISR
+// touches this lock.
+static REMOTE_NIC: IrqSafeMutex<Option<NicEntry>> = IrqSafeMutex::new(None);
 
 /// Set when `RemoteNic::register` succeeds; checked lock-free on the hot
 /// TX path by `net::send_frame`.
@@ -699,14 +704,20 @@ mod tests {
             RemoteNic::ensure_link_event_entry(mac, Some(recovered_ep)),
             Some(recovered_ep)
         );
-        assert!(!RESTART_SUSPECTED.load(Ordering::Acquire));
+        // `RESTART_SUSPECTED` is intentionally NOT cleared by
+        // `ensure_link_event_entry` — see the doc-comment at the
+        // `live_endpoint.is_some()` branch in that function. The latch is
+        // consumed on `sendto_restart_ret` observation instead so the
+        // userspace `sendto` retry loop reliably catches the EAGAIN
+        // window. The recovery the test name refers to is the endpoint /
+        // MAC update, asserted below.
         assert_eq!(registered_endpoint(), Some(recovered_ep));
         assert_eq!(RemoteNic::mac_address(), Some(mac));
     }
 
     #[test_case]
     fn inject_rx_frame_queues_payload_for_deferred_dispatch() {
-        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_rx_notify};
 
         reset_remote_nic_state();
         RemoteNic::register(EndpointId(4), [0; 6]);
@@ -717,7 +728,7 @@ mod tests {
             frame_len: frame.len() as u16,
             flags: 0,
         };
-        let mut payload = encode_net_send(header).to_vec();
+        let mut payload = encode_net_rx_notify(header).to_vec();
         payload.extend_from_slice(&frame);
 
         assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
@@ -726,18 +737,22 @@ mod tests {
 
     #[test_case]
     fn drain_rx_queue_removes_malformed_frames_after_deferred_queueing() {
-        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_rx_notify};
 
         reset_remote_nic_state();
         RemoteNic::register(EndpointId(5), [0; 6]);
 
-        let frame = [0u8; 14];
+        // Frame is shorter than the 14-byte Ethernet header so
+        // `process_rx_frames` rejects it at the link layer. The header
+        // still decodes (frame_len matches the supplied payload), so
+        // inject queues it; drain then drops it as malformed.
+        let frame = [0u8; 8];
         let header = NetFrameHeader {
             kind: NET_RX_FRAME,
             frame_len: frame.len() as u16,
             flags: 0,
         };
-        let mut payload = encode_net_send(header).to_vec();
+        let mut payload = encode_net_rx_notify(header).to_vec();
         payload.extend_from_slice(&frame);
 
         assert_eq!(RemoteNic::inject_rx_frame(&payload), 1);
@@ -747,7 +762,7 @@ mod tests {
 
     #[test_case]
     fn inject_rx_frame_queues_each_record_in_a_multi_frame_batch() {
-        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_send};
+        use kernel_core::driver_ipc::net::{NET_RX_FRAME, NetFrameHeader, encode_net_rx_notify};
 
         reset_remote_nic_state();
         RemoteNic::register(EndpointId(6), [0; 6]);
@@ -764,7 +779,7 @@ mod tests {
                 frame_len: frame.len() as u16,
                 flags: 0,
             };
-            bulk.extend_from_slice(&encode_net_send(header));
+            bulk.extend_from_slice(&encode_net_rx_notify(header));
             bulk.extend_from_slice(frame);
         }
 

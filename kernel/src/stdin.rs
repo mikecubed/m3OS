@@ -5,8 +5,8 @@
 //! are delivered here (immediately in raw mode, on newline in cooked).
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
 /// Maximum size of the read-ready buffer.
@@ -51,7 +51,11 @@ impl StdinState {
     }
 }
 
-static STDIN: Mutex<StdinState> = Mutex::new(StdinState::new());
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  STDIN is only acquired
+/// from task context (line-discipline feeder, read syscall); the PS/2 ISR
+/// routes scancodes through `RAW_INPUT_ROUTER`, never through STDIN.
+static STDIN: IrqSafeMutex<StdinState> = IrqSafeMutex::new(StdinState::new());
 
 /// EOF flag: when set, has_data() returns true but read() returns 0.
 static EOF_PENDING: AtomicBool = AtomicBool::new(false);

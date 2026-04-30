@@ -75,32 +75,53 @@ fn online_core_count() -> u8 {
 ///
 /// If only one core is online, skips the IPI (single-core fast path, T034).
 pub fn tlb_shootdown(addr: u64) {
-    let _lock = SHOOTDOWN_LOCK.lock();
+    // Phase 57b — `SHOOTDOWN_LOCK` migration shape: **preempt-only**.
+    //
+    // The lock holder broadcasts an IPI to every other online core and
+    // spins on `SHOOTDOWN_PENDING` until each acks.  IF MUST stay enabled
+    // throughout the lock-held region: a contending core that takes the
+    // lock with IF=0 (or waits on the lock with IF=0) cannot service the
+    // shootdown IPI from the holder, deadlocking both cores.  The
+    // `tlb_shootdown_ipi_handler` itself never touches `SHOOTDOWN_LOCK`,
+    // so re-entry of an IRQ handler on the holder's core during the wait
+    // is safe.
+    //
+    // `preempt_disable` is required (Phase 57b F semantic): keeps the
+    // task pinned across the IPI broadcast so 57d/57e cannot preempt the
+    // holder mid-handshake.  It is lock-free (Phase 57b D.2) so it cannot
+    // recurse through this caller.
+    crate::task::scheduler::preempt_disable();
+    {
+        let _lock = SHOOTDOWN_LOCK.lock();
 
-    let online = online_core_count();
+        let online = online_core_count();
 
-    // Always invalidate locally.
-    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+        // Always invalidate locally.
+        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
 
-    if online <= 1 {
-        return; // single-core fast path
+        if online > 1 {
+            // Clear range state so the IPI handler uses the legacy single-address path.
+            SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
+            SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
+
+            // Set up the request.
+            SHOOTDOWN_ADDR.store(addr, Ordering::Release);
+            SHOOTDOWN_PENDING.store(online - 1, Ordering::Release);
+
+            // Send TLB shootdown IPI to all other cores.
+            ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
+
+            // Spin-wait for all remote cores to acknowledge.  IF stays
+            // enabled here; a self-targeted IRQ (timer, etc.) is allowed
+            // to fire and return.  Remote cores' IPI handlers run with
+            // their own IF state, never contend for `SHOOTDOWN_LOCK`,
+            // and only touch the `SHOOTDOWN_*` atomics.
+            while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+                core::hint::spin_loop();
+            }
+        }
     }
-
-    // Clear range state so the IPI handler uses the legacy single-address path.
-    SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
-    SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
-
-    // Set up the request.
-    SHOOTDOWN_ADDR.store(addr, Ordering::Release);
-    SHOOTDOWN_PENDING.store(online - 1, Ordering::Release);
-
-    // Send TLB shootdown IPI to all other cores.
-    ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
-
-    // Spin-wait for all remote cores to acknowledge.
-    while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-        core::hint::spin_loop();
-    }
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Invalidate a range of page mappings on targeted cores.
@@ -112,83 +133,94 @@ pub fn tlb_shootdown(addr: u64) {
 ///
 /// Falls back to a local-only flush if no remote cores are active.
 pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end: u64) {
-    let _lock = SHOOTDOWN_LOCK.lock();
+    // Phase 57b — preempt-only migration shape; same rationale as
+    // [`tlb_shootdown`].  IF must stay enabled across the lock-held region
+    // so contending cores can service this core's IPIs.
+    crate::task::scheduler::preempt_disable();
+    'critical: {
+        let _lock = SHOOTDOWN_LOCK.lock();
 
-    // Align the range to page boundaries so every page intersecting
-    // [start, end) is invalidated, even when start or end are not aligned.
-    let aligned_start = start & !(4096 - 1);
-    let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
+        // Align the range to page boundaries so every page intersecting
+        // [start, end) is invalidated, even when start or end are not aligned.
+        let aligned_start = start & !(4096 - 1);
+        let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
 
-    // Base the threshold decision on the aligned flush range.
-    let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
-    let use_cr3_reload = page_count > INVLPG_THRESHOLD;
+        // Base the threshold decision on the aligned flush range.
+        let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
+        let use_cr3_reload = page_count > INVLPG_THRESHOLD;
 
-    // Local flush first.
-    if use_cr3_reload {
-        // Full TLB flush via CR3 reload.
-        let (frame, flags) = x86_64::registers::control::Cr3::read();
-        unsafe {
-            x86_64::registers::control::Cr3::write(frame, flags);
+        // Local flush first.
+        if use_cr3_reload {
+            // Full TLB flush via CR3 reload.
+            let (frame, flags) = x86_64::registers::control::Cr3::read();
+            unsafe {
+                x86_64::registers::control::Cr3::write(frame, flags);
+            }
+        } else {
+            // Per-page invlpg.
+            let mut addr = aligned_start;
+            while addr < aligned_end {
+                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+                addr += 4096;
+            }
         }
-    } else {
-        // Per-page invlpg.
-        let mut addr = aligned_start;
-        while addr < aligned_end {
-            x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
-            addr += 4096;
+
+        // Find remote cores that need flushing.
+        let active = addr_space.active_cores();
+        let my_core = super::per_core().core_id;
+        let remote_mask = active & !(1u64 << my_core);
+
+        if remote_mask == 0 {
+            // No remote cores have this address space loaded — exit the
+            // critical block, then `preempt_enable` below.
+            break 'critical;
+        }
+
+        // Set up range request for the IPI handler (pass aligned boundaries).
+        SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
+        SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
+        SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
+
+        // Count targeted cores first so the pending count is initialized before
+        // any IPI is sent — otherwise a remote core can handle the IPI and
+        // fetch_sub(1) while SHOOTDOWN_PENDING is still 0, causing underflow.
+        //
+        // Use get_core_data + is_online per bit instead of online_core_count()
+        // as an upper bound — online_core_count() is a count, not a max core_id,
+        // and would skip higher-numbered cores if a lower-numbered core is offline.
+        let mut targets = 0u8;
+        for core_id in 0..64u8 {
+            if remote_mask & (1u64 << core_id) != 0
+                && let Some(data) = super::get_core_data(core_id)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                targets = targets.saturating_add(1);
+            }
+        }
+
+        if targets == 0 {
+            break 'critical;
+        }
+
+        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+
+        // Now that the pending count is visible, send the IPIs.
+        // send_ipi_to_core already checks existence + is_online, matching the
+        // count above.
+        for core_id in 0..64u8 {
+            if remote_mask & (1u64 << core_id) != 0 {
+                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+            }
+        }
+
+        // Spin-wait for acknowledgment from all targeted cores.  IF stays
+        // enabled; remote cores must be able to receive their IPIs and
+        // ack via the `SHOOTDOWN_*` atomics.
+        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+            core::hint::spin_loop();
         }
     }
-
-    // Find remote cores that need flushing.
-    let active = addr_space.active_cores();
-    let my_core = super::per_core().core_id;
-    let remote_mask = active & !(1u64 << my_core);
-
-    if remote_mask == 0 {
-        return; // No remote cores have this address space loaded.
-    }
-
-    // Set up range request for the IPI handler (pass aligned boundaries).
-    SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
-    SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
-    SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
-
-    // Count targeted cores first so the pending count is initialized before
-    // any IPI is sent — otherwise a remote core can handle the IPI and
-    // fetch_sub(1) while SHOOTDOWN_PENDING is still 0, causing underflow.
-    //
-    // Use get_core_data + is_online per bit instead of online_core_count()
-    // as an upper bound — online_core_count() is a count, not a max core_id,
-    // and would skip higher-numbered cores if a lower-numbered core is offline.
-    let mut targets = 0u8;
-    for core_id in 0..64u8 {
-        if remote_mask & (1u64 << core_id) != 0
-            && let Some(data) = super::get_core_data(core_id)
-            && data.is_online.load(Ordering::Acquire)
-        {
-            targets = targets.saturating_add(1);
-        }
-    }
-
-    if targets == 0 {
-        return;
-    }
-
-    SHOOTDOWN_PENDING.store(targets, Ordering::Release);
-
-    // Now that the pending count is visible, send the IPIs.
-    // send_ipi_to_core already checks existence + is_online, matching the
-    // count above.
-    for core_id in 0..64u8 {
-        if remote_mask & (1u64 << core_id) != 0 {
-            ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
-        }
-    }
-
-    // Spin-wait for acknowledgment from all targeted cores.
-    while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-        core::hint::spin_loop();
-    }
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Handle a TLB shootdown IPI on the receiving core.

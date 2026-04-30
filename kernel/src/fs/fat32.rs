@@ -8,7 +8,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::fat32::{self, FAT_ENTRY_MASK, FAT_EOC, Fat32Bpb, Fat32DirEntry, Fat32Error};
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 /// Maximum cluster chain length before we assume corruption.
 const MAX_CHAIN_LEN: usize = 65536;
@@ -27,7 +28,13 @@ pub struct Fat32FileMeta {
 
 /// In-memory permissions index for the FAT32 volume.
 /// Key is the relative path within /data (e.g. "etc/passwd").
-pub static FAT32_PERMISSIONS: Mutex<BTreeMap<String, Fat32FileMeta>> = Mutex::new(BTreeMap::new());
+///
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  FAT32_PERMISSIONS is
+/// only acquired from task context (mount, syscall paths); no ISR ever
+/// reaches it.  Type swap is a pure auto-deref change for callsites.
+pub static FAT32_PERMISSIONS: IrqSafeMutex<BTreeMap<String, Fat32FileMeta>> =
+    IrqSafeMutex::new(BTreeMap::new());
 
 /// Get metadata for a FAT32 file, returning defaults if not in the index.
 pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
@@ -187,7 +194,12 @@ pub struct Fat32Volume {
 }
 
 /// Global mounted FAT32 volume (set by mount_fat32).
-pub static FAT32_VOLUME: Mutex<Option<Fat32Volume>> = Mutex::new(None);
+///
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// FAT32_VOLUME is only acquired from task context (mount, read/write
+/// syscalls); no ISR ever reaches it.  Type swap is a pure auto-deref
+/// change for callsites.
+pub static FAT32_VOLUME: IrqSafeMutex<Option<Fat32Volume>> = IrqSafeMutex::new(None);
 
 impl Fat32Volume {
     /// Mount a FAT32 partition at the given base LBA.

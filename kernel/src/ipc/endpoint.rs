@@ -30,9 +30,10 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use spin::{Lazy, Mutex};
+use spin::Lazy;
 
 use super::{CapError, Capability, Message, NotifId};
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::EndpointId;
@@ -49,12 +50,17 @@ const ENDPOINT_GROW_INCREMENT: usize = 16;
 
 /// Global registry of all kernel IPC endpoints.
 ///
-/// Protected by a `Mutex` — IPC operations acquire this lock briefly to
-/// inspect or mutate sender/receiver queues.
+/// Protected by an [`IrqSafeMutex`] — IPC operations acquire this lock briefly
+/// to inspect or mutate sender/receiver queues.
 ///
 /// Uses `spin::Lazy` because `EndpointRegistry::new()` allocates a `Vec`.
-pub static ENDPOINTS: Lazy<Mutex<EndpointRegistry>> =
-    Lazy::new(|| Mutex::new(EndpointRegistry::new()));
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  `ENDPOINTS` is only
+/// acquired from task context (IPC syscalls, cleanup); no ISR ever reaches
+/// it.  Pure type swap — callsites compile unchanged via auto-deref.
+pub static ENDPOINTS: Lazy<IrqSafeMutex<EndpointRegistry>> =
+    Lazy::new(|| IrqSafeMutex::new(EndpointRegistry::new()));
 
 /// Dynamically growable container for all [`Endpoint`] objects.
 pub struct EndpointRegistry {
