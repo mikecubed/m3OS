@@ -1,7 +1,7 @@
 //! ARP (Address Resolution Protocol) — pure logic re-exported from kernel-core,
 //! kernel-specific cache and send/handle functions remain here.
 
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 use super::ethernet::{self, MAC_BROADCAST};
 use super::virtio_net::MacAddr;
@@ -76,7 +76,11 @@ impl ArpCache {
     }
 }
 
-static ARP_CACHE: Mutex<ArpCache> = Mutex::new(ArpCache::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline
+// (lock raises `preempt_count`, drop lowers it).  ARP_CACHE is never taken
+// from an ISR — `handle_packet` runs in the net polling task — so the type
+// change is purely additive: callsites compile unchanged via auto-deref.
+static ARP_CACHE: IrqSafeMutex<ArpCache> = IrqSafeMutex::new(ArpCache::new());
 
 /// Look up a MAC address in the ARP cache.
 pub fn resolve(target_ip: Ipv4Addr) -> Option<MacAddr> {

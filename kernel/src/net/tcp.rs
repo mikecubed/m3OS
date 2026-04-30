@@ -3,7 +3,8 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
@@ -301,7 +302,11 @@ impl TcpConnections {
     }
 }
 
-static TCP_CONNS: Mutex<TcpConnections> = Mutex::new(TcpConnections::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// TCP_CONNS is acquired only from task context; the NIC ISR feeds RX through
+// wake-queues, never reaching this lock from inside an ISR.  Pure type
+// change: callsites compile unchanged through auto-deref.
+static TCP_CONNS: IrqSafeMutex<TcpConnections> = IrqSafeMutex::new(TcpConnections::new());
 
 pub fn create(local_port: u16) -> Option<usize> {
     let local_ip = super::config::our_ip();

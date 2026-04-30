@@ -11,8 +11,8 @@ use alloc::{
     string::String,
     vec::Vec,
 };
-use spin::Mutex;
 
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
 // ===========================================================================
@@ -117,7 +117,10 @@ impl UnixSocketTable {
     }
 }
 
-static UNIX_SOCKET_TABLE: Mutex<UnixSocketTable> = Mutex::new(UnixSocketTable::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// AF_UNIX sockets are touched only from socket syscalls (task context);
+// no ISR holds this lock.  Pure type change.
+static UNIX_SOCKET_TABLE: IrqSafeMutex<UnixSocketTable> = IrqSafeMutex::new(UnixSocketTable::new());
 
 /// Allocate a new Unix socket entry. Returns the handle (index) or None if full.
 pub fn alloc_unix_socket(socket_type: UnixSocketType) -> Option<usize> {
@@ -246,7 +249,9 @@ pub fn wake_unix_socket(handle: usize) {
 // D.4 — Path-to-handle map for named sockets
 // ===========================================================================
 
-static UNIX_PATH_MAP: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// Path-map lookups happen only from task-context bind/connect syscalls.
+static UNIX_PATH_MAP: IrqSafeMutex<BTreeMap<String, usize>> = IrqSafeMutex::new(BTreeMap::new());
 
 /// Register a binding from a filesystem path to a Unix socket handle.
 /// Returns `Err(())` if the path is already bound.
