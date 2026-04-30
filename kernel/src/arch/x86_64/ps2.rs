@@ -107,6 +107,38 @@ static MOUSE_RING_TAIL: AtomicUsize = AtomicUsize::new(0);
 /// Decoder state — fed from the IRQ12 handler.
 static MOUSE_DECODER: Mutex<Ps2MouseDecoder> = Mutex::new(Ps2MouseDecoder::new());
 
+/// Phase 57b G.8 — task-context wrapper around [`MOUSE_DECODER`].
+///
+/// `MOUSE_DECODER` is classified `explicit-preempt-and-cli` per Track A.1
+/// audit (`kernel/src/arch/x86_64/ps2.rs:108`): the IRQ12 / IRQ1 ISR path
+/// reaches `feed_byte_isr` which acquires the lock from interrupt context,
+/// so converting to `IrqSafeMutex` would not work — the ISR runs with
+/// IF=0 and never raises the per-task `preempt_count`.
+///
+/// This helper wraps the two task-context callsites in [`init_mouse`]
+/// (the `resync` reset and the `enable_wheel_mode` follow-up) so the
+/// `preempt_disable` / `interrupts::without_interrupts` / `MOUSE_DECODER.lock()`
+/// / `preempt_enable` boilerplate lives in one place. Mirrors the G.1.c
+/// `with_driver` and G.5.c `with_unit_slots` template (commits 4983e3cb,
+/// 1b84aac).
+///
+/// **Do not call this from an ISR**: [`feed_byte_isr`] takes
+/// `MOUSE_DECODER` directly because interrupt handlers already run with
+/// IF=0 and follow their own discipline (no kernel preemption, no nested
+/// `preempt_disable`).
+///
+/// Lock-ordering: `preempt_disable` is lock-free (Phase 57b D.2), so
+/// calling it before `without_interrupts` cannot recurse.
+fn with_mouse_decoder<R>(f: impl FnOnce(&mut Ps2MouseDecoder) -> R) -> R {
+    crate::task::scheduler::preempt_disable();
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut decoder = MOUSE_DECODER.lock();
+        f(&mut decoder)
+    });
+    crate::task::scheduler::preempt_enable();
+    result
+}
+
 /// Records successful AUX-port initialization. **Informational only — it
 /// does not gate the IRQ12 path.** The actual gate is the PIC mask: until
 /// [`init_mouse`] has unmasked IRQ12 (and the BIOS / firmware hasn't left
@@ -322,7 +354,10 @@ fn try_intellimouse_handshake() -> Result<bool, Ps2Error> {
 /// PIC is unmasked for IRQ12).
 pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Reset decoder + clear any leftover state from BIOS.
-    MOUSE_DECODER.lock().resync();
+    // Phase 57b G.8 — `with_mouse_decoder` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate around the IRQ-shared `MOUSE_DECODER`
+    // lock.
+    with_mouse_decoder(|decoder| decoder.resync());
     drain_output();
 
     // Step 1 — enable the AUX device port at the controller.
@@ -342,7 +377,10 @@ pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Step 4 — IntelliMouse magic-knock; if it fails we fall back silently.
     let wheel = try_intellimouse_handshake().unwrap_or(false);
     if wheel {
-        MOUSE_DECODER.lock().enable_wheel_mode();
+        // Phase 57b G.8 — `with_mouse_decoder` wraps the `preempt_disable` +
+        // `without_interrupts` boilerplate around the IRQ-shared
+        // `MOUSE_DECODER` lock.
+        with_mouse_decoder(|decoder| decoder.enable_wheel_mode());
     }
 
     // Step 5 — enable streaming. From here, IRQ12 fires on each packet.
