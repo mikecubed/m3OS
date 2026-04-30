@@ -226,9 +226,9 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** The Phase 57a I.1 acceptance gate fails because of cooperative-scheduling starvation.  57c's primary acceptance test is that I.1 now passes.
 
 **Acceptance:**
-- [x] On user test hardware, `cargo xtask run-gui --fresh`: cursor moves on mouse motion within 1 s; keyboard echoes within 100 ms; `term` reaches `TERM_SMOKE:ready`.
-- [x] Repeated 5 times, 5 successes (placement varies between boots).
-- [x] Zero `[WARN] [sched]` lines in the first 60 s of each boot.
+- [ ] On user test hardware, `cargo xtask run-gui --fresh`: cursor moves on mouse motion within 1 s; keyboard echoes within 100 ms; `term` reaches `TERM_SMOKE:ready`.
+- [ ] Repeated 5 times, 5 successes (placement varies between boots).
+- [ ] Zero `[WARN] [sched]` lines in the first 60 s of each boot.
 
 ### E.2 — 30 + 30 min soak
 
@@ -237,10 +237,10 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** A 60-minute soak with idle and load shows the conversions are stable under realistic conditions.
 
 **Acceptance:**
-- [x] 30 min idle + 30 min synthetic IPC + futex + notification load on 4 cores.
-- [x] Zero `[WARN] [sched] cpu-hog` warnings whose corrected `ran` exceeds 200 ms.
-- [x] Zero `[WARN] [sched]` stuck-task warnings.
-- [x] No deadlocks, panics, or scheduler hangs.
+- [ ] 30 min idle + 30 min synthetic IPC + futex + notification load on 4 cores.
+- [ ] Zero `[WARN] [sched] cpu-hog` warnings whose corrected `ran` exceeds 200 ms.
+- [ ] Zero `[WARN] [sched]` stuck-task warnings.
+- [ ] No deadlocks, panics, or scheduler hangs.
 
 ### E.3 — SSH disconnect/reconnect soak
 
@@ -249,8 +249,8 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** Defence-in-depth — the 57a I.2 gate should also pass under 57c's improvements.
 
 **Acceptance:**
-- [x] 50 consecutive SSH disconnect/reconnect cycles in one session without a scheduler hang.
-- [x] Zero `[WARN] [sched]` lines during the soak.
+- [ ] 50 consecutive SSH disconnect/reconnect cycles in one session without a scheduler hang.
+- [ ] Zero `[WARN] [sched]` lines during the soak.
 
 ### E.4 — Documentation update
 

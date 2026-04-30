@@ -828,17 +828,20 @@ fn nic_irq_handler() {
 
 // Kernel task (net_task):
 loop {
-    // Process any pending RX frames.
-    while let Some(frame) = nic.poll_rx() { handle_frame(frame); }
-    // Block until the next IRQ fires.
+    // Clear before draining so an IRQ that fires during poll_rx() is not lost:
+    // if the IRQ runs between here and block_current_until, the flag will be
+    // true when block_current_until checks it and the call returns immediately.
     NIC_WOKEN.store(false, Ordering::Release);
+    // Drain all pending RX frames.
+    while let Some(frame) = nic.poll_rx() { handle_frame(frame); }
+    // Block until the next IRQ fires (or until a wakeup already pending above).
     block_current_until(&NIC_WOKEN, None);
 }
 ```
 
 Key invariants:
 - The `AtomicBool` is **owned by the IRQ handler** (or the other task that drives the condition).
-- `store(false)` happens **before** the final `load` check inside `block_current_until`, preventing lost wakeups.
+- `store(false)` happens **before draining work**, not after.  An IRQ that fires during `poll_rx()` sets the flag to `true`; when `block_current_until` checks it at the end of the loop, it returns immediately so the frame is not lost.
 - The IRQ handler does **not** call `block_current_until` or allocate — it only sets the flag and calls `wake_task`.
 
 ### Pattern: task-to-task wake via WaitQueue

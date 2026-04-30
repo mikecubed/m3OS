@@ -42,7 +42,7 @@ Each entry maps to a Track B (convert), Track C (annotate), or Track D/leave (le
 | Decision | Count | Sites |
 |---|---|---|
 | **convert** (Track B) | 0 | — (all known convert sites were already handled in Phase 57a) |
-| **annotate** (Track C) | 16 | ipi.rs:46, tlb.rs:120, tlb.rs:220, boot.rs:277, intel.rs:247, intel.rs:368, intel.rs:390, amd.rs:339, ps2.rs:239, ps2.rs:252, apic.rs:436, main.rs:185, frame_allocator.rs:942, slab.rs:495, rtc.rs:90 + one more below |
+| **annotate** (Track C) | 15 | ipi.rs:46, tlb.rs:120, tlb.rs:220, boot.rs:277, intel.rs:247, intel.rs:368, intel.rs:390, amd.rs:339, ps2.rs:239, ps2.rs:252, apic.rs:436, main.rs:185, frame_allocator.rs:942, slab.rs:495, rtc.rs:90 |
 | **leave** (C.7 / documented) | 4 | scheduler.rs:2699, scheduler.rs:2910, task/mod.rs:667, syscall/mod.rs:3302 |
 
 > **Note on Track B:** The audit finds no new unbounded-convert sites. The Phase 57a migration already converted all unbounded busy-spins in `virtio_blk`, `sys_poll`, `net_task`, `WaitQueue::sleep`, `futex_wait`, and the NVMe device-host path. Track B's work is therefore verification that these conversions remain intact under the new audit lens, plus regression tests for the verified paths.
