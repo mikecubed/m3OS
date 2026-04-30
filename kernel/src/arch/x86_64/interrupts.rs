@@ -43,6 +43,7 @@
 //! 3 is the rule that class of bug violated. Every handler below
 //! relies on at least one of the three lock disciplines it enumerates.
 
+use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
@@ -54,6 +55,7 @@ use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
+use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser};
 
 // ---------------------------------------------------------------------------
 // APIC / PIC mode flag
@@ -505,8 +507,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
 
-    // Hardware IRQs
-    idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
+    // Hardware IRQs — timer and reschedule IPI use raw naked-asm entry stubs
+    // (Phase 57d Track B) so they are installed via `set_handler_addr`.
+    unsafe {
+        idt[InterruptIndex::Timer as u8]
+            .set_handler_addr(VirtAddr::new(timer_entry as *const () as u64));
+    }
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
     // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
     // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
@@ -518,7 +524,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
 
     // SMP IPI vectors (Phase 25).
-    idt[crate::smp::ipi::IPI_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
+    unsafe {
+        idt[crate::smp::ipi::IPI_RESCHEDULE]
+            .set_handler_addr(VirtAddr::new(reschedule_ipi_entry as *const () as u64));
+    }
     idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
     idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
 
@@ -553,6 +562,138 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 /// Load the IDT.
 pub fn init() {
     IDT.load();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track B — naked-asm preemption entry stubs
+// ---------------------------------------------------------------------------
+//
+// `timer_entry` and `reschedule_ipi_entry` are ring-aware two-path stubs.
+// They push all 15 GPRs BEFORE any Rust function prologue can clobber them,
+// then call the appropriate Rust handler (`*_user` or `*_kernel`) with a
+// pointer to the on-stack frame.
+//
+// GPR push order (both stubs, both paths): r15 first → rax last, so that
+// rax ends up at the lowest address (gprs[0] in `PreemptTrapFrameUser/Kernel`).
+//
+// Kernel-path alignment: the kernel stack is not guaranteed 16-byte aligned
+// at interrupt entry, so we save RSP in r12 (callee-saved), align with
+// `and rsp, -16`, call, then restore from r12.  After the call, `pop r12`
+// loads the interrupted task's r12 from the frame slot — the scratch value
+// in the live register is overwritten by the pop, which is correct.
+
+global_asm!(
+    // -----------------------------------------------------------------------
+    // Shared macros: GPR save / restore used by both stubs.
+    // -----------------------------------------------------------------------
+    ".macro save_gprs_all",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rax",
+    ".endm",
+    "",
+    ".macro restore_gprs_all",
+    "pop rax",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    ".endm",
+    "",
+    // -----------------------------------------------------------------------
+    // timer_entry
+    // -----------------------------------------------------------------------
+    ".global timer_entry",
+    "timer_entry:",
+    // CS is at [rsp+8] on both ring-0 (3-field frame: rip/cs/rflags) and
+    // ring-3 (5-field frame: rip/cs/rflags/rsp/ss) IRQ entries.
+    "test QWORD PTR [rsp+8], 3",
+    "jnz .Ltimer_user",
+    "",
+    // --- Kernel path --------------------------------------------------------
+    ".Ltimer_kernel:",
+    "save_gprs_all",
+    // After 15 pushes, rsp = &gprs[0].
+    // interrupted RSP = rsp + 15*8 + 3*8 = rsp + 144.
+    "lea rsi, [rsp + 144]", // arg2: captured_kernel_rsp
+    "cld",
+    "mov rdi, rsp", // arg1: &PreemptTrapFrameKernel
+    "mov r12, rsp", // save pre-alignment rsp (r12 is callee-saved)
+    "and rsp, -16", // align to 16 bytes for SysV call ABI
+    "call timer_handler_kernel",
+    "mov rsp, r12", // restore (pop r12 below loads original r12 from frame)
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // --- User path ----------------------------------------------------------
+    ".Ltimer_user:",
+    "save_gprs_all",
+    // After 15 GPR pushes + 5 CPU-pushed fields = 160 bytes.
+    // If TSS.RSP0 is 16-aligned, 160 ≡ 0 (mod 16) → already aligned.
+    "cld",
+    "mov rdi, rsp", // arg1: &mut PreemptTrapFrameUser
+    "call timer_handler_user",
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // -----------------------------------------------------------------------
+    // reschedule_ipi_entry
+    // -----------------------------------------------------------------------
+    ".global reschedule_ipi_entry",
+    "reschedule_ipi_entry:",
+    "test QWORD PTR [rsp+8], 3",
+    "jnz .Lrescheduleipi_user",
+    "",
+    // --- Kernel path --------------------------------------------------------
+    ".Lrescheduleipi_kernel:",
+    "save_gprs_all",
+    "lea rsi, [rsp + 144]",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call reschedule_ipi_handler_kernel",
+    "mov rsp, r12",
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // --- User path ----------------------------------------------------------
+    ".Lrescheduleipi_user:",
+    "save_gprs_all",
+    "cld",
+    "mov rdi, rsp",
+    "call reschedule_ipi_handler_user",
+    "restore_gprs_all",
+    "iretq",
+);
+
+// Rust-side declarations for the asm entry symbols (used when installing
+// into the IDT via `set_handler_addr`).
+unsafe extern "C" {
+    fn timer_entry();
+    fn reschedule_ipi_entry();
 }
 
 // ---------------------------------------------------------------------------
@@ -697,10 +838,14 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 
-fn maybe_redirect_group_exit_trampoline(stack_frame: &mut InterruptStackFrame) {
-    if stack_frame.code_segment.rpl() != x86_64::PrivilegeLevel::Ring3
-        || !crate::smp::is_per_core_ready()
-    {
+/// User-path replacement for `maybe_redirect_group_exit_trampoline`.
+///
+/// Operates directly on the on-stack [`PreemptTrapFrameUser`] so it can be
+/// called from the naked-asm user-path handlers without requiring an
+/// `InterruptStackFrame`.  The ring-3 check is omitted — the user-path
+/// handler is only ever reached when `(cs & 3) == 3`.
+fn maybe_redirect_group_exit_trampoline_user(frame: &mut PreemptTrapFrameUser) {
+    if !crate::smp::is_per_core_ready() {
         return;
     }
 
@@ -724,17 +869,11 @@ fn maybe_redirect_group_exit_trampoline(stack_frame: &mut InterruptStackFrame) {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
     }
-    unsafe {
-        stack_frame.as_mut().update(|f| {
-            f.instruction_pointer = VirtAddr::new(
-                crate::arch::x86_64::syscall::forced_group_exit_trampoline as *const () as u64,
-            );
-            f.code_segment = gdt::kernel_code_selector();
-            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-            f.stack_pointer = VirtAddr::new(kernel_rsp);
-            f.stack_segment = gdt::kernel_data_selector();
-        });
-    }
+    frame.rip = crate::arch::x86_64::syscall::forced_group_exit_trampoline as *const () as u64;
+    frame.cs = u64::from(gdt::kernel_code_selector().0);
+    frame.rflags &= !0x200u64; // clear INTERRUPT_FLAG (bit 9)
+    frame.rsp = kernel_rsp;
+    frame.ss = u64::from(gdt::kernel_data_selector().0);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
@@ -893,23 +1032,18 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
-    // Only the BSP increments the global tick counter. APs have their own
-    // per-1ms LAPIC timers that drive the scheduler but must not skew the
-    // global wall-clock tick count (which nanosleep and uptime rely on).
-    //
-    // In PIC mode (no MADT / single-core), we are always the BSP and
-    // `is_bsp()` must not be called — it reads LAPIC MMIO which is not
-    // mapped when the APIC was never initialised.
+/// Phase 57d Track B — timer handler, user (ring 3) path.
+///
+/// Called from the `timer_entry` naked stub when the interrupted context was
+/// ring 3.  `frame` points directly at the on-stack [`PreemptTrapFrameUser`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        // Phase 56 Track B.3 — subdivide the 1 kHz timer into the configured
-        // frame-tick rate. Only the BSP drives the counter so AP timers
-        // don't double-count.
         crate::time::on_timer_tick_isr();
     }
     crate::task::signal_reschedule();
-    maybe_redirect_group_exit_trampoline(&mut stack_frame);
+    maybe_redirect_group_exit_trampoline_user(frame);
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     } else {
@@ -918,7 +1052,42 @@ extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    #[cfg(debug_assertions)]
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    #[cfg(feature = "preempt-voluntary")]
+    if let Some(pc) = crate::smp::try_per_core() {
+        if pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            crate::task::signal_reschedule();
+        }
+    }
+}
+
+/// Phase 57d Track B — timer handler, kernel path.
+///
+/// Called from the `timer_entry` naked stub when the interrupted context was
+/// ring 0.  `captured_kernel_rsp` is the RSP value the interrupted kernel
+/// code had immediately before the interrupt fired.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_handler_kernel(
+    _frame: &mut PreemptTrapFrameKernel,
+    _captured_kernel_rsp: u64,
+) {
+    if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::time::on_timer_tick_isr();
+    }
+    crate::task::signal_reschedule();
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Timer as u8);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,15 +1382,9 @@ extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
 // SMP IPI handlers (Phase 25)
 // ---------------------------------------------------------------------------
 
-/// Reschedule IPI handler (vector 0xFE).
-///
-/// Sets the reschedule flag on the receiving core, causing the scheduler to
-/// pick the next ready task on the next opportunity.
-extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStackFrame) {
-    // Phase 57 DEBUG: count IPIs received per core so we can tell
-    // if any core is being silently starved of reschedule signals.
-    // Throttled to first 4 per core so the boot transcript stays
-    // readable.
+/// Phase 57d Track B — reschedule IPI handler, user (ring 3) path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFrameUser) {
     if let Some(pc) = crate::smp::try_per_core() {
         let n = pc
             .ipi_recv_log_budget
@@ -1231,9 +1394,37 @@ extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStack
         }
     }
     crate::task::signal_reschedule();
-    maybe_redirect_group_exit_trampoline(&mut stack_frame);
+    maybe_redirect_group_exit_trampoline_user(frame);
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    #[cfg(debug_assertions)]
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    #[cfg(feature = "preempt-voluntary")]
+    if let Some(pc) = crate::smp::try_per_core() {
+        if pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            crate::task::signal_reschedule();
+        }
+    }
+}
+
+/// Phase 57d Track B — reschedule IPI handler, kernel path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
+    _frame: &mut PreemptTrapFrameKernel,
+    _captured_kernel_rsp: u64,
+) {
+    if let Some(pc) = crate::smp::try_per_core() {
+        let n = pc
+            .ipi_recv_log_budget
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::info!("[ipi] reschedule received core={}", pc.core_id);
+        }
+    }
+    crate::task::signal_reschedule();
+    super::apic::lapic_eoi();
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).

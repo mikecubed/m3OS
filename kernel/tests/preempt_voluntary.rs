@@ -123,11 +123,42 @@ fn no_preempt_when_kernel_mode() {
     // TODO: activate in Track G
 }
 
-/// Stub: `preempt_enable` dropping the count to zero while `reschedule == true`
-/// sets `preempt_resched_pending` so the scheduler yields at the next safe point.
+/// Stub: `timer_entry` user path saves all 15 GPRs and `PreemptTrapFrameUser`
+/// layout matches the on-stack layout laid down by the asm stub.
 ///
-/// TODO: activate in Track G once the zero-crossing hook in `preempt_enable` lands.
+/// TODO: activate in Track G once the QEMU single-step harness can inspect
+/// register state before and after the handler returns via `iretq`.
 #[test_case]
-fn preempt_enable_zero_crossing() {
+fn timer_entry_user_path_saves_gprs() {
+    // TODO: activate in Track G
+}
+
+/// Stub: `timer_entry` kernel path saves all 15 GPRs into
+/// `PreemptTrapFrameKernel` and `captured_kernel_rsp` equals the interrupted
+/// RSP (rsp + 15*8 + 3*8 at the point of the `lea`).
+///
+/// TODO: activate in Track G.
+#[test_case]
+fn timer_entry_kernel_path_saves_gprs() {
+    // TODO: activate in Track G
+}
+
+/// Stub: the `mov rdi, rsp` + `call timer_handler_user` sequence lands with
+/// RSP 16-byte aligned so any `movaps` in the Rust handler does not fault.
+///
+/// TODO: activate in Track G once the alignment invariant is verified via
+/// QEMU memory access breakpoints.
+#[test_case]
+fn timer_entry_movaps_alignment() {
+    // TODO: activate in Track G
+}
+
+/// Stub: `reschedule_ipi_entry` kernel path round-trip — GPRs saved before
+/// `call reschedule_ipi_handler_kernel` are intact after `restore_gprs_all`
+/// + `iretq`.
+///
+/// TODO: activate in Track G.
+#[test_case]
+fn reschedule_ipi_entry_kernel_round_trip() {
     // TODO: activate in Track G
 }
