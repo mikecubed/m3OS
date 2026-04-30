@@ -796,10 +796,17 @@ static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
 /// Serializes initiators so concurrent memory-pressure drains cannot stomp the
 /// shared pending counter or IPI handshake.
 ///
-/// Phase 57b G.4 — `IrqSafeMutex` so the drain initiator inherits Track F.1's
-/// preempt-discipline.  Task-context only; the IPI handshake is decremented
-/// by remote cores and does not depend on local IRQ delivery.
-static CACHE_DRAIN_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
+/// Phase 57b — **preempt-only** migration shape.  The lock holder broadcasts
+/// `IPI_CACHE_DRAIN` to every other online core and spins on `DRAIN_PENDING`
+/// until each acks via [`handle_cache_drain_ipi`].  IF MUST stay enabled
+/// across the lock-held region: a contender that takes this lock with IF=0
+/// cannot service the drain IPI from the holder, deadlocking both cores.
+/// `handle_cache_drain_ipi` does not touch this lock, so re-entry of an IRQ
+/// handler on the holder's core during the spin-wait is safe.
+///
+/// `preempt_disable` is still required around acquisition (Phase 57b F
+/// semantic) so 57d/57e cannot preempt the holder mid-handshake.
+static CACHE_DRAIN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// Whether the current `IPI_CACHE_DRAIN` round should also service page-cache
 /// drains on the remote cores.
 static CACHE_DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -852,48 +859,60 @@ pub fn drain_per_cpu_caches() {
         return;
     }
 
-    let _drain_guard = CACHE_DRAIN_LOCK.lock();
-    let core_count = crate::smp::core_count();
+    // Phase 57b — preempt-only migration.  Raise `preempt_count` so 57d/57e
+    // cannot preempt the holder mid-IPI-handshake; do NOT mask IF, since the
+    // holder spins on `DRAIN_PENDING` while remote cores ack via the
+    // `IPI_CACHE_DRAIN` handler — and another core entering this routine
+    // would block on `CACHE_DRAIN_LOCK`, so any contender that masked IF
+    // would fail to service the holder's drain IPI and deadlock both cores.
+    crate::task::scheduler::preempt_disable();
+    'critical: {
+        let _drain_guard = CACHE_DRAIN_LOCK.lock();
+        let core_count = crate::smp::core_count();
 
-    // Drain local cache.
-    let _ = drain_local_page_cache_to_pool();
+        // Drain local cache.
+        let _ = drain_local_page_cache_to_pool();
 
-    if core_count <= 1 {
-        return;
-    }
-
-    // Count online remote cores.
-    let my_core = crate::smp::per_core().core_id;
-    let mut remote_count: u8 = 0;
-    for cid in 0..core_count {
-        if cid == my_core {
-            continue;
+        if core_count <= 1 {
+            break 'critical;
         }
-        if let Some(data) = crate::smp::get_core_data(cid)
-            && data.is_online.load(Ordering::Acquire)
-        {
-            remote_count += 1;
+
+        // Count online remote cores.
+        let my_core = crate::smp::per_core().core_id;
+        let mut remote_count: u8 = 0;
+        for cid in 0..core_count {
+            if cid == my_core {
+                continue;
+            }
+            if let Some(data) = crate::smp::get_core_data(cid)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                remote_count += 1;
+            }
         }
+
+        if remote_count == 0 {
+            break 'critical;
+        }
+
+        DRAIN_PENDING.store(remote_count, Ordering::Release);
+        CACHE_DRAIN_ACTIVE.store(true, Ordering::Release);
+        crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+
+        // Spin-wait for all remote cores to complete their drain.  IF is
+        // enabled here so this core can still service its own IRQs (and
+        // remote cores' IPIs cannot deadlock the holder).
+        while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+        CACHE_DRAIN_ACTIVE.store(false, Ordering::Release);
+
+        log::debug!(
+            "[mm] drained per-CPU page caches on {} remote core(s)",
+            remote_count
+        );
     }
-
-    if remote_count == 0 {
-        return;
-    }
-
-    DRAIN_PENDING.store(remote_count, Ordering::Release);
-    CACHE_DRAIN_ACTIVE.store(true, Ordering::Release);
-    crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
-
-    // Spin-wait for all remote cores to complete their drain.
-    while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
-    }
-    CACHE_DRAIN_ACTIVE.store(false, Ordering::Release);
-
-    log::debug!(
-        "[mm] drained per-CPU page caches on {} remote core(s)",
-        remote_count
-    );
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Handle a cache-drain IPI on the receiving core.

@@ -472,9 +472,12 @@ impl AllocatorLocalReclaimStats {
 /// Serializes allocator-local reclaim so the shared remote-drain handshakes in
 /// the frame and slab layers cannot race with each other.
 ///
-/// Phase 57b G.4 — `IrqSafeMutex` so the reclaim helper inherits Track F.1's
-/// preempt-discipline.  Task-context only; never taken from an ISR.
-static ALLOCATOR_RECLAIM_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
+/// Phase 57b — **preempt-only** migration shape.  Held across nested IPI
+/// handshakes ([`super::frame_allocator::drain_per_cpu_caches`],
+/// [`super::slab::collect_remote_frees`]); a contender taking this lock with
+/// IF=0 cannot service the holder's drain IPIs and would deadlock both
+/// cores.  IF stays enabled across the lock-held region.
+static ALLOCATOR_RECLAIM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Recover allocator-local memory before declaring OOM / high-order failure.
 ///
@@ -490,23 +493,31 @@ static ALLOCATOR_RECLAIM_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 /// Callers must not hold the frame allocator lock, slab locks, or local
 /// magazine/page-cache guards while entering this helper.
 pub(crate) fn reclaim_allocator_local_caches(reason: &'static str) -> AllocatorLocalReclaimStats {
-    let _reclaim_guard = ALLOCATOR_RECLAIM_LOCK.lock();
+    // Phase 57b — preempt-only.  IF stays enabled because the inner
+    // `drain_per_cpu_caches` / `collect_remote_frees` paths broadcast
+    // `IPI_CACHE_DRAIN` and spin on remote acks.
+    crate::task::scheduler::preempt_disable();
+    let stats = {
+        let _reclaim_guard = ALLOCATOR_RECLAIM_LOCK.lock();
 
-    super::frame_allocator::drain_per_cpu_caches();
-    let mut stats = super::slab::collect_remote_frees();
-    stats.reclaimed_slab_pages = super::slab::reclaim_empty_slabs();
+        super::frame_allocator::drain_per_cpu_caches();
+        let mut stats = super::slab::collect_remote_frees();
+        stats.reclaimed_slab_pages = super::slab::reclaim_empty_slabs();
 
-    if stats.touched_allocator_state() {
-        log::debug!(
-            "[mm] allocator-local reclaim for {}: remote={} magazines={} depot={} slab_pages={}",
-            reason,
-            stats.remote_free_objects,
-            stats.magazine_objects,
-            stats.depot_objects,
-            stats.reclaimed_slab_pages,
-        );
-    }
+        if stats.touched_allocator_state() {
+            log::debug!(
+                "[mm] allocator-local reclaim for {}: remote={} magazines={} depot={} slab_pages={}",
+                reason,
+                stats.remote_free_objects,
+                stats.magazine_objects,
+                stats.depot_objects,
+                stats.reclaimed_slab_pages,
+            );
+        }
 
+        stats
+    };
+    crate::task::scheduler::preempt_enable();
     stats
 }
 
