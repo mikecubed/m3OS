@@ -10,9 +10,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use spin::Lazy;
-use spin::Mutex;
 
 use crate::task::TaskId;
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Waiter entry
@@ -44,8 +44,13 @@ pub struct FutexWaiter {
 type FutexKey = (u64, u64);
 
 /// Global table of futex wait queues, keyed by `(pml4_phys, vaddr)`.
-pub static FUTEX_TABLE: Lazy<Mutex<BTreeMap<FutexKey, Vec<FutexWaiter>>>> =
-    Lazy::new(|| Mutex::new(BTreeMap::new()));
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (futex syscalls + signal-delivery wake);
+/// no ISR ever reaches it.  Pure type swap — callsites compile unchanged
+/// via auto-deref.
+pub static FUTEX_TABLE: Lazy<IrqSafeMutex<BTreeMap<FutexKey, Vec<FutexWaiter>>>> =
+    Lazy::new(|| IrqSafeMutex::new(BTreeMap::new()));
 
 // ---------------------------------------------------------------------------
 // Constants

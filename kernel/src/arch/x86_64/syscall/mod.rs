@@ -92,7 +92,10 @@ const TMPFS_TOTAL_BLOCKS: u64 =
 const TMPFS_TOTAL_FILES: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_BLOCKS: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_FILES: u64 = 1024;
-static MOUNT_OP_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (sys_mount / sys_umount).
+static MOUNT_OP_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
+    crate::task::scheduler::IrqSafeMutex::new(());
 
 #[repr(C)]
 struct Statfs {
@@ -11993,7 +11996,10 @@ fn sys_clone_thread(
             let child_pid = crate::process::alloc_pid_pub();
             let tg = Arc::new(ThreadGroup {
                 leader_tid: parent_tgid,
-                members: spin::Mutex::new(alloc::vec![parent_tgid, child_pid]),
+                members: crate::task::scheduler::IrqSafeMutex::new(alloc::vec![
+                    parent_tgid,
+                    child_pid
+                ]),
                 exit_owner: core::sync::atomic::AtomicU32::new(0),
             });
             // Set the parent's thread_group under lock.
@@ -12016,7 +12022,7 @@ fn sys_clone_thread(
         Some(match parent_shared_fd {
             Some(arc) => arc,
             None => {
-                let arc = Arc::new(spin::Mutex::new(parent_fds));
+                let arc = Arc::new(crate::task::scheduler::IrqSafeMutex::new(parent_fds));
                 // Update parent to use shared fd table.
                 {
                     let mut table = PROCESS_TABLE.lock();
@@ -12037,7 +12043,9 @@ fn sys_clone_thread(
         Some(match parent_shared_sig {
             Some(arc) => arc,
             None => {
-                let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
+                let arc = Arc::new(crate::task::scheduler::IrqSafeMutex::new(
+                    parent_signal_actions,
+                ));
                 {
                     let mut table = PROCESS_TABLE.lock();
                     if let Some(p) = table.find_mut(parent_pid) {
@@ -15226,9 +15234,13 @@ impl EpollInstance {
     }
 }
 
-static EPOLL_TABLE: spin::Mutex<[Option<EpollInstance>; MAX_EPOLL_INSTANCES]> = {
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (epoll_create/ctl/wait + close-on-exec).
+static EPOLL_TABLE: crate::task::scheduler::IrqSafeMutex<
+    [Option<EpollInstance>; MAX_EPOLL_INSTANCES],
+> = {
     const NONE: Option<EpollInstance> = None;
-    spin::Mutex::new([NONE; MAX_EPOLL_INSTANCES])
+    crate::task::scheduler::IrqSafeMutex::new([NONE; MAX_EPOLL_INSTANCES])
 };
 
 /// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).

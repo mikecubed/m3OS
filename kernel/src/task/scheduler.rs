@@ -248,6 +248,26 @@ impl<T: ?Sized> IrqSafeMutex<T> {
     }
 }
 
+impl<T: core::fmt::Debug> core::fmt::Debug for IrqSafeMutex<T> {
+    /// Phase 57b G.6 — needed so structs that hold an `IrqSafeMutex<T>`
+    /// field can `#[derive(Debug)]` (matches the behaviour `spin::Mutex`
+    /// provided before the migration).  Delegates to `try_lock` so a
+    /// concurrently-held lock is rendered as `<locked>` rather than
+    /// deadlocking.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.inner.try_lock() {
+            Some(guard) => f
+                .debug_struct("IrqSafeMutex")
+                .field("data", &*guard)
+                .finish(),
+            None => f
+                .debug_struct("IrqSafeMutex")
+                .field("data", &"<locked>")
+                .finish(),
+        }
+    }
+}
+
 impl<T: ?Sized> core::ops::Deref for IrqSafeGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {

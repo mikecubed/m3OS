@@ -91,8 +91,8 @@
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
-use spin::Mutex;
 
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::NotifId;
@@ -220,16 +220,22 @@ pub(crate) static TCB_BOUND_NOTIF: [AtomicU8; MAX_TASKS] = {
 /// Per-notification waiter.
 ///
 /// `WAITERS[i]` is `Some(task_id)` when a task is blocked in [`wait`] on
-/// notification `i`.  Protected by a `Mutex` — only accessed in task context,
-/// never from an interrupt handler.
-static WAITERS: Mutex<[Option<TaskId>; MAX_NOTIFS]> = Mutex::new([None; MAX_NOTIFS]);
+/// notification `i`.  Protected by an [`IrqSafeMutex`] — only accessed in
+/// task context, never from an interrupt handler.
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Pure type swap — callsites compile unchanged via auto-deref.
+static WAITERS: IrqSafeMutex<[Option<TaskId>; MAX_NOTIFS]> = IrqSafeMutex::new([None; MAX_NOTIFS]);
 
 // ---------------------------------------------------------------------------
 // Allocation registry
 // ---------------------------------------------------------------------------
 
 /// Tracks which notification slots are allocated.
-static ALLOCATED: Mutex<[bool; MAX_NOTIFS]> = Mutex::new([false; MAX_NOTIFS]);
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Pure type swap — callsites compile unchanged via auto-deref.
+static ALLOCATED: IrqSafeMutex<[bool; MAX_NOTIFS]> = IrqSafeMutex::new([false; MAX_NOTIFS]);
 
 /// Return the notification pool capacity.
 pub fn capacity() -> usize {
