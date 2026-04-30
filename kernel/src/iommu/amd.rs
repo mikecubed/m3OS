@@ -42,10 +42,10 @@
 
 #![allow(dead_code)] // Phase 55a wiring lands in Track E; symbols used by tests only until then.
 
+use crate::task::scheduler::IrqSafeMutex;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
 
 use kernel_core::iommu::amdvi_page_table::{AmdViPageTableEntry, AmdViPteFlags};
 use kernel_core::iommu::amdvi_regs::{
@@ -158,7 +158,7 @@ struct DomainState {
     bdf: Option<u16>,
 }
 
-// SAFETY: AmdViUnit is only accessed through `UNITS` behind a [`Mutex`];
+// SAFETY: AmdViUnit is only accessed through `UNITS` behind an [`IrqSafeMutex`];
 // the MMIO virtual address remains valid for the lifetime of the kernel
 // because the phys-offset map is installed before any IOMMU init runs.
 unsafe impl Send for AmdViUnit {}
@@ -916,7 +916,14 @@ impl AmdViUnit {
 /// Registry of AMD-Vi units discovered during ACPI init. Populated by
 /// Track E's wiring; the registry type and mutex shape are defined here
 /// so the `IommuUnit` dispatch surface is local to this module.
-pub static UNITS: Mutex<Vec<AmdViUnit>> = Mutex::new(Vec::new());
+///
+/// Phase 57b G.5 — converted from `spin::Mutex` to [`IrqSafeMutex`] per the
+/// Track A.1 audit (`docs/handoffs/57b-spinlock-callsite-audit.md` row
+/// `kernel/src/iommu/amd.rs:919`). Classification is task-only (the
+/// AMD-Vi fault-dispatch ISR path is currently a Track E TODO; no ISR
+/// handler is installed today). Inherits Track F's preempt-discipline
+/// automatically.
+pub static UNITS: IrqSafeMutex<Vec<AmdViUnit>> = IrqSafeMutex::new(Vec::new());
 
 // ---------------------------------------------------------------------------
 // Tests — limited to host-compilable assertions on constant math. The
