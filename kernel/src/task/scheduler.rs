@@ -659,80 +659,84 @@ impl Scheduler {
     /// Removes stale/ineligible entries as it scans.
     fn dequeue_local(&mut self, core_id: u8, core_bit: u64) -> Option<usize> {
         let data = crate::smp::get_core_data(core_id)?;
-        let mut q = data.run_queue.lock();
-        let mut best_pos: Option<usize> = None;
-        let mut best_prio: u8 = u8::MAX;
+        // Phase 57b G.8 — `with_run_queue` wraps the `preempt_disable` +
+        // `without_interrupts` boilerplate around the IRQ-shared
+        // `run_queue` lock.
+        data.with_run_queue(|q| {
+            let mut best_pos: Option<usize> = None;
+            let mut best_prio: u8 = u8::MAX;
 
-        let mut i = 0;
-        while i < q.len() {
-            let idx = q[i];
-            // Phase 57a follow-up DEBUG: log the SPECIFIC filter reason when
-            // dropping a queue entry — without this, a task that's queued
-            // but never dispatched is invisible (the silent `continue` was
-            // hiding a per-core dispatch regression).  Budgeted in caller
-            // via DEQUEUE_FILTER_LOG_BUDGET to avoid drowning the log.
-            if idx >= self.tasks.len() {
-                log_dequeue_filter_drop(core_id, idx, "idx-out-of-bounds", 0, 0);
-                q.remove(i);
-                continue;
+            let mut i = 0;
+            while i < q.len() {
+                let idx = q[i];
+                // Phase 57a follow-up DEBUG: log the SPECIFIC filter reason when
+                // dropping a queue entry — without this, a task that's queued
+                // but never dispatched is invisible (the silent `continue` was
+                // hiding a per-core dispatch regression).  Budgeted in caller
+                // via DEQUEUE_FILTER_LOG_BUDGET to avoid drowning the log.
+                if idx >= self.tasks.len() {
+                    log_dequeue_filter_drop(core_id, idx, "idx-out-of-bounds", 0, 0);
+                    q.remove(i);
+                    continue;
+                }
+                if self.tasks[idx].state != TaskState::Ready {
+                    log_dequeue_filter_drop(
+                        core_id,
+                        idx,
+                        "state-not-ready",
+                        self.tasks[idx].pid,
+                        self.tasks[idx].state as u64,
+                    );
+                    q.remove(i);
+                    continue;
+                }
+                if self.idle_tasks.contains(&Some(idx)) {
+                    log_dequeue_filter_drop(core_id, idx, "is-idle", self.tasks[idx].pid, 0);
+                    q.remove(i);
+                    continue;
+                }
+                if self.tasks[idx].affinity_mask & core_bit == 0 {
+                    log_dequeue_filter_drop(
+                        core_id,
+                        idx,
+                        "affinity-mismatch",
+                        self.tasks[idx].pid,
+                        self.tasks[idx].affinity_mask,
+                    );
+                    q.remove(i);
+                    continue;
+                }
+                if self.tasks[idx].saved_rsp == 0 {
+                    log::error!(
+                        "[sched] dropping ready task idx={} pid={} name={} with zero saved_rsp",
+                        idx,
+                        self.tasks[idx].pid,
+                        self.tasks[idx].name
+                    );
+                    // TODO(57a-C/D): route through pi_lock + with_block_state
+                    self.tasks[idx].state = TaskState::Dead;
+                    q.remove(i);
+                    continue;
+                }
+                if self.tasks[idx].priority < best_prio {
+                    best_prio = self.tasks[idx].priority;
+                    best_pos = Some(i);
+                }
+                i += 1;
             }
-            if self.tasks[idx].state != TaskState::Ready {
-                log_dequeue_filter_drop(
-                    core_id,
-                    idx,
-                    "state-not-ready",
-                    self.tasks[idx].pid,
-                    self.tasks[idx].state as u64,
-                );
-                q.remove(i);
-                continue;
-            }
-            if self.idle_tasks.contains(&Some(idx)) {
-                log_dequeue_filter_drop(core_id, idx, "is-idle", self.tasks[idx].pid, 0);
-                q.remove(i);
-                continue;
-            }
-            if self.tasks[idx].affinity_mask & core_bit == 0 {
-                log_dequeue_filter_drop(
-                    core_id,
-                    idx,
-                    "affinity-mismatch",
-                    self.tasks[idx].pid,
-                    self.tasks[idx].affinity_mask,
-                );
-                q.remove(i);
-                continue;
-            }
-            if self.tasks[idx].saved_rsp == 0 {
-                log::error!(
-                    "[sched] dropping ready task idx={} pid={} name={} with zero saved_rsp",
-                    idx,
-                    self.tasks[idx].pid,
-                    self.tasks[idx].name
-                );
-                // TODO(57a-C/D): route through pi_lock + with_block_state
-                self.tasks[idx].state = TaskState::Dead;
-                q.remove(i);
-                continue;
-            }
-            if self.tasks[idx].priority < best_prio {
-                best_prio = self.tasks[idx].priority;
-                best_pos = Some(i);
-            }
-            i += 1;
-        }
 
-        if let Some(pos) = best_pos {
-            let idx = q.remove(pos).unwrap();
-            debug_assert!(
-                self.tasks[idx].state == TaskState::Ready,
-                "pick_next: local queue task idx={} not Ready (state={:?})",
-                idx,
-                self.tasks[idx].state
-            );
-            return Some(idx);
-        }
-        None
+            if let Some(pos) = best_pos {
+                let idx = q.remove(pos).unwrap();
+                debug_assert!(
+                    self.tasks[idx].state == TaskState::Ready,
+                    "pick_next: local queue task idx={} not Ready (state={:?})",
+                    idx,
+                    self.tasks[idx].state
+                );
+                return Some(idx);
+            }
+            None
+        })
     }
 
     /// Try to steal one task from another core's run queue (Phase 52c A.2).
@@ -746,6 +750,9 @@ impl Scheduler {
         }
 
         // Find the core with the longest run queue (excluding ourselves).
+        // Phase 57b G.8 — `with_run_queue` wraps the `preempt_disable` +
+        // `without_interrupts` boilerplate around the IRQ-shared
+        // `run_queue` lock at every task-context callsite below.
         let mut best_core: Option<u8> = None;
         let mut best_len: usize = 0;
         for id in 0..n {
@@ -753,7 +760,7 @@ impl Scheduler {
                 continue;
             }
             if let Some(data) = crate::smp::get_core_data(id) {
-                let len = data.run_queue.lock().len();
+                let len = data.with_run_queue(|q| q.len());
                 if len > best_len {
                     best_len = len;
                     best_core = Some(id);
@@ -767,50 +774,51 @@ impl Scheduler {
         }
 
         let data = crate::smp::get_core_data(victim_core)?;
-        let mut q = data.run_queue.lock();
+        data.with_run_queue(|q| {
+            // Find a stealable task: Ready, affinity-compatible with our core,
+            // not an idle task.
+            for i in 0..q.len() {
+                let idx = q[i];
+                if idx >= self.tasks.len() {
+                    continue;
+                }
+                let task = &self.tasks[idx];
+                if task.state != TaskState::Ready {
+                    continue;
+                }
+                // Fresh fork/clone children carry a task-local fork_ctx until their
+                // first dispatch through fork_child_trampoline. Keep them on the
+                // spawning core so the parent's immediate wait/read-yield loop
+                // can't starve them behind background work on another CPU.
+                if task.fork_ctx.is_some() {
+                    continue;
+                }
+                if crate::arch::x86_64::interrupts::tick_count()
+                    .saturating_sub(task.last_migrated_tick)
+                    < MIGRATE_COOLDOWN
+                {
+                    continue;
+                }
+                if self.idle_tasks.contains(&Some(idx)) {
+                    continue;
+                }
+                if task.affinity_mask & my_core_bit == 0 {
+                    continue;
+                }
+                if task.saved_rsp == 0 {
+                    continue;
+                }
+                // Steal this task.
+                q.remove(i);
+                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
+                    task_idx: idx as u32,
+                    core: my_core,
+                });
+                return Some(idx);
+            }
 
-        // Find a stealable task: Ready, affinity-compatible with our core,
-        // not an idle task.
-        for i in 0..q.len() {
-            let idx = q[i];
-            if idx >= self.tasks.len() {
-                continue;
-            }
-            let task = &self.tasks[idx];
-            if task.state != TaskState::Ready {
-                continue;
-            }
-            // Fresh fork/clone children carry a task-local fork_ctx until their
-            // first dispatch through fork_child_trampoline. Keep them on the
-            // spawning core so the parent's immediate wait/read-yield loop
-            // can't starve them behind background work on another CPU.
-            if task.fork_ctx.is_some() {
-                continue;
-            }
-            if crate::arch::x86_64::interrupts::tick_count().saturating_sub(task.last_migrated_tick)
-                < MIGRATE_COOLDOWN
-            {
-                continue;
-            }
-            if self.idle_tasks.contains(&Some(idx)) {
-                continue;
-            }
-            if task.affinity_mask & my_core_bit == 0 {
-                continue;
-            }
-            if task.saved_rsp == 0 {
-                continue;
-            }
-            // Steal this task.
-            q.remove(i);
-            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
-                task_idx: idx as u32,
-                core: my_core,
-            });
-            return Some(idx);
-        }
-
-        None
+            None
+        })
     }
 }
 
@@ -861,7 +869,10 @@ fn core_load(sched: &Scheduler, core_id: u8) -> usize {
         return usize::MAX;
     }
 
-    let mut load = data.run_queue.lock().len();
+    // Phase 57b G.8 — `with_run_queue` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate around the IRQ-shared `run_queue`
+    // lock.
+    let mut load = data.with_run_queue(|q| q.len());
     let current = data.current_task_idx.load(Ordering::Relaxed);
     if current >= 0 {
         let idx = current as usize;
@@ -908,6 +919,12 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
         core_id,
         crate::smp::MAX_CORES
     );
+    // Phase 57b G.8 — pair `preempt_disable` / `preempt_enable` around the
+    // existing `without_interrupts` block so the F.1 preempt-discipline
+    // stays balanced across the IRQ-shared `run_queue` acquisition.
+    // `preempt_disable` is lock-free (Phase 57b D.2), so calling it before
+    // `without_interrupts` cannot recurse.
+    preempt_disable();
     interrupts::without_interrupts(|| {
         if let Some(data) = crate::smp::get_core_data(core_id) {
             data.run_queue.lock().push_back(idx);
@@ -936,6 +953,7 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
             }
         }
     });
+    preempt_enable();
 }
 
 /// Allocate a slot for a new task, reusing a dead slot from the free list
@@ -3443,13 +3461,16 @@ pub fn maybe_load_balance() {
     if cores <= 1 {
         return;
     }
+    // Phase 57b G.8 — `with_run_queue` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate around the IRQ-shared `run_queue`
+    // lock at every task-context callsite below.
     let mut longest_core = 0u8;
     let mut longest_len = 0usize;
     let mut shortest_core = 0u8;
     let mut shortest_len = usize::MAX;
     for id in 0..cores {
         if let Some(data) = crate::smp::get_core_data(id) {
-            let len = data.run_queue.lock().len();
+            let len = data.with_run_queue(|q| q.len());
             if len > longest_len {
                 longest_len = len;
                 longest_core = id;
@@ -3468,27 +3489,30 @@ pub fn maybe_load_balance() {
     // Lock ordering: SCHEDULER first, then run_queue (matches pick_next).
     if let Some(src) = crate::smp::get_core_data(longest_core) {
         let sched = scheduler_lock();
-        let mut q = src.run_queue.lock();
-        // Find a migratable task: affinity-compatible, not pinned by fork_ctx,
-        // and not recently assigned/woken/yielded on its current core.
-        let mut found = None;
-        for i in 0..q.len() {
-            if let Some(&idx) = q.get(i)
-                && idx < sched.tasks.len()
-                && sched.tasks[idx].fork_ctx.is_none()
-                && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
-                && current_tick.saturating_sub(sched.tasks[idx].last_migrated_tick)
-                    >= MIGRATE_COOLDOWN
-            {
-                found = Some(i);
-                break;
+        let migrated = src.with_run_queue(|q| {
+            // Find a migratable task: affinity-compatible, not pinned by fork_ctx,
+            // and not recently assigned/woken/yielded on its current core.
+            let mut found = None;
+            for i in 0..q.len() {
+                if let Some(&idx) = q.get(i)
+                    && idx < sched.tasks.len()
+                    && sched.tasks[idx].fork_ctx.is_none()
+                    && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
+                    && current_tick.saturating_sub(sched.tasks[idx].last_migrated_tick)
+                        >= MIGRATE_COOLDOWN
+                {
+                    found = Some(i);
+                    break;
+                }
             }
-        }
-        if let Some(pos) = found
-            && let Some(idx) = q.remove(pos)
-        {
-            drop(q);
-            drop(sched);
+            if let Some(pos) = found {
+                q.remove(pos)
+            } else {
+                None
+            }
+        });
+        drop(sched);
+        if let Some(idx) = migrated {
             // Update assigned_core and migration timestamp.
             {
                 let mut sched = scheduler_lock();
@@ -3585,11 +3609,15 @@ pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
         // new core's queue so pick_next doesn't drop it as ineligible.
         if new_core != old_core && sched.tasks[idx].state == TaskState::Ready {
             // Remove from old queue (if present).
+            // Phase 57b G.8 — `with_run_queue` wraps the `preempt_disable` +
+            // `without_interrupts` boilerplate around the IRQ-shared
+            // `run_queue` lock.
             if let Some(old_data) = crate::smp::get_core_data(old_core) {
-                let mut q = old_data.run_queue.lock();
-                if let Some(pos) = q.iter().position(|&i| i == idx) {
-                    q.remove(pos);
-                }
+                old_data.with_run_queue(|q| {
+                    if let Some(pos) = q.iter().position(|&i| i == idx) {
+                        q.remove(pos);
+                    }
+                });
             }
             drop(sched);
             enqueue_to_core(new_core, idx);

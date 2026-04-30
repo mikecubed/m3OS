@@ -328,6 +328,42 @@ pub struct PerCoreData {
 unsafe impl Send for PerCoreData {}
 unsafe impl Sync for PerCoreData {}
 
+impl PerCoreData {
+    /// Phase 57b G.8 — task-context wrapper around [`PerCoreData::run_queue`].
+    ///
+    /// `run_queue` is an IRQ-shared `spin::Mutex` (per Track A.1 audit row
+    /// `kernel/src/smp/mod.rs:194`): `signal_reschedule` and the dispatch
+    /// path on the wake side reach this lock from IRQ context, so converting
+    /// to `IrqSafeMutex` would not work — the ISR side already runs with
+    /// IF=0 and never raises the per-task `preempt_count`. Task-context
+    /// callsites must therefore explicitly `preempt_disable` +
+    /// `interrupts::without_interrupts` + `run_queue.lock()` +
+    /// `preempt_enable` so the F.1 preempt-discipline stays balanced.
+    ///
+    /// This helper wraps every task-context acquisition of `run_queue` so
+    /// the boilerplate lives in one place and every callsite shares the
+    /// same shape (matches G.1.c `with_driver`, G.5.c `with_unit_slots`).
+    /// The closure receives `&mut VecDeque<usize>` so callers can mutate
+    /// the queue uniformly.
+    ///
+    /// **Do not call this from an ISR**: interrupt handlers already run
+    /// with IF=0 and follow their own discipline (no kernel preemption,
+    /// no nested `preempt_disable`).
+    ///
+    /// Lock-ordering: `preempt_disable` is lock-free (Phase 57b D.2), so
+    /// calling it before `without_interrupts` cannot recurse.
+    #[inline]
+    pub fn with_run_queue<R>(&self, f: impl FnOnce(&mut VecDeque<usize>) -> R) -> R {
+        crate::task::scheduler::preempt_disable();
+        let result = x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut q = self.run_queue.lock();
+            f(&mut q)
+        });
+        crate::task::scheduler::preempt_enable();
+        result
+    }
+}
+
 /// Global array of per-core data pointers. Indexed by logical core_id (0 = BSP).
 /// Null until the core is initialized.
 static mut PER_CORE_DATA: [*mut PerCoreData; MAX_CORES] = [core::ptr::null_mut(); MAX_CORES];
