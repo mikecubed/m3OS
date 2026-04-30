@@ -1584,6 +1584,24 @@ pub fn preempt_enable() {
         return;
     }
     // Safety: identical pointee invariant as [`preempt_disable`].
+    // Phase 57d E.2: deferred-reschedule on zero-crossing.
+    // `fetch_sub` returns the PREVIOUS value; if that was 1 the
+    // post-decrement count is 0 (preemption is now re-enabled).
+    // When `reschedule` is also set, record a pending reschedule so
+    // the user-mode-return boundary can trigger the scheduler.
+    // We do NOT call into the scheduler here — kernel-mode is
+    // non-preemptible under PREEMPT_VOLUNTARY, and we may be inside
+    // an interrupt-disabled window.  The flag is consumed in E.3.
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
+        if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
+            pc.preempt_resched_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(not(feature = "preempt-voluntary"))]
+    // Safety: identical pointee invariant as [`preempt_disable`].
     unsafe {
         (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
     }

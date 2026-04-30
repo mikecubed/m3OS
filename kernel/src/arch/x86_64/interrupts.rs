@@ -96,6 +96,18 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     }
+    // Phase 57d E.3: consume deferred reschedule at IRQ-return to user mode.
+    #[cfg(feature = "preempt-voluntary")]
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        if let Some(pc) = crate::smp::try_per_core() {
+            if pc
+                .preempt_resched_pending
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
+                crate::task::signal_reschedule();
+            }
+        }
+    }
     #[cfg(not(debug_assertions))]
     let _ = stack_frame;
 }

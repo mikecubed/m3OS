@@ -1808,6 +1808,24 @@ pub extern "C" fn syscall_handler(
     // (DRY-clean per the Engineering Practice Gates).
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
 
+    // Phase 57d E.3: consume deferred reschedule at syscall-return to user mode.
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        if let Some(pc) = crate::smp::try_per_core() {
+            if pc
+                .preempt_resched_pending
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
+                // A preempt_enable zero-crossing recorded a pending reschedule.
+                // Re-signal so the scheduler picks it up on the next dispatch
+                // opportunity.  Track G will wire the actual preempt-to-scheduler
+                // call; for now the flag is consumed (not leaked) and the
+                // reschedule bit stays set for the normal scheduler loop.
+                crate::task::signal_reschedule();
+            }
+        }
+    }
+
     result
 }
 

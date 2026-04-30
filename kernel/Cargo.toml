@@ -22,6 +22,11 @@ legacy-bootstrap-allocator = []
 # Enable with: cargo xtask check --features sched-trace
 # (or pass --features kernel/sched-trace to direct cargo invocations)
 sched-trace = []
+# Phase 57d E.2: voluntary-preemption zero-crossing logic.
+# When enabled, `preempt_enable` records a deferred reschedule at the
+# zero-crossing point; consumed at the user-mode-return boundary (E.3).
+# NOT in `default` — wired in Track I once all phase 57d tracks land.
+preempt-voluntary = []
 # When `hardened` is enabled, the `sys_block_read` whitelist is restricted to
 # production storage servers only (vfs_server, fat_server). Without this flag,
 # test binaries such as `nvme-crash-smoke` are also permitted, which allows
