@@ -34,9 +34,8 @@
 //! - Atomic ordering between cores — kernel uses `AtomicI32::fetch_add`
 //!   with `Acquire` / `Release`; the model is single-threaded.
 //! - The boot dummy (`SCHED_PREEMPT_COUNT_DUMMY`) — Track C.1.
-//! - The deferred-reschedule on zero-crossing — Phase 57d.
 //!
-//! Source ref: phase-57b-track-A.2
+//! Source ref: phase-57b-track-A.2, phase-57d-track-A.1
 
 /// Pure-logic preempt counter.
 ///
@@ -134,6 +133,101 @@ impl Counter {
             "preempt_count != 0 at user-mode return boundary: {}",
             self.value
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track A.1 — Voluntary preemption model
+// ---------------------------------------------------------------------------
+
+/// Events that can drive the voluntary-preemption model in property tests.
+///
+/// Used by `kernel-core/tests/preempt_property.rs` to generate random event
+/// sequences and verify the four core invariants.  Not wired into the kernel —
+/// the kernel uses concrete function calls (`preempt_disable` /
+/// `preempt_enable` / the zero-crossing hook at `preempt_enable`'s tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// Enter a non-preemptible region (`preempt_disable`).
+    Disable,
+    /// Leave a non-preemptible region (`preempt_enable`).
+    Enable,
+    /// A user-mode-return boundary: attempt voluntary preemption.
+    Preempt { from_user: bool },
+    /// `preempt_enable` dropped the count to zero with a pending reschedule.
+    PreemptEnableZeroCrossing,
+}
+
+/// Pure-logic snapshot of per-task preempt state for property testing.
+///
+/// Mirrors the kernel fields touched by the voluntary-preemption path so
+/// property tests can verify invariants without a live kernel.  All fields
+/// are `pub` so proptest strategies can construct arbitrary states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreemptState {
+    /// Current preempt-disable nesting depth.  Must be ≥ 0; negative values
+    /// indicate a bug (unmatched `preempt_enable`).
+    pub preempt_count: i32,
+    /// Set by the scheduler when a higher-priority task becomes runnable.
+    /// Cleared when the task is actually preempted or rescheduled.
+    pub reschedule: bool,
+    /// Snapshot of the CPU mode at the point of the preemption check.
+    pub from_user: bool,
+    /// Set by the zero-crossing hook in `preempt_enable` when `reschedule`
+    /// is true at the moment `preempt_count` drops to zero.  The scheduler
+    /// loop polls this flag and yields at the next safe point.
+    pub preempt_resched_pending: bool,
+}
+
+/// Simulate a user-mode-return preemption check.
+///
+/// Returns `(new_state, did_preempt)`.
+///
+/// Preemption fires — `did_preempt == true` — iff **all** of:
+/// * `from_user` is `true` (we are returning to ring 3), and
+/// * `state.preempt_count == 0` (no preempt-disable lock is held), and
+/// * `state.reschedule || state.preempt_resched_pending` (the scheduler
+///   signalled that a context switch is needed).
+///
+/// When `did_preempt` is `true` both `reschedule` and `preempt_resched_pending`
+/// are cleared in the returned state (the kernel performs the switch).
+/// Otherwise the state is returned unchanged.
+pub fn apply_preempt(state: PreemptState, from_user: bool) -> (PreemptState, bool) {
+    let eligible = from_user
+        && state.preempt_count == 0
+        && (state.reschedule || state.preempt_resched_pending);
+
+    if eligible {
+        let new_state = PreemptState {
+            reschedule: false,
+            preempt_resched_pending: false,
+            ..state
+        };
+        (new_state, true)
+    } else {
+        (state, false)
+    }
+}
+
+/// Simulate the zero-crossing hook inside `preempt_enable`.
+///
+/// Decrements `preempt_count` by 1.  If the post-decrement count is zero and
+/// `reschedule` is `true`, sets `preempt_resched_pending` so the scheduler
+/// loop picks it up at the next safe yield point.
+///
+/// The returned state has `preempt_count` decremented; all other fields are
+/// unchanged except `preempt_resched_pending` which may be set.
+pub fn apply_preempt_enable_zero_crossing(state: PreemptState) -> PreemptState {
+    let new_count = state.preempt_count - 1;
+    let pending = if new_count == 0 && state.reschedule {
+        true
+    } else {
+        state.preempt_resched_pending
+    };
+    PreemptState {
+        preempt_count: new_count,
+        preempt_resched_pending: pending,
+        ..state
     }
 }
 
