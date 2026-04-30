@@ -804,6 +804,70 @@ acquire `pi_lock`; doing so deadlocks in debug builds (assertion panic).
 
 ---
 
+## Notification objects as block+wake sources (Phase 57c)
+
+`Notification` objects are the canonical wake source for IRQ-driven block+wake conversions.
+The Phase 57c audit (see [`docs/handoffs/57c-busy-wait-audit.md`](./handoffs/57c-busy-wait-audit.md))
+confirms that every converted unbounded kernel busy-spin uses either a `Notification` or a
+`WaitQueue` as its wake source.
+
+### Pattern: IRQ-driven wake via Notification
+
+When a kernel task must wait for a hardware event (e.g., NIC RX, block device completion):
+
+```rust
+// kernel/src/: static wake flag owned by the IRQ handler
+pub(crate) static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
+
+// IRQ handler (runs in interrupt context, no alloc, no IPC):
+fn nic_irq_handler() {
+    // ... acknowledge interrupt, read status ...
+    NIC_WOKEN.store(true, Ordering::Release);
+    wake_task(net_task_id());   // enqueues task; sends reschedule IPI if cross-core
+}
+
+// Kernel task (net_task):
+loop {
+    // Process any pending RX frames.
+    while let Some(frame) = nic.poll_rx() { handle_frame(frame); }
+    // Block until the next IRQ fires.
+    NIC_WOKEN.store(false, Ordering::Release);
+    block_current_until(&NIC_WOKEN, None);
+}
+```
+
+Key invariants:
+- The `AtomicBool` is **owned by the IRQ handler** (or the other task that drives the condition).
+- `store(false)` happens **before** the final `load` check inside `block_current_until`, preventing lost wakeups.
+- The IRQ handler does **not** call `block_current_until` or allocate — it only sets the flag and calls `wake_task`.
+
+### Pattern: task-to-task wake via WaitQueue
+
+When one kernel task wakes another (e.g., a producer/consumer pair):
+
+```rust
+// Shared wait queue (lives in the resource being waited on):
+static QUEUE: WaitQueue = WaitQueue::new();
+
+// Consumer:
+loop {
+    if let Some(item) = try_dequeue() { process(item); continue; }
+    QUEUE.sleep();  // blocks via block_current_until internally
+}
+
+// Producer:
+enqueue(item);
+QUEUE.wake_one();  // wakes a waiting consumer
+```
+
+### When NOT to use Notification as the wake source
+
+- **Cross-process IPC**: use `sys_call` / `sys_reply_recv` (synchronous rendezvous).
+- **Hardware-bounded busy-spins**: if the holder is hardware and the wait is < 1 µs,
+  leave the spin and add a bound annotation comment (see `docs/04-tasking.md` §Audit-derived patterns).
+
+---
+
 ## See Also
 
 - `docs/05-userspace-entry.md` — ring-3 execution model (Phase 5)
@@ -814,6 +878,7 @@ acquire `pi_lock`; doing so deadlocks in debug builds (assertion panic).
 - `docs/roadmap/tasks/06-ipc-core-tasks.md` — task list
 - `docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md` — Phase 57a block/wake rewrite
 - `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` — v2 state-transition spec
+- `docs/handoffs/57c-busy-wait-audit.md` — Phase 57c durable busy-wait audit catalogue
 - `kernel/src/ipc/mod.rs` — module overview and syscall dispatcher
 - `kernel/src/ipc/endpoint.rs` — rendezvous endpoint implementation
 - `kernel/src/ipc/notification.rs` — async notification objects

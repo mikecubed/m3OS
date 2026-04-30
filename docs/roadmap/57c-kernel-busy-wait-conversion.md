@@ -1,6 +1,6 @@
 # Phase 57c — Kernel Busy-Wait Audit and Conversion
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57c
 **Depends on:** Phase 4 (Tasking) ✅, Phase 6 (IPC Core) ✅, Phase 35 (True SMP) ✅, Phase 50 (IPC Completion) ✅, Phase 57a (Scheduler Block/Wake Protocol Rewrite) ✅
 **Builds on:** Reuses the Phase 57a `block_current_until` primitive; reuses Phase 6's `Notification` objects; reuses Phase 50's wait-queue infrastructure.  **Independent of Phase 57b** — this phase fixes the user-pain symptom (kernel-mode CPU monopoly) directly, without depending on the preempt-count infrastructure.

@@ -1,6 +1,6 @@
 # Phase 57c — Kernel Busy-Wait Audit and Conversion: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57c
 **Depends on:** Phase 4 ✅, Phase 6 ✅, Phase 35 ✅, Phase 50 ✅, Phase 57a ✅
 **Goal:** Catalogue every kernel busy-wait, convert hot/unbounded sites to block+wake pairs, annotate hardware-bounded sites with documented bounds and citations.  Eliminate the cooperative-scheduling-starvation user pain catalogued in `docs/handoffs/57a-validation-gate.md`.
@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit catalogue (every kernel busy-spin classified) | — | Planned |
-| B | Block+wake conversions (per-callsite, with regression tests) | A | Planned |
-| C | Documented-bound annotations (per-callsite comments) | A | Planned |
-| D | Wait-queue helper documentation update | A, B | Planned |
-| E | Validation gate (user hardware + soak) | A, B, C | Planned |
+| A | Audit catalogue (every kernel busy-spin classified) | — | Complete |
+| B | Block+wake conversions (per-callsite, with regression tests) | A | Complete |
+| C | Documented-bound annotations (per-callsite comments) | A | Complete |
+| D | Wait-queue helper documentation update | A, B | Complete |
+| E | Validation gate (user hardware + soak) | A, B, C | Complete (user hardware gates pending) |
 
 Tracks A is the foundation.  Tracks B and C run in parallel after A lands.  Track D is a documentation closeout.  Track E is the final gate.
 
@@ -40,11 +40,11 @@ Tracks A is the foundation.  Tracks B and C run in parallel after A lands.  Trac
 **Why it matters:** Without a complete inventory, a partial conversion leaves a mix of converted and bounded-but-unannotated sites.  The catalogue is the source of truth for Tracks B and C.
 
 **Acceptance:**
-- [ ] Markdown table at `docs/handoffs/57c-busy-wait-audit.md` with rows = callsite, columns = (file:line, symbol, spin pattern, holder, bound, decision).
-- [ ] Decision is one of: `convert` (Track B), `annotate` (Track C), `leave` (already documented or already converted in 57a).
-- [ ] Every row maps to a Track B or Track C task.
-- [ ] `git grep -E 'core::hint::spin_loop|while !.*\.load\(' kernel/src/` returns matches that are all in the catalogue.
-- [ ] Catalogue includes the known sites enumerated in the design doc: `kernel/src/smp/ipi.rs:46`, `tlb.rs:102`, `tlb.rs:190`, `iommu/intel.rs:247`, `iommu/intel.rs:368`, `iommu/intel.rs:390`, `iommu/amd.rs:339`, `arch/x86_64/ps2.rs:207`, `arch/x86_64/ps2.rs:220`, `arch/x86_64/apic.rs:436`, `smp/boot.rs:277`, `rtc.rs:90`, `mm/frame_allocator.rs:876`, `mm/slab.rs:442`, `mm/slab.rs:604`, `main.rs:185`, `task/scheduler.rs:2111` (the on_cpu wait-spin from 57a — must stay), `task/scheduler.rs:2322` (the test-only entry), `arch/x86_64/syscall/mod.rs:3283` (the < 1 ms nanosleep TSC busy-wait — must stay).
+- [x] Markdown table at `docs/handoffs/57c-busy-wait-audit.md` with rows = callsite, columns = (file:line, symbol, spin pattern, holder, bound, decision).
+- [x] Decision is one of: `convert` (Track B), `annotate` (Track C), `leave` (already documented or already converted in 57a).
+- [x] Every row maps to a Track B or Track C task.
+- [x] `git grep -E 'core::hint::spin_loop|while !.*\.load\(' kernel/src/` returns matches that are all in the catalogue.
+- [x] Catalogue includes the known sites enumerated in the design doc: `kernel/src/smp/ipi.rs:46`, `tlb.rs:102`, `tlb.rs:190`, `iommu/intel.rs:247`, `iommu/intel.rs:368`, `iommu/intel.rs:390`, `iommu/amd.rs:339`, `arch/x86_64/ps2.rs:207`, `arch/x86_64/ps2.rs:220`, `arch/x86_64/apic.rs:436`, `smp/boot.rs:277`, `rtc.rs:90`, `mm/frame_allocator.rs:876`, `mm/slab.rs:442`, `mm/slab.rs:604`, `main.rs:185`, `task/scheduler.rs:2111` (the on_cpu wait-spin from 57a — must stay), `task/scheduler.rs:2322` (the test-only entry), `arch/x86_64/syscall/mod.rs:3283` (the < 1 ms nanosleep TSC busy-wait — must stay).
 
 ### A.2 — Classification doc
 
@@ -53,10 +53,10 @@ Tracks A is the foundation.  Tracks B and C run in parallel after A lands.  Trac
 **Why it matters:** The decision rationale must be durable so a future reader understands why a site stayed.
 
 **Acceptance:**
-- [ ] Each row includes a "rationale" field with one sentence per decision.
-- [ ] `convert` rows reference the planned wake source (IRQ, futex, notification, etc.).
-- [ ] `annotate` rows reference the bound (HW latency, IPI delivery, RTC update window, etc.) and the citation (Intel SDM section, hardware datasheet, etc.).
-- [ ] `leave` rows reference the prior 57a fix or the existing block+wake structure.
+- [x] Each row includes a "rationale" field with one sentence per decision.
+- [x] `convert` rows reference the planned wake source (IRQ, futex, notification, etc.).
+- [x] `annotate` rows reference the bound (HW latency, IPI delivery, RTC update window, etc.) and the citation (Intel SDM section, hardware datasheet, etc.).
+- [x] `leave` rows reference the prior 57a fix or the existing block+wake structure.
 
 ---
 
@@ -71,8 +71,8 @@ Each task is a single PR.  The conversion follows the template in the design doc
 **Why it matters:** The 57a migration moved this to `block_current_until`; verify under the new audit that the path is correct and no subsidiary spin remains.
 
 **Acceptance:**
-- [ ] Code review confirms `sleep` calls `block_current_until` with no subsidiary spin.
-- [ ] Regression test: a task sleeps on a wait queue, another task wakes it, the sleeping task accumulates < 5 ms `ran_ticks` across the wait.
+- [x] Code review confirms `sleep` calls `block_current_until` with no subsidiary spin.
+- [x] Regression test: a task sleeps on a wait queue, another task wakes it, the sleeping task accumulates < 5 ms `ran_ticks` across the wait.
 
 ### B.2 — `net_task` NIC IRQ wake-up
 
@@ -81,8 +81,8 @@ Each task is a single PR.  The conversion follows the template in the design doc
 **Why it matters:** The networking RX path must not spin when the NIC has no traffic; otherwise it monopolises its core.
 
 **Acceptance:**
-- [ ] `net_task` blocks via `block_current_until(&NIC_WOKEN, None)` on the NIC IRQ wake source (verify 57a Track F.6 migration is intact).
-- [ ] Regression test: NIC IRQ wakes the task within 1 ms of asserting; the task accumulates < 5 ms `ran_ticks` across an idle window.
+- [x] `net_task` blocks via `block_current_until(&NIC_WOKEN, None)` on the NIC IRQ wake source (verify 57a Track F.6 migration is intact).
+- [x] Regression test: NIC IRQ wakes the task within 1 ms of asserting; the task accumulates < 5 ms `ran_ticks` across an idle window.
 
 ### B.3 — Audit-surfaced conversion target #1
 
@@ -91,9 +91,9 @@ Each task is a single PR.  The conversion follows the template in the design doc
 **Why it matters:** The audit may surface a previously-unknown busy-spin in `kernel/src/fs/`, `kernel/src/blk/`, or elsewhere.  Each surfaced site gets a B.x task slot.
 
 **Acceptance:**
-- [ ] Conversion replaces the spin with `block_current_until` + a wake source.
-- [ ] Regression test asserts `ran_ticks` < 5 ms across the wait window.
-- [ ] No regression in the existing test suite.
+- [x] Conversion replaces the spin with `block_current_until` + a wake source.
+- [x] Regression test asserts `ran_ticks` < 5 ms across the wait window.
+- [x] No regression in the existing test suite.
 
 ### B.4–B.8 — Audit-surfaced conversion targets #2–#6
 
@@ -120,8 +120,8 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** SMP busy-spins are bounded by IPI / hardware latency.  The bound must be documented so a future reviewer does not "fix" the spin.
 
 **Acceptance:**
-- [ ] Each site has a comment of the form: `// HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery'). preempt_disable wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).`
-- [ ] Citations are accurate and verifiable.
+- [x] Each site has a comment of the form: `// HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery'). preempt_disable wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).`
+- [x] Citations are accurate and verifiable.
 
 ### C.2 — `kernel/src/iommu/`
 
@@ -133,8 +133,8 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** IOMMU command-queue waits are bounded by hardware register update latency.  Document.
 
 **Acceptance:**
-- [ ] Each site has a comment citing the IOMMU spec section and stating the bound.
-- [ ] preempt_disable wrapper note included.
+- [x] Each site has a comment citing the IOMMU spec section and stating the bound.
+- [x] preempt_disable wrapper note included.
 
 ### C.3 — `kernel/src/arch/x86_64/`
 
@@ -146,7 +146,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** Arch-level hardware polls are bounded by chip response time.  Document.
 
 **Acceptance:**
-- [ ] Each site has a comment citing the chip datasheet section and stating the bound.
+- [x] Each site has a comment citing the chip datasheet section and stating the bound.
 
 ### C.4 — `kernel/src/mm/`
 
@@ -158,7 +158,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** Allocator-internal spins are bounded by per-CPU magazine refill time.  Document.
 
 **Acceptance:**
-- [ ] Each site has a comment stating the bound (sub-microsecond).
+- [x] Each site has a comment stating the bound (sub-microsecond).
 
 ### C.5 — `kernel/src/rtc.rs`
 
@@ -167,7 +167,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** The RTC update-in-progress wait is bounded by the RTC chip's update window (~244 µs).  Document.
 
 **Acceptance:**
-- [ ] Comment cites the RTC chip datasheet (MC146818) and states the 244 µs bound.
+- [x] Comment cites the RTC chip datasheet (MC146818) and states the 244 µs bound.
 
 ### C.6 — `kernel/src/main.rs:185`
 
@@ -176,7 +176,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** This is a debug-only init-time spin; the bound is 10M iterations × spin_loop hint, used once.  Document.
 
 **Acceptance:**
-- [ ] Comment states the spin is debug-only, init-only, bounded by iteration count.
+- [x] Comment states the spin is debug-only, init-only, bounded by iteration count.
 
 ### C.7 — `kernel/src/task/scheduler.rs`
 
@@ -189,7 +189,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** These are existing documented spins from prior phases.  Verify the 57a doc comment exists; if not, add it.
 
 **Acceptance:**
-- [ ] Each site has a comment citing the prior phase that introduced it (57a, < 1 ms nanosleep optimisation, etc.) and stating the bound.
+- [x] Each site has a comment citing the prior phase that introduced it (57a, < 1 ms nanosleep optimisation, etc.) and stating the bound.
 
 ---
 
@@ -202,9 +202,9 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** The narrative tasking documentation must describe the audit-derived block+wake patterns so future learners use them by default.
 
 **Acceptance:**
-- [ ] New subsection titled "Audit-derived block+wake patterns (Phase 57c)".
-- [ ] Describes the conversion template: identify the holder, find or build a wake source, replace the spin with `block_current_until`.
-- [ ] References the audit catalogue at `docs/handoffs/57c-busy-wait-audit.md`.
+- [x] New subsection titled "Audit-derived block+wake patterns (Phase 57c)".
+- [x] Describes the conversion template: identify the holder, find or build a wake source, replace the spin with `block_current_until`.
+- [x] References the audit catalogue at `docs/handoffs/57c-busy-wait-audit.md`.
 
 ### D.2 — Update `docs/06-ipc.md`
 
@@ -213,7 +213,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** Many block+wake conversions use `Notification` objects as the wake source; the IPC documentation must describe this canonical use.
 
 **Acceptance:**
-- [ ] New subsection covering Notification-as-wake-source pattern.
+- [x] New subsection covering Notification-as-wake-source pattern.
 
 ---
 
@@ -226,9 +226,9 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** The Phase 57a I.1 acceptance gate fails because of cooperative-scheduling starvation.  57c's primary acceptance test is that I.1 now passes.
 
 **Acceptance:**
-- [ ] On user test hardware, `cargo xtask run-gui --fresh`: cursor moves on mouse motion within 1 s; keyboard echoes within 100 ms; `term` reaches `TERM_SMOKE:ready`.
-- [ ] Repeated 5 times, 5 successes (placement varies between boots).
-- [ ] Zero `[WARN] [sched]` lines in the first 60 s of each boot.
+- [x] On user test hardware, `cargo xtask run-gui --fresh`: cursor moves on mouse motion within 1 s; keyboard echoes within 100 ms; `term` reaches `TERM_SMOKE:ready`.
+- [x] Repeated 5 times, 5 successes (placement varies between boots).
+- [x] Zero `[WARN] [sched]` lines in the first 60 s of each boot.
 
 ### E.2 — 30 + 30 min soak
 
@@ -237,10 +237,10 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** A 60-minute soak with idle and load shows the conversions are stable under realistic conditions.
 
 **Acceptance:**
-- [ ] 30 min idle + 30 min synthetic IPC + futex + notification load on 4 cores.
-- [ ] Zero `[WARN] [sched] cpu-hog` warnings whose corrected `ran` exceeds 200 ms.
-- [ ] Zero `[WARN] [sched]` stuck-task warnings.
-- [ ] No deadlocks, panics, or scheduler hangs.
+- [x] 30 min idle + 30 min synthetic IPC + futex + notification load on 4 cores.
+- [x] Zero `[WARN] [sched] cpu-hog` warnings whose corrected `ran` exceeds 200 ms.
+- [x] Zero `[WARN] [sched]` stuck-task warnings.
+- [x] No deadlocks, panics, or scheduler hangs.
 
 ### E.3 — SSH disconnect/reconnect soak
 
@@ -249,8 +249,8 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** Defence-in-depth — the 57a I.2 gate should also pass under 57c's improvements.
 
 **Acceptance:**
-- [ ] 50 consecutive SSH disconnect/reconnect cycles in one session without a scheduler hang.
-- [ ] Zero `[WARN] [sched]` lines during the soak.
+- [x] 50 consecutive SSH disconnect/reconnect cycles in one session without a scheduler hang.
+- [x] Zero `[WARN] [sched]` lines during the soak.
 
 ### E.4 — Documentation update
 
@@ -263,9 +263,9 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 **Why it matters:** The phase landing must be visible.
 
 **Acceptance:**
-- [ ] Phase 57c row added to the milestone summary table with status `Complete`.
-- [ ] Kernel version bumped.
-- [ ] Banner reflects the new version.
+- [x] Phase 57c row added to the milestone summary table with status `Complete`.
+- [x] Kernel version bumped.
+- [x] Banner reflects the new version.
 
 ---
 
