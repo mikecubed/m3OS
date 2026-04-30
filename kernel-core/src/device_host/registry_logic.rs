@@ -9,6 +9,24 @@
 //
 // TDD red commit: the type exists with stub bodies that compile but fail
 // the invariants. The green commit wires it up.
+//
+// ## Phase 57b G.9 — preempt-discipline classification
+//
+// Per the Track A.1 spinlock callsite audit
+// (`docs/handoffs/57b-spinlock-callsite-audit.md`, row for
+// `kernel-core/src/device_host/registry_logic.rs`), this module declares
+// **no lock of its own** — `DeviceHostRegistryCore` is a plain `Vec`-backed
+// state machine. The audit classifies the row as `host-test-only` because
+// the kernel-side wrapper that holds it (`DEVICE_HOST_REGISTRY` in
+// `kernel/src/syscall/device_host.rs`) IS the lock surface, and Phase 57b
+// Track G.6.b already migrated that wrapper to
+// `IrqSafeMutex<DeviceHostRegistry>`. Track F's preempt-discipline therefore
+// covers every kernel-build acquisition of this type by construction — no
+// `kernel-core` change is required for G.9.
+//
+// Host tests in this file (`#[cfg(test)] mod tests` below) drive the
+// registry single-threaded with no lock at all, exactly as the
+// `host-test-only` classification expects.
 
 extern crate alloc;
 
