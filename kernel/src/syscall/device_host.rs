@@ -10,7 +10,10 @@
 //!
 //! ## Locking contract
 //!
-//! Two narrow [`spin::Mutex`] locks are introduced in this module:
+//! Two narrow [`crate::task::scheduler::IrqSafeMutex`] locks are introduced
+//! in this module (Phase 57b G.6: converted from plain `spin::Mutex` to
+//! inherit Track F.1's preempt-discipline; lock raises `preempt_count`,
+//! drop lowers it):
 //!
 //! * `DEVICE_HOST_REGISTRY` — protects:
 //!     1. the `DeviceHostRegistryCore` (BDF → owning PID mapping), and
@@ -55,13 +58,13 @@ use kernel_core::device_host::{
 use kernel_core::ipc::Capability;
 use kernel_core::ipc::capability::CapHandle;
 use kernel_core::types::NotifId;
-use spin::Mutex;
 
 use crate::mm::AddressSpace;
 use crate::pci::bar::{UserMapError, map_mmio_region_to_user, unmap_mmio_region_from_user};
 use crate::pci::{ClaimError, PciDeviceHandle, claim_pci_device_by_bdf};
 use crate::process::Pid;
 use crate::task::scheduler;
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Errno constants (duplicated locally so we don't have to reach into the arch
@@ -224,9 +227,15 @@ impl DeviceHostRegistry {
     }
 }
 
-/// Global registry. Narrow `spin::Mutex` — no lock is held across IPC or
+/// Global registry. Narrow [`IrqSafeMutex`] — no lock is held across IPC or
 /// page-table operations; see module docs for the ordering.
-static DEVICE_HOST_REGISTRY: Mutex<DeviceHostRegistry> = Mutex::new(DeviceHostRegistry::new());
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (device-host syscalls, process teardown);
+/// no ISR ever reaches it.  Pure type swap — callsites compile unchanged
+/// via auto-deref.
+static DEVICE_HOST_REGISTRY: IrqSafeMutex<DeviceHostRegistry> =
+    IrqSafeMutex::new(DeviceHostRegistry::new());
 
 // ---------------------------------------------------------------------------
 // MMIO registry (Phase 55b Track B.2)
@@ -401,7 +410,10 @@ enum MmioRegistryError {
 
 /// Global MMIO registry. Declared with the same narrow-mutex convention as
 /// [`DEVICE_HOST_REGISTRY`]; see the module-level locking contract.
-static MMIO_REGISTRY: Mutex<MmioRegistry> = Mutex::new(MmioRegistry::new());
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context.  Pure type swap.
+static MMIO_REGISTRY: IrqSafeMutex<MmioRegistry> = IrqSafeMutex::new(MmioRegistry::new());
 
 // ---------------------------------------------------------------------------
 // Phase 55b Track B.4 — IRQ binding registry + ISR-visible dispatch tables
@@ -411,7 +423,7 @@ static MMIO_REGISTRY: Mutex<MmioRegistry> = Mutex::new(MmioRegistry::new());
 //
 // 1. **`IRQ_BINDING_REGISTRY`** — the authoritative pure-logic record of
 //    every live `(pid, key, vector, notif, bit)` subscription. Mutated only
-//    from task context under a narrow `spin::Mutex`.
+//    from task context under a narrow `IrqSafeMutex` (Phase 57b G.6).
 //
 // 2. **`IRQ_SHIM_NOTIF` / `IRQ_SHIM_BIT`** — lock-free mirrors indexed by the
 //    device-IRQ vector *offset* (0..`DEVICE_IRQ_VECTOR_COUNT`). The ISR
@@ -436,8 +448,12 @@ static MMIO_REGISTRY: Mutex<MmioRegistry> = Mutex::new(MmioRegistry::new());
 // (`DEVICE_IRQ_VECTOR_COUNT`) because that is the only range where the IDT
 // has a dispatcher we can install through `register_device_irq`.
 
-static IRQ_BINDING_REGISTRY: Mutex<IrqBindingRegistryCore> =
-    Mutex::new(IrqBindingRegistryCore::new());
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (subscribe/release from device-host
+/// syscalls); IRQ delivery side reads via the lock-free
+/// `IRQ_SHIM_NOTIF`/`IRQ_SHIM_BIT` mirrors and never touches this lock.
+static IRQ_BINDING_REGISTRY: IrqSafeMutex<IrqBindingRegistryCore> =
+    IrqSafeMutex::new(IrqBindingRegistryCore::new());
 
 /// Lock-free ISR mirror of the notification-slot portion of each binding.
 /// `0xff` means the corresponding vector is unbound.
@@ -1900,12 +1916,17 @@ impl DmaRegistry {
 /// `DmaBuffer::allocate` call (which walks 5 + 6) so a concurrent
 /// `release_claims_for_pid` cannot race the handle reference. No lock is
 /// held across `log::*!` writes.
-static DMA_REGISTRY: Mutex<DmaRegistry> = Mutex::new(DmaRegistry::new());
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context.  Pure type swap.
+static DMA_REGISTRY: IrqSafeMutex<DmaRegistry> = IrqSafeMutex::new(DmaRegistry::new());
 
 /// Records the domains for which the `device_host.dma_alloc.identity`
 /// event has already been emitted. Once per device, per boot, not per
 /// allocation.
-static IDENTITY_FALLBACK_LOGGED: Mutex<Vec<DeviceCapKey>> = Mutex::new(Vec::new());
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline.
+/// Acquired only from task context (one-shot logging path).
+static IDENTITY_FALLBACK_LOGGED: IrqSafeMutex<Vec<DeviceCapKey>> = IrqSafeMutex::new(Vec::new());
 
 /// Internal allocation path shared between the syscall entry and the test
 /// helpers. Runs the four-step allocation order; rolls back cleanly on
