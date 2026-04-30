@@ -803,7 +803,20 @@ static PICS: Mutex<pic8259::ChainedPics> = Mutex::new(unsafe { pic8259::ChainedP
 /// Calling it out of order can cause IRQs to fire without a registered handler,
 /// resulting in a triple fault.
 pub unsafe fn init_pics() {
-    unsafe {
+    // Phase 57b G.8 — `PICS` is classified `explicit-preempt-and-cli` per
+    // Track A.1 audit (`kernel/src/arch/x86_64/interrupts.rs:756`). The ISR
+    // EOI callsites (vectors 32, 33, 36, 44) already run with IF=0 and do
+    // not touch the per-task preempt counter, so they need no migration.
+    // The lone task-context callsite is this `init_pics` body, which runs
+    // before interrupts are enabled but must still pair `preempt_disable` /
+    // `preempt_enable` to keep F.1 preempt-discipline balanced. The
+    // `without_interrupts` wrap is a no-op for IF (already off) but stays
+    // for shape consistency with G.8.b / G.5.c.
+    //
+    // `preempt_disable` is lock-free (Phase 57b D.2), so calling it before
+    // `without_interrupts` cannot recurse.
+    crate::task::scheduler::preempt_disable();
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
         // Mask every IRQ line except: IRQ0 (timer), IRQ1 (keyboard),
@@ -817,7 +830,8 @@ pub unsafe fn init_pics() {
         // master: bits 3–7 masked (0b1111_1000) — IRQ0/1/2 unmasked.
         // slave:  bits 0–3 + 5–7 masked (0b1110_1111) — IRQ12 unmasked.
         pics.write_masks(0b1111_1000, 0b1110_1111);
-    }
+    });
+    crate::task::scheduler::preempt_enable();
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,14 +1293,24 @@ pub fn register_device_irq(vector: u8, entry: DeviceIrqEntry) -> Result<(), &'st
         return Err("vector out of device IRQ range");
     }
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    // Phase 57b G.8 — `DEVICE_IRQ_TABLE` is `explicit-preempt-and-cli` per
+    // Track A.1 audit (IRQ-shared via `dispatch_device_irq`, called from
+    // every `device_irq_stub_*` ISR). Pair `preempt_disable` /
+    // `preempt_enable` with the existing `without_interrupts` wrap so the
+    // F.1 preempt-discipline stays balanced. `preempt_disable` is
+    // lock-free (Phase 57b D.2), so calling it before
+    // `without_interrupts` cannot recurse.
+    crate::task::scheduler::preempt_disable();
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut tbl = DEVICE_IRQ_TABLE.lock();
         if tbl[idx].is_some() {
             return Err("device IRQ vector already registered");
         }
         tbl[idx] = Some(entry);
         Ok(())
-    })
+    });
+    crate::task::scheduler::preempt_enable();
+    result
 }
 
 /// Remove the handler installed at `vector`. Silently ignores missing entries.
@@ -1301,10 +1325,16 @@ pub fn unregister_device_irq(vector: u8) {
         return;
     }
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    // Phase 57b G.8 — pair `preempt_disable` / `preempt_enable` around the
+    // existing `without_interrupts` wrap so the F.1 preempt-discipline
+    // stays balanced. See `register_device_irq` for the lock-classification
+    // rationale.
+    crate::task::scheduler::preempt_disable();
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut tbl = DEVICE_IRQ_TABLE.lock();
         tbl[idx] = None;
     });
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Dispatch a device IRQ to its registered handler. Runs in ISR context.
