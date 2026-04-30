@@ -736,6 +736,62 @@ core::arch::global_asm!(
     "mov rax, [rdi + 0]",
     "mov rdi, [rdi + 40]",
     "iretq",
+    //
+    // ---------------------------------------------------------------------------
+    // Phase 57d D.3 (fix) — dispatch_preempted_and_resume
+    //
+    // Dispatches a preempted task by:
+    //   1. Building a switch_context-compatible frame on the scheduler stack so
+    //      that per_core_scheduler_rsp is updated BEFORE we iretq.
+    //   2. Saving the new scheduler RSP to *per_sched_rsp_ptr (rdi).
+    //   3. Jumping to preempt_resume_to_user to restore user GPRs and iretq.
+    //
+    // When the task is later preempted again (or cooperatively yields back),
+    // preempt_to_scheduler calls switch_context(task_save, *per_sched_rsp_ptr).
+    // switch_context loads our frame and `ret`s to .Ldispatch_preempted_resume,
+    // which then `ret`s to the call site (the dispatch loop's epilogue).
+    //
+    // Stack layout built by this function (low address first, relative to the
+    // saved_rsp value stored into *per_sched_rsp_ptr):
+    //   [saved_rsp+0]:  RFLAGS (saved by pushf; IF=0 since caller had IRQs disabled)
+    //   [saved_rsp+8]:  r15
+    //   [saved_rsp+16]: r14
+    //   [saved_rsp+24]: r13
+    //   [saved_rsp+32]: r12
+    //   [saved_rsp+40]: rbp
+    //   [saved_rsp+48]: rbx
+    //   [saved_rsp+56]: .Ldispatch_preempted_resume  ← switch_context ret target
+    //   [saved_rsp+64]: call return addr              ← returned to by .Ldispatch_preempted_resume ret
+    //
+    // PRECONDITION: IRQs must be disabled on entry (pushf captures IF=0).
+    // Args (SysV AMD64): rdi = per_sched_rsp_ptr, rsi = frame (*const PreemptFrame)
+    // ---------------------------------------------------------------------------
+    ".global dispatch_preempted_and_resume",
+    "dispatch_preempted_and_resume:",
+    // Push .Ldispatch_preempted_resume as the switch_context `ret` target.
+    "lea rax, [rip + .Ldispatch_preempted_resume]",
+    "push rax",
+    // Push callee-saved registers (matching switch_context's push order).
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    // pushf saves RFLAGS (including IF, which is 0 because IRQs are disabled).
+    "pushf",
+    "cli", // redundant but explicit: ensure IF=0 in the saved frame
+    // Save the current RSP (= address of the RFLAGS word we just pushed).
+    "mov [rdi], rsp",
+    // Dispatch the preempted task. rsi already holds the frame pointer.
+    "mov rdi, rsi",
+    "jmp preempt_resume_to_user",
+    // Landing label: switch_context restores callee-saves from our frame,
+    // pops this label as the return address, and jumps here.
+    // At this point RSP points at the `call dispatch_preempted_and_resume`
+    // return address; the second `ret` returns to the dispatch loop.
+    ".Ldispatch_preempted_resume:",
+    "ret",
 );
 
 // Rust-side declarations for the asm entry symbols (used when installing
@@ -747,9 +803,23 @@ unsafe extern "C" {
     ///
     /// Restores all 15 GPRs and the full iretq frame from `frame`, then
     /// executes `iretq` to return to the interrupted user-mode instruction.
-    /// Never returns.
+    /// Never returns. Called only from dispatch_preempted_and_resume asm.
     #[cfg(feature = "preempt-voluntary")]
+    #[allow(dead_code)]
     pub fn preempt_resume_to_user(frame: *const kernel_core::preempt_frame::PreemptFrame) -> !;
+    /// Phase 57d D.3 (fix) — dispatch a preempted task after updating sched RSP.
+    ///
+    /// Builds a `switch_context`-compatible frame on the scheduler stack,
+    /// saves the scheduler RSP, and jumps to `preempt_resume_to_user`.
+    ///
+    /// From Rust's perspective this function returns `()` — it returns after
+    /// the task next switches back to the scheduler (via preemption or a
+    /// cooperative yield). IRQs must be disabled on entry.
+    #[cfg(feature = "preempt-voluntary")]
+    pub(crate) fn dispatch_preempted_and_resume(
+        per_sched_rsp_ptr: *mut u64,
+        frame: *const kernel_core::preempt_frame::PreemptFrame,
+    );
 }
 
 // ---------------------------------------------------------------------------

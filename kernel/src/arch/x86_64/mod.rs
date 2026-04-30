@@ -229,8 +229,11 @@ pub unsafe fn enter_userspace_fork(
     // Phase 57b D.3: assert preempt_count == 0 before the assembly
     // trampoline runs `iretq` to ring 3.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
-    // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
-    crate::task::scheduler::check_deferred_preempt_at_user_return();
+    // NOTE: do NOT call check_deferred_preempt_at_user_return() here.
+    // enter_userspace_fork is the fork trampoline: it runs before the child task
+    // has a valid scheduler RSP. Yielding mid-trampoline (if preempt_resched_pending
+    // is set) panics with a zero scheduler RSP. The real user-return boundaries
+    // (enter_userspace / restore_and_enter_userspace) already call it.
     // Write to per-core ForkEntryCtx and pass pointer to assembly trampoline.
     let data =
         crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;

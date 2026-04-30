@@ -1790,7 +1790,7 @@ pub fn yield_now() {
         let n =
             YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         if n > 0 {
-            log::info!("[sched] yield-enter core={}", core_id);
+            log::debug!("[sched] yield-enter core={}", core_id);
         }
     }
     let addr_space_snapshot =
@@ -1842,7 +1842,7 @@ pub fn yield_now() {
     {
         let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
         if n >= 0 {
-            log::info!(
+            log::debug!(
                 "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
                 my_core,
                 sched_rsp,
@@ -3160,7 +3160,7 @@ pub fn run() -> ! {
         interrupts::enable();
 
         if wake_log_budget > 0 {
-            log::info!("[sched] run-loop wake core={}", core_id);
+            log::debug!("[sched] run-loop wake core={}", core_id);
             wake_log_budget -= 1;
         }
 
@@ -3490,7 +3490,7 @@ pub fn run() -> ! {
         // switch_context. Pairs with `resume` log below to detect a
         // dispatch that hangs / never returns to the scheduler.
         if dispatch_log_budget > 0 {
-            log::info!(
+            log::debug!(
                 "[sched] dispatch core={} task_idx={} task_rsp={:#x}",
                 core_id,
                 _task_idx,
@@ -3525,22 +3525,35 @@ pub fn run() -> ! {
 
         // Switch to the task.
         //
-        // Phase 57d D.3: if the task was preempted (resume_mode == Preempted),
-        // restore its full user context via iretq instead of switch_context.
-        // preempt_resume_to_user never returns — it builds the iretq frame from
-        // task.preempt_frame and jumps directly to the interrupted user instruction.
-        // The scheduler's SCHED_RSP is NOT updated here; the next preempt_to_scheduler
-        // call will jump back to the saved RSP from the most recent cooperative switch.
+        // Phase 57d D.3 (fix): For Preempted tasks, use dispatch_preempted_and_resume
+        // which saves the scheduler RSP before iretq-ing to user mode. The previous
+        // direct call to preempt_resume_to_user diverged without updating
+        // per_core_scheduler_rsp, leaving a stale frame that the dispatch loop's
+        // own stack usage would overwrite. On the next preemption, switch_context
+        // loaded the clobbered frame → garbage callee-saves → UB → panic.
+        //
+        // INVARIANT: for Preempted tasks, task_rsp is the RSP saved inside
+        // preempt_to_scheduler (on the task's kernel stack), not a cooperative RSP.
+        // The Preempted branch ignores task_rsp and uses _task_preempt_frame_ptr
+        // instead; cooperative/initial branches use task_rsp via switch_context.
         #[cfg(feature = "preempt-voluntary")]
         if _task_resume_mode == ResumeMode::Preempted && !_task_preempt_frame_ptr.is_null() {
-            // SAFETY: task.preempt_frame lives for the task's lifetime (Vec<Box<Task>>
-            // guarantees stable heap addresses).  IRQs are disabled (retarget left them
-            // masked).  preempt_resume_to_user restores GPRs and executes iretq.
+            // SAFETY: task.preempt_frame lives for the task's lifetime.
+            // IRQs are disabled (retarget_preempt_count_to_task left them masked).
+            // dispatch_preempted_and_resume returns when the task next switches back
+            // to the scheduler (preempted or cooperative).
             unsafe {
-                crate::arch::x86_64::interrupts::preempt_resume_to_user(_task_preempt_frame_ptr);
+                crate::arch::x86_64::interrupts::dispatch_preempted_and_resume(
+                    per_core_scheduler_rsp_ptr(),
+                    _task_preempt_frame_ptr,
+                );
+            }
+        } else {
+            unsafe {
+                switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
             }
         }
-
+        #[cfg(not(feature = "preempt-voluntary"))]
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
@@ -3561,7 +3574,7 @@ pub fn run() -> ! {
 
         // --- Scheduler resumes here after the task yields back ---
         if resume_log_budget > 0 {
-            log::info!("[sched] resume core={}", core_id);
+            log::debug!("[sched] resume core={}", core_id);
             resume_log_budget -= 1;
         }
         // The task's RSP has now been saved by switch_context. Commit bookkeeping.
