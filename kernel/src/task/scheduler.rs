@@ -352,11 +352,17 @@ impl<T: ?Sized> IrqSafeMutex<T> {
 impl<T: core::fmt::Debug> core::fmt::Debug for IrqSafeMutex<T> {
     /// Phase 57b G.6 — needed so structs that hold an `IrqSafeMutex<T>`
     /// field can `#[derive(Debug)]` (matches the behaviour `spin::Mutex`
-    /// provided before the migration).  Delegates to `try_lock` so a
+    /// provided before the migration).  Routes through the wrapper's own
+    /// [`Self::try_lock`] so successful Debug formatting raises
+    /// `preempt_count` and masks IRQs for the formatting window — same
+    /// discipline as every other [`IrqSafeMutex`] acquisition.  A naked
+    /// `self.inner.try_lock()` would create an untracked spinlock critical
+    /// section that the user-mode-return assertion (Phase 57b D.3) cannot
+    /// catch and that future preemption could interrupt mid-format.  A
     /// concurrently-held lock is rendered as `<locked>` rather than
     /// deadlocking.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self.inner.try_lock() {
+        match self.try_lock() {
             Some(guard) => f
                 .debug_struct("IrqSafeMutex")
                 .field("data", &*guard)
@@ -1059,17 +1065,32 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
 
 /// Allocate a slot for a new task, reusing a dead slot from the free list
 /// if available, otherwise appending to the task vec.
+///
+/// On free-list reuse the **`Box<Task>`** at `tasks[idx]` is preserved; only
+/// its contents are overwritten via `*tasks[idx] = task`.  The Box's heap
+/// address is therefore stable across reuse.  This matches the prior
+/// `Vec<Task>` storage's in-place-mutation semantics: paths such as
+/// `wake_task_v2`, `mark_task_dead_by_pid`, and
+/// `quiesce_task_for_remote_reap_by_pid` capture raw pointers to fields like
+/// `tasks[idx].pi_lock` / `on_cpu` under `scheduler_lock()`, drop the lock,
+/// then dereference.  A concurrent drain/reuse between drop and dereference
+/// would turn a wholesale `Box`-replacement into use-after-free; in-place
+/// mutation keeps the address valid (callers that observe a state mismatch
+/// detect it under the next `scheduler_lock()` acquire — same contract as
+/// pre-Phase-57b).
 fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
-    let boxed = Box::new(task);
     if let Some(idx) = sched.free_list.pop() {
-        // Reuse a dead slot. Overwriting the slot drops the prior `Box<Task>`
-        // and installs a fresh stable heap address for the new task.
+        // Reuse a dead slot.  Mutate the existing `Box<Task>` in place: the
+        // prior `Task`'s `Drop` runs (releasing its caps, dropping its stack,
+        // etc.), then the new `Task` is move-assigned into the same heap
+        // location.  Critically, the `Box` itself is NOT replaced — its
+        // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
-        sched.tasks[idx] = boxed;
+        *sched.tasks[idx] = task;
         idx
     } else {
         let idx = sched.tasks.len();
-        sched.tasks.push(boxed);
+        sched.tasks.push(Box::new(task));
         idx
     }
 }
@@ -2904,7 +2925,10 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
     task.id = task_id;
     // TODO(57a-C/D): route through pi_lock + with_block_state
     task.state = TaskState::Ready;
-    sched.tasks[idx] = Box::new(task);
+    // In-place mutation matches `alloc_task_slot`: the `Box` heap address is
+    // preserved across overwrite so any raw pointer captured into the prior
+    // filler `Task`'s fields stays valid.
+    *sched.tasks[idx] = task;
 }
 
 /// Return whether any live task other than `excluding` still holds a cap to

@@ -14,8 +14,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use x86_64::instructions::interrupts;
-
 use super::ipi;
 
 // ---------------------------------------------------------------------------
@@ -77,14 +75,23 @@ fn online_core_count() -> u8 {
 ///
 /// If only one core is online, skips the IPI (single-core fast path, T034).
 pub fn tlb_shootdown(addr: u64) {
-    // Phase 57b G.8 — `SHOOTDOWN_LOCK` is classified `explicit-preempt-and-cli`
-    // per Track A.1 audit (IRQ-shared via `tlb_shootdown_ipi_handler`). Wrap
-    // the critical section in `preempt_disable` + `without_interrupts` +
-    // `preempt_enable` so the F.1 preempt-discipline stays balanced.
-    // `preempt_disable` is lock-free (Phase 57b D.2), so calling it before
-    // `without_interrupts` cannot recurse.
+    // Phase 57b — `SHOOTDOWN_LOCK` migration shape: **preempt-only**.
+    //
+    // The lock holder broadcasts an IPI to every other online core and
+    // spins on `SHOOTDOWN_PENDING` until each acks.  IF MUST stay enabled
+    // throughout the lock-held region: a contending core that takes the
+    // lock with IF=0 (or waits on the lock with IF=0) cannot service the
+    // shootdown IPI from the holder, deadlocking both cores.  The
+    // `tlb_shootdown_ipi_handler` itself never touches `SHOOTDOWN_LOCK`,
+    // so re-entry of an IRQ handler on the holder's core during the wait
+    // is safe.
+    //
+    // `preempt_disable` is required (Phase 57b F semantic): keeps the
+    // task pinned across the IPI broadcast so 57d/57e cannot preempt the
+    // holder mid-handshake.  It is lock-free (Phase 57b D.2) so it cannot
+    // recurse through this caller.
     crate::task::scheduler::preempt_disable();
-    interrupts::without_interrupts(|| {
+    {
         let _lock = SHOOTDOWN_LOCK.lock();
 
         let online = online_core_count();
@@ -92,29 +99,28 @@ pub fn tlb_shootdown(addr: u64) {
         // Always invalidate locally.
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
 
-        if online <= 1 {
-            return; // single-core fast path
+        if online > 1 {
+            // Clear range state so the IPI handler uses the legacy single-address path.
+            SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
+            SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
+
+            // Set up the request.
+            SHOOTDOWN_ADDR.store(addr, Ordering::Release);
+            SHOOTDOWN_PENDING.store(online - 1, Ordering::Release);
+
+            // Send TLB shootdown IPI to all other cores.
+            ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
+
+            // Spin-wait for all remote cores to acknowledge.  IF stays
+            // enabled here; a self-targeted IRQ (timer, etc.) is allowed
+            // to fire and return.  Remote cores' IPI handlers run with
+            // their own IF state, never contend for `SHOOTDOWN_LOCK`,
+            // and only touch the `SHOOTDOWN_*` atomics.
+            while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+                core::hint::spin_loop();
+            }
         }
-
-        // Clear range state so the IPI handler uses the legacy single-address path.
-        SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
-        SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
-
-        // Set up the request.
-        SHOOTDOWN_ADDR.store(addr, Ordering::Release);
-        SHOOTDOWN_PENDING.store(online - 1, Ordering::Release);
-
-        // Send TLB shootdown IPI to all other cores.
-        ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
-
-        // Spin-wait for all remote cores to acknowledge. Remote cores keep
-        // their own IF=1 and run the shootdown handler without contending
-        // for `SHOOTDOWN_LOCK` (the IPI handler only touches the
-        // SHOOTDOWN_* atomics).
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
-    });
+    }
     crate::task::scheduler::preempt_enable();
 }
 
@@ -127,13 +133,11 @@ pub fn tlb_shootdown(addr: u64) {
 ///
 /// Falls back to a local-only flush if no remote cores are active.
 pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end: u64) {
-    // Phase 57b G.8 — `SHOOTDOWN_LOCK` is `explicit-preempt-and-cli` per
-    // Track A.1 audit. Wrap the critical section in `preempt_disable` +
-    // `without_interrupts` + `preempt_enable` so the F.1 preempt-discipline
-    // stays balanced. `preempt_disable` is lock-free (Phase 57b D.2), so
-    // calling it before `without_interrupts` cannot recurse.
+    // Phase 57b — preempt-only migration shape; same rationale as
+    // [`tlb_shootdown`].  IF must stay enabled across the lock-held region
+    // so contending cores can service this core's IPIs.
     crate::task::scheduler::preempt_disable();
-    interrupts::without_interrupts(|| {
+    'critical: {
         let _lock = SHOOTDOWN_LOCK.lock();
 
         // Align the range to page boundaries so every page intersecting
@@ -167,7 +171,9 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         let remote_mask = active & !(1u64 << my_core);
 
         if remote_mask == 0 {
-            return; // No remote cores have this address space loaded.
+            // No remote cores have this address space loaded — exit the
+            // critical block, then `preempt_enable` below.
+            break 'critical;
         }
 
         // Set up range request for the IPI handler (pass aligned boundaries).
@@ -193,7 +199,7 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         }
 
         if targets == 0 {
-            return;
+            break 'critical;
         }
 
         SHOOTDOWN_PENDING.store(targets, Ordering::Release);
@@ -207,11 +213,13 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
             }
         }
 
-        // Spin-wait for acknowledgment from all targeted cores.
+        // Spin-wait for acknowledgment from all targeted cores.  IF stays
+        // enabled; remote cores must be able to receive their IPIs and
+        // ack via the `SHOOTDOWN_*` atomics.
         while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
             core::hint::spin_loop();
         }
-    });
+    }
     crate::task::scheduler::preempt_enable();
 }
 

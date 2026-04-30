@@ -356,10 +356,14 @@ static SLAB_RECLAIM_PENDING: AtomicU8 = AtomicU8::new(0);
 static SLAB_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Serializes initiators so the reclaim IPI handshake cannot race.
 ///
-/// Phase 57b G.4 — `IrqSafeMutex` so the reclaim helper inherits Track F.1's
-/// preempt-discipline.  Task-context only; the IPI handshake is decremented
-/// by remote cores and does not depend on local IRQ delivery.
-static SLAB_RECLAIM_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
+/// Phase 57b — **preempt-only** migration shape.  The lock holder broadcasts
+/// `IPI_CACHE_DRAIN` to every other online core and spins on
+/// `SLAB_RECLAIM_PENDING` until each acks via [`handle_reclaim_ipi`].  IF
+/// MUST stay enabled across the lock-held region: a contender that takes
+/// this lock with IF=0 cannot service the holder's reclaim IPI, deadlocking
+/// both cores.  `handle_reclaim_ipi` does not touch this lock, so re-entry
+/// of an IRQ handler on the holder's core during the spin-wait is safe.
+static SLAB_RECLAIM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 fn drain_local_reclaimable_objects() -> super::heap::AllocatorLocalReclaimStats {
     let mut stats = super::heap::AllocatorLocalReclaimStats::default();
@@ -430,35 +434,43 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
         return super::heap::AllocatorLocalReclaimStats::default();
     }
 
-    let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
-    let mut stats = drain_local_reclaimable_objects();
+    // Phase 57b — preempt-only.  IF stays enabled because the holder
+    // broadcasts `IPI_CACHE_DRAIN` and spins on remote acks; a contender
+    // that masked IF would block both cores.
+    crate::task::scheduler::preempt_disable();
+    let stats = {
+        let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
+        let mut stats = drain_local_reclaimable_objects();
 
-    if crate::smp::is_per_core_ready() {
-        let my_core = crate::smp::per_core().core_id;
-        let mut remote_count: u8 = 0;
-        for cid in 0..crate::smp::core_count() {
-            if cid == my_core {
-                continue;
+        if crate::smp::is_per_core_ready() {
+            let my_core = crate::smp::per_core().core_id;
+            let mut remote_count: u8 = 0;
+            for cid in 0..crate::smp::core_count() {
+                if cid == my_core {
+                    continue;
+                }
+                if let Some(data) = crate::smp::get_core_data(cid)
+                    && data.is_online.load(Ordering::Acquire)
+                {
+                    remote_count += 1;
+                }
             }
-            if let Some(data) = crate::smp::get_core_data(cid)
-                && data.is_online.load(Ordering::Acquire)
-            {
-                remote_count += 1;
+
+            if remote_count != 0 {
+                SLAB_RECLAIM_PENDING.store(remote_count, Ordering::Release);
+                SLAB_RECLAIM_ACTIVE.store(true, Ordering::Release);
+                crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+                while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
+                    core::hint::spin_loop();
+                }
+                SLAB_RECLAIM_ACTIVE.store(false, Ordering::Release);
             }
         }
 
-        if remote_count != 0 {
-            SLAB_RECLAIM_PENDING.store(remote_count, Ordering::Release);
-            SLAB_RECLAIM_ACTIVE.store(true, Ordering::Release);
-            crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
-            while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
-                core::hint::spin_loop();
-            }
-            SLAB_RECLAIM_ACTIVE.store(false, Ordering::Release);
-        }
-    }
-
-    drain_depot_magazines(&mut stats);
+        drain_depot_magazines(&mut stats);
+        stats
+    };
+    crate::task::scheduler::preempt_enable();
     stats
 }
 
