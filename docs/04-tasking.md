@@ -474,6 +474,51 @@ Every such spin must carry a comment of the form:
 
 ---
 
+## Dual-Resume Dispatch and `preempt_enable` Deferred Reschedule (Phase 57d)
+
+Phase 57d adds user-mode preemption on top of the Phase 57b foundation.  Two
+additions to the scheduler and task model make this work.
+
+### `ResumeMode` and dual-resume dispatch
+
+`Task` gains an `AtomicU8` field `resume_mode` initialised to `ResumeMode::Initial`.
+The `ResumeMode` enum has three variants:
+
+- **`Initial`** — task has never been dispatched; the dispatcher calls the entry
+  function directly.
+- **`Cooperative`** — task was suspended via `block_current_until` or `yield_now`;
+  `switch_context` saved callee-saved registers only.  The dispatcher restores via
+  `switch_context`'s `ret`-based resume.
+- **`Preempted`** — task was interrupted mid-instruction by the timer or reschedule
+  IPI; all 15 GPRs plus the full iretq frame were saved into `Task::preempt_frame`
+  by `preempt_to_scheduler`.  The dispatcher calls `preempt_resume_to_user(frame)`
+  which restores all GPRs and performs an `iretq` back to ring 3.
+
+The dispatch loop inspects `resume_mode` to select the correct restore path; the
+two restore sequences (`switch_context` vs. `preempt_resume_to_user`) have
+incompatible contracts and must never be mixed.  `resume_mode` is set atomically at
+the suspending path and cleared to `Cooperative` or `Preempted` immediately before
+the task is re-inserted into the run-queue.
+
+### `preempt_enable` deferred reschedule
+
+When `preempt_enable` decrements `preempt_count` to zero and the per-core
+`reschedule` flag is already set, it records a deferred reschedule by setting
+`PerCoreData::preempt_resched_pending = true` (Release) — without calling into the
+scheduler.  This is safe because under `PREEMPT_VOLUNTARY` the kernel is
+non-preemptible: the task is currently executing kernel code, and the preemption will
+happen at the next user-mode return rather than immediately.
+
+The pending flag is consumed at every user-mode return boundary (syscall return and
+IRQ-return-to-ring-3) via `check_deferred_preempt_at_user_return()`, which performs a
+`preempt_resched_pending.swap(false, AcqRel)`.  If the swap returns `true`, the same
+four-condition check as the IRQ-return path fires and the task is preempted.  This
+closes the latency gap between "lock released, reschedule pending" and "next timer
+tick", typically reducing worst-case user-visible latency from one full tick (~55 ms at
+18 Hz) to the next kernel-exit boundary.
+
+---
+
 ## See Also
 
 - `docs/03-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers

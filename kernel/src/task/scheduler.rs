@@ -226,7 +226,7 @@ use core::{cell::UnsafeCell, sync::atomic::Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{Task, TaskId, TaskState, switch_context};
+use super::{ResumeMode, Task, TaskId, TaskState, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
 type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
@@ -1584,9 +1584,59 @@ pub fn preempt_enable() {
         return;
     }
     // Safety: identical pointee invariant as [`preempt_disable`].
+    // Phase 57d E.2: deferred-reschedule on zero-crossing.
+    // `fetch_sub` returns the PREVIOUS value; if that was 1 the
+    // post-decrement count is 0 (preemption is now re-enabled).
+    // When `reschedule` is also set, record a pending reschedule so
+    // the user-mode-return boundary can trigger the scheduler.
+    // We do NOT call into the scheduler here — kernel-mode is
+    // non-preemptible under PREEMPT_VOLUNTARY, and we may be inside
+    // an interrupt-disabled window.  The flag is consumed in E.3.
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
+        if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
+            pc.preempt_resched_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(not(feature = "preempt-voluntary"))]
+    // Safety: identical pointee invariant as [`preempt_disable`].
     unsafe {
         (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d F.1 — lock-free IRQ-context preempt count peek
+// ---------------------------------------------------------------------------
+
+/// Read the current task's preempt-disable depth from within an IRQ handler.
+///
+/// Uses `PerCoreData::current_preempt_count_ptr` — the same per-CPU pointer
+/// that `preempt_disable`/`preempt_enable` use (established in Phase 57b).
+/// The pointer is stable for the lifetime of the interrupt frame because:
+/// 1. We are executing in IRQ context (interrupts disabled by the CPU on entry).
+/// 2. No context switch can happen while interrupts are disabled.
+///
+/// Load ordering: `Acquire` on the pointer load + `Relaxed` on the counter
+/// load is sufficient — the pointer is only updated under the scheduler lock
+/// (or during task init before the task is runnable), and the IRQ entry itself
+/// provides a strong enough ordering barrier for observing the counter value.
+///
+/// Returns `0` when no task is current (e.g., during early boot before the
+/// first task is scheduled). In that case the caller should not preempt.
+pub fn peek_preempt_count_irq() -> i32 {
+    let ptr = crate::smp::per_core()
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: ptr is non-null and points to a live AtomicI32 within a Task
+    // that remains allocated for the duration of this interrupt (no task free
+    // can happen while interrupts are disabled on this core).
+    unsafe { (*ptr).load(core::sync::atomic::Ordering::Relaxed) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1707,44 @@ pub(crate) fn assert_preempt_count_zero_at_user_return() {
 #[inline(always)]
 pub(crate) fn assert_preempt_count_zero_at_user_return() {}
 
+// ---------------------------------------------------------------------------
+// Phase 57d Track G — deferred preemption check at user-return boundaries
+// ---------------------------------------------------------------------------
+
+/// Check and consume `preempt_resched_pending` at a user-mode return boundary.
+///
+/// Called from every path that transitions from kernel mode to user mode.
+/// Unlike `check_and_preempt_user`, this runs in kernel-mode context (not IRQ
+/// handler), so it triggers a voluntary reschedule via `yield_now` rather than
+/// `preempt_to_scheduler`.
+///
+/// Under `PREEMPT_VOLUNTARY`, the contract is:
+/// - If `preempt_count == 0` and `preempt_resched_pending` was set, yield.
+/// - Otherwise return (the task will keep running).
+///
+/// Gated on `cfg(feature = "preempt-voluntary")`.
+#[cfg(feature = "preempt-voluntary")]
+pub fn check_deferred_preempt_at_user_return() {
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let pc = peek_preempt_count_irq();
+    if pc != 0 {
+        return;
+    }
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if pending {
+        yield_now();
+    }
+}
+
+/// No-op stub when the `preempt-voluntary` feature is disabled.
+#[cfg(not(feature = "preempt-voluntary"))]
+#[inline(always)]
+pub fn check_deferred_preempt_at_user_return() {}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
@@ -1724,6 +1812,10 @@ pub fn yield_now() {
         // switch_context saves the RSP.
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+        // D.2: cooperative yield — dispatch via switch_context on resume.
+        sched.tasks[idx]
+            .resume_mode
+            .store(ResumeMode::Cooperative as u8, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1759,6 +1851,71 @@ pub fn yield_now() {
         }
     }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d C.1 — voluntary preemption entry point
+// ---------------------------------------------------------------------------
+
+/// Preempt the current task at an interrupt boundary and switch to the
+/// scheduler.
+///
+/// Called from [`timer_handler_user`] and [`reschedule_ipi_handler_user`]
+/// (under `#[cfg(feature = "preempt-voluntary")]`) when
+/// `preempt_resched_pending` is set and the task is in ring 3.
+///
+/// Saves `frame` into `task.preempt_frame`, marks `resume_mode = Preempted`,
+/// then performs the same `PENDING_REENQUEUE + switch_context` handoff that
+/// [`yield_now`] uses.  The dispatch loop (D.3) will see `Preempted` and
+/// resume via `preempt_resume_to_user` rather than `switch_context`.
+///
+/// # Safety / divergence
+///
+/// This function never returns.  `switch_context` saves the current RSP and
+/// jumps to the scheduler; the task's next dispatch goes through
+/// `preempt_resume_to_user` (`iretq`), which bypasses `switch_context`'s
+/// return path entirely.
+#[cfg(feature = "preempt-voluntary")]
+pub fn preempt_to_scheduler(
+    frame: &crate::arch::x86_64::preempt_trap_frame::PreemptTrapFrameUser,
+) -> ! {
+    let my_core = crate::smp::per_core().core_id as usize;
+    let preempt_frame = frame.to_preempt_frame();
+    let idx = {
+        let mut sched = scheduler_lock();
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => {
+                drop(sched);
+                panic!("preempt_to_scheduler: no current task on core {}", my_core);
+            }
+        };
+        accumulate_ticks(&mut sched, idx);
+        sched.tasks[idx].preempt_frame = preempt_frame;
+        sched.tasks[idx]
+            .resume_mode
+            .store(ResumeMode::Preempted as u8, Ordering::Release);
+        // E.1: mark RSP-publication window (cleared by dispatch epilogue).
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+        set_current_task_idx(None);
+        idx
+    };
+    // Store idx so the dispatch epilogue can commit saved_rsp and re-enqueue.
+    PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
+    let sched_rsp = per_core_scheduler_rsp();
+    debug_assert!(
+        sched_rsp != 0,
+        "preempt_to_scheduler: scheduler RSP is zero on core {}",
+        my_core
+    );
+    // SAFETY: same invariants as yield_now.  switch_context saves the current
+    // RSP (inside this frame) and jumps to the scheduler.  The saved RSP is
+    // committed to task.saved_rsp by the epilogue but never loaded — D.3 uses
+    // preempt_resume_to_user instead.  This call therefore never returns.
+    unsafe {
+        switch_context(per_core_switch_save_rsp_ptr(), sched_rsp);
+        core::hint::unreachable_unchecked()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2038,6 +2195,10 @@ pub fn block_current_until(
             // because `on_cpu` clears only at the dispatch epilogue, which
             // can't run until the ISR returns; that would deadlock.
             sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+            // D.2: cooperative block — dispatch via switch_context on resume.
+            sched.tasks[idx]
+                .resume_mode
+                .store(ResumeMode::Cooperative as u8, Ordering::Release);
             save_user_return_state(
                 &mut sched.tasks[idx],
                 addr_space_snapshot.0,
@@ -3296,7 +3457,11 @@ pub fn run() -> ! {
         // dropped.  The retarget itself happens further below — after every
         // scheduler-context lock guard has been released — so that the
         // pointer transition does not straddle a lock acquire/release.
-        let task_preempt_count_ptr: *const core::sync::atomic::AtomicI32 = {
+        //
+        // Phase 57d D.3: also capture resume_mode and preempt_frame ptr so
+        // the Preempted branch below can call preempt_resume_to_user without
+        // re-acquiring the lock.
+        let (task_preempt_count_ptr, _task_resume_mode, _task_preempt_frame_ptr) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
                 if let Some((base, top)) = task.stack_bounds() {
@@ -3310,9 +3475,14 @@ pub fn run() -> ! {
                         core_id
                     );
                 }
-                &task.preempt_count as *const core::sync::atomic::AtomicI32
+                let resume_mode = ResumeMode::from(task.resume_mode.load(Ordering::Acquire));
+                (
+                    &task.preempt_count as *const core::sync::atomic::AtomicI32,
+                    resume_mode,
+                    &task.preempt_frame as *const kernel_core::preempt_frame::PreemptFrame,
+                )
             } else {
-                core::ptr::null()
+                (core::ptr::null(), ResumeMode::Initial, core::ptr::null())
             }
         };
 
@@ -3354,6 +3524,23 @@ pub fn run() -> ! {
         }
 
         // Switch to the task.
+        //
+        // Phase 57d D.3: if the task was preempted (resume_mode == Preempted),
+        // restore its full user context via iretq instead of switch_context.
+        // preempt_resume_to_user never returns — it builds the iretq frame from
+        // task.preempt_frame and jumps directly to the interrupted user instruction.
+        // The scheduler's SCHED_RSP is NOT updated here; the next preempt_to_scheduler
+        // call will jump back to the saved RSP from the most recent cooperative switch.
+        #[cfg(feature = "preempt-voluntary")]
+        if _task_resume_mode == ResumeMode::Preempted && !_task_preempt_frame_ptr.is_null() {
+            // SAFETY: task.preempt_frame lives for the task's lifetime (Vec<Box<Task>>
+            // guarantees stable heap addresses).  IRQs are disabled (retarget left them
+            // masked).  preempt_resume_to_user restores GPRs and executes iretq.
+            unsafe {
+                crate::arch::x86_64::interrupts::preempt_resume_to_user(_task_preempt_frame_ptr);
+            }
+        }
+
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }

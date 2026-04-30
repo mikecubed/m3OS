@@ -1808,6 +1808,21 @@ pub extern "C" fn syscall_handler(
     // (DRY-clean per the Engineering Practice Gates).
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
 
+    // Phase 57d E.3: consume deferred reschedule at syscall-return to user mode.
+    #[cfg(feature = "preempt-voluntary")]
+    if let Some(pc) = crate::smp::try_per_core()
+        && pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    {
+        // A preempt_enable zero-crossing recorded a pending reschedule.
+        // Re-signal so the scheduler picks it up on the next dispatch
+        // opportunity.  Track G will wire the actual preempt-to-scheduler
+        // call; for now the flag is consumed (not leaked) and the
+        // reschedule bit stays set for the normal scheduler loop.
+        crate::task::signal_reschedule();
+    }
+
     result
 }
 
@@ -2601,6 +2616,8 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     // path; see
     // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
+    crate::task::scheduler::check_deferred_preempt_at_user_return();
     unsafe {
         use core::arch::asm;
         // We need to restore all GPRs.  The simplest approach: push the iretq
