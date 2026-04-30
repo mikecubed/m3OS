@@ -118,9 +118,8 @@ pub fn tlb_shootdown(addr: u64) {
             // and only touch the `SHOOTDOWN_*` atomics.
             // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
             // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-            // this core can service its own IRQs.  Cannot yield here: we hold
-            // preempt_disable() wrapping the SHOOTDOWN_* atomics.
-            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+            // this core can service its own IRQs.  Cannot yield here: we are still inside
+            // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
             while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
                 core::hint::spin_loop();
             }
@@ -223,9 +222,8 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         // ack via the `SHOOTDOWN_*` atomics.
         // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
         // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-        // this core can service its own IRQs.  Cannot yield here: we hold
-        // preempt_disable() wrapping the SHOOTDOWN_* atomics.
-        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+        // this core can service its own IRQs.  Cannot yield here: we are still inside
+        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
         while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
             core::hint::spin_loop();
         }

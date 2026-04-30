@@ -494,7 +494,9 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
                 // IPI-bounded: remote CPUs decrement SLAB_RECLAIM_PENDING in their IPI
                 // handler after flushing their per-CPU magazine.  Identical structure to
                 // the frame-allocator drain wait; same safety rationale.
-                // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+                // This wait already runs under the collect_remote_frees()
+                // preempt_disable()/preempt_enable() wrapper (load-bearing for
+                // PREEMPT_FULL only).
                 while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
                     core::hint::spin_loop();
                 }

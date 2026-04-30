@@ -2697,8 +2697,11 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         let on_cpu_ref = unsafe { &*on_cpu_ptr };
         // Phase 57a: bounded by cross-core context-switch completion time.  The
         // remote core clears `on_cpu` with Ordering::Release on its next switch-out.
-        // Converting to block+wake here risks deadlock (we may hold pi_lock while
-        // the woken task also needs pi_lock on its own switch-in path).
+        // We intentionally busy-wait here: step 3 has already committed the
+        // wakeup transition, but step 5 has not yet published the task on its
+        // assigned core's run queue.  Blocking or yielding in this handoff
+        // window would require an additional wake/publication protocol to avoid
+        // losing forward progress under the current lock/queue invariants.
         // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
         while on_cpu_ref.load(Ordering::Acquire) {
             core::hint::spin_loop();

@@ -423,7 +423,7 @@ conversions intact and classified the remaining 15 spins as hardware-bounded.
 When you add a new kernel wait that depends on a software condition:
 
 1. **Identify the holder** — what code, on what core, completes the condition?
-   - *This-core IRQ handler* → use a `Notification` object as the wake source.
+   - *This-core IRQ handler* → use an `AtomicBool` flag + `wake_task_v2` as the wake source.
    - *Another task* → use `WaitQueue::wake_one` / `wake_all`.
    - *Hardware register* → document the hardware bound; leave as spin with annotation.
 
@@ -432,7 +432,7 @@ When you add a new kernel wait that depends on a software condition:
    static MY_WOKEN: AtomicBool = AtomicBool::new(false);
    // In IRQ handler or task waker:
    MY_WOKEN.store(true, Ordering::Release);
-   wake_task(waiting_task_id);
+   wake_task_v2(waiting_task_id);
    ```
 
 3. **Replace the spin with `block_current_until`**:

@@ -825,7 +825,7 @@ pub(crate) static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
 fn nic_irq_handler() {
     // ... acknowledge interrupt, read status ...
     NIC_WOKEN.store(true, Ordering::Release);
-    wake_task(net_task_id());   // enqueues task; sends reschedule IPI if cross-core
+    wake_task_v2(net_task_id());   // enqueues task; sends reschedule IPI if cross-core
 }
 
 // Kernel task (net_task):
@@ -844,7 +844,7 @@ loop {
 Key invariants:
 - The `AtomicBool` is **owned by the IRQ handler** (or the other task that drives the condition).
 - `store(false)` happens **before draining work**, not after.  An IRQ that fires during `poll_rx()` sets the flag to `true`; when `block_current_until` checks it at the end of the loop, it returns immediately so the frame is not lost.
-- The IRQ handler does **not** call `block_current_until` or allocate — it only sets the flag and calls `wake_task`.
+- The IRQ handler does **not** call `block_current_until` or allocate — it only sets the flag and calls `wake_task_v2`.
 
 ### Pattern: task-to-task wake via WaitQueue
 

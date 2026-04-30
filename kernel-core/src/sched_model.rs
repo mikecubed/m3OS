@@ -1722,7 +1722,7 @@ mod tests {
             BlockState::BlockedOnRecv,
             "WaitQueue::sleep must park with BlockedOnRecv"
         );
-        assert!(fx1.yielded, "sleep must yield when queue event is pending");
+        assert!(fx1.yielded, "sleep must yield when no wake is pending");
 
         // wake_one / wake_all fires: woken flag set + wake_task_v2.
         let (s2, fx2) = apply_event(s1, Event::Wake);
