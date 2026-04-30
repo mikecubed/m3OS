@@ -100,15 +100,13 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
     }
     // Phase 57d E.3: consume deferred reschedule at IRQ-return to user mode.
     #[cfg(feature = "preempt-voluntary")]
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        if let Some(pc) = crate::smp::try_per_core() {
-            if pc
-                .preempt_resched_pending
-                .swap(false, core::sync::atomic::Ordering::AcqRel)
-            {
-                crate::task::signal_reschedule();
-            }
-        }
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3
+        && let Some(pc) = crate::smp::try_per_core()
+        && pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    {
+        crate::task::signal_reschedule();
     }
     #[cfg(not(debug_assertions))]
     let _ = stack_frame;
@@ -1154,7 +1152,7 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
     }
     #[cfg(not(feature = "sched-trace"))]
     let _ = trigger;
-    unsafe { crate::task::scheduler::preempt_to_scheduler(frame) };
+    crate::task::scheduler::preempt_to_scheduler(frame);
 }
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
