@@ -176,3 +176,41 @@ fn reschedule_ipi_entry_kernel_round_trip() {
 fn peek_preempt_count_matches_task_count() {
     // Full impl in Track G when the scheduler is wired up.
 }
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track C+D stubs — activate in Track G
+// ---------------------------------------------------------------------------
+
+/// Stub: `preempt_to_scheduler` correctly saves all 15 GPRs and the iretq
+/// fields (rip, cs, rflags, rsp, ss) into `Task::preempt_frame`.
+///
+/// Full verification requires QEMU + the full scheduler running a real
+/// userspace task so the frame can be compared before and after preemption.
+///
+/// TODO: activate in Track G.
+#[test_case]
+#[ignore = "requires QEMU + full scheduler init"]
+fn preempt_to_scheduler_saves_frame_correctly() {
+    // TODO: activate in Track G.
+}
+
+/// Stub: `preempt_resume_to_user` restores rip and all GPRs from
+/// `Task::preempt_frame` and executes iretq to the original user instruction.
+///
+/// TODO: activate in Track G once the QEMU single-step harness can inspect
+/// register state immediately after the iretq.
+#[test_case]
+#[ignore = "requires QEMU + full scheduler init"]
+fn preempt_resume_restores_rip_and_registers() {
+    // TODO: activate in Track G.
+}
+
+/// Stub: a cooperative yield (via `yield_now`) still uses `switch_context`
+/// (resume_mode == Cooperative) rather than `preempt_resume_to_user`.
+///
+/// TODO: activate in Track G once dispatch-path tracing is available.
+#[test_case]
+#[ignore = "requires QEMU + full scheduler init"]
+fn cooperative_yield_still_uses_switch_context() {
+    // TODO: activate in Track G.
+}

@@ -689,11 +689,69 @@ global_asm!(
     "iretq",
 );
 
+// ---------------------------------------------------------------------------
+// Phase 57d C.2 — preempt_resume_to_user
+// ---------------------------------------------------------------------------
+//
+// Restores the full user-mode register state saved by preempt_to_scheduler
+// and returns to the interrupted user instruction via iretq.
+//
+// PreemptFrame offsets (kernel_core::preempt_frame::PreemptFrame):
+//   rax=0   rbx=8   rcx=16  rdx=24  rsi=32  rdi=40  rbp=48
+//   r8=56   r9=64   r10=72  r11=80  r12=88  r13=96  r14=104 r15=112
+//   rip=120 cs=128  rflags=136 rsp=144 ss=152
+//
+// Calling convention: rdi = *const PreemptFrame (SysV AMD64 arg1).
+// Called from the scheduler dispatch loop (D.3) with IRQs disabled.
+// Never returns.
+
+core::arch::global_asm!(
+    ".global preempt_resume_to_user",
+    "preempt_resume_to_user:",
+    // Build the iretq frame on the current (scheduler) stack.
+    // iretq pops: rip, cs, rflags, rsp, ss — push in reverse (ss first).
+    "mov rax, [rdi + 152]", // ss
+    "push rax",
+    "mov rax, [rdi + 144]", // rsp (user-mode stack pointer)
+    "push rax",
+    "mov rax, [rdi + 136]", // rflags
+    "push rax",
+    "mov rax, [rdi + 128]", // cs
+    "push rax",
+    "mov rax, [rdi + 120]", // rip
+    "push rax",
+    // Restore GPRs — all except rax and rdi (rdi is still our frame pointer).
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    // Restore rax, then rdi last (pointer becomes invalid after this).
+    "mov rax, [rdi + 0]",
+    "mov rdi, [rdi + 40]",
+    "iretq",
+);
+
 // Rust-side declarations for the asm entry symbols (used when installing
 // into the IDT via `set_handler_addr`).
 unsafe extern "C" {
     fn timer_entry();
     fn reschedule_ipi_entry();
+    /// Phase 57d C.2 — resume a preempted user-mode task.
+    ///
+    /// Restores all 15 GPRs and the full iretq frame from `frame`, then
+    /// executes `iretq` to return to the interrupted user-mode instruction.
+    /// Never returns.
+    #[cfg(feature = "preempt-voluntary")]
+    pub fn preempt_resume_to_user(frame: *const kernel_core::preempt_frame::PreemptFrame) -> !;
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1118,10 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
             .preempt_resched_pending
             .swap(false, core::sync::atomic::Ordering::AcqRel)
         {
-            crate::task::signal_reschedule();
+            // C.1: task was in ring 3 with a pending reschedule — preempt it.
+            // preempt_to_scheduler saves the full register state, switches to
+            // the scheduler, and never returns.
+            crate::task::scheduler::preempt_to_scheduler(frame);
         }
     }
 }
@@ -1404,7 +1465,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
             .preempt_resched_pending
             .swap(false, core::sync::atomic::Ordering::AcqRel)
         {
-            crate::task::signal_reschedule();
+            // C.1: preempt the task at this IPI boundary.
+            crate::task::scheduler::preempt_to_scheduler(frame);
         }
     }
 }
