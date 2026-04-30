@@ -4408,13 +4408,23 @@ unsafe fn cow_clone_user_pages(
 
         // SMP shootdown: ensure remote cores that have the parent's address
         // space loaded also see the cleared WRITABLE bits on CoW pages.
+        //
+        // Phase 57b post-review fix: PROCESS_TABLE is now an `IrqSafeMutex`
+        // (G.6.c).  Holding it across `tlb_shootdown_range` would mask IF
+        // on this core for the duration of the IPI handshake; a remote
+        // core that contends on `PROCESS_TABLE` would spin with IF=0 and
+        // fail to service this core's TLB-shootdown IPI, deadlocking
+        // both.  Clone the `Arc<AddressSpace>` under the lock, drop the
+        // guard, then call shootdown outside any IF-masking critical
+        // section.
         if cow_range_start < cow_range_end {
             let parent_pid = crate::process::current_pid();
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table.find(parent_pid)
-                && let Some(ref addr_space) = p.addr_space
-            {
-                crate::smp::tlb::tlb_shootdown_range(addr_space, cow_range_start, cow_range_end);
+            let addr_space = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(parent_pid).and_then(|p| p.addr_space.clone())
+            };
+            if let Some(addr_space) = addr_space {
+                crate::smp::tlb::tlb_shootdown_range(&addr_space, cow_range_start, cow_range_end);
             }
         }
 
