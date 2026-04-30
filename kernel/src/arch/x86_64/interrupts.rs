@@ -909,6 +909,34 @@ pub fn read_scancode() -> Option<u8> {
     Some(byte)
 }
 
+/// Phase 57b G.7 — Task-context `RAW_INPUT_ROUTER` acquisition helper.
+///
+/// `RAW_INPUT_ROUTER` is an IRQ-shared `spin::Mutex`: `keyboard_handler`
+/// (the ISR) acquires it to route each drained byte, so converting to
+/// `IrqSafeMutex` would not work with the ISR's existing pattern (the ISR
+/// runs with IF=0 and never raises the per-task preempt counter).  Instead,
+/// every task-context reader runs with explicit
+/// `preempt_disable` + `interrupts::without_interrupts` + `preempt_enable`
+/// boilerplate.  This helper centralises that pattern so the two readers
+/// (`read_raw_scancode` and `reset_raw_input_state`) cannot drift.
+///
+/// IF must be masked on the current CPU while the lock is held, otherwise a
+/// same-core keyboard IRQ landing on this path while the lock is held would
+/// deadlock the ISR (same bug class as the 2026-04-21 `SCHEDULER.lock`
+/// post-mortem; see `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`).
+///
+/// Lock-ordering: `preempt_disable` is lock-free (Phase 57b D.2), so calling
+/// it before `without_interrupts` cannot recurse.
+fn with_raw_input_router<R>(f: impl FnOnce(&mut ScancodeRouter) -> R) -> R {
+    crate::task::scheduler::preempt_disable();
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut router = RAW_INPUT_ROUTER.lock();
+        f(&mut router)
+    });
+    crate::task::scheduler::preempt_enable();
+    result
+}
+
 /// Pop one scancode from the **raw / game-input** ring buffer, or `None`.
 ///
 /// `RAW_INPUT_ROUTER` is also held by `keyboard_handler` in ISR context,
@@ -917,9 +945,11 @@ pub fn read_scancode() -> Option<u8> {
 /// task holds the lock deadlocks the ISR (same bug class as the 2026-04-21
 /// `SCHEDULER.lock` post-mortem). See
 /// `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`.
+///
+/// Phase 57b G.7 — `with_raw_input_router` wraps the
+/// `preempt_disable` + `without_interrupts` boilerplate.
 pub fn read_raw_scancode() -> Option<u8> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let _guard = RAW_INPUT_ROUTER.lock();
+    with_raw_input_router(|_router| {
         let head = RAW_SCANCODE_BUF_HEAD.load(Ordering::Acquire);
         let tail = RAW_SCANCODE_BUF_TAIL.load(Ordering::Acquire);
         if head == tail {
@@ -936,8 +966,7 @@ pub fn read_raw_scancode() -> Option<u8> {
 /// See [`read_raw_scancode`] for the ISR-safety rationale around
 /// `RAW_INPUT_ROUTER`.
 pub fn reset_raw_input_state() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut router = RAW_INPUT_ROUTER.lock();
+    with_raw_input_router(|router| {
         router.reset();
         RAW_SCANCODE_BUF_HEAD.store(0, Ordering::Release);
         RAW_SCANCODE_BUF_TAIL.store(0, Ordering::Release);
