@@ -1090,6 +1090,73 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57d Track G — voluntary preemption IRQ-return helpers
+// ---------------------------------------------------------------------------
+
+/// Source of a voluntary-preemption event, for tracing.
+#[cfg(feature = "preempt-voluntary")]
+#[derive(Debug, Clone, Copy)]
+pub enum PreemptTrigger {
+    Timer,
+    RescheduleIpi,
+    #[allow(dead_code)]
+    PreemptEnableZeroCrossing,
+}
+
+/// Emit a preemption trace entry to the sched-trace ring.
+///
+/// Only compiled under `cfg(feature = "sched-trace")`. Zero overhead in
+/// the default build.
+#[cfg(feature = "sched-trace")]
+fn emit_preempt_trace(frame: &PreemptTrapFrameUser, trigger: PreemptTrigger) {
+    // Repurpose sched_trace::record: pid=preempted_rip (truncated to u32),
+    // old_state=255 (preempt sentinel), new_state=trigger discriminant.
+    crate::task::sched_trace::record(frame.rip as u32, 255, trigger as u8);
+}
+
+/// Check the four voluntary-preemption conditions and, if met, preempt the
+/// interrupted user-mode task.
+///
+/// Called from `timer_handler_user` and `reschedule_ipi_handler_user` after
+/// the IRQ's tick/EOI work is complete.
+///
+/// # Conditions checked (all must be true to preempt)
+/// 1. `from_user` — implicit: callers are in the `_user` handler path.
+/// 2. `preempt_count == 0` — no preempt-disable lock held by the task.
+/// 3. `reschedule || preempt_resched_pending` — scheduler flagged a switch.
+///
+/// # Safety
+/// Must be called with IRQs disabled (guaranteed by IRQ handler context).
+/// `frame` must point to a valid on-stack `PreemptTrapFrameUser`.
+#[cfg(feature = "preempt-voluntary")]
+unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: PreemptTrigger) {
+    let pc = crate::task::scheduler::peek_preempt_count_irq();
+    if pc != 0 {
+        return; // task holds a preempt-disable lock — do not preempt
+    }
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let reschedule = core
+        .reschedule
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if !reschedule && !pending {
+        return; // no rescheduling requested
+    }
+    // All conditions met — capture and preempt.
+    #[cfg(feature = "sched-trace")]
+    unsafe {
+        emit_preempt_trace(frame, trigger);
+    }
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = trigger;
+    unsafe { crate::task::scheduler::preempt_to_scheduler(frame) };
+}
+
 /// Phase 57d Track B — timer handler, user (ring 3) path.
 ///
 /// Called from the `timer_entry` naked stub when the interrupted context was
@@ -1113,16 +1180,8 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     #[cfg(debug_assertions)]
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
-    if let Some(pc) = crate::smp::try_per_core() {
-        if pc
-            .preempt_resched_pending
-            .swap(false, core::sync::atomic::Ordering::AcqRel)
-        {
-            // C.1: task was in ring 3 with a pending reschedule — preempt it.
-            // preempt_to_scheduler saves the full register state, switches to
-            // the scheduler, and never returns.
-            crate::task::scheduler::preempt_to_scheduler(frame);
-        }
+    unsafe {
+        check_and_preempt_user(frame, PreemptTrigger::Timer);
     }
 }
 
@@ -1460,14 +1519,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
     #[cfg(debug_assertions)]
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
-    if let Some(pc) = crate::smp::try_per_core() {
-        if pc
-            .preempt_resched_pending
-            .swap(false, core::sync::atomic::Ordering::AcqRel)
-        {
-            // C.1: preempt the task at this IPI boundary.
-            crate::task::scheduler::preempt_to_scheduler(frame);
-        }
+    unsafe {
+        check_and_preempt_user(frame, PreemptTrigger::RescheduleIpi);
     }
 }
 
