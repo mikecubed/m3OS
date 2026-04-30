@@ -96,8 +96,14 @@ impl Counter {
     /// `fetch_sub(1, Release)` — `Release` because the critical section
     /// must happen-before the lock release that pairs with this counter
     /// drop.
-    pub fn enable(&mut self) {
+    ///
+    /// Returns `true` if this call crossed the zero boundary (previous
+    /// depth was 1 and is now 0) — the Phase 57d E.2 deferred-reschedule
+    /// trigger condition.
+    pub fn enable(&mut self) -> bool {
+        let crossed_zero = self.value == 1;
         self.value -= 1;
+        crossed_zero
     }
 
     /// Read the current depth.
@@ -137,6 +143,64 @@ impl Counter {
     }
 }
 
+/// Pure-logic model of the per-core `preempt_resched_pending` flag.
+///
+/// Used in Phase 57d E.2 zero-crossing tests: when `enable` crosses from
+/// depth 1 to 0 and `reschedule` is `true`, `preempt_resched_pending` must
+/// be set so the user-mode-return boundary (E.3) can consume it.
+///
+/// This struct is host-testable (no kernel atomics) and exercises the same
+/// state-machine logic as the kernel's `preempt_enable` zero-crossing path.
+#[derive(Debug, Default, Clone)]
+pub struct DeferredReschedModel {
+    counter: Counter,
+    /// Mirrors `PerCoreData::reschedule`.
+    pub reschedule: bool,
+    /// Mirrors `PerCoreData::preempt_resched_pending`.
+    pub preempt_resched_pending: bool,
+}
+
+impl DeferredReschedModel {
+    /// Construct a fresh model: depth 0, no reschedule pending.
+    pub fn new() -> Self {
+        Self {
+            counter: Counter::new(),
+            reschedule: false,
+            preempt_resched_pending: false,
+        }
+    }
+
+    /// Disable preemption — increments the depth counter.
+    pub fn disable(&mut self) {
+        self.counter.disable();
+    }
+
+    /// Enable preemption — decrements depth and applies the E.2 zero-crossing rule.
+    ///
+    /// If the depth crosses from 1 → 0 **and** `reschedule` is set,
+    /// `preempt_resched_pending` is set to `true`.
+    pub fn enable(&mut self) {
+        let crossed = self.counter.enable();
+        if crossed && self.reschedule {
+            self.preempt_resched_pending = true;
+        }
+    }
+
+    /// Consume the pending flag — mirrors the `swap(false, AcqRel)` in E.3.
+    ///
+    /// Returns `true` if a deferred reschedule was pending.
+    pub fn consume_pending(&mut self) -> bool {
+        let was_pending = self.preempt_resched_pending;
+        self.preempt_resched_pending = false;
+        was_pending
+    }
+
+    /// Read current depth.
+    pub fn count(&self) -> i32 {
+        self.counter.count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,9 +218,9 @@ mod tests {
         assert_eq!(c.count(), 1);
         c.disable();
         assert_eq!(c.count(), 2);
-        c.enable();
+        assert!(!c.enable(), "depth 2→1 is not a zero-crossing");
         assert_eq!(c.count(), 1);
-        c.enable();
+        assert!(c.enable(), "depth 1→0 is a zero-crossing");
         assert_eq!(c.count(), 0);
     }
 
@@ -181,10 +245,104 @@ mod tests {
             c.disable();
         }
         assert_eq!(c.count(), 32);
-        for _ in 0..32 {
-            c.enable();
+        for i in 0..32 {
+            let crossed = c.enable();
+            if i == 31 {
+                assert!(crossed, "final enable must report zero-crossing");
+            } else {
+                assert!(!crossed, "non-final enable must not report zero-crossing");
+            }
         }
         assert_eq!(c.count(), 0);
         c.assert_balanced();
+    }
+
+    // ----- Phase 57d E.2 regression tests -----
+
+    /// E.2: preempt_enable at depth 1 with reschedule=true sets preempt_resched_pending.
+    #[test]
+    fn e2_zero_crossing_with_reschedule_sets_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        assert_eq!(m.count(), 1);
+        assert!(!m.preempt_resched_pending, "flag must start clear");
+        m.enable();
+        assert_eq!(m.count(), 0);
+        assert!(
+            m.preempt_resched_pending,
+            "E.2: zero-crossing with reschedule=true must set preempt_resched_pending"
+        );
+    }
+
+    /// E.2: preempt_enable at depth 1 with reschedule=false does NOT set the flag.
+    #[test]
+    fn e2_zero_crossing_without_reschedule_does_not_set_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = false;
+        m.disable();
+        m.enable();
+        assert!(
+            !m.preempt_resched_pending,
+            "E.2: zero-crossing with reschedule=false must NOT set preempt_resched_pending"
+        );
+    }
+
+    /// E.2: preempt_enable at depth > 1 does NOT set the flag even with reschedule=true.
+    #[test]
+    fn e2_non_zero_crossing_does_not_set_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        m.disable(); // depth 2
+        m.enable(); // depth 1 — NOT a zero-crossing
+        assert!(
+            !m.preempt_resched_pending,
+            "E.2: enable at depth 2→1 must NOT set preempt_resched_pending"
+        );
+        assert_eq!(m.count(), 1);
+    }
+
+    /// E.3: consuming the pending flag clears it.
+    #[test]
+    fn e3_consume_pending_clears_flag() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        m.enable();
+        assert!(m.preempt_resched_pending, "precondition: flag must be set");
+        let was = m.consume_pending();
+        assert!(was, "E.3: consume must return true when flag was set");
+        assert!(
+            !m.preempt_resched_pending,
+            "E.3: flag must be cleared after consume"
+        );
+        let again = m.consume_pending();
+        assert!(
+            !again,
+            "E.3: second consume must return false (flag already clear)"
+        );
+    }
+
+    /// E.2: nested disable/enable — flag only set on final zero-crossing.
+    #[test]
+    fn e2_nested_pairs_flag_on_final_zero_crossing_only() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        for _ in 0..4 {
+            m.disable();
+        }
+        // Three enables that don't reach zero.
+        for _ in 0..3 {
+            m.enable();
+            assert!(!m.preempt_resched_pending, "premature flag set");
+        }
+        // Final enable reaches zero.
+        m.enable();
+        assert_eq!(m.count(), 0);
+        assert!(
+            m.preempt_resched_pending,
+            "E.2: flag must be set on the final zero-crossing enable"
+        );
     }
 }
