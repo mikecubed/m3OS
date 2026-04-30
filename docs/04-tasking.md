@@ -259,7 +259,7 @@ real inter-task communication will require tasks to block on endpoint receive.
 
 ## Block/Wake Protocol (v2 — Phase 57a)
 
-> **Current protocol as of kernel v0.57.1.** Phase 57a rewrote the block/wake
+> **Current protocol as of kernel v0.57.2.** Phase 57a rewrote the block/wake
 > primitive to eliminate the lost-wake bug class that arose from v1's use of
 > multiple boolean flags (`switching_out`, `wake_after_switch`,
 > `PENDING_SWITCH_OUT`) as intermediate state. See
