@@ -11,19 +11,25 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use spin::Mutex;
 
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
 pub use kernel_core::pipe::Pipe;
 
 /// Global pipe table.
-static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());
+///
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// PIPE_TABLE is only acquired from task context (pipe syscall paths); no
+/// ISR reaches it.
+static PIPE_TABLE: IrqSafeMutex<Vec<Option<Pipe>>> = IrqSafeMutex::new(Vec::new());
 
 /// Per-pipe wait queues — indexed by pipe_id, allocated alongside the pipe.
 /// Woken on write (data available to reader), read (space available to writer),
 /// and close (EOF / broken pipe notification).
-pub static PIPE_WAITQUEUES: Mutex<Vec<Option<WaitQueue>>> = Mutex::new(Vec::new());
+///
+/// Phase 57b G.7 — IrqSafeMutex (task-context only).
+pub static PIPE_WAITQUEUES: IrqSafeMutex<Vec<Option<WaitQueue>>> = IrqSafeMutex::new(Vec::new());
 
 /// Wake all tasks waiting on the given pipe.
 pub fn wake_pipe(pipe_id: usize) {
