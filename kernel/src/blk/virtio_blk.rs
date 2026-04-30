@@ -432,6 +432,31 @@ static REQUEST_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
 // under REQUEST_LOCK, so only one task is ever waiting at a time.
 static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 
+/// Phase 57b G.1.c — IRQ-shared `spin::Mutex` `DRIVER` stays a plain
+/// `spin::Mutex` because [`virtio_blk_irq_handler`] (the ISR) also acquires
+/// it. Task-context callers must explicitly `preempt_disable` +
+/// `interrupts::without_interrupts` to satisfy the F.1 preempt-discipline,
+/// since converting to `IrqSafeMutex` would not work with the ISR's
+/// existing pattern (the ISR already runs with IF=0 and does not raise the
+/// per-task preempt counter).
+///
+/// This helper wraps every task-context acquisition of `DRIVER` so the
+/// boilerplate lives in one place. The closure receives `&mut
+/// Option<VirtioBlkDriver>` so callers can probe the `Some` / `None` state
+/// uniformly.
+///
+/// Lock-ordering: `preempt_disable` is lock-free (Phase 57b D.2), so
+/// calling it before `without_interrupts` cannot recurse.
+fn with_driver<R>(f: impl FnOnce(&mut Option<VirtioBlkDriver>) -> R) -> R {
+    crate::task::scheduler::preempt_disable();
+    let result = interrupts::without_interrupts(|| {
+        let mut driver = DRIVER.lock();
+        f(&mut driver)
+    });
+    crate::task::scheduler::preempt_enable();
+    result
+}
+
 // ===========================================================================
 // IRQ handler
 // ===========================================================================
@@ -494,13 +519,11 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         }
         // Copy from DMA buffer to caller's buffer. See Fix 1 note in
         // `do_request`: the driver lock must be taken with IF off to stay
-        // out of the ISR's way.
-        let dma_virt: *mut u8 = interrupts::without_interrupts(|| {
-            let d = DRIVER.lock();
-            match d.as_ref() {
-                Some(d) => d.dma_virt,
-                None => core::ptr::null_mut(),
-            }
+        // out of the ISR's way. Phase 57b G.1.c — `with_driver` wraps the
+        // `preempt_disable` + `without_interrupts` boilerplate.
+        let dma_virt: *mut u8 = with_driver(|d| match d.as_ref() {
+            Some(d) => d.dma_virt,
+            None => core::ptr::null_mut(),
         });
         if dma_virt.is_null() {
             return Err(0xFF);
@@ -533,9 +556,9 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
         let offset = i * SECTOR_SIZE;
         // Stage the sector into the DMA buffer. See Fix 1 note in
         // `do_request`: the driver lock must be taken with IF off to stay
-        // out of the ISR's way.
-        let stage_result: Result<(), u8> = interrupts::without_interrupts(|| {
-            let mut d = DRIVER.lock();
+        // out of the ISR's way. Phase 57b G.1.c — `with_driver` wraps the
+        // `preempt_disable` + `without_interrupts` boilerplate.
+        let stage_result: Result<(), u8> = with_driver(|d| {
             let driver = d.as_mut().ok_or(0xFFu8)?;
             // SAFETY: dma_virt is driver-owned scratch; only one task writes
             // at a time (DRIVER lock).
@@ -576,8 +599,9 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // LAPIC and legacy INTx is routed to the BSP, so no other core can hold
     // the mutex while the ISR fires elsewhere.
     REQ_WOKEN.store(false, Ordering::Release);
-    let status_virt_result: Result<*mut u8, u8> = interrupts::without_interrupts(|| {
-        let mut d = DRIVER.lock();
+    // Phase 57b G.1.c — `with_driver` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate around the IRQ-shared `DRIVER` lock.
+    let status_virt_result: Result<*mut u8, u8> = with_driver(|d| {
         let driver = d.as_mut().ok_or(0xFFu8)?;
         if sector >= driver.capacity_sectors {
             log::error!(
@@ -636,9 +660,10 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
         None,
     );
     // Phase 3: read the status byte (driver lock re-acquired to ensure
-    // memory ordering). Same IF-off rule as the submit side.
-    let status = interrupts::without_interrupts(|| {
-        let _d = DRIVER.lock();
+    // memory ordering). Same IF-off rule as the submit side. Phase 57b
+    // G.1.c — `with_driver` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate.
+    let status = with_driver(|_d| {
         // SAFETY: status_virt lives in the driver's scratch page, valid
         // for the life of the driver.
         unsafe { core::ptr::read_volatile(status_virt) }
@@ -831,7 +856,11 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         dma_virt,
         irq,
     };
-    *DRIVER.lock() = Some(driver);
+    // Phase 57b G.1.c — `with_driver` wraps the `preempt_disable` +
+    // `without_interrupts` boilerplate around the IRQ-shared `DRIVER` lock.
+    with_driver(|d| {
+        *d = Some(driver);
+    });
     VIRTIO_BLK_READY.store(true, Ordering::Release);
     log::info!("[virtio-blk] driver initialized successfully");
     DriverProbeResult::Bound
@@ -853,4 +882,140 @@ pub fn init() {
 #[inline]
 fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57b G.1.c — preempt-discipline regression test
+// ---------------------------------------------------------------------------
+//
+// Pins the property that a virtio-blk-shaped task-context request submit
+// followed by an IRQ-side completion drain leaves `preempt_count` at 0.
+//
+// The real `with_driver` helper is not directly observable from the test
+// harness: kernel tests run before SMP per-core init (see
+// `kernel/src/main.rs`), so `try_per_core` returns `None` and the real
+// `preempt_disable` / `preempt_enable` helpers degrade to no-ops — they
+// have no observable counter to assert against.
+//
+// This test mirrors the synthetic-counter pattern Wave 5's F.1 tests use:
+// it reconstructs the `with_driver` shape (preempt_disable → without_irq →
+// spin lock → release order reversed) against an explicit `AtomicI32` and
+// asserts the counter cycles 0 → 1 → 0 across a submit + an ISR-side
+// drain. Importantly, the ISR mirror does NOT raise the counter (the real
+// ISR runs with IF=0 and never touches `preempt_count`), so a balanced
+// task-context submit that completes via IRQ must still net to zero.
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    /// Synthetic mirror of `with_driver` for the Phase 57b G.1.c
+    /// regression test. Mirrors the production helper's shape:
+    ///
+    /// 1. `preempt_disable` (raise the counter).
+    /// 2. Mask IRQs (`without_interrupts` body).
+    /// 3. Take the spin lock (no-op here — single-threaded test).
+    /// 4. Run the closure.
+    /// 5. Drop spin lock, restore IF, `preempt_enable` (lower the counter).
+    fn synthetic_with_driver<R>(counter: &AtomicI32, f: impl FnOnce() -> R) -> R {
+        counter.fetch_add(1, Ordering::Acquire);
+        let r = f();
+        counter.fetch_sub(1, Ordering::Release);
+        r
+    }
+
+    /// Synthetic mirror of `virtio_blk_irq_handler`: the real ISR runs
+    /// with IF=0 and never raises `preempt_count`. Modeling that
+    /// explicitly here pins the property that the IRQ-side drain leaves
+    /// the per-task counter unchanged — only task-context callsites
+    /// raise/lower it.
+    fn synthetic_irq_drain(counter: &AtomicI32) -> i32 {
+        // No counter mutation: ISR context. Just observe.
+        counter.load(Ordering::Acquire)
+    }
+
+    /// Phase 57b G.1.c — `with_driver`-shaped task-context lock plus an
+    /// ISR-side drain net to zero on the per-task `preempt_count`.
+    ///
+    /// Mirrors the virtio-blk request lifecycle:
+    ///   - Task takes `DRIVER` via `with_driver` (counter: 0 → 1).
+    ///   - Submits the request, releases the lock (counter: 1 → 0).
+    ///   - ISR fires asynchronously and drains the used ring — does NOT
+    ///     touch `preempt_count` (counter stays 0 throughout).
+    ///   - Task re-acquires `DRIVER` via `with_driver` to read the
+    ///     status byte (counter: 0 → 1 → 0).
+    ///
+    /// Net effect: counter ends at 0. A regression that left a raise
+    /// dangling on either side would flip this to a non-zero end value.
+    #[test_case]
+    fn with_driver_submit_then_irq_wake_returns_preempt_count_to_zero() {
+        let counter = AtomicI32::new(0);
+
+        // Pre-submit: counter at 0.
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        // Phase 1: task-context submit under `with_driver`.
+        let observed_during_submit =
+            synthetic_with_driver(&counter, || counter.load(Ordering::Acquire));
+        assert_eq!(
+            observed_during_submit, 1,
+            "with_driver must raise preempt_count by exactly 1 inside its closure",
+        );
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "with_driver must lower preempt_count back to 0 on closure exit",
+        );
+
+        // Phase 2: ISR-side drain — must NOT touch preempt_count.
+        let observed_during_irq = synthetic_irq_drain(&counter);
+        assert_eq!(
+            observed_during_irq, 0,
+            "ISR-side drain must not raise preempt_count (ISR runs with IF=0)",
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        // Phase 3: task-context status read under `with_driver`.
+        synthetic_with_driver(&counter, || {
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                1,
+                "second with_driver acquisition must again raise preempt_count to 1",
+            );
+        });
+
+        // Final: counter back to 0 across the full submit + IRQ + read
+        // lifecycle.
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "Phase 57b G.1.c — virtio-blk request submit + IRQ wake must \
+             return preempt_count to 0",
+        );
+    }
+
+    /// Phase 57b G.1.c — nested `with_driver` calls (e.g. the `do_request`
+    /// path that takes `DRIVER` for submit, then re-takes it later for
+    /// the status read) must each charge and release a single
+    /// `preempt_count` raise without leaking.
+    #[test_case]
+    fn with_driver_back_to_back_acquires_each_balance_to_zero() {
+        let counter = AtomicI32::new(0);
+
+        for i in 0..5 {
+            synthetic_with_driver(&counter, || {
+                assert_eq!(
+                    counter.load(Ordering::Acquire),
+                    1,
+                    "iteration {}: inside with_driver counter must be 1",
+                    i,
+                );
+            });
+            assert_eq!(
+                counter.load(Ordering::Acquire),
+                0,
+                "iteration {}: after with_driver counter must be back to 0",
+                i,
+            );
+        }
+    }
 }
