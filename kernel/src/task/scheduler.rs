@@ -115,6 +115,107 @@
 //! `switching_out`, `wake_after_switch`, and `PENDING_SWITCH_OUT` are absent
 //! from this codebase (removed in Phase 57a Tracks E–F). Any reference to
 //! these names is a bug.
+//!
+//! # `preempt_count`
+//!
+//! Phase 57b introduced a per-task preempt-disable counter that gates the
+//! preemption fired by Phases 57d (voluntary preemption) and 57e (full
+//! kernel preemption).  57b ships the discipline as a no-op refactor: every
+//! spinlock callsite increments the counter while the lock is held, but no
+//! IRQ handler consults it.  See
+//! [`docs/appendix/preemptive-multitasking.md`](../../../docs/appendix/preemptive-multitasking.md)
+//! for the design source of truth and
+//! [`docs/roadmap/57b-preemption-foundation.md`](../../../docs/roadmap/57b-preemption-foundation.md)
+//! for the phase rationale.
+//!
+//! ## Storage
+//!
+//! - **Per-task value.** [`super::Task::preempt_count`] is an
+//!   `AtomicI32`, initialised to `0` at task construction and stored
+//!   on the heap behind a `Box` (see `Scheduler::tasks: Vec<Box<Task>>`).
+//!   The `Box` indirection is what makes a cached raw pointer into the
+//!   field stable for the task's lifetime.
+//! - **Per-CPU pointer.** [`crate::smp::PerCoreData::current_preempt_count_ptr`]
+//!   is an `AtomicPtr<AtomicI32>` that targets either the running task's
+//!   `preempt_count` (in task context) or one slot of the
+//!   `SCHED_PREEMPT_COUNT_DUMMY` array (in scheduler / idle context).
+//!   The dispatch path retargets the pointer in two phases: a switch-out
+//!   epilogue retarget to the per-core dummy
+//!   ([`retarget_preempt_count_to_dummy`]) and a switch-in handoff retarget
+//!   to the incoming task ([`retarget_preempt_count_to_task`]).
+//!
+//! ## Raise on lock, drop on unlock
+//!
+//! Every [`IrqSafeMutex::lock`] calls [`preempt_disable`] *before* masking
+//! interrupts; [`IrqSafeGuard::Drop`] calls [`preempt_enable`] *after* the
+//! spin guard releases and IF is restored — see the F.1 commentary directly
+//! above [`IrqSafeMutex`] for the load-bearing drop order.  Non-`IrqSafeMutex`
+//! callsites either migrate to `IrqSafeMutex` or wrap their critical section
+//! in an explicit [`preempt_disable`] / [`preempt_enable`] pair (the latter
+//! is required for IRQ-shared `spin::Mutex` callsites that must keep their
+//! type for ABI reasons; see the durable audit at
+//! [`docs/handoffs/57b-spinlock-callsite-audit.md`](../../../docs/handoffs/57b-spinlock-callsite-audit.md)
+//! for the per-callsite classification).
+//!
+//! ## Return-to-0 invariant
+//!
+//! `preempt_count` must equal `0` at every user-mode return.  Track D.3
+//! installs a `debug_assert!` at the syscall-return path
+//! (`kernel/src/arch/x86_64/syscall/mod.rs`) and at the IRQ-return-to-ring-3
+//! path (`kernel/src/arch/x86_64/interrupts.rs`) that panics on a non-zero
+//! count.  Release builds compile the assertion out — the 57a stuck-task
+//! watchdog is the coarse signal there.
+//!
+//! ## Maximum nesting depth
+//!
+//! [`preempt_disable`] panics in debug builds if the post-increment counter
+//! exceeds `32` (16 for nested locks plus 16 of slack for diagnostic frames).
+//! This catches "preempt_disable in a loop" bugs at the first iteration
+//! that escapes the legitimate nesting bound.
+//!
+//! ## Recursion safety (lock-free helpers)
+//!
+//! [`preempt_disable`] and [`preempt_enable`] are **lock-free by mandate**.
+//! Each helper performs a single `AtomicPtr::load(Acquire)` on
+//! `current_preempt_count_ptr` followed by a single `fetch_add` /
+//! `fetch_sub` on the pointee.  No `scheduler_lock()` call, no
+//! [`IrqSafeMutex::lock`] call, no `current_task_idx()` lookup.
+//!
+//! This is what allows F.1's wiring (`IrqSafeMutex::lock` calls
+//! `preempt_disable` first) to be non-recursive: if the helper itself took
+//! an `IrqSafeMutex`, every `IrqSafeMutex::lock` would recurse infinitely
+//! through `preempt_disable → IrqSafeMutex::lock → preempt_disable → …`.
+//! The lock-free design eliminates that hazard at the source.  Any future
+//! patch that adds a lock-acquiring call inside `preempt_disable` /
+//! `preempt_enable` reintroduces the recursive-deadlock hazard described in
+//! the PR-131 review and must be rejected.
+//!
+//! ## Per-task storage of value, per-CPU storage of pointer
+//!
+//! `preempt_count` lives on the **task**, not the CPU.  Per-task placement
+//! is slower than Linux's per-CPU placement (which avoids the atomic on
+//! the hot path) but is much easier to reason about: there is no
+//! save-and-restore at context-switch time, only a single `AtomicPtr`
+//! retarget at each dispatch boundary.  The pointer lives on `PerCoreData`,
+//! not on `Task`, because the fast path is "what counter does *this CPU*
+//! charge right now" — a per-task pointer would require following
+//! `current_task` first.
+//!
+//! ## 57d / 57e dependency
+//!
+//! 57b is a no-op refactor: every IRQ handler still ignores `preempt_count`.
+//! The counter becomes load-bearing in:
+//!
+//! - **57d (voluntary preemption).**  The IRQ-return path consults
+//!   `preempt_count == 0` *and* `cs.rpl == 3` (i.e. the IRQ interrupted user
+//!   mode) before firing preemption.  Kernel-mode code remains
+//!   non-preemptible by construction.  The `preempt_enable` zero-crossing
+//!   reschedule trigger (Linux's `preempt_enable() → schedule()` pattern) is
+//!   also added in 57d — 57b's `preempt_enable` is a pure decrement.
+//! - **57e (full kernel preemption).**  Drops the `cs.rpl == 3` check;
+//!   kernel-mode code becomes preemptible at any point where
+//!   `preempt_count == 0`.  The 57c busy-wait `preempt_disable` wrappers
+//!   become load-bearing here (under 57d they are no-ops).
 #![allow(dead_code)]
 
 extern crate alloc;
