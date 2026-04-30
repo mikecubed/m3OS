@@ -51,6 +51,7 @@
 //! magazines and takes the per-size-class slab lock, but it never holds a slab
 //! lock while requesting another CPU to mutate its local caches.
 
+use crate::task::scheduler::IrqSafeMutex;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use kernel_core::cross_cpu_free::CrossCpuFreeList;
 use kernel_core::magazine::{Magazine, MagazineDepot};
@@ -58,7 +59,6 @@ use kernel_core::magazine::{Magazine, MagazineDepot};
 use kernel_core::size_class::size_to_class;
 use kernel_core::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES};
 use kernel_core::slab::SlabCache;
-use spin::Mutex;
 
 // ---------------------------------------------------------------------------
 // Per-CPU magazine layer (B.3)
@@ -231,10 +231,16 @@ unsafe impl Sync for CrossCpuFreeLists {}
 // ---------------------------------------------------------------------------
 
 /// Per-size-class global state: a magazine depot and a backing slab cache.
+///
+/// Phase 57b G.4 — `slab` is an [`IrqSafeMutex`] so the per-size-class slab
+/// cache inherits Track F.1's preempt-discipline.  Acquired only from task
+/// context; the magazine layer wraps callsites in `without_interrupts`
+/// already, so the additional IRQ-mask in `IrqSafeMutex::lock` is a no-op
+/// inside those scopes.
 #[allow(dead_code)]
 struct SizeClassState {
     depot: MagazineDepot,
-    slab: Mutex<SlabCache>,
+    slab: IrqSafeMutex<SlabCache>,
 }
 
 /// Global array of per-size-class depots and slab caches.
@@ -261,18 +267,21 @@ fn size_class_state_ready() -> bool {
 ///
 /// These caches are infrastructure for future migration of kernel object
 /// allocations (Phase 33, Track C.4 — deferred).
+///
+/// Phase 57b G.4 — each cache is wrapped in [`IrqSafeMutex`] so it inherits
+/// Track F.1's preempt-discipline.  Task-context only.
 #[allow(dead_code)]
 pub struct KernelSlabCaches {
     /// 512-byte objects (e.g. task control blocks).
-    pub task_cache: Mutex<SlabCache>,
+    pub task_cache: IrqSafeMutex<SlabCache>,
     /// 64-byte objects (e.g. file descriptors).
-    pub fd_cache: Mutex<SlabCache>,
+    pub fd_cache: IrqSafeMutex<SlabCache>,
     /// 128-byte objects (e.g. IPC endpoints).
-    pub endpoint_cache: Mutex<SlabCache>,
+    pub endpoint_cache: IrqSafeMutex<SlabCache>,
     /// 4096-byte objects (e.g. pipe buffers).
-    pub pipe_cache: Mutex<SlabCache>,
+    pub pipe_cache: IrqSafeMutex<SlabCache>,
     /// 256-byte objects (e.g. socket structures).
-    pub socket_cache: Mutex<SlabCache>,
+    pub socket_cache: IrqSafeMutex<SlabCache>,
 }
 
 static SLAB_CACHES: spin::Once<KernelSlabCaches> = spin::Once::new();
@@ -315,17 +324,17 @@ pub fn init() {
         // Build each element; core::array::from_fn isn't const but works here.
         core::array::from_fn(|i| SizeClassState {
             depot: MagazineDepot::new(),
-            slab: Mutex::new(SlabCache::new(SIZE_CLASSES[i], 4096)),
+            slab: IrqSafeMutex::new(SlabCache::new(SIZE_CLASSES[i], 4096)),
         })
     });
 
     // Named caches (backward compatibility).
     SLAB_CACHES.call_once(|| KernelSlabCaches {
-        task_cache: Mutex::new(SlabCache::new(512, 4096)),
-        fd_cache: Mutex::new(SlabCache::new(64, 4096)),
-        endpoint_cache: Mutex::new(SlabCache::new(128, 4096)),
-        pipe_cache: Mutex::new(SlabCache::new(4096, 4096)),
-        socket_cache: Mutex::new(SlabCache::new(256, 4096)),
+        task_cache: IrqSafeMutex::new(SlabCache::new(512, 4096)),
+        fd_cache: IrqSafeMutex::new(SlabCache::new(64, 4096)),
+        endpoint_cache: IrqSafeMutex::new(SlabCache::new(128, 4096)),
+        pipe_cache: IrqSafeMutex::new(SlabCache::new(4096, 4096)),
+        socket_cache: IrqSafeMutex::new(SlabCache::new(256, 4096)),
     });
     log::info!("[mm] slab caches initialized (13 size classes + depots)");
 }
@@ -346,7 +355,11 @@ static SLAB_RECLAIM_PENDING: AtomicU8 = AtomicU8::new(0);
 /// magazines / cross-CPU free lists on the receiving cores.
 static SLAB_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Serializes initiators so the reclaim IPI handshake cannot race.
-static SLAB_RECLAIM_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b G.4 — `IrqSafeMutex` so the reclaim helper inherits Track F.1's
+/// preempt-discipline.  Task-context only; the IPI handshake is decremented
+/// by remote cores and does not depend on local IRQ delivery.
+static SLAB_RECLAIM_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 
 fn drain_local_reclaimable_objects() -> super::heap::AllocatorLocalReclaimStats {
     let mut stats = super::heap::AllocatorLocalReclaimStats::default();

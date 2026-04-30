@@ -12,9 +12,10 @@ pub mod slab;
 pub mod user_mem;
 pub mod user_space;
 
+use crate::task::scheduler::{IrqSafeGuard, IrqSafeMutex};
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, MutexGuard, Once};
+use spin::Once;
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
@@ -28,11 +29,17 @@ use x86_64::{
 ///
 /// Wraps the PML4 physical address with metadata for TLB shootdown
 /// optimization (generation counter) and multi-core tracking.
+///
+/// Phase 57b G.4 — `page_table_lock` is an [`IrqSafeMutex`] so it inherits
+/// Track F.1's preempt-discipline.  Task-context only; consumers (paging,
+/// user_mem copy helpers, syscall handlers, PCI BAR mapping, page-fault
+/// handler) only hold the guard for RAII purposes (the `()` body is
+/// otherwise unused), so the type swap is transparent.
 pub struct AddressSpace {
     pml4_phys: PhysAddr,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
-    page_table_lock: Mutex<()>,
+    page_table_lock: IrqSafeMutex<()>,
 }
 
 #[allow(dead_code)]
@@ -42,7 +49,7 @@ impl AddressSpace {
             pml4_phys,
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
-            page_table_lock: Mutex::new(()),
+            page_table_lock: IrqSafeMutex::new(()),
         }
     }
 
@@ -72,7 +79,7 @@ impl AddressSpace {
         self.active_on_cores.load(Ordering::Acquire)
     }
 
-    pub fn lock_page_tables(&self) -> MutexGuard<'_, ()> {
+    pub fn lock_page_tables(&self) -> IrqSafeGuard<'_, ()> {
         self.page_table_lock.lock()
     }
 }

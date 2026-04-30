@@ -29,11 +29,11 @@
 
 extern crate alloc;
 
+use crate::task::scheduler::IrqSafeMutex;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES, size_to_class};
-use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 
@@ -238,14 +238,20 @@ impl BootstrapState {
 /// Early allocations are long-lived kernel structures, so deallocation is a
 /// deliberate no-op. Bootstrap pointers are still recognized by range so they
 /// remain safe to "free" after the cutover without corrupting size-class state.
+///
+/// Phase 57b G.4 — `state` is an [`IrqSafeMutex`] so it inherits Track F.1's
+/// preempt-discipline.  The bootstrap allocator is invoked from `GlobalAlloc`
+/// callsites that may run inside the page-fault exception path; never from a
+/// hard IRQ (allocation is forbidden in ISR context).  The conversion is
+/// purely additive — callsites compile unchanged via auto-deref.
 struct BootstrapAllocator {
-    state: Mutex<BootstrapState>,
+    state: IrqSafeMutex<BootstrapState>,
 }
 
 impl BootstrapAllocator {
     const fn new() -> Self {
         Self {
-            state: Mutex::new(BootstrapState::new()),
+            state: IrqSafeMutex::new(BootstrapState::new()),
         }
     }
 
@@ -465,7 +471,10 @@ impl AllocatorLocalReclaimStats {
 
 /// Serializes allocator-local reclaim so the shared remote-drain handshakes in
 /// the frame and slab layers cannot race with each other.
-static ALLOCATOR_RECLAIM_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b G.4 — `IrqSafeMutex` so the reclaim helper inherits Track F.1's
+/// preempt-discipline.  Task-context only; never taken from an ISR.
+static ALLOCATOR_RECLAIM_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 
 /// Recover allocator-local memory before declaring OOM / high-order failure.
 ///
@@ -675,7 +684,10 @@ static HEAP_MAPPED: AtomicUsize = AtomicUsize::new(0);
 /// `grow_heap` avoids leaving unmapped holes in the bootstrap heap range if two
 /// cores hit the fallback concurrently and one growth attempt only partially
 /// succeeds.
-static GROW_HEAP_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b G.4 — `IrqSafeMutex` so the growth helper inherits Track F.1's
+/// preempt-discipline.  Task-context only.
+static GROW_HEAP_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 
 /// Map the kernel heap region and initialise the bootstrap allocator.
 ///

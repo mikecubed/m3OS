@@ -43,11 +43,11 @@
 
 extern crate alloc;
 
+use crate::task::scheduler::IrqSafeMutex;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use kernel_core::buddy::BuddyAllocator;
-use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
@@ -454,10 +454,19 @@ impl FrameAllocator {
     }
 }
 
-struct LockedFrameAllocator(Mutex<FrameAllocator>);
+/// Phase 57b G.4 — `FRAME_ALLOCATOR.0` is an [`IrqSafeMutex`] so it inherits
+/// Track F.1's preempt-discipline.  The audit
+/// (docs/handoffs/57b-spinlock-callsite-audit.md, G.4 row) classifies the
+/// frame allocator as `convert-to-irqsafe`: the lock is taken from the CoW
+/// page-fault path, which is exception (task) context, not a hard IRQ.
+/// `IrqSafeMutex::lock` masks IRQs internally, so the explicit
+/// `without_interrupts` in `with_frame_alloc_irq_safe` is now redundant but
+/// retained as belt-and-suspenders for callers that read the helper's name
+/// to reason about ordering.
+struct LockedFrameAllocator(IrqSafeMutex<FrameAllocator>);
 
 static FRAME_ALLOCATOR: LockedFrameAllocator =
-    LockedFrameAllocator(Mutex::new(FrameAllocator::new()));
+    LockedFrameAllocator(IrqSafeMutex::new(FrameAllocator::new()));
 
 /// Acquire the global frame allocator lock with interrupts masked.
 ///
@@ -786,7 +795,11 @@ pub fn free_contiguous(phys: u64, order: usize) {
 static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
 /// Serializes initiators so concurrent memory-pressure drains cannot stomp the
 /// shared pending counter or IPI handshake.
-static CACHE_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Phase 57b G.4 — `IrqSafeMutex` so the drain initiator inherits Track F.1's
+/// preempt-discipline.  Task-context only; the IPI handshake is decremented
+/// by remote cores and does not depend on local IRQ delivery.
+static CACHE_DRAIN_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 /// Whether the current `IPI_CACHE_DRAIN` round should also service page-cache
 /// drains on the remote cores.
 static CACHE_DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
