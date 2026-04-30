@@ -751,8 +751,10 @@ mod tests {
     // depending on a fully-initialised SMP environment.  The kernel test
     // harness runs `test_main()` *before* `smp::init_bsp_per_core()` (see
     // `kernel/src/main.rs`), so [`crate::smp::per_core`] is not callable
-    // here — invoking [`crate::task::scheduler::preempt_disable`]
-    // directly would panic on the uninitialised gs_base.
+    // here.  [`crate::task::scheduler::preempt_disable`] guards itself with
+    // [`crate::smp::try_per_core`] and degrades to a no-op when per-core
+    // data is not yet initialised, so calling it directly is safe at this
+    // point — but it would not exercise the `fetch_add` we want to pin.
     //
     // Approach: mirror the exact atomic operations the helpers perform
     // against a private [`AtomicI32`].  This pins:

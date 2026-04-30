@@ -135,9 +135,9 @@ pub struct PreemptFrame {
 /// Byte offset of [`PreemptFrame::rax`].  Asserted to be 0.
 pub const PREEMPT_FRAME_OFFSET_RAX: usize = offset_of!(PreemptFrame, rax);
 
-/// Byte offset of [`PreemptFrame::rip`].  Asserted to be 14 × 8 = 112
-/// (15 GPRs precede `rip`, of which `rip` is the 16th `u64`-aligned
-/// slot at index 14 — after `rax..r15`).
+/// Byte offset of [`PreemptFrame::rip`].  Asserted to be 15 × 8 = 120
+/// (15 GPRs precede `rip`, so it occupies the 16th `u64`-aligned
+/// slot — immediately after `rax..r15`).
 pub const PREEMPT_FRAME_OFFSET_RIP: usize = offset_of!(PreemptFrame, rip);
 
 /// Byte offset of [`PreemptFrame::cs`].
