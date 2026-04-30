@@ -330,6 +330,11 @@ impl AmdViUnit {
         // ordered the COMPLETION_WAIT after the target command, so seeing
         // the marker means every preceding command has drained.
         // SAFETY: see above.
+        // HW-bounded: AMD-Vi hardware processes the command ring and writes the
+        // completion marker to the store page within the IOMMU command-queue
+        // completion latency (AMD IOMMU Specification §3.3.3, typically < 1 µs
+        // per command for cache-invalidation entries).
+        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
         loop {
             let observed =
                 unsafe { read_volatile(phys_to_virt(self.completion_store_phys) as *const u64) };

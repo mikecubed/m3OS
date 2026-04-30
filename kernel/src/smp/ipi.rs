@@ -42,6 +42,12 @@ pub(super) unsafe fn lapic_write(offset: usize, value: u32) {
 
 pub(super) unsafe fn wait_icr_idle() {
     unsafe {
+        // HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery').
+        // The LAPIC clears the delivery-pending bit in hardware after the IPI is
+        // accepted by the target local APIC.  No software agent holds this condition;
+        // converting to block+wake would require an interrupt-on-delivery that the
+        // LAPIC does not provide.
+        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
         while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
         }

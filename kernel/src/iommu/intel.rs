@@ -244,6 +244,10 @@ impl VtdUnit {
             if (self.read_u32(VtdRegs::GSTS) & bit) != 0 {
                 return Ok(());
             }
+            // HW-bounded: VT-d hardware updates GSTS within ~1 µs of receiving the
+            // write (Intel VT-d Architecture Specification §11.4.4, 'Global Status
+            // Register').  No IRQ-on-completion mechanism exists for GSTS updates.
+            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
             core::hint::spin_loop();
         }
         Err(IommuError::HardwareFault)
@@ -365,6 +369,9 @@ impl VtdUnit {
             if (self.read_u64(VtdRegs::CCMD) & CCMD_ICC) == 0 {
                 return;
             }
+            // HW-bounded: VT-d hardware clears ICC (bit 63 of CCMD_REG) after
+            // context-cache invalidation completes (Intel VT-d spec §11.4.4).
+            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
             core::hint::spin_loop();
         }
     }
@@ -387,6 +394,9 @@ impl VtdUnit {
             if (self.read_u64(cmd_offset) & IOTLB_IVT) == 0 {
                 return;
             }
+            // HW-bounded: VT-d hardware clears IVT (bit 63 of IOTLB_REG) after IOTLB
+            // invalidation completes (Intel VT-d spec §11.4.4).
+            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
             core::hint::spin_loop();
         }
     }

@@ -268,6 +268,10 @@ fn delay_us(us: u64) {
     let tpm = crate::arch::x86_64::apic::lapic_ticks_per_ms();
     let target_ticks = (tpm as u64 * us) / 1000;
     let start = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
+    // HW-bounded: ≤ `us` µs; used only during AP startup IPI sequence (Intel
+    // SDM Vol 3A §8.4.4, 'AP Initialization').  LAPIC timer countdown is a
+    // one-shot hardware register; no software agent drives it.
+    // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
     loop {
         let current = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
         let elapsed = start.wrapping_sub(current) as u64;

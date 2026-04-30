@@ -432,6 +432,11 @@ fn calibrate_lapic_timer() -> u32 {
         pit_gate.write(gate | 0x01); // gate high — starts countdown
 
         // Spin until PIT channel 2 output goes high (bit 5 of port 0x61).
+        // HW-bounded: 8254 PIT channel 2 sets bit 5 of port 0x61 after exactly
+        // 10 ms (the configured countdown period).  This spin runs once during
+        // LAPIC timer calibration at boot; it is not attributable to any user
+        // workload.
+        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
         while pit_gate.read() & 0x20 == 0 {
             core::hint::spin_loop();
         }
