@@ -1,6 +1,6 @@
 # Phase 57b — Preemption Foundation: Task List
 
-**Status:** Planned
+**Status:** Complete pending soak (PR #132)
 **Source Ref:** phase-57b
 **Depends on:** Phase 4 ✅, Phase 25 ✅, Phase 35 ✅, Phase 52c ✅ (free-list reuse), Phase 57a ✅
 **Goal:** Land per-task `preempt_count` discipline, the `PreemptFrame` save area, stable per-task storage, a per-CPU `current_preempt_count_ptr`, and lock-free spinlock-raises-`preempt_count` wiring as a no-op refactor.  Establish the contract every later subphase relies on.  No behaviour change; the kernel becomes preemption-CAPABLE but pre-emption is never actually fired.
@@ -9,14 +9,14 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit + TDD foundation (kernel-core model, lock declaration *and* acquisition catalogue) | — | Planned |
-| B | Stable per-task storage (`Vec<Box<Task>>`); free-list and indexing audit | A | Planned |
-| C | Per-CPU `current_preempt_count_ptr` + boot dummy + dispatch wiring | B | Planned |
-| D | `Task::preempt_count` field + lock-free `preempt_disable` / `preempt_enable` helpers + user-mode-return assertion | C | Planned |
-| E | `PreemptFrame` save-area struct + offset-of constants (unused in 57b) | A | Planned |
-| F | `IrqSafeMutex` migration to raise `preempt_count` (lock-free) | C, D | Planned |
-| G | Per-callsite migration of non-`IrqSafeMutex` lock sites (with IRQ-shared classification) | A, F | Planned |
-| H | Documentation, invariants, version bump, validation | A–G | Planned |
+| A | Audit + TDD foundation (kernel-core model, lock declaration *and* acquisition catalogue) | — | Complete |
+| B | Stable per-task storage (`Vec<Box<Task>>`); free-list and indexing audit | A | Complete |
+| C | Per-CPU `current_preempt_count_ptr` + boot dummy + dispatch wiring | B | Complete |
+| D | `Task::preempt_count` field + lock-free `preempt_disable` / `preempt_enable` helpers + user-mode-return assertion | C | Complete |
+| E | `PreemptFrame` save-area struct + offset-of constants (unused in 57b) | A | Complete |
+| F | `IrqSafeMutex` migration to raise `preempt_count` (lock-free) | C, D | Complete |
+| G | Per-callsite migration of non-`IrqSafeMutex` lock sites (with IRQ-shared classification) | A, F | Complete |
+| H | Documentation, invariants, version bump, validation | A–G | Complete pending soak |
 
 Tracks A through D are the foundation — they must complete before F/G.  Track E is independent and can run in parallel.  Track H is the closeout gate.
 
