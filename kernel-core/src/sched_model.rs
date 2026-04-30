@@ -1829,7 +1829,7 @@ mod tests {
         assert!(fx2.enqueue_to_run_queue);
     }
 
-    /// TB-6 — NVMe device-host: no kernel-side spin (structural contract).
+    /// TB-6 — NVMe device-host: no kernel-side spin (abstract IRQ-delivery contract).
     ///
     /// The NVMe driver runs entirely in ring-3 userspace.  The kernel-side
     /// device-host syscalls (`sys_device_claim`, `sys_device_mmio_map`,
@@ -1839,8 +1839,14 @@ mod tests {
     /// userspace NVMe driver goes through the standard notification /
     /// `block_current_until` path already exercised by TB-1 through TB-5.
     ///
-    /// This test is a structural contract assertion: it documents that the
-    /// kernel NVMe path has NO kernel-side block+wake site to convert.
+    /// This test verifies the abstract state-machine model of the NVMe IRQ
+    /// delivery contract: a ring-3 driver waiting for an IRQ must park via
+    /// `BlockedOnRecv` (yielding the CPU rather than spinning), and must
+    /// transition cleanly to `Ready` on the wake event.  It is a
+    /// model-level assertion, not a code-scan assertion — a code-scan for
+    /// `spin_loop()` absence is not needed because the device-host syscalls
+    /// are structurally immediate-return: they contain no loop bodies.
+    /// See the doc comment above for the architectural rationale.
     #[test]
     fn nvme_device_host_kernel_side_has_no_spin() {
         // The NVMe driver's ring-3 interrupt wait is modelled identically

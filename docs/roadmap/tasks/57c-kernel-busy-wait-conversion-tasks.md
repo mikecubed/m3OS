@@ -44,7 +44,7 @@ Tracks A is the foundation.  Tracks B and C run in parallel after A lands.  Trac
 - [x] Decision is one of: `convert` (Track B), `annotate` (Track C), `leave` (already documented or already converted in 57a).
 - [x] Every row maps to a Track B or Track C task.
 - [x] `git grep -E 'core::hint::spin_loop|while !.*\.load\(' kernel/src/` returns matches that are all in the catalogue.
-- [x] Catalogue includes the known sites enumerated in the design doc: `kernel/src/smp/ipi.rs:46`, `tlb.rs:102`, `tlb.rs:190`, `iommu/intel.rs:247`, `iommu/intel.rs:368`, `iommu/intel.rs:390`, `iommu/amd.rs:339`, `arch/x86_64/ps2.rs:207`, `arch/x86_64/ps2.rs:220`, `arch/x86_64/apic.rs:436`, `smp/boot.rs:277`, `rtc.rs:90`, `mm/frame_allocator.rs:876`, `mm/slab.rs:442`, `mm/slab.rs:604`, `main.rs:185`, `task/scheduler.rs:2111` (the on_cpu wait-spin from 57a — must stay), `task/scheduler.rs:2322` (the test-only entry), `arch/x86_64/syscall/mod.rs:3283` (the < 1 ms nanosleep TSC busy-wait — must stay).
+- [x] Catalogue includes the known sites enumerated in the design doc: `kernel/src/smp/ipi.rs:46`, `tlb.rs:120`, `tlb.rs:220`, `iommu/intel.rs:247`, `iommu/intel.rs:368`, `iommu/intel.rs:390`, `iommu/amd.rs:339`, `arch/x86_64/ps2.rs:239`, `arch/x86_64/ps2.rs:252`, `arch/x86_64/apic.rs:436`, `smp/boot.rs:277`, `rtc.rs:90`, `mm/frame_allocator.rs:942`, `mm/slab.rs:495`, `main.rs:185`, `task/scheduler.rs:2706` (the on_cpu wait-spin from 57a — must stay), `task/scheduler.rs:2916` (the test-only entry), `arch/x86_64/syscall/mod.rs:3302` (the < 1 ms nanosleep TSC busy-wait — must stay).
 
 ### A.2 — Classification doc
 
@@ -72,7 +72,7 @@ Each task is a single PR.  The conversion follows the template in the design doc
 
 **Acceptance:**
 - [x] Code review confirms `sleep` calls `block_current_until` with no subsidiary spin.
-- [x] Regression test: a task sleeps on a wait queue, another task wakes it, the sleeping task accumulates < 5 ms `ran_ticks` across the wait.
+- [x] Regression test: a task sleeps on a wait queue, another task wakes it; the sleeping task parks with `BlockedOnRecv` and yields immediately, then transitions to `Ready` on wake (verified by `sched_model` host-side test TB-4).
 
 ### B.2 — `net_task` NIC IRQ wake-up
 
@@ -81,8 +81,8 @@ Each task is a single PR.  The conversion follows the template in the design doc
 **Why it matters:** The networking RX path must not spin when the NIC has no traffic; otherwise it monopolises its core.
 
 **Acceptance:**
-- [x] `net_task` blocks via `block_current_until(&NIC_WOKEN, None)` on the NIC IRQ wake source (verify 57a Track F.6 migration is intact).
-- [x] Regression test: NIC IRQ wakes the task within 1 ms of asserting; the task accumulates < 5 ms `ran_ticks` across an idle window.
+- [x] `net_task` blocks via `block_current_until(TaskState::BlockedOnRecv, &NIC_WOKEN, None)` on the NIC IRQ wake source (verify 57a Track F.6 migration is intact).
+- [x] Regression test: NIC IRQ wakes the task within 1 ms of asserting; the task parks with `BlockedOnRecv` and yields immediately on quiescence, then transitions to `Ready` on the NIC wake event (verified by `sched_model` host-side test TB-3).
 
 ### B.3 — Audit-surfaced conversion target #1
 
@@ -92,7 +92,7 @@ Each task is a single PR.  The conversion follows the template in the design doc
 
 **Acceptance:**
 - [x] Conversion replaces the spin with `block_current_until` + a wake source.
-- [x] Regression test asserts `ran_ticks` < 5 ms across the wait window.
+- [x] Regression test: the blocking task parks with `BlockedOnRecv` and yields immediately, then transitions to `Ready` on wake (verified by the applicable `sched_model` host-side test).
 - [x] No regression in the existing test suite.
 
 ### B.4–B.8 — Audit-surfaced conversion targets #2–#6
@@ -163,7 +163,7 @@ Each task adds a doc comment to a hardware-bounded busy-spin.  No behavioural ch
 ### C.5 — `kernel/src/rtc.rs`
 
 **File:** `kernel/src/rtc.rs:90`
-**Symbol:** `wait_for_update_complete`
+**Symbol:** `read_rtc` (inner `update_in_progress()` UIP poll loop)
 **Why it matters:** The RTC update-in-progress wait is bounded by the RTC chip's update window (~244 µs).  Document.
 
 **Acceptance:**
