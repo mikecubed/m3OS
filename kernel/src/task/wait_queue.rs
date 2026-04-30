@@ -41,14 +41,24 @@ impl WaitQueue {
         }
     }
 
-    /// Block the current task and add it to this wait queue.
+    /// Block the current task until this wait queue is woken.
     ///
-    /// The task is set to `BlockedOnRecv` state and will be woken when
-    /// `wake_one()` or `wake_all()` is called.
+    /// The task transitions `Running → BlockedOnRecv` and yields to the
+    /// scheduler.  It accumulates no CPU time while blocked.
     ///
-    /// Uses an atomic `woken` flag to prevent lost wakeups: if a waker
-    /// sets the flag between enqueue and the blocking call, the task
-    /// skips blocking entirely.
+    /// **Wake source:** any caller of [`WaitQueue::wake_one`] or
+    /// [`WaitQueue::wake_all`], which set the per-waiter `woken` flag and
+    /// call `wake_task_v2` to enqueue the task on the run queue.
+    ///
+    /// **Expected wake latency:** ≤ one scheduler quantum after the waker
+    /// runs (typically < 10 ms for the 1 kHz tick, or within the same
+    /// quantum on a multi-core system).
+    ///
+    /// **Lost-wakeup safety:** an atomic `woken` flag per waiter closes the
+    /// TOCTOU window between enqueue and block.  If `wake_one`/`wake_all`
+    /// races with the enqueue, `block_current_until`'s step-3 recheck
+    /// observes the flag already `true` and self-reverts to `Running`
+    /// without yielding.
     pub fn sleep(&self) {
         if let Some(id) = scheduler::current_task_id() {
             let woken = Arc::new(AtomicBool::new(false));
