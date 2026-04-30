@@ -594,8 +594,42 @@ impl VtdUnit {
 
 const MAX_FAULT_UNITS: usize = 8;
 
+/// Phase 57b G.5 — IRQ-shared `spin::Mutex` per the Track A.1 audit
+/// (`docs/handoffs/57b-spinlock-callsite-audit.md` row
+/// `kernel/src/iommu/intel.rs:597`). [`dispatch_fault_irq`] (called from
+/// the VT-d MSI fault ISR via [`vtd_fault_irq_trampoline`]) acquires this
+/// lock to snapshot the slot-pointer array, so converting to
+/// `IrqSafeMutex` would not work with the ISR's existing pattern (the ISR
+/// runs with IF=0 and never raises the per-task preempt counter).
+///
+/// Task-context callers must explicitly `preempt_disable` +
+/// `interrupts::without_interrupts` to satisfy the F.1 preempt-discipline.
+/// See [`with_unit_slots`].
 static UNIT_SLOTS: spin::Mutex<[Option<usize>; MAX_FAULT_UNITS]> =
     spin::Mutex::new([None; MAX_FAULT_UNITS]);
+
+/// Phase 57b G.5 — task-context wrapper around [`UNIT_SLOTS`].
+///
+/// Wraps the `preempt_disable` + `interrupts::without_interrupts` +
+/// `UNIT_SLOTS.lock()` + `preempt_enable` boilerplate so every
+/// task-context callsite shares the same shape.
+///
+/// **Do not call this from an ISR**: [`dispatch_fault_irq`] takes
+/// `UNIT_SLOTS` directly because interrupt handlers already run with IF=0
+/// and follow their own discipline (no kernel preemption, no nested
+/// `preempt_disable`).
+///
+/// Lock-ordering: `preempt_disable` is lock-free (Phase 57b D.2), so
+/// calling it before `without_interrupts` cannot recurse.
+fn with_unit_slots<R>(f: impl FnOnce(&mut [Option<usize>; MAX_FAULT_UNITS]) -> R) -> R {
+    crate::task::scheduler::preempt_disable();
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slots = UNIT_SLOTS.lock();
+        f(&mut slots)
+    });
+    crate::task::scheduler::preempt_enable();
+    result
+}
 
 /// Tracks which device-IRQ vector (if any) the VT-d fault handler has
 /// claimed. Written once on first `install_fault_handler`.
@@ -899,20 +933,27 @@ impl IommuUnit for VtdUnit {
         };
 
         // 3. Register this unit's register base in the shared slot
-        //    array so the global IRQ dispatch can reach it.
-        {
-            let mut slots = UNIT_SLOTS.lock();
-            if !slots.contains(&Some(self.regs_virt as usize)) {
-                if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
-                    *slot = Some(self.regs_virt as usize);
-                } else {
-                    log::warn!(
-                        "[iommu] vtd unit[{}] fault slot array full, fault IRQ not installed",
-                        self.unit_index
-                    );
-                    return Err(IommuError::HardwareFault);
-                }
+        //    array so the global IRQ dispatch can reach it. Phase 57b
+        //    G.5 — `with_unit_slots` wraps the `preempt_disable` +
+        //    `without_interrupts` boilerplate around the IRQ-shared
+        //    `UNIT_SLOTS` lock.
+        let slot_result: Result<(), IommuError> = with_unit_slots(|slots| {
+            if slots.contains(&Some(self.regs_virt as usize)) {
+                return Ok(());
             }
+            if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
+                *slot = Some(self.regs_virt as usize);
+                Ok(())
+            } else {
+                Err(IommuError::HardwareFault)
+            }
+        });
+        if let Err(e) = slot_result {
+            log::warn!(
+                "[iommu] vtd unit[{}] fault slot array full, fault IRQ not installed",
+                self.unit_index
+            );
+            return Err(e);
         }
 
         // 4. Program FEDATA / FEADDR to route faults to the LAPIC of
