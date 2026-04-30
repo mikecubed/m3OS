@@ -18,14 +18,19 @@
 //! the file level.
 #![allow(dead_code)]
 
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 #[allow(unused_imports)]
 pub use kernel_core::fs::tmpfs::{MAX_FILE_SIZE, Tmpfs, TmpfsError, TmpfsStat};
 
 /// Global tmpfs instance. Rooted at the tmpfs tree root; `/tmp` and `/run`
 /// are created as top-level children by [`init`].
-pub static TMPFS: Mutex<Tmpfs> = Mutex::new(Tmpfs::new());
+///
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  TMPFS is only acquired
+/// from task context (init, syscall paths); no ISR ever reaches it.  Type
+/// swap is a pure auto-deref change for callsites.
+pub static TMPFS: IrqSafeMutex<Tmpfs> = IrqSafeMutex::new(Tmpfs::new());
 
 /// Populate the tmpfs tree with the standard mount-point directories.
 ///

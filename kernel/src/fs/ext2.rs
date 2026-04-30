@@ -17,7 +17,8 @@ use kernel_core::fs::ext2::{
     EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
     Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG,
 };
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Ext2Volume (P28-T019)
@@ -52,11 +53,20 @@ pub struct Ext2Volume {
     superblock_raw: Vec<u8>,
     /// Read-through block cache: block_num → data.
     /// Bounded to BLOCK_CACHE_MAX entries; no eviction (fill-and-hold).
-    block_cache: Mutex<BTreeMap<u32, Vec<u8>>>,
+    ///
+    /// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+    /// The block cache is only touched from task context (read/write
+    /// syscalls dispatched through `EXT2_VOLUME`); no ISR ever reaches it.
+    block_cache: IrqSafeMutex<BTreeMap<u32, Vec<u8>>>,
 }
 
 /// Global mounted ext2 volume (set by mount_ext2).
-pub static EXT2_VOLUME: Mutex<Option<Ext2Volume>> = Mutex::new(None);
+///
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// EXT2_VOLUME is only acquired from task context (mount, read/write/
+/// getdents syscalls); no ISR ever reaches it.  Type swap is a pure
+/// auto-deref change for callsites.
+pub static EXT2_VOLUME: IrqSafeMutex<Option<Ext2Volume>> = IrqSafeMutex::new(None);
 
 impl Ext2Volume {
     /// Mount an ext2 partition at the given base LBA (P28-T019).
@@ -101,7 +111,7 @@ impl Ext2Volume {
             block_size,
             sectors_per_block,
             superblock_raw: sb_raw,
-            block_cache: Mutex::new(BTreeMap::new()),
+            block_cache: IrqSafeMutex::new(BTreeMap::new()),
         })
     }
 
