@@ -131,3 +131,17 @@ fn no_preempt_when_kernel_mode() {
 fn preempt_enable_zero_crossing() {
     // TODO: activate in Track G
 }
+
+/// Stub: `peek_preempt_count_irq()` returns a value matching the lock-acquired
+/// path's read of the current task's `preempt_count`.
+///
+/// With preempts disabled, `peek_preempt_count_irq()` must equal the task's
+/// own `preempt_count` field (read atomically through the scheduler lock).
+///
+/// TODO: activate in Track G when the scheduler is fully wired up and we can
+/// run with a real current task context in the QEMU harness.
+#[test_case]
+#[ignore = "requires QEMU + full scheduler init"]
+fn peek_preempt_count_matches_task_count() {
+    // Full impl in Track G when the scheduler is wired up.
+}

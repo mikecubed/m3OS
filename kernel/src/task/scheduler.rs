@@ -1608,6 +1608,38 @@ pub fn preempt_enable() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57d F.1 — lock-free IRQ-context preempt count peek
+// ---------------------------------------------------------------------------
+
+/// Read the current task's preempt-disable depth from within an IRQ handler.
+///
+/// Uses `PerCoreData::current_preempt_count_ptr` — the same per-CPU pointer
+/// that `preempt_disable`/`preempt_enable` use (established in Phase 57b).
+/// The pointer is stable for the lifetime of the interrupt frame because:
+/// 1. We are executing in IRQ context (interrupts disabled by the CPU on entry).
+/// 2. No context switch can happen while interrupts are disabled.
+///
+/// Load ordering: `Acquire` on the pointer load + `Relaxed` on the counter
+/// load is sufficient — the pointer is only updated under the scheduler lock
+/// (or during task init before the task is runnable), and the IRQ entry itself
+/// provides a strong enough ordering barrier for observing the counter value.
+///
+/// Returns `0` when no task is current (e.g., during early boot before the
+/// first task is scheduled). In that case the caller should not preempt.
+pub fn peek_preempt_count_irq() -> i32 {
+    let ptr = crate::smp::per_core()
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: ptr is non-null and points to a live AtomicI32 within a Task
+    // that remains allocated for the duration of this interrupt (no task free
+    // can happen while interrupts are disabled on this core).
+    unsafe { (*ptr).load(core::sync::atomic::Ordering::Relaxed) }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 57b D.3 — user-mode-return preempt_count assertion
 // ---------------------------------------------------------------------------
 
