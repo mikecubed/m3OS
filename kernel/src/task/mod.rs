@@ -166,6 +166,39 @@ pub enum TaskState {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57d D.1 — ResumeMode
+// ---------------------------------------------------------------------------
+
+/// Determines which resume path the scheduler uses when dispatching a task.
+///
+/// Stored atomically in [`Task::resume_mode`].  Set under the scheduler lock
+/// at the suspension point; read at the dispatch point to choose
+/// between `switch_context` (cooperative) and `preempt_resume_to_user`
+/// (preempted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResumeMode {
+    /// Task has never been dispatched (initial state) — use cooperative path.
+    Initial = 0,
+    /// Task suspended cooperatively via `yield_now` or `block_current_until`.
+    /// Resume via `switch_context` (callee-saved restore + `ret`).
+    Cooperative = 1,
+    /// Task was preempted by `preempt_to_scheduler`.  Dispatch via
+    /// `preempt_resume_to_user` (full GPR restore + `iretq` to ring 3).
+    Preempted = 2,
+}
+
+impl From<u8> for ResumeMode {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => ResumeMode::Cooperative,
+            2 => ResumeMode::Preempted,
+            _ => ResumeMode::Initial,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TaskBlockState (Phase 57a B.1)
 // ---------------------------------------------------------------------------
 
@@ -335,6 +368,11 @@ pub struct Task {
     /// `PREEMPT_FRAME_OFFSET_*` constants exported from that module — the
     /// assembly stub uses those offsets directly.
     pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
+    /// Phase 57d D.1 — which resume path the scheduler uses for this task.
+    ///
+    /// `Preempted` → `preempt_resume_to_user` (full restore + `iretq`).
+    /// `Cooperative` / `Initial` → existing `switch_context` path.
+    pub resume_mode: core::sync::atomic::AtomicU8,
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +471,7 @@ impl Task {
             // entry, and 57d/57e's resume routines read it back to issue
             // `iretq` to the preempted instruction.
             preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
+            resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
         }
     }
 
