@@ -47,7 +47,8 @@ use kernel_core::driver_ipc::net::{
     NetDriverError, NetLinkEvent, decode_net_link_event, decode_net_rx_notify,
 };
 use kernel_core::types::{EndpointId, MacAddr};
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Tunable — TX queue depth cap
@@ -82,7 +83,11 @@ struct NicEntry {
 
 /// Global slot for the registered `RemoteNic`. `None` while no ring-3 NIC
 /// driver has registered; `Some(…)` once `RemoteNic::register` completes.
-static REMOTE_NIC: Mutex<Option<NicEntry>> = Mutex::new(None);
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// `RemoteNic` is the userspace-driver facade; every callsite is task
+// context (register, send_frame, drain_*, inject_rx_frame).  No ISR
+// touches this lock.
+static REMOTE_NIC: IrqSafeMutex<Option<NicEntry>> = IrqSafeMutex::new(None);
 
 /// Set when `RemoteNic::register` succeeds; checked lock-free on the hot
 /// TX path by `net::send_frame`.

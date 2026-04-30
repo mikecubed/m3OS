@@ -105,8 +105,7 @@ pub fn mac_address() -> Option<kernel_core::types::MacAddr> {
 // Socket table — Phase 23
 // ===========================================================================
 
-use spin::Mutex;
-
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
 /// Maximum number of open sockets system-wide.
@@ -202,7 +201,10 @@ impl SocketTable {
     }
 }
 
-static SOCKET_TABLE: Mutex<SocketTable> = Mutex::new(SocketTable::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// SOCKET_TABLE is touched only from socket syscalls and the net polling
+// task; the NIC ISR uses wake-queues instead of reaching this lock.
+static SOCKET_TABLE: IrqSafeMutex<SocketTable> = IrqSafeMutex::new(SocketTable::new());
 
 /// Per-socket wait queues — woken on data arrival, connection, close, etc.
 #[allow(clippy::declare_interior_mutable_const)]

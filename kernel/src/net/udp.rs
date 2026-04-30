@@ -1,6 +1,6 @@
 //! UDP datagram send/receive — pure logic re-exported from kernel-core.
 
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
@@ -9,7 +9,10 @@ use kernel_core::net::udp::{UdpBindings, build, parse};
 #[allow(unused_imports)]
 pub use kernel_core::net::udp::{UdpDatagram, UdpHeader};
 
-static UDP_BINDINGS: Mutex<UdpBindings> = Mutex::new(UdpBindings::new());
+// Phase 57b G.2.a — IrqSafeMutex inherits Track F.1's preempt-discipline.
+// UDP_BINDINGS is touched only from the net polling task and from socket
+// syscalls (task context); no ISR ever holds it.  Pure type change.
+static UDP_BINDINGS: IrqSafeMutex<UdpBindings> = IrqSafeMutex::new(UdpBindings::new());
 
 /// Bind a local UDP port for receiving datagrams.
 pub fn bind(port: u16) -> bool {
