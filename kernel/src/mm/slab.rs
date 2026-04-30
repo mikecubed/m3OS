@@ -436,21 +436,41 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
 
     // Phase 57b post-review fix — if IF is already masked on entry, the
     // caller is inside an `IrqSafeMutex` critical section (or an ISR /
-    // `without_interrupts`).  Broadcasting `IPI_CACHE_DRAIN` from such a
-    // context is unsafe: a contender on the outer IF-masking lock cannot
-    // service this core's drain IPI, so the holder waits forever for the
-    // ack.  Skip the broadcast and run only local + depot drains —
-    // sufficient to free objects this CPU has already returned and
-    // bounded so OOM can be reported back through the allocator slow
-    // path without deadlocking.
+    // `without_interrupts`).  Two hazards apply:
+    //
+    //   1. Broadcasting `IPI_CACHE_DRAIN` from this context is unsafe —
+    //      a contender on the outer IF-masking lock cannot service this
+    //      core's drain IPI, so the holder waits forever for the ack.
+    //   2. **Contending** on `SLAB_RECLAIM_LOCK` itself is unsafe — if
+    //      another core already holds it and is waiting for this core's
+    //      IPI ack, we would spin here with IF=0 and never service that
+    //      IPI, deadlocking both cores.
+    //
+    // The fix:
+    //
+    //   - IF=1 caller: take the lock with `.lock()` (waits if contended,
+    //     safe because we can service incoming IPIs while spinning), then
+    //     broadcast as usual.
+    //   - IF=0 caller: take the lock with `.try_lock()`.  On `None`
+    //     (contended) bail out completely — even bare local + depot
+    //     drains aren't worth a deadlock window.  Allocation surfaces
+    //     OOM and the caller retries or returns a null pointer.
     let if_enabled = x86_64::instructions::interrupts::are_enabled();
 
     // Phase 57b — preempt-only.  IF stays enabled because the holder
     // broadcasts `IPI_CACHE_DRAIN` and spins on remote acks; a contender
     // that masked IF would block both cores.
     crate::task::scheduler::preempt_disable();
+    let guard = if if_enabled {
+        Some(SLAB_RECLAIM_LOCK.lock())
+    } else {
+        SLAB_RECLAIM_LOCK.try_lock()
+    };
+    let Some(_reclaim_guard) = guard else {
+        crate::task::scheduler::preempt_enable();
+        return super::heap::AllocatorLocalReclaimStats::default();
+    };
     let stats = {
-        let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
         let mut stats = drain_local_reclaimable_objects();
 
         if if_enabled && crate::smp::is_per_core_ready() {

@@ -861,12 +861,28 @@ pub fn drain_per_cpu_caches() {
 
     // Phase 57b post-review fix — if IF is already masked on entry, the
     // caller is inside an `IrqSafeMutex` critical section, an ISR, or an
-    // explicit `without_interrupts(...)` block.  Broadcasting
-    // `IPI_CACHE_DRAIN` from such a context is unsafe: a contender on the
-    // outer IF-masking lock cannot service this core's drain IPI, so the
-    // holder waits forever for the ack.  Skip the broadcast and run only
-    // the local drain — callers (allocator slow path) handle the residual
-    // OOM by retrying or returning a null pointer.
+    // explicit `without_interrupts(...)` block.  Two hazards apply:
+    //
+    //   1. Broadcasting `IPI_CACHE_DRAIN` from this context is unsafe — a
+    //      contender on the outer IF-masking lock cannot service this
+    //      core's drain IPI, so the holder waits forever for the ack.
+    //   2. **Contending** on `CACHE_DRAIN_LOCK` itself is unsafe — if
+    //      another core already holds it and is waiting for this core's
+    //      IPI ack, we would spin here with IF=0 and never service that
+    //      IPI, deadlocking both cores.
+    //
+    // The fix:
+    //
+    //   - IF=1 caller: take the lock with `.lock()` (waits if contended,
+    //     safe because we can service incoming IPIs while spinning), then
+    //     broadcast as usual.
+    //   - IF=0 caller: take the lock with `.try_lock()`.  On `None`
+    //     (contended) bail out completely — no local drain either, since
+    //     even bare local work isn't worth a deadlock window.  Allocation
+    //     surfaces OOM and the caller retries or returns a null pointer.
+    //
+    // Local drain still runs in the IF=0 path *if* `try_lock` succeeded,
+    // which is the common case under non-pathological pressure.
     let if_enabled = x86_64::instructions::interrupts::are_enabled();
 
     // Phase 57b — preempt-only migration.  Raise `preempt_count` so 57d/57e
@@ -876,8 +892,16 @@ pub fn drain_per_cpu_caches() {
     // would block on `CACHE_DRAIN_LOCK`, so any contender that masked IF
     // would fail to service the holder's drain IPI and deadlock both cores.
     crate::task::scheduler::preempt_disable();
+    let guard = if if_enabled {
+        Some(CACHE_DRAIN_LOCK.lock())
+    } else {
+        CACHE_DRAIN_LOCK.try_lock()
+    };
+    let Some(_drain_guard) = guard else {
+        crate::task::scheduler::preempt_enable();
+        return;
+    };
     'critical: {
-        let _drain_guard = CACHE_DRAIN_LOCK.lock();
         let core_count = crate::smp::core_count();
 
         // Drain local cache (always — pure local work, no IPI required).

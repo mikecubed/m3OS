@@ -493,13 +493,31 @@ static ALLOCATOR_RECLAIM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 /// Callers must not hold the frame allocator lock, slab locks, or local
 /// magazine/page-cache guards while entering this helper.
 pub(crate) fn reclaim_allocator_local_caches(reason: &'static str) -> AllocatorLocalReclaimStats {
-    // Phase 57b — preempt-only.  IF stays enabled because the inner
-    // `drain_per_cpu_caches` / `collect_remote_frees` paths broadcast
-    // `IPI_CACHE_DRAIN` and spin on remote acks.
+    // Phase 57b post-review fix — same IF=0 hazard as the inner reclaim
+    // functions: contending on `ALLOCATOR_RECLAIM_LOCK` with IF masked
+    // can deadlock against a remote holder that is waiting for this
+    // core's IPI ack.  Use `try_lock` in the IF=0 path and bail out on
+    // contention — the caller (allocator slow path) handles OOM by
+    // retrying the local cache or returning a null pointer.  This also
+    // backstops the inner `drain_per_cpu_caches` / `collect_remote_frees`
+    // try_lock fallbacks: if we fail at this outer lock we never even
+    // attempt the inner ones.
+    //
+    // Phase 57b — preempt-only.  IF stays at the caller's level; the
+    // inner paths broadcast `IPI_CACHE_DRAIN` and spin on remote acks
+    // only when entered with IF=1.
+    let if_enabled = x86_64::instructions::interrupts::are_enabled();
     crate::task::scheduler::preempt_disable();
+    let guard = if if_enabled {
+        Some(ALLOCATOR_RECLAIM_LOCK.lock())
+    } else {
+        ALLOCATOR_RECLAIM_LOCK.try_lock()
+    };
+    let Some(_reclaim_guard) = guard else {
+        crate::task::scheduler::preempt_enable();
+        return AllocatorLocalReclaimStats::default();
+    };
     let stats = {
-        let _reclaim_guard = ALLOCATOR_RECLAIM_LOCK.lock();
-
         super::frame_allocator::drain_per_cpu_caches();
         let mut stats = super::slab::collect_remote_frees();
         stats.reclaimed_slab_pages = super::slab::reclaim_empty_slabs();
