@@ -419,7 +419,14 @@ pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 // chain, one scratch page, one DMA buffer, and one wake flag. Serialize all
 // task-context I/O through that single in-flight slot until the driver grows
 // true multi-request bookkeeping.
-static REQUEST_LOCK: Mutex<()> = Mutex::new(());
+//
+// Phase 57b G.1.a — `IrqSafeMutex` so the F.1 wiring raises
+// `preempt_count` on acquire and the matching guard `Drop` lowers it on
+// release. REQUEST_LOCK is task-context-only (no ISR ever touches it), so
+// the IrqSafeMutex shape is sufficient — no explicit-preempt-and-cli
+// wrapper is needed at the callsites.
+static REQUEST_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
+    crate::task::scheduler::IrqSafeMutex::new(());
 
 // Single wake flag reused across requests — requests are fully serialized
 // under REQUEST_LOCK, so only one task is ever waiting at a time.
