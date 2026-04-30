@@ -450,6 +450,50 @@ struct VirtioNetDriver {
 
 static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
 
+/// Phase 57b G.2.b — IRQ-shared `DRIVER` lock helper.
+///
+/// `DRIVER` is a plain `spin::Mutex` because the virtio-net IRQ handler
+/// (`virtio_net_irq_handler`) acquires the same lock from ISR context
+/// (legacy INTx ack path).  Converting to [`IrqSafeMutex`] would be
+/// incorrect — the ISR runs with `IF=0` already, so a `preempt_disable`
+/// on the ISR side would unbalance the per-task counter against the
+/// task-context release.
+///
+/// Task-context acquisitions therefore wrap the lock manually with the
+/// Track G.2.b template:
+///
+///   1. [`preempt_disable`] — raise `preempt_count` *before* masking IRQs
+///      so a preempt-aware assertion (Phase 57b D.3) can observe the lock
+///      as held even from a stack trace taken inside the critical section.
+///   2. [`interrupts::without_interrupts`] — mask IF for the duration of
+///      the inner `DRIVER.lock()` so a same-core ISR cannot deadlock on
+///      the held spin lock.
+///   3. `DRIVER.lock()` — the ISR-shared `spin::Mutex` acquire.
+///   4. [`preempt_enable`] — drop `preempt_count` *after* the spin guard
+///      and IF restore have unwound, mirroring [`IrqSafeMutex::Drop`]'s
+///      tail order from Track F.1.
+///
+/// The ISR callsite (`virtio_net_irq_handler`) is intentionally left as a
+/// bare `DRIVER.lock()`: it executes with `IF=0` because the CPU enters
+/// the handler with interrupts already masked, and the ISR-side
+/// preempt-count contribution is accounted for by the wave-3 user-mode-
+/// return assertion (Phase 57b D.3) — not by paired
+/// `preempt_disable` / `preempt_enable` here.
+///
+/// Single helper to keep the four task-context callsites DRY (`recv_frames`,
+/// `send_frame`, `mac_address`, `pci_interrupt_line`, plus the one-shot
+/// init-side `*DRIVER.lock() = Some(driver)` in `init_with_handle`).
+#[inline]
+fn with_driver<R>(f: impl FnOnce(&mut Option<VirtioNetDriver>) -> R) -> R {
+    crate::task::scheduler::preempt_disable();
+    let result = interrupts::without_interrupts(|| {
+        let mut guard = DRIVER.lock();
+        f(&mut guard)
+    });
+    crate::task::scheduler::preempt_enable();
+    result
+}
+
 /// Set to true once the driver is initialized and ready.
 pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 
@@ -498,7 +542,7 @@ pub fn wake_net_task() {
 /// Returns the MAC address of the virtio-net device, if initialized.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<MacAddr> {
-    interrupts::without_interrupts(|| DRIVER.lock().as_ref().map(|d| d.mac))
+    with_driver(|slot| slot.as_ref().map(|d| d.mac))
 }
 
 /// Returns the legacy PCI interrupt line of the claimed virtio-net device,
@@ -508,10 +552,8 @@ pub fn mac_address() -> Option<MacAddr> {
 /// the PCI handle lives inside the driver (Phase 55 B.3).
 #[allow(dead_code)]
 pub fn pci_interrupt_line() -> Option<u8> {
-    interrupts::without_interrupts(|| {
-        DRIVER
-            .lock()
-            .as_ref()
+    with_driver(|slot| {
+        slot.as_ref()
             .map(|d| d.pci.device().interrupt_line)
             .filter(|&line| line != 0xFF)
     })
@@ -583,10 +625,11 @@ fn virtio_net_irq_handler() {
 pub fn recv_frames() -> Vec<Vec<u8>> {
     // The driver lock must be taken with IF off so the ISR (which also
     // takes the lock) cannot fire on this CPU mid-critical-section. See
-    // Fix 1 note in `blk/virtio_blk.rs`.
-    let mut raw_frames: Vec<Vec<u8>> = interrupts::without_interrupts(|| {
-        let mut driver = DRIVER.lock();
-        let driver = match driver.as_mut() {
+    // Fix 1 note in `blk/virtio_blk.rs`. `with_driver` is the Track G.2.b
+    // wrapper that adds the paired `preempt_disable` / `preempt_enable`
+    // around the IF-off region.
+    let mut raw_frames: Vec<Vec<u8>> = with_driver(|slot| {
+        let driver = match slot.as_mut() {
             Some(d) => d,
             None => return Vec::new(),
         };
@@ -649,9 +692,8 @@ pub fn send_frame(frame: &[u8]) {
     let mut buf = vec![0u8; total];
     buf[VIRTIO_NET_HDR_SIZE..].copy_from_slice(frame);
 
-    interrupts::without_interrupts(|| {
-        let mut driver = DRIVER.lock();
-        let driver = match driver.as_mut() {
+    with_driver(|slot| {
+        let driver = match slot.as_mut() {
             Some(d) => d,
             None => {
                 log::warn!("[virtio-net] send_frame: driver not initialized");
@@ -885,7 +927,7 @@ fn init_with_handle(handle: pci::PciDeviceHandle) {
         Port::<u16>::new(io_base + VIRTIO_QUEUE_NOTIFY).write(0);
     }
 
-    *DRIVER.lock() = Some(driver);
+    with_driver(|slot| *slot = Some(driver));
     VIRTIO_NET_READY.store(true, Ordering::Release);
 
     log::info!("[virtio-net] driver initialized successfully");
