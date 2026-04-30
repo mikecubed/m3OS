@@ -5,6 +5,48 @@
 //!
 //! A [`MagazineDepot`] is the shared pool from which CPUs exchange empty
 //! magazines for full ones (and vice-versa), protected by a spinlock.
+//!
+//! ## Phase 57b G.9 — preempt-discipline classification
+//!
+//! Per the Track A.1 spinlock callsite audit
+//! (`docs/handoffs/57b-spinlock-callsite-audit.md`, row for
+//! `kernel-core/src/magazine.rs`), the two `spin::Mutex` fields inside
+//! [`MagazineDepot`] (`full` and `empty`) are classified **host-test-only**:
+//!
+//! - **Host build (`cargo test -p kernel-core`)** — the locks are exercised
+//!   directly by the in-module unit tests below. Host tests are
+//!   single-threaded and have no scheduler, so `spin::Mutex` provides exactly
+//!   the contract the tests need; preempt-discipline is a no-op concept.
+//!
+//! - **Kernel build (`cargo xtask run`/`test`)** — the depot is a member of
+//!   `kernel::mm::slab::SizeClassState`. The depot's lock acquisitions are
+//!   reached from the slab fast path (`magazine_alloc` / `magazine_free`)
+//!   and the cold reclaim path (`drain_depot_magazines`). The audit's
+//!   classification is "host-test-only on host build / convert-to-irqsafe
+//!   via wrapper on kernel build" — the **wrapper** referenced is the
+//!   kernel-side caller, not a kernel-core type. `kernel-core` cannot
+//!   reach `kernel::task::scheduler::preempt_disable` /
+//!   `preempt_enable` from a `no_std` cdep without an extern hook, so
+//!   the discipline is enforced **at the kernel-side consumer site** —
+//!   either by holding the depot inside an `IrqSafeMutex` (Track F) or by
+//!   bracketing each depot operation in an explicit `preempt_disable` /
+//!   `preempt_enable` pair at the slab callsite.
+//!
+//! Today the kernel callers (`kernel/src/mm/slab.rs`) wrap depot operations
+//! in `interrupts::without_interrupts(|| ...)` so IF=0 across the critical
+//! section. That alone is sufficient to keep the depot's `spin::Mutex` from
+//! being re-entered by an ISR on the same core. Phase 57b's `preempt_count`
+//! discipline (Track F) adds a parallel guarantee that voluntary preemption
+//! cannot fire inside the locked region; if/when Phase 57d wires voluntary
+//! preemption points into the slab fast path, the kernel-side caller — not
+//! `kernel-core` — owns the migration to `preempt_disable` / `preempt_enable`
+//! (or to wrapping the depot in an `IrqSafeMutex<MagazineDepot>` field).
+//!
+//! Track G.9 deliberately keeps `MagazineDepot::full` / `::empty` as plain
+//! `spin::Mutex` so the host test suite continues to exercise the pure-logic
+//! invariants of the magazine state machine without pulling in any kernel-
+//! side `IrqSafeMutex` machinery. The audit row's "host-test-only" tag
+//! pins this contract.
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -99,6 +141,23 @@ impl Magazine {
 /// Shared depot of full and empty magazines, one per size-class.
 ///
 /// CPUs exchange their exhausted/filled magazines here under the depot lock.
+///
+/// ## Lock-discipline contract (Phase 57b G.9, host-test-only)
+///
+/// `full` and `empty` are `spin::Mutex` on every build target.  See the
+/// module-level "Phase 57b G.9 — preempt-discipline classification" section
+/// for the full rationale.  In short:
+///
+/// - **Host build** — `cargo test -p kernel-core` uses these locks directly.
+/// - **Kernel build** — the kernel-side caller (`kernel/src/mm/slab.rs`) is
+///   responsible for wrapping every depot operation in an interrupt-masked
+///   region (`without_interrupts`, IrqSafeMutex, or an explicit
+///   `preempt_disable` / `preempt_enable` pair).  `MagazineDepot` itself does
+///   not call `preempt_disable` because `kernel-core` is `no_std` and cannot
+///   reach `kernel::task::scheduler` from the host build.
+///
+/// Source ref: `docs/handoffs/57b-spinlock-callsite-audit.md` row
+/// `kernel-core/src/magazine.rs:?` (classification: `host-test-only`).
 pub struct MagazineDepot {
     full: Mutex<Vec<Magazine>>,
     empty: Mutex<Vec<Magazine>>,
