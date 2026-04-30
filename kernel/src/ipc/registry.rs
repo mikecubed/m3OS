@@ -1,16 +1,23 @@
 //! Service registry — re-exported from kernel-core with global state wrapper.
 #![allow(dead_code)]
 
-use spin::{Lazy, Mutex};
+use spin::Lazy;
 
 use super::EndpointId;
+use crate::task::scheduler::IrqSafeMutex;
 
 #[allow(unused_imports)]
 pub use kernel_core::ipc::registry::RegistryError;
 
 use kernel_core::ipc::registry::Registry;
 
-static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::new()));
+/// Service registry global.
+///
+/// Phase 57b G.6 — `IrqSafeMutex` inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  Only acquired from task
+/// context (registry lookups during ipc syscalls); no ISR ever reaches it.
+/// Pure type swap — callsites compile unchanged via auto-deref.
+static REGISTRY: Lazy<IrqSafeMutex<Registry>> = Lazy::new(|| IrqSafeMutex::new(Registry::new()));
 
 /// Register a named service endpoint.
 pub fn register(name: &str, ep_id: EndpointId) -> Result<(), RegistryError> {
