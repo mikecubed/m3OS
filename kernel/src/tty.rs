@@ -4,7 +4,8 @@
 //! window size, foreground process group, and unified line discipline.
 
 use kernel_core::tty::{LineDiscipline, Winsize};
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 /// Kernel-side TTY state for the single console.
 ///
@@ -27,4 +28,8 @@ impl TtyState {
 }
 
 /// The single console TTY instance.
-pub static TTY0: Mutex<TtyState> = Mutex::new(TtyState::new());
+///
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// TTY0 is only acquired from task context (serial input feeder, console
+/// writes, syscall handlers); no ISR reaches it.
+pub static TTY0: IrqSafeMutex<TtyState> = IrqSafeMutex::new(TtyState::new());

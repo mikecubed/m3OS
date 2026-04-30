@@ -3,14 +3,23 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use kernel_core::log_ring::LogRing;
-use spin::Mutex;
 use uart_16550::SerialPort;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 const COM1_PORT: u16 = 0x3F8;
 const DMESG_RING_SIZE: usize = 64 * 1024;
 
-static SERIAL1: Mutex<Option<SerialPort>> = Mutex::new(None);
-static DMESG_RING: Mutex<LogRing<DMESG_RING_SIZE>> = Mutex::new(LogRing::new());
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// SERIAL1 is only acquired from task / panic context (kernel logs and the
+/// panic handler); the COM1 RX ISR (`handle_serial_irq`) does not take this
+/// lock — it pushes bytes through a lock-free atomic ring buffer
+/// (`SERIAL_RX_RAW`).
+static SERIAL1: IrqSafeMutex<Option<SerialPort>> = IrqSafeMutex::new(None);
+
+/// Phase 57b G.7 — IrqSafeMutex (task / panic-context only, written from
+/// the same path as SERIAL1).
+static DMESG_RING: IrqSafeMutex<LogRing<DMESG_RING_SIZE>> = IrqSafeMutex::new(LogRing::new());
 
 pub fn init() {
     let mut serial_port = unsafe { SerialPort::new(COM1_PORT) };

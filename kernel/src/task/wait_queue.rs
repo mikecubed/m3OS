@@ -13,8 +13,8 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
+use super::scheduler::IrqSafeMutex;
 use super::{TaskId, scheduler};
 
 /// An entry in the wait queue: task id + atomic woken token.
@@ -24,14 +24,20 @@ struct WaitEntry {
 }
 
 /// A queue of tasks waiting for an event.
+///
+/// Phase 57b G.7 — `waiters` uses `IrqSafeMutex` so it inherits Track F.1's
+/// preempt-discipline.  The wait-queue API is task-context only (sleep,
+/// register, deregister, wake_one, wake_all are all called from kernel task
+/// paths — never from an ISR; ISR-side wakers signal `AtomicBool` flags and
+/// invoke `wake_task_v2` directly).
 pub struct WaitQueue {
-    waiters: Mutex<VecDeque<WaitEntry>>,
+    waiters: IrqSafeMutex<VecDeque<WaitEntry>>,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
         WaitQueue {
-            waiters: Mutex::new(VecDeque::new()),
+            waiters: IrqSafeMutex::new(VecDeque::new()),
         }
     }
 

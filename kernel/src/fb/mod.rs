@@ -14,7 +14,8 @@
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
-use spin::Mutex;
+
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // 8×16 VGA font — IBM Code Page 437, glyphs 0x20–0x7E (95 characters).
@@ -804,7 +805,10 @@ impl FbConsole {
 // Global state
 // ---------------------------------------------------------------------------
 
-static CONSOLE: Mutex<Option<FbConsole>> = Mutex::new(None);
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// CONSOLE is only acquired from task / panic context (kernel logs,
+/// framebuffer init, panic handler).  No ISR reaches it.
+static CONSOLE: IrqSafeMutex<Option<FbConsole>> = IrqSafeMutex::new(None);
 
 /// When `true`, framebuffer text output is suppressed (a graphical process owns
 /// the framebuffer directly).  Serial output is unaffected.

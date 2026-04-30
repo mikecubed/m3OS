@@ -4,14 +4,18 @@
 //! per-PTY termios, edit buffer, and foreground process group tracking.
 
 use kernel_core::pty::{MAX_PTYS, PtyPairState};
-use spin::Mutex;
 
+use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
 /// Global PTY pair table. Each slot is `None` (free) or `Some(PtyPairState)`.
-pub static PTY_TABLE: Mutex<[Option<PtyPairState>; MAX_PTYS]> = {
+///
+/// Phase 57b G.7 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// PTY_TABLE is only acquired from task context (PTY syscalls); no ISR
+/// reaches it.
+pub static PTY_TABLE: IrqSafeMutex<[Option<PtyPairState>; MAX_PTYS]> = {
     const NONE: Option<PtyPairState> = None;
-    Mutex::new([NONE; MAX_PTYS])
+    IrqSafeMutex::new([NONE; MAX_PTYS])
 };
 
 /// Per-PTY wait queues for master side (woken when slave writes data to s2m).
