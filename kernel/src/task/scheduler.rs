@@ -1736,6 +1736,11 @@ pub fn check_deferred_preempt_at_user_return() {
         .preempt_resched_pending
         .swap(false, core::sync::atomic::Ordering::AcqRel);
     if pending {
+        log::info!(
+            "[preempt] deferred-yield at user-return: core={} pid={}",
+            core.core_id,
+            crate::process::current_pid()
+        );
         yield_now();
     }
 }
@@ -1790,7 +1795,7 @@ pub fn yield_now() {
         let n =
             YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         if n > 0 {
-            log::debug!("[sched] yield-enter core={}", core_id);
+            log::info!("[sched] yield-enter core={}", core_id);
         }
     }
     let addr_space_snapshot =
@@ -1842,7 +1847,7 @@ pub fn yield_now() {
     {
         let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
         if n >= 0 {
-            log::debug!(
+            log::info!(
                 "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
                 my_core,
                 sched_rsp,
@@ -1851,6 +1856,18 @@ pub fn yield_now() {
         }
     }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+    // Task resumed cooperatively from yield_now — heading back to user mode.
+    {
+        let core_id = crate::smp::per_core().core_id;
+        let n = YIELD_LOG_BUDGET[core_id as usize].load(core::sync::atomic::Ordering::Relaxed);
+        if n >= 0 {
+            log::info!(
+                "[sched] yield-resumed core={} pid={}",
+                core_id,
+                crate::process::current_pid()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
