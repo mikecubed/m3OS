@@ -434,6 +434,17 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
         return super::heap::AllocatorLocalReclaimStats::default();
     }
 
+    // Phase 57b post-review fix — if IF is already masked on entry, the
+    // caller is inside an `IrqSafeMutex` critical section (or an ISR /
+    // `without_interrupts`).  Broadcasting `IPI_CACHE_DRAIN` from such a
+    // context is unsafe: a contender on the outer IF-masking lock cannot
+    // service this core's drain IPI, so the holder waits forever for the
+    // ack.  Skip the broadcast and run only local + depot drains —
+    // sufficient to free objects this CPU has already returned and
+    // bounded so OOM can be reported back through the allocator slow
+    // path without deadlocking.
+    let if_enabled = x86_64::instructions::interrupts::are_enabled();
+
     // Phase 57b — preempt-only.  IF stays enabled because the holder
     // broadcasts `IPI_CACHE_DRAIN` and spins on remote acks; a contender
     // that masked IF would block both cores.
@@ -442,7 +453,7 @@ pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
         let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
         let mut stats = drain_local_reclaimable_objects();
 
-        if crate::smp::is_per_core_ready() {
+        if if_enabled && crate::smp::is_per_core_ready() {
             let my_core = crate::smp::per_core().core_id;
             let mut remote_count: u8 = 0;
             for cid in 0..crate::smp::core_count() {

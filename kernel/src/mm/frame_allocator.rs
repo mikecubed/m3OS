@@ -859,6 +859,16 @@ pub fn drain_per_cpu_caches() {
         return;
     }
 
+    // Phase 57b post-review fix — if IF is already masked on entry, the
+    // caller is inside an `IrqSafeMutex` critical section, an ISR, or an
+    // explicit `without_interrupts(...)` block.  Broadcasting
+    // `IPI_CACHE_DRAIN` from such a context is unsafe: a contender on the
+    // outer IF-masking lock cannot service this core's drain IPI, so the
+    // holder waits forever for the ack.  Skip the broadcast and run only
+    // the local drain — callers (allocator slow path) handle the residual
+    // OOM by retrying or returning a null pointer.
+    let if_enabled = x86_64::instructions::interrupts::are_enabled();
+
     // Phase 57b — preempt-only migration.  Raise `preempt_count` so 57d/57e
     // cannot preempt the holder mid-IPI-handshake; do NOT mask IF, since the
     // holder spins on `DRAIN_PENDING` while remote cores ack via the
@@ -870,10 +880,12 @@ pub fn drain_per_cpu_caches() {
         let _drain_guard = CACHE_DRAIN_LOCK.lock();
         let core_count = crate::smp::core_count();
 
-        // Drain local cache.
+        // Drain local cache (always — pure local work, no IPI required).
         let _ = drain_local_page_cache_to_pool();
 
-        if core_count <= 1 {
+        if core_count <= 1 || !if_enabled {
+            // Either single-core (nothing to broadcast) or caller has IF
+            // masked (broadcast would deadlock — see comment above).
             break 'critical;
         }
 
