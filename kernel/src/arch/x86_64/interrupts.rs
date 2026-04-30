@@ -175,6 +175,42 @@ fn fault_kill_trampoline() -> ! {
     crate::task::mark_current_dead();
 }
 
+/// Phase 57b post-review fix — invoke [`crate::smp::tlb::tlb_shootdown_range`]
+/// safely from page-fault exception context.
+///
+/// CPU exception handlers (page fault, GP, etc.) run with `IF=0` set by
+/// hardware on entry.  If two cores fault concurrently and both reach the
+/// shootdown path, one takes `SHOOTDOWN_LOCK` and broadcasts an
+/// `IPI_TLB_SHOOTDOWN` to the other, then spins waiting for the ack — but
+/// the other core is contending for `SHOOTDOWN_LOCK` with `IF=0` and
+/// cannot service the IPI.  Both cores deadlock.
+///
+/// `tlb_shootdown_range` itself uses the **preempt-only** discipline (no
+/// IF masking), so it is safe to enable IF here for the duration of the
+/// shootdown.  The page-fault handler has already finished its
+/// synchronous page-table mutation under
+/// [`crate::mm::AddressSpace::lock_page_tables`]; `IF=1` during the
+/// shootdown does not race against that critical section because the
+/// guard has been dropped before this helper runs.
+///
+/// On `iretq` the CPU pops the saved RFLAGS so the user's original IF
+/// state is restored regardless of the IF bit at the moment of the
+/// `iretq`.
+fn tlb_shootdown_range_from_fault_context(
+    addr_space: &crate::mm::AddressSpace,
+    start: u64,
+    end: u64,
+) {
+    let saved_if = x86_64::instructions::interrupts::are_enabled();
+    if !saved_if {
+        x86_64::instructions::interrupts::enable();
+    }
+    crate::smp::tlb::tlb_shootdown_range(addr_space, start, end);
+    if !saved_if {
+        x86_64::instructions::interrupts::disable();
+    }
+}
+
 /// Resolve a copy-on-write page fault at `vaddr`.
 ///
 /// Reads the current PTE, allocates a fresh frame, copies the page contents,
@@ -266,7 +302,7 @@ pub fn resolve_cow_fault(vaddr: u64) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
+        tlb_shootdown_range_from_fault_context(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
     } else {
         x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
     }
@@ -385,7 +421,7 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(
+        tlb_shootdown_range_from_fault_context(
             unsafe { addr_space.as_ref() },
             page_base,
             page_base + 4096,
@@ -429,7 +465,7 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(
+        tlb_shootdown_range_from_fault_context(
             unsafe { addr_space.as_ref() },
             page_base,
             page_base + 4096,
