@@ -1171,12 +1171,7 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task_idx: idx as u32,
         core: target_core,
     });
-    // PHASE 57 DEBUG: log every fork-child task spawn at INFO so the
-    // boot transcript shows the (pid, task_idx, target_core) tuple
-    // for every fork. Two pids (kbd at 6, fat at 10) never reach
-    // their userspace child path; this trace tells us whether they
-    // even get enqueued, and to which core.
-    log::info!(
+    log::debug!(
         "[sched] fork-task-spawn pid={} task_idx={} target_core={} rip={:#x} rsp={:#x}",
         fork_pid,
         idx,
@@ -1736,7 +1731,7 @@ pub fn check_deferred_preempt_at_user_return() {
         .preempt_resched_pending
         .swap(false, core::sync::atomic::Ordering::AcqRel);
     if pending {
-        log::info!(
+        log::debug!(
             "[preempt] deferred-yield at user-return: core={} pid={}",
             core.core_id,
             crate::process::current_pid()
@@ -1750,21 +1745,9 @@ pub fn check_deferred_preempt_at_user_return() {
 #[inline(always)]
 pub fn check_deferred_preempt_at_user_return() {}
 
-/// Phase 57 DEBUG: per-core countdown for yield_now log markers.
-/// Atomic so the IPI-context observer doesn't trip race detection
-/// in case a yield races with another path.
-// Phase 57a follow-up: bumped from 4 to 1024 so the per-core dispatch
-// regression (tasks queued on core 1 silently never dispatching after the
-// first wave) is visible in the boot transcript instead of being budgeted
-// out after the first 4 yields.
-static YIELD_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
-    [const { core::sync::atomic::AtomicI32::new(1024) }; crate::smp::MAX_CORES];
-
-// Phase 57a follow-up DEBUG: per-core budget for the dequeue filter-drop
-// trace.  Each filter rejection in `dequeue_local` consumes one slot.
-// Bounded so a permanently-stuck task that the queue scanner repeatedly
-// rejects doesn't drown the log; large enough to surface the *first*
-// time a previously-running task gets filtered out.
+// Per-core budget for the dequeue filter-drop trace in `dequeue_local`.
+// Each filter rejection consumes one slot; bounded so a permanently-stuck task
+// doesn't drown the log.
 static DEQUEUE_FILTER_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
     [const { core::sync::atomic::AtomicI32::new(64) }; crate::smp::MAX_CORES];
 
@@ -1786,18 +1769,6 @@ fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extr
 
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
-    // Phase 57 DEBUG: log entry and exit of yield_now per core. If
-    // we see "yield-enter core=3" but no "yield-handoff core=3" or
-    // a missing "resume core=3" pair, we'll know the yield itself is
-    // hanging vs the switch_context call site is hanging.
-    {
-        let core_id = crate::smp::per_core().core_id;
-        let n =
-            YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        if n > 0 {
-            log::info!("[sched] yield-enter core={}", core_id);
-        }
-    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
@@ -1842,32 +1813,7 @@ pub fn yield_now() {
         task_idx: idx as u32,
         core: my_core as u8,
     });
-    // Phase 57 DEBUG: log right before the switch_context handoff so
-    // we can spot a yield that reaches here but doesn't hand off.
-    {
-        let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
-        if n >= 0 {
-            log::info!(
-                "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
-                my_core,
-                sched_rsp,
-                idx
-            );
-        }
-    }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
-    // Task resumed cooperatively from yield_now — heading back to user mode.
-    {
-        let core_id = crate::smp::per_core().core_id;
-        let n = YIELD_LOG_BUDGET[core_id as usize].load(core::sync::atomic::Ordering::Relaxed);
-        if n >= 0 {
-            log::info!(
-                "[sched] yield-resumed core={} pid={}",
-                core_id,
-                crate::process::current_pid()
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3156,12 +3102,7 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
 /// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
-    // Phase 57 DEBUG: log scheduler-loop iterations per core so we can
-    // tell whether a "stuck" core is actually executing the loop at all.
-    // Bumped from 4 to 1024 (Phase 57a follow-up) so a per-core dispatch
-    // failure that emerges AFTER the initial 4 events is still visible
-    // in the boot transcript.  Once the per-core dispatch regression is
-    // root-caused, restore the smaller budget.
+    // Phase 57d: budget for initial dispatcher debug logs (debug-level, off in release).
     let mut wake_log_budget: u32 = 1024;
     let mut dispatch_log_budget: u32 = 1024;
     let mut resume_log_budget: u32 = 1024;
@@ -3481,7 +3422,12 @@ pub fn run() -> ! {
         let (task_preempt_count_ptr, _task_resume_mode, _task_preempt_frame_ptr) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
-                if let Some((base, top)) = task.stack_bounds() {
+                let resume_mode = ResumeMode::from(task.resume_mode.load(Ordering::Acquire));
+                // For Preempted tasks, task_rsp is on the process kernel stack (TSS.RSP0
+                // stack), not the task kernel stack — skip the stack-bounds check.
+                if resume_mode != ResumeMode::Preempted
+                    && let Some((base, top)) = task.stack_bounds()
+                {
                     debug_assert!(
                         task_rsp >= base && task_rsp < top,
                         "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
@@ -3492,7 +3438,6 @@ pub fn run() -> ! {
                         core_id
                     );
                 }
-                let resume_mode = ResumeMode::from(task.resume_mode.load(Ordering::Acquire));
                 (
                     &task.preempt_count as *const core::sync::atomic::AtomicI32,
                     resume_mode,
@@ -3503,9 +3448,7 @@ pub fn run() -> ! {
             }
         };
 
-        // Phase 57 DEBUG: log per-core dispatches just before
-        // switch_context. Pairs with `resume` log below to detect a
-        // dispatch that hangs / never returns to the scheduler.
+        // Log per-core dispatches (debug-level; paired with resume log below).
         if dispatch_log_budget > 0 {
             log::debug!(
                 "[sched] dispatch core={} task_idx={} task_rsp={:#x}",
