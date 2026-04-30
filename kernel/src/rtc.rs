@@ -87,6 +87,11 @@ pub fn read_rtc() -> (u32, u32, u32, u32, u32, u32) {
             // Wait for any in-progress update to finish (bounded).
             let mut spins = 0;
             while update_in_progress() && spins < MAX_UIP_SPINS {
+                // HW-bounded: the Motorola MC146818A RTC chip clears the UIP (Update-
+                // In-Progress) bit within ~244–248 µs of the start of its internal
+                // update cycle (published figures vary slightly by rounding;
+                // see MC146818A datasheet §2.3).  MAX_UIP_SPINS provides an additional
+                // hard upper bound.
                 core::hint::spin_loop();
                 spins += 1;
             }

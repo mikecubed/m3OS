@@ -182,6 +182,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let start = arch::x86_64::interrupts::tick_count();
         let mut ticked = false;
         for _ in 0..10_000_000u32 {
+            // Debug-only, init-time: bounded by 10 M iterations × spin_loop hint
+            // (~500 ms worst case at 50 ns/iter).  Never executed in release builds.
+            // Not attributable to any user workload.
             core::hint::spin_loop();
             if arch::x86_64::interrupts::tick_count().wrapping_sub(start) >= 1 {
                 ticked = true;

@@ -585,7 +585,24 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// Submit a single-sector request and wait for completion via the IRQ.
+/// Submit a single-sector request and block until the IRQ fires.
+///
+/// **Block+wake mechanism:** `block_current_until(TaskState::BlockedOnRecv,
+/// &REQ_WOKEN, None)` parks the calling task; it accumulates no CPU time while
+/// waiting for the device.
+///
+/// **Wake source:** `virtio_blk_irq_handler` → `drain_used_from_irq`, which
+/// sets `REQ_WOKEN = true` and calls `wake_task_v2(waiter.task)` for the
+/// head-descriptor's waiter entry.
+///
+/// **Expected wake latency:** ≤ VirtIO disk interrupt latency (typically
+/// ~100 µs for in-QEMU requests) plus ≤ one scheduler quantum for the
+/// woken task to be redispatched.
+///
+/// **Lost-wakeup safety:** `REQ_WOKEN` is cleared *before* `submit_request`
+/// so any IRQ that fires between submit and `block_current_until` is visible
+/// at step 3 of the CAS protocol; the task self-reverts to `Running`
+/// without descending into `switch_context`.
 fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // Phase 1: enqueue under the DRIVER lock.
     //

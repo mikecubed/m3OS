@@ -236,6 +236,9 @@ fn wait_input_clear() -> Result<(), Ps2Error> {
         if s & STATUS_INPUT_FULL == 0 {
             return Ok(());
         }
+        // HW-bounded: PS/2 controller clears STATUS_INPUT_FULL within microseconds
+        // of accepting a command (IBM PC/AT Technical Reference Manual §A-2).
+        // POLL_BUDGET provides a hard upper iteration limit.
         core::hint::spin_loop();
     }
     Err(Ps2Error::Timeout)
@@ -249,6 +252,9 @@ fn wait_output_full() -> Result<(), Ps2Error> {
         if s & STATUS_OUTPUT_FULL != 0 {
             return Ok(());
         }
+        // HW-bounded: PS/2 controller sets STATUS_OUTPUT_FULL within microseconds
+        // of producing output (IBM PC/AT Technical Reference Manual §A-2).
+        // POLL_BUDGET provides a hard upper iteration limit.
         core::hint::spin_loop();
     }
     Err(Ps2Error::Timeout)

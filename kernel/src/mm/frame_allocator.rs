@@ -938,6 +938,12 @@ pub fn drain_per_cpu_caches() {
         // Spin-wait for all remote cores to complete their drain.  IF is
         // enabled here so this core can still service its own IRQs (and
         // remote cores' IPIs cannot deadlock the holder).
+        // IPI-bounded: remote CPUs decrement DRAIN_PENDING in their IPI handler
+        // after draining their per-CPU page magazine.  Analogous to the TLB
+        // shootdown wait: IF is enabled (remote cores receive their IPI), and we
+        // drain_per_cpu_caches() already holds preempt_disable() while polling,
+        // which is the load-bearing protection for the DRAIN_* atomics under
+        // PREEMPT_FULL.
         while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
         }

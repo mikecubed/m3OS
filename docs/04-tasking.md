@@ -406,6 +406,74 @@ hierarchy from the v2 block/wake protocol above — acquiring or releasing
 
 ---
 
+## Audit-derived block+wake patterns (Phase 57c)
+
+Phase 57c audited every `core::hint::spin_loop()` invocation in `kernel/src/` and classified
+each as *convert*, *annotate* (hardware-bounded), or *leave* (already documented).  The
+durable result is [`docs/handoffs/57c-busy-wait-audit.md`](./handoffs/57c-busy-wait-audit.md).
+
+### The audit found zero new convert sites
+
+All unbounded kernel busy-spins were converted in Phase 57a (`virtio_blk`, `sys_poll`,
+`net_task`, `WaitQueue::sleep`, `futex_wait`, NVMe device-host).  The audit confirmed these
+conversions intact and classified the remaining 15 spins as hardware-bounded.
+
+### How to convert a kernel busy-spin
+
+When you add a new kernel wait that depends on a software condition:
+
+1. **Identify the holder** — what code, on what core, completes the condition?
+   - *This-core IRQ handler* → use an `AtomicBool` flag + `wake_task_v2` as the wake source.
+   - *Another task* → use `WaitQueue::wake_one` / `wake_all`.
+   - *Hardware register* → document the hardware bound; leave as spin with annotation.
+
+2. **Find or build a wake source** — an `AtomicBool` asserted by the holder:
+   ```rust
+   static MY_WOKEN: AtomicBool = AtomicBool::new(false);
+   // In IRQ handler or task waker:
+   MY_WOKEN.store(true, Ordering::Release);
+   wake_task_v2(waiting_task_id);
+   ```
+
+3. **Replace the spin with `block_current_until`**:
+   ```rust
+   // Before: busy-poll
+   while !condition.load(Ordering::Acquire) {
+       core::hint::spin_loop();
+   }
+
+   // After: block + wake
+   // MY_WOKEN (from step 2) is the edge-triggered wake gate; `condition` is
+   // the durable work predicate (often the same AtomicBool in simple drain loops).
+   loop {
+       MY_WOKEN.store(false, Ordering::Release);  // clear before checking (lost-wakeup safety)
+       if condition.load(Ordering::Acquire) { break; }
+       // Parks the task; self-reverts immediately if MY_WOKEN was set while draining.
+       block_current_until(TaskState::BlockedOnRecv, &MY_WOKEN, None);
+   }
+   ```
+
+4. **Add a doc comment** on the wait condition stating: what asserts it, who clears it,
+   expected wake latency.
+
+5. **Add a regression test** in `kernel-core` (host-testable structural test) or `kernel/tests/`
+   (in-QEMU) verifying the block+wake contract.  See Phase 57c Track B for examples.
+
+### When a spin should stay
+
+A busy-spin may remain **if and only if**:
+- The holder is hardware (not a software task that can be preempted); **and**
+- The bound is documentable (hardware spec section or datasheet reference); **and**
+- A context-switch would cost more than the spin (e.g., < 1 µs LAPIC delivery).
+
+Every such spin must carry a comment of the form:
+```rust
+// HW-bounded: ~1 µs (Intel SDM Vol 3A §10.6, 'Local APIC ICR Delivery').
+// preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+```
+
+---
+
 ## See Also
 
 - `docs/03-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers
@@ -413,3 +481,4 @@ hierarchy from the v2 block/wake protocol above — acquiring or releasing
 - `docs/roadmap/README.md` — per-phase scope and milestones
 - `docs/roadmap/tasks/57a-scheduler-rewrite-tasks.md` — Phase 57a block/wake rewrite
 - `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` — v2 state-transition spec
+- `docs/handoffs/57c-busy-wait-audit.md` — Phase 57c durable audit catalogue

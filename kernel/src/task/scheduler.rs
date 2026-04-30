@@ -2695,6 +2695,14 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     let waker_core = crate::smp::per_core().core_id;
     if assigned_core != waker_core {
         let on_cpu_ref = unsafe { &*on_cpu_ptr };
+        // Phase 57a: bounded by cross-core context-switch completion time.  The
+        // remote core clears `on_cpu` with Ordering::Release on its next switch-out.
+        // We intentionally busy-wait here: step 3 has already committed the
+        // wakeup transition, but step 5 has not yet published the task on its
+        // assigned core's run queue.  Blocking or yielding in this handoff
+        // window would require an additional wake/publication protocol to avoid
+        // losing forward progress under the current lock/queue invariants.
+        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
         while on_cpu_ref.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }
