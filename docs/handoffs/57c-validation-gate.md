@@ -32,9 +32,9 @@ durable validation gate artefact.
 ### A.3 — All convert entries verified intact with regression tests
 
 ✅ Phase 57a block+wake conversions verified:
-- `virtio_blk::do_request` → `block_current_until(&REQ_WOKEN, None)`
+- `virtio_blk::do_request` → `block_current_until(TaskState::BlockedOnRecv, &REQ_WOKEN, None)`
 - `sys_poll` no-waiter path → `block_current_until` / `yield_now` fallback
-- `net_task` NIC wake → `block_current_until(&NIC_WOKEN, None)`
+- `net_task` NIC wake → `block_current_until(TaskState::BlockedOnRecv, &NIC_WOKEN, None)`
 - `WaitQueue::sleep` → `block_current_until` (no subsidiary spin)
 - `futex_wait` → `block_current_until` (F.3 path)
 - NVMe device-host → no kernel-side spin (ring-3 driver)
@@ -140,7 +140,7 @@ phase — they are load-bearing only for Phase 57e (`PREEMPT_FULL`) and land in 
 | `kernel/src/blk/virtio_blk.rs` | B: enhanced doc comment |
 | `kernel-core/src/sched_model.rs` | B: 11 regression tests (TB-1–TB-6) |
 | `docs/04-tasking.md` | D: audit-derived block+wake patterns section |
-| `docs/06-ipc.md` | D: Notification-as-wake-source section |
+| `docs/06-ipc.md` | D: IRQ-driven block+wake pattern section (`AtomicBool` + `wake_task_v2`) and when not to use Notifications |
 | `docs/roadmap/README.md` | E: Phase 57c row → Complete; Gantt updated |
 | `docs/roadmap/57c-kernel-busy-wait-conversion.md` | E: Status → Complete |
 | `docs/roadmap/tasks/57c-kernel-busy-wait-conversion-tasks.md` | E: Status → Complete |
