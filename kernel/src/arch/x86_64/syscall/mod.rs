@@ -2619,6 +2619,8 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     // path; see
     // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
+    crate::task::scheduler::check_deferred_preempt_at_user_return();
     unsafe {
         use core::arch::asm;
         // We need to restore all GPRs.  The simplest approach: push the iretq

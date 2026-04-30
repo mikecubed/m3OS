@@ -214,3 +214,35 @@ fn preempt_resume_restores_rip_and_registers() {
 fn cooperative_yield_still_uses_switch_context() {
     // TODO: activate in Track G.
 }
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track G stubs — IRQ-return voluntary preemption
+// ---------------------------------------------------------------------------
+
+/// Stub: timer ISR preempts a user-mode tight loop within 1 ms.
+///
+/// Full implementation requires QEMU + `preempt-voluntary` feature + a ring-3
+/// tight-loop binary that the kernel spawns and then observes is preempted.
+#[test_case]
+#[ignore = "requires QEMU + preempt-voluntary feature + userspace tight loop"]
+fn timer_handler_preempts_user_within_1ms() {
+    // Feature-on: spawn a tight ring-3 loop, observe preemption fires within 1ms.
+}
+
+/// Stub: reschedule IPI preempts a user-mode task on core 1 within 1 ms.
+///
+/// Full implementation requires QEMU + SMP + `preempt-voluntary` feature.
+#[test_case]
+#[ignore = "requires QEMU + SMP + preempt-voluntary feature"]
+fn reschedule_ipi_preempts_user_within_1ms() {
+    // Core 1 tight loop; core 0 sends wake IPI; core 1 preempts within 1ms.
+}
+
+/// Stub: `preempt_count != 0` suppresses preemption at the IRQ-return boundary.
+///
+/// Full implementation requires QEMU + `preempt-voluntary` feature.
+#[test_case]
+#[ignore = "requires QEMU + preempt-voluntary feature"]
+fn preempt_count_nonzero_suppresses_preemption() {
+    // preempt_disable() held: timer fires, preempt_count != 0, no preemption.
+}

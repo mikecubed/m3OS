@@ -1707,6 +1707,44 @@ pub(crate) fn assert_preempt_count_zero_at_user_return() {
 #[inline(always)]
 pub(crate) fn assert_preempt_count_zero_at_user_return() {}
 
+// ---------------------------------------------------------------------------
+// Phase 57d Track G — deferred preemption check at user-return boundaries
+// ---------------------------------------------------------------------------
+
+/// Check and consume `preempt_resched_pending` at a user-mode return boundary.
+///
+/// Called from every path that transitions from kernel mode to user mode.
+/// Unlike `check_and_preempt_user`, this runs in kernel-mode context (not IRQ
+/// handler), so it triggers a voluntary reschedule via `yield_now` rather than
+/// `preempt_to_scheduler`.
+///
+/// Under `PREEMPT_VOLUNTARY`, the contract is:
+/// - If `preempt_count == 0` and `preempt_resched_pending` was set, yield.
+/// - Otherwise return (the task will keep running).
+///
+/// Gated on `cfg(feature = "preempt-voluntary")`.
+#[cfg(feature = "preempt-voluntary")]
+pub fn check_deferred_preempt_at_user_return() {
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let pc = peek_preempt_count_irq();
+    if pc != 0 {
+        return;
+    }
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if pending {
+        yield_now();
+    }
+}
+
+/// No-op stub when the `preempt-voluntary` feature is disabled.
+#[cfg(not(feature = "preempt-voluntary"))]
+#[inline(always)]
+pub fn check_deferred_preempt_at_user_return() {}
+
 /// Phase 57 DEBUG: per-core countdown for yield_now log markers.
 /// Atomic so the IPI-context observer doesn't trip race detection
 /// in case a yield races with another path.
