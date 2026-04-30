@@ -81,6 +81,19 @@ const KBD_EVENT_PULL: u64 = 2;
 /// constant in `userspace/display_server/src/input.rs`.
 const KBD_EVENT_NONE: u64 = 3;
 
+/// Phase 57d — non-blocking scancode probe used by `stdin_feeder`.
+///
+/// Unlike `KBD_READ` (label 1) which blocks internally until a key is
+/// pressed, this label returns immediately: the reply label is the raw
+/// scancode byte, or 0 if the ring buffer is empty.  Callers must treat
+/// reply 0 as "no key yet" and sleep before retrying.
+///
+/// This avoids the kbd_server stall that occurs when `stdin_feeder`'s
+/// blocking `KBD_READ` request holds the server while `display_server`
+/// is waiting for a `KBD_EVENT_PULL` reply (Phase 57d timing change
+/// made this race consistently reproducible).
+const KBD_TRY_READ: u64 = 4;
+
 /// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
 const REPLY_CAP_HANDLE: u32 = 1;
 
@@ -240,6 +253,18 @@ fn handle_kbd_read() {
     syscall_lib::ipc_reply(REPLY_CAP_HANDLE, scancode as u64, 0);
 }
 
+/// Handle a `KBD_TRY_READ` request — non-blocking scancode probe.
+///
+/// Polls the kernel ring buffer exactly once and replies immediately
+/// with the raw scancode byte as the label, or 0 if the buffer is
+/// empty. The caller (`stdin_feeder`) treats 0 as "no key available"
+/// and sleeps briefly before retrying, which keeps kbd_server's
+/// request queue drainable between polls.
+fn handle_kbd_try_read() {
+    let sc = syscall_lib::read_kbd_scancode();
+    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, sc as u64, 0);
+}
+
 /// Handle a `KBD_EVENT_PULL` request.
 ///
 /// Polls scancodes through the keymap pipeline until either a fully-
@@ -383,6 +408,7 @@ fn program_main(_args: &[&str]) -> i32 {
         match label {
             KBD_READ => handle_kbd_read(),
             KBD_EVENT_PULL => handle_kbd_event_pull(&mut pipeline),
+            KBD_TRY_READ => handle_kbd_try_read(),
             _ => {
                 // Unknown label — typed error, observable to clients.
                 syscall_lib::write_str(
