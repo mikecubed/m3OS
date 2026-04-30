@@ -587,8 +587,8 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
 
 /// Submit a single-sector request and block until the IRQ fires.
 ///
-/// **Block+wake mechanism:** `block_current_until(&REQ_WOKEN, None)` parks
-/// the calling task with `BlockedOnRecv`; it accumulates no CPU time while
+/// **Block+wake mechanism:** `block_current_until(TaskState::BlockedOnRecv,
+/// &REQ_WOKEN, None)` parks the calling task; it accumulates no CPU time while
 /// waiting for the device.
 ///
 /// **Wake source:** `virtio_blk_irq_handler` → `drain_used_from_irq`, which

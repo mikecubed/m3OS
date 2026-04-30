@@ -443,11 +443,13 @@ When you add a new kernel wait that depends on a software condition:
    }
 
    // After: block + wake
-   let woken = AtomicBool::new(false);
-   register_waker(&woken, &MY_WOKEN_QUEUE);
+   // MY_WOKEN (from step 2) is the edge-triggered wake gate; `condition` is
+   // the durable work predicate (often the same AtomicBool in simple drain loops).
    loop {
+       MY_WOKEN.store(false, Ordering::Release);  // clear before checking (lost-wakeup safety)
        if condition.load(Ordering::Acquire) { break; }
-       let _ = block_current_until(&woken, deadline);
+       // Parks the task; self-reverts immediately if MY_WOKEN was set while draining.
+       block_current_until(TaskState::BlockedOnRecv, &MY_WOKEN, None);
    }
    ```
 

@@ -804,14 +804,16 @@ acquire `pi_lock`; doing so deadlocks in debug builds (assertion panic).
 
 ---
 
-## Notification objects as block+wake sources (Phase 57c)
+## IRQ-driven block+wake pattern (Phase 57c)
 
-`Notification` objects are the canonical wake source for IRQ-driven block+wake conversions.
+The `AtomicBool` + `wake_task_v2` pair is the kernel-internal pattern for IRQ-driven
+block+wake conversions.  It is distinct from the IPC `Notification` capability type
+(seL4-style bitfield, used for inter-process notification delivery).
 The Phase 57c audit (see [`docs/handoffs/57c-busy-wait-audit.md`](./handoffs/57c-busy-wait-audit.md))
-confirms that every converted unbounded kernel busy-spin uses either a `Notification` or a
-`WaitQueue` as its wake source.
+confirms that every converted unbounded kernel busy-spin uses either an `AtomicBool` +
+`wake_task_v2` pair or a `WaitQueue` as its wake source.
 
-### Pattern: IRQ-driven wake via Notification
+### Pattern: IRQ-driven wake via AtomicBool + wake_task_v2
 
 When a kernel task must wait for a hardware event (e.g., NIC RX, block device completion):
 
@@ -835,7 +837,7 @@ loop {
     // Drain all pending RX frames.
     while let Some(frame) = nic.poll_rx() { handle_frame(frame); }
     // Block until the next IRQ fires (or until a wakeup already pending above).
-    block_current_until(&NIC_WOKEN, None);
+    block_current_until(TaskState::BlockedOnRecv, &NIC_WOKEN, None);
 }
 ```
 

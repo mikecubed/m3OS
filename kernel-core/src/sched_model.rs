@@ -1462,7 +1462,7 @@ mod tests {
     //   TB-5  futex_wait                     — FUTEX_WAKE → block_current_until
     //   TB-6  NVMe device-host               — no kernel-side spin (doc only)
     //
-    // All tests are host-runnable (`cargo test -p kernel-core`).
+    // All tests are host-runnable (`cargo test -p kernel-core --target x86_64-unknown-linux-gnu`).
 
     /// TB-1 — `virtio_blk::do_request` block+wake regression.
     ///
