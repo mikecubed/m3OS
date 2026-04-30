@@ -259,7 +259,7 @@ real inter-task communication will require tasks to block on endpoint receive.
 
 ## Block/Wake Protocol (v2 — Phase 57a)
 
-> **Current protocol as of kernel v0.57.1.** Phase 57a rewrote the block/wake
+> **Current protocol as of kernel v0.57.2.** Phase 57a rewrote the block/wake
 > primitive to eliminate the lost-wake bug class that arose from v1's use of
 > multiple boolean flags (`switching_out`, `wake_after_switch`,
 > `PENDING_SWITCH_OUT`) as intermediate state. See
@@ -325,6 +325,84 @@ are **absent** from the current codebase (deleted in Phase 57a Tracks E–F):
 `switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT`. Any reference to
 these names in source code is a bug; the v2 protocol uses `Task::on_cpu` and
 `TaskBlockState.state` under `pi_lock` exclusively.
+
+---
+
+## Preempt-discipline (Phase 57b)
+
+> **Current discipline as of kernel v0.57.2.** Phase 57b adds Linux-style
+> `preempt_count` infrastructure as a no-op refactor: every spinlock callsite
+> increments a per-task counter while the lock is held, but no IRQ handler
+> consults it yet. The counter becomes load-bearing in Phase 57d (voluntary
+> preemption) and Phase 57e (full kernel preemption). The design source of
+> truth is
+> [`docs/appendix/preemptive-multitasking.md`](./appendix/preemptive-multitasking.md);
+> the phase rationale and acceptance criteria are in
+> [`docs/roadmap/57b-preemption-foundation.md`](./roadmap/57b-preemption-foundation.md).
+> The full top-of-file reference for the discipline lives at the head of
+> `kernel/src/task/scheduler.rs` (`# preempt_count` section).
+
+### `preempt_count`
+
+Each `Task` carries a `preempt_count: AtomicI32` initialised to `0` at
+construction. The counter is incremented on every spinlock acquire and
+decremented on every release; it must return to `0` at every user-mode
+return boundary. `Scheduler::tasks` is `Vec<Box<Task>>` so a cached raw
+pointer into `Task::preempt_count` is stable for the task's lifetime — the
+outer `Vec` may reallocate when growing, but the inner `Box` keeps each
+`Task` at a fixed heap address.
+
+The counter has a documented maximum nesting depth of 32 (16 for nested
+locks plus 16 of slack for diagnostic frames); a `debug_assert!` in
+`preempt_disable` panics if the post-increment value exceeds that bound.
+
+### `current_preempt_count_ptr`
+
+`PerCoreData::current_preempt_count_ptr: AtomicPtr<AtomicI32>` is the
+per-CPU dispatch pointer that `preempt_disable` and `preempt_enable` read
+on the hot path. It targets either the running task's `preempt_count` (in
+task context) or one slot of the per-core
+`SCHED_PREEMPT_COUNT_DUMMY: [AtomicI32; MAX_CORES]` array (in scheduler /
+idle context). The dispatch path retargets the pointer in two phases —
+switch-out epilogue retargets to the dummy; switch-in handoff retargets to
+the incoming task — each wrapped in an explicit `cli` / interrupts-restore
+window so no `IrqSafeMutex::lock` straddles a retarget. The per-CPU
+indirection is what makes `preempt_disable` and `preempt_enable` lock-free
+free functions: each helper performs a single `AtomicPtr::load(Acquire)`
+followed by a single `fetch_add` / `fetch_sub` on the pointee, without
+acquiring any scheduler lock.
+
+### `IrqSafeMutex` integration (Track F)
+
+`IrqSafeMutex::lock` calls `preempt_disable` *before* masking interrupts;
+`IrqSafeGuard::Drop` calls `preempt_enable` *after* the spin guard releases
+and IF is restored. The drop sequence (spin-unlock → IF restore →
+`preempt_enable`) is load-bearing: the unlock-before-IF-restore window is
+the same Phase 57a invariant that prevents an ISR from reaching a
+just-freed lock with stale `was_enabled` state, and dropping the
+`preempt_count` last keeps the count elevated for the entire critical
+section. `try_lock` mirrors the pattern: it raises `preempt_count` before
+the inner attempt and undoes the raise (paired `preempt_enable`) iff the
+inner `try_lock` returned `None`, so a failed acquire has zero net effect.
+This single integration point gives every existing `IrqSafeMutex` callsite
+preempt-discipline for free; non-`IrqSafeMutex` callsites are migrated per
+the durable per-callsite audit at
+[`docs/handoffs/57b-spinlock-callsite-audit.md`](./handoffs/57b-spinlock-callsite-audit.md)
+(Track G).
+
+### User-mode-return invariant (Track D.3)
+
+The earliest possible detection of a forgotten `preempt_enable` is at the
+user-mode return boundary. Track D.3 installs a `debug_assert!` at the
+syscall-return path (`kernel/src/arch/x86_64/syscall/mod.rs`) and at every
+IRQ-return-to-ring-3 path (`kernel/src/arch/x86_64/interrupts.rs`) that
+reads `(*per_core().current_preempt_count_ptr.load(Acquire)).load(Relaxed)`
+and panics on a non-zero count. Release builds compile the assertion out
+(no overhead); the 57a stuck-task watchdog is the coarse signal there.
+
+`preempt_count` is **task-local** and does not participate in the lock
+hierarchy from the v2 block/wake protocol above — acquiring or releasing
+`preempt_count` does not invalidate any other lock held by the task.
 
 ---
 
