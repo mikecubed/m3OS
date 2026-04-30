@@ -234,6 +234,51 @@ Linux, FreeBSD, and seL4 all follow this path.
 
 ---
 
+## Phase 57d — Voluntary Preemption at the IRQ-Return Boundary
+
+Phase 57d activates the preemption infrastructure laid by Phase 57b by wiring a
+preemption check at every IRQ-return-to-ring-3 path.
+
+### Naked-asm entry stubs (`timer_entry`, `reschedule_ipi_entry`)
+
+The existing `extern "x86-interrupt"` handler approach cannot safely support
+preemption: by the time the Rust body executes, the compiler prologue has already
+clobbered caller-saved GPRs.  Phase 57d replaces the timer and reschedule-IPI IDT
+entries with raw naked-asm stubs (`timer_entry`, `reschedule_ipi_entry`) defined in
+`kernel/src/arch/x86_64/asm/preempt_entry.S`.
+
+Each stub performs **ring-aware dispatch**: on entry it branches on `(cs & 3)` *before
+any GPR push*.  The ring-3 (user) path pushes all 15 GPRs into a `PreemptTrapFrameUser`
+and calls `timer_handler_user(&mut PreemptTrapFrameUser)`.  The ring-0 (kernel) path
+captures the interrupted kernel RSP via `lea rsi, [rsp + 24]` before pushing the 15 GPRs
+into a `PreemptTrapFrameKernel` and calls `timer_handler_kernel(&mut PreemptTrapFrameKernel,
+captured_kernel_rsp: u64)`.  Both paths clear the direction flag (`cld`) and enforce
+System V AMD64 ABI stack alignment before the `call`.  On a non-preempting return the
+stubs pop the saved GPRs and `iretq`.  The same two-path shape is used by
+`reschedule_ipi_entry`.
+
+### IRQ-return preemption check (four conditions)
+
+Inside `timer_handler_user` (and `reschedule_ipi_handler_user`), after the tick counter
+increment and EOI, the following four conditions are evaluated in order — gated on
+`cfg(feature = "preempt-voluntary")`:
+
+1. **`from_user`** — `(frame.cs & 3) == 3`.  If false, return immediately; kernel-mode
+   code is non-preemptible under `PREEMPT_VOLUNTARY`.
+2. **`preempt_count == 0`** — read via `peek_preempt_count_irq()` which dereferences
+   `PerCoreData::current_preempt_count_ptr` (a lock-free pointer into the current task's
+   `preempt_count` field, stable since Phase 57b).  If non-zero, return immediately.
+3. **`reschedule || preempt_resched_pending`** — `reschedule` is the per-core timer-set
+   flag; `preempt_resched_pending` is the deferred-reschedule flag set by
+   `preempt_enable` at its zero-crossing (Phase 57d Track E).  Both are consumed with
+   `swap(false, AcqRel)` together; if neither was set, return immediately.
+4. **Call `preempt_to_scheduler(frame)`** — copies the trap frame into
+   `Task::preempt_frame`, marks the task `Ready` with `resume_mode = Preempted`, inserts
+   it at the tail of the run-queue, and jumps to the per-core scheduler dispatch entry.
+   This function is `-> !`; the stub's pop/iretq epilogue is unreachable on this path.
+
+---
+
 ## Key Crates
 
 | Crate | Role |

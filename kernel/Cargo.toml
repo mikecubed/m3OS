@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.57.3"
+version = "0.57.4"
 edition = "2024"
 
 [dependencies]
@@ -13,7 +13,9 @@ pic8259 = "0.11.0"
 kernel-core = { path = "../kernel-core", default-features = false }
 
 [features]
-default = ["trace"]
+default = ["trace", "preempt-voluntary"]
+# I.2 soak (procedural gate): 24-hour post-flip soak required before removing the
+# cfg(feature = "preempt-voluntary") guards (I.3). Do not remove guards until I.2 passes.
 trace = []
 legacy-bootstrap-allocator = []
 # When `sched-trace` is enabled, every block/wake/scan state transition
@@ -25,7 +27,10 @@ sched-trace = []
 # Phase 57d E.2: voluntary-preemption zero-crossing logic.
 # When enabled, `preempt_enable` records a deferred reschedule at the
 # zero-crossing point; consumed at the user-mode-return boundary (E.3).
-# NOT in `default` — wired in Track I once all phase 57d tracks land.
+# Now in `default` as of Track I (v0.57.4).
+# TODO(I.3): remove this feature flag and unwrap all cfg(feature = "preempt-voluntary")
+# gates once the 24-hour post-flip soak (I.2) passes. Until then, the gates remain as
+# rollback safety. See docs/roadmap/tasks/57d-voluntary-preemption-tasks.md § I.3.
 preempt-voluntary = []
 # When `hardened` is enabled, the `sys_block_read` whitelist is restricted to
 # production storage servers only (vfs_server, fat_server). Without this flag,
