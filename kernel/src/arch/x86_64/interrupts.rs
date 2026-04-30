@@ -1194,11 +1194,27 @@ fn emit_preempt_trace(frame: &PreemptTrapFrameUser, trigger: PreemptTrigger) {
 /// 2. `preempt_count == 0` — no preempt-disable lock held by the task.
 /// 3. `reschedule || preempt_resched_pending` — scheduler flagged a switch.
 ///
+/// The function also guards against group-exit redirects: if
+/// `maybe_redirect_group_exit_trampoline_user` rewrites `frame.cs` to the
+/// kernel code selector before this call, the frame is skipped (preemption
+/// would corrupt the iretq return because `preempt_resume_to_user` always
+/// builds a 5-slot ring-3 frame).
+///
 /// # Safety
 /// Must be called with IRQs disabled (guaranteed by IRQ handler context).
 /// `frame` must point to a valid on-stack `PreemptTrapFrameUser`.
 #[cfg(feature = "preempt-voluntary")]
 unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: PreemptTrigger) {
+    // Guard: maybe_redirect_group_exit_trampoline_user (called before this
+    // function) can rewrite frame.cs to the kernel code selector (ring 0)
+    // when group_exit_pending is set. preempt_resume_to_user always builds
+    // a 5-slot user-return iretq frame; resuming a ring-0 CS frame via iretq
+    // causes the CPU to pop only 3 slots instead of 5 (same-privilege return),
+    // leaving RSP pointing at frame data and corrupting the return. Skip
+    // preemption whenever the frame is no longer ring 3.
+    if frame.cs & 3 != 3 {
+        return;
+    }
     let pc = crate::task::scheduler::peek_preempt_count_irq();
     if pc != 0 {
         return; // task holds a preempt-disable lock — do not preempt
