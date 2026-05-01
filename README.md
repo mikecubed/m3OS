@@ -115,6 +115,70 @@ Click the QEMU window to grab input, then press `Ctrl+Alt+G` to release it. On
 Wayland-based desktops, if keyboard input feels unresponsive, prefix the command
 with `SDL_VIDEODRIVER=x11` to force SDL through XWayland.
 
+### Debugging
+
+#### Enabling kernel debug feature flags
+
+Kernel debug features live behind cargo features in `kernel/Cargo.toml` so they
+add zero overhead to the default build. Enable one or more by passing them
+through the `M3OS_KERNEL_FEATURES` environment variable; xtask forwards them to
+`cargo build --features kernel/...` when it builds the kernel.
+
+```bash
+# Enable a single feature
+M3OS_KERNEL_FEATURES=exec-trace cargo xtask run-gui --fresh
+
+# Enable several at once (comma-separated)
+M3OS_KERNEL_FEATURES=exec-trace,sched-trace cargo xtask run --fresh
+```
+
+Currently available debug features:
+
+| Feature | Output | When to use |
+|---|---|---|
+| `exec-trace` | `[exec-trace] pid=N ...` lines for fork-child userspace entry, every `close`, `dup2`, and `execve` syscall (including failure paths) | Diagnosing a fork-child that never reaches `execve`, an `execve` that fails silently, or a child that exits before its first observable syscall. |
+| `sched-trace` | Per-block / wake / scan structured `[TRACE] [sched] ...` entries in the trace ring | Diagnosing scheduler fairness, IPC wake latency, or preemption-discipline bugs. |
+
+#### Capturing a clean serial transcript
+
+`cargo xtask run` and `run-gui` always emit serial output through QEMU's
+`-serial stdio`, so the easiest way to capture a transcript is to redirect
+stdout to a file:
+
+```bash
+M3OS_KERNEL_FEATURES=exec-trace cargo xtask run-gui --fresh 2>&1 | tee m3os.log
+```
+
+For headless reproductions, `cargo xtask run` emits the same transcript without
+the SDL window, which is usually faster to iterate on:
+
+```bash
+cargo xtask run --fresh 2>&1 | tee m3os.log
+```
+
+#### Reading the boot log
+
+The boot transcript contains a few well-known fixed-format lines you can grep
+for to triage common problems:
+
+| Pattern | Meaning |
+|---|---|
+| `[INFO] [proc] execve: pid=N path=...` | A privileged binary execed (only emitted for "interactive debug" paths like `/bin/term`, `/bin/login`, etc., to keep noise low). |
+| `[INFO] [proc] fork: parent_pid=... child_pid=...` | A parent forked. If the matching `[exec-trace] pid=<child> ...` line never appears under `exec-trace`, the child is stuck before its first syscall. |
+| `[INFO] [framebuffer_mmap] pid=N mapped ...` | `display_server` claimed the framebuffer. After this point the kernel framebuffer console can no longer write to the screen — output is serial-only until a graphical client paints. |
+| `display_server: registered as 'display.input-owner' ...` | The first Toplevel surface mapped, so `stdin_feeder` has handed PS/2 ownership over to the focus dispatcher. Absent ⇒ no graphical client mapped a Toplevel; PS/2 still goes through `stdin_feeder` to the kernel TTY. |
+| `TERM_SMOKE:ready` | `term` registered its IPC service and entered its main event loop. The shell child is exec-ing in parallel; expect an `[exec-trace] ... execve OK path="/bin/ion"` shortly after if `exec-trace` is on. |
+
+#### QEMU keyboard / display tips
+
+- Click the QEMU window to grab keyboard, `Ctrl+Alt+G` to release.
+- Headless (`cargo xtask run`) directs typed bytes to COM1 via `-serial stdio`,
+  not to PS/2. PS/2 is only meaningful in `run-gui`.
+- Slow keyboard echo on `run-gui` was Phase 56-era chunked-pixel-upload
+  overhead per glyph. As of the Phase 57d follow-up, `term` throttles compose
+  to ~60 Hz so PTY echo bursts coalesce; the chunked path is still the
+  underlying transport (replacement is tracked as a follow-up).
+
 ## Project Layout
 
 ```
