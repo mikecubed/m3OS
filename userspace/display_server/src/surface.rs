@@ -500,6 +500,21 @@ impl SurfaceRegistry {
             }
             ClientMessage::DamageSurface { surface_id, rect } => {
                 self.apply_event(*surface_id, SurfaceEvent::DamageSurface(*rect), &mut result)?;
+                // SHM-backed surfaces edit pixels in place: the buffer
+                // identity does not change between commits, so the
+                // existing CommitSurface arm (which marks dirty only
+                // when `pending_buffer.take()` returns Some) leaves
+                // them clean forever after the first commit. Damage
+                // is the explicit "I changed pixel contents" signal,
+                // so mark the surface dirty here whenever a buffer is
+                // already attached. The chunked path is unaffected
+                // because chunked clients always Damage before they
+                // commit and the dirty bit is reset after compose.
+                if let Some(s) = self.surfaces.get_mut(surface_id)
+                    && (s.committed_buffer.is_some() || s.pending_buffer.is_some())
+                {
+                    s.dirty = true;
+                }
             }
             ClientMessage::CommitSurface { surface_id } => {
                 // The kernel-core state machine emits `SurfaceEffect::Configured`
