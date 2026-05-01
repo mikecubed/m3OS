@@ -1185,6 +1185,20 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         fork_rip,
         fork_rsp,
     );
+    // Phase 57d follow-up — the same line at info-level under
+    // exec-trace so a fork-child that's enqueued-but-never-dispatched
+    // produces a paired "spawned on core C with idx I" / no
+    // "trampoline-enter" signal in the boot transcript. Without this,
+    // distinguishing "task dispatched then hung" from "task never
+    // dispatched" requires correlating two debug-level logs that the
+    // serial console doesn't show.
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] fork-task-spawn pid={} task_idx={} target_core={}",
+        fork_pid,
+        idx,
+        target_core
+    );
     enqueue_to_core(target_core, idx);
 
     target_core
