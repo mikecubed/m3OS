@@ -98,6 +98,18 @@ const IDLE_SLEEP_NS: u32 = 1_000_000;
 #[cfg(not(test))]
 const PTY_READ_CHUNK: usize = 256;
 
+/// Minimum gap between successive `Renderer::compose()` calls, in
+/// milliseconds. Caps the compose / framebuffer-upload frequency at
+/// roughly 60 Hz: the renderer's `damaged()` queue keeps accumulating
+/// `PutGlyph` ops between calls, so a burst of PTY echo bytes (one
+/// per typed key) coalesces into a single compose pass instead of
+/// firing one full-buffer upload per character. With the Phase 56
+/// chunked-pixel path, each upload is ~252 IPC roundtrips for the
+/// 640×400 surface; without throttling, every keystroke paid that
+/// cost in series.
+#[cfg(not(test))]
+const COMPOSE_INTERVAL_MS: u64 = 16;
+
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
@@ -189,6 +201,13 @@ fn program_main(_args: &[&str]) -> i32 {
 
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
+    // Track the last compose timestamp so the throttle below only
+    // composes when at least `COMPOSE_INTERVAL_MS` has elapsed. The
+    // underlying `Renderer` keeps its damage queue intact between
+    // composes, so dropping a single frame's worth of compose calls
+    // does not lose any glyphs — the next compose flushes everything.
+    let mut last_compose_ms = clock.now_ms();
+
     // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
     //    display_server outbound-event drain, the bell, the shell-exit
     //    poll, and the renderer's per-tick compose.
@@ -249,10 +268,21 @@ fn program_main(_args: &[&str]) -> i32 {
             }
         }
 
-        // 5d. Compose dirty frame, if any.
+        // 5d. Compose dirty frame, if any — throttled so we don't pay
+        //     the full-surface upload cost on every keystroke. The
+        //     `damaged()` queue accumulates between calls, and the
+        //     `did_work = false` branch below picks the idle sleep so
+        //     this loop neither busy-spins nor starves on a slow
+        //     compose. When the chunked-pixel path is replaced by
+        //     shared-memory buffers, the throttle still amortises
+        //     `DamageSurface` IPC traffic across multiple PTY bytes.
         if renderer.damaged() {
-            renderer.compose();
-            did_work = true;
+            let now_ms = clock.now_ms();
+            if now_ms.saturating_sub(last_compose_ms) >= COMPOSE_INTERVAL_MS {
+                renderer.compose();
+                last_compose_ms = now_ms;
+                did_work = true;
+            }
         }
 
         // 5e. Yield briefly when nothing happened so we don't burn CPU.
