@@ -82,11 +82,15 @@ pub const CELL_WIDTH: u8 = 8;
 /// Cell pixel height — pinned to the bundled font's cell size.
 pub const CELL_HEIGHT: u8 = 16;
 
-/// Maximum payload bytes per chunk = MAX_BULK_LEN (4096) minus the
+/// Maximum payload bytes per chunk = MAX_BULK_LEN (65536) minus the
 /// 24-byte chunk header. Each [`FramebufferOwner::submit`] uploads
 /// `ceil(SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX * 4 / CHUNK_PAYLOAD_LEN)`
-/// chunks per frame.
-const CHUNK_PAYLOAD_LEN: usize = 4096 - CHUNK_HEADER_LEN;
+/// chunks per frame. The Phase 57d follow-up bumped this from
+/// (4096 - 24) to (65536 - 24): 1 MiB / 65512 ≈ 16 chunks per
+/// frame instead of ~252, taking term compose's IPC roundtrip
+/// budget from ~250 ms to ~16 ms and unblocking the focus
+/// dispatcher's outbound queue under fast typing.
+const CHUNK_PAYLOAD_LEN: usize = 65536 - CHUNK_HEADER_LEN;
 
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`

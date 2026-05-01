@@ -541,7 +541,20 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Maximum bulk-data payload accepted by `ipc_send_buf` / `ipc_call_buf`.
-const MAX_BULK_LEN: usize = 4096;
+///
+/// Sized at 16 4 KiB pages so high-bandwidth pixel-upload paths
+/// (`term` → `display_server` chunked surface buffers) hit the kernel
+/// IPC primitive in ~16 roundtrips per 1 MiB frame instead of ~252.
+/// The kernel allocates `len` bytes on demand per `ipc_send_with_bulk`,
+/// not `MAX_BULK_LEN`, so small protocol verbs still cost ~tens of bytes
+/// each — this bump only changes the ceiling, not the per-call alloc.
+/// Raising it further is safe in principle but consumers'
+/// `bulk_buf: Vec<u8>` reservations need to track in lockstep
+/// (`display_server::client::MAX_BULK_BYTES`,
+/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`). 65536 picks
+/// a comfortable round-binary headroom over the 1 MiB / 16 = 64 KiB
+/// per-chunk upper bound a Phase 56 surface ever wants to send.
+const MAX_BULK_LEN: usize = 65536;
 
 /// Send (or call) with an attached bulk-data buffer.
 ///

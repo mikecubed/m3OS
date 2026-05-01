@@ -93,8 +93,12 @@ pub const LABEL_CLIENT_EVENT_NONE: u64 = 4;
 pub const MAX_CLIENT_EVENT_QUEUE: usize = 128;
 
 /// Maximum bulk size accepted by the dispatcher (matches the kernel's
-/// `MAX_BULK_LEN`).
-pub const MAX_BULK_BYTES: usize = 4096;
+/// `MAX_BULK_LEN`). Bumped from 4096 to 65536 in the Phase 57d
+/// follow-up to cut the chunked-pixel upload count for term's 1 MiB
+/// surface from ~252 roundtrips per compose to ~16. Must stay equal
+/// to or larger than the kernel constant or oversized bulks will
+/// truncate at the dispatcher.
+pub const MAX_BULK_BYTES: usize = 65536;
 
 /// Bytes per BGRA8888 pixel — used to validate that the bulk length on a
 /// `LABEL_PIXELS` frame matches `width * height * BYTES_PER_PIXEL_BGRA8888`.
