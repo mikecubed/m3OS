@@ -188,6 +188,17 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     let mut input_handler = InputHandler::new();
+
+    // Paint an initial cleared frame so the surface gets a buffer
+    // attached *before* any PTY traffic arrives. Without this, the
+    // renderer queue stays empty until the shell echoes its first byte
+    // (or the user types), so `display_server` never sees an
+    // `AttachBuffer` for term's surface and skips it during compose —
+    // the user just sees the teal background and cursor with no
+    // terminal rectangle. Pushing `RenderCommand::Clear` mirrors what
+    // the screen state machine would emit on `ESC [ 2 J`; the throttle
+    // below the loop will flush it on its first tick.
+    renderer.apply(RenderCommand::Clear);
     let mut bell_audio = Some(Bell::new(AudioClientBellSink::new()));
     let mut bell_unavail: Option<Bell<AudioUnavailableBellSink>> = None;
     let mut render_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
