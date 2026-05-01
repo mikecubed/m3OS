@@ -303,7 +303,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
             layer: entry.layer,
             rect,
             damage: &dmg[..],
-            pixels: &entry.buf.pixels,
+            pixels: entry.buf.pixels_slice(),
             opaque: entry.is_opaque(),
         });
     }

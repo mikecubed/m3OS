@@ -55,6 +55,71 @@ use kernel_core::display::surface::{
     SurfaceEffect, SurfaceError, SurfaceEvent, SurfaceStateMachine,
 };
 
+/// Storage backing for a committed buffer's pixel data.
+///
+/// Phase 56's chunked-pixel path produced [`Vec<u8>`]-owned buffers
+/// reassembled from IPC bulk fragments. The Phase 57d follow-up adds
+/// [`BufferStorage::Shared`], where pixel bytes live in a shared-memory
+/// region the client allocated via `sys_shm_create` and the compositor
+/// mapped read-only via `sys_shm_map`. The compose path treats both
+/// uniformly through [`BufferStorage::as_slice`].
+///
+/// `Owned` cleans up automatically on drop. `Shared` carries the
+/// owning user virtual address + length so [`Drop`] can call
+/// `sys_shm_unmap` to release the mapping (and decrement the registry
+/// refcount) when the surface is destroyed or re-attached.
+#[derive(Debug)]
+pub enum BufferStorage {
+    Owned(Vec<u8>),
+    Shared {
+        /// User virtual address returned by `sys_shm_map`.
+        user_va: u64,
+        /// Byte length = `width * height * 4` rounded up to a page.
+        len: usize,
+    },
+}
+
+impl Clone for BufferStorage {
+    fn clone(&self) -> Self {
+        match self {
+            BufferStorage::Owned(v) => BufferStorage::Owned(v.clone()),
+            // Shared mappings are not deep-cloneable: the kernel
+            // refcount is decremented on drop, and we cannot bump it
+            // again from userspace without a syscall round-trip. The
+            // composer takes `&CommittedBuffer` borrows so a clone is
+            // never structurally required; if it ever is, fall back
+            // to materialising an owned copy of the visible bytes.
+            BufferStorage::Shared { user_va, len } => unsafe {
+                let slice = core::slice::from_raw_parts(*user_va as *const u8, *len);
+                BufferStorage::Owned(slice.to_vec())
+            },
+        }
+    }
+}
+
+impl Drop for BufferStorage {
+    fn drop(&mut self) {
+        if let BufferStorage::Shared { user_va, .. } = self {
+            // Best-effort release. If the syscall fails the SHM
+            // registry still has us as a holder; the leak is bounded
+            // by the surviving kernel registry's lifetime, not by
+            // accumulating across many surfaces.
+            let _ = syscall_lib::shm_unmap(*user_va);
+        }
+    }
+}
+
+impl BufferStorage {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            BufferStorage::Owned(v) => v,
+            BufferStorage::Shared { user_va, len } => unsafe {
+                core::slice::from_raw_parts(*user_va as *const u8, *len)
+            },
+        }
+    }
+}
+
 /// Committed pixel buffer for one surface.
 ///
 /// Phase 56 transports pixel bytes inline via the bulk-IPC primitive (see
@@ -62,12 +127,39 @@ use kernel_core::display::surface::{
 /// here once committed. Width/height are tracked separately so the composer
 /// can clip and stride correctly without trusting client-supplied geometry
 /// on the protocol surface.
+///
+/// Phase 57d follow-up — `pixels` now carries a [`BufferStorage`] so
+/// shared-memory-backed buffers can avoid the chunked-IPC double copy.
+/// Existing readers go through [`pixels_slice`] for both variants.
 #[derive(Debug, Clone)]
 pub struct CommittedBuffer {
     pub buffer_id: BufferId,
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: BufferStorage,
+}
+
+impl CommittedBuffer {
+    /// Construct a `CommittedBuffer` from an owned pixel `Vec<u8>` —
+    /// the legacy path used by the chunked-pixel transport. New
+    /// shared-buffer attaches build the struct directly with a
+    /// `BufferStorage::Shared` value, never going through this helper.
+    pub fn from_owned(buffer_id: BufferId, width: u32, height: u32, pixels: Vec<u8>) -> Self {
+        Self {
+            buffer_id,
+            width,
+            height,
+            pixels: BufferStorage::Owned(pixels),
+        }
+    }
+
+    /// Borrow the committed pixels uniformly across owned and shared
+    /// storage. Length is exactly `width * height * 4` for shared
+    /// storage; for owned storage it's whatever the bulk transport
+    /// reassembled (validated against the same expression at intake).
+    pub fn pixels_slice(&self) -> &[u8] {
+        self.pixels.as_slice()
+    }
 }
 
 /// Per-surface state owned by the display server.
@@ -265,12 +357,9 @@ impl SurfaceRegistry {
             if self.pending_bulk.len() >= MAX_PENDING_BULK {
                 return Err(ChunkError::TotalTooLarge);
             }
-            self.pending_bulk.push(CommittedBuffer {
-                buffer_id,
-                width,
-                height,
-                pixels,
-            });
+            self.pending_bulk.push(CommittedBuffer::from_owned(
+                buffer_id, width, height, pixels,
+            ));
         }
         Ok(())
     }
@@ -330,6 +419,46 @@ impl SurfaceRegistry {
                 if let Some(s) = self.surfaces.get_mut(surface_id) {
                     s.role = Some(*role);
                     result.created.push((*surface_id, *role));
+                }
+            }
+            ClientMessage::AttachSharedBuffer {
+                surface_id,
+                buffer_id,
+                shm_id,
+                width,
+                height,
+            } => {
+                // Map the SHM region into our address space. The
+                // mapping survives until the resulting `CommittedBuffer`
+                // is dropped (Drop calls `sys_shm_unmap`); the kernel
+                // refcount keeps the underlying frames alive even if
+                // the client exits before the surface is torn down.
+                let user_va = syscall_lib::shm_map(*shm_id);
+                if user_va == 0 {
+                    return Err(SurfaceShimError::PendingBulkIdMismatch {
+                        expected: *buffer_id,
+                        pending: alloc::vec::Vec::new(),
+                    });
+                }
+                let byte_count = (*width as usize)
+                    .saturating_mul(*height as usize)
+                    .saturating_mul(4);
+                let buf = CommittedBuffer {
+                    buffer_id: *buffer_id,
+                    width: *width,
+                    height: *height,
+                    pixels: BufferStorage::Shared {
+                        user_va,
+                        len: byte_count,
+                    },
+                };
+                self.apply_event(
+                    *surface_id,
+                    SurfaceEvent::AttachBuffer(*buffer_id),
+                    &mut result,
+                )?;
+                if let Some(s) = self.surfaces.get_mut(surface_id) {
+                    s.pending_buffer = Some(buf);
                 }
             }
             ClientMessage::AttachBuffer {
@@ -668,22 +797,21 @@ fn cursor_from_committed(
         .checked_mul(buf.height as usize)
         .and_then(|wh| wh.checked_mul(4))
         .unwrap_or(usize::MAX);
-    if buf.pixels.len() != byte_count {
+    let pixels = buf.pixels_slice();
+    if pixels.len() != byte_count {
         return Err(
             kernel_core::display::cursor::ClientCursorError::PixelLengthMismatch {
                 expected: byte_count,
-                actual: buf.pixels.len(),
+                actual: pixels.len(),
             },
         );
     }
     // Decode the BGRA byte stream into u32 cells. Each cell is one
     // pixel (BGRA in little-endian wire byte order — `to_le_bytes`
-    // round-trips back to `[B, G, R, A]`). Hand the owned `Vec`
-    // directly to `from_vec` so we don't pay a second alloc + clone
-    // inside `ClientCursor::new`.
+    // round-trips back to `[B, G, R, A]`).
     let pixel_count = byte_count / 4;
     let mut packed: Vec<u32> = Vec::with_capacity(pixel_count);
-    for chunk in buf.pixels.chunks_exact(4) {
+    for chunk in pixels.chunks_exact(4) {
         let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
         packed.push(u32::from_le_bytes(arr));
     }

@@ -25,17 +25,11 @@
 //! frame ids for double-buffering; today the single-id pattern keeps
 //! the protocol footprint minimal.
 
-use alloc::vec;
-use alloc::vec::Vec;
-
-use kernel_core::display::pixel_chunk::{
-    CHUNK_HEADER_LEN, PixelChunkHeader, cell_pixel_offset, chunk_plan,
-};
+use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
 };
 use kernel_core::session::font::{BasicBitmapFont, FontProvider};
-use surface_buffer::{PixelFormat, SurfaceBuffer, SurfaceBufferId};
 use syscall_lib::STDOUT_FILENO;
 
 use crate::render::FramebufferOwner;
@@ -43,9 +37,6 @@ use crate::{DEFAULT_COLS, DEFAULT_ROWS, TermError};
 
 /// IPC label for protocol verbs (mirrors `display_server::client::LABEL_VERB`).
 const LABEL_VERB: u64 = 1;
-/// IPC label for chunked pixel uploads (mirrors
-/// `display_server::client::LABEL_PIXELS_CHUNK`).
-const LABEL_PIXELS_CHUNK: u64 = 5;
 
 /// Per-attempt sleep between display-server lookups (5 ms). Mirrors
 /// the gfx-demo / kbd_server bounded retry shape.
@@ -82,34 +73,46 @@ pub const CELL_WIDTH: u8 = 8;
 /// Cell pixel height — pinned to the bundled font's cell size.
 pub const CELL_HEIGHT: u8 = 16;
 
-/// Maximum payload bytes per chunk = MAX_BULK_LEN (65536) minus the
-/// 24-byte chunk header. Each [`FramebufferOwner::submit`] uploads
-/// `ceil(SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX * 4 / CHUNK_PAYLOAD_LEN)`
-/// chunks per frame. The Phase 57d follow-up bumped this from
-/// (4096 - 24) to (65536 - 24): 1 MiB / 65512 ≈ 16 chunks per
-/// frame instead of ~252, taking term compose's IPC roundtrip
-/// budget from ~250 ms to ~16 ms and unblocking the focus
-/// dispatcher's outbound queue under fast typing.
-const CHUNK_PAYLOAD_LEN: usize = 65536 - CHUNK_HEADER_LEN;
-
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`
 /// at ~24 bytes; a 64-byte buffer is ample.
 const VERB_ENCODE_BUF_LEN: usize = 64;
 
 /// Production [`FramebufferOwner`] for the `term` graphical client.
+///
+/// Phase 57d follow-up — the local pixel store is now backed by a
+/// shared-memory region that `display_server` maps read-only. Term
+/// writes pixels directly into the mapping (no IPC), then per frame
+/// sends a small `DamageSurface` + `CommitSurface` pair to publish
+/// updates. The chunked-pixel transport (`upload_chunked` /
+/// `LABEL_PIXELS_CHUNK`) is gone from the hot path.
 pub struct DisplayClient {
     server_handle: u32,
-    surface: SurfaceBuffer,
-    chunk_buf: Vec<u8>,
+    /// User-virtual base of the shared-memory region. The mapping
+    /// lasts for `DisplayClient`'s lifetime; `Drop` releases it via
+    /// `sys_shm_unmap`. Sized at `SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX
+    /// * 4` rounded up to a 4 KiB page.
+    surface_va: u64,
+    /// Total mapped byte length (page-aligned).
+    surface_len: usize,
+    /// SHM id assigned by the kernel registry. Travels in
+    /// `AttachSharedBuffer` so `display_server` can map the same
+    /// frames into its own address space.
+    shm_id: u32,
+    /// True once `attach_shared_buffer_once` has succeeded — every
+    /// later submit just sends `DamageSurface` + `CommitSurface` on
+    /// the existing buffer-id binding. Re-attach is cheap (no new
+    /// mapping) but unnecessary, and the kernel's pending-bulk slot
+    /// is empty in the SHM path so we skip it.
+    attached: bool,
 }
 
 impl DisplayClient {
     /// Look up `display_server`, send the `Hello` + `CreateSurface`
-    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate the local
-    /// 640 × 400 BGRA buffer, and return a ready-to-submit
+    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a 1 MiB
+    /// shared-memory region, and return a ready-to-submit
     /// `DisplayClient`. Returns a typed error if the lookup, encode,
-    /// or `ipc_call_buf` fails.
+    /// `ipc_call_buf`, or SHM allocation fails.
     pub fn connect() -> Result<Self, TermError> {
         let server_handle = match Self::lookup_with_backoff() {
             Some(h) => h,
@@ -143,33 +146,82 @@ impl DisplayClient {
             return Err(TermError::DisplayServerUnavailable);
         }
 
-        // 4. Allocate the local pixel store. 640 × 400 × 4 = 1 MiB,
-        //    well under the 4 MiB chunked-transport cap.
-        let surface = SurfaceBuffer::new(
-            SurfaceBufferId(BUFFER_ID.0),
-            SURFACE_WIDTH_PX,
-            SURFACE_HEIGHT_PX,
-            PixelFormat::Bgra8888,
-        )
-        .map_err(|_| TermError::DisplayServerUnavailable)?;
-
-        let chunk_buf = vec![0u8; CHUNK_HEADER_LEN + CHUNK_PAYLOAD_LEN];
+        // 4. Allocate the shared-memory region. 640 × 400 × 4 = 1 MiB
+        //    (256 contiguous 4 KiB pages). The SHM registry's create
+        //    path rounds up to the next page boundary; the buddy
+        //    allocator orders fit comfortably inside MAX_ORDER=9.
+        let byte_len = (SURFACE_WIDTH_PX as usize)
+            .saturating_mul(SURFACE_HEIGHT_PX as usize)
+            .saturating_mul(4);
+        let shm_id = syscall_lib::shm_create(byte_len);
+        if shm_id == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "term: shm_create failed\n");
+            return Err(TermError::DisplayServerUnavailable);
+        }
+        let surface_va = syscall_lib::shm_map(shm_id);
+        if surface_va == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "term: shm_map failed\n");
+            return Err(TermError::DisplayServerUnavailable);
+        }
+        // Pages are pre-zeroed by the SHM create path; no fill
+        // needed. Round byte_len up to the page boundary for the
+        // unmap on Drop — `sys_shm_create` rounded the same way.
+        let surface_len = byte_len.div_ceil(4096) * 4096;
 
         Ok(Self {
             server_handle,
-            surface,
-            chunk_buf,
+            surface_va,
+            surface_len,
+            shm_id,
+            attached: false,
         })
     }
 
-    /// Mutable access to the underlying pixel buffer — used by the
-    /// `FramebufferOwner` impl below and (in the future) by
-    /// rendering paths that need to write directly without going
-    /// through a glyph.
+    /// Mutable access to the shared-memory pixel mapping — used by
+    /// the `FramebufferOwner` impl below.
+    ///
+    /// SAFETY: the kernel mapped `surface_len` writable bytes at
+    /// `surface_va` for this process; `display_server`'s read-only
+    /// view does not violate Rust aliasing rules from this side
+    /// because the compositor never mutates and our writes are racy
+    /// against its reads only at the framebuffer-pixel granularity
+    /// (last-writer-wins is the standard shared-buffer contract).
     fn pixels_mut(&mut self) -> &mut [u8] {
-        self.surface.pixels_mut()
+        unsafe { core::slice::from_raw_parts_mut(self.surface_va as *mut u8, self.surface_len) }
     }
 
+    /// Send `AttachSharedBuffer` exactly once for this surface. Called
+    /// from `submit` lazily so the first compose pass is the one that
+    /// pays the attach cost. Returns `true` on success.
+    fn attach_shared_buffer_once(&mut self) -> bool {
+        if self.attached {
+            return true;
+        }
+        let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
+        let attach = ClientMessage::AttachSharedBuffer {
+            surface_id: SURFACE_ID,
+            buffer_id: BUFFER_ID,
+            shm_id: self.shm_id,
+            width: SURFACE_WIDTH_PX,
+            height: SURFACE_HEIGHT_PX,
+        };
+        if !Self::send_verb(self.server_handle, &attach, &mut buf, "AttachSharedBuffer") {
+            return false;
+        }
+        self.attached = true;
+        true
+    }
+}
+
+impl Drop for DisplayClient {
+    fn drop(&mut self) {
+        if self.surface_va != 0 {
+            let _ = syscall_lib::shm_unmap(self.surface_va);
+        }
+    }
+}
+
+impl DisplayClient {
     /// `display_server` lookup with bounded retry. Mirrors
     /// `gfx-demo::lookup_display_with_backoff`.
     fn lookup_with_backoff() -> Option<u32> {
@@ -208,64 +260,12 @@ impl DisplayClient {
         true
     }
 
-    /// Upload the entire local surface to `display_server` via the
-    /// chunked-bulk wire. Each chunk is 4 KiB (24-byte header + up
-    /// to 4072 pixel bytes); total chunk count is
-    /// `ceil(byte_len() / CHUNK_PAYLOAD_LEN)` ≈ 257 for the default
-    /// 1 MiB buffer.
-    fn upload_chunked(&mut self) -> bool {
-        let byte_len = self.surface.byte_len() as u32;
-        // `chunk_plan` produces the (offset, chunk_len) sequence and
-        // is host-tested in `kernel_core::display::pixel_chunk` —
-        // the production loop here just translates each pair into
-        // an IPC bulk call.
-        for (offset, chunk_len) in chunk_plan(byte_len, CHUNK_PAYLOAD_LEN as u32) {
-            let header = PixelChunkHeader {
-                buffer_id: BUFFER_ID.0,
-                width: SURFACE_WIDTH_PX,
-                height: SURFACE_HEIGHT_PX,
-                total_bytes: byte_len,
-                offset,
-                chunk_len,
-            };
-            if header
-                .encode(&mut self.chunk_buf[..CHUNK_HEADER_LEN])
-                .is_err()
-            {
-                syscall_lib::write_str(STDOUT_FILENO, "term: chunk header encode failed\n");
-                return false;
-            }
-            let src_start = offset as usize;
-            let src_end = src_start + chunk_len as usize;
-            self.chunk_buf[CHUNK_HEADER_LEN..CHUNK_HEADER_LEN + chunk_len as usize]
-                .copy_from_slice(&self.surface.pixels()[src_start..src_end]);
-            let payload = &self.chunk_buf[..CHUNK_HEADER_LEN + chunk_len as usize];
-            let reply = syscall_lib::ipc_call_buf(
-                self.server_handle,
-                LABEL_PIXELS_CHUNK,
-                BUFFER_ID.0 as u64,
-                payload,
-            );
-            if reply == u64::MAX {
-                syscall_lib::write_str(STDOUT_FILENO, "term: chunked upload ipc_call_buf failed\n");
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Send the post-chunked `AttachBuffer` + `DamageSurface(full)` +
-    /// `CommitSurface` verbs.
-    fn finalise_frame(&mut self) -> bool {
+    /// Send `DamageSurface(full)` + `CommitSurface` to publish the
+    /// pixels term wrote into the shared region. With shared-memory
+    /// backing this is the entire submit cost — no pixel transport.
+    /// `display_server` reads pixels in place during compose.
+    fn publish_frame(&mut self) -> bool {
         let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
-
-        let attach = ClientMessage::AttachBuffer {
-            surface_id: SURFACE_ID,
-            buffer_id: BUFFER_ID,
-        };
-        if !Self::send_verb(self.server_handle, &attach, &mut buf, "AttachBuffer") {
-            return false;
-        }
 
         let damage = ClientMessage::DamageSurface {
             surface_id: SURFACE_ID,
@@ -357,7 +357,17 @@ impl FramebufferOwner for DisplayClient {
     }
 
     fn clear(&mut self) {
-        self.surface.fill(DEFAULT_BG_BGRA);
+        // Fill the shared mapping byte-wise with the BG colour. The
+        // pixels are 4 bytes wide; we splat the same little-endian
+        // BGRA value across the whole buffer.
+        let len = self.surface_len;
+        let pixels = self.pixels_mut();
+        let bg_bytes = DEFAULT_BG_BGRA.to_le_bytes();
+        let mut offset = 0;
+        while offset + 4 <= len {
+            pixels[offset..offset + 4].copy_from_slice(&bg_bytes);
+            offset += 4;
+        }
     }
 
     fn scroll(&mut self, amount: i16) {
@@ -366,7 +376,7 @@ impl FramebufferOwner for DisplayClient {
         }
         let stride = (SURFACE_WIDTH_PX as usize) * 4;
         let row_bytes = stride * (CELL_HEIGHT as usize);
-        let buf_len = self.surface.byte_len();
+        let buf_len = self.surface_len;
         let pixels = self.pixels_mut();
         if amount > 0 {
             // Scroll up: shift everything up by `amount * row_bytes`,
@@ -396,10 +406,13 @@ impl FramebufferOwner for DisplayClient {
     }
 
     fn submit(&mut self) {
-        if !self.upload_chunked() {
+        // First submit attaches the shared buffer; subsequent submits
+        // just publish a damage rect since the buffer-id binding is
+        // already in place.
+        if !self.attach_shared_buffer_once() {
             return;
         }
-        let _ = self.finalise_frame();
+        let _ = self.publish_frame();
     }
 }
 

@@ -1274,6 +1274,22 @@ mod syscall_nr {
     /// number of ticks accumulated since the last drain (saturating
     /// coalesce; never blocks).
     pub const FRAME_TICK_DRAIN: u64 = 0x1017;
+    /// Phase 57d follow-up: allocate a shared-memory region of
+    /// `byte_len` bytes (rounded up to a page boundary). Returns the
+    /// new `ShmId` as a `u32` packed into the low bits of the return.
+    /// Errors return `u64::MAX`.
+    pub const SHM_CREATE: u64 = 0x1018;
+    /// Map an existing shared-memory region into the caller's address
+    /// space. Increments the registry refcount; the caller MUST pair
+    /// each successful map with a matching `SHM_UNMAP`. Returns the
+    /// user virtual address of the mapping, or `u64::MAX` on error.
+    pub const SHM_MAP: u64 = 0x1019;
+    /// Unmap a previously-mapped shared-memory region from the caller's
+    /// address space and decrement the registry refcount. The frames
+    /// are returned to the buddy when the last reference drops.
+    /// `arg0` is the user virtual address returned by `SHM_MAP`.
+    /// Returns `0` on success, `u64::MAX` on error.
+    pub const SHM_UNMAP: u64 = 0x101A;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1652,6 +1668,9 @@ pub extern "C" fn syscall_handler(
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
+        SHM_CREATE => sys_shm_create(arg0),
+        SHM_MAP => sys_shm_map(arg0),
+        SHM_UNMAP => sys_shm_unmap(arg0),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -9098,6 +9117,258 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
         virt_addr
     );
     virt_addr
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d follow-up: shared-memory region syscalls (0x1018..=0x101A)
+//
+// `sys_shm_create` allocates a new SHM region of the requested byte
+// length and returns the assigned `ShmId` (zero-extended into u64).
+// `sys_shm_map` maps an existing region into the caller's address
+// space and returns the user virtual address. `sys_shm_unmap` reverses
+// the map and decrements the registry refcount.
+//
+// The chosen wire shape is "ShmId travels as a plain integer": Phase
+// 56's single-client display protocol does not need cap-secure grant
+// semantics, and the hot path (`term` writing pixels into the region
+// and `display_server` reading them) is the same direct memory access
+// that capability-secured SHM would provide. A future multi-client
+// build can wrap the id inside a `Capability::Grant` without changing
+// the kernel registry — the cap variant already has the right shape
+// (`frame, page_count, writable`).
+// ---------------------------------------------------------------------------
+
+/// SHM-mapped pages set this bit on their leaf PTEs so
+/// `mm::free_process_page_table` skips them during process-exit
+/// teardown — the SHM registry's refcount is the single source of
+/// truth for when frames return to the buddy allocator. Same mechanism
+/// the framebuffer mapping uses.
+fn shm_pte_flags() -> x86_64::structures::paging::PageTableFlags {
+    use x86_64::structures::paging::PageTableFlags;
+    PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::BIT_11
+}
+
+pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
+    if byte_len == 0 {
+        return u64::MAX;
+    }
+    match crate::mm::shm::create(byte_len as usize) {
+        Ok((id, _start_phys, _page_count)) => u64::from(id.0),
+        Err(_) => u64::MAX,
+    }
+}
+
+pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+
+    // Increment refcount up front; if any later step fails we decref
+    // on the way out. Holds the SHM frames live across the
+    // page-table-mapping path even if we yield to wait on a lock.
+    let (start_phys, page_count) = match crate::mm::shm::incref(id) {
+        Ok(v) => v,
+        Err(_) => return u64::MAX,
+    };
+    let total_size = (page_count as u64) * 4096;
+
+    // Build the per-page PhysFrame array the user_space helper expects.
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+    let mut frames = alloc::vec::Vec::with_capacity(page_count as usize);
+    for i in 0..(page_count as u64) {
+        let phys_addr = x86_64::PhysAddr::new(start_phys + i * 4096);
+        match PhysFrame::<Size4KiB>::from_start_address(phys_addr) {
+            Ok(f) => frames.push(f),
+            Err(_) => {
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        }
+    }
+
+    let pid = crate::process::current_pid();
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+
+    let virt_addr = {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        // Claim a virtual address range from the process's anon-mmap
+        // cursor so we don't collide with an existing mapping.
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        let virt_addr =
+            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                let current = if *mmap_next == 0 {
+                    ANON_MMAP_BASE
+                } else {
+                    *mmap_next
+                };
+                let base = (current + 4095) & !4095;
+                let end = base
+                    .checked_add(total_size)
+                    .filter(|v| *v <= USER_SPACE_END)?;
+                *mmap_next = end;
+                Some(base)
+            }) {
+                Some(Some(base)) => base,
+                _ => {
+                    let _ = crate::mm::shm::decref(id);
+                    return u64::MAX;
+                }
+            };
+        let reservation_end = virt_addr + total_size;
+
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+            Some(phys) => phys,
+            None => {
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        };
+        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        };
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+
+        if unsafe {
+            crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, shm_pte_flags())
+        }
+        .is_err()
+        {
+            // Roll back the reservation if no other mapping advanced
+            // the cursor in between, then drop our refcount.
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = virt_addr;
+                    }
+                });
+            let _ = crate::mm::shm::decref(id);
+            return u64::MAX;
+        }
+
+        // Record a VMA so munmap / process teardown can find it. We
+        // pack the SHM id into the high bits of `flags` so unmap can
+        // recover it without a separate kernel-side table.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
+                start: virt_addr,
+                len: total_size,
+                prot: 3, // PROT_READ | PROT_WRITE
+                flags: shm_vma_flags(id),
+            });
+        });
+        virt_addr
+    };
+
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, virt_addr, virt_addr + total_size);
+        addr_space.bump_generation();
+    }
+
+    virt_addr
+}
+
+pub(super) fn sys_shm_unmap(user_va: u64) -> u64 {
+    if user_va == 0 || !user_va.is_multiple_of(4096) {
+        return u64::MAX;
+    }
+    let pid = crate::process::current_pid();
+    // Look up the VMA registered by `sys_shm_map` to recover the
+    // mapping length and the SHM id we packed into `flags`.
+    let info = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree
+            .iter()
+            .find(|m| m.start == user_va && (m.flags & SHM_VMA_FLAG_MARKER) != 0)
+            .map(|m| (m.len, shm_id_from_vma_flags(m.flags)))
+    });
+    let (len, id) = match info {
+        Some(Some((len, Some(id)))) => (len, id),
+        _ => return u64::MAX,
+    };
+
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+
+    {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+            Some(phys) => phys,
+            None => return u64::MAX,
+        };
+        use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+            Ok(f) => f,
+            Err(_) => return u64::MAX,
+        };
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+        let pages = len / 4096;
+        use x86_64::structures::paging::Mapper;
+        for i in 0..pages {
+            let vaddr = x86_64::VirtAddr::new(user_va + i * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(vaddr);
+            // Use unmap directly. Frame ownership transfers back to
+            // the SHM registry's refcount path, not to the buddy
+            // allocator — that's why `BIT_11` was set on the PTEs at
+            // map time.
+            if let Ok((_frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+        }
+    }
+
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, user_va, user_va + len);
+        addr_space.bump_generation();
+    }
+
+    // Drop the VMA entry.
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree.remove(user_va);
+    });
+
+    // Decrement refcount; if this was the last reference, frames go
+    // back to the buddy.
+    let _ = crate::mm::shm::decref(id);
+    0
+}
+
+/// Marker bit in `MemoryMapping.flags` that distinguishes SHM-mapped
+/// regions from regular anonymous mappings. Sits in the OS-private
+/// flag range (above the public POSIX MAP_* bits, like `FB_MAPPING_FLAG`).
+const SHM_VMA_FLAG_MARKER: u64 = 1 << 33;
+
+/// Pack an SHM id into a `MemoryMapping.flags` value. The id occupies
+/// bits 0..32 (low 32 bits); the SHM marker bit is OR'd on top.
+fn shm_vma_flags(id: crate::mm::shm::ShmId) -> u64 {
+    SHM_VMA_FLAG_MARKER | u64::from(id.0)
+}
+
+/// Recover an SHM id from a flags value previously produced by
+/// `shm_vma_flags`. Returns `None` if the SHM marker bit is not set.
+fn shm_id_from_vma_flags(flags: u64) -> Option<crate::mm::shm::ShmId> {
+    if (flags & SHM_VMA_FLAG_MARKER) == 0 {
+        return None;
+    }
+    Some(crate::mm::shm::ShmId(flags as u32))
 }
 
 // ---------------------------------------------------------------------------

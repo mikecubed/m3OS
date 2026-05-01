@@ -268,6 +268,17 @@ pub const SYS_FRAME_TICK_HZ: u64 = 0x1016;
 /// Phase 56 Track B.3: drain pending frame-tick events (saturating).
 pub const SYS_FRAME_TICK_DRAIN: u64 = 0x1017;
 
+/// Phase 57d follow-up: allocate a shared-memory region.
+/// `sys_shm_create(byte_len)` returns the new ShmId in the low 32 bits;
+/// callers compare against `u64::MAX` for failure.
+pub const SYS_SHM_CREATE: u64 = 0x1018;
+/// Map an existing shared-memory region. Returns the user virtual
+/// address, or `u64::MAX` on error. Increments the registry refcount.
+pub const SYS_SHM_MAP: u64 = 0x1019;
+/// Unmap a shared-memory region and decrement its refcount. Frames
+/// return to the buddy when the last reference drops.
+pub const SYS_SHM_UNMAP: u64 = 0x101A;
+
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
@@ -2065,6 +2076,34 @@ pub fn frame_tick_hz() -> u32 {
 /// (saturating coalesce). Never blocks; returns 0 if no ticks elapsed.
 pub fn frame_tick_drain() -> u32 {
     unsafe { syscall0(SYS_FRAME_TICK_DRAIN) as u32 }
+}
+
+/// Allocate a shared-memory region of `byte_len` bytes (rounded up to
+/// a 4 KiB page boundary). Returns the new region's id, or `0` on
+/// error (kernel returns `u64::MAX` which we map to 0 since 0 is the
+/// reserved unset id). Refcount starts at 1 — the matching cleanup is
+/// `shm_unmap` after a successful map.
+pub fn shm_create(byte_len: usize) -> u32 {
+    let raw = unsafe { syscall1(SYS_SHM_CREATE, byte_len as u64) };
+    if raw == u64::MAX {
+        return 0;
+    }
+    raw as u32
+}
+
+/// Map an existing shared-memory region into the caller's address
+/// space. Returns the user virtual address (non-zero) on success, or
+/// `0` on error. Increments the registry refcount.
+pub fn shm_map(shm_id: u32) -> u64 {
+    let raw = unsafe { syscall1(SYS_SHM_MAP, u64::from(shm_id)) };
+    if raw == u64::MAX { 0 } else { raw }
+}
+
+/// Unmap a previously-mapped shared-memory region and decrement its
+/// refcount. Returns `true` on success.
+pub fn shm_unmap(user_va: u64) -> bool {
+    let raw = unsafe { syscall1(SYS_SHM_UNMAP, user_va) };
+    raw == 0
 }
 
 /// Reads one raw PS/2 scancode from the keyboard ring buffer.

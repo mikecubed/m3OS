@@ -179,12 +179,12 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
             // pending-bulk queue is at the documented cap. Refusing
             // additional buffers protects compositor memory from a
             // client that floods `LABEL_PIXELS` without `AttachBuffer`.
-            if !registry.receive_bulk(CommittedBuffer {
+            if !registry.receive_bulk(CommittedBuffer::from_owned(
                 buffer_id,
                 width,
                 height,
-                pixels: pixels.to_vec(),
-            }) {
+                pixels.to_vec(),
+            )) {
                 out.fatal = true;
                 return out;
             }
