@@ -334,6 +334,7 @@ fn drain_output() {
 // usb-mouse` or with the default PS/2 mouse. We accept either result and
 // configure the decoder accordingly.
 
+#[allow(dead_code)]
 fn try_intellimouse_handshake() -> Result<bool, Ps2Error> {
     write_to_aux_with_arg(MOUSE_CMD_SET_SAMPLE_RATE, 200)?;
     write_to_aux_with_arg(MOUSE_CMD_SET_SAMPLE_RATE, 100)?;
@@ -380,14 +381,10 @@ pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Step 3 — set defaults on the mouse to start from a known state.
     let _ = write_to_aux(MOUSE_CMD_SET_DEFAULTS);
 
-    // Step 4 — IntelliMouse magic-knock; if it fails we fall back silently.
-    let wheel = try_intellimouse_handshake().unwrap_or(false);
-    if wheel {
-        // Phase 57b G.8 — `with_mouse_decoder` wraps the `preempt_disable` +
-        // `without_interrupts` boilerplate around the IRQ-shared
-        // `MOUSE_DECODER` lock.
-        with_mouse_decoder(|decoder| decoder.enable_wheel_mode());
-    }
+    // Step 4 — stay in the standard 3-byte packet mode. Some QEMU/front-end
+    // combinations acknowledge the IntelliMouse probe but still surface basic
+    // PS/2 motion to the guest; using 3-byte framing keeps cursor movement
+    // reliable and simply ignores any optional wheel byte as a resync.
 
     // Step 5 — enable streaming. From here, IRQ12 fires on each packet.
     write_to_aux(MOUSE_CMD_ENABLE_STREAMING)?;

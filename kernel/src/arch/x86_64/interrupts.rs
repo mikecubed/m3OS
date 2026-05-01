@@ -1427,6 +1427,8 @@ unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte
 extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
+    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+    const STATUS_AUX_OUTPUT: u8 = 1 << 5;
     let mut data_port: Port<u8> = Port::new(0x60);
     let mut status_port: Port<u8> = Port::new(0x64);
 
@@ -1454,8 +1456,11 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 
     for _ in 0..MAX_DRAIN {
         let status = unsafe { status_port.read() };
-        if status & 0x01 == 0 {
+        if status & STATUS_OUTPUT_FULL == 0 {
             break; // output buffer empty — nothing left to read
+        }
+        if status & STATUS_AUX_OUTPUT != 0 {
+            break; // AUX byte belongs to the mouse ISR.
         }
         let scancode: u8 = unsafe { data_port.read() };
 

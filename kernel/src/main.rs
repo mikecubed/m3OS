@@ -273,8 +273,9 @@ fn init_task() -> ! {
     // the userspace kbd_server via IPC and pushes to stdin via stdin_push syscall.
 
     // Phase 21: serial stdin feeder — reads bytes from COM1, feeds stdin buffer.
-    // Allows testing ion interactively via `cargo xtask run` with piped input.
-    task::spawn(serial_stdin_feeder_task, "serial-stdin");
+    // COM1 IRQ4 is routed to the BSP, so keep the feeder on the same core and
+    // avoid cross-core scheduler wakeups from interrupt context.
+    task::spawn_on_current_core(serial_stdin_feeder_task, "serial-stdin");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
     spawn_userspace_init();
@@ -503,8 +504,10 @@ fn idle_task() -> ! {
 ///    (edge-triggered, same as `NIC_WOKEN` in `net_task`).
 /// 3. Drain all pending bytes from the ring buffer.
 /// 4. If no bytes were available, park via
-///    `block_current_until(&STDIN_FEEDER_WOKEN, None)`.  The scheduler can now
-///    dispatch other tasks on this core while the feeder is blocked.
+///    `block_current_until(&STDIN_FEEDER_WOKEN, Some(now + 1ms))`.  The scheduler
+///    can now dispatch other tasks on this core while the feeder is blocked,
+///    and the short deadline guarantees a missed IRQ wake cannot make console
+///    input appear dead.
 /// 5. On wake (ISR set the flag + IPI'd us), loop back to step 2.
 fn serial_stdin_feeder_task() -> ! {
     // Enable UART Receive Data Available interrupt (IER bit 0).
@@ -589,15 +592,15 @@ fn serial_stdin_feeder_task() -> ! {
             continue;
         }
 
-        // Ring buffer was empty — park until the COM1 RX ISR signals us.
-        // block_current_until removes this task from the run queue; the
-        // scheduler is free to dispatch other tasks (e.g. kbd_server) on this
-        // core.  On wake the ISR will have set STDIN_FEEDER_WOKEN = true and
-        // issued a cross-core IPI if necessary.
+        // Ring buffer was empty — park briefly until the COM1 RX ISR signals
+        // us, with a 1 ms deadline as a safety net. The IRQ wake is the fast
+        // path; the deadline prevents console input from getting stuck if an
+        // interrupt-side wake races or is otherwise lost.
+        let deadline = arch::x86_64::interrupts::tick_count().saturating_add(1);
         let _ = task::scheduler::block_current_until(
             task::TaskState::BlockedOnRecv,
             &crate::serial::STDIN_FEEDER_WOKEN,
-            None,
+            Some(deadline),
         );
     }
 }

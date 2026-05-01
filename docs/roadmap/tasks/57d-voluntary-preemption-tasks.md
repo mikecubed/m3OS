@@ -362,6 +362,10 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 - [x] Per-task `fxsave64`/`fxrstor64` state is saved/restored across scheduler switches so preempted musl/Rust binaries that use XMM/SIMD state (for example `/bin/ion`) resume without the observed `rip=0x4c1e10` userspace fault.
 - [x] Fresh QEMU boot reaches `TERM_SMOKE:ready` and then logs both lazy input-service connections after decoupling framebuffer pixel ownership from raw/game scancode routing, making display_server keep kbd_server/stdin_feeder input instead of draining all IRQ1 scancodes into the raw buffer.
 - [x] The first toplevel surface is focused automatically, so the graphical terminal receives key events without requiring an initial mouse click.
+- [x] PS/2 IRQ routing keeps the shared i8042 output buffer type-safe: IRQ1 stops when the queued byte is AUX-owned, so keyboard handling no longer consumes mouse bytes before IRQ12 can decode them.
+- [x] `stdin_feeder` uses a cap-free service-existence probe to stand down when the graphical `display` service is registered, preventing the text-mode PS/2 bridge from stealing scancodes from display_server while preserving text fallback when display never starts or later disappears.
+- [x] COM1 serial input stays on the BSP with IRQ4, and the serial feeder uses a short deadline while parked so missed interrupt-side wakeups cannot leave console input stuck indefinitely.
+- [x] PS/2 mouse initialization stays in standard 3-byte packet mode so cursor motion decodes reliably even when QEMU/frontends disagree about IntelliMouse wheel framing.
 - [x] The boot log no longer contains temporary `[ipc-diag]`, `[sched-diag]`, AP-idle, or display protocol trace spam.
 - [x] Display startup avoids blocking on input-service lookup; keyboard and mouse reconnect lazily after registration.
 - [x] The display/control endpoints are registered after framebuffer/input state is initialized, so clients cannot observe a half-initialized compositor.

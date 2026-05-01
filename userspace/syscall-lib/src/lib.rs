@@ -348,6 +348,9 @@ pub const SYS_IPC_TAKE_PENDING_BULK: u64 = 0x1112;
 /// loop to multiplex the frame-tick poll + control-endpoint serving.
 pub const SYS_IPC_TRY_RECV_MSG: u64 = 0x1113;
 
+/// Query whether a named service is registered without allocating a cap handle.
+pub const SYS_IPC_SERVICE_EXISTS: u64 = 0x1114;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -445,6 +448,20 @@ pub fn ipc_lookup_service(name: &str) -> u64 {
             name.as_ptr() as u64,
             name.len() as u64,
         )
+    }
+}
+
+/// Return true if a named service is currently registered.
+///
+/// Unlike [`ipc_lookup_service`], this does not insert an endpoint capability
+/// into the caller's cap table, so it is safe for polling ownership changes.
+pub fn ipc_service_exists(name: &str) -> bool {
+    unsafe {
+        syscall2(
+            SYS_IPC_SERVICE_EXISTS,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        ) == 1
     }
 }
 

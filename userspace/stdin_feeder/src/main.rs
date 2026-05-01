@@ -9,6 +9,10 @@
 //! `KBD_EVENT_PULL` requests are not starved while this feeder polls.
 //! When kbd_server reports an empty buffer (reply 0), stdin_feeder sleeps
 //! 5 ms before retrying.
+//! If the graphical `display` service is present, stdin_feeder stands down:
+//! display_server owns PS/2 keyboard delivery and forwards events to the
+//! graphical terminal over the display protocol. Text-mode fallback boots
+//! (where `display` never registers) continue using this bridge.
 //!
 //! All terminal policy (canonical editing, echo, signal generation, ICRNL)
 //! is handled by the kernel-side `LineDiscipline` in `push_raw_input`.
@@ -98,6 +102,11 @@ const KBD_TRY_READ: u64 = 4;
 /// matching the legacy kbd_server internal poll interval).
 const KBD_POLL_INTERVAL_NS: u32 = 5_000_000;
 
+/// How often to re-check for graphical display ownership while falling back
+/// to the text-mode PS/2-to-stdin bridge. The check is capability-free, so it
+/// can run on every empty poll without leaking handles.
+const DISPLAY_PROBE_INTERVAL_EMPTY_POLLS: u32 = 1;
+
 fn lookup_kbd_service() -> u32 {
     loop {
         let handle = syscall_lib::ipc_lookup_service("kbd");
@@ -106,6 +115,10 @@ fn lookup_kbd_service() -> u32 {
         }
         let _ = syscall_lib::nanosleep_for(0, 20_000_000); // 20 ms
     }
+}
+
+fn display_service_available() -> bool {
+    syscall_lib::ipc_service_exists("display")
 }
 
 fn program_main(_args: &[&str]) -> i32 {
@@ -120,8 +133,16 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut shift = false;
     let mut ctrl = false;
+    let mut graphical_input_owner = display_service_available();
+    let mut empty_polls_since_display_probe = 0u32;
 
     loop {
+        if graphical_input_owner {
+            let _ = syscall_lib::nanosleep_for(0, 50_000_000);
+            graphical_input_owner = display_service_available();
+            continue;
+        }
+
         // Request one scancode from kbd_server via the non-blocking probe
         // label.  kbd_server replies 0 if the buffer is currently empty;
         // we sleep briefly and retry rather than holding the server busy
@@ -132,9 +153,15 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         }
         if sc_rc == 0 {
+            empty_polls_since_display_probe = empty_polls_since_display_probe.saturating_add(1);
+            if empty_polls_since_display_probe >= DISPLAY_PROBE_INTERVAL_EMPTY_POLLS {
+                empty_polls_since_display_probe = 0;
+                graphical_input_owner = display_service_available();
+            }
             let _ = syscall_lib::nanosleep_for(0, KBD_POLL_INTERVAL_NS);
             continue;
         }
+        empty_polls_since_display_probe = 0;
         let sc = sc_rc as u8;
 
         // Key-release (break) codes: bit 7 set.
