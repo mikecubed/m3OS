@@ -7038,12 +7038,20 @@ pub(crate) fn vfs_service_close_pub(service_handle: u64) {
 
 pub(super) fn sys_linux_close(fd: u64) -> u64 {
     let fd = fd as usize;
+    // PID 1 (init) runs `check_control_commands` on every reap-loop
+    // iteration: open(/run/init.cmd) → read → close → open(trunc) →
+    // close. Two closes per iter at >100 Hz produces ~81K trace lines
+    // per minute, drowning out the fork-exec close traces we actually
+    // care about. Skip pid 1 so the trace stays focused on the
+    // fork-child fd-juggling path that is the typical reason for
+    // enabling `exec-trace` in the first place.
     #[cfg(feature = "exec-trace")]
-    log::info!(
-        "[exec-trace] pid={} close fd={}",
-        crate::process::current_pid(),
-        fd
-    );
+    {
+        let pid = crate::process::current_pid();
+        if pid != 1 {
+            log::info!("[exec-trace] pid={} close fd={}", pid, fd);
+        }
+    }
     // stdin/stdout/stderr (0–2) are virtual and cannot be closed.
     if fd < 3 {
         return 0;
