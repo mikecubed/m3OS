@@ -997,20 +997,34 @@ impl KeyRepeatScheduler {
     /// Drive the scheduler with a monotonic timestamp. Returns at most one
     /// repeat event per call; callers should poll until `None` is returned
     /// to drain back-pressure.
+    ///
+    /// Auto-repeat targets only the most recently pressed key, even when
+    /// other keys are still physically held. Standard Linux/X11 keyboard
+    /// behaviour: pressing A then B while still holding A produces
+    /// `aaaaabbbbb…`, not interleaved `ababab…`. When the most recent
+    /// key is released, the next-most-recent still-held key takes over
+    /// the repeat slot; the per-slot `age` field gives the ordering.
     pub fn tick(&mut self, timestamp_ms: u64) -> Option<KeyEvent> {
-        let mut best_idx: Option<usize> = None;
-        let mut best_due_at: u64 = u64::MAX;
+        // Pick the most recently pressed occupied slot — highest `age`.
+        // Older slots stay tracked (so released-then-re-pressed sees a
+        // de-dup) but do not generate repeat events while a newer key
+        // is held.
+        let mut newest_idx: Option<usize> = None;
+        let mut newest_age: u32 = 0;
         for (idx, slot) in self.slots.iter().enumerate() {
             if !slot.occupied {
                 continue;
             }
-            let due_at = self.next_due_ms(slot);
-            if timestamp_ms >= due_at && due_at < best_due_at {
-                best_due_at = due_at;
-                best_idx = Some(idx);
+            if newest_idx.is_none() || slot.age > newest_age {
+                newest_age = slot.age;
+                newest_idx = Some(idx);
             }
         }
-        let idx = best_idx?;
+        let idx = newest_idx?;
+        let slot_due_at = self.next_due_ms(&self.slots[idx]);
+        if timestamp_ms < slot_due_at {
+            return None;
+        }
         let slot = &mut self.slots[idx];
         slot.last_emit_ms = timestamp_ms;
         Some(KeyEvent {
@@ -1409,16 +1423,47 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_multiple_held_keys_repeat_independently() {
+    fn scheduler_repeats_only_most_recently_pressed_held_key() {
+        // Standard Linux/X11 keyboard repeat: only the most recently
+        // pressed still-held key auto-repeats. Pressing A, then B
+        // while still holding A, should produce repeats of B (not A,
+        // not interleaved A/B). When B is released, the repeat slot
+        // falls back to A (verified by the older-key-takeover test
+        // below).
         let mut s = KeyRepeatScheduler::new();
         let mods = ModifierState::empty();
         s.observe(KEY_A, KeyEventKind::Down, mods, 0).expect("a");
         s.observe(KEY_B, KeyEventKind::Down, mods, 0).expect("b");
-        let first = s.tick(DEFAULT_REPEAT_INITIAL_DELAY_MS).expect("first");
-        let second = s.tick(DEFAULT_REPEAT_INITIAL_DELAY_MS).expect("second");
-        let codes = [first.keycode, second.keycode];
-        assert!(codes.contains(&KEY_A.0));
-        assert!(codes.contains(&KEY_B.0));
+        // Drive the tick repeatedly past the initial delay; every
+        // emitted repeat must target B (the newer press), not A.
+        for tick_ms in (DEFAULT_REPEAT_INITIAL_DELAY_MS
+            ..=DEFAULT_REPEAT_INITIAL_DELAY_MS + 5 * (1000u64 / DEFAULT_REPEAT_RATE_HZ as u64))
+            .step_by((1000u64 / DEFAULT_REPEAT_RATE_HZ as u64) as usize)
+        {
+            if let Some(ev) = s.tick(tick_ms) {
+                assert_eq!(ev.keycode, KEY_B.0);
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_repeat_falls_back_to_older_key_when_newer_releases() {
+        // Pressing A then B then releasing B should hand the repeat
+        // slot back to A (still held). This is the "older key
+        // takeover" case mentioned in the standard repeat test above.
+        let mut s = KeyRepeatScheduler::new();
+        let mods = ModifierState::empty();
+        s.observe(KEY_A, KeyEventKind::Down, mods, 0)
+            .expect("a-down");
+        s.observe(KEY_B, KeyEventKind::Down, mods, 0)
+            .expect("b-down");
+        s.observe(KEY_B, KeyEventKind::Up, mods, 50).expect("b-up");
+        // Now A is the only held key. Tick past the initial delay
+        // and confirm A repeats.
+        let ev = s
+            .tick(DEFAULT_REPEAT_INITIAL_DELAY_MS + 100)
+            .expect("repeat");
+        assert_eq!(ev.keycode, KEY_A.0);
     }
 
     #[test]
