@@ -9164,6 +9164,11 @@ pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
 
 pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        log::warn!(
+            "[shm] map: invalid shm_id_arg={:#x} from pid={}",
+            shm_id_arg,
+            crate::process::current_pid()
+        );
         return u64::MAX;
     }
     let id = crate::mm::shm::ShmId(shm_id_arg as u32);
@@ -9173,7 +9178,15 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     // page-table-mapping path even if we yield to wait on a lock.
     let (start_phys, page_count) = match crate::mm::shm::incref(id) {
         Ok(v) => v,
-        Err(_) => return u64::MAX,
+        Err(e) => {
+            log::warn!(
+                "[shm] map: incref({:?}) failed err={:?} pid={}",
+                id,
+                e,
+                crate::process::current_pid()
+            );
+            return u64::MAX;
+        }
     };
     let total_size = (page_count as u64) * 4096;
 
@@ -9221,6 +9234,7 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
             }) {
                 Some(Some(base)) => base,
                 _ => {
+                    log::warn!("[shm] map: with_shared_mm_mut returned None pid={}", pid);
                     let _ = crate::mm::shm::decref(id);
                     return u64::MAX;
                 }
@@ -9230,6 +9244,7 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
         let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
             Some(phys) => phys,
             None => {
+                log::warn!("[shm] map: no addr_space for pid={}", pid);
                 let _ = crate::mm::shm::decref(id);
                 return u64::MAX;
             }
@@ -9237,6 +9252,11 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
         let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
             Ok(f) => f,
             Err(_) => {
+                log::warn!(
+                    "[shm] map: cr3 not page-aligned pid={} cr3={:#x}",
+                    pid,
+                    cr3_phys.as_u64()
+                );
                 let _ = crate::mm::shm::decref(id);
                 return u64::MAX;
             }
@@ -9248,6 +9268,12 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
         }
         .is_err()
         {
+            log::warn!(
+                "[shm] map: map_user_frames failed pid={} virt={:#x} pages={}",
+                pid,
+                virt_addr,
+                page_count
+            );
             // Roll back the reservation if no other mapping advanced
             // the cursor in between, then drop our refcount.
             let _ =

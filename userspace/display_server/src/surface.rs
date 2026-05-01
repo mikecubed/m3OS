@@ -435,11 +435,30 @@ impl SurfaceRegistry {
                 // the client exits before the surface is torn down.
                 let user_va = syscall_lib::shm_map(*shm_id);
                 if user_va == 0 {
+                    // Phase 57d follow-up — log the failure so the
+                    // intermittent boot-1 "no terminal" symptom (where
+                    // display_server silently drops AttachSharedBuffer
+                    // and the surface never gets pixels) produces a
+                    // visible signal in the boot transcript.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "display_server: AttachSharedBuffer shm_map failed shm_id=",
+                    );
+                    write_u32_log(*shm_id);
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
                     return Err(SurfaceShimError::PendingBulkIdMismatch {
                         expected: *buffer_id,
                         pending: alloc::vec::Vec::new(),
                     });
                 }
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "display_server: AttachSharedBuffer ok shm_id=",
+                );
+                write_u32_log(*shm_id);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
+                write_u64_log(user_va);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
                 let byte_count = (*width as usize)
                     .saturating_mul(*height as usize)
                     .saturating_mul(4);
@@ -786,6 +805,56 @@ impl<'a> ComposeEntry<'a> {
             self.layer,
             ComposeLayer::Toplevel | ComposeLayer::Background
         )
+    }
+}
+
+/// Phase 57d follow-up — minimal u32 → decimal serial log helper.
+/// Used by the intermittent-AttachSharedBuffer trace lines so we can
+/// see whether display_server's `shm_map` succeeded or failed and
+/// what id it received. No `alloc` dependency; writes directly to
+/// the stdout fd.
+fn write_u32_log(mut value: u32) {
+    let mut buf = [0u8; 10];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
+    }
+}
+
+/// Phase 57d follow-up — companion u64 hex logger for the SHM va.
+fn write_u64_log(mut value: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            let digit = (value & 0xF) as u8;
+            buf[idx] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + (digit - 10)
+            };
+            value >>= 4;
+        }
+    }
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "0x");
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
     }
 }
 
