@@ -798,7 +798,6 @@ impl Scheduler {
                     continue;
                 }
                 if self.idle_tasks.contains(&Some(idx)) {
-                    log_dequeue_filter_drop(core_id, idx, "is-idle", self.tasks[idx].pid, 0);
                     q.remove(i);
                     continue;
                 }
@@ -891,13 +890,6 @@ impl Scheduler {
                 }
                 let task = &self.tasks[idx];
                 if task.state != TaskState::Ready {
-                    continue;
-                }
-                // Fresh fork/clone children carry a task-local fork_ctx until their
-                // first dispatch through fork_child_trampoline. Keep them on the
-                // spawning core so the parent's immediate wait/read-yield loop
-                // can't starve them behind background work on another CPU.
-                if task.fork_ctx.is_some() {
                     continue;
                 }
                 if crate::arch::x86_64::interrupts::tick_count()
@@ -1142,7 +1134,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         least_loaded_core(&sched)
     };
     task.assigned_core = target_core;
-    task.last_migrated_tick = now;
+    // Fork children carry their entry context on the task itself, so they are
+    // safe to steal before first dispatch. Make them immediately stealable: if
+    // their initially selected core misses a wakeup, another idle core can still
+    // run the trampoline instead of waiting for the migration cooldown.
+    task.last_migrated_tick = now.saturating_sub(MIGRATE_COOLDOWN);
     task.last_ready_tick = now;
     // Fresh fork children need one prompt first dispatch so they can consume
     // `fork_ctx` in `fork_child_trampoline` and enter their normal userspace
@@ -3584,13 +3580,13 @@ pub fn run() -> ! {
                     }
 
                     // Phase 54 diagnostic: detect CPU-hog patterns. If a task
-                    // held the CPU for >= 20 ticks (~200 ms) before yielding,
-                    // log it. Suggests a syscall that spin-waits (e.g.
+                    // held the CPU for >= 200 ms before yielding, log it.
+                    // Suggests a syscall that spin-waits (e.g.
                     // virtio_blk poll under contention) rather than a normal
                     // interactive task.
                     let now = crate::arch::x86_64::interrupts::tick_count();
                     let ran_ticks = now.saturating_sub(task.start_tick);
-                    if ran_ticks >= 20 {
+                    if ran_ticks >= 200 {
                         let exec_path = if task.pid != 0 {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table.find(task.pid).map(|proc| proc.exec_path.clone())
@@ -4008,6 +4004,11 @@ pub fn watchdog_scan() {
                     | super::TaskState::BlockedOnFutex
             );
             if !is_blocked {
+                continue;
+            }
+            // A server sitting in a plain receive loop has no timeout/deadline
+            // by design; warn on receive blocks only when a deadline exists.
+            if task.state == super::TaskState::BlockedOnRecv && task.wake_deadline.is_none() {
                 continue;
             }
             let verdict = watchdog_verdict(now, task.blocked_since_tick, task.wake_deadline);

@@ -106,13 +106,6 @@ pub const MOUSE_EVENT_PULL: u64 = 1;
 /// `userspace/mouse_server/src/main.rs`.
 pub const MOUSE_EVENT_NONE: u64 = 2;
 
-/// Service-lookup retry attempts before [`lookup_with_backoff`] gives
-/// up.
-pub const SERVICE_LOOKUP_ATTEMPTS: u32 = 8;
-
-/// Backoff between service-lookup attempts (5 ms).
-pub const SERVICE_LOOKUP_BACKOFF_NS: u32 = 5_000_000;
-
 /// Throttle for the lazy reconnect path inside `KbdInputSource` /
 /// `MouseInputSource`: the source retries `ipc_lookup_service` every
 /// `LAZY_RECONNECT_DRAIN_INTERVAL` drain calls when its handle is
@@ -123,30 +116,6 @@ pub const SERVICE_LOOKUP_BACKOFF_NS: u32 = 5_000_000;
 /// so 100 → ~1 lookup/second — cheap, and the reconnect lands within
 /// a second of the service appearing.
 pub const LAZY_RECONNECT_DRAIN_INTERVAL: u32 = 100;
-
-// ---------------------------------------------------------------------------
-// Service-handle lookup
-// ---------------------------------------------------------------------------
-
-/// Bounded-retry service lookup. Mirrors `gfx-demo`'s
-/// `lookup_display_with_backoff`: up to [`SERVICE_LOOKUP_ATTEMPTS`]
-/// tries with [`SERVICE_LOOKUP_BACKOFF_NS`] between them. Returns
-/// `Some(handle)` on success or `None` if the service never appears
-/// (in which case the caller falls back to a no-op input source so the
-/// compositor still composes its background and any test client).
-pub fn lookup_with_backoff(name: &str) -> Option<u32> {
-    for attempt in 0..SERVICE_LOOKUP_ATTEMPTS {
-        let raw = syscall_lib::ipc_lookup_service(name);
-        if raw != u64::MAX {
-            return Some(raw as u32);
-        }
-        if attempt + 1 == SERVICE_LOOKUP_ATTEMPTS {
-            return None;
-        }
-        let _ = syscall_lib::nanosleep_for(0, SERVICE_LOOKUP_BACKOFF_NS);
-    }
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Real `InputSource` impls
@@ -179,15 +148,11 @@ pub struct KbdInputSource {
 }
 
 impl KbdInputSource {
-    /// Look up the `"kbd"` service with backoff. Returns a source whose
-    /// `poll_key` will pull `KeyEvent`s from `kbd_server` if the lookup
-    /// succeeds; otherwise returns a source whose `poll_key` retries
-    /// the lookup lazily (see [`LAZY_RECONNECT_DRAIN_INTERVAL`]) so a
-    /// late-starting / crashed-and-restarted `kbd_server` is picked up
-    /// without a display_server restart.
-    pub fn lookup_with_backoff() -> Self {
+    /// Start disconnected; the drain path reconnects lazily without delaying
+    /// display registration or contending with init's service-start burst.
+    pub fn new_lazy() -> Self {
         Self {
-            handle: lookup_with_backoff(KBD_SERVICE_NAME),
+            handle: None,
             drains_since_last_lookup: 0,
         }
     }
@@ -239,6 +204,9 @@ impl InputSource for KbdInputSource {
         // dispatcher loop; future observability can count them
         // separately because the labels are now distinct.
         let label = syscall_lib::ipc_call(handle, KBD_EVENT_PULL, 0);
+        if label == KBD_EVENT_NONE {
+            return None;
+        }
         if label != KBD_EVENT_PULL {
             return None;
         }
@@ -274,13 +242,11 @@ pub struct MouseInputSource {
 }
 
 impl MouseInputSource {
-    /// Look up the `"mouse"` service with backoff. If the initial
-    /// lookup races and loses (mouse_server has `depends=display`, so
-    /// it always starts after display_server), `poll_pointer` retries
-    /// lazily — see [`LAZY_RECONNECT_DRAIN_INTERVAL`].
-    pub fn lookup_with_backoff() -> Self {
+    /// Start disconnected; the drain path reconnects lazily without delaying
+    /// display registration or contending with init's service-start burst.
+    pub fn new_lazy() -> Self {
         Self {
-            handle: lookup_with_backoff(MOUSE_SERVICE_NAME),
+            handle: None,
             drains_since_last_lookup: 0,
         }
     }
@@ -328,6 +294,9 @@ impl InputSource for MouseInputSource {
         // labels are now distinct so future observability can count
         // them separately.
         let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
+        if label == MOUSE_EVENT_NONE {
+            return None;
+        }
         if label != MOUSE_EVENT_PULL {
             return None;
         }
@@ -414,8 +383,8 @@ impl InputWiring {
     pub fn new() -> Self {
         Self {
             dispatcher: InputDispatcher::new(),
-            kbd: KbdInputSource::lookup_with_backoff(),
-            mouse: MouseInputSource::lookup_with_backoff(),
+            kbd: KbdInputSource::new_lazy(),
+            mouse: MouseInputSource::new_lazy(),
             injected_keys: Vec::new(),
         }
     }
@@ -500,6 +469,7 @@ impl InputWiring {
     /// [`Self::drain_one_pass`] but accepts the sources by reference
     /// so tests can construct + script them inline.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn drain_with<K: InputSource, M: InputSource>(
         dispatcher: &mut InputDispatcher,
         kbd: &mut K,

@@ -1,6 +1,6 @@
 # Phase 57d — Voluntary Preemption (PREEMPT_VOLUNTARY): Task List
 
-**Status:** Complete (I.2, I.3, H.3, H.4 pending procedural/hardware gates)
+**Status:** Complete (QEMU graphical boot stabilized; I.2, I.3, H.3 hardware, H.4 soak pending procedural/hardware gates)
 **Source Ref:** phase-57d
 **Depends on:** Phase 3 ✅, Phase 4 ✅, Phase 25 ✅, Phase 35 ✅, Phase 57a ✅, Phase 57b ✅
 **Goal:** Activate the 57b foundation by firing preemption at the IRQ-return boundary whenever the interrupted code is in user mode, `preempt_count == 0`, and the per-core `reschedule` flag is set.  User-mode CPU-bound tasks become preemptible within one timer tick; kernel-mode code remains non-preemptible.  Closes the latency gap left by `preempt_enable` zero-crossings via a deferred-reschedule record consumed at the next user-mode return boundary.
@@ -355,6 +355,14 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 - [ ] On user test hardware, `cargo xtask run-gui --fresh` with `preempt-voluntary` enabled: cursor moves, keyboard echoes, `term` reaches `TERM_SMOKE:ready`.
 - [ ] Repeated 5 times, 5 successes.
 - [ ] Zero `[WARN] [sched]` lines.
+
+**Current QEMU evidence:**
+- [x] `cargo xtask run --fresh` reaches `TERM_SMOKE:ready` with default-on `preempt-voluntary`.
+- [x] The boot log no longer contains temporary `[ipc-diag]`, `[sched-diag]`, AP-idle, or display protocol trace spam.
+- [x] Display startup avoids blocking on input-service lookup; keyboard and mouse reconnect lazily after registration.
+- [x] The display/control endpoints are registered after framebuffer/input state is initialized, so clients cannot observe a half-initialized compositor.
+- [x] The compositor/input service chain is kept on the BSP during startup to avoid AP run-queue latency stranding synchronous display/input IPC before the terminal draws.
+- [ ] `cargo xtask smoke-test --timeout 120` still times out in the existing tcc smoke segment (`SMOKE:tcc-version:BEGIN` without `PASS`) and remains outside this graphical boot stabilization gate.
 
 ### H.4 — 30 + 30 min soak
 

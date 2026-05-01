@@ -112,6 +112,7 @@ impl KernelFramebufferOwner {
 
     /// Explicit release path. Returns the kernel's syscall result so the
     /// caller can react (negative errno on failure).
+    #[allow(dead_code)]
     pub fn release(mut self) -> isize {
         if self.released {
             return 0;

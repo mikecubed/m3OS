@@ -1815,11 +1815,6 @@ pub extern "C" fn syscall_handler(
             .preempt_resched_pending
             .swap(false, core::sync::atomic::Ordering::AcqRel)
     {
-        // A preempt_enable zero-crossing recorded a pending reschedule.
-        // Re-signal so the scheduler picks it up on the next dispatch
-        // opportunity.  Track G will wire the actual preempt-to-scheduler
-        // call; for now the flag is consumed (not leaked) and the
-        // reschedule bit stays set for the normal scheduler loop.
         crate::task::signal_reschedule();
     }
 
@@ -3882,6 +3877,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     let name: &str = &resolved_name;
     let pid = crate::process::current_pid();
+    // The Phase 56/57 graphical stack starts as a synchronous IPC chain:
+    // term -> display_server -> kbd_server/mouse_server. Keep that boot-critical
+    // compositor/input trio on the BSP so startup cannot strand one side of the
+    // chain behind AP run-queue latency before the terminal has drawn.
+    if name == "/bin/display_server" || name == "/bin/kbd_server" || name == "/bin/mouse_server" {
+        let _ = crate::task::scheduler::sys_sched_setaffinity(0, 1);
+    }
     log::debug!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
     // it from the canonical single-threaded TGID owner. Otherwise shared-mm
@@ -4056,15 +4058,22 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // real reclamation happens in Phase 13 when a free list is added.
         crate::mm::free_process_page_table(old_cr3_phys);
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
-        let kstack_top = crate::process::PROCESS_TABLE
+        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
             .lock()
             .find(pid)
-            .map(|p| p.kernel_stack_top)
-            .unwrap_or(0);
+            .map(|p| (p.kernel_stack_top, p.fs_base))
+            .unwrap_or((0, 0));
         if kstack_top != 0 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
+        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
+            user_rsp,
+            kernel_stack_top: kstack_top,
+            fs_base,
+            cr3_phys: new_cr3.start_address().as_u64(),
+            addr_space_gen: new_addr_space.generation(),
+        });
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }

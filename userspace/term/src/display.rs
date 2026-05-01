@@ -51,7 +51,7 @@ const LABEL_PIXELS_CHUNK: u64 = 5;
 /// the gfx-demo / kbd_server bounded retry shape.
 const LOOKUP_BACKOFF_NS: u32 = 5_000_000;
 /// Maximum lookup attempts before [`DisplayClient::connect`] gives up.
-const LOOKUP_MAX_ATTEMPTS: u32 = 8;
+const LOOKUP_MAX_ATTEMPTS: u32 = 2000;
 
 /// Surface id term claims. Stable across the binary lifetime — only
 /// one Toplevel surface per `term` instance.

@@ -1268,31 +1268,10 @@ impl ServiceManager {
         }
 
         if pid == 0 {
-            // PHASE 57 DEBUG: very first marker in the child path —
-            // before reading svc data, before any allocation, before
-            // any function call. Two services (kbd, fat) are reaching
-            // init's parent "started 'name' pid=N" log but never
-            // reach IC1A. This marker tells us whether the fork-child
-            // task is even running for those pids. We bake the idx
-            // into the marker so we can map it back to the service
-            // even with svc reads being suspect.
-            {
-                let mut idx_buf = [0u8; 64];
-                let mut ip = 0usize;
-                ip += append_to_buf(&mut idx_buf, ip, b"init: trace.IC0 fork-child entered idx=");
-                ip += append_u64_to_buf(&mut idx_buf, ip, idx as u64);
-                ip += append_to_buf(&mut idx_buf, ip, b"\n");
-                if let Ok(s) = core::str::from_utf8(&idx_buf[..ip]) {
-                    syscall_lib::serial_print(s);
-                }
-            }
-
             // Child: build path with null terminator and exec.
             let mut path_buf = [0u8; MAX_CMD + 1];
             let path_len = svc.command.write_null_terminated(&mut path_buf);
             let path = &path_buf[..path_len];
-
-            syscall_lib::serial_print("init: trace.IC0B path-built\n");
 
             // Phase 56 Track F.2 / close-out (G.1, G.2) — append the
             // test-only env vars when their respective markers are
@@ -1306,13 +1285,9 @@ impl ServiceManager {
                 self.display_server_inject_key,
             );
 
-            syscall_lib::serial_print("init: trace.IC0C envp-built\n");
-
             // Drop privileges if run_as_uid is set.
             if svc.run_as_uid != 0 {
-                syscall_lib::serial_print("init: trace.IC0D before-setuid\n");
                 let ret = setuid(svc.run_as_uid);
-                syscall_lib::serial_print("init: trace.IC0E after-setuid\n");
                 if ret < 0 {
                     write_str(STDOUT_FILENO, "init: setuid failed for '");
                     write(STDOUT_FILENO, svc.name.as_bytes());
@@ -1324,37 +1299,7 @@ impl ServiceManager {
             // Build argv: argv[0] = command path.
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
 
-            // PHASE 57 DEBUG: granular markers between fork-child
-            // entry and the execve syscall. Each marker is built as a
-            // SINGLE buffer with name+path inlined so it lands as one
-            // log line — split serial_print calls produce separate
-            // log lines that get filtered out by `trace.IC` greps.
-            let svc_name_bytes = svc.name.as_bytes();
-            let path_bytes = &path[..path.len().saturating_sub(1)];
-
-            let mut mbuf = [0u8; 192];
-            let mut mp = 0usize;
-            mp += append_to_buf(&mut mbuf, mp, b"init: trace.IC1A enter name=*");
-            mp += append_to_buf(&mut mbuf, mp, svc_name_bytes);
-            mp += append_to_buf(&mut mbuf, mp, b"* path=*");
-            mp += append_to_buf(&mut mbuf, mp, path_bytes);
-            mp += append_to_buf(&mut mbuf, mp, b"*\n");
-            if let Ok(s) = core::str::from_utf8(&mbuf[..mp]) {
-                syscall_lib::serial_print(s);
-            }
-
-            syscall_lib::serial_print("init: trace.IC1D about to call execve\n");
             let ret = execve(path, &argv, &envp);
-
-            // Failure path — only reached if execve returned.
-            let mut fbuf = [0u8; 96];
-            let mut fp = 0usize;
-            fp += append_to_buf(&mut fbuf, fp, b"init: trace.IC2 execve returned name=*");
-            fp += append_to_buf(&mut fbuf, fp, svc_name_bytes);
-            fp += append_to_buf(&mut fbuf, fp, b"*\n");
-            if let Ok(s) = core::str::from_utf8(&fbuf[..fp]) {
-                syscall_lib::serial_print(s);
-            }
 
             write_str(STDOUT_FILENO, "init: execve failed for '");
             write(STDOUT_FILENO, svc.name.as_bytes());
@@ -1387,6 +1332,13 @@ impl ServiceManager {
         pos += append_to_buf(&mut buf, pos, b"\n");
         write(STDOUT_FILENO, &buf[..pos]);
         self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
+
+        // Services fork during a dense boot burst and many immediately create
+        // IPC endpoints that later services synchronously call. Give each child
+        // one short dispatch window after fork so it can consume its fork
+        // context and exec/register before PID 1 continues flooding the run
+        // queues with dependent daemons.
+        let _ = nanosleep_for(0, 5_000_000);
 
         // During the initial boot wave, batch status writes so PID 1 doesn't
         // stall on a filesystem round-trip after every single service fork.

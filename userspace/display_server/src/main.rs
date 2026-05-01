@@ -1,16 +1,14 @@
 //! Phase 56 — userspace display server (compositor).
 //!
 //! This binary owns presentation: it claims the primary framebuffer from
-//! the kernel via the Phase 47/56 syscall surface, fills it with a known
-//! background color so the ownership transfer is visually unambiguous,
-//! registers itself in the service registry as `"display"`, and idles on
-//! its IPC endpoint so init's supervisor sees a healthy daemon.
+//! the kernel via the Phase 47/56 syscall surface, registers itself in the
+//! service registry as `"display"`, and idles on its IPC endpoint so init's
+//! supervisor sees a healthy daemon.
 //!
 //! Tracks landed in this PR:
 //!   * **C.1** — crate scaffolding + four-place new-binary wiring.
 //!   * **C.2** — framebuffer acquisition through the [`KernelFramebufferOwner`]
-//!     impl of the `kernel-core::display::fb_owner::FramebufferOwner` trait,
-//!     plus initial background fill.
+//!     impl of the `kernel-core::display::fb_owner::FramebufferOwner` trait.
 //!
 //! Tracks deferred to follow-up PRs (foundation in `kernel-core`):
 //!   * **C.3 / C.4** — surface state machine + damage-tracked composer.
@@ -34,7 +32,7 @@ mod input;
 mod surface;
 
 use core::alloc::Layout;
-use kernel_core::display::fb_owner::{FbError, FramebufferOwner};
+use kernel_core::display::fb_owner::FramebufferOwner;
 use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId};
 use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
@@ -176,7 +174,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         );
     }
 
-    // ----- Service registration -------------------------------------------
+    // ----- Service endpoints ----------------------------------------------
     let ep_handle = syscall_lib::create_endpoint();
     if ep_handle == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "display_server: failed to create endpoint\n");
@@ -184,18 +182,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     }
     let ep_handle = ep_handle as u32;
 
-    let reg = syscall_lib::ipc_register_service(ep_handle, "display");
-    if reg == u64::MAX {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "display_server: failed to register 'display'\n",
-        );
-        return 1;
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
-
     // Phase 56 Track E.4 — second IPC endpoint for the control socket.
-    // The endpoint is registered as `"display-control"` so `m3ctl`
+    // The endpoint is later registered as `"display-control"` so `m3ctl`
     // (and any future native bar / launcher client) can locate it via
     // `ipc_lookup_service`. The codec, dispatcher, subscription
     // registry, and runtime byte-flow are all wired: each loop
@@ -214,18 +202,6 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         return 1;
     }
     let ctl_ep_handle = ctl_ep_handle as u32;
-    let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
-    if ctl_reg == u64::MAX {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "display_server: failed to register 'display-control'\n",
-        );
-        return 1;
-    }
-    syscall_lib::write_str(
-        STDOUT_FILENO,
-        "display_server: registered as 'display-control'\n",
-    );
 
     // ----- Framebuffer acquisition (C.2) ---------------------------------
     let mut owner = match acquire_framebuffer_with_backoff() {
@@ -239,28 +215,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     };
     let meta = owner.metadata();
 
-    // Initial fill across the whole framebuffer so the ownership handoff
-    // is visually unambiguous during bring-up.
-    if let Err(err) = paint_solid(&mut owner, BG_PIXEL) {
-        report_fb_error("initial fill", err);
-        // Consume the owner so its Drop does not best-effort release a
-        // second time (which the kernel would reject with -EPERM).
-        let _ = owner.release();
-        return 1;
-    }
-    let _ = owner.present();
-
     syscall_lib::write_str(STDOUT_FILENO, "display_server: framebuffer acquired\n");
     log_fb_meta(meta.width, meta.height, meta.stride_bytes);
 
     // ----- Input wiring (D.3) --------------------------------------------
-    //
-    // Look up the kbd / mouse services with bounded retry. Either may be
-    // unavailable at startup (mouse_server is D.2; if it lands later
-    // than this binary the first run-gui will boot without a pointer).
-    // The dispatcher drains both each loop iteration; a missing service
-    // simply yields `None` from its poll method and the dispatcher
-    // idles for that source.
     let mut input_wiring = InputWiring::new();
     if input_wiring.kbd.is_connected() {
         syscall_lib::write_str(STDOUT_FILENO, "display_server: kbd service connected\n");
@@ -366,6 +324,25 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // `MAX_BULK_BYTES`.
     let mut event_reply_buf = [0u8; 128];
 
+    let reg = syscall_lib::ipc_register_service(ep_handle, "display");
+    if reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to register 'display'\n",
+        );
+        return 1;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
+
+    let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
+    if ctl_reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to register 'display-control'\n",
+        );
+        return 1;
+    }
+
     loop {
         // 1. Try to receive one graphical-endpoint message non-blocking.
         //    Phase 56 close-out: switched from blocking `ipc_recv_msg`
@@ -449,9 +426,6 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 STDOUT_FILENO,
                 "display_server: client protocol violation; dropping message\n",
             );
-        }
-        if !outcome.outbound.is_empty() {
-            log_outbound_count(outcome.outbound.len() as u32);
         }
         if outcome.closed {
             syscall_lib::write_str(
@@ -936,37 +910,6 @@ fn acquire_framebuffer_with_backoff() -> Result<KernelFramebufferOwner, &'static
     Err("framebuffer busy after retry budget")
 }
 
-/// Fill the entire framebuffer rectangle with `pixel` (packed 32-bit).
-fn paint_solid(owner: &mut KernelFramebufferOwner, pixel: u32) -> Result<(), FbError> {
-    let meta = owner.metadata();
-    let w = meta.width;
-    let h = meta.height;
-    if w == 0 || h == 0 {
-        return Ok(());
-    }
-    // Build one full row of pixel data, then write each row in turn. Avoids
-    // allocating a width*height*4 staging buffer on the heap.
-    let row_bytes_len = (w as usize) * 4;
-    let mut row: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(row_bytes_len);
-    let bytes = pixel.to_le_bytes();
-    for _ in 0..w {
-        row.extend_from_slice(&bytes);
-    }
-    for y in 0..h {
-        owner.write_pixels(
-            Rect {
-                x: 0,
-                y: y as i32,
-                w,
-                h: 1,
-            },
-            &row,
-            row_bytes_len as u32,
-        )?;
-    }
-    Ok(())
-}
-
 fn log_fb_meta(w: u32, h: u32, stride: u32) {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: fb metadata: ");
     write_u32(w);
@@ -974,12 +917,6 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
     write_u32(h);
     syscall_lib::write_str(STDOUT_FILENO, " stride=");
     write_u32(stride);
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-}
-
-fn log_outbound_count(n: u32) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: outbound queued n=");
-    write_u32(n);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
@@ -999,18 +936,6 @@ fn write_u32(mut value: u32) {
     if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
         syscall_lib::write_str(STDOUT_FILENO, s);
     }
-}
-
-fn report_fb_error(stage: &str, err: FbError) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: fb error in ");
-    syscall_lib::write_str(STDOUT_FILENO, stage);
-    let suffix = match err {
-        FbError::OutOfBounds => " (OutOfBounds)\n",
-        FbError::Truncated => " (Truncated)\n",
-        FbError::InvalidStride => " (InvalidStride)\n",
-        FbError::Unsupported => " (Unsupported)\n",
-    };
-    syscall_lib::write_str(STDOUT_FILENO, suffix);
 }
 
 /// Map the kernel's reported pixel-format tag onto
