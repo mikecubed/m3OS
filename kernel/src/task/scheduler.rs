@@ -1950,6 +1950,18 @@ pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     Some(ctx)
 }
 
+/// Phase 57d follow-up — peek at the current task's `fork_ctx.pid`
+/// without consuming the context. Used by the fork-child trampoline's
+/// pre-panic diagnostic log so we can attribute "trampoline entered"
+/// events to the correct child pid even if a later step panics or
+/// hangs before `take_current_task_fork_ctx` is called.
+pub fn current_task_fork_ctx_pid() -> Option<u32> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let task = sched.tasks.get(idx)?;
+    task.fork_ctx.as_ref().map(|c| c.pid)
+}
+
 /// Return the PID associated with the given task index.
 fn task_pid(idx: usize) -> u32 {
     scheduler_lock().tasks[idx].pid

@@ -1626,6 +1626,22 @@ pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64
 /// CR3 if set, updates the kernel stack in TSS/MSR, sets `CURRENT_PID`, then
 /// enters ring 3 at the forked RIP with rax=0.
 pub fn fork_child_trampoline() -> ! {
+    // Phase 57d follow-up — log trampoline entry BEFORE any potentially
+    // panicking step so a fork-child that gets scheduled but never
+    // reaches enter_userspace_fork produces a visible signal. If this
+    // line never appears for a forked pid, the task is enqueued but
+    // never dispatched (a scheduler bug); if it appears but the
+    // matching "entering ring 3" line below does not, the trampoline
+    // is hanging in the middle (CR3 switch, lock, etc.).
+    let pre_pid = crate::task::scheduler::current_task_fork_ctx_pid().unwrap_or(0);
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] fork-child pid={} trampoline-enter task_idx={:?}",
+        pre_pid,
+        crate::task::scheduler::get_current_task_idx()
+    );
+    let _ = pre_pid;
+
     let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
 
