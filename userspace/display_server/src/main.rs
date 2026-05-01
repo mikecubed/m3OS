@@ -43,6 +43,14 @@ use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{InboundFrame, dispatch};
 use crate::compose::{ComposeContext, default_layout, fill_background, run_compose};
+
+/// Phase 57d follow-up — per-second diagnostic counters for the SHM
+/// transport bring-up. Sampled and logged once per second from the
+/// compose path so a hung surface, a stuck compose tick, or a dropped
+/// Damage event produces visible signal in the boot transcript
+/// instead of silent emptiness. Ripped once SHM is stable.
+static DIAG_COMPOSES_RUN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
     publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -596,16 +604,31 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             };
             match compose_result {
                 Ok(0) => {}
-                Ok(_writes) => {
-                    // Per-frame `composed writes=N` log was retired in
-                    // Phase 57: at 60 Hz with a graphical client doing
-                    // chunked uploads it produced ~60 lines/sec on the
-                    // serial console, drowning real signal. The
-                    // frame-stats ring still records the sample so a
-                    // future control-socket query can surface compose
-                    // throughput on demand.
+                Ok(writes) => {
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
+                    // Phase 57d follow-up — diagnostic: log per-second
+                    // compose throughput so a hung surface or a
+                    // dropped Damage event produces a visible signal
+                    // rather than silent emptiness during the SHM
+                    // bring-up. Sampled by counting composes per ~16 ms
+                    // tick and logging when the cumulative count
+                    // crosses each 60-frame multiple (~once per second
+                    // at 60 Hz). Total writes since startup are
+                    // included so stalls are obvious. Ripped once the
+                    // SHM transport is stable.
+                    DIAG_COMPOSES_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    DIAG_FB_WRITES.fetch_add(writes as u64, core::sync::atomic::Ordering::Relaxed);
+                    let cur = DIAG_COMPOSES_RUN.load(core::sync::atomic::Ordering::Relaxed);
+                    if cur.is_multiple_of(60) {
+                        let total_writes =
+                            DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
+                        syscall_lib::write_str(STDOUT_FILENO, "display_server: composes=");
+                        write_u32(cur as u32);
+                        syscall_lib::write_str(STDOUT_FILENO, " total_writes=");
+                        write_u32(total_writes as u32);
+                        syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    }
                 }
                 Err(_) => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
