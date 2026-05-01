@@ -358,6 +358,8 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 
 **Current QEMU evidence:**
 - [x] `cargo xtask run --fresh` reaches `TERM_SMOKE:ready` with default-on `preempt-voluntary`.
+- [x] Repeated fresh QEMU boots reach `TERM_SMOKE:ready` after `/bin/ion` starts; the second run also shows `display_server: kbd service connected (lazy)` and `display_server: mouse service connected (lazy)`.
+- [x] Per-task `fxsave64`/`fxrstor64` state is saved/restored across scheduler switches so preempted musl/Rust binaries that use XMM/SIMD state (for example `/bin/ion`) resume without the observed `rip=0x4c1e10` userspace fault.
 - [x] The boot log no longer contains temporary `[ipc-diag]`, `[sched-diag]`, AP-idle, or display protocol trace spam.
 - [x] Display startup avoids blocking on input-service lookup; keyboard and mouse reconnect lazily after registration.
 - [x] The display/control endpoints are registered after framebuffer/input state is initialized, so clients cannot observe a half-initialized compositor.
@@ -446,4 +448,5 @@ Tracks A–C are the foundation; D wires dispatch; E closes the deferred-resched
 - Track B's naked-asm entry stubs are non-negotiable for correctness: a Rust `extern "x86-interrupt"` cannot save the interrupted task's full GPR state because the compiler's prologue can clobber caller-saved registers before the explicit preemption check runs.  This was the central correctness blocker raised in the PR-131 review.
 - Track E's `preempt_enable` deferred-reschedule closes the latency gap between "lock released, reschedule pending" and "next timer tick".  Under `PREEMPT_VOLUNTARY` the trigger is recorded and consumed at the next user-mode return — never immediately, because kernel-mode is non-preemptible in this phase.
 - Track F deliberately reuses 57b's `current_preempt_count_ptr` rather than introducing a duplicate `current_task_idx_fast`.  The existing `PerCoreData::current_task_idx` (Phase 35 / 57a) is unchanged.
+- Default-on IRQ-return preemption must preserve FPU/SIMD state.  Even though m3OS builds its own kernel/userspace with `-mmx,-sse`, hosted musl/Rust ports such as `/bin/ion` can use XMM instructions; scheduler switch-out saves each task's `FxSaveArea`, dispatch restores the selected task's area before `switch_context`/`iretq`, and `execve` resets the current task's area to the architectural defaults.
 - The `preempt-voluntary` feature flag is a rollback safety net.  The flag is removed in I.3 only after the 24-hour soak passes.

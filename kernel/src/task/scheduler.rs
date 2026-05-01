@@ -226,7 +226,7 @@ use core::{cell::UnsafeCell, sync::atomic::Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{ResumeMode, Task, TaskId, TaskState, switch_context};
+use super::{FxSaveArea, ResumeMode, Task, TaskId, TaskState, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
 type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
@@ -551,6 +551,9 @@ pub(crate) struct Scheduler {
     /// Addresses of `Task` instances are stable for the task's lifetime. Per-CPU dispatch state (`current_preempt_count_ptr`) caches raw pointers into `Task::preempt_count` and relies on this stability. The outer `Vec` may reallocate when growing; the inner `Box` keeps each `Task` at a fixed heap address regardless.
     #[allow(clippy::vec_box)]
     tasks: Vec<Box<Task>>,
+    /// Per-task FPU/SIMD state, indexed in lock-step with `tasks`.
+    #[allow(clippy::vec_box)]
+    fpu_states: Vec<Box<FxSaveArea>>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
@@ -565,6 +568,7 @@ impl Scheduler {
     const fn new() -> Self {
         Scheduler {
             tasks: Vec::new(),
+            fpu_states: Vec::new(),
             last_run: 0,
             idle_tasks: [const { None }; crate::smp::MAX_CORES],
             free_list: Vec::new(),
@@ -1079,10 +1083,16 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
         *sched.tasks[idx] = task;
+        if idx < sched.fpu_states.len() {
+            *sched.fpu_states[idx] = FxSaveArea::new();
+        } else {
+            sched.fpu_states.push(Box::new(FxSaveArea::new()));
+        }
         idx
     } else {
         let idx = sched.tasks.len();
         sched.tasks.push(Box::new(task));
+        sched.fpu_states.push(Box::new(FxSaveArea::new()));
         idx
     }
 }
@@ -1395,6 +1405,28 @@ fn retarget_preempt_count_to_task(
         Some(_task_idx),
         PreemptPtrPhase::SwitchIn,
     );
+}
+
+#[inline]
+unsafe fn save_fpu_state(area: &mut FxSaveArea) {
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{area}]",
+            area = in(reg) area.as_mut_ptr(),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline]
+unsafe fn restore_fpu_state(area: &FxSaveArea) {
+    unsafe {
+        core::arch::asm!(
+            "fxrstor64 [{area}]",
+            area = in(reg) area.as_ptr(),
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 /// Phase 57b C.5 — `current_preempt_count_ptr` retarget tracepoint.
@@ -1895,6 +1927,17 @@ pub fn set_current_task_pid(pid: u32) {
 pub fn set_current_user_return(urs: crate::task::UserReturnState) {
     if let Some(idx) = get_current_task_idx() {
         scheduler_lock().tasks[idx].user_return = Some(urs);
+    }
+}
+
+/// Reset the current task to the architectural FPU/SIMD defaults after exec.
+pub fn reset_current_task_fpu_state() {
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if let Some(area) = sched.fpu_states.get_mut(idx) {
+            **area = FxSaveArea::new();
+            unsafe { restore_fpu_state(area.as_ref()) };
+        }
     }
 }
 
@@ -3415,7 +3458,12 @@ pub fn run() -> ! {
         // Phase 57d D.3: also capture resume_mode and preempt_frame ptr so
         // the Preempted branch below can call preempt_resume_to_user without
         // re-acquiring the lock.
-        let (task_preempt_count_ptr, _task_resume_mode, _task_preempt_frame_ptr) = {
+        let (
+            task_preempt_count_ptr,
+            _task_resume_mode,
+            _task_preempt_frame_ptr,
+            task_fpu_state_ptr,
+        ) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
                 let resume_mode = ResumeMode::from(task.resume_mode.load(Ordering::Acquire));
@@ -3438,9 +3486,19 @@ pub fn run() -> ! {
                     &task.preempt_count as *const core::sync::atomic::AtomicI32,
                     resume_mode,
                     &task.preempt_frame as *const kernel_core::preempt_frame::PreemptFrame,
+                    sched
+                        .fpu_states
+                        .get(_task_idx)
+                        .map(|area| area.as_ref() as *const FxSaveArea)
+                        .unwrap_or(core::ptr::null()),
                 )
             } else {
-                (core::ptr::null(), ResumeMode::Initial, core::ptr::null())
+                (
+                    core::ptr::null(),
+                    ResumeMode::Initial,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                )
             }
         };
 
@@ -3477,6 +3535,9 @@ pub fn run() -> ! {
             // mask IRQs anyway so `switch_context` jumps in with IF
             // observably whatever the chosen task's saved RFLAGS dictates.
             interrupts::disable();
+        }
+        if !task_fpu_state_ptr.is_null() {
+            unsafe { restore_fpu_state(&*task_fpu_state_ptr) };
         }
 
         // Switch to the task.
@@ -3558,6 +3619,9 @@ pub fn run() -> ! {
                     core_id
                 );
                 if sidx < sched.tasks.len() {
+                    if let Some(area) = sched.fpu_states.get_mut(sidx) {
+                        unsafe { save_fpu_state(area.as_mut()) };
+                    }
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
                     // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably written.

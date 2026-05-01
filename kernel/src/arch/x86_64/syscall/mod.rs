@@ -4030,6 +4030,8 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         log::info!("[proc] execve: pid={} path={}", pid, name);
     }
 
+    crate::task::scheduler::reset_current_task_fpu_state();
+
     // Switch to the new page table and enter ring 3.
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {

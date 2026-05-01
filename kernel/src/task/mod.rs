@@ -232,6 +232,34 @@ pub struct TaskBlockState {
 // Task structure
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct FxSaveArea {
+    bytes: [u8; 512],
+}
+
+impl FxSaveArea {
+    pub const fn new() -> Self {
+        let mut bytes = [0u8; 512];
+        // x87 control word = default 0x037f, MXCSR = default 0x1f80.
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        bytes[28] = 0xff;
+        bytes[29] = 0xff;
+        Self { bytes }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+}
+
 pub struct Task {
     /// Unique task identifier.
     pub id: TaskId,
