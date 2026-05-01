@@ -249,20 +249,35 @@ fn program_main(_args: &[&str]) -> i32 {
         // n < 0 path: either -EAGAIN (no data) or a hard error. We
         // do not distinguish today; the next iteration retries.
 
-        // 5b. Drain one queued ServerMessage from display_server.
-        //     The C.5 outbound queue per-client cap is 128; a busy
-        //     keyboard cannot starve the renderer because we drain
-        //     at most one event per tick.
-        match pull_one_event(display_handle, &mut event_buf) {
-            PulledEvent::Key(ev) => {
-                did_work = true;
-                input_handler.translate(&ev, &mut writer);
+        // 5b. Drain ALL queued ServerMessages from display_server
+        //     before yielding to compose. The previous "one event per
+        //     iter" shape played badly with a 250 ms+ compose: while
+        //     compose blocked, key + pointer events accumulated in
+        //     display_server's per-client outbound queue (cap 128)
+        //     and overflowed under fast typing — m3os4.log showed 100+
+        //     "outbound queue full; oldest dropped" lines, plus a
+        //     visibly-frozen mouse cursor whenever the user typed.
+        //     Pulling in a tight loop while events are pending keeps
+        //     the queue empty between composes regardless of compose
+        //     wall-time, with no risk of starvation: PTY drain, exit
+        //     poll, and compose still run after the queue is empty.
+        let mut disconnect = false;
+        loop {
+            match pull_one_event(display_handle, &mut event_buf) {
+                PulledEvent::Key(ev) => {
+                    did_work = true;
+                    input_handler.translate(&ev, &mut writer);
+                }
+                PulledEvent::Disconnect => {
+                    syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
+                    disconnect = true;
+                    break;
+                }
+                PulledEvent::None => break,
             }
-            PulledEvent::Disconnect => {
-                syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
-                break;
-            }
-            PulledEvent::None => {}
+        }
+        if disconnect {
+            break;
         }
 
         // 5c. Poll shell exit. `Some(_)` ⇒ child exited (cleanly or
