@@ -8890,7 +8890,8 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     // page tables.  This eliminates the TOCTOU window that the old two-step
     // check-then-store had: two racing processes can no longer both observe
     // owner==0 and proceed to map.
-    if !crate::fb::try_yield_console(pid) {
+    let raw_input_enabled = !is_current_exec_path("/bin/display_server");
+    if !crate::fb::try_yield_console(pid, raw_input_enabled) {
         return NEG_EBUSY;
     }
 

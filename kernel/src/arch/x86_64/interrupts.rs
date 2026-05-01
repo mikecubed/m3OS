@@ -1301,16 +1301,18 @@ pub unsafe extern "C" fn timer_handler_kernel(
 // There are TWO separate ring buffers:
 //
 //   SCANCODE_BUF  — normal TTY / kbd_server path; consumed via
-//                   `read_scancode()`.  Only populated when no process
-//                   owns the framebuffer (FB_OWNER_PID == 0).
+//                   `read_scancode()`.  Populated when no raw-input
+//                   framebuffer client is active.
 //
 //   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
 //                   (sys_read_scancode syscall 0x1007).  Only populated when
-//                   a process owns the framebuffer (FB_OWNER_PID != 0).
+//                   the framebuffer owner explicitly keeps raw input enabled.
 //
-// Routing is exclusive: each scancode goes to exactly one buffer based on
-// framebuffer ownership.  This prevents stale scancodes from accumulating
-// in SCANCODE_BUF during gameplay and replaying when the game exits.
+// Routing is exclusive: each scancode goes to exactly one buffer based on the
+// raw-input policy. This prevents stale scancodes from accumulating in
+// SCANCODE_BUF during gameplay and replaying when the game exits, while still
+// allowing the display_server compositor to own pixels without stealing input
+// from kbd_server / stdin_feeder.
 
 const SCANCODE_BUF_SIZE: usize = 256;
 // Bitmask wraparound requires a power-of-two buffer size.
@@ -1457,7 +1459,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
         }
         let scancode: u8 = unsafe { data_port.read() };
 
-        match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
+        match raw_input_router.route_byte(scancode, crate::fb::raw_input_active()) {
             ScancodeSink::Raw => unsafe {
                 // Raw path: scancodes go to the game buffer only.
                 // kbd_server does NOT receive scancodes while a process

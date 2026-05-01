@@ -33,7 +33,7 @@ mod surface;
 
 use core::alloc::Layout;
 use kernel_core::display::fb_owner::FramebufferOwner;
-use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId};
+use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId, SurfaceRole};
 use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
@@ -433,10 +433,26 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 "display_server: client closed; resetting registry\n",
             );
             registry = SurfaceRegistry::new();
+            focused = None;
             // E.3 — the previous cursor (if any) belonged to that
             // client. Reset the compose context so the next first-
             // frame draws the fallback `DefaultArrowCursor` cleanly.
             compose_ctx = ComposeContext::new();
+        }
+        if let Some(focused_id) = focused
+            && outcome.destroyed.iter().any(|id| *id == focused_id)
+        {
+            focused = None;
+            publish_focus_changed(&mut control_subs, focused);
+        }
+        if focused.is_none()
+            && let Some((surface_id, _)) = outcome
+                .created
+                .iter()
+                .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        {
+            focused = Some(*surface_id);
+            publish_focus_changed(&mut control_subs, focused);
         }
 
         // Track E.4 — diff the current registered surface ids against

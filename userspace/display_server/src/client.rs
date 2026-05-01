@@ -40,7 +40,8 @@ use alloc::vec::Vec;
 
 use kernel_core::display::pixel_chunk::{CHUNK_HEADER_LEN, PixelChunkHeader};
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage,
+    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage, SurfaceId,
+    SurfaceRole,
 };
 use syscall_lib::IpcMessage;
 
@@ -116,6 +117,10 @@ pub struct DispatchOutcome {
     /// `true` if the client violated the wire protocol (decode error,
     /// state-machine error, oversized bulk). The caller should disconnect.
     pub fatal: bool,
+    /// Surfaces whose roles became mapped during this dispatch.
+    pub created: Vec<(SurfaceId, SurfaceRole)>,
+    /// Surfaces destroyed during this dispatch.
+    pub destroyed: Vec<SurfaceId>,
 }
 
 /// One Phase 56 IPC message from a client. Created by the C.5 dispatch
@@ -223,7 +228,11 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                     out.closed = true;
                 }
                 ref other => match registry.handle_message(other) {
-                    Ok(result) => out.outbound.extend(result.outbound),
+                    Ok(result) => {
+                        out.outbound.extend(result.outbound);
+                        out.created.extend(result.created);
+                        out.destroyed.extend(result.destroyed);
+                    }
                     Err(_) => {
                         // Recoverable surface-shim errors
                         // (UnknownSurface, DuplicateSurface, StateMachine,

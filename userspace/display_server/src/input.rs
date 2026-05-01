@@ -153,7 +153,7 @@ impl KbdInputSource {
     pub fn new_lazy() -> Self {
         Self {
             handle: None,
-            drains_since_last_lookup: 0,
+            drains_since_last_lookup: LAZY_RECONNECT_DRAIN_INTERVAL,
         }
     }
 
@@ -247,7 +247,7 @@ impl MouseInputSource {
     pub fn new_lazy() -> Self {
         Self {
             handle: None,
-            drains_since_last_lookup: 0,
+            drains_since_last_lookup: LAZY_RECONNECT_DRAIN_INTERVAL,
         }
     }
 

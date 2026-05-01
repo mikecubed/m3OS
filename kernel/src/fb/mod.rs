@@ -818,6 +818,14 @@ static CONSOLE_YIELDED: AtomicBool = AtomicBool::new(false);
 static FB_OWNER_PID: AtomicU32 = AtomicU32::new(0);
 const FB_OWNER_TRANSITIONING: u32 = u32::MAX;
 
+/// Whether the current framebuffer owner should receive raw/game scancodes.
+///
+/// Direct framebuffer clients such as DOOM need exclusive raw keyboard input,
+/// but the ring-3 compositor owns the framebuffer while still expecting input
+/// to flow through `kbd_server` / `stdin_feeder`. Keep that policy explicit so
+/// pixel ownership does not implicitly steal the normal TTY input route.
+static FB_RAW_INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -960,8 +968,9 @@ pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
 /// For internal use only.  External callers that need to claim the
 /// framebuffer should use [`try_yield_console`] which performs an
 /// atomic compare-and-swap ownership check.
-fn yield_console(owner_pid: u32) {
+fn yield_console(owner_pid: u32, raw_input_enabled: bool) {
     FB_OWNER_PID.store(owner_pid, Ordering::Release);
+    FB_RAW_INPUT_ENABLED.store(raw_input_enabled, Ordering::Release);
     crate::arch::x86_64::interrupts::reset_raw_input_state();
     let _guard = CONSOLE.lock();
     CONSOLE_YIELDED.store(true, Ordering::Release);
@@ -973,9 +982,10 @@ fn yield_console(owner_pid: u32) {
 /// Returns `true` if the framebuffer was unowned (CAS succeeded) or is already
 /// owned by `owner_pid` (re-entrant call).  Returns `false` if another process
 /// owns it — caller should return `EBUSY` without doing any mapping.
-pub fn try_yield_console(owner_pid: u32) -> bool {
+pub fn try_yield_console(owner_pid: u32, raw_input_enabled: bool) -> bool {
     match FB_OWNER_PID.compare_exchange(0, owner_pid, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
+            FB_RAW_INPUT_ENABLED.store(raw_input_enabled, Ordering::Release);
             crate::arch::x86_64::interrupts::reset_raw_input_state();
             // Hold the console lock while flipping the flag so write_str
             // cannot slip through between the CAS and the flag transition.
@@ -984,6 +994,7 @@ pub fn try_yield_console(owner_pid: u32) -> bool {
             true
         }
         Err(current) if current == owner_pid => {
+            FB_RAW_INPUT_ENABLED.store(raw_input_enabled, Ordering::Release);
             // Re-entrant: we already own the FB.  The original claim may still
             // be waiting to acquire CONSOLE before setting CONSOLE_YIELDED=true,
             // so ensure the flag is set before we return to avoid a window where
@@ -1013,6 +1024,7 @@ pub fn release_console_claim(owner_pid: u32) {
         .is_ok()
     {
         crate::arch::x86_64::interrupts::reset_raw_input_state();
+        FB_RAW_INPUT_ENABLED.store(false, Ordering::Release);
         CONSOLE_YIELDED.store(false, Ordering::Release);
         FB_OWNER_PID.store(0, Ordering::Release);
     }
@@ -1046,6 +1058,7 @@ pub fn restore_console() {
     } // ← lock drops here
 
     crate::arch::x86_64::interrupts::reset_raw_input_state();
+    FB_RAW_INPUT_ENABLED.store(false, Ordering::Release);
 
     // Clear ownership last: a concurrent try_yield_console sees owner != 0
     // until this point, preventing it from racing mid-restore and then having
@@ -1057,4 +1070,9 @@ pub fn restore_console() {
 /// (0 = no owner).
 pub fn fb_owner_pid() -> u32 {
     FB_OWNER_PID.load(Ordering::Acquire)
+}
+
+/// True when IRQ1 should route scancodes to the raw/game-input buffer.
+pub fn raw_input_active() -> bool {
+    fb_owner_pid() != 0 && FB_RAW_INPUT_ENABLED.load(Ordering::Acquire)
 }
