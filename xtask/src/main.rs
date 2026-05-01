@@ -1613,20 +1613,29 @@ fn build_kernel() -> PathBuf {
     fetch_port_sources();
     // Phase 47: cross-compile DOOM.
     build_doom();
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "build",
-            "--release",
-            "--package",
-            "kernel",
-            "--target",
-            "x86_64-unknown-none",
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-        ])
-        .status()
-        .expect("failed to run cargo build");
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.current_dir(&root).args([
+        "build",
+        "--release",
+        "--package",
+        "kernel",
+        "--target",
+        "x86_64-unknown-none",
+        "-Zbuild-std=core,compiler_builtins,alloc",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    // Forward `M3OS_KERNEL_FEATURES=feat1,feat2` into `cargo build
+    // --features ...` so debugging features (e.g. `exec-trace`) can be
+    // enabled without editing `kernel/Cargo.toml` or rerouting through
+    // a one-off cargo invocation. Empty / unset leaves the kernel on
+    // its default feature set.
+    let kernel_features = std::env::var("M3OS_KERNEL_FEATURES").unwrap_or_default();
+    let kernel_features = kernel_features.trim();
+    if !kernel_features.is_empty() {
+        cmd.args(["--features", kernel_features]);
+        println!("kernel: building with extra features: {}", kernel_features);
+    }
+    let status = cmd.status().expect("failed to run cargo build");
 
     if !status.success() {
         eprintln!("Kernel build failed");

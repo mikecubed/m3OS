@@ -1711,6 +1711,13 @@ pub fn fork_child_trampoline() -> ! {
         rip: ctx.user_rip,
         rsp: ctx.user_rsp,
     });
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] fork-child pid={} entering ring 3 rip={:#x} rsp={:#x}",
+        ctx.pid,
+        ctx.user_rip,
+        ctx.user_rsp
+    );
     unsafe {
         crate::arch::enter_userspace_fork(
             ctx.user_rip,

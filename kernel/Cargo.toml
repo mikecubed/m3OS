@@ -38,3 +38,13 @@ preempt-voluntary = []
 # EAGAIN observation from the kernel facade path during integration testing.
 # Enable this feature for production / secure-boot images.
 hardened = []
+# Phase 57d follow-up — temporary diagnostic instrumentation around the
+# fork → dup2 → execve pipeline. Used to investigate cases where a
+# fork-child appears never to reach `execve` (e.g. the term → ion
+# bring-up where keyboard echo works but no shell prompt ever appears).
+# Logs every fork-child first userspace entry, every close/dup2/execve
+# syscall with pid + arguments, and every execve outcome. Default OFF
+# because it is noisy under load; enable with
+#   cargo xtask run-gui --features kernel/exec-trace
+# (or its equivalent on `cargo build -p kernel`).
+exec-trace = []

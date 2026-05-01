@@ -3109,7 +3109,20 @@ pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     let oldfd = oldfd as usize;
     let newfd = newfd as usize;
 
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} dup2 oldfd={} newfd={}",
+        crate::process::current_pid(),
+        oldfd,
+        newfd
+    );
+
     if oldfd >= MAX_FDS || newfd >= MAX_FDS {
+        #[cfg(feature = "exec-trace")]
+        log::info!(
+            "[exec-trace] pid={} dup2 -> EBADF (out of range)",
+            crate::process::current_pid()
+        );
         return NEG_EBADF;
     }
 
@@ -3821,21 +3834,56 @@ fn read_user_string_array(
 ///
 /// Phase 14: now parses argv and envp from user memory (Linux ABI).
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve(path_ptr={:#x}, argv_ptr={:#x}, envp_ptr={:#x})",
+        crate::process::current_pid(),
+        path_ptr,
+        argv_ptr,
+        envp_ptr
+    );
     // Read the filename as a null-terminated C string.
     let mut name_cstr = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
-        None => return NEG_EFAULT,
+        None => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad path_ptr)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve path=\"{}\"",
+        crate::process::current_pid(),
+        raw_name
+    );
 
     // Parse argv and envp from user memory.
     let user_argv = match read_user_string_array(argv_ptr, 256) {
         Ok(v) => v,
-        Err(()) => return NEG_EFAULT,
+        Err(()) => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad argv)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
     let user_envp = match read_user_string_array(envp_ptr, 256) {
         Ok(v) => v,
-        Err(()) => return NEG_EFAULT,
+        Err(()) => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad envp)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
 
     let (resolved_name, exec_owned, exec_static) = {
@@ -3846,17 +3894,39 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // Follow the final symlink like Linux execve().
         let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
             Ok(path) => path,
-            Err(err) => return err,
+            Err(err) => {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve resolve_path_from_dirfd failed: errno={}",
+                    crate::process::current_pid(),
+                    err as i64
+                );
+                return err;
+            }
         };
         let resolved = match resolve_existing_fs_path(&lexical, true) {
             Ok(path) => path,
-            Err(err) => return err,
+            Err(err) => {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve resolve_existing_fs_path failed: errno={}",
+                    crate::process::current_pid(),
+                    err as i64
+                );
+                return err;
+            }
         };
 
         // Phase 27: Execute permission check.
         if let Some((fu, fg, fm)) = path_metadata(&resolved) {
             let (_, _, euid, egid) = current_process_ids();
             if !check_permission(fu, fg, fm, euid, egid, 1) {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve -> EACCES (perm check) path=\"{}\"",
+                    crate::process::current_pid(),
+                    resolved
+                );
                 return NEG_EACCES;
             }
         }
@@ -3869,6 +3939,12 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     Ok(buf) => (resolved, Some(buf), None),
                     Err(errno) => {
                         log::warn!("[execve] file not found or rejected: {}", resolved);
+                        #[cfg(feature = "exec-trace")]
+                        log::info!(
+                            "[exec-trace] pid={} execve read_file_from_disk failed: errno={}",
+                            crate::process::current_pid(),
+                            errno as i64
+                        );
                         return errno;
                     }
                 }
@@ -4029,6 +4105,14 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     if is_interactive_debug_exec_path(name) {
         log::info!("[proc] execve: pid={} path={}", pid, name);
     }
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve OK path=\"{}\" entry={:#x} rsp={:#x}",
+        pid,
+        name,
+        loaded.entry,
+        user_rsp
+    );
 
     crate::task::scheduler::reset_current_task_fpu_state();
 
@@ -6954,6 +7038,12 @@ pub(crate) fn vfs_service_close_pub(service_handle: u64) {
 
 pub(super) fn sys_linux_close(fd: u64) -> u64 {
     let fd = fd as usize;
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} close fd={}",
+        crate::process::current_pid(),
+        fd
+    );
     // stdin/stdout/stderr (0–2) are virtual and cannot be closed.
     if fd < 3 {
         return 0;
