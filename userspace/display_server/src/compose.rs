@@ -277,8 +277,27 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         })
         .collect();
 
+    // Snapshot the current pixel contents of every compose entry into
+    // owned `Vec<u8>` buffers before building the `ComposeSurface`
+    // borrows. SHM-backed surfaces are mapped into both the client's
+    // and the compositor's address spaces; the client edits pixels
+    // in place, which the Rust compiler treats as a *non-volatile*
+    // memory access through `&[u8]`. Without an explicit per-compose
+    // copy LLVM is free to assume that two reads of the same byte in
+    // the same compose pass yield the same value — a soundness
+    // assumption the cross-process editing pattern violates. Copying
+    // here freezes the snapshot for the duration of `compose_frame`,
+    // is observably-correct (each compose sees a coherent point-in-
+    // time view of the buffer), and adds a single 1 MiB memcpy per
+    // 60 Hz frame for the term surface — well below the budget the
+    // chunked-pixel path used to consume.
+    let snapshots: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| entry.buf.pixels_slice().to_vec())
+        .collect();
+
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-    for (entry, dmg) in entries.iter().zip(damages.iter()) {
+    for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
         // Phase 56 close-out (G.1) — Toplevel surfaces use the layout
         // policy's arrangement for placement; Layer / Cursor surfaces
         // keep their iter_compose-derived rects (anchor-driven for
@@ -303,7 +322,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
             layer: entry.layer,
             rect,
             damage: &dmg[..],
-            pixels: entry.buf.pixels_slice(),
+            pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
         });
     }
