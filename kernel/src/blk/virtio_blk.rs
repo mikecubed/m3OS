@@ -417,141 +417,19 @@ pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 
 // The legacy virtio-blk implementation still uses one shared descriptor
 // chain, one scratch page, one DMA buffer, and one wake flag. Serialize all
-// task-context I/O through one atomic in-flight slot plus a scheduler-blocking
-// waiter list until the driver grows true multi-request bookkeeping.
-static REQUEST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-const MAX_REQUEST_WAITERS: usize = 64;
+// task-context I/O through that single in-flight slot until the driver grows
+// true multi-request bookkeeping.
+//
+// Phase 57b G.1.a — `IrqSafeMutex` so the F.1 wiring raises
+// `preempt_count` on acquire and the matching guard `Drop` lowers it on
+// release. REQUEST_LOCK is task-context-only (no ISR ever touches it), so
+// the IrqSafeMutex shape is sufficient — no explicit-preempt-and-cli
+// wrapper is needed at the callsites.
+static REQUEST_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
+    crate::task::scheduler::IrqSafeMutex::new(());
 
-#[derive(Clone, Copy)]
-struct RequestWaiter {
-    task: TaskId,
-    woken_addr: usize,
-}
-
-struct RequestWaitQueue {
-    waiters: [Option<RequestWaiter>; MAX_REQUEST_WAITERS],
-}
-
-impl RequestWaitQueue {
-    const fn new() -> Self {
-        Self {
-            waiters: [None; MAX_REQUEST_WAITERS],
-        }
-    }
-
-    fn push_or_update(&mut self, waiter: RequestWaiter) -> bool {
-        for slot in self.waiters.iter_mut() {
-            if let Some(existing) = slot
-                && existing.task == waiter.task
-            {
-                existing.woken_addr = waiter.woken_addr;
-                return true;
-            }
-        }
-        for slot in self.waiters.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(waiter);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn remove(&mut self, task: TaskId, woken_addr: usize) {
-        for slot in self.waiters.iter_mut() {
-            if slot.is_some_and(|waiter| waiter.task == task && waiter.woken_addr == woken_addr) {
-                *slot = None;
-                return;
-            }
-        }
-    }
-
-    fn take_all(&mut self) -> [Option<RequestWaiter>; MAX_REQUEST_WAITERS] {
-        let waiters = self.waiters;
-        self.waiters = [None; MAX_REQUEST_WAITERS];
-        waiters
-    }
-}
-
-static REQUEST_WAITERS: crate::task::scheduler::IrqSafeMutex<RequestWaitQueue> =
-    crate::task::scheduler::IrqSafeMutex::new(RequestWaitQueue::new());
-
-struct RequestSlot;
-
-impl RequestSlot {
-    fn acquire() -> Self {
-        loop {
-            if let Some(slot) = Self::try_acquire() {
-                return slot;
-            }
-            if crate::smp::try_per_core().is_none() {
-                core::hint::spin_loop();
-                continue;
-            }
-            let Some(task) = current_task_id() else {
-                core::hint::spin_loop();
-                continue;
-            };
-
-            let woken = AtomicBool::new(false);
-            let woken_addr = &woken as *const AtomicBool as usize;
-            if !Self::register_waiter(task, woken_addr) {
-                core::hint::spin_loop();
-                continue;
-            }
-            if let Some(slot) = Self::try_acquire() {
-                Self::unregister_waiter(task, woken_addr);
-                return slot;
-            }
-            let _ = crate::task::scheduler::block_current_until(
-                crate::task::TaskState::BlockedOnRecv,
-                &woken,
-                None,
-            );
-            Self::unregister_waiter(task, woken_addr);
-        }
-    }
-
-    fn try_acquire() -> Option<Self> {
-        match REQUEST_IN_FLIGHT.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {
-            Ok(_) => Some(Self),
-            Err(_) => None,
-        }
-    }
-
-    fn register_waiter(task: TaskId, woken_addr: usize) -> bool {
-        REQUEST_WAITERS
-            .lock()
-            .push_or_update(RequestWaiter { task, woken_addr })
-    }
-
-    fn unregister_waiter(task: TaskId, woken_addr: usize) {
-        REQUEST_WAITERS.lock().remove(task, woken_addr);
-    }
-
-    fn wake_waiters() {
-        let waiters = REQUEST_WAITERS.lock().take_all();
-        for waiter in waiters.into_iter().flatten() {
-            // SAFETY: woken_addr points to the stack-local AtomicBool in a
-            // task currently blocked in RequestSlot::acquire. The waiter is
-            // removed before that stack frame can return.
-            let woken = unsafe { &*(waiter.woken_addr as *const AtomicBool) };
-            woken.store(true, Ordering::Release);
-            let _ = crate::task::scheduler::wake_task_v2(waiter.task);
-        }
-    }
-}
-
-impl Drop for RequestSlot {
-    fn drop(&mut self) {
-        REQUEST_IN_FLIGHT.store(false, Ordering::Release);
-        RequestSlot::wake_waiters();
-    }
-}
-
-// Single wake flag reused across requests — requests are fully serialized by
-// REQUEST_IN_FLIGHT, so only one task is ever waiting at a time.
+// Single wake flag reused across requests — requests are fully serialized
+// under REQUEST_LOCK, so only one task is ever waiting at a time.
 static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 
 /// Phase 57b G.1.c — IRQ-shared `spin::Mutex` `DRIVER` stays a plain
@@ -617,7 +495,7 @@ fn virtio_blk_irq_handler() {
 
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
-    let _request_slot = RequestSlot::acquire();
+    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(
@@ -662,7 +540,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
-    let _request_slot = RequestSlot::acquire();
+    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(
@@ -1156,26 +1034,5 @@ mod tests {
                 i,
             );
         }
-    }
-
-    #[test_case]
-    fn request_slot_releases_single_in_flight_request_without_spinlock_guard() {
-        let first = super::RequestSlot::try_acquire();
-        assert!(
-            first.is_some(),
-            "request slot should be available before a request starts",
-        );
-        assert!(
-            super::RequestSlot::try_acquire().is_none(),
-            "request slot must reject a second in-flight request",
-        );
-
-        drop(first);
-
-        let second = super::RequestSlot::try_acquire();
-        assert!(
-            second.is_some(),
-            "request slot must become available after the guard drops",
-        );
     }
 }
