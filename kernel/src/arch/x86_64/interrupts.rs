@@ -1594,7 +1594,7 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
             .ipi_recv_log_budget
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         if n > 0 {
-            log::info!("[ipi] reschedule received core={}", pc.core_id);
+            log::debug!("[ipi] reschedule received core={}", pc.core_id);
         }
     }
     crate::task::signal_reschedule();
@@ -1619,7 +1619,7 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
             .ipi_recv_log_budget
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         if n > 0 {
-            log::info!("[ipi] reschedule received core={}", pc.core_id);
+            log::debug!("[ipi] reschedule received core={}", pc.core_id);
         }
     }
     crate::task::signal_reschedule();

@@ -55,13 +55,6 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
     crate::task::scheduler::check_deferred_preempt_at_user_return();
-    // Diagnostic: confirm we reach iretq (temporary probe, Phase 57d debug).
-    log::info!(
-        "[eu] iretq: pid={} entry={:#x} rsp={:#x}",
-        crate::process::current_pid(),
-        entry,
-        user_stack_top
-    );
     unsafe {
         use core::arch::asm;
         asm!(
