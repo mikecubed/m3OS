@@ -219,17 +219,41 @@ fn program_main(_args: &[&str]) -> i32 {
     // does not lose any glyphs — the next compose flushes everything.
     let mut last_compose_ms = clock.now_ms();
 
+    // Phase 57d follow-up — diagnostic stat counters. Print one stat
+    // line every 1000 iters so we can confirm term's main loop is
+    // alive when display_server reports an outbound queue overflow,
+    // and bisect *which* of (PTY drain / event pull / compose / idle
+    // sleep) the loop is spending its time in. Ripped once the
+    // input-pipeline race is closed.
+    let mut iter_count: u64 = 0;
+    let mut events_pulled: u64 = 0;
+    let mut composes: u64 = 0;
+    let mut pty_bytes: u64 = 0;
+
     // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
     //    display_server outbound-event drain, the bell, the shell-exit
     //    poll, and the renderer's per-tick compose.
     loop {
         let mut did_work = false;
+        iter_count = iter_count.wrapping_add(1);
+        if iter_count.is_multiple_of(1000) {
+            syscall_lib::write_str(STDOUT_FILENO, "term: iter=");
+            log_u32(iter_count as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " events=");
+            log_u32(events_pulled as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " composes=");
+            log_u32(composes as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " pty_bytes=");
+            log_u32(pty_bytes as u32);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
 
         // 5a. Drain the PTY primary fd. Nonblocking: -EAGAIN means
         //     no data this tick. 0 means the shell closed its end.
         let n = syscall_lib::read(primary_fd, &mut pty_buf);
         if n > 0 {
             did_work = true;
+            pty_bytes = pty_bytes.saturating_add(n as u64);
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
@@ -266,6 +290,7 @@ fn program_main(_args: &[&str]) -> i32 {
             match pull_one_event(display_handle, &mut event_buf) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
+                    events_pulled = events_pulled.saturating_add(1);
                     input_handler.translate(&ev, &mut writer);
                 }
                 PulledEvent::Disconnect => {
@@ -307,6 +332,7 @@ fn program_main(_args: &[&str]) -> i32 {
             if now_ms.saturating_sub(last_compose_ms) >= COMPOSE_INTERVAL_MS {
                 renderer.compose();
                 last_compose_ms = now_ms;
+                composes = composes.saturating_add(1);
                 did_work = true;
             }
         }
@@ -355,6 +381,27 @@ impl PtyWriter for PrimaryFdWriter {
         // failure followed by recovery still produces a fresh log
         // line if the failure recurs.
         self.warned = false;
+    }
+}
+
+/// Phase 57d follow-up — minimal u32 → decimal serial log helper for
+/// the diagnostic stat lines in the main loop. No alloc dependency.
+#[cfg(not(test))]
+fn log_u32(mut value: u32) {
+    let mut buf = [0u8; 10];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
     }
 }
 
