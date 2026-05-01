@@ -602,33 +602,42 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             } else {
                 elapsed_us as u32
             };
+            // Phase 57d follow-up — diagnostic: count every compose
+            // path entry, separately from the writes-counter, so we
+            // can distinguish "compose loop alive but returns 0
+            // writes" (surface_damage and cursor_motion both false)
+            // from "compose loop never runs" (frame_tick stuck or
+            // display_server hung in input drain). Log the first 5
+            // entries individually so we see compose come up, then
+            // every 60 entries so the steady-state log doesn't drown
+            // the boot transcript. Includes the result tag so we
+            // know which arm fired.
+            let entry_count =
+                DIAG_COMPOSES_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            let result_tag: &'static str = match &compose_result {
+                Ok(0) => "ok0",
+                Ok(_) => "okN",
+                Err(_) => "err",
+            };
+            let writes_this = compose_result.as_ref().copied().unwrap_or(0);
+            DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
+            if entry_count <= 5 || entry_count.is_multiple_of(60) {
+                let total_writes = DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: compose#");
+                write_u32(entry_count as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " ");
+                syscall_lib::write_str(STDOUT_FILENO, result_tag);
+                syscall_lib::write_str(STDOUT_FILENO, " writes=");
+                write_u32(writes_this as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " total=");
+                write_u32(total_writes as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
             match compose_result {
                 Ok(0) => {}
-                Ok(writes) => {
+                Ok(_writes) => {
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
-                    // Phase 57d follow-up — diagnostic: log per-second
-                    // compose throughput so a hung surface or a
-                    // dropped Damage event produces a visible signal
-                    // rather than silent emptiness during the SHM
-                    // bring-up. Sampled by counting composes per ~16 ms
-                    // tick and logging when the cumulative count
-                    // crosses each 60-frame multiple (~once per second
-                    // at 60 Hz). Total writes since startup are
-                    // included so stalls are obvious. Ripped once the
-                    // SHM transport is stable.
-                    DIAG_COMPOSES_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    DIAG_FB_WRITES.fetch_add(writes as u64, core::sync::atomic::Ordering::Relaxed);
-                    let cur = DIAG_COMPOSES_RUN.load(core::sync::atomic::Ordering::Relaxed);
-                    if cur.is_multiple_of(60) {
-                        let total_writes =
-                            DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
-                        syscall_lib::write_str(STDOUT_FILENO, "display_server: composes=");
-                        write_u32(cur as u32);
-                        syscall_lib::write_str(STDOUT_FILENO, " total_writes=");
-                        write_u32(total_writes as u32);
-                        syscall_lib::write_str(STDOUT_FILENO, "\n");
-                    }
                 }
                 Err(_) => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: compose failed\n");
