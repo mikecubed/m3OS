@@ -42,7 +42,7 @@ use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{InboundFrame, dispatch};
-use crate::compose::{ComposeContext, default_layout, run_compose};
+use crate::compose::{ComposeContext, default_layout, fill_background, run_compose};
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
     publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -218,6 +218,23 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: framebuffer acquired\n");
     log_fb_meta(meta.width, meta.height, meta.stride_bytes);
 
+    // Initial whole-screen wipe. The framebuffer still contains the
+    // kernel framebuffer console's boot-log text at this point;
+    // without an explicit fill, the surface- and cursor-blit passes
+    // (which only paint mapped-surface and cursor regions) would leave
+    // the boot text visible everywhere else, and the cursor-trail
+    // damage path would create a teal trail wherever the mouse moved.
+    // The first-frame branch in `run_compose` does the same thing for
+    // any subsequent context reset; running it once here covers the
+    // pre-first-frame interval where a slow client still hasn't
+    // committed any surface.
+    if let Err(_e) = fill_background(&mut owner) {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: initial background fill failed\n",
+        );
+    }
+
     // ----- Input wiring (D.3) --------------------------------------------
     let mut input_wiring = InputWiring::new();
     if input_wiring.kbd.is_connected() {
@@ -333,6 +350,17 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         return 1;
     }
     syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
+
+    // Phase 57d follow-up — separate service marker for "display has
+    // grabbed graphical input". Registered lazily on the first Toplevel
+    // map below. While unregistered, `stdin_feeder` keeps owning PS/2
+    // keystrokes (the text-mode bridge); once a real graphical client
+    // maps a Toplevel surface, `stdin_feeder` polls this name and
+    // stands down so `display_server`'s focus dispatcher can deliver
+    // typed `KeyEvent`s. Keeping the bootstrap split means clients
+    // can still find `"display"` to send Hello/CreateSurface, while
+    // the input-grab decision waits for an actual graphical surface.
+    let mut input_owner_registered = false;
 
     let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
     if ctl_reg == u64::MAX {
@@ -453,6 +481,37 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         {
             focused = Some(*surface_id);
             publish_focus_changed(&mut control_subs, focused);
+        }
+
+        // First-Toplevel-map gate for the input-owner service. Any
+        // Toplevel created in this iteration means a real graphical
+        // client (`term`, a layer client wrapping a Toplevel, etc.)
+        // is up. Once that's true, register the marker exactly once
+        // so `stdin_feeder` can transition out of the PS/2-to-TTY
+        // bridge. Re-using the graphical endpoint as the registered
+        // endpoint is fine here: the marker is only consulted via
+        // `ipc_service_exists` (cap-free probe), not used to send
+        // IPC traffic, so there's no danger of confusing it with the
+        // protocol traffic that flows over `"display"`.
+        if !input_owner_registered
+            && outcome
+                .created
+                .iter()
+                .any(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        {
+            let rc = syscall_lib::ipc_register_service(ep_handle, "display.input-owner");
+            if rc != u64::MAX {
+                input_owner_registered = true;
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: registered as 'display.input-owner' (first Toplevel mapped)\n",
+                );
+            } else {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: failed to register 'display.input-owner'\n",
+                );
+            }
         }
 
         // Track E.4 — diff the current registered surface ids against

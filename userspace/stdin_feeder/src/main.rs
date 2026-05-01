@@ -9,10 +9,13 @@
 //! `KBD_EVENT_PULL` requests are not starved while this feeder polls.
 //! When kbd_server reports an empty buffer (reply 0), stdin_feeder sleeps
 //! 5 ms before retrying.
-//! If the graphical `display` service is present, stdin_feeder stands down:
-//! display_server owns PS/2 keyboard delivery and forwards events to the
-//! graphical terminal over the display protocol. Text-mode fallback boots
-//! (where `display` never registers) continue using this bridge.
+//! If the `display.input-owner` service is present, stdin_feeder stands
+//! down: `display_server` registers that name only after the first
+//! Toplevel surface is mapped, so PS/2 input ownership transfers only
+//! when a real graphical client (e.g. `term`) is actually up. Boots
+//! that never reach a Toplevel — text-mode fallback or a stalled
+//! graphical bring-up — keep PS/2 routed through this bridge to the
+//! kernel line discipline.
 //!
 //! All terminal policy (canonical editing, echo, signal generation, ICRNL)
 //! is handled by the kernel-side `LineDiscipline` in `push_raw_input`.
@@ -117,8 +120,16 @@ fn lookup_kbd_service() -> u32 {
     }
 }
 
-fn display_service_available() -> bool {
-    syscall_lib::ipc_service_exists("display")
+/// Probe for the `display.input-owner` marker. `display_server` registers
+/// this name lazily, only after the first Toplevel surface is mapped —
+/// so a "yes" here means a real graphical client is up and PS/2
+/// scancodes belong to the focus dispatcher, not to this bridge.
+/// Probing the marker (rather than the bare `display` service) avoids
+/// the early-boot race where `display_server` is registered but no
+/// graphical client has connected yet, which used to leave the
+/// keyboard deaf in text-mode fallback boots.
+fn display_input_owner_available() -> bool {
+    syscall_lib::ipc_service_exists("display.input-owner")
 }
 
 fn program_main(_args: &[&str]) -> i32 {
@@ -133,13 +144,13 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut shift = false;
     let mut ctrl = false;
-    let mut graphical_input_owner = display_service_available();
+    let mut graphical_input_owner = display_input_owner_available();
     let mut empty_polls_since_display_probe = 0u32;
 
     loop {
         if graphical_input_owner {
             let _ = syscall_lib::nanosleep_for(0, 50_000_000);
-            graphical_input_owner = display_service_available();
+            graphical_input_owner = display_input_owner_available();
             continue;
         }
 
@@ -156,7 +167,7 @@ fn program_main(_args: &[&str]) -> i32 {
             empty_polls_since_display_probe = empty_polls_since_display_probe.saturating_add(1);
             if empty_polls_since_display_probe >= DISPLAY_PROBE_INTERVAL_EMPTY_POLLS {
                 empty_polls_since_display_probe = 0;
-                graphical_input_owner = display_service_available();
+                graphical_input_owner = display_input_owner_available();
             }
             let _ = syscall_lib::nanosleep_for(0, KBD_POLL_INTERVAL_NS);
             continue;
