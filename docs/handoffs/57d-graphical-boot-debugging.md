@@ -157,15 +157,20 @@ fix work landed during the post-merge debugging.
     shows burst-time `CommitSurface` protocol violations after PTY output grows
     into the tens of KiB; keep that as a separate display-protocol lead if
     visual glitches remain after the stale-cell fix.
-14. **Latest interactive `ls` liveness split:** `m3os2.log` showed first `ls`
+14. **Latest interactive `ls` / no-prompt liveness split:** `m3os2.log` showed first `ls`
     completing and Ion forking the next `/bin/PROMPT`, then a second `ls`
     reaching `execve OK` but never logging its final `close fd=3`. The matching
     IPC root cause was that `vfs_server` still replied through hardcoded cap
     slot `1` even though `recv_msg` now publishes the actual reply cap in
     `msg.data[3]`. If slot `1` was not the current caller's reply cap, the VFS
     reply failed and the `ls` caller remained blocked in the directory IPC.
-    `syscall-lib::IpcMessage::reply_cap_handle()` now exposes the kernel-provided
-    handle and `vfs_server` uses it for all replies.
+    The follow-up no-prompt `m3os.log` exposed the matching kernel-side gap:
+    when `call_msg` delivered directly to an already-waiting server, it inserted
+    a reply cap but did not encode that handle into `data[3]`, so
+    `vfs_server` logged `request missing reply cap` and pid 19 stayed
+    `BlockedOnReply`. `kernel-core::ipc::Message::with_reply_cap_handle()` now
+    centralizes the encoding and `call_msg`, `recv_msg`, `recv_msg_nowait`, and
+    `recv_msg_with_notif` all use it before delivery.
 
 ---
 
@@ -231,6 +236,7 @@ in commit `968b579`.
 | `userspace/sshd/src/main.rs` | Wait for `term.prompt-ready` before `/etc/ssh` setup and listener startup, so SSH directory writes do not race the local graphical prompt. | `cargo test -p sshd --target x86_64-unknown-linux-gnu --quiet`; GUI logs show `sshd: prompt-ready gate open` only after the prompt marker. |
 | `userspace/term/src/screen.rs` | Repaint blank cells for backspace and ANSI erase-line modes so shell editing/redraw clears stale glyphs on the graphical terminal. | `cargo test -p term --target x86_64-unknown-linux-gnu --quiet`: 68 tests pass. |
 | `userspace/syscall-lib/src/lib.rs`, `userspace/vfs_server/src/main.rs` | Use the reply capability handle delivered in `IpcMessage::data[3]` instead of hardcoding cap slot `1`, so VFS replies cannot miss the caller when the cap table layout changes. | `cargo test -p syscall-lib --target x86_64-unknown-linux-gnu ipc_message_reply_cap --quiet`; `cargo check -p vfs_server --target x86_64-unknown-linux-gnu --quiet`. |
+| `kernel-core/src/ipc/message.rs`, `kernel/src/ipc/endpoint.rs` | Encode the inserted reply-cap handle into `Message::data[3]` for direct `call_msg` delivery as well as queued receive paths. | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu with_reply_cap_handle_sets_data3 --quiet`; `cargo check -p kernel --quiet`. |
 
 ### Virtio-blk request-slot history
 

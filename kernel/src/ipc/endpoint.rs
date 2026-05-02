@@ -374,7 +374,7 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             // would silently corrupt those services on the recv-pops-sender
             // race path.
             if let Some(handle) = reply_cap_handle {
-                pending.msg.data[3] = handle as u64;
+                pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
@@ -486,7 +486,7 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
     // receiver via `data[3]` (mirrors the same convention in `recv_msg`).
     // See `recv_msg` for why this MUST be `data[3]`, not `data[2]`.
     if let Some(handle) = reply_cap_handle {
-        pending.msg.data[3] = handle as u64;
+        pending.msg = pending.msg.with_reply_cap_handle(handle);
     }
 
     scheduler::deliver_message(receiver, pending.msg);
@@ -590,7 +590,7 @@ pub fn recv_msg_with_notif(
             // `recv_msg` and `recv_msg_nowait`). See `recv_msg` for why this
             // MUST be `data[3]`, not `data[2]`.
             if let Some(handle) = reply_cap_handle {
-                pending.msg.data[3] = handle as u64;
+                pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
 
             scheduler::deliver_message(receiver, pending.msg);
@@ -794,26 +794,32 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
             // Insert the reply cap BEFORE delivering the message so the server
             // always has a reply cap when it sees the request, or never gets
             // the request at all (consistent failure for the caller).
-            if scheduler::insert_cap(receiver, Capability::Reply(caller)).is_err() {
-                log::warn!("[ipc] call_msg: server capability table full, reply cap not inserted");
-                // Put the receiver back at the front of the queue so it
-                // remains blocked on the endpoint as if this call never arrived.
-                let mut reg = ENDPOINTS.lock();
-                if let Some(ep) = reg.get_mut(ep_id)
-                    && !ep.closed
-                {
-                    ep.receivers.push_front(receiver);
-                } else {
-                    // Endpoint was closed or destroyed; wake receiver with an
-                    // explicit IPC error so it does not remain stranded.
-                    drop(reg);
-                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                    let _ = crate::task::scheduler::wake_task_v2(receiver);
+            let reply_cap_handle = match scheduler::insert_cap(receiver, Capability::Reply(caller))
+            {
+                Ok(handle) => handle,
+                Err(_) => {
+                    log::warn!(
+                        "[ipc] call_msg: server capability table full, reply cap not inserted"
+                    );
+                    // Put the receiver back at the front of the queue so it
+                    // remains blocked on the endpoint as if this call never arrived.
+                    let mut reg = ENDPOINTS.lock();
+                    if let Some(ep) = reg.get_mut(ep_id)
+                        && !ep.closed
+                    {
+                        ep.receivers.push_front(receiver);
+                    } else {
+                        // Endpoint was closed or destroyed; wake receiver with an
+                        // explicit IPC error so it does not remain stranded.
+                        drop(reg);
+                        scheduler::deliver_message(receiver, Message::new(u64::MAX));
+                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+                        let _ = crate::task::scheduler::wake_task_v2(receiver);
+                    }
+                    return Message::new(u64::MAX);
                 }
-                return Message::new(u64::MAX);
-            }
-            scheduler::deliver_message(receiver, msg);
+            };
+            scheduler::deliver_message(receiver, msg.with_reply_cap_handle(reply_cap_handle));
             transfer_bulk(caller, receiver);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
