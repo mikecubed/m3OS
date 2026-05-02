@@ -323,8 +323,7 @@ fn spawn_userspace_init() {
                 phys_off,
                 argv,
                 envp,
-                loaded.phdr_vaddr,
-                loaded.phnum,
+                loaded.aux_info(),
             )
         }
         .expect("[init] ABI stack setup failed for /sbin/init");

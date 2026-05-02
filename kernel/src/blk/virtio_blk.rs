@@ -7,14 +7,11 @@
 //!   that used to live inline here).
 //! * Descriptor ring, scratch, and DMA buffers are [`crate::mm::dma::DmaBuffer`]
 //!   instead of raw `alloc_contiguous_frames` + `phys_offset` arithmetic.
-//! * Completion: the IRQ handler walks the used ring and is wired up for
-//!   future async consumers, but `read_sectors`/`write_sectors` poll the
-//!   used ring from task context rather than parking on the scheduler.
-//!   Scheduler-park was measured to round-trip a context switch (and an
-//!   optional cross-core IPI wake) per sector under SMP, making ext2 boot
-//!   walks pathologically slow; the completion arrives in well under a
-//!   scheduler tick so polling is the right shape for this size of request.
-//!   Routed here from `docs/debug/54-followups.md` item 5.
+//! * Completion: the IRQ handler walks the used ring and wakes the task
+//!   parked on the current single-sector request. The legacy device path still
+//!   has one descriptor chain and one scratch/DMA buffer, so callers acquire a
+//!   scheduler-blocking single-flight slot before touching those shared
+//!   buffers.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -416,20 +413,170 @@ static DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 
 // The legacy virtio-blk implementation still uses one shared descriptor
-// chain, one scratch page, one DMA buffer, and one wake flag. Serialize all
-// task-context I/O through that single in-flight slot until the driver grows
-// true multi-request bookkeeping.
+// chain, one scratch page, one DMA buffer, and one wake flag. Serialize that
+// shared hardware state with a scheduler-blocking single-flight slot.
 //
-// Phase 57b G.1.a — `IrqSafeMutex` so the F.1 wiring raises
-// `preempt_count` on acquire and the matching guard `Drop` lowers it on
-// release. REQUEST_LOCK is task-context-only (no ISR ever touches it), so
-// the IrqSafeMutex shape is sufficient — no explicit-preempt-and-cli
-// wrapper is needed at the callsites.
-static REQUEST_LOCK: crate::task::scheduler::IrqSafeMutex<()> =
-    crate::task::scheduler::IrqSafeMutex::new(());
+// This must not be an `IrqSafeMutex` held across `do_request()`: `do_request`
+// parks in `block_current_until`, and sleeping while holding an interrupt-
+// masking spin lock lets a later block caller spin with IF=0 until the first
+// request completes. Under voluntary kernel preemption that pins the whole AP.
+static REQUEST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-// Single wake flag reused across requests — requests are fully serialized
-// under REQUEST_LOCK, so only one task is ever waiting at a time.
+const MAX_REQUEST_WAITERS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct RequestWaitSnapshot {
+    task: TaskId,
+}
+
+struct RequestWaiterSlot {
+    task: Option<TaskId>,
+    woken: AtomicBool,
+}
+
+impl RequestWaiterSlot {
+    const fn empty() -> Self {
+        Self {
+            task: None,
+            woken: AtomicBool::new(false),
+        }
+    }
+}
+
+struct RequestWaitQueue {
+    waiters: [RequestWaiterSlot; MAX_REQUEST_WAITERS],
+}
+
+impl RequestWaitQueue {
+    const fn new() -> Self {
+        Self {
+            waiters: [const { RequestWaiterSlot::empty() }; MAX_REQUEST_WAITERS],
+        }
+    }
+
+    fn register(&mut self, task: TaskId) -> Option<(usize, *const AtomicBool)> {
+        for (idx, slot) in self.waiters.iter_mut().enumerate() {
+            if slot.task == Some(task) {
+                slot.woken.store(false, Ordering::Release);
+                return Some((idx, &raw const slot.woken));
+            }
+        }
+        for (idx, slot) in self.waiters.iter_mut().enumerate() {
+            if slot.task.is_none() {
+                slot.task = Some(task);
+                slot.woken.store(false, Ordering::Release);
+                return Some((idx, &raw const slot.woken));
+            }
+        }
+        None
+    }
+
+    fn unregister(&mut self, idx: usize, task: TaskId) {
+        if let Some(slot) = self.waiters.get_mut(idx)
+            && slot.task == Some(task)
+        {
+            slot.task = None;
+            slot.woken.store(false, Ordering::Release);
+        }
+    }
+
+    fn wake_all(&self) -> ([Option<RequestWaitSnapshot>; MAX_REQUEST_WAITERS], usize) {
+        // Wake-all is intentional for the 57d transition: a wake-one variant
+        // regressed late fork-child dispatch. Losers re-check the in-flight
+        // bit and re-park without relying on cooperative yields.
+        let mut tasks = [None; MAX_REQUEST_WAITERS];
+        let mut count = 0usize;
+        for slot in self.waiters.iter() {
+            if let Some(task) = slot.task {
+                slot.woken.store(true, Ordering::Release);
+                if count < tasks.len() {
+                    tasks[count] = Some(RequestWaitSnapshot { task });
+                    count += 1;
+                }
+            }
+        }
+        (tasks, count)
+    }
+}
+
+static REQUEST_WAITERS: crate::task::scheduler::IrqSafeMutex<RequestWaitQueue> =
+    crate::task::scheduler::IrqSafeMutex::new(RequestWaitQueue::new());
+
+struct RequestSlot;
+
+impl RequestSlot {
+    fn acquire() -> Result<Self, u8> {
+        loop {
+            if let Some(slot) = Self::try_acquire() {
+                return Ok(slot);
+            }
+
+            if crate::smp::try_per_core().is_none() {
+                core::hint::spin_loop();
+                continue;
+            }
+
+            let Some(task) = current_task_id() else {
+                core::hint::spin_loop();
+                continue;
+            };
+
+            let Some((waiter_idx, woken_ptr)) = Self::register_waiter(task) else {
+                log::error!("[virtio-blk] request waiter table full");
+                return Err(kernel_core::driver_ipc::block::BlockDriverError::Busy.to_byte());
+            };
+
+            if let Some(slot) = Self::try_acquire() {
+                Self::unregister_waiter(waiter_idx, task);
+                return Ok(slot);
+            }
+
+            // SAFETY: `woken_ptr` points into the static REQUEST_WAITERS
+            // storage, not a stack frame. The slot is not reused until this
+            // task unregisters it after `block_current_until` returns.
+            let woken = unsafe { &*woken_ptr };
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                woken,
+                None,
+            );
+            Self::unregister_waiter(waiter_idx, task);
+        }
+    }
+
+    fn try_acquire() -> Option<Self> {
+        REQUEST_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+
+    fn register_waiter(task: TaskId) -> Option<(usize, *const AtomicBool)> {
+        REQUEST_WAITERS.lock().register(task)
+    }
+
+    fn unregister_waiter(waiter_idx: usize, task: TaskId) {
+        REQUEST_WAITERS.lock().unregister(waiter_idx, task);
+    }
+
+    fn wake_waiters() {
+        let (tasks, count) = REQUEST_WAITERS.lock().wake_all();
+        for snapshot in tasks.iter().take(count).copied().flatten() {
+            let _ = crate::task::scheduler::wake_task_v2(snapshot.task);
+        }
+    }
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        REQUEST_IN_FLIGHT.store(false, Ordering::Release);
+        RequestSlot::wake_waiters();
+    }
+}
+
+// Single completion flag reused across requests — requests are fully
+// serialized under REQUEST_IN_FLIGHT, so only one submitted request can be
+// waiting for an IRQ completion at a time.
 static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 
 /// Phase 57b G.1.c — IRQ-shared `spin::Mutex` `DRIVER` stays a plain
@@ -495,7 +642,6 @@ fn virtio_blk_irq_handler() {
 
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
-    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(
@@ -507,6 +653,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     }
 
     for i in 0..count {
+        let _request_slot = RequestSlot::acquire()?;
         let sector = start_sector + i as u64;
         let status = do_request(VIRTIO_BLK_T_IN, sector)?;
         if status != 0 {
@@ -540,7 +687,6 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
-    let _request_guard = REQUEST_LOCK.lock();
     let needed = count * SECTOR_SIZE;
     if buf.len() < needed {
         log::error!(
@@ -552,6 +698,7 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
     }
 
     for i in 0..count {
+        let _request_slot = RequestSlot::acquire()?;
         let sector = start_sector + i as u64;
         let offset = i * SECTOR_SIZE;
         // Stage the sector into the DMA buffer. See Fix 1 note in

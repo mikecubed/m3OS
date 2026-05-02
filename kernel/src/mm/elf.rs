@@ -129,8 +129,28 @@ pub struct LoadedElf {
     /// Virtual address of the program header table in the loaded image.
     /// Used to populate AT_PHDR in the auxiliary vector for musl/glibc.
     pub phdr_vaddr: u64,
+    /// Size of one program header entry (for AT_PHENT).
+    pub phentsize: u16,
     /// Number of program header entries (for AT_PHNUM).
     pub phnum: u16,
+}
+
+/// Program-header values published in the initial process auxiliary vector.
+#[derive(Clone, Copy)]
+pub struct ElfAuxInfo {
+    pub phdr_vaddr: u64,
+    pub phentsize: u16,
+    pub phnum: u16,
+}
+
+impl LoadedElf {
+    pub fn aux_info(&self) -> ElfAuxInfo {
+        ElfAuxInfo {
+            phdr_vaddr: self.phdr_vaddr,
+            phentsize: self.phentsize,
+            phnum: self.phnum,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,10 +444,9 @@ pub unsafe fn setup_abi_stack(
     mapper: &OffsetPageTable<'_>,
     phys_off: u64,
     argv: &[&[u8]],
-    phdr_vaddr: u64,
-    phnum: u16,
+    aux: ElfAuxInfo,
 ) -> Result<u64, ElfError> {
-    unsafe { setup_abi_stack_with_envp(stack_top, mapper, phys_off, argv, &[], phdr_vaddr, phnum) }
+    unsafe { setup_abi_stack_with_envp(stack_top, mapper, phys_off, argv, &[], aux) }
 }
 
 /// Build the SysV AMD64 ABI initial stack with argv and envp.
@@ -440,8 +459,7 @@ pub unsafe fn setup_abi_stack_with_envp(
     phys_off: u64,
     argv: &[&[u8]],
     envp: &[&[u8]],
-    phdr_vaddr: u64,
-    phnum: u16,
+    aux: ElfAuxInfo,
 ) -> Result<u64, ElfError> {
     unsafe {
         // Helper: translate a virtual address in the target page table to a kernel
@@ -511,7 +529,7 @@ pub unsafe fn setup_abi_stack_with_envp(
         // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
         // Calculate the total size of the pointer table so we can align
         // BEFORE writing it, keeping argc/argv/envp contiguous.
-        let auxv_slots = 5 * 2; // 5 entries × 2 (key + value)
+        let auxv_slots = 6 * 2; // 6 entries × 2 (key + value)
         let envp_slots = env_ptrs.len() + 1; // pointers + NULL
         let argv_slots = arg_ptrs.len() + 1; // pointers + NULL
         let argc_slot = 1;
@@ -525,6 +543,7 @@ pub unsafe fn setup_abi_stack_with_envp(
 
         // Auxiliary vector (key, value pairs, terminated by AT_NULL).
         const AT_PHDR: u64 = 3;
+        const AT_PHENT: u64 = 4;
         const AT_PHNUM: u64 = 5;
         const AT_PAGESZ: u64 = 6;
         const AT_RANDOM: u64 = 25;
@@ -544,8 +563,9 @@ pub unsafe fn setup_abi_stack_with_envp(
         push_aux(&mut cursor, AT_NULL, 0)?;
         push_aux(&mut cursor, AT_RANDOM, at_random_ptr)?;
         push_aux(&mut cursor, AT_PAGESZ, 4096)?;
-        push_aux(&mut cursor, AT_PHNUM, phnum as u64)?;
-        push_aux(&mut cursor, AT_PHDR, phdr_vaddr)?;
+        push_aux(&mut cursor, AT_PHNUM, aux.phnum as u64)?;
+        push_aux(&mut cursor, AT_PHENT, aux.phentsize as u64)?;
+        push_aux(&mut cursor, AT_PHDR, aux.phdr_vaddr)?;
 
         // envp: pointers followed by NULL terminator.
         cursor -= 8;
@@ -680,6 +700,7 @@ pub unsafe fn load_elf_into(
             entry: ehdr.entry + load_bias,
             stack_top,
             phdr_vaddr,
+            phentsize: ehdr.phentsize,
             phnum: ehdr.phnum,
         })
     }

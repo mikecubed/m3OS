@@ -951,6 +951,119 @@ pub(crate) unsafe fn set_per_core_syscall_stack_top(val: u64) {
     }
 }
 
+/// User register save area built by `syscall_entry` before calling Rust.
+///
+/// The field order must match the push order in the assembly stub below. The
+/// helper at the syscall-return boundary uses this to build a normal
+/// `PreemptFrame` after the syscall return value is known.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyscallSavedFrame {
+    r9: u64,
+    r8: u64,
+    r10: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    rflags: u64,
+    rip: u64,
+}
+
+#[cfg(feature = "exec-trace")]
+static SYSCALL_RETURN_PREEMPT_TRACE_BUDGET: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(128);
+
+const USER_RFLAGS_PRIV_MASK: u64 =
+    (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+
+fn sanitize_user_rflags(rflags: u64) -> u64 {
+    (rflags & !USER_RFLAGS_PRIV_MASK) | 0x202
+}
+
+/// Syscall-return preemption hook called from the assembly return tail.
+///
+/// Timer and reschedule-IPI handlers that interrupt kernel-mode syscall work
+/// cannot preempt immediately under PREEMPT_VOLUNTARY, but they do set the
+/// per-core reschedule flag. At the point this hook runs, the syscall's full
+/// user-visible register state is saved and IF is masked again, so a pending
+/// reschedule can be converted into the same full-register scheduler handoff
+/// used by IRQ-return preemption without relying on a cooperative yield.
+#[unsafe(no_mangle)]
+#[allow(dead_code)]
+extern "C" fn syscall_return_maybe_preempt(saved_frame: *const u8, syscall_result: u64) -> u64 {
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        let Some(pc) = crate::smp::try_per_core() else {
+            return syscall_result;
+        };
+        if crate::task::scheduler::peek_preempt_count_irq() != 0 {
+            return syscall_result;
+        }
+        let reschedule = pc
+            .reschedule
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
+        let pending = pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
+        if !reschedule && !pending {
+            return syscall_result;
+        }
+
+        let Some(saved) = (unsafe { (saved_frame as *const SyscallSavedFrame).as_ref() }) else {
+            return syscall_result;
+        };
+        #[cfg(feature = "exec-trace")]
+        {
+            let n = SYSCALL_RETURN_PREEMPT_TRACE_BUDGET
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            if n > 0 {
+                log::info!(
+                    "[exec-trace] syscall-return-preempt core={} pid={} rip={:#x} reschedule={} pending={}",
+                    pc.core_id,
+                    crate::process::current_pid(),
+                    saved.rip,
+                    reschedule,
+                    pending
+                );
+            }
+        }
+        let frame = kernel_core::preempt_frame::PreemptFrame {
+            rax: syscall_result,
+            rbx: saved.rbx,
+            rcx: saved.rip,
+            rdx: saved.rdx,
+            rsi: saved.rsi,
+            rdi: saved.rdi,
+            rbp: saved.rbp,
+            r8: saved.r8,
+            r9: saved.r9,
+            r10: saved.r10,
+            r11: saved.rflags,
+            r12: saved.r12,
+            r13: saved.r13,
+            r14: saved.r14,
+            r15: saved.r15,
+            rip: saved.rip,
+            cs: u64::from(gdt::user_code_selector().0),
+            rflags: sanitize_user_rflags(saved.rflags),
+            rsp: pc.syscall_user_rsp,
+            ss: u64::from(gdt::user_data_selector().0),
+        };
+        crate::task::scheduler::preempt_frame_to_scheduler(frame);
+    }
+    #[cfg(not(feature = "preempt-voluntary"))]
+    {
+        let _ = saved_frame;
+        syscall_result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Assembly entry stub
 // ---------------------------------------------------------------------------
@@ -1036,8 +1149,21 @@ global_asm!(
     "mov rdx, rsi",                // arg1
     "mov rsi, rdi",                // arg0
     "mov rdi, rax",                // syscall number
+    // SYSCALL entry masks IF via SFMASK. Once the full user register state is
+    // saved on this kernel stack, re-enable interrupts so AP timer/reschedule
+    // IPIs and device IRQs can run while the syscall body executes. The return
+    // tail disables IF again before restoring user RSP, so no IRQ can land on
+    // the user stack before SYSRET.
+    "sti",
     "call syscall_handler",
     // Return value is in RAX.
+    "cli",
+    // Convert a pending reschedule observed during the syscall into the same
+    // full-frame preemption path used by timer/IPI user returns. If no
+    // preemption is needed this returns RAX unchanged.
+    "mov rdi, rsp",
+    "mov rsi, rax",
+    "call syscall_return_maybe_preempt",
 
     // --- Restore caller-saved registers (Linux-preserved) ---
     "pop r9",
@@ -4049,8 +4175,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 phys_off,
                 &argv_refs,
                 &envp_refs,
-                loaded.phdr_vaddr,
-                loaded.phnum,
+                loaded.aux_info(),
             )
         } {
             Ok(rsp) => rsp,

@@ -1884,8 +1884,19 @@ pub fn yield_now() {
 pub fn preempt_to_scheduler(
     frame: &crate::arch::x86_64::preempt_trap_frame::PreemptTrapFrameUser,
 ) -> ! {
+    preempt_frame_to_scheduler(frame.to_preempt_frame())
+}
+
+/// Switch away from the current task using an already-materialised full
+/// userspace register frame.
+///
+/// This is shared by IRQ-return preemption and syscall-return preemption.
+/// The IRQ path builds the frame from the interrupt stack; the syscall path
+/// builds an equivalent frame from the syscall entry save area after the
+/// syscall return value is known.
+#[cfg(feature = "preempt-voluntary")]
+pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::PreemptFrame) -> ! {
     let my_core = crate::smp::per_core().core_id as usize;
-    let preempt_frame = frame.to_preempt_frame();
     let idx = {
         let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
@@ -1896,6 +1907,9 @@ pub fn preempt_to_scheduler(
             }
         };
         accumulate_ticks(&mut sched, idx);
+        if let Some(urs) = sched.tasks[idx].user_return.as_mut() {
+            urs.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+        }
         sched.tasks[idx].preempt_frame = preempt_frame;
         sched.tasks[idx]
             .resume_mode
