@@ -4,8 +4,11 @@
 clean fork-trampoline pass. The follow-up Ion/userspace null page fault at
 `rip=0x65e54b` is also fixed. The later shell-prompt investigation found and
 fixed a VFS readiness race plus the last cooperative `waitpid` loop; the latest
-Ion parent trace shows the prompt path reaches the expected steady state (Ion
-writes the prompt bytes, then blocks in `read(0, ...)` waiting for input).
+work adds retryable display publishing plus a `term.prompt-ready` readiness gate
+so non-critical boot daemons do not race the first graphical prompt with early
+disk writes. The remaining open issue is the underlying virtio-blk write timeout
+(`type=1`, sector 2072), which can still appear but no longer blocks the prompt
+in the latest validation logs.
 
 **Branch:** `feat/57d-voluntary-preemption` (pushed). Ahead of `main` by 17
 commits past the original 57d landing; the most recent 12 are diagnostic and
@@ -127,6 +130,21 @@ fix work landed during the post-merge debugging.
     registration; the next target is the legacy single-flight write request path
     or deferring boot-time write-heavy daemons so shell reads cannot sit behind a
     stuck log/host-key write.
+12. **Prompt-readiness gating and display retry:** The latest failure set split
+    into two classes. `m3os2.log` had `/bin/ion` but no `/bin/PROMPT`, with PTY
+    bytes stuck at 0/8 behind a virtio write timeout (`owner_pid=2`, `type=1`,
+    sector 4352). `m3os3.log` did reach `/bin/PROMPT` and `pty_bytes=158`, but
+    a transient `CommitSurface` protocol failure dropped the publish, making it
+    a display-visibility failure rather than an Ion-spawn failure. `term` now
+    keeps failed display submits pending and retries them without replaying draw
+    operations, then registers `term.prompt-ready` after enough PTY bytes prove
+    the prompt path is alive. `syslogd` and `sshd` block on that service before
+    boot-time persistent log / `/etc/ssh` setup, using the scheduler-blocking
+    service wait primitive rather than yield loops. `m3os-prompt-ready-fix2.log`
+    and `m3os-prompt-ready-fix3.log` both reached `/bin/PROMPT`,
+    `TERM_SMOKE:prompt-ready`, syslogd/sshd gate-open logs, and stable
+    `pty_bytes=158`. Both still showed one recoverable virtio timeout for
+    `owner_pid=19 type=1 sector=2072`, so the timeout root cause is not closed.
 
 ---
 
@@ -186,6 +204,10 @@ in commit `968b579`.
 | `kernel/src/blk/virtio_blk.rs` | Add bounded no-yield timeout recovery for the single-flight virtio-blk path: request/slot waiters stay parked, timeout paths drain the used ring, re-notify the queue, and deliver wakes after dropping the driver lock so `wake_task_v2` cannot spin while holding the virtio lock. Timeout logs include owner PID, request type, sector, and whether a completion was drained. | `cargo xtask check`; `m3os-blk-type-probe.log` shows VFS registration, `/bin/ion`, `TERM_SMOKE:ready`, and stable `pty_bytes=158` after timeout recovery. `m3os-final-block-pty-1.log` still reproduced a later prompt miss behind an early stuck write owner, so this is not yet a full closure. |
 | `kernel/src/arch/x86_64/syscall/mod.rs` | Replace PTY master/slave blocking-read `yield_now()` loops with PTY wait-queue registration plus `block_current_until`. | `cargo xtask check`; Ion reaches the normal `BlockedOnRecv` steady state after writing prompt bytes. |
 | `userspace/term/src/{lib.rs,syscall_pty.rs}` | Pass `-i` when graphical term execs `/bin/ion`, with a host test for the argv shape. | `cargo test -p term --target x86_64-unknown-linux-gnu ion_argv_forces_interactive_mode --quiet`. |
+| `userspace/term/src/{render.rs,display.rs}` | Make display publish retryable: `FramebufferOwner::submit()` reports success/failure, and `Renderer` keeps a failed submit pending so a transient `CommitSurface` failure cannot drop the prompt frame. | `cargo test -p term --target x86_64-unknown-linux-gnu failed_submit_keeps_frame_pending_without_replaying_ops --quiet`. |
+| `userspace/term/src/{lib.rs,main.rs}` | Register `term.prompt-ready` after PTY output reaches the prompt-readiness threshold. | `m3os-prompt-ready-fix2.log` and `m3os-prompt-ready-fix3.log` reached `TERM_SMOKE:prompt-ready` and stable `pty_bytes=158`. |
+| `userspace/syslogd/src/main.rs` | Bind `/dev/log`, then wait for `term.prompt-ready` before creating/opening persistent log files; replace zero-duration cooperative backpressure sleeps with timed parking. | `cargo xtask check`; GUI logs show `syslogd: prompt-ready gate open` only after the prompt marker. |
+| `userspace/sshd/src/main.rs` | Wait for `term.prompt-ready` before `/etc/ssh` setup and listener startup, so SSH directory writes do not race the local graphical prompt. | `cargo test -p sshd --target x86_64-unknown-linux-gnu --quiet`; GUI logs show `sshd: prompt-ready gate open` only after the prompt marker. |
 
 ### Virtio-blk request-slot history
 
@@ -307,11 +329,49 @@ when 9+ keys are held. Defensive cap at 8; message text is now slightly
 misleading after `673f400` (we only repeat the highest-age key, but the
 table still tracks all held keys for de-dup). Cosmetic only.
 
+### S5 — Prompt-ready regressions after the first liveness fixes (mitigated)
+
+The post-waitpid/VFS failures had two different signatures:
+
+- **Ion/PTY liveness:** `/bin/ion` execs but `/bin/PROMPT` never execs or PTY
+  bytes remain near zero. This correlated with early virtio write timeouts from
+  non-critical daemons (`syslogd` and then `sshd`) before the local shell prompt
+  had proven ready.
+- **Display publish loss:** `/bin/PROMPT` execs and PTY bytes reach the normal
+  158-byte prompt plateau, but `CommitSurface` fails once and the old renderer
+  had already drained the frame operations, so no later compose retried the
+  publish.
+
+The mitigation keeps to the no-yield policy: term publishes a scheduler-visible
+`term.prompt-ready` service only after PTY output proves the prompt path is
+alive, syslogd/sshd block on that service before write-heavy setup, and the
+renderer retains failed display submits for retry. This improves startup
+ordering but does not eliminate the lower-level virtio timeout itself.
+
 ---
 
 ## Where to investigate next
 
-### Highest-value lead: visual prompt confirmation
+### Highest-value lead: remaining virtio write timeout
+
+The current prompt-ready mitigation intentionally avoids making early boot
+write-heavy daemons compete with the first shell prompt, but the underlying
+single-flight virtio-blk timeout still appears. In the latest successful
+prompt-ready validations (`m3os-prompt-ready-fix2.log` and
+`m3os-prompt-ready-fix3.log`), it appeared as:
+
+```text
+[virtio-blk] completion poll + queue notify after request timeout owner_pid=19 type=1 sector=2072 completed=false
+```
+
+Because the prompt still reached `/bin/PROMPT`, `TERM_SMOKE:prompt-ready`, and
+stable `pty_bytes=158`, treat this as the next root-cause target rather than as
+a current graphical boot blocker. Good next questions: which Ion filesystem
+operation writes sector 2072, why the completion is not observed before the
+deadline, and whether the timeout recovery path is missing a final wake or
+whether QEMU/virtqueue notification timing is simply delayed.
+
+### Secondary lead: visual prompt confirmation
 
 The Ion null fault and the VFS registered-but-not-receiving window are no longer
 the highest-value leads. In `m3os-vfs-ready-fix.log`, graphical boot is
@@ -342,8 +402,10 @@ term: ... pty_bytes=158
 That is the expected prompt-ready state from the kernel/PTY perspective. If a
 future GUI run still looks blank, debug display rendering or visual surface
 damage next, not Ion exec/TLS, VFS readiness, waitpid, or the original
-missing-trampoline stall. Keep the fork-trampoline parser and `userspace page
-fault` grep only as regression guards.
+missing-trampoline stall. The renderer now retries failed submits, so if
+`CommitSurface` protocol violations continue, inspect the display server client
+state machine and surface-generation expectations. Keep the fork-trampoline
+parser and `userspace page fault` grep only as regression guards.
 
 ### If the fork-dispatch stall returns
 
@@ -438,8 +500,11 @@ The function exists at `kernel/src/task/sched_trace.rs::dump_sched_trace_rings`
 | `kernel/src/blk/virtio_blk.rs` | current working tree | Scheduler-blocking single-flight request slot; must not park while holding IRQ-masking locks |
 | `kernel/src/mm/shm.rs` | `7f6f6c4` | New refcounted shared-region registry (created by SHM rebuild) |
 | `kernel/src/arch/x86_64/interrupts.rs` | `8f46411`, `5f4338c`, `f5c64ce`, `e0a842b` | Timer-IRQ preempt path; AP IRQ routing |
-| `userspace/term/src/main.rs` | `73e5c1d`, `73c25b6`, `d98d136`, `7d27a3a` | Main loop with new diagnostics |
-| `userspace/term/src/display.rs` | `7f6f6c4` | SHM-backed `DisplayClient` |
+| `userspace/term/src/main.rs` | current working tree, `73e5c1d`, `73c25b6`, `d98d136`, `7d27a3a` | Main loop with prompt-ready marker and diagnostics |
+| `userspace/term/src/render.rs` | current working tree | Renderer pending-submit retry for transient display publish failures |
+| `userspace/term/src/display.rs` | current working tree, `7f6f6c4` | SHM-backed `DisplayClient`; submit success/failure reporting |
+| `userspace/syslogd/src/main.rs` | current working tree | Prompt-ready gate before persistent log file setup |
+| `userspace/sshd/src/main.rs` | current working tree | Prompt-ready gate before `/etc/ssh` setup and listener startup |
 | `userspace/display_server/src/main.rs` | `cbcdeb3`, `0decf62`, `c745d45` | Compose loop diagnostic counters |
 | `userspace/display_server/src/surface.rs` | `0468d3f`, `f88aa80`, `7f6f6c4` | `BufferStorage::Shared`, `AttachSharedBuffer` handler |
 | `kernel-core/src/display/protocol.rs` | `7f6f6c4` | `ClientMessage::AttachSharedBuffer` |
@@ -451,6 +516,9 @@ The function exists at `kernel/src/task/sched_trace.rs::dump_sched_trace_rings`
 
 | File | Description |
 |---|---|
+| `m3os-prompt-ready-fix3.log` (May 2) | Latest bounded GUI validation after prompt-ready gating: `/bin/PROMPT`, `TERM_SMOKE:prompt-ready`, syslogd/sshd gate-open logs, stable `pty_bytes=158`; one recoverable Ion-owned virtio write timeout remains |
+| `m3os-prompt-ready-fix2.log` (May 2) | First successful GUI validation after adding the sshd prompt-ready gate; same prompt-ready signature as fix3 |
+| `m3os-prompt-ready-fix.log` (May 2) | Failed syslog-only gate experiment: stuck write owner moved to pid 3 (`sshd`), refuting syslogd as the sole boot-write cause |
 | `m3os-slot-preempt-postdoc.log` (May 1) | Latest post-edit validation: all 19 fork children reached trampoline, graphical stack reached ready markers, then separate Ion null fault at `rip=0x65e54b` |
 | `m3os-ion-tls-fix.log` (May 2) | Latest Ion/TLS fix validation: all 19 fork children reached trampoline, graphical stack reached ready markers, `/bin/ion` exec succeeded, and no userspace page fault occurred; term stayed at `pty_bytes=0` before timeout |
 | `m3os-slot-preempt-final.log` (May 1) | Earlier current-tree validation: all 19 fork children reached trampoline, graphical stack reached ready markers, then separate Ion null fault at `rip=0x65e54b` |
@@ -459,7 +527,10 @@ The function exists at `kernel/src/task/sched_trace.rs::dump_sched_trace_rings`
 | `m3os-ds-pv.log` (May 1 22:20) | After failed `ee73f3c`: all fork children dispatched, but display protocol violations and `CommitSurface` IPC failures appeared |
 | `m3os-no-text.log` (May 1 22:20) | After failed `ee73f3c`: login/TERM_SMOKE present, but no typed chars; pid=6 and pid=19 missing trampoline |
 | `m3os-mouse-sticky.log` (May 1 22:20) | After failed `ee73f3c`: mouse cursor moved then snapped back; pid=19 missing trampoline |
-| `m3os.log` (May 1 20:34) | Failure: pid=8 and pid=19 both stuck on `target_core=1` |
+| `m3os.log` (May 2, overwritten by user) | Prompt failure class: partial PTY bytes plus display `CommitSurface` failures; compare with `m3os-prompt.log` |
+| `m3os2.log` (May 2, overwritten by user) | Prompt failure class: `/bin/ion` without `/bin/PROMPT`, PTY stuck near zero behind virtio write timeout owner pid 2 |
+| `m3os3.log` (May 2, overwritten by user) | Display publish class: `/bin/PROMPT` and `pty_bytes=158` reached, but display protocol violation dropped a commit |
+| historical `m3os.log` (May 1 20:34) | Failure: pid=8 and pid=19 both stuck on `target_core=1` |
 | `m3os-no-terminal.log` (May 1 20:04) | Failure: term + session_manager stuck, login (pid=18) ran |
 | `m3os-no-display.log` (May 1 20:03) | Failure: display_server's pid=7 stuck, full text-fallback |
 | `m3os3.log` (May 1 19:42) | Working boot: 8+ seconds of healthy compose |

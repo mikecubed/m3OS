@@ -44,7 +44,7 @@ pub trait FramebufferOwner {
     fn scroll(&mut self, amount: i16);
 
     /// Submit the current frame to the display server.
-    fn submit(&mut self);
+    fn submit(&mut self) -> bool;
 }
 
 /// One queued framebuffer op buffered between `apply` calls and
@@ -78,6 +78,7 @@ enum QueuedOp {
 pub struct Renderer<F: FramebufferOwner> {
     fb: F,
     queue: alloc::vec::Vec<QueuedOp>,
+    pending_submit: bool,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
@@ -86,6 +87,7 @@ impl<F: FramebufferOwner> Renderer<F> {
         Self {
             fb,
             queue: alloc::vec::Vec::new(),
+            pending_submit: false,
         }
     }
 
@@ -125,31 +127,36 @@ impl<F: FramebufferOwner> Renderer<F> {
 
     /// True when there is buffered damage waiting to be submitted.
     pub fn damaged(&self) -> bool {
-        !self.queue.is_empty()
+        !self.queue.is_empty() || self.pending_submit
     }
 
     /// Submit any buffered damage to the framebuffer. No-op when
     /// `damaged()` is false (no work, no submit).
     pub fn compose(&mut self) {
-        if self.queue.is_empty() {
+        if self.queue.is_empty() && !self.pending_submit {
             return;
         }
-        for op in self.queue.drain(..) {
-            match op {
-                QueuedOp::Put {
-                    row,
-                    col,
-                    codepoint,
-                    fg,
-                    bg,
-                } => {
-                    self.fb.put_glyph(row, col, codepoint, fg, bg);
+        if !self.queue.is_empty() {
+            for op in self.queue.drain(..) {
+                match op {
+                    QueuedOp::Put {
+                        row,
+                        col,
+                        codepoint,
+                        fg,
+                        bg,
+                    } => {
+                        self.fb.put_glyph(row, col, codepoint, fg, bg);
+                    }
+                    QueuedOp::Clear => self.fb.clear(),
+                    QueuedOp::Scroll { amount } => self.fb.scroll(amount),
                 }
-                QueuedOp::Clear => self.fb.clear(),
-                QueuedOp::Scroll { amount } => self.fb.scroll(amount),
             }
+            self.pending_submit = true;
         }
-        self.fb.submit();
+        if self.pending_submit && self.fb.submit() {
+            self.pending_submit = false;
+        }
     }
 }
 
@@ -168,11 +175,22 @@ mod tests {
 
     struct FakeFb {
         ops: Vec<FakeOp>,
+        submit_results: Vec<bool>,
     }
 
     impl FakeFb {
         fn new() -> Self {
-            Self { ops: Vec::new() }
+            Self {
+                ops: Vec::new(),
+                submit_results: Vec::new(),
+            }
+        }
+
+        fn with_submit_results(results: Vec<bool>) -> Self {
+            Self {
+                ops: Vec::new(),
+                submit_results: results,
+            }
         }
     }
 
@@ -193,8 +211,12 @@ mod tests {
             self.ops.push(FakeOp::Scroll { amount });
         }
 
-        fn submit(&mut self) {
+        fn submit(&mut self) -> bool {
             self.ops.push(FakeOp::Submit);
+            if self.submit_results.is_empty() {
+                return true;
+            }
+            self.submit_results.remove(0)
         }
     }
 
@@ -228,6 +250,37 @@ mod tests {
         });
         r.compose();
         assert!(!r.damaged(), "compose must clear damage");
+    }
+
+    #[test]
+    fn failed_submit_keeps_frame_pending_without_replaying_ops() {
+        let mut r = Renderer::new(FakeFb::with_submit_results(Vec::from([false, true])));
+        r.apply(RenderCommand::PutGlyph {
+            row: 1,
+            col: 2,
+            codepoint: b'X' as u32,
+            fg: 0xFFFF_FFFF,
+            bg: 0,
+        });
+
+        r.compose();
+        assert!(r.damaged(), "failed submit must leave a retry pending");
+
+        r.compose();
+        assert!(!r.damaged(), "successful retry clears pending submit");
+        assert_eq!(
+            r.fb.ops,
+            Vec::from([
+                FakeOp::Put {
+                    row: 1,
+                    col: 2,
+                    codepoint: b'X' as u32
+                },
+                FakeOp::Submit,
+                FakeOp::Submit,
+            ]),
+            "retry should resubmit the already-rendered frame, not replay drawing ops"
+        );
     }
 
     #[test]

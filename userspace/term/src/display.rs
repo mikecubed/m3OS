@@ -405,14 +405,14 @@ impl FramebufferOwner for DisplayClient {
         }
     }
 
-    fn submit(&mut self) {
+    fn submit(&mut self) -> bool {
         // First submit attaches the shared buffer; subsequent submits
         // just publish a damage rect since the buffer-id binding is
         // already in place.
         if !self.attach_shared_buffer_once() {
-            return;
+            return false;
         }
-        let _ = self.publish_frame();
+        self.publish_frame()
     }
 }
 

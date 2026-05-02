@@ -69,6 +69,13 @@ pub const READY_SENTINEL: &str = "TERM_SMOKE:ready\n";
 /// registry so `session_manager` can probe its readiness.
 pub const SERVICE_NAME: &str = "term";
 
+/// Service marker published after the graphical shell has produced enough
+/// PTY output to prove the prompt path is alive.
+pub const PROMPT_READY_SERVICE: &str = "term.prompt-ready";
+
+/// Minimum PTY bytes before publishing [`PROMPT_READY_SERVICE`].
+pub const PROMPT_READY_MIN_BYTES: u64 = 32;
+
 /// Service-manifest restart budget — pinned at 3 per the G.1
 /// acceptance ("`restart=on-failure max_restart=3
 /// depends=display,kbd,session_manager`"). The dep names match the

@@ -55,7 +55,9 @@ use term::screen::{RenderCommand, Screen};
 #[cfg(not(test))]
 use term::syscall_pty::SyscallPtyOps;
 #[cfg(not(test))]
-use term::{BOOT_LOG_MARKER, READY_SENTINEL, SERVICE_NAME};
+use term::{
+    BOOT_LOG_MARKER, PROMPT_READY_MIN_BYTES, PROMPT_READY_SERVICE, READY_SENTINEL, SERVICE_NAME,
+};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -241,6 +243,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut iter_count: u64 = 0;
     let mut events_pulled: u64 = 0;
     let mut pty_bytes: u64 = 0;
+    let mut prompt_ready_registered = false;
 
     // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
     //    display_server outbound-event drain, the bell, the shell-exit
@@ -266,6 +269,13 @@ fn program_main(_args: &[&str]) -> i32 {
         if n > 0 {
             did_work = true;
             pty_bytes = pty_bytes.saturating_add(n as u64);
+            if !prompt_ready_registered && pty_bytes >= PROMPT_READY_MIN_BYTES {
+                let rc = syscall_lib::ipc_register_service(ep_u32, PROMPT_READY_SERVICE);
+                if rc != u64::MAX {
+                    prompt_ready_registered = true;
+                    syscall_lib::write_str(STDOUT_FILENO, "TERM_SMOKE:prompt-ready\n");
+                }
+            }
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }

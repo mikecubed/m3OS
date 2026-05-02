@@ -21,8 +21,8 @@ use core::alloc::Layout;
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     AF_INET, NEG_EEXIST, POLLIN, PollFd, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO,
-    WNOHANG, accept, close, fork, getpid, listen, mkdir, poll, socket, waitpid, write_str,
-    write_u64,
+    WNOHANG, accept, close, fork, getpid, ipc_wait_service, listen, mkdir, poll, socket, waitpid,
+    write_str, write_u64,
 };
 
 #[cfg(not(test))]
@@ -45,12 +45,16 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 const SSH_PORT: u16 = 22;
 const LISTENER_POLL_TIMEOUT_MS: i32 = 1000;
+const PROMPT_READY_SERVICE: &str = "term.prompt-ready";
+const PROMPT_READY_TIMEOUT_MS: u64 = 30_000;
 
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
     write_str(STDOUT_FILENO, "sshd: starting\n");
+
+    wait_for_prompt_ready();
 
     // B.1: Ensure /etc/ssh/ directory exists.
     ensure_ssh_dir();
@@ -70,6 +74,14 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // Accept loop (host key generated lazily on first connection).
     accept_loop(listen_fd);
+}
+
+fn wait_for_prompt_ready() {
+    if ipc_wait_service(PROMPT_READY_SERVICE, PROMPT_READY_TIMEOUT_MS) {
+        write_str(STDOUT_FILENO, "sshd: prompt-ready gate open\n");
+    } else {
+        write_str(STDOUT_FILENO, "sshd: prompt-ready gate timed out\n");
+    }
 }
 
 /// B.1: Create /etc/ssh/ with mode 0755 if it does not exist.
