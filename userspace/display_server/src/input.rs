@@ -204,18 +204,25 @@ impl InputSource for KbdInputSource {
         // dispatcher loop; future observability can count them
         // separately because the labels are now distinct.
         let label = syscall_lib::ipc_call(handle, KBD_EVENT_PULL, 0);
-        if label == KBD_EVENT_NONE {
-            return None;
-        }
-        if label != KBD_EVENT_PULL {
-            return None;
-        }
-
-        // Drain the kernel-staged reply bulk. Buffer sized to the
-        // exact wire frame so a malformed (oversized) reply is
-        // truncated and rejected by the decoder.
+        // Drain the kernel-staged reply bulk regardless of label. The kernel's
+        // `endpoint::reply` calls `transfer_bulk(server, caller)` unconditionally —
+        // any byte still parked in `kbd_server`'s `pending_bulk` slot at reply time
+        // gets moved into the caller's slot even when the reply was a
+        // `KBD_EVENT_NONE` sentinel that does not stage fresh bulk. Returning
+        // early without draining left those stale bytes in `display_server`'s
+        // `pending_bulk` slot, where a subsequent `ipc_try_recv_msg` whose
+        // sender has no fresh bulk to overwrite the slot would surface the
+        // stale bytes as a malformed verb frame to the dispatcher
+        // (`reason=verb-decode opcode=304` = `OP_SERVER_KEY_EVENT` traced back
+        // to this leak). Always drain so the slot is empty before the next
+        // syscall path can read it.
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if label != KBD_EVENT_PULL {
+            // KBD_EVENT_NONE (no event this tick) or `u64::MAX` (transport
+            // error). Slot is now drained; surface no event to the loop.
+            return None;
+        }
         if n != KEY_EVENT_WIRE_SIZE as u64 {
             // u64::MAX = drain error; any other mismatch = protocol
             // violation. Drop the event silently to keep the
@@ -294,15 +301,17 @@ impl InputSource for MouseInputSource {
         // labels are now distinct so future observability can count
         // them separately.
         let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
-        if label == MOUSE_EVENT_NONE {
-            return None;
-        }
+        // Drain pending_bulk regardless of label — see [`KbdInputSource::poll_key`]
+        // for the matching kernel-side rationale: `endpoint::reply` always
+        // transfers any bytes parked in `mouse_server`'s `pending_bulk` slot,
+        // including across NONE-sentinel replies that did not stage fresh
+        // bulk. Returning early without draining left stale bytes in
+        // display_server's slot that later surfaced as bogus verb frames.
+        let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if label != MOUSE_EVENT_PULL {
             return None;
         }
-
-        let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
-        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if n != POINTER_EVENT_WIRE_SIZE as u64 {
             return None;
         }
