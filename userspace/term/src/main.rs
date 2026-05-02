@@ -57,6 +57,7 @@ use term::syscall_pty::SyscallPtyOps;
 #[cfg(not(test))]
 use term::{
     BOOT_LOG_MARKER, PROMPT_READY_MIN_BYTES, PROMPT_READY_SERVICE, READY_SENTINEL, SERVICE_NAME,
+    should_compose_frame,
 };
 
 #[cfg(not(test))]
@@ -250,6 +251,7 @@ fn program_main(_args: &[&str]) -> i32 {
     //    poll, and the renderer's per-tick compose.
     loop {
         let mut did_work = false;
+        let mut pty_drained_this_tick = false;
         iter_count = iter_count.wrapping_add(1);
         if iter_count.is_multiple_of(1000) {
             syscall_lib::write_str(STDOUT_FILENO, "term: iter=");
@@ -268,6 +270,7 @@ fn program_main(_args: &[&str]) -> i32 {
         let n = syscall_lib::read(primary_fd, &mut pty_buf);
         if n > 0 {
             did_work = true;
+            pty_drained_this_tick = true;
             pty_bytes = pty_bytes.saturating_add(n as u64);
             if !prompt_ready_registered && pty_bytes >= PROMPT_READY_MIN_BYTES {
                 let rc = syscall_lib::ipc_register_service(ep_u32, PROMPT_READY_SERVICE);
@@ -351,7 +354,16 @@ fn program_main(_args: &[&str]) -> i32 {
         //     `DamageSurface` IPC traffic across multiple PTY bytes.
         if renderer.damaged() {
             let now_ms = clock.now_ms();
-            if now_ms.saturating_sub(last_compose_ms) >= COMPOSE_INTERVAL_MS {
+            let elapsed_ms = now_ms.saturating_sub(last_compose_ms);
+            let (cursor_row, _) = screen.cursor();
+            if should_compose_frame(
+                true,
+                pty_drained_this_tick,
+                cursor_row,
+                screen.rows(),
+                elapsed_ms,
+                COMPOSE_INTERVAL_MS,
+            ) {
                 renderer.compose();
                 last_compose_ms = now_ms;
                 composes = composes.saturating_add(1);

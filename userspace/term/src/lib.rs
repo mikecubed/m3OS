@@ -106,6 +106,29 @@ pub const DEFAULT_COLS: u16 = 80;
 /// [`DEFAULT_COLS`].
 pub const DEFAULT_ROWS: u16 = 25;
 
+/// Decide whether the event loop should publish the current renderer frame.
+///
+/// The normal throttle avoids excessive display IPC, but PTY output that has
+/// already reached the bottom row must be published promptly. Otherwise the
+/// current line can appear to contain only the first glyph until a later scroll
+/// replays the queued glyph operations.
+pub fn should_compose_frame(
+    damaged: bool,
+    pty_drained_this_tick: bool,
+    cursor_row: u16,
+    rows: u16,
+    elapsed_ms: u64,
+    interval_ms: u64,
+) -> bool {
+    if !damaged {
+        return false;
+    }
+    if pty_drained_this_tick && rows > 0 && cursor_row >= rows.saturating_sub(1) {
+        return true;
+    }
+    elapsed_ms >= interval_ms
+}
+
 /// Top-level error type for the terminal binary.  Every fallible
 /// boundary inside `term` returns one of these; the binary's
 /// `program_main` matches and writes a structured marker to stdout
@@ -158,5 +181,29 @@ mod tests {
     #[test]
     fn scrollback_cap_pinned() {
         assert_eq!(SCROLLBACK_LINES, 1000);
+    }
+
+    #[test]
+    fn compose_policy_flushes_damaged_last_row_without_waiting_for_throttle() {
+        assert!(
+            should_compose_frame(true, true, DEFAULT_ROWS - 1, DEFAULT_ROWS, 0, 16),
+            "bottom-row PTY output must publish promptly instead of waiting for scroll"
+        );
+    }
+
+    #[test]
+    fn compose_policy_keeps_throttle_away_from_bottom_row() {
+        assert!(
+            !should_compose_frame(true, true, 0, DEFAULT_ROWS, 0, 16),
+            "off-bottom PTY output should still respect the frame throttle"
+        );
+        assert!(
+            should_compose_frame(true, true, 0, DEFAULT_ROWS, 16, 16),
+            "elapsed throttle interval still permits compose"
+        );
+        assert!(
+            !should_compose_frame(false, true, DEFAULT_ROWS - 1, DEFAULT_ROWS, 16, 16),
+            "undamaged frames must not compose"
+        );
     }
 }

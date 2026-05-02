@@ -181,6 +181,14 @@ fix work landed during the post-merge debugging.
     `dequeue-drop` diagnostic budget is reduced. If `CommitSurface` failures
     recur, use the new `display_server: client protocol violation reason=...`
     line as the next root-cause discriminator.
+16. **Latest bottom-row terminal rendering target:** user testing now confirms a
+    successful boot with prompt and command execution, but the current line at
+    the bottom of the terminal can visually show only its first glyph until the
+    next scroll replays queued glyph operations. The working tree adds a
+    host-tested compose policy that keeps the normal frame throttle away from
+    the bottom row, but immediately publishes damaged PTY output once the cursor
+    is on the last terminal row. This remains preemption-compatible: no
+    cooperative yield/poll loop was added.
 
 ---
 
