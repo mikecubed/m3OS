@@ -168,9 +168,19 @@ fix work landed during the post-merge debugging.
     when `call_msg` delivered directly to an already-waiting server, it inserted
     a reply cap but did not encode that handle into `data[3]`, so
     `vfs_server` logged `request missing reply cap` and pid 19 stayed
-    `BlockedOnReply`. `kernel-core::ipc::Message::with_reply_cap_handle()` now
-    centralizes the encoding and `call_msg`, `recv_msg`, `recv_msg_nowait`, and
-    `recv_msg_with_notif` all use it before delivery.
+     `BlockedOnReply`. `kernel-core::ipc::Message::with_reply_cap_handle()` now
+     centralizes the encoding and `call_msg`, `recv_msg`, `recv_msg_nowait`, and
+     `recv_msg_with_notif` all use it before delivery.
+15. **Latest prompt-success log-spam split:** the newest user GUI log reaches
+    `/bin/ion`, `/bin/PROMPT`, `TERM_SMOKE:prompt-ready`, and rising
+    `pty_bytes`, so the reply-cap/no-prompt bug is not reproducing there. The
+    remaining spam is now bounded and classified: display-server fatal protocol
+    replies carry a `reason`, `label`, `bulk_len`, and decoded frame
+    `body_len/opcode` for the first few occurrences, term display-verb failure
+    logs are rate-limited, and the scheduler's stale run-queue
+    `dequeue-drop` diagnostic budget is reduced. If `CommitSurface` failures
+    recur, use the new `display_server: client protocol violation reason=...`
+    line as the next root-cause discriminator.
 
 ---
 

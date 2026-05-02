@@ -41,7 +41,7 @@ use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
-use crate::client::{InboundFrame, dispatch};
+use crate::client::{FatalReason, InboundFrame, dispatch};
 use crate::compose::{ComposeContext, default_layout, fill_background, run_compose};
 
 /// Phase 57d follow-up — per-second diagnostic counters for the SHM
@@ -51,6 +51,8 @@ use crate::compose::{ComposeContext, default_layout, fill_background, run_compos
 /// instead of silent emptiness. Ripped once SHM is stable.
 static DIAG_COMPOSES_RUN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_PROTOCOL_VIOLATION_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
     publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -458,10 +460,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             client::DispatchOutcome::default()
         };
         if outcome.fatal {
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "display_server: client protocol violation; dropping message\n",
-            );
+            log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf);
         }
         if outcome.closed {
             syscall_lib::write_str(
@@ -1025,6 +1024,57 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
     syscall_lib::write_str(STDOUT_FILENO, " stride=");
     write_u32(stride);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+fn log_client_protocol_violation(
+    reason: Option<FatalReason>,
+    header: &IpcMessage,
+    bulk_buf: &[u8],
+) {
+    if DIAG_PROTOCOL_VIOLATION_LOG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let bulk_len = (header.data[1] as usize).min(bulk_buf.len());
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: client protocol violation reason=",
+    );
+    syscall_lib::write_str(STDOUT_FILENO, fatal_reason_name(reason));
+    syscall_lib::write_str(STDOUT_FILENO, " label=");
+    write_u32(header.label as u32);
+    syscall_lib::write_str(STDOUT_FILENO, " bulk_len=");
+    write_u32(bulk_len as u32);
+    if bulk_len >= 4 {
+        let body_len = u16::from_le_bytes([bulk_buf[0], bulk_buf[1]]);
+        let opcode = u16::from_le_bytes([bulk_buf[2], bulk_buf[3]]);
+        syscall_lib::write_str(STDOUT_FILENO, " body_len=");
+        write_u32(body_len as u32);
+        syscall_lib::write_str(STDOUT_FILENO, " opcode=");
+        write_u32(opcode as u32);
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+fn fatal_reason_name(reason: Option<FatalReason>) -> &'static str {
+    match reason {
+        Some(FatalReason::BulkTooLarge) => "bulk-too-large",
+        Some(FatalReason::PixelHeaderTooShort) => "pixel-header-too-short",
+        Some(FatalReason::PixelSizeMismatch) => "pixel-size-mismatch",
+        Some(FatalReason::PendingBulkFull) => "pending-bulk-full",
+        Some(FatalReason::ChunkHeaderTooShort) => "chunk-header-too-short",
+        Some(FatalReason::ChunkDecode) => "chunk-decode",
+        Some(FatalReason::ChunkBufferMismatch) => "chunk-buffer-mismatch",
+        Some(FatalReason::ChunkReceive) => "chunk-receive",
+        Some(FatalReason::VerbDecode) => "verb-decode",
+        None => "unknown",
+    }
 }
 
 fn write_u32(mut value: u32) {

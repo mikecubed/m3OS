@@ -121,10 +121,37 @@ pub struct DispatchOutcome {
     /// `true` if the client violated the wire protocol (decode error,
     /// state-machine error, oversized bulk). The caller should disconnect.
     pub fatal: bool,
+    /// Narrow reason for `fatal`, used by the compositor's serial log so a
+    /// production boot transcript can distinguish malformed frames from
+    /// resource exhaustion without reproducing under a debugger.
+    pub fatal_reason: Option<FatalReason>,
     /// Surfaces whose roles became mapped during this dispatch.
     pub created: Vec<(SurfaceId, SurfaceRole)>,
     /// Surfaces destroyed during this dispatch.
     pub destroyed: Vec<SurfaceId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatalReason {
+    BulkTooLarge,
+    PixelHeaderTooShort,
+    PixelSizeMismatch,
+    PendingBulkFull,
+    ChunkHeaderTooShort,
+    ChunkDecode,
+    ChunkBufferMismatch,
+    ChunkReceive,
+    VerbDecode,
+}
+
+impl DispatchOutcome {
+    fn fatal(reason: FatalReason) -> Self {
+        Self {
+            fatal: true,
+            fatal_reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// One Phase 56 IPC message from a client. Created by the C.5 dispatch
@@ -144,8 +171,7 @@ pub struct InboundFrame<'a> {
 pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> DispatchOutcome {
     let mut out = DispatchOutcome::default();
     if frame.bulk.len() > MAX_BULK_BYTES {
-        out.fatal = true;
-        return out;
+        return DispatchOutcome::fatal(FatalReason::BulkTooLarge);
     }
 
     match frame.header.label {
@@ -158,8 +184,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
             // `w * h * BYTES_PER_PIXEL_BGRA8888` BGRA8888 pixels.
             let buffer_id = BufferId(frame.header.data[0] as u32);
             if frame.bulk.len() < PIXEL_BULK_HEADER_LEN {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::PixelHeaderTooShort);
             }
             let mut wbuf = [0u8; 4];
             let mut hbuf = [0u8; 4];
@@ -172,8 +197,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 .checked_mul(height as usize)
                 .and_then(|wh| wh.checked_mul(BYTES_PER_PIXEL_BGRA8888));
             if expected != Some(pixels.len()) {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::PixelSizeMismatch);
             }
             // Resource bound — `receive_bulk` returns `false` if the
             // pending-bulk queue is at the documented cap. Refusing
@@ -185,8 +209,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 height,
                 pixels.to_vec(),
             )) {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::PendingBulkFull);
             }
         }
         LABEL_PIXELS_CHUNK => {
@@ -195,27 +218,23 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
             // reassembly state; the dispatcher just decodes the
             // header, splits the body, and forwards.
             if frame.bulk.len() < CHUNK_HEADER_LEN {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkHeaderTooShort);
             }
             let header = match PixelChunkHeader::decode(&frame.bulk[..CHUNK_HEADER_LEN]) {
                 Ok(h) => h,
                 Err(_) => {
-                    out.fatal = true;
-                    return out;
+                    return DispatchOutcome::fatal(FatalReason::ChunkDecode);
                 }
             };
             // The IPC `data0` carries the BufferId; cross-check
             // against the in-bulk header so a confused client cannot
             // accidentally race two buffers' chunks together.
             if frame.header.data[0] as u32 != header.buffer_id {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkBufferMismatch);
             }
             let body = &frame.bulk[CHUNK_HEADER_LEN..];
             if registry.receive_chunk(header, body).is_err() {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkReceive);
             }
         }
         LABEL_VERB => match decode_message(frame.bulk) {
@@ -249,7 +268,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 },
             },
             Err(_) => {
-                out.fatal = true;
+                return DispatchOutcome::fatal(FatalReason::VerbDecode);
             }
         },
         _ => {

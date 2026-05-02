@@ -77,6 +77,8 @@ pub const CELL_HEIGHT: u8 = 16;
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`
 /// at ~24 bytes; a 64-byte buffer is ample.
 const VERB_ENCODE_BUF_LEN: usize = 64;
+static DISPLAY_VERB_FAILURE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
 
 /// Production [`FramebufferOwner`] for the `term` graphical client.
 ///
@@ -244,20 +246,32 @@ impl DisplayClient {
         let len = match msg.encode(buf) {
             Ok(n) => n,
             Err(_) => {
-                syscall_lib::write_str(STDOUT_FILENO, "term: display verb encode failed: ");
-                syscall_lib::write_str(STDOUT_FILENO, step);
-                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                Self::log_verb_failure("term: display verb encode failed: ", step);
                 return false;
             }
         };
         let reply = syscall_lib::ipc_call_buf(handle, LABEL_VERB, 0, &buf[..len]);
         if reply == u64::MAX {
-            syscall_lib::write_str(STDOUT_FILENO, "term: display verb ipc_call_buf failed: ");
-            syscall_lib::write_str(STDOUT_FILENO, step);
-            syscall_lib::write_str(STDOUT_FILENO, "\n");
+            Self::log_verb_failure("term: display verb ipc_call_buf failed: ", step);
             return false;
         }
         true
+    }
+
+    fn log_verb_failure(prefix: &str, step: &str) {
+        if DISPLAY_VERB_FAILURE_LOG_BUDGET
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_err()
+        {
+            return;
+        }
+        syscall_lib::write_str(STDOUT_FILENO, prefix);
+        syscall_lib::write_str(STDOUT_FILENO, step);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
     }
 
     /// Send `DamageSurface(full)` + `CommitSurface` to publish the

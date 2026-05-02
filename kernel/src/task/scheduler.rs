@@ -1794,7 +1794,7 @@ pub fn check_deferred_preempt_at_user_return() {}
 // Each filter rejection consumes one slot; bounded so a permanently-stuck task
 // doesn't drown the log.
 static DEQUEUE_FILTER_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
-    [const { core::sync::atomic::AtomicI32::new(64) }; crate::smp::MAX_CORES];
+    [const { core::sync::atomic::AtomicI32::new(8) }; crate::smp::MAX_CORES];
 
 #[cold]
 fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extra: u64) {
