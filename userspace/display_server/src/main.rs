@@ -335,6 +335,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut layout = default_layout();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 57d follow-up — small ring of recently dispatched verb
+    // frames so the next protocol-violation log can show whether the
+    // failing bulk was preceded by a structurally similar frame, and
+    // whether the offending opcode/body_len matches a frame seen one
+    // or two iterations ago. Strictly diagnostic; rate-limited via the
+    // same `DIAG_PROTOCOL_VIOLATION_LOG_BUDGET` as the headline log.
+    let mut recent_frames = RecentFrames::new();
     // Phase 56 C.5 close-out — per-client outbound queue. The
     // dispatcher's `InputEffect::Outbound(ServerMessage::Key|Pointer)`
     // fires on focused-client key/pointer events; we accumulate the
@@ -449,18 +456,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             } else {
                 &[][..]
             };
-            dispatch(
+            let outcome = dispatch(
                 InboundFrame {
                     header,
                     bulk: bulk_slice,
                 },
                 &mut registry,
-            )
+            );
+            recent_frames.push(&header, bulk_slice, &outcome);
+            outcome
         } else {
             client::DispatchOutcome::default()
         };
         if outcome.fatal {
-            log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf);
+            log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
             syscall_lib::write_str(
@@ -1030,6 +1039,7 @@ fn log_client_protocol_violation(
     reason: Option<FatalReason>,
     header: &IpcMessage,
     bulk_buf: &[u8],
+    recent: &RecentFrames,
 ) {
     if DIAG_PROTOCOL_VIOLATION_LOG_BUDGET
         .fetch_update(
@@ -1059,7 +1069,129 @@ fn log_client_protocol_violation(
         syscall_lib::write_str(STDOUT_FILENO, " opcode=");
         write_u32(opcode as u32);
     }
+    syscall_lib::write_str(STDOUT_FILENO, " head16=");
+    write_hex_prefix(bulk_buf, bulk_len, 16);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+    recent.dump();
+}
+
+/// Phase 57d follow-up — small ring of recently dispatched verb frames.
+/// Captures `(label, bulk_len, head8 bytes, outcome tag)` so a fatal
+/// dispatch can show whether the offending bulk's bytes match a frame
+/// the dispatcher accepted moments earlier (which would point at a
+/// stale-bulk read on the receiver side, rather than a malformed frame
+/// from the client).
+const RECENT_FRAMES_CAP: usize = 8;
+
+#[derive(Clone, Copy)]
+struct RecentFrame {
+    label: u64,
+    bulk_len: u32,
+    head: [u8; 8],
+    head_len: u8,
+    outcome: RecentOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum RecentOutcome {
+    Ok,
+    Closed,
+    Fatal(Option<FatalReason>),
+}
+
+struct RecentFrames {
+    entries: [Option<RecentFrame>; RECENT_FRAMES_CAP],
+    next: usize,
+}
+
+impl RecentFrames {
+    fn new() -> Self {
+        Self {
+            entries: [None; RECENT_FRAMES_CAP],
+            next: 0,
+        }
+    }
+
+    fn push(&mut self, header: &IpcMessage, bulk: &[u8], outcome: &client::DispatchOutcome) {
+        let mut head = [0u8; 8];
+        let head_len = bulk.len().min(head.len());
+        head[..head_len].copy_from_slice(&bulk[..head_len]);
+        let outcome_tag = if outcome.fatal {
+            RecentOutcome::Fatal(outcome.fatal_reason)
+        } else if outcome.closed {
+            RecentOutcome::Closed
+        } else {
+            RecentOutcome::Ok
+        };
+        let entry = RecentFrame {
+            label: header.label,
+            bulk_len: bulk.len() as u32,
+            head,
+            head_len: head_len as u8,
+            outcome: outcome_tag,
+        };
+        self.entries[self.next] = Some(entry);
+        self.next = (self.next + 1) % RECENT_FRAMES_CAP;
+    }
+
+    /// Print the ring oldest-first with the most recent entry last so
+    /// scanners see the failing frame at the bottom and its predecessor
+    /// just above it.
+    fn dump(&self) {
+        let mut age = 0;
+        for offset in 0..RECENT_FRAMES_CAP {
+            let idx = (self.next + offset) % RECENT_FRAMES_CAP;
+            if let Some(entry) = &self.entries[idx] {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server:   recent[-");
+                write_u32((RECENT_FRAMES_CAP - 1 - age) as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "] label=");
+                write_u32(entry.label as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " bulk_len=");
+                write_u32(entry.bulk_len);
+                syscall_lib::write_str(STDOUT_FILENO, " head=");
+                write_hex_prefix(
+                    &entry.head[..entry.head_len as usize],
+                    entry.head_len as usize,
+                    entry.head_len as usize,
+                );
+                syscall_lib::write_str(STDOUT_FILENO, " outcome=");
+                syscall_lib::write_str(STDOUT_FILENO, recent_outcome_name(entry.outcome));
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+            age += 1;
+        }
+    }
+}
+
+fn recent_outcome_name(outcome: RecentOutcome) -> &'static str {
+    match outcome {
+        RecentOutcome::Ok => "ok",
+        RecentOutcome::Closed => "closed",
+        RecentOutcome::Fatal(reason) => fatal_reason_name(reason),
+    }
+}
+
+/// Print up to `max` bytes of `buf[..len]` as lowercase hex without
+/// separators. `len` is capped at `buf.len()` defensively. Designed for
+/// terse single-line log output — 16 bytes prints as 32 hex chars.
+fn write_hex_prefix(buf: &[u8], len: usize, max: usize) {
+    let n = len.min(buf.len()).min(max);
+    let mut out = [0u8; 2];
+    for byte in &buf[..n] {
+        out[0] = hex_nibble(byte >> 4);
+        out[1] = hex_nibble(byte & 0x0F);
+        if let Ok(s) = core::str::from_utf8(&out) {
+            syscall_lib::write_str(STDOUT_FILENO, s);
+        }
+    }
+}
+
+fn hex_nibble(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=15 => b'a' + (v - 10),
+        _ => b'?',
+    }
 }
 
 fn fatal_reason_name(reason: Option<FatalReason>) -> &'static str {
