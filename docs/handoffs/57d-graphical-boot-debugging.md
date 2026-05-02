@@ -108,8 +108,25 @@ fix work landed during the post-merge debugging.
     write through the actual `switch_context`, closing the preemptive
     mark-blocked-but-not-switched window. `m3os-ipc-wait-service6.log` reached
     VFS registration, `/bin/ion`, `AttachSharedBuffer ok`, `TERM_SMOKE:ready`,
-    and eventually stable `pty_bytes=158`; Ion still sometimes delays before the
-    prompt helper fork and remains the next liveness target.
+     and eventually stable `pty_bytes=158`; Ion still sometimes delays before the
+     prompt helper fork and remains the next liveness target.
+11. **Latest no-yield block/PTY work:** Follow-up runs showed two separate
+    timing-dependent stalls: VFS could start but never register because a
+    virtio-blk completion/wake was missed, and Ion could exec but sit behind an
+    early disk owner while term stayed at `pty_bytes=0`. The current fix keeps
+    the non-yield path: virtio-blk request and slot waits use bounded
+    `block_current_until` deadlines to poll completions and re-notify the queue,
+    used-ring wake delivery now happens after dropping the driver lock, and PTY
+    master/slave blocking reads park on PTY wait queues instead of calling
+    `yield_now()`. `term` also execs Ion with `-i` so the graphical PTY always
+    requests an interactive prompt even if TTY detection races early boot. This
+    improves the split but does **not** fully close the intermittent prompt miss:
+    `m3os-final-block-pty-1.log` still reproduced VFS ready + `/bin/ion` exec +
+    `TERM_SMOKE:ready` with `pty_bytes=0`. Its timeout diagnostics show an early
+    active virtio write request (`type=1`, sector 2072, owner pid 3) before VFS
+    registration; the next target is the legacy single-flight write request path
+    or deferring boot-time write-heavy daemons so shell reads cannot sit behind a
+    stuck log/host-key write.
 
 ---
 
@@ -166,6 +183,9 @@ in commit `968b579`.
 | `kernel/src/ipc/mod.rs` | Let `ipc_service_exists` report private-service presence while keeping `ipc_lookup_service` denied, so clients can wait for readiness without receiving a callable capability. | Term can gate Ion startup on `vfs` readiness without exposing the private VFS endpoint. |
 | `kernel/src/ipc/{mod.rs,registry.rs}`, `userspace/syscall-lib/src/lib.rs`, `kernel/src/task/{mod.rs,scheduler.rs}` | Add `ipc_wait_service` (`0x1115`) and `BlockedOnService`: service waiters park in the scheduler; registration marks matching waiters ready and defers wake delivery to the waiter's assigned-core scheduler loop. | `cargo xtask check`; `m3os-ipc-wait-service6.log` shows VFS registration completing while term is blocked on readiness, then term wakes and launches Ion. |
 | `kernel/src/task/scheduler.rs` | Make the `block_current_until` park transition non-preemptible from the blocked-state write until `switch_context` returns on wake, preventing `on_cpu=true` from being left visible without a saved blocked stack. | `cargo xtask check`; GUI validation no longer hangs VFS inside immediate service registration wake when the deferred service-wake path is active. |
+| `kernel/src/blk/virtio_blk.rs` | Add bounded no-yield timeout recovery for the single-flight virtio-blk path: request/slot waiters stay parked, timeout paths drain the used ring, re-notify the queue, and deliver wakes after dropping the driver lock so `wake_task_v2` cannot spin while holding the virtio lock. Timeout logs include owner PID, request type, sector, and whether a completion was drained. | `cargo xtask check`; `m3os-blk-type-probe.log` shows VFS registration, `/bin/ion`, `TERM_SMOKE:ready`, and stable `pty_bytes=158` after timeout recovery. `m3os-final-block-pty-1.log` still reproduced a later prompt miss behind an early stuck write owner, so this is not yet a full closure. |
+| `kernel/src/arch/x86_64/syscall/mod.rs` | Replace PTY master/slave blocking-read `yield_now()` loops with PTY wait-queue registration plus `block_current_until`. | `cargo xtask check`; Ion reaches the normal `BlockedOnRecv` steady state after writing prompt bytes. |
+| `userspace/term/src/{lib.rs,syscall_pty.rs}` | Pass `-i` when graphical term execs `/bin/ion`, with a host test for the argv shape. | `cargo test -p term --target x86_64-unknown-linux-gnu ion_argv_forces_interactive_mode --quiet`. |
 
 ### Virtio-blk request-slot history
 

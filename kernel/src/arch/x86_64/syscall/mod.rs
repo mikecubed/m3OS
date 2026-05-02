@@ -4951,6 +4951,58 @@ fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
     Ok(())
 }
 
+fn block_on_pty_master_read(pty_id: u32) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => !pair.s2m.is_empty() || (pair.slave_refcount == 0 && pair.slave_opened),
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
+fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => {
+                if pair.termios.is_canonical() {
+                    pair.edit_buf.as_slice().contains(&b'\n')
+                        || pair.eof_pending
+                        || pair.master_refcount == 0
+                } else {
+                    !pair.m2s.is_empty() || pair.master_refcount == 0
+                }
+            }
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
@@ -5261,7 +5313,9 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                if let Err(err) = block_on_pty_master_read(pty_id) {
+                    return err;
+                }
             }
         }
         FdBackend::PtySlave { pty_id } => {
@@ -5334,7 +5388,9 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                if let Err(err) = block_on_pty_slave_read(pty_id) {
+                    return err;
+                }
             }
         }
         FdBackend::Socket { .. } => {

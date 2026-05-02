@@ -49,6 +49,7 @@ use syscall_lib::{STDOUT_FILENO, WNOHANG};
 /// as a null-terminated byte string so it can travel through
 /// `execve` without any per-call allocation.
 const SHELL_PATH_ION: &[u8] = b"/bin/ion\0";
+const SHELL_ARG_INTERACTIVE: &[u8] = b"-i\0";
 
 /// Fallback shell — minimal in-tree shell that ships unconditionally.
 /// Matches `login`'s "ion-first, sh0-fallback" recovery shape so a
@@ -61,6 +62,14 @@ const SHELL_PATH_SH0: &[u8] = b"/bin/sh0\0";
 /// "dup2 failed" in the boot transcript without parsing free-form text.
 const CHILD_EXIT_DUP2: i32 = 110;
 const CHILD_EXIT_EXECVE: i32 = 111;
+
+fn ion_argv() -> [*const u8; 3] {
+    [
+        SHELL_PATH_ION.as_ptr(),
+        SHELL_ARG_INTERACTIVE.as_ptr(),
+        core::ptr::null(),
+    ]
+}
 
 /// Production `PtyOps`: thin wrapper over `syscall_lib` that feeds
 /// the same `PtyHost` lifecycle the host tests exercise against
@@ -129,10 +138,9 @@ impl PtyOps for SyscallPtyOps {
             env_home.as_ptr(),
             core::ptr::null(),
         ];
-        // Try ion (the production default). argv is just the program
-        // name — Phase 57 does not yet thread through user-supplied
-        // argv.
-        let argv_ion: [*const u8; 2] = [SHELL_PATH_ION.as_ptr(), core::ptr::null()];
+        // Try ion (the production default). Force interactive mode because
+        // m3OS PTY detection can race early boot; term always wants a prompt.
+        let argv_ion = ion_argv();
         let _rc = syscall_lib::execve(SHELL_PATH_ION, &argv_ion, &envp);
         // execve only returns on failure. Fall back to sh0, mirroring
         // `login`'s recovery shape.
@@ -154,5 +162,18 @@ impl PtyOps for SyscallPtyOps {
         let mut status: i32 = 0;
         let rc = syscall_lib::waitpid(pid, &mut status, WNOHANG);
         decode_wait_status(rc, status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ion_argv_forces_interactive_mode() {
+        let argv = ion_argv();
+        assert_eq!(argv[0], SHELL_PATH_ION.as_ptr());
+        assert_eq!(argv[1], SHELL_ARG_INTERACTIVE.as_ptr());
+        assert!(argv[2].is_null());
     }
 }

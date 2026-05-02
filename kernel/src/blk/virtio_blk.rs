@@ -14,7 +14,7 @@
 //!   buffers.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use kernel_core::types::TaskId;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -334,10 +334,16 @@ impl Virtqueue {
             .write_reg::<u16>(VIRTIO_QUEUE_NOTIFY, self.queue_index);
     }
 
-    /// Drain all new used-ring entries. Called from the IRQ handler; wakes
-    /// each completion's waiter.
-    fn drain_used_from_irq(&mut self) {
+    /// Drain all new used-ring entries and return the completed waiter, if any.
+    ///
+    /// The legacy path serializes requests, so at most one waiter is expected.
+    /// Wake delivery is intentionally done by the caller after dropping the
+    /// driver lock; `wake_task_v2` may briefly wait on another core's
+    /// `on_cpu` handoff and must not do that while holding the virtio lock.
+    fn drain_used(&mut self) -> Option<TaskId> {
+        let mut completed = None;
         loop {
+            core::sync::atomic::fence(Ordering::Acquire);
             let used_idx = unsafe { core::ptr::read_volatile(&raw const (*self.used_base).idx) };
             if self.last_used_idx == used_idx {
                 break;
@@ -356,17 +362,19 @@ impl Virtqueue {
                 && let Some(waiter) = self.waiters[head as usize].take()
             {
                 waiter.woken.store(true, Ordering::Release);
-                // F.6: under sched-v2 use wake_task_v2 (CAS-based); under v1 use wake_task.
-                {
-                    use crate::task::scheduler::wake_task_v2;
-                    let _ = wake_task_v2(waiter.task);
-                }
+                completed = Some(waiter.task);
                 // status_virt is read by the task after wake; no IRQ
                 // work needed here.
                 let _ = waiter.status_virt;
             }
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
         }
+        completed
+    }
+
+    fn notify(&mut self) {
+        self.port
+            .write_reg::<u16>(VIRTIO_QUEUE_NOTIFY, self.queue_index);
     }
 }
 
@@ -421,6 +429,12 @@ pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 // masking spin lock lets a later block caller spin with IF=0 until the first
 // request completes. Under voluntary kernel preemption that pins the whole AP.
 static REQUEST_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+const REQUEST_WAIT_TIMEOUT_TICKS: u64 = 250;
+static REQUEST_TIMEOUT_LOG_BUDGET: AtomicI32 = AtomicI32::new(8);
+static ACTIVE_REQUEST_PID: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_REQUEST_SECTOR: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_REQUEST_TYPE: AtomicU32 = AtomicU32::new(0);
 
 const MAX_REQUEST_WAITERS: usize = 64;
 
@@ -535,11 +549,21 @@ impl RequestSlot {
             // storage, not a stack frame. The slot is not reused until this
             // task unregisters it after `block_current_until` returns.
             let woken = unsafe { &*woken_ptr };
-            let _ = crate::task::scheduler::block_current_until(
+            let deadline = Some(
+                crate::arch::x86_64::interrupts::tick_count()
+                    .saturating_add(REQUEST_WAIT_TIMEOUT_TICKS),
+            );
+            let outcome = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
                 woken,
-                None,
+                deadline,
             );
+            if matches!(
+                outcome,
+                crate::task::scheduler::BlockOutcome::DeadlineExpired
+            ) {
+                poll_completions_from_task("slot-wait");
+            }
             Self::unregister_waiter(waiter_idx, task);
         }
     }
@@ -604,6 +628,33 @@ fn with_driver<R>(f: impl FnOnce(&mut Option<VirtioBlkDriver>) -> R) -> R {
     result
 }
 
+fn poll_completions_from_task(reason: &str) {
+    let completed = with_driver(|driver| {
+        if let Some(driver) = driver.as_mut() {
+            let _isr = driver.port.read_reg::<u8>(VIRTIO_ISR_STATUS);
+            let completed = driver.request_queue.drain_used();
+            driver.request_queue.notify();
+            completed
+        } else {
+            None
+        }
+    });
+    if let Some(task) = completed {
+        let _ = crate::task::scheduler::wake_task_v2(task);
+    }
+    let n = REQUEST_TIMEOUT_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+    if n > 0 {
+        log::warn!(
+            "[virtio-blk] completion poll + queue notify after {} timeout owner_pid={} type={} sector={} completed={}",
+            reason,
+            ACTIVE_REQUEST_PID.load(Ordering::Acquire),
+            ACTIVE_REQUEST_TYPE.load(Ordering::Acquire),
+            ACTIVE_REQUEST_SECTOR.load(Ordering::Acquire),
+            completed.is_some(),
+        );
+    }
+}
+
 // ===========================================================================
 // IRQ handler
 // ===========================================================================
@@ -627,12 +678,19 @@ fn with_driver<R>(f: impl FnOnce(&mut Option<VirtioBlkDriver>) -> R) -> R {
 /// No allocation, no blocking, no IPC.
 fn virtio_blk_irq_handler() {
     // Acknowledge the device interrupt and drain the used ring.
-    let mut driver = DRIVER.lock();
-    if let Some(ref mut d) = *driver {
-        // Legacy virtio ISR status register: reading clears the bit and
-        // acks the interrupt on the device.
-        let _isr = d.port.read_reg::<u8>(VIRTIO_ISR_STATUS);
-        d.request_queue.drain_used_from_irq();
+    let completed = {
+        let mut driver = DRIVER.lock();
+        if let Some(ref mut d) = *driver {
+            // Legacy virtio ISR status register: reading clears the bit and
+            // acks the interrupt on the device.
+            let _isr = d.port.read_reg::<u8>(VIRTIO_ISR_STATUS);
+            d.request_queue.drain_used()
+        } else {
+            None
+        }
+    };
+    if let Some(task) = completed {
+        let _ = crate::task::scheduler::wake_task_v2(task);
     }
 }
 
@@ -763,6 +821,9 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // LAPIC and legacy INTx is routed to the BSP, so no other core can hold
     // the mutex while the ISR fires elsewhere.
     REQ_WOKEN.store(false, Ordering::Release);
+    ACTIVE_REQUEST_PID.store(crate::process::current_pid(), Ordering::Release);
+    ACTIVE_REQUEST_TYPE.store(req_type, Ordering::Release);
+    ACTIVE_REQUEST_SECTOR.store(sector, Ordering::Release);
     // Phase 57b G.1.c — `with_driver` wraps the `preempt_disable` +
     // `without_interrupts` boilerplate around the IRQ-shared `DRIVER` lock.
     let status_virt_result: Result<*mut u8, u8> = with_driver(|d| {
@@ -818,11 +879,26 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // if `REQ_WOKEN` is already true at entry, the function returns
     // without yielding.  No deadline because the IRQ is the only wake
     // source.
-    let _ = crate::task::scheduler::block_current_until(
-        crate::task::TaskState::BlockedOnRecv,
-        &REQ_WOKEN,
-        None,
-    );
+    while !REQ_WOKEN.load(Ordering::Acquire) {
+        let deadline = Some(
+            crate::arch::x86_64::interrupts::tick_count()
+                .saturating_add(REQUEST_WAIT_TIMEOUT_TICKS),
+        );
+        let outcome = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &REQ_WOKEN,
+            deadline,
+        );
+        if REQ_WOKEN.load(Ordering::Acquire) {
+            break;
+        }
+        if matches!(
+            outcome,
+            crate::task::scheduler::BlockOutcome::DeadlineExpired
+        ) {
+            poll_completions_from_task("request");
+        }
+    }
     // Phase 3: read the status byte (driver lock re-acquired to ensure
     // memory ordering). Same IF-off rule as the submit side. Phase 57b
     // G.1.c — `with_driver` wraps the `preempt_disable` +
@@ -832,6 +908,7 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
         // for the life of the driver.
         unsafe { core::ptr::read_volatile(status_virt) }
     });
+    ACTIVE_REQUEST_PID.store(0, Ordering::Release);
     Ok(status)
 }
 

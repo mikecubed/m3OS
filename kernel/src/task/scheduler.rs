@@ -1900,7 +1900,7 @@ pub fn preempt_to_scheduler(
 #[cfg(feature = "preempt-voluntary")]
 pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::PreemptFrame) -> ! {
     let my_core = crate::smp::per_core().core_id as usize;
-    let idx = {
+    let (idx, preempt_count_ptr) = {
         let mut sched = scheduler_lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
@@ -1910,6 +1910,8 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
             }
         };
         accumulate_ticks(&mut sched, idx);
+        let preempt_count_ptr: *const core::sync::atomic::AtomicI32 =
+            &raw const sched.tasks[idx].preempt_count;
         if let Some(urs) = sched.tasks[idx].user_return.as_mut() {
             urs.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
         }
@@ -1920,8 +1922,15 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
-        idx
+        (idx, preempt_count_ptr)
     };
+    // The preemption gates only enter this path from user/syscall-return
+    // boundaries where the task's counter was observed as zero. Scheduler
+    // bookkeeping during the handoff must not leak a transient disable into
+    // the resumed user task, or the next timer/IPI will be suppressed forever.
+    unsafe {
+        (*preempt_count_ptr).store(0, Ordering::Release);
+    }
     // Store idx so the dispatch epilogue can commit saved_rsp and re-enqueue.
     PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
     let sched_rsp = per_core_scheduler_rsp();

@@ -53,7 +53,7 @@ pub mod screen;
 
 #[cfg(all(not(test), feature = "os-binary"))]
 pub mod display;
-#[cfg(all(not(test), feature = "os-binary"))]
+#[cfg(any(test, all(not(test), feature = "os-binary")))]
 pub mod syscall_pty;
 
 /// Boot-log marker written when the terminal starts.  Used by smoke
