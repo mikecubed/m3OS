@@ -377,8 +377,12 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
             // Deliver the message to the receiver now that all caps are in place.
+            let claimed_bulk = pending.msg.data[1];
             scheduler::deliver_message(receiver, pending.msg);
-            transfer_bulk(pending.task, receiver);
+            let transferred = transfer_bulk(pending.task, receiver);
+            if claimed_bulk != 0 && !transferred {
+                log_bulk_mismatch("recv_msg", pending.task, receiver, claimed_bulk);
+            }
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
@@ -489,8 +493,12 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         pending.msg = pending.msg.with_reply_cap_handle(handle);
     }
 
+    let claimed_bulk = pending.msg.data[1];
     scheduler::deliver_message(receiver, pending.msg);
-    transfer_bulk(pending.task, receiver);
+    let transferred = transfer_bulk(pending.task, receiver);
+    if claimed_bulk != 0 && !transferred {
+        log_bulk_mismatch("recv_msg_nowait", pending.task, receiver, claimed_bulk);
+    }
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
         task_idx: receiver.0 as u32,
         ep: ep_id.0 as u32,
@@ -593,8 +601,12 @@ pub fn recv_msg_with_notif(
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
 
+            let claimed_bulk = pending.msg.data[1];
             scheduler::deliver_message(receiver, pending.msg);
-            transfer_bulk(pending.task, receiver);
+            let transferred = transfer_bulk(pending.task, receiver);
+            if claimed_bulk != 0 && !transferred {
+                log_bulk_mismatch("recv_msg_with_notif", pending.task, receiver, claimed_bulk);
+            }
             if !pending.wants_reply {
                 scheduler::complete_send(pending.task);
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
@@ -679,10 +691,58 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
 ///
 /// Called alongside `deliver_message` to move the sender's bulk payload to
 /// the receiver's slot.  No-op if no bulk data is pending.
-fn transfer_bulk(src: TaskId, dst: TaskId) {
+///
+/// Returns `true` if a bulk was actually transferred, `false` if `src` had
+/// nothing in its pending_bulk slot. Callers that delivered a message with
+/// `data[1] != 0` use the return value to detect the
+/// "message claims a bulk, but the slot is empty" inconsistency that
+/// surfaces as `client protocol violation reason=verb-decode bulk_len=0` at
+/// the dispatcher.
+fn transfer_bulk(src: TaskId, dst: TaskId) -> bool {
     if let Some(bulk) = scheduler::take_bulk_data(src) {
         scheduler::deliver_bulk(dst, bulk);
+        true
+    } else {
+        false
     }
+}
+
+/// Phase 57d follow-up — bounded budget for `log_bulk_mismatch`.
+/// When a delivered message claims `data[1] != 0` but the sender's
+/// pending_bulk slot is empty, we want to know which IPC site is
+/// involved without flooding the boot transcript on a tight retry
+/// loop. 16 occurrences is enough to see the first burst.
+static BULK_MISMATCH_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
+
+/// Phase 57d follow-up — log when an inbound message arrives at a
+/// receiver advertising `data[1] != 0` but the sender's `pending_bulk`
+/// slot was empty at `transfer_bulk` time. The sender used a
+/// bulk-attached send path (`ipc_send_with_bulk` set both `data[1]`
+/// and the slot together), so an empty slot at receiver-pop time is
+/// either a bulk-cleanup race in the sender's syscall path or a
+/// duplicate-PendingSend bug in the senders queue. Either way, the log
+/// pins the path (`recv_msg`, `recv_msg_nowait`, `recv_msg_with_notif`)
+/// and the participating task ids so the next transcript narrows the
+/// search.
+fn log_bulk_mismatch(site: &str, sender: TaskId, receiver: TaskId, claimed_bulk: u64) {
+    if BULK_MISMATCH_LOG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[ipc] {site}: sender {} delivered msg with data[1]={} but pending_bulk slot empty; \
+         receiver {} will see bulk_len=0 (pre-fix: stale bulk_buf bytes)",
+        sender.0,
+        claimed_bulk,
+        receiver.0,
+    );
 }
 
 /// Send a message to an endpoint.
