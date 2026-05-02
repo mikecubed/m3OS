@@ -136,8 +136,37 @@ Currently available debug features:
 
 | Feature | Output | When to use |
 |---|---|---|
-| `exec-trace` | `[exec-trace] pid=N ...` lines for fork-child userspace entry, every `close`, `dup2`, and `execve` syscall (including failure paths) | Diagnosing a fork-child that never reaches `execve`, an `execve` that fails silently, or a child that exits before its first observable syscall. |
-| `sched-trace` | Per-block / wake / scan structured `[TRACE] [sched] ...` entries in the trace ring | Diagnosing scheduler fairness, IPC wake latency, or preemption-discipline bugs. |
+| `exec-trace` | All `[exec-trace] ...` log lines: scheduler `fork-task-spawn`, process `fork-child trampoline-enter` and `entering ring 3`, syscall-return `syscall-return-preempt` (budgeted), every `dup2` call, every `execve` attempt + outcome (incl. EFAULT / EACCES / read failures), and every `close fd=F` (skipped for pid=1). See `kernel/Cargo.toml` for the full emit list. | Diagnosing a fork-child that never reaches userspace, a syscall return that fails to preempt when it should, an `execve` that fails silently, or any "process spawned but never observed" symptom. |
+| `sched-trace` | Per-block / wake / scan structured `[TRACE] [sched] ...` entries in the trace ring (see `kernel/src/task/sched_trace.rs`) | Diagnosing scheduler fairness, IPC wake latency, or preemption-discipline bugs. Currently the rings are dumped on panic; a future control-socket hook (see `dump_sched_trace_rings`) would let you sample them on demand. |
+
+The `[exec-trace]` and `[TRACE] [sched]` emit sites are gated on
+`#[cfg(feature = "...")]` so default builds compile them out entirely.
+They are intentionally retained between debugging sessions so the next
+investigation can re-enable a focused subset without re-deriving the
+log shapes.
+
+#### Always-on operational logs
+
+A handful of structured log lines are emitted unconditionally because
+they are the canonical bring-up sentinels and the per-component liveness
+counters. None of them are feature-gated; default builds emit them at
+`log::info!` or via direct `write_str` to stdout/serial.
+
+| Source | Pattern | Meaning |
+|---|---|---|
+| `term` | `term: iter=N events=E composes=C pty_bytes=B` (every 1000 iterations) | Main-loop liveness counter. `pty_bytes` plateauing at 158 after `/bin/PROMPT` execs is the documented prompt-ready steady state. |
+| `term` | `TERM_SMOKE:ready` then later `TERM_SMOKE:prompt-ready` | Service-registration ready, then prompt-readiness gate after the PTY proves the prompt path is alive. |
+| `audio_server` | `AUDIO_SMOKE:server:READY` | AC'97 driver bound and the audio service is registered. |
+| `session_manager` | `session_manager: session.boot: state=running` (or `text-fallback` / `recovering`) | Phase 57 supervised boot sequence reached its terminal state. |
+| `display_server` | `display_server: compose#N <ok0\|okN\|err> writes=W ...` (first 5 + every 60th) | Compose-loop liveness counter. `okN` means non-zero framebuffer writes; `ok0` means compose ran but had no surface damage; `err` means compose returned an error. |
+| `display_server` | `display_server: AttachSharedBuffer ok shm_id=I va=...` / `... shm_map failed shm_id=I` | SHM transport binding outcome for the term surface. |
+| `display_server` | `display_server: client protocol violation reason=R label=L bulk_len=N body_len=B opcode=O` | Fatal protocol error decoded; the client is being disconnected. The discriminator fields are the next root-cause hook for burst-time `CommitSurface` failures. |
+| `syslogd` / `sshd` | `<service>: prompt-ready gate open` / `... timed out` | Phase 57d follow-up — these daemons block on the `term.prompt-ready` service before write-heavy setup so they cannot race the first graphical prompt with disk writes. |
+| kernel | `[virtio-blk] completion poll + queue notify after request timeout owner_pid=P type=T sector=S completed=B` | Bounded no-yield timeout recovery on the single-flight virtio-blk request slot. Recoverable; not a graphical-boot blocker on its own. |
+
+The "Reading the boot log" table below covers the additional kernel-side
+fixed-format markers that differential triage hangs off of (`fork:`,
+`framebuffer_mmap`, etc.).
 
 #### Capturing a clean serial transcript
 

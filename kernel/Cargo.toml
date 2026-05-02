@@ -38,13 +38,42 @@ preempt-voluntary = []
 # EAGAIN observation from the kernel facade path during integration testing.
 # Enable this feature for production / secure-boot images.
 hardened = []
-# Phase 57d follow-up — temporary diagnostic instrumentation around the
-# fork → dup2 → execve pipeline. Used to investigate cases where a
-# fork-child appears never to reach `execve` (e.g. the term → ion
-# bring-up where keyboard echo works but no shell prompt ever appears).
-# Logs every fork-child first userspace entry, every close/dup2/execve
-# syscall with pid + arguments, and every execve outcome. Default OFF
-# because it is noisy under load; enable with
-#   cargo xtask run-gui --features kernel/exec-trace
-# (or its equivalent on `cargo build -p kernel`).
+# Phase 57d follow-up — diagnostic instrumentation around the
+# fork → dispatch → execve pipeline plus the syscall-return preemption
+# boundary. Retained behind a feature flag so default builds pay zero
+# cost while the same toolchain remains available for diagnosing
+# regressions without a kernel rebuild from scratch.
+#
+# Emits (all `[exec-trace] ...` lines, all `log::info!`-level):
+#
+# * `fork-task-spawn pid=N task_idx=I target_core=C`
+#   — scheduler enqueued a fresh fork child onto its target core.
+# * `fork-child pid=N trampiline-enter task_idx=Some(I)`
+#   — fork child reached `fork_child_trampoline` (regression guard for
+#     the "spawned but never dispatched" stall fixed by the syscall-return
+#     preemption + virtio-blk single-flight slot rework).
+# * `fork-child pid=N entering ring 3 rip=... rsp=...`
+#   — fork child is about to `iretq` / `sysretq` to user mode for the
+#     first time.
+# * `syscall-return-preempt core=C pid=N rip=... reschedule=B pending=B`
+#   — syscall-return path is about to call `preempt_frame_to_scheduler`
+#     because either the per-core `reschedule` flag or the deferred
+#     `preempt_resched_pending` flag was set. Budgeted via
+#     `SYSCALL_RETURN_PREEMPT_TRACE_BUDGET` so a busy build doesn't drown
+#     the boot transcript.
+# * `pid=N dup2 oldfd=A newfd=B` and `pid=N dup2 -> EBADF (out of range)`
+#   — every dup2 call (success or failure).
+# * `pid=N execve(path_ptr=..., argv_ptr=..., envp_ptr=...)`,
+#   `pid=N execve path="..."`,
+#   `pid=N execve OK path="..." entry=... rsp=...`,
+#   plus the matching error legs (`-> EFAULT`, `-> EACCES`,
+#   `read_file_from_disk failed`, `resolve_path_from_dirfd failed`,
+#   `resolve_existing_fs_path failed`).
+#   — every execve attempt and outcome.
+# * `pid=N close fd=F` (skipped for pid=1 to drop init's reap-loop spam).
+#
+# Default OFF because it is noisy under load. Enable with
+#   M3OS_KERNEL_FEATURES=exec-trace cargo xtask run-gui --fresh
+# or, for direct cargo invocations,
+#   cargo build -p kernel --features kernel/exec-trace
 exec-trace = []

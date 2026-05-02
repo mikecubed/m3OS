@@ -632,13 +632,34 @@ canonical fixed-stall validation.
   sufficient to root the fork-dispatch stall, and the final validation log
   covers the regression guard. Add targeted Ion/userspace diagnostics only if
   needed for S3.
-- **All diagnostic logs are still in the tree.** Once the bug is
-  rooted, do a one-shot `chore: remove Phase 57d-followup diagnostic
-  instrumentation` commit that reverts every `[exec-trace]` log line,
-  the term per-iter stats, the display_server compose stats, and the
-  `M3OS_KERNEL_FEATURES` xtask plumbing. Optionally keep the
-  `exec-trace` feature flag itself behind `cfg(feature)` for future
-  diagnoses, but its emit sites should be empty in the default build.
+- **Diagnostic instrumentation is intentionally retained behind feature
+  flags.** The kernel-side `[exec-trace]` log lines (fork-task-spawn,
+  trampoline-enter, syscall-return-preempt, dup2/execve/close) are
+  gated on `#[cfg(feature = "exec-trace")]` so default builds compile
+  them out entirely. The `[TRACE] [sched]` ring is gated on
+  `sched-trace` the same way. Both are documented in
+  [`README.md` § Debugging](../../README.md#debugging) along with the
+  full emit list and the `M3OS_KERNEL_FEATURES=...` toggle path.
+  Userspace bring-up sentinels (`TERM_SMOKE:ready`,
+  `TERM_SMOKE:prompt-ready`, `AUDIO_SMOKE:server:READY`,
+  `session_manager: session.boot: state=...`), the term per-1000-iter
+  liveness counter, the `display_server: compose#N` stats, the
+  `display_server: AttachSharedBuffer ok|fail` outcome, and the
+  `[virtio-blk] completion poll + queue notify after request timeout
+  ...` recovery line are unconditional — they are the canonical
+  always-on operational signals and are also documented in the
+  README's Debugging section. Do not delete or further-gate any of
+  these without updating the README and the relevant `Cargo.toml`
+  comments at the same time.
+- **The historical "remove Phase 57d-followup diagnostic
+  instrumentation" cleanup is deferred.** Earlier revisions of this
+  handoff called for a one-shot revert commit. That cleanup is
+  postponed: with the boot stable but the burst-time `CommitSurface`
+  protocol-violation lead and the sector-2072 virtio write timeout
+  still open, the ability to flip `exec-trace` back on without a
+  scaffolding rebuild has measurable value. Revisit the cleanup once
+  both leads are root-caused. The default-build cost is already zero
+  (everything is `cfg`-gated) so retention has no production impact.
 - **The SHM rebuild is real work** that should not be rolled back. It
   unlocks zero-copy pixel transport and the kernel SHM module is
   reusable beyond display.
