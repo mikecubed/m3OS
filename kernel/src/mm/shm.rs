@@ -21,13 +21,30 @@
 //!
 //! 1. `create(byte_len)` allocates `ceil(byte_len / 4096)` contiguous
 //!    pre-zeroed pages from the buddy, inserts a registry entry with
-//!    `refcount = 1`, and returns a small numeric `ShmId`.
+//!    `refcount = 1`, and returns a small numeric `ShmId`. The initial
+//!    `1` is the *creator handle*: the process that called `create`
+//!    is responsible for one matching `decref` (via `sys_shm_destroy`,
+//!    or as part of `sys_shm_unmap` if it later maps and unmaps the
+//!    same region itself; `sys_shm_destroy` is the path that always
+//!    works, including on the failure path before any map happens).
 //! 2. `incref(id)` raises the refcount; the caller is now responsible
 //!    for one matching `decref` (typically via `sys_shm_unmap`).
 //! 3. `decref(id)` lowers the refcount; the frames are returned to the
 //!    buddy when the count reaches zero.
 //! 4. `frames(id)` returns the (start_phys, page_count) of an existing
 //!    region for callers that need to install page-table mappings.
+//!
+//! Each `create` therefore needs one matching `destroy`, and each
+//! successful `map` needs one matching `unmap`. A typical
+//! create -> map -> unmap -> destroy cycle in the creator's process
+//! returns the underlying frames to the buddy at the final step.
+//!
+//! # Page allocation note
+//!
+//! The buddy allocator only produces power-of-two contiguous runs, so
+//! `byte_len` is rounded up to the next power-of-two page count rather
+//! than just to the next page boundary. Callers that care about exact
+//! pad bytes should size their request to a power-of-two pages.
 //!
 //! # Page-table integration
 //!

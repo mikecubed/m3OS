@@ -1416,6 +1416,15 @@ mod syscall_nr {
     /// `arg0` is the user virtual address returned by `SHM_MAP`.
     /// Returns `0` on success, `u64::MAX` on error.
     pub const SHM_UNMAP: u64 = 0x101A;
+    /// Drop the creator's reference on a shared-memory region without
+    /// requiring an existing mapping. `arg0` is the `ShmId` returned
+    /// by `SHM_CREATE`. Decrements the registry refcount once; the
+    /// frames are returned to the buddy when the last reference drops.
+    /// Used by the creating process to release the +1 that `SHM_CREATE`
+    /// reserved, both on the normal teardown path and on early failure
+    /// paths between `create` and the first successful `map`.
+    /// Returns `0` on success, `u64::MAX` on error.
+    pub const SHM_DESTROY: u64 = 0x101B;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1797,6 +1806,7 @@ pub extern "C" fn syscall_handler(
         SHM_CREATE => sys_shm_create(arg0),
         SHM_MAP => sys_shm_map(arg0),
         SHM_UNMAP => sys_shm_unmap(arg0),
+        SHM_DESTROY => sys_shm_destroy(arg0),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -9579,6 +9589,17 @@ pub(super) fn sys_shm_unmap(user_va: u64) -> u64 {
     // back to the buddy.
     let _ = crate::mm::shm::decref(id);
     0
+}
+
+pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    match crate::mm::shm::decref(id) {
+        Ok(_) => 0,
+        Err(_) => u64::MAX,
+    }
 }
 
 /// Marker bit in `MemoryMapping.flags` that distinguishes SHM-mapped

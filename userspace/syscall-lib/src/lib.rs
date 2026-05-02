@@ -281,6 +281,10 @@ pub const SYS_SHM_MAP: u64 = 0x1019;
 /// Unmap a shared-memory region and decrement its refcount. Frames
 /// return to the buddy when the last reference drops.
 pub const SYS_SHM_UNMAP: u64 = 0x101A;
+/// Drop the creator's reference on a shared-memory region without
+/// requiring an existing mapping. Used by the creating process to
+/// release the +1 that `SHM_CREATE` reserved.
+pub const SYS_SHM_DESTROY: u64 = 0x101B;
 
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
@@ -2144,11 +2148,22 @@ pub fn frame_tick_drain() -> u32 {
     unsafe { syscall0(SYS_FRAME_TICK_DRAIN) as u32 }
 }
 
-/// Allocate a shared-memory region of `byte_len` bytes (rounded up to
-/// a 4 KiB page boundary). Returns the new region's id, or `0` on
-/// error (kernel returns `u64::MAX` which we map to 0 since 0 is the
-/// reserved unset id). Refcount starts at 1 — the matching cleanup is
-/// `shm_unmap` after a successful map.
+/// Allocate a shared-memory region of `byte_len` bytes. The buddy
+/// allocator can only produce power-of-two contiguous runs, so the
+/// kernel rounds the page count up to the next power of two; callers
+/// that care about exact pad bytes should size requests to a
+/// power-of-two number of 4 KiB pages.
+///
+/// Returns the new region's id, or `0` on error (kernel returns
+/// `u64::MAX` which is mapped to 0 since 0 is the reserved unset id).
+///
+/// `shm_create` reserves a +1 *creator* reference on the kernel
+/// registry. The creator must release that reference exactly once
+/// when finished with the region — call [`shm_destroy`] for that.
+/// `shm_map` increments the refcount independently of the creator
+/// reference and pairs with `shm_unmap`. A typical
+/// create -> map -> unmap -> destroy cycle returns the underlying
+/// frames to the buddy on the final step.
 pub fn shm_create(byte_len: usize) -> u32 {
     let raw = unsafe { syscall1(SYS_SHM_CREATE, byte_len as u64) };
     if raw == u64::MAX {
@@ -2159,7 +2174,8 @@ pub fn shm_create(byte_len: usize) -> u32 {
 
 /// Map an existing shared-memory region into the caller's address
 /// space. Returns the user virtual address (non-zero) on success, or
-/// `0` on error. Increments the registry refcount.
+/// `0` on error. Increments the registry refcount; pair every
+/// successful call with one [`shm_unmap`].
 pub fn shm_map(shm_id: u32) -> u64 {
     let raw = unsafe { syscall1(SYS_SHM_MAP, u64::from(shm_id)) };
     if raw == u64::MAX { 0 } else { raw }
@@ -2169,6 +2185,16 @@ pub fn shm_map(shm_id: u32) -> u64 {
 /// refcount. Returns `true` on success.
 pub fn shm_unmap(user_va: u64) -> bool {
     let raw = unsafe { syscall1(SYS_SHM_UNMAP, user_va) };
+    raw == 0
+}
+
+/// Drop the creator's reference on a shared-memory region without
+/// requiring an existing mapping. Use this to release the +1 that
+/// `shm_create` reserved — including on early failure paths between
+/// `shm_create` and the first successful `shm_map`. Returns `true`
+/// on success.
+pub fn shm_destroy(shm_id: u32) -> bool {
+    let raw = unsafe { syscall1(SYS_SHM_DESTROY, u64::from(shm_id)) };
     raw == 0
 }
 

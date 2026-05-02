@@ -142,6 +142,13 @@ pub enum FatalReason {
     ChunkBufferMismatch,
     ChunkReceive,
     VerbDecode,
+    /// `AttachSharedBuffer` referenced an SHM id that the compositor
+    /// could not map. This is a transport failure (kernel refused the
+    /// map) rather than a recoverable verb error — without a buffer
+    /// the surface cannot make progress, so the dispatcher disconnects
+    /// the client to force a clean reconnect rather than silently
+    /// stranding it without a committed buffer.
+    ShmMapFailed,
 }
 
 impl DispatchOutcome {
@@ -255,6 +262,15 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                         out.outbound.extend(result.outbound);
                         out.created.extend(result.created);
                         out.destroyed.extend(result.destroyed);
+                    }
+                    Err(crate::surface::SurfaceShimError::ShmMapFailed { .. }) => {
+                        // SHM mapping failures are not a recoverable verb
+                        // error: without a backing buffer the client's
+                        // surface cannot progress. Treat as fatal so the
+                        // dispatcher disconnects and forces a clean
+                        // reconnect rather than leaving the client
+                        // permanently without a committed buffer.
+                        return DispatchOutcome::fatal(FatalReason::ShmMapFailed);
                     }
                     Err(_) => {
                         // Recoverable surface-shim errors

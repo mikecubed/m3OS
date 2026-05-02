@@ -61,13 +61,19 @@ use kernel_core::display::surface::{
 /// reassembled from IPC bulk fragments. The Phase 57d follow-up adds
 /// [`BufferStorage::Shared`], where pixel bytes live in a shared-memory
 /// region the client allocated via `sys_shm_create` and the compositor
-/// mapped read-only via `sys_shm_map`. The compose path treats both
+/// mapped writable via `sys_shm_map`. The compose path treats both
 /// uniformly through [`BufferStorage::as_slice`].
 ///
 /// `Owned` cleans up automatically on drop. `Shared` carries the
 /// owning user virtual address + length so [`Drop`] can call
 /// `sys_shm_unmap` to release the mapping (and decrement the registry
 /// refcount) when the surface is destroyed or re-attached.
+///
+/// Note: the kernel currently maps SHM pages writable for every mapper
+/// — the compositor does not enforce read-only on its side. Phase 57d
+/// callers do not write through the compositor's mapping, but the
+/// [`BufferStorage::as_slice`] API is `unsafe` because the underlying
+/// bytes are concurrently writable by the originating client.
 #[derive(Debug)]
 pub enum BufferStorage {
     Owned(Vec<u8>),
@@ -89,10 +95,21 @@ impl Clone for BufferStorage {
             // composer takes `&CommittedBuffer` borrows so a clone is
             // never structurally required; if it ever is, fall back
             // to materialising an owned copy of the visible bytes.
-            BufferStorage::Shared { user_va, len } => unsafe {
-                let slice = core::slice::from_raw_parts(*user_va as *const u8, *len);
-                BufferStorage::Owned(slice.to_vec())
-            },
+            //
+            // SAFETY: copy directly through a raw pointer rather than
+            // synthesising an `&[u8]` so the producer's concurrent
+            // writes never alias a Rust reference, even briefly. Torn
+            // reads are inherent to the cross-process editing pattern;
+            // the resulting `Vec<u8>` is a single-point-in-time
+            // snapshot.
+            BufferStorage::Shared { user_va, len } => {
+                let mut owned = alloc::vec::Vec::<u8>::with_capacity(*len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
+                    owned.set_len(*len);
+                }
+                BufferStorage::Owned(owned)
+            }
         }
     }
 }
@@ -110,7 +127,28 @@ impl Drop for BufferStorage {
 }
 
 impl BufferStorage {
-    pub fn as_slice(&self) -> &[u8] {
+    /// Borrow the pixels as a contiguous byte slice.
+    ///
+    /// # Safety
+    ///
+    /// For [`BufferStorage::Shared`] the returned slice aliases a
+    /// shared-memory region that the originating client can mutate
+    /// concurrently (the kernel maps these pages writable for every
+    /// mapper). Holding an `&[u8]` across operations that allow the
+    /// client to publish new bytes — even just yielding to the
+    /// scheduler — gives LLVM permission to assume the bytes are
+    /// stable, which they are not.
+    ///
+    /// Callers must consume the slice before relinquishing control to
+    /// any code path the producer can run, and must tolerate torn
+    /// reads. The compose path snapshots the bytes into an owned
+    /// `Vec<u8>` immediately on entry; the cursor path does the same
+    /// before the byte values are observed.
+    ///
+    /// For [`BufferStorage::Owned`] the slice is just a normal
+    /// `&Vec<u8>` borrow and the safety conditions are vacuously
+    /// satisfied; the unsafety lives entirely on the `Shared` arm.
+    pub unsafe fn as_slice(&self) -> &[u8] {
         match self {
             BufferStorage::Owned(v) => v,
             BufferStorage::Shared { user_va, len } => unsafe {
@@ -157,8 +195,15 @@ impl CommittedBuffer {
     /// storage. Length is exactly `width * height * 4` for shared
     /// storage; for owned storage it's whatever the bulk transport
     /// reassembled (validated against the same expression at intake).
-    pub fn pixels_slice(&self) -> &[u8] {
-        self.pixels.as_slice()
+    ///
+    /// # Safety
+    ///
+    /// Same conditions as [`BufferStorage::as_slice`]: for `Shared`
+    /// pixels the returned slice aliases a concurrently-writable
+    /// shared-memory mapping and must be consumed before yielding to
+    /// the producer.
+    pub unsafe fn pixels_slice(&self) -> &[u8] {
+        unsafe { self.pixels.as_slice() }
     }
 }
 
@@ -211,6 +256,15 @@ pub enum SurfaceShimError {
     /// already holds the global exclusive-keyboard claim. Phase 56
     /// E.2 enforces a single exclusive-keyboard layer.
     Layer(LayerError),
+    /// `AttachSharedBuffer` could not map the SHM region into the
+    /// compositor's address space. Distinct from
+    /// `PendingBulkIdMismatch` so the dispatcher can treat it as a
+    /// hard transport failure rather than a recoverable client
+    /// protocol error.
+    ShmMapFailed {
+        shm_id: u32,
+        buffer_id: BufferId,
+    },
 }
 
 impl From<LayerError> for SurfaceShimError {
@@ -446,9 +500,9 @@ impl SurfaceRegistry {
                     );
                     write_u32_log(*shm_id);
                     syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-                    return Err(SurfaceShimError::PendingBulkIdMismatch {
-                        expected: *buffer_id,
-                        pending: alloc::vec::Vec::new(),
+                    return Err(SurfaceShimError::ShmMapFailed {
+                        shm_id: *shm_id,
+                        buffer_id: *buffer_id,
                     });
                 }
                 syscall_lib::write_str(
@@ -881,7 +935,12 @@ fn cursor_from_committed(
         .checked_mul(buf.height as usize)
         .and_then(|wh| wh.checked_mul(4))
         .unwrap_or(usize::MAX);
-    let pixels = buf.pixels_slice();
+    // SAFETY: `pixels_slice` is `unsafe` because shared-memory
+    // buffers can be mutated by the producer concurrently. The
+    // cursor decode path here completes before any further IPC so
+    // the borrow does not span a yield, and the BGRA values are
+    // copied into the owned `packed` vector below.
+    let pixels = unsafe { buf.pixels_slice() };
     if pixels.len() != byte_count {
         return Err(
             kernel_core::display::cursor::ClientCursorError::PixelLengthMismatch {

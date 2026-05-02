@@ -1073,6 +1073,7 @@ fn fatal_reason_name(reason: Option<FatalReason>) -> &'static str {
         Some(FatalReason::ChunkBufferMismatch) => "chunk-buffer-mismatch",
         Some(FatalReason::ChunkReceive) => "chunk-receive",
         Some(FatalReason::VerbDecode) => "verb-decode",
+        Some(FatalReason::ShmMapFailed) => "shm-map-failed",
         None => "unknown",
     }
 }

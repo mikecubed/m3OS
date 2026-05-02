@@ -291,9 +291,19 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // time view of the buffer), and adds a single 1 MiB memcpy per
     // 60 Hz frame for the term surface — well below the budget the
     // chunked-pixel path used to consume.
+    // SAFETY: `pixels_slice` is `unsafe` because for shared-memory
+    // buffers the underlying bytes are concurrently writable by the
+    // originating client. We immediately materialise a `Vec<u8>`
+    // copy here so the unsafe borrow lives only for the length of
+    // the `to_vec` call — within that window LLVM can still
+    // theoretically reorder reads, but the resulting snapshot is a
+    // single-point-in-time view that the rest of the compose pass
+    // treats as stable. Torn reads are an inherent property of the
+    // cross-process editing pattern, not a soundness regression
+    // introduced here.
     let snapshots: Vec<Vec<u8>> = entries
         .iter()
-        .map(|entry| entry.buf.pixels_slice().to_vec())
+        .map(|entry| unsafe { entry.buf.pixels_slice() }.to_vec())
         .collect();
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());

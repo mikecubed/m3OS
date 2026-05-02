@@ -163,6 +163,9 @@ impl DisplayClient {
         let surface_va = syscall_lib::shm_map(shm_id);
         if surface_va == 0 {
             syscall_lib::write_str(STDOUT_FILENO, "term: shm_map failed\n");
+            // Release the creator's +1 reference so the region's
+            // frames return to the buddy instead of leaking.
+            let _ = syscall_lib::shm_destroy(shm_id);
             return Err(TermError::DisplayServerUnavailable);
         }
         // Pages are pre-zeroed by the SHM create path; no fill
@@ -182,13 +185,25 @@ impl DisplayClient {
     /// Mutable access to the shared-memory pixel mapping — used by
     /// the `FramebufferOwner` impl below.
     ///
-    /// SAFETY: the kernel mapped `surface_len` writable bytes at
-    /// `surface_va` for this process; `display_server`'s read-only
-    /// view does not violate Rust aliasing rules from this side
-    /// because the compositor never mutates and our writes are racy
-    /// against its reads only at the framebuffer-pixel granularity
-    /// (last-writer-wins is the standard shared-buffer contract).
-    fn pixels_mut(&mut self) -> &mut [u8] {
+    /// # Safety
+    ///
+    /// This API hands out an `&mut [u8]` aliased with another
+    /// process's mapping (`display_server`'s read-only view), which
+    /// strictly speaking violates Rust's aliasing model: the compiler
+    /// is entitled to assume that the bytes referenced by an
+    /// `&mut [u8]` are not observed by anyone else. Phase 57d's
+    /// shared-buffer contract is "writer wins, reader copies": the
+    /// compositor snapshots the bytes into an owned `Vec<u8>` before
+    /// reading (see `display_server::compose`), so the only concrete
+    /// hazard left is LLVM-level reordering of writes by this
+    /// process. We tolerate that for the toy-OS bring-up; a future
+    /// hardening pass can replace this with `*mut u8` + `core::ptr`
+    /// volatile writes.
+    ///
+    /// Callers must not retain the borrow across syscalls that may
+    /// observe SHM bytes (e.g. `CommitSurface`); the `pixels_mut`
+    /// users in this file all consume the slice within a single call.
+    unsafe fn pixels_mut(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.surface_va as *mut u8, self.surface_len) }
     }
 
@@ -219,6 +234,12 @@ impl Drop for DisplayClient {
     fn drop(&mut self) {
         if self.surface_va != 0 {
             let _ = syscall_lib::shm_unmap(self.surface_va);
+        }
+        // Release the creator's +1 reference reserved by `shm_create`.
+        // Without this, the region's frames stay pinned by the
+        // registry refcount even after the last unmap.
+        if self.shm_id != 0 {
+            let _ = syscall_lib::shm_destroy(self.shm_id);
         }
     }
 }
@@ -338,7 +359,9 @@ impl FramebufferOwner for DisplayClient {
         // a sub-slice of the cell's pixels and pass the surface
         // stride (in u32 pixels) so glyph rows index correctly into
         // the larger surface buffer.
-        let pixels = self.pixels_mut();
+        // SAFETY: see `pixels_mut` — the borrow stays inside this
+        // call and the compositor snapshots before reading.
+        let pixels = unsafe { self.pixels_mut() };
         let pixel_count = pixels.len() / 4;
         // SAFETY: SurfaceBuffer allocates `width * height * 4` bytes
         // with default alignment. `Vec<u8>` is aligned to at least 1
@@ -375,7 +398,8 @@ impl FramebufferOwner for DisplayClient {
         // pixels are 4 bytes wide; we splat the same little-endian
         // BGRA value across the whole buffer.
         let len = self.surface_len;
-        let pixels = self.pixels_mut();
+        // SAFETY: see `pixels_mut` — borrow scoped to this call.
+        let pixels = unsafe { self.pixels_mut() };
         let bg_bytes = DEFAULT_BG_BGRA.to_le_bytes();
         let mut offset = 0;
         while offset + 4 <= len {
@@ -391,7 +415,8 @@ impl FramebufferOwner for DisplayClient {
         let stride = (SURFACE_WIDTH_PX as usize) * 4;
         let row_bytes = stride * (CELL_HEIGHT as usize);
         let buf_len = self.surface_len;
-        let pixels = self.pixels_mut();
+        // SAFETY: see `pixels_mut` — borrow scoped to this call.
+        let pixels = unsafe { self.pixels_mut() };
         if amount > 0 {
             // Scroll up: shift everything up by `amount * row_bytes`,
             // blank the bottom `amount` rows.

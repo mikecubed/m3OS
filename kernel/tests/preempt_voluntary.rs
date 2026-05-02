@@ -231,68 +231,68 @@ fn test_preempt_enable_zero_crossing_sets_resched_pending() {
 /// Stub: user-mode task is preempted mid-loop when the scheduler sets
 /// `reschedule` and `preempt_count == 0` at the syscall-return boundary.
 ///
-/// TODO: activate in Track G once the syscall-return preemption hook lands.
+/// Track G activation pending once the syscall-return preemption hook lands.
 #[test_case]
 fn preempt_user_loop() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: `preempt_count > 0` prevents preemption even when `reschedule` is set.
 ///
-/// TODO: activate in Track G once the preempt_disable / preempt_enable kernel
+/// Track G activation pending once the preempt_disable / preempt_enable kernel
 /// wiring and the preemption eligibility check are in place.
 #[test_case]
 fn no_preempt_when_count_nonzero() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: kernel-mode paths (from_user == false) do not trigger preemption at
 /// the user-mode-return boundary check.
 ///
-/// TODO: activate in Track G once the IRQ-return-to-ring-3 path is wired.
+/// Track G activation pending once the IRQ-return-to-ring-3 path is wired.
 #[test_case]
 fn no_preempt_when_kernel_mode() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: `timer_entry` user path saves all 15 GPRs and `PreemptTrapFrameUser`
 /// layout matches the on-stack layout laid down by the asm stub.
 ///
-/// TODO: activate in Track G once the QEMU single-step harness can inspect
+/// Track G activation pending once the QEMU single-step harness can inspect
 /// register state before and after the handler returns via `iretq`.
 #[test_case]
 fn timer_entry_user_path_saves_gprs() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: `timer_entry` kernel path saves all 15 GPRs into
 /// `PreemptTrapFrameKernel` and `captured_kernel_rsp` equals the interrupted
 /// RSP (rsp + 15*8 + 3*8 at the point of the `lea`).
 ///
-/// TODO: activate in Track G.
+/// Track G activation pending.
 #[test_case]
 fn timer_entry_kernel_path_saves_gprs() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: the `mov rdi, rsp` + `call timer_handler_user` sequence lands with
 /// RSP 16-byte aligned so any `movaps` in the Rust handler does not fault.
 ///
-/// TODO: activate in Track G once the alignment invariant is verified via
+/// Track G activation pending once the alignment invariant is verified via
 /// QEMU memory access breakpoints.
 #[test_case]
 fn timer_entry_movaps_alignment() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: `reschedule_ipi_entry` kernel path round-trip — GPRs saved before
 /// `call reschedule_ipi_handler_kernel` are intact after `restore_gprs_all`
 /// + `iretq`.
 ///
-/// TODO: activate in Track G.
+/// Track G activation pending.
 #[test_case]
 fn reschedule_ipi_entry_kernel_round_trip() {
-    // TODO: activate in Track G
+    // Track G activation pending
 }
 
 /// Stub: `peek_preempt_count_irq()` returns a value matching the lock-acquired
@@ -301,7 +301,7 @@ fn reschedule_ipi_entry_kernel_round_trip() {
 /// With preempts disabled, `peek_preempt_count_irq()` must equal the task's
 /// own `preempt_count` field (read atomically through the scheduler lock).
 ///
-/// TODO: activate in Track G when the scheduler is fully wired up and we can
+/// Track G activation pending when the scheduler is fully wired up and we can
 /// run with a real current task context in the QEMU harness.
 #[test_case]
 #[ignore = "requires QEMU + full scheduler init"]
@@ -319,32 +319,32 @@ fn peek_preempt_count_matches_task_count() {
 /// Full verification requires QEMU + the full scheduler running a real
 /// userspace task so the frame can be compared before and after preemption.
 ///
-/// TODO: activate in Track G.
+/// Track G activation pending.
 #[test_case]
 #[ignore = "requires QEMU + full scheduler init"]
 fn preempt_to_scheduler_saves_frame_correctly() {
-    // TODO: activate in Track G.
+    // Track G activation pending.
 }
 
 /// Stub: `preempt_resume_to_user` restores rip and all GPRs from
 /// `Task::preempt_frame` and executes iretq to the original user instruction.
 ///
-/// TODO: activate in Track G once the QEMU single-step harness can inspect
+/// Track G activation pending once the QEMU single-step harness can inspect
 /// register state immediately after the iretq.
 #[test_case]
 #[ignore = "requires QEMU + full scheduler init"]
 fn preempt_resume_restores_rip_and_registers() {
-    // TODO: activate in Track G.
+    // Track G activation pending.
 }
 
 /// Stub: a cooperative yield (via `yield_now`) still uses `switch_context`
 /// (resume_mode == Cooperative) rather than `preempt_resume_to_user`.
 ///
-/// TODO: activate in Track G once dispatch-path tracing is available.
+/// Track G activation pending once dispatch-path tracing is available.
 #[test_case]
 #[ignore = "requires QEMU + full scheduler init"]
 fn cooperative_yield_still_uses_switch_context() {
-    // TODO: activate in Track G.
+    // Track G activation pending.
 }
 
 // ---------------------------------------------------------------------------
