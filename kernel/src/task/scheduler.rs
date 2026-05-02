@@ -2148,6 +2148,7 @@ pub fn block_current_until(
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
         ),
         "block_current_until kind must be a Blocked* variant; got {:?}",
         kind
@@ -2831,6 +2832,7 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
         ) {
             return WakeOutcome::AlreadyAwake;
         }
@@ -3800,6 +3802,7 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
         ) {
             // Not Blocked* — stale deadline.  Don't touch it here; the next
             // state transition (or the next scan after wake_task_v2 clears
@@ -4106,6 +4109,7 @@ pub fn watchdog_scan() {
                     | super::TaskState::BlockedOnReply
                     | super::TaskState::BlockedOnNotif
                     | super::TaskState::BlockedOnFutex
+                    | super::TaskState::BlockedOnWait
             );
             if !is_blocked {
                 continue;

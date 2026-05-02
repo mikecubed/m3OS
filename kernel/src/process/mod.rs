@@ -24,13 +24,14 @@ pub mod futex;
 
 extern crate alloc;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use crate::mm::AddressSpace;
+use crate::task::TaskId;
 use crate::task::scheduler::IrqSafeMutex;
 
 // Re-export VMA types from kernel-core for host-testability.
@@ -1362,6 +1363,46 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
     true
 }
 
+struct ChildWaiter {
+    task_id: TaskId,
+    woken: Arc<AtomicBool>,
+}
+
+static CHILD_WAITERS: IrqSafeMutex<BTreeMap<Pid, Vec<ChildWaiter>>> =
+    IrqSafeMutex::new(BTreeMap::new());
+
+/// Register a task blocked in waitpid() for any child state change from `parent_pid`.
+pub fn register_child_waiter(parent_pid: Pid, task_id: TaskId, woken: &Arc<AtomicBool>) {
+    CHILD_WAITERS
+        .lock()
+        .entry(parent_pid)
+        .or_default()
+        .push(ChildWaiter {
+            task_id,
+            woken: Arc::clone(woken),
+        });
+}
+
+/// Remove a waitpid() waiter when the syscall returns without consuming a child wake.
+pub fn deregister_child_waiter(parent_pid: Pid, task_id: TaskId) {
+    let mut waiters = CHILD_WAITERS.lock();
+    if let Some(parent_waiters) = waiters.get_mut(&parent_pid) {
+        parent_waiters.retain(|w| w.task_id != task_id);
+        if parent_waiters.is_empty() {
+            waiters.remove(&parent_pid);
+        }
+    }
+}
+
+/// Wake all tasks blocked in waitpid() for `parent_pid`.
+pub fn wake_child_waiters(parent_pid: Pid) {
+    let to_wake = CHILD_WAITERS.lock().remove(&parent_pid).unwrap_or_default();
+    for waiter in to_wake {
+        waiter.woken.store(true, Ordering::Release);
+        let _ = crate::task::scheduler::wake_task_v2(waiter.task_id);
+    }
+}
+
 /// Decide whether `sig` should abort a task's IPC wait for `proc`.
 ///
 /// IPC waits are only broken when the signal will actually do something:
@@ -1468,6 +1509,7 @@ pub fn send_sigchld_to_parent(child_pid: Pid) {
         table.find(child_pid).map(|p| p.ppid).unwrap_or(0)
     };
     if ppid != 0 {
+        wake_child_waiters(ppid);
         send_signal(ppid, SIGCHLD);
     }
 }

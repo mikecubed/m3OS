@@ -516,10 +516,9 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
-    syscall_lib::write_str(
-        STDOUT_FILENO,
-        "vfs_server: registered, entering server loop\n",
-    );
+    // Do not write to stdout after publishing the service name: clients may
+    // immediately send IPC and block until this server reaches ipc_recv_msg.
+    syscall_lib::serial_print("vfs_server: registered, entering server loop\n");
 
     // 5. Server loop.
     server_loop(&ext2, ep_handle);

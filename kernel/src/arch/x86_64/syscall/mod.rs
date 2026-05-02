@@ -4308,10 +4308,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     }
 }
 
-/// `waitpid(pid, status_ptr, _flags)` — wait for a child to exit.
-///
-/// Spins with `yield_now()` until the target child is a zombie, then
-/// collects its exit code and reaps it.
 /// `waitpid(pid, status_ptr, options)` — wait for a child to exit or stop.
 ///
 /// Supports pid > 0 (specific child), pid == -1 (any child), pid == 0
@@ -4337,7 +4333,25 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 
     const NEG_ECHILD: u64 = (-10_i64) as u64;
 
+    let blocking_wait = options & WNOHANG == 0;
+    let wait_task = if blocking_wait {
+        match crate::task::scheduler::current_task_id() {
+            Some(id) => Some(id),
+            None => return (-4_i64) as u64, // EINTR
+        }
+    } else {
+        None
+    };
+    let wait_woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
     loop {
+        if blocking_wait {
+            wait_woken.store(false, core::sync::atomic::Ordering::Release);
+        }
+        if let Some(task_id) = wait_task {
+            crate::process::register_child_waiter(calling_pid, task_id, &wait_woken);
+        }
+
         // Scan for a matching child that is zombie (or stopped if WUNTRACED).
         let result = {
             let mut table = crate::process::PROCESS_TABLE.lock();
@@ -4385,7 +4399,10 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
             }
 
             if !has_eligible_child {
-                return NEG_ECHILD;
+                if let Some(task_id) = wait_task {
+                    crate::process::deregister_child_waiter(calling_pid, task_id);
+                }
+                break NEG_ECHILD;
             }
 
             if let Some(pid) = found_pid {
@@ -4406,6 +4423,9 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
+            if let Some(task_id) = wait_task {
+                crate::process::deregister_child_waiter(calling_pid, task_id);
+            }
             // Write wstatus.
             if status_ptr != 0 {
                 let wstatus = if stopped {
@@ -4429,15 +4449,18 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 child_pid,
                 if stopped { "stopped" } else { "exited" }
             );
-            return child_pid as u64;
+            break child_pid as u64;
         }
 
         // No matching child ready.
         if options & WNOHANG != 0 {
-            return 0;
+            break 0;
         }
-        // Yield and try again.
-        crate::task::yield_now();
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnWait,
+            &wait_woken,
+            None,
+        );
     }
 }
 

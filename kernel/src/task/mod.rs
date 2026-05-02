@@ -161,6 +161,8 @@ pub enum TaskState {
     BlockedOnNotif,
     /// Task is blocked waiting on a futex (Phase 40).
     BlockedOnFutex,
+    /// Task is blocked waiting for a child process state change.
+    BlockedOnWait,
     /// Task has permanently exited; the scheduler will remove it on next pass.
     Dead,
 }

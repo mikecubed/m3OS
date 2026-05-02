@@ -1,11 +1,11 @@
 # Phase 57d Graphical Boot — Debugging Handoff
 
-**Status:** Root cause for the graphical-boot stall is fixed in the current
-working tree and validated by a clean fork-trampoline pass. The follow-up
-Ion/userspace null page fault at `rip=0x65e54b` is also fixed in the current
-working tree; one bounded post-fix run still showed `term` stuck at
-`pty_bytes=0`, so treat shell-prompt/liveness as the next separate follow-up if
-it reproduces.
+**Status:** Root cause for the graphical-boot stall is fixed and validated by a
+clean fork-trampoline pass. The follow-up Ion/userspace null page fault at
+`rip=0x65e54b` is also fixed. The later shell-prompt investigation found and
+fixed a VFS readiness race plus the last cooperative `waitpid` loop; the latest
+Ion parent trace shows the prompt path reaches the expected steady state (Ion
+writes the prompt bytes, then blocks in `read(0, ...)` waiting for input).
 
 **Branch:** `feat/57d-voluntary-preemption` (pushed). Ahead of `main` by 17
 commits past the original 57d landing; the most recent 12 are diagnostic and
@@ -60,6 +60,30 @@ fix work landed during the post-merge debugging.
    The same bounded run did not hit `PTY EOF; shell closed`, but `term` stayed
    at `pty_bytes=0` before timeout; debug that only as a separate shell/PTY
    liveness issue if it reproduces.
+7. **Latest shell-liveness split:** `m3os-stat-trace.log` showed Ion entering
+   `stat("/root/.local/share/ion/history")` and issuing VFS IPC while
+   `vfs_server` had published the `vfs` service but had not yet entered
+   `ipc_recv_msg`, because it wrote the `"registered, entering server loop"`
+   banner to stdout after `ipc_register_service`. The working tree now sends
+   that banner to serial instead, eliminating the registered-but-not-receiving
+   window. `m3os-vfs-ready-fix.log` confirms VFS reaches the receive loop early
+   and Ion gets as far as forking child pid 20.
+8. **Prompt-helper classification:** `m3os-ion-parent-strace.log` shows the
+   helper path is not stuck after the VFS fix: Ion forks pid 20, pid 20 execs
+   `/bin/PROMPT`, Ion reaps it via `wait4`, reads 28 bytes from the helper pipe,
+   writes 158 bytes to fd 1, then blocks in `read(0, ...)` waiting for input.
+   The `pty_bytes=158` plateau is therefore a prompt-ready steady state unless
+   a visual run proves the prompt is not rendered. Final clean validation
+   `m3os-waitpid-reregister-final2.log` reached `AUDIO_SMOKE:server:READY`,
+   `TERM_SMOKE:ready`, `session.boot: state=running`, early VFS readiness, Ion
+   child pid 20 fork, and stable `pty_bytes=158`, with no userspace page fault.
+   A follow-up 3-run fresh GUI retry (`m3os-repeat-{1,2,3}.log`) reproduced the
+   same prompt-ready signature in all runs: VFS ready, session running,
+   `/bin/ion` exec, `/bin/PROMPT` exec, stable `pty_bytes=158`, and no page
+   fault / PTY EOF / panic. The display-side compose totals also advanced after
+   `/bin/PROMPT` exec (`total=39` before the helper, then `total=59` or `79` by
+   compose#600), so the prompt bytes are reaching the renderer/display path; if
+   a human still sees a blank window, debug surface damage/composition next.
 
 ---
 
@@ -109,6 +133,8 @@ in commit `968b579`.
 | `kernel/src/blk/virtio_blk.rs` | Replace `REQUEST_LOCK` held across `do_request()` with a scheduler-blocking single-flight request slot using static waiter flags. | Final GUI run: `spawned 19 trampolines 19 missing 0`. |
 | `kernel/src/task/scheduler.rs` | Refresh the current task's saved FS.base before publishing a full preemption frame, so syscall-return preemption after `ARCH_SET_FS` does not restore stale TLS state. | `m3os-ion-tls-fix.log`: `/bin/ion` execs with no `rip=0x65e54b` page fault. |
 | `kernel/src/mm/elf.rs` | Add typed `ElfAuxInfo` and publish `AT_PHENT` alongside `AT_PHDR`/`AT_PHNUM` in the initial aux vector. | Musl can walk program headers with the correct entry size during TLS setup. |
+| `userspace/vfs_server/src/main.rs` | Avoid stdout writes after `ipc_register_service("vfs")`; the readiness banner now goes to serial so clients cannot observe `vfs` registered while the server is blocked on terminal output before its first `ipc_recv_msg`. | `m3os-vfs-ready-fix.log`: `vfs_server: registered, entering server loop` appears at line 708 and Ion progresses beyond startup to `parent_pid=19 ... child_pid=20`. |
+| `kernel/src/process/mod.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `kernel/src/task/{mod.rs,scheduler.rs}` | Replace `waitpid`'s cooperative `yield_now()` polling with a child-exit wait queue and `BlockedOnWait` scheduler state. Child exit wakes parents from `send_sigchld_to_parent`. | `cargo xtask check`; `m3os-ion-parent-strace.log` shows Ion reaps `/bin/PROMPT`, writes the prompt, and blocks waiting for input. `m3os-waitpid-reregister-final2.log` confirms the clean build reaches the same `pty_bytes=158` steady state after the missed-wakeup review fix; `m3os-repeat-{1,2,3}.log` repeated that signature 3/3 times. |
 
 ### Virtio-blk request-slot history
 
@@ -234,25 +260,39 @@ table still tracks all held keys for de-dup). Cosmetic only.
 
 ## Where to investigate next
 
-### Highest-value lead: shell/PTY liveness if it reproduces
+### Highest-value lead: visual prompt confirmation
 
-The Ion null fault is no longer the highest-value lead. In
-`m3os-ion-tls-fix.log`, graphical boot is complete, `/bin/ion` execs, and no
-userspace page fault occurs:
+The Ion null fault and the VFS registered-but-not-receiving window are no longer
+the highest-value leads. In `m3os-vfs-ready-fix.log`, graphical boot is
+complete, `vfs_server` is receiving early, `/bin/ion` starts, and Ion forks its
+first helper:
 
 ```text
 AUDIO_SMOKE:server:READY
 TERM_SMOKE:ready
-display_server: AttachSharedBuffer ok shm_id=1 va=0x20003e8000
 session_manager: session.boot: state=running
-[INFO] [exec-trace] pid=19 execve OK path="/bin/ion" entry=0x4101c2 rsp=...
+[INFO] [userspace] vfs_server: registered, entering server loop
+[INFO] [proc] fork: parent_pid=19 parent_exec=/bin/ion child_pid=20
+term: iter=3000 events=0 composes=2 pty_bytes=158
 ```
 
-If the shell still appears silent, start from term/PTY liveness rather than
-from Ion fault mapping: the post-fix bounded run showed repeated
-`term: iter=... pty_bytes=0` and `pid=17 ... BlockedOnReply` warnings before
-timeout. Keep the fork-trampoline parser and `userspace page fault` grep only
-as regression guards.
+`m3os-ion-parent-strace.log` classifies the `pty_bytes=158` plateau:
+
+```text
+pid=19 fork() -> child pid 20
+pid=20 execve path="/bin/PROMPT"
+pid=19 wait4(..., WUNTRACED) -> 20
+pid=19 read(fd=3, ...) -> 28
+pid=19 write(fd=1, ..., 158) -> 158
+pid=19 read(fd=0, ...)   # blocks waiting for input
+term: ... pty_bytes=158
+```
+
+That is the expected prompt-ready state from the kernel/PTY perspective. If a
+future GUI run still looks blank, debug display rendering or visual surface
+damage next, not Ion exec/TLS, VFS readiness, waitpid, or the original
+missing-trampoline stall. Keep the fork-trampoline parser and `userspace page
+fault` grep only as regression guards.
 
 ### If the fork-dispatch stall returns
 
