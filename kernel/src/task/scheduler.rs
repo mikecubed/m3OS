@@ -220,9 +220,12 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::{cell::UnsafeCell, sync::atomic::Ordering};
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
@@ -2374,26 +2377,22 @@ pub fn block_current_until(
 /// function instead of `block_current_on_reply_unless_message`.  The semantic
 /// outcome is identical: the caller resumes when a reply is delivered.
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
-    use core::sync::atomic::AtomicBool;
-
-    // Check if a message was already delivered before we even try to block.
-    {
-        let sched = scheduler_lock();
-        if sched
-            .find(caller)
-            .map(|idx| sched.tasks[idx].pending_msg.is_some())
-            .unwrap_or(false)
-        {
-            return true;
-        }
+    let woken = Arc::new(AtomicBool::new(false));
+    if !register_reply_waker(caller, woken.clone()) {
+        return false;
     }
 
-    // Use a stack-allocated AtomicBool as the v2 woken flag.
-    // Track D will set this from wake_task; for now it stays false until
-    // the block side self-reverts (which cannot happen without Track D waking it).
-    let woken = AtomicBool::new(false);
+    // Register the waker before checking pending_msg. If the server replies
+    // between this check and the state transition inside block_current_until,
+    // deliver_message sets `woken`, so the block side self-reverts instead of
+    // parking after an AlreadyAwake wake_task_v2 outcome.
+    if has_pending_message(caller) {
+        clear_reply_waker(caller);
+        return true;
+    }
 
     let outcome = block_current_until(TaskState::BlockedOnReply, &woken, None);
+    clear_reply_waker(caller);
 
     // Regardless of the outcome, the caller (call_msg) will call take_message()
     // to confirm message delivery. We report true for Woken/AlreadyTrue, false
@@ -2401,6 +2400,23 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     match outcome {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+fn register_reply_waker(id: TaskId, waker: Arc<AtomicBool>) -> bool {
+    let mut sched = scheduler_lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].reply_waker = Some(waker);
+        true
+    } else {
+        false
+    }
+}
+
+fn clear_reply_waker(id: TaskId) {
+    let mut sched = scheduler_lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].reply_waker = None;
     }
 }
 
@@ -2969,6 +2985,9 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_msg = Some(msg);
+        if let Some(waker) = sched.tasks[idx].reply_waker.as_ref() {
+            waker.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2984,6 +3003,9 @@ pub fn try_deliver_message(id: TaskId, msg: Message) -> bool {
         && sched.tasks[idx].pending_msg.is_none()
     {
         sched.tasks[idx].pending_msg = Some(msg);
+        if let Some(waker) = sched.tasks[idx].reply_waker.as_ref() {
+            waker.store(true, Ordering::Release);
+        }
         return true;
     }
     false

@@ -111,6 +111,13 @@ const PTY_READ_CHUNK: usize = 256;
 const COMPOSE_INTERVAL_MS: u64 = 16;
 
 #[cfg(not(test))]
+const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
+#[cfg(not(test))]
+const SHELL_DEPENDENCY_WAIT_ATTEMPTS: usize = 3_000;
+#[cfg(not(test))]
+const SHELL_DEPENDENCY_WAIT_NS: u32 = 10_000_000;
+
+#[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, BOOT_LOG_MARKER);
 
@@ -163,6 +170,10 @@ fn program_main(_args: &[&str]) -> i32 {
     //    `SyscallPtyOps` is the production wiring of the
     //    `PtyOps` trait the lib already exercises against
     //    `MockPtyOps`.
+    if !wait_for_shell_dependencies() {
+        syscall_lib::write_str(STDOUT_FILENO, "term: VFS unavailable before shell spawn\n");
+        return 6;
+    }
     let mut pty = PtyHost::new(SyscallPtyOps::new());
     if let Err(_e) = pty.open_and_spawn() {
         syscall_lib::write_str(STDOUT_FILENO, "term: PTY open / shell spawn failed\n");
@@ -210,6 +221,13 @@ fn program_main(_args: &[&str]) -> i32 {
     };
     let clock = MonotonicClock;
 
+    // Attach and publish the initial clear frame before the event-pull loop.
+    // Otherwise early key/mouse traffic can keep term draining display events
+    // before the first `AttachSharedBuffer`, leaving the terminal invisible.
+    renderer.compose();
+    let mut composes: u64 = 1;
+    let mut last_compose_ms = clock.now_ms();
+
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
     // Track the last compose timestamp so the throttle below only
@@ -217,7 +235,6 @@ fn program_main(_args: &[&str]) -> i32 {
     // underlying `Renderer` keeps its damage queue intact between
     // composes, so dropping a single frame's worth of compose calls
     // does not lose any glyphs — the next compose flushes everything.
-    let mut last_compose_ms = clock.now_ms();
 
     // Phase 57d follow-up — diagnostic stat counters. Print one stat
     // line every 1000 iters so we can confirm term's main loop is
@@ -227,7 +244,6 @@ fn program_main(_args: &[&str]) -> i32 {
     // input-pipeline race is closed.
     let mut iter_count: u64 = 0;
     let mut events_pulled: u64 = 0;
-    let mut composes: u64 = 0;
     let mut pty_bytes: u64 = 0;
 
     // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
@@ -382,6 +398,17 @@ impl PtyWriter for PrimaryFdWriter {
         // line if the failure recurs.
         self.warned = false;
     }
+}
+
+#[cfg(not(test))]
+fn wait_for_shell_dependencies() -> bool {
+    for _ in 0..SHELL_DEPENDENCY_WAIT_ATTEMPTS {
+        if syscall_lib::ipc_service_exists(SHELL_DEPENDENCY_SERVICE) {
+            return true;
+        }
+        let _ = syscall_lib::nanosleep_for(0, SHELL_DEPENDENCY_WAIT_NS);
+    }
+    false
 }
 
 /// Phase 57d follow-up — minimal u32 → decimal serial log helper for

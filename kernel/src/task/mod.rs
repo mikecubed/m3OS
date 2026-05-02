@@ -46,7 +46,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::ipc::{CapabilityTable, Message};
 
@@ -403,6 +403,11 @@ pub struct Task {
     /// `Preempted` → `preempt_resume_to_user` (full restore + `iretq`).
     /// `Cooperative` / `Initial` → existing `switch_context` path.
     pub resume_mode: core::sync::atomic::AtomicU8,
+    /// Wake flag registered by an IPC caller before parking in
+    /// [`TaskState::BlockedOnReply`]. Reply delivery sets this before calling
+    /// `wake_task_v2`, closing the "reply arrived just before park" lost-wake
+    /// window.
+    pub reply_waker: Option<Arc<core::sync::atomic::AtomicBool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +507,7 @@ impl Task {
             // `iretq` to the preempted instruction.
             preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
             resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
+            reply_waker: None,
         }
     }
 

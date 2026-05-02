@@ -451,6 +451,9 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
 
 /// Syscall 21 (0x1114): query whether a named service is currently registered
 /// without inserting a capability into the caller's cap table.
+///
+/// Private services are visible through this presence-only probe so dependent
+/// userspace can wait for readiness without receiving a callable endpoint.
 fn ipc_service_exists(name_ptr: u64, name_len: u64) -> u64 {
     if name_ptr == 0 {
         return u64::MAX;
@@ -470,9 +473,6 @@ fn ipc_service_exists(name_ptr: u64, name_len: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    if is_private_service_name(name) {
-        return 0;
-    }
     u64::from(registry::is_registered(name))
 }
 
