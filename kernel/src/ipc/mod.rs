@@ -43,6 +43,59 @@ pub mod registry;
 
 use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
 
+/// Phase 57d follow-up — bounded budget for `log_send_with_bulk_anomaly`.
+/// Caps log spam at 16 occurrences per boot so a recurrent bug stays
+/// readable in the transcript without flooding when the violation fires
+/// in a tight loop (term's renderer retries on submit failure).
+static SEND_BULK_ANOMALY_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
+
+/// Phase 57d follow-up — log when a sender allocates a 24-byte bulk
+/// vec but writes a CommitSurface header (`04 00 15 00`) at offset 0.
+/// This is the smoking-gun shape of the
+/// `bulk_len=24 head=04001500010000000000000000000000` violation
+/// observed at the receiver: term's `publish_frame` should send Damage
+/// (24-byte) and Commit (8-byte) as separate calls, never a 24-byte
+/// CommitSurface. The log captures `task_id`, `label`, and the first 12
+/// bytes of the bulk so the next transcript pins down whether term is
+/// passing the wrong `buf_len` or the kernel's per-core syscall args
+/// got crossed across a context switch.
+fn log_send_with_bulk_anomaly(task_id: crate::task::TaskId, label: u64, bulk: &[u8]) {
+    if SEND_BULK_ANOMALY_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let n = bulk.len().min(12);
+    let mut hex = [0u8; 24];
+    let mut idx = 0;
+    for &b in &bulk[..n] {
+        hex[idx] = nibble_to_hex(b >> 4);
+        hex[idx + 1] = nibble_to_hex(b & 0x0F);
+        idx += 2;
+    }
+    log::warn!(
+        "[ipc] send_with_bulk anomaly: task={} label={:#x} buf_len={} head={}",
+        task_id.0,
+        label,
+        bulk.len(),
+        core::str::from_utf8(&hex[..idx]).unwrap_or("??"),
+    );
+}
+
+fn nibble_to_hex(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=15 => b'a' + (v - 10),
+        _ => b'?',
+    }
+}
+
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
@@ -635,6 +688,24 @@ fn ipc_send_with_bulk(
         return u64::MAX;
     }
 
+    // Phase 57d follow-up — diagnostic for the
+    // `bulk_len=24 head=04001500010000000000000000000000` violation
+    // pattern. Log every send whose first four bytes look like a
+    // CommitSurface header (`04 00 15 00`) but whose `buf_len` is 24
+    // (DamageSurface size). That is the smoking-gun shape of the
+    // mismatch: a commit-shaped frame body delivered with a damage-
+    // shaped bulk size. Rate-limited so a real attack cannot flood
+    // the log; budget bumps every boot.
+    if bulk.len() == 24
+        && bulk.len() >= 4
+        && bulk[0] == 0x04
+        && bulk[1] == 0x00
+        && bulk[2] == 0x15
+        && bulk[3] == 0x00
+    {
+        log_send_with_bulk_anomaly(task_id, msg.label, &bulk);
+    }
+
     // Encode the actual bulk data length in data[1] so the receiver knows
     // how many bytes to expect in its output buffer.
     msg.data[1] = len as u64;
@@ -677,7 +748,7 @@ fn ipc_recv_msg(
     use crate::task::scheduler;
     use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION};
 
-    let (kind, msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
+    let (kind, mut msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
         if let Some(notif_id) = notification::lookup_bound_notif(task_sched_idx) {
             endpoint::recv_msg_with_notif(task_id, ep_id, notif_id)
         } else {
@@ -689,6 +760,21 @@ fn ipc_recv_msg(
 
     if msg.label == u64::MAX && kind == RECV_KIND_MESSAGE {
         return u64::MAX;
+    }
+
+    // Take bulk first so the user-visible `data[1]` reflects the actual
+    // delivered bulk length. See `ipc_try_recv_msg` for the rationale.
+    let mut delivered_len: u64 = 0;
+    let bulk = if kind == RECV_KIND_MESSAGE && buf_ptr != 0 {
+        scheduler::take_bulk_data(task_id)
+    } else {
+        None
+    };
+    if let Some(b) = &bulk {
+        delivered_len = b.len() as u64;
+    }
+    if kind == RECV_KIND_MESSAGE {
+        msg.data[1] = delivered_len;
     }
 
     // Write the IpcMessage header (label + 4 data words = 40 bytes) to
@@ -708,11 +794,7 @@ fn ipc_recv_msg(
         }
     }
 
-    // Copy bulk data to the receiver's buffer if present.
-    if kind == RECV_KIND_MESSAGE
-        && buf_ptr != 0
-        && let Some(bulk) = scheduler::take_bulk_data(task_id)
-    {
+    if let Some(bulk) = bulk {
         let copy_len = bulk.len().min(buf_len as usize);
         if copy_len > 0
             && UserSliceWo::new(buf_ptr, copy_len)
@@ -754,7 +836,7 @@ fn ipc_try_recv_msg(
 ) -> u64 {
     use crate::task::scheduler;
 
-    let msg = match endpoint::recv_msg_nowait(task_id, ep_id) {
+    let mut msg = match endpoint::recv_msg_nowait(task_id, ep_id) {
         Some(m) => m,
         None => return u64::MAX,
     };
@@ -762,6 +844,27 @@ fn ipc_try_recv_msg(
     if msg.label == u64::MAX {
         return u64::MAX;
     }
+
+    // Take the bulk slot first so the user-visible `data[1]` can be
+    // overridden with the actual bulk length. Without this, a delivery
+    // path with `msg.data[1] = N_sender` but a kernel bulk Vec whose
+    // length is `N_actual != N_sender` (signal-races on the sender's
+    // `pending_bulk` slot, stale leftover from a failed `ipc_reply`,
+    // etc.) lets the receiver read up to `N_sender` bytes from
+    // `bulk_buf` while only the first `N_actual` bytes were actually
+    // copied — surfacing as "frame header for N_actual-byte verb +
+    // trailing stale/zero bytes" to the dispatcher (m3os.log line
+    // 824ff: `bulk_len=24 head=04001500010000000000000000000000`).
+    let mut delivered_len: u64 = 0;
+    let bulk = if buf_ptr != 0 {
+        scheduler::take_bulk_data(task_id)
+    } else {
+        None
+    };
+    if let Some(b) = &bulk {
+        delivered_len = b.len() as u64;
+    }
+    msg.data[1] = delivered_len;
 
     if msg_ptr != 0 {
         let mut header = [0u8; 40];
@@ -778,9 +881,7 @@ fn ipc_try_recv_msg(
         }
     }
 
-    if buf_ptr != 0
-        && let Some(bulk) = scheduler::take_bulk_data(task_id)
-    {
+    if let Some(bulk) = bulk {
         let copy_len = bulk.len().min(buf_len as usize);
         if copy_len > 0
             && UserSliceWo::new(buf_ptr, copy_len)
