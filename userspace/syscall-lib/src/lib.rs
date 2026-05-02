@@ -7,6 +7,9 @@
 //!   rcx and r11 are clobbered by syscall instruction
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 use core::arch::asm;
 
 #[cfg(feature = "alloc")]
@@ -389,6 +392,49 @@ impl IpcMessage {
             label,
             data: [0; 4],
         }
+    }
+
+    /// Return the reply capability handle staged by the kernel for call-shaped
+    /// receives.
+    ///
+    /// `recv_msg` writes this handle into `data[3]`; `0` means the sender did
+    /// not request a reply. Servers must use this value instead of assuming a
+    /// fixed capability-table slot.
+    pub fn reply_cap_handle(&self) -> Option<u32> {
+        let raw = self.data[3];
+        if raw == 0 || raw > u64::from(u32::MAX) {
+            None
+        } else {
+            Some(raw as u32)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpcMessage;
+
+    #[test]
+    fn ipc_message_reply_cap_uses_kernel_supplied_data3() {
+        let mut msg = IpcMessage::new(0);
+        msg.data[3] = 17;
+
+        assert_eq!(msg.reply_cap_handle(), Some(17));
+    }
+
+    #[test]
+    fn ipc_message_reply_cap_treats_zero_as_absent() {
+        let msg = IpcMessage::new(0);
+
+        assert_eq!(msg.reply_cap_handle(), None);
+    }
+
+    #[test]
+    fn ipc_message_reply_cap_rejects_out_of_range_handle() {
+        let mut msg = IpcMessage::new(0);
+        msg.data[3] = u64::from(u32::MAX) + 1;
+
+        assert_eq!(msg.reply_cap_handle(), None);
     }
 }
 
