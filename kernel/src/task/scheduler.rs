@@ -2019,6 +2019,20 @@ pub fn pid_for_task_id(task_id: TaskId) -> Option<u32> {
     sched.tasks.iter().find(|t| t.id == task_id).map(|t| t.pid)
 }
 
+/// Return `(pid, name)` for a [`TaskId`] in one scheduler-lock acquisition,
+/// or `None` if no live task carries `task_id`. Used by IPC diagnostics so
+/// a single warning can show both the pid (which userspace identifies
+/// processes by) and the kernel-side debug name (which says e.g.
+/// `fork-child` vs `init`).
+pub fn task_label_for_id(task_id: TaskId) -> Option<(u32, &'static str)> {
+    let sched = scheduler_lock();
+    sched
+        .tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .map(|t| (t.pid, t.name))
+}
+
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;

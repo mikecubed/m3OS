@@ -721,10 +721,10 @@ static BULK_MISMATCH_LOG_BUDGET: core::sync::atomic::AtomicU32 =
 /// bulk-attached send path (`ipc_send_with_bulk` set both `data[1]`
 /// and the slot together), so an empty slot at receiver-pop time is
 /// either a bulk-cleanup race in the sender's syscall path or a
-/// duplicate-PendingSend bug in the senders queue. Either way, the log
-/// pins the path (`recv_msg`, `recv_msg_nowait`, `recv_msg_with_notif`)
-/// and the participating task ids so the next transcript narrows the
-/// search.
+/// duplicate-PendingSend bug in the senders queue.
+///
+/// Translates `TaskId` to `pid` + exec name so logs are actionable
+/// (TaskId is the kernel's allocation counter, not the userspace pid).
 fn log_bulk_mismatch(site: &str, sender: TaskId, receiver: TaskId, claimed_bulk: u64) {
     if BULK_MISMATCH_LOG_BUDGET
         .fetch_update(
@@ -736,13 +736,20 @@ fn log_bulk_mismatch(site: &str, sender: TaskId, receiver: TaskId, claimed_bulk:
     {
         return;
     }
+    let sender_label = describe_task(sender);
+    let receiver_label = describe_task(receiver);
     log::warn!(
-        "[ipc] {site}: sender {} delivered msg with data[1]={} but pending_bulk slot empty; \
-         receiver {} will see bulk_len=0 (pre-fix: stale bulk_buf bytes)",
-        sender.0,
-        claimed_bulk,
-        receiver.0,
+        "[ipc] {site}: sender {sender_label} delivered msg with data[1]={claimed_bulk} but \
+         pending_bulk slot empty; receiver {receiver_label} sees bulk_len=0 \
+         (pre-fix: stale bulk_buf bytes)"
     );
+}
+
+fn describe_task(id: TaskId) -> alloc::string::String {
+    match scheduler::task_label_for_id(id) {
+        Some((pid, name)) => alloc::format!("task={} pid={} name={}", id.0, pid, name),
+        None => alloc::format!("task={} (gone)", id.0),
+    }
 }
 
 /// Send a message to an endpoint.
@@ -825,6 +832,18 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
 /// `label = u64::MAX` on error.  Use this when the caller needs the reply
 /// data payload (e.g. a VFS server forwarding a fat_server reply to a client).
 pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
+    // Drain any stale `pending_msg` left over from a prior aborted IPC. If
+    // a previous call landed an EINTR sentinel via `try_deliver_message`
+    // and the caller's `take_message` already consumed the legit reply,
+    // a fresh `pending_msg` from a late path could otherwise make
+    // `block_current_on_reply_v2` short-circuit on `has_pending_message`,
+    // leaving this call's PendingSend stranded in the senders queue. The
+    // stranded send later pairs with a different call's bulk transfer
+    // (off-by-one cascade) and surfaces at the receiver as the
+    // `data[1] != 0 but pending_bulk slot empty` mismatch the IPC
+    // diagnostic logs on every recv. Drop here so the block actually
+    // blocks for THIS call's reply.
+    let _ = scheduler::take_message(caller);
     let (matched_receiver, pending_hook) = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
