@@ -83,6 +83,7 @@ pub use registry::RegistryError;
 /// | 19 | 0x1112 | `ipc_take_pending_bulk(buf_ptr, buf_len)` | `arg0, arg1` → bytes_copied or u64::MAX |
 /// | 20 | 0x1113 | `ipc_try_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, or u64::MAX if no pending message |
 /// | 21 | 0x1114 | `ipc_service_exists(name_ptr, name_len)` | `arg0, arg1` → 1 if registered, 0 otherwise |
+/// | 22 | 0x1115 | `ipc_wait_service(name_ptr, name_len, timeout_ms)` | `arg0..2` → 1 ready, 0 timeout |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -121,7 +122,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, 12, 17, 18, 19, and 21 do not use arg0 as a pre-looked-up cap
+    // Syscalls 10, 11, 12, 17, 18, 19, 21, and 22 do not use arg0 as a pre-looked-up cap
     // handle — process them before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
@@ -143,6 +144,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 21 {
         return ipc_service_exists(arg0, arg1);
+    }
+    if number == 22 {
+        return ipc_wait_service(task_id, arg0, arg1, arg2);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -474,6 +478,47 @@ fn ipc_service_exists(name_ptr: u64, name_len: u64) -> u64 {
         Err(_) => return u64::MAX,
     };
     u64::from(registry::is_registered(name))
+}
+
+/// Syscall 22 (0x1115): block until a named service is registered.
+///
+/// `timeout_ms == 0` waits indefinitely. A positive timeout uses the scheduler
+/// deadline scanner (1 tick = 1 ms). Returns `1` when ready, `0` on timeout,
+/// and `u64::MAX` for invalid input.
+fn ipc_wait_service(
+    task_id: crate::task::TaskId,
+    name_ptr: u64,
+    name_len: u64,
+    timeout_ms: u64,
+) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
+    if name_len == 0 || name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
+    let mut name_buf = [0u8; 32];
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let name = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let deadline_ticks = if timeout_ms == 0 {
+        None
+    } else {
+        Some(crate::arch::x86_64::interrupts::tick_count().saturating_add(timeout_ms))
+    };
+    u64::from(registry::wait_until_registered(
+        name,
+        task_id,
+        deadline_ticks,
+    ))
 }
 
 /// Syscall 12 (0x110B): allocate a new IPC endpoint and insert an Endpoint

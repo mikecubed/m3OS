@@ -163,6 +163,8 @@ pub enum TaskState {
     BlockedOnFutex,
     /// Task is blocked waiting for a child process state change.
     BlockedOnWait,
+    /// Task is blocked waiting for a named IPC service to register.
+    BlockedOnService,
     /// Task has permanently exited; the scheduler will remove it on next pass.
     Dead,
 }

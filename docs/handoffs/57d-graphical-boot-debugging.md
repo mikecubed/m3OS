@@ -91,14 +91,25 @@ fix work landed during the post-merge debugging.
    separate IPC reply lost-wake window was fixed by registering a per-task reply
    waker before parking in `BlockedOnReply`; replies now set that flag before
    `wake_task_v2`, closing the "reply arrived just before park" race without
-   yielding. Finally, `term` waits for the private `vfs` service with bounded
-   `nanosleep_for` polling before spawning Ion, and the presence-only
-   `ipc_service_exists` probe now reports private service readiness without
-   granting endpoint capabilities. Normal GUI validation
+   yielding. `term` no longer polls private `vfs` readiness; it blocks in
+   `ipc_wait_service("vfs", 0)`, a readiness-only syscall that never grants a
+   callable endpoint capability. Normal GUI validation
    (`m3os-no-exec-trace-fix.log`) reached `/bin/ion`, `AttachSharedBuffer ok`
    before `TERM_SMOKE:ready`, and stable `pty_bytes=158`; exec-trace builds can
    perturb this path enough to stall Ion startup and should not be treated as the
    prompt-readiness oracle by themselves.
+10. **Blocking service-readiness primitive:** `ipc_wait_service` adds a
+    scheduler-blocking service wait path (`BlockedOnService`) for userspace
+    readiness dependencies. The wait path avoids `SERVICE_WAITERS`/`REGISTRY`
+    lock overlap, and service registration defers wake delivery to the waiter's
+    assigned-core scheduler loop so the registering task does not spin in
+    cross-core `wake_task_v2` while the waiter is still publishing its blocked
+    stack. `block_current_until` now disables preemption from the blocked-state
+    write through the actual `switch_context`, closing the preemptive
+    mark-blocked-but-not-switched window. `m3os-ipc-wait-service6.log` reached
+    VFS registration, `/bin/ion`, `AttachSharedBuffer ok`, `TERM_SMOKE:ready`,
+    and eventually stable `pty_bytes=158`; Ion still sometimes delays before the
+    prompt helper fork and remains the next liveness target.
 
 ---
 
@@ -150,9 +161,11 @@ in commit `968b579`.
 | `kernel/src/mm/elf.rs` | Add typed `ElfAuxInfo` and publish `AT_PHENT` alongside `AT_PHDR`/`AT_PHNUM` in the initial aux vector. | Musl can walk program headers with the correct entry size during TLS setup. |
 | `userspace/vfs_server/src/main.rs` | Avoid stdout writes after `ipc_register_service("vfs")`; the readiness banner now goes to serial so clients cannot observe `vfs` registered while the server is blocked on terminal output before its first `ipc_recv_msg`. | `m3os-vfs-ready-fix.log`: `vfs_server: registered, entering server loop` appears at line 708 and Ion progresses beyond startup to `parent_pid=19 ... child_pid=20`. |
 | `kernel/src/process/mod.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `kernel/src/task/{mod.rs,scheduler.rs}` | Replace `waitpid`'s cooperative `yield_now()` polling with a child-exit wait queue and `BlockedOnWait` scheduler state. Child exit wakes parents from `send_sigchld_to_parent`. | `cargo xtask check`; `m3os-ion-parent-strace.log` shows Ion reaps `/bin/PROMPT`, writes the prompt, and blocks waiting for input. `m3os-waitpid-reregister-final2.log` confirms the clean build reaches the same `pty_bytes=158` steady state after the missed-wakeup review fix; `m3os-repeat-{1,2,3}.log` repeated that signature 3/3 times. |
-| `userspace/term/src/main.rs` | Force the initial clear-frame compose before `TERM_SMOKE:ready`, and wait for VFS readiness with bounded `nanosleep_for` polling before spawning Ion. | `m3os-no-exec-trace-fix.log`: `display_server: AttachSharedBuffer ok` precedes `TERM_SMOKE:ready`; `/bin/ion` launches and term stabilizes at `pty_bytes=158`. |
+| `userspace/term/src/main.rs` | Force the initial clear-frame compose before `TERM_SMOKE:ready`, and block on `ipc_wait_service("vfs", 0)` before spawning Ion. | `m3os-ipc-wait-service6.log`: `display_server: AttachSharedBuffer ok` precedes `TERM_SMOKE:ready`; `/bin/ion` launches and term stabilizes at `pty_bytes=158`. |
 | `kernel/src/task/{mod.rs,scheduler.rs}` | Register a reply wait flag on the task before `BlockedOnReply` parking; `deliver_message` / `try_deliver_message` set it before `wake_task_v2` to close the reply-before-park lost-wake race. | `cargo xtask check`; the latest normal GUI run did not strand term in `BlockedOnReply`. |
 | `kernel/src/ipc/mod.rs` | Let `ipc_service_exists` report private-service presence while keeping `ipc_lookup_service` denied, so clients can wait for readiness without receiving a callable capability. | Term can gate Ion startup on `vfs` readiness without exposing the private VFS endpoint. |
+| `kernel/src/ipc/{mod.rs,registry.rs}`, `userspace/syscall-lib/src/lib.rs`, `kernel/src/task/{mod.rs,scheduler.rs}` | Add `ipc_wait_service` (`0x1115`) and `BlockedOnService`: service waiters park in the scheduler; registration marks matching waiters ready and defers wake delivery to the waiter's assigned-core scheduler loop. | `cargo xtask check`; `m3os-ipc-wait-service6.log` shows VFS registration completing while term is blocked on readiness, then term wakes and launches Ion. |
+| `kernel/src/task/scheduler.rs` | Make the `block_current_until` park transition non-preemptible from the blocked-state write until `switch_context` returns on wake, preventing `on_cpu=true` from being left visible without a saved blocked stack. | `cargo xtask check`; GUI validation no longer hangs VFS inside immediate service registration wake when the deferred service-wake path is active. |
 
 ### Virtio-blk request-slot history
 

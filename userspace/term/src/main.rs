@@ -112,10 +112,6 @@ const COMPOSE_INTERVAL_MS: u64 = 16;
 
 #[cfg(not(test))]
 const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
-#[cfg(not(test))]
-const SHELL_DEPENDENCY_WAIT_ATTEMPTS: usize = 3_000;
-#[cfg(not(test))]
-const SHELL_DEPENDENCY_WAIT_NS: u32 = 10_000_000;
 
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
@@ -402,13 +398,7 @@ impl PtyWriter for PrimaryFdWriter {
 
 #[cfg(not(test))]
 fn wait_for_shell_dependencies() -> bool {
-    for _ in 0..SHELL_DEPENDENCY_WAIT_ATTEMPTS {
-        if syscall_lib::ipc_service_exists(SHELL_DEPENDENCY_SERVICE) {
-            return true;
-        }
-        let _ = syscall_lib::nanosleep_for(0, SHELL_DEPENDENCY_WAIT_NS);
-    }
-    false
+    syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
 }
 
 /// Phase 57d follow-up — minimal u32 → decimal serial log helper for

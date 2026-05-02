@@ -362,6 +362,9 @@ pub const SYS_IPC_TRY_RECV_MSG: u64 = 0x1113;
 /// Query whether a named service is registered without allocating a cap handle.
 pub const SYS_IPC_SERVICE_EXISTS: u64 = 0x1114;
 
+/// Block until a named service is registered without allocating a cap handle.
+pub const SYS_IPC_WAIT_SERVICE: u64 = 0x1115;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -472,6 +475,23 @@ pub fn ipc_service_exists(name: &str) -> bool {
             SYS_IPC_SERVICE_EXISTS,
             name.as_ptr() as u64,
             name.len() as u64,
+        ) == 1
+    }
+}
+
+/// Wait until a named service is registered.
+///
+/// `timeout_ms == 0` waits indefinitely. A positive timeout is bounded in
+/// milliseconds. Returns `true` when the service is ready, `false` on timeout
+/// or invalid input. Like [`ipc_service_exists`], this does not insert an
+/// endpoint capability into the caller's cap table.
+pub fn ipc_wait_service(name: &str, timeout_ms: u64) -> bool {
+    unsafe {
+        syscall3(
+            SYS_IPC_WAIT_SERVICE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            timeout_ms,
         ) == 1
     }
 }

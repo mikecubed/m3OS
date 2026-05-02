@@ -2057,6 +2057,14 @@ pub fn task_debug_snapshot(id: TaskId) -> Option<TaskDebugSnapshot> {
     ))
 }
 
+/// Return the blocking state and assigned core for a task.
+pub fn task_state_and_assigned_core(id: TaskId) -> Option<(TaskState, u8)> {
+    let sched = scheduler_lock();
+    let idx = sched.find(id)?;
+    let task = sched.tasks.get(idx)?;
+    Some((task.state, task.assigned_core))
+}
+
 /// Return dead tasks whose IPC state still needs deferred cleanup.
 pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
     let sched = scheduler_lock();
@@ -2152,6 +2160,7 @@ pub fn block_current_until(
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
                 | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ),
         "block_current_until kind must be a Blocked* variant; got {:?}",
         kind
@@ -2203,6 +2212,8 @@ pub fn block_current_until(
         // scheduler_lock dropped here.
     };
 
+    preempt_disable();
+
     // ── Step 1: Atomic state write under pi_lock (OUTER) → scheduler_lock (INNER)
     //
     // SAFETY: pi_lock_ptr points into the stable Task struct captured above.
@@ -2217,6 +2228,7 @@ pub fn block_current_until(
         {
             let mut sched = scheduler_lock();
             if idx >= sched.tasks.len() {
+                preempt_enable();
                 return BlockOutcome::AlreadyTrue;
             }
             // Canonical (pi_lock-protected) write.
@@ -2308,11 +2320,13 @@ pub fn block_current_until(
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
-        return if already_expired {
+        let outcome = if already_expired {
             BlockOutcome::DeadlineExpired
         } else {
             BlockOutcome::AlreadyTrue
         };
+        preempt_enable();
+        return outcome;
     }
 
     // ── Step 4: Yield via SCHEDULER.lock → switch_context ────────────────────
@@ -2336,6 +2350,7 @@ pub fn block_current_until(
     // SAFETY: same invariants as block_current_unless_woken_inner — we are
     // the running task on this core, scheduler RSP is valid.
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+    preempt_enable();
 
     // On resume: the waker called wake_task which transitioned us to Ready and
     // re-enqueued us. The dispatch loop re-set current_task_idx. Now check why
@@ -2849,6 +2864,7 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
                 | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ) {
             return WakeOutcome::AlreadyAwake;
         }
@@ -3264,6 +3280,7 @@ pub fn run() -> ! {
         if core_id == 0 {
             crate::ipc::notification::drain_pending_waiters();
         }
+        crate::ipc::registry::drain_pending_service_waiters();
 
         // Remove dead tasks (BSP only to avoid contention).
         if core_id == 0 {
@@ -3825,6 +3842,7 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
                 | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ) {
             // Not Blocked* — stale deadline.  Don't touch it here; the next
             // state transition (or the next scan after wake_task_v2 clears
@@ -4132,6 +4150,7 @@ pub fn watchdog_scan() {
                     | super::TaskState::BlockedOnNotif
                     | super::TaskState::BlockedOnFutex
                     | super::TaskState::BlockedOnWait
+                    | super::TaskState::BlockedOnService
             );
             if !is_blocked {
                 continue;
