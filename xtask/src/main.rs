@@ -1698,31 +1698,104 @@ const MUSL_CC_CANDIDATES: &[&str] = &[
 
 /// Find a musl cross-compiler on the system.
 ///
-/// Checks the candidates in `MUSL_CC_CANDIDATES` in order.
+/// Checks the candidates in `MUSL_CC_CANDIDATES` in order, plus any
+/// candidate supplied via the `M3OS_MUSL_CC` environment variable
+/// (which is checked first so users can override a stricter detection).
 ///
 /// Some minimal musl cross toolchains (for example a hand-installed raiden or
 /// musl-cross-make toolchain under `/opt/`) omit musl's empty static
 /// compatibility stubs (`libdl.a`, `libpthread.a`, `librt.a`). Ports like TCC
-/// still link `-ldl`, so we reject those toolchains here and keep searching for
-/// a distro-provided compiler that can satisfy the full static link.
+/// still link `-ldl`, so by default we reject those toolchains here and keep
+/// searching for a distro-provided compiler that can satisfy the full static
+/// link.
+///
+/// Set `M3OS_MUSL_CC_SKIP_STATIC_CHECK=1` to bypass the stub-link probe — useful
+/// when a recent musl release dropped the legacy empty stubs (newer Arch
+/// packages, for example) and the C ports do not actually depend on `-ldl` /
+/// `-lpthread` / `-lrt` at link time.
 fn find_musl_cc() -> Option<&'static str> {
     static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
     *MUSL_CC.get_or_init(|| {
-        for cc in MUSL_CC_CANDIDATES {
+        let skip_static = std::env::var("M3OS_MUSL_CC_SKIP_STATIC_CHECK")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let env_override = std::env::var("M3OS_MUSL_CC").ok();
+        let env_override_str: Option<&str> = env_override.as_deref();
+
+        // Try the env override first, then the built-in candidate list.
+        let mut tried: Vec<(String, MuslCcStatus)> = Vec::new();
+        let mut try_one = |cc: &str| -> Option<&'static str> {
             if !musl_cc_runs(cc) {
-                continue;
+                tried.push((cc.to_string(), MuslCcStatus::NotFound));
+                return None;
             }
-            if musl_cc_has_static_compat_stubs(cc) {
-                return Some(*cc);
+            if skip_static {
+                let leaked: &'static str = Box::leak(cc.to_string().into_boxed_str());
+                return Some(leaked);
             }
-            eprintln!(
-                "warning: skipping musl compiler `{cc}` — static link check for \
-                 -ldl/-lpthread/-lrt failed; install/use a distro musl toolchain \
-                 (musl-tools or musl-gcc-cross-bin)"
-            );
+            match musl_cc_static_compat_stub_check(cc) {
+                Ok(()) => {
+                    let leaked: &'static str = Box::leak(cc.to_string().into_boxed_str());
+                    Some(leaked)
+                }
+                Err(err) => {
+                    tried.push((cc.to_string(), MuslCcStatus::StaticStubFail(err)));
+                    None
+                }
+            }
+        };
+
+        if let Some(env_cc) = env_override_str
+            && let Some(found) = try_one(env_cc)
+        {
+            return Some(found);
         }
+        for cc in MUSL_CC_CANDIDATES {
+            if let Some(found) = try_one(cc) {
+                return Some(found);
+            }
+        }
+
+        // Detection failed — emit one structured diagnostic that lists every
+        // candidate, its status, and stderr from the static-stub probe so the
+        // user can see WHY each one was rejected. Without this the silent
+        // failure looked like "no musl compiler installed" even when one was
+        // on PATH.
+        eprintln!("musl cross-compiler detection failed. Tried:");
+        for (cc, status) in &tried {
+            match status {
+                MuslCcStatus::NotFound => {
+                    eprintln!("  - `{cc}`: not on PATH (or `--version` failed)");
+                }
+                MuslCcStatus::StaticStubFail(stderr) => {
+                    eprintln!(
+                        "  - `{cc}`: ran OK but `-static -ldl -lpthread -lrt` link probe failed:"
+                    );
+                    for line in stderr.lines().take(8) {
+                        eprintln!("      {line}");
+                    }
+                }
+            }
+        }
+        if let Some(env_cc) = env_override_str {
+            eprintln!("  - M3OS_MUSL_CC={env_cc} (env override) was tried first");
+        }
+        eprintln!(
+            "Hints:\n  \
+             * Set M3OS_MUSL_CC=/path/to/musl-gcc to point at a specific compiler.\n  \
+             * Set M3OS_MUSL_CC_SKIP_STATIC_CHECK=1 if your toolchain is fine but lacks musl's \
+             empty libdl.a/libpthread.a/librt.a stubs (newer Arch musl packages dropped them).\n  \
+             * Debian/Ubuntu: `apt install musl-tools`. Arch: `pacman -S musl-cross-tools` or \
+             AUR `musl-gcc-cross-bin`."
+        );
         None
     })
+}
+
+#[derive(Debug)]
+enum MuslCcStatus {
+    NotFound,
+    StaticStubFail(String),
 }
 
 /// Find any working musl cross-compiler, ignoring the static stub check.
@@ -1813,16 +1886,13 @@ fn warn_ar_fallback_once(cc: &str, missing_ar: &str) {
     });
 }
 
-fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
-    let Ok(dir) = tempfile::tempdir() else {
-        return false;
-    };
+fn musl_cc_static_compat_stub_check(cc: &str) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let src = dir.path().join("stub-check.c");
     let out = dir.path().join("stub-check");
-    if fs::write(&src, "int main(void) { return 0; }\n").is_err() {
-        return false;
-    }
-    Command::new(cc)
+    fs::write(&src, "int main(void) { return 0; }\n")
+        .map_err(|e| format!("write stub source: {e}"))?;
+    let output = Command::new(cc)
         .args([
             "-static",
             src.to_str().unwrap(),
@@ -1832,10 +1902,13 @@ fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
             "-lpthread",
             "-lrt",
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .map_err(|e| format!("spawn `{cc}`: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
 }
 
 fn find_ovmf() -> PathBuf {
