@@ -175,9 +175,11 @@ for to triage common problems:
 - Headless (`cargo xtask run`) directs typed bytes to COM1 via `-serial stdio`,
   not to PS/2. PS/2 is only meaningful in `run-gui`.
 - Slow keyboard echo on `run-gui` was Phase 56-era chunked-pixel-upload
-  overhead per glyph. As of the Phase 57d follow-up, `term` throttles compose
-  to ~60 Hz so PTY echo bursts coalesce; the chunked path is still the
-  underlying transport (replacement is tracked as a follow-up).
+  overhead per glyph. The Phase 57d follow-up replaced the chunked transport
+  entirely: `term` now allocates a shared-memory region, hands its `ShmId`
+  to `display_server` via `AttachSharedBuffer`, and per-frame updates degenerate
+  to a small `DamageSurface` + `CommitSurface` verb pair with no pixel transport.
+  Compose is still throttled to ~60 Hz so PTY echo bursts coalesce.
 
 ## Project Layout
 

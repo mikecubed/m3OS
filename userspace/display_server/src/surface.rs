@@ -80,7 +80,10 @@ pub enum BufferStorage {
     Shared {
         /// User virtual address returned by `sys_shm_map`.
         user_va: u64,
-        /// Byte length = `width * height * 4` rounded up to a page.
+        /// Byte length of the visible pixel region: exactly
+        /// `width * height * 4`. The kernel's underlying mapping is
+        /// page-aligned and may extend past this length, but only
+        /// the first `len` bytes are valid pixel data.
         len: usize,
     },
 }
@@ -127,6 +130,38 @@ impl Drop for BufferStorage {
 }
 
 impl BufferStorage {
+    /// Materialise an owned byte snapshot of the committed pixels.
+    ///
+    /// For [`BufferStorage::Owned`] this clones the existing
+    /// `Vec<u8>`. For [`BufferStorage::Shared`] this allocates a
+    /// fresh `Vec<u8>` and copies the pixel bytes through a raw
+    /// pointer — no Rust slice reference (`&[u8]`) ever aliases the
+    /// concurrently-writable shared-memory mapping, so callers can
+    /// hand the resulting `Vec` to safe code without violating the
+    /// aliasing model. Torn reads are inherent to the cross-process
+    /// editing pattern; the snapshot is a single-point-in-time view.
+    ///
+    /// This is the safe entry point. Prefer this over [`as_slice`]
+    /// for any code path that does not strictly need a borrow with
+    /// the original lifetime.
+    pub fn snapshot(&self) -> Vec<u8> {
+        match self {
+            BufferStorage::Owned(v) => v.clone(),
+            BufferStorage::Shared { user_va, len } => {
+                let mut owned = Vec::<u8>::with_capacity(*len);
+                // SAFETY: kernel mapped `*len` bytes at `*user_va` for
+                // this process; we copy through a raw pointer rather
+                // than synthesising an `&[u8]` so the producer's
+                // concurrent writes never alias a Rust reference.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
+                    owned.set_len(*len);
+                }
+                owned
+            }
+        }
+    }
+
     /// Borrow the pixels as a contiguous byte slice.
     ///
     /// # Safety
@@ -139,11 +174,11 @@ impl BufferStorage {
     /// scheduler — gives LLVM permission to assume the bytes are
     /// stable, which they are not.
     ///
-    /// Callers must consume the slice before relinquishing control to
-    /// any code path the producer can run, and must tolerate torn
-    /// reads. The compose path snapshots the bytes into an owned
-    /// `Vec<u8>` immediately on entry; the cursor path does the same
-    /// before the byte values are observed.
+    /// Most callers should prefer [`BufferStorage::snapshot`] which
+    /// performs a raw-pointer copy and never materialises an `&[u8]`
+    /// to shared memory. `as_slice` exists only for borrow-only
+    /// callers that can prove they consume the slice within a single
+    /// operation that the producer cannot interleave.
     ///
     /// For [`BufferStorage::Owned`] the slice is just a normal
     /// `&Vec<u8>` borrow and the safety conditions are vacuously
@@ -201,9 +236,18 @@ impl CommittedBuffer {
     /// Same conditions as [`BufferStorage::as_slice`]: for `Shared`
     /// pixels the returned slice aliases a concurrently-writable
     /// shared-memory mapping and must be consumed before yielding to
-    /// the producer.
+    /// the producer. Most callers should prefer
+    /// [`CommittedBuffer::pixels_snapshot`].
     pub unsafe fn pixels_slice(&self) -> &[u8] {
         unsafe { self.pixels.as_slice() }
+    }
+
+    /// Materialise an owned byte snapshot of the committed pixels.
+    /// Safe: for shared-memory buffers the copy goes through a raw
+    /// pointer so no `&[u8]` ever aliases the producer's mapping.
+    /// See [`BufferStorage::snapshot`] for the underlying mechanism.
+    pub fn pixels_snapshot(&self) -> Vec<u8> {
+        self.pixels.snapshot()
     }
 }
 
@@ -935,12 +979,10 @@ fn cursor_from_committed(
         .checked_mul(buf.height as usize)
         .and_then(|wh| wh.checked_mul(4))
         .unwrap_or(usize::MAX);
-    // SAFETY: `pixels_slice` is `unsafe` because shared-memory
-    // buffers can be mutated by the producer concurrently. The
-    // cursor decode path here completes before any further IPC so
-    // the borrow does not span a yield, and the BGRA values are
-    // copied into the owned `packed` vector below.
-    let pixels = unsafe { buf.pixels_slice() };
+    // `pixels_snapshot` does a raw-pointer copy for shared-memory
+    // buffers, so we never hold an `&[u8]` to concurrently-writable
+    // memory while decoding into `packed`.
+    let pixels = buf.pixels_snapshot();
     if pixels.len() != byte_count {
         return Err(
             kernel_core::display::cursor::ClientCursorError::PixelLengthMismatch {
