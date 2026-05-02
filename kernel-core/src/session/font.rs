@@ -84,7 +84,20 @@ impl Glyph {
         if stride < w {
             return Err(FontError::InvalidStride);
         }
-        if buf.len() < stride * h {
+        // The render writes pixels at indices `row * stride + col` for
+        // `row` in `0..h` and `col` in `0..w`, so the highest index
+        // touched is `(h-1) * stride + (w-1)`. The minimum buffer size
+        // is therefore `(h-1) * stride + w`, *not* `stride * h` —
+        // requiring the latter rejects callers that legitimately pass a
+        // tail-slice ending exactly at the bottom-right pixel of a
+        // larger surface (e.g. the last cell of `term`'s 80×25 grid).
+        // A strict-equality check on `stride * h` silently dropped the
+        // last-row glyphs after column 0 in production.
+        if h == 0 || w == 0 {
+            return Ok(());
+        }
+        let min_buf = (h - 1) * stride + w;
+        if buf.len() < min_buf {
             return Err(FontError::BufferTooSmall);
         }
         let bytes_per_row = w.div_ceil(8);
@@ -154,5 +167,64 @@ impl FontProvider for BasicBitmapFont {
 
     fn cell_size(&self) -> (u8, u8) {
         (CELL_WIDTH, CELL_HEIGHT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tail-slice that ends exactly at the cell's bottom-right pixel
+    /// (e.g. the last cell of `term`'s 80×25 surface) must render
+    /// successfully — earlier code rejected it as `BufferTooSmall`,
+    /// which dropped every glyph past column 0 on the last row.
+    #[test]
+    fn render_into_accepts_buffer_ending_at_last_cell_pixel() {
+        let font = BasicBitmapFont::new();
+        let glyph = font.glyph(b'A' as u32).expect("glyph for 'A' present");
+        let stride = 640usize;
+        let h = glyph.height as usize;
+        let w = glyph.width as usize;
+        // `(h-1) * stride + w` is exactly the minimum tail-slice
+        // produced by `term::display::DisplayClient::put_glyph` for the
+        // bottom-right cell of the 80×25 grid.
+        let mut buf = vec![0u32; (h - 1) * stride + w];
+        glyph
+            .render_into(&mut buf, stride, 0xFFFF_FFFF, 0)
+            .expect("bottom-right tail slice must render");
+        // The last index touched must be in bounds and the call must
+        // have written something (at minimum the bg/fg pattern at the
+        // last pixel position).
+        let last = (h - 1) * stride + (w - 1);
+        let _ = buf[last];
+    }
+
+    /// Truly under-sized buffers still get rejected.
+    #[test]
+    fn render_into_rejects_buffer_one_short_of_minimum() {
+        let font = BasicBitmapFont::new();
+        let glyph = font.glyph(b'A' as u32).expect("glyph for 'A' present");
+        let stride = 640usize;
+        let h = glyph.height as usize;
+        let w = glyph.width as usize;
+        let too_small = (h - 1) * stride + w - 1;
+        let mut buf = vec![0u32; too_small];
+        assert_eq!(
+            glyph.render_into(&mut buf, stride, 0, 0),
+            Err(FontError::BufferTooSmall)
+        );
+    }
+
+    /// Stride narrower than the glyph width is still an error.
+    #[test]
+    fn render_into_rejects_stride_smaller_than_glyph_width() {
+        let font = BasicBitmapFont::new();
+        let glyph = font.glyph(b'A' as u32).expect("glyph for 'A' present");
+        let bad_stride = (glyph.width as usize) - 1;
+        let mut buf = vec![0u32; 1024];
+        assert_eq!(
+            glyph.render_into(&mut buf, bad_stride, 0, 0),
+            Err(FontError::InvalidStride)
+        );
     }
 }
