@@ -204,6 +204,7 @@ impl Screen {
             ConsoleCmd::Backspace => {
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
+                    self.blank_cell(self.cursor_row, self.cursor_col, out);
                     out.push(RenderCommand::MoveCursor {
                         row: self.cursor_row,
                         col: self.cursor_col,
@@ -277,7 +278,7 @@ impl Screen {
                 });
             }
             ConsoleCmd::EraseDisplay(_) => { /* not yet — keep the screen */ }
-            ConsoleCmd::EraseLine(_) => { /* not yet — keep the line */ }
+            ConsoleCmd::EraseLine(mode) => self.erase_line(mode, out),
             ConsoleCmd::SetCursorVisible(_) => { /* renderer policy */ }
             ConsoleCmd::Sgr(sgr) => self.apply_sgr(&sgr, out),
         }
@@ -337,6 +338,48 @@ impl Screen {
             self.buf[i] = Cell::blank(self.fg, self.bg);
         }
         out.push(RenderCommand::Scroll { amount: 1 });
+    }
+
+    fn erase_line(&mut self, mode: u16, out: &mut Vec<RenderCommand>) {
+        if self.rows == 0 || self.cols == 0 || self.cursor_row >= self.rows {
+            return;
+        }
+        let row = self.cursor_row;
+        let cursor_col = self.cursor_col.min(self.cols);
+        match mode {
+            0 => {
+                for col in cursor_col..self.cols {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            1 => {
+                let end = cursor_col.min(self.cols.saturating_sub(1));
+                for col in 0..=end {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            2 => {
+                for col in 0..self.cols {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn blank_cell(&mut self, row: u16, col: u16, out: &mut Vec<RenderCommand>) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let idx = row as usize * self.cols as usize + col as usize;
+        self.buf[idx] = Cell::blank(self.fg, self.bg);
+        out.push(RenderCommand::PutGlyph {
+            row,
+            col,
+            codepoint: b' ' as u32,
+            fg: self.fg,
+            bg: self.bg,
+        });
     }
 
     fn clear_buffer(&mut self) {
@@ -474,6 +517,79 @@ mod tests {
         let mut s = Screen::with_geometry(80, 25);
         let _ = feed_str(&mut s, "ABC\r");
         assert_eq!(s.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn backspace_erases_previous_cell() {
+        let mut s = Screen::with_geometry(8, 2);
+        let cmds = feed_str(&mut s, "AB\x08");
+
+        assert_eq!(s.cursor(), (0, 1));
+        assert_eq!(s.cell(0, 1).unwrap().codepoint, b' ' as u32);
+        assert!(
+            cmds.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    RenderCommand::PutGlyph {
+                        row: 0,
+                        col: 1,
+                        codepoint,
+                        ..
+                    } if *codepoint == b' ' as u32
+                )
+            }),
+            "backspace must repaint the erased cell so stale glyphs disappear"
+        );
+    }
+
+    #[test]
+    fn erase_line_zero_clears_from_cursor_to_end() {
+        let mut s = Screen::with_geometry(5, 2);
+        let cmds = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[K");
+
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, b'A' as u32);
+        assert_eq!(s.cell(0, 1).unwrap().codepoint, b'B' as u32);
+        for col in 2..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        let erased = cmds
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    RenderCommand::PutGlyph {
+                        row: 0,
+                        col: 2..=4,
+                        codepoint,
+                        ..
+                    } if *codepoint == b' ' as u32
+                )
+            })
+            .count();
+        assert_eq!(erased, 3, "erase-line must repaint every cleared cell");
+    }
+
+    #[test]
+    fn erase_line_one_clears_start_through_cursor() {
+        let mut s = Screen::with_geometry(5, 2);
+        let _ = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[1K");
+
+        for col in 0..=2 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        assert_eq!(s.cell(0, 3).unwrap().codepoint, b'D' as u32);
+        assert_eq!(s.cell(0, 4).unwrap().codepoint, b'E' as u32);
+    }
+
+    #[test]
+    fn erase_line_two_clears_entire_line() {
+        let mut s = Screen::with_geometry(5, 2);
+        let _ = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[2K");
+
+        for col in 0..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        assert_eq!(s.cursor(), (0, 2));
     }
 
     /// Phase 57 G.4 acceptance: writing past the right edge wraps to

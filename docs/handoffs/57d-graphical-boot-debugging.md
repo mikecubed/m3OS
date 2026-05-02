@@ -145,6 +145,18 @@ fix work landed during the post-merge debugging.
     `TERM_SMOKE:prompt-ready`, syslogd/sshd gate-open logs, and stable
     `pty_bytes=158`. Both still showed one recoverable virtio timeout for
     `owner_pid=19 type=1 sector=2072`, so the timeout root cause is not closed.
+13. **Latest visual terminal validation:** User testing now confirms the
+    graphical prompt appears reliably. The current graphical boot path still
+    bypasses the text `login` interaction and drops directly into Ion as root;
+    treat that as a session/login policy issue, not as a prompt-readiness
+    regression. The terminal renderer had a confirmed stale-cell bug:
+    `ConsoleCmd::Backspace` only moved the cursor, and `EraseLine` (`ESC[K`)
+    was ignored, so deleted characters and shell line-redraw clears were not
+    painted over. The working tree now repaints blanks for backspace and
+    erase-line modes 0/1/2 with host tests. The same interactive log still
+    shows burst-time `CommitSurface` protocol violations after PTY output grows
+    into the tens of KiB; keep that as a separate display-protocol lead if
+    visual glitches remain after the stale-cell fix.
 
 ---
 
@@ -208,6 +220,7 @@ in commit `968b579`.
 | `userspace/term/src/{lib.rs,main.rs}` | Register `term.prompt-ready` after PTY output reaches the prompt-readiness threshold. | `m3os-prompt-ready-fix2.log` and `m3os-prompt-ready-fix3.log` reached `TERM_SMOKE:prompt-ready` and stable `pty_bytes=158`. |
 | `userspace/syslogd/src/main.rs` | Bind `/dev/log`, then wait for `term.prompt-ready` before creating/opening persistent log files; replace zero-duration cooperative backpressure sleeps with timed parking. | `cargo xtask check`; GUI logs show `syslogd: prompt-ready gate open` only after the prompt marker. |
 | `userspace/sshd/src/main.rs` | Wait for `term.prompt-ready` before `/etc/ssh` setup and listener startup, so SSH directory writes do not race the local graphical prompt. | `cargo test -p sshd --target x86_64-unknown-linux-gnu --quiet`; GUI logs show `sshd: prompt-ready gate open` only after the prompt marker. |
+| `userspace/term/src/screen.rs` | Repaint blank cells for backspace and ANSI erase-line modes so shell editing/redraw clears stale glyphs on the graphical terminal. | `cargo test -p term --target x86_64-unknown-linux-gnu --quiet`: 68 tests pass. |
 
 ### Virtio-blk request-slot history
 
@@ -348,11 +361,45 @@ alive, syslogd/sshd block on that service before write-heavy setup, and the
 renderer retains failed display submits for retry. This improves startup
 ordering but does not eliminate the lower-level virtio timeout itself.
 
+### S6 — Terminal stale glyphs and burst-time commit failures (partially fixed)
+
+The first successful user-visible prompt run exposed terminal-rendering bugs
+instead of prompt-liveness bugs:
+
+- Backspace moved the cursor but did not repaint the erased cell, so deleted
+  characters stayed visible until later text overwrote them.
+- ANSI `EraseLine` (`ESC[K`, `ESC[1K`, `ESC[2K`) was ignored, so shell
+  prompt redraws and line editing left stale glyphs behind.
+- After sustained interactive output, `m3os.log` still shows repeated
+  `display_server: client protocol violation; dropping message` paired with
+  `term: display verb ipc_call_buf failed: CommitSurface`. The screen fix does
+  not claim to root-cause that protocol violation; it only fixes the stale-cell
+  redraw path.
+
+The current working tree fixes the first two bullets with host tests. If the
+"only first char on the last line" symptom survives, prioritize the burst-time
+`CommitSurface` protocol failure next.
+
 ---
 
 ## Where to investigate next
 
-### Highest-value lead: remaining virtio write timeout
+### Highest-value lead: burst-time display commit protocol failures
+
+The latest interactive `m3os.log` reaches prompt readiness and handles user
+input, but once PTY output grows under sustained typing/commands it logs many:
+
+```text
+display_server: client protocol violation; dropping message
+term: display verb ipc_call_buf failed: CommitSurface
+```
+
+This is no longer an Ion/VFS/waitpid issue. The next concrete target is to log
+the exact `ProtocolError`/bulk length/opcode in `display_server::client` and
+determine why `DamageSurface` succeeds while the following small
+`CommitSurface` frame is decoded as fatal under output bursts.
+
+### Secondary lead: remaining virtio write timeout
 
 The current prompt-ready mitigation intentionally avoids making early boot
 write-heavy daemons compete with the first shell prompt, but the underlying
@@ -371,7 +418,7 @@ operation writes sector 2072, why the completion is not observed before the
 deadline, and whether the timeout recovery path is missing a final wake or
 whether QEMU/virtqueue notification timing is simply delayed.
 
-### Secondary lead: visual prompt confirmation
+### Tertiary lead: visual prompt confirmation
 
 The Ion null fault and the VFS registered-but-not-receiving window are no longer
 the highest-value leads. In `m3os-vfs-ready-fix.log`, graphical boot is
