@@ -3077,44 +3077,9 @@ pub fn take_message(id: TaskId) -> Option<Message> {
 }
 
 /// Store bulk data alongside a pending message (Phase 52).
-///
-/// Phase 57d follow-up: if the slot already holds a `Some(_)`, the
-/// previous bulk is silently dropped. That signals one of two bug
-/// shapes: (a) a sender did multiple `ipc_send_with_bulk` calls
-/// without the receiver pulling between them — the queued messages
-/// pair with the *latest* bulk, off-by-one cascading into the
-/// display-protocol "valid frame + zero padding" violation
-/// `display_server` sees; or (b) a previous send's `transfer_bulk`
-/// path failed to drain. Either way, log a rate-limited warning so
-/// the next adversarial reproduction surfaces it directly instead of
-/// being inferred from receiver-side noise. Budget is shared with
-/// `BULK_MISMATCH_LOG_BUDGET` in spirit — bumped to 256 so the
-/// fork-child transient-state warnings don't burn the whole budget
-/// at boot.
-static DELIVER_BULK_OVERWRITE_BUDGET: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(256);
-
 pub fn deliver_bulk(id: TaskId, data: alloc::vec::Vec<u8>) {
     let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
-        let prev_len = sched.tasks[idx].pending_bulk.as_ref().map(|v| v.len());
-        if let Some(prev) = prev_len
-            && DELIVER_BULK_OVERWRITE_BUDGET
-                .fetch_update(
-                    core::sync::atomic::Ordering::Relaxed,
-                    core::sync::atomic::Ordering::Relaxed,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-        {
-            log::warn!(
-                "[ipc] deliver_bulk overwrote non-empty pending_bulk slot: task={} \
-                 prev_len={} new_len={}",
-                id.0,
-                prev,
-                data.len()
-            );
-        }
         sched.tasks[idx].pending_bulk = Some(data);
     }
 }

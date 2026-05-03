@@ -9750,6 +9750,17 @@ pub(super) fn sys_fb_reacquire() -> u64 {
     // concurrent claimer cannot race past us, and re-asserts
     // `CONSOLE_YIELDED=true` plus the raw-input routing flag.
     if crate::fb::try_yield_console(pid, raw_input_enabled) {
+        // Phase 57d follow-up — inject break codes for keys possibly
+        // held when the takeover program took over (Enter is the
+        // common stuck case after `fb-takeover doom`). Done here so
+        // it runs only on reclaim, not on the boot-time initial FB
+        // claim where there is no prior input state to clear.
+        // `raw_input_enabled = false` distinguishes a graphical-server
+        // reclaim (display_server is the caller, wants synthetic
+        // releases) from any future caller wanting raw input.
+        if !raw_input_enabled {
+            crate::arch::x86_64::interrupts::inject_release_all_held_modifiers();
+        }
         0
     } else {
         NEG_EBUSY

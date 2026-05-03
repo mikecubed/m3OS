@@ -1457,20 +1457,24 @@ pub fn reset_raw_input_state() {
 /// believes those keys are pressed; the repeat scheduler then emits
 /// repeat events forever (e.g. stuck Enter after exiting doom).
 ///
-/// Called from [`crate::fb::try_yield_console`] when the new owner is
-/// transitioning back to "display_server claims FB but raw input is
-/// disabled" — i.e. a reclaim, not an initial claim. The break codes
-/// are make-code | 0x80 for: Enter (0x9C), LShift (0xAA), RShift
-/// (0xB6), LCtrl (0x9D), LAlt (0xB8), Space (0xB9). Any of these
-/// were possibly held at yield-time and won't be cleared by the
-/// next user keystroke (a fresh down doesn't cancel a prior down in
-/// the scheduler — it just refreshes it).
+/// Called from `sys_fb_reacquire` after a successful FB reclaim so the
+/// injection happens once per takeover session and does not run at
+/// initial display_server boot (where there's no prior input state to
+/// clear, and where pushing synthetic scancodes before kbd_server is
+/// even up could only do harm).
 ///
-/// Other keys (letters, digits, function keys) are left alone —
-/// while they could in theory be held, the user invoking
-/// `fb-takeover doom` and then quitting is overwhelmingly the
-/// stuck-Enter case. If a future use case needs broader coverage,
-/// this list grows.
+/// `SCANCODE_BUF` is normally written by the keyboard ISR (single
+/// producer); calling `push_to_buf` from task context introduces a
+/// second producer, so we wrap with `without_interrupts` on the
+/// current CPU to serialise against IRQ1 here. Other CPUs do not
+/// drive the keyboard ISR (IRQ1 is steered to BSP by the APIC init),
+/// so masking IF on the calling CPU is sufficient.
+///
+/// The break codes are make-code | 0x80 for: Enter (0x9C), LShift
+/// (0xAA), RShift (0xB6), LCtrl (0x9D), LAlt (0xB8), Space (0xB9).
+/// Any of these were possibly held at yield-time and won't be
+/// cleared by the next user keystroke (a fresh down doesn't cancel a
+/// prior down in the scheduler — it just refreshes it).
 pub fn inject_release_all_held_modifiers() {
     // Order is intentional: Enter first because it's the most common
     // stuck case (user hits Enter to launch the takeover program).
@@ -1482,16 +1486,18 @@ pub fn inject_release_all_held_modifiers() {
         0xB8, // LAlt
         0xB9, // Space
     ];
-    for &sc in BREAK_CODES {
-        unsafe {
-            push_to_buf(
-                (&raw mut SCANCODE_BUF).cast::<u8>(),
-                &SCANCODE_BUF_HEAD,
-                &SCANCODE_BUF_TAIL,
-                sc,
-            );
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for &sc in BREAK_CODES {
+            unsafe {
+                push_to_buf(
+                    (&raw mut SCANCODE_BUF).cast::<u8>(),
+                    &SCANCODE_BUF_HEAD,
+                    &SCANCODE_BUF_TAIL,
+                    sc,
+                );
+            }
         }
-    }
+    });
     // Wake kbd_server so it drains the synthetic releases promptly.
     crate::ipc::notification::signal_irq(1);
 }
