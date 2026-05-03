@@ -179,6 +179,50 @@ graphical programs that doesn't involve mode switching. Useful as a
 forcing function to find protocol bugs that single-client `term` +
 `gfx-demo` don't exercise.
 
+## Known Tier 1 reclaim residuals
+
+Tier 1 ships fixes for the most-visible reclaim issues, but two
+input-state-machine corners are tracked here for follow-up:
+
+### Stuck Enter (and other modifier keys) after reclaim — fixed
+
+When the user types `fb-takeover doom` and presses Enter to invoke,
+the Enter press routes to TTY (`kbd_server` sees it, schedules a
+repeat). When `display_server` yields, scancodes route to the RAW
+buffer; the eventual Enter release goes to the takeover program (or
+nowhere) instead of `kbd_server`. After reclaim, `kbd_server`'s
+tracker still believes Enter is held; the repeat scheduler emits
+ENTER repeats forever.
+
+**Fix landed:** the kernel's `try_yield_console`, when called by
+`sys_fb_reacquire` (i.e. the new owner is `display_server` and
+`raw_input_enabled = false`), injects break codes for Enter / Shift
+/ Ctrl / Alt / Space into the TTY scancode buffer. `kbd_server`
+processes them as ordinary key releases and clears the held state.
+
+The set of injected break codes is hand-curated for the common
+stuck-key cases. If a future use-case surfaces a held letter or
+function key, the list grows; doing the full 102-key sweep was
+deemed overkill.
+
+### Mouse pointer resets to top-left after reclaim — open
+
+After reclaim, moving the mouse repaints the screen but the cursor
+position keeps resetting to the top-left corner. The compositor's
+`pointer_position` accumulator likely gets reset (or the mouse-event
+stream emits an absolute-zero event) somewhere in the FB-ownership
+transition path. Needs investigation. Workaround: keep moving the
+mouse until the surface repaints; the cursor will track normally on
+the next event chain.
+
+Hypothesis: PS/2 mouse decoder is delta-only, so `pointer_position`
+is summed in userspace. During yield no events arrive at
+`mouse_server` (events route somewhere else), and on reclaim the
+first event's delta lands at whatever `pointer_position` happens to
+be. If something else clears `pointer_position` to `(0, 0)` on
+reclaim (cursor renderer reset?), every fresh delta starts from
+zero.
+
 ## Decision log
 
 - **2026-05-02:** Tier 1 selected for immediate implementation.

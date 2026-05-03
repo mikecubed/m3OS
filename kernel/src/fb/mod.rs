@@ -987,6 +987,20 @@ pub fn try_yield_console(owner_pid: u32, raw_input_enabled: bool) -> bool {
         Ok(_) => {
             FB_RAW_INPUT_ENABLED.store(raw_input_enabled, Ordering::Release);
             crate::arch::x86_64::interrupts::reset_raw_input_state();
+            // Phase 57d follow-up — when display_server reclaims FB
+            // ownership after a fullscreen takeover, inject break
+            // codes into the TTY scancode buffer so kbd_server's
+            // tracker / repeat scheduler clears any keys that were
+            // held at yield-time but whose release scancodes went to
+            // the RAW buffer (e.g. the Enter the user held to launch
+            // `fb-takeover doom`). Detected by `!raw_input_enabled`:
+            // this distinguishes a graphical-server reclaim
+            // (which wants synthetic releases) from a takeover
+            // program acquiring the FB (which wants the real
+            // scancodes to flow to RAW).
+            if !raw_input_enabled {
+                crate::arch::x86_64::interrupts::inject_release_all_held_modifiers();
+            }
             // Hold the console lock while flipping the flag so write_str
             // cannot slip through between the CAS and the flag transition.
             let _guard = CONSOLE.lock();

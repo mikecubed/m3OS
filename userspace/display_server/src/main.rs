@@ -343,6 +343,15 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // composer would race the takeover program on FB pages it no
     // longer owns.
     let mut fb_yielded = false;
+    // Phase 57d follow-up — post-reclaim full-screen background fill.
+    // Set to `true` by the reclaim handler so the next compose tick
+    // calls `fill_background` before `run_compose`. Without this, any
+    // pixels the takeover program drew outside our toplevel surfaces
+    // (e.g. the doom HUD area when term's surface is centered and
+    // smaller than the FB) keep showing through — the pure-logic
+    // `run_compose` only paints surface and cursor regions, so the
+    // background gutter would still display whatever doom left there.
+    let mut needs_post_reclaim_fill = false;
     // Phase 57d follow-up — small ring of recently dispatched verb
     // frames so the next protocol-violation log can show whether the
     // failing bulk was preceded by a structurally similar frame, and
@@ -604,6 +613,26 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             syscall_lib::frame_tick_drain()
         };
         if ticks > 0 {
+            // Phase 57d follow-up — post-reclaim full-screen fill.
+            // After Tier 1 fullscreen-takeover, the takeover program
+            // (e.g. doom) drew over the entire FB. `run_compose`
+            // below only paints surface and cursor regions; any
+            // background gutter would still show doom's last frame.
+            // Reset the cursor-damage tracking too so the cursor is
+            // redrawn at the current position rather than computing
+            // damage against a "previous" pointer that referred to
+            // pre-yield FB state.
+            if needs_post_reclaim_fill {
+                if let Err(_e) = fill_background(&mut owner) {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: post-reclaim background fill failed\n",
+                    );
+                }
+                compose_ctx = ComposeContext::new();
+                needs_post_reclaim_fill = false;
+            }
+
             // E.3 — gate has moved into `run_compose`. The composer
             // checks both `registry.has_damage()` AND pointer-motion
             // damage (via `cursor_damage`); a tick with no surface
@@ -811,6 +840,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &owner,
             &mut input_wiring,
             &mut fb_yielded,
+            &mut needs_post_reclaim_fill,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -851,6 +881,7 @@ fn serve_one_control_request(
     fb_owner: &KernelFramebufferOwner,
     input_wiring: &mut InputWiring,
     fb_yielded: &mut bool,
+    needs_post_reclaim_fill: &mut bool,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -899,9 +930,12 @@ fn serve_one_control_request(
     let n = if let Ok((cmd, _)) = decode_command(&req_buf[..bulk_len]) {
         match cmd {
             ControlCommand::YieldFb => handle_fb_yield_request(fb_yielded, &mut reply_buf),
-            ControlCommand::ReclaimFb => {
-                handle_fb_reclaim_request(registry, fb_yielded, &mut reply_buf)
-            }
+            ControlCommand::ReclaimFb => handle_fb_reclaim_request(
+                registry,
+                fb_yielded,
+                needs_post_reclaim_fill,
+                &mut reply_buf,
+            ),
             _ => {
                 let client = control::ClientId(0);
                 let pixel_reader =
@@ -1108,10 +1142,15 @@ fn handle_fb_yield_request(fb_yielded: &mut bool, reply_buf: &mut [u8]) -> usize
 /// On success, marks every live surface dirty so the next compose
 /// pass repaints the screen — between yield and reclaim the takeover
 /// program drew over the FB and any cached compose state is now
-/// stale.
+/// stale. Also sets `needs_post_reclaim_fill` so the next compose
+/// tick `fill_background`s the entire FB before running compose:
+/// surface blits only paint surface and cursor regions, leaving any
+/// background gutter (where doom drew but our toplevels don't cover)
+/// showing whatever the takeover program left behind.
 fn handle_fb_reclaim_request(
     registry: &mut SurfaceRegistry,
     fb_yielded: &mut bool,
+    needs_post_reclaim_fill: &mut bool,
     reply_buf: &mut [u8],
 ) -> usize {
     use kernel_core::display::control::{ControlErrorCode, ControlEvent};
@@ -1133,6 +1172,7 @@ fn handle_fb_reclaim_request(
     }
     registry.mark_all_dirty();
     *fb_yielded = false;
+    *needs_post_reclaim_fill = true;
     syscall_lib::write_str(
         STDOUT_FILENO,
         "display_server: framebuffer reclaimed; full repaint queued\n",

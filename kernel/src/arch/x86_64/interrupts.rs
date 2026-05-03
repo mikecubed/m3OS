@@ -1444,6 +1444,58 @@ pub fn reset_raw_input_state() {
     });
 }
 
+/// Phase 57d follow-up — inject break codes for commonly-held keys into
+/// the TTY scancode buffer so `kbd_server`'s modifier tracker and
+/// repeat scheduler clear any state stuck across a fullscreen-takeover
+/// session.
+///
+/// Background: while a takeover program (e.g. doom) owns the FB,
+/// scancodes route to the RAW buffer and `kbd_server` sees nothing —
+/// any release scancodes for keys held at yield-time go to the
+/// takeover program. When ownership returns to `display_server`,
+/// `kbd_server` resumes reading from TTY but its tracker still
+/// believes those keys are pressed; the repeat scheduler then emits
+/// repeat events forever (e.g. stuck Enter after exiting doom).
+///
+/// Called from [`crate::fb::try_yield_console`] when the new owner is
+/// transitioning back to "display_server claims FB but raw input is
+/// disabled" — i.e. a reclaim, not an initial claim. The break codes
+/// are make-code | 0x80 for: Enter (0x9C), LShift (0xAA), RShift
+/// (0xB6), LCtrl (0x9D), LAlt (0xB8), Space (0xB9). Any of these
+/// were possibly held at yield-time and won't be cleared by the
+/// next user keystroke (a fresh down doesn't cancel a prior down in
+/// the scheduler — it just refreshes it).
+///
+/// Other keys (letters, digits, function keys) are left alone —
+/// while they could in theory be held, the user invoking
+/// `fb-takeover doom` and then quitting is overwhelmingly the
+/// stuck-Enter case. If a future use case needs broader coverage,
+/// this list grows.
+pub fn inject_release_all_held_modifiers() {
+    // Order is intentional: Enter first because it's the most common
+    // stuck case (user hits Enter to launch the takeover program).
+    const BREAK_CODES: &[u8] = &[
+        0x9C, // Enter
+        0xAA, // LShift
+        0xB6, // RShift
+        0x9D, // LCtrl
+        0xB8, // LAlt
+        0xB9, // Space
+    ];
+    for &sc in BREAK_CODES {
+        unsafe {
+            push_to_buf(
+                (&raw mut SCANCODE_BUF).cast::<u8>(),
+                &SCANCODE_BUF_HEAD,
+                &SCANCODE_BUF_TAIL,
+                sc,
+            );
+        }
+    }
+    // Wake kbd_server so it drains the synthetic releases promptly.
+    crate::ipc::notification::signal_irq(1);
+}
+
 #[inline(always)]
 unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte: u8) {
     let t = tail.load(Ordering::Relaxed);
