@@ -1,6 +1,10 @@
 # Fullscreen-takeover tiers
 
-**Status:** Tier 1 landed (Phase 57d follow-up). Tiers 2 and 3 deferred.
+**Status:** Tier 1 landed and shipping. First-takeover path verified
+working. Second-takeover-hang and mouse-pointer-reset residuals open
+(see "Known Tier 1 reclaim residuals"). Tiers 2 and 3 deferred.
+
+**Branch:** `feat/57d-voluntary-preemption` — head at `8619928`.
 
 **Source ref:** Discussion during the 57d-graphical-boot-debugging session,
 prompted by doom hanging silently because `display_server` owned the
@@ -194,44 +198,97 @@ nowhere) instead of `kbd_server`. After reclaim, `kbd_server`'s
 tracker still believes Enter is held; the repeat scheduler emits
 ENTER repeats forever.
 
-**Fix landed:** the kernel's `try_yield_console`, when called by
-`sys_fb_reacquire` (i.e. the new owner is `display_server` and
-`raw_input_enabled = false`), injects break codes for Enter / Shift
-/ Ctrl / Alt / Space into the TTY scancode buffer. `kbd_server`
-processes them as ordinary key releases and clears the held state.
+**Fix landed:** the kernel's `try_yield_console`, when transferring
+the console to a non-raw owner (i.e. `raw_input_enabled = false`),
+injects break codes for Enter / Shift / Ctrl / Alt / Space into the
+TTY scancode buffer via `inject_release_all_held_modifiers`.
+`kbd_server` processes them as ordinary key releases and clears the
+held state. The injection is wrapped in `without_interrupts` so it
+isn't racy against the keyboard ISR (regression caught in
+`c643ab1`).
 
 The set of injected break codes is hand-curated for the common
 stuck-key cases. If a future use-case surfaces a held letter or
 function key, the list grows; doing the full 102-key sweep was
 deemed overkill.
 
+**Empirical quirk — keep the boot-time fire:** `try_yield_console`
+is called twice in a normal session — once at boot when
+`display_server` does its initial `sys_fb_acquire`, and again on
+every `sys_fb_reacquire` after a takeover. The boot-time call is
+*semantically* a no-op (no keys held, `kbd_server`'s tracker is
+empty), but commit `8619928` established that removing the
+boot-time inject — even with the inject still firing on every
+reclaim — regresses the *first* `fb-takeover doom` invocation in
+the session: doom mmaps the FB, prints its banner, then wedges in
+`BlockedOnReply` on its next IPC. Restoring the boot-time fire
+makes the first invocation work again. The actual upstream cause
+of why exercising the kbd_server → display_server input pipeline
+at boot matters is unresolved; investigation lead below under
+"Second consecutive `fb-takeover doom` hangs".
+
 ### Second consecutive `fb-takeover doom` hangs — open
 
 The first `fb-takeover doom` invocation in a session works end-to-end
 (framebuffer mmap, WAD load, gameplay, exit, reclaim). A second
 invocation in the same session hangs: doom (the new pid) maps the FB
-successfully, then stays in `BlockedOnReply` indefinitely on its
-first kernel-internal IPC. The watchdog's 30-second "no waker
-registered" warning fires repeatedly with the same `stuck-since`
-counter incrementing — i.e. doom is genuinely wedged on a single
-call, not just slow.
+successfully, prints its DG_Init / GPL banner over the PTY, then stays
+in `BlockedOnReply` indefinitely on its next kernel-internal IPC.
+The watchdog's 30-second "no waker registered" warning fires
+repeatedly (200+ times in some runs) with the same `stuck-since`
+counter incrementing monotonically — i.e. doom is genuinely wedged
+on a single call, not just slow.
 
-The disk subsystem is alive at the time (a `virtio-blk completion
-poll + queue notify after request timeout owner_pid=11 type=0
-sector=N completed=true` warning indicates the reply request did
-finish — the polling path caught a missed IRQ — but the requester
-chain didn't propagate the wake).
+The disk subsystem is alive at the time:
+- In some runs a `virtio-blk completion poll + queue notify after
+  request timeout owner_pid=11 type=0 sector=N completed=true`
+  warning indicates the reply request did finish (the polling path
+  caught a missed IRQ) but the requester chain didn't propagate the
+  wake.
+- In other runs (the most recent test against `8619928`) there are
+  *no* virtio-blk timeouts — the hang is purely IPC-wake propagation,
+  not disk I/O.
 
-Hypotheses to investigate:
+The same boot-time-inject quirk noted above (removing the boot-time
+inject regresses the *first* takeover) almost certainly shares an
+upstream cause with this second-takeover hang: both are about
+something in the kbd_server → display_server input pipeline that
+needs to have been "exercised" before doom can complete its first
+non-FB IPC, and the once-only exercise from boot doesn't carry over
+to a second takeover in the same session.
+
+Hypotheses to investigate (in priority order):
+- The reclaim path doesn't re-arm whatever the boot-time path arms.
+  Compare the post-`sys_fb_reacquire` state of `kbd_server`'s
+  endpoint, `display_server`'s bind tables, and any cross-process
+  notification subscriptions against the post-boot state. A
+  diff that's empty at boot but non-empty after the first reclaim
+  is the smoking gun.
 - Stale `Reply` capability or pending-message slot left over from
   the first session that displaces the second session's reply
-  delivery.
+  delivery. doom's exit cleanup may not be tearing down its
+  endpoint state cleanly enough that the next takeover starts with
+  a clean inbox.
 - virtio-blk waiter slot or `ACTIVE_REQUEST_*` state not fully
   cleared between sessions, causing the post-completion wake to
-  target the wrong (now-gone) task.
+  target the wrong (now-gone) task. Ruled less likely by the
+  no-virtio-blk-timeout run, but waiter-slot leaks could still
+  affect the wake-propagation chain via vfs_server.
 - Task-ID recycling across sessions interacting with cached IPC
   state somewhere (display_server's bind tables, vfs_server's
   open-handle map, etc.).
+- doom-side: doom's per-process state (NCURSES tty mode, signal
+  handlers from the previous run's exit path) somehow persists in a
+  shared resource. Less likely — doom is fork+exec'd as a fresh
+  process each time — but worth ruling out by capturing the second
+  doom's `/proc`-equivalent state at the hang point.
+
+Suggested next investigation step: instrument the kernel scheduler
+to dump every `BlockedOnReply` task's `pending_msg`, its endpoint
+binding, and the corresponding endpoint's wait queue when the
+watchdog fires. The wedge is on a *specific* IPC reply that never
+lands; identifying which endpoint and which expected reply is the
+fastest path to the root cause.
 
 Workaround: reboot between doom sessions. The first run still
 works.
@@ -267,3 +324,23 @@ zero.
 - **2026-05-02:** Tier 3 deferred. Reason: out of scope for the
   current debug session; the goal was "make doom work today", not
   "make doom architecturally correct".
+- **2026-05-03:** Boot-time `inject_release_all_held_modifiers`
+  retained as a workaround. Removing it (commit `c643ab1`) regressed
+  the first-takeover path; restoring it (commit `8619928`) fixes
+  first-takeover but does not address the second-takeover hang.
+  The injection is treated as load-bearing until the upstream
+  IPC-wake-propagation cause is identified.
+
+## Commit log (current branch)
+
+| Commit | Subject | Notes |
+|---|---|---|
+| `43fa68e` | feat(display): Tier 1 fullscreen takeover via yield/reclaim FB | Original Tier 1 landing. |
+| `1445c04` | fix(doom): exit with clear error when framebuffer unavailable | Replaces the silent doom-runs-blind failure mode. |
+| `6423e9e` | fix(input): stop dropping 0xAA — it's the LSHIFT break code | Decoder no longer eats LSHIFT releases. |
+| `4a3cddd` | fix(fb-takeover): resolve relative names + route diagnostics to serial | `/bin/` prefix + serial_print so yield-time diagnostics survive. |
+| `6ebd713` | fix(fb-takeover): full background fill + clear stuck modifiers on reclaim | First version of the modifier-release inject. |
+| `58b5a70` | fix(display): tolerate stale-tail bulks + surveil the IPC desync | Loosened protocol decoder: `consumed > bulk.len()` instead of `!=`. |
+| `c643ab1` | fix(ipc): revert deliver_bulk warning + harden modifier-release inject | Reverts a `log::warn!` while holding `scheduler_lock` that starved IPC; wraps the inject in `without_interrupts`. **Also moved the inject out of `try_yield_console`'s boot path — this is the regression `8619928` undoes.** |
+| `0968c0c` | fix(ipc): drop false-positive bulk_mismatch warnings; doc 2nd-doom hang | Removes `log_bulk_mismatch` (false positives on VFS_READ where `data[1]=offset`). |
+| `8619928` | fix(fb): restore boot-time inject so first doom takeover works again | Current head. Restores the working `6ebd713` pattern of inject inside `try_yield_console` while keeping the `c643ab1` IRQ-safety wrapping. |
