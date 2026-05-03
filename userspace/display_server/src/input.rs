@@ -515,86 +515,103 @@ impl InputWiring {
         bind_table: &kernel_core::input::bind_table::BindTable,
         grab_state: &mut kernel_core::input::bind_table::GrabState,
     ) -> Vec<InputEffect> {
+        // Per-pass drain cap. Previously this fn drained the full kbd
+        // queue in a `while let Some(...)` loop *before* polling the
+        // mouse at all. While a key was held the autorepeat stream kept
+        // `kbd.poll_key()` returning Some, so the inner loop never
+        // exited and the pointer drain was starved — the visible
+        // symptom was "mouse cursor freezes while a key is held, jumps
+        // to the new position on release". Bounding each source at
+        // [`MAX_DRAINS_PER_PASS`] events per pass and interleaving the
+        // two polls means the pointer is always serviced once per
+        // iteration of this loop, regardless of how busy the keyboard
+        // is. The main loop iterates roughly 1 kHz, so the cap still
+        // sustains thousands of events per second per source, well
+        // above PS/2's physical throughput.
+        const MAX_DRAINS_PER_PASS: usize = 8;
+
         let mut effects = Vec::new();
-
-        // Drain all keyboard events first — they cannot move the
-        // pointer, so order-relative-to-pointer does not matter for
-        // correctness.
-        while let Some(ev) = kbd.poll_key() {
-            let mut state = CompositorState {
-                focused,
-                active_exclusive_layer,
-                pointer_position,
-                surface_geometry,
-                bind_table,
-                grab_state,
-            };
-            match dispatcher.route_key_event(&ev, &mut state) {
-                RouteDecision::DeliverTo(_id) => {
-                    effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
-                }
-                RouteDecision::Grab(id) => {
-                    effects.push(InputEffect::BindTriggered { id: id.raw() });
-                }
-                RouteDecision::Drop => {
-                    // Suppressed (post-grab Repeat/Up, or no focus).
-                }
-                // `RouteDecision` is `#[non_exhaustive]` so future
-                // variants (e.g. `BoundCursorOnly`) do not break the
-                // match. Treat them as suppressed until specific
-                // wiring lands.
-                _ => {}
-            }
-        }
-
-        // Drain pointer events. Each event can produce an enter/leave
-        // pair *and* a delivery, plus an optional focus change. We
-        // also always emit a `CursorMoved` effect with the
-        // compositor-integrated absolute position so the framebuffer
-        // cursor follows the pointer even when no surface is under it.
         let mut current_pointer = pointer_position;
-        while let Some(mut ev) = mouse.poll_pointer() {
-            // Integrate relative `dx` / `dy` into a new absolute
-            // position. Keep `abs_position` if the source already
-            // carries one (future absolute pointer like USB tablet).
-            let abs = match ev.abs_position {
-                Some(p) => p,
-                None => (
-                    current_pointer.0.saturating_add(ev.dx),
-                    current_pointer.1.saturating_add(ev.dy),
-                ),
-            };
-            // Stamp the compositor-maintained absolute position back
-            // into the event so any client that receives it via the
-            // Outbound branch (when a surface is under the cursor)
-            // sees the same coordinates the dispatcher hit-tested
-            // against.
-            ev.abs_position = Some(abs);
-            current_pointer = abs;
-            let mut state = CompositorState {
-                focused,
-                active_exclusive_layer,
-                pointer_position: abs,
-                surface_geometry,
-                bind_table,
-                grab_state,
-            };
-            let decision: PointerRouteDecision = dispatcher.route_pointer_event(&ev, &mut state);
-            // Emit the new compositor-maintained position regardless
-            // of routing. The cursor blit in `compose.rs` needs this
-            // to follow motion when the pointer is over no surface.
-            effects.push(InputEffect::CursorMoved(abs));
-            for (sid, kind) in decision.enter_leave.iter() {
-                effects.push(match kind {
-                    EnterOrLeave::Enter => InputEffect::PointerEnter(sid),
-                    EnterOrLeave::Leave => InputEffect::PointerLeave(sid),
-                });
+
+        for _ in 0..MAX_DRAINS_PER_PASS {
+            let key_ev = kbd.poll_key();
+            let ptr_ev = mouse.poll_pointer();
+            if key_ev.is_none() && ptr_ev.is_none() {
+                break;
             }
-            if decision.deliver_to.is_some() {
-                effects.push(InputEffect::Outbound(ServerMessage::Pointer(ev)));
+
+            if let Some(ev) = key_ev {
+                let mut state = CompositorState {
+                    focused,
+                    active_exclusive_layer,
+                    pointer_position: current_pointer,
+                    surface_geometry,
+                    bind_table,
+                    grab_state,
+                };
+                match dispatcher.route_key_event(&ev, &mut state) {
+                    RouteDecision::DeliverTo(_id) => {
+                        effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
+                    }
+                    RouteDecision::Grab(id) => {
+                        effects.push(InputEffect::BindTriggered { id: id.raw() });
+                    }
+                    RouteDecision::Drop => {
+                        // Suppressed (post-grab Repeat/Up, or no focus).
+                    }
+                    // `RouteDecision` is `#[non_exhaustive]` so future
+                    // variants (e.g. `BoundCursorOnly`) do not break
+                    // the match. Treat them as suppressed until
+                    // specific wiring lands.
+                    _ => {}
+                }
             }
-            if let Some(target) = decision.focus_change {
-                effects.push(InputEffect::FocusChanged(target));
+
+            if let Some(mut ev) = ptr_ev {
+                // Integrate relative `dx` / `dy` into a new absolute
+                // position. Keep `abs_position` if the source already
+                // carries one (future absolute pointer like USB tablet).
+                let abs = match ev.abs_position {
+                    Some(p) => p,
+                    None => (
+                        current_pointer.0.saturating_add(ev.dx),
+                        current_pointer.1.saturating_add(ev.dy),
+                    ),
+                };
+                // Stamp the compositor-maintained absolute position
+                // back into the event so any client that receives it
+                // via the Outbound branch (when a surface is under the
+                // cursor) sees the same coordinates the dispatcher
+                // hit-tested against.
+                ev.abs_position = Some(abs);
+                current_pointer = abs;
+                let mut state = CompositorState {
+                    focused,
+                    active_exclusive_layer,
+                    pointer_position: abs,
+                    surface_geometry,
+                    bind_table,
+                    grab_state,
+                };
+                let decision: PointerRouteDecision =
+                    dispatcher.route_pointer_event(&ev, &mut state);
+                // Emit the new compositor-maintained position
+                // regardless of routing. The cursor blit in
+                // `compose.rs` needs this to follow motion when the
+                // pointer is over no surface.
+                effects.push(InputEffect::CursorMoved(abs));
+                for (sid, kind) in decision.enter_leave.iter() {
+                    effects.push(match kind {
+                        EnterOrLeave::Enter => InputEffect::PointerEnter(sid),
+                        EnterOrLeave::Leave => InputEffect::PointerLeave(sid),
+                    });
+                }
+                if decision.deliver_to.is_some() {
+                    effects.push(InputEffect::Outbound(ServerMessage::Pointer(ev)));
+                }
+                if let Some(target) = decision.focus_change {
+                    effects.push(InputEffect::FocusChanged(target));
+                }
             }
         }
 
