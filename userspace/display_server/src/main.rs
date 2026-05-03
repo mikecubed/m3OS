@@ -708,6 +708,21 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 write_u32(pointer_position.0.max(0) as u32);
                 syscall_lib::write_str(STDOUT_FILENO, ",");
                 write_u32(pointer_position.1.max(0) as u32);
+                let mbytes = syscall_lib::ps2_diag_counter(0);
+                let mpackets = syscall_lib::ps2_diag_counter(1);
+                let mdrops = syscall_lib::ps2_diag_counter(2);
+                let irq1 = syscall_lib::ps2_diag_counter(3);
+                let irq12 = syscall_lib::ps2_diag_counter(4);
+                syscall_lib::write_str(STDOUT_FILENO, " irq1=");
+                write_u32(irq1 as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " irq12=");
+                write_u32(irq12 as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mbytes=");
+                write_u32(mbytes as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mpkts=");
+                write_u32(mpackets as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mdrops=");
+                write_u32(mdrops as u32);
                 syscall_lib::write_str(STDOUT_FILENO, "\n");
             }
             match compose_result {

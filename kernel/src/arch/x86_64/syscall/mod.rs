@@ -1443,6 +1443,13 @@ mod syscall_nr {
     /// success, `NEG_EBUSY` if some other process currently owns the
     /// framebuffer, `NEG_ENOENT` if the caller has no FB VMA.
     pub const FB_REACQUIRE: u64 = 0x101D;
+    /// Diagnostic: read one of the PS/2 ISR counters. `arg0` selects
+    /// the counter (0=mouse_bytes_seen, 1=mouse_packets_produced,
+    /// 2=mouse_ring_drops, 3=irq1_entries, 4=irq12_entries). Returns
+    /// the counter value as a u64; an out-of-range selector returns 0.
+    /// Used by display_server's compose-log line during the held-key
+    /// cursor-freeze investigation. Strip once root-caused.
+    pub const PS2_DIAG_COUNTER: u64 = 0x101E;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1820,6 +1827,7 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
         FB_YIELD => sys_fb_yield(),
         FB_REACQUIRE => sys_fb_reacquire(),
+        PS2_DIAG_COUNTER => sys_ps2_diag_counter(arg0),
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
@@ -9768,6 +9776,19 @@ pub(super) fn sys_fb_reacquire() -> u64 {
 // copy, `NEG_EAGAIN` when the ring is empty, and `NEG_EINVAL` / `NEG_EFAULT`
 // for invalid pointer / length / copy_to_user failure.
 // ---------------------------------------------------------------------------
+
+/// Diagnostic: read one of the PS/2 ISR counters. See `PS2_DIAG_COUNTER`.
+pub(super) fn sys_ps2_diag_counter(selector: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    match selector {
+        0 => super::ps2::MOUSE_BYTES_SEEN.load(Ordering::Relaxed),
+        1 => super::ps2::MOUSE_PACKETS_PRODUCED.load(Ordering::Relaxed),
+        2 => super::ps2::MOUSE_RING_DROPS.load(Ordering::Relaxed),
+        3 => super::ps2::IRQ1_ENTRIES.load(Ordering::Relaxed),
+        4 => super::ps2::IRQ12_ENTRIES.load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
 
 pub(super) fn sys_read_mouse_packet(buf_ptr: u64, buf_len: u64) -> u64 {
     if buf_ptr == 0 || (buf_len as usize) < super::ps2::MOUSE_PACKET_WIRE_SIZE {

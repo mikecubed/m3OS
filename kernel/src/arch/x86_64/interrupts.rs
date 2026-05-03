@@ -1617,6 +1617,7 @@ fn ps2_drain_all_bytes() {
 }
 
 extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+    super::ps2::IRQ1_ENTRIES.fetch_add(1, Ordering::Relaxed);
     ps2_drain_all_bytes();
 
     if USING_APIC.load(Ordering::Relaxed) {
@@ -1644,6 +1645,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
 extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
+    super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);
     // Both kbd and mouse bytes drain through the same helper — see the
     // doc comment on `ps2_drain_all_bytes` for why each ISR drains
     // both byte types.

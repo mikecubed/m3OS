@@ -270,6 +270,8 @@ pub const SYS_FRAME_TICK_HZ: u64 = 0x1016;
 
 /// Phase 56 Track B.3: drain pending frame-tick events (saturating).
 pub const SYS_FRAME_TICK_DRAIN: u64 = 0x1017;
+/// Diagnostic: read one PS/2 ISR counter. See [`ps2_diag_counter`].
+pub const SYS_PS2_DIAG_COUNTER: u64 = 0x101E;
 
 /// Phase 57d follow-up: allocate a shared-memory region.
 /// `sys_shm_create(byte_len)` returns the new ShmId in the low 32 bits;
@@ -2178,6 +2180,21 @@ pub fn frame_tick_hz() -> u32 {
 /// (saturating coalesce). Never blocks; returns 0 if no ticks elapsed.
 pub fn frame_tick_drain() -> u32 {
     unsafe { syscall0(SYS_FRAME_TICK_DRAIN) as u32 }
+}
+
+/// Diagnostic: read one of the PS/2 ISR counters by selector.
+///
+/// Selectors:
+/// - 0: total mouse bytes seen by `feed_byte_isr`
+/// - 1: total mouse packets produced by the decoder
+/// - 2: total mouse-ring overwrites (drops)
+/// - 3: total IRQ1 (keyboard) handler entries
+/// - 4: total IRQ12 (mouse) handler entries
+///
+/// Used by `display_server`'s diagnostic compose-log line during the
+/// held-key cursor-freeze investigation. Strip once root-caused.
+pub fn ps2_diag_counter(selector: u64) -> u64 {
+    unsafe { syscall1(SYS_PS2_DIAG_COUNTER, selector) }
 }
 
 /// Allocate a shared-memory region of `byte_len` bytes. The buddy
