@@ -680,6 +680,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
             if entry_count <= 5 || entry_count.is_multiple_of(60) {
                 let total_writes = DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
+                let key_some =
+                    input::DIAG_KEY_DRAINS_SOME.load(core::sync::atomic::Ordering::Relaxed);
+                let key_none =
+                    input::DIAG_KEY_DRAINS_NONE.load(core::sync::atomic::Ordering::Relaxed);
+                let ptr_some =
+                    input::DIAG_PTR_DRAINS_SOME.load(core::sync::atomic::Ordering::Relaxed);
+                let ptr_none =
+                    input::DIAG_PTR_DRAINS_NONE.load(core::sync::atomic::Ordering::Relaxed);
                 syscall_lib::write_str(STDOUT_FILENO, "display_server: compose#");
                 write_u32(entry_count as u32);
                 syscall_lib::write_str(STDOUT_FILENO, " ");
@@ -688,6 +696,18 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 write_u32(writes_this as u32);
                 syscall_lib::write_str(STDOUT_FILENO, " total=");
                 write_u32(total_writes as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " keys=");
+                write_u32(key_some as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "/");
+                write_u32(key_none as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " ptrs=");
+                write_u32(ptr_some as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "/");
+                write_u32(ptr_none as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " pos=");
+                write_u32(pointer_position.0.max(0) as u32);
+                syscall_lib::write_str(STDOUT_FILENO, ",");
+                write_u32(pointer_position.1.max(0) as u32);
                 syscall_lib::write_str(STDOUT_FILENO, "\n");
             }
             match compose_result {

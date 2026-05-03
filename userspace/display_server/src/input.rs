@@ -59,6 +59,20 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Diagnostic counter — total `KeyEvent`s drained from `kbd_server`
+/// since boot. Incremented in [`InputWiring::drain_inner`] each time
+/// `kbd.poll_key()` returns `Some`.
+pub static DIAG_KEY_DRAINS_SOME: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — `kbd.poll_key()` calls that returned `None`.
+pub static DIAG_KEY_DRAINS_NONE: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — total `PointerEvent`s drained from
+/// `mouse_server` since boot.
+pub static DIAG_PTR_DRAINS_SOME: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — `mouse.poll_pointer()` calls that returned
+/// `None`.
+pub static DIAG_PTR_DRAINS_NONE: AtomicU64 = AtomicU64::new(0);
 
 use kernel_core::display::protocol::{ServerMessage, SurfaceId};
 use kernel_core::input::dispatch::{
@@ -536,6 +550,16 @@ impl InputWiring {
         for _ in 0..MAX_DRAINS_PER_PASS {
             let key_ev = kbd.poll_key();
             let ptr_ev = mouse.poll_pointer();
+            if key_ev.is_some() {
+                DIAG_KEY_DRAINS_SOME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DIAG_KEY_DRAINS_NONE.fetch_add(1, Ordering::Relaxed);
+            }
+            if ptr_ev.is_some() {
+                DIAG_PTR_DRAINS_SOME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DIAG_PTR_DRAINS_NONE.fetch_add(1, Ordering::Relaxed);
+            }
             if key_ev.is_none() && ptr_ev.is_none() {
                 break;
             }
