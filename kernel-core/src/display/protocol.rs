@@ -114,6 +114,8 @@ const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
 // grab-hook regression to drive a chord through the input dispatcher
 // without needing real PS/2 scancode hardware events.
 const OP_CTL_INJECT_KEY: u16 = 0x020A;
+const OP_CTL_YIELD_FB: u16 = 0x020B;
+const OP_CTL_RECLAIM_FB: u16 = 0x020C;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -450,6 +452,25 @@ pub enum ControlCommand {
         keycode: u32,
         kind: u8,
     },
+    /// Phase 57d follow-up — Tier 1 fullscreen-takeover yield.
+    ///
+    /// Tells `display_server` to release framebuffer ownership without
+    /// shutting down: the compose loop pauses, the kernel `FB_YIELD`
+    /// syscall is issued (so a fullscreen program like `doom` can
+    /// `FRAMEBUFFER_MMAP` the screen), and the existing FB VMA stays
+    /// alive for fast resume. Issued by `/bin/fb-takeover` before
+    /// fork/exec'ing the takeover program. See
+    /// `docs/appendix/fb-takeover-tiers.md` for the full state
+    /// transition table.
+    YieldFb,
+    /// Phase 57d follow-up — Tier 1 fullscreen-takeover reclaim.
+    ///
+    /// Counterpart to [`ControlCommand::YieldFb`]. Tells
+    /// `display_server` to re-acquire framebuffer ownership (via
+    /// `FB_REACQUIRE`) and resume the compose loop, marking every
+    /// surface dirty so the next compose pass repaints the screen.
+    /// Issued after the takeover program exits.
+    ReclaimFb,
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -1135,6 +1156,9 @@ impl ControlCommand {
                 body[2..6].copy_from_slice(&keycode.to_le_bytes());
                 body[6] = *kind;
             }),
+            // Phase 57d follow-up — Tier 1 fullscreen-takeover yield.
+            Self::YieldFb => encode_fixed_body(buf, OP_CTL_YIELD_FB, 0, |_| {}),
+            Self::ReclaimFb => encode_fixed_body(buf, OP_CTL_RECLAIM_FB, 0, |_| {}),
         }
     }
 
@@ -1201,6 +1225,14 @@ impl ControlCommand {
                     keycode: read_u32(body, 2)?,
                     kind: body[6],
                 }
+            }
+            OP_CTL_YIELD_FB => {
+                expect_body_len(body_len, 0)?;
+                Self::YieldFb
+            }
+            OP_CTL_RECLAIM_FB => {
+                expect_body_len(body_len, 0)?;
+                Self::ReclaimFb
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };

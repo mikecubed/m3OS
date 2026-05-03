@@ -248,6 +248,11 @@ static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
 // via the standard service-config path (`command=/bin/term`).
 static TERM_ELF: &[u8] = generated_initrd_asset!("term");
 
+// Phase 57d follow-up — Tier 1 fullscreen-takeover wrapper. Exposed
+// under /bin so `term` (and the post-login shell) can run
+// `fb-takeover /bin/doom`. Not a daemon: no `.conf`.
+static FB_TAKEOVER_ELF: &[u8] = generated_initrd_asset!("fb-takeover");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -655,6 +660,16 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     // Phase 56 Track E.4: minimal control-socket CLI. Not a daemon
     // — invoked by the shell or test harness; no `.conf` required.
     ("m3ctl", RamdiskNode::File { content: M3CTL_ELF }),
+    // Phase 57d follow-up — Tier 1 fullscreen-takeover wrapper.
+    // Invoked manually from the shell (`fb-takeover /bin/doom`) so
+    // doom can paint directly to the framebuffer between
+    // `display_server` yield and reclaim. Not a daemon.
+    (
+        "fb-takeover",
+        RamdiskNode::File {
+            content: FB_TAKEOVER_ELF,
+        },
+    ),
     // Phase 56 Track F.2: display-service crash-and-restart smoke
     // client. Not a daemon; invoked from the post-login shell by the
     // F.2 regression. No `.conf` required.

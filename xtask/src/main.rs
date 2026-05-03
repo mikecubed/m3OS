@@ -463,6 +463,11 @@ fn build_userspace_bins() {
         // provider, ANSI parser) and uses `alloc` types in the screen
         // and renderer paths.
         ("term", "term", true),
+        // Phase 57d follow-up — Tier 1 fullscreen-takeover wrapper.
+        // `needs_alloc = true` because the binary links `kernel-core`
+        // (control codec) and uses `Vec` for the per-arg
+        // null-terminated argv copy buffer in the child path.
+        ("fb-takeover", "fb-takeover", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -492,6 +497,10 @@ fn build_userspace_bins() {
             // sets `os-binary` to build the `_start`-bearing OS
             // binary; host tests compile the lib only.
             "m3ctl" => &["--features", "os-binary"],
+            // Phase 57d follow-up: `fb-takeover` uses the same
+            // `os-binary` gate as `m3ctl` so its `_start` entry point
+            // is built only when the xtask asks for the OS binary.
+            "fb-takeover" => &["--features", "os-binary"],
             _ => &[],
         };
 

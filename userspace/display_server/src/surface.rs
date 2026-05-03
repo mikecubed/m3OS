@@ -786,6 +786,16 @@ impl SurfaceRegistry {
         }
     }
 
+    /// Force a full repaint by marking every surface dirty. Used by the
+    /// Tier 1 fullscreen-takeover reclaim path: between `YieldFb` and
+    /// `ReclaimFb` a foreign program drew over the framebuffer, so the
+    /// composer can't trust any cached "nothing changed" damage state.
+    pub fn mark_all_dirty(&mut self) {
+        for s in self.surfaces.values_mut() {
+            s.dirty = true;
+        }
+    }
+
     /// Iterate all live surfaces with their current committed buffer (if
     /// any) and their layer / geometry. The composer wiring (C.4) consumes
     /// this to build `ComposeSurface`s for each frame.

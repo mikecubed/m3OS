@@ -335,6 +335,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut layout = default_layout();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
+    // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
+    // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
+    // this flag; the compose loop then skips its frame-tick work
+    // until `ReclaimFb` reverses the transition. Without the gate the
+    // composer would race the takeover program on FB pages it no
+    // longer owns.
+    let mut fb_yielded = false;
     // Phase 57d follow-up — small ring of recently dispatched verb
     // frames so the next protocol-violation log can show whether the
     // failing bulk was preceded by a structurally similar frame, and
@@ -582,7 +590,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         //    `present` as a real swap point (today `KernelFramebufferOwner`
         //    uses the trait's default no-op, so the duplicate was visible
         //    only to a reviewer reading the code).
-        let ticks = syscall_lib::frame_tick_drain();
+        // Phase 57d follow-up — Tier 1 fullscreen-takeover gate.
+        // While `fb_yielded` is set, the takeover program owns the
+        // framebuffer. Skip the entire compose path: don't drain the
+        // frame-tick (so the next reclaim sees a clean tick budget),
+        // don't run `run_compose` (it would write to FB pages owned by
+        // another process), don't emit `compose_micros` samples (those
+        // would lie about composer health). The reclaim handler marks
+        // every surface dirty so the post-reclaim tick redraws.
+        let ticks = if fb_yielded {
+            0
+        } else {
+            syscall_lib::frame_tick_drain()
+        };
         if ticks > 0 {
             // E.3 — gate has moved into `run_compose`. The composer
             // checks both `registry.has_damage()` AND pointer-motion
@@ -781,7 +801,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // and control-endpoint serving without blocking.
         serve_one_control_request(
             ctl_ep_handle,
-            &registry,
+            &mut registry,
             &mut bind_table,
             &mut control_subs,
             &frame_stats,
@@ -790,6 +810,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             inject_key_policy,
             &owner,
             &mut input_wiring,
+            &mut fb_yielded,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -820,7 +841,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
 /// reply is sent so clients always observe a well-formed frame.
 fn serve_one_control_request(
     ep_handle: u32,
-    registry: &SurfaceRegistry,
+    registry: &mut SurfaceRegistry,
     bind_table: &mut BindTable,
     subscriptions: &mut control::ControlSubscriptions,
     frame_stats: &FrameStatsRing,
@@ -829,6 +850,7 @@ fn serve_one_control_request(
     inject_key_policy: control::InjectKeyPolicy,
     fb_owner: &KernelFramebufferOwner,
     input_wiring: &mut InputWiring,
+    fb_yielded: &mut bool,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -865,23 +887,65 @@ fn serve_one_control_request(
     let bulk_len = bulk_len.min(req_buf.len());
 
     let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
-    let client = control::ClientId(0); // Phase 56 single-client.
-    let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
-    let inject_key_sink = |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
-    let n = serve_control_iter(
-        &req_buf[..bulk_len],
-        client,
-        registry,
-        bind_table,
-        subscriptions,
-        frame_stats,
-        debug_crash,
-        readback,
-        inject_key_policy,
-        pixel_reader,
-        inject_key_sink,
-        &mut reply_buf,
-    );
+
+    // Phase 57d follow-up — Tier 1 fullscreen-takeover hooks. Peek at
+    // the decoded command for `YieldFb` / `ReclaimFb` and route them
+    // through `handle_fb_yield_request` / `handle_fb_reclaim_request`
+    // directly. These have side effects (a kernel syscall plus
+    // compose-loop state changes) the pure-logic `dispatch_command`
+    // shouldn't carry, and the rest of the control surface is unaware
+    // of the yielded state.
+    use kernel_core::display::control::{ControlCommand, decode_command};
+    let n = if let Ok((cmd, _)) = decode_command(&req_buf[..bulk_len]) {
+        match cmd {
+            ControlCommand::YieldFb => handle_fb_yield_request(fb_yielded, &mut reply_buf),
+            ControlCommand::ReclaimFb => {
+                handle_fb_reclaim_request(registry, fb_yielded, &mut reply_buf)
+            }
+            _ => {
+                let client = control::ClientId(0);
+                let pixel_reader =
+                    |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
+                let inject_key_sink =
+                    |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
+                serve_control_iter(
+                    &req_buf[..bulk_len],
+                    client,
+                    registry,
+                    bind_table,
+                    subscriptions,
+                    frame_stats,
+                    debug_crash,
+                    readback,
+                    inject_key_policy,
+                    pixel_reader,
+                    inject_key_sink,
+                    &mut reply_buf,
+                )
+            }
+        }
+    } else {
+        // Fall through to generic decoder so its error reply path stays
+        // the single source of truth for malformed frames.
+        let client = control::ClientId(0);
+        let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
+        let inject_key_sink =
+            |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
+        serve_control_iter(
+            &req_buf[..bulk_len],
+            client,
+            registry,
+            bind_table,
+            subscriptions,
+            frame_stats,
+            debug_crash,
+            readback,
+            inject_key_policy,
+            pixel_reader,
+            inject_key_sink,
+            &mut reply_buf,
+        )
+    };
     if n > 0 {
         let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
     }
@@ -998,6 +1062,82 @@ fn encode_event_or_drop(
     reply_buf: &mut [u8],
 ) -> usize {
     kernel_core::display::control::encode_event(evt, reply_buf).unwrap_or_default()
+}
+
+/// Phase 57d follow-up — Tier 1 fullscreen-takeover yield handler.
+///
+/// Drops framebuffer ownership via `SYS_FB_YIELD` so a fullscreen
+/// program (e.g. doom launched via `/bin/fb-takeover`) can claim it.
+/// Sets `fb_yielded = true` so the compose loop skips its frame-tick
+/// work — without this gate the compositor would keep writing pixels
+/// while another process draws, racing on the same physical FB pages.
+/// Idempotent: a second yield while already yielded is a no-op
+/// success.
+fn handle_fb_yield_request(fb_yielded: &mut bool, reply_buf: &mut [u8]) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if *fb_yielded {
+        return encode_event_or_drop(&ControlEvent::Ack, reply_buf);
+    }
+    let rc = syscall_lib::fb_yield();
+    if rc != 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: fb_yield syscall failed\n");
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::ResourceExhausted,
+            },
+            reply_buf,
+        );
+    }
+    *fb_yielded = true;
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: framebuffer yielded for takeover\n",
+    );
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+/// Phase 57d follow-up — Tier 1 fullscreen-takeover reclaim handler.
+///
+/// Counterpart to [`handle_fb_yield_request`]. Re-acquires framebuffer
+/// ownership via `SYS_FB_REACQUIRE` and clears the yielded gate. If
+/// the takeover program exited normally the kernel's exit cleanup
+/// already cleared the FB owner; if `FB_REACQUIRE` returns `EBUSY`
+/// the reclaimer will retry shortly (the wrapper retries the verb on
+/// `Internal`).
+///
+/// On success, marks every live surface dirty so the next compose
+/// pass repaints the screen — between yield and reclaim the takeover
+/// program drew over the FB and any cached compose state is now
+/// stale.
+fn handle_fb_reclaim_request(
+    registry: &mut SurfaceRegistry,
+    fb_yielded: &mut bool,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if !*fb_yielded {
+        return encode_event_or_drop(&ControlEvent::Ack, reply_buf);
+    }
+    let rc = syscall_lib::fb_reacquire();
+    if rc != 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: fb_reacquire syscall failed\n",
+        );
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::ResourceExhausted,
+            },
+            reply_buf,
+        );
+    }
+    registry.mark_all_dirty();
+    *fb_yielded = false;
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: framebuffer reclaimed; full repaint queued\n",
+    );
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
 }
 
 /// Try to acquire the framebuffer with bounded retry, in case another

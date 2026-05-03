@@ -1426,6 +1426,24 @@ mod syscall_nr {
     /// Returns `0` on success, `u64::MAX` on error.
     pub const SHM_DESTROY: u64 = 0x101B;
 
+    /// Phase 57d follow-up: yield framebuffer ownership without
+    /// unmapping the caller's FB VMA or restoring the kernel console.
+    /// Used by display_server to temporarily release the framebuffer
+    /// to a fullscreen takeover program (see
+    /// `docs/appendix/fb-takeover-tiers.md`). The caller's existing
+    /// FB mapping stays alive so a later `FB_REACQUIRE` can resume
+    /// drawing without paying the page-table fixup cost. Returns `0`
+    /// on success, `NEG_EPERM` if the caller is not the current FB
+    /// owner. No arguments.
+    pub const FB_YIELD: u64 = 0x101C;
+    /// Phase 57d follow-up: re-claim framebuffer ownership previously
+    /// yielded via `FB_YIELD`. The caller must already have an
+    /// FB-flagged VMA (i.e. it called `FRAMEBUFFER_MMAP` and then
+    /// `FB_YIELD` rather than `FRAMEBUFFER_RELEASE`). Returns `0` on
+    /// success, `NEG_EBUSY` if some other process currently owns the
+    /// framebuffer, `NEG_ENOENT` if the caller has no FB VMA.
+    pub const FB_REACQUIRE: u64 = 0x101D;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     pub const IPC_LAST: u64 = 0x1115;
@@ -1800,6 +1818,8 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
+        FB_YIELD => sys_fb_yield(),
+        FB_REACQUIRE => sys_fb_reacquire(),
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
@@ -9677,6 +9697,62 @@ pub(super) fn sys_framebuffer_release() -> u64 {
             crate::fb::restore_console();
             NEG_ENOENT
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d follow-up: framebuffer yield / reacquire (0x101C / 0x101D)
+//
+// Tier 1 of the fullscreen-takeover mechanism. `FB_YIELD` lets the
+// current FB owner (typically `display_server`) drop ownership without
+// unmapping its FB VMA or repainting the kernel console: the caller's
+// pixel mapping survives so a subsequent `FB_REACQUIRE` can resume
+// composing without re-walking the page tables. While yielded, no
+// process owns the framebuffer (`fb_owner_pid() == 0`) and the next
+// caller of `FRAMEBUFFER_MMAP` (e.g. `doom`) wins the CAS atomically.
+//
+// `FB_REACQUIRE` is the inverse: take ownership back assuming a
+// previously-yielded VMA still exists. Used by `display_server` once
+// the takeover program exits, after `/bin/fb-takeover` has reported
+// the child's status. See `docs/appendix/fb-takeover-tiers.md`.
+// ---------------------------------------------------------------------------
+
+pub(super) fn sys_fb_yield() -> u64 {
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return NEG_EPERM;
+    }
+    // Soft release: mark the FB unowned but keep the caller's VMA so a
+    // later `FB_REACQUIRE` can avoid re-allocating page tables. The
+    // kernel console stays yielded (CONSOLE_YIELDED=true) so any pixel
+    // writes the next owner makes are not overpainted by stale console
+    // text. See `release_console_claim` for the exact ordering.
+    crate::fb::release_console_claim(pid);
+    0
+}
+
+pub(super) fn sys_fb_reacquire() -> u64 {
+    let pid = crate::process::current_pid();
+    let raw_input_enabled = !is_current_exec_path("/bin/display_server");
+
+    // Verify the caller still has an FB VMA — `FB_REACQUIRE` is meant
+    // for the post-yield path where the caller never tore its mapping
+    // down. A caller without an FB VMA should use `FRAMEBUFFER_MMAP`
+    // instead so the pages get mapped properly.
+    let has_fb_vma = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree.iter().any(|m| (m.flags & FB_MAPPING_FLAG) != 0)
+    });
+    if !matches!(has_fb_vma, Some(true)) {
+        return NEG_ENOENT;
+    }
+
+    // Atomically claim ownership. `try_yield_console` uses a CAS so a
+    // concurrent claimer cannot race past us, and re-asserts
+    // `CONSOLE_YIELDED=true` plus the raw-input routing flag.
+    if crate::fb::try_yield_console(pid, raw_input_enabled) {
+        0
+    } else {
+        NEG_EBUSY
     }
 }
 

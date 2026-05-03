@@ -286,6 +286,19 @@ pub const SYS_SHM_UNMAP: u64 = 0x101A;
 /// release the +1 that `SHM_CREATE` reserved.
 pub const SYS_SHM_DESTROY: u64 = 0x101B;
 
+/// Phase 57d follow-up: temporarily release framebuffer ownership
+/// without unmapping the caller's FB VMA (so a future
+/// `SYS_FB_REACQUIRE` can resume composing without re-walking page
+/// tables). Tier 1 fullscreen-takeover primitive — see
+/// `docs/appendix/fb-takeover-tiers.md`.
+pub const SYS_FB_YIELD: u64 = 0x101C;
+/// Phase 57d follow-up: re-claim framebuffer ownership previously
+/// dropped via `SYS_FB_YIELD`. Caller must already have an
+/// FB-flagged VMA (i.e. it called `SYS_FRAMEBUFFER_MMAP` then
+/// `SYS_FB_YIELD`). Returns 0 on success, `-EBUSY` if another
+/// process owns the framebuffer.
+pub const SYS_FB_REACQUIRE: u64 = 0x101D;
+
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
@@ -2105,6 +2118,25 @@ pub fn framebuffer_mmap() -> u64 {
 /// mapping was found despite the owner flag being set).
 pub fn framebuffer_release() -> isize {
     unsafe { syscall0(SYS_FRAMEBUFFER_RELEASE) as isize }
+}
+
+/// Phase 57d follow-up: yield framebuffer ownership without unmapping
+/// the caller's FB VMA. Used by `display_server` to hand the screen to
+/// a fullscreen takeover program (see `/bin/fb-takeover`) and resume
+/// later via [`fb_reacquire`] without re-walking page tables. Returns
+/// `0` on success, negative errno on failure (`-EPERM` if caller is
+/// not the current FB owner).
+pub fn fb_yield() -> isize {
+    unsafe { syscall0(SYS_FB_YIELD) as isize }
+}
+
+/// Phase 57d follow-up: counterpart to [`fb_yield`]. Reclaims FB
+/// ownership for the caller, which must still hold its FB-flagged VMA
+/// from the prior [`framebuffer_mmap`] call. Returns `0` on success,
+/// `-EBUSY` if another process owns the framebuffer, `-ENOENT` if no
+/// FB VMA is mapped.
+pub fn fb_reacquire() -> isize {
+    unsafe { syscall0(SYS_FB_REACQUIRE) as isize }
 }
 
 /// Phase 56 Track B.2: read one decoded PS/2 mouse packet from the kernel.
