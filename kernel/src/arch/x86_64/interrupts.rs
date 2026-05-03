@@ -1516,34 +1516,49 @@ unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte
     // over blocking an interrupt handler).
 }
 
-extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+/// Shared i8042 drain shape used by both [`keyboard_handler`] and
+/// [`mouse_handler`].
+///
+/// ## Why both ISRs drain both byte types
+///
+/// The previous design had each ISR bail on the wrong byte type (kbd
+/// ISR bailed on AUX bytes, mouse ISR bailed on non-AUX bytes), with
+/// the assumption that the corresponding IRQ would fire and pick up
+/// the stranded byte. That assumption breaks under sustained
+/// keyboard activity: when a key is held and PS/2 hardware autorepeat
+/// fires kbd scancodes at ~30 Hz, mouse motion bytes queue behind
+/// kbd bytes in the i8042 internal FIFOs. The mouse ISR fires once,
+/// reads status, sees `AUX=0` (a kbd byte at the head), bails. The
+/// kbd ISR drains the kbd byte but does NOT re-trigger IRQ12 — the
+/// LAPIC IRR bit for vector 44 was already acknowledged by the
+/// previous mouse ISR dispatch, and the i8042 only re-asserts on the
+/// next *new* AUX byte arriving from the device. The pending mouse
+/// byte sits in the FIFO until either fresh mouse motion fires
+/// another IRQ12 or some other side effect drains it. Visible
+/// symptom: cursor freezes during a held key, jumps to current
+/// position when the key releases.
+///
+/// Linux's i8042 driver solves this with a single combined ISR that
+/// drains ALL pending bytes regardless of which IRQ fired, dispatching
+/// each byte by its `STATUS_AUX_OUTPUT` bit. We adopt the same shape:
+/// each ISR (still installed on its own vector) calls this helper, so
+/// either IRQ will drain whatever is queued.
+fn ps2_drain_all_bytes() {
     use x86_64::instructions::port::Port;
 
     const STATUS_OUTPUT_FULL: u8 = 1 << 0;
     const STATUS_AUX_OUTPUT: u8 = 1 << 5;
+    /// Bound the per-ISR iteration count. Sized for: 16 PS/2 mouse
+    /// packets (3 bytes each) + a worst-case 16-byte kbd burst, with
+    /// headroom. The 8042 hardware FIFO is small (typically 16 bytes
+    /// per device); this cap is comfortably above that.
+    const MAX_DRAIN: usize = 64;
+
     let mut data_port: Port<u8> = Port::new(0x60);
     let mut status_port: Port<u8> = Port::new(0x64);
 
-    // Drain all pending bytes from the i8042 output buffer.
-    //
-    // Extended scancodes (e.g. 0xE0 prefixed arrow keys) arrive as multi-byte
-    // sequences.  With edge-triggered IRQ delivery, reading only one byte per
-    // interrupt can strand the second byte of an extended break code until the
-    // next key event, making keys appear stuck.  We loop while the i8042
-    // status register's Output Buffer Full bit (bit 0) is set.
-    //
-    // A small iteration cap prevents pathological infinite loops if the
-    // controller misbehaves.
-    const MAX_DRAIN: usize = 16;
-
-    // Route each byte to the appropriate sink.
-    //
-    // Ownership can change while we are draining the i8042, so we re-check the
-    // framebuffer owner for every new sequence instead of snapshotting once per
-    // batch. Multi-byte prefixes (`0xE0`, `0xE1`) stay latched to the sink that
-    // received their first byte so an ownership handoff cannot split one
-    // extended scancode sequence across RAW_SCANCODE_BUF and SCANCODE_BUF.
     let mut got_tty_byte = false;
+    let mut produced_mouse_packet = false;
     let mut raw_input_router = RAW_INPUT_ROUTER.lock();
 
     for _ in 0..MAX_DRAIN {
@@ -1551,23 +1566,28 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
         if status & STATUS_OUTPUT_FULL == 0 {
             break; // output buffer empty — nothing left to read
         }
+        let byte = unsafe { data_port.read() };
         if status & STATUS_AUX_OUTPUT != 0 {
-            break; // AUX byte belongs to the mouse ISR.
+            // Mouse byte. `feed_byte_isr` locks `MOUSE_DECODER`
+            // separately from `RAW_INPUT_ROUTER`; the lock order is
+            // (RAW_INPUT_ROUTER, MOUSE_DECODER) and matches between
+            // both ISRs, so no deadlock potential.
+            if super::ps2::feed_byte_isr(byte) {
+                produced_mouse_packet = true;
+            }
+            continue;
         }
-        let scancode: u8 = unsafe { data_port.read() };
-
-        match raw_input_router.route_byte(scancode, crate::fb::raw_input_active()) {
+        // Keyboard byte. Route through `ScancodeRouter` so multi-byte
+        // prefixes (`0xE0`, `0xE1`) stay latched to the sink that
+        // received their first byte even if an ownership handoff
+        // happens mid-sequence.
+        match raw_input_router.route_byte(byte, crate::fb::raw_input_active()) {
             ScancodeSink::Raw => unsafe {
-                // Raw path: scancodes go to the game buffer only.
-                // kbd_server does NOT receive scancodes while a process
-                // (DOOM) owns the framebuffer — this prevents stale
-                // scancodes from accumulating and replaying after the
-                // game exits.
                 push_to_buf(
                     (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
                     &RAW_SCANCODE_BUF_HEAD,
                     &RAW_SCANCODE_BUF_TAIL,
-                    scancode,
+                    byte,
                 );
             },
             ScancodeSink::Tty => {
@@ -1576,7 +1596,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
                         (&raw mut SCANCODE_BUF).cast::<u8>(),
                         &SCANCODE_BUF_HEAD,
                         &SCANCODE_BUF_TAIL,
-                        scancode,
+                        byte,
                     );
                 }
                 got_tty_byte = true;
@@ -1584,10 +1604,20 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
         }
     }
 
-    // Signal kbd_server once after draining the whole batch, not per byte.
+    // Signal once per ISR after the whole drain so neither server
+    // gets a wake-up storm. Releasing the router lock before
+    // signalling keeps the wait-queue path off the lock-held window.
+    drop(raw_input_router);
     if got_tty_byte {
         crate::ipc::notification::signal_irq(1);
     }
+    if produced_mouse_packet {
+        crate::ipc::notification::signal_irq(12);
+    }
+}
+
+extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+    ps2_drain_all_bytes();
 
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
@@ -1614,52 +1644,10 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
 extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
-    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
-    const STATUS_AUX_OUTPUT: u8 = 1 << 5;
-    const MAX_DRAIN: usize = 16;
-
-    let mut data_port: Port<u8> = Port::new(super::ps2::PS2_DATA);
-    let mut status_port: Port<u8> = Port::new(super::ps2::PS2_STATUS);
-    let mut produced_packet = false;
-
-    for _ in 0..MAX_DRAIN {
-        let status = unsafe { status_port.read() };
-        if status & STATUS_OUTPUT_FULL == 0 {
-            break;
-        }
-        // Bytes destined for the keyboard (status bit 5 = 0) belong to
-        // the keyboard ISR. The previous implementation read+discarded
-        // them on the assumption that "IRQ1 and IRQ12 are routed
-        // independently on QEMU", but with APIC mode + IRQ 12 routing
-        // newly enabled (Phase 56 follow-up), this branch IS taken
-        // when the AUX device queues a byte while a keyboard byte is
-        // still in the i8042 output buffer. Discarding it would
-        // silently swallow keyboard input — under load this dropped
-        // tcc/stdin-feeder traffic, breaking the smoke runner.
-        //
-        // The correct behaviour is: leave the byte in the buffer and
-        // bail. The OUTPUT_FULL bit stays asserted, the keyboard ISR
-        // (vector 33) drains the byte the next time it runs, and the
-        // i8042 then forwards the queued AUX byte and re-asserts
-        // IRQ 12. Edge-triggered IRQ 12 will fire again at that
-        // point and this handler will pick up the AUX byte cleanly.
-        if status & STATUS_AUX_OUTPUT == 0 {
-            break;
-        }
-        let byte = unsafe { data_port.read() };
-        if super::ps2::feed_byte_isr(byte) {
-            produced_packet = true;
-        }
-    }
-
-    // Signal IRQ12 once after draining the whole batch (one notify per
-    // burst, not per byte) so userspace `mouse_server` wakes if blocked on
-    // a notification capability.
-    if produced_packet {
-        crate::ipc::notification::signal_irq(12);
-    }
+    // Both kbd and mouse bytes drain through the same helper — see the
+    // doc comment on `ps2_drain_all_bytes` for why each ISR drains
+    // both byte types.
+    ps2_drain_all_bytes();
 
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
