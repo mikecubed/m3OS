@@ -2849,8 +2849,29 @@ fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
-    if sig == 0 || sig >= 32 {
+    if sig == 0 || sig >= 64 {
         return NEG_EINVAL;
+    }
+    // m3OS only delivers the standard 31 signals; real-time signals
+    // 32..63 are not implemented but musl's `posix_spawn` /
+    // `__libc_start_main` cleanup loops iterate through them resetting
+    // handlers. Returning EINVAL for those calls makes musl's child
+    // path bail out (or fall through to a path that, in the doom build,
+    // visibly corrupts callee-saved registers — see m3os.log GPF in
+    // `<child>` at +0xa4). Accept the call as a no-op success since
+    // there is no kernel state to track; the rtsig handler will never
+    // fire either way.
+    if (32..64).contains(&sig) {
+        if oldact_ptr != 0 {
+            let zeros = [0u8; 32];
+            if UserSliceWo::new(oldact_ptr, zeros.len())
+                .and_then(|s| s.copy_from_kernel(&zeros))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+        }
+        return 0;
     }
     // SIGKILL and SIGSTOP cannot be caught or ignored.
     if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
