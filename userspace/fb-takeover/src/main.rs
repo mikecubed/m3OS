@@ -57,15 +57,15 @@ mod os_binary {
         ControlCommand, ControlEvent, decode_event, encode_command,
     };
     use m3ctl::{DISPLAY_CONTROL_SERVICE_NAME, LABEL_DISPLAY_CTL_CMD};
-    use syscall_lib::STDOUT_FILENO;
     use syscall_lib::heap::BrkAllocator;
+    use syscall_lib::serial_print;
 
     #[global_allocator]
     static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
     #[alloc_error_handler]
     fn alloc_error(_layout: Layout) -> ! {
-        syscall_lib::write_str(STDOUT_FILENO, "fb-takeover: alloc error\n");
+        serial_print("fb-takeover: alloc error\n");
         syscall_lib::exit(99)
     }
 
@@ -213,8 +213,14 @@ mod os_binary {
     /// hand off control. Never returns on success; on failure (alloc
     /// fail, path too long, execve errno) prints a diagnostic and
     /// falls back to the caller, which exits 127.
+    ///
+    /// If the program name has no `/` in it, we prefix `/bin/` — the
+    /// kernel `execve` resolves names relative to cwd (no PATH lookup
+    /// in-kernel), so a bare `doom` would otherwise be looked up at
+    /// `/doom` and ENOENT. This mirrors the convention every m3OS
+    /// daemon launcher uses (`/bin/<name>`).
     fn child_exec(child_argv_strs: &[&str]) {
-        let path = child_argv_strs[0];
+        let raw_path = child_argv_strs[0];
         // Enforce per-arg length so the per-string null-terminated
         // copy stays bounded.
         for arg in child_argv_strs {
@@ -224,10 +230,26 @@ mod os_binary {
             }
         }
 
-        // Path must be null-terminated.
-        let mut path_buf: Vec<u8> = Vec::with_capacity(path.len() + 1);
-        path_buf.extend_from_slice(path.as_bytes());
-        path_buf.push(0);
+        // Path must be null-terminated. Resolve relative names by
+        // prefixing `/bin/`.
+        let needs_bin_prefix = !raw_path.starts_with('/') && !raw_path.contains('/');
+        let path_buf: Vec<u8> = if needs_bin_prefix {
+            let mut buf = Vec::with_capacity(5 + raw_path.len() + 1);
+            buf.extend_from_slice(b"/bin/");
+            buf.extend_from_slice(raw_path.as_bytes());
+            buf.push(0);
+            buf
+        } else {
+            let mut buf = Vec::with_capacity(raw_path.len() + 1);
+            buf.extend_from_slice(raw_path.as_bytes());
+            buf.push(0);
+            buf
+        };
+        print_str("fb-takeover: execve ");
+        if let Ok(s) = core::str::from_utf8(&path_buf[..path_buf.len() - 1]) {
+            print_str(s);
+        }
+        print_str("\n");
 
         // Per-arg storage: vec of vec<u8>, each null-terminated.
         let mut arg_storage: Vec<Vec<u8>> = Vec::with_capacity(child_argv_strs.len());
@@ -270,8 +292,14 @@ mod os_binary {
         None
     }
 
+    /// Diagnostic output — routed to the kernel serial log via
+    /// `SYS_DEBUG_PRINT` rather than stdout, because between
+    /// `YieldFb` and `ReclaimFb` the framebuffer is owned by the
+    /// takeover program and the wrapper's PTY-backed stdout is not
+    /// visible. Using serial means every fb-takeover diagnostic shows
+    /// up in `m3os.log` regardless of FB ownership state.
     fn print_str(s: &str) {
-        syscall_lib::write_str(STDOUT_FILENO, s);
+        serial_print(s);
     }
 
     fn print_usage() {
@@ -287,7 +315,7 @@ mod os_binary {
 
     #[panic_handler]
     fn panic(_: &core::panic::PanicInfo) -> ! {
-        syscall_lib::write_str(STDOUT_FILENO, "fb-takeover: PANIC\n");
+        serial_print("fb-takeover: PANIC\n");
         syscall_lib::exit(101)
     }
 }
