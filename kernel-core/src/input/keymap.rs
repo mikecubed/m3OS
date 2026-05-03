@@ -427,9 +427,22 @@ impl ScancodeDecoder {
                 DecodedScancode::InProgress
             }
             // 0x00 is the 8042 "buffer overflow / error" marker; common reply
-            // bytes (ACK 0xFA, basic-assurance 0xAA, resend 0xFE, echo 0xEE,
-            // device error 0xFF) are also dropped silently.
-            0x00 | 0xFF | 0xAA | 0xFA | 0xFE | 0xEE => DecodedScancode::Discarded,
+            // bytes (ACK 0xFA, resend 0xFE, echo 0xEE, device error 0xFF)
+            // are also dropped silently. They never collide with a bound
+            // make code's break form (the corresponding make codes 0x7F /
+            // 0x7A / 0x7E / 0x6E are unbound).
+            //
+            // Phase 57d follow-up: 0xAA is intentionally **not** in this
+            // list. The keyboard's basic-assurance test (BAT) reply uses
+            // 0xAA, but BAT is sent exactly once, immediately after a
+            // controller-driven Reset (`0xFF`) command, well before
+            // userspace runs. After that, every 0xAA on the wire is the
+            // break code for `0x2A` — i.e. LSHIFT release. Discarding it
+            // here ate the release edge, leaving the modifier tracker
+            // with `MOD_SHIFT` permanently held; subsequent letters all
+            // came out uppercase (looks like Caps Lock) with no way to
+            // recover from within the graphical session.
+            0x00 | 0xFF | 0xFA | 0xFE | 0xEE => DecodedScancode::Discarded,
             _ => self.emit_simple_edge(byte),
         }
     }
@@ -1220,12 +1233,47 @@ mod tests {
 
     #[test]
     fn decoder_recovers_after_arbitrary_garbage() {
+        // 0xAA was deliberately removed from this list in Phase 57d
+        // follow-up: it is the LSHIFT break code, not garbage. See
+        // `decoder_emits_lshift_release_for_0xaa` below.
         let mut d = ScancodeDecoder::new();
-        for b in [0x00, 0xFF, 0xAA, 0xFE, 0xEE, 0xFA] {
+        for b in [0x00, 0xFF, 0xFE, 0xEE, 0xFA] {
             let _ = d.feed(b);
         }
         let events = feed_all(&mut d, &[0x1E]);
         assert_eq!(last_edge(&events), Some((KEY_A, KeyEventKind::Down)));
+    }
+
+    #[test]
+    fn decoder_emits_lshift_release_for_0xaa() {
+        // Regression: `0xAA` was previously dropped as the keyboard's
+        // basic-assurance test reply byte. After init, every `0xAA` on
+        // the wire is the break code for `0x2A` (LSHIFT). Discarding it
+        // left the modifier tracker permanently shifted, which the user
+        // experienced as a stuck Caps Lock when typing the underscore
+        // in `fb-takeover` (Shift+Minus). The decoder must surface the
+        // LSHIFT release.
+        let mut d = ScancodeDecoder::new();
+        let events = feed_all(&mut d, &[0xAA]);
+        assert_eq!(last_edge(&events), Some((KEY_LSHIFT, KeyEventKind::Up)));
+    }
+
+    #[test]
+    fn decoder_full_shift_minus_sequence_emits_release() {
+        // End-to-end shape of typing `_` (Shift + Minus): press LSHIFT,
+        // press MINUS, release MINUS, release LSHIFT. The post-release
+        // tracker state must be unshifted.
+        let mut d = ScancodeDecoder::new();
+        let mut tracker = ModifierTracker::new();
+        for sc in [0x2A, 0x0C, 0x8C, 0xAA] {
+            if let DecodedScancode::Edge { keycode, kind } = d.feed(sc) {
+                tracker.apply(keycode, kind);
+            }
+        }
+        assert!(
+            !tracker.state().contains(MOD_SHIFT),
+            "shift must clear after 0xAA release"
+        );
     }
 
     // ---- Keymap ------------------------------------------------------------
