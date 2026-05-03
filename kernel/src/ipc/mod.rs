@@ -748,7 +748,7 @@ fn ipc_recv_msg(
     use crate::task::scheduler;
     use kernel_core::ipc::wake_kind::{RECV_KIND_MESSAGE, RECV_KIND_NOTIFICATION};
 
-    let (kind, mut msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
+    let (kind, msg) = if let Some(task_sched_idx) = scheduler::get_current_task_idx() {
         if let Some(notif_id) = notification::lookup_bound_notif(task_sched_idx) {
             endpoint::recv_msg_with_notif(task_id, ep_id, notif_id)
         } else {
@@ -762,23 +762,16 @@ fn ipc_recv_msg(
         return u64::MAX;
     }
 
-    // Take bulk first so the user-visible `data[1]` reflects the actual
-    // delivered bulk length. See `ipc_try_recv_msg` for the rationale.
-    let mut delivered_len: u64 = 0;
-    let bulk = if kind == RECV_KIND_MESSAGE && buf_ptr != 0 {
-        scheduler::take_bulk_data(task_id)
-    } else {
-        None
-    };
-    if let Some(b) = &bulk {
-        delivered_len = b.len() as u64;
-    }
-    if kind == RECV_KIND_MESSAGE {
-        msg.data[1] = delivered_len;
-    }
-
     // Write the IpcMessage header (label + 4 data words = 40 bytes) to
     // userspace.  Layout must match syscall_lib::IpcMessage.
+    //
+    // `msg.data[1]` is preserved as the sender wrote it: for messages from
+    // `ipc_send_with_bulk` it's the bulk length, but kernel-internal IPC
+    // (e.g. `vfs_service_read` packs the file offset into `data[1]`) uses
+    // the field for protocol-specific data and overriding it broke
+    // `vfs_server`'s offset handling — every read came in as offset 0,
+    // which made doom's WAD-directory load return the same first chunk
+    // repeatedly and the lump-name lookup miss `PNAMES`.
     if msg_ptr != 0 {
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
@@ -794,7 +787,11 @@ fn ipc_recv_msg(
         }
     }
 
-    if let Some(bulk) = bulk {
+    // Copy bulk data to the receiver's buffer if present.
+    if kind == RECV_KIND_MESSAGE
+        && buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
         let copy_len = bulk.len().min(buf_len as usize);
         if copy_len > 0
             && UserSliceWo::new(buf_ptr, copy_len)
@@ -836,7 +833,7 @@ fn ipc_try_recv_msg(
 ) -> u64 {
     use crate::task::scheduler;
 
-    let mut msg = match endpoint::recv_msg_nowait(task_id, ep_id) {
+    let msg = match endpoint::recv_msg_nowait(task_id, ep_id) {
         Some(m) => m,
         None => return u64::MAX,
     };
@@ -845,27 +842,15 @@ fn ipc_try_recv_msg(
         return u64::MAX;
     }
 
-    // Take the bulk slot first so the user-visible `data[1]` can be
-    // overridden with the actual bulk length. Without this, a delivery
-    // path with `msg.data[1] = N_sender` but a kernel bulk Vec whose
-    // length is `N_actual != N_sender` (signal-races on the sender's
-    // `pending_bulk` slot, stale leftover from a failed `ipc_reply`,
-    // etc.) lets the receiver read up to `N_sender` bytes from
-    // `bulk_buf` while only the first `N_actual` bytes were actually
-    // copied — surfacing as "frame header for N_actual-byte verb +
-    // trailing stale/zero bytes" to the dispatcher (m3os.log line
-    // 824ff: `bulk_len=24 head=04001500010000000000000000000000`).
-    let mut delivered_len: u64 = 0;
-    let bulk = if buf_ptr != 0 {
-        scheduler::take_bulk_data(task_id)
-    } else {
-        None
-    };
-    if let Some(b) = &bulk {
-        delivered_len = b.len() as u64;
-    }
-    msg.data[1] = delivered_len;
-
+    // `msg.data[1]` is preserved as the sender wrote it. The receive-side
+    // override (= `take_bulk_data().len()`) was removed because the field
+    // is protocol-specific for kernel-internal IPC: `vfs_service_read`
+    // packs the read offset into `data[1]`, and forcing it to the bulk
+    // length pinned every read at offset 0, which made doom's WAD load
+    // miss `PNAMES`. The legitimate bulk-mismatch the override was
+    // chasing (display_server seeing `bulk_len=24` with stale `bulk_buf`
+    // bytes) now needs a fix that doesn't conflate the size carried in
+    // `data[1]` with whatever value the userspace protocol carries there.
     if msg_ptr != 0 {
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
@@ -881,7 +866,9 @@ fn ipc_try_recv_msg(
         }
     }
 
-    if let Some(bulk) = bulk {
+    if buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
         let copy_len = bulk.len().min(buf_len as usize);
         if copy_len > 0
             && UserSliceWo::new(buf_ptr, copy_len)
