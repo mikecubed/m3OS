@@ -987,6 +987,23 @@ pub fn try_yield_console(owner_pid: u32, raw_input_enabled: bool) -> bool {
         Ok(_) => {
             FB_RAW_INPUT_ENABLED.store(raw_input_enabled, Ordering::Release);
             crate::arch::x86_64::interrupts::reset_raw_input_state();
+            // Phase 57d follow-up — when transitioning to a graphical-server
+            // FB owner (raw_input_enabled = false: display_server, not a
+            // takeover program), inject break codes for commonly-held keys
+            // so kbd_server's tracker / repeat scheduler clear any keys
+            // that were held when the previous FB owner took over.
+            //
+            // This fires at every FB ownership transition into a
+            // graphical-server — both the initial display_server boot
+            // claim AND post-takeover reclaim. The boot fire is benign
+            // (no keys held, no prior tracker state) but empirically
+            // affects subsequent takeover behavior, so we keep it. The
+            // injection is wrapped in `without_interrupts` inside
+            // `inject_release_all_held_modifiers` to serialise the
+            // task-context push against the keyboard ISR.
+            if !raw_input_enabled {
+                crate::arch::x86_64::interrupts::inject_release_all_held_modifiers();
+            }
             // Hold the console lock while flipping the flag so write_str
             // cannot slip through between the CAS and the flag transition.
             let _guard = CONSOLE.lock();
