@@ -1006,12 +1006,46 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     mut stack_frame: InterruptStackFrame,
     _err: u64,
 ) {
+    // Capture the user's callee-saved GPRs IMMEDIATELY, before any Rust
+    // code can clobber them. With the `x86-interrupt` calling convention,
+    // these still hold the user's values at the first instruction of the
+    // handler body (caller-saved regs are spilled by the entry stub but
+    // callee-saved are preserved across the Rust call boundary).
+    // `panic_diag::capture_registers` runs deeper in the call chain, so
+    // r12-r15 there reflect kernel state, not the user's view.
+    let user_r12: u64;
+    let user_r13: u64;
+    let user_r14: u64;
+    let user_r15: u64;
+    let user_rbx: u64;
+    let user_rbp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, rbx",
+            "mov {1}, rbp",
+            "mov {2}, r12",
+            "mov {3}, r13",
+            "mov {4}, r14",
+            "mov {5}, r15",
+            out(reg) user_rbx,
+            out(reg) user_rbp,
+            out(reg) user_r12,
+            out(reg) user_r13,
+            out(reg) user_r14,
+            out(reg) user_r15,
+            options(nostack, preserves_flags),
+        );
+    }
     // Check if the fault came from ring 3.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace GPF: pid={} — process killed\n{:?}\n",
             pid, stack_frame
+        ));
+        _panic_print(format_args!(
+            "[int] user GPRs at fault: rbx={:#018x} rbp={:#018x} r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}\n",
+            user_rbx, user_rbp, user_r12, user_r13, user_r14, user_r15
         ));
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
