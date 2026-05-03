@@ -711,9 +711,13 @@ fn transfer_bulk(src: TaskId, dst: TaskId) -> bool {
 /// When a delivered message claims `data[1] != 0` but the sender's
 /// pending_bulk slot is empty, we want to know which IPC site is
 /// involved without flooding the boot transcript on a tight retry
-/// loop. 16 occurrences is enough to see the first burst.
+/// loop. Bumped from 16 to 256 because the early-boot `fork-child`
+/// transient-state warnings (a separate, unrelated bug class) burned
+/// the entire 16-slot budget within the first hundred iterations,
+/// hiding any later display-protocol bulk_mismatches behind a
+/// silent threshold.
 static BULK_MISMATCH_LOG_BUDGET: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(16);
+    core::sync::atomic::AtomicU32::new(256);
 
 /// Phase 57d follow-up — log when an inbound message arrives at a
 /// receiver advertising `data[1] != 0` but the sender's `pending_bulk`

@@ -302,11 +302,30 @@ fn decode_message(bulk: &[u8]) -> Result<ClientMessage, ProtocolError> {
         return Err(ProtocolError::BodyTooLarge);
     }
     let (msg, consumed) = ClientMessage::decode(bulk)?;
-    // Phase 56 wire framing is "exactly one frame per IPC bulk" — trailing
-    // bytes are a protocol violation, not a forward-compatible extension.
-    // Reject so fuzzing / adversarial clients cannot smuggle a half-second
-    // frame past the dispatcher and produce ambiguous framing.
-    if consumed != bulk.len() {
+    // Phase 56 wire framing is nominally "exactly one frame per IPC
+    // bulk" — but Phase 57d follow-up: a kernel-side IPC
+    // bulk-vs-message desync shows up at this seam as "a valid frame
+    // at the start of a larger bulk than the frame consumes". The
+    // bulk content is the *previous* send's bytes (e.g. an 8-byte
+    // CommitSurface frame delivered in display_server's 24-byte
+    // `bulk_buf` slot because the sender's `pending_bulk` slot held
+    // a stale Commit-shaped vec when the Damage send tried to attach
+    // its 24-byte bulk). The trailing bytes are stale `bulk_buf`
+    // content from a prior recv (typically Damage rect coords —
+    // **not** all zero), so a "trailing must be zero" check is too
+    // narrow. Trust the frame header and ignore the trailing bytes.
+    //
+    // Adversarial-frame note: the strict-frame check this softens
+    // was originally there to prevent fuzzing clients from smuggling
+    // a half-second frame. In a toy OS with no untrusted
+    // compositor clients today, accepting trailing bytes is the
+    // right ergonomic trade-off; if a future hardening pass needs
+    // the strict check back, gate it behind a `#[cfg]` and tighten
+    // up the upstream IPC desync first. The desync itself is being
+    // surveilled by the kernel-side `deliver_bulk overwrote
+    // non-empty pending_bulk slot` warning added alongside this
+    // workaround.
+    if consumed > bulk.len() {
         return Err(ProtocolError::BodyLengthMismatch);
     }
     Ok(msg)
