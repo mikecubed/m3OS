@@ -205,6 +205,37 @@ stuck-key cases. If a future use-case surfaces a held letter or
 function key, the list grows; doing the full 102-key sweep was
 deemed overkill.
 
+### Second consecutive `fb-takeover doom` hangs — open
+
+The first `fb-takeover doom` invocation in a session works end-to-end
+(framebuffer mmap, WAD load, gameplay, exit, reclaim). A second
+invocation in the same session hangs: doom (the new pid) maps the FB
+successfully, then stays in `BlockedOnReply` indefinitely on its
+first kernel-internal IPC. The watchdog's 30-second "no waker
+registered" warning fires repeatedly with the same `stuck-since`
+counter incrementing — i.e. doom is genuinely wedged on a single
+call, not just slow.
+
+The disk subsystem is alive at the time (a `virtio-blk completion
+poll + queue notify after request timeout owner_pid=11 type=0
+sector=N completed=true` warning indicates the reply request did
+finish — the polling path caught a missed IRQ — but the requester
+chain didn't propagate the wake).
+
+Hypotheses to investigate:
+- Stale `Reply` capability or pending-message slot left over from
+  the first session that displaces the second session's reply
+  delivery.
+- virtio-blk waiter slot or `ACTIVE_REQUEST_*` state not fully
+  cleared between sessions, causing the post-completion wake to
+  target the wrong (now-gone) task.
+- Task-ID recycling across sessions interacting with cached IPC
+  state somewhere (display_server's bind tables, vfs_server's
+  open-handle map, etc.).
+
+Workaround: reboot between doom sessions. The first run still
+works.
+
 ### Mouse pointer resets to top-left after reclaim — open
 
 After reclaim, moving the mouse repaints the screen but the cursor
