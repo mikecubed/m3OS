@@ -12520,14 +12520,35 @@ pub(super) fn sys_clone(
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
     // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
     // combination used by musl's posix_spawn/system() — treat all as fork.
+    //
+    // For the CLONE_VM|CLONE_VFORK case (musl's posix_spawn / system),
+    // honour the caller-provided `child_stack`: musl's clone wrapper
+    // pushes the child's `args` and target function onto child_stack
+    // before issuing the syscall, then in the child branch does
+    // `pop rdi; call *rdx`. If we ignore `child_stack` and reuse the
+    // parent's RSP, the child pops random bytes from the (CoW-shared)
+    // parent stack as `args` and the called function dereferences
+    // garbage — m3os.log line 808 onward shows the resulting GPF in
+    // musl's posix_spawn `child` at +0xa4 with `r12 = 0x001628c481480424`
+    // (a non-canonical value composed of x86 instruction bytes that
+    // confirm the bogus pointer landed in code memory).
+    //
+    // For plain fork (`flags == 0` or `SIGCHLD`), child_stack is
+    // typically NULL and the child legitimately reuses the parent's
+    // RSP. Fall through to that semantic in those cases.
     let fork_flags =
         flags & !(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID | CLONE_SETTLS);
-    if fork_flags == 0
-        || fork_flags == SIGCHLD
-        || fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+    if fork_flags == 0 || fork_flags == SIGCHLD {
+        sys_fork(user_rip, user_rsp)
+    } else if fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
         || fork_flags == (CLONE_VM | CLONE_VFORK)
     {
-        sys_fork(user_rip, user_rsp)
+        let child_rsp = if child_stack != 0 {
+            child_stack
+        } else {
+            user_rsp
+        };
+        sys_fork(user_rip, child_rsp)
     } else {
         log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS
