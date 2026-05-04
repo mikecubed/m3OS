@@ -84,8 +84,13 @@ pub struct ShmId(pub u32);
 pub enum ShmError {
     /// Caller asked for zero bytes.
     InvalidLength,
-    /// Caller's `byte_len` rounds up to more pages than fit in a
-    /// `u16` page count (max 2^16 × 4 KiB = 256 MiB).
+    /// Caller's `byte_len` rounds up to more than 2^15 pages
+    /// (128 MiB) — the largest power-of-two page count that fits in
+    /// the `u16` page count without the `(1 << order) as u16` cast
+    /// wrapping. The buddy allocator's effective ceiling is currently
+    /// `MAX_ORDER = 9` (512 pages = 2 MiB), so requests between 2 MiB
+    /// and 128 MiB will fail earlier with [`OutOfContiguousFrames`];
+    /// this guard keeps the cast sound if `MAX_ORDER` is ever raised.
     LengthTooLarge,
     /// Buddy allocator could not produce a contiguous block of the
     /// requested order. Phase 56's terminal surfaces fit comfortably
@@ -128,7 +133,9 @@ pub fn create(byte_len: usize) -> Result<(ShmId, u64, u16), ShmError> {
         return Err(ShmError::InvalidLength);
     }
     let pages = byte_len.div_ceil(4096);
-    if pages > u16::MAX as usize {
+    // Bound: `pages.next_power_of_two()` must fit in u16 so the
+    // `(1 << order) as u16` cast below cannot wrap to 0.
+    if pages > (1usize << 15) {
         return Err(ShmError::LengthTooLarge);
     }
     let order = pages.next_power_of_two().trailing_zeros() as usize;
