@@ -43,6 +43,59 @@ pub mod registry;
 
 use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
 
+/// Phase 57d follow-up — bounded budget for `log_send_with_bulk_anomaly`.
+/// Caps log spam at 16 occurrences per boot so a recurrent bug stays
+/// readable in the transcript without flooding when the violation fires
+/// in a tight loop (term's renderer retries on submit failure).
+static SEND_BULK_ANOMALY_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
+
+/// Phase 57d follow-up — log when a sender allocates a 24-byte bulk
+/// vec but writes a CommitSurface header (`04 00 15 00`) at offset 0.
+/// This is the smoking-gun shape of the
+/// `bulk_len=24 head=04001500010000000000000000000000` violation
+/// observed at the receiver: term's `publish_frame` should send Damage
+/// (24-byte) and Commit (8-byte) as separate calls, never a 24-byte
+/// CommitSurface. The log captures `task_id`, `label`, and the first 12
+/// bytes of the bulk so the next transcript pins down whether term is
+/// passing the wrong `buf_len` or the kernel's per-core syscall args
+/// got crossed across a context switch.
+fn log_send_with_bulk_anomaly(task_id: crate::task::TaskId, label: u64, bulk: &[u8]) {
+    if SEND_BULK_ANOMALY_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let n = bulk.len().min(12);
+    let mut hex = [0u8; 24];
+    let mut idx = 0;
+    for &b in &bulk[..n] {
+        hex[idx] = nibble_to_hex(b >> 4);
+        hex[idx + 1] = nibble_to_hex(b & 0x0F);
+        idx += 2;
+    }
+    log::warn!(
+        "[ipc] send_with_bulk anomaly: task={} label={:#x} buf_len={} head={}",
+        task_id.0,
+        label,
+        bulk.len(),
+        core::str::from_utf8(&hex[..idx]).unwrap_or("??"),
+    );
+}
+
+fn nibble_to_hex(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=15 => b'a' + (v - 10),
+        _ => b'?',
+    }
+}
+
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
@@ -82,6 +135,8 @@ pub use registry::RegistryError;
 /// | 18 | 0x1111 | `sys_notif_bind(notif_cap, ep_cap)` | `arg0 = notif_cap, arg1 = ep_cap` → 0 or NEG_EBUSY/NEG_EBADF/u64::MAX |
 /// | 19 | 0x1112 | `ipc_take_pending_bulk(buf_ptr, buf_len)` | `arg0, arg1` → bytes_copied or u64::MAX |
 /// | 20 | 0x1113 | `ipc_try_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, or u64::MAX if no pending message |
+/// | 21 | 0x1114 | `ipc_service_exists(name_ptr, name_len)` | `arg0, arg1` → 1 if registered, 0 otherwise |
+/// | 22 | 0x1115 | `ipc_wait_service(name_ptr, name_len, timeout_ms)` | `arg0..2` → 1 ready, 0 timeout |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -120,7 +175,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, 12, 17, and 18 do not use arg0 as a pre-looked-up cap
+    // Syscalls 10, 11, 12, 17, 18, 19, 21, and 22 do not use arg0 as a pre-looked-up cap
     // handle — process them before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
@@ -139,6 +194,12 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 19 {
         return ipc_take_pending_bulk(task_id, arg0, arg1);
+    }
+    if number == 21 {
+        return ipc_service_exists(arg0, arg1);
+    }
+    if number == 22 {
+        return ipc_wait_service(task_id, arg0, arg1, arg2);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -445,6 +506,74 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
     }
 }
 
+/// Syscall 21 (0x1114): query whether a named service is currently registered
+/// without inserting a capability into the caller's cap table.
+///
+/// Private services are visible through this presence-only probe so dependent
+/// userspace can wait for readiness without receiving a callable endpoint.
+fn ipc_service_exists(name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
+    if name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
+    let mut name_buf = [0u8; 32];
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let name = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    u64::from(registry::is_registered(name))
+}
+
+/// Syscall 22 (0x1115): block until a named service is registered.
+///
+/// `timeout_ms == 0` waits indefinitely. A positive timeout uses the scheduler
+/// deadline scanner (1 tick = 1 ms). Returns `1` when ready, `0` on timeout,
+/// and `u64::MAX` for invalid input.
+fn ipc_wait_service(
+    task_id: crate::task::TaskId,
+    name_ptr: u64,
+    name_len: u64,
+    timeout_ms: u64,
+) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
+    if name_len == 0 || name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
+    let mut name_buf = [0u8; 32];
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let name = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let deadline_ticks = if timeout_ms == 0 {
+        None
+    } else {
+        Some(crate::arch::x86_64::interrupts::tick_count().saturating_add(timeout_ms))
+    };
+    u64::from(registry::wait_until_registered(
+        name,
+        task_id,
+        deadline_ticks,
+    ))
+}
+
 /// Syscall 12 (0x110B): allocate a new IPC endpoint and insert an Endpoint
 /// capability into the caller's capability table.
 ///
@@ -510,7 +639,20 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Maximum bulk-data payload accepted by `ipc_send_buf` / `ipc_call_buf`.
-const MAX_BULK_LEN: usize = 4096;
+///
+/// Sized at 16 4 KiB pages so high-bandwidth pixel-upload paths
+/// (`term` → `display_server` chunked surface buffers) hit the kernel
+/// IPC primitive in ~16 roundtrips per 1 MiB frame instead of ~252.
+/// The kernel allocates `len` bytes on demand per `ipc_send_with_bulk`,
+/// not `MAX_BULK_LEN`, so small protocol verbs still cost ~tens of bytes
+/// each — this bump only changes the ceiling, not the per-call alloc.
+/// Raising it further is safe in principle but consumers'
+/// `bulk_buf: Vec<u8>` reservations need to track in lockstep
+/// (`display_server::client::MAX_BULK_BYTES`,
+/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`). 65536 picks
+/// a comfortable round-binary headroom over the 1 MiB / 16 = 64 KiB
+/// per-chunk upper bound a Phase 56 surface ever wants to send.
+const MAX_BULK_LEN: usize = 65536;
 
 /// Send (or call) with an attached bulk-data buffer.
 ///
@@ -544,6 +686,24 @@ fn ipc_send_with_bulk(
         .is_err()
     {
         return u64::MAX;
+    }
+
+    // Phase 57d follow-up — diagnostic for the
+    // `bulk_len=24 head=04001500010000000000000000000000` violation
+    // pattern. Log every send whose first four bytes look like a
+    // CommitSurface header (`04 00 15 00`) but whose `buf_len` is 24
+    // (DamageSurface size). That is the smoking-gun shape of the
+    // mismatch: a commit-shaped frame body delivered with a damage-
+    // shaped bulk size. Rate-limited so a real attack cannot flood
+    // the log; budget bumps every boot.
+    if bulk.len() == 24
+        && bulk.len() >= 4
+        && bulk[0] == 0x04
+        && bulk[1] == 0x00
+        && bulk[2] == 0x15
+        && bulk[3] == 0x00
+    {
+        log_send_with_bulk_anomaly(task_id, msg.label, &bulk);
     }
 
     // Encode the actual bulk data length in data[1] so the receiver knows
@@ -604,6 +764,14 @@ fn ipc_recv_msg(
 
     // Write the IpcMessage header (label + 4 data words = 40 bytes) to
     // userspace.  Layout must match syscall_lib::IpcMessage.
+    //
+    // `msg.data[1]` is preserved as the sender wrote it: for messages from
+    // `ipc_send_with_bulk` it's the bulk length, but kernel-internal IPC
+    // (e.g. `vfs_service_read` packs the file offset into `data[1]`) uses
+    // the field for protocol-specific data and overriding it broke
+    // `vfs_server`'s offset handling — every read came in as offset 0,
+    // which made doom's WAD-directory load return the same first chunk
+    // repeatedly and the lump-name lookup miss `PNAMES`.
     if msg_ptr != 0 {
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
@@ -674,6 +842,15 @@ fn ipc_try_recv_msg(
         return u64::MAX;
     }
 
+    // `msg.data[1]` is preserved as the sender wrote it. The receive-side
+    // override (= `take_bulk_data().len()`) was removed because the field
+    // is protocol-specific for kernel-internal IPC: `vfs_service_read`
+    // packs the read offset into `data[1]`, and forcing it to the bulk
+    // length pinned every read at offset 0, which made doom's WAD load
+    // miss `PNAMES`. The legitimate bulk-mismatch the override was
+    // chasing (display_server seeing `bulk_len=24` with stale `bulk_buf`
+    // bytes) now needs a fix that doesn't conflate the size carried in
+    // `data[1]` with whatever value the userspace protocol carries there.
     if msg_ptr != 0 {
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(&msg.label.to_ne_bytes());

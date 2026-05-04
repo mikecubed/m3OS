@@ -104,6 +104,20 @@ static mut MOUSE_PACKET_RING: [MousePacket; MOUSE_RING_CAPACITY] = [MousePacket 
 static MOUSE_RING_HEAD: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_RING_TAIL: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic counters for the held-key cursor-freeze investigation.
+/// `MOUSE_BYTES_SEEN` is incremented for every mouse byte the ISR
+/// reads from i8042; `MOUSE_PACKETS_PRODUCED` counts decoder
+/// outputs; `MOUSE_RING_DROPS` counts overwrites when the ring is
+/// full; `IRQ1_ENTRIES` / `IRQ12_ENTRIES` count handler invocations.
+/// Sampling these alongside the userspace `ptrs=` counters pinpoints
+/// exactly which leg of the pipeline drops events.
+pub static MOUSE_BYTES_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static MOUSE_PACKETS_PRODUCED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static MOUSE_RING_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static IRQ1_ENTRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static IRQ12_ENTRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Decoder state — fed from the IRQ12 handler.
 static MOUSE_DECODER: Mutex<Ps2MouseDecoder> = Mutex::new(Ps2MouseDecoder::new());
 
@@ -183,12 +197,14 @@ pub fn has_mouse_packet() -> bool {
 /// Returns true when a packet was produced — the caller uses this to know
 /// whether to signal the userspace mouse-server notification.
 pub fn feed_byte_isr(byte: u8) -> bool {
+    MOUSE_BYTES_SEEN.fetch_add(1, Ordering::Relaxed);
     // Lock contention is impossible in practice: the IRQ handler is the
     // only caller, and IRQ12 is masked while this runs.
     let mut decoder = MOUSE_DECODER.lock();
     match decoder.feed(byte) {
         Some(DecoderEvent::Packet(packet)) => {
             push_packet_isr(packet);
+            MOUSE_PACKETS_PRODUCED.fetch_add(1, Ordering::Relaxed);
             true
         }
         Some(DecoderEvent::Resync) | None => false,
@@ -207,6 +223,7 @@ fn push_packet_isr(packet: MousePacket) {
         let head = MOUSE_RING_HEAD.load(Ordering::Acquire);
         let new_head = (head + 1) & (MOUSE_RING_CAPACITY - 1);
         MOUSE_RING_HEAD.store(new_head, Ordering::Release);
+        MOUSE_RING_DROPS.fetch_add(1, Ordering::Relaxed);
     }
     // SAFETY: tail is valid, this is the sole producer.
     unsafe {
@@ -334,6 +351,7 @@ fn drain_output() {
 // usb-mouse` or with the default PS/2 mouse. We accept either result and
 // configure the decoder accordingly.
 
+#[allow(dead_code)]
 fn try_intellimouse_handshake() -> Result<bool, Ps2Error> {
     write_to_aux_with_arg(MOUSE_CMD_SET_SAMPLE_RATE, 200)?;
     write_to_aux_with_arg(MOUSE_CMD_SET_SAMPLE_RATE, 100)?;
@@ -380,14 +398,10 @@ pub unsafe fn init_mouse() -> Result<(), Ps2Error> {
     // Step 3 — set defaults on the mouse to start from a known state.
     let _ = write_to_aux(MOUSE_CMD_SET_DEFAULTS);
 
-    // Step 4 — IntelliMouse magic-knock; if it fails we fall back silently.
-    let wheel = try_intellimouse_handshake().unwrap_or(false);
-    if wheel {
-        // Phase 57b G.8 — `with_mouse_decoder` wraps the `preempt_disable` +
-        // `without_interrupts` boilerplate around the IRQ-shared
-        // `MOUSE_DECODER` lock.
-        with_mouse_decoder(|decoder| decoder.enable_wheel_mode());
-    }
+    // Step 4 — stay in the standard 3-byte packet mode. Some QEMU/front-end
+    // combinations acknowledge the IntelliMouse probe but still surface basic
+    // PS/2 motion to the guest; using 3-byte framing keeps cursor movement
+    // reliable and simply ignores any optional wheel byte as a resync.
 
     // Step 5 — enable streaming. From here, IRQ12 fires on each packet.
     write_to_aux(MOUSE_CMD_ENABLE_STREAMING)?;

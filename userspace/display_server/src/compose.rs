@@ -221,22 +221,33 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
     let entries = registry.iter_compose(output);
 
-    // Cursor-trail fix (Phase 56 follow-up): when the cursor moved,
-    // `blit_cursor` only paints the *new* cursor position. The old
-    // cursor's opaque pixels would remain on the framebuffer as a
-    // stale "arrow trail" anywhere the underlying surface-blit pass
-    // does not repaint over them — i.e. all background area outside
-    // mapped surfaces. Explicitly clear the union of old + new
-    // cursor damage rects with the framebuffer's background color
-    // (opaque black) before the surface and cursor passes run.
-    //
-    // Inside mapped-surface bounds the clear is overpainted by the
-    // surface-blit pass below; outside, it stays as the cleared
-    // background. Either way the old cursor pixels are gone before
-    // `blit_cursor` paints the new position.
-    if cursor_motion
+    // First-compose-pass background wipe. On the first call (and again
+    // any time `ComposeContext` was reset, e.g. on client close) the
+    // framebuffer still holds whatever the kernel framebuffer console
+    // wrote at boot. Without an explicit whole-screen clear, the
+    // surface- and cursor-blit passes would paint *over* that stale
+    // image, leaving boot-log text peeking through outside mapped
+    // surface bounds. Mirrors the startup wipe `display_server::main`
+    // does after `framebuffer_mmap` so the two cases converge on the
+    // same clean background.
+    let is_first_compose = ctx.prev_pointer.is_none() || ctx.prev_cursor_size.is_none();
+    if is_first_compose {
+        clear_rect_to_background(owner, output)?;
+    } else if cursor_motion
         && let (Some(prev_pos), Some(prev_size)) = (ctx.prev_pointer, ctx.prev_cursor_size)
     {
+        // Cursor-trail fix (Phase 56 follow-up): when the cursor moved,
+        // `blit_cursor` only paints the *new* cursor position. The old
+        // cursor's opaque pixels would remain on the framebuffer as a
+        // stale "arrow trail" anywhere the underlying surface-blit pass
+        // does not repaint over them — i.e. all background area outside
+        // mapped surfaces. Explicitly clear the union of old + new
+        // cursor damage rects before the surface and cursor passes run.
+        //
+        // Inside mapped-surface bounds the clear is overpainted by the
+        // surface-blit pass below; outside, it stays as the cleared
+        // background. Either way the old cursor pixels are gone before
+        // `blit_cursor` paints the new position.
         let damage = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
         for rect in damage {
             clear_rect_to_background(owner, rect)?;
@@ -266,8 +277,33 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         })
         .collect();
 
+    // Snapshot the current pixel contents of every compose entry into
+    // owned `Vec<u8>` buffers before building the `ComposeSurface`
+    // borrows. SHM-backed surfaces are mapped into both the client's
+    // and the compositor's address spaces; the client edits pixels
+    // in place, which the Rust compiler treats as a *non-volatile*
+    // memory access through `&[u8]`. Without an explicit per-compose
+    // copy LLVM is free to assume that two reads of the same byte in
+    // the same compose pass yield the same value — a soundness
+    // assumption the cross-process editing pattern violates. Copying
+    // here freezes the snapshot for the duration of `compose_frame`,
+    // is observably-correct (each compose sees a coherent point-in-
+    // time view of the buffer), and adds a single 1 MiB memcpy per
+    // 60 Hz frame for the term surface — well below the budget the
+    // chunked-pixel path used to consume.
+    // `pixels_snapshot` performs a raw-pointer copy for shared-memory
+    // buffers — no `&[u8]` ever aliases the producer's mapping, so
+    // the snapshot is sound under Rust's aliasing model. Torn reads
+    // are inherent to the cross-process editing pattern; the
+    // resulting `Vec<u8>` is a single-point-in-time view that the
+    // rest of the compose pass treats as stable.
+    let snapshots: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| entry.buf.pixels_snapshot())
+        .collect();
+
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-    for (entry, dmg) in entries.iter().zip(damages.iter()) {
+    for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
         // Phase 56 close-out (G.1) — Toplevel surfaces use the layout
         // policy's arrangement for placement; Layer / Cursor surfaces
         // keep their iter_compose-derived rects (anchor-driven for
@@ -292,7 +328,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
             layer: entry.layer,
             rect,
             damage: &dmg[..],
-            pixels: &entry.buf.pixels,
+            pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
         });
     }
@@ -490,6 +526,28 @@ fn clear_rect_to_background<O: FramebufferOwner>(owner: &mut O, rect: Rect) -> R
     }
     let stride = (rect.w as u32).saturating_mul(bpp as u32);
     owner.write_pixels(rect, &buf, stride)
+}
+
+/// Fill the entire framebuffer with [`crate::BG_PIXEL`].
+///
+/// Called by `display_server::main` once at startup, immediately after
+/// `framebuffer_mmap` succeeds, so the kernel framebuffer console's
+/// boot-log text is wiped before any surface composes. The first-frame
+/// path inside [`run_compose`] does the same job when
+/// `ComposeContext::prev_pointer` is `None` — keeping both paths means
+/// a fresh boot is clean *and* a registry / context reset (e.g. on
+/// client close) recovers a clean background on the very next compose.
+pub fn fill_background<O: FramebufferOwner>(owner: &mut O) -> Result<(), FbError> {
+    let meta = owner.metadata();
+    clear_rect_to_background(
+        owner,
+        Rect {
+            x: 0,
+            y: 0,
+            w: meta.width,
+            h: meta.height,
+        },
+    )
 }
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named

@@ -72,6 +72,10 @@ const OP_CLIENT_ATTACH_BUFFER: u16 = 0x0013;
 const OP_CLIENT_DAMAGE_SURFACE: u16 = 0x0014;
 const OP_CLIENT_COMMIT_SURFACE: u16 = 0x0015;
 const OP_CLIENT_ACK_CONFIGURE: u16 = 0x0016;
+/// Phase 57d follow-up — attach an externally-allocated shared-memory
+/// buffer. Body layout: surface_id (u32 LE), buffer_id (u32 LE),
+/// shm_id (u32 LE), width (u32 LE), height (u32 LE).
+const OP_CLIENT_ATTACH_SHARED_BUFFER: u16 = 0x0017;
 
 // Server → client (0x0100..=0x01FF)
 const OP_SERVER_WELCOME: u16 = 0x0101;
@@ -110,6 +114,8 @@ const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
 // grab-hook regression to drive a chord through the input dispatcher
 // without needing real PS/2 scancode hardware events.
 const OP_CTL_INJECT_KEY: u16 = 0x020A;
+const OP_CTL_YIELD_FB: u16 = 0x020B;
+const OP_CTL_RECLAIM_FB: u16 = 0x020C;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -315,6 +321,21 @@ pub enum ClientMessage {
         surface_id: SurfaceId,
         buffer_id: BufferId,
     },
+    /// Phase 57d follow-up — attach a buffer backed by a shared-memory
+    /// region the client allocated via `sys_shm_create`. The compositor
+    /// maps the same physical frames read-only and reads pixels in
+    /// place during compose, so per-frame updates degenerate to small
+    /// `DamageSurface` + `CommitSurface` verbs with no chunked-pixel
+    /// transport. Replaces the chunked path for high-bandwidth clients
+    /// (`term`); the chunked path stays for clients that haven't been
+    /// migrated.
+    AttachSharedBuffer {
+        surface_id: SurfaceId,
+        buffer_id: BufferId,
+        shm_id: u32,
+        width: u32,
+        height: u32,
+    },
     DamageSurface {
         surface_id: SurfaceId,
         rect: Rect,
@@ -431,6 +452,25 @@ pub enum ControlCommand {
         keycode: u32,
         kind: u8,
     },
+    /// Phase 57d follow-up — Tier 1 fullscreen-takeover yield.
+    ///
+    /// Tells `display_server` to release framebuffer ownership without
+    /// shutting down: the compose loop pauses, the kernel `FB_YIELD`
+    /// syscall is issued (so a fullscreen program like `doom` can
+    /// `FRAMEBUFFER_MMAP` the screen), and the existing FB VMA stays
+    /// alive for fast resume. Issued by `/bin/fb-takeover` before
+    /// fork/exec'ing the takeover program. See
+    /// `docs/appendix/fb-takeover-tiers.md` for the full state
+    /// transition table.
+    YieldFb,
+    /// Phase 57d follow-up — Tier 1 fullscreen-takeover reclaim.
+    ///
+    /// Counterpart to [`ControlCommand::YieldFb`]. Tells
+    /// `display_server` to re-acquire framebuffer ownership (via
+    /// `FB_REACQUIRE`) and resume the compose loop, marking every
+    /// surface dirty so the next compose pass repaints the screen.
+    /// Issued after the takeover program exits.
+    ReclaimFb,
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -813,6 +853,19 @@ impl ClientMessage {
                 body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
                 body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
             }),
+            Self::AttachSharedBuffer {
+                surface_id,
+                buffer_id,
+                shm_id,
+                width,
+                height,
+            } => encode_fixed_body(buf, OP_CLIENT_ATTACH_SHARED_BUFFER, 20, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
+                body[8..12].copy_from_slice(&shm_id.to_le_bytes());
+                body[12..16].copy_from_slice(&width.to_le_bytes());
+                body[16..20].copy_from_slice(&height.to_le_bytes());
+            }),
             Self::DamageSurface { surface_id, rect } => {
                 encode_fixed_body(buf, OP_CLIENT_DAMAGE_SURFACE, 20, |body| {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
@@ -878,6 +931,16 @@ impl ClientMessage {
                 Self::AttachBuffer {
                     surface_id: SurfaceId(read_u32(body, 0)?),
                     buffer_id: BufferId(read_u32(body, 4)?),
+                }
+            }
+            OP_CLIENT_ATTACH_SHARED_BUFFER => {
+                expect_body_len(body_len, 20)?;
+                Self::AttachSharedBuffer {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    buffer_id: BufferId(read_u32(body, 4)?),
+                    shm_id: read_u32(body, 8)?,
+                    width: read_u32(body, 12)?,
+                    height: read_u32(body, 16)?,
                 }
             }
             OP_CLIENT_DAMAGE_SURFACE => {
@@ -1093,6 +1156,9 @@ impl ControlCommand {
                 body[2..6].copy_from_slice(&keycode.to_le_bytes());
                 body[6] = *kind;
             }),
+            // Phase 57d follow-up — Tier 1 fullscreen-takeover yield.
+            Self::YieldFb => encode_fixed_body(buf, OP_CTL_YIELD_FB, 0, |_| {}),
+            Self::ReclaimFb => encode_fixed_body(buf, OP_CTL_RECLAIM_FB, 0, |_| {}),
         }
     }
 
@@ -1159,6 +1225,14 @@ impl ControlCommand {
                     keycode: read_u32(body, 2)?,
                     kind: body[6],
                 }
+            }
+            OP_CTL_YIELD_FB => {
+                expect_body_len(body_len, 0)?;
+                Self::YieldFb
+            }
+            OP_CTL_RECLAIM_FB => {
+                expect_body_len(body_len, 0)?;
+                Self::ReclaimFb
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };

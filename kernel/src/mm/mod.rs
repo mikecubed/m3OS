@@ -8,6 +8,7 @@ pub mod frame_allocator;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;
+pub mod shm;
 pub mod slab;
 pub mod user_mem;
 pub mod user_space;

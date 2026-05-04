@@ -1,16 +1,14 @@
 //! Phase 56 — userspace display server (compositor).
 //!
 //! This binary owns presentation: it claims the primary framebuffer from
-//! the kernel via the Phase 47/56 syscall surface, fills it with a known
-//! background color so the ownership transfer is visually unambiguous,
-//! registers itself in the service registry as `"display"`, and idles on
-//! its IPC endpoint so init's supervisor sees a healthy daemon.
+//! the kernel via the Phase 47/56 syscall surface, registers itself in the
+//! service registry as `"display"`, and idles on its IPC endpoint so init's
+//! supervisor sees a healthy daemon.
 //!
 //! Tracks landed in this PR:
 //!   * **C.1** — crate scaffolding + four-place new-binary wiring.
 //!   * **C.2** — framebuffer acquisition through the [`KernelFramebufferOwner`]
-//!     impl of the `kernel-core::display::fb_owner::FramebufferOwner` trait,
-//!     plus initial background fill.
+//!     impl of the `kernel-core::display::fb_owner::FramebufferOwner` trait.
 //!
 //! Tracks deferred to follow-up PRs (foundation in `kernel-core`):
 //!   * **C.3 / C.4** — surface state machine + damage-tracked composer.
@@ -34,8 +32,8 @@ mod input;
 mod surface;
 
 use core::alloc::Layout;
-use kernel_core::display::fb_owner::{FbError, FramebufferOwner};
-use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId};
+use kernel_core::display::fb_owner::FramebufferOwner;
+use kernel_core::display::protocol::{Rect, ServerMessage, SurfaceId, SurfaceRole};
 use kernel_core::display::stats::FrameStatsRing;
 use kernel_core::input::bind_table::{BindTable, GrabState};
 use kernel_core::input::dispatch::SurfaceGeometry;
@@ -43,8 +41,18 @@ use syscall_lib::IpcMessage;
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
-use crate::client::{InboundFrame, dispatch};
-use crate::compose::{ComposeContext, default_layout, run_compose};
+use crate::client::{FatalReason, InboundFrame, dispatch};
+use crate::compose::{ComposeContext, default_layout, fill_background, run_compose};
+
+/// Phase 57d follow-up — per-second diagnostic counters for the SHM
+/// transport bring-up. Sampled and logged once per second from the
+/// compose path so a hung surface, a stuck compose tick, or a dropped
+/// Damage event produces visible signal in the boot transcript
+/// instead of silent emptiness. Ripped once SHM is stable.
+static DIAG_COMPOSES_RUN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIAG_PROTOCOL_VIOLATION_LOG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(16);
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
     publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -176,7 +184,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         );
     }
 
-    // ----- Service registration -------------------------------------------
+    // ----- Service endpoints ----------------------------------------------
     let ep_handle = syscall_lib::create_endpoint();
     if ep_handle == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "display_server: failed to create endpoint\n");
@@ -184,18 +192,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     }
     let ep_handle = ep_handle as u32;
 
-    let reg = syscall_lib::ipc_register_service(ep_handle, "display");
-    if reg == u64::MAX {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "display_server: failed to register 'display'\n",
-        );
-        return 1;
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
-
     // Phase 56 Track E.4 — second IPC endpoint for the control socket.
-    // The endpoint is registered as `"display-control"` so `m3ctl`
+    // The endpoint is later registered as `"display-control"` so `m3ctl`
     // (and any future native bar / launcher client) can locate it via
     // `ipc_lookup_service`. The codec, dispatcher, subscription
     // registry, and runtime byte-flow are all wired: each loop
@@ -214,18 +212,6 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         return 1;
     }
     let ctl_ep_handle = ctl_ep_handle as u32;
-    let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
-    if ctl_reg == u64::MAX {
-        syscall_lib::write_str(
-            STDOUT_FILENO,
-            "display_server: failed to register 'display-control'\n",
-        );
-        return 1;
-    }
-    syscall_lib::write_str(
-        STDOUT_FILENO,
-        "display_server: registered as 'display-control'\n",
-    );
 
     // ----- Framebuffer acquisition (C.2) ---------------------------------
     let mut owner = match acquire_framebuffer_with_backoff() {
@@ -239,28 +225,27 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     };
     let meta = owner.metadata();
 
-    // Initial fill across the whole framebuffer so the ownership handoff
-    // is visually unambiguous during bring-up.
-    if let Err(err) = paint_solid(&mut owner, BG_PIXEL) {
-        report_fb_error("initial fill", err);
-        // Consume the owner so its Drop does not best-effort release a
-        // second time (which the kernel would reject with -EPERM).
-        let _ = owner.release();
-        return 1;
-    }
-    let _ = owner.present();
-
     syscall_lib::write_str(STDOUT_FILENO, "display_server: framebuffer acquired\n");
     log_fb_meta(meta.width, meta.height, meta.stride_bytes);
 
+    // Initial whole-screen wipe. The framebuffer still contains the
+    // kernel framebuffer console's boot-log text at this point;
+    // without an explicit fill, the surface- and cursor-blit passes
+    // (which only paint mapped-surface and cursor regions) would leave
+    // the boot text visible everywhere else, and the cursor-trail
+    // damage path would create a teal trail wherever the mouse moved.
+    // The first-frame branch in `run_compose` does the same thing for
+    // any subsequent context reset; running it once here covers the
+    // pre-first-frame interval where a slow client still hasn't
+    // committed any surface.
+    if let Err(_e) = fill_background(&mut owner) {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: initial background fill failed\n",
+        );
+    }
+
     // ----- Input wiring (D.3) --------------------------------------------
-    //
-    // Look up the kbd / mouse services with bounded retry. Either may be
-    // unavailable at startup (mouse_server is D.2; if it lands later
-    // than this binary the first run-gui will boot without a pointer).
-    // The dispatcher drains both each loop iteration; a missing service
-    // simply yields `None` from its poll method and the dispatcher
-    // idles for that source.
     let mut input_wiring = InputWiring::new();
     if input_wiring.kbd.is_connected() {
         syscall_lib::write_str(STDOUT_FILENO, "display_server: kbd service connected\n");
@@ -350,6 +335,30 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut layout = default_layout();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
+    // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
+    // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
+    // this flag; the compose loop then skips its frame-tick work
+    // until `ReclaimFb` reverses the transition. Without the gate the
+    // composer would race the takeover program on FB pages it no
+    // longer owns.
+    let mut fb_yielded = false;
+    // Phase 57d follow-up — post-reclaim full-screen background fill.
+    // Set to `true` by the reclaim handler so the next compose tick
+    // calls `fill_background` before `run_compose`. Without this, any
+    // pixels the takeover program drew outside our toplevel surfaces
+    // (e.g. the doom HUD area when term's surface is centered and
+    // smaller than the FB) keep showing through — the pure-logic
+    // `run_compose` only paints surface and cursor regions, so the
+    // background gutter would still display whatever doom left there.
+    let mut needs_post_reclaim_fill = false;
+    // Phase 57d follow-up — small ring of recently dispatched verb
+    // frames so the next protocol-violation log can show whether the
+    // failing bulk was preceded by a structurally similar frame, and
+    // whether the offending opcode/body_len matches a frame seen one
+    // or two iterations ago. Strictly diagnostic; rate-limited via the
+    // same `DIAG_PROTOCOL_VIOLATION_LOG_BUDGET` as the headline log.
+    let mut recent_frames = RecentFrames::new();
     // Phase 56 C.5 close-out — per-client outbound queue. The
     // dispatcher's `InputEffect::Outbound(ServerMessage::Key|Pointer)`
     // fires on focused-client key/pointer events; we accumulate the
@@ -365,6 +374,36 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // bytes leaves ample headroom while staying well below
     // `MAX_BULK_BYTES`.
     let mut event_reply_buf = [0u8; 128];
+
+    let reg = syscall_lib::ipc_register_service(ep_handle, "display");
+    if reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to register 'display'\n",
+        );
+        return 1;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "display_server: registered as 'display'\n");
+
+    // Phase 57d follow-up — separate service marker for "display has
+    // grabbed graphical input". Registered lazily on the first Toplevel
+    // map below. While unregistered, `stdin_feeder` keeps owning PS/2
+    // keystrokes (the text-mode bridge); once a real graphical client
+    // maps a Toplevel surface, `stdin_feeder` polls this name and
+    // stands down so `display_server`'s focus dispatcher can deliver
+    // typed `KeyEvent`s. Keeping the bootstrap split means clients
+    // can still find `"display"` to send Hello/CreateSurface, while
+    // the input-grab decision waits for an actual graphical surface.
+    let mut input_owner_registered = false;
+
+    let ctl_reg = syscall_lib::ipc_register_service(ctl_ep_handle, "display-control");
+    if ctl_reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: failed to register 'display-control'\n",
+        );
+        return 1;
+    }
 
     loop {
         // 1. Try to receive one graphical-endpoint message non-blocking.
@@ -434,24 +473,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             } else {
                 &[][..]
             };
-            dispatch(
+            let outcome = dispatch(
                 InboundFrame {
                     header,
                     bulk: bulk_slice,
                 },
                 &mut registry,
-            )
+            );
+            recent_frames.push(&header, bulk_slice, &outcome);
+            outcome
         } else {
             client::DispatchOutcome::default()
         };
         if outcome.fatal {
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "display_server: client protocol violation; dropping message\n",
-            );
-        }
-        if !outcome.outbound.is_empty() {
-            log_outbound_count(outcome.outbound.len() as u32);
+            log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
             syscall_lib::write_str(
@@ -459,10 +494,57 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 "display_server: client closed; resetting registry\n",
             );
             registry = SurfaceRegistry::new();
+            focused = None;
             // E.3 — the previous cursor (if any) belonged to that
             // client. Reset the compose context so the next first-
             // frame draws the fallback `DefaultArrowCursor` cleanly.
             compose_ctx = ComposeContext::new();
+        }
+        if let Some(focused_id) = focused
+            && outcome.destroyed.iter().any(|id| *id == focused_id)
+        {
+            focused = None;
+            publish_focus_changed(&mut control_subs, focused);
+        }
+        if focused.is_none()
+            && let Some((surface_id, _)) = outcome
+                .created
+                .iter()
+                .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        {
+            focused = Some(*surface_id);
+            publish_focus_changed(&mut control_subs, focused);
+        }
+
+        // First-Toplevel-map gate for the input-owner service. Any
+        // Toplevel created in this iteration means a real graphical
+        // client (`term`, a layer client wrapping a Toplevel, etc.)
+        // is up. Once that's true, register the marker exactly once
+        // so `stdin_feeder` can transition out of the PS/2-to-TTY
+        // bridge. Re-using the graphical endpoint as the registered
+        // endpoint is fine here: the marker is only consulted via
+        // `ipc_service_exists` (cap-free probe), not used to send
+        // IPC traffic, so there's no danger of confusing it with the
+        // protocol traffic that flows over `"display"`.
+        if !input_owner_registered
+            && outcome
+                .created
+                .iter()
+                .any(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        {
+            let rc = syscall_lib::ipc_register_service(ep_handle, "display.input-owner");
+            if rc != u64::MAX {
+                input_owner_registered = true;
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: registered as 'display.input-owner' (first Toplevel mapped)\n",
+                );
+            } else {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: failed to register 'display.input-owner'\n",
+                );
+            }
         }
 
         // Track E.4 — diff the current registered surface ids against
@@ -517,8 +599,40 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         //    `present` as a real swap point (today `KernelFramebufferOwner`
         //    uses the trait's default no-op, so the duplicate was visible
         //    only to a reviewer reading the code).
-        let ticks = syscall_lib::frame_tick_drain();
+        // Phase 57d follow-up — Tier 1 fullscreen-takeover gate.
+        // While `fb_yielded` is set, the takeover program owns the
+        // framebuffer. Skip the entire compose path: don't drain the
+        // frame-tick (so the next reclaim sees a clean tick budget),
+        // don't run `run_compose` (it would write to FB pages owned by
+        // another process), don't emit `compose_micros` samples (those
+        // would lie about composer health). The reclaim handler marks
+        // every surface dirty so the post-reclaim tick redraws.
+        let ticks = if fb_yielded {
+            0
+        } else {
+            syscall_lib::frame_tick_drain()
+        };
         if ticks > 0 {
+            // Phase 57d follow-up — post-reclaim full-screen fill.
+            // After Tier 1 fullscreen-takeover, the takeover program
+            // (e.g. doom) drew over the entire FB. `run_compose`
+            // below only paints surface and cursor regions; any
+            // background gutter would still show doom's last frame.
+            // Reset the cursor-damage tracking too so the cursor is
+            // redrawn at the current position rather than computing
+            // damage against a "previous" pointer that referred to
+            // pre-yield FB state.
+            if needs_post_reclaim_fill {
+                if let Err(_e) = fill_background(&mut owner) {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: post-reclaim background fill failed\n",
+                    );
+                }
+                compose_ctx = ComposeContext::new();
+                needs_post_reclaim_fill = false;
+            }
+
             // E.3 — gate has moved into `run_compose`. The composer
             // checks both `registry.has_damage()` AND pointer-motion
             // damage (via `cursor_damage`); a tick with no surface
@@ -545,16 +659,75 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             } else {
                 elapsed_us as u32
             };
+            // Phase 57d follow-up — diagnostic: count every compose
+            // path entry, separately from the writes-counter, so we
+            // can distinguish "compose loop alive but returns 0
+            // writes" (surface_damage and cursor_motion both false)
+            // from "compose loop never runs" (frame_tick stuck or
+            // display_server hung in input drain). Log the first 5
+            // entries individually so we see compose come up, then
+            // every 60 entries so the steady-state log doesn't drown
+            // the boot transcript. Includes the result tag so we
+            // know which arm fired.
+            let entry_count =
+                DIAG_COMPOSES_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            let result_tag: &'static str = match &compose_result {
+                Ok(0) => "ok0",
+                Ok(_) => "okN",
+                Err(_) => "err",
+            };
+            let writes_this = compose_result.as_ref().copied().unwrap_or(0);
+            DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
+            if entry_count <= 5 || entry_count.is_multiple_of(60) {
+                let total_writes = DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
+                let key_some =
+                    input::DIAG_KEY_DRAINS_SOME.load(core::sync::atomic::Ordering::Relaxed);
+                let key_none =
+                    input::DIAG_KEY_DRAINS_NONE.load(core::sync::atomic::Ordering::Relaxed);
+                let ptr_some =
+                    input::DIAG_PTR_DRAINS_SOME.load(core::sync::atomic::Ordering::Relaxed);
+                let ptr_none =
+                    input::DIAG_PTR_DRAINS_NONE.load(core::sync::atomic::Ordering::Relaxed);
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: compose#");
+                write_u32(entry_count as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " ");
+                syscall_lib::write_str(STDOUT_FILENO, result_tag);
+                syscall_lib::write_str(STDOUT_FILENO, " writes=");
+                write_u32(writes_this as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " total=");
+                write_u32(total_writes as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " keys=");
+                write_u32(key_some as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "/");
+                write_u32(key_none as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " ptrs=");
+                write_u32(ptr_some as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "/");
+                write_u32(ptr_none as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " pos=");
+                write_u32(pointer_position.0.max(0) as u32);
+                syscall_lib::write_str(STDOUT_FILENO, ",");
+                write_u32(pointer_position.1.max(0) as u32);
+                let mbytes = syscall_lib::ps2_diag_counter(0);
+                let mpackets = syscall_lib::ps2_diag_counter(1);
+                let mdrops = syscall_lib::ps2_diag_counter(2);
+                let irq1 = syscall_lib::ps2_diag_counter(3);
+                let irq12 = syscall_lib::ps2_diag_counter(4);
+                syscall_lib::write_str(STDOUT_FILENO, " irq1=");
+                write_u32(irq1 as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " irq12=");
+                write_u32(irq12 as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mbytes=");
+                write_u32(mbytes as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mpkts=");
+                write_u32(mpackets as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " mdrops=");
+                write_u32(mdrops as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
             match compose_result {
                 Ok(0) => {}
                 Ok(_writes) => {
-                    // Per-frame `composed writes=N` log was retired in
-                    // Phase 57: at 60 Hz with a graphical client doing
-                    // chunked uploads it produced ~60 lines/sec on the
-                    // serial console, drowning real signal. The
-                    // frame-stats ring still records the sample so a
-                    // future control-socket query can surface compose
-                    // throughput on demand.
                     record_frame_sample(&mut frame_stats, frame_index_counter, compose_micros);
                     frame_index_counter = frame_index_counter.saturating_add(1);
                 }
@@ -692,7 +865,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // and control-endpoint serving without blocking.
         serve_one_control_request(
             ctl_ep_handle,
-            &registry,
+            &mut registry,
             &mut bind_table,
             &mut control_subs,
             &frame_stats,
@@ -701,6 +874,8 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             inject_key_policy,
             &owner,
             &mut input_wiring,
+            &mut fb_yielded,
+            &mut needs_post_reclaim_fill,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -731,7 +906,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
 /// reply is sent so clients always observe a well-formed frame.
 fn serve_one_control_request(
     ep_handle: u32,
-    registry: &SurfaceRegistry,
+    registry: &mut SurfaceRegistry,
     bind_table: &mut BindTable,
     subscriptions: &mut control::ControlSubscriptions,
     frame_stats: &FrameStatsRing,
@@ -740,6 +915,8 @@ fn serve_one_control_request(
     inject_key_policy: control::InjectKeyPolicy,
     fb_owner: &KernelFramebufferOwner,
     input_wiring: &mut InputWiring,
+    fb_yielded: &mut bool,
+    needs_post_reclaim_fill: &mut bool,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -776,23 +953,68 @@ fn serve_one_control_request(
     let bulk_len = bulk_len.min(req_buf.len());
 
     let mut reply_buf = [0u8; control::MAX_BULK_BYTES];
-    let client = control::ClientId(0); // Phase 56 single-client.
-    let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
-    let inject_key_sink = |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
-    let n = serve_control_iter(
-        &req_buf[..bulk_len],
-        client,
-        registry,
-        bind_table,
-        subscriptions,
-        frame_stats,
-        debug_crash,
-        readback,
-        inject_key_policy,
-        pixel_reader,
-        inject_key_sink,
-        &mut reply_buf,
-    );
+
+    // Phase 57d follow-up — Tier 1 fullscreen-takeover hooks. Peek at
+    // the decoded command for `YieldFb` / `ReclaimFb` and route them
+    // through `handle_fb_yield_request` / `handle_fb_reclaim_request`
+    // directly. These have side effects (a kernel syscall plus
+    // compose-loop state changes) the pure-logic `dispatch_command`
+    // shouldn't carry, and the rest of the control surface is unaware
+    // of the yielded state.
+    use kernel_core::display::control::{ControlCommand, decode_command};
+    let n = if let Ok((cmd, _)) = decode_command(&req_buf[..bulk_len]) {
+        match cmd {
+            ControlCommand::YieldFb => handle_fb_yield_request(fb_yielded, &mut reply_buf),
+            ControlCommand::ReclaimFb => handle_fb_reclaim_request(
+                registry,
+                fb_yielded,
+                needs_post_reclaim_fill,
+                &mut reply_buf,
+            ),
+            _ => {
+                let client = control::ClientId(0);
+                let pixel_reader =
+                    |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
+                let inject_key_sink =
+                    |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
+                serve_control_iter(
+                    &req_buf[..bulk_len],
+                    client,
+                    registry,
+                    bind_table,
+                    subscriptions,
+                    frame_stats,
+                    debug_crash,
+                    readback,
+                    inject_key_policy,
+                    pixel_reader,
+                    inject_key_sink,
+                    &mut reply_buf,
+                )
+            }
+        }
+    } else {
+        // Fall through to generic decoder so its error reply path stays
+        // the single source of truth for malformed frames.
+        let client = control::ClientId(0);
+        let pixel_reader = |x: u32, y: u32| -> Option<u32> { fb_owner.read_pixel(x, y).ok() };
+        let inject_key_sink =
+            |ev: kernel_core::input::events::KeyEvent| input_wiring.inject_key(ev);
+        serve_control_iter(
+            &req_buf[..bulk_len],
+            client,
+            registry,
+            bind_table,
+            subscriptions,
+            frame_stats,
+            debug_crash,
+            readback,
+            inject_key_policy,
+            pixel_reader,
+            inject_key_sink,
+            &mut reply_buf,
+        )
+    };
     if n > 0 {
         let _ = syscall_lib::ipc_store_reply_bulk(&reply_buf[..n]);
     }
@@ -911,6 +1133,88 @@ fn encode_event_or_drop(
     kernel_core::display::control::encode_event(evt, reply_buf).unwrap_or_default()
 }
 
+/// Phase 57d follow-up — Tier 1 fullscreen-takeover yield handler.
+///
+/// Drops framebuffer ownership via `SYS_FB_YIELD` so a fullscreen
+/// program (e.g. doom launched via `/bin/fb-takeover`) can claim it.
+/// Sets `fb_yielded = true` so the compose loop skips its frame-tick
+/// work — without this gate the compositor would keep writing pixels
+/// while another process draws, racing on the same physical FB pages.
+/// Idempotent: a second yield while already yielded is a no-op
+/// success.
+fn handle_fb_yield_request(fb_yielded: &mut bool, reply_buf: &mut [u8]) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if *fb_yielded {
+        return encode_event_or_drop(&ControlEvent::Ack, reply_buf);
+    }
+    let rc = syscall_lib::fb_yield();
+    if rc != 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: fb_yield syscall failed\n");
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::ResourceExhausted,
+            },
+            reply_buf,
+        );
+    }
+    *fb_yielded = true;
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: framebuffer yielded for takeover\n",
+    );
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+/// Phase 57d follow-up — Tier 1 fullscreen-takeover reclaim handler.
+///
+/// Counterpart to [`handle_fb_yield_request`]. Re-acquires framebuffer
+/// ownership via `SYS_FB_REACQUIRE` and clears the yielded gate. If
+/// the takeover program exited normally the kernel's exit cleanup
+/// already cleared the FB owner; if `FB_REACQUIRE` returns `EBUSY`
+/// the reclaimer will retry shortly (the wrapper retries the verb on
+/// `Internal`).
+///
+/// On success, marks every live surface dirty so the next compose
+/// pass repaints the screen — between yield and reclaim the takeover
+/// program drew over the FB and any cached compose state is now
+/// stale. Also sets `needs_post_reclaim_fill` so the next compose
+/// tick `fill_background`s the entire FB before running compose:
+/// surface blits only paint surface and cursor regions, leaving any
+/// background gutter (where doom drew but our toplevels don't cover)
+/// showing whatever the takeover program left behind.
+fn handle_fb_reclaim_request(
+    registry: &mut SurfaceRegistry,
+    fb_yielded: &mut bool,
+    needs_post_reclaim_fill: &mut bool,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if !*fb_yielded {
+        return encode_event_or_drop(&ControlEvent::Ack, reply_buf);
+    }
+    let rc = syscall_lib::fb_reacquire();
+    if rc != 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: fb_reacquire syscall failed\n",
+        );
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::ResourceExhausted,
+            },
+            reply_buf,
+        );
+    }
+    registry.mark_all_dirty();
+    *fb_yielded = false;
+    *needs_post_reclaim_fill = true;
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: framebuffer reclaimed; full repaint queued\n",
+    );
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
 /// Try to acquire the framebuffer with bounded retry, in case another
 /// short-lived process is still releasing ownership at boot.
 fn acquire_framebuffer_with_backoff() -> Result<KernelFramebufferOwner, &'static str> {
@@ -936,37 +1240,6 @@ fn acquire_framebuffer_with_backoff() -> Result<KernelFramebufferOwner, &'static
     Err("framebuffer busy after retry budget")
 }
 
-/// Fill the entire framebuffer rectangle with `pixel` (packed 32-bit).
-fn paint_solid(owner: &mut KernelFramebufferOwner, pixel: u32) -> Result<(), FbError> {
-    let meta = owner.metadata();
-    let w = meta.width;
-    let h = meta.height;
-    if w == 0 || h == 0 {
-        return Ok(());
-    }
-    // Build one full row of pixel data, then write each row in turn. Avoids
-    // allocating a width*height*4 staging buffer on the heap.
-    let row_bytes_len = (w as usize) * 4;
-    let mut row: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(row_bytes_len);
-    let bytes = pixel.to_le_bytes();
-    for _ in 0..w {
-        row.extend_from_slice(&bytes);
-    }
-    for y in 0..h {
-        owner.write_pixels(
-            Rect {
-                x: 0,
-                y: y as i32,
-                w,
-                h: 1,
-            },
-            &row,
-            row_bytes_len as u32,
-        )?;
-    }
-    Ok(())
-}
-
 fn log_fb_meta(w: u32, h: u32, stride: u32) {
     syscall_lib::write_str(STDOUT_FILENO, "display_server: fb metadata: ");
     write_u32(w);
@@ -977,10 +1250,179 @@ fn log_fb_meta(w: u32, h: u32, stride: u32) {
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
-fn log_outbound_count(n: u32) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: outbound queued n=");
-    write_u32(n);
+fn log_client_protocol_violation(
+    reason: Option<FatalReason>,
+    header: &IpcMessage,
+    bulk_buf: &[u8],
+    recent: &RecentFrames,
+) {
+    if DIAG_PROTOCOL_VIOLATION_LOG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let bulk_len = (header.data[1] as usize).min(bulk_buf.len());
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: client protocol violation reason=",
+    );
+    syscall_lib::write_str(STDOUT_FILENO, fatal_reason_name(reason));
+    syscall_lib::write_str(STDOUT_FILENO, " label=");
+    write_u32(header.label as u32);
+    syscall_lib::write_str(STDOUT_FILENO, " bulk_len=");
+    write_u32(bulk_len as u32);
+    if bulk_len >= 4 {
+        let body_len = u16::from_le_bytes([bulk_buf[0], bulk_buf[1]]);
+        let opcode = u16::from_le_bytes([bulk_buf[2], bulk_buf[3]]);
+        syscall_lib::write_str(STDOUT_FILENO, " body_len=");
+        write_u32(body_len as u32);
+        syscall_lib::write_str(STDOUT_FILENO, " opcode=");
+        write_u32(opcode as u32);
+    }
+    syscall_lib::write_str(STDOUT_FILENO, " head16=");
+    write_hex_prefix(bulk_buf, bulk_len, 16);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
+    recent.dump();
+}
+
+/// Phase 57d follow-up — small ring of recently dispatched verb frames.
+/// Captures `(label, bulk_len, head8 bytes, outcome tag)` so a fatal
+/// dispatch can show whether the offending bulk's bytes match a frame
+/// the dispatcher accepted moments earlier (which would point at a
+/// stale-bulk read on the receiver side, rather than a malformed frame
+/// from the client).
+const RECENT_FRAMES_CAP: usize = 8;
+
+#[derive(Clone, Copy)]
+struct RecentFrame {
+    label: u64,
+    bulk_len: u32,
+    head: [u8; 8],
+    head_len: u8,
+    outcome: RecentOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum RecentOutcome {
+    Ok,
+    Closed,
+    Fatal(Option<FatalReason>),
+}
+
+struct RecentFrames {
+    entries: [Option<RecentFrame>; RECENT_FRAMES_CAP],
+    next: usize,
+}
+
+impl RecentFrames {
+    fn new() -> Self {
+        Self {
+            entries: [None; RECENT_FRAMES_CAP],
+            next: 0,
+        }
+    }
+
+    fn push(&mut self, header: &IpcMessage, bulk: &[u8], outcome: &client::DispatchOutcome) {
+        let mut head = [0u8; 8];
+        let head_len = bulk.len().min(head.len());
+        head[..head_len].copy_from_slice(&bulk[..head_len]);
+        let outcome_tag = if outcome.fatal {
+            RecentOutcome::Fatal(outcome.fatal_reason)
+        } else if outcome.closed {
+            RecentOutcome::Closed
+        } else {
+            RecentOutcome::Ok
+        };
+        let entry = RecentFrame {
+            label: header.label,
+            bulk_len: bulk.len() as u32,
+            head,
+            head_len: head_len as u8,
+            outcome: outcome_tag,
+        };
+        self.entries[self.next] = Some(entry);
+        self.next = (self.next + 1) % RECENT_FRAMES_CAP;
+    }
+
+    /// Print the ring oldest-first with the most recent entry last so
+    /// scanners see the failing frame at the bottom and its predecessor
+    /// just above it.
+    fn dump(&self) {
+        let mut age = 0;
+        for offset in 0..RECENT_FRAMES_CAP {
+            let idx = (self.next + offset) % RECENT_FRAMES_CAP;
+            if let Some(entry) = &self.entries[idx] {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server:   recent[-");
+                write_u32((RECENT_FRAMES_CAP - 1 - age) as u32);
+                syscall_lib::write_str(STDOUT_FILENO, "] label=");
+                write_u32(entry.label as u32);
+                syscall_lib::write_str(STDOUT_FILENO, " bulk_len=");
+                write_u32(entry.bulk_len);
+                syscall_lib::write_str(STDOUT_FILENO, " head=");
+                write_hex_prefix(
+                    &entry.head[..entry.head_len as usize],
+                    entry.head_len as usize,
+                    entry.head_len as usize,
+                );
+                syscall_lib::write_str(STDOUT_FILENO, " outcome=");
+                syscall_lib::write_str(STDOUT_FILENO, recent_outcome_name(entry.outcome));
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+            }
+            age += 1;
+        }
+    }
+}
+
+fn recent_outcome_name(outcome: RecentOutcome) -> &'static str {
+    match outcome {
+        RecentOutcome::Ok => "ok",
+        RecentOutcome::Closed => "closed",
+        RecentOutcome::Fatal(reason) => fatal_reason_name(reason),
+    }
+}
+
+/// Print up to `max` bytes of `buf[..len]` as lowercase hex without
+/// separators. `len` is capped at `buf.len()` defensively. Designed for
+/// terse single-line log output — 16 bytes prints as 32 hex chars.
+fn write_hex_prefix(buf: &[u8], len: usize, max: usize) {
+    let n = len.min(buf.len()).min(max);
+    let mut out = [0u8; 2];
+    for byte in &buf[..n] {
+        out[0] = hex_nibble(byte >> 4);
+        out[1] = hex_nibble(byte & 0x0F);
+        if let Ok(s) = core::str::from_utf8(&out) {
+            syscall_lib::write_str(STDOUT_FILENO, s);
+        }
+    }
+}
+
+fn hex_nibble(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=15 => b'a' + (v - 10),
+        _ => b'?',
+    }
+}
+
+fn fatal_reason_name(reason: Option<FatalReason>) -> &'static str {
+    match reason {
+        Some(FatalReason::BulkTooLarge) => "bulk-too-large",
+        Some(FatalReason::PixelHeaderTooShort) => "pixel-header-too-short",
+        Some(FatalReason::PixelSizeMismatch) => "pixel-size-mismatch",
+        Some(FatalReason::PendingBulkFull) => "pending-bulk-full",
+        Some(FatalReason::ChunkHeaderTooShort) => "chunk-header-too-short",
+        Some(FatalReason::ChunkDecode) => "chunk-decode",
+        Some(FatalReason::ChunkBufferMismatch) => "chunk-buffer-mismatch",
+        Some(FatalReason::ChunkReceive) => "chunk-receive",
+        Some(FatalReason::VerbDecode) => "verb-decode",
+        Some(FatalReason::ShmMapFailed) => "shm-map-failed",
+        None => "unknown",
+    }
 }
 
 fn write_u32(mut value: u32) {
@@ -999,18 +1441,6 @@ fn write_u32(mut value: u32) {
     if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
         syscall_lib::write_str(STDOUT_FILENO, s);
     }
-}
-
-fn report_fb_error(stage: &str, err: FbError) {
-    syscall_lib::write_str(STDOUT_FILENO, "display_server: fb error in ");
-    syscall_lib::write_str(STDOUT_FILENO, stage);
-    let suffix = match err {
-        FbError::OutOfBounds => " (OutOfBounds)\n",
-        FbError::Truncated => " (Truncated)\n",
-        FbError::InvalidStride => " (InvalidStride)\n",
-        FbError::Unsupported => " (Unsupported)\n",
-    };
-    syscall_lib::write_str(STDOUT_FILENO, suffix);
 }
 
 /// Map the kernel's reported pixel-format tag onto

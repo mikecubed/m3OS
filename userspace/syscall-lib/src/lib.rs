@@ -7,6 +7,9 @@
 //!   rcx and r11 are clobbered by syscall instruction
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 use core::arch::asm;
 
 #[cfg(feature = "alloc")]
@@ -267,6 +270,36 @@ pub const SYS_FRAME_TICK_HZ: u64 = 0x1016;
 
 /// Phase 56 Track B.3: drain pending frame-tick events (saturating).
 pub const SYS_FRAME_TICK_DRAIN: u64 = 0x1017;
+/// Diagnostic: read one PS/2 ISR counter. See [`ps2_diag_counter`].
+pub const SYS_PS2_DIAG_COUNTER: u64 = 0x101E;
+
+/// Phase 57d follow-up: allocate a shared-memory region.
+/// `sys_shm_create(byte_len)` returns the new ShmId in the low 32 bits;
+/// callers compare against `u64::MAX` for failure.
+pub const SYS_SHM_CREATE: u64 = 0x1018;
+/// Map an existing shared-memory region. Returns the user virtual
+/// address, or `u64::MAX` on error. Increments the registry refcount.
+pub const SYS_SHM_MAP: u64 = 0x1019;
+/// Unmap a shared-memory region and decrement its refcount. Frames
+/// return to the buddy when the last reference drops.
+pub const SYS_SHM_UNMAP: u64 = 0x101A;
+/// Drop the creator's reference on a shared-memory region without
+/// requiring an existing mapping. Used by the creating process to
+/// release the +1 that `SHM_CREATE` reserved.
+pub const SYS_SHM_DESTROY: u64 = 0x101B;
+
+/// Phase 57d follow-up: temporarily release framebuffer ownership
+/// without unmapping the caller's FB VMA (so a future
+/// `SYS_FB_REACQUIRE` can resume composing without re-walking page
+/// tables). Tier 1 fullscreen-takeover primitive — see
+/// `docs/appendix/fb-takeover-tiers.md`.
+pub const SYS_FB_YIELD: u64 = 0x101C;
+/// Phase 57d follow-up: re-claim framebuffer ownership previously
+/// dropped via `SYS_FB_YIELD`. Caller must already have an
+/// FB-flagged VMA (i.e. it called `SYS_FRAMEBUFFER_MMAP` then
+/// `SYS_FB_YIELD`). Returns 0 on success, `-EBUSY` if another
+/// process owns the framebuffer.
+pub const SYS_FB_REACQUIRE: u64 = 0x101D;
 
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
@@ -348,6 +381,12 @@ pub const SYS_IPC_TAKE_PENDING_BULK: u64 = 0x1112;
 /// loop to multiplex the frame-tick poll + control-endpoint serving.
 pub const SYS_IPC_TRY_RECV_MSG: u64 = 0x1113;
 
+/// Query whether a named service is registered without allocating a cap handle.
+pub const SYS_IPC_SERVICE_EXISTS: u64 = 0x1114;
+
+/// Block until a named service is registered without allocating a cap handle.
+pub const SYS_IPC_WAIT_SERVICE: u64 = 0x1115;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -372,6 +411,49 @@ impl IpcMessage {
             label,
             data: [0; 4],
         }
+    }
+
+    /// Return the reply capability handle staged by the kernel for call-shaped
+    /// receives.
+    ///
+    /// `recv_msg` writes this handle into `data[3]`; `0` means the sender did
+    /// not request a reply. Servers must use this value instead of assuming a
+    /// fixed capability-table slot.
+    pub fn reply_cap_handle(&self) -> Option<u32> {
+        let raw = self.data[3];
+        if raw == 0 || raw > u64::from(u32::MAX) {
+            None
+        } else {
+            Some(raw as u32)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IpcMessage;
+
+    #[test]
+    fn ipc_message_reply_cap_uses_kernel_supplied_data3() {
+        let mut msg = IpcMessage::new(0);
+        msg.data[3] = 17;
+
+        assert_eq!(msg.reply_cap_handle(), Some(17));
+    }
+
+    #[test]
+    fn ipc_message_reply_cap_treats_zero_as_absent() {
+        let msg = IpcMessage::new(0);
+
+        assert_eq!(msg.reply_cap_handle(), None);
+    }
+
+    #[test]
+    fn ipc_message_reply_cap_rejects_out_of_range_handle() {
+        let mut msg = IpcMessage::new(0);
+        msg.data[3] = u64::from(u32::MAX) + 1;
+
+        assert_eq!(msg.reply_cap_handle(), None);
     }
 }
 
@@ -445,6 +527,37 @@ pub fn ipc_lookup_service(name: &str) -> u64 {
             name.as_ptr() as u64,
             name.len() as u64,
         )
+    }
+}
+
+/// Return true if a named service is currently registered.
+///
+/// Unlike [`ipc_lookup_service`], this does not insert an endpoint capability
+/// into the caller's cap table, so it is safe for polling ownership changes.
+pub fn ipc_service_exists(name: &str) -> bool {
+    unsafe {
+        syscall2(
+            SYS_IPC_SERVICE_EXISTS,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        ) == 1
+    }
+}
+
+/// Wait until a named service is registered.
+///
+/// `timeout_ms == 0` waits indefinitely. A positive timeout is bounded in
+/// milliseconds. Returns `true` when the service is ready, `false` on timeout
+/// or invalid input. Like [`ipc_service_exists`], this does not insert an
+/// endpoint capability into the caller's cap table.
+pub fn ipc_wait_service(name: &str, timeout_ms: u64) -> bool {
+    unsafe {
+        syscall3(
+            SYS_IPC_WAIT_SERVICE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            timeout_ms,
+        ) == 1
     }
 }
 
@@ -2009,6 +2122,25 @@ pub fn framebuffer_release() -> isize {
     unsafe { syscall0(SYS_FRAMEBUFFER_RELEASE) as isize }
 }
 
+/// Phase 57d follow-up: yield framebuffer ownership without unmapping
+/// the caller's FB VMA. Used by `display_server` to hand the screen to
+/// a fullscreen takeover program (see `/bin/fb-takeover`) and resume
+/// later via [`fb_reacquire`] without re-walking page tables. Returns
+/// `0` on success, negative errno on failure (`-EPERM` if caller is
+/// not the current FB owner).
+pub fn fb_yield() -> isize {
+    unsafe { syscall0(SYS_FB_YIELD) as isize }
+}
+
+/// Phase 57d follow-up: counterpart to [`fb_yield`]. Reclaims FB
+/// ownership for the caller, which must still hold its FB-flagged VMA
+/// from the prior [`framebuffer_mmap`] call. Returns `0` on success,
+/// `-EBUSY` if another process owns the framebuffer, `-ENOENT` if no
+/// FB VMA is mapped.
+pub fn fb_reacquire() -> isize {
+    unsafe { syscall0(SYS_FB_REACQUIRE) as isize }
+}
+
 /// Phase 56 Track B.2: read one decoded PS/2 mouse packet from the kernel.
 ///
 /// `buf` must be at least 8 bytes (`MOUSE_PACKET_WIRE_SIZE`). On success the
@@ -2048,6 +2180,71 @@ pub fn frame_tick_hz() -> u32 {
 /// (saturating coalesce). Never blocks; returns 0 if no ticks elapsed.
 pub fn frame_tick_drain() -> u32 {
     unsafe { syscall0(SYS_FRAME_TICK_DRAIN) as u32 }
+}
+
+/// Diagnostic: read one of the PS/2 ISR counters by selector.
+///
+/// Selectors:
+/// - 0: total mouse bytes seen by `feed_byte_isr`
+/// - 1: total mouse packets produced by the decoder
+/// - 2: total mouse-ring overwrites (drops)
+/// - 3: total IRQ1 (keyboard) handler entries
+/// - 4: total IRQ12 (mouse) handler entries
+///
+/// Used by `display_server`'s diagnostic compose-log line during the
+/// held-key cursor-freeze investigation. Strip once root-caused.
+pub fn ps2_diag_counter(selector: u64) -> u64 {
+    unsafe { syscall1(SYS_PS2_DIAG_COUNTER, selector) }
+}
+
+/// Allocate a shared-memory region of `byte_len` bytes. The buddy
+/// allocator can only produce power-of-two contiguous runs, so the
+/// kernel rounds the page count up to the next power of two; callers
+/// that care about exact pad bytes should size requests to a
+/// power-of-two number of 4 KiB pages.
+///
+/// Returns the new region's id, or `0` on error (kernel returns
+/// `u64::MAX` which is mapped to 0 since 0 is the reserved unset id).
+///
+/// `shm_create` reserves a +1 *creator* reference on the kernel
+/// registry. The creator must release that reference exactly once
+/// when finished with the region — call [`shm_destroy`] for that.
+/// `shm_map` increments the refcount independently of the creator
+/// reference and pairs with `shm_unmap`. A typical
+/// create -> map -> unmap -> destroy cycle returns the underlying
+/// frames to the buddy on the final step.
+pub fn shm_create(byte_len: usize) -> u32 {
+    let raw = unsafe { syscall1(SYS_SHM_CREATE, byte_len as u64) };
+    if raw == u64::MAX {
+        return 0;
+    }
+    raw as u32
+}
+
+/// Map an existing shared-memory region into the caller's address
+/// space. Returns the user virtual address (non-zero) on success, or
+/// `0` on error. Increments the registry refcount; pair every
+/// successful call with one [`shm_unmap`].
+pub fn shm_map(shm_id: u32) -> u64 {
+    let raw = unsafe { syscall1(SYS_SHM_MAP, u64::from(shm_id)) };
+    if raw == u64::MAX { 0 } else { raw }
+}
+
+/// Unmap a previously-mapped shared-memory region and decrement its
+/// refcount. Returns `true` on success.
+pub fn shm_unmap(user_va: u64) -> bool {
+    let raw = unsafe { syscall1(SYS_SHM_UNMAP, user_va) };
+    raw == 0
+}
+
+/// Drop the creator's reference on a shared-memory region without
+/// requiring an existing mapping. Use this to release the +1 that
+/// `shm_create` reserved — including on early failure paths between
+/// `shm_create` and the first successful `shm_map`. Returns `true`
+/// on success.
+pub fn shm_destroy(shm_id: u32) -> bool {
+    let raw = unsafe { syscall1(SYS_SHM_DESTROY, u64::from(shm_id)) };
+    raw == 0
 }
 
 /// Reads one raw PS/2 scancode from the keyboard ring buffer.

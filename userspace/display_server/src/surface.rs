@@ -55,6 +55,144 @@ use kernel_core::display::surface::{
     SurfaceEffect, SurfaceError, SurfaceEvent, SurfaceStateMachine,
 };
 
+/// Storage backing for a committed buffer's pixel data.
+///
+/// Phase 56's chunked-pixel path produced [`Vec<u8>`]-owned buffers
+/// reassembled from IPC bulk fragments. The Phase 57d follow-up adds
+/// [`BufferStorage::Shared`], where pixel bytes live in a shared-memory
+/// region the client allocated via `sys_shm_create` and the compositor
+/// mapped writable via `sys_shm_map`. The compose path treats both
+/// uniformly through [`BufferStorage::as_slice`].
+///
+/// `Owned` cleans up automatically on drop. `Shared` carries the
+/// owning user virtual address + length so [`Drop`] can call
+/// `sys_shm_unmap` to release the mapping (and decrement the registry
+/// refcount) when the surface is destroyed or re-attached.
+///
+/// Note: the kernel currently maps SHM pages writable for every mapper
+/// — the compositor does not enforce read-only on its side. Phase 57d
+/// callers do not write through the compositor's mapping, but the
+/// [`BufferStorage::as_slice`] API is `unsafe` because the underlying
+/// bytes are concurrently writable by the originating client.
+#[derive(Debug)]
+pub enum BufferStorage {
+    Owned(Vec<u8>),
+    Shared {
+        /// User virtual address returned by `sys_shm_map`.
+        user_va: u64,
+        /// Byte length of the visible pixel region: exactly
+        /// `width * height * 4`. The kernel's underlying mapping is
+        /// page-aligned and may extend past this length, but only
+        /// the first `len` bytes are valid pixel data.
+        len: usize,
+    },
+}
+
+impl Clone for BufferStorage {
+    fn clone(&self) -> Self {
+        match self {
+            BufferStorage::Owned(v) => BufferStorage::Owned(v.clone()),
+            // Shared mappings are not deep-cloneable: the kernel
+            // refcount is decremented on drop, and we cannot bump it
+            // again from userspace without a syscall round-trip. The
+            // composer takes `&CommittedBuffer` borrows so a clone is
+            // never structurally required; if it ever is, fall back
+            // to materialising an owned copy of the visible bytes.
+            //
+            // SAFETY: copy directly through a raw pointer rather than
+            // synthesising an `&[u8]` so the producer's concurrent
+            // writes never alias a Rust reference, even briefly. Torn
+            // reads are inherent to the cross-process editing pattern;
+            // the resulting `Vec<u8>` is a single-point-in-time
+            // snapshot.
+            BufferStorage::Shared { user_va, len } => {
+                let mut owned = alloc::vec::Vec::<u8>::with_capacity(*len);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
+                    owned.set_len(*len);
+                }
+                BufferStorage::Owned(owned)
+            }
+        }
+    }
+}
+
+impl Drop for BufferStorage {
+    fn drop(&mut self) {
+        if let BufferStorage::Shared { user_va, .. } = self {
+            // Best-effort release. If the syscall fails the SHM
+            // registry still has us as a holder; the leak is bounded
+            // by the surviving kernel registry's lifetime, not by
+            // accumulating across many surfaces.
+            let _ = syscall_lib::shm_unmap(*user_va);
+        }
+    }
+}
+
+impl BufferStorage {
+    /// Materialise an owned byte snapshot of the committed pixels.
+    ///
+    /// For [`BufferStorage::Owned`] this clones the existing
+    /// `Vec<u8>`. For [`BufferStorage::Shared`] this allocates a
+    /// fresh `Vec<u8>` and copies the pixel bytes through a raw
+    /// pointer — no Rust slice reference (`&[u8]`) ever aliases the
+    /// concurrently-writable shared-memory mapping, so callers can
+    /// hand the resulting `Vec` to safe code without violating the
+    /// aliasing model. Torn reads are inherent to the cross-process
+    /// editing pattern; the snapshot is a single-point-in-time view.
+    ///
+    /// This is the safe entry point. Prefer this over [`as_slice`]
+    /// for any code path that does not strictly need a borrow with
+    /// the original lifetime.
+    pub fn snapshot(&self) -> Vec<u8> {
+        match self {
+            BufferStorage::Owned(v) => v.clone(),
+            BufferStorage::Shared { user_va, len } => {
+                let mut owned = Vec::<u8>::with_capacity(*len);
+                // SAFETY: kernel mapped `*len` bytes at `*user_va` for
+                // this process; we copy through a raw pointer rather
+                // than synthesising an `&[u8]` so the producer's
+                // concurrent writes never alias a Rust reference.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(*user_va as *const u8, owned.as_mut_ptr(), *len);
+                    owned.set_len(*len);
+                }
+                owned
+            }
+        }
+    }
+
+    /// Borrow the pixels as a contiguous byte slice.
+    ///
+    /// # Safety
+    ///
+    /// For [`BufferStorage::Shared`] the returned slice aliases a
+    /// shared-memory region that the originating client can mutate
+    /// concurrently (the kernel maps these pages writable for every
+    /// mapper). Holding an `&[u8]` across operations that allow the
+    /// client to publish new bytes — even just yielding to the
+    /// scheduler — gives LLVM permission to assume the bytes are
+    /// stable, which they are not.
+    ///
+    /// Most callers should prefer [`BufferStorage::snapshot`] which
+    /// performs a raw-pointer copy and never materialises an `&[u8]`
+    /// to shared memory. `as_slice` exists only for borrow-only
+    /// callers that can prove they consume the slice within a single
+    /// operation that the producer cannot interleave.
+    ///
+    /// For [`BufferStorage::Owned`] the slice is just a normal
+    /// `&Vec<u8>` borrow and the safety conditions are vacuously
+    /// satisfied; the unsafety lives entirely on the `Shared` arm.
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        match self {
+            BufferStorage::Owned(v) => v,
+            BufferStorage::Shared { user_va, len } => unsafe {
+                core::slice::from_raw_parts(*user_va as *const u8, *len)
+            },
+        }
+    }
+}
+
 /// Committed pixel buffer for one surface.
 ///
 /// Phase 56 transports pixel bytes inline via the bulk-IPC primitive (see
@@ -62,12 +200,55 @@ use kernel_core::display::surface::{
 /// here once committed. Width/height are tracked separately so the composer
 /// can clip and stride correctly without trusting client-supplied geometry
 /// on the protocol surface.
+///
+/// Phase 57d follow-up — `pixels` now carries a [`BufferStorage`] so
+/// shared-memory-backed buffers can avoid the chunked-IPC double copy.
+/// Existing readers go through [`pixels_slice`] for both variants.
 #[derive(Debug, Clone)]
 pub struct CommittedBuffer {
     pub buffer_id: BufferId,
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: BufferStorage,
+}
+
+impl CommittedBuffer {
+    /// Construct a `CommittedBuffer` from an owned pixel `Vec<u8>` —
+    /// the legacy path used by the chunked-pixel transport. New
+    /// shared-buffer attaches build the struct directly with a
+    /// `BufferStorage::Shared` value, never going through this helper.
+    pub fn from_owned(buffer_id: BufferId, width: u32, height: u32, pixels: Vec<u8>) -> Self {
+        Self {
+            buffer_id,
+            width,
+            height,
+            pixels: BufferStorage::Owned(pixels),
+        }
+    }
+
+    /// Borrow the committed pixels uniformly across owned and shared
+    /// storage. Length is exactly `width * height * 4` for shared
+    /// storage; for owned storage it's whatever the bulk transport
+    /// reassembled (validated against the same expression at intake).
+    ///
+    /// # Safety
+    ///
+    /// Same conditions as [`BufferStorage::as_slice`]: for `Shared`
+    /// pixels the returned slice aliases a concurrently-writable
+    /// shared-memory mapping and must be consumed before yielding to
+    /// the producer. Most callers should prefer
+    /// [`CommittedBuffer::pixels_snapshot`].
+    pub unsafe fn pixels_slice(&self) -> &[u8] {
+        unsafe { self.pixels.as_slice() }
+    }
+
+    /// Materialise an owned byte snapshot of the committed pixels.
+    /// Safe: for shared-memory buffers the copy goes through a raw
+    /// pointer so no `&[u8]` ever aliases the producer's mapping.
+    /// See [`BufferStorage::snapshot`] for the underlying mechanism.
+    pub fn pixels_snapshot(&self) -> Vec<u8> {
+        self.pixels.snapshot()
+    }
 }
 
 /// Per-surface state owned by the display server.
@@ -119,6 +300,15 @@ pub enum SurfaceShimError {
     /// already holds the global exclusive-keyboard claim. Phase 56
     /// E.2 enforces a single exclusive-keyboard layer.
     Layer(LayerError),
+    /// `AttachSharedBuffer` could not map the SHM region into the
+    /// compositor's address space. Distinct from
+    /// `PendingBulkIdMismatch` so the dispatcher can treat it as a
+    /// hard transport failure rather than a recoverable client
+    /// protocol error.
+    ShmMapFailed {
+        shm_id: u32,
+        buffer_id: BufferId,
+    },
 }
 
 impl From<LayerError> for SurfaceShimError {
@@ -265,12 +455,9 @@ impl SurfaceRegistry {
             if self.pending_bulk.len() >= MAX_PENDING_BULK {
                 return Err(ChunkError::TotalTooLarge);
             }
-            self.pending_bulk.push(CommittedBuffer {
-                buffer_id,
-                width,
-                height,
-                pixels,
-            });
+            self.pending_bulk.push(CommittedBuffer::from_owned(
+                buffer_id, width, height, pixels,
+            ));
         }
         Ok(())
     }
@@ -332,6 +519,65 @@ impl SurfaceRegistry {
                     result.created.push((*surface_id, *role));
                 }
             }
+            ClientMessage::AttachSharedBuffer {
+                surface_id,
+                buffer_id,
+                shm_id,
+                width,
+                height,
+            } => {
+                // Map the SHM region into our address space. The
+                // mapping survives until the resulting `CommittedBuffer`
+                // is dropped (Drop calls `sys_shm_unmap`); the kernel
+                // refcount keeps the underlying frames alive even if
+                // the client exits before the surface is torn down.
+                let user_va = syscall_lib::shm_map(*shm_id);
+                if user_va == 0 {
+                    // Phase 57d follow-up — log the failure so the
+                    // intermittent boot-1 "no terminal" symptom (where
+                    // display_server silently drops AttachSharedBuffer
+                    // and the surface never gets pixels) produces a
+                    // visible signal in the boot transcript.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "display_server: AttachSharedBuffer shm_map failed shm_id=",
+                    );
+                    write_u32_log(*shm_id);
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                    return Err(SurfaceShimError::ShmMapFailed {
+                        shm_id: *shm_id,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "display_server: AttachSharedBuffer ok shm_id=",
+                );
+                write_u32_log(*shm_id);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
+                write_u64_log(user_va);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                let byte_count = (*width as usize)
+                    .saturating_mul(*height as usize)
+                    .saturating_mul(4);
+                let buf = CommittedBuffer {
+                    buffer_id: *buffer_id,
+                    width: *width,
+                    height: *height,
+                    pixels: BufferStorage::Shared {
+                        user_va,
+                        len: byte_count,
+                    },
+                };
+                self.apply_event(
+                    *surface_id,
+                    SurfaceEvent::AttachBuffer(*buffer_id),
+                    &mut result,
+                )?;
+                if let Some(s) = self.surfaces.get_mut(surface_id) {
+                    s.pending_buffer = Some(buf);
+                }
+            }
             ClientMessage::AttachBuffer {
                 surface_id,
                 buffer_id,
@@ -371,6 +617,21 @@ impl SurfaceRegistry {
             }
             ClientMessage::DamageSurface { surface_id, rect } => {
                 self.apply_event(*surface_id, SurfaceEvent::DamageSurface(*rect), &mut result)?;
+                // SHM-backed surfaces edit pixels in place: the buffer
+                // identity does not change between commits, so the
+                // existing CommitSurface arm (which marks dirty only
+                // when `pending_buffer.take()` returns Some) leaves
+                // them clean forever after the first commit. Damage
+                // is the explicit "I changed pixel contents" signal,
+                // so mark the surface dirty here whenever a buffer is
+                // already attached. The chunked path is unaffected
+                // because chunked clients always Damage before they
+                // commit and the dirty bit is reset after compose.
+                if let Some(s) = self.surfaces.get_mut(surface_id)
+                    && (s.committed_buffer.is_some() || s.pending_buffer.is_some())
+                {
+                    s.dirty = true;
+                }
             }
             ClientMessage::CommitSurface { surface_id } => {
                 // The kernel-core state machine emits `SurfaceEffect::Configured`
@@ -525,6 +786,16 @@ impl SurfaceRegistry {
         }
     }
 
+    /// Force a full repaint by marking every surface dirty. Used by the
+    /// Tier 1 fullscreen-takeover reclaim path: between `YieldFb` and
+    /// `ReclaimFb` a foreign program drew over the framebuffer, so the
+    /// composer can't trust any cached "nothing changed" damage state.
+    pub fn mark_all_dirty(&mut self) {
+        for s in self.surfaces.values_mut() {
+            s.dirty = true;
+        }
+    }
+
     /// Iterate all live surfaces with their current committed buffer (if
     /// any) and their layer / geometry. The composer wiring (C.4) consumes
     /// this to build `ComposeSurface`s for each frame.
@@ -645,6 +916,56 @@ impl<'a> ComposeEntry<'a> {
     }
 }
 
+/// Phase 57d follow-up — minimal u32 → decimal serial log helper.
+/// Used by the intermittent-AttachSharedBuffer trace lines so we can
+/// see whether display_server's `shm_map` succeeded or failed and
+/// what id it received. No `alloc` dependency; writes directly to
+/// the stdout fd.
+fn write_u32_log(mut value: u32) {
+    let mut buf = [0u8; 10];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
+    }
+}
+
+/// Phase 57d follow-up — companion u64 hex logger for the SHM va.
+fn write_u64_log(mut value: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            let digit = (value & 0xF) as u8;
+            buf[idx] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + (digit - 10)
+            };
+            value >>= 4;
+        }
+    }
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "0x");
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, s);
+    }
+}
+
 fn centre_rect(output: Rect, w: u32, h: u32) -> Rect {
     let cx = output.x + (output.w as i32 - w as i32) / 2;
     let cy = output.y + (output.h as i32 - h as i32) / 2;
@@ -668,22 +989,24 @@ fn cursor_from_committed(
         .checked_mul(buf.height as usize)
         .and_then(|wh| wh.checked_mul(4))
         .unwrap_or(usize::MAX);
-    if buf.pixels.len() != byte_count {
+    // `pixels_snapshot` does a raw-pointer copy for shared-memory
+    // buffers, so we never hold an `&[u8]` to concurrently-writable
+    // memory while decoding into `packed`.
+    let pixels = buf.pixels_snapshot();
+    if pixels.len() != byte_count {
         return Err(
             kernel_core::display::cursor::ClientCursorError::PixelLengthMismatch {
                 expected: byte_count,
-                actual: buf.pixels.len(),
+                actual: pixels.len(),
             },
         );
     }
     // Decode the BGRA byte stream into u32 cells. Each cell is one
     // pixel (BGRA in little-endian wire byte order — `to_le_bytes`
-    // round-trips back to `[B, G, R, A]`). Hand the owned `Vec`
-    // directly to `from_vec` so we don't pay a second alloc + clone
-    // inside `ClientCursor::new`.
+    // round-trips back to `[B, G, R, A]`).
     let pixel_count = byte_count / 4;
     let mut packed: Vec<u32> = Vec::with_capacity(pixel_count);
-    for chunk in buf.pixels.chunks_exact(4) {
+    for chunk in pixels.chunks_exact(4) {
         let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
         packed.push(u32::from_le_bytes(arr));
     }

@@ -59,6 +59,20 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Diagnostic counter — total `KeyEvent`s drained from `kbd_server`
+/// since boot. Incremented in [`InputWiring::drain_inner`] each time
+/// `kbd.poll_key()` returns `Some`.
+pub static DIAG_KEY_DRAINS_SOME: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — `kbd.poll_key()` calls that returned `None`.
+pub static DIAG_KEY_DRAINS_NONE: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — total `PointerEvent`s drained from
+/// `mouse_server` since boot.
+pub static DIAG_PTR_DRAINS_SOME: AtomicU64 = AtomicU64::new(0);
+/// Diagnostic counter — `mouse.poll_pointer()` calls that returned
+/// `None`.
+pub static DIAG_PTR_DRAINS_NONE: AtomicU64 = AtomicU64::new(0);
 
 use kernel_core::display::protocol::{ServerMessage, SurfaceId};
 use kernel_core::input::dispatch::{
@@ -106,13 +120,6 @@ pub const MOUSE_EVENT_PULL: u64 = 1;
 /// `userspace/mouse_server/src/main.rs`.
 pub const MOUSE_EVENT_NONE: u64 = 2;
 
-/// Service-lookup retry attempts before [`lookup_with_backoff`] gives
-/// up.
-pub const SERVICE_LOOKUP_ATTEMPTS: u32 = 8;
-
-/// Backoff between service-lookup attempts (5 ms).
-pub const SERVICE_LOOKUP_BACKOFF_NS: u32 = 5_000_000;
-
 /// Throttle for the lazy reconnect path inside `KbdInputSource` /
 /// `MouseInputSource`: the source retries `ipc_lookup_service` every
 /// `LAZY_RECONNECT_DRAIN_INTERVAL` drain calls when its handle is
@@ -123,30 +130,6 @@ pub const SERVICE_LOOKUP_BACKOFF_NS: u32 = 5_000_000;
 /// so 100 → ~1 lookup/second — cheap, and the reconnect lands within
 /// a second of the service appearing.
 pub const LAZY_RECONNECT_DRAIN_INTERVAL: u32 = 100;
-
-// ---------------------------------------------------------------------------
-// Service-handle lookup
-// ---------------------------------------------------------------------------
-
-/// Bounded-retry service lookup. Mirrors `gfx-demo`'s
-/// `lookup_display_with_backoff`: up to [`SERVICE_LOOKUP_ATTEMPTS`]
-/// tries with [`SERVICE_LOOKUP_BACKOFF_NS`] between them. Returns
-/// `Some(handle)` on success or `None` if the service never appears
-/// (in which case the caller falls back to a no-op input source so the
-/// compositor still composes its background and any test client).
-pub fn lookup_with_backoff(name: &str) -> Option<u32> {
-    for attempt in 0..SERVICE_LOOKUP_ATTEMPTS {
-        let raw = syscall_lib::ipc_lookup_service(name);
-        if raw != u64::MAX {
-            return Some(raw as u32);
-        }
-        if attempt + 1 == SERVICE_LOOKUP_ATTEMPTS {
-            return None;
-        }
-        let _ = syscall_lib::nanosleep_for(0, SERVICE_LOOKUP_BACKOFF_NS);
-    }
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Real `InputSource` impls
@@ -179,16 +162,12 @@ pub struct KbdInputSource {
 }
 
 impl KbdInputSource {
-    /// Look up the `"kbd"` service with backoff. Returns a source whose
-    /// `poll_key` will pull `KeyEvent`s from `kbd_server` if the lookup
-    /// succeeds; otherwise returns a source whose `poll_key` retries
-    /// the lookup lazily (see [`LAZY_RECONNECT_DRAIN_INTERVAL`]) so a
-    /// late-starting / crashed-and-restarted `kbd_server` is picked up
-    /// without a display_server restart.
-    pub fn lookup_with_backoff() -> Self {
+    /// Start disconnected; the drain path reconnects lazily without delaying
+    /// display registration or contending with init's service-start burst.
+    pub fn new_lazy() -> Self {
         Self {
-            handle: lookup_with_backoff(KBD_SERVICE_NAME),
-            drains_since_last_lookup: 0,
+            handle: None,
+            drains_since_last_lookup: LAZY_RECONNECT_DRAIN_INTERVAL,
         }
     }
 
@@ -239,15 +218,25 @@ impl InputSource for KbdInputSource {
         // dispatcher loop; future observability can count them
         // separately because the labels are now distinct.
         let label = syscall_lib::ipc_call(handle, KBD_EVENT_PULL, 0);
-        if label != KBD_EVENT_PULL {
-            return None;
-        }
-
-        // Drain the kernel-staged reply bulk. Buffer sized to the
-        // exact wire frame so a malformed (oversized) reply is
-        // truncated and rejected by the decoder.
+        // Drain the kernel-staged reply bulk regardless of label. The kernel's
+        // `endpoint::reply` calls `transfer_bulk(server, caller)` unconditionally —
+        // any byte still parked in `kbd_server`'s `pending_bulk` slot at reply time
+        // gets moved into the caller's slot even when the reply was a
+        // `KBD_EVENT_NONE` sentinel that does not stage fresh bulk. Returning
+        // early without draining left those stale bytes in `display_server`'s
+        // `pending_bulk` slot, where a subsequent `ipc_try_recv_msg` whose
+        // sender has no fresh bulk to overwrite the slot would surface the
+        // stale bytes as a malformed verb frame to the dispatcher
+        // (`reason=verb-decode opcode=304` = `OP_SERVER_KEY_EVENT` traced back
+        // to this leak). Always drain so the slot is empty before the next
+        // syscall path can read it.
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if label != KBD_EVENT_PULL {
+            // KBD_EVENT_NONE (no event this tick) or `u64::MAX` (transport
+            // error). Slot is now drained; surface no event to the loop.
+            return None;
+        }
         if n != KEY_EVENT_WIRE_SIZE as u64 {
             // u64::MAX = drain error; any other mismatch = protocol
             // violation. Drop the event silently to keep the
@@ -274,14 +263,12 @@ pub struct MouseInputSource {
 }
 
 impl MouseInputSource {
-    /// Look up the `"mouse"` service with backoff. If the initial
-    /// lookup races and loses (mouse_server has `depends=display`, so
-    /// it always starts after display_server), `poll_pointer` retries
-    /// lazily — see [`LAZY_RECONNECT_DRAIN_INTERVAL`].
-    pub fn lookup_with_backoff() -> Self {
+    /// Start disconnected; the drain path reconnects lazily without delaying
+    /// display registration or contending with init's service-start burst.
+    pub fn new_lazy() -> Self {
         Self {
-            handle: lookup_with_backoff(MOUSE_SERVICE_NAME),
-            drains_since_last_lookup: 0,
+            handle: None,
+            drains_since_last_lookup: LAZY_RECONNECT_DRAIN_INTERVAL,
         }
     }
 
@@ -328,12 +315,17 @@ impl InputSource for MouseInputSource {
         // labels are now distinct so future observability can count
         // them separately.
         let label = syscall_lib::ipc_call(handle, MOUSE_EVENT_PULL, 0);
+        // Drain pending_bulk regardless of label — see [`KbdInputSource::poll_key`]
+        // for the matching kernel-side rationale: `endpoint::reply` always
+        // transfers any bytes parked in `mouse_server`'s `pending_bulk` slot,
+        // including across NONE-sentinel replies that did not stage fresh
+        // bulk. Returning early without draining left stale bytes in
+        // display_server's slot that later surfaced as bogus verb frames.
+        let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
+        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if label != MOUSE_EVENT_PULL {
             return None;
         }
-
-        let mut buf = [0u8; POINTER_EVENT_WIRE_SIZE];
-        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
         if n != POINTER_EVENT_WIRE_SIZE as u64 {
             return None;
         }
@@ -414,8 +406,8 @@ impl InputWiring {
     pub fn new() -> Self {
         Self {
             dispatcher: InputDispatcher::new(),
-            kbd: KbdInputSource::lookup_with_backoff(),
-            mouse: MouseInputSource::lookup_with_backoff(),
+            kbd: KbdInputSource::new_lazy(),
+            mouse: MouseInputSource::new_lazy(),
             injected_keys: Vec::new(),
         }
     }
@@ -500,6 +492,7 @@ impl InputWiring {
     /// [`Self::drain_one_pass`] but accepts the sources by reference
     /// so tests can construct + script them inline.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn drain_with<K: InputSource, M: InputSource>(
         dispatcher: &mut InputDispatcher,
         kbd: &mut K,
@@ -536,86 +529,113 @@ impl InputWiring {
         bind_table: &kernel_core::input::bind_table::BindTable,
         grab_state: &mut kernel_core::input::bind_table::GrabState,
     ) -> Vec<InputEffect> {
+        // Per-pass drain cap. Previously this fn drained the full kbd
+        // queue in a `while let Some(...)` loop *before* polling the
+        // mouse at all. While a key was held the autorepeat stream kept
+        // `kbd.poll_key()` returning Some, so the inner loop never
+        // exited and the pointer drain was starved — the visible
+        // symptom was "mouse cursor freezes while a key is held, jumps
+        // to the new position on release". Bounding each source at
+        // [`MAX_DRAINS_PER_PASS`] events per pass and interleaving the
+        // two polls means the pointer is always serviced once per
+        // iteration of this loop, regardless of how busy the keyboard
+        // is. The main loop iterates roughly 1 kHz, so the cap still
+        // sustains thousands of events per second per source, well
+        // above PS/2's physical throughput.
+        const MAX_DRAINS_PER_PASS: usize = 8;
+
         let mut effects = Vec::new();
-
-        // Drain all keyboard events first — they cannot move the
-        // pointer, so order-relative-to-pointer does not matter for
-        // correctness.
-        while let Some(ev) = kbd.poll_key() {
-            let mut state = CompositorState {
-                focused,
-                active_exclusive_layer,
-                pointer_position,
-                surface_geometry,
-                bind_table,
-                grab_state,
-            };
-            match dispatcher.route_key_event(&ev, &mut state) {
-                RouteDecision::DeliverTo(_id) => {
-                    effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
-                }
-                RouteDecision::Grab(id) => {
-                    effects.push(InputEffect::BindTriggered { id: id.raw() });
-                }
-                RouteDecision::Drop => {
-                    // Suppressed (post-grab Repeat/Up, or no focus).
-                }
-                // `RouteDecision` is `#[non_exhaustive]` so future
-                // variants (e.g. `BoundCursorOnly`) do not break the
-                // match. Treat them as suppressed until specific
-                // wiring lands.
-                _ => {}
-            }
-        }
-
-        // Drain pointer events. Each event can produce an enter/leave
-        // pair *and* a delivery, plus an optional focus change. We
-        // also always emit a `CursorMoved` effect with the
-        // compositor-integrated absolute position so the framebuffer
-        // cursor follows the pointer even when no surface is under it.
         let mut current_pointer = pointer_position;
-        while let Some(mut ev) = mouse.poll_pointer() {
-            // Integrate relative `dx` / `dy` into a new absolute
-            // position. Keep `abs_position` if the source already
-            // carries one (future absolute pointer like USB tablet).
-            let abs = match ev.abs_position {
-                Some(p) => p,
-                None => (
-                    current_pointer.0.saturating_add(ev.dx),
-                    current_pointer.1.saturating_add(ev.dy),
-                ),
-            };
-            // Stamp the compositor-maintained absolute position back
-            // into the event so any client that receives it via the
-            // Outbound branch (when a surface is under the cursor)
-            // sees the same coordinates the dispatcher hit-tested
-            // against.
-            ev.abs_position = Some(abs);
-            current_pointer = abs;
-            let mut state = CompositorState {
-                focused,
-                active_exclusive_layer,
-                pointer_position: abs,
-                surface_geometry,
-                bind_table,
-                grab_state,
-            };
-            let decision: PointerRouteDecision = dispatcher.route_pointer_event(&ev, &mut state);
-            // Emit the new compositor-maintained position regardless
-            // of routing. The cursor blit in `compose.rs` needs this
-            // to follow motion when the pointer is over no surface.
-            effects.push(InputEffect::CursorMoved(abs));
-            for (sid, kind) in decision.enter_leave.iter() {
-                effects.push(match kind {
-                    EnterOrLeave::Enter => InputEffect::PointerEnter(sid),
-                    EnterOrLeave::Leave => InputEffect::PointerLeave(sid),
-                });
+
+        for _ in 0..MAX_DRAINS_PER_PASS {
+            let key_ev = kbd.poll_key();
+            let ptr_ev = mouse.poll_pointer();
+            if key_ev.is_some() {
+                DIAG_KEY_DRAINS_SOME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DIAG_KEY_DRAINS_NONE.fetch_add(1, Ordering::Relaxed);
             }
-            if decision.deliver_to.is_some() {
-                effects.push(InputEffect::Outbound(ServerMessage::Pointer(ev)));
+            if ptr_ev.is_some() {
+                DIAG_PTR_DRAINS_SOME.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DIAG_PTR_DRAINS_NONE.fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(target) = decision.focus_change {
-                effects.push(InputEffect::FocusChanged(target));
+            if key_ev.is_none() && ptr_ev.is_none() {
+                break;
+            }
+
+            if let Some(ev) = key_ev {
+                let mut state = CompositorState {
+                    focused,
+                    active_exclusive_layer,
+                    pointer_position: current_pointer,
+                    surface_geometry,
+                    bind_table,
+                    grab_state,
+                };
+                match dispatcher.route_key_event(&ev, &mut state) {
+                    RouteDecision::DeliverTo(_id) => {
+                        effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
+                    }
+                    RouteDecision::Grab(id) => {
+                        effects.push(InputEffect::BindTriggered { id: id.raw() });
+                    }
+                    RouteDecision::Drop => {
+                        // Suppressed (post-grab Repeat/Up, or no focus).
+                    }
+                    // `RouteDecision` is `#[non_exhaustive]` so future
+                    // variants (e.g. `BoundCursorOnly`) do not break
+                    // the match. Treat them as suppressed until
+                    // specific wiring lands.
+                    _ => {}
+                }
+            }
+
+            if let Some(mut ev) = ptr_ev {
+                // Integrate relative `dx` / `dy` into a new absolute
+                // position. Keep `abs_position` if the source already
+                // carries one (future absolute pointer like USB tablet).
+                let abs = match ev.abs_position {
+                    Some(p) => p,
+                    None => (
+                        current_pointer.0.saturating_add(ev.dx),
+                        current_pointer.1.saturating_add(ev.dy),
+                    ),
+                };
+                // Stamp the compositor-maintained absolute position
+                // back into the event so any client that receives it
+                // via the Outbound branch (when a surface is under the
+                // cursor) sees the same coordinates the dispatcher
+                // hit-tested against.
+                ev.abs_position = Some(abs);
+                current_pointer = abs;
+                let mut state = CompositorState {
+                    focused,
+                    active_exclusive_layer,
+                    pointer_position: abs,
+                    surface_geometry,
+                    bind_table,
+                    grab_state,
+                };
+                let decision: PointerRouteDecision =
+                    dispatcher.route_pointer_event(&ev, &mut state);
+                // Emit the new compositor-maintained position
+                // regardless of routing. The cursor blit in
+                // `compose.rs` needs this to follow motion when the
+                // pointer is over no surface.
+                effects.push(InputEffect::CursorMoved(abs));
+                for (sid, kind) in decision.enter_leave.iter() {
+                    effects.push(match kind {
+                        EnterOrLeave::Enter => InputEffect::PointerEnter(sid),
+                        EnterOrLeave::Leave => InputEffect::PointerLeave(sid),
+                    });
+                }
+                if decision.deliver_to.is_some() {
+                    effects.push(InputEffect::Outbound(ServerMessage::Pointer(ev)));
+                }
+                if let Some(target) = decision.focus_change {
+                    effects.push(InputEffect::FocusChanged(target));
+                }
             }
         }
 

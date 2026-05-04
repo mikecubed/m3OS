@@ -53,7 +53,7 @@ pub mod screen;
 
 #[cfg(all(not(test), feature = "os-binary"))]
 pub mod display;
-#[cfg(all(not(test), feature = "os-binary"))]
+#[cfg(any(test, all(not(test), feature = "os-binary")))]
 pub mod syscall_pty;
 
 /// Boot-log marker written when the terminal starts.  Used by smoke
@@ -68,6 +68,13 @@ pub const READY_SENTINEL: &str = "TERM_SMOKE:ready\n";
 /// Service name under which `term` registers with the IPC service
 /// registry so `session_manager` can probe its readiness.
 pub const SERVICE_NAME: &str = "term";
+
+/// Service marker published after the graphical shell has produced enough
+/// PTY output to prove the prompt path is alive.
+pub const PROMPT_READY_SERVICE: &str = "term.prompt-ready";
+
+/// Minimum PTY bytes before publishing [`PROMPT_READY_SERVICE`].
+pub const PROMPT_READY_MIN_BYTES: u64 = 32;
 
 /// Service-manifest restart budget — pinned at 3 per the G.1
 /// acceptance ("`restart=on-failure max_restart=3
@@ -98,6 +105,29 @@ pub const DEFAULT_COLS: u16 = 80;
 /// Default cell grid rows.  Same fixed-geometry rationale as
 /// [`DEFAULT_COLS`].
 pub const DEFAULT_ROWS: u16 = 25;
+
+/// Decide whether the event loop should publish the current renderer frame.
+///
+/// The normal throttle avoids excessive display IPC, but PTY output that has
+/// already reached the bottom row must be published promptly. Otherwise the
+/// current line can appear to contain only the first glyph until a later scroll
+/// replays the queued glyph operations.
+pub fn should_compose_frame(
+    damaged: bool,
+    pty_drained_this_tick: bool,
+    cursor_row: u16,
+    rows: u16,
+    elapsed_ms: u64,
+    interval_ms: u64,
+) -> bool {
+    if !damaged {
+        return false;
+    }
+    if pty_drained_this_tick && rows > 0 && cursor_row >= rows.saturating_sub(1) {
+        return true;
+    }
+    elapsed_ms >= interval_ms
+}
 
 /// Top-level error type for the terminal binary.  Every fallible
 /// boundary inside `term` returns one of these; the binary's
@@ -151,5 +181,29 @@ mod tests {
     #[test]
     fn scrollback_cap_pinned() {
         assert_eq!(SCROLLBACK_LINES, 1000);
+    }
+
+    #[test]
+    fn compose_policy_flushes_damaged_last_row_without_waiting_for_throttle() {
+        assert!(
+            should_compose_frame(true, true, DEFAULT_ROWS - 1, DEFAULT_ROWS, 0, 16),
+            "bottom-row PTY output must publish promptly instead of waiting for scroll"
+        );
+    }
+
+    #[test]
+    fn compose_policy_keeps_throttle_away_from_bottom_row() {
+        assert!(
+            !should_compose_frame(true, true, 0, DEFAULT_ROWS, 0, 16),
+            "off-bottom PTY output should still respect the frame throttle"
+        );
+        assert!(
+            should_compose_frame(true, true, 0, DEFAULT_ROWS, 16, 16),
+            "elapsed throttle interval still permits compose"
+        );
+        assert!(
+            !should_compose_frame(false, true, DEFAULT_ROWS - 1, DEFAULT_ROWS, 16, 16),
+            "undamaged frames must not compose"
+        );
     }
 }

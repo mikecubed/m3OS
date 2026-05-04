@@ -419,7 +419,6 @@ fn decode_handle(handle: u64) -> (u16, u16) {
 // IPC constants
 // ---------------------------------------------------------------------------
 
-const REPLY_CAP_HANDLE: u32 = 1;
 const MAX_BULK_BUF: usize = VFS_MAX_READ;
 const SLOW_REQUEST_USEC: u64 = 50_000;
 
@@ -516,10 +515,9 @@ fn program_main(_args: &[&str]) -> i32 {
         return 1;
     }
 
-    syscall_lib::write_str(
-        STDOUT_FILENO,
-        "vfs_server: registered, entering server loop\n",
-    );
+    // Do not write to stdout after publishing the service name: clients may
+    // immediately send IPC and block until this server reaches ipc_recv_msg.
+    syscall_lib::serial_print("vfs_server: registered, entering server loop\n");
 
     // 5. Server loop.
     server_loop(&ext2, ep_handle);
@@ -558,7 +556,13 @@ fn server_loop(ext2: &Ext2State, ep_handle: u32) -> ! {
         // We use two separate syscalls (reply + recv) because we need to
         // send data words in the reply (not just a label), and the
         // combined reply_recv_msg only supports a label.
-        syscall_lib::ipc_reply(REPLY_CAP_HANDLE, reply_label, reply_data0);
+        if let Some(reply_cap) = msg.reply_cap_handle() {
+            if syscall_lib::ipc_reply(reply_cap, reply_label, reply_data0) == u64::MAX {
+                syscall_lib::serial_print("vfs_server: ipc_reply failed\n");
+            }
+        } else {
+            syscall_lib::serial_print("vfs_server: request missing reply cap\n");
+        }
 
         msg = syscall_lib::IpcMessage::new(0);
         syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);

@@ -46,7 +46,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::ipc::{CapabilityTable, Message};
 
@@ -161,8 +161,45 @@ pub enum TaskState {
     BlockedOnNotif,
     /// Task is blocked waiting on a futex (Phase 40).
     BlockedOnFutex,
+    /// Task is blocked waiting for a child process state change.
+    BlockedOnWait,
+    /// Task is blocked waiting for a named IPC service to register.
+    BlockedOnService,
     /// Task has permanently exited; the scheduler will remove it on next pass.
     Dead,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d D.1 — ResumeMode
+// ---------------------------------------------------------------------------
+
+/// Determines which resume path the scheduler uses when dispatching a task.
+///
+/// Stored atomically in [`Task::resume_mode`].  Set under the scheduler lock
+/// at the suspension point; read at the dispatch point to choose
+/// between `switch_context` (cooperative) and `preempt_resume_to_user`
+/// (preempted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResumeMode {
+    /// Task has never been dispatched (initial state) — use cooperative path.
+    Initial = 0,
+    /// Task suspended cooperatively via `yield_now` or `block_current_until`.
+    /// Resume via `switch_context` (callee-saved restore + `ret`).
+    Cooperative = 1,
+    /// Task was preempted by `preempt_to_scheduler`.  Dispatch via
+    /// `preempt_resume_to_user` (full GPR restore + `iretq` to ring 3).
+    Preempted = 2,
+}
+
+impl From<u8> for ResumeMode {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => ResumeMode::Cooperative,
+            2 => ResumeMode::Preempted,
+            _ => ResumeMode::Initial,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +235,34 @@ pub struct TaskBlockState {
 // ---------------------------------------------------------------------------
 // Task structure
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct FxSaveArea {
+    bytes: [u8; 512],
+}
+
+impl FxSaveArea {
+    pub const fn new() -> Self {
+        let mut bytes = [0u8; 512];
+        // x87 control word = default 0x037f, MXCSR = default 0x1f80.
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        bytes[28] = 0xff;
+        bytes[29] = 0xff;
+        Self { bytes }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+}
 
 pub struct Task {
     /// Unique task identifier.
@@ -335,6 +400,16 @@ pub struct Task {
     /// `PREEMPT_FRAME_OFFSET_*` constants exported from that module — the
     /// assembly stub uses those offsets directly.
     pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
+    /// Phase 57d D.1 — which resume path the scheduler uses for this task.
+    ///
+    /// `Preempted` → `preempt_resume_to_user` (full restore + `iretq`).
+    /// `Cooperative` / `Initial` → existing `switch_context` path.
+    pub resume_mode: core::sync::atomic::AtomicU8,
+    /// Wake flag registered by an IPC caller before parking in
+    /// [`TaskState::BlockedOnReply`]. Reply delivery sets this before calling
+    /// `wake_task_v2`, closing the "reply arrived just before park" lost-wake
+    /// window.
+    pub reply_waker: Option<Arc<core::sync::atomic::AtomicBool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +508,8 @@ impl Task {
             // entry, and 57d/57e's resume routines read it back to issue
             // `iretq` to the preempted instruction.
             preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
+            resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
+            reply_waker: None,
         }
     }
 

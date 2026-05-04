@@ -104,10 +104,19 @@ void DG_Init(void)
     long rc = syscall2(SYS_FRAMEBUFFER_INFO,
                        (long)&g_fb_info, (long)sizeof(FbInfo));
     if (rc != 0) {
-        /* No framebuffer available -- fall back to a null pointer;
-         * DG_DrawFrame will be a no-op in this case. */
-        g_fb_ptr = NULL;
-        return;
+        /* No framebuffer available — print a clear error and exit
+         * rather than silently running the game with `DG_DrawFrame`
+         * as a no-op (the user sees the init banner up to "M_Init"
+         * and then nothing for minutes; the game IS running, just
+         * not displayed). Phase 56+ ships display_server which owns
+         * the framebuffer until someone yields it; that handoff is
+         * not yet implemented for fullscreen-takeover programs like
+         * doom. */
+        fprintf(stderr, "DOOM: framebuffer info unavailable (rc=%ld). "
+                        "display_server owns the framebuffer; doom needs a tty-takeover mode "
+                        "that's not yet implemented. Aborting.\n",
+                rc);
+        exit(1);
     }
 
     /* Guard: only RGB (0) and BGR (1) are supported by DG_DrawFrame. */
@@ -119,8 +128,10 @@ void DG_Init(void)
     /* Map framebuffer physical pages into our virtual address space */
     long fb_virt = syscall0(SYS_FRAMEBUFFER_MMAP);
     if (fb_virt <= 0) {
-        g_fb_ptr = NULL;
-        return;
+        fprintf(stderr, "DOOM: framebuffer mmap failed (rc=%ld). "
+                        "display_server already owns the framebuffer. Aborting.\n",
+                fb_virt);
+        exit(1);
     }
     g_fb_ptr = (uint8_t *)fb_virt;
 

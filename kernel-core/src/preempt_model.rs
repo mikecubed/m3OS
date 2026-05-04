@@ -34,9 +34,8 @@
 //! - Atomic ordering between cores — kernel uses `AtomicI32::fetch_add`
 //!   with `Acquire` / `Release`; the model is single-threaded.
 //! - The boot dummy (`SCHED_PREEMPT_COUNT_DUMMY`) — Track C.1.
-//! - The deferred-reschedule on zero-crossing — Phase 57d.
 //!
-//! Source ref: phase-57b-track-A.2
+//! Source ref: phase-57b-track-A.2, phase-57d-track-A.1
 
 /// Pure-logic preempt counter.
 ///
@@ -96,8 +95,14 @@ impl Counter {
     /// `fetch_sub(1, Release)` — `Release` because the critical section
     /// must happen-before the lock release that pairs with this counter
     /// drop.
-    pub fn enable(&mut self) {
+    ///
+    /// Returns `true` if this call crossed the zero boundary (previous
+    /// depth was 1 and is now 0) — the Phase 57d E.2 deferred-reschedule
+    /// trigger condition.
+    pub fn enable(&mut self) -> bool {
+        let crossed_zero = self.value == 1;
         self.value -= 1;
+        crossed_zero
     }
 
     /// Read the current depth.
@@ -137,6 +142,163 @@ impl Counter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 57d Track A.1 — Voluntary preemption model
+// ---------------------------------------------------------------------------
+
+/// Events that can drive the voluntary-preemption model in property tests.
+///
+/// Used by `kernel-core/tests/preempt_property.rs` to generate random event
+/// sequences and verify the four core invariants.  Not wired into the kernel —
+/// the kernel uses concrete function calls (`preempt_disable` /
+/// `preempt_enable` / the zero-crossing hook at `preempt_enable`'s tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// Enter a non-preemptible region (`preempt_disable`).
+    Disable,
+    /// Leave a non-preemptible region (`preempt_enable`).
+    Enable,
+    /// A user-mode-return boundary: attempt voluntary preemption.
+    Preempt { from_user: bool },
+    /// `preempt_enable` dropped the count to zero with a pending reschedule.
+    PreemptEnableZeroCrossing,
+}
+
+/// Pure-logic snapshot of per-task preempt state for property testing.
+///
+/// Mirrors the kernel fields touched by the voluntary-preemption path so
+/// property tests can verify invariants without a live kernel.  All fields
+/// are `pub` so proptest strategies can construct arbitrary states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreemptState {
+    /// Current preempt-disable nesting depth.  Must be ≥ 0; negative values
+    /// indicate a bug (unmatched `preempt_enable`).
+    pub preempt_count: i32,
+    /// Set by the scheduler when a higher-priority task becomes runnable.
+    /// Cleared when the task is actually preempted or rescheduled.
+    pub reschedule: bool,
+    /// Snapshot of the CPU mode at the point of the preemption check.
+    pub from_user: bool,
+    /// Set by the zero-crossing hook in `preempt_enable` when `reschedule`
+    /// is true at the moment `preempt_count` drops to zero.  The scheduler
+    /// loop polls this flag and yields at the next safe point.
+    pub preempt_resched_pending: bool,
+}
+
+/// Simulate a user-mode-return preemption check.
+///
+/// Returns `(new_state, did_preempt)`.
+///
+/// Preemption fires — `did_preempt == true` — iff **all** of:
+/// * `from_user` is `true` (we are returning to ring 3), and
+/// * `state.preempt_count == 0` (no preempt-disable lock is held), and
+/// * `state.reschedule || state.preempt_resched_pending` (the scheduler
+///   signalled that a context switch is needed).
+///
+/// When `did_preempt` is `true` both `reschedule` and `preempt_resched_pending`
+/// are cleared in the returned state (the kernel performs the switch).
+/// Otherwise the state is returned unchanged.
+pub fn apply_preempt(state: PreemptState, from_user: bool) -> (PreemptState, bool) {
+    let eligible = from_user
+        && state.preempt_count == 0
+        && (state.reschedule || state.preempt_resched_pending);
+
+    if eligible {
+        let new_state = PreemptState {
+            reschedule: false,
+            preempt_resched_pending: false,
+            ..state
+        };
+        (new_state, true)
+    } else {
+        (state, false)
+    }
+}
+
+/// Simulate the zero-crossing hook inside `preempt_enable`.
+///
+/// Decrements `preempt_count` by 1.  If the post-decrement count is zero and
+/// `reschedule` is `true`, sets `preempt_resched_pending` so the scheduler
+/// loop picks it up at the next safe yield point.
+///
+/// The returned state has `preempt_count` decremented; all other fields are
+/// unchanged except `preempt_resched_pending` which may be set.
+pub fn apply_preempt_enable_zero_crossing(state: PreemptState) -> PreemptState {
+    let new_count = state.preempt_count - 1;
+    let pending = if new_count == 0 && state.reschedule {
+        true
+    } else {
+        state.preempt_resched_pending
+    };
+    PreemptState {
+        preempt_count: new_count,
+        preempt_resched_pending: pending,
+        ..state
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track E — DeferredReschedModel (zero-crossing host model)
+// ---------------------------------------------------------------------------
+
+/// Pure-logic model of the per-core `preempt_resched_pending` flag.
+///
+/// Used in Phase 57d E.2 zero-crossing tests: when `enable` crosses from
+/// depth 1 to 0 and `reschedule` is `true`, `preempt_resched_pending` must
+/// be set so the user-mode-return boundary (E.3) can consume it.
+///
+/// This struct is host-testable (no kernel atomics) and exercises the same
+/// state-machine logic as the kernel's `preempt_enable` zero-crossing path.
+#[derive(Debug, Default, Clone)]
+pub struct DeferredReschedModel {
+    counter: Counter,
+    /// Mirrors `PerCoreData::reschedule`.
+    pub reschedule: bool,
+    /// Mirrors `PerCoreData::preempt_resched_pending`.
+    pub preempt_resched_pending: bool,
+}
+
+impl DeferredReschedModel {
+    /// Construct a fresh model: depth 0, no reschedule pending.
+    pub fn new() -> Self {
+        Self {
+            counter: Counter::new(),
+            reschedule: false,
+            preempt_resched_pending: false,
+        }
+    }
+
+    /// Disable preemption — increments the depth counter.
+    pub fn disable(&mut self) {
+        self.counter.disable();
+    }
+
+    /// Enable preemption — decrements depth and applies the E.2 zero-crossing rule.
+    ///
+    /// If the depth crosses from 1 → 0 **and** `reschedule` is set,
+    /// `preempt_resched_pending` is set to `true`.
+    pub fn enable(&mut self) {
+        let crossed = self.counter.enable();
+        if crossed && self.reschedule {
+            self.preempt_resched_pending = true;
+        }
+    }
+
+    /// Consume the pending flag — mirrors the `swap(false, AcqRel)` in E.3.
+    ///
+    /// Returns `true` if a deferred reschedule was pending.
+    pub fn consume_pending(&mut self) -> bool {
+        let was_pending = self.preempt_resched_pending;
+        self.preempt_resched_pending = false;
+        was_pending
+    }
+
+    /// Read current depth.
+    pub fn count(&self) -> i32 {
+        self.counter.count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,9 +316,9 @@ mod tests {
         assert_eq!(c.count(), 1);
         c.disable();
         assert_eq!(c.count(), 2);
-        c.enable();
+        assert!(!c.enable(), "depth 2→1 is not a zero-crossing");
         assert_eq!(c.count(), 1);
-        c.enable();
+        assert!(c.enable(), "depth 1→0 is a zero-crossing");
         assert_eq!(c.count(), 0);
     }
 
@@ -181,10 +343,104 @@ mod tests {
             c.disable();
         }
         assert_eq!(c.count(), 32);
-        for _ in 0..32 {
-            c.enable();
+        for i in 0..32 {
+            let crossed = c.enable();
+            if i == 31 {
+                assert!(crossed, "final enable must report zero-crossing");
+            } else {
+                assert!(!crossed, "non-final enable must not report zero-crossing");
+            }
         }
         assert_eq!(c.count(), 0);
         c.assert_balanced();
+    }
+
+    // ----- Phase 57d E.2 regression tests -----
+
+    /// E.2: preempt_enable at depth 1 with reschedule=true sets preempt_resched_pending.
+    #[test]
+    fn e2_zero_crossing_with_reschedule_sets_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        assert_eq!(m.count(), 1);
+        assert!(!m.preempt_resched_pending, "flag must start clear");
+        m.enable();
+        assert_eq!(m.count(), 0);
+        assert!(
+            m.preempt_resched_pending,
+            "E.2: zero-crossing with reschedule=true must set preempt_resched_pending"
+        );
+    }
+
+    /// E.2: preempt_enable at depth 1 with reschedule=false does NOT set the flag.
+    #[test]
+    fn e2_zero_crossing_without_reschedule_does_not_set_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = false;
+        m.disable();
+        m.enable();
+        assert!(
+            !m.preempt_resched_pending,
+            "E.2: zero-crossing with reschedule=false must NOT set preempt_resched_pending"
+        );
+    }
+
+    /// E.2: preempt_enable at depth > 1 does NOT set the flag even with reschedule=true.
+    #[test]
+    fn e2_non_zero_crossing_does_not_set_pending() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        m.disable(); // depth 2
+        m.enable(); // depth 1 — NOT a zero-crossing
+        assert!(
+            !m.preempt_resched_pending,
+            "E.2: enable at depth 2→1 must NOT set preempt_resched_pending"
+        );
+        assert_eq!(m.count(), 1);
+    }
+
+    /// E.3: consuming the pending flag clears it.
+    #[test]
+    fn e3_consume_pending_clears_flag() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        m.disable();
+        m.enable();
+        assert!(m.preempt_resched_pending, "precondition: flag must be set");
+        let was = m.consume_pending();
+        assert!(was, "E.3: consume must return true when flag was set");
+        assert!(
+            !m.preempt_resched_pending,
+            "E.3: flag must be cleared after consume"
+        );
+        let again = m.consume_pending();
+        assert!(
+            !again,
+            "E.3: second consume must return false (flag already clear)"
+        );
+    }
+
+    /// E.2: nested disable/enable — flag only set on final zero-crossing.
+    #[test]
+    fn e2_nested_pairs_flag_on_final_zero_crossing_only() {
+        let mut m = DeferredReschedModel::new();
+        m.reschedule = true;
+        for _ in 0..4 {
+            m.disable();
+        }
+        // Three enables that don't reach zero.
+        for _ in 0..3 {
+            m.enable();
+            assert!(!m.preempt_resched_pending, "premature flag set");
+        }
+        // Final enable reaches zero.
+        m.enable();
+        assert_eq!(m.count(), 0);
+        assert!(
+            m.preempt_resched_pending,
+            "E.2: flag must be set on the final zero-crossing enable"
+        );
     }
 }

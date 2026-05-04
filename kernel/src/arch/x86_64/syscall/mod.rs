@@ -951,6 +951,119 @@ pub(crate) unsafe fn set_per_core_syscall_stack_top(val: u64) {
     }
 }
 
+/// User register save area built by `syscall_entry` before calling Rust.
+///
+/// The field order must match the push order in the assembly stub below. The
+/// helper at the syscall-return boundary uses this to build a normal
+/// `PreemptFrame` after the syscall return value is known.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyscallSavedFrame {
+    r9: u64,
+    r8: u64,
+    r10: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    rflags: u64,
+    rip: u64,
+}
+
+#[cfg(feature = "exec-trace")]
+static SYSCALL_RETURN_PREEMPT_TRACE_BUDGET: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(128);
+
+const USER_RFLAGS_PRIV_MASK: u64 =
+    (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+
+fn sanitize_user_rflags(rflags: u64) -> u64 {
+    (rflags & !USER_RFLAGS_PRIV_MASK) | 0x202
+}
+
+/// Syscall-return preemption hook called from the assembly return tail.
+///
+/// Timer and reschedule-IPI handlers that interrupt kernel-mode syscall work
+/// cannot preempt immediately under PREEMPT_VOLUNTARY, but they do set the
+/// per-core reschedule flag. At the point this hook runs, the syscall's full
+/// user-visible register state is saved and IF is masked again, so a pending
+/// reschedule can be converted into the same full-register scheduler handoff
+/// used by IRQ-return preemption without relying on a cooperative yield.
+#[unsafe(no_mangle)]
+#[allow(dead_code)]
+extern "C" fn syscall_return_maybe_preempt(saved_frame: *const u8, syscall_result: u64) -> u64 {
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        let Some(pc) = crate::smp::try_per_core() else {
+            return syscall_result;
+        };
+        if crate::task::scheduler::peek_preempt_count_irq() != 0 {
+            return syscall_result;
+        }
+        let reschedule = pc
+            .reschedule
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
+        let pending = pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel);
+        if !reschedule && !pending {
+            return syscall_result;
+        }
+
+        let Some(saved) = (unsafe { (saved_frame as *const SyscallSavedFrame).as_ref() }) else {
+            return syscall_result;
+        };
+        #[cfg(feature = "exec-trace")]
+        {
+            let n = SYSCALL_RETURN_PREEMPT_TRACE_BUDGET
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            if n > 0 {
+                log::info!(
+                    "[exec-trace] syscall-return-preempt core={} pid={} rip={:#x} reschedule={} pending={}",
+                    pc.core_id,
+                    crate::process::current_pid(),
+                    saved.rip,
+                    reschedule,
+                    pending
+                );
+            }
+        }
+        let frame = kernel_core::preempt_frame::PreemptFrame {
+            rax: syscall_result,
+            rbx: saved.rbx,
+            rcx: saved.rip,
+            rdx: saved.rdx,
+            rsi: saved.rsi,
+            rdi: saved.rdi,
+            rbp: saved.rbp,
+            r8: saved.r8,
+            r9: saved.r9,
+            r10: saved.r10,
+            r11: saved.rflags,
+            r12: saved.r12,
+            r13: saved.r13,
+            r14: saved.r14,
+            r15: saved.r15,
+            rip: saved.rip,
+            cs: u64::from(gdt::user_code_selector().0),
+            rflags: sanitize_user_rflags(saved.rflags),
+            rsp: pc.syscall_user_rsp,
+            ss: u64::from(gdt::user_data_selector().0),
+        };
+        crate::task::scheduler::preempt_frame_to_scheduler(frame);
+    }
+    #[cfg(not(feature = "preempt-voluntary"))]
+    {
+        let _ = saved_frame;
+        syscall_result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Assembly entry stub
 // ---------------------------------------------------------------------------
@@ -1036,8 +1149,21 @@ global_asm!(
     "mov rdx, rsi",                // arg1
     "mov rsi, rdi",                // arg0
     "mov rdi, rax",                // syscall number
+    // SYSCALL entry masks IF via SFMASK. Once the full user register state is
+    // saved on this kernel stack, re-enable interrupts so AP timer/reschedule
+    // IPIs and device IRQs can run while the syscall body executes. The return
+    // tail disables IF again before restoring user RSP, so no IRQ can land on
+    // the user stack before SYSRET.
+    "sti",
     "call syscall_handler",
     // Return value is in RAX.
+    "cli",
+    // Convert a pending reschedule observed during the syscall into the same
+    // full-frame preemption path used by timer/IPI user returns. If no
+    // preemption is needed this returns RAX unchanged.
+    "mov rdi, rsp",
+    "mov rsi, rax",
+    "call syscall_return_maybe_preempt",
 
     // --- Restore caller-saved registers (Linux-preserved) ---
     "pop r9",
@@ -1274,10 +1400,60 @@ mod syscall_nr {
     /// number of ticks accumulated since the last drain (saturating
     /// coalesce; never blocks).
     pub const FRAME_TICK_DRAIN: u64 = 0x1017;
+    /// Phase 57d follow-up: allocate a shared-memory region of
+    /// `byte_len` bytes (rounded up to a page boundary). Returns the
+    /// new `ShmId` as a `u32` packed into the low bits of the return.
+    /// Errors return `u64::MAX`.
+    pub const SHM_CREATE: u64 = 0x1018;
+    /// Map an existing shared-memory region into the caller's address
+    /// space. Increments the registry refcount; the caller MUST pair
+    /// each successful map with a matching `SHM_UNMAP`. Returns the
+    /// user virtual address of the mapping, or `u64::MAX` on error.
+    pub const SHM_MAP: u64 = 0x1019;
+    /// Unmap a previously-mapped shared-memory region from the caller's
+    /// address space and decrement the registry refcount. The frames
+    /// are returned to the buddy when the last reference drops.
+    /// `arg0` is the user virtual address returned by `SHM_MAP`.
+    /// Returns `0` on success, `u64::MAX` on error.
+    pub const SHM_UNMAP: u64 = 0x101A;
+    /// Drop the creator's reference on a shared-memory region without
+    /// requiring an existing mapping. `arg0` is the `ShmId` returned
+    /// by `SHM_CREATE`. Decrements the registry refcount once; the
+    /// frames are returned to the buddy when the last reference drops.
+    /// Used by the creating process to release the +1 that `SHM_CREATE`
+    /// reserved, both on the normal teardown path and on early failure
+    /// paths between `create` and the first successful `map`.
+    /// Returns `0` on success, `u64::MAX` on error.
+    pub const SHM_DESTROY: u64 = 0x101B;
+
+    /// Phase 57d follow-up: yield framebuffer ownership without
+    /// unmapping the caller's FB VMA or restoring the kernel console.
+    /// Used by display_server to temporarily release the framebuffer
+    /// to a fullscreen takeover program (see
+    /// `docs/appendix/fb-takeover-tiers.md`). The caller's existing
+    /// FB mapping stays alive so a later `FB_REACQUIRE` can resume
+    /// drawing without paying the page-table fixup cost. Returns `0`
+    /// on success, `NEG_EPERM` if the caller is not the current FB
+    /// owner. No arguments.
+    pub const FB_YIELD: u64 = 0x101C;
+    /// Phase 57d follow-up: re-claim framebuffer ownership previously
+    /// yielded via `FB_YIELD`. The caller must already have an
+    /// FB-flagged VMA (i.e. it called `FRAMEBUFFER_MMAP` and then
+    /// `FB_YIELD` rather than `FRAMEBUFFER_RELEASE`). Returns `0` on
+    /// success, `NEG_EBUSY` if some other process currently owns the
+    /// framebuffer, `NEG_ENOENT` if the caller has no FB VMA.
+    pub const FB_REACQUIRE: u64 = 0x101D;
+    /// Diagnostic: read one of the PS/2 ISR counters. `arg0` selects
+    /// the counter (0=mouse_bytes_seen, 1=mouse_packets_produced,
+    /// 2=mouse_ring_drops, 3=irq1_entries, 4=irq12_entries). Returns
+    /// the counter value as a u64; an out-of-range selector returns 0.
+    /// Used by display_server's compose-log line during the held-key
+    /// cursor-freeze investigation. Strip once root-caused.
+    pub const PS2_DIAG_COUNTER: u64 = 0x101E;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x1113;
+    pub const IPC_LAST: u64 = 0x1115;
 
     // -- device host (Phase 55b Track B) --
     //
@@ -1649,9 +1825,16 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
+        FB_YIELD => sys_fb_yield(),
+        FB_REACQUIRE => sys_fb_reacquire(),
+        PS2_DIAG_COUNTER => sys_ps2_diag_counter(arg0),
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
         FRAME_TICK_DRAIN => sys_frame_tick_drain(),
+        SHM_CREATE => sys_shm_create(arg0),
+        SHM_MAP => sys_shm_map(arg0),
+        SHM_UNMAP => sys_shm_unmap(arg0),
+        SHM_DESTROY => sys_shm_destroy(arg0),
         READ_SCANCODE => sys_read_scancode(),
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
@@ -1807,6 +1990,16 @@ pub extern "C" fn syscall_handler(
     // return and IRQ-return-to-ring-3 paths share a single helper
     // (DRY-clean per the Engineering Practice Gates).
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+
+    // Phase 57d E.3: consume deferred reschedule at syscall-return to user mode.
+    #[cfg(feature = "preempt-voluntary")]
+    if let Some(pc) = crate::smp::try_per_core()
+        && pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    {
+        crate::task::signal_reschedule();
+    }
 
     result
 }
@@ -2601,6 +2794,8 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     // path; see
     // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // Phase 57d G.4: consume deferred reschedule at every user-return boundary.
+    crate::task::scheduler::check_deferred_preempt_at_user_return();
     unsafe {
         use core::arch::asm;
         // We need to restore all GPRs.  The simplest approach: push the iretq
@@ -2682,8 +2877,29 @@ fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
-    if sig == 0 || sig >= 32 {
+    if sig == 0 || sig >= 64 {
         return NEG_EINVAL;
+    }
+    // m3OS only delivers the standard 31 signals; real-time signals
+    // 32..63 are not implemented but musl's `posix_spawn` /
+    // `__libc_start_main` cleanup loops iterate through them resetting
+    // handlers. Returning EINVAL for those calls makes musl's child
+    // path bail out (or fall through to a path that, in the doom build,
+    // visibly corrupts callee-saved registers — see m3os.log GPF in
+    // `<child>` at +0xa4). Accept the call as a no-op success since
+    // there is no kernel state to track; the rtsig handler will never
+    // fire either way.
+    if (32..64).contains(&sig) {
+        if oldact_ptr != 0 {
+            let zeros = [0u8; 32];
+            if UserSliceWo::new(oldact_ptr, zeros.len())
+                .and_then(|s| s.copy_from_kernel(&zeros))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+        }
+        return 0;
     }
     // SIGKILL and SIGSTOP cannot be caught or ignored.
     if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
@@ -3097,7 +3313,20 @@ pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     let oldfd = oldfd as usize;
     let newfd = newfd as usize;
 
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} dup2 oldfd={} newfd={}",
+        crate::process::current_pid(),
+        oldfd,
+        newfd
+    );
+
     if oldfd >= MAX_FDS || newfd >= MAX_FDS {
+        #[cfg(feature = "exec-trace")]
+        log::info!(
+            "[exec-trace] pid={} dup2 -> EBADF (out of range)",
+            crate::process::current_pid()
+        );
         return NEG_EBADF;
     }
 
@@ -3809,21 +4038,56 @@ fn read_user_string_array(
 ///
 /// Phase 14: now parses argv and envp from user memory (Linux ABI).
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve(path_ptr={:#x}, argv_ptr={:#x}, envp_ptr={:#x})",
+        crate::process::current_pid(),
+        path_ptr,
+        argv_ptr,
+        envp_ptr
+    );
     // Read the filename as a null-terminated C string.
     let mut name_cstr = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
-        None => return NEG_EFAULT,
+        None => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad path_ptr)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve path=\"{}\"",
+        crate::process::current_pid(),
+        raw_name
+    );
 
     // Parse argv and envp from user memory.
     let user_argv = match read_user_string_array(argv_ptr, 256) {
         Ok(v) => v,
-        Err(()) => return NEG_EFAULT,
+        Err(()) => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad argv)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
     let user_envp = match read_user_string_array(envp_ptr, 256) {
         Ok(v) => v,
-        Err(()) => return NEG_EFAULT,
+        Err(()) => {
+            #[cfg(feature = "exec-trace")]
+            log::info!(
+                "[exec-trace] pid={} execve -> EFAULT (bad envp)",
+                crate::process::current_pid()
+            );
+            return NEG_EFAULT;
+        }
     };
 
     let (resolved_name, exec_owned, exec_static) = {
@@ -3834,17 +4098,39 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // Follow the final symlink like Linux execve().
         let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
             Ok(path) => path,
-            Err(err) => return err,
+            Err(err) => {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve resolve_path_from_dirfd failed: errno={}",
+                    crate::process::current_pid(),
+                    err as i64
+                );
+                return err;
+            }
         };
         let resolved = match resolve_existing_fs_path(&lexical, true) {
             Ok(path) => path,
-            Err(err) => return err,
+            Err(err) => {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve resolve_existing_fs_path failed: errno={}",
+                    crate::process::current_pid(),
+                    err as i64
+                );
+                return err;
+            }
         };
 
         // Phase 27: Execute permission check.
         if let Some((fu, fg, fm)) = path_metadata(&resolved) {
             let (_, _, euid, egid) = current_process_ids();
             if !check_permission(fu, fg, fm, euid, egid, 1) {
+                #[cfg(feature = "exec-trace")]
+                log::info!(
+                    "[exec-trace] pid={} execve -> EACCES (perm check) path=\"{}\"",
+                    crate::process::current_pid(),
+                    resolved
+                );
                 return NEG_EACCES;
             }
         }
@@ -3857,6 +4143,12 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     Ok(buf) => (resolved, Some(buf), None),
                     Err(errno) => {
                         log::warn!("[execve] file not found or rejected: {}", resolved);
+                        #[cfg(feature = "exec-trace")]
+                        log::info!(
+                            "[exec-trace] pid={} execve read_file_from_disk failed: errno={}",
+                            crate::process::current_pid(),
+                            errno as i64
+                        );
                         return errno;
                     }
                 }
@@ -3865,6 +4157,13 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     let name: &str = &resolved_name;
     let pid = crate::process::current_pid();
+    // The Phase 56/57 graphical stack starts as a synchronous IPC chain:
+    // term -> display_server -> kbd_server/mouse_server. Keep that boot-critical
+    // compositor/input trio on the BSP so startup cannot strand one side of the
+    // chain behind AP run-queue latency before the terminal has drawn.
+    if name == "/bin/display_server" || name == "/bin/kbd_server" || name == "/bin/mouse_server" {
+        let _ = crate::task::scheduler::sys_sched_setaffinity(0, 1);
+    }
     log::debug!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
     // it from the canonical single-threaded TGID owner. Otherwise shared-mm
@@ -3935,8 +4234,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 phys_off,
                 &argv_refs,
                 &envp_refs,
-                loaded.phdr_vaddr,
-                loaded.phnum,
+                loaded.aux_info(),
             )
         } {
             Ok(rsp) => rsp,
@@ -4010,6 +4308,16 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     if is_interactive_debug_exec_path(name) {
         log::info!("[proc] execve: pid={} path={}", pid, name);
     }
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] pid={} execve OK path=\"{}\" entry={:#x} rsp={:#x}",
+        pid,
+        name,
+        loaded.entry,
+        user_rsp
+    );
+
+    crate::task::scheduler::reset_current_task_fpu_state();
 
     // Switch to the new page table and enter ring 3.
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
@@ -4039,23 +4347,26 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // real reclamation happens in Phase 13 when a free list is added.
         crate::mm::free_process_page_table(old_cr3_phys);
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
-        let kstack_top = crate::process::PROCESS_TABLE
+        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
             .lock()
             .find(pid)
-            .map(|p| p.kernel_stack_top)
-            .unwrap_or(0);
+            .map(|p| (p.kernel_stack_top, p.fs_base))
+            .unwrap_or((0, 0));
         if kstack_top != 0 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
+        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
+            user_rsp,
+            kernel_stack_top: kstack_top,
+            fs_base,
+            cr3_phys: new_cr3.start_address().as_u64(),
+            addr_space_gen: new_addr_space.generation(),
+        });
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
 
-/// `waitpid(pid, status_ptr, _flags)` — wait for a child to exit.
-///
-/// Spins with `yield_now()` until the target child is a zombie, then
-/// collects its exit code and reaps it.
 /// `waitpid(pid, status_ptr, options)` — wait for a child to exit or stop.
 ///
 /// Supports pid > 0 (specific child), pid == -1 (any child), pid == 0
@@ -4081,7 +4392,25 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 
     const NEG_ECHILD: u64 = (-10_i64) as u64;
 
+    let blocking_wait = options & WNOHANG == 0;
+    let wait_task = if blocking_wait {
+        match crate::task::scheduler::current_task_id() {
+            Some(id) => Some(id),
+            None => return (-4_i64) as u64, // EINTR
+        }
+    } else {
+        None
+    };
+    let wait_woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
     loop {
+        if blocking_wait {
+            wait_woken.store(false, core::sync::atomic::Ordering::Release);
+        }
+        if let Some(task_id) = wait_task {
+            crate::process::register_child_waiter(calling_pid, task_id, &wait_woken);
+        }
+
         // Scan for a matching child that is zombie (or stopped if WUNTRACED).
         let result = {
             let mut table = crate::process::PROCESS_TABLE.lock();
@@ -4129,7 +4458,10 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
             }
 
             if !has_eligible_child {
-                return NEG_ECHILD;
+                if let Some(task_id) = wait_task {
+                    crate::process::deregister_child_waiter(calling_pid, task_id);
+                }
+                break NEG_ECHILD;
             }
 
             if let Some(pid) = found_pid {
@@ -4150,6 +4482,9 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
+            if let Some(task_id) = wait_task {
+                crate::process::deregister_child_waiter(calling_pid, task_id);
+            }
             // Write wstatus.
             if status_ptr != 0 {
                 let wstatus = if stopped {
@@ -4173,15 +4508,18 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 child_pid,
                 if stopped { "stopped" } else { "exited" }
             );
-            return child_pid as u64;
+            break child_pid as u64;
         }
 
         // No matching child ready.
         if options & WNOHANG != 0 {
-            return 0;
+            break 0;
         }
-        // Yield and try again.
-        crate::task::yield_now();
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnWait,
+            &wait_woken,
+            None,
+        );
     }
 }
 
@@ -4672,6 +5010,58 @@ fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
     Ok(())
 }
 
+fn block_on_pty_master_read(pty_id: u32) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => !pair.s2m.is_empty() || (pair.slave_refcount == 0 && pair.slave_opened),
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_MASTER_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
+fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
+    let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].register(task_id, &woken);
+    let ready = {
+        let table = crate::pty::PTY_TABLE.lock();
+        match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
+            Some(pair) => {
+                if pair.termios.is_canonical() {
+                    pair.edit_buf.as_slice().contains(&b'\n')
+                        || pair.eof_pending
+                        || pair.master_refcount == 0
+                } else {
+                    !pair.m2s.is_empty() || pair.master_refcount == 0
+                }
+            }
+            None => true,
+        }
+    };
+    if !ready {
+        let _ = crate::task::scheduler::block_current_until(
+            crate::task::TaskState::BlockedOnRecv,
+            &woken,
+            None,
+        );
+    }
+    crate::pty::PTY_SLAVE_WQ[pty_id as usize].deregister(task_id);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
@@ -4982,7 +5372,9 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                if let Err(err) = block_on_pty_master_read(pty_id) {
+                    return err;
+                }
             }
         }
         FdBackend::PtySlave { pty_id } => {
@@ -5055,7 +5447,9 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                if let Err(err) = block_on_pty_slave_read(pty_id) {
+                    return err;
+                }
             }
         }
         FdBackend::Socket { .. } => {
@@ -6926,6 +7320,20 @@ pub(crate) fn vfs_service_close_pub(service_handle: u64) {
 
 pub(super) fn sys_linux_close(fd: u64) -> u64 {
     let fd = fd as usize;
+    // PID 1 (init) runs `check_control_commands` on every reap-loop
+    // iteration: open(/run/init.cmd) → read → close → open(trunc) →
+    // close. Two closes per iter at >100 Hz produces ~81K trace lines
+    // per minute, drowning out the fork-exec close traces we actually
+    // care about. Skip pid 1 so the trace stays focused on the
+    // fork-child fd-juggling path that is the typical reason for
+    // enabling `exec-trace` in the first place.
+    #[cfg(feature = "exec-trace")]
+    {
+        let pid = crate::process::current_pid();
+        if pid != 1 {
+            log::info!("[exec-trace] pid={} close fd={}", pid, fd);
+        }
+    }
     // stdin/stdout/stderr (0–2) are virtual and cannot be closed.
     if fd < 3 {
         return 0;
@@ -8862,7 +9270,8 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     // page tables.  This eliminates the TOCTOU window that the old two-step
     // check-then-store had: two racing processes can no longer both observe
     // owner==0 and proceed to map.
-    if !crate::fb::try_yield_console(pid) {
+    let raw_input_enabled = !is_current_exec_path("/bin/display_server");
+    if !crate::fb::try_yield_console(pid, raw_input_enabled) {
         return NEG_EBUSY;
     }
 
@@ -8974,6 +9383,295 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57d follow-up: shared-memory region syscalls (0x1018..=0x101A)
+//
+// `sys_shm_create` allocates a new SHM region of the requested byte
+// length and returns the assigned `ShmId` (zero-extended into u64).
+// `sys_shm_map` maps an existing region into the caller's address
+// space and returns the user virtual address. `sys_shm_unmap` reverses
+// the map and decrements the registry refcount.
+//
+// The chosen wire shape is "ShmId travels as a plain integer": Phase
+// 56's single-client display protocol does not need cap-secure grant
+// semantics, and the hot path (`term` writing pixels into the region
+// and `display_server` reading them) is the same direct memory access
+// that capability-secured SHM would provide. A future multi-client
+// build can wrap the id inside a `Capability::Grant` without changing
+// the kernel registry — the cap variant already has the right shape
+// (`frame, page_count, writable`).
+// ---------------------------------------------------------------------------
+
+/// SHM-mapped pages set this bit on their leaf PTEs so
+/// `mm::free_process_page_table` skips them during process-exit
+/// teardown — the SHM registry's refcount is the single source of
+/// truth for when frames return to the buddy allocator. Same mechanism
+/// the framebuffer mapping uses.
+fn shm_pte_flags() -> x86_64::structures::paging::PageTableFlags {
+    use x86_64::structures::paging::PageTableFlags;
+    PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::BIT_11
+}
+
+pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
+    if byte_len == 0 {
+        return u64::MAX;
+    }
+    match crate::mm::shm::create(byte_len as usize) {
+        Ok((id, _start_phys, _page_count)) => u64::from(id.0),
+        Err(_) => u64::MAX,
+    }
+}
+
+pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        log::warn!(
+            "[shm] map: invalid shm_id_arg={:#x} from pid={}",
+            shm_id_arg,
+            crate::process::current_pid()
+        );
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+
+    // Increment refcount up front; if any later step fails we decref
+    // on the way out. Holds the SHM frames live across the
+    // page-table-mapping path even if we yield to wait on a lock.
+    let (start_phys, page_count) = match crate::mm::shm::incref(id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "[shm] map: incref({:?}) failed err={:?} pid={}",
+                id,
+                e,
+                crate::process::current_pid()
+            );
+            return u64::MAX;
+        }
+    };
+    let total_size = (page_count as u64) * 4096;
+
+    // Build the per-page PhysFrame array the user_space helper expects.
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+    let mut frames = alloc::vec::Vec::with_capacity(page_count as usize);
+    for i in 0..(page_count as u64) {
+        let phys_addr = x86_64::PhysAddr::new(start_phys + i * 4096);
+        match PhysFrame::<Size4KiB>::from_start_address(phys_addr) {
+            Ok(f) => frames.push(f),
+            Err(_) => {
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        }
+    }
+
+    let pid = crate::process::current_pid();
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+
+    let virt_addr = {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        // Claim a virtual address range from the process's anon-mmap
+        // cursor so we don't collide with an existing mapping.
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        let virt_addr =
+            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                let current = if *mmap_next == 0 {
+                    ANON_MMAP_BASE
+                } else {
+                    *mmap_next
+                };
+                let base = (current + 4095) & !4095;
+                let end = base
+                    .checked_add(total_size)
+                    .filter(|v| *v <= USER_SPACE_END)?;
+                *mmap_next = end;
+                Some(base)
+            }) {
+                Some(Some(base)) => base,
+                _ => {
+                    log::warn!("[shm] map: with_shared_mm_mut returned None pid={}", pid);
+                    let _ = crate::mm::shm::decref(id);
+                    return u64::MAX;
+                }
+            };
+        let reservation_end = virt_addr + total_size;
+
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+            Some(phys) => phys,
+            None => {
+                log::warn!("[shm] map: no addr_space for pid={}", pid);
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        };
+        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+            Ok(f) => f,
+            Err(_) => {
+                log::warn!(
+                    "[shm] map: cr3 not page-aligned pid={} cr3={:#x}",
+                    pid,
+                    cr3_phys.as_u64()
+                );
+                let _ = crate::mm::shm::decref(id);
+                return u64::MAX;
+            }
+        };
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+
+        if unsafe {
+            crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, shm_pte_flags())
+        }
+        .is_err()
+        {
+            log::warn!(
+                "[shm] map: map_user_frames failed pid={} virt={:#x} pages={}",
+                pid,
+                virt_addr,
+                page_count
+            );
+            // Roll back the reservation if no other mapping advanced
+            // the cursor in between, then drop our refcount.
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = virt_addr;
+                    }
+                });
+            let _ = crate::mm::shm::decref(id);
+            return u64::MAX;
+        }
+
+        // Record a VMA so munmap / process teardown can find it. We
+        // pack the SHM id into the high bits of `flags` so unmap can
+        // recover it without a separate kernel-side table.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
+                start: virt_addr,
+                len: total_size,
+                prot: 3, // PROT_READ | PROT_WRITE
+                flags: shm_vma_flags(id),
+            });
+        });
+        virt_addr
+    };
+
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, virt_addr, virt_addr + total_size);
+        addr_space.bump_generation();
+    }
+
+    virt_addr
+}
+
+pub(super) fn sys_shm_unmap(user_va: u64) -> u64 {
+    if user_va == 0 || !user_va.is_multiple_of(4096) {
+        return u64::MAX;
+    }
+    let pid = crate::process::current_pid();
+    // Look up the VMA registered by `sys_shm_map` to recover the
+    // mapping length and the SHM id we packed into `flags`.
+    let info = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree
+            .iter()
+            .find(|m| m.start == user_va && (m.flags & SHM_VMA_FLAG_MARKER) != 0)
+            .map(|m| (m.len, shm_id_from_vma_flags(m.flags)))
+    });
+    let (len, id) = match info {
+        Some(Some((len, Some(id)))) => (len, id),
+        _ => return u64::MAX,
+    };
+
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+
+    {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+            Some(phys) => phys,
+            None => return u64::MAX,
+        };
+        use x86_64::structures::paging::{Page, PhysFrame, Size4KiB};
+        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+            Ok(f) => f,
+            Err(_) => return u64::MAX,
+        };
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+        let pages = len / 4096;
+        use x86_64::structures::paging::Mapper;
+        for i in 0..pages {
+            let vaddr = x86_64::VirtAddr::new(user_va + i * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(vaddr);
+            // Use unmap directly. Frame ownership transfers back to
+            // the SHM registry's refcount path, not to the buddy
+            // allocator — that's why `BIT_11` was set on the PTEs at
+            // map time.
+            if let Ok((_frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+        }
+    }
+
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, user_va, user_va + len);
+        addr_space.bump_generation();
+    }
+
+    // Drop the VMA entry.
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree.remove(user_va);
+    });
+
+    // Decrement refcount; if this was the last reference, frames go
+    // back to the buddy.
+    let _ = crate::mm::shm::decref(id);
+    0
+}
+
+pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
+    if shm_id_arg == 0 || shm_id_arg > u64::from(u32::MAX) {
+        return u64::MAX;
+    }
+    let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    match crate::mm::shm::decref(id) {
+        Ok(_) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Marker bit in `MemoryMapping.flags` that distinguishes SHM-mapped
+/// regions from regular anonymous mappings. Sits in the OS-private
+/// flag range (above the public POSIX MAP_* bits, like `FB_MAPPING_FLAG`).
+const SHM_VMA_FLAG_MARKER: u64 = 1 << 33;
+
+/// Pack an SHM id into a `MemoryMapping.flags` value. The id occupies
+/// bits 0..32 (low 32 bits); the SHM marker bit is OR'd on top.
+fn shm_vma_flags(id: crate::mm::shm::ShmId) -> u64 {
+    SHM_VMA_FLAG_MARKER | u64::from(id.0)
+}
+
+/// Recover an SHM id from a flags value previously produced by
+/// `shm_vma_flags`. Returns `None` if the SHM marker bit is not set.
+fn shm_id_from_vma_flags(flags: u64) -> Option<crate::mm::shm::ShmId> {
+    if (flags & SHM_VMA_FLAG_MARKER) == 0 {
+        return None;
+    }
+    Some(crate::mm::shm::ShmId(flags as u32))
+}
+
+// ---------------------------------------------------------------------------
 // Phase 56 Track B.1: explicit framebuffer release syscall (0x1014)
 //
 // Counterpart to FRAMEBUFFER_MMAP. Tears down the framebuffer mapping in
@@ -9011,6 +9709,65 @@ pub(super) fn sys_framebuffer_release() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57d follow-up: framebuffer yield / reacquire (0x101C / 0x101D)
+//
+// Tier 1 of the fullscreen-takeover mechanism. `FB_YIELD` lets the
+// current FB owner (typically `display_server`) drop ownership without
+// unmapping its FB VMA or repainting the kernel console: the caller's
+// pixel mapping survives so a subsequent `FB_REACQUIRE` can resume
+// composing without re-walking the page tables. While yielded, no
+// process owns the framebuffer (`fb_owner_pid() == 0`) and the next
+// caller of `FRAMEBUFFER_MMAP` (e.g. `doom`) wins the CAS atomically.
+//
+// `FB_REACQUIRE` is the inverse: take ownership back assuming a
+// previously-yielded VMA still exists. Used by `display_server` once
+// the takeover program exits, after `/bin/fb-takeover` has reported
+// the child's status. See `docs/appendix/fb-takeover-tiers.md`.
+// ---------------------------------------------------------------------------
+
+pub(super) fn sys_fb_yield() -> u64 {
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return NEG_EPERM;
+    }
+    // Soft release: mark the FB unowned but keep the caller's VMA so a
+    // later `FB_REACQUIRE` can avoid re-allocating page tables. The
+    // kernel console stays yielded (CONSOLE_YIELDED=true) so any pixel
+    // writes the next owner makes are not overpainted by stale console
+    // text. See `release_console_claim` for the exact ordering.
+    crate::fb::release_console_claim(pid);
+    0
+}
+
+pub(super) fn sys_fb_reacquire() -> u64 {
+    let pid = crate::process::current_pid();
+    let raw_input_enabled = !is_current_exec_path("/bin/display_server");
+
+    // Verify the caller still has an FB VMA — `FB_REACQUIRE` is meant
+    // for the post-yield path where the caller never tore its mapping
+    // down. A caller without an FB VMA should use `FRAMEBUFFER_MMAP`
+    // instead so the pages get mapped properly.
+    let has_fb_vma = crate::process::with_shared_mm_mut(pid, |_brk, _mmap_next, vma_tree| {
+        vma_tree.iter().any(|m| (m.flags & FB_MAPPING_FLAG) != 0)
+    });
+    if !matches!(has_fb_vma, Some(true)) {
+        return NEG_ENOENT;
+    }
+
+    // Atomically claim ownership. `try_yield_console` uses a CAS so a
+    // concurrent claimer cannot race past us, re-asserts
+    // `CONSOLE_YIELDED=true` plus the raw-input routing flag, and
+    // (for `raw_input_enabled = false`) injects synthetic key-release
+    // scancodes so kbd_server clears any state stuck across the
+    // takeover session.
+    if crate::fb::try_yield_console(pid, raw_input_enabled) {
+        0
+    } else {
+        NEG_EBUSY
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 56 Track B.2 — read one decoded mouse packet (0x1015)
 //
 // Pops the next `MousePacket` from the kernel-side AUX ring (fed by IRQ12 in
@@ -9019,6 +9776,19 @@ pub(super) fn sys_framebuffer_release() -> u64 {
 // copy, `NEG_EAGAIN` when the ring is empty, and `NEG_EINVAL` / `NEG_EFAULT`
 // for invalid pointer / length / copy_to_user failure.
 // ---------------------------------------------------------------------------
+
+/// Diagnostic: read one of the PS/2 ISR counters. See `PS2_DIAG_COUNTER`.
+pub(super) fn sys_ps2_diag_counter(selector: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    match selector {
+        0 => super::ps2::MOUSE_BYTES_SEEN.load(Ordering::Relaxed),
+        1 => super::ps2::MOUSE_PACKETS_PRODUCED.load(Ordering::Relaxed),
+        2 => super::ps2::MOUSE_RING_DROPS.load(Ordering::Relaxed),
+        3 => super::ps2::IRQ1_ENTRIES.load(Ordering::Relaxed),
+        4 => super::ps2::IRQ12_ENTRIES.load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
 
 pub(super) fn sys_read_mouse_packet(buf_ptr: u64, buf_len: u64) -> u64 {
     if buf_ptr == 0 || (buf_len as usize) < super::ps2::MOUSE_PACKET_WIRE_SIZE {
@@ -11850,14 +12620,35 @@ pub(super) fn sys_clone(
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
     // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
     // combination used by musl's posix_spawn/system() — treat all as fork.
+    //
+    // For the CLONE_VM|CLONE_VFORK case (musl's posix_spawn / system),
+    // honour the caller-provided `child_stack`: musl's clone wrapper
+    // pushes the child's `args` and target function onto child_stack
+    // before issuing the syscall, then in the child branch does
+    // `pop rdi; call *rdx`. If we ignore `child_stack` and reuse the
+    // parent's RSP, the child pops random bytes from the (CoW-shared)
+    // parent stack as `args` and the called function dereferences
+    // garbage — m3os.log line 808 onward shows the resulting GPF in
+    // musl's posix_spawn `child` at +0xa4 with `r12 = 0x001628c481480424`
+    // (a non-canonical value composed of x86 instruction bytes that
+    // confirm the bogus pointer landed in code memory).
+    //
+    // For plain fork (`flags == 0` or `SIGCHLD`), child_stack is
+    // typically NULL and the child legitimately reuses the parent's
+    // RSP. Fall through to that semantic in those cases.
     let fork_flags =
         flags & !(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID | CLONE_SETTLS);
-    if fork_flags == 0
-        || fork_flags == SIGCHLD
-        || fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+    if fork_flags == 0 || fork_flags == SIGCHLD {
+        sys_fork(user_rip, user_rsp)
+    } else if fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
         || fork_flags == (CLONE_VM | CLONE_VFORK)
     {
-        sys_fork(user_rip, user_rsp)
+        let child_rsp = if child_stack != 0 {
+            child_stack
+        } else {
+            user_rsp
+        };
+        sys_fork(user_rip, child_rsp)
     } else {
         log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS

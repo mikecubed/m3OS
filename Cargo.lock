@@ -620,6 +620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb-takeover"
+version = "0.1.0"
+dependencies = [
+ "kernel-core",
+ "m3ctl",
+ "syscall-lib",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -923,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.57.3"
+version = "0.57.4"
 dependencies = [
  "bootloader_api",
  "kernel-core",

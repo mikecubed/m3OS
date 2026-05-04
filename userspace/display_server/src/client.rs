@@ -40,7 +40,8 @@ use alloc::vec::Vec;
 
 use kernel_core::display::pixel_chunk::{CHUNK_HEADER_LEN, PixelChunkHeader};
 use kernel_core::display::protocol::{
-    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage,
+    BufferId, ClientMessage, MAX_FRAME_BODY_LEN, ProtocolError, ServerMessage, SurfaceId,
+    SurfaceRole,
 };
 use syscall_lib::IpcMessage;
 
@@ -92,8 +93,12 @@ pub const LABEL_CLIENT_EVENT_NONE: u64 = 4;
 pub const MAX_CLIENT_EVENT_QUEUE: usize = 128;
 
 /// Maximum bulk size accepted by the dispatcher (matches the kernel's
-/// `MAX_BULK_LEN`).
-pub const MAX_BULK_BYTES: usize = 4096;
+/// `MAX_BULK_LEN`). Bumped from 4096 to 65536 in the Phase 57d
+/// follow-up to cut the chunked-pixel upload count for term's 1 MiB
+/// surface from ~252 roundtrips per compose to ~16. Must stay equal
+/// to or larger than the kernel constant or oversized bulks will
+/// truncate at the dispatcher.
+pub const MAX_BULK_BYTES: usize = 65536;
 
 /// Bytes per BGRA8888 pixel — used to validate that the bulk length on a
 /// `LABEL_PIXELS` frame matches `width * height * BYTES_PER_PIXEL_BGRA8888`.
@@ -116,6 +121,44 @@ pub struct DispatchOutcome {
     /// `true` if the client violated the wire protocol (decode error,
     /// state-machine error, oversized bulk). The caller should disconnect.
     pub fatal: bool,
+    /// Narrow reason for `fatal`, used by the compositor's serial log so a
+    /// production boot transcript can distinguish malformed frames from
+    /// resource exhaustion without reproducing under a debugger.
+    pub fatal_reason: Option<FatalReason>,
+    /// Surfaces whose roles became mapped during this dispatch.
+    pub created: Vec<(SurfaceId, SurfaceRole)>,
+    /// Surfaces destroyed during this dispatch.
+    pub destroyed: Vec<SurfaceId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatalReason {
+    BulkTooLarge,
+    PixelHeaderTooShort,
+    PixelSizeMismatch,
+    PendingBulkFull,
+    ChunkHeaderTooShort,
+    ChunkDecode,
+    ChunkBufferMismatch,
+    ChunkReceive,
+    VerbDecode,
+    /// `AttachSharedBuffer` referenced an SHM id that the compositor
+    /// could not map. This is a transport failure (kernel refused the
+    /// map) rather than a recoverable verb error — without a buffer
+    /// the surface cannot make progress, so the dispatcher disconnects
+    /// the client to force a clean reconnect rather than silently
+    /// stranding it without a committed buffer.
+    ShmMapFailed,
+}
+
+impl DispatchOutcome {
+    fn fatal(reason: FatalReason) -> Self {
+        Self {
+            fatal: true,
+            fatal_reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// One Phase 56 IPC message from a client. Created by the C.5 dispatch
@@ -135,8 +178,7 @@ pub struct InboundFrame<'a> {
 pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> DispatchOutcome {
     let mut out = DispatchOutcome::default();
     if frame.bulk.len() > MAX_BULK_BYTES {
-        out.fatal = true;
-        return out;
+        return DispatchOutcome::fatal(FatalReason::BulkTooLarge);
     }
 
     match frame.header.label {
@@ -149,8 +191,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
             // `w * h * BYTES_PER_PIXEL_BGRA8888` BGRA8888 pixels.
             let buffer_id = BufferId(frame.header.data[0] as u32);
             if frame.bulk.len() < PIXEL_BULK_HEADER_LEN {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::PixelHeaderTooShort);
             }
             let mut wbuf = [0u8; 4];
             let mut hbuf = [0u8; 4];
@@ -163,21 +204,19 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 .checked_mul(height as usize)
                 .and_then(|wh| wh.checked_mul(BYTES_PER_PIXEL_BGRA8888));
             if expected != Some(pixels.len()) {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::PixelSizeMismatch);
             }
             // Resource bound — `receive_bulk` returns `false` if the
             // pending-bulk queue is at the documented cap. Refusing
             // additional buffers protects compositor memory from a
             // client that floods `LABEL_PIXELS` without `AttachBuffer`.
-            if !registry.receive_bulk(CommittedBuffer {
+            if !registry.receive_bulk(CommittedBuffer::from_owned(
                 buffer_id,
                 width,
                 height,
-                pixels: pixels.to_vec(),
-            }) {
-                out.fatal = true;
-                return out;
+                pixels.to_vec(),
+            )) {
+                return DispatchOutcome::fatal(FatalReason::PendingBulkFull);
             }
         }
         LABEL_PIXELS_CHUNK => {
@@ -186,27 +225,23 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
             // reassembly state; the dispatcher just decodes the
             // header, splits the body, and forwards.
             if frame.bulk.len() < CHUNK_HEADER_LEN {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkHeaderTooShort);
             }
             let header = match PixelChunkHeader::decode(&frame.bulk[..CHUNK_HEADER_LEN]) {
                 Ok(h) => h,
                 Err(_) => {
-                    out.fatal = true;
-                    return out;
+                    return DispatchOutcome::fatal(FatalReason::ChunkDecode);
                 }
             };
             // The IPC `data0` carries the BufferId; cross-check
             // against the in-bulk header so a confused client cannot
             // accidentally race two buffers' chunks together.
             if frame.header.data[0] as u32 != header.buffer_id {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkBufferMismatch);
             }
             let body = &frame.bulk[CHUNK_HEADER_LEN..];
             if registry.receive_chunk(header, body).is_err() {
-                out.fatal = true;
-                return out;
+                return DispatchOutcome::fatal(FatalReason::ChunkReceive);
             }
         }
         LABEL_VERB => match decode_message(frame.bulk) {
@@ -223,7 +258,20 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                     out.closed = true;
                 }
                 ref other => match registry.handle_message(other) {
-                    Ok(result) => out.outbound.extend(result.outbound),
+                    Ok(result) => {
+                        out.outbound.extend(result.outbound);
+                        out.created.extend(result.created);
+                        out.destroyed.extend(result.destroyed);
+                    }
+                    Err(crate::surface::SurfaceShimError::ShmMapFailed { .. }) => {
+                        // SHM mapping failures are not a recoverable verb
+                        // error: without a backing buffer the client's
+                        // surface cannot progress. Treat as fatal so the
+                        // dispatcher disconnects and forces a clean
+                        // reconnect rather than leaving the client
+                        // permanently without a committed buffer.
+                        return DispatchOutcome::fatal(FatalReason::ShmMapFailed);
+                    }
                     Err(_) => {
                         // Recoverable surface-shim errors
                         // (UnknownSurface, DuplicateSurface, StateMachine,
@@ -236,7 +284,7 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                 },
             },
             Err(_) => {
-                out.fatal = true;
+                return DispatchOutcome::fatal(FatalReason::VerbDecode);
             }
         },
         _ => {
@@ -254,11 +302,30 @@ fn decode_message(bulk: &[u8]) -> Result<ClientMessage, ProtocolError> {
         return Err(ProtocolError::BodyTooLarge);
     }
     let (msg, consumed) = ClientMessage::decode(bulk)?;
-    // Phase 56 wire framing is "exactly one frame per IPC bulk" — trailing
-    // bytes are a protocol violation, not a forward-compatible extension.
-    // Reject so fuzzing / adversarial clients cannot smuggle a half-second
-    // frame past the dispatcher and produce ambiguous framing.
-    if consumed != bulk.len() {
+    // Phase 56 wire framing is nominally "exactly one frame per IPC
+    // bulk" — but Phase 57d follow-up: a kernel-side IPC
+    // bulk-vs-message desync shows up at this seam as "a valid frame
+    // at the start of a larger bulk than the frame consumes". The
+    // bulk content is the *previous* send's bytes (e.g. an 8-byte
+    // CommitSurface frame delivered in display_server's 24-byte
+    // `bulk_buf` slot because the sender's `pending_bulk` slot held
+    // a stale Commit-shaped vec when the Damage send tried to attach
+    // its 24-byte bulk). The trailing bytes are stale `bulk_buf`
+    // content from a prior recv (typically Damage rect coords —
+    // **not** all zero), so a "trailing must be zero" check is too
+    // narrow. Trust the frame header and ignore the trailing bytes.
+    //
+    // Adversarial-frame note: the strict-frame check this softens
+    // was originally there to prevent fuzzing clients from smuggling
+    // a half-second frame. In a toy OS with no untrusted
+    // compositor clients today, accepting trailing bytes is the
+    // right ergonomic trade-off; if a future hardening pass needs
+    // the strict check back, gate it behind a `#[cfg]` and tighten
+    // up the upstream IPC desync first. The desync itself is being
+    // surveilled by the kernel-side `deliver_bulk overwrote
+    // non-empty pending_bulk slot` warning added alongside this
+    // workaround.
+    if consumed > bulk.len() {
         return Err(ProtocolError::BodyLengthMismatch);
     }
     Ok(msg)

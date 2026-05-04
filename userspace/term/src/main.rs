@@ -55,7 +55,10 @@ use term::screen::{RenderCommand, Screen};
 #[cfg(not(test))]
 use term::syscall_pty::SyscallPtyOps;
 #[cfg(not(test))]
-use term::{BOOT_LOG_MARKER, READY_SENTINEL, SERVICE_NAME};
+use term::{
+    BOOT_LOG_MARKER, PROMPT_READY_MIN_BYTES, PROMPT_READY_SERVICE, READY_SENTINEL, SERVICE_NAME,
+    should_compose_frame,
+};
 
 #[cfg(not(test))]
 #[global_allocator]
@@ -97,6 +100,21 @@ const IDLE_SLEEP_NS: u32 = 1_000_000;
 /// noisy program cannot starve the input + render passes.
 #[cfg(not(test))]
 const PTY_READ_CHUNK: usize = 256;
+
+/// Minimum gap between successive `Renderer::compose()` calls, in
+/// milliseconds. Caps the compose / framebuffer-upload frequency at
+/// roughly 60 Hz: the renderer's `damaged()` queue keeps accumulating
+/// `PutGlyph` ops between calls, so a burst of PTY echo bytes (one
+/// per typed key) coalesces into a single compose pass instead of
+/// firing one full-buffer upload per character. With the Phase 56
+/// chunked-pixel path, each upload is ~252 IPC roundtrips for the
+/// 640×400 surface; without throttling, every keystroke paid that
+/// cost in series.
+#[cfg(not(test))]
+const COMPOSE_INTERVAL_MS: u64 = 16;
+
+#[cfg(not(test))]
+const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
 
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
@@ -151,6 +169,10 @@ fn program_main(_args: &[&str]) -> i32 {
     //    `SyscallPtyOps` is the production wiring of the
     //    `PtyOps` trait the lib already exercises against
     //    `MockPtyOps`.
+    if !wait_for_shell_dependencies() {
+        syscall_lib::write_str(STDOUT_FILENO, "term: VFS unavailable before shell spawn\n");
+        return 6;
+    }
     let mut pty = PtyHost::new(SyscallPtyOps::new());
     if let Err(_e) = pty.open_and_spawn() {
         syscall_lib::write_str(STDOUT_FILENO, "term: PTY open / shell spawn failed\n");
@@ -176,6 +198,17 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     let mut input_handler = InputHandler::new();
+
+    // Paint an initial cleared frame so the surface gets a buffer
+    // attached *before* any PTY traffic arrives. Without this, the
+    // renderer queue stays empty until the shell echoes its first byte
+    // (or the user types), so `display_server` never sees an
+    // `AttachBuffer` for term's surface and skips it during compose —
+    // the user just sees the teal background and cursor with no
+    // terminal rectangle. Pushing `RenderCommand::Clear` mirrors what
+    // the screen state machine would emit on `ESC [ 2 J`; the throttle
+    // below the loop will flush it on its first tick.
+    renderer.apply(RenderCommand::Clear);
     let mut bell_audio = Some(Bell::new(AudioClientBellSink::new()));
     let mut bell_unavail: Option<Bell<AudioUnavailableBellSink>> = None;
     let mut render_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
@@ -187,19 +220,74 @@ fn program_main(_args: &[&str]) -> i32 {
     };
     let clock = MonotonicClock;
 
+    // Attach and publish the initial clear frame before the event-pull loop.
+    // Otherwise early key/mouse traffic can keep term draining display events
+    // before the first `AttachSharedBuffer`, leaving the terminal invisible.
+    renderer.compose();
+    let mut composes: u64 = 1;
+    let mut last_compose_ms = clock.now_ms();
+
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
+
+    // Track the last compose timestamp so the throttle below only
+    // composes when at least `COMPOSE_INTERVAL_MS` has elapsed. The
+    // underlying `Renderer` keeps its damage queue intact between
+    // composes, so dropping a single frame's worth of compose calls
+    // does not lose any glyphs — the next compose flushes everything.
+
+    // Phase 57d follow-up — diagnostic stat counters. Print one stat
+    // line every 1000 iters so we can confirm term's main loop is
+    // alive when display_server reports an outbound queue overflow,
+    // and bisect *which* of (PTY drain / event pull / compose / idle
+    // sleep) the loop is spending its time in. Ripped once the
+    // input-pipeline race is closed.
+    let mut iter_count: u64 = 0;
+    let mut events_pulled: u64 = 0;
+    let mut pty_bytes: u64 = 0;
+    let mut prompt_ready_registered = false;
 
     // 5. Event loop. Single-threaded; multiplexes the PTY drain, the
     //    display_server outbound-event drain, the bell, the shell-exit
     //    poll, and the renderer's per-tick compose.
     loop {
         let mut did_work = false;
+        let mut pty_drained_this_tick = false;
+        iter_count = iter_count.wrapping_add(1);
+        if iter_count.is_multiple_of(1000) {
+            syscall_lib::write_str(STDOUT_FILENO, "term: iter=");
+            log_u32(iter_count as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " events=");
+            log_u32(events_pulled as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " composes=");
+            log_u32(composes as u32);
+            syscall_lib::write_str(STDOUT_FILENO, " pty_bytes=");
+            log_u32(pty_bytes as u32);
+            syscall_lib::write_str(STDOUT_FILENO, "\n");
+        }
 
         // 5a. Drain the PTY primary fd. Nonblocking: -EAGAIN means
         //     no data this tick. 0 means the shell closed its end.
         let n = syscall_lib::read(primary_fd, &mut pty_buf);
         if n > 0 {
             did_work = true;
+            pty_drained_this_tick = true;
+            pty_bytes = pty_bytes.saturating_add(n as u64);
+            if !prompt_ready_registered && pty_bytes >= PROMPT_READY_MIN_BYTES {
+                let rc = syscall_lib::ipc_register_service(ep_u32, PROMPT_READY_SERVICE);
+                if rc != u64::MAX {
+                    prompt_ready_registered = true;
+                    syscall_lib::write_str(STDOUT_FILENO, "TERM_SMOKE:prompt-ready\n");
+                }
+            }
+            // Phase 57d follow-up — diagnostic for the "backspace doesn't
+            // erase" symptom. After prompt-ready (so we skip noisy boot
+            // output) log a short hex dump of each PTY read so the next
+            // boot transcript reveals which sequence the active shell
+            // actually sends on backspace. Rate-limited so a long
+            // command (`seq 1 1000` etc.) does not flood the log.
+            if prompt_ready_registered {
+                log_pty_bytes(&pty_buf[..n as usize]);
+            }
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
@@ -219,20 +307,36 @@ fn program_main(_args: &[&str]) -> i32 {
         // n < 0 path: either -EAGAIN (no data) or a hard error. We
         // do not distinguish today; the next iteration retries.
 
-        // 5b. Drain one queued ServerMessage from display_server.
-        //     The C.5 outbound queue per-client cap is 128; a busy
-        //     keyboard cannot starve the renderer because we drain
-        //     at most one event per tick.
-        match pull_one_event(display_handle, &mut event_buf) {
-            PulledEvent::Key(ev) => {
-                did_work = true;
-                input_handler.translate(&ev, &mut writer);
+        // 5b. Drain ALL queued ServerMessages from display_server
+        //     before yielding to compose. The previous "one event per
+        //     iter" shape played badly with a 250 ms+ compose: while
+        //     compose blocked, key + pointer events accumulated in
+        //     display_server's per-client outbound queue (cap 128)
+        //     and overflowed under fast typing — m3os4.log showed 100+
+        //     "outbound queue full; oldest dropped" lines, plus a
+        //     visibly-frozen mouse cursor whenever the user typed.
+        //     Pulling in a tight loop while events are pending keeps
+        //     the queue empty between composes regardless of compose
+        //     wall-time, with no risk of starvation: PTY drain, exit
+        //     poll, and compose still run after the queue is empty.
+        let mut disconnect = false;
+        loop {
+            match pull_one_event(display_handle, &mut event_buf) {
+                PulledEvent::Key(ev) => {
+                    did_work = true;
+                    events_pulled = events_pulled.saturating_add(1);
+                    input_handler.translate(&ev, &mut writer);
+                }
+                PulledEvent::Disconnect => {
+                    syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
+                    disconnect = true;
+                    break;
+                }
+                PulledEvent::None => break,
             }
-            PulledEvent::Disconnect => {
-                syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
-                break;
-            }
-            PulledEvent::None => {}
+        }
+        if disconnect {
+            break;
         }
 
         // 5c. Poll shell exit. `Some(_)` ⇒ child exited (cleanly or
@@ -249,10 +353,31 @@ fn program_main(_args: &[&str]) -> i32 {
             }
         }
 
-        // 5d. Compose dirty frame, if any.
+        // 5d. Compose dirty frame, if any — throttled so we don't pay
+        //     the full-surface upload cost on every keystroke. The
+        //     `damaged()` queue accumulates between calls, and the
+        //     `did_work = false` branch below picks the idle sleep so
+        //     this loop neither busy-spins nor starves on a slow
+        //     compose. When the chunked-pixel path is replaced by
+        //     shared-memory buffers, the throttle still amortises
+        //     `DamageSurface` IPC traffic across multiple PTY bytes.
         if renderer.damaged() {
-            renderer.compose();
-            did_work = true;
+            let now_ms = clock.now_ms();
+            let elapsed_ms = now_ms.saturating_sub(last_compose_ms);
+            let (cursor_row, _) = screen.cursor();
+            if should_compose_frame(
+                true,
+                pty_drained_this_tick,
+                cursor_row,
+                screen.rows(),
+                elapsed_ms,
+                COMPOSE_INTERVAL_MS,
+            ) {
+                renderer.compose();
+                last_compose_ms = now_ms;
+                composes = composes.saturating_add(1);
+                did_work = true;
+            }
         }
 
         // 5e. Yield briefly when nothing happened so we don't burn CPU.
@@ -299,6 +424,81 @@ impl PtyWriter for PrimaryFdWriter {
         // failure followed by recovery still produces a fresh log
         // line if the failure recurs.
         self.warned = false;
+    }
+}
+
+#[cfg(not(test))]
+fn wait_for_shell_dependencies() -> bool {
+    syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
+}
+
+/// Phase 57d follow-up — diagnostic budget for `log_pty_bytes`.
+/// Each PTY read after prompt-ready costs one budget unit; once
+/// exhausted, the dump is silent so a sustained command output does
+/// not flood the boot transcript. Sized for ~30 typical interactive
+/// edits which is enough to capture the shell's exact backspace
+/// sequence without burying the rest of the run.
+#[cfg(not(test))]
+static PTY_BYTE_LOG_BUDGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(30);
+
+/// Phase 57d follow-up — log the first 32 bytes of one PTY read as a
+/// hex dump, with the actual length prefix. The user's transcript
+/// then reveals exactly which bytes the shell emitted, which is the
+/// answer to "which backspace sequence does my shell use?".
+#[cfg(not(test))]
+fn log_pty_bytes(bytes: &[u8]) {
+    if PTY_BYTE_LOG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "term: pty-read len=");
+    log_u32(bytes.len() as u32);
+    syscall_lib::write_str(STDOUT_FILENO, " hex=");
+    let n = bytes.len().min(32);
+    for &b in &bytes[..n] {
+        let mut out = [0u8; 2];
+        out[0] = hex_nibble(b >> 4);
+        out[1] = hex_nibble(b & 0x0F);
+        if let Ok(s) = core::str::from_utf8(&out) {
+            syscall_lib::write_str(STDOUT_FILENO, s);
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+#[cfg(not(test))]
+fn hex_nibble(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=15 => b'a' + (v - 10),
+        _ => b'?',
+    }
+}
+
+/// Phase 57d follow-up — minimal u32 → decimal serial log helper for
+/// the diagnostic stat lines in the main loop. No alloc dependency.
+#[cfg(not(test))]
+fn log_u32(mut value: u32) {
+    let mut buf = [0u8; 10];
+    let mut idx = buf.len();
+    if value == 0 {
+        idx -= 1;
+        buf[idx] = b'0';
+    } else {
+        while value != 0 {
+            idx -= 1;
+            buf[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
     }
 }
 

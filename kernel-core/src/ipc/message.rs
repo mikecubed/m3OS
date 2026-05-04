@@ -44,6 +44,17 @@ impl Message {
         self.cap = Some(cap);
         self
     }
+
+    /// Encode the receiver's reply capability handle into the reserved IPC
+    /// metadata word.
+    ///
+    /// `data[3]` is reserved by call-shaped deliveries so userspace servers can
+    /// reply through the exact one-shot cap the kernel inserted. Protocol data
+    /// must not use this word for request payloads.
+    pub const fn with_reply_cap_handle(mut self, handle: u32) -> Self {
+        self.data[3] = handle as u64;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -100,5 +111,12 @@ mod tests {
         assert!(m1.cap.is_none());
         assert!(m2.cap.is_none());
         assert!(m3.cap.is_none());
+    }
+
+    #[test]
+    fn with_reply_cap_handle_sets_data3() {
+        let msg = Message::with2(7, 10, 20).with_reply_cap_handle(5);
+
+        assert_eq!(msg.data, [10, 20, 0, 5]);
     }
 }

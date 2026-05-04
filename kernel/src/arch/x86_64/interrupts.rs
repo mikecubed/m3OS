@@ -43,6 +43,7 @@
 //! 3 is the rule that class of bug violated. Every handler below
 //! relies on at least one of the three lock disciplines it enumerates.
 
+use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
@@ -54,6 +55,7 @@ use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
+use super::preempt_trap_frame::{PreemptTrapFrameKernel, PreemptTrapFrameUser};
 
 // ---------------------------------------------------------------------------
 // APIC / PIC mode flag
@@ -95,6 +97,16 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
     #[cfg(debug_assertions)]
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    }
+    // Phase 57d E.3: consume deferred reschedule at IRQ-return to user mode.
+    #[cfg(feature = "preempt-voluntary")]
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3
+        && let Some(pc) = crate::smp::try_per_core()
+        && pc
+            .preempt_resched_pending
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    {
+        crate::task::signal_reschedule();
     }
     #[cfg(not(debug_assertions))]
     let _ = stack_frame;
@@ -493,8 +505,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
 
-    // Hardware IRQs
-    idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
+    // Hardware IRQs — timer and reschedule IPI use raw naked-asm entry stubs
+    // (Phase 57d Track B) so they are installed via `set_handler_addr`.
+    unsafe {
+        idt[InterruptIndex::Timer as u8]
+            .set_handler_addr(VirtAddr::new(timer_entry as *const () as u64));
+    }
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
     // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
     // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
@@ -506,7 +522,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
 
     // SMP IPI vectors (Phase 25).
-    idt[crate::smp::ipi::IPI_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
+    unsafe {
+        idt[crate::smp::ipi::IPI_RESCHEDULE]
+            .set_handler_addr(VirtAddr::new(reschedule_ipi_entry as *const () as u64));
+    }
     idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
     idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
 
@@ -541,6 +560,266 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 /// Load the IDT.
 pub fn init() {
     IDT.load();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d Track B — naked-asm preemption entry stubs
+// ---------------------------------------------------------------------------
+//
+// `timer_entry` and `reschedule_ipi_entry` are ring-aware two-path stubs.
+// They push all 15 GPRs BEFORE any Rust function prologue can clobber them,
+// then call the appropriate Rust handler (`*_user` or `*_kernel`) with a
+// pointer to the on-stack frame.
+//
+// GPR push order (both stubs, both paths): r15 first → rax last, so that
+// rax ends up at the lowest address (gprs[0] in `PreemptTrapFrameUser/Kernel`).
+//
+// Kernel-path alignment: the kernel stack is not guaranteed 16-byte aligned
+// at interrupt entry, so we save RSP in r12 (callee-saved), align with
+// `and rsp, -16`, call, then restore from r12.  After the call, `pop r12`
+// loads the interrupted task's r12 from the frame slot — the scratch value
+// in the live register is overwritten by the pop, which is correct.
+
+global_asm!(
+    // -----------------------------------------------------------------------
+    // Shared macros: GPR save / restore used by both stubs.
+    // -----------------------------------------------------------------------
+    ".macro save_gprs_all",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rax",
+    ".endm",
+    "",
+    ".macro restore_gprs_all",
+    "pop rax",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    ".endm",
+    "",
+    // -----------------------------------------------------------------------
+    // timer_entry
+    // -----------------------------------------------------------------------
+    ".global timer_entry",
+    "timer_entry:",
+    // CS is at [rsp+8] on both ring-0 (3-field frame: rip/cs/rflags) and
+    // ring-3 (5-field frame: rip/cs/rflags/rsp/ss) IRQ entries.
+    "test QWORD PTR [rsp+8], 3",
+    "jnz .Ltimer_user",
+    "",
+    // --- Kernel path --------------------------------------------------------
+    ".Ltimer_kernel:",
+    "save_gprs_all",
+    // After 15 pushes, rsp = &gprs[0].
+    // interrupted RSP = rsp + 15*8 + 3*8 = rsp + 144.
+    "lea rsi, [rsp + 144]", // arg2: captured_kernel_rsp
+    "cld",
+    "mov rdi, rsp", // arg1: &PreemptTrapFrameKernel
+    "mov r12, rsp", // save pre-alignment rsp (r12 is callee-saved)
+    "and rsp, -16", // align to 16 bytes for SysV call ABI
+    "call timer_handler_kernel",
+    "mov rsp, r12", // restore (pop r12 below loads original r12 from frame)
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // --- User path ----------------------------------------------------------
+    ".Ltimer_user:",
+    "save_gprs_all",
+    // After 15 GPR pushes + 5 CPU-pushed fields = 160 bytes.
+    // If TSS.RSP0 is 16-aligned, 160 ≡ 0 (mod 16) → already aligned.
+    "cld",
+    "mov rdi, rsp", // arg1: &mut PreemptTrapFrameUser
+    "call timer_handler_user",
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // -----------------------------------------------------------------------
+    // reschedule_ipi_entry
+    // -----------------------------------------------------------------------
+    ".global reschedule_ipi_entry",
+    "reschedule_ipi_entry:",
+    "test QWORD PTR [rsp+8], 3",
+    "jnz .Lrescheduleipi_user",
+    "",
+    // --- Kernel path --------------------------------------------------------
+    ".Lrescheduleipi_kernel:",
+    "save_gprs_all",
+    "lea rsi, [rsp + 144]",
+    "cld",
+    "mov rdi, rsp",
+    "mov r12, rsp",
+    "and rsp, -16",
+    "call reschedule_ipi_handler_kernel",
+    "mov rsp, r12",
+    "restore_gprs_all",
+    "iretq",
+    "",
+    // --- User path ----------------------------------------------------------
+    ".Lrescheduleipi_user:",
+    "save_gprs_all",
+    "cld",
+    "mov rdi, rsp",
+    "call reschedule_ipi_handler_user",
+    "restore_gprs_all",
+    "iretq",
+);
+
+// ---------------------------------------------------------------------------
+// Phase 57d C.2 — preempt_resume_to_user
+// ---------------------------------------------------------------------------
+//
+// Restores the full user-mode register state saved by preempt_to_scheduler
+// and returns to the interrupted user instruction via iretq.
+//
+// PreemptFrame offsets (kernel_core::preempt_frame::PreemptFrame):
+//   rax=0   rbx=8   rcx=16  rdx=24  rsi=32  rdi=40  rbp=48
+//   r8=56   r9=64   r10=72  r11=80  r12=88  r13=96  r14=104 r15=112
+//   rip=120 cs=128  rflags=136 rsp=144 ss=152
+//
+// Calling convention: rdi = *const PreemptFrame (SysV AMD64 arg1).
+// Called from the scheduler dispatch loop (D.3) with IRQs disabled.
+// Never returns.
+
+core::arch::global_asm!(
+    ".global preempt_resume_to_user",
+    "preempt_resume_to_user:",
+    // Build the iretq frame on the current (scheduler) stack.
+    // iretq pops: rip, cs, rflags, rsp, ss — push in reverse (ss first).
+    "mov rax, [rdi + 152]", // ss
+    "push rax",
+    "mov rax, [rdi + 144]", // rsp (user-mode stack pointer)
+    "push rax",
+    "mov rax, [rdi + 136]", // rflags
+    "push rax",
+    "mov rax, [rdi + 128]", // cs
+    "push rax",
+    "mov rax, [rdi + 120]", // rip
+    "push rax",
+    // Restore GPRs — all except rax and rdi (rdi is still our frame pointer).
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    // Restore rax, then rdi last (pointer becomes invalid after this).
+    "mov rax, [rdi + 0]",
+    "mov rdi, [rdi + 40]",
+    "iretq",
+    //
+    // ---------------------------------------------------------------------------
+    // Phase 57d D.3 (fix) — dispatch_preempted_and_resume
+    //
+    // Dispatches a preempted task by:
+    //   1. Building a switch_context-compatible frame on the scheduler stack so
+    //      that per_core_scheduler_rsp is updated BEFORE we iretq.
+    //   2. Saving the new scheduler RSP to *per_sched_rsp_ptr (rdi).
+    //   3. Jumping to preempt_resume_to_user to restore user GPRs and iretq.
+    //
+    // When the task is later preempted again (or cooperatively yields back),
+    // preempt_to_scheduler calls switch_context(task_save, *per_sched_rsp_ptr).
+    // switch_context loads our frame and `ret`s to .Ldispatch_preempted_resume,
+    // which then `ret`s to the call site (the dispatch loop's epilogue).
+    //
+    // Stack layout built by this function (low address first, relative to the
+    // saved_rsp value stored into *per_sched_rsp_ptr):
+    //   [saved_rsp+0]:  RFLAGS (saved by pushf; IF=0 since caller had IRQs disabled)
+    //   [saved_rsp+8]:  r15
+    //   [saved_rsp+16]: r14
+    //   [saved_rsp+24]: r13
+    //   [saved_rsp+32]: r12
+    //   [saved_rsp+40]: rbp
+    //   [saved_rsp+48]: rbx
+    //   [saved_rsp+56]: .Ldispatch_preempted_resume  ← switch_context ret target
+    //   [saved_rsp+64]: call return addr              ← returned to by .Ldispatch_preempted_resume ret
+    //
+    // PRECONDITION: IRQs must be disabled on entry (pushf captures IF=0).
+    // Args (SysV AMD64): rdi = per_sched_rsp_ptr, rsi = frame (*const PreemptFrame)
+    // ---------------------------------------------------------------------------
+    ".global dispatch_preempted_and_resume",
+    "dispatch_preempted_and_resume:",
+    // Push .Ldispatch_preempted_resume as the switch_context `ret` target.
+    "lea rax, [rip + .Ldispatch_preempted_resume]",
+    "push rax",
+    // Push callee-saved registers (matching switch_context's push order).
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    // pushf saves RFLAGS (including IF, which is 0 because IRQs are disabled).
+    "pushf",
+    "cli", // redundant but explicit: ensure IF=0 in the saved frame
+    // Save the current RSP (= address of the RFLAGS word we just pushed).
+    "mov [rdi], rsp",
+    // Dispatch the preempted task. rsi already holds the frame pointer.
+    "mov rdi, rsi",
+    "jmp preempt_resume_to_user",
+    // Landing label: switch_context restores callee-saves from our frame,
+    // pops this label as the return address, and jumps here.
+    // At this point RSP points at the `call dispatch_preempted_and_resume`
+    // return address; the second `ret` returns to the dispatch loop.
+    ".Ldispatch_preempted_resume:",
+    "ret",
+);
+
+// Rust-side declarations for the asm entry symbols (used when installing
+// into the IDT via `set_handler_addr`).
+unsafe extern "C" {
+    fn timer_entry();
+    fn reschedule_ipi_entry();
+    /// Phase 57d C.2 — resume a preempted user-mode task.
+    ///
+    /// Restores all 15 GPRs and the full iretq frame from `frame`, then
+    /// executes `iretq` to return to the interrupted user-mode instruction.
+    /// Never returns. Called only from dispatch_preempted_and_resume asm.
+    #[cfg(feature = "preempt-voluntary")]
+    #[allow(dead_code)]
+    pub fn preempt_resume_to_user(frame: *const kernel_core::preempt_frame::PreemptFrame) -> !;
+    /// Phase 57d D.3 (fix) — dispatch a preempted task after updating sched RSP.
+    ///
+    /// Builds a `switch_context`-compatible frame on the scheduler stack,
+    /// saves the scheduler RSP, and jumps to `preempt_resume_to_user`.
+    ///
+    /// From Rust's perspective this function returns `()` — it returns after
+    /// the task next switches back to the scheduler (via preemption or a
+    /// cooperative yield). IRQs must be disabled on entry.
+    #[cfg(feature = "preempt-voluntary")]
+    pub(crate) fn dispatch_preempted_and_resume(
+        per_sched_rsp_ptr: *mut u64,
+        frame: *const kernel_core::preempt_frame::PreemptFrame,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -685,10 +964,14 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 
-fn maybe_redirect_group_exit_trampoline(stack_frame: &mut InterruptStackFrame) {
-    if stack_frame.code_segment.rpl() != x86_64::PrivilegeLevel::Ring3
-        || !crate::smp::is_per_core_ready()
-    {
+/// User-path replacement for `maybe_redirect_group_exit_trampoline`.
+///
+/// Operates directly on the on-stack [`PreemptTrapFrameUser`] so it can be
+/// called from the naked-asm user-path handlers without requiring an
+/// `InterruptStackFrame`.  The ring-3 check is omitted — the user-path
+/// handler is only ever reached when `(cs & 3) == 3`.
+fn maybe_redirect_group_exit_trampoline_user(frame: &mut PreemptTrapFrameUser) {
+    if !crate::smp::is_per_core_ready() {
         return;
     }
 
@@ -712,29 +995,57 @@ fn maybe_redirect_group_exit_trampoline(stack_frame: &mut InterruptStackFrame) {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
     }
-    unsafe {
-        stack_frame.as_mut().update(|f| {
-            f.instruction_pointer = VirtAddr::new(
-                crate::arch::x86_64::syscall::forced_group_exit_trampoline as *const () as u64,
-            );
-            f.code_segment = gdt::kernel_code_selector();
-            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
-            f.stack_pointer = VirtAddr::new(kernel_rsp);
-            f.stack_segment = gdt::kernel_data_selector();
-        });
-    }
+    frame.rip = crate::arch::x86_64::syscall::forced_group_exit_trampoline as *const () as u64;
+    frame.cs = u64::from(gdt::kernel_code_selector().0);
+    frame.rflags &= !0x200u64; // clear INTERRUPT_FLAG (bit 9)
+    frame.rsp = kernel_rsp;
+    frame.ss = u64::from(gdt::kernel_data_selector().0);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
     mut stack_frame: InterruptStackFrame,
     _err: u64,
 ) {
+    // Capture the user's callee-saved GPRs IMMEDIATELY, before any Rust
+    // code can clobber them. With the `x86-interrupt` calling convention,
+    // these still hold the user's values at the first instruction of the
+    // handler body (caller-saved regs are spilled by the entry stub but
+    // callee-saved are preserved across the Rust call boundary).
+    // `panic_diag::capture_registers` runs deeper in the call chain, so
+    // r12-r15 there reflect kernel state, not the user's view.
+    let user_r12: u64;
+    let user_r13: u64;
+    let user_r14: u64;
+    let user_r15: u64;
+    let user_rbx: u64;
+    let user_rbp: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, rbx",
+            "mov {1}, rbp",
+            "mov {2}, r12",
+            "mov {3}, r13",
+            "mov {4}, r14",
+            "mov {5}, r15",
+            out(reg) user_rbx,
+            out(reg) user_rbp,
+            out(reg) user_r12,
+            out(reg) user_r13,
+            out(reg) user_r14,
+            out(reg) user_r15,
+            options(nostack, preserves_flags),
+        );
+    }
     // Check if the fault came from ring 3.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace GPF: pid={} — process killed\n{:?}\n",
             pid, stack_frame
+        ));
+        _panic_print(format_args!(
+            "[int] user GPRs at fault: rbx={:#018x} rbp={:#018x} r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}\n",
+            user_rbx, user_rbp, user_r12, user_r13, user_r14, user_r15
         ));
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
@@ -881,23 +1192,113 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
-    // Only the BSP increments the global tick counter. APs have their own
-    // per-1ms LAPIC timers that drive the scheduler but must not skew the
-    // global wall-clock tick count (which nanosleep and uptime rely on).
-    //
-    // In PIC mode (no MADT / single-core), we are always the BSP and
-    // `is_bsp()` must not be called — it reads LAPIC MMIO which is not
-    // mapped when the APIC was never initialised.
+// ---------------------------------------------------------------------------
+// Phase 57d Track G — voluntary preemption IRQ-return helpers
+// ---------------------------------------------------------------------------
+
+/// Source of a voluntary-preemption event, for tracing.
+#[cfg(feature = "preempt-voluntary")]
+#[derive(Debug, Clone, Copy)]
+pub enum PreemptTrigger {
+    Timer,
+    RescheduleIpi,
+    #[allow(dead_code)]
+    PreemptEnableZeroCrossing,
+}
+
+/// Emit a preemption trace entry to the sched-trace ring.
+///
+/// Only compiled under `cfg(feature = "sched-trace")`. Zero overhead in
+/// the default build.
+#[cfg(feature = "sched-trace")]
+fn emit_preempt_trace(frame: &PreemptTrapFrameUser, trigger: PreemptTrigger) {
+    // Repurpose sched_trace::record: pid=preempted_rip (truncated to u32),
+    // old_state=255 (preempt sentinel), new_state=trigger discriminant.
+    crate::task::sched_trace::record(frame.rip as u32, 255, trigger as u8);
+}
+
+/// Check the four voluntary-preemption conditions and, if met, preempt the
+/// interrupted user-mode task.
+///
+/// Called from `timer_handler_user` and `reschedule_ipi_handler_user` after
+/// the IRQ's tick/EOI work is complete.
+///
+/// # Conditions checked (all must be true to preempt)
+/// 1. `from_user` — implicit: callers are in the `_user` handler path.
+/// 2. `preempt_count == 0` — no preempt-disable lock held by the task.
+/// 3. `reschedule || preempt_resched_pending` — scheduler flagged a switch.
+///
+/// The function also guards against group-exit redirects: if
+/// `maybe_redirect_group_exit_trampoline_user` rewrites `frame.cs` to the
+/// kernel code selector before this call, the frame is skipped (preemption
+/// would corrupt the iretq return because `preempt_resume_to_user` always
+/// builds a 5-slot ring-3 frame).
+///
+/// # Safety
+/// Must be called with IRQs disabled (guaranteed by IRQ handler context).
+/// `frame` must point to a valid on-stack `PreemptTrapFrameUser`.
+#[cfg(feature = "preempt-voluntary")]
+unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: PreemptTrigger) {
+    // Guard: maybe_redirect_group_exit_trampoline_user (called before this
+    // function) can rewrite frame.cs to the kernel code selector (ring 0)
+    // when group_exit_pending is set. preempt_resume_to_user always builds
+    // a 5-slot user-return iretq frame; resuming a ring-0 CS frame via iretq
+    // causes the CPU to pop only 3 slots instead of 5 (same-privilege return),
+    // leaving RSP pointing at frame data and corrupting the return. Skip
+    // preemption whenever the frame is no longer ring 3.
+    if frame.cs & 3 != 3 {
+        return;
+    }
+    let pc = crate::task::scheduler::peek_preempt_count_irq();
+    if pc != 0 {
+        return; // task holds a preempt-disable lock — do not preempt
+    }
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let reschedule = core
+        .reschedule
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if !reschedule && !pending {
+        return; // no rescheduling requested
+    }
+    // All conditions met — capture and preempt.
+    #[cfg(feature = "sched-trace")]
+    unsafe {
+        emit_preempt_trace(frame, trigger);
+    }
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = trigger;
+    crate::task::scheduler::preempt_to_scheduler(frame);
+}
+
+/// Phase 57d Track B — timer handler, user (ring 3) path.
+///
+/// Called from the `timer_entry` naked stub when the interrupted context was
+/// ring 3.  `frame` points directly at the on-stack [`PreemptTrapFrameUser`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        // Phase 56 Track B.3 — subdivide the 1 kHz timer into the configured
-        // frame-tick rate. Only the BSP drives the counter so AP timers
-        // don't double-count.
         crate::time::on_timer_tick_isr();
+        // Phase 57d follow-up: poll the i8042 from the timer ISR as a
+        // backstop against the held-key cursor freeze. Diagnostic
+        // counters showed mouse bytes never reach the controller's
+        // output buffer during sustained keyboard autorepeat — IRQ12
+        // is being suppressed (we suspect by QEMU's PS/2 arbitration
+        // when the CPU is actively servicing IRQ1). The timer ISR
+        // runs at the configured tick rate (default 100 Hz) and is
+        // not on the IRQ1/IRQ12 priority class, so it can drain the
+        // i8042 even while kbd autorepeat is hot. The drain helper
+        // bails immediately when the output buffer is empty, so the
+        // common case (no input) costs one port read per tick.
+        ps2_drain_all_bytes();
     }
     crate::task::signal_reschedule();
-    maybe_redirect_group_exit_trampoline(&mut stack_frame);
+    maybe_redirect_group_exit_trampoline_user(frame);
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     } else {
@@ -906,7 +1307,39 @@ extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    #[cfg(debug_assertions)]
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    #[cfg(feature = "preempt-voluntary")]
+    unsafe {
+        check_and_preempt_user(frame, PreemptTrigger::Timer);
+    }
+}
+
+/// Phase 57d Track B — timer handler, kernel path.
+///
+/// Called from the `timer_entry` naked stub when the interrupted context was
+/// ring 0.  `captured_kernel_rsp` is the RSP value the interrupted kernel
+/// code had immediately before the interrupt fired.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_handler_kernel(
+    _frame: &mut PreemptTrapFrameKernel,
+    _captured_kernel_rsp: u64,
+) {
+    if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::time::on_timer_tick_isr();
+        // See the matching note in `timer_handler_user`.
+        ps2_drain_all_bytes();
+    }
+    crate::task::signal_reschedule();
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Timer as u8);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -916,16 +1349,18 @@ extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
 // There are TWO separate ring buffers:
 //
 //   SCANCODE_BUF  — normal TTY / kbd_server path; consumed via
-//                   `read_scancode()`.  Only populated when no process
-//                   owns the framebuffer (FB_OWNER_PID == 0).
+//                   `read_scancode()`.  Populated when no raw-input
+//                   framebuffer client is active.
 //
 //   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
 //                   (sys_read_scancode syscall 0x1007).  Only populated when
-//                   a process owns the framebuffer (FB_OWNER_PID != 0).
+//                   the framebuffer owner explicitly keeps raw input enabled.
 //
-// Routing is exclusive: each scancode goes to exactly one buffer based on
-// framebuffer ownership.  This prevents stale scancodes from accumulating
-// in SCANCODE_BUF during gameplay and replaying when the game exits.
+// Routing is exclusive: each scancode goes to exactly one buffer based on the
+// raw-input policy. This prevents stale scancodes from accumulating in
+// SCANCODE_BUF during gameplay and replaying when the game exits, while still
+// allowing the display_server compositor to own pixels without stealing input
+// from kbd_server / stdin_feeder.
 
 const SCANCODE_BUF_SIZE: usize = 256;
 // Bitmask wraparound requires a power-of-two buffer size.
@@ -1023,6 +1458,64 @@ pub fn reset_raw_input_state() {
     });
 }
 
+/// Phase 57d follow-up — inject break codes for commonly-held keys into
+/// the TTY scancode buffer so `kbd_server`'s modifier tracker and
+/// repeat scheduler clear any state stuck across a fullscreen-takeover
+/// session.
+///
+/// Background: while a takeover program (e.g. doom) owns the FB,
+/// scancodes route to the RAW buffer and `kbd_server` sees nothing —
+/// any release scancodes for keys held at yield-time go to the
+/// takeover program. When ownership returns to `display_server`,
+/// `kbd_server` resumes reading from TTY but its tracker still
+/// believes those keys are pressed; the repeat scheduler then emits
+/// repeat events forever (e.g. stuck Enter after exiting doom).
+///
+/// Called from `sys_fb_reacquire` after a successful FB reclaim so the
+/// injection happens once per takeover session and does not run at
+/// initial display_server boot (where there's no prior input state to
+/// clear, and where pushing synthetic scancodes before kbd_server is
+/// even up could only do harm).
+///
+/// `SCANCODE_BUF` is normally written by the keyboard ISR (single
+/// producer); calling `push_to_buf` from task context introduces a
+/// second producer, so we wrap with `without_interrupts` on the
+/// current CPU to serialise against IRQ1 here. Other CPUs do not
+/// drive the keyboard ISR (IRQ1 is steered to BSP by the APIC init),
+/// so masking IF on the calling CPU is sufficient.
+///
+/// The break codes are make-code | 0x80 for: Enter (0x9C), LShift
+/// (0xAA), RShift (0xB6), LCtrl (0x9D), LAlt (0xB8), Space (0xB9).
+/// Any of these were possibly held at yield-time and won't be
+/// cleared by the next user keystroke (a fresh down doesn't cancel a
+/// prior down in the scheduler — it just refreshes it).
+pub fn inject_release_all_held_modifiers() {
+    // Order is intentional: Enter first because it's the most common
+    // stuck case (user hits Enter to launch the takeover program).
+    const BREAK_CODES: &[u8] = &[
+        0x9C, // Enter
+        0xAA, // LShift
+        0xB6, // RShift
+        0x9D, // LCtrl
+        0xB8, // LAlt
+        0xB9, // Space
+    ];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for &sc in BREAK_CODES {
+            unsafe {
+                push_to_buf(
+                    (&raw mut SCANCODE_BUF).cast::<u8>(),
+                    &SCANCODE_BUF_HEAD,
+                    &SCANCODE_BUF_TAIL,
+                    sc,
+                );
+            }
+        }
+    });
+    // Wake kbd_server so it drains the synthetic releases promptly.
+    crate::ipc::notification::signal_irq(1);
+}
+
 #[inline(always)]
 unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte: u8) {
     let t = tail.load(Ordering::Relaxed);
@@ -1037,53 +1530,89 @@ unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte
     // over blocking an interrupt handler).
 }
 
-extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+/// Shared i8042 drain shape used by both [`keyboard_handler`] and
+/// [`mouse_handler`].
+///
+/// ## Why both ISRs drain both byte types
+///
+/// The previous design had each ISR bail on the wrong byte type (kbd
+/// ISR bailed on AUX bytes, mouse ISR bailed on non-AUX bytes), with
+/// the assumption that the corresponding IRQ would fire and pick up
+/// the stranded byte. That assumption breaks under sustained
+/// keyboard activity: when a key is held and PS/2 hardware autorepeat
+/// fires kbd scancodes at ~30 Hz, mouse motion bytes queue behind
+/// kbd bytes in the i8042 internal FIFOs. The mouse ISR fires once,
+/// reads status, sees `AUX=0` (a kbd byte at the head), bails. The
+/// kbd ISR drains the kbd byte but does NOT re-trigger IRQ12 — the
+/// LAPIC IRR bit for vector 44 was already acknowledged by the
+/// previous mouse ISR dispatch, and the i8042 only re-asserts on the
+/// next *new* AUX byte arriving from the device. The pending mouse
+/// byte sits in the FIFO until either fresh mouse motion fires
+/// another IRQ12 or some other side effect drains it. Visible
+/// symptom: cursor freezes during a held key, jumps to current
+/// position when the key releases.
+///
+/// Linux's i8042 driver solves this with a single combined ISR that
+/// drains ALL pending bytes regardless of which IRQ fired, dispatching
+/// each byte by its `STATUS_AUX_OUTPUT` bit. We adopt the same shape:
+/// each ISR (still installed on its own vector) calls this helper, so
+/// either IRQ will drain whatever is queued.
+fn ps2_drain_all_bytes() {
     use x86_64::instructions::port::Port;
+
+    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+    const STATUS_AUX_OUTPUT: u8 = 1 << 5;
+    /// Bound the per-ISR iteration count. Sized for: 16 PS/2 mouse
+    /// packets (3 bytes each) + a worst-case 16-byte kbd burst, with
+    /// headroom. The 8042 hardware FIFO is small (typically 16 bytes
+    /// per device); this cap is comfortably above that.
+    const MAX_DRAIN: usize = 64;
 
     let mut data_port: Port<u8> = Port::new(0x60);
     let mut status_port: Port<u8> = Port::new(0x64);
 
-    // Drain all pending bytes from the i8042 output buffer.
-    //
-    // Extended scancodes (e.g. 0xE0 prefixed arrow keys) arrive as multi-byte
-    // sequences.  With edge-triggered IRQ delivery, reading only one byte per
-    // interrupt can strand the second byte of an extended break code until the
-    // next key event, making keys appear stuck.  We loop while the i8042
-    // status register's Output Buffer Full bit (bit 0) is set.
-    //
-    // A small iteration cap prevents pathological infinite loops if the
-    // controller misbehaves.
-    const MAX_DRAIN: usize = 16;
+    // Fast path: peek the status port without locking. The timer ISR
+    // calls this 100×/s as a backstop against IRQ12 suppression; in
+    // the common case there's nothing to drain and we shouldn't pay
+    // for a `RAW_INPUT_ROUTER` lock acquisition. The kbd/mouse ISRs
+    // already check status indirectly by being invoked, but the
+    // peek is cheap so they share the gate.
+    let initial_status = unsafe { status_port.read() };
+    if initial_status & STATUS_OUTPUT_FULL == 0 {
+        return;
+    }
 
-    // Route each byte to the appropriate sink.
-    //
-    // Ownership can change while we are draining the i8042, so we re-check the
-    // framebuffer owner for every new sequence instead of snapshotting once per
-    // batch. Multi-byte prefixes (`0xE0`, `0xE1`) stay latched to the sink that
-    // received their first byte so an ownership handoff cannot split one
-    // extended scancode sequence across RAW_SCANCODE_BUF and SCANCODE_BUF.
     let mut got_tty_byte = false;
+    let mut produced_mouse_packet = false;
     let mut raw_input_router = RAW_INPUT_ROUTER.lock();
 
     for _ in 0..MAX_DRAIN {
         let status = unsafe { status_port.read() };
-        if status & 0x01 == 0 {
+        if status & STATUS_OUTPUT_FULL == 0 {
             break; // output buffer empty — nothing left to read
         }
-        let scancode: u8 = unsafe { data_port.read() };
-
-        match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
+        let byte = unsafe { data_port.read() };
+        if status & STATUS_AUX_OUTPUT != 0 {
+            // Mouse byte. `feed_byte_isr` locks `MOUSE_DECODER`
+            // separately from `RAW_INPUT_ROUTER`; the lock order is
+            // (RAW_INPUT_ROUTER, MOUSE_DECODER) and matches between
+            // both ISRs, so no deadlock potential.
+            if super::ps2::feed_byte_isr(byte) {
+                produced_mouse_packet = true;
+            }
+            continue;
+        }
+        // Keyboard byte. Route through `ScancodeRouter` so multi-byte
+        // prefixes (`0xE0`, `0xE1`) stay latched to the sink that
+        // received their first byte even if an ownership handoff
+        // happens mid-sequence.
+        match raw_input_router.route_byte(byte, crate::fb::raw_input_active()) {
             ScancodeSink::Raw => unsafe {
-                // Raw path: scancodes go to the game buffer only.
-                // kbd_server does NOT receive scancodes while a process
-                // (DOOM) owns the framebuffer — this prevents stale
-                // scancodes from accumulating and replaying after the
-                // game exits.
                 push_to_buf(
                     (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
                     &RAW_SCANCODE_BUF_HEAD,
                     &RAW_SCANCODE_BUF_TAIL,
-                    scancode,
+                    byte,
                 );
             },
             ScancodeSink::Tty => {
@@ -1092,7 +1621,7 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
                         (&raw mut SCANCODE_BUF).cast::<u8>(),
                         &SCANCODE_BUF_HEAD,
                         &SCANCODE_BUF_TAIL,
-                        scancode,
+                        byte,
                     );
                 }
                 got_tty_byte = true;
@@ -1100,10 +1629,21 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
         }
     }
 
-    // Signal kbd_server once after draining the whole batch, not per byte.
+    // Signal once per ISR after the whole drain so neither server
+    // gets a wake-up storm. Releasing the router lock before
+    // signalling keeps the wait-queue path off the lock-held window.
+    drop(raw_input_router);
     if got_tty_byte {
         crate::ipc::notification::signal_irq(1);
     }
+    if produced_mouse_packet {
+        crate::ipc::notification::signal_irq(12);
+    }
+}
+
+extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
+    super::ps2::IRQ1_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    ps2_drain_all_bytes();
 
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
@@ -1130,52 +1670,11 @@ extern "x86-interrupt" fn keyboard_handler(stack_frame: InterruptStackFrame) {
 /// bytes whose status byte indicates the AUX port owns them. The 8042
 /// reports this via the AUX-OUTPUT bit (status bit 5).
 extern "x86-interrupt" fn mouse_handler(stack_frame: InterruptStackFrame) {
-    use x86_64::instructions::port::Port;
-
-    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
-    const STATUS_AUX_OUTPUT: u8 = 1 << 5;
-    const MAX_DRAIN: usize = 16;
-
-    let mut data_port: Port<u8> = Port::new(super::ps2::PS2_DATA);
-    let mut status_port: Port<u8> = Port::new(super::ps2::PS2_STATUS);
-    let mut produced_packet = false;
-
-    for _ in 0..MAX_DRAIN {
-        let status = unsafe { status_port.read() };
-        if status & STATUS_OUTPUT_FULL == 0 {
-            break;
-        }
-        // Bytes destined for the keyboard (status bit 5 = 0) belong to
-        // the keyboard ISR. The previous implementation read+discarded
-        // them on the assumption that "IRQ1 and IRQ12 are routed
-        // independently on QEMU", but with APIC mode + IRQ 12 routing
-        // newly enabled (Phase 56 follow-up), this branch IS taken
-        // when the AUX device queues a byte while a keyboard byte is
-        // still in the i8042 output buffer. Discarding it would
-        // silently swallow keyboard input — under load this dropped
-        // tcc/stdin-feeder traffic, breaking the smoke runner.
-        //
-        // The correct behaviour is: leave the byte in the buffer and
-        // bail. The OUTPUT_FULL bit stays asserted, the keyboard ISR
-        // (vector 33) drains the byte the next time it runs, and the
-        // i8042 then forwards the queued AUX byte and re-asserts
-        // IRQ 12. Edge-triggered IRQ 12 will fire again at that
-        // point and this handler will pick up the AUX byte cleanly.
-        if status & STATUS_AUX_OUTPUT == 0 {
-            break;
-        }
-        let byte = unsafe { data_port.read() };
-        if super::ps2::feed_byte_isr(byte) {
-            produced_packet = true;
-        }
-    }
-
-    // Signal IRQ12 once after draining the whole batch (one notify per
-    // burst, not per byte) so userspace `mouse_server` wakes if blocked on
-    // a notification capability.
-    if produced_packet {
-        crate::ipc::notification::signal_irq(12);
-    }
+    super::ps2::IRQ12_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    // Both kbd and mouse bytes drain through the same helper — see the
+    // doc comment on `ps2_drain_all_bytes` for why each ISR drains
+    // both byte types.
+    ps2_drain_all_bytes();
 
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
@@ -1201,27 +1700,44 @@ extern "x86-interrupt" fn spurious_handler(stack_frame: InterruptStackFrame) {
 // SMP IPI handlers (Phase 25)
 // ---------------------------------------------------------------------------
 
-/// Reschedule IPI handler (vector 0xFE).
-///
-/// Sets the reschedule flag on the receiving core, causing the scheduler to
-/// pick the next ready task on the next opportunity.
-extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStackFrame) {
-    // Phase 57 DEBUG: count IPIs received per core so we can tell
-    // if any core is being silently starved of reschedule signals.
-    // Throttled to first 4 per core so the boot transcript stays
-    // readable.
+/// Phase 57d Track B — reschedule IPI handler, user (ring 3) path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFrameUser) {
     if let Some(pc) = crate::smp::try_per_core() {
         let n = pc
             .ipi_recv_log_budget
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         if n > 0 {
-            log::info!("[ipi] reschedule received core={}", pc.core_id);
+            log::debug!("[ipi] reschedule received core={}", pc.core_id);
         }
     }
     crate::task::signal_reschedule();
-    maybe_redirect_group_exit_trampoline(&mut stack_frame);
+    maybe_redirect_group_exit_trampoline_user(frame);
     super::apic::lapic_eoi();
-    assert_preempt_count_zero_on_return_to_user(&stack_frame);
+    #[cfg(debug_assertions)]
+    crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    #[cfg(feature = "preempt-voluntary")]
+    unsafe {
+        check_and_preempt_user(frame, PreemptTrigger::RescheduleIpi);
+    }
+}
+
+/// Phase 57d Track B — reschedule IPI handler, kernel path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
+    _frame: &mut PreemptTrapFrameKernel,
+    _captured_kernel_rsp: u64,
+) {
+    if let Some(pc) = crate::smp::try_per_core() {
+        let n = pc
+            .ipi_recv_log_budget
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::debug!("[ipi] reschedule received core={}", pc.core_id);
+        }
+    }
+    crate::task::signal_reschedule();
+    super::apic::lapic_eoi();
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).

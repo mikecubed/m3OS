@@ -3,6 +3,7 @@ use core::arch::global_asm;
 pub mod apic;
 pub mod gdt;
 pub mod interrupts;
+pub mod preempt_trap_frame;
 pub mod ps2;
 pub mod syscall;
 
@@ -52,6 +53,11 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
     // `kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`
     // for the invariant rationale.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // Do not consume deferred reschedule here. `enter_userspace` is the
+    // one-way execve initial-entry trampoline, not a normal syscall return;
+    // yielding here saves a continuation on the process kernel stack before
+    // the new image has ever run. Timer IRQ-return preemption can reschedule
+    // the task immediately after ring 3 starts.
     unsafe {
         use core::arch::asm;
         asm!(
@@ -82,6 +88,8 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
 pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
     // Phase 57b D.3: assert preempt_count == 0 before iretq to ring 3.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // Phase 57d G.4: consume deferred reschedule at this user-return boundary.
+    crate::task::scheduler::check_deferred_preempt_at_user_return();
     unsafe {
         use core::arch::asm;
         asm!(
@@ -224,6 +232,12 @@ pub unsafe fn enter_userspace_fork(
     // Phase 57b D.3: assert preempt_count == 0 before the assembly
     // trampoline runs `iretq` to ring 3.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
+    // NOTE: do NOT call check_deferred_preempt_at_user_return() here.
+    // enter_userspace_fork is the fork trampoline: it runs before the child task
+    // has a valid scheduler RSP. Yielding mid-trampoline (if preempt_resched_pending
+    // is set) panics with a zero scheduler RSP. Normal syscall/signal-return
+    // boundaries handle deferred reschedules after the task has a stable
+    // continuation.
     // Write to per-core ForkEntryCtx and pass pointer to assembly trampoline.
     let data =
         crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;

@@ -204,6 +204,7 @@ impl Screen {
             ConsoleCmd::Backspace => {
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
+                    self.blank_cell(self.cursor_row, self.cursor_col, out);
                     out.push(RenderCommand::MoveCursor {
                         row: self.cursor_row,
                         col: self.cursor_col,
@@ -276,8 +277,19 @@ impl Screen {
                     col: self.cursor_col,
                 });
             }
-            ConsoleCmd::EraseDisplay(_) => { /* not yet — keep the screen */ }
-            ConsoleCmd::EraseLine(_) => { /* not yet — keep the line */ }
+            // ED 0 (`ESC [ J` with no param or `ESC [ 0 J`): erase from
+            // the cursor (inclusive) to the end of the display. ion
+            // emits `\r\x1b[J<new line>` on every keystroke to redraw
+            // the prompt, so dropping this leaves stale glyphs from any
+            // longer prior content (the "backspace doesn't erase" /
+            // "shorter history line leaves trailing chars" symptoms).
+            ConsoleCmd::EraseDisplay(0) => self.erase_display_to_end(out),
+            // ED 1: erase from the start of the display to the cursor
+            // (inclusive). Less common in shells but cheap to handle
+            // alongside ED 0.
+            ConsoleCmd::EraseDisplay(1) => self.erase_display_to_cursor(out),
+            ConsoleCmd::EraseDisplay(_) => { /* unsupported mode — keep the screen */ }
+            ConsoleCmd::EraseLine(mode) => self.erase_line(mode, out),
             ConsoleCmd::SetCursorVisible(_) => { /* renderer policy */ }
             ConsoleCmd::Sgr(sgr) => self.apply_sgr(&sgr, out),
         }
@@ -337,6 +349,86 @@ impl Screen {
             self.buf[i] = Cell::blank(self.fg, self.bg);
         }
         out.push(RenderCommand::Scroll { amount: 1 });
+    }
+
+    /// ED 0: blank from `(cursor_row, cursor_col)` (inclusive) to the
+    /// bottom-right corner of the grid. Cursor position is unchanged
+    /// (per ANSI ED semantics — the shell positions the cursor before
+    /// the erase, not after).
+    fn erase_display_to_end(&mut self, out: &mut Vec<RenderCommand>) {
+        if self.rows == 0 || self.cols == 0 || self.cursor_row >= self.rows {
+            return;
+        }
+        let row = self.cursor_row;
+        let start_col = self.cursor_col.min(self.cols);
+        for col in start_col..self.cols {
+            self.blank_cell(row, col, out);
+        }
+        for r in (row + 1)..self.rows {
+            for col in 0..self.cols {
+                self.blank_cell(r, col, out);
+            }
+        }
+    }
+
+    /// ED 1: blank from the top-left corner to `(cursor_row,
+    /// cursor_col)` (inclusive). Cursor position is unchanged.
+    fn erase_display_to_cursor(&mut self, out: &mut Vec<RenderCommand>) {
+        if self.rows == 0 || self.cols == 0 || self.cursor_row >= self.rows {
+            return;
+        }
+        let row = self.cursor_row;
+        for r in 0..row {
+            for col in 0..self.cols {
+                self.blank_cell(r, col, out);
+            }
+        }
+        let end = self.cursor_col.min(self.cols.saturating_sub(1));
+        for col in 0..=end {
+            self.blank_cell(row, col, out);
+        }
+    }
+
+    fn erase_line(&mut self, mode: u16, out: &mut Vec<RenderCommand>) {
+        if self.rows == 0 || self.cols == 0 || self.cursor_row >= self.rows {
+            return;
+        }
+        let row = self.cursor_row;
+        let cursor_col = self.cursor_col.min(self.cols);
+        match mode {
+            0 => {
+                for col in cursor_col..self.cols {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            1 => {
+                let end = cursor_col.min(self.cols.saturating_sub(1));
+                for col in 0..=end {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            2 => {
+                for col in 0..self.cols {
+                    self.blank_cell(row, col, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn blank_cell(&mut self, row: u16, col: u16, out: &mut Vec<RenderCommand>) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let idx = row as usize * self.cols as usize + col as usize;
+        self.buf[idx] = Cell::blank(self.fg, self.bg);
+        out.push(RenderCommand::PutGlyph {
+            row,
+            col,
+            codepoint: b' ' as u32,
+            fg: self.fg,
+            bg: self.bg,
+        });
     }
 
     fn clear_buffer(&mut self) {
@@ -476,6 +568,79 @@ mod tests {
         assert_eq!(s.cursor(), (0, 0));
     }
 
+    #[test]
+    fn backspace_erases_previous_cell() {
+        let mut s = Screen::with_geometry(8, 2);
+        let cmds = feed_str(&mut s, "AB\x08");
+
+        assert_eq!(s.cursor(), (0, 1));
+        assert_eq!(s.cell(0, 1).unwrap().codepoint, b' ' as u32);
+        assert!(
+            cmds.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    RenderCommand::PutGlyph {
+                        row: 0,
+                        col: 1,
+                        codepoint,
+                        ..
+                    } if *codepoint == b' ' as u32
+                )
+            }),
+            "backspace must repaint the erased cell so stale glyphs disappear"
+        );
+    }
+
+    #[test]
+    fn erase_line_zero_clears_from_cursor_to_end() {
+        let mut s = Screen::with_geometry(5, 2);
+        let cmds = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[K");
+
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, b'A' as u32);
+        assert_eq!(s.cell(0, 1).unwrap().codepoint, b'B' as u32);
+        for col in 2..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        let erased = cmds
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    RenderCommand::PutGlyph {
+                        row: 0,
+                        col: 2..=4,
+                        codepoint,
+                        ..
+                    } if *codepoint == b' ' as u32
+                )
+            })
+            .count();
+        assert_eq!(erased, 3, "erase-line must repaint every cleared cell");
+    }
+
+    #[test]
+    fn erase_line_one_clears_start_through_cursor() {
+        let mut s = Screen::with_geometry(5, 2);
+        let _ = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[1K");
+
+        for col in 0..=2 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        assert_eq!(s.cell(0, 3).unwrap().codepoint, b'D' as u32);
+        assert_eq!(s.cell(0, 4).unwrap().codepoint, b'E' as u32);
+    }
+
+    #[test]
+    fn erase_line_two_clears_entire_line() {
+        let mut s = Screen::with_geometry(5, 2);
+        let _ = feed_str(&mut s, "ABCDE\r\x1b[2C\x1b[2K");
+
+        for col in 0..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        assert_eq!(s.cursor(), (0, 2));
+    }
+
     /// Phase 57 G.4 acceptance: writing past the right edge wraps to
     /// the next row.
     #[test]
@@ -537,6 +702,72 @@ mod tests {
         let mut s = Screen::with_geometry(80, 25);
         let cmds = feed_str(&mut s, "ABC\x1b[2J");
         assert!(cmds.iter().any(|c| matches!(c, RenderCommand::Clear)));
+    }
+
+    /// Regression: ion redraws its prompt with `\r\x1b[J<new content>`
+    /// on every keystroke. If we drop ED 0, characters past the new
+    /// line's end stay visible — that produces the "backspace doesn't
+    /// erase" and "shorter history line leaves trailing chars" bugs.
+    #[test]
+    fn ed_0_clears_from_cursor_to_end_of_display() {
+        let mut s = Screen::with_geometry(5, 3);
+        // Fill rows 0 and 1 with text, then position cursor at (0, 2).
+        let _ = feed_str(&mut s, "ABCDE\nFGHIJ\r\x1b[A\x1b[3G");
+        assert_eq!(s.cursor(), (0, 2));
+        let _ = feed_str(&mut s, "\x1b[J");
+        // Row 0: cells 0..2 unchanged, cells 2..5 blank.
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, b'A' as u32);
+        assert_eq!(s.cell(0, 1).unwrap().codepoint, b'B' as u32);
+        for col in 2..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        // Row 1 fully blanked.
+        for col in 0..5 {
+            assert_eq!(s.cell(1, col).unwrap().codepoint, b' ' as u32);
+        }
+        // Cursor unchanged.
+        assert_eq!(s.cursor(), (0, 2));
+    }
+
+    /// Direct regression for the ion redraw shape: the user types a
+    /// long line, ion echoes it, then ion sends `\r\x1b[J<shorter>`.
+    /// The trailing tail of the old line must be gone afterwards.
+    #[test]
+    fn ed_0_after_cr_clears_trailing_chars_from_prior_line() {
+        let mut s = Screen::with_geometry(10, 2);
+        let _ = feed_str(&mut s, "aaaaa");
+        // Ion's redraw shape on backspace / history recall.
+        let _ = feed_str(&mut s, "\r\x1b[Jbbb");
+        for col in 0..3 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b'b' as u32);
+        }
+        for col in 3..5 {
+            assert_eq!(
+                s.cell(0, col).unwrap().codepoint,
+                b' ' as u32,
+                "trailing char at col {col} must be cleared"
+            );
+        }
+    }
+
+    /// ED 1 mirrors ED 0 from the other side: blank from the start of
+    /// the display through the cursor (inclusive).
+    #[test]
+    fn ed_1_clears_from_start_to_cursor() {
+        let mut s = Screen::with_geometry(5, 3);
+        let _ = feed_str(&mut s, "ABCDE\nFGHIJ\r\x1b[3G");
+        assert_eq!(s.cursor(), (1, 2));
+        let _ = feed_str(&mut s, "\x1b[1J");
+        // Row 0 fully blanked.
+        for col in 0..5 {
+            assert_eq!(s.cell(0, col).unwrap().codepoint, b' ' as u32);
+        }
+        // Row 1: cells 0..=2 blanked, cells 3..5 unchanged.
+        for col in 0..=2 {
+            assert_eq!(s.cell(1, col).unwrap().codepoint, b' ' as u32);
+        }
+        assert_eq!(s.cell(1, 3).unwrap().codepoint, b'I' as u32);
+        assert_eq!(s.cell(1, 4).unwrap().codepoint, b'J' as u32);
     }
 
     /// Phase 57 G.4 acceptance: `out_of_bounds` cell access surfaces

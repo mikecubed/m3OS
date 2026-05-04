@@ -334,7 +334,7 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
     }
 
     let mut buf = [0u8; MOUSE_PACKET_WIRE_SIZE];
-    for _ in 0..MAX_PULL_POLLS {
+    for iter in 0..MAX_PULL_POLLS {
         let rc = syscall_lib::read_mouse_packet(&mut buf);
         match rc {
             0 => {
@@ -352,8 +352,12 @@ fn handle_mouse_event_pull(pipeline: &mut MousePipeline) {
                 continue;
             }
             ERRNO_EAGAIN => {
-                // Empty ring — sleep and retry.
-                let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+                // Empty ring. Only sleep if another bounded poll will follow;
+                // with MAX_PULL_POLLS == 1 this keeps the pull path genuinely
+                // non-blocking for display_server's single-threaded loop.
+                if iter + 1 < MAX_PULL_POLLS {
+                    let _ = syscall_lib::nanosleep_for(0, POLL_INTERVAL_NS);
+                }
                 continue;
             }
             other => {

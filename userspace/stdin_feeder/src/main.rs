@@ -1,8 +1,21 @@
 //! Userspace stdin feeder for m3OS (Phase 52d, Track C).
 //!
-//! Obtains scancodes from the `kbd_server` service via IPC (`KBD_READ`),
+//! Obtains scancodes from the `kbd_server` service via IPC (`KBD_TRY_READ`),
 //! translates them to raw bytes using a US-QWERTY lookup table, and forwards
 //! each byte to the kernel via `push_raw_input`.
+//!
+//! Uses the non-blocking `KBD_TRY_READ` label (Phase 57d) rather than the
+//! blocking `KBD_READ`, so that `display_server`'s concurrent
+//! `KBD_EVENT_PULL` requests are not starved while this feeder polls.
+//! When kbd_server reports an empty buffer (reply 0), stdin_feeder sleeps
+//! 5 ms before retrying.
+//! If the `display.input-owner` service is present, stdin_feeder stands
+//! down: `display_server` registers that name only after the first
+//! Toplevel surface is mapped, so PS/2 input ownership transfers only
+//! when a real graphical client (e.g. `term`) is actually up. Boots
+//! that never reach a Toplevel — text-mode fallback or a stalled
+//! graphical bring-up — keep PS/2 routed through this bridge to the
+//! kernel line discipline.
 //!
 //! All terminal policy (canonical editing, echo, signal generation, ICRNL)
 //! is handled by the kernel-side `LineDiscipline` in `push_raw_input`.
@@ -80,8 +93,22 @@ fn scancode_to_char(sc: u8, shift: bool) -> Option<char> {
 
 syscall_lib::entry_point!(program_main);
 
-/// IPC operation label: read one scancode from kbd_server.
-const KBD_READ: u64 = 1;
+/// IPC operation label: non-blocking scancode probe (Phase 57d).
+///
+/// kbd_server replies immediately with the scancode byte, or 0 if the
+/// buffer is empty.  Using this instead of the blocking `KBD_READ = 1`
+/// keeps kbd_server's request queue drainable so `display_server`'s
+/// concurrent `KBD_EVENT_PULL` requests are not starved.
+const KBD_TRY_READ: u64 = 4;
+
+/// How long to sleep when kbd_server reports an empty buffer (5 ms,
+/// matching the legacy kbd_server internal poll interval).
+const KBD_POLL_INTERVAL_NS: u32 = 5_000_000;
+
+/// How often to re-check for graphical display ownership while falling back
+/// to the text-mode PS/2-to-stdin bridge. The check is capability-free, so it
+/// can run on every empty poll without leaking handles.
+const DISPLAY_PROBE_INTERVAL_EMPTY_POLLS: u32 = 1;
 
 fn lookup_kbd_service() -> u32 {
     loop {
@@ -91,6 +118,18 @@ fn lookup_kbd_service() -> u32 {
         }
         let _ = syscall_lib::nanosleep_for(0, 20_000_000); // 20 ms
     }
+}
+
+/// Probe for the `display.input-owner` marker. `display_server` registers
+/// this name lazily, only after the first Toplevel surface is mapped —
+/// so a "yes" here means a real graphical client is up and PS/2
+/// scancodes belong to the focus dispatcher, not to this bridge.
+/// Probing the marker (rather than the bare `display` service) avoids
+/// the early-boot race where `display_server` is registered but no
+/// graphical client has connected yet, which used to leave the
+/// keyboard deaf in text-mode fallback boots.
+fn display_input_owner_available() -> bool {
+    syscall_lib::ipc_service_exists("display.input-owner")
 }
 
 fn program_main(_args: &[&str]) -> i32 {
@@ -105,16 +144,35 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut shift = false;
     let mut ctrl = false;
+    let mut graphical_input_owner = display_input_owner_available();
+    let mut empty_polls_since_display_probe = 0u32;
 
     loop {
-        // Request one scancode from kbd_server via IPC.  This blocks until
-        // the keyboard service has a scancode ready (it blocks on IRQ1
-        // internally).  The scancode is returned as the reply label.
-        let sc_rc = syscall_lib::ipc_call(kbd_handle, KBD_READ, 0);
+        if graphical_input_owner {
+            let _ = syscall_lib::nanosleep_for(0, 50_000_000);
+            graphical_input_owner = display_input_owner_available();
+            continue;
+        }
+
+        // Request one scancode from kbd_server via the non-blocking probe
+        // label.  kbd_server replies 0 if the buffer is currently empty;
+        // we sleep briefly and retry rather than holding the server busy
+        // while display_server is waiting for KBD_EVENT_PULL replies.
+        let sc_rc = syscall_lib::ipc_call(kbd_handle, KBD_TRY_READ, 0);
         if sc_rc == u64::MAX {
             kbd_handle = lookup_kbd_service();
             continue;
         }
+        if sc_rc == 0 {
+            empty_polls_since_display_probe = empty_polls_since_display_probe.saturating_add(1);
+            if empty_polls_since_display_probe >= DISPLAY_PROBE_INTERVAL_EMPTY_POLLS {
+                empty_polls_since_display_probe = 0;
+                graphical_input_owner = display_input_owner_available();
+            }
+            let _ = syscall_lib::nanosleep_for(0, KBD_POLL_INTERVAL_NS);
+            continue;
+        }
+        empty_polls_since_display_probe = 0;
         let sc = sc_rc as u8;
 
         // Key-release (break) codes: bit 7 set.

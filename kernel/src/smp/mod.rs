@@ -294,6 +294,11 @@ pub struct PerCoreData {
     /// on the same core.
     pub holds_scheduler_lock: AtomicBool,
 
+    // ----- Phase 57d E.1: deferred-reschedule pending flag -----
+    /// Set by `preempt_enable` zero-crossing when `reschedule` is true;
+    /// consumed at the next user-mode return boundary. Phase 57d E.1.
+    pub preempt_resched_pending: AtomicBool,
+
     // ----- Phase 57b C.1: per-CPU preempt_count pointer -----
     /// Pointer to the `AtomicI32` that `preempt_disable` / `preempt_enable`
     /// must mutate on this core right now.
@@ -653,6 +658,7 @@ pub fn init_bsp_per_core() {
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
         holds_scheduler_lock: AtomicBool::new(false),
+        preempt_resched_pending: AtomicBool::new(false),
         // Phase 57b C.1: pointer starts at this core's dummy slot.  The
         // dispatch path (C.2 / C.3) retargets it to the running task's
         // `preempt_count` while the task executes and back to the dummy
@@ -777,6 +783,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
         holds_scheduler_lock: AtomicBool::new(false),
+        preempt_resched_pending: AtomicBool::new(false),
         // Phase 57b C.1: pointer starts at this AP's dummy slot.  The
         // dispatch path (C.2 / C.3) retargets it to the running task's
         // `preempt_count` while the task executes and back to the dummy

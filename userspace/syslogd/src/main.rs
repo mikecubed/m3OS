@@ -12,6 +12,10 @@ use syscall_lib::{
     STDOUT_FILENO, SockaddrUn,
 };
 
+const PROMPT_READY_SERVICE: &str = "term.prompt-ready";
+const PROMPT_READY_TIMEOUT_MS: u64 = 30_000;
+const BACKPRESSURE_SLEEP_NS: u32 = 1_000_000;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -21,9 +25,6 @@ syscall_lib::entry_point!(program_main);
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "syslogd: starting\n");
 
-    // Ensure /var/log exists.
-    ensure_log_dirs();
-
     // Remove stale socket if present, then bind /dev/log.
     let sock_fd = match setup_socket() {
         Some(fd) => fd,
@@ -32,6 +33,11 @@ fn program_main(_args: &[&str]) -> i32 {
             return 1;
         }
     };
+
+    wait_for_prompt_ready();
+
+    // Ensure /var/log exists.
+    ensure_log_dirs();
 
     // Open log files.
     let msg_fd = open_log_file(b"/var/log/messages\0");
@@ -53,6 +59,14 @@ fn program_main(_args: &[&str]) -> i32 {
 
     // Main loop.
     main_loop(sock_fd, msg_fd, kern_fd, kmsg_fd);
+}
+
+fn wait_for_prompt_ready() {
+    if syscall_lib::ipc_wait_service(PROMPT_READY_SERVICE, PROMPT_READY_TIMEOUT_MS) {
+        syscall_lib::write_str(STDOUT_FILENO, "syslogd: prompt-ready gate open\n");
+    } else {
+        syscall_lib::write_str(STDOUT_FILENO, "syslogd: prompt-ready gate timed out\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,20 +156,20 @@ fn setup_socket() -> Option<i32> {
 /// divisor; `poll(2000)` now correctly sleeps for 2 s.
 const POLL_TIMEOUT_MS: i32 = 2000;
 
-/// Maximum syslog-socket datagrams to process per poll wakeup before yielding.
+/// Maximum syslog-socket datagrams to process per poll wakeup before parking.
 /// Prevents any single burst from starving other tasks.
 const MAX_SOCKET_DRAIN_PER_LOOP: usize = 4;
 
 /// Maximum kernel-log messages per *chunk* inside `drain_kmsg`.
 ///
 /// H.3 secondary defence (Hypothesis B): `drain_kmsg` processes messages in
-/// chunks of this size, yielding (`nanosleep(0)` → kernel `yield_now()`) after
-/// each full chunk so other tasks on the same core can run.  The outer while
-/// loop in `drain_kmsg` continues draining until the fd returns EAGAIN, so a
-/// large burst of kmsg messages is handled without waiting for the next 2 s
-/// poll timeout — but never in one uninterrupted stretch.
+/// chunks of this size, parking briefly after each full chunk so other tasks
+/// on the same core can run.  The outer while loop in `drain_kmsg` continues
+/// draining until the fd returns EAGAIN, so a large burst of kmsg messages is
+/// handled without waiting for the next 2 s poll timeout — but never in one
+/// uninterrupted stretch.
 ///
-/// 32 messages per chunk × ~128 B average → ~4 KiB of log work between yields.
+/// 32 messages per chunk × ~128 B average → ~4 KiB of log work between parks.
 pub const KMSG_DRAIN_CHUNK: usize = 32;
 
 fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
@@ -220,8 +234,7 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
                 }
                 drained += 1;
                 if drained >= MAX_SOCKET_DRAIN_PER_LOOP {
-                    // Cooperative yield: let other tasks run before the next chunk.
-                    let _ = syscall_lib::nanosleep(0);
+                    let _ = syscall_lib::nanosleep_for(0, BACKPRESSURE_SLEEP_NS);
                     break;
                 }
             }
@@ -241,8 +254,8 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 
 /// Drain all available messages from `kmsg_fd` in chunks of [`KMSG_DRAIN_CHUNK`].
 ///
-/// After each full chunk a cooperative yield (`nanosleep(0)`) is issued so
-/// that other tasks on the same core can run.  The loop continues until
+/// After each full chunk the daemon parks briefly so other tasks on the same
+/// core can run.  The loop continues until
 /// `read()` returns ≤ 0 (EAGAIN on a non-blocking fd), so a large burst is
 /// consumed without relying on the 2 s poll timeout to re-enter this function.
 fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
@@ -263,9 +276,7 @@ fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf:
         }
         chunk_count += 1;
         if chunk_count >= KMSG_DRAIN_CHUNK {
-            // Yield cooperatively between chunks so we do not monopolise the
-            // CPU during a burst.  nanosleep(0) → kernel yield_now().
-            let _ = syscall_lib::nanosleep(0);
+            let _ = syscall_lib::nanosleep_for(0, BACKPRESSURE_SLEEP_NS);
             chunk_count = 0;
         }
     }

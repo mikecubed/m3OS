@@ -463,6 +463,11 @@ fn build_userspace_bins() {
         // provider, ANSI parser) and uses `alloc` types in the screen
         // and renderer paths.
         ("term", "term", true),
+        // Phase 57d follow-up — Tier 1 fullscreen-takeover wrapper.
+        // `needs_alloc = true` because the binary links `kernel-core`
+        // (control codec) and uses `Vec` for the per-arg
+        // null-terminated argv copy buffer in the child path.
+        ("fb-takeover", "fb-takeover", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -492,6 +497,10 @@ fn build_userspace_bins() {
             // sets `os-binary` to build the `_start`-bearing OS
             // binary; host tests compile the lib only.
             "m3ctl" => &["--features", "os-binary"],
+            // Phase 57d follow-up: `fb-takeover` uses the same
+            // `os-binary` gate as `m3ctl` so its `_start` entry point
+            // is built only when the xtask asks for the OS binary.
+            "fb-takeover" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -684,19 +693,22 @@ fn build_musl_bins() {
         }
     };
 
+    let extra_ldflags = musl_cc_extra_ldflags();
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
         let dst = initrd.join(format!("{name}"));
-        let status = match Command::new(cc)
-            .args([
-                "-static",
-                "-O2",
-                src.to_str().expect("non-UTF-8 path"),
-                "-o",
-                dst.to_str().expect("non-UTF-8 path"),
-            ])
-            .status()
-        {
+        let mut cmd = Command::new(cc);
+        cmd.args([
+            "-static",
+            "-O2",
+            src.to_str().expect("non-UTF-8 path"),
+            "-o",
+            dst.to_str().expect("non-UTF-8 path"),
+        ]);
+        for f in &extra_ldflags {
+            cmd.arg(f);
+        }
+        let status = match cmd.status() {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
@@ -1008,6 +1020,7 @@ fn build_pdpmake() {
             return;
         }
     };
+    args.extend(musl_cc_extra_ldflags());
 
     let status = match Command::new(cc).args(&args).status() {
         Ok(s) => s,
@@ -1235,6 +1248,7 @@ fn build_doom() {
     args.extend(c_files);
     args.push("-o".to_string());
     args.push(doom_bin.to_str().unwrap().to_string());
+    args.extend(musl_cc_extra_ldflags());
 
     let status = match Command::new(cc).args(&args).status() {
         Ok(s) => s,
@@ -1360,6 +1374,18 @@ fn build_tcc() -> Option<PathBuf> {
     // Configure TCC.
     // Use --extra-ldflags=-static to produce a fully static, non-PIE binary.
     // The --extra-cflags=-static alone doesn't prevent PIE on newer toolchains.
+    // Append any toolchain stub `-L` flags so a minimal cross compiler whose
+    // musl install lacks `libdl.a`/`libpthread.a`/`librt.a` (raiden,
+    // musl-cross-make, recent Arch musl-cross-tools) finds the empty
+    // archives `find_musl_cc` auto-generated in `target/musl-stub-libs/`.
+    let extra_ldflags = {
+        let mut s = String::from("-static -no-pie");
+        for f in musl_cc_extra_ldflags() {
+            s.push(' ');
+            s.push_str(&f);
+        }
+        s
+    };
     println!("tcc: configuring with {cc} (static, --prefix=/usr)...");
     let configure_status = Command::new("sh")
         .current_dir(&tcc_src)
@@ -1368,7 +1394,7 @@ fn build_tcc() -> Option<PathBuf> {
             "--prefix=/usr",
             &format!("--cc={cc} -static"),
             "--extra-cflags=-static",
-            "--extra-ldflags=-static -no-pie",
+            &format!("--extra-ldflags={extra_ldflags}"),
             "--cpu=x86_64",
             "--triplet=x86_64-linux-musl",
             "--config-musl",
@@ -1613,20 +1639,29 @@ fn build_kernel() -> PathBuf {
     fetch_port_sources();
     // Phase 47: cross-compile DOOM.
     build_doom();
-    let status = Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args([
-            "build",
-            "--release",
-            "--package",
-            "kernel",
-            "--target",
-            "x86_64-unknown-none",
-            "-Zbuild-std=core,compiler_builtins,alloc",
-            "-Zbuild-std-features=compiler-builtins-mem",
-        ])
-        .status()
-        .expect("failed to run cargo build");
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.current_dir(&root).args([
+        "build",
+        "--release",
+        "--package",
+        "kernel",
+        "--target",
+        "x86_64-unknown-none",
+        "-Zbuild-std=core,compiler_builtins,alloc",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    // Forward `M3OS_KERNEL_FEATURES=feat1,feat2` into `cargo build
+    // --features ...` so debugging features (e.g. `exec-trace`) can be
+    // enabled without editing `kernel/Cargo.toml` or rerouting through
+    // a one-off cargo invocation. Empty / unset leaves the kernel on
+    // its default feature set.
+    let kernel_features = std::env::var("M3OS_KERNEL_FEATURES").unwrap_or_default();
+    let kernel_features = kernel_features.trim();
+    if !kernel_features.is_empty() {
+        cmd.args(["--features", kernel_features]);
+        println!("kernel: building with extra features: {}", kernel_features);
+    }
+    let status = cmd.status().expect("failed to run cargo build");
 
     if !status.success() {
         eprintln!("Kernel build failed");
@@ -1689,31 +1724,166 @@ const MUSL_CC_CANDIDATES: &[&str] = &[
 
 /// Find a musl cross-compiler on the system.
 ///
-/// Checks the candidates in `MUSL_CC_CANDIDATES` in order.
+/// Checks the candidates in `MUSL_CC_CANDIDATES` in order, plus any
+/// candidate supplied via the `M3OS_MUSL_CC` environment variable
+/// (which is checked first so users can override a stricter detection).
 ///
-/// Some minimal musl cross toolchains (for example a hand-installed raiden or
-/// musl-cross-make toolchain under `/opt/`) omit musl's empty static
-/// compatibility stubs (`libdl.a`, `libpthread.a`, `librt.a`). Ports like TCC
-/// still link `-ldl`, so we reject those toolchains here and keep searching for
-/// a distro-provided compiler that can satisfy the full static link.
+/// Some minimal musl cross toolchains (raiden, musl-cross-make, recent Arch
+/// `musl-cross-tools`) omit musl's empty static compatibility stubs
+/// (`libdl.a`, `libpthread.a`, `librt.a`). Ports like TCC still pass
+/// `-ldl`/`-lpthread`/`-lrt` at link time. Rather than reject those
+/// toolchains (which leaves the user with no working build), we
+/// auto-generate empty archives in `target/musl-stub-libs/` and retry the
+/// static-stub probe with `-L<stub_dir>` added. If the augmented probe
+/// passes, the compiler is accepted and [`musl_cc_extra_ldflags`] returns
+/// the same `-L` flag so callers can plumb it into their own link
+/// commands (TCC's `--extra-ldflags`, doom's `-Wl,...`, etc.).
 fn find_musl_cc() -> Option<&'static str> {
     static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
     *MUSL_CC.get_or_init(|| {
-        for cc in MUSL_CC_CANDIDATES {
+        let env_override = std::env::var("M3OS_MUSL_CC").ok();
+        let env_override_str: Option<&str> = env_override.as_deref();
+
+        // Phase 57d follow-up — order: env override (if set) first, then
+        // built-in candidates. For each, run the static-stub probe; on
+        // failure, generate the empty stubs and retry with `-L<stub_dir>`.
+        let mut tried: Vec<(String, MuslCcStatus)> = Vec::new();
+        let try_one = |cc: &str, tried: &mut Vec<(String, MuslCcStatus)>| -> Option<&'static str> {
             if !musl_cc_runs(cc) {
-                continue;
+                tried.push((cc.to_string(), MuslCcStatus::NotFound));
+                return None;
             }
-            if musl_cc_has_static_compat_stubs(cc) {
-                return Some(*cc);
+            if musl_cc_static_compat_stub_check(cc, &[]).is_ok() {
+                MUSL_CC_NEEDS_STUB_DIR.store(false, core::sync::atomic::Ordering::Relaxed);
+                let leaked: &'static str = Box::leak(cc.to_string().into_boxed_str());
+                return Some(leaked);
             }
-            eprintln!(
-                "warning: skipping musl compiler `{cc}` — static link check for \
-                 -ldl/-lpthread/-lrt failed; install/use a distro musl toolchain \
-                 (musl-tools or musl-gcc-cross-bin)"
-            );
+            // First probe failed — generate empty stubs and retry. The
+            // toolchain is otherwise fine; it just lacks the historical
+            // empty .a files for libs musl folded into libc.
+            match ensure_musl_stub_libs() {
+                Ok(stub_dir) => {
+                    let extra = format!("-L{}", stub_dir.display());
+                    if musl_cc_static_compat_stub_check(cc, &[&extra]).is_ok() {
+                        MUSL_CC_NEEDS_STUB_DIR.store(true, core::sync::atomic::Ordering::Relaxed);
+                        let leaked: &'static str = Box::leak(cc.to_string().into_boxed_str());
+                        return Some(leaked);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to materialize musl stub libs: {e}");
+                }
+            }
+            // Both probes failed — capture the original error for the
+            // structured diagnostic block at the bottom of the function.
+            let err = match musl_cc_static_compat_stub_check(cc, &[]) {
+                Ok(()) => "passed second time but failed first?".to_string(),
+                Err(s) => s,
+            };
+            tried.push((cc.to_string(), MuslCcStatus::StaticStubFail(err)));
+            None
+        };
+
+        if let Some(env_cc) = env_override_str
+            && let Some(found) = try_one(env_cc, &mut tried)
+        {
+            return Some(found);
         }
+        for cc in MUSL_CC_CANDIDATES {
+            if let Some(found) = try_one(cc, &mut tried) {
+                return Some(found);
+            }
+        }
+
+        // Detection failed — emit one structured diagnostic that lists every
+        // candidate, its status, and stderr from the static-stub probe so the
+        // user can see WHY each one was rejected. Without this the silent
+        // failure looked like "no musl compiler installed" even when one was
+        // on PATH.
+        eprintln!("musl cross-compiler detection failed (even with auto-generated stubs). Tried:");
+        for (cc, status) in &tried {
+            match status {
+                MuslCcStatus::NotFound => {
+                    eprintln!("  - `{cc}`: not on PATH (or `--version` failed)");
+                }
+                MuslCcStatus::StaticStubFail(stderr) => {
+                    eprintln!(
+                        "  - `{cc}`: ran OK but `-static -ldl -lpthread -lrt` link probe failed:"
+                    );
+                    for line in stderr.lines().take(8) {
+                        eprintln!("      {line}");
+                    }
+                }
+            }
+        }
+        if let Some(env_cc) = env_override_str {
+            eprintln!("  - M3OS_MUSL_CC={env_cc} (env override) was tried first");
+        }
+        eprintln!(
+            "Hints:\n  \
+             * Set M3OS_MUSL_CC=/path/to/musl-gcc to point at a specific compiler.\n  \
+             * Debian/Ubuntu: `apt install musl-tools`.\n  \
+             * Arch: `pacman -S musl-cross-tools` or AUR `musl-gcc-cross-bin`.\n  \
+             * Hand-built raiden / musl-cross-make under /opt/ should now work via the\n    \
+                  auto-generated `target/musl-stub-libs/` empty archives — if the probe is\n    \
+                  still failing, the underlying error above (not a missing-stubs error) is\n    \
+                  the real blocker."
+        );
         None
     })
+}
+
+/// True when [`find_musl_cc`] accepted a compiler only after the empty
+/// stub archives in `target/musl-stub-libs/` were added to its `-L`
+/// search path. Callers that drive the compiler directly (TCC's
+/// `--extra-ldflags`, doom's invocation, etc.) read this via
+/// [`musl_cc_extra_ldflags`] so they apply the same `-L` and the real
+/// link succeeds for the same reason the probe did.
+static MUSL_CC_NEEDS_STUB_DIR: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Return any extra `-L` / linker flags the C ports must apply on top of
+/// their normal toolchain invocation when [`find_musl_cc`] accepted a
+/// minimal toolchain backed by the auto-generated stub archives.
+///
+/// Returns an empty `Vec` when the toolchain provided its own stubs.
+pub fn musl_cc_extra_ldflags() -> Vec<String> {
+    if !MUSL_CC_NEEDS_STUB_DIR.load(core::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+    match ensure_musl_stub_libs() {
+        Ok(stub_dir) => vec![format!("-L{}", stub_dir.display())],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Materialize empty `libdl.a`, `libpthread.a`, `librt.a` archives in
+/// `target/musl-stub-libs/`. The archives are byte-for-byte just the
+/// 8-byte ar global header `!<arch>\n` — a valid (empty) static archive
+/// the linker accepts and traverses with no symbols. Idempotent: only
+/// writes a file if it is missing or has the wrong size.
+fn ensure_musl_stub_libs() -> std::io::Result<PathBuf> {
+    let root = workspace_root();
+    let stub_dir = root.join("target/musl-stub-libs");
+    fs::create_dir_all(&stub_dir)?;
+    const AR_HEADER: &[u8] = b"!<arch>\n";
+    for name in &["libdl.a", "libpthread.a", "librt.a"] {
+        let path = stub_dir.join(name);
+        let needs_write = match fs::metadata(&path) {
+            Ok(m) => m.len() != AR_HEADER.len() as u64,
+            Err(_) => true,
+        };
+        if needs_write {
+            fs::write(&path, AR_HEADER)?;
+        }
+    }
+    Ok(stub_dir)
+}
+
+#[derive(Debug)]
+enum MuslCcStatus {
+    NotFound,
+    StaticStubFail(String),
 }
 
 /// Find any working musl cross-compiler, ignoring the static stub check.
@@ -1804,29 +1974,29 @@ fn warn_ar_fallback_once(cc: &str, missing_ar: &str) {
     });
 }
 
-fn musl_cc_has_static_compat_stubs(cc: &str) -> bool {
-    let Ok(dir) = tempfile::tempdir() else {
-        return false;
-    };
+fn musl_cc_static_compat_stub_check(cc: &str, extra_args: &[&str]) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let src = dir.path().join("stub-check.c");
     let out = dir.path().join("stub-check");
-    if fs::write(&src, "int main(void) { return 0; }\n").is_err() {
-        return false;
+    fs::write(&src, "int main(void) { return 0; }\n")
+        .map_err(|e| format!("write stub source: {e}"))?;
+    let mut cmd = Command::new(cc);
+    cmd.args([
+        "-static",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    for arg in extra_args {
+        cmd.arg(arg);
     }
-    Command::new(cc)
-        .args([
-            "-static",
-            src.to_str().unwrap(),
-            "-o",
-            out.to_str().unwrap(),
-            "-ldl",
-            "-lpthread",
-            "-lrt",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    cmd.args(["-ldl", "-lpthread", "-lrt"]);
+    let output = cmd.output().map_err(|e| format!("spawn `{cc}`: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
 }
 
 fn find_ovmf() -> PathBuf {

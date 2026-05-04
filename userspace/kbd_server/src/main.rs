@@ -81,6 +81,19 @@ const KBD_EVENT_PULL: u64 = 2;
 /// constant in `userspace/display_server/src/input.rs`.
 const KBD_EVENT_NONE: u64 = 3;
 
+/// Phase 57d — non-blocking scancode probe used by `stdin_feeder`.
+///
+/// Unlike `KBD_READ` (label 1) which blocks internally until a key is
+/// pressed, this label returns immediately: the reply label is the raw
+/// scancode byte, or 0 if the ring buffer is empty.  Callers must treat
+/// reply 0 as "no key yet" and sleep before retrying.
+///
+/// This avoids the kbd_server stall that occurs when `stdin_feeder`'s
+/// blocking `KBD_READ` request holds the server while `display_server`
+/// is waiting for a `KBD_EVENT_PULL` reply (Phase 57d timing change
+/// made this race consistently reproducible).
+const KBD_TRY_READ: u64 = 4;
+
 /// Reply-cap slot is fixed at 1 by the kernel's IPC ABI.
 const REPLY_CAP_HANDLE: u32 = 1;
 
@@ -240,6 +253,18 @@ fn handle_kbd_read() {
     syscall_lib::ipc_reply(REPLY_CAP_HANDLE, scancode as u64, 0);
 }
 
+/// Handle a `KBD_TRY_READ` request — non-blocking scancode probe.
+///
+/// Polls the kernel ring buffer exactly once and replies immediately
+/// with the raw scancode byte as the label, or 0 if the buffer is
+/// empty. The caller (`stdin_feeder`) treats 0 as "no key available"
+/// and sleeps briefly before retrying, which keeps kbd_server's
+/// request queue drainable between polls.
+fn handle_kbd_try_read() {
+    let sc = syscall_lib::read_kbd_scancode();
+    syscall_lib::ipc_reply(REPLY_CAP_HANDLE, sc as u64, 0);
+}
+
 /// Handle a `KBD_EVENT_PULL` request.
 ///
 /// Polls scancodes through the keymap pipeline until either a fully-
@@ -335,25 +360,13 @@ fn emit_key_event(ev: &KeyEvent) {
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
-    // PHASE 57 DEBUG: previous run showed pid=6 (kbd_server) producing
-    // ZERO output through `write_str` (which goes through SYS_WRITE +
-    // the fd table). Switch the early markers to `serial_print` —
-    // which uses SYS_DEBUG_PRINT direct to the kernel serial driver,
-    // bypassing the fd table entirely. If THESE markers land but the
-    // `write_str` ones don't, the issue is kbd_server's STDOUT fd
-    // somehow not being writable / not connected at fork.
-    syscall_lib::serial_print("kbd_server: trace.S1 enter (serial_print)\n");
-    let _ = syscall_lib::write(STDOUT_FILENO, b"kbd_server: trace.K1 enter (write fd=1)\n");
-    syscall_lib::serial_print("kbd_server: trace.S2 after-K1\n");
     syscall_lib::write_str(
         STDOUT_FILENO,
         "kbd_server: starting (Phase 56 D.1 — KeyEvent pipeline online)\n",
     );
-    syscall_lib::serial_print("kbd_server: trace.S3 after-banner\n");
 
     // 1. Create the IPC endpoint that backs the `kbd` service.
     let ep_handle = syscall_lib::create_endpoint();
-    syscall_lib::serial_print("kbd_server: trace.S4 create-ep-ok\n");
     if ep_handle == u64::MAX {
         syscall_lib::serial_print("kbd_server: failed to create endpoint\n");
         return 1;
@@ -364,13 +377,11 @@ fn program_main(_args: &[&str]) -> i32 {
     //    via a single service lookup. Label-based dispatch decides the
     //    request shape.
     let ret = syscall_lib::ipc_register_service(ep_handle, "kbd");
-    syscall_lib::serial_print("kbd_server: trace.S5 register-ok\n");
     if ret == u64::MAX {
         syscall_lib::serial_print("kbd_server: failed to register 'kbd'\n");
         return 1;
     }
 
-    syscall_lib::serial_print("kbd_server: trace.S6 ready\n");
     syscall_lib::write_str(STDOUT_FILENO, "kbd_server: ready\n");
 
     let mut pipeline = KeyboardPipeline::new();
@@ -383,6 +394,7 @@ fn program_main(_args: &[&str]) -> i32 {
         match label {
             KBD_READ => handle_kbd_read(),
             KBD_EVENT_PULL => handle_kbd_event_pull(&mut pipeline),
+            KBD_TRY_READ => handle_kbd_try_read(),
             _ => {
                 // Unknown label — typed error, observable to clients.
                 syscall_lib::write_str(

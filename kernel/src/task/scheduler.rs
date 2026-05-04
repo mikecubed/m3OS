@@ -220,13 +220,16 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::{cell::UnsafeCell, sync::atomic::Ordering};
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{Task, TaskId, TaskState, switch_context};
+use super::{FxSaveArea, ResumeMode, Task, TaskId, TaskState, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
 type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
@@ -551,6 +554,9 @@ pub(crate) struct Scheduler {
     /// Addresses of `Task` instances are stable for the task's lifetime. Per-CPU dispatch state (`current_preempt_count_ptr`) caches raw pointers into `Task::preempt_count` and relies on this stability. The outer `Vec` may reallocate when growing; the inner `Box` keeps each `Task` at a fixed heap address regardless.
     #[allow(clippy::vec_box)]
     tasks: Vec<Box<Task>>,
+    /// Per-task FPU/SIMD state, indexed in lock-step with `tasks`.
+    #[allow(clippy::vec_box)]
+    fpu_states: Vec<Box<FxSaveArea>>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
@@ -565,6 +571,7 @@ impl Scheduler {
     const fn new() -> Self {
         Scheduler {
             tasks: Vec::new(),
+            fpu_states: Vec::new(),
             last_run: 0,
             idle_tasks: [const { None }; crate::smp::MAX_CORES],
             free_list: Vec::new(),
@@ -798,7 +805,6 @@ impl Scheduler {
                     continue;
                 }
                 if self.idle_tasks.contains(&Some(idx)) {
-                    log_dequeue_filter_drop(core_id, idx, "is-idle", self.tasks[idx].pid, 0);
                     q.remove(i);
                     continue;
                 }
@@ -891,13 +897,6 @@ impl Scheduler {
                 }
                 let task = &self.tasks[idx];
                 if task.state != TaskState::Ready {
-                    continue;
-                }
-                // Fresh fork/clone children carry a task-local fork_ctx until their
-                // first dispatch through fork_child_trampoline. Keep them on the
-                // spawning core so the parent's immediate wait/read-yield loop
-                // can't starve them behind background work on another CPU.
-                if task.fork_ctx.is_some() {
                     continue;
                 }
                 if crate::arch::x86_64::interrupts::tick_count()
@@ -1087,10 +1086,16 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
         *sched.tasks[idx] = task;
+        if idx < sched.fpu_states.len() {
+            *sched.fpu_states[idx] = FxSaveArea::new();
+        } else {
+            sched.fpu_states.push(Box::new(FxSaveArea::new()));
+        }
         idx
     } else {
         let idx = sched.tasks.len();
         sched.tasks.push(Box::new(task));
+        sched.fpu_states.push(Box::new(FxSaveArea::new()));
         idx
     }
 }
@@ -1142,7 +1147,11 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         least_loaded_core(&sched)
     };
     task.assigned_core = target_core;
-    task.last_migrated_tick = now;
+    // Fork children carry their entry context on the task itself, so they are
+    // safe to steal before first dispatch. Make them immediately stealable: if
+    // their initially selected core misses a wakeup, another idle core can still
+    // run the trampoline instead of waiting for the migration cooldown.
+    task.last_migrated_tick = now.saturating_sub(MIGRATE_COOLDOWN);
     task.last_ready_tick = now;
     // Fresh fork children need one prompt first dispatch so they can consume
     // `fork_ctx` in `fork_child_trampoline` and enter their normal userspace
@@ -1171,18 +1180,27 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task_idx: idx as u32,
         core: target_core,
     });
-    // PHASE 57 DEBUG: log every fork-child task spawn at INFO so the
-    // boot transcript shows the (pid, task_idx, target_core) tuple
-    // for every fork. Two pids (kbd at 6, fat at 10) never reach
-    // their userspace child path; this trace tells us whether they
-    // even get enqueued, and to which core.
-    log::info!(
+    log::debug!(
         "[sched] fork-task-spawn pid={} task_idx={} target_core={} rip={:#x} rsp={:#x}",
         fork_pid,
         idx,
         target_core,
         fork_rip,
         fork_rsp,
+    );
+    // Phase 57d follow-up — the same line at info-level under
+    // exec-trace so a fork-child that's enqueued-but-never-dispatched
+    // produces a paired "spawned on core C with idx I" / no
+    // "trampoline-enter" signal in the boot transcript. Without this,
+    // distinguishing "task dispatched then hung" from "task never
+    // dispatched" requires correlating two debug-level logs that the
+    // serial console doesn't show.
+    #[cfg(feature = "exec-trace")]
+    log::info!(
+        "[exec-trace] fork-task-spawn pid={} task_idx={} target_core={}",
+        fork_pid,
+        idx,
+        target_core
     );
     enqueue_to_core(target_core, idx);
 
@@ -1406,6 +1424,28 @@ fn retarget_preempt_count_to_task(
     );
 }
 
+#[inline]
+unsafe fn save_fpu_state(area: &mut FxSaveArea) {
+    unsafe {
+        core::arch::asm!(
+            "fxsave64 [{area}]",
+            area = in(reg) area.as_mut_ptr(),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline]
+unsafe fn restore_fpu_state(area: &FxSaveArea) {
+    unsafe {
+        core::arch::asm!(
+            "fxrstor64 [{area}]",
+            area = in(reg) area.as_ptr(),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Phase 57b C.5 — `current_preempt_count_ptr` retarget tracepoint.
 ///
 /// Distinguishes switch-out from switch-in retargets in the
@@ -1584,9 +1624,59 @@ pub fn preempt_enable() {
         return;
     }
     // Safety: identical pointee invariant as [`preempt_disable`].
+    // Phase 57d E.2: deferred-reschedule on zero-crossing.
+    // `fetch_sub` returns the PREVIOUS value; if that was 1 the
+    // post-decrement count is 0 (preemption is now re-enabled).
+    // When `reschedule` is also set, record a pending reschedule so
+    // the user-mode-return boundary can trigger the scheduler.
+    // We do NOT call into the scheduler here — kernel-mode is
+    // non-preemptible under PREEMPT_VOLUNTARY, and we may be inside
+    // an interrupt-disabled window.  The flag is consumed in E.3.
+    #[cfg(feature = "preempt-voluntary")]
+    {
+        let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
+        if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
+            pc.preempt_resched_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    #[cfg(not(feature = "preempt-voluntary"))]
+    // Safety: identical pointee invariant as [`preempt_disable`].
     unsafe {
         (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d F.1 — lock-free IRQ-context preempt count peek
+// ---------------------------------------------------------------------------
+
+/// Read the current task's preempt-disable depth from within an IRQ handler.
+///
+/// Uses `PerCoreData::current_preempt_count_ptr` — the same per-CPU pointer
+/// that `preempt_disable`/`preempt_enable` use (established in Phase 57b).
+/// The pointer is stable for the lifetime of the interrupt frame because:
+/// 1. We are executing in IRQ context (interrupts disabled by the CPU on entry).
+/// 2. No context switch can happen while interrupts are disabled.
+///
+/// Load ordering: `Acquire` on the pointer load + `Relaxed` on the counter
+/// load is sufficient — the pointer is only updated under the scheduler lock
+/// (or during task init before the task is runnable), and the IRQ entry itself
+/// provides a strong enough ordering barrier for observing the counter value.
+///
+/// Returns `0` when no task is current (e.g., during early boot before the
+/// first task is scheduled). In that case the caller should not preempt.
+pub fn peek_preempt_count_irq() -> i32 {
+    let ptr = crate::smp::per_core()
+        .current_preempt_count_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: ptr is non-null and points to a live AtomicI32 within a Task
+    // that remains allocated for the duration of this interrupt (no task free
+    // can happen while interrupts are disabled on this core).
+    unsafe { (*ptr).load(core::sync::atomic::Ordering::Relaxed) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,23 +1747,54 @@ pub(crate) fn assert_preempt_count_zero_at_user_return() {
 #[inline(always)]
 pub(crate) fn assert_preempt_count_zero_at_user_return() {}
 
-/// Phase 57 DEBUG: per-core countdown for yield_now log markers.
-/// Atomic so the IPI-context observer doesn't trip race detection
-/// in case a yield races with another path.
-// Phase 57a follow-up: bumped from 4 to 1024 so the per-core dispatch
-// regression (tasks queued on core 1 silently never dispatching after the
-// first wave) is visible in the boot transcript instead of being budgeted
-// out after the first 4 yields.
-static YIELD_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
-    [const { core::sync::atomic::AtomicI32::new(1024) }; crate::smp::MAX_CORES];
+// ---------------------------------------------------------------------------
+// Phase 57d Track G — deferred preemption check at user-return boundaries
+// ---------------------------------------------------------------------------
 
-// Phase 57a follow-up DEBUG: per-core budget for the dequeue filter-drop
-// trace.  Each filter rejection in `dequeue_local` consumes one slot.
-// Bounded so a permanently-stuck task that the queue scanner repeatedly
-// rejects doesn't drown the log; large enough to surface the *first*
-// time a previously-running task gets filtered out.
+/// Check and consume `preempt_resched_pending` at a user-mode return boundary.
+///
+/// Called from every path that transitions from kernel mode to user mode.
+/// Unlike `check_and_preempt_user`, this runs in kernel-mode context (not IRQ
+/// handler), so it triggers a voluntary reschedule via `yield_now` rather than
+/// `preempt_to_scheduler`.
+///
+/// Under `PREEMPT_VOLUNTARY`, the contract is:
+/// - If `preempt_count == 0` and `preempt_resched_pending` was set, yield.
+/// - Otherwise return (the task will keep running).
+///
+/// Gated on `cfg(feature = "preempt-voluntary")`.
+#[cfg(feature = "preempt-voluntary")]
+pub fn check_deferred_preempt_at_user_return() {
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let pc = peek_preempt_count_irq();
+    if pc != 0 {
+        return;
+    }
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if pending {
+        log::debug!(
+            "[preempt] deferred-yield at user-return: core={} pid={}",
+            core.core_id,
+            crate::process::current_pid()
+        );
+        yield_now();
+    }
+}
+
+/// No-op stub when the `preempt-voluntary` feature is disabled.
+#[cfg(not(feature = "preempt-voluntary"))]
+#[inline(always)]
+pub fn check_deferred_preempt_at_user_return() {}
+
+// Per-core budget for the dequeue filter-drop trace in `dequeue_local`.
+// Each filter rejection consumes one slot; bounded so a permanently-stuck task
+// doesn't drown the log.
 static DEQUEUE_FILTER_LOG_BUDGET: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] =
-    [const { core::sync::atomic::AtomicI32::new(64) }; crate::smp::MAX_CORES];
+    [const { core::sync::atomic::AtomicI32::new(8) }; crate::smp::MAX_CORES];
 
 #[cold]
 fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extra: u64) {
@@ -1693,18 +1814,6 @@ fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extr
 
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
-    // Phase 57 DEBUG: log entry and exit of yield_now per core. If
-    // we see "yield-enter core=3" but no "yield-handoff core=3" or
-    // a missing "resume core=3" pair, we'll know the yield itself is
-    // hanging vs the switch_context call site is hanging.
-    {
-        let core_id = crate::smp::per_core().core_id;
-        let n =
-            YIELD_LOG_BUDGET[core_id as usize].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        if n > 0 {
-            log::info!("[sched] yield-enter core={}", core_id);
-        }
-    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
@@ -1724,6 +1833,10 @@ pub fn yield_now() {
         // switch_context saves the RSP.
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+        // D.2: cooperative yield — dispatch via switch_context on resume.
+        sched.tasks[idx]
+            .resume_mode
+            .store(ResumeMode::Cooperative as u8, Ordering::Release);
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1745,20 +1858,95 @@ pub fn yield_now() {
         task_idx: idx as u32,
         core: my_core as u8,
     });
-    // Phase 57 DEBUG: log right before the switch_context handoff so
-    // we can spot a yield that reaches here but doesn't hand off.
-    {
-        let n = YIELD_LOG_BUDGET[my_core].load(core::sync::atomic::Ordering::Relaxed);
-        if n >= 0 {
-            log::info!(
-                "[sched] yield-handoff core={} sched_rsp={:#x} idx={}",
-                my_core,
-                sched_rsp,
-                idx
-            );
-        }
-    }
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57d C.1 — voluntary preemption entry point
+// ---------------------------------------------------------------------------
+
+/// Preempt the current task at an interrupt boundary and switch to the
+/// scheduler.
+///
+/// Called from [`timer_handler_user`] and [`reschedule_ipi_handler_user`]
+/// (under `#[cfg(feature = "preempt-voluntary")]`) when
+/// `preempt_resched_pending` is set and the task is in ring 3.
+///
+/// Saves `frame` into `task.preempt_frame`, marks `resume_mode = Preempted`,
+/// then performs the same `PENDING_REENQUEUE + switch_context` handoff that
+/// [`yield_now`] uses.  The dispatch loop (D.3) will see `Preempted` and
+/// resume via `preempt_resume_to_user` rather than `switch_context`.
+///
+/// # Safety / divergence
+///
+/// This function never returns.  `switch_context` saves the current RSP and
+/// jumps to the scheduler; the task's next dispatch goes through
+/// `preempt_resume_to_user` (`iretq`), which bypasses `switch_context`'s
+/// return path entirely.
+#[cfg(feature = "preempt-voluntary")]
+pub fn preempt_to_scheduler(
+    frame: &crate::arch::x86_64::preempt_trap_frame::PreemptTrapFrameUser,
+) -> ! {
+    preempt_frame_to_scheduler(frame.to_preempt_frame())
+}
+
+/// Switch away from the current task using an already-materialised full
+/// userspace register frame.
+///
+/// This is shared by IRQ-return preemption and syscall-return preemption.
+/// The IRQ path builds the frame from the interrupt stack; the syscall path
+/// builds an equivalent frame from the syscall entry save area after the
+/// syscall return value is known.
+#[cfg(feature = "preempt-voluntary")]
+pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::PreemptFrame) -> ! {
+    let my_core = crate::smp::per_core().core_id as usize;
+    let (idx, preempt_count_ptr) = {
+        let mut sched = scheduler_lock();
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => {
+                drop(sched);
+                panic!("preempt_to_scheduler: no current task on core {}", my_core);
+            }
+        };
+        accumulate_ticks(&mut sched, idx);
+        let preempt_count_ptr: *const core::sync::atomic::AtomicI32 =
+            &raw const sched.tasks[idx].preempt_count;
+        if let Some(urs) = sched.tasks[idx].user_return.as_mut() {
+            urs.fs_base = x86_64::registers::model_specific::FsBase::read().as_u64();
+        }
+        sched.tasks[idx].preempt_frame = preempt_frame;
+        sched.tasks[idx]
+            .resume_mode
+            .store(ResumeMode::Preempted as u8, Ordering::Release);
+        // E.1: mark RSP-publication window (cleared by dispatch epilogue).
+        sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+        set_current_task_idx(None);
+        (idx, preempt_count_ptr)
+    };
+    // The preemption gates only enter this path from user/syscall-return
+    // boundaries where the task's counter was observed as zero. Scheduler
+    // bookkeeping during the handoff must not leak a transient disable into
+    // the resumed user task, or the next timer/IPI will be suppressed forever.
+    unsafe {
+        (*preempt_count_ptr).store(0, Ordering::Release);
+    }
+    // Store idx so the dispatch epilogue can commit saved_rsp and re-enqueue.
+    PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
+    let sched_rsp = per_core_scheduler_rsp();
+    debug_assert!(
+        sched_rsp != 0,
+        "preempt_to_scheduler: scheduler RSP is zero on core {}",
+        my_core
+    );
+    // SAFETY: same invariants as yield_now.  switch_context saves the current
+    // RSP (inside this frame) and jumps to the scheduler.  The saved RSP is
+    // committed to task.saved_rsp by the epilogue but never loaded — D.3 uses
+    // preempt_resume_to_user instead.  This call therefore never returns.
+    unsafe {
+        switch_context(per_core_switch_save_rsp_ptr(), sched_rsp);
+        core::hint::unreachable_unchecked()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,6 +1970,17 @@ pub fn set_current_user_return(urs: crate::task::UserReturnState) {
     }
 }
 
+/// Reset the current task to the architectural FPU/SIMD defaults after exec.
+pub fn reset_current_task_fpu_state() {
+    if let Some(idx) = get_current_task_idx() {
+        let mut sched = scheduler_lock();
+        if let Some(area) = sched.fpu_states.get_mut(idx) {
+            **area = FxSaveArea::new();
+            unsafe { restore_fpu_state(area.as_ref()) };
+        }
+    }
+}
+
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
     let mut sched = scheduler_lock();
@@ -1789,6 +1988,18 @@ pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let ctx = task.fork_ctx.take()?;
     task.priority = 20;
     Some(ctx)
+}
+
+/// Phase 57d follow-up — peek at the current task's `fork_ctx.pid`
+/// without consuming the context. Used by the fork-child trampoline's
+/// pre-panic diagnostic log so we can attribute "trampoline entered"
+/// events to the correct child pid even if a later step panics or
+/// hangs before `take_current_task_fork_ctx` is called.
+pub fn current_task_fork_ctx_pid() -> Option<u32> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let task = sched.tasks.get(idx)?;
+    task.fork_ctx.as_ref().map(|c| c.pid)
 }
 
 /// Return the PID associated with the given task index.
@@ -1806,6 +2017,20 @@ fn task_pid(idx: usize) -> u32 {
 pub fn pid_for_task_id(task_id: TaskId) -> Option<u32> {
     let sched = scheduler_lock();
     sched.tasks.iter().find(|t| t.id == task_id).map(|t| t.pid)
+}
+
+/// Return `(pid, name)` for a [`TaskId`] in one scheduler-lock acquisition,
+/// or `None` if no live task carries `task_id`. Used by IPC diagnostics so
+/// a single warning can show both the pid (which userspace identifies
+/// processes by) and the kernel-side debug name (which says e.g.
+/// `fork-child` vs `init`).
+pub fn task_label_for_id(task_id: TaskId) -> Option<(u32, &'static str)> {
+    let sched = scheduler_lock();
+    sched
+        .tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .map(|t| (t.pid, t.name))
 }
 
 /// Return the user and system tick counts for the current task.
@@ -1853,6 +2078,14 @@ pub fn task_debug_snapshot(id: TaskId) -> Option<TaskDebugSnapshot> {
         task.last_ready_tick,
         task.last_migrated_tick,
     ))
+}
+
+/// Return the blocking state and assigned core for a task.
+pub fn task_state_and_assigned_core(id: TaskId) -> Option<(TaskState, u8)> {
+    let sched = scheduler_lock();
+    let idx = sched.find(id)?;
+    let task = sched.tasks.get(idx)?;
+    Some((task.state, task.assigned_core))
 }
 
 /// Return dead tasks whose IPC state still needs deferred cleanup.
@@ -1949,6 +2182,8 @@ pub fn block_current_until(
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ),
         "block_current_until kind must be a Blocked* variant; got {:?}",
         kind
@@ -2000,6 +2235,8 @@ pub fn block_current_until(
         // scheduler_lock dropped here.
     };
 
+    preempt_disable();
+
     // ── Step 1: Atomic state write under pi_lock (OUTER) → scheduler_lock (INNER)
     //
     // SAFETY: pi_lock_ptr points into the stable Task struct captured above.
@@ -2014,6 +2251,7 @@ pub fn block_current_until(
         {
             let mut sched = scheduler_lock();
             if idx >= sched.tasks.len() {
+                preempt_enable();
                 return BlockOutcome::AlreadyTrue;
             }
             // Canonical (pi_lock-protected) write.
@@ -2038,6 +2276,10 @@ pub fn block_current_until(
             // because `on_cpu` clears only at the dispatch epilogue, which
             // can't run until the ISR returns; that would deadlock.
             sched.tasks[idx].on_cpu.store(true, Ordering::Release);
+            // D.2: cooperative block — dispatch via switch_context on resume.
+            sched.tasks[idx]
+                .resume_mode
+                .store(ResumeMode::Cooperative as u8, Ordering::Release);
             save_user_return_state(
                 &mut sched.tasks[idx],
                 addr_space_snapshot.0,
@@ -2101,11 +2343,13 @@ pub fn block_current_until(
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
-        return if already_expired {
+        let outcome = if already_expired {
             BlockOutcome::DeadlineExpired
         } else {
             BlockOutcome::AlreadyTrue
         };
+        preempt_enable();
+        return outcome;
     }
 
     // ── Step 4: Yield via SCHEDULER.lock → switch_context ────────────────────
@@ -2129,6 +2373,7 @@ pub fn block_current_until(
     // SAFETY: same invariants as block_current_unless_woken_inner — we are
     // the running task on this core, scheduler RSP is valid.
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+    preempt_enable();
 
     // On resume: the waker called wake_task which transitioned us to Ready and
     // re-enqueued us. The dispatch loop re-set current_task_idx. Now check why
@@ -2170,26 +2415,22 @@ pub fn block_current_until(
 /// function instead of `block_current_on_reply_unless_message`.  The semantic
 /// outcome is identical: the caller resumes when a reply is delivered.
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
-    use core::sync::atomic::AtomicBool;
-
-    // Check if a message was already delivered before we even try to block.
-    {
-        let sched = scheduler_lock();
-        if sched
-            .find(caller)
-            .map(|idx| sched.tasks[idx].pending_msg.is_some())
-            .unwrap_or(false)
-        {
-            return true;
-        }
+    let woken = Arc::new(AtomicBool::new(false));
+    if !register_reply_waker(caller, woken.clone()) {
+        return false;
     }
 
-    // Use a stack-allocated AtomicBool as the v2 woken flag.
-    // Track D will set this from wake_task; for now it stays false until
-    // the block side self-reverts (which cannot happen without Track D waking it).
-    let woken = AtomicBool::new(false);
+    // Register the waker before checking pending_msg. If the server replies
+    // between this check and the state transition inside block_current_until,
+    // deliver_message sets `woken`, so the block side self-reverts instead of
+    // parking after an AlreadyAwake wake_task_v2 outcome.
+    if has_pending_message(caller) {
+        clear_reply_waker(caller);
+        return true;
+    }
 
     let outcome = block_current_until(TaskState::BlockedOnReply, &woken, None);
+    clear_reply_waker(caller);
 
     // Regardless of the outcome, the caller (call_msg) will call take_message()
     // to confirm message delivery. We report true for Woken/AlreadyTrue, false
@@ -2197,6 +2438,23 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     match outcome {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
+    }
+}
+
+fn register_reply_waker(id: TaskId, waker: Arc<AtomicBool>) -> bool {
+    let mut sched = scheduler_lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].reply_waker = Some(waker);
+        true
+    } else {
+        false
+    }
+}
+
+fn clear_reply_waker(id: TaskId) {
+    let mut sched = scheduler_lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].reply_waker = None;
     }
 }
 
@@ -2628,6 +2886,8 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ) {
             return WakeOutcome::AlreadyAwake;
         }
@@ -2764,6 +3024,9 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].pending_msg = Some(msg);
+        if let Some(waker) = sched.tasks[idx].reply_waker.as_ref() {
+            waker.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2779,6 +3042,9 @@ pub fn try_deliver_message(id: TaskId, msg: Message) -> bool {
         && sched.tasks[idx].pending_msg.is_none()
     {
         sched.tasks[idx].pending_msg = Some(msg);
+        if let Some(waker) = sched.tasks[idx].reply_waker.as_ref() {
+            waker.store(true, Ordering::Release);
+        }
         return true;
     }
     false
@@ -2978,12 +3244,7 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
 /// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
-    // Phase 57 DEBUG: log scheduler-loop iterations per core so we can
-    // tell whether a "stuck" core is actually executing the loop at all.
-    // Bumped from 4 to 1024 (Phase 57a follow-up) so a per-core dispatch
-    // failure that emerges AFTER the initial 4 events is still visible
-    // in the boot transcript.  Once the per-core dispatch regression is
-    // root-caused, restore the smaller budget.
+    // Phase 57d: budget for initial dispatcher debug logs (debug-level, off in release).
     let mut wake_log_budget: u32 = 1024;
     let mut dispatch_log_budget: u32 = 1024;
     let mut resume_log_budget: u32 = 1024;
@@ -2999,7 +3260,7 @@ pub fn run() -> ! {
         interrupts::enable();
 
         if wake_log_budget > 0 {
-            log::info!("[sched] run-loop wake core={}", core_id);
+            log::debug!("[sched] run-loop wake core={}", core_id);
             wake_log_budget -= 1;
         }
 
@@ -3042,6 +3303,7 @@ pub fn run() -> ! {
         if core_id == 0 {
             crate::ipc::notification::drain_pending_waiters();
         }
+        crate::ipc::registry::drain_pending_service_waiters();
 
         // Remove dead tasks (BSP only to avoid contention).
         if core_id == 0 {
@@ -3296,10 +3558,24 @@ pub fn run() -> ! {
         // dropped.  The retarget itself happens further below — after every
         // scheduler-context lock guard has been released — so that the
         // pointer transition does not straddle a lock acquire/release.
-        let task_preempt_count_ptr: *const core::sync::atomic::AtomicI32 = {
+        //
+        // Phase 57d D.3: also capture resume_mode and preempt_frame ptr so
+        // the Preempted branch below can call preempt_resume_to_user without
+        // re-acquiring the lock.
+        let (
+            task_preempt_count_ptr,
+            _task_resume_mode,
+            _task_preempt_frame_ptr,
+            task_fpu_state_ptr,
+        ) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
-                if let Some((base, top)) = task.stack_bounds() {
+                let resume_mode = ResumeMode::from(task.resume_mode.load(Ordering::Acquire));
+                // For Preempted tasks, task_rsp is on the process kernel stack (TSS.RSP0
+                // stack), not the task kernel stack — skip the stack-bounds check.
+                if resume_mode != ResumeMode::Preempted
+                    && let Some((base, top)) = task.stack_bounds()
+                {
                     debug_assert!(
                         task_rsp >= base && task_rsp < top,
                         "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
@@ -3310,17 +3586,29 @@ pub fn run() -> ! {
                         core_id
                     );
                 }
-                &task.preempt_count as *const core::sync::atomic::AtomicI32
+                (
+                    &task.preempt_count as *const core::sync::atomic::AtomicI32,
+                    resume_mode,
+                    &task.preempt_frame as *const kernel_core::preempt_frame::PreemptFrame,
+                    sched
+                        .fpu_states
+                        .get(_task_idx)
+                        .map(|area| area.as_ref() as *const FxSaveArea)
+                        .unwrap_or(core::ptr::null()),
+                )
             } else {
-                core::ptr::null()
+                (
+                    core::ptr::null(),
+                    ResumeMode::Initial,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                )
             }
         };
 
-        // Phase 57 DEBUG: log per-core dispatches just before
-        // switch_context. Pairs with `resume` log below to detect a
-        // dispatch that hangs / never returns to the scheduler.
+        // Log per-core dispatches (debug-level; paired with resume log below).
         if dispatch_log_budget > 0 {
-            log::info!(
+            log::debug!(
                 "[sched] dispatch core={} task_idx={} task_rsp={:#x}",
                 core_id,
                 _task_idx,
@@ -3352,8 +3640,41 @@ pub fn run() -> ! {
             // observably whatever the chosen task's saved RFLAGS dictates.
             interrupts::disable();
         }
+        if !task_fpu_state_ptr.is_null() {
+            unsafe { restore_fpu_state(&*task_fpu_state_ptr) };
+        }
 
         // Switch to the task.
+        //
+        // Phase 57d D.3 (fix): For Preempted tasks, use dispatch_preempted_and_resume
+        // which saves the scheduler RSP before iretq-ing to user mode. The previous
+        // direct call to preempt_resume_to_user diverged without updating
+        // per_core_scheduler_rsp, leaving a stale frame that the dispatch loop's
+        // own stack usage would overwrite. On the next preemption, switch_context
+        // loaded the clobbered frame → garbage callee-saves → UB → panic.
+        //
+        // INVARIANT: for Preempted tasks, task_rsp is the RSP saved inside
+        // preempt_to_scheduler (on the task's kernel stack), not a cooperative RSP.
+        // The Preempted branch ignores task_rsp and uses _task_preempt_frame_ptr
+        // instead; cooperative/initial branches use task_rsp via switch_context.
+        #[cfg(feature = "preempt-voluntary")]
+        if _task_resume_mode == ResumeMode::Preempted && !_task_preempt_frame_ptr.is_null() {
+            // SAFETY: task.preempt_frame lives for the task's lifetime.
+            // IRQs are disabled (retarget_preempt_count_to_task left them masked).
+            // dispatch_preempted_and_resume returns when the task next switches back
+            // to the scheduler (preempted or cooperative).
+            unsafe {
+                crate::arch::x86_64::interrupts::dispatch_preempted_and_resume(
+                    per_core_scheduler_rsp_ptr(),
+                    _task_preempt_frame_ptr,
+                );
+            }
+        } else {
+            unsafe {
+                switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
+            }
+        }
+        #[cfg(not(feature = "preempt-voluntary"))]
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
@@ -3374,7 +3695,7 @@ pub fn run() -> ! {
 
         // --- Scheduler resumes here after the task yields back ---
         if resume_log_budget > 0 {
-            log::info!("[sched] resume core={}", core_id);
+            log::debug!("[sched] resume core={}", core_id);
             resume_log_budget -= 1;
         }
         // The task's RSP has now been saved by switch_context. Commit bookkeeping.
@@ -3402,6 +3723,9 @@ pub fn run() -> ! {
                     core_id
                 );
                 if sidx < sched.tasks.len() {
+                    if let Some(area) = sched.fpu_states.get_mut(sidx) {
+                        unsafe { save_fpu_state(area.as_mut()) };
+                    }
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
                     // E.1 epilogue: clear on_cpu AFTER saved_rsp is durably written.
@@ -3424,13 +3748,13 @@ pub fn run() -> ! {
                     }
 
                     // Phase 54 diagnostic: detect CPU-hog patterns. If a task
-                    // held the CPU for >= 20 ticks (~200 ms) before yielding,
-                    // log it. Suggests a syscall that spin-waits (e.g.
+                    // held the CPU for >= 200 ms before yielding, log it.
+                    // Suggests a syscall that spin-waits (e.g.
                     // virtio_blk poll under contention) rather than a normal
                     // interactive task.
                     let now = crate::arch::x86_64::interrupts::tick_count();
                     let ran_ticks = now.saturating_sub(task.start_tick);
-                    if ran_ticks >= 20 {
+                    if ran_ticks >= 200 {
                         let exec_path = if task.pid != 0 {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table.find(task.pid).map(|proc| proc.exec_path.clone())
@@ -3540,6 +3864,8 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex
+                | TaskState::BlockedOnWait
+                | TaskState::BlockedOnService
         ) {
             // Not Blocked* — stale deadline.  Don't touch it here; the next
             // state transition (or the next scan after wake_task_v2 clears
@@ -3846,8 +4172,15 @@ pub fn watchdog_scan() {
                     | super::TaskState::BlockedOnReply
                     | super::TaskState::BlockedOnNotif
                     | super::TaskState::BlockedOnFutex
+                    | super::TaskState::BlockedOnWait
+                    | super::TaskState::BlockedOnService
             );
             if !is_blocked {
+                continue;
+            }
+            // A server sitting in a plain receive loop has no timeout/deadline
+            // by design; warn on receive blocks only when a deadline exists.
+            if task.state == super::TaskState::BlockedOnRecv && task.wake_deadline.is_none() {
                 continue;
             }
             let verdict = watchdog_verdict(now, task.blocked_since_tick, task.wake_deadline);
