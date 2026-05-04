@@ -4,7 +4,7 @@
 //! (whether XSAVE is supported by the CPU, whether the OS is allowed to enable
 //! it via CR4.OSXSAVE, the supported state-component bitmap, the maximum and
 //! current XSAVE area sizes for those components, and whether `xsaveopt` is
-//! available).  The result is stored in a `OnceCell` and consulted by:
+//! available).  The result is stored in a `spin::Once` and consulted by:
 //!
 //! * `enable_xsave_state()` (BSP and AP boot) — to set CR4.OSXSAVE and write
 //!   the per-core XCR0 mask.
@@ -31,9 +31,11 @@ use spin::Once;
 /// AVX (bit 2).  AVX-512 (bit 5) is intentionally deferred.
 pub const XSAVE_FEATURE_MASK: u64 = 0x7;
 
-/// Static XSAVE area size for the 1.0 mask.  Validated at boot against the
-/// runtime CPUID-reported size in `XSaveFeatures::area_size` — if a future
-/// CPUID change ever makes this too small, the kernel panics.
+/// Static XSAVE area size for the 1.0 mask.  Validated at boot in
+/// `kernel_main` against the post-`enable_xsave_state` size returned by
+/// [`enabled_area_size`] (CPUID 0Dh.0.EBX re-read after `xsetbv` so it
+/// reflects the actually-enabled XCR0 mask) — if a future CPUID change
+/// ever makes this too small, the kernel panics.
 ///
 /// Intel SDM Vol 1 §13.4: with x87 + SSE + AVX enabled in XCR0, the standard
 /// area is 832 bytes (legacy region 512, header 64, AVX YMM_HI region 256).
@@ -220,26 +222,22 @@ struct CpuidRaw {
 }
 
 /// Execute `cpuid` with the given leaf and sub-leaf.
+///
+/// Delegates to [`core::arch::x86_64::__cpuid_count`], the canonical
+/// intrinsic that handles RBX preservation under PIC correctly.  An earlier
+/// hand-rolled inline-asm version used `out(reg) _` for the RBX spill slot,
+/// which the compiler could legitimately allocate to RBX itself — making the
+/// save a `mov rbx, rbx` no-op and corrupting the caller's RBX after the
+/// `cpuid` clobber.
 fn cpuid_raw(leaf: u32, sub_leaf: u32) -> CpuidRaw {
-    let eax: u32;
-    let ebx: u32;
-    let ecx: u32;
-    let edx: u32;
-    unsafe {
-        // Preserve rbx (LLVM reserves it under PIC).  Spill via a free
-        // register, then restore.
-        core::arch::asm!(
-            "mov {rbx_save:r}, rbx",
-            "cpuid",
-            "mov {ebx_out:r}, rbx",
-            "mov rbx, {rbx_save:r}",
-            rbx_save = out(reg) _,
-            ebx_out = out(reg) ebx,
-            inout("eax") leaf => eax,
-            inout("ecx") sub_leaf => ecx,
-            out("edx") edx,
-            options(nomem, nostack, preserves_flags),
-        );
+    // `__cpuid_count` is safe on x86_64 — the `cpuid` instruction is
+    // unconditionally available (it's the architectural feature-discovery
+    // mechanism) and has no preconditions beyond setting eax/ecx.
+    let result = core::arch::x86_64::__cpuid_count(leaf, sub_leaf);
+    CpuidRaw {
+        eax: result.eax,
+        ebx: result.ebx,
+        ecx: result.ecx,
+        edx: result.edx,
     }
-    CpuidRaw { eax, ebx, ecx, edx }
 }

@@ -586,7 +586,7 @@ The kernel today uses `fxsave64`/`fxrstor64` (`kernel/src/task/scheduler.rs:1428
 **Why it matters:** XSAVE faults if `CR4.OSXSAVE` is not set or if `XCR0` does not enable the state components passed to xsave's mask.  Both must be configured on every core.
 
 **Acceptance:**
-- [x] Helper sets `CR4.OSXSAVE` (bit 18); verifies `CR4.OSFXSR` is already set via `debug_assert!`.
+- [x] Helper sets `CR4.OSXSAVE` (bit 18); verifies `CR4.OSFXSR` is already set via `assert!` (release builds fail fast — see commit a70445c, was `debug_assert!` originally).
 - [x] Helper writes `XCR0 = 0x7` (x87 | SSE | AVX) via `xsetbv` with ECX=0.
 - [x] BSP calls the helper before the first `spawn_kernel_task` / `spawn_user_task`. — Wired into `kernel_main` after `smp::init_bsp_per_core` and before `smp::boot::boot_aps()` so APs inherit `CR4.OSXSAVE` from the trampoline `DATA_CR4` copy.
 - [x] Each AP calls the helper before entering the scheduler idle loop in `smp::boot`. — Wired into `ap_entry` after the trampoline CR4 load (which carries OSXSAVE forward) and before the scheduler enter; XCR0 is per-core and not part of CR4, so it must be set on each AP individually.
@@ -607,7 +607,7 @@ The kernel today uses `fxsave64`/`fxrstor64` (`kernel/src/task/scheduler.rs:1428
 - [x] `XSaveArea::new()` initialises:
   - First 24 bytes (legacy region): x87 control word `0x037F`, MXCSR `0x1F80`, MXCSR mask `0xFFFF`, matching `FxSaveArea::new()`.
   - Header region (offset 512–575): clear `XSTATE_BV` to 0 — the xsave init optimisation interprets this as "no state is in modified-from-init form", so xrstor will load architectural defaults for everything.
-- [x] Boot-time assertion: `XSAVE_AREA_SIZE >= xsave_features().area_size_at_mask` — panics in `kernel_main` before `enable_xsave_state` if a future CPUID change makes the static size too small.
+- [x] Boot-time assertion: `XSAVE_AREA_SIZE >= cpuid::enabled_area_size()` — panics in `kernel_main` *after* `enable_xsave_state` runs (re-queries CPUID 0Dh.0.EBX once XCR0 = 0x7 is live, since the probe-time `area_size_at_mask` reflects the reset XCR0 and is not suitable for the size check).
 - [x] `Scheduler::fpu_states: Vec<Box<XSaveArea>>` — type updated; all callsites migrated.
 
 ### J.4 — Replace asm with `xsave64` / `xrstor64`

@@ -32,7 +32,7 @@ kernel busy-spin and per-CPU access pattern in `kernel/src/`.  It covers:
 | `kernel/src/iommu/intel.rs:362–380` | `invalidate_context_cache_global` | VT-d ICC poll | placeholder → wrapped | yes | 362–380 | B.2 — added |
 | `kernel/src/iommu/intel.rs:382–402` | `invalidate_iotlb_global` | VT-d IVT poll | placeholder → wrapped | yes | 382–402 | B.2 — added |
 | `kernel/src/rtc.rs:81–123` | `read_rtc` | UIP wait + double-read retry | placeholder → wrapped | yes | 81–123 | B.2 — added (whole function) |
-| `kernel/src/task/scheduler.rs:3001–3015` | `wake_task_v2` | cross-core `on_cpu` spin | placeholder → wrapped | yes | 3011–3015 | B.2 — added; pinning the waker prevents migration mid-spin |
+| `kernel/src/task/scheduler.rs:3200–3209` | `wake_task_v2` | cross-core `on_cpu` spin | placeholder → wrapped | yes | 3205–3209 | B.2 — added; pinning the waker prevents migration mid-spin |
 
 ### B.1 — Verified intact
 
