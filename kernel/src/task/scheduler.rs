@@ -1718,6 +1718,135 @@ pub fn preempt_enable() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 57e Track D.3 — held-lock watchdog
+// ---------------------------------------------------------------------------
+//
+// Catches missed `preempt_disable` annotations around a *non-IrqSafeMutex*
+// scheduler-context lock under PREEMPT_FULL.  The discipline 57e is most
+// exposed to: a kernel function takes a raw `spin::Mutex` (which does **not**
+// raise `preempt_count`), an IRQ fires while the lock is held, the
+// `check_and_preempt_kernel` predicate observes `preempt_count == 0` and
+// preempts — leaving the next dispatch on a different core trying to acquire
+// the same lock.  Without the watchdog, that bug presents only as a deadlock
+// during the 24-hour soak with no obvious source.
+//
+// # Current registry
+//
+// As of 57e, every scheduler-context lock in m3OS is `IrqSafeMutex`, which
+// raises `preempt_count` on acquire (Phase 57b F.1).  No raw `spin::Mutex` is
+// known to participate in scheduler-context state — so the registry below
+// records *zero* tracked locks today and the watchdog is a defensive
+// framework rather than an active alarm.  The hook is wired into
+// `check_and_preempt_kernel` and the registration API
+// (`register_held_lock` / `release_held_lock`) is `pub(crate)` so a future
+// PR introducing a non-IrqSafe scheduler-context lock can opt into the
+// watchdog without restructuring the IRQ path.
+//
+// If a missed-annotation bug is suspected, a debug-build extension can call
+// `register_held_lock` from `IrqSafeMutex::lock` itself to expand the
+// coverage to every scheduler-context lock; the API is shaped to allow that
+// without changing the watchdog's call site or output format.
+
+/// Maximum number of locks tracked by the watchdog.  Sized to comfortably
+/// cover the canonical scheduler-context lock set (SCHEDULER, IRQ_REGISTRY,
+/// IPC_PORTS, …) plus headroom for ad-hoc opt-in tracking during debugging.
+#[cfg(feature = "preempt-full")]
+pub(crate) const WATCHDOG_TRACKED_LOCK_COUNT: usize = 16;
+
+/// Watchdog registry entry: `(name, holder_pid)`.
+///
+/// `holder_pid == 0` means "unheld" (PID 0 is the kernel idle task, which
+/// never acquires scheduler-context locks under the discipline).
+#[cfg(feature = "preempt-full")]
+#[allow(dead_code)]
+pub(crate) struct HeldLockSlot {
+    pub name: &'static str,
+    pub holder_pid: core::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "preempt-full")]
+#[allow(dead_code)]
+impl HeldLockSlot {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            holder_pid: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+/// Static watchdog registry.  Empty by default — see the module-level
+/// commentary above for why.
+#[cfg(feature = "preempt-full")]
+#[allow(dead_code)]
+pub(crate) static HELD_LOCK_REGISTRY: [HeldLockSlot; 0] = [];
+
+/// Register the current task as the holder of `lock_idx` in the registry.
+/// No-op on out-of-range or unregistered indices.
+#[cfg(feature = "preempt-full")]
+#[allow(dead_code)]
+pub(crate) fn register_held_lock(lock_idx: usize) {
+    if lock_idx >= HELD_LOCK_REGISTRY.len() {
+        return;
+    }
+    let pid = crate::process::current_pid();
+    HELD_LOCK_REGISTRY[lock_idx]
+        .holder_pid
+        .store(pid, core::sync::atomic::Ordering::Release);
+}
+
+/// Clear the holder of `lock_idx` in the registry.  Pairs with
+/// `register_held_lock` at the matching `Drop`.
+#[cfg(feature = "preempt-full")]
+#[allow(dead_code)]
+pub(crate) fn release_held_lock(lock_idx: usize) {
+    if lock_idx >= HELD_LOCK_REGISTRY.len() {
+        return;
+    }
+    HELD_LOCK_REGISTRY[lock_idx]
+        .holder_pid
+        .store(0, core::sync::atomic::Ordering::Release);
+}
+
+/// Phase 57e Track D.3 — at kernel-mode preempt entry, scan the tracked-lock
+/// registry for the current pid.  If any match, emit a `[WARN] [preempt]
+/// kernel-mode preemption with held lock` line and (in debug builds) panic.
+///
+/// Returns `true` if a held lock was observed (caller should suppress the
+/// preempt for safety in release builds).  Returns `false` on the clean
+/// path; callers proceed with the preempt.
+///
+/// Currently always returns `false` because `HELD_LOCK_REGISTRY` is empty —
+/// see the module-level commentary.  The function is still wired into the
+/// IRQ-handler path so a future patch enabling tracked locks does not need
+/// to revisit the IRQ side.
+#[cfg(feature = "preempt-full")]
+pub(crate) fn kernel_preempt_watchdog(rip: u64) -> bool {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return false;
+    }
+    for slot in HELD_LOCK_REGISTRY.iter() {
+        if slot.holder_pid.load(core::sync::atomic::Ordering::Acquire) == pid {
+            log::warn!(
+                "[preempt] kernel-mode preemption with held lock pid={} lock={} rip={:#x}",
+                pid,
+                slot.name,
+                rip
+            );
+            #[cfg(debug_assertions)]
+            panic!(
+                "kernel_preempt_watchdog: pid={} held lock {} at preempt rip={:#x}",
+                pid, slot.name, rip
+            );
+            #[cfg(not(debug_assertions))]
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Phase 57d F.1 — lock-free IRQ-context preempt count peek
 // ---------------------------------------------------------------------------
 

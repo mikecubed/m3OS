@@ -1437,6 +1437,15 @@ unsafe fn check_and_preempt_kernel(
     if !reschedule && !pending {
         return; // no rescheduling requested
     }
+    // Phase 57e Track D.3 — held-lock watchdog.  In release builds the
+    // watchdog returns `true` when a tracked lock is found held; we suppress
+    // the preempt in that case because dispatching with a held
+    // scheduler-context lock would deadlock on the next acquire on a
+    // different core.  In debug builds the watchdog panics so the
+    // discipline bug surfaces immediately rather than during the soak.
+    if crate::task::scheduler::kernel_preempt_watchdog(frame.rip) {
+        return;
+    }
     #[cfg(feature = "sched-trace")]
     unsafe {
         emit_preempt_trace(frame.rip, trigger, true);
