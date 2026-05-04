@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.57.4"
+version = "0.57.5"
 edition = "2024"
 
 [dependencies]
@@ -32,6 +32,13 @@ sched-trace = []
 # gates once the 24-hour post-flip soak (I.2) passes. Until then, the gates remain as
 # rollback safety. See docs/roadmap/tasks/57d-voluntary-preemption-tasks.md § I.3.
 preempt-voluntary = []
+# Phase 57e — Full Kernel Preemption (PREEMPT_FULL).
+# When enabled, the kernel-mode IRQ handlers preempt at any preempt_count == 0
+# zero-crossing (not only at user-mode return as in 57d voluntary).  Layers on
+# top of preempt-voluntary so the user-mode preemption foundation is always in
+# force first.  Default OFF until the 24-hour soak (Track G) validates.
+# See docs/roadmap/tasks/57e-full-kernel-preemption-tasks.md.
+preempt-full = ["preempt-voluntary"]
 # When `hardened` is enabled, the `sys_block_read` whitelist is restricted to
 # production storage servers only (vfs_server, fat_server). Without this flag,
 # test binaries such as `nvme-crash-smoke` are also permitted, which allows
