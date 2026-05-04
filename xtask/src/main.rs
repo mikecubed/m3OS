@@ -324,7 +324,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>]... [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -2578,6 +2578,11 @@ struct TestArgs {
     timeout_secs: u64,
     display: bool,
     devices: DeviceSet,
+    /// Features forwarded verbatim to `cargo build --tests` via `--features`.
+    /// Accepts the same comma- or space-separated forms cargo does, including
+    /// the `crate/feat` syntax used to enable a feature on a workspace member
+    /// (e.g. `kernel/preempt-full`).  Repeated `--features` flags accumulate.
+    features: Vec<String>,
 }
 
 fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
@@ -2590,6 +2595,7 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
     let mut test_name = None;
     let mut timeout_secs = 60u64;
     let mut display = false;
+    let mut features: Vec<String> = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -2614,6 +2620,20 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
             "--display" => {
                 display = true;
             }
+            "--features" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `--features`".to_string())?;
+                features.push(value.clone());
+            }
+            "-F" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `-F`".to_string())?;
+                features.push(value.clone());
+            }
             _ if let Some(value) = arg.strip_prefix("--test=") => {
                 test_name = Some(value.to_string());
             }
@@ -2621,6 +2641,9 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
                 timeout_secs = value
                     .parse()
                     .map_err(|_| format!("invalid timeout value: {value}"))?;
+            }
+            _ if let Some(value) = arg.strip_prefix("--features=") => {
+                features.push(value.to_string());
             }
             _ => {
                 return Err(format!("unknown test flag `{arg}`"));
@@ -2634,6 +2657,7 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
         timeout_secs,
         display,
         devices,
+        features,
     })
 }
 
@@ -2641,7 +2665,7 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
 ///
 /// Uses `cargo build --tests --message-format=json` to discover the compiled
 /// test binary paths without running them.
-fn build_test_binaries(test_name: Option<&str>) -> Vec<PathBuf> {
+fn build_test_binaries(test_name: Option<&str>, features: &[String]) -> Vec<PathBuf> {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
@@ -2668,6 +2692,14 @@ fn build_test_binaries(test_name: Option<&str>) -> Vec<PathBuf> {
         test_flag = name.to_string();
         build_args.push("--test");
         build_args.push(&test_flag);
+    }
+
+    // Forward `--features` flags to cargo. Each entry was captured verbatim
+    // from a `--features <list>` / `-F <list>` / `--features=<list>` arg, so
+    // cargo applies its own comma-/space-splitting and `crate/feat` parsing.
+    for feat in features {
+        build_args.push("--features");
+        build_args.push(feat);
     }
 
     let output = Command::new(env!("CARGO"))
@@ -2744,7 +2776,7 @@ fn qemu_test_args_with_devices(
 }
 
 fn cmd_test(test_args: &TestArgs) {
-    let binaries = build_test_binaries(test_args.test_name.as_deref());
+    let binaries = build_test_binaries(test_args.test_name.as_deref(), &test_args.features);
     let ovmf = find_ovmf();
     let mut all_passed = true;
 
