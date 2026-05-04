@@ -1697,10 +1697,17 @@ pub fn preempt_enable() {
             #[cfg(feature = "preempt-full")]
             {
                 if x86_64::instructions::interrupts::are_enabled() {
-                    // Clear the pending flag so the next user-mode-return
-                    // boundary doesn't double-yield on a stale signal — the
-                    // immediate yield_now below is consuming this event now.
+                    // Clear both the pending flag and the per-core reschedule
+                    // request so the next IRQ or user-mode-return boundary
+                    // doesn't double-yield on a stale signal — the immediate
+                    // yield_now below is consuming this event now.  The
+                    // scheduler dispatch loop will swap `reschedule` itself
+                    // on its next iteration, but until then a concurrent IRQ
+                    // could observe the still-set flag and re-enter
+                    // `check_and_preempt_kernel` for redundant work.
                     pc.preempt_resched_pending
+                        .store(false, core::sync::atomic::Ordering::Release);
+                    pc.reschedule
                         .store(false, core::sync::atomic::Ordering::Release);
                     yield_now();
                     return;

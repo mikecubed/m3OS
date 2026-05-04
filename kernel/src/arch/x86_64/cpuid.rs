@@ -167,8 +167,12 @@ pub unsafe fn enable_xsave_state() {
     // CR4.OSFXSR (bit 9) is already set by the bootloader / startup — required
     // for fxsave64 to have worked under 57d.  We assert rather than set so an
     // unexpected unset surfaces loudly rather than silently re-enabling.
+    // `assert!` (not `debug_assert!`) so a release-build boot-path regression
+    // fails fast here instead of producing hard-to-debug #UD/#GP faults later
+    // on the first SSE/AVX instruction.  This runs once per core at boot;
+    // the runtime cost is irrelevant.
     let cr4 = Cr4::read();
-    debug_assert!(
+    assert!(
         cr4.contains(Cr4Flags::OSFXSR),
         "CR4.OSFXSR must be set before enable_xsave_state"
     );

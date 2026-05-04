@@ -1428,6 +1428,17 @@ unsafe fn check_and_preempt_kernel(
     let Some(core) = crate::smp::try_per_core() else {
         return;
     };
+    // Phase 57e early-boot guard.  Between `init_bsp_per_core` (per-core ready,
+    // `signal_reschedule` activates) and the first dispatch in
+    // `scheduler::run`, `current_task_idx == -1`.  Wakeups from notification /
+    // IPC paths can set `reschedule = true` in this window; without this guard
+    // the timer ISR would consume the flag and call
+    // `preempt_to_scheduler_kernel`, which panics in `preempt_frame_to_scheduler`
+    // ("no current task").  Bail without consuming the flag so the dispatch
+    // loop picks it up when it starts.
+    if crate::task::scheduler::get_current_task_idx().is_none() {
+        return;
+    }
     let reschedule = core
         .reschedule
         .swap(false, core::sync::atomic::Ordering::AcqRel);
@@ -1444,6 +1455,18 @@ unsafe fn check_and_preempt_kernel(
     // different core.  In debug builds the watchdog panics so the
     // discipline bug surfaces immediately rather than during the soak.
     if crate::task::scheduler::kernel_preempt_watchdog(frame.rip) {
+        // Restore the flags we consumed above so the next IRQ-return or
+        // user-mode-return boundary can act on the still-pending reschedule
+        // request.  A concurrent set from another core wins; otherwise we put
+        // back what we took.
+        if reschedule {
+            core.reschedule
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+        if pending {
+            core.preempt_resched_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
         return;
     }
     #[cfg(feature = "sched-trace")]
