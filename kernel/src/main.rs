@@ -164,6 +164,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
+    // Phase 57e Track J — enable XSAVE/AVX state preservation on the BSP.
+    //
+    // CPUID probe runs first so the kernel can panic with a clear message on
+    // pre-2011 CPUs (no OSXSAVE).  `enable_xsave_state` then sets CR4.OSXSAVE
+    // and writes XCR0 = x87+SSE+AVX = 0x7.
+    //
+    // Ordering matters: this must happen *before* `smp::boot::boot_aps()` so
+    // every AP picks up CR4.OSXSAVE = 1 from the trampoline's `DATA_CR4` slot
+    // (the trampoline reads BSP CR4 at install time, see kernel/src/smp/boot.rs).
+    // APs still need to set XCR0 themselves — XCR0 is per-core and not part
+    // of CR4 — handled in `ap_entry`.
+    let xsave = arch::x86_64::cpuid::probe();
+    log::info!(
+        "[xsave] supported components={:#x} max_area={} mask_area={} xsaveopt={}",
+        xsave.supported_components,
+        xsave.max_area_size,
+        xsave.area_size_at_mask,
+        xsave.xsaveopt
+    );
+    assert!(
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE >= xsave.area_size_at_mask,
+        "XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area ({})",
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE,
+        xsave.area_size_at_mask
+    );
+    unsafe { arch::x86_64::cpuid::enable_xsave_state() };
+
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
     // `userspace/drivers/e1000`. The kernel registers only virtio-net here;

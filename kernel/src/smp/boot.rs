@@ -389,11 +389,21 @@ pub fn boot_aps() {
 
 /// Rust entry point for APs, called from the trampoline.
 extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
-    // Load BSP's CR4 value to match feature flags (PGE, etc.).
+    // Load BSP's CR4 value to match feature flags (PGE, OSXSAVE, etc.).  The
+    // BSP set CR4.OSXSAVE during `kernel_main` (Phase 57e Track J) so this AP
+    // observes it set immediately after the load.
     let bsp_cr4 =
         unsafe { core::ptr::read_volatile((TRAMPOLINE_PHYS + DATA_CR4 as u64) as *const u64) };
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) bsp_cr4, options(nostack));
+    }
+
+    // Phase 57e Track J — write this AP's XCR0 to the 1.0 mask
+    // (x87 + SSE + AVX).  XCR0 is per-core: CR4.OSXSAVE was inherited from the
+    // BSP via the trampoline copy above, but XCR0 itself was not set yet on
+    // this core, so xsave64 / xrstor64 would fault until this call lands.
+    unsafe {
+        crate::arch::x86_64::cpuid::enable_xsave_state();
     }
 
     let data = unsafe { &*per_core_data_ptr };

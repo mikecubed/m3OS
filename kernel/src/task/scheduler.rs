@@ -229,7 +229,7 @@ use core::{
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{FxSaveArea, ResumeMode, Task, TaskId, TaskState, switch_context};
+use super::{ResumeMode, Task, TaskId, TaskState, XSaveArea, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
 type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
@@ -556,7 +556,7 @@ pub(crate) struct Scheduler {
     tasks: Vec<Box<Task>>,
     /// Per-task FPU/SIMD state, indexed in lock-step with `tasks`.
     #[allow(clippy::vec_box)]
-    fpu_states: Vec<Box<FxSaveArea>>,
+    fpu_states: Vec<Box<XSaveArea>>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
@@ -1087,15 +1087,15 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         crate::ipc::notification::clear_bound_task(idx);
         *sched.tasks[idx] = task;
         if idx < sched.fpu_states.len() {
-            *sched.fpu_states[idx] = FxSaveArea::new();
+            *sched.fpu_states[idx] = XSaveArea::new();
         } else {
-            sched.fpu_states.push(Box::new(FxSaveArea::new()));
+            sched.fpu_states.push(Box::new(XSaveArea::new()));
         }
         idx
     } else {
         let idx = sched.tasks.len();
         sched.tasks.push(Box::new(task));
-        sched.fpu_states.push(Box::new(FxSaveArea::new()));
+        sched.fpu_states.push(Box::new(XSaveArea::new()));
         idx
     }
 }
@@ -1424,25 +1424,71 @@ fn retarget_preempt_count_to_task(
     );
 }
 
+/// Phase 57e Track J — save the current task's FPU/AVX state.
+///
+/// Uses `xsaveopt64` when CPUID 0Dh.1 advertises XSAVEOPT, otherwise the plain
+/// `xsave64`.  Both forms take the state-component mask in `EDX:EAX`; we pass
+/// the 1.0 mask (x87 + SSE + AVX = 0x7) on every call.
+///
+/// Falls back to `fxsave64` when [`crate::arch::x86_64::cpuid::osxsave_enabled`]
+/// reports false — exercised only by the very early boot window before the BSP
+/// runs `enable_xsave_state`, where the only "FPU dirtiers" are heap-init smoke
+/// tests that touch x87 / SSE only.
 #[inline]
-unsafe fn save_fpu_state(area: &mut FxSaveArea) {
+unsafe fn save_fpu_state(area: &mut XSaveArea) {
     unsafe {
-        core::arch::asm!(
-            "fxsave64 [{area}]",
-            area = in(reg) area.as_mut_ptr(),
-            options(nostack, preserves_flags)
-        );
+        if crate::arch::x86_64::cpuid::osxsave_enabled() {
+            let mask = crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+            if crate::arch::x86_64::cpuid::features().xsaveopt {
+                core::arch::asm!(
+                    "xsaveopt64 [{area}]",
+                    area = in(reg) area.as_mut_ptr(),
+                    in("eax") mask as u32,
+                    in("edx") (mask >> 32) as u32,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                core::arch::asm!(
+                    "xsave64 [{area}]",
+                    area = in(reg) area.as_mut_ptr(),
+                    in("eax") mask as u32,
+                    in("edx") (mask >> 32) as u32,
+                    options(nostack, preserves_flags),
+                );
+            }
+        } else {
+            core::arch::asm!(
+                "fxsave64 [{area}]",
+                area = in(reg) area.as_mut_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
+/// Phase 57e Track J — restore the current task's FPU/AVX state.
+///
+/// Uses `xrstor64` with the 1.0 mask in `EDX:EAX`; falls back to `fxrstor64`
+/// when XSAVE has not been enabled yet (early boot window).
 #[inline]
-unsafe fn restore_fpu_state(area: &FxSaveArea) {
+unsafe fn restore_fpu_state(area: &XSaveArea) {
     unsafe {
-        core::arch::asm!(
-            "fxrstor64 [{area}]",
-            area = in(reg) area.as_ptr(),
-            options(nostack, preserves_flags)
-        );
+        if crate::arch::x86_64::cpuid::osxsave_enabled() {
+            let mask = crate::arch::x86_64::cpuid::XSAVE_FEATURE_MASK;
+            core::arch::asm!(
+                "xrstor64 [{area}]",
+                area = in(reg) area.as_ptr(),
+                in("eax") mask as u32,
+                in("edx") (mask >> 32) as u32,
+                options(nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "fxrstor64 [{area}]",
+                area = in(reg) area.as_ptr(),
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
@@ -1975,7 +2021,7 @@ pub fn reset_current_task_fpu_state() {
     if let Some(idx) = get_current_task_idx() {
         let mut sched = scheduler_lock();
         if let Some(area) = sched.fpu_states.get_mut(idx) {
-            **area = FxSaveArea::new();
+            **area = XSaveArea::new();
             unsafe { restore_fpu_state(area.as_ref()) };
         }
     }
@@ -3593,7 +3639,7 @@ pub fn run() -> ! {
                     sched
                         .fpu_states
                         .get(_task_idx)
-                        .map(|area| area.as_ref() as *const FxSaveArea)
+                        .map(|area| area.as_ref() as *const XSaveArea)
                         .unwrap_or(core::ptr::null()),
                 )
             } else {

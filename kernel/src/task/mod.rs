@@ -236,22 +236,49 @@ pub struct TaskBlockState {
 // Task structure
 // ---------------------------------------------------------------------------
 
+/// Per-task XSAVE area used by the dispatch boundary's
+/// `save_fpu_state` / `restore_fpu_state` helpers.
+///
+/// Phase 57e Track J: replaces the prior 512-byte 16-aligned `FxSaveArea`
+/// (FXSAVE legacy region only).  The expanded layout covers x87 + SSE + AVX
+/// state — the legacy region is the same first 512 bytes so the existing
+/// `XSTATE_BV` init sequence still produces the architectural defaults; the
+/// header sits at offset 512 (`XSTATE_BV` itself at 512, `XCOMP_BV` at 520),
+/// and the AVX YMM_HI region starts at offset 576.
+///
+/// Required alignment is 64 bytes (Intel SDM Vol 1 §13.4).
+///
+/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes)
+/// is checked at boot against the runtime CPUID-reported size; if a future
+/// CPUID change ever reports a larger area, the kernel panics at boot rather
+/// than silently truncating saved state.
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
-pub struct FxSaveArea {
-    bytes: [u8; 512],
+#[repr(C, align(64))]
+pub struct XSaveArea {
+    bytes: [u8; crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE],
 }
 
-impl FxSaveArea {
+impl XSaveArea {
     pub const fn new() -> Self {
-        let mut bytes = [0u8; 512];
-        // x87 control word = default 0x037f, MXCSR = default 0x1f80.
+        let mut bytes = [0u8; crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE];
+        // Legacy region defaults — same byte layout as the prior FxSaveArea
+        // so a freshly-restored task observes the architectural FPU/SSE
+        // defaults rather than zeroed control words.
+        // x87 control word = 0x037F (offset 0).
         bytes[0] = 0x7f;
         bytes[1] = 0x03;
+        // MXCSR = 0x1F80 (offset 24).
         bytes[24] = 0x80;
         bytes[25] = 0x1f;
+        // MXCSR mask = 0xFFFF (offset 28).
         bytes[28] = 0xff;
         bytes[29] = 0xff;
+        // Header region (offsets 512-575): XSTATE_BV cleared.  The xsave init
+        // optimisation interprets a clear `XSTATE_BV` as "no state in
+        // modified-from-init form", so xrstor will load architectural defaults
+        // for every component — exactly what we want for a freshly-allocated
+        // task.  XCOMP_BV stays clear (we use the standard XSAVE format, not
+        // compacted; xrstor selects format based on bit 63 of XCOMP_BV).
         Self { bytes }
     }
 

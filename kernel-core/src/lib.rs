@@ -41,3 +41,4 @@ pub mod tty;
 pub mod types;
 pub mod user_range;
 pub mod watchdog_policy;
+pub mod xsave_model;
