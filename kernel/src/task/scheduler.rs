@@ -1936,6 +1936,34 @@ pub fn preempt_to_scheduler(
     preempt_frame_to_scheduler(frame.to_preempt_frame())
 }
 
+/// Phase 57e Track C.0 — switch away from a preempted **kernel-mode** task.
+///
+/// Called from `timer_handler_kernel` and `reschedule_ipi_handler_kernel`
+/// (under `#[cfg(feature = "preempt-full")]`) when `preempt_count == 0` and
+/// `reschedule` is observed at the IRQ-return boundary in ring 0.
+///
+/// The 57d kernel-path asm stub already passes the captured kernel RSP as the
+/// second argument to the Rust handler; this shim builds a `PreemptFrame`
+/// from the on-stack `PreemptTrapFrameKernel` plus that captured RSP and
+/// delegates to the same `preempt_frame_to_scheduler` routine the user path
+/// uses.  All resume bookkeeping (`state = Ready`, `on_cpu = false`,
+/// `resume_mode = Preempted`, `Task::preempt_frame` write) lives in the
+/// shared routine — no `_kernel`-specific bookkeeping is duplicated here.
+///
+/// # Safety / divergence
+///
+/// Never returns.  `preempt_frame_to_scheduler` issues `switch_context` which
+/// jumps to the scheduler dispatch loop; the next dispatch goes through
+/// `preempt_resume_to_kernel` (3-field same-CPL `iretq`) rather than
+/// `switch_context`'s normal return path.
+#[cfg(feature = "preempt-full")]
+pub fn preempt_to_scheduler_kernel(
+    frame: &crate::arch::x86_64::preempt_trap_frame::PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
+) -> ! {
+    preempt_frame_to_scheduler(frame.to_preempt_frame(captured_kernel_rsp))
+}
+
 /// Switch away from the current task using an already-materialised full
 /// userspace register frame.
 ///
@@ -3714,12 +3742,38 @@ pub fn run() -> ! {
         if _task_resume_mode == ResumeMode::Preempted && !_task_preempt_frame_ptr.is_null() {
             // SAFETY: task.preempt_frame lives for the task's lifetime.
             // IRQs are disabled (retarget_preempt_count_to_task left them masked).
-            // dispatch_preempted_and_resume returns when the task next switches back
-            // to the scheduler (preempted or cooperative).
-            unsafe {
-                crate::arch::x86_64::interrupts::dispatch_preempted_and_resume(
-                    per_core_scheduler_rsp_ptr(),
-                    _task_preempt_frame_ptr,
+            // dispatch_preempted_and_resume[_kernel] returns when the task next
+            // switches back to the scheduler (preempted or cooperative).
+            //
+            // Phase 57e Track C.2: route between the user-mode and kernel-mode
+            // resume paths based on the saved CS RPL.  A wrong branch produces
+            // a privilege-changing iretq from a same-CPL frame (or vice versa)
+            // — both fault, but routing here avoids the fault entirely.
+            let saved_cs = unsafe { (*_task_preempt_frame_ptr).cs };
+            if saved_cs & 3 == 3 {
+                unsafe {
+                    crate::arch::x86_64::interrupts::dispatch_preempted_and_resume(
+                        per_core_scheduler_rsp_ptr(),
+                        _task_preempt_frame_ptr,
+                    );
+                }
+            } else {
+                #[cfg(feature = "preempt-full")]
+                unsafe {
+                    crate::arch::x86_64::interrupts::dispatch_preempted_and_resume_kernel(
+                        per_core_scheduler_rsp_ptr(),
+                        _task_preempt_frame_ptr,
+                    );
+                }
+                // Under preempt-voluntary alone, a kernel-mode preempt frame
+                // (CS rpl == 0) must not exist — `timer_handler_kernel` and
+                // `reschedule_ipi_handler_kernel` early-return without
+                // building a PreemptFrame.  Reaching this branch indicates a
+                // discipline bug; panic in debug builds.
+                #[cfg(not(feature = "preempt-full"))]
+                panic!(
+                    "kernel-mode preempt frame at dispatch with preempt-full disabled (cs={:#x})",
+                    saved_cs
                 );
             }
         } else {

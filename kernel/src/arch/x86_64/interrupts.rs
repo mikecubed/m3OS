@@ -794,6 +794,102 @@ core::arch::global_asm!(
     "ret",
 );
 
+// ---------------------------------------------------------------------------
+// Phase 57e Track C.1 / C.4 — preempt_resume_to_kernel + dispatch_preempted_and_resume_kernel
+// ---------------------------------------------------------------------------
+//
+// Same-CPL iretq resume: the CPU pops only `rip / cs / rflags` (3 fields,
+// 24 bytes) and does **not** swap rsp/ss.  Therefore RSP must already point
+// at the interrupted task's kernel stack at the moment of iretq.  This
+// routine's structure differs from `preempt_resume_to_user` in two ways:
+//
+//   1. We must `mov rsp, preempt_frame.rsp` BEFORE pushing the iretq frame
+//      so the 3-field push lands at the correct location on the interrupted
+//      kernel stack.
+//   2. The iretq frame is 3 fields (rflags / cs / rip) instead of 5
+//      (rflags / cs / rip / rsp / ss).
+//
+// Stack-safety note: the 24 bytes the iretq pushes occupy what was
+// originally the CPU-pushed IRQ frame on the interrupted kernel stack
+// (between `captured_kernel_rsp - 24` and `captured_kernel_rsp - 1`).
+// That region was the same scratch area the CPU wrote when the IRQ fired,
+// so no live kernel-stack data is overwritten.
+//
+// Calling convention: rdi = *const PreemptFrame.  Called only from
+// `dispatch_preempted_and_resume_kernel` with IRQs disabled.  Never returns.
+//
+// Gated on `preempt-full`: under voluntary mode no kernel-mode preempt
+// frames are ever produced, so the symbol is unreachable and excluded.
+
+#[cfg(feature = "preempt-full")]
+core::arch::global_asm!(
+    ".global preempt_resume_to_kernel",
+    "preempt_resume_to_kernel:",
+    // Save rip / cs / rflags into scratch BEFORE switching rsp — once we
+    // mov rsp we are no longer on the scheduler stack and pushes target the
+    // interrupted task's kernel stack.  rdi remains valid as the frame
+    // pointer because the frame lives in the heap-backed Task struct.
+    "mov rax, [rdi + 120]", // rip
+    "mov rbx, [rdi + 128]", // cs
+    "mov rcx, [rdi + 136]", // rflags
+    // Switch RSP to the interrupted task's kernel stack (the value the
+    // interrupted code had immediately before the IRQ fired).
+    "mov rsp, [rdi + 144]",
+    // Build the same-CPL iretq frame.  Push order: rflags first (highest
+    // address), cs middle, rip last (lowest, ends up at [rsp+0]).
+    "push rcx",
+    "push rbx",
+    "push rax",
+    // Restore GPRs from the frame.  Re-load rax/rbx/rcx (used as scratch
+    // above) and load rdi last (the frame pointer becomes invalid after).
+    "mov rax, [rdi + 0]",
+    "mov rbx, [rdi + 8]",
+    "mov rcx, [rdi + 16]",
+    "mov rdx, [rdi + 24]",
+    "mov rsi, [rdi + 32]",
+    "mov rbp, [rdi + 48]",
+    "mov r8,  [rdi + 56]",
+    "mov r9,  [rdi + 64]",
+    "mov r10, [rdi + 72]",
+    "mov r11, [rdi + 80]",
+    "mov r12, [rdi + 88]",
+    "mov r13, [rdi + 96]",
+    "mov r14, [rdi + 104]",
+    "mov r15, [rdi + 112]",
+    "mov rdi, [rdi + 40]",
+    "iretq",
+    //
+    // ---------------------------------------------------------------------------
+    // Phase 57e Track C.4 — dispatch_preempted_and_resume_kernel
+    //
+    // Mirror of `dispatch_preempted_and_resume` for kernel-mode preempted
+    // tasks.  Same scheduler-RSP publication discipline (the bug 57d D.3
+    // fixed) — diverges only in the final `jmp preempt_resume_to_kernel`.
+    //
+    // The shared `.Ldispatch_preempted_resume` label is reused as the ret
+    // target so both trampolines fall through to the same dispatch-loop
+    // epilogue when the task next yields back via switch_context.
+    //
+    // Args (SysV AMD64): rdi = per_sched_rsp_ptr, rsi = frame.
+    // PRECONDITION: IRQs must be disabled on entry.
+    // ---------------------------------------------------------------------------
+    ".global dispatch_preempted_and_resume_kernel",
+    "dispatch_preempted_and_resume_kernel:",
+    "lea rax, [rip + .Ldispatch_preempted_resume]",
+    "push rax",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "pushf",
+    "cli",
+    "mov [rdi], rsp",
+    "mov rdi, rsi",
+    "jmp preempt_resume_to_kernel",
+);
+
 // Rust-side declarations for the asm entry symbols (used when installing
 // into the IDT via `set_handler_addr`).
 unsafe extern "C" {
@@ -817,6 +913,25 @@ unsafe extern "C" {
     /// cooperative yield). IRQs must be disabled on entry.
     #[cfg(feature = "preempt-voluntary")]
     pub(crate) fn dispatch_preempted_and_resume(
+        per_sched_rsp_ptr: *mut u64,
+        frame: *const kernel_core::preempt_frame::PreemptFrame,
+    );
+    /// Phase 57e Track C.1 — resume a preempted kernel-mode (ring-0) task.
+    ///
+    /// Restores all 15 GPRs and a 3-field same-CPL iretq frame on the
+    /// interrupted task's kernel stack, then `iretq`s.  Never returns.
+    /// Called only from `dispatch_preempted_and_resume_kernel` asm.
+    #[cfg(feature = "preempt-full")]
+    #[allow(dead_code)]
+    pub fn preempt_resume_to_kernel(frame: *const kernel_core::preempt_frame::PreemptFrame) -> !;
+    /// Phase 57e Track C.4 — dispatch a preempted kernel-mode task.
+    ///
+    /// Identical structure to `dispatch_preempted_and_resume` (publishes the
+    /// scheduler RSP to `*per_sched_rsp_ptr` before the iretq path) — the
+    /// only divergence is the final tail-call to `preempt_resume_to_kernel`.
+    /// IRQs must be disabled on entry.
+    #[cfg(feature = "preempt-full")]
+    pub(crate) fn dispatch_preempted_and_resume_kernel(
         per_sched_rsp_ptr: *mut u64,
         frame: *const kernel_core::preempt_frame::PreemptFrame,
     );
