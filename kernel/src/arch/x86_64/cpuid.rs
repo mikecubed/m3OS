@@ -44,9 +44,10 @@ pub struct XSaveFeatures {
     /// CPUID.1.ECX[26]: XSAVE instruction set supported by the CPU.
     pub supported: bool,
     /// CPUID.1.ECX[27]: OSXSAVE — the OS has enabled XSAVE via CR4.OSXSAVE.
-    /// At boot this reflects the CPU's capability bit *before* we set OSXSAVE;
-    /// after `enable_xsave_state` runs on the BSP, every core observes
-    /// CR4.OSXSAVE = 1.
+    /// At probe time this is 0 (we haven't set CR4.OSXSAVE yet); the field is
+    /// retained for diagnostic inspection of whether someone else has already
+    /// enabled XSAVE on this CPU.
+    #[allow(dead_code)]
     pub osxsave_capable: bool,
     /// CPUID.0Dh.0.EDX:EAX — supported state-component bitmap.
     pub supported_components: u64,
@@ -96,9 +97,17 @@ static OSXSAVE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Probe CPUID for XSAVE features.  Idempotent — first call wins.
 ///
-/// Panics if the CPU does not support OSXSAVE or does not advertise the
-/// required state-component mask (x87 + SSE + AVX = 0x7).  m3OS as of 57e
-/// requires Sandy Bridge (2011) or later.
+/// Panics if the CPU does not advertise XSAVE (CPUID 1.ECX bit 26) or does
+/// not advertise the required state-component mask (x87 + SSE + AVX = 0x7
+/// in CPUID 0Dh.0.EDX:EAX).  m3OS as of 57e requires Sandy Bridge (2011)
+/// or later.
+///
+/// **Note on `OSXSAVE`:** CPUID 1.ECX bit 27 (OSXSAVE) reflects the runtime
+/// state of `CR4.OSXSAVE`, which is 0 at probe time (no kernel sets it
+/// before this call) and 1 after [`enable_xsave_state`] runs.  We therefore
+/// **don't** require it at probe time — only the architectural XSAVE bit.
+/// The `osxsave_capable` field on [`XSaveFeatures`] is left for diagnostic
+/// inspection of whether someone else has already enabled XSAVE.
 pub fn probe() -> &'static XSaveFeatures {
     FEATURES.call_once(|| {
         let leaf1 = cpuid_raw(1, 0);
@@ -113,8 +122,8 @@ pub fn probe() -> &'static XSaveFeatures {
             leaf_d_1.eax,
         );
         assert!(
-            f.supported && f.osxsave_capable,
-            "57e requires OSXSAVE; running on a pre-2011 CPU is not supported"
+            f.supported,
+            "57e requires XSAVE (CPUID 1.ECX bit 26); running on a pre-2011 CPU is not supported"
         );
         assert!(
             f.supported_components & XSAVE_FEATURE_MASK == XSAVE_FEATURE_MASK,
@@ -146,7 +155,7 @@ pub fn features() -> &'static XSaveFeatures {
 pub unsafe fn enable_xsave_state() {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     let f = features();
-    debug_assert!(f.supported && f.osxsave_capable);
+    debug_assert!(f.supported);
 
     // CR4.OSFXSR (bit 9) is already set by the bootloader / startup — required
     // for fxsave64 to have worked under 57d.  We assert rather than set so an

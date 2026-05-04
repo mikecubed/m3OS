@@ -2107,6 +2107,13 @@ fn qemu_args_with_devices_resolved(
         "1024".to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
+        // Phase 57e Track J: advertise XSAVE + AVX + XSAVEOPT so the BSP
+        // CPUID probe (kernel/src/arch/x86_64/cpuid.rs) finds OSXSAVE
+        // capable; the kernel `panic!`s at boot otherwise per the 1.0
+        // hardware floor (Sandy Bridge / Bulldozer 2011+).  The default
+        // QEMU `qemu64` model lacks these bits.
+        "-cpu".to_string(),
+        "qemu64,+xsave,+avx,+xsaveopt".to_string(),
     ];
 
     match display_mode {

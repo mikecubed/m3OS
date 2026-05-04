@@ -44,10 +44,14 @@ impl XSaveFeaturesModel {
     }
 
     /// True when the CPU advertises the 1.0 required mask (x87 + SSE + AVX).
+    ///
+    /// The boot-time probe only requires the architectural XSAVE bit (bit 26)
+    /// — `osxsave_capable` (bit 27) reflects the runtime state of
+    /// `CR4.OSXSAVE`, which is 0 before the kernel sets it.  The model
+    /// mirrors that contract: meets_minimum is independent of whether the
+    /// OS has already enabled XSAVE.
     pub fn meets_minimum(&self) -> bool {
-        self.supported
-            && self.osxsave_capable
-            && (self.supported_components & XSAVE_FEATURE_MASK) == XSAVE_FEATURE_MASK
+        self.supported && (self.supported_components & XSAVE_FEATURE_MASK) == XSAVE_FEATURE_MASK
     }
 }
 
@@ -92,6 +96,25 @@ mod tests {
     fn pre_sandy_bridge_rejected() {
         let f = XSaveFeaturesModel::from_raw(0, 0, 0, 0, 0, 0);
         assert!(!f.meets_minimum());
+    }
+
+    /// CPU advertises XSAVE+AVX but OSXSAVE not yet enabled by the OS — this
+    /// is the state the kernel observes at boot before
+    /// `enable_xsave_state` runs.  Minimum is met (we only require the
+    /// architectural XSAVE bit at probe time).
+    #[test]
+    fn xsave_supported_but_osxsave_not_yet_enabled() {
+        let f = XSaveFeaturesModel::from_raw(
+            LEAF1_ECX_XSAVE, // OSXSAVE bit 27 NOT set
+            0x0000_0007,
+            832,
+            832,
+            0,
+            0,
+        );
+        assert!(f.meets_minimum());
+        assert!(!f.osxsave_capable);
+        assert!(f.supported);
     }
 
     /// XSAVE+OSXSAVE present but AVX not advertised — m3OS 1.0 requires AVX.
