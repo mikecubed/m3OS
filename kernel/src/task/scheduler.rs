@@ -1871,9 +1871,21 @@ pub(crate) fn kernel_preempt_watchdog(rip: u64) -> bool {
 /// provides a strong enough ordering barrier for observing the counter value.
 ///
 /// Returns `0` when no task is current (e.g., during early boot before the
-/// first task is scheduled). In that case the caller should not preempt.
+/// first task is scheduled, or before `init_bsp_per_core` runs at all).
+/// In that case the caller should not preempt.
+///
+/// Phase 57e regression fix: Under `preempt-full` the LAPIC timer ISR enters
+/// `check_and_preempt_kernel` which calls this helper *before* it has a
+/// chance to run `try_per_core`.  If the timer fires during the ~few-instruction
+/// window between `apic::init()` re-enabling interrupts and `init_bsp_per_core`
+/// installing GS_BASE, the helper would panic.  Use `try_per_core` here so a
+/// missing GS_BASE collapses to "no preempt-disable held" and the caller's
+/// own per-core guard handles the rest.
 pub fn peek_preempt_count_irq() -> i32 {
-    let ptr = crate::smp::per_core()
+    let Some(core) = crate::smp::try_per_core() else {
+        return 0;
+    };
+    let ptr = core
         .current_preempt_count_ptr
         .load(core::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
