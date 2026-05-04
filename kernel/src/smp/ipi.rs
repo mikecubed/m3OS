@@ -47,10 +47,17 @@ pub(super) unsafe fn wait_icr_idle() {
         // accepted by the target local APIC.  No software agent holds this condition;
         // converting to block+wake would require an interrupt-on-delivery that the
         // LAPIC does not provide.
-        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+        //
+        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
+        // mid-spin could migrate this task to another core whose LAPIC ICR
+        // status is unrelated to the IPI we are waiting on, breaking forward
+        // progress.  `preempt_disable` is a no-op before per-core data is
+        // live, so the wrapper is harmless on the early-boot caller path.
+        crate::task::scheduler::preempt_disable();
         while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
         }
+        crate::task::scheduler::preempt_enable();
     }
 }
 

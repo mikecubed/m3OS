@@ -334,7 +334,16 @@ impl AmdViUnit {
         // completion marker to the store page within the IOMMU command-queue
         // completion latency (AMD IOMMU Specification §3.3.3, typically < 1 µs
         // per command for cache-invalidation entries).
-        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+        //
+        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
+        // mid-spin would migrate this task to another core, leaving the
+        // pending command marker observable from a core that did not
+        // initiate it.  AMD-Vi commands target the IOMMU as a whole so
+        // forward progress would still happen, but the per-task accounting
+        // and the locking discipline around `IommuRegistry::with_unit_mut`
+        // both expect the issuing core to own the spin until the marker
+        // appears.
+        crate::task::scheduler::preempt_disable();
         loop {
             let observed =
                 unsafe { read_volatile(phys_to_virt(self.completion_store_phys) as *const u64) };
@@ -343,6 +352,7 @@ impl AmdViUnit {
             }
             core::hint::spin_loop();
         }
+        crate::task::scheduler::preempt_enable();
         Ok(())
     }
 

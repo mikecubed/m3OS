@@ -271,7 +271,15 @@ fn delay_us(us: u64) {
     // HW-bounded: ≤ `us` µs; used only during AP startup IPI sequence (Intel
     // SDM Vol 3A §8.4.4, 'AP Initialization').  LAPIC timer countdown is a
     // one-shot hardware register; no software agent drives it.
-    // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+    //
+    // Phase 57e Track B.2: `delay_us` only runs during AP boot orchestration
+    // — the BSP holds the boot lock at this point and the scheduler has not
+    // yet handed CPU to user tasks.  The `preempt_disable` wrapper is
+    // therefore a no-op (per-core data may be initialised but no preemption
+    // can fire here yet); we keep the discipline regardless so any future
+    // refactor that calls `delay_us` from a runtime context inherits the
+    // correct migration guard.
+    crate::task::scheduler::preempt_disable();
     loop {
         let current = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
         let elapsed = start.wrapping_sub(current) as u64;
@@ -280,6 +288,7 @@ fn delay_us(us: u64) {
         }
         core::hint::spin_loop();
     }
+    crate::task::scheduler::preempt_enable();
 }
 
 // ---------------------------------------------------------------------------

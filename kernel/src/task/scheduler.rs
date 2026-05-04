@@ -3008,10 +3008,17 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         // assigned core's run queue.  Blocking or yielding in this handoff
         // window would require an additional wake/publication protocol to avoid
         // losing forward progress under the current lock/queue invariants.
-        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+        //
+        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
+        // mid-spin could migrate this task off `waker_core` and break the
+        // step 5 invariant ("the waker enqueues onto the wakee's assigned
+        // core").  `preempt_disable` keeps the waker pinned for the duration
+        // of the spin and the subsequent `enqueue_to_core` call.
+        preempt_disable();
         while on_cpu_ref.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }
+        preempt_enable();
     }
 
     // ── Step 5: Enqueue to assigned_core run queue + reschedule IPI ──────────
