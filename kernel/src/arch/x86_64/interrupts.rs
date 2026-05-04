@@ -1284,6 +1284,18 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
+        // Phase 57d follow-up: poll the i8042 from the timer ISR as a
+        // backstop against the held-key cursor freeze. Diagnostic
+        // counters showed mouse bytes never reach the controller's
+        // output buffer during sustained keyboard autorepeat — IRQ12
+        // is being suppressed (we suspect by QEMU's PS/2 arbitration
+        // when the CPU is actively servicing IRQ1). The timer ISR
+        // runs at the configured tick rate (default 100 Hz) and is
+        // not on the IRQ1/IRQ12 priority class, so it can drain the
+        // i8042 even while kbd autorepeat is hot. The drain helper
+        // bails immediately when the output buffer is empty, so the
+        // common case (no input) costs one port read per tick.
+        ps2_drain_all_bytes();
     }
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline_user(frame);
@@ -1316,6 +1328,8 @@ pub unsafe extern "C" fn timer_handler_kernel(
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
+        // See the matching note in `timer_handler_user`.
+        ps2_drain_all_bytes();
     }
     crate::task::signal_reschedule();
     if USING_APIC.load(Ordering::Relaxed) {
@@ -1556,6 +1570,17 @@ fn ps2_drain_all_bytes() {
 
     let mut data_port: Port<u8> = Port::new(0x60);
     let mut status_port: Port<u8> = Port::new(0x64);
+
+    // Fast path: peek the status port without locking. The timer ISR
+    // calls this 100×/s as a backstop against IRQ12 suppression; in
+    // the common case there's nothing to drain and we shouldn't pay
+    // for a `RAW_INPUT_ROUTER` lock acquisition. The kbd/mouse ISRs
+    // already check status indirectly by being invoked, but the
+    // peek is cheap so they share the gate.
+    let initial_status = unsafe { status_port.read() };
+    if initial_status & STATUS_OUTPUT_FULL == 0 {
+        return;
+    }
 
     let mut got_tty_byte = false;
     let mut produced_mouse_packet = false;
