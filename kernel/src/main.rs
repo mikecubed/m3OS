@@ -177,19 +177,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // of CR4 — handled in `ap_entry`.
     let xsave = arch::x86_64::cpuid::probe();
     log::info!(
-        "[xsave] supported components={:#x} max_area={} mask_area={} xsaveopt={}",
+        "[xsave] supported components={:#x} max_area={} probe_xcr0_area={} xsaveopt={}",
         xsave.supported_components,
         xsave.max_area_size,
         xsave.area_size_at_mask,
         xsave.xsaveopt
     );
-    assert!(
-        arch::x86_64::cpuid::XSAVE_AREA_SIZE >= xsave.area_size_at_mask,
-        "XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area ({})",
-        arch::x86_64::cpuid::XSAVE_AREA_SIZE,
-        xsave.area_size_at_mask
-    );
     unsafe { arch::x86_64::cpuid::enable_xsave_state() };
+    // Validate the static `XSAVE_AREA_SIZE` against the *enabled* mask size
+    // (CPUID 0Dh.0.EBX re-read after `xsetbv`).  `area_size_at_mask` from the
+    // probe was captured before XCR0 = 0x7 was set, so it reflects the reset
+    // mask and is unsuitable for the size assertion.
+    let enabled_area = arch::x86_64::cpuid::enabled_area_size();
+    log::info!("[xsave] post-enable XCR0 area={enabled_area}");
+    assert!(
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE >= enabled_area,
+        "XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area for enabled XCR0 ({})",
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE,
+        enabled_area
+    );
 
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in

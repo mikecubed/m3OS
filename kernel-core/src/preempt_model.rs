@@ -457,28 +457,33 @@ mod tests {
     // the only difference is *which* IRQ-return path calls the helper.
     // ---------------------------------------------------------------------------
 
-    /// D.2.1: kernel-mode preempt fires when count == 0 and reschedule is set.
+    /// D.2.1: `apply_preempt` is a no-op for kernel-mode callers.
+    ///
+    /// Even with `count == 0` and `reschedule = true`, the from-user-only
+    /// helper returns `(state, false)` and leaves the state untouched.  Under
+    /// PREEMPT_FULL the kernel-handler body uses an equivalent predicate
+    /// (`peek_preempt_count_irq() == 0 && reschedule_requested`), but the
+    /// gating call is composed by the IRQ-return path itself, *not* by this
+    /// model helper.  The invariant pinned here: kernel-mode preempt
+    /// eligibility never flows through `apply_preempt`.
     #[test]
-    fn d2_kernel_preempts_when_count_zero_and_reschedule_set() {
+    fn d2_apply_preempt_no_op_for_kernel_mode_caller() {
         let state = PreemptState {
             preempt_count: 0,
             reschedule: true,
             from_user: false,
             preempt_resched_pending: false,
         };
-        // Under PREEMPT_FULL the kernel-handler body calls the same
-        // `apply_preempt`-equivalent logic with from_user=false.  Model that
-        // by passing from_user=false explicitly here.
         let (new_state, did) = apply_preempt(state, false);
         assert!(
             !did,
             "apply_preempt is voluntary-mode (from_user-only); kernel-mode \
              eligibility uses the same predicate composed by the caller"
         );
-        // The state must be unchanged — voluntary apply_preempt is a no-op
-        // for kernel-mode (the kernel handler is what's preemptible under 57e,
-        // not this helper).
-        assert_eq!(new_state, state);
+        assert_eq!(
+            new_state, state,
+            "voluntary apply_preempt must not mutate state for kernel-mode callers"
+        );
     }
 
     /// D.2.2: kernel-mode preempt is suppressed when count != 0 (preempt_disable held).

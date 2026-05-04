@@ -150,6 +150,7 @@ fn percentile(sorted_samples: &[u64], q: usize) -> u64 {
 /// kernel-mode IPIs go from "ignored at IRQ-return" under 57d to
 /// "preempt immediately" under 57e).
 #[test_case]
+#[ignore = "Track G activation pending — needs smp::boot::boot_aps + futex syscalls"]
 fn bench_cross_core_ipi_wakeup() {
     // Track G activation pending — needs smp::boot::boot_aps + futex syscalls
     // wired into the test harness.
@@ -165,6 +166,7 @@ fn bench_cross_core_ipi_wakeup() {
 /// not add a self-IPI; same-core wakes still rely on the next timer tick or
 /// `preempt_enable` zero-crossing.
 #[test_case]
+#[ignore = "Track G activation pending — needs futex syscalls + scheduler dispatch"]
 fn bench_same_core_wakeup() {
     // Track G activation pending.
 }
@@ -179,6 +181,7 @@ fn bench_same_core_wakeup() {
 /// 57e expectation: P95 < 1.5 × `1000 / TICKS_PER_SEC` ms (one timer tick
 /// plus a margin).
 #[test_case]
+#[ignore = "Track G activation pending — needs kernel task spawn + scheduler dispatch"]
 fn bench_kernel_timer_preempt() {
     // Track G activation pending — needs kernel task spawn + scheduler
     // dispatch wired into the test harness.
@@ -195,6 +198,7 @@ fn bench_kernel_timer_preempt() {
 /// milliseconds depending on workload).  57e target: drops to microsecond
 /// range when the calling context is preempt-safe (IF == 1).
 #[test_case]
+#[ignore = "Track G activation pending — needs scheduler + lock-release instrumentation"]
 fn bench_preempt_enable_zero_crossing() {
     // Track G activation pending.
 }

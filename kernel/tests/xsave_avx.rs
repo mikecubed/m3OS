@@ -134,12 +134,14 @@ fn parse_xsaveopt_capable() {
 /// the original YMM upper halves are restored.  Fails under FXSAVE; passes
 /// under XSAVE with XCR0 = 0x7.
 #[test_case]
+#[ignore = "Track G activation pending — needs smp::init_bsp_per_core + scheduler dispatch"]
 fn ymm_upper_halves_survive_context_switch() {
     // Track G activation pending — needs smp::init_bsp_per_core + scheduler dispatch
 }
 
 /// J.5 robustness: 1000 iterations of the yield-and-verify cycle.
 #[test_case]
+#[ignore = "Track G activation pending — needs scheduler + iterated yield harness"]
 fn ymm_upper_halves_survive_1000_iterations() {
     // Track G activation pending
 }

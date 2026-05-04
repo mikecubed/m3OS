@@ -17,8 +17,11 @@
 //! bit in XCR0; trivial to add).
 //!
 //! Hardware floor: Intel Sandy Bridge (2011) / AMD Bulldozer (2011) or later.
-//! Earlier CPUs lack OSXSAVE and are explicitly unsupported.  If the boot-time
-//! probe finds OSXSAVE absent, the kernel panics with a clear message.
+//! Earlier CPUs lack the architectural XSAVE instruction (CPUID.1.ECX bit 26)
+//! and the AVX state component, so they are explicitly unsupported.  If the
+//! boot-time probe finds either missing, the kernel panics with a clear
+//! message.  The probe does **not** require CR4.OSXSAVE — that bit reflects
+//! runtime state and is 0 until [`enable_xsave_state`] sets it.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -54,8 +57,12 @@ pub struct XSaveFeatures {
     /// CPUID.0Dh.0.ECX — maximum XSAVE area size for *all* supported
     /// components.  Always `>=` [`XSAVE_AREA_SIZE`].
     pub max_area_size: usize,
-    /// CPUID.0Dh.0.EBX — current XSAVE area size at the present XCR0.  Read
-    /// after `xsetbv` runs so reflects the 1.0 mask (x87 + SSE + AVX).
+    /// CPUID.0Dh.0.EBX — current XSAVE area size for the components currently
+    /// enabled in XCR0.  Captured at probe time (before [`enable_xsave_state`]
+    /// runs), so this reflects the reset XCR0 (typically x87-only, ~512 B) on
+    /// the BSP and is **not** the post-enable size for the 1.0 mask.  Use
+    /// [`XSaveFeatures::max_area_size`] for the worst-case allocation budget;
+    /// `area_size_at_mask` is retained for diagnostic output.
     pub area_size_at_mask: usize,
     /// CPUID.0Dh.1.EAX[0]: XSAVEOPT supported.  When true, the save path uses
     /// `xsaveopt64` to skip components in init form.
@@ -182,6 +189,15 @@ pub unsafe fn enable_xsave_state() {
     }
 
     OSXSAVE_ENABLED.store(true, Ordering::Release);
+}
+
+/// XSAVE area size (CPUID 0Dh.0.EBX) for the components currently enabled in
+/// XCR0.  Re-runs CPUID every call — must be invoked after
+/// [`enable_xsave_state`] for the value to reflect the 1.0 mask (x87+SSE+AVX
+/// = 832 B).  Used by the boot-time validation assertion to confirm
+/// [`XSAVE_AREA_SIZE`] fits the actually-enabled mask.
+pub fn enabled_area_size() -> usize {
+    cpuid_raw(0x0D, 0).ebx as usize
 }
 
 /// True once `enable_xsave_state` has run at least once on the BSP.  Used by
