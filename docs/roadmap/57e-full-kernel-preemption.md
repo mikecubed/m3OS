@@ -2,9 +2,9 @@
 
 **Status:** Planned
 **Source Ref:** phase-57e
-**Depends on:** Phase 57b (Preemption Foundation) ✅, Phase 57c (Kernel Busy-Wait Audit and Conversion) ✅, Phase 57d (Voluntary Preemption) ✅
+**Depends on:** Phase 57b (Preemption Foundation) ✅, Phase 57c (Kernel Busy-Wait Audit and Conversion) ✅, Phase 57d (Voluntary Preemption) — functional ✅; gates I.2 (24-hour post-flip soak) and I.3 (`preempt-voluntary` flag removal) must close before 57e starts (see task-list Track 0).
 **Builds on:** Drops the `from_user` check from the IRQ-return preemption point introduced in 57d.  Once dropped, every kernel-mode IRQ-return becomes a potential preemption point — and the 57b `preempt_count` discipline becomes load-bearing for kernel-mode safety, not just user-mode.
-**Primary Components:** `kernel/src/arch/x86_64/interrupts.rs` (replace 57d's early-return in `timer_handler_kernel` / `reschedule_ipi_handler_kernel` with the same preempt check the user handlers run), `kernel/src/task/scheduler.rs` (`preempt_to_scheduler_kernel`, kernel-mode preempt invariants, kernel-mode `preempt_enable` immediate zero-crossing), `kernel/src/arch/x86_64/asm/preempt_entry.S` (`preempt_resume_to_kernel` same-CPL `iretq` resume routine)
+**Primary Components:** `kernel/src/arch/x86_64/interrupts.rs` (replace 57d's early-return in `timer_handler_kernel` / `reschedule_ipi_handler_kernel` with the same preempt check the user handlers run; extend the existing `global_asm!` block with `preempt_resume_to_kernel` and `dispatch_preempted_and_resume_kernel`), `kernel/src/task/scheduler.rs` (`preempt_to_scheduler_kernel` Rust shim, kernel-mode preempt invariants, kernel-mode `preempt_enable` immediate zero-crossing with IF-enabled gate, FXSAVE→XSAVE migration in `save_fpu_state`/`restore_fpu_state`), `kernel/src/arch/x86_64/cpuid.rs` (XSAVE feature detection), `kernel/src/smp/boot.rs` and `kernel/src/main.rs` (CR4.OSXSAVE + XCR0 wiring on BSP and APs).
 
 ## Milestone Goal
 
@@ -121,9 +121,23 @@ A new in-QEMU test suite (`kernel/tests/preempt_latency.rs`) measures **four dis
 
 Acceptance is **per-trigger**: each benchmark is rejected if its measured floor regresses against the 57d baseline.  No single "≥10× drop" claim is made; the cross-core IPI path is the only one where that magnitude is realistic.
 
+### XSAVE migration (FPU state coverage)
+
+The kernel today saves/restores FPU state via `fxsave64`/`fxrstor64` at every dispatch boundary (`kernel/src/task/scheduler.rs:1428–1447, 3644, 3727, 1979`).  FXSAVE only covers x87 + MMX + SSE; it does **not** save AVX YMM upper halves.  Hosted binaries (musl ports, modern Rust crates) emit AVX freely; under 57e's higher switch frequency the resulting silent FP corruption becomes a likely soak failure rather than a rare one.
+
+57e migrates to `xsave64`/`xrstor64` with `XCR0 = x87 | SSE | AVX = 0x7`:
+
+- CPUID-detected at boot; `OSXSAVE` is required (CPUs without it — pre-2011 Sandy Bridge / Bulldozer — are explicitly unsupported).
+- `CR4.OSXSAVE` set, `XCR0` written via `xsetbv` on BSP and every AP before any task runs.
+- `FxSaveArea` (512 bytes, 16-byte aligned) replaced by `XSaveArea` (832 bytes, 64-byte aligned).
+- Save and restore call sites are unchanged — they're already at the dispatch boundary.  Only the type, alignment, and instruction change.
+- AVX-512 is deferred (one additional bit in XCR0; bump `XSAVE_AREA_SIZE`; CPUID-conditional sizing).
+
+This work is folded into 57e rather than a separate phase because the same 24-hour soak validates both the kernel-mode preemption headline change and the AVX coverage.  Splitting them would require two soaks and two release-gate cycles for what is, in implementation terms, ~200 lines across five files.
+
 ### Soak gate
 
-A 24-hour soak with `PREEMPT_FULL` enabled, running the standard graphical-stack workload plus a synthetic IPC + futex + notification load.  No deadlocks, no `[WARN] [sched]` lines, no panics.  The soak is the gate.
+A 24-hour soak with `PREEMPT_FULL` enabled, running the standard graphical-stack workload plus a synthetic IPC + futex + notification load **and** an AVX-using component (so the XSAVE migration is exercised under load).  No deadlocks, no `[WARN] [sched]` lines, no `[WARN] [preempt]` lines, no panics, no AVX checksum drift.  The soak is the gate.
 
 ## Engineering Practice Requirements
 
@@ -189,14 +203,16 @@ Property tests for the kernel-mode preemption transition:
 
 ## Implementation Outline
 
+0. **Track 0 — Prelude.**  Confirm 57d I.2 (post-flip 24-hour soak) and I.3 (`preempt-voluntary` flag removal) have closed.  Re-baseline latency benchmarks against the post-57d-cleanup `main` so 57e numbers compare apples-to-apples.
 1. **Track A — Audit (kernel preempt invariants).**  Second pass over 57c's catalogue.  Produce `docs/handoffs/57e-kernel-preempt-audit.md`.
-2. **Track B — `preempt_disable` wrapping.**  For every "annotate" entry in 57c that requires `preempt_disable` under `PREEMPT_FULL`, add the wrapper.  One PR per subsystem.
-3. **Track C — `preempt_resume_to_kernel`.**  Implement the kernel-mode resume routine.  Test in isolation.
-4. **Track D — Dispatch reentrancy audit.**  Validate the dispatch path windows.  Add invariant tests.
-5. **Track E — Latency benchmarks.**  Land the benchmarks against the 57d baseline.
-6. **Track F — Drop the `from_user` check.**  Headline change.  Gated on `cfg(feature = "preempt-full")`.
-7. **Track G — 24-hour soak.**  Run the standard workload + synthetic load.  Confirm no regression.
-8. **Track H — Default-on flip.**  Flip the feature default.  Remove the flag.
+2. **Track B — `preempt_disable` wrapping.**  Verify already-wrapped sites (B.1); wrap the remaining annotated-but-not-wrapped sites (B.2); per-CPU access audit with the "value escapes the local statement" heuristic (B.3).
+3. **Track C — `preempt_resume_to_kernel` + `dispatch_preempted_and_resume_kernel`.**  Add the same-CPL resume routine *and* the dispatch trampoline that updates `*per_sched_rsp_ptr` before iretq (mirrors 57d's user-side `dispatch_preempted_and_resume`).  Without the trampoline the saved-rsp invariant breaks.
+4. **Track D — Dispatch reentrancy audit + held-lock watchdog.**  Validate the dispatch path windows.  Add the `[WARN] [preempt] kernel-mode preemption with held lock` watchdog so a missed `preempt_disable` annotation surfaces as a flagged warning rather than a silent deadlock.
+5. **Track E — Latency benchmarks.**  Land the per-trigger benchmarks against the 57d baseline.
+6. **Track J — XSAVE migration.**  Replace FXSAVE with XSAVE+AVX before Track F so the 24-hour soak validates both changes.  Lands on its own; can be merged ahead of F if convenient.
+7. **Track F — Drop the `from_user` check.**  Headline change.  Gated on `cfg(feature = "preempt-full")` (which transitively pulls in `preempt-voluntary` if 57d I.3 has not yet landed).  Includes the kernel-mode `preempt_enable` immediate zero-crossing with IF-enabled gate.
+8. **Track G — 24-hour soak.**  Run the standard workload + synthetic load + AVX-using component.  Confirm no regression and no FPU corruption.
+9. **Track H — Default-on flip.**  Flip the feature default.  Remove the flag.
 
 ## Acceptance Criteria
 
@@ -222,7 +238,16 @@ Property tests for the kernel-mode preemption transition:
 - TDD: every track has tests landed before implementation; PR commit history shows test-first ordering.
 - The `preempt-full` feature flag is removable in a follow-up after the 24-hour soak passes.
 - `docs/handoffs/57e-kernel-preempt-audit.md` exists and classifies every kernel codepath.
-- `docs/03-interrupts.md` and `docs/04-tasking.md` are updated to describe `PREEMPT_FULL` semantics.
+- `docs/03-interrupts.md` and `docs/04-tasking.md` are updated to describe `PREEMPT_FULL` semantics and the XSAVE state-component mask.
+
+### XSAVE migration (Track J)
+
+- CPUID detection helper exists; OSXSAVE absence panics at boot with a clear message.
+- `CR4.OSXSAVE` and `XCR0 = 0x7` (x87 + SSE + AVX) are set on BSP and every AP before any task runs.
+- `XSaveArea` replaces `FxSaveArea`; size 832 bytes, alignment 64 bytes.
+- `xsave64` / `xrstor64` (or `xsaveopt64` if available) replace `fxsave64` / `fxrstor64` at the existing dispatch-boundary call sites.
+- AVX context-switch regression test passes (`kernel/tests/xsave_avx.rs`).
+- 24-hour soak workload includes an AVX-using component with checksum verification every 100 ms; no drift over 24 hours.
 
 ## Companion Task List
 
@@ -243,3 +268,6 @@ Property tests for the kernel-mode preemption transition:
 - **Lockdep equivalent** for runtime lock-ordering and preempt-disable checking.  Deferred (a separate kernel-infrastructure phase).
 - **Loom-style formal interleaving search** of preempted kernel codepaths.  Stretch goal.
 - **`PREEMPT_RT` parity** — replacing all spinlocks with sleeping mutexes.  Deferred indefinitely; m3OS does not target real-time guarantees.
+- **AVX-512 in `XCR0`.**  Track J ships with `XCR0 = 0x7` (x87 + SSE + AVX).  Adding AVX-512 (bit 5) requires bumping `XSAVE_AREA_SIZE`, querying CPUID 0Dh sub-leaf 0 ECX for the runtime size, and verifying QEMU's CPU model advertises AVX-512.  Trivial work; deferred until a hosted binary actually uses AVX-512.
+- **XSAVE fallback for pre-2011 CPUs.**  m3OS explicitly drops support for CPUs without OSXSAVE.  A FXSAVE fallback could be added if a contributor needs to run on hardware older than Sandy Bridge / Bulldozer.
+- **Memory protection keys (PKRU) save/restore.**  Bit 9 of XCR0; not used by m3OS.  Deferred.
