@@ -1675,13 +1675,37 @@ pub fn preempt_enable() {
     // post-decrement count is 0 (preemption is now re-enabled).
     // When `reschedule` is also set, record a pending reschedule so
     // the user-mode-return boundary can trigger the scheduler.
-    // We do NOT call into the scheduler here — kernel-mode is
-    // non-preemptible under PREEMPT_VOLUNTARY, and we may be inside
-    // an interrupt-disabled window.  The flag is consumed in E.3.
+    //
+    // Under PREEMPT_VOLUNTARY (57d) we never call the scheduler from
+    // here — kernel-mode is non-preemptible and the calling site might
+    // be inside `without_interrupts`.  The flag is consumed in E.3 at
+    // the user-return boundary.
+    //
+    // Under PREEMPT_FULL (57e Track F.2), kernel-mode IS preemptible,
+    // so a zero-crossing with `reschedule == true` *and* a preempt-safe
+    // calling context (IF == 1) drains the reschedule **immediately**
+    // by yielding into the scheduler, bringing the latency floor down
+    // to a single `yield_now` round trip.  The IF gate is critical: if
+    // a caller sits inside `without_interrupts`, dispatching here
+    // would resume the chosen task with IF = 0 until its next
+    // IRQ-disabled→enabled transition — silently breaking the
+    // "tasks resume with their own RFLAGS" invariant.
     #[cfg(feature = "preempt-voluntary")]
     {
         let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
         if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
+            #[cfg(feature = "preempt-full")]
+            {
+                if x86_64::instructions::interrupts::are_enabled() {
+                    // Clear the pending flag so the next user-mode-return
+                    // boundary doesn't double-yield on a stale signal — the
+                    // immediate yield_now below is consuming this event now.
+                    pc.preempt_resched_pending
+                        .store(false, core::sync::atomic::Ordering::Release);
+                    yield_now();
+                    return;
+                }
+            }
             pc.preempt_resched_pending
                 .store(true, core::sync::atomic::Ordering::Release);
         }

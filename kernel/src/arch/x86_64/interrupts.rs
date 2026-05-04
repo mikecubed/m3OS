@@ -1325,11 +1325,18 @@ pub enum PreemptTrigger {
 ///
 /// Only compiled under `cfg(feature = "sched-trace")`. Zero overhead in
 /// the default build.
+///
+/// Phase 57e Track F.3: encodes `kernel_mode` into bit 7 of the trigger
+/// discriminant (low 7 bits = `PreemptTrigger`, high bit = `kernel_mode`).
+/// The existing `SchedTrace` schema (`pid` / `old_state` / `new_state`) is
+/// preserved unchanged; downstream tooling that already reads `new_state`
+/// continues to see the trigger discriminant after masking with `0x7F`.
 #[cfg(feature = "sched-trace")]
-fn emit_preempt_trace(frame: &PreemptTrapFrameUser, trigger: PreemptTrigger) {
+fn emit_preempt_trace(rip: u64, trigger: PreemptTrigger, kernel_mode: bool) {
+    let new_state = (trigger as u8) | if kernel_mode { 0x80 } else { 0 };
     // Repurpose sched_trace::record: pid=preempted_rip (truncated to u32),
-    // old_state=255 (preempt sentinel), new_state=trigger discriminant.
-    crate::task::sched_trace::record(frame.rip as u32, 255, trigger as u8);
+    // old_state=255 (preempt sentinel), new_state=encoded trigger+kernel_mode.
+    crate::task::sched_trace::record(rip as u32, 255, new_state);
 }
 
 /// Check the four voluntary-preemption conditions and, if met, preempt the
@@ -1383,11 +1390,60 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
     // All conditions met — capture and preempt.
     #[cfg(feature = "sched-trace")]
     unsafe {
-        emit_preempt_trace(frame, trigger);
+        emit_preempt_trace(frame.rip, trigger, false);
     }
     #[cfg(not(feature = "sched-trace"))]
     let _ = trigger;
     crate::task::scheduler::preempt_to_scheduler(frame);
+}
+
+/// Phase 57e Track F.1 — kernel-mode counterpart of `check_and_preempt_user`.
+///
+/// Called from `timer_handler_kernel` and `reschedule_ipi_handler_kernel`
+/// after the IRQ's tick / EOI work is complete.  Differs from the user
+/// variant in two ways:
+///
+/// 1. **No group-exit redirect.**  Kernel-mode tasks do not have
+///    `group_exit_pending` semantics, and the same-CPL 3-field iretq frame
+///    has no `rsp` / `ss` to redirect through.  This asymmetry is
+///    structural, not an oversight (see the 57e doc Track F.1 acceptance).
+/// 2. **Captured kernel RSP threading.**  The asm stub passes the
+///    interrupted kernel RSP as a separate argument; we forward it to
+///    `preempt_to_scheduler_kernel` so the resume path can rebuild the
+///    same-CPL iretq frame on the original kernel stack.
+///
+/// # Safety
+/// Must be called with IRQs disabled (guaranteed by IRQ handler context).
+/// `frame` must point to a valid on-stack `PreemptTrapFrameKernel`.
+#[cfg(feature = "preempt-full")]
+unsafe fn check_and_preempt_kernel(
+    frame: &PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
+    trigger: PreemptTrigger,
+) {
+    let pc = crate::task::scheduler::peek_preempt_count_irq();
+    if pc != 0 {
+        return; // kernel code holds a preempt-disable lock — do not preempt
+    }
+    let Some(core) = crate::smp::try_per_core() else {
+        return;
+    };
+    let reschedule = core
+        .reschedule
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    let pending = core
+        .preempt_resched_pending
+        .swap(false, core::sync::atomic::Ordering::AcqRel);
+    if !reschedule && !pending {
+        return; // no rescheduling requested
+    }
+    #[cfg(feature = "sched-trace")]
+    unsafe {
+        emit_preempt_trace(frame.rip, trigger, true);
+    }
+    #[cfg(not(feature = "sched-trace"))]
+    let _ = trigger;
+    crate::task::scheduler::preempt_to_scheduler_kernel(frame, captured_kernel_rsp);
 }
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
@@ -1435,10 +1491,20 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
 /// Called from the `timer_entry` naked stub when the interrupted context was
 /// ring 0.  `captured_kernel_rsp` is the RSP value the interrupted kernel
 /// code had immediately before the interrupt fired.
+///
+/// Under `preempt-voluntary` only, this handler runs the tick / EOI /
+/// reschedule-flag work and returns — kernel-mode preemption is structurally
+/// absent (57d behaviour preserved).
+///
+/// Under `preempt-full` (Phase 57e Track F.1), the handler additionally
+/// performs the same preempt check as the user-path handler and tail-calls
+/// `preempt_to_scheduler_kernel` when all conditions are met.  The group-exit
+/// redirect is intentionally **not** applied on this path — see
+/// `check_and_preempt_kernel` for the asymmetry rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_handler_kernel(
-    _frame: &mut PreemptTrapFrameKernel,
-    _captured_kernel_rsp: u64,
+    frame: &mut PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
 ) {
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1454,6 +1520,15 @@ pub unsafe extern "C" fn timer_handler_kernel(
             PICS.lock()
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
+    }
+    #[cfg(feature = "preempt-full")]
+    unsafe {
+        check_and_preempt_kernel(frame, captured_kernel_rsp, PreemptTrigger::Timer);
+    }
+    #[cfg(not(feature = "preempt-full"))]
+    {
+        let _ = frame;
+        let _ = captured_kernel_rsp;
     }
 }
 
@@ -1838,10 +1913,17 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
 }
 
 /// Phase 57d Track B — reschedule IPI handler, kernel path.
+///
+/// Phase 57e Track F.1: under `preempt-full`, performs the same preempt
+/// check as `reschedule_ipi_handler_user` and tail-calls
+/// `preempt_to_scheduler_kernel` when conditions are met.  This is the
+/// trigger path 57e is expected to make qualitatively faster — under 57d
+/// voluntary, an IPI delivered to a kernel-mode core is ignored at the
+/// IRQ-return boundary; under 57e, it preempts immediately.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
-    _frame: &mut PreemptTrapFrameKernel,
-    _captured_kernel_rsp: u64,
+    frame: &mut PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
 ) {
     if let Some(pc) = crate::smp::try_per_core() {
         let n = pc
@@ -1853,6 +1935,15 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
     }
     crate::task::signal_reschedule();
     super::apic::lapic_eoi();
+    #[cfg(feature = "preempt-full")]
+    unsafe {
+        check_and_preempt_kernel(frame, captured_kernel_rsp, PreemptTrigger::RescheduleIpi);
+    }
+    #[cfg(not(feature = "preempt-full"))]
+    {
+        let _ = frame;
+        let _ = captured_kernel_rsp;
+    }
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).
