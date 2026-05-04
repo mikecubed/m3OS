@@ -1083,19 +1083,9 @@ impl KeyRepeatScheduler {
 
     fn start_hold(&mut self, keycode: Keycode, timestamp_ms: u64) -> Result<(), KeymapError> {
         // De-dup: pressing a key that's already held doesn't double-track.
-        // Previously this also reset `pressed_at_ms` and `last_emit_ms`, on
-        // the assumption that any Down edge for an already-held key was a
-        // host-side re-press. With hardware typematic slowed to 2 Hz (to
-        // unstick the QEMU PS/2 cursor freeze — see
-        // `arch::x86_64::ps2::slow_keyboard_typematic`), duplicate Down
-        // edges arriving at 2 Hz are *autorepeat*, not fresh presses.
-        // Resetting `last_emit_ms` would push the next software repeat
-        // past `repeat_interval_ms` again every 500 ms, so the user would
-        // see the software scheduler "pause" at every hardware autorepeat
-        // tick. Treating duplicates as a no-op lets the software
-        // scheduler emit repeats independently at its own 30 Hz rate
-        // while hardware autorepeat just keeps the slot occupied.
-        if self.find_mut(keycode).is_some() {
+        if let Some(slot) = self.find_mut(keycode) {
+            slot.pressed_at_ms = timestamp_ms;
+            slot.last_emit_ms = timestamp_ms;
             return Ok(());
         }
 

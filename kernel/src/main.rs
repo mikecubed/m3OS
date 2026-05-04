@@ -146,21 +146,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Err(e) => log::warn!("[ps2] mouse init failed: {:?} — booting without mouse", e),
     }
 
-    // Slow the keyboard's hardware typematic rate to its minimum (2 Hz,
-    // 1 s delay) so QEMU's i8042 kbd-priority arbitration doesn't drown
-    // out mouse IRQ delivery during a held key. The userspace
-    // `kbd_server` runs a software `KeyRepeatScheduler` that produces
-    // fast repeats from the initial Down edge, so user-visible behaviour
-    // is unchanged. See `slow_keyboard_typematic` for the full
-    // explanation.
-    match unsafe { arch::x86_64::ps2::slow_keyboard_typematic() } {
-        Ok(()) => log::info!("[ps2] keyboard typematic slowed to 2 Hz / 1 s delay"),
-        Err(e) => log::warn!(
-            "[ps2] failed to slow keyboard typematic: {:?} — held-key cursor freeze may persist",
-            e
-        ),
-    }
-
     // Enable PIC and unmask IRQs now that all subsystems are initialized.
     unsafe { arch::enable_interrupts() };
     log::info!("[arch] interrupts enabled");

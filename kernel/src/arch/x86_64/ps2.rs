@@ -418,61 +418,6 @@ pub fn is_ready() -> bool {
     MOUSE_READY.load(Ordering::Acquire)
 }
 
-/// Set the keyboard's hardware typematic rate to its slowest setting
-/// (2 Hz with 1 s initial delay).
-///
-/// # Why
-///
-/// QEMU's i8042 emulation arbitrates between the kbd and mouse FIFOs
-/// with kbd-priority: as long as the kbd FIFO has any byte, AUX bytes
-/// are not promoted to `OUTPUT_FULL`. Diagnostic counters in
-/// `display_server`'s compose log proved that 6 s of held-key
-/// autorepeat (213 IRQ1 entries) produced exactly zero IRQ12 entries
-/// and zero mouse bytes drained, even with a timer-ISR backstop
-/// polling the controller at 100 Hz. The mouse hardware *was*
-/// generating motion the whole time — the bytes just stayed in
-/// QEMU's internal AUX queue until kbd activity quieted.
-///
-/// Slowing hardware autorepeat to 2 Hz reduces the kbd byte rate by
-/// ~15× (from ~30 Hz default to 2 Hz), which gives QEMU's
-/// arbitration room to promote AUX bytes between kbd bytes. The
-/// userspace `kbd_server` already runs a software
-/// `KeyRepeatScheduler` that produces fast repeats from the
-/// initial Down edge, so the user-visible repeat rate is unchanged
-/// — only the on-the-wire PS/2 traffic slows.
-///
-/// # Wire format
-///
-/// `0xF3` is the Set Typematic Rate command. The parameter byte:
-/// - bits 0–4: rate (0x00 = 30 Hz, 0x1F = 2 Hz, log scale)
-/// - bits 5–6: delay (0b00 = 250 ms … 0b11 = 1000 ms)
-/// - bit 7: reserved (0)
-///
-/// `0x7F` selects the slowest rate (0x1F) and longest delay (0b11).
-///
-/// # Safety
-///
-/// Performs port I/O during early boot before the keyboard ISR is
-/// active. Must be called from kernel init context.
-pub unsafe fn slow_keyboard_typematic() -> Result<(), Ps2Error> {
-    /// Set Typematic Rate / Delay command.
-    const KBD_CMD_SET_TYPEMATIC: u8 = 0xF3;
-    /// Slowest rate + longest delay (2 Hz, 1 s).
-    const TYPEMATIC_SLOWEST: u8 = 0x7F;
-
-    write_data(KBD_CMD_SET_TYPEMATIC)?;
-    let response = read_data()?;
-    if response != MOUSE_RESPONSE_ACK {
-        return Err(Ps2Error::NotAcked);
-    }
-    write_data(TYPEMATIC_SLOWEST)?;
-    let response = read_data()?;
-    if response != MOUSE_RESPONSE_ACK {
-        return Err(Ps2Error::NotAcked);
-    }
-    Ok(())
-}
-
 // Wire-encoding (`encode_packet` + `MOUSE_PACKET_WIRE_SIZE`) lives in
 // `kernel_core::input::mouse` so it's host-testable; the kernel side
 // re-exports those symbols at the top of this module.
