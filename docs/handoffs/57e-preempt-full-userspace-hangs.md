@@ -1,6 +1,6 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status:** Headless `cargo xtask smoke-test` under `preempt-full` passes at `d83ecc7` (3 fixes: `init_task` halt, idle-task yield cfg-gate, `reply()` preempt_disable bracket). One intermittent retry still hangs at `display_server: starting` — recovered by smoke-test's retry logic but indicates F2 (apply F1 to other `deliver_message + wake_task_v2` pairs) is still pending. GUI reproducers and 10-minute soak under `run-gui` not yet verified. See *Session 3 — resolution* below.
+**Status:** Headless `cargo xtask smoke-test` under `preempt-full` is intermittent. The Bug #6 fixes that landed (`init_task` halt, idle-task yield cfg-gate, `reply()` preempt_disable bracket, `deliver_message_and_wake` helper) close all three preempt-full-only livelock and lost-wake variants. The remaining intermittency is a **separate bug**: a slab-allocator page fault in `kernel_core::slab::SlabCache::allocate` on a non-BSP core that `hlt`'s only the faulting core; other cores then cascade into `BlockedOnReply` because their wake targets live in tasks now stranded on the dead core. See *Session 3 — resolution* and *Session 4 — slab UAF* below.
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
 
@@ -620,3 +620,64 @@ To make further progress, one of the following is needed:
 `cargo xtask run` (no smoke wrapper, no retry) under preempt-full **does** reach `SMOKE:PASS` reliably across the runs we tested. The bug is severe enough to surface under the heavier disk + tighter timing of `cargo xtask smoke-test`, mild enough to not surface under `cargo xtask run`.
 
 Track G's 24 h soak gate **must** stay closed until smoke-test is deterministic.
+
+---
+
+## Session 4 — slab UAF identified as the residual
+
+After F1 + idle + F2-partial, smoke-test was *intermittent* — sometimes attempt 1 passes, sometimes attempt 2, sometimes all three fail. Diagnosing this required a way to capture full kernel serial output past the wrapper's 80-line tail; the kernel's deferred trace-ring dump (which fires on stuck-no-waker watchdog hits) was always being truncated.
+
+### `M3OS_SMOKE_SERIAL_DUMP` diagnostic flag
+
+`xtask` was extended with `M3OS_SMOKE_SERIAL_DUMP=<path>` (commit landed alongside this section). When set, `run_smoke_script` writes the full `serial_history` to that path on every error return, and the per-iteration trim threshold is bumped from 256 KiB / 192 KiB to 32 MiB / 24 MiB so the trace-ring dump (≈ 1 MiB per fire under 4096-entry rings × 4 cores) does not evict the boot log it followed.
+
+Usage:
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+  cargo xtask smoke-test
+```
+
+### What the full capture revealed
+
+A `cargo xtask smoke-test` run that **passed on attempt 2** but failed on attempt 1 had this in `/tmp/m3os-smoke-full.log` (attempt 1's serial):
+
+```
+init: started 'syslogd' pid=2
+[INFO] [proc] execve: pid=2 path=/bin/syslogd
+syslogd: starting
+[int] kernel page fault: addr=Ok(VirtAddr(0xffff8000005119f8)) err=PageFaultErrorCode(0x0)
+InterruptStackFrame { instruction_pointer: VirtAddr(0x100008798b3), code_segment: SegmentSelector { index: 1, rpl: Ring0 }, … }
+[int] KERNEL page fault — CR3=0x000000003f261000
+=== CRASH DIAGNOSTICS ===
+…
+--- Current Task ---
+  task_idx=9 on core 1
+  TaskId=10 state=Running saved_rsp=…
+  pid=2 assigned_core=1 priority=20
+…
+```
+
+`addr2line` resolves RIP `0x8798b3` to **`<kernel_core::slab::SlabCache>::allocate`**. The faulting access is at offset 0x80 from `R13=0xffff800000511978`, which points into the bootstrap heap at `0xffff800000000000`. `err=0x0` is "page not present, read access from kernel mode" — so the slab cache is dereferencing a pointer to a frame that is unmapped.
+
+The kernel page-fault handler at `kernel/src/arch/x86_64/interrupts.rs:1067-1079` calls `dump_crash_context`, dumps the trace ring, then `crate::hlt_loop()`. **`hlt_loop` halts only the faulting core**; other cores keep running. So one core dies, three continue, and any task whose wake depends on a service running on the dead core stalls in `BlockedOnReply` — explaining the cascade we saw in earlier session logs.
+
+### Implications
+
+1. **The Bug #6 fixes that landed are correct and necessary.** They close three real preempt-full-specific livelock / lost-wake variants. With these fixes, *if* the slab fault doesn't fire, smoke-test passes within standard timing.
+2. **The slab fault is a separate bug** — almost certainly a use-after-free or double-free, surfaced by `preempt-full`'s tighter scheduling cadence and reproduced on-and-off across all of our smoke-test runs. It is most likely **not** in `kernel_core::slab` itself but in a caller that frees a slab object too eagerly.
+3. **The single-core hlt_loop on kernel page fault is dangerous in itself.** A faulting core should at minimum kill the running task and reclaim its slot, or drop to a recovery scheduler that quiesces other cores; otherwise the system becomes a partial-deadlock zombie. That is a separate Phase 57 hardening item.
+
+### Where to investigate the slab UAF (Session 5)
+
+1. `addr2line -e target/x86_64-unknown-none/release/kernel -f -C 0x8798b3` — confirm `SlabCache::allocate`. Then look at the **caller** of `allocate` from the faulting RIP's call chain: the `pid=2 (syslogd)` task was just `execve`'d, so the most likely caller is one of `execve` → process / address-space allocation, or one of the per-process kernel data structures (e.g., capability table, FD table, signal mask).
+2. The fault address `0xffff8000005119f8` minus the bootstrap heap base `0xffff800000000000` = **offset 0x5119f8 ≈ 5.1 MiB**. Check whether the bootstrap heap is sized to cover this offset and whether anything is allocating beyond the mapped portion.
+3. The fault fires **right after `syslogd` starts**, before `sshd`. Common kernel actions during the early life of a userspace process: `execve` arg/env copy, signal-mask init, FD-table init, capability-table init. Any of these that uses `SlabCache` is a candidate.
+4. Re-run with sched-trace + slab-trace (if the slab module has tracing) and `M3OS_SMOKE_SERIAL_DUMP` — compare passing vs failing attempts to localise.
+
+### Acceptance criteria for closing this issue
+
+1. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` reaches `SMOKE:PASS` deterministically on attempt 1, ten runs in a row.
+2. The slab UAF root cause is identified and fixed (or reverted-by-causing-commit if a regression).
+3. Kernel page fault handler is hardened to either kill the faulting task and continue (single-task fault) or quiesce all cores and panic (kernel state corruption fault), instead of `hlt_loop`'ing only the faulting core.
