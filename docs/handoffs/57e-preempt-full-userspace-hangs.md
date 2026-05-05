@@ -8,13 +8,30 @@ This handoff describes three reproducible userspace correctness failures that th
 
 ---
 
-## TL;DR
+## Resolution summary (as of `95d231a`)
+
+Two distinct bugs were tangled in the original three reproducers:
+
+1. **Bug #6 family — `preempt_enable` zero-crossing synchronous yield (closed).** Three preempt-full-only call sites where `SchedulerGuard::drop` zero-crossed `preempt_count` with `reschedule == true` and called `yield_now` synchronously, monopolising a core or losing an IPC wake. All three closed in this session — see *Session 3 — resolution* and *Session 3 follow-on fixes*.
+   - `init_task`'s `loop { task::yield_now() }` — replaced with `enable_and_hlt` (commit `695f800`).
+   - BSP `idle_task` and AP `ap_idle_task`'s post-hlt `yield_now` — `cfg(not(preempt-full))`-gated (commit `38d35ea`).
+   - `ipc::endpoint::reply()` deliver+wake gap and 11 other simple `deliver_message + wake_task_v2` pairs — bracketed via `preempt_disable` directly or via the new `scheduler::deliver_message_and_wake` helper (commits `d83ecc7`, `3e3107c`).
+
+2. **Slab/MM page fault — open.** Surfaces under `preempt-full` only, manifests as a kernel page fault inside `kernel_core::slab::SlabCache::allocate` while a non-BSP core is in early userspace setup (right after a process's first `execve`). `hlt_loop`'s only the faulting core, leaving the system in a partial-deadlock zombie state where surviving cores eventually cascade into `BlockedOnReply` because they depend on services running on the dead core. See *Session 4 — slab UAF identified as the residual* for the diagnosis.
+
+`cargo xtask run` under `preempt-full` reaches `SMOKE:PASS` reliably. `cargo xtask smoke-test` (heavier disk + retry-driven) is intermittent — sometimes passes on attempt 1 or 2, sometimes hits the slab fault on every attempt. The retry mechanism recovers when the fault doesn't fire deterministically.
+
+**Track G's 24 h soak gate stays closed** until the slab fault is identified and fixed.
+
+## Original TL;DR (from session 1, kept for context)
 
 - After Bug #1–#5 fixes, the `preempt-full` kernel boots, executes services, and runs userspace through several fork generations. **It does not stay healthy.**
 - Three distinct userspace failures reproduce, each consistent with a **lost wakeup** for an IPC reply or notification — `wake_task_v2` either never ran, or ran without re-queueing the target.
 - The kernel emits **`[WARN] [sched] task pid=N … state=BlockedOnReply stuck-since=Wms (no waker registered)`** — this fires on the doom hang and is the cleanest signature.
 - The "benign" `[WARN] [sched] dequeue-drop core=N … reason=state-not-ready extra=0x2` warnings are correlated with the hangs, not benign.
 - Default build is unaffected on all three reproducers.
+
+(After all the work documented below, points 1, 2 are addressed: the kernel does stay healthy across the smoke-test core path. The "lost wakeup" framing was *partially* correct — `reply()`'s gap was real, but the `init_task` busy-yield livelock is the dominant variant. Point 4's "dequeue-drop is correlated with hangs" was wrong; with the busy-yield closed, those warnings are again benign log noise.)
 
 ## The three reproducers
 
@@ -552,29 +569,29 @@ The yield is required under `preempt-voluntary` (where the IPI handler only sets
 
 F1 fix: bracket the deliver+wake pair with `preempt_disable` / `preempt_enable` so `deliver_message`'s drop sees `preempt_count > 0`, no zero-cross, no synchronous yield. The pair is now atomic from the caller's state machine's perspective.
 
-### Status of the original acceptance criteria
+### Status of the original acceptance criteria (snapshot at end of Session 3)
 
 | Criterion | Status |
 | --- | --- |
 | (1) `run-gui` + login + `fb-takeover doom` renders | **not verified** — needs interactive run-gui |
 | (2) `run-gui` + login + TAB completion → ion completes | **not verified** — needs interactive run-gui |
-| (3) `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes within standard timeout | ✅ **PASS** — exit 0, completed on attempt 3 of 3 in 67 s |
+| (3) `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes within standard timeout | ⚠️ passed *once* on attempt 3 of 3 in 67 s; subsequent runs were intermittent — see *Session 4* for the actual root cause |
 | (4) `run-gui` 10-minute soak with zero `(no waker registered)` warnings | **not verified** — needs interactive run-gui |
 
-### Residual: intermittent `display_server: starting` hang on smoke-test attempts 1–2
+### Initial hypothesis for the smoke-test intermittency: another deliver+wake pair
+
+> **Note:** This subsection captures the working theory at the end of Session 3. Session 4 (below) replaces it: the intermittent hang is a slab/MM page fault, not another `deliver_message + wake_task_v2` race. The F2 partial described next still landed and is correct on its own merits, but it does **not** close the residual.
 
 `cargo xtask smoke-test` retry attempts 1 and 2 hang at `display_server: starting (Phase 56 — C.1+C.2)` with no further serial output until the trace-ring dump fires. Attempt 3 boots cleanly and runs to completion. The pattern is **timing-sensitive**: same kernel, same disk, different outcome.
 
-Likely cause: another `deliver_message + wake_task_v2` pair (F2 in the original *Proposed fixes*) hits the same race that F1 just closed for `reply()`. Candidate sites from `grep -rn deliver_message kernel/src/ipc/`:
+Likely cause (turned out to be wrong): another `deliver_message + wake_task_v2` pair (F2 in the original *Proposed fixes*) hits the same race that F1 just closed for `reply()`. Candidate sites from `grep -rn deliver_message kernel/src/ipc/`:
 
 - `kernel/src/ipc/endpoint.rs:340, 360, 380, 461, 479, 492, 568, 582, 596, 740, 850, 857` (sender-side delivery in send/recv paths)
 - `kernel/src/ipc/cleanup.rs:94, 99, 105` (error-path delivery on task death)
 
-Each pair should either be wrapped with `preempt_disable` / `preempt_enable` (per-site) or refactored to call a `deliver_and_wake_atomic` helper.
+Each pair should either be wrapped with `preempt_disable` / `preempt_enable` (per-site) or refactored to call a `deliver_and_wake_atomic` helper. The right next step (we thought) was to introduce that helper, since one place to bracket means no risk of forgetting a pair on a future addition. F2 partial below landed exactly that.
 
-The right next step is to introduce that helper (one place to bracket, no risk of forgetting a pair on a future addition) rather than per-site bracketing. Once it lands, smoke-test should pass deterministically on attempt 1, and the GUI reproducers (criteria 1, 2, 4) can be verified.
-
-#### `7d…` — F2 partial — `deliver_message_and_wake` helper + 11 simple sites refactored
+#### `3e3107c` — F2 partial — `deliver_message_and_wake` helper + 11 simple sites refactored
 
 A `pub fn deliver_message_and_wake(id, msg) -> WakeOutcome` helper was added to `kernel/src/task/scheduler.rs` next to `deliver_message`. It brackets `deliver_message` + `wake_task_v2` with `preempt_disable` / `preempt_enable`. 11 simple call sites were refactored to use it:
 
@@ -604,11 +621,11 @@ So **F2 did not regress anything** — the same intermittency reproduces with F2
 
 To make further progress, one of the following is needed:
 
-1. **A smoke-test variant that captures full serial output** to a file across all attempts (e.g., a flag to write `/tmp/m3os-smoke-attempt-N.log` per attempt before the QEMU process is killed).
+1. **A smoke-test variant that captures full serial output** to a file across all attempts (e.g., a flag to write `/tmp/m3os-smoke-attempt-N.log` per attempt before the QEMU process is killed). ✅ landed in Session 4 as the `M3OS_SMOKE_SERIAL_DUMP` env-var (commit `d5da120`).
 2. **A more aggressive trigger for the trace dump** that fires sooner (e.g., on the first stuck-since > 5 s rather than > 30 s) so the dump lands before the wrapper times out the attempt.
 3. **A smaller in-kernel reproducer** that triggers the same stuck-on-reply pattern in `cargo xtask test` (with `--display` for a visible QEMU window) so we can attach lldb / step through.
 
-#### Status of acceptance criteria as of `7d…`
+#### Status of acceptance criteria as of `3e3107c`
 
 | Criterion | Status |
 | --- | --- |
@@ -700,3 +717,42 @@ Cargo.toml's `kernel-core` exports `SlabCache::allocate`. The kernel-side caller
 1. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` reaches `SMOKE:PASS` deterministically on attempt 1, ten runs in a row.
 2. The slab UAF root cause is identified and fixed (or reverted-by-causing-commit if a regression).
 3. Kernel page fault handler is hardened to either kill the faulting task and continue (single-task fault) or quiesce all cores and panic (kernel state corruption fault), instead of `hlt_loop`'ing only the faulting core.
+
+---
+
+## Session 5 — required reading and reproducer
+
+### Reproducer
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+  cargo xtask smoke-test
+```
+
+When the slab fault fires (intermittent — sometimes attempt 1, sometimes attempt 2 or 3), `/tmp/m3os-smoke-full.log` contains the full kernel serial including the deferred trace-ring dump. Look for `[int] kernel page fault: addr=Ok(VirtAddr(0xffff8000…))`. If smoke-test passes deterministically, the fault did not fire on this run — try again or increase the iteration count to find a failing seed.
+
+### Files to pre-load
+
+- `kernel-core/src/slab.rs:269-278` — `SlabCache::allocate` (the function the page-fault RIP resolves to).
+- `kernel-core/src/slab.rs:366-397` — `create_span` (where the inlined `partition_point` lives — the actual faulting binary search).
+- `kernel/src/mm/heap.rs:728-768` — `init_heap` (the eager mapper of the 8 MiB bootstrap heap).
+- `kernel/src/mm/heap.rs:815-886` — `grow_heap` (uses `get_mapper()` which uses CR3 — see below).
+- `kernel/src/mm/paging.rs:33-60` — `active_level_4_table` and `get_mapper` (CR3-derived mapper; the suspicious bit).
+- `kernel/src/mm/mod.rs:258-359` — `new_process_page_table` (kernel-half PML4 sharing for new processes).
+- `kernel/src/mm/mod.rs:183-238` — `mm::init` (capture order: KERNEL_PML4_PHYS, then heap, then buddy, then refcounts, then slab).
+- `kernel/src/main.rs:41-45` — `BootloaderConfig` with `Mapping::Dynamic` for `physical_memory` (a candidate for the address-space conflict hypothesis below).
+- `kernel/src/arch/x86_64/interrupts.rs:1067-1080` — kernel page-fault handler that `hlt_loop`'s only the faulting core.
+
+### Hypotheses to investigate
+
+In rough order of cheapness to confirm:
+
+1. **`get_mapper()` uses CR3, not KERNEL_PML4_PHYS.** `init_heap`'s mapper IS for the kernel PML4 (because `paging::init` is called at boot before any process exists). But `grow_heap` calls `get_mapper()` which calls `active_level_4_table()` which reads CR3. If `grow_heap` runs while a process CR3 is loaded, it adds the new heap mapping to the *process's* page-table walk — and other processes that don't share that PDPT entry would see the page as not-present. **Verify:** when does grow_heap fire (boot? per-allocation?) and what CR3 is loaded at that time?
+2. **Address-space conflict.** `HEAP_START = 0xffff_8000_0000_0000` is fixed; `physical_memory_offset` is `Mapping::Dynamic` from the bootloader. If the bootloader picks the same base address for the phys-mapping range, the heap and phys-mapping conflict in PML4[256]. **Verify:** log `physical_memory_offset` at boot and confirm it does *not* overlap `[HEAP_START, HEAP_START + HEAP_MAX_SIZE)`.
+3. **PML4[256] not actually shared after `new_process_page_table`.** The shallow copy at `kernel/src/mm/mod.rs:292-294` copies PML4 entries 1..512. If PML4[256] points to a PDPT that itself was DEEP-copied somewhere, mappings added after process creation wouldn't propagate. **Verify:** is PML4[256]'s PDPT ever deep-copied? Search for any `.clone()` or new-frame-allocate within the kernel half.
+4. **Frame-allocator returns a frame that's still mapped elsewhere.** Less likely but worth ruling out — verify `frame_allocator::allocate_frame` doesn't return a frame already used as a page-table or heap page.
+
+### Quick-confirm command
+
+`addr2line -e target/x86_64-unknown-none/release/kernel -f -C 0x8798b3` should resolve to `<kernel_core::slab::SlabCache>::allocate`. If a future kernel build moves the inline boundary, re-disassemble the function around that RIP to find the new offset of the `cmp %rdx,(%r13,%r8,1)` instruction.
