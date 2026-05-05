@@ -1071,9 +1071,28 @@ The earlier "Bug #7 fix" moved `Cr3::read` to before `set_current_user_return`. 
 
 The lesson: under `preempt-full`, **anything that reads PROCESS_TABLE.addr_space.pml4_phys() AFTER the table has been mutated is suspect**. Use the captured-before-mutation Arc instead.
 
-### Acceptance criteria pending verification
+### Validation observations
 
-Validation in progress: 6 sequential `cargo xtask smoke-test` runs under `M3OS_KERNEL_FEATURES=preempt-full,sched-trace`. Need 10 deterministic passes for criterion (8). Will record results as a follow-up.
+After landing `d8db950`, multiple `cargo xtask smoke-test` runs under preempt-full confirm:
+
+1. **Zero kernel page faults** across all attempts of all iterations. The `0xffff80000051ca18` / corrupted PML4[256] symptom is gone.
+2. **Zero `[free_pt] !!! cr3_phys EQUALS active CR3` warnings** — the defensive sanity check stays silent, confirming the active-CR3 race is closed.
+3. **Smoke-test is still intermittent**, but the failure mode has shifted: instead of the kernel-side slab UAF, runs that fail now hang on a `BlockedOnReply` watchdog cascade — `pid=18 BlockedOnWait` (smoke-runner waitpid'ing the tcc forkchild) and `pid=21 BlockedOnReply` (tcc subprocess waiting on IPC reply that never arrives).
+4. **Successful runs pass cleanly** (e.g. 51 s on attempt 3 of one early validation). Failures and successes alternate run-to-run.
+
+The `BlockedOnReply` cascade is **the same shape as the original Session 1–3 lost-wakeup symptom** (Bug #6 family), not a regression of the just-fixed Bug #7 slab UAF. Sessions 3–4 originally attributed the cascade to the slab UAF zombieing a non-BSP core (which created a partial-deadlock zombie when other cores depended on the dead core). With the UAF closed, the cascade should be gone — but it isn't, so a separate Bug #6 variant is still open.
+
+### Residual — separate Bug #6 variant under preempt-full smoke-test
+
+The smoke-test specifically (not bare `cargo xtask run`) intermittently hits the `BlockedOnReply` cascade. The likely candidates:
+
+1. **A fourth Bug #6 deliver+wake site that the F2 partial helper missed.** The Session 3 helper `deliver_message_and_wake` covers 11 simple sites in `endpoint.rs` and `cleanup.rs`, but `endpoint.rs:340..850` has more complex multi-step send/recv paths that may not be wrapped.
+2. **An IPI-coalesce-style livelock** that survives the Session 3 `init_task` halt fix (the bare-coalesce experiment at `scheduler.rs:1041` was reverted, but the underlying wake-storm pattern may still surface under heavy fork/exec load).
+3. **A slow-boot effect** unrelated to wakeups — e.g. preempt-full's tighter scheduling cadence elongates each tcc-compile step enough that the smoke-runner's 30 s watchdog fires before tcc completes.
+
+This residual is **independent of the Session 8 fix** and was already present in earlier sessions when the slab UAF was the dominant symptom. Filing as Bug #8 for a separate session.
+
+### Acceptance criteria status
 
 | Criterion | Status |
 | --- | --- |
