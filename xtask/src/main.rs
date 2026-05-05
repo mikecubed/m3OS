@@ -3295,12 +3295,27 @@ fn run_smoke_script(
     let mut queue: VecDeque<&SmokeStep> = steps.iter().collect();
     let mut step_num = 0usize;
 
+    // Phase 57e Bug #6 diagnostic: when M3OS_SMOKE_SERIAL_DUMP=<path> is set,
+    // every error return below writes the full serial_history to that file
+    // before formatting the (truncated) error message.  Lets the trace-ring
+    // dump that the kernel emits on stuck-no-waker survive into a file we
+    // can inspect post-run, instead of being lost to the 80-line tail.
+    let serial_dump_path = std::env::var("M3OS_SMOKE_SERIAL_DUMP").ok();
+    let dump_serial = |history: &str| {
+        if let Some(path) = &serial_dump_path {
+            // Best-effort: failure to write should not change the error
+            // surfaced to the user.
+            let _ = std::fs::write(path, history);
+        }
+    };
+
     while let Some(step) = queue.pop_front() {
         step_num += 1;
         // Global timeout check.
         if global_start.elapsed() > global_timeout {
             let _ = child.kill();
             let _ = child.wait();
+            dump_serial(&serial_history);
             return Err(format!(
                 "global timeout ({global_timeout:?}) exceeded at step {}",
                 step_num
@@ -3340,6 +3355,7 @@ fn run_smoke_script(
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
+                        dump_serial(&serial_history);
                         let tail = tail_lines(&strip_ansi(&serial_history), 80);
                         return Err(format!(
                             "step {} timed out: {label}\n\
@@ -3366,6 +3382,7 @@ fn run_smoke_script(
                                 serial_buf.clear();
                                 break;
                             }
+                            dump_serial(&serial_history);
                             let tail = tail_lines(&strip_ansi(&serial_history), 80);
                             return Err(format!(
                                 "QEMU exited while waiting for step {}: {label}\n\
@@ -3450,6 +3467,7 @@ fn run_smoke_script(
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
+                        dump_serial(&serial_history);
                         let tail = tail_lines(&strip_ansi(&serial_history), 80);
                         return Err(format!(
                             "step {} timed out: {label}\n\
@@ -3466,6 +3484,7 @@ fn run_smoke_script(
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             let _ = child.wait();
+                            dump_serial(&serial_history);
                             let tail = tail_lines(&strip_ansi(&serial_history), 80);
                             return Err(format!(
                                 "QEMU exited while waiting for step {}: {label}\n\
@@ -3506,7 +3525,15 @@ fn append_serial_chunk(serial_buf: &mut String, serial_history: &mut String, chu
     serial_buf.push_str(&text);
     serial_history.push_str(&text);
     trim_serial_buffer(serial_buf, 64 * 1024, 48 * 1024);
-    trim_serial_buffer(serial_history, 256 * 1024, 192 * 1024);
+    // When M3OS_SMOKE_SERIAL_DUMP is set, retain the full history (capped at
+    // 32 MB to bound memory) so the kernel's deferred trace-ring dump survives
+    // alongside the boot log it followed.  Without this, the trace dump can
+    // push the history past the trim threshold and evict everything before it.
+    if std::env::var("M3OS_SMOKE_SERIAL_DUMP").is_ok() {
+        trim_serial_buffer(serial_history, 32 * 1024 * 1024, 24 * 1024 * 1024);
+    } else {
+        trim_serial_buffer(serial_history, 256 * 1024, 192 * 1024);
+    }
 }
 
 fn trim_serial_buffer(buf: &mut String, max_len: usize, keep_len: usize) {
