@@ -573,3 +573,50 @@ Likely cause: another `deliver_message + wake_task_v2` pair (F2 in the original 
 Each pair should either be wrapped with `preempt_disable` / `preempt_enable` (per-site) or refactored to call a `deliver_and_wake_atomic` helper.
 
 The right next step is to introduce that helper (one place to bracket, no risk of forgetting a pair on a future addition) rather than per-site bracketing. Once it lands, smoke-test should pass deterministically on attempt 1, and the GUI reproducers (criteria 1, 2, 4) can be verified.
+
+#### `7d…` — F2 partial — `deliver_message_and_wake` helper + 11 simple sites refactored
+
+A `pub fn deliver_message_and_wake(id, msg) -> WakeOutcome` helper was added to `kernel/src/task/scheduler.rs` next to `deliver_message`. It brackets `deliver_message` + `wake_task_v2` with `preempt_disable` / `preempt_enable`. 11 simple call sites were refactored to use it:
+
+- `kernel/src/ipc/cleanup.rs`: 3 sites (stranded senders, stranded receivers, reply waiters).
+- `kernel/src/ipc/endpoint.rs`: 8 EINTR-style error paths (cap-table-full, transfer-cap-failed, endpoint-closed).
+
+#### Smoke-test under preempt-full is genuinely intermittent
+
+After F1 + idle + F2-partial, `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` is *non-deterministic*. The same kernel binary fails or passes across different invocations:
+
+| Run | F2 partial? | Outcome |
+| --- | --- | --- |
+| postfix3 | no | ✅ passed on attempt 3/3 in 67 s |
+| postfix4 | yes | ❌ failed all three attempts (pid=18 BlockedOnWait) |
+| baseline (F2 stashed) | no | ❌ failed all three attempts |
+| stf2 (sched-trace + F2) | yes | ❌ failed all three attempts (pid=18 BlockedOnWait, pid=21 BlockedOnReply) |
+
+So **F2 did not regress anything** — the same intermittency reproduces with F2 stashed. The remaining failure mode is `pid=21` (a tcc-compile subprocess) `BlockedOnReply` for 100+ seconds while `display_server` and `term` continue making progress, suggesting:
+
+- The wake target's wake_task_v2 either never ran, ran with `AlreadyAwake`, or ran but the dispatch is being suppressed somehow.
+- The scheduler is healthy enough that other tasks make progress; this is NOT a livelock anymore.
+- This is the H7 lost-wakeup pattern surviving F1 — F1 only covers the `reply()` path; other servers may use a different path that still has the gap.
+
+#### Why smoke-test diagnosis is hard
+
+`cargo xtask smoke-test` discards the QEMU serial pipe between retry attempts. Only the last ~100 lines of "serial output" are surfaced in the failure report, which is too short to capture the deferred trace-ring dump. The dump fires once per boot but is overwritten or truncated before the smoke-test wrapper reports it.
+
+To make further progress, one of the following is needed:
+
+1. **A smoke-test variant that captures full serial output** to a file across all attempts (e.g., a flag to write `/tmp/m3os-smoke-attempt-N.log` per attempt before the QEMU process is killed).
+2. **A more aggressive trigger for the trace dump** that fires sooner (e.g., on the first stuck-since > 5 s rather than > 30 s) so the dump lands before the wrapper times out the attempt.
+3. **A smaller in-kernel reproducer** that triggers the same stuck-on-reply pattern in `cargo xtask test` (with `--display` for a visible QEMU window) so we can attach lldb / step through.
+
+#### Status of acceptance criteria as of `7d…`
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically | ❌ — intermittent |
+| (4) `run-gui` 10-min soak | not verified |
+
+`cargo xtask run` (no smoke wrapper, no retry) under preempt-full **does** reach `SMOKE:PASS` reliably across the runs we tested. The bug is severe enough to surface under the heavier disk + tighter timing of `cargo xtask smoke-test`, mild enough to not surface under `cargo xtask run`.
+
+Track G's 24 h soak gate **must** stay closed until smoke-test is deterministic.
