@@ -409,6 +409,23 @@ pub fn free_process_page_table(cr3_phys: u64) {
         caller.file(),
         caller.line()
     );
+    // Phase 57e Session 8 — sanity check: free_process_page_table on the
+    // currently-active CR3 means CR3 is dangling once we return. That can
+    // only be intentional in restore_kernel_cr3 paths, never in execve's
+    // old-cr3 free.  Log loudly so the trace dump (when it fires) shows
+    // the lifecycle right next to the offending free.
+    {
+        use x86_64::registers::control::Cr3;
+        let (active_cr3, _) = Cr3::read();
+        if active_cr3.start_address().as_u64() == cr3_phys {
+            log::warn!(
+                "[free_pt] !!! cr3_phys={:#x} EQUALS active CR3 — caller={}:{}",
+                cr3_phys,
+                caller.file(),
+                caller.line()
+            );
+        }
+    }
     let phys_off = VirtAddr::new(phys_offset());
     let kernel_pml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
 

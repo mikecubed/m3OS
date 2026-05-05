@@ -4391,27 +4391,29 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             .map(|p| (p.kernel_stack_top, p.fs_base))
             .unwrap_or((0, 0));
 
-        // Phase 57e Bug #7 fix — capture `old_cr3_phys` BEFORE publishing
-        // the new `UserReturnState`.
+        // Phase 57e Bug #7 fix — derive `old_cr3_phys` from the
+        // already-captured `_old_addr_space` Arc, NOT from `Cr3::read`.
         //
-        // After `set_current_user_return(... new_cr3 ...)`, a kernel-mode
-        // timer/IPI preempt under preempt-full causes the dispatcher to
-        // restore Cr3 from the just-published urs (= new_cr3).  When
-        // execve resumes and runs `Cr3::read()`, it reads `new_cr3`
-        // instead of `old_cr3`, and the subsequent
-        // `free_process_page_table(old_cr3_phys)` actually frees the
-        // **new** PML4 — silently — while CR3 is still pointing at it.
-        // Subsequent kernel work (heap mutation, syscalls) walks page
-        // tables through a frame that has already gone back to the
-        // allocator and is being reused as a slab span / next process's
-        // PML4 / etc.  The corruption surfaces as PML4-level garbage on
-        // an arbitrary later kernel access.
+        // After `proc.addr_space = Some(new_addr_space)` at the
+        // PROCESS_TABLE update earlier in this function, any
+        // `save_user_return_state(...)` call (yield_now / block path,
+        // including the synchronous `yield_now` that
+        // `reset_current_task_fpu_state`'s `scheduler_lock` drop can
+        // trigger via `preempt_enable` zero-crossing under preempt-full)
+        // reads `current_user_return_addr_space_snapshot(pid)` from
+        // PROCESS_TABLE — which now returns *new* cr3 — and overwrites
+        // `urs.cr3_phys = new_cr3`.  The next dispatcher restore loads
+        // `Cr3 = new_cr3` so when execve resumes and reads `Cr3::read()`
+        // it gets `new_cr3`, making `old_cr3_phys == new_cr3` and
+        // causing `free_process_page_table(old_cr3_phys)` below to free
+        // the just-allocated PML4 while CR3 still points at it.
         //
-        // Capturing old_cr3_phys before urs publish is race-free: it
-        // reflects whichever CR3 was active on entry, regardless of any
-        // intervening dispatcher restore.
-        let (old_cr3, _) = Cr3::read();
-        let old_cr3_phys = old_cr3.start_address().as_u64();
+        // The Arc captured before any PROCESS_TABLE mutation is the
+        // race-free source of truth for the pre-execve CR3.
+        let old_cr3_phys = _old_addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.pml4_phys().as_u64())
+            .unwrap_or(0);
 
         // Phase 57e Bug #5 fix — publish the new `UserReturnState`
         // BEFORE switching CR3.
@@ -4463,7 +4465,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // Free the old page table's user-space frames now that CR3 no longer
         // points to it. The bump allocator makes this a no-op today; the
         // real reclamation happens in Phase 13 when a free list is added.
-        crate::mm::free_process_page_table(old_cr3_phys);
+        if old_cr3_phys != 0 {
+            crate::mm::free_process_page_table(old_cr3_phys);
+        }
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
         if kstack_top != 0 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
