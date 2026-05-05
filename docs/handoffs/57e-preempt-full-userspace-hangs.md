@@ -1168,3 +1168,148 @@ This residual is **independent of the Session 8 fix** and was already present in
 | (4) `run-gui` 10-min soak | not verified |
 | (7) per-frame trace ring + page-fault dump | ✅ landed |
 | (8) Bug #7 frame UAF identified and fixed | ✅ (`d8db950`); 0 recurrences across 5-iter validation |
+
+---
+
+## Session 9 — scheduler-side fix attempt failed; root cause is virtio-blk latency, not IPI livelock
+
+### TL;DR
+
+Diagnosed the captured `BlockedOnReply` failure mode as an **IPI-driven preempt-resume livelock** on an AP core (Session 2's H7' shape) and tried four variants of a two-pronged fix (source-side IPI coalesce with idle-target exception + target-side preempt filter). All four variants failed validation: best result was 3/5 pass-rate (no improvement over the 1/5 baseline once timing variance is accounted for), worst was 0/10 with a fundamental boot regression.
+
+The diagnosis was wrong. The "livelock" trace pattern (`Dispatch → SwitchOut → RunQueueEnqueue` cycles with `saved_rsp` ping-ponging by 16 bytes) is consistent with **normal heavy IPC on a slow disk**, not a kernel preempt loop. The actual bottleneck is **virtio-blk completion latency**: 340 ms for a single READ, with `[WARN] [virtio-blk] completion poll + queue notify after request timeout` firing repeatedly. Cumulative slowness across tcc-compile's many file reads exceeds the smoke-test's 180 s budget. **All scheduler changes have been reverted** — branch tip after this session matches its state before Session 9 started (`2e1bbc4` plus the handoff updates landed at the tail).
+
+Track G's 24 h soak gate stays closed.
+
+### What was tried (and reverted)
+
+Working hypothesis at session start: target-side preempt filter would catch the case where `pick_next` would re-dispatch the currently-running task, and source-side IPI coalesce would refine Session 2's reverted bare-coalesce by handling the AP-hlt wake hole (always send IPI when target is in `enable_and_hlt`).
+
+| Variant | What changed | Pass-rate | Failure mode |
+|---|---|---|---|
+| v1 — naive | Source-side CAS coalesce + idle exception via new `is_idle: AtomicBool`; target-side filter "skip preempt if local run queue empty" on all cores | 0/10 | Boot hangs after `init: started 'sshd' pid=3`. `init`'s 5 ms `nanosleep_for(...)` between service spawns relies on the scheduler dispatch loop running `drive_expired_wake_deadlines()`. The "skip if queue empty" filter blocked the dispatch loop from iterating, so deadlines never expired. |
+| v2 — deadline-aware | Same as v1 plus a global `ACTIVE_WAKE_DEADLINES > 0` gate that disables the filter when any task has a pending deadline | 3/5 (some on attempt 2 or 3) | Cascade still surfaces. virtio-blk's polling timeouts likely keep `ACTIVE_WAKE_DEADLINES > 0` continuously, defeating the filter for most of boot. |
+| v3 — AP-only | Filter applies only on non-BSP cores; BSP always preempts so its dispatch loop keeps housekeeping (deadline scan, drain_dead, watchdog, load_balance) running | 1/5 | New `[WARN] [sched] stale-ready: pid=N name=fork-child core=2 stale~50 ms` warnings (Ready tasks not dispatched for 50–80 ms) and `cpu-hog: pid=0 name=idle ran~30350 ms final_state=Running` on a stuck AP. The source-side coalesce was racing against the AP filter and losing wakes. |
+| v4 — filter only | Removed source-side coalesce entirely; kept AP-only target-side filter | 1/5 | Same shape as baseline. Filter wasn't catching the actual livelock pattern (queue is non-empty when ion is the highest-priority task; `pick_next` would re-pick it regardless). |
+
+All four variants have been reverted (`git checkout kernel/src/arch/x86_64/interrupts.rs kernel/src/task/scheduler.rs kernel/src/main.rs kernel/src/smp/boot.rs kernel/src/smp/mod.rs` — tree clean as of session end).
+
+### Why the diagnosis was wrong
+
+Re-reading the original Bug #8 trace dump (`/tmp/m3os-smoke-bug8-1.log`) with fresh eyes plus the new soak captures:
+
+1. **`task_idx=20 == /bin/ion`, not the smoke-runner's tcc-compile child.** Confirmed by the cpu-hog log line in the original Session 2 capture: `pid=20 name=fork-child exec_path=/bin/ion`. ion is the userspace shell that term spawns at session boot — it's reading shell init scripts via vfs_server, which does heavy IPC.
+2. **The `saved_rsp` ping-pong by 16 bytes is consistent with normal short userspace work between IPC blocks**, not a tight kernel-mode preempt-resume loop. Each Dispatch is followed by a small amount of userspace before the next IRQ. The lack of `RecvBlock`/`CallBlock` events in the 256-entry trace ring just means those events were OVERWRITTEN by newer Dispatch/SwitchOut events — at high IPC frequency, the 4096-entry ring still wraps in tens of ms.
+3. **Even if it WERE a kernel-mode preempt loop, the "skip preempt when queue empty" filter doesn't catch it.** The original livelock had OTHER tasks on the queue (woken by cross-core IPI from vfs/drivers); they just had lower priority than the running ion. `pick_next` would still pick ion, regardless of queue contents.
+4. **The `(no waker registered)` watchdog message is misleading for `BlockedOnWait`.** A `BlockedOnWait` task's "waker" is the child's exit. If the child hasn't exited (because it's slowly chugging through disk I/O), no waker is registered — that's expected, not a bug.
+
+The four failed variants together rule out the IPI-livelock framing. The actual bottleneck is somewhere else.
+
+### Where the data points: virtio-blk completion latency
+
+The reproducible slow signal across both Bug #8 failure shapes is virtio-blk:
+
+```
+[WARN] [virtio-blk] completion poll + queue notify after request timeout owner_pid=21 type=1 sector=2072 completed=false
+[WARN] [virtio-blk] completion poll + queue notify after slot-wait timeout owner_pid=21 type=1 sector=2072 completed=false
+… (6 repetitions per request)
+vfs_server: slow req#43 READ elapsed_us=340165
+```
+
+340 ms for one READ. Tcc-compile reads ~hundreds of files (headers, source, intermediate output); if each round-trip is hundreds of ms under preempt-full instead of the ~ms expected under preempt-voluntary, the 180 s smoke-test budget is exhausted before tcc finishes. That explains both:
+
+- **Cascade failure mode (Bug #8.1):** parent (smoke-runner pid=18) waits via `waitpid` on child (tcc); child waits on vfs_server; vfs_server waits on virtio-blk; virtio-blk timeout-and-retries each completion. Cumulative latency exceeds the test step's deadline.
+- **Slow-boot failure mode (Bug #8.2):** `prompt-ready gate timed out` because syslogd / sshd's readiness handshake reads files via the same slow virtio-blk path.
+
+Without scheduler intervention, `cargo xtask run` (no smoke-runner timeout, no retry harness) under preempt-full reaches `SMOKE:PASS` reliably (handoff Session 3 confirmed). The 180 s smoke-test step boundary is what makes Bug #8 visible.
+
+### Recommended next step — targeted profile, then fix
+
+**Don't patch blind again.** Profile a single virtio-blk request end-to-end under both kernel modes, with timestamps at:
+
+1. Request submitted to virtq (driver task).
+2. MMIO write to notify the device (driver task).
+3. Completion IRQ fires (LAPIC IRR set on which core?).
+4. IRQ handler reads completion ring and signals waker.
+5. Waker delivers to driver/vfs_server task; `wake_task_v2` → dispatch.
+6. vfs_server reads ring, replies to caller via IPC.
+
+The 340 ms outlier has to be in *one* of those steps. Knowing which one tells you the fix:
+
+- **(3) IRQ delivery delayed** → MSI-X routing race or LAPIC IRR collapsing under preempt-full's higher IRQ traffic. Fix in IRQ delivery path / MSI-X vector strategy.
+- **(4 → 5) wake delivery delayed** → the wake fires but reaches the dispatcher with extra latency (cross-core sync, pi_lock contention, dispatch-loop iteration delay). Fix in `wake_task_v2` or virtio-blk's IRQ-context wake handoff.
+- **(6) vfs_server slow** → ring contention or extra preempts inside the server. Fix in vfs_server's hot path or scheduling priority.
+
+Minimal instrumentation patch (suggested shape — not yet written):
+
+```rust
+// In the virtio-blk request submission + completion path, gated by a feature
+// flag or env var so it's off in production:
+
+#[cfg(feature = "virtblk-trace")]
+{
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    log::info!(
+        "[virtblk-trace] req={} stage=submit owner_pid={} sector={} t={}",
+        req_id, owner_pid, sector, now,
+    );
+}
+// … and similar at: notify, irq-fire, irq-handler-completion, wake-fire,
+// dispatch, vfs-ack, vfs-reply.
+```
+
+Capture under `M3OS_KERNEL_FEATURES="preempt-full,virtblk-trace"` and `M3OS_KERNEL_FEATURES="preempt-voluntary,virtblk-trace"`, run a single `cargo xtask smoke-test` to first failure (or full pass), grep the timestamps, find the slow step, fix.
+
+### Other options if profiling is out of scope
+
+In rough order of decreasing rigor:
+
+1. **Band-aid: relax timeouts.** Bump the 180 s smoke-test step timeout *and* virtio-blk's per-request retry deadline (whatever drives the "completion poll + queue notify after request timeout" warning). Closes the test (probably) but hides the regression. Not a real fix; just unblocks the soak gate.
+2. **Lower preempt-full's IRQ-handler overhead.** The `signal_reschedule` + `lapic_eoi` + `check_and_preempt_kernel` path runs on every IRQ. Under preempt-full this path is structurally heavier than preempt-voluntary's IRQ-return path. If virtio-blk's MSI-X completions land at high frequency (each disk read = 1 IRQ, tcc-compile = hundreds of reads), per-IRQ overhead amplifies. Audit `kernel/src/arch/x86_64/interrupts.rs:1535-1596` (`check_and_preempt_kernel`) for hot-path optimisations.
+3. **Step back and reframe.** The Bug #6 closure relied on the assumption that `(no waker registered)` warnings ALWAYS meant a lost-wake. Sessions 1–8 chased that hypothesis through six dead ends before Bug #7 closed the slab UAF. Consider that what's left is genuinely "preempt-full IS slower per IPC round-trip, and the smoke-test budget needs to reflect that" — measure the slowdown ratio, decide if it's acceptable, either accept it (adjust budgets and proceed to Track G) or schedule real perf work.
+
+### What NOT to do (lessons from Session 9)
+
+1. **Don't patch the scheduler based on a single trace ring's pattern.** The 256/4096-entry rings can wrap thousands of times during a 30 s hang; the surviving entries show the LAST tens of ms, which may not represent the steady state. Use sched-trace + `M3OS_SMOKE_SERIAL_DUMP` together, and triangulate with cpu-hog / stale-ready warnings.
+2. **Don't try "skip preempt when queue empty" without checking deadline pressure.** `init`'s `nanosleep_for(...)` between service spawns relies on the dispatch loop iterating; any filter that prevents preempts also prevents the dispatch loop from running, which prevents `drive_expired_wake_deadlines` from running.
+3. **Don't combine source-side IPI coalesce with target-side filter without designing the interaction.** They race: if the source coalesces (skips IPI because `reschedule` was already true) but the target's previous reschedule was just consumed by a filter-skip, the wake is delivered as a queue entry but never gets a preempt to dispatch it. Stale-ready tasks ensue.
+4. **Don't trust task_idx-to-pid mapping by inspection.** Use sched-trace (which logs pid + state transitions with `#[track_caller]` file:line) to confirm WHICH userspace task is showing the "livelock" pattern. The session-9 confusion was caused by assuming `task_idx=20` was the smoke-runner's tcc child when it was actually `/bin/ion`.
+
+### Files touched and reverted (for posterity)
+
+```
+kernel/src/arch/x86_64/interrupts.rs   (filter calls in check_and_preempt_user/kernel)
+kernel/src/task/scheduler.rs           (should_skip_preempt_irq helper, enqueue_to_core coalesce)
+kernel/src/main.rs                     (idle_task is_idle gating)
+kernel/src/smp/boot.rs                 (ap_idle_task is_idle gating)
+kernel/src/smp/mod.rs                  (PerCoreData::is_idle field)
+```
+
+All reverted via `git checkout` — branch tip clean, `cargo xtask check` green.
+
+### Acceptance criteria status (unchanged from Session 8)
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically | ❌ — 1/5 pass-rate; failures attributed to virtio-blk completion latency under preempt-full, NOT scheduler livelock |
+| (4) `run-gui` 10-min soak | not verified |
+
+### Files to pre-load for next session (Session 10)
+
+- `kernel/src/drivers/virtio_blk` (or the actual path — see `cargo xtask check` output for crate layout) — completion-wait path, request-timeout retry logic.
+- `kernel/src/ipc/endpoint.rs` — vfs_server's reply path.
+- `userspace/vfs_server/src/main.rs` — vfs_server's READ handler.
+- `/tmp/m3os-smoke-bug8-1.log` — the original failure capture (includes both failure shapes plus the "completion poll + queue notify" warnings).
+- `xtask/src/main.rs:3282..3540` — `run_smoke_script` and `M3OS_SMOKE_SERIAL_DUMP` plumbing.
+
+### Quick-start reproducer (unchanged)
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+  cargo xtask smoke-test
+```
+
+Pass rate is ~1 in 5 attempts. On failure, `/tmp/m3os-smoke-full.log` contains the full kernel serial including any deferred trace-ring dump.
