@@ -857,3 +857,98 @@ Likely suspects to read carefully:
 - `kernel/src/mm/mod.rs:373-…` — `free_process_page_table` (the freeing walk).
 - `kernel/src/arch/x86_64/interrupts.rs:1067-1100` — kernel page-fault handler (single-core hlt → all-core quiesce hardening).
 - `/tmp/m3os-smoke-full.log` from a run that hits *either* fault variant — both are now data points for the same bug.
+
+---
+
+## Session 6 — PML4-level corruption confirmed; frame allocator UAF is the root cause
+
+### PT-walk diagnostic landed (`78417ee`)
+
+`dump_pte_walk_diagnostics(vaddr)` is now wired into both the ring-0 kernel page-fault path and the ring-3 not-present page-fault path. It walks the four-level page table from BOTH the active CR3's PML4 and `KERNEL_PML4_PHYS`, printing each level's flags + addr. Builds clean (`cargo xtask check` passes).
+
+### First fault captured under instrumentation (smoke-test iteration 1, attempt 1)
+
+```
+[INFO] [proc] fork: parent_pid=17 parent_exec=/bin/term child_pid=20
+[INFO] [proc] execve: pid=20 path=/bin/ion
+[int] kernel page fault: addr=Ok(VirtAddr(0xffff80000051ca18)) err=PageFaultErrorCode(CAUSED_BY_WRITE)
+InterruptStackFrame { instruction_pointer: VirtAddr(0x1000087add9), ... }
+[int] KERNEL page fault — CR3=0x00000000017eb000
+[pf-diag] vaddr=0xffff80000051ca18 idx=[p4=256 p3=0 p2=2 p1=284] active_cr3=0x17eb000 kernel_pml4=0x101000
+[pf-diag] active: PML4[256] flags=PageTableFlags(BIT_11 | BIT_52 | BIT_53 | BIT_54 | BIT_55 | BIT_56 | BIT_57 | BIT_59 | BIT_60) addr=0x64ec9f4294000
+[pf-diag] kernel: PML4[256] flags=PageTableFlags(PRESENT | WRITABLE | ACCESSED) addr=0x3feda000
+[pf-diag] kernel: PDPT[0] flags=PageTableFlags(PRESENT | WRITABLE | ACCESSED) addr=0x3fed9000
+[pf-diag] kernel: PD  [2] flags=PageTableFlags(PRESENT | WRITABLE | ACCESSED) addr=0x3fad6000
+[pf-diag] kernel: PT  [284] flags=PageTableFlags(PRESENT | WRITABLE | ACCESSED | DIRTY) addr=0x3f9ba000
+```
+
+**Reading the divergence:**
+
+- `active_cr3 = 0x17eb000` is pid=20 ion's freshly-created PML4 (just had its first `execve`).
+- `active PML4[256]` is **corrupted** — `PRESENT` bit is **clear**, the address `0x64ec9f4294000` is impossible (≈ 6.9 PB), and the high bits are random-looking OS-available bits (BIT_52..57, 59, 60) plus BIT_11 set in the low.
+- `kernel PML4[256]` is correct (`PRESENT | WRITABLE | ACCESSED`, addr `0x3feda000`).
+- The kernel was about to write to its own heap at `0xffff80000051ca18`. The walk needed PML4[256] → PDPT[0] → PD[2] → PT[284]. From the kernel PML4 the walk works fine. From the active PML4 it dies at level 4 because the entry is non-PRESENT.
+
+### Why this rules out Hyp #1 / #2 / #3 conclusively
+
+`new_process_page_table` (`mm/mod.rs:280-294`) explicitly sets `new_pml4[256]` from the kernel's PML4:
+
+```rust
+for i in 1usize..512 {
+    new_pml4[i] = cur_pml4[i].clone();
+}
+```
+
+The PML4 frame is also zeroed first (line 268). So immediately after `new_process_page_table` returns, the new PML4's `[256]` entry **must** equal the kernel's, byte for byte. The corruption we observe happens *after* `new_process_page_table` returns and *before* the kernel's first heap mutation in execve.
+
+Phys-offset is at PML4[5] (Session 5 layout log), so it cannot collide. The kernel PML4 is intact (the comparison walk on the same fault confirms it). PT/PD-level corruption can be ruled out for this fault — the PML4 entry itself is wrong, so no sub-table walk happens.
+
+### Working diagnosis — frame allocator UAF (Hyp #4 confirmed)
+
+The corruption pattern is consistent with **another kernel data structure being written into frame `0x17eb000`** at byte offset `0x800` (= entry index 256 × 8 bytes). That is, the same physical frame that became pid=20's PML4 is *also* being used as the backing memory for some other kernel object (a Vec, slab span, kernel stack, DMA buffer, IPC message page, etc.).
+
+Two ways this happens:
+
+1. **Double-allocate.** `allocate_frame` returned the same physical frame to two callers without an intervening `free_frame`. The frame allocator's free-list / per-CPU-cache / refcount logic has a race window where the same frame is enqueued twice (or never properly dequeued).
+2. **Free-while-mapped.** The frame was freed by some path while a stale reference (Vec, slab span pointer, kernel stack pointer) still held it. `new_process_page_table`'s `allocate_frame` returns the freed frame, the freshly-zeroed PML4 is constructed, and the original holder later overwrites it.
+
+Both shapes match the BIT_11 + BIT_52..60 garbage pattern (it looks like 8 bytes of arbitrary kernel data, not a recognizable structure).
+
+### Why this is `preempt-full`-only
+
+Under `preempt-voluntary`, kernel code paths are not preempted between consecutive `allocate_frame` calls or between `free_frame` and a subsequent re-use. The race window is closed by single-threaded execution within each call site. Under `preempt-full`, kernel code can be preempted *anywhere*, and the per-CPU page cache can hand the same frame to two different allocation contexts that interleave.
+
+The pattern matches the prior Session 4 slab fault and Session 5 sshd userspace fault — all three are downstream consequences of the same UAF; the visible fault address depends on which page tables happen to be torn.
+
+### Next step (Session 7)
+
+Add a debug-only allocate/free trace to `frame_allocator::allocate_frame` and `frame_allocator::free_frame`. Each call records `(timestamp, core_id, frame_phys, op, caller_rip)` into a small per-core ring (e.g. 1024 entries). On a kernel page fault, dump the rings filtered to the offending physical frame (the active CR3 phys for PML4 corruption, the leaf PT-frame for sub-table corruption).
+
+Specifically wanted output:
+
+```
+[frame-trace] 0x17eb000 last operations:
+  [tick=N] core=K op=ALLOC  rip=<caller>  ← who got it
+  [tick=N-x] core=K op=FREE   rip=<caller>  ← who freed it (UAF means alloc-after-this is the bug)
+  ...
+```
+
+If we see two ALLOCs without an intervening FREE, that's the double-allocate bug. If we see a FREE followed by an ALLOC and the FREE-er didn't actually relinquish the pointer, that's the free-while-mapped bug.
+
+Pre-load files:
+
+- `kernel/src/mm/frame_allocator.rs:557-628` — `allocate_frame` per-CPU cache + buddy fallback.
+- `kernel/src/mm/frame_allocator.rs:722-762` — `free_frame` refcount-then-cache logic.
+- `kernel/src/mm/frame_allocator.rs:225-290` — `release_last_reference`, refcount inc/dec.
+- `kernel/src/mm/frame_allocator.rs:340-450` — buddy allocator internals (`free_to_pool`, `allocate`).
+
+### Hardening still pending
+
+The kernel page-fault handler still ends with `crate::hlt_loop()` which halts only the faulting core. Other cores keep running, hit dependencies on the dead core, and cascade into `BlockedOnReply`. Replacing `hlt_loop()` with `panic!` would be slightly better but the existing `panic_handler` also calls `hlt_loop` — true hardening requires sending an NMI/IPI to all cores and stopping cleanly. Filed as a separate hardening sub-task.
+
+### Updated acceptance criteria (Session 6 revision)
+
+(unchanged from Session 5) plus:
+
+7. The frame allocator carries a per-frame allocate/free trace ring, and a kernel page-fault dump prints the recent history of the offending frame.
+8. Root-cause UAF/double-allocate site is identified, fixed, and validated by 10 deterministic smoke-test passes under `preempt-full`.
