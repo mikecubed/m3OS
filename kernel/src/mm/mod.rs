@@ -5,6 +5,7 @@ pub mod debug;
 pub mod dma;
 pub mod elf;
 pub mod frame_allocator;
+pub mod frame_trace;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;
@@ -393,9 +394,21 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
 /// `cr3_phys` must be the physical address of a valid, now-unreachable PML4
 /// that is no longer loaded in CR3. No other code may access the page table
 /// after this call.
+#[track_caller]
 pub fn free_process_page_table(cr3_phys: u64) {
     use alloc::vec::Vec;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
+    // Phase 57e Bug #7 diag — log every PT free with the immediate caller's
+    // file:line so we can correlate "who freed this PML4" against the
+    // frame-trace ring's allocation history.  Cheap (one log line per
+    // process exit / execve cleanup) and dropped when the residual closes.
+    let caller = core::panic::Location::caller();
+    log::info!(
+        "[free_pt] cr3_phys={:#x} caller={}:{}",
+        cr3_phys,
+        caller.file(),
+        caller.line()
+    );
     let phys_off = VirtAddr::new(phys_offset());
     let kernel_pml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
 

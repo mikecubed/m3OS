@@ -4391,6 +4391,28 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             .map(|p| (p.kernel_stack_top, p.fs_base))
             .unwrap_or((0, 0));
 
+        // Phase 57e Bug #7 fix — capture `old_cr3_phys` BEFORE publishing
+        // the new `UserReturnState`.
+        //
+        // After `set_current_user_return(... new_cr3 ...)`, a kernel-mode
+        // timer/IPI preempt under preempt-full causes the dispatcher to
+        // restore Cr3 from the just-published urs (= new_cr3).  When
+        // execve resumes and runs `Cr3::read()`, it reads `new_cr3`
+        // instead of `old_cr3`, and the subsequent
+        // `free_process_page_table(old_cr3_phys)` actually frees the
+        // **new** PML4 — silently — while CR3 is still pointing at it.
+        // Subsequent kernel work (heap mutation, syscalls) walks page
+        // tables through a frame that has already gone back to the
+        // allocator and is being reused as a slab span / next process's
+        // PML4 / etc.  The corruption surfaces as PML4-level garbage on
+        // an arbitrary later kernel access.
+        //
+        // Capturing old_cr3_phys before urs publish is race-free: it
+        // reflects whichever CR3 was active on entry, regardless of any
+        // intervening dispatcher restore.
+        let (old_cr3, _) = Cr3::read();
+        let old_cr3_phys = old_cr3.start_address().as_u64();
+
         // Phase 57e Bug #5 fix — publish the new `UserReturnState`
         // BEFORE switching CR3.
         //
@@ -4422,9 +4444,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             addr_space_gen: new_addr_space.generation(),
         });
 
-        // Capture old CR3 before switching so we can free its frames after.
-        let (old_cr3, _) = Cr3::read();
-        let old_cr3_phys = old_cr3.start_address().as_u64();
         Cr3::write(new_cr3, Cr3Flags::empty());
         if crate::smp::is_per_core_ready() {
             let pc = crate::smp::per_core();
