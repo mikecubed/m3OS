@@ -377,6 +377,12 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             if let Some(handle) = reply_cap_handle {
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
+            // Phase 57e Bug #8 — bracket the deliver/complete_send/wake region
+            // (F1 pattern, see endpoint.rs:925). complete_send drops scheduler_lock,
+            // and that drop's preempt_enable can synchronously yield under
+            // preempt-full before wake_task_v2 runs, leaving the sender with
+            // send_completed=true but not enqueued.
+            crate::task::scheduler::preempt_disable();
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
             let _ = transfer_bulk(pending.task, receiver);
@@ -389,6 +395,7 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
             }
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // Block; sender will call deliver_message + wake_task on us.
@@ -488,6 +495,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         pending.msg = pending.msg.with_reply_cap_handle(handle);
     }
 
+    // Phase 57e Bug #8 — bracket the deliver/complete_send/wake region (F1).
+    crate::task::scheduler::preempt_disable();
     scheduler::deliver_message(receiver, pending.msg);
     let _ = transfer_bulk(pending.task, receiver);
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
@@ -499,6 +508,7 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
         let _ = crate::task::scheduler::wake_task_v2(pending.task);
     }
+    crate::task::scheduler::preempt_enable();
 
     scheduler::take_message(receiver)
 }
@@ -593,6 +603,8 @@ pub fn recv_msg_with_notif(
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
 
+            // Phase 57e Bug #8 — bracket the deliver/complete_send/wake region (F1).
+            crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, pending.msg);
             let _ = transfer_bulk(pending.task, receiver);
             if !pending.wants_reply {
@@ -600,6 +612,7 @@ pub fn recv_msg_with_notif(
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
             }
+            crate::task::scheduler::preempt_enable();
 
             match scheduler::take_message(receiver) {
                 Some(msg) => (RECV_KIND_MESSAGE, msg),
@@ -737,6 +750,12 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
 
     match matched_receiver {
         Some(receiver) => {
+            // Phase 57e Bug #8 — bracket the deliver+wake pair with
+            // preempt_disable/enable so `deliver_message`'s SchedulerGuard::drop
+            // does NOT zero-cross `preempt_count` under preempt-full and
+            // synchronously fire `yield_now` between the two operations. Same
+            // F1 pattern as `reply()` — see endpoint.rs:925.
+            crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg);
             transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
@@ -750,6 +769,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
             // blocking.
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -854,10 +874,19 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                     return Message::new(u64::MAX);
                 }
             };
+            // Phase 57e Bug #8 — bracket the deliver+wake pair (F1 pattern,
+            // see endpoint.rs:925). Without this, under preempt-full a
+            // synchronous yield_now between deliver_message and wake_task_v2
+            // can leave the server with pending_msg + reply_waker set but
+            // not enqueued, so when the caller blocks on reply the server
+            // never gets dispatched and the caller stays parked in
+            // BlockedOnReply.  This is the cascade pattern in Bug #8.
+            crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg.with_reply_cap_handle(reply_cap_handle));
             transfer_bulk(caller, receiver);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // Server not yet waiting — we're already enqueued above with
@@ -1076,6 +1105,8 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 }
                 return false;
             }
+            // Phase 57e Bug #8 — bracket the deliver+wake pair (F1 pattern).
+            crate::task::scheduler::preempt_disable();
             scheduler::deliver_message(receiver, msg);
             transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
@@ -1084,6 +1115,7 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
             });
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
