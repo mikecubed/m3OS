@@ -671,10 +671,29 @@ The kernel page-fault handler at `kernel/src/arch/x86_64/interrupts.rs:1067-1079
 
 ### Where to investigate the slab UAF (Session 5)
 
-1. `addr2line -e target/x86_64-unknown-none/release/kernel -f -C 0x8798b3` — confirm `SlabCache::allocate`. Then look at the **caller** of `allocate` from the faulting RIP's call chain: the `pid=2 (syslogd)` task was just `execve`'d, so the most likely caller is one of `execve` → process / address-space allocation, or one of the per-process kernel data structures (e.g., capability table, FD table, signal mask).
-2. The fault address `0xffff8000005119f8` minus the bootstrap heap base `0xffff800000000000` = **offset 0x5119f8 ≈ 5.1 MiB**. Check whether the bootstrap heap is sized to cover this offset and whether anything is allocating beyond the mapped portion.
-3. The fault fires **right after `syslogd` starts**, before `sshd`. Common kernel actions during the early life of a userspace process: `execve` arg/env copy, signal-mask init, FD-table init, capability-table init. Any of these that uses `SlabCache` is a candidate.
-4. Re-run with sched-trace + slab-trace (if the slab module has tracing) and `M3OS_SMOKE_SERIAL_DUMP` — compare passing vs failing attempts to localise.
+The disassembly at `0x8798b3` confirms the faulting instruction is an inlined `Vec::partition_point` binary search:
+
+```
+8798a9: add %rsi,%r15           ; binary-search advance
+8798ac: mov %r15,%r8
+8798af: shl $0x7,%r8            ; r8 = r15 * 128 (= sizeof SpanMeta)
+8798b3: cmp %rdx,(%r13,%r8)     ; compare [r13 + r8], rdx ← FAULT
+```
+
+`R13 = 0xffff800000511978` is the heap base of `self.spans` (`Vec<SpanMeta>`). At the fault, `R15 == 1` and `R8 == 128`, meaning `self.spans.len() == 2` and the search probed `&spans[1]` — a 128-byte structure whose memory is in the SAME 4 KiB page as `&spans[0]` (`0x511978` and `0x5119f8` are both in page `0x511000`). The page-not-present error means **page `0x511000` of the bootstrap heap is not mapped**, even though `R13` (which is supposed to be a valid heap pointer) lives there.
+
+That points away from a slab-internal bug and toward one of:
+
+1. **Heap allocator returning an address whose page is not yet mapped.** Bootstrap heap should be eagerly mapped at `0xffff800000000000` for 8 MiB = ends at `0xffff800000800000`. Fault is at `0x5119f8`, well within that range, so the heap *should* cover it. Check the bootstrap heap mapping path and whether all 8 MiB is actually mapped, or only enough for what was used at boot — and whether growth past initial usage requires explicit mapping.
+2. **Vec growing past the mapped portion of the bootstrap heap.** The slab cache's `self.spans` grew from len=1 to len=2 (when `create_span` ran during `allocate`), forcing `Vec` to reallocate to a larger backing buffer. If that reallocation lands on an address whose page isn't mapped, the next access faults.
+3. **TLB / page-table sync bug.** Less likely on a fresh address — TLB miss should walk page tables, find an entry, and map it. Page-not-present means the entry isn't there at all.
+
+Cargo.toml's `kernel-core` exports `SlabCache::allocate`. The kernel-side caller chain is in `kernel/src/mm/heap.rs` or similar; that wrapper provides the `page_alloc` callback. Trace the page-allocation callback to see whether it ever returns an address that the kernel hasn't mapped.
+
+#### What is NOT this bug
+
+- The 8 MiB bootstrap heap is the small heap used during early init. The runtime kernel heap is different and uses `BuddyAllocator` or similar. Verify which heap the slab cache is using at the time of the fault.
+- The fault is **not** under `preempt-voluntary` (doc TL;DR confirms). So either this only triggers under preempt-full's specific allocation timing, or preempt-voluntary serializes things enough to hide it. Both cases imply a race or ordering issue.
 
 ### Acceptance criteria for closing this issue
 
