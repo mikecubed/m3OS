@@ -341,6 +341,30 @@ This must be tracked as a follow-up before Track G's 24 h soak is gated open. Se
 
 The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the Bug #3 fork-child user-GPR corruption above, and (4) is the Track G soak gate which can be reopened once Bug #3 is also resolved.
 
+## Bug #3 root cause (FOUND, not yet fixed)
+
+The bisection table below proved the bug requires *some* kernel-mode preempt path; instrumentation then narrowed it to a specific data hazard.
+
+**Diagnostic instrumentation used** (uncommitted, applied + reverted): a `log::warn!` in `enter_userspace_fork` (`kernel/src/arch/x86_64/mod.rs:235`) logging `pid`, `rip`, `rsp`, `r14`, `rbx`, `rbp` immediately before the asm trampoline iretqs to ring 3. The log lines proved the **R14 value at iretq-time already matches the corrupted R14 observed at the user-mode page fault** (e.g. `pid=10 ... r14=0xf` ⇒ user fault `addr=0x7f` ⇒ `0xf + 0x70 = 0x7f` ✓). Therefore the corruption happens *upstream*, in the parent's `fork()` syscall, before the child's `ForkChildCtx` is built.
+
+**The hazard:** `kernel/src/arch/x86_64/syscall/mod.rs` (the `syscall_entry` asm at lines 1100–1120) writes the user GPR snapshot to **per-core** slots in `PerCoreData` — `syscall_user_rbx`, `syscall_user_r14`, etc. (`kernel/src/smp/mod.rs:224`). `make_fork_ctx` (`kernel/src/process/mod.rs:1573–1588`) reads back from those *same per-core slots* to build the child's `ForkChildCtx`.
+
+Under `preempt-voluntary` this is safe: a task in `syscall_handler` can only be preempted at user-return boundaries, never mid-syscall, so the per-core slots remain that task's snapshot for the entire syscall lifetime.
+
+**Under `preempt-full`, a task can be preempted mid-`syscall_handler`.** The dispatched-next task's own `syscall_entry` will overwrite `syscall_user_rbx`/`syscall_user_r14`/… on the *same core*. When the original task is later re-dispatched and resumes inside its `fork()` call, `pc.syscall_user_r14` no longer holds *that task's* user R14 — it holds whatever the most recent same-core `syscall_entry` left there. The fork child inherits these stale values via `ForkChildCtx`, then iretqs into init's address space with corrupt R14 and immediately faults at the next service-struct field access.
+
+This is a design flaw in the per-core syscall snapshot, surfaced by `preempt-full` enabling mid-kernel preemption. Fix candidates:
+
+1. **Move `syscall_user_*` into the `Task` struct.** The cleanest answer: each task keeps its own GPR snapshot; same-core preemption can no longer alias. Touches `PerCoreData`, the `syscall_entry` asm (one extra `gs:`-relative chase to find the current task's snapshot offset), `make_fork_ctx`, `make_fork_ctx_for_thread`, and `UserReturnState` consumers.
+2. **Save/restore the per-core slots across kernel-mode preempt.** `preempt_to_scheduler_kernel` and `preempt_resume_to_kernel` would copy the per-core slots into / out of `Task::preempt_frame` (which already exists for GPRs). Smaller diff but adds 13 more u64s to `PreemptFrame` and an extra mem copy on every preempt.
+3. **Suppress kernel-mode preempt while in `syscall_handler`.** Bump `preempt_count` at `syscall_entry` and decrement before sysret (or at user-mode return). This restores preempt-voluntary's safety property at the cost of throughput parity with `preempt-voluntary` for the duration of any syscall.
+
+Option (3) is the smallest, safest bridge to ship `preempt-full` while preserving correctness; (1) is the proper long-term fix. (2) trades complexity for the same correctness as (1) without taking on the broader refactor.
+
+The fix is **not** in this session's commits — Bug #3 is now characterised but not closed. Track G's 24 h soak gate stays closed until one of (1)–(3) is implemented and re-verified.
+
+---
+
 ## Bug #3 bisection (this session)
 
 Two diagnostic patches (uncommitted, applied and reverted) verified that **disabling both kernel-mode preempt paths** under `preempt-full` eliminates the fork-child fault:
