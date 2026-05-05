@@ -1015,3 +1015,71 @@ Three viable hypotheses remain:
 | (4) `run-gui` 10-min soak | not verified |
 | (7) per-frame trace ring + page-fault dump | ✅ landed |
 | (8) UAF/double-allocate site identified, fixed | ❌ — lifecycle traced but root caller TBD |
+
+---
+
+## Session 8 — root cause identified and fixed
+
+### The defensive log fired (`b23a24c` + new sanity check)
+
+After making `free_process_page_table` `#[track_caller]` and adding a sanity check that warns when `cr3_phys` equals the active CR3 at free time, a captured fault produced this output:
+
+```
+[INFO] [free_pt] cr3_phys=0x6d0000 caller=kernel/src/arch/x86_64/syscall/mod.rs:4466
+[WARN] [free_pt] !!! cr3_phys=0x6d0000 EQUALS active CR3 — caller=kernel/src/arch/x86_64/syscall/mod.rs:4466
+```
+
+`syscall/mod.rs:4466` is execve's `free_process_page_table(old_cr3_phys)` call. The fact that `cr3_phys` (= `old_cr3_phys`) equals the active CR3 (= `new_cr3` after `Cr3::write(new_cr3)`) deterministically proves Hypothesis #3: `old_cr3_phys == new_cr3_phys`.
+
+### Root cause
+
+The race chain in execve:
+
+1. `proc.addr_space = Some(new_addr_space.clone())` updates PROCESS_TABLE (line 4332).
+2. `reset_current_task_fpu_state()` takes `scheduler_lock` (line 4373). On drop, `SchedulerGuard::drop` calls `preempt_enable`.
+3. Under `preempt-full`, `preempt_enable`'s zero-cross can synchronously fire `yield_now` if `reschedule == true` and `IF == 1`.
+4. `yield_now`'s `save_user_return_state` reads `current_user_return_addr_space_snapshot(pid)` — which now returns the **new** CR3 because PROCESS_TABLE was updated in step 1 — and writes `urs.cr3_phys = new_cr3`.
+5. Dispatcher restore loads `Cr3 = urs.cr3_phys = new_cr3`.
+6. execve resumes; the previous Bug #7 fix's `Cr3::read()` returns `new_cr3`.
+7. `old_cr3_phys = new_cr3`.
+8. `free_process_page_table(old_cr3_phys)` frees the just-allocated new PML4 while CR3 still points at it.
+9. The freed frame is reused by a slab span (or another new PML4); the new owner overwrites the kernel-half PML4 entries.
+10. The next kernel heap mutation walks PML4[256] of the zombie CR3 and faults on garbage.
+
+This is the exact `0xffff80000051ca18` / corrupted PML4[256] symptom Sessions 4–7 chased.
+
+### Fix (`d8db950`)
+
+Derive `old_cr3_phys` from the **already-captured `_old_addr_space` Arc** rather than from `Cr3::read`:
+
+```rust
+let old_cr3_phys = _old_addr_space
+    .as_ref()
+    .map(|addr_space| addr_space.pml4_phys().as_u64())
+    .unwrap_or(0);
+```
+
+The `_old_addr_space` Arc is taken at line 4314 — **before** PROCESS_TABLE is mutated at line 4332. Its `pml4_phys()` field is immutable, so even if `save_user_return_state` later overwrites `urs.cr3_phys`, the captured Arc still represents the actual pre-execve CR3.
+
+The `Cr3::read()` is gone entirely from this code path — it was the broken source of truth.
+
+Also added a `if old_cr3_phys != 0` guard so the very first execv'd task (which has no prior `addr_space`) does not call `free_process_page_table(0)`.
+
+### Why the previous Session 7 attempt failed
+
+The earlier "Bug #7 fix" moved `Cr3::read` to before `set_current_user_return`. That closed the *direct* "preempt between urs publish and Cr3::read makes dispatcher restore Cr3 = new_cr3" race — but it did not close the *upstream* race where `reset_current_task_fpu_state`'s `scheduler_lock` drop fires `preempt_enable` → `yield_now` → `save_user_return_state` reading the already-mutated PROCESS_TABLE. The dispatcher then restores `Cr3 = new_cr3` *before* execve's `Cr3::read` runs, and the outcome is the same.
+
+The lesson: under `preempt-full`, **anything that reads PROCESS_TABLE.addr_space.pml4_phys() AFTER the table has been mutated is suspect**. Use the captured-before-mutation Arc instead.
+
+### Acceptance criteria pending verification
+
+Validation in progress: 6 sequential `cargo xtask smoke-test` runs under `M3OS_KERNEL_FEATURES=preempt-full,sched-trace`. Need 10 deterministic passes for criterion (8). Will record results as a follow-up.
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically | pending validation |
+| (4) `run-gui` 10-min soak | not verified |
+| (7) per-frame trace ring + page-fault dump | ✅ landed |
+| (8) UAF/double-allocate site identified and fixed | ✅ (`d8db950`); deterministic-pass count pending |
