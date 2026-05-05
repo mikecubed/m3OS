@@ -756,3 +756,104 @@ In rough order of cheapness to confirm:
 ### Quick-confirm command
 
 `addr2line -e target/x86_64-unknown-none/release/kernel -f -C 0x8798b3` should resolve to `<kernel_core::slab::SlabCache>::allocate`. If a future kernel build moves the inline boundary, re-disassemble the function around that RIP to find the new offset of the `cmp %rdx,(%r13,%r8,1)` instruction.
+
+---
+
+## Session 5 — Hypotheses 2 & 3 ruled out, working theory shifts to frame UAF (Hyp #4)
+
+### Diag patch landed (`8567dbc`)
+
+`mm::init` now logs the kernel address-space layout at boot:
+
+```rust
+log::info!(
+    "[mm] addr-space layout: KERNEL_PML4_PHYS={:#x} phys_offset={:#x} (PML4[{}]) heap={:#x}..{:#x} (PML4[{}]) collide={}",
+    ...
+);
+```
+
+Run output (`M3OS_KERNEL_FEATURES=preempt-full,sched-trace M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log cargo xtask smoke-test`):
+
+```
+[INFO] [mm] addr-space layout: KERNEL_PML4_PHYS=0x101000 phys_offset=0x28000000000 (PML4[5]) heap=0xffff800000000000..0xffff800004000000 (PML4[256]) collide=false
+```
+
+### Hypothesis #2 — eliminated
+
+The bootloader's `Mapping::Dynamic` phys_offset placed phys-memory at PML4[5] (`0x28000000000`). The heap is at PML4[256] (`0xffff800000000000`). They share no PML4 entry; they cannot conflict at any sub-table level.
+
+### Hypothesis #3 — audited, looks correct
+
+`new_process_page_table` (`kernel/src/mm/mod.rs:292-294`) shallow-copies PML4[1..512] from `KERNEL_PML4_PHYS` (not from CR3 — see comment at 271-274 explicitly noting this). PML4[256] is therefore copied as a single entry value, meaning every process inherits a pointer to the **same kernel-side PDPT physical frame** for the heap. Any subsequent modification under that PDPT (PD entries, PT entries, leaf 4 KiB pages) is visible to every process via shared sub-tables.
+
+PML4[256] is never deep-copied anywhere — the only deep-copy in `new_process_page_table` is for PML4[0] (the user-space lower half, conditional on the kernel having a present PDPT there). No `.clone()` on heap-region tables exists anywhere we found in `kernel/src/mm/`.
+
+So Hypothesis #3 also does not explain the fault.
+
+### Hypothesis #1 — structurally real but does not match this fault address
+
+`get_mapper()` (`kernel/src/mm/paging.rs:54-60`) does read CR3, and `grow_heap` does call `get_mapper()`, so a heap growth made while a process CR3 is loaded would walk that process's PML4. **However:** the fault address `0xffff8000005119f8` is at heap offset `0x5119f8` ≈ 5.07 MiB, well within `HEAP_INITIAL_SIZE = 8 MiB` (`heap.rs:42`). That range is mapped eagerly by `init_heap` at boot, *before* any process page-table exists. `grow_heap` never had to fire for this address.
+
+Hyp #1 is still a real latent bug for the > 8 MiB heap region — worth fixing for defence-in-depth — but it does not explain this fault.
+
+### New observation: a *different* fault on the same run
+
+The smoke-test run that produced the layout log above also captured a **userspace** instruction-fetch fault, not a kernel slab fault:
+
+```
+init: started 'sshd' pid=3
+[int] userspace page fault: pid=3 addr=Ok(VirtAddr(0x439e00)) err=PageFaultErrorCode(USER_MODE | INSTRUCTION_FETCH) rip=0x439e00 — process killed
+[WARN] [sched] cpu-hog: pid=3 name=fork-child exec_path=/bin/sshd core=1 ran~1577 ms final_state=Dead
+```
+
+`0x439e00` is just past `USER_VADDR_MIN = 0x400000`, deep inside `/bin/sshd`'s text segment. The page-fault error code is `USER_MODE | INSTRUCTION_FETCH` with the present bit clear → **the page that backs sshd's text at `0x439000` is not present in pid=3's page table**, even though sshd had been running successfully for ~1.58 s.
+
+Cascade after sshd is killed: `pid=18 BlockedOnWait` (smoke-runner waitpid'ing the test forkchild) and `pid=21 BlockedOnReply` (the tcc subprocess — likely waiting on vfs/fat which depends on the same wakers). These are downstream consequences, not the trigger.
+
+### Why this matters
+
+We now have **two structurally identical faults** that fire under preempt-full only:
+
+| Fault | Where | What |
+| --- | --- | --- |
+| Slab fault (Session 4) | `kernel_core::slab::SlabCache::allocate` at heap offset `0x5119f8` | kernel data page not present, ring 0 read |
+| Userspace IF fault (this session) | sshd at `rip=0x439e00` | userspace code page not present, ring 3 instruction fetch |
+
+Both: "page that should be mapped is not present." Both: intermittent. Both: preempt-full only. Both: on a non-BSP core (slab fault was core 1; sshd ran on core 1 here).
+
+The unifying explanation is **frame UAF / stale page-table linkage** — at some point a frame that was backing one page gets either:
+
+1. Returned to the frame allocator while still referenced by a live PTE, and later reallocated (the new owner may overwrite it; the old owner now reads garbage or — if the PTE's present bit is then cleared by some other path — sees a not-present fault), OR
+2. The PTE pointing at a still-live frame gets cleared by an unrelated TLB-shootdown or page-table-edit code path, leaving the address space inconsistent.
+
+(2) is more consistent with the symptoms because both observed faults are *not-present* faults, not "wrong contents" faults — i.e. the PTE itself is gone, not that the frame contains stale data.
+
+### Hypothesis #4 elevated — frame UAF / spurious PTE clear
+
+Working theory for Session 6: a TLB-shootdown / page-table-update / mm cleanup code path under preempt-full is racing against a CR3-load-or-frame-free, with the result that a leaf PTE under the active CR3 gets cleared while the address is still in use.
+
+Likely suspects to read carefully:
+
+- `kernel/src/smp/tlb.rs` — `tlb_shootdown_range` (and any IPI handlers that do PTE writes from interrupt context).
+- `kernel/src/mm/free_process_page_table` (`kernel/src/mm/mod.rs:373-…`) — walks process PML4 freeing user-only pages; could it free pages that are also mapped under a kernel-half PDPT? (Less likely, since kernel half is shallow-copied, but the *freeing logic* is a known source of UAF in similar kernels.)
+- `kernel/src/mm/heap.rs:705-720` and the `bootstrap_dealloc` / size-class deactivation paths — does any deallocation accidentally `unmap` a heap page rather than just `free` the underlying buffer?
+- The frame-allocator buddy / refcount paths (`kernel/src/mm/frame_allocator.rs`) — does `free_frame` ever fire on a frame that's still page-table-linked? Add an assertion at frame-free time that any PTE pointing at the frame is already cleared.
+
+### Hardening item still pending
+
+`hlt_loop`-on-faulting-core remains dangerous regardless of root cause. The kernel page-fault handler should at least quiesce all cores and panic on a kernel-half not-present fault, so the symptom is one observable crash instead of a partial-deadlock zombie. Filed as a sub-task for Session 6.
+
+### Updated acceptance criteria
+
+(unchanged from Session 4) plus:
+
+5. The frame allocator carries a debug-build invariant: every frame returned by `allocate_frame` is *not* present in any active PTE in any active CR3 at the moment of allocation.
+6. Every `free_frame` call site is audited; a frame is not freed until all PTEs referencing it have been cleared and TLB-shot-down.
+
+### Files to pre-load (Session 6)
+
+- `kernel/src/mm/frame_allocator.rs` — buddy allocator, refcounts, `allocate_frame` / `free_frame`.
+- `kernel/src/smp/tlb.rs` — `tlb_shootdown_range`, IPI handler, page-table-edit synchronization.
+- `kernel/src/mm/mod.rs:373-…` — `free_process_page_table` (the freeing walk).
+- `kernel/src/arch/x86_64/interrupts.rs:1067-1100` — kernel page-fault handler (single-core hlt → all-core quiesce hardening).
+- `/tmp/m3os-smoke-full.log` from a run that hits *either* fault variant — both are now data points for the same bug.
