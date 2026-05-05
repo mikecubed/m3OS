@@ -4382,6 +4382,46 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
         use x86_64::registers::control::{Cr3, Cr3Flags};
+        // Read kstack/fs_base from PROCESS_TABLE first; these don't depend
+        // on CR3 and we want them in scope for `set_current_user_return`
+        // which we run BEFORE `Cr3::write` (Bug #5 fix below).
+        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
+            .lock()
+            .find(pid)
+            .map(|p| (p.kernel_stack_top, p.fs_base))
+            .unwrap_or((0, 0));
+
+        // Phase 57e Bug #5 fix — publish the new `UserReturnState`
+        // BEFORE switching CR3.
+        //
+        // Pre-fix order was `Cr3::write(new_cr3)` then
+        // `set_current_user_return(... cr3_phys: new_cr3 ...)`.  Under
+        // preempt-full a kernel-mode timer/IPI firing in the window
+        // between those two calls leaves `task.user_return.cr3_phys`
+        // pointing at the **old** address space (set by
+        // `snapshot_user_return_state` at syscall entry).  When the
+        // dispatcher resumes this task it restores Cr3 from the stale
+        // urs, so when execve continues and `iretq`'s to ring 3 at
+        // the new entry point, the page is unmapped in the OLD cr3 →
+        // INSTRUCTION_FETCH page fault at the binary's `_start`.
+        //
+        // Publishing urs first makes the dispatcher's restore always
+        // pick the new cr3.  Cases:
+        //   - preempt before urs publish: urs unchanged (old cr3),
+        //     dispatch restores old cr3, iretq back here, retry both.
+        //   - preempt after urs publish, before Cr3::write: urs has
+        //     new cr3, dispatch restores new cr3, Cr3::write is a
+        //     no-op when execve resumes.
+        //   - preempt after Cr3::write: both states are new — fine.
+        // No state can disagree.
+        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
+            user_rsp,
+            kernel_stack_top: kstack_top,
+            fs_base,
+            cr3_phys: new_cr3.start_address().as_u64(),
+            addr_space_gen: new_addr_space.generation(),
+        });
+
         // Capture old CR3 before switching so we can free its frames after.
         let (old_cr3, _) = Cr3::read();
         let old_cr3_phys = old_cr3.start_address().as_u64();
@@ -4406,22 +4446,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // real reclamation happens in Phase 13 when a free list is added.
         crate::mm::free_process_page_table(old_cr3_phys);
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
-        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
-            .lock()
-            .find(pid)
-            .map(|p| (p.kernel_stack_top, p.fs_base))
-            .unwrap_or((0, 0));
         if kstack_top != 0 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
-        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
-            user_rsp,
-            kernel_stack_top: kstack_top,
-            fs_base,
-            cr3_phys: new_cr3.start_address().as_u64(),
-            addr_space_gen: new_addr_space.generation(),
-        });
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
