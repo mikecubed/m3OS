@@ -952,3 +952,66 @@ The kernel page-fault handler still ends with `crate::hlt_loop()` which halts on
 
 7. The frame allocator carries a per-frame allocate/free trace ring, and a kernel page-fault dump prints the recent history of the offending frame.
 8. Root-cause UAF/double-allocate site is identified, fixed, and validated by 10 deterministic smoke-test passes under `preempt-full`.
+
+---
+
+## Session 7 — frame-trace ring landed; lifecycle traced; root caller still TBD
+
+### What landed (`b23a24c`)
+
+1. `kernel/src/mm/frame_trace.rs` — global 16 384-entry ring keyed by physical frame address. Records every `allocate_frame` / `allocate_contiguous` / `free_frame` / `free_frame_direct` / `free_contiguous` with the immediate caller's `&'static Location` via `#[track_caller]`. Wired into the kernel page-fault handler — on a ring-0 fault the active CR3 frame's recent history is dumped.
+2. `kernel/src/arch/x86_64/syscall/mod.rs` (execve) — speculative Bug #7 fix: capture `old_cr3_phys` via `Cr3::read` BEFORE `set_current_user_return` so a kernel-mode preempt between the urs publish and the read cannot make `Cr3::read` return new_cr3.
+3. `kernel/src/mm/mod.rs` (free_process_page_table) — `[free_pt] cr3_phys=… caller=…` log on every entry so the next captured fault identifies which path passed the just-allocated PML4 as cr3_phys.
+
+### What the first captured fault revealed
+
+The frame-trace dump for the corrupted PML4 frame (`0x1673000` in Session 6, `0x1674000` in iteration 3 here — they shift each run) shows a deterministic six-event lifecycle:
+
+```
+[tick=N+0]  ALLOC  caller=kernel/src/mm/elf.rs:400        ← initial ELF user page (some pid)
+[tick=N+~70] FREE  caller=kernel/src/arch/x86_64/interrupts.rs:322  ← CoW handler core 1 (refcount 2→1)
+[tick=N+~70] FREE  caller=kernel/src/arch/x86_64/interrupts.rs:322  ← CoW handler core 3 (refcount 1→0)
+[tick=N+~70] ALLOC caller=kernel/src/mm/mod.rs:288        ← new_process_page_table (new PML4)
+[tick=N+~73] FREE  caller=kernel/src/mm/mod.rs:498        ← free_process_page_table cr3_phys (!!!)
+[tick=N+~74] ALLOC caller=kernel/src/mm/slab.rs:303       ← reused as a slab span
+```
+
+The mm/mod.rs:498 free is the smoking gun: the just-allocated new PML4 is being passed to `free_process_page_table` as `cr3_phys` only ~3 ticks after creation. CR3 is still pointing at this frame when the kernel next mutates its heap, walks PML4[256], and faults on the now-corrupted entry that was overwritten by the slab cache.
+
+### The Bug #7 fix did not close the residual
+
+`b23a24c` moved `Cr3::read()` in execve to BEFORE `set_current_user_return` so the captured `old_cr3_phys` cannot be the new_cr3 (eliminating the obvious "preempt between urs publish and Cr3::read makes the dispatcher restore Cr3 = new_cr3" race). The same six-event lifecycle still reproduces under preempt-full smoke-test, so the actual race is elsewhere.
+
+Three viable hypotheses remain:
+
+1. **Frame allocator double-allocate.** Two allocate_frame calls on different cores returning the same physical address. The per-CPU page cache + fetch_add on the cache head could have a race window under preempt-full where two pops return the same slot. Verify by reading the per-CPU cache pop path with concurrency in mind.
+2. **`free_process_page_table` called on a frame that's also live elsewhere.** A process Y dies and `free_process_page_table` walks Y's page table, finds the victim frame as a *user leaf* in Y's PT, and frees it — even though Y's PT was supposed to be updated by the CoW handler when Y wrote to that page. This would imply the CoW handler's per-process PTE update on Y's side did NOT actually take effect, OR Y's PT inherited a stale copy. Verify by examining `cow_clone_user_pages` and `resolve_cow_fault` for any path that fails to update the OTHER CoW partner's PT.
+3. **`execve` calling `free_process_page_table` with `new_cr3_phys` instead of `old_cr3_phys`.** Despite the fix, some path within execve's flow ends up with `old_cr3_phys == new_cr3_phys`. Possible routes: a yield-style call between PROCESS_TABLE update (line 4332) and Cr3::read that runs `save_user_return_state` with the now-updated PROCESS_TABLE → urs.cr3_phys = new_cr3 → preempt → dispatcher restores Cr3 = new_cr3 → execve resumes → Cr3::read returns new_cr3 → old_cr3_phys = new_cr3.
+
+`save_user_return_state` is called by `yield_now` (`scheduler.rs:2062`) and `block_current_until` (`scheduler.rs:2533`). It is **not** called by `preempt_frame_to_scheduler` (`scheduler.rs:2151`), which only refreshes `urs.fs_base`. So a pure IRQ-driven preempt does NOT refresh urs.cr3_phys. The race in Hyp #3 would require a yield/block between PROCESS_TABLE update and Cr3::read.
+
+### Next-session investigation (Session 8)
+
+1. **Make `free_process_page_table` `#[track_caller]`** so the trace ring records the **outer** caller (currently records mm/mod.rs:498 which is uninformative). Until that lands, the `[free_pt]` log line is the only signal — but it didn't fire on a faulting iteration during Session 7's runs (the [free_pt] log emits at every entry; on a fault the dump shows the surrounding history). Re-run with multiple iterations to capture both signals together.
+2. **Audit `cow_clone_user_pages` for refcount/flag setup.** Specifically: when fork CoW-clones, does it correctly increment refcount for shared pages? Does it correctly mark BOTH parent and child PTEs with BIT_9 + non-WRITABLE? If the child's PT inherits a stale entry (mapped to old frame, BIT_9 marker missing), the CoW handler in the child wouldn't update it — but then the parent's free would leave an orphaned mapping in the child.
+3. **Audit execve between line 4332 (PROCESS_TABLE update) and line 4413 (Cr3::read)** for any explicit or implicit yield. Specifically, `reset_current_task_fpu_state`, the `log::info!` calls, and any `Vec::push`/heap mutation that could trigger `try_grow_on_oom_for_layout` → `grow_heap` → ... → yield.
+4. **Add a `#[track_caller]` chain through `new_process_page_table`** so the frame-trace records who called it. Currently mm/mod.rs:288 is uninformative.
+
+### Files to pre-load (Session 8)
+
+- `kernel/src/mm/mod.rs:282-381` — `new_process_page_table` (allocate_frame call).
+- `kernel/src/mm/mod.rs:396-500` — `free_process_page_table` (already track_caller, but inner call sites are not).
+- `kernel/src/arch/x86_64/syscall/mod.rs:3858-3960` — `sys_fork` and `cow_clone_user_pages`.
+- `kernel/src/arch/x86_64/interrupts.rs:233-326` — `resolve_cow_fault`.
+- `kernel/src/arch/x86_64/syscall/mod.rs:4263-4475` — `sys_execve` (with my Bug #7 fix at 4413).
+
+### Status of acceptance criteria as of `b23a24c`
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically | ❌ — still intermittent; about 1 in 3 attempts hits the kernel page fault |
+| (4) `run-gui` 10-min soak | not verified |
+| (7) per-frame trace ring + page-fault dump | ✅ landed |
+| (8) UAF/double-allocate site identified, fixed | ❌ — lifecycle traced but root caller TBD |
