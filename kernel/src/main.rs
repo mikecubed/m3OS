@@ -521,9 +521,25 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 // These are now userspace processes (userspace/fat_server, userspace/vfs_server).
 
 /// Idle task: halts the CPU between timer ticks.
+///
+/// Under `preempt-voluntary` we explicitly yield after the IRQ that woke us
+/// finishes — the IRQ handler only sets `reschedule`, it does not dispatch,
+/// so without the yield we'd hlt again instead of running the task that the
+/// IPI was meant to wake.
+///
+/// Under `preempt-full` the kernel-mode preempt path in
+/// `check_and_preempt_kernel` already dispatches on IRQ-return when
+/// `reschedule` is set, so the yield is redundant.  Worse, the
+/// `SchedulerGuard::drop` inside `yield_now` hits `preempt_enable`'s
+/// zero-crossing branch (`scheduler.rs:1693-1714`); if cross-core IPC keeps
+/// setting `reschedule` on this core, that branch synchronously calls
+/// `yield_now` again and the scheduler picks idle as the only ready task —
+/// a 30-second livelock equivalent to the Bug #6 init_task pattern.  Same
+/// mitigation: just halt.
 fn idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+        #[cfg(not(feature = "preempt-full"))]
         task::yield_now();
     }
 }
