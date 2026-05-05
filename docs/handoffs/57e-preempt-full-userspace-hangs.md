@@ -1,6 +1,6 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status:** Open. Three independent userspace failures observed under `M3OS_KERNEL_FEATURES=preempt-full` after the Bug #1–#5 fixes landed. All reproduce on `feat/phase-57e-full-preemption` at `defb146` (PR #136). The default build (preempt-voluntary) is unaffected.
+**Status:** Headless `cargo xtask smoke-test` under `preempt-full` passes at `d83ecc7` (3 fixes: `init_task` halt, idle-task yield cfg-gate, `reply()` preempt_disable bracket). One intermittent retry still hangs at `display_server: starting` — recovered by smoke-test's retry logic but indicates F2 (apply F1 to other `deliver_message + wake_task_v2` pairs) is still pending. GUI reproducers and 10-minute soak under `run-gui` not yet verified. See *Session 3 — resolution* below.
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
 
@@ -478,3 +478,98 @@ c3a3b84 docs(57e): record Bug #5 fix and Bug #6-family residual list   ← class
 4109101 fix(57e): make user_rsp per-task in TaskSyscallSnapshot (Bug #4)
 d0bf15a fix(57e): move user GPR snapshot from per-core to per-task (Bug #3)
 ```
+
+---
+
+## Session 3 — resolution
+
+### What the sched-trace capture (run8) revealed
+
+Captured under `M3OS_KERNEL_FEATURES="preempt-full,sched-trace"` at `2b1c3f5`. The watchdog trips at the headless smoke step `SMOKE:tcc-compile:BEGIN` exactly as in earlier runs. The new sched-trace ring localised the stuck core's hot path:
+
+- **Per timer tick on the stuck core (10 ms cadence):** five sched-trace entries — one kernel-mode `emit_preempt_trace` at `interrupts.rs:1339` plus two complete `retarget_preempt_count_to_dummy` / `retarget_preempt_count_to_task` pairs. Two full dispatch handoffs per timer tick.
+- **`pid` field of the SwitchIn pivot at `scheduler.rs:1418`:** the same `task_idx` every cycle, which corresponds to the kernel's `init_task` (the bootstrap task spawned at `kernel/src/main.rs:249`).
+- **`pid` field of the kernel-mode preempt event:** the truncated saved RIP, constant at `0x7A4E62`. `addr2line` resolves this to `init_task+0x410`. Disassembly of that offset shows the inlined body of `preempt_enable`'s zero-crossing branch (`scheduler.rs:1693-1714`) — `lock decl (preempt_count)`, conditional read of `pc.reschedule`, conditional `call yield_now`.
+
+### Why H7 and the original H7' were both incomplete
+
+- **H7 (lost wakeup):** ruled out by the trace. There was no missing `WakeTask` event — the receiver was simply never selected, because the core was dispatching `init_task` instead.
+- **H7' (IPI livelock):** directionally right — cross-core wakes do keep setting `reschedule = true` on the stuck core, but the *effect* lives at the `preempt_enable` zero-cross inside `init_task`'s busy-yield, not at the IPI handler. The bare-coalesce IPI experiment (run7) suppressed the trigger but introduced new wake delays because of the AP 10 ms timer.
+
+### Mechanism (final)
+
+1. `task::spawn(init_task, "init")` placed on whichever core `least_loaded_core` picks at boot, or migrated there later by load balance. Often an AP, not the BSP.
+2. `init_task` finishes service setup and falls into `loop { task::yield_now(); }` (`kernel/src/main.rs:325-327`).
+3. Each iteration: `yield_now → scheduler_lock → SchedulerGuard::drop → preempt_enable`.
+4. Cross-core IPC traffic (vfs / fat / session servers) keeps setting `reschedule = true` on `init_task`'s core via `enqueue_to_core` (`scheduler.rs:1041`).
+5. `preempt_enable`'s zero-crossing observes `reschedule == true` with IF=1 and synchronously calls `yield_now` again (`scheduler.rs:1707`).
+6. Scheduler picks `init_task` as the only ready task on this core (real userspace tasks on the same core are now `BlockedOnReply` waiting for the wakers that `init_task` is starving).
+7. Loop forever. The core makes zero userspace progress for 30+ seconds; the watchdog catches it as `(no waker registered)` on whichever userspace task happened to land on the same core.
+
+The `cpu-hog: pid=20 ion ran~30035 ms` warning was a red herring — `ran_ticks = now - start_tick`, and `start_tick` was set when ion was first dispatched 30 s earlier. By the time the warning fired, ion had long since been preempted off the core; `init_task` had taken over.
+
+### Fix that landed (`695f800`)
+
+One-line change in `kernel/src/main.rs:325-336`:
+
+```rust
+log::info!("[init] service set started — yielding");
+loop {
+    x86_64::instructions::interrupts::enable_and_hlt();
+}
+```
+
+`init_task` has no work after service setup, so halting it removes it as a wake target on whichever core it ends up. This does not address the underlying tendency for `preempt_enable` zero-crossing to fire synchronous yields when `reschedule` is set — that is still latent for any future kernel task with the same shape — but `init_task` was the only such task in the kernel today.
+
+### Verification
+
+- **Headless** `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run` (run9, post-fix):
+  - `SMOKE:auth:PASS`, `SMOKE:tcc-version:PASS`, `SMOKE:tcc-compile:PASS`, `SMOKE:hello:PASS`, `SMOKE:storage:PASS`, `SMOKE:net:PASS`, `SMOKE:log:PASS`, `SMOKE:PASS`.
+  - `display_server` compose loop reaches `compose#11160` at the 240 s timeout, no heartbeat stalls.
+  - **0** `cpu-hog` warnings; **0** `(no waker registered)` watchdog hits; **0** stale-ready warnings ≥ 1 s.
+  - 12 residual `dequeue-drop … extra=0x2 (BlockedOnRecv)` warnings — back to genuinely benign now that no core is monopolised.
+- **Acceptance criteria 1, 2, 4** (GUI doom + GUI TAB + 10 min soak under `run-gui`) — **not yet verified**. Suggested next step before reopening Track G's 24 h soak gate.
+
+### Residual concerns
+
+1. **Why `init_task` ends up on an AP at all.** `task::spawn` selects via `least_loaded_core`. At boot, all APs are empty so the choice is arbitrary. Pinning `init_task` to BSP would have masked this bug too, but the halt-yield fix is more robust because it survives later load-balance migration.
+2. **Other busy-yield kernel tasks.** `grep -n "loop { *task::yield_now()" kernel/src/` should be empty after this fix; if a future task is added with that shape, the same livelock is possible.
+3. **The `preempt_enable` synchronous-yield path is still the most aggressive option under `preempt-full`.** Consider whether F3 from the original *Proposed fixes* — suppress synchronous yield inside IPC reply paths — should land as defence in depth, even though it is no longer required to close this bug.
+
+### Follow-on fixes that landed in this session
+
+After the `init_task` halt fix passed `cargo xtask run` but **`cargo xtask smoke-test`** (heavier disk, retry-driven) still hung at `tcc-compile` with `pid=2 syslogd state=BlockedOnReply stuck-since=134973ms`, two more fixes were needed:
+
+#### `38d35ea` — cfg-gate idle yield_now to preempt-voluntary
+
+`idle_task` (BSP, `kernel/src/main.rs`) and `ap_idle_task` (APs, `kernel/src/smp/boot.rs`) both followed every `enable_and_hlt` with a `task::yield_now()`. The same Bug #6 mechanism applied: under `preempt-full`, the post-hlt yield's `SchedulerGuard::drop` zero-crossed `preempt_count` with `reschedule` set, synchronously calling `yield_now` again. Scheduler picked idle as the only ready task on the core, redispatched it, livelock.
+
+The yield is required under `preempt-voluntary` (where the IPI handler only sets `reschedule` without dispatching) so it was cfg-gated, not removed.
+
+#### `d83ecc7` — bracket `reply()` with preempt_disable / preempt_enable (F1)
+
+`ipc::endpoint::reply` is `deliver_message(caller, msg)` followed by `wake_task_v2(caller)`. `deliver_message`'s `SchedulerGuard::drop` zero-crosses between (A) and (B). Under `preempt-full` the synchronous yield branch fires, server yields before `wake_task_v2` runs. If wake is then delayed (server starved or its CAS bails), the caller is parked in `BlockedOnReply` with `pending_msg` set but no run-queue entry — the original H7 lost-wakeup signature.
+
+F1 fix: bracket the deliver+wake pair with `preempt_disable` / `preempt_enable` so `deliver_message`'s drop sees `preempt_count > 0`, no zero-cross, no synchronous yield. The pair is now atomic from the caller's state machine's perspective.
+
+### Status of the original acceptance criteria
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + login + `fb-takeover doom` renders | **not verified** — needs interactive run-gui |
+| (2) `run-gui` + login + TAB completion → ion completes | **not verified** — needs interactive run-gui |
+| (3) `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes within standard timeout | ✅ **PASS** — exit 0, completed on attempt 3 of 3 in 67 s |
+| (4) `run-gui` 10-minute soak with zero `(no waker registered)` warnings | **not verified** — needs interactive run-gui |
+
+### Residual: intermittent `display_server: starting` hang on smoke-test attempts 1–2
+
+`cargo xtask smoke-test` retry attempts 1 and 2 hang at `display_server: starting (Phase 56 — C.1+C.2)` with no further serial output until the trace-ring dump fires. Attempt 3 boots cleanly and runs to completion. The pattern is **timing-sensitive**: same kernel, same disk, different outcome.
+
+Likely cause: another `deliver_message + wake_task_v2` pair (F2 in the original *Proposed fixes*) hits the same race that F1 just closed for `reply()`. Candidate sites from `grep -rn deliver_message kernel/src/ipc/`:
+
+- `kernel/src/ipc/endpoint.rs:340, 360, 380, 461, 479, 492, 568, 582, 596, 740, 850, 857` (sender-side delivery in send/recv paths)
+- `kernel/src/ipc/cleanup.rs:94, 99, 105` (error-path delivery on task death)
+
+Each pair should either be wrapped with `preempt_disable` / `preempt_enable` (per-site) or refactored to call a `deliver_and_wake_atomic` helper.
+
+The right next step is to introduce that helper (one place to bracket, no risk of forgetting a pair on a future addition) rather than per-site bracketing. Once it lands, smoke-test should pass deterministically on attempt 1, and the GUI reproducers (criteria 1, 2, 4) can be verified.
