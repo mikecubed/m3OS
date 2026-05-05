@@ -91,20 +91,16 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
             );
         }
         let _ = scheduler::take_bulk_data(stranded.task);
-        scheduler::deliver_message(stranded.task, error_msg);
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(stranded.task);
+        // Phase 57e Bug #6 (F2): atomic deliver+wake — see
+        // scheduler::deliver_message_and_wake.
+        let _ = scheduler::deliver_message_and_wake(stranded.task, error_msg);
     }
     for task in stranded_receivers {
-        scheduler::deliver_message(task, error_msg);
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(task);
+        let _ = scheduler::deliver_message_and_wake(task, error_msg);
     }
 
     for caller in reply_waiters {
-        scheduler::deliver_message(caller, error_msg);
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(caller);
+        let _ = scheduler::deliver_message_and_wake(caller, error_msg);
     }
 
     let reclaimable: alloc::vec::Vec<_> = reclaim_candidates

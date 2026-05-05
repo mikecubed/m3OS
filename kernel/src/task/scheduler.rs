@@ -3298,6 +3298,30 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     }
 }
 
+/// Atomically [`deliver_message`] and [`wake_task_v2`] for the same target.
+///
+/// Bracketed with [`preempt_disable`] / [`preempt_enable`] so
+/// `deliver_message`'s `SchedulerGuard::drop` does NOT zero-cross
+/// `preempt_count` between the two operations.  Without this, under
+/// `preempt-full` a synchronous `yield_now` from `preempt_enable`'s
+/// zero-crossing branch (`scheduler.rs:1693-1714`) could fire BEFORE
+/// `wake_task_v2` runs, parking the target in a `Blocked*` state with
+/// `pending_msg` set but no run-queue entry — the H7 lost-wakeup signature
+/// from `docs/handoffs/57e-preempt-full-userspace-hangs.md`.
+///
+/// Use this in place of every `deliver_message` + `wake_task_v2` pair where
+/// the same `id` is the target of both calls and no other scheduler-locked
+/// work happens between them.  For pairs with intervening work (bulk
+/// transfer, registry mutation, etc.) bracket the whole critical section
+/// with [`preempt_disable`] / [`preempt_enable`] manually instead.
+pub fn deliver_message_and_wake(id: TaskId, msg: Message) -> WakeOutcome {
+    preempt_disable();
+    deliver_message(id, msg);
+    let outcome = wake_task_v2(id);
+    preempt_enable();
+    outcome
+}
+
 /// Store a [`Message`] only if the task's pending slot is empty.
 ///
 /// Returns `true` if the message was installed. Used by signal delivery so

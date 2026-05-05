@@ -337,9 +337,11 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                         log::warn!(
                             "[ipc] recv_msg: capability table full, unblocking sender without reply"
                         );
-                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ = scheduler::deliver_message_and_wake(
+                            pending.task,
+                            Message::new(u64::MAX),
+                        );
                         return Message::new(u64::MAX);
                     }
                 }
@@ -357,9 +359,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
                 // Wake the sender with an error so it doesn't block forever.
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return Message::new(u64::MAX);
             }
             // Phase 56 close-out — communicate the assigned reply-cap handle
@@ -458,9 +459,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
                 log::warn!(
                     "[ipc] recv_msg_nowait: capability table full, unblocking sender without reply"
                 );
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return Some(Message::new(u64::MAX));
             }
         }
@@ -476,9 +476,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         if let Some(handle) = reply_cap_handle {
             let _ = scheduler::remove_task_cap(receiver, handle);
         }
-        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+        let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
         return Some(Message::new(u64::MAX));
     }
 
@@ -565,9 +564,11 @@ pub fn recv_msg_with_notif(
                     Ok(handle) => Some(handle),
                     Err(_) => {
                         log::warn!("[ipc] recv_msg_with_notif: cap table full");
-                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ = scheduler::deliver_message_and_wake(
+                            pending.task,
+                            Message::new(u64::MAX),
+                        );
                         return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
                     }
                 }
@@ -579,9 +580,8 @@ pub fn recv_msg_with_notif(
                 if let Some(handle) = reply_cap_handle {
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
             }
 
@@ -847,9 +847,9 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                         // Endpoint was closed or destroyed; wake receiver with an
                         // explicit IPC error so it does not remain stranded.
                         drop(reg);
-                        scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(receiver);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ =
+                            scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
                     }
                     return Message::new(u64::MAX);
                 }
@@ -1071,9 +1071,8 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                     ep.receivers.push_front(receiver);
                 } else {
                     drop(reg);
-                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                    let _ = crate::task::scheduler::wake_task_v2(receiver);
+                    // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                    let _ = scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
                 }
                 return false;
             }
