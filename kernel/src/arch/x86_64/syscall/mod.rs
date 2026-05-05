@@ -872,9 +872,16 @@ use super::gdt;
 // PerCoreData — user code cannot change it: no FSGSBASE, no wrmsr in ring 3).
 // The Rust-side helpers below read from per-core data.
 
-/// Read the per-core `syscall_arg3` (R10 at SYSCALL entry).
+/// Read the current task's syscall arg3 (R10 at SYSCALL entry).
+///
+/// Phase 57e Bug #4 follow-up — was `pc.syscall_arg3` per-core; the
+/// per-core slot has the same mid-syscall-preempt aliasing hazard
+/// Bugs #3/#4 closed for `syscall_user_*`/`syscall_user_rsp`. The
+/// snapshot's `user_r10` is the same value (also written by the asm
+/// prologue) and is per-task, so reading from there eliminates the
+/// hazard with no asm change.
 pub(super) fn per_core_syscall_arg3() -> u64 {
-    crate::smp::per_core().syscall_arg3
+    crate::task::current_task_syscall_snapshot().user_r10
 }
 
 /// Read the current task's R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
