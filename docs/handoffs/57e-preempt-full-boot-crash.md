@@ -360,9 +360,11 @@ Implemented option (1) from the candidates section — moved the user GPR snapsh
 3. `cargo xtask smoke-test` (default) — PASSED on attempt 2 (9 steps in 15 s).
 4. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` — progresses through `SMOKE:auth:PASS` and onward through `SMOKE:tcc-version:PASS` / `SMOKE:tcc-compile` (was: timing out on the very first auth step). Still fails the suite at the `tcc-version` / `tcc-compile` per-step timeouts, plus one additional preempt-full-only userspace fault on `term` (pid 17, write protection violation at a real userspace address — different signature from Bug #3, separate issue).
 
-**Residual under `preempt-full` (Bug #4, not investigated this session):**
+**Residual under `preempt-full` (Bug #4, FIXED this session):**
 
-- `term` (pid 17) consistently faults at `rip=0x403895` with `addr=0x408a18`, error code `PROTECTION_VIOLATION | CAUSED_BY_WRITE | USER_MODE` — a write to a present but read-only page in its own text/rodata range. Default build (`preempt-voluntary`) does not exhibit this; term starts and forks normally. Likely a separate preempt-full hazard (CoW miss? page-table interaction?) or term-specific bug exposed by mid-syscall preempt of `term`'s startup. Track G's 24-h soak gate stays closed pending Bug #4 triage.
+Same hazard family as Bug #3 — `pc.syscall_user_rsp` was still per-core. The window between `syscall_entry`'s `mov gs:[OFF_USER_RSP], rsp` and `snapshot_user_return_state()`'s read-back from that slot left another mid-syscall kernel-mode-preempt aliasing site: a different task's `syscall_entry` could overwrite the slot, so when the preempted task's syscall handler eventually ran, `task.user_return.user_rsp` was populated from a foreign value, and the next sysret landed the resumed user task on a stranger's stack — corrupting RIP, crashing on the next instruction-fetch / `ret`.
+
+Fix: extend `TaskSyscallSnapshot` with a `user_rsp` field, save it from the asm prologue (one extra `mov [rcx + SNAP_USER_RSP], r9` reusing the snapshot pointer in `rcx` and the user-rsp value already in `r9` for the syscall_handler arg), and restore `pc.syscall_user_rsp` from the per-task snapshot on **every** dispatch (the legacy restore only ran when `task.user_return` was already populated, which was exactly the window the bug exploited). The sysret tail still reads `gs:[OFF_USER_RSP]`, but that slot is now reliably the current task's value.
 
 ---
 

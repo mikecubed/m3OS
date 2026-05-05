@@ -3935,6 +3935,25 @@ pub fn run() -> ! {
             unsafe {
                 *pc.current_syscall_snapshot_ptr.get() = task_syscall_snapshot_ptr;
             }
+            // Phase 57e Bug #4 fix — restore `pc.syscall_user_rsp` from
+            // the per-task snapshot on every dispatch so the sysret tail
+            // (`mov rsp, gs:[OFF_USER_RSP]`) sees *this* task's user RSP
+            // and not whatever a same-core task last wrote.  The legacy
+            // restore further up only ran when `task.user_return` was
+            // populated (post-`snapshot_user_return_state`), leaving a
+            // window for kernel-mode preempt to corrupt the slot before
+            // the snapshot ran.  Always restoring from the per-task
+            // snapshot — which `syscall_entry` writes during its
+            // IRQs-masked prologue — closes that window.  For tasks
+            // that never made a syscall (kernel tasks, fork-children
+            // before first iretq) the snapshot is zero, but the value
+            // is irrelevant: those tasks reach user mode via
+            // fork_enter_userspace (uses `ForkEntryCtx`, not the
+            // per-core slot) and never sysret.
+            unsafe {
+                let data = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                (*data).syscall_user_rsp = (*task_syscall_snapshot_ptr).user_rsp;
+            }
         }
         if !task_fpu_state_ptr.is_null() {
             unsafe { restore_fpu_state(&*task_fpu_state_ptr) };

@@ -330,6 +330,24 @@ pub struct TaskSyscallSnapshot {
     pub user_r9: u64,     // 80
     pub user_r10: u64,    // 88
     pub user_rflags: u64, // 96
+    /// Phase 57e Bug #4 fix — user RSP at SYSCALL entry.
+    ///
+    /// The asm was originally only saving user RSP to a per-core slot
+    /// (`PerCoreData::syscall_user_rsp`).  Under preempt-full a kernel-
+    /// mode preempt firing in the window between the per-core save and
+    /// `snapshot_user_return_state()`'s read of it would let another
+    /// task's `syscall_entry` overwrite the per-core slot, so the
+    /// preempted task's `task.user_return.user_rsp` was populated with a
+    /// foreign value when its syscall handler eventually got around to
+    /// running.  At sysret the bad RSP would land the resumed user task
+    /// on a stranger's stack, with the next `ret`/instruction-fetch
+    /// hitting garbage.
+    ///
+    /// Storing user RSP per-task and rebuilding the per-core slot from
+    /// the snapshot on every dispatch closes the window: the snapshot
+    /// is touched *only* by the owning task's `syscall_entry` (during
+    /// the IRQs-masked prologue) so no aliasing is possible.
+    pub user_rsp: u64, // 104
 }
 
 /// Byte offsets within `TaskSyscallSnapshot`.  The syscall-entry asm
@@ -351,6 +369,7 @@ pub mod task_syscall_snapshot_offsets {
     pub const SNAP_USER_R9: usize = offset_of!(TaskSyscallSnapshot, user_r9);
     pub const SNAP_USER_R10: usize = offset_of!(TaskSyscallSnapshot, user_r10);
     pub const SNAP_USER_RFLAGS: usize = offset_of!(TaskSyscallSnapshot, user_rflags);
+    pub const SNAP_USER_RSP: usize = offset_of!(TaskSyscallSnapshot, user_rsp);
 }
 
 /// Read a snapshot of the **current task's** user GPRs as captured by the
@@ -402,6 +421,7 @@ pub fn current_task_syscall_snapshot() -> TaskSyscallSnapshot {
             user_r9: (*ptr).user_r9,
             user_r10: (*ptr).user_r10,
             user_rflags: (*ptr).user_rflags,
+            user_rsp: (*ptr).user_rsp,
         }
     }
 }

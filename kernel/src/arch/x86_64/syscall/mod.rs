@@ -1094,6 +1094,7 @@ global_asm!(
     ".equ SNAP_USER_R9,     {snap_user_r9}",
     ".equ SNAP_USER_R10,    {snap_user_r10}",
     ".equ SNAP_USER_RFLAGS, {snap_user_rflags}",
+    ".equ SNAP_USER_RSP,    {snap_user_rsp}",
 
     ".global syscall_entry",
     "syscall_entry:",
@@ -1187,6 +1188,13 @@ global_asm!(
     // Load r8 (user_rip) BEFORE overwriting rcx.
     "mov r8, [rsp + 104]",         // user_rip (5th param)
     "mov r9, gs:[OFF_USER_RSP]",   // user_rsp (6th param)
+    // Phase 57e Bug #4 fix — save user_rsp to the per-task snapshot so
+    // a kernel-mode preempt firing before `snapshot_user_return_state`
+    // runs cannot leave `task.user_return.user_rsp` populated from
+    // another task's per-core slot.  `rcx` still holds the snapshot
+    // pointer (next instruction `mov rcx, rdx` clobbers it for the
+    // SysV arg shuffle).
+    "mov [rcx + SNAP_USER_RSP], r9",
     "mov rcx, rdx",                // arg2
     "mov rdx, rsi",                // arg1
     "mov rsi, rdi",                // arg0
@@ -1246,6 +1254,7 @@ global_asm!(
     snap_user_r9     = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R9,
     snap_user_r10    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R10,
     snap_user_rflags = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RFLAGS,
+    snap_user_rsp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSP,
 );
 
 // ---------------------------------------------------------------------------
