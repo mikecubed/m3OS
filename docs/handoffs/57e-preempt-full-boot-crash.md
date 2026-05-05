@@ -1,6 +1,6 @@
 # Phase 57e — `preempt-full` Boot Crash Handoff
 
-**Status:** Open — investigation paused after Bug #1 fix; Bug #2 reproduces 100 % on every boot under `preempt-full`.
+**Status:** Bug #2 root cause identified and fixed in the working tree (uncommitted as of this update). H6 confirmed: scheduler dispatch prep was non-re-entrant under `preempt-full` because the `IrqSafeMutex` guard around `pick_next` re-enabled IRQs on drop, leaving a window where a stray timer/IPI could recurse through `preempt_to_scheduler_kernel` → `switch_context` with `RSP=0` (BSP first dispatch) or a stale scheduler RSP (subsequent dispatches). Fix: `interrupts::disable()` placed **before** the `pick_next` lock acquire so the guard's `was_enabled` snapshot is `false` and the drop is a no-op, keeping IRQs masked from commit through `switch_context`. Default-build smoke-test passes; `cargo xtask check` clean. Under `preempt-full` the kernel now boots all services to completion and the smoke-test fails much later in userspace at `SMOKE:tcc-version:PASS` — that residual is a separate issue (not the original Bug #2). See "Resolution" section below.
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136), branch tip `29d38e7` at the time of handoff.
 **Companion:** `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`, `docs/roadmap/tasks/57e-full-kernel-preemption-tasks.md`.
 
@@ -126,7 +126,64 @@ Adding a `log::info!("[sched-dbg] pre-switch_context core=… task_rsp=… resum
 
 ---
 
+## Important nuance: `debug_assert!` is off in release
+
+The `debug_assert!(task_rsp != 0, ...)` at `scheduler.rs:3653` is compiled out in release builds (smoke-test runs release). So in the failing run, that check never fires. The bug *could* be either:
+
+- (a) `task.saved_rsp` was already 0 in the chosen task at `pick_next` time (release builds don't catch this), OR
+- (b) The local `task_rsp` value got clobbered between line 3648 (where it is bound) and line 3953 (where it materialises into `rsi`) — a ~300-line window.
+
+Both possibilities need to be considered. The handoff originally only addressed (b); H6 below covers (a).
+
 ## Leading hypotheses (in order of likelihood)
+
+### H6 (NEW — top candidate) — recursive `preempt_to_scheduler_kernel` with `sched_rsp == 0`
+
+**Key facts establishing the race:**
+
+- `per_core.scheduler_rsp` is **initialised to 0** in `kernel/src/smp/mod.rs:627` and `:749`. It is only populated when the first `switch_context` call on that core writes to it via `mov [rdi], rsp`. **Before the BSP's first successful switch_context, `per_core_scheduler_rsp() == 0`.**
+- The dispatch-prep block acquires `scheduler_lock()` (an `IrqSafeMutex`) at `scheduler.rs:3824` and releases it at `:3860`. The release re-enables IRQs.
+- The next IRQ-disable does not happen until *inside* `retarget_preempt_count_to_task` at `scheduler.rs:3888`. That leaves a ~28-line window (`:3860`–`:3887`) where:
+  - IRQs are enabled,
+  - `current_task_idx` is still set (committed at `:3623`),
+  - `current_preempt_count_ptr` still targets the per-core dummy (value 0) — the switch-in retarget has not yet run.
+
+**Sequence that produces the observed fault:**
+
+1. BSP enters `scheduler::run` for the first time. `pick_next` returns init (`idx=1`, `task_rsp=0x28000967fb8`).
+2. `Dispatch` trace event fires.
+3. Address-space restore loop runs (no-op for `pid=0`).
+4. Lock acquire/release at `:3824/:3860` captures `preempt_count_ptr`, `resume_mode`, `fpu_state_ptr`. **Lock release re-enables IRQs.**
+5. **A queued LAPIC timer IRQ fires here.**
+6. `timer_handler_kernel` → `check_and_preempt_kernel` (`interrupts.rs:1419`):
+   - `peek_preempt_count_irq()` → 0 (dummy slot).
+   - `try_per_core()` → `Some`.
+   - `current_task_idx.is_none()` → **false** (init's idx is committed) — early-boot guard added in `a70445c` does not trip.
+   - `reschedule` flag → true (init's wakeup set it).
+   - `kernel_preempt_watchdog` → false (no scheduler-context lock currently held).
+   - → calls `preempt_to_scheduler_kernel` → `preempt_frame_to_scheduler` (`scheduler.rs:2147`).
+7. `preempt_frame_to_scheduler` calls `switch_context(per_core_switch_save_rsp_ptr(), sched_rsp)` at `:2193` where **`sched_rsp == 0`** (per_core.scheduler_rsp uninitialised).
+8. Inside `switch_context`: `mov rsp, rsi` loads 0 → `popf` faults at `[0]` → `#PF` with no IST → double fault.
+
+**Why this matches the observed fault model exactly:**
+
+- Fault IP inside `switch_context` at `popf` ✓
+- `RSP=0` in the saved frame ✓
+- `CR2 = 0xfffffffffffffff8` (= `0 − 8` from the `#PF` exception push) ✓
+- Trace ring shows `Dispatch` as the last event — `preempt_to_scheduler_kernel` does not emit a trace point ✓
+- Adding `log::info!` immediately before `switch_context` removes the crash because `log::info!` takes the serial `IrqSafeMutex`, which disables IRQs for the duration of the formatting work — narrowing or eliminating the vulnerable window ✓
+- Alternate fault IP `0x7792ca` in `fork_enter_userspace` is plausibly the same recursive-preempt mechanism on a different code path (a fork-child first-dispatch under the same race) ✓
+
+**Test (single-line probe):** add `crate::arch::x86_64::interrupts::disable();` immediately after the dispatch-prep lock-release block at `scheduler.rs:3860`, before `dispatch_log_budget` work. If the double fault disappears, H6 is confirmed.
+
+**Proper fix (if confirmed):** keep IRQs disabled across the entire prep window from the lock-release at `:3860` through the `switch_context` call at `:3953`. Two clean implementations:
+
+1. Move `retarget_preempt_count_to_task` and `restore_fpu_state` *inside* the existing lock-guarded scope at `:3823–3860` (smallest diff).
+2. Wrap `:3860–:3953` in an `IrqGuard` (or explicit `disable()` after `:3860` paired with the existing `disable()` inside `retarget_preempt_count_to_task`). The `popf` inside `switch_context` will restore the chosen task's IF state, so re-enable doesn't need an explicit call.
+
+Either way: the invariant under `preempt-full` must be that **between lock-release of the per-task data acquire and the `switch_context` call, IRQs are masked** — otherwise `check_and_preempt_kernel` can recurse with a still-zero `per_core.scheduler_rsp` (or a stale one for non-first dispatches).
+
+---
 
 ### H1 — IRQ-during-`switch_context`-tail clobbers something
 
@@ -235,6 +292,40 @@ c52e1d5 feat(kernel): Phase 57e Track C — kernel-mode preempt resume routines
 ```
 
 `a70445c` and `c52e1d5` together introduce most of the code paths that Bug #2 lives in. Start the next session by re-reading those two commit diffs, then attack H1 → H4 in order.
+
+---
+
+## Resolution (this session)
+
+**Root cause** — H6 confirmed. The dispatch loop's `pick_next` block (`scheduler.rs:3624`) acquires `scheduler_lock()` (an `IrqSafeMutex`).  Inside the guard, `set_current_task_idx(Some(idx))` commits the chosen task; on guard drop, `IrqSafeMutex` checks the `was_enabled` snapshot taken at acquire-time and re-enables IRQs because they were on at that point.  Between the lock release and the next `interrupts::disable()` call (originally inside `retarget_preempt_count_to_task`, ~28 lines later), there is a window in which:
+
+- `current_task_idx == Some(idx)` (committed),
+- `current_preempt_count_ptr` still targets the per-core dummy (value `0` — the switch-in retarget hasn't run yet),
+- `kernel_preempt_watchdog == false` (no scheduler-context lock currently held),
+- `reschedule == true` (set by any wakeup in the system),
+- IRQs are enabled.
+
+Under `preempt-full`, all of `check_and_preempt_kernel`'s gates pass and a queued LAPIC timer / reschedule IPI recurses through `preempt_to_scheduler_kernel` → `preempt_frame_to_scheduler` (`scheduler.rs:2147`) → `switch_context(per_core_switch_save_rsp_ptr(), per_core_scheduler_rsp())`. On the BSP's *first* dispatch, `per_core.scheduler_rsp` is still its zero initialiser (`smp/mod.rs:627`), so `rsi == 0`, `mov rsp, rsi` loads `0`, and `popf` faults at `[0]` → `#PF` with no IST → double fault (CR2 = `0xfffffffffffffff8`). On subsequent dispatches the value is non-zero but stale, unwinding the scheduler stack to a prior dispatch point and corrupting bookkeeping.
+
+**Fix** — `kernel/src/task/scheduler.rs`, dispatch loop body. Insert `interrupts::disable()` **before** the `let next = { let mut sched = scheduler_lock(); ... };` block. Now the lock acquire captures `was_enabled = false`, the drop is a no-op, and IRQs stay masked from the moment we commit the chosen task all the way through `switch_context`'s `popf` (which restores the resumed task's saved RFLAGS and so reactivates IF if appropriate). The next iteration's top-of-loop `enable_and_hlt`/`enable` re-enables IRQs in the scheduler context.
+
+**Why simpler attempts didn't work** — A first attempt placed the disable *after* the second lock guard at `scheduler.rs:3860` (just before `retarget_preempt_count_to_task`). That closed only the trailing 28-line window; the address-space restore block (`:3666–:3804`) and the second lock-acquire block (`:3818–:3860`) ran with IRQs enabled, leaving a wide non-re-entrant window. A second attempt placed it right after `match next`. That left a tiny gap between the `pick_next` lock drop and the disable that, while small, is still exploitable when the LAPIC timer is firing at 1 ms and `set_current_task_idx` has already committed the dispatch. Only by disabling IRQs *before* the lock acquire — so that the lock's drop is a no-op — does the window collapse to zero.
+
+**What's still residual (not Bug #2)** — Under `preempt-full`, the boot now reaches every service in the smoke-test config (`syslogd`, `sshd`, `crond`, `console`, `kbd`, `display`, `term`, etc.) and runs userspace through several fork generations. The smoke-test failure now bubbles up at `SMOKE:tcc-version:PASS`, with kernel diagnostic warnings:
+
+- `[WARN] [fault_kill] trampoline running for pid <N>` — userspace fault (kbd at one point, etc.) handled gracefully by the kernel.
+- `[WARN] [sched] dequeue-drop core=<C> idx=<I> pid=<P> reason=state-not-ready extra=0x2` — run-queue contains a stale entry for a task whose `state == BlockedOnRecv (0x2)`. The dispatcher correctly drops the entry; this is a benign log of a pre-existing or preempt-full-amplified state inconsistency.
+
+These are separate from the original Bug #2 and likely either pre-existing soak quality issues or downstream effects of preempt-full's increased preemption pressure. They should be filed and tracked as their own item before the Track G 24 h soak is gated open.
+
+**Verification** — In this session:
+
+1. `cargo xtask check` — clean (clippy `-D warnings`, rustfmt, kernel-core + passwd + driver_runtime host tests all pass).
+2. `cargo xtask smoke-test` (default features) — PASSED on attempt 3 (9 steps in 16s, fixture's normal retry pattern).
+3. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run` — boots cleanly through all services, runs for the full timeout window without a kernel fault. (Was: 100 % double-fault on init's first dispatch.)
+4. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` — boots through, fails much later at `SMOKE:tcc-version:PASS` (separate userspace issue).
+
+The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the residual userspace progression issue, and (4) is the Track G soak gate which can be reopened once (3)'s residual is also resolved.
 
 ---
 

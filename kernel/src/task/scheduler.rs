@@ -3599,6 +3599,28 @@ pub fn run() -> ! {
         // ready-to-running latency exceeds the diagnostic threshold; logged
         // after the lock is dropped (Phase 54 diagnostic).
         let mut stale_info: Option<(u32, &'static str, u64, u64)> = None;
+        // Phase 57e Bug #2 fix — disable IRQs *before* acquiring the
+        // pick_next lock so the `IrqSafeMutex` guard's drop does not
+        // re-enable them.  The drop checks `was_enabled` captured at
+        // lock-time; with IRQs already off, `was_enabled = false` and
+        // the drop is a no-op.  This closes the otherwise-tiny window
+        // between the lock release and a downstream `interrupts::disable`
+        // — under `preempt-full`, even a single-instruction window is
+        // exploitable by a queued LAPIC timer or reschedule IPI:
+        // `check_and_preempt_kernel` would see `current_task_idx ==
+        // Some(idx)` (committed below by `set_current_task_idx`),
+        // `peek_preempt_count_irq() == 0` (per-core dummy not yet
+        // retargeted), `kernel_preempt_watchdog == false`, and recurse
+        // into `preempt_to_scheduler_kernel` →
+        // `switch_context(per_core_switch_save_rsp_ptr(), sched_rsp)`,
+        // unwinding the scheduler stack to a stale frame and faulting
+        // at `popf` with `RSP=0` (or a stale value).  Keeping IRQs
+        // masked through the entire dispatch prep eliminates the race.
+        // The matching `interrupts::enable` is implicit — `switch_context`
+        // restores the resumed task's RFLAGS via `popf`, and the next
+        // iteration's top-of-loop `enable_and_hlt`/`enable` re-enables
+        // IRQs in the scheduler context.
+        interrupts::disable();
         let next = {
             let mut sched = scheduler_lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
