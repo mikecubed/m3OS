@@ -322,8 +322,15 @@ fn init_task() -> ! {
     spawn_userspace_init();
 
     log::info!("[init] service set started — yielding");
+    // Phase 57e Bug #6 experiment: previously `loop { task::yield_now(); }`.
+    // Under preempt-full, that busy-yield was getting stuck in
+    // `preempt_enable`'s zero-crossing synchronous-yield branch
+    // (`scheduler.rs:1693-1714`) whenever cross-core IPC traffic kept
+    // setting `reschedule = true` on the core init_task ended up on,
+    // monopolising that core for 30+ seconds with no userspace progress.
+    // init_task has no work after service setup — halt it.
     loop {
-        task::yield_now();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
