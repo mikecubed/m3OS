@@ -203,6 +203,29 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // Store physical memory offset globally so other modules can rebuild the mapper.
     PHYS_OFFSET.call_once(|| phys_offset);
 
+    // Phase 57e diag (slab UAF Hyp #2): log address-space layout so we can
+    // verify the bootloader's Mapping::Dynamic phys-offset does not collide
+    // with HEAP_START..HEAP_MAX_SIZE at PML4[256].
+    {
+        let kernel_pml4 = *KERNEL_PML4_PHYS.get().expect("KERNEL_PML4_PHYS set above");
+        let heap_start = heap::HEAP_START as u64;
+        let heap_end = heap_start + heap::HEAP_MAX_SIZE as u64;
+        let pml4_idx = |va: u64| ((va >> 39) & 0x1FF) as usize;
+        let phys_off_pml4 = pml4_idx(phys_offset);
+        let heap_pml4 = pml4_idx(heap_start);
+        let collide = phys_off_pml4 == heap_pml4;
+        log::info!(
+            "[mm] addr-space layout: KERNEL_PML4_PHYS={:#x} phys_offset={:#x} (PML4[{}]) heap={:#x}..{:#x} (PML4[{}]) collide={}",
+            kernel_pml4,
+            phys_offset,
+            phys_off_pml4,
+            heap_start,
+            heap_end,
+            heap_pml4,
+            collide,
+        );
+    }
+
     memory_map::init(static_regions);
     frame_allocator::init(static_regions, phys_offset);
 
