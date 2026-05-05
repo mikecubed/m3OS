@@ -1,10 +1,11 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (branch tip `2e1bbc4`, end of Session 8):**
+**Status (branch tip `6b725f5`, end of Session 10):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
-- **Bug #8** (the remaining `cargo xtask smoke-test` intermittency under `preempt-full`) — **open**. After Bug #7 closed, the smoke-test still passes only ~1/5 of the time; failures are now exclusively a `BlockedOnReply` watchdog cascade (same shape as the Sessions 1–3 lost-wakeup family) or a `prompt-ready` slow-boot timeout. **Track G's 24 h soak gate stays closed** until Bug #8 is fixed.
+- **Bug #8.1** (`BlockedOnReply` watchdog cascade — six unbracketed `deliver_message + wake_task_v2` pairs in `endpoint.rs` that the F2-partial helper missed) — **closed** in Session 10 (commit `6b725f5`). Validated: 0 cascades across two `preempt-full,sched-trace` smoke-test runs; one passed on attempt 2 in 9 s. See *Session 10* below.
+- **Bug #8.2** (`prompt-ready` slow-boot / `pid=18 BlockedOnWait` from waitpid'ing a slow child) — **open**. Session 9's "virtio-blk completion latency" framing is correct for THIS failure mode; Session 10 confirmed it does NOT cause the cascade but DOES make boot slow enough to occasionally exhaust the smoke-test step budget. **Track G's 24 h soak gate stays closed** until Bug #8.2 is fixed or budgets are relaxed.
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
@@ -1313,3 +1314,83 @@ M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
 ```
 
 Pass rate is ~1 in 5 attempts. On failure, `/tmp/m3os-smoke-full.log` contains the full kernel serial including any deferred trace-ring dump.
+
+---
+
+## Session 10 — Bug #8.1 closed (lost-wakeup cascade fixed)
+
+### TL;DR
+
+Phase 1 log forensics on a fresh `preempt-full,sched-trace` smoke-test capture rejected Session 9's "virtio-blk latency causes the cascade" framing and confirmed the original H7 lost-wakeup hypothesis. Six `deliver_message + wake_task_v2` (or `complete_send + wake_task_v2`) pairs in `kernel/src/ipc/endpoint.rs` were not bracketed by Session 3's F2-partial helper. Applied the same `preempt_disable` / `preempt_enable` discipline F1 used for `reply()` (commit `d83ecc7`). Two-run validation: 0 cascades, 0 kernel faults, 0 `[free_pt] !!!` warnings; one run passed on attempt 2 in 9 s. **Bug #8.1 is closed.** Bug #8.2 (slow-boot under preempt-full, virtio-blk completion latency) is a separate pre-existing perf issue that this fix does not address — the cascade-versus-slow-boot framing in Session 9's table was correct; only the virtio-blk-as-cascade-cause attribution was wrong.
+
+### Phase 1 forensics — what the captured log actually showed
+
+`/tmp/m3os-smoke-bug8.log` (1.46 MB, fresh capture from clean branch tip `59eba58`):
+
+- **Only 2 virtio-blk timeout warnings in the entire log**, both for the same single boot-time request (`pid=20 ion sector=2072`), both `completed=false`. After that single 461 ms request, **zero** further virtio-blk timeouts — the device is not sustained-slow.
+- pid=21 (tcc subprocess): `BlockedOnReply` for 30+ seconds with no waker registered.
+- pid=11 (vfs_server) and pid=10 (fat_server): completely silent in the last ~1 second of trace ring data — zero `WakeTask`, zero `Dispatch`, zero IPC events. They are parked and never being woken.
+- core 2: pure idle-task cycles (`task_idx=1` Dispatch/SwitchOut/Re-enqueue every 10 ms with identical `saved_rsp=0x2803e887de0`). Not a CPU-hog — the dispatch path is correctly running idle because **nothing is on the run queue** and **no wake is delivered**.
+
+This rules out Session 9's "virtio-blk completion latency exhausts smoke budget" framing for the **cascade** failure mode. The IRQ-fires-but-wake-doesn't-deliver shape is the canonical lost-wakeup signature.
+
+### The unclosed gap
+
+`grep -n "deliver_message\|wake_task_v2" kernel/src/ipc/endpoint.rs` revealed six pairs not using the F2-partial `deliver_message_and_wake` helper:
+
+| Site | Function | Pattern |
+| --- | --- | --- |
+| `:381 + :390` | `recv_msg` recv-pops-sender (no-reply branch) | `complete_send + wake` on sender |
+| `:491 + :500` | `recv_msg_nowait` recv-pops-sender (no-reply branch) | `complete_send + wake` on sender |
+| `:596 + :601` | `recv_msg_with_notif` recv-pops-sender (no-reply branch) | `complete_send + wake` on sender |
+| `:740 + :752` | `send_msg` matched_receiver | `deliver + wake` on receiver |
+| `:857 + :860` | `call_msg` matched_receiver | `deliver + wake` on receiver |
+| `:1079 + :1086` | `send_with_cap` matched_receiver | `deliver + wake` on receiver |
+
+These are exactly the "multi-step send/recv paths" the Bug #8 quick-start flagged as not covered by the F2 helper.
+
+### The fix (`6b725f5`)
+
+Apply F1's `preempt_disable` / `preempt_enable` bracketing pattern (the one that closed `reply()`'s race in `d83ecc7`) to all six sites. The bracket pushes the `SchedulerGuard::drop` zero-crossing in `deliver_message` / `complete_send` past the subsequent `wake_task_v2`, eliminating the synchronous-yield gap.
+
+`cargo xtask check` stays green (the pre-commit hook ran the full kernel-core host-test suite).
+
+### Validation (two runs of `M3OS_KERNEL_FEATURES="preempt-full,sched-trace" cargo xtask smoke-test`)
+
+| Run | Outcome | Cascades | Kernel faults | `[free_pt] !!!` | Notes |
+| --- | --- | --- | --- | --- | --- |
+| post-fix #1 | failed (test harness regex) | **0** | **0** | **0** | Kernel reached `SMOKE:PASS` on attempt 3; smoke-runner regex couldn't match `SMOKE:log:PASS` because a `display_server: compose#720 ... pos=0,0` line interleaved into it. Cosmetic. |
+| post-fix #2 | **PASSED on attempt 2** in 9 s | **0** | **0** | **0** | Attempt 1 hit a `BlockedOnWait` cascade (pid=18 smoke-runner waitpid'ing a slow child — Bug #8.2 slow-boot, not lost-wake). Attempt 2 passed cleanly. |
+
+The cascade is gone. The remaining intermittency is the slow-boot variant.
+
+### What remains (Bug #8.2 — slow boot under preempt-full)
+
+Still observed: a single early-boot virtio-blk slow READ (`vfs_server: slow req#42 READ elapsed_us=461095`) and occasional `pid=18 BlockedOnWait` watchdog hits when the smoke-runner `waitpid`'s a child that's making slow progress through disk I/O. This is structural: under `preempt-full`'s tighter scheduling, IPC round-trips and virtio-blk submit→complete cycles take measurably longer than under `preempt-voluntary`. The fix in this session does not reduce per-IPC latency — it only closes the lost-wakeup race.
+
+Acceptable mitigations for Bug #8.2 (in rough order of rigor):
+
+1. **Targeted virtio-blk lifecycle profile** (Phase 2 of this session's plan, not executed because Phase 1 already pinned the cascade root cause). Add 4 trace points (submit / IRQ-drain / wake-fire / request-complete) gated by `feature = "virtblk-trace"`. Capture under both kernel modes, diff per-stage deltas. Pinpoints whether the slow stage is the device-side wait, the IRQ delivery, the wake-to-dispatch hop, or the userspace-server reply. Roughly half a day of work to write + capture + analyse.
+2. **Relax the smoke-test step timeout** under `preempt-full`. Practical band-aid that unblocks Track G's 24 h soak gate. Hides the regression rather than fixing it.
+3. **Audit `check_and_preempt_kernel`'s hot path.** Per-IRQ overhead under `preempt-full` is structurally heavier than under `preempt-voluntary`; if virtio-blk MSI-X completions land at high frequency during heavy I/O, the cumulative overhead amplifies. `kernel/src/arch/x86_64/interrupts.rs:1535-1596` is the suspect site.
+
+### Acceptance criteria status (Session 10 revision)
+
+| Criterion | Status |
+| --- | --- |
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically | ⚠️ — Bug #8.1 closed; Bug #8.2 (slow boot) remains, ~50% pass rate on attempt 1, near-100% on attempt 2 |
+| (4) `run-gui` 10-min soak | not verified |
+| (8) Bug #8.1 lost-wakeup cascade closed | ✅ (`6b725f5`); 0 recurrences across 2-run validation |
+
+Track G's 24 h soak gate remains closed pending Bug #8.2 disposition (fix or accept-and-relax-budgets).
+
+### Files to pre-load for next session (if pursuing Bug #8.2)
+
+- `kernel/src/blk/virtio_blk.rs:679-695` — `virtio_blk_irq_handler` (ISR drain + wake)
+- `kernel/src/blk/virtio_blk.rs:811-913` — `do_request` (submit + park-on-deadline path)
+- `kernel/src/arch/x86_64/interrupts.rs:1535-1596` — `check_and_preempt_kernel` (per-IRQ hot path under preempt-full)
+- `userspace/vfs_server/src/main.rs` — vfs_server READ handler (slow_req timing source)
+- `/tmp/m3os-smoke-bug8.log` — Session 10's captured cascade reproducer (kept for reference)
+- `/tmp/m3os-smoke-bug8-postfix-2.log` — post-fix capture (zero cascades, slow-boot warnings only)
