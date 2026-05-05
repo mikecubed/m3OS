@@ -341,12 +341,34 @@ This must be tracked as a follow-up before Track G's 24 h soak is gated open. Se
 
 The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the Bug #3 fork-child user-GPR corruption above, and (4) is the Track G soak gate which can be reopened once Bug #3 is also resolved.
 
+## Bug #3 bisection (this session)
+
+Two diagnostic patches (uncommitted, applied and reverted) verified that **disabling both kernel-mode preempt paths** under `preempt-full` eliminates the fork-child fault:
+
+1. `check_and_preempt_kernel` (`kernel/src/arch/x86_64/interrupts.rs:1419`) — IRQ-driven preempt at zero `preempt_count`.
+2. `preempt_enable`'s yield-on-zero-crossing (`kernel/src/task/scheduler.rs:1697–1714`) — cooperative `yield_now` when `preempt_count` decrements from 1 to 0 with `reschedule` set under `preempt-full`.
+
+Test matrix (all under `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run`, 30 s):
+
+| `check_and_preempt_kernel` | `preempt_enable.yield_now` | Fork-child fault? |
+|---|---|---|
+| enabled | enabled | YES (the original Bug #3) |
+| disabled | enabled | YES |
+| enabled | disabled | YES |
+| disabled | disabled | NO — all 17 services start cleanly |
+
+Conclusion: **either path alone is sufficient to trigger the fault**. The bug is not in one specific path; it's in something exercised by *any* kernel-mode preempt under `preempt-full`. Three remaining suspects:
+
+1. **`preempt_to_scheduler_kernel` / `preempt_frame_to_scheduler` / `preempt_resume_to_kernel`** — the kernel-mode preempt save-and-resume asm trampolines. A subtle GPR mishandling here would manifest only when kernel-mode preemption actually fires.
+2. **`dispatch_preempted_and_resume_kernel`** (`interrupts.rs:876`) — the dispatch-side trampoline that publishes the scheduler RSP and tail-calls `preempt_resume_to_kernel`.
+3. **Kernel-mode preempt of `fork()` syscall / `fork_child_trampoline`** — if either is preempted at a sensitive point and resumed via the `_kernel` path, the parent's saved user-GPR snapshot used to populate the child's `ForkEntryCtx` could be stale.
+
 ## Bug #3 next steps (not started)
 
-1. Reproduce with `sched-trace` enabled and look at preempt events around the fork-child's first dispatch. Specifically: did a kernel-mode preempt fire during the `fork()` syscall or during `fork_child_trampoline`?
-2. Instrument `enter_userspace_fork` (`kernel/src/arch/x86_64/mod.rs:216`) to log the full `ForkEntryCtx` contents immediately before it calls into `fork_enter_userspace` asm. Compare against the user RIP `0x4044c2` / corrupt R14 observed at fault.
-3. Audit `preempt_resume_to_user` (`kernel/src/arch/x86_64/interrupts.rs:706`) and the user-mode iretq frame construction. The GPR offsets check out on paper (matches `PreemptTrapFrameUser::to_preempt_frame`); the corruption could be at *save* time (timer IRQ during a stack push window) rather than restore.
-4. Bisect: temporarily make `check_and_preempt_kernel` always early-return (i.e. neuter kernel-mode preempt) under a debug feature flag and rerun the smoke-test. If the fork-child faults disappear, the bug is in the preempt-full kernel-mode preempt path, not in the user-mode resume path.
+1. Add `sched-trace` to a focused run and capture preempt events around the fork-child's first dispatch.
+2. Instrument `enter_userspace_fork` (`kernel/src/arch/x86_64/mod.rs:216`) to log the full `ForkEntryCtx.r14` immediately before `fork_enter_userspace` asm runs. If R14 is already corrupt at iretq time, the bug is upstream in fork(); if R14 is correct at iretq time, the bug is in the user-mode resume path post-iretq (which would point at a kernel-mode preempt of the *child* between iretq and the first user instruction — but iretq is atomic, so this would be paradoxical).
+3. Bisect inside the `_kernel` resume asm: temporarily route the Preempted-kernel branch at `scheduler.rs:3955` through the userspace `dispatch_preempted_and_resume` even for kernel-mode frames (it would fault on the rsp/ss popped from a 5-field iretq, but the symptom would tell us whether the kernel-mode-specific asm differs in the right way).
+4. Audit `preempt_resume_to_user` (`kernel/src/arch/x86_64/interrupts.rs:706`) and the user-mode iretq frame construction. The GPR offsets check out on paper (matches `PreemptTrapFrameUser::to_preempt_frame`); the corruption could be at *save* time (timer IRQ during a stack push window) rather than restore.
 5. Examine `dispatch_preempted_and_resume_kernel` (`kernel/src/arch/x86_64/interrupts.rs:876`) — the handoff originally flagged it as the highest-risk new asm under H4.
 
 ---
