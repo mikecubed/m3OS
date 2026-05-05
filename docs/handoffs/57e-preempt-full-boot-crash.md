@@ -341,7 +341,32 @@ This must be tracked as a follow-up before Track G's 24 h soak is gated open. Se
 
 The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the Bug #3 fork-child user-GPR corruption above, and (4) is the Track G soak gate which can be reopened once Bug #3 is also resolved.
 
-## Bug #3 root cause (FOUND, not yet fixed)
+## Bug #3 fix (CLOSED, this session)
+
+Implemented option (1) from the candidates section — moved the user GPR snapshot from `PerCoreData` to a new per-task `TaskSyscallSnapshot` field. The hazard is fully eliminated: each task has its own snapshot, so two tasks sharing a core can no longer alias under preempt-full's mid-syscall kernel-mode preempt.
+
+**Code shape:**
+
+- `kernel/src/task/mod.rs` — new `TaskSyscallSnapshot` (`#[repr(C)]`, 13 × u64), new `Task::syscall_snapshot: UnsafeCell<…>` field, `task_syscall_snapshot_offsets` module exposing `SNAP_USER_*` const offsets for the asm, and a `current_task_syscall_snapshot()` Rust helper that copies-by-value through the per-core indirection pointer.
+- `kernel/src/smp/mod.rs` — replaced 13 `syscall_user_*` per-core fields with a single `current_syscall_snapshot_ptr: UnsafeCell<*mut TaskSyscallSnapshot>`. Kept `syscall_user_rsp` per-core (only consulted with IRQs masked at entry/exit). Removed the obsolete `SYSCALL_USER_*` offsets.
+- `kernel/src/arch/x86_64/syscall/mod.rs` — `syscall_entry` asm now loads `gs:[OFF_TASK_SNAPSHOT_PTR]` into `rcx` (already clobbered moments later by the SysV arg shuffle) and writes the user GPRs into `[rcx + SNAP_*]` instead of `gs:[OFF_USER_*]`. The kernel-stack push order is unchanged so the sysret tail is untouched.
+- `kernel/src/task/scheduler.rs` — dispatch loop captures `task.syscall_snapshot.get()` alongside the existing preempt-count / FPU-state pointers, and writes it into `pc.current_syscall_snapshot_ptr` after `retarget_preempt_count_to_task` (still inside the IRQs-disabled window).
+- `kernel/src/process/mod.rs` (`make_fork_ctx`, `make_fork_ctx_for_thread`) and the syscall handlers in `kernel/src/arch/x86_64/syscall/mod.rs` (`per_core_syscall_user_r8/r9` plus inline reads in `mmap`, `clone`, `socket` accept/getsockopt/setsockopt, `futex`, `linkat`, etc.) and `kernel/src/ipc/mod.rs` — all now read the current task's snapshot via `current_task_syscall_snapshot()` instead of `pc.syscall_user_*`.
+
+**Verification (this session):**
+
+1. `cargo xtask check` — clean (clippy `-D warnings`, rustfmt, host tests).
+2. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run` (30 s) — all 17 services start cleanly, **zero `[fault_kill]` on init's fork-children**, no small-CR2 NULL-deref pattern. (Was: 100% fault on every fork-child, repeating every service start.)
+3. `cargo xtask smoke-test` (default) — PASSED on attempt 2 (9 steps in 15 s).
+4. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` — progresses through `SMOKE:auth:PASS` and onward through `SMOKE:tcc-version:PASS` / `SMOKE:tcc-compile` (was: timing out on the very first auth step). Still fails the suite at the `tcc-version` / `tcc-compile` per-step timeouts, plus one additional preempt-full-only userspace fault on `term` (pid 17, write protection violation at a real userspace address — different signature from Bug #3, separate issue).
+
+**Residual under `preempt-full` (Bug #4, not investigated this session):**
+
+- `term` (pid 17) consistently faults at `rip=0x403895` with `addr=0x408a18`, error code `PROTECTION_VIOLATION | CAUSED_BY_WRITE | USER_MODE` — a write to a present but read-only page in its own text/rodata range. Default build (`preempt-voluntary`) does not exhibit this; term starts and forks normally. Likely a separate preempt-full hazard (CoW miss? page-table interaction?) or term-specific bug exposed by mid-syscall preempt of `term`'s startup. Track G's 24-h soak gate stays closed pending Bug #4 triage.
+
+---
+
+## Bug #3 root cause (was: not yet fixed; now FIXED above)
 
 The bisection table below proved the bug requires *some* kernel-mode preempt path; instrumentation then narrowed it to a specific data hazard.
 

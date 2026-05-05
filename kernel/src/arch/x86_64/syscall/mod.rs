@@ -877,14 +877,19 @@ pub(super) fn per_core_syscall_arg3() -> u64 {
     crate::smp::per_core().syscall_arg3
 }
 
-/// Read the per-core R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
+/// Read the current task's R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
+///
+/// Phase 57e Bug #3 fix — was `pc.syscall_user_r8` per-core; aliased
+/// across tasks under preempt-full's mid-syscall kernel-mode preempt.
 fn per_core_syscall_user_r8() -> u64 {
-    crate::smp::per_core().syscall_user_r8
+    crate::task::current_task_syscall_snapshot().user_r8
 }
 
-/// Read the per-core R9 saved at SYSCALL entry (syscall arg5 = offset for mmap).
+/// Read the current task's R9 saved at SYSCALL entry (syscall arg5 = offset for mmap).
+///
+/// Phase 57e Bug #3 fix — see [`per_core_syscall_user_r8`].
 fn per_core_syscall_user_r9() -> u64 {
-    crate::smp::per_core().syscall_user_r9
+    crate::task::current_task_syscall_snapshot().user_r9
 }
 
 /// Read the per-core `syscall_stack_top`.
@@ -1070,22 +1075,25 @@ extern "C" fn syscall_return_maybe_preempt(saved_frame: *const u8, syscall_resul
 
 global_asm!(
     // Per-core field offsets (computed at compile time via offset_of!).
-    ".equ OFF_STACK_TOP,   {off_stack_top}",
-    ".equ OFF_USER_RSP,    {off_user_rsp}",
-    ".equ OFF_ARG3,        {off_arg3}",
-    ".equ OFF_USER_RBX,    {off_user_rbx}",
-    ".equ OFF_USER_RBP,    {off_user_rbp}",
-    ".equ OFF_USER_R12,    {off_user_r12}",
-    ".equ OFF_USER_R13,    {off_user_r13}",
-    ".equ OFF_USER_R14,    {off_user_r14}",
-    ".equ OFF_USER_R15,    {off_user_r15}",
-    ".equ OFF_USER_RDI,    {off_user_rdi}",
-    ".equ OFF_USER_RSI,    {off_user_rsi}",
-    ".equ OFF_USER_RDX,    {off_user_rdx}",
-    ".equ OFF_USER_R8,     {off_user_r8}",
-    ".equ OFF_USER_R9,     {off_user_r9}",
-    ".equ OFF_USER_R10,    {off_user_r10}",
-    ".equ OFF_USER_RFLAGS, {off_user_rflags}",
+    ".equ OFF_STACK_TOP,           {off_stack_top}",
+    ".equ OFF_USER_RSP,            {off_user_rsp}",
+    ".equ OFF_ARG3,                {off_arg3}",
+    // Phase 57e Bug #3 fix — pointer-to-task-snapshot indirection.
+    ".equ OFF_TASK_SNAPSHOT_PTR,   {off_task_snapshot_ptr}",
+    // Field offsets within `TaskSyscallSnapshot` (target of the indirection).
+    ".equ SNAP_USER_RBX,    {snap_user_rbx}",
+    ".equ SNAP_USER_RBP,    {snap_user_rbp}",
+    ".equ SNAP_USER_R12,    {snap_user_r12}",
+    ".equ SNAP_USER_R13,    {snap_user_r13}",
+    ".equ SNAP_USER_R14,    {snap_user_r14}",
+    ".equ SNAP_USER_R15,    {snap_user_r15}",
+    ".equ SNAP_USER_RDI,    {snap_user_rdi}",
+    ".equ SNAP_USER_RSI,    {snap_user_rsi}",
+    ".equ SNAP_USER_RDX,    {snap_user_rdx}",
+    ".equ SNAP_USER_R8,     {snap_user_r8}",
+    ".equ SNAP_USER_R9,     {snap_user_r9}",
+    ".equ SNAP_USER_R10,    {snap_user_r10}",
+    ".equ SNAP_USER_RFLAGS, {snap_user_rflags}",
 
     ".global syscall_entry",
     "syscall_entry:",
@@ -1102,22 +1110,35 @@ global_asm!(
     "mov rsp, gs:[OFF_STACK_TOP]",
     "cld",
 
-    // --- Save user callee-saved registers to per-core data ---
-    "mov gs:[OFF_USER_RBX], rbx",
-    "mov gs:[OFF_USER_RBP], rbp",
-    "mov gs:[OFF_USER_R12], r12",
-    "mov gs:[OFF_USER_R13], r13",
-    "mov gs:[OFF_USER_R14], r14",
-    "mov gs:[OFF_USER_R15], r15",
-
-    // --- Save user caller-saved registers (Linux ABI preserves these) ---
-    "mov gs:[OFF_USER_RDI], rdi",
-    "mov gs:[OFF_USER_RSI], rsi",
-    "mov gs:[OFF_USER_RDX], rdx",
-    "mov gs:[OFF_USER_R8],  r8",
-    "mov gs:[OFF_USER_R9],  r9",
-    "mov gs:[OFF_USER_R10], r10",
-    "mov gs:[OFF_USER_RFLAGS], r11",
+    // --- Save user GPRs to the **current task's** TaskSyscallSnapshot ---
+    //
+    // Phase 57e Bug #3 fix: under preempt-full, mid-syscall kernel-mode
+    // preemption can let a different task's `syscall_entry` run on this
+    // core; per-core slots would alias.  The dispatcher publishes
+    // `&task.syscall_snapshot` into `current_syscall_snapshot_ptr` on
+    // every dispatch, so each task's user GPRs land in its own snapshot
+    // and `make_fork_ctx` / `r8`/`r9`-arg consumers read the correct
+    // task's values regardless of what other tasks ran in between.
+    //
+    // We can't use `rax` as the scratch pointer (it holds the syscall
+    // number); use `r11` instead — it's the user RFLAGS, but we have
+    // already pushed it on the kernel stack a moment from now and the
+    // sysret path restores it from there.  No: we have *not* yet pushed
+    // it.  Use a different scratch.  `rcx` holds the user RIP and is
+    // also live until pushed.  Safest: spill `rax` briefly, do the
+    // saves, then restore `rax`.  That keeps the syscall number live
+    // across the sequence without consuming an extra GPR.
+    //
+    // Actually simpler: do the indirected stores using a single scratch
+    // grabbed AFTER the kernel-stack pushes (where the syscall number
+    // is already at a known offset on the stack).  Move the snapshot
+    // saves to *after* the pushes so we have free scratch registers.
+    //
+    // But the pushes also push rcx (user RIP) and r11 (user RFLAGS).
+    // Those get saved on the stack regardless.  Push order picked so
+    // the kernel stack has the same layout the sysret path expects.
+    //
+    // Push first, then do the snapshot save with a free scratch.
 
     // --- Save return address and user flags on stack ---
     "push rcx", // user RIP
@@ -1138,6 +1159,27 @@ global_asm!(
     "push r10",
     "push r8",
     "push r9",
+
+    // --- Now mirror the user GPR snapshot into the current task's slot.
+    //     `rax` is the syscall number, must survive.  `rcx` is user RIP
+    //     (now on the kernel stack at known offset, restored before
+    //     sysret).  Use `rcx` as the scratch pointer to the snapshot —
+    //     it's clobbered by the upcoming `mov rcx, rdx` arg-shuffle
+    //     anyway, so no extra spill needed.
+    "mov rcx, gs:[OFF_TASK_SNAPSHOT_PTR]",
+    "mov [rcx + SNAP_USER_RBX],    rbx",
+    "mov [rcx + SNAP_USER_RBP],    rbp",
+    "mov [rcx + SNAP_USER_R12],    r12",
+    "mov [rcx + SNAP_USER_R13],    r13",
+    "mov [rcx + SNAP_USER_R14],    r14",
+    "mov [rcx + SNAP_USER_R15],    r15",
+    "mov [rcx + SNAP_USER_RDI],    rdi",
+    "mov [rcx + SNAP_USER_RSI],    rsi",
+    "mov [rcx + SNAP_USER_RDX],    rdx",
+    "mov [rcx + SNAP_USER_R8],     r8",
+    "mov [rcx + SNAP_USER_R9],     r9",
+    "mov [rcx + SNAP_USER_R10],    r10",
+    "mov [rcx + SNAP_USER_RFLAGS], r11",
 
     // --- Set up SysV arguments for syscall_handler ---
     // Save r10 (arg3) to per-core data for kernel-side access.
@@ -1187,22 +1229,23 @@ global_asm!(
     "mov rsp, gs:[OFF_USER_RSP]",
     "sysretq",
 
-    off_stack_top   = const crate::smp::offsets::SYSCALL_STACK_TOP,
-    off_user_rsp    = const crate::smp::offsets::SYSCALL_USER_RSP,
-    off_arg3        = const crate::smp::offsets::SYSCALL_ARG3,
-    off_user_rbx    = const crate::smp::offsets::SYSCALL_USER_RBX,
-    off_user_rbp    = const crate::smp::offsets::SYSCALL_USER_RBP,
-    off_user_r12    = const crate::smp::offsets::SYSCALL_USER_R12,
-    off_user_r13    = const crate::smp::offsets::SYSCALL_USER_R13,
-    off_user_r14    = const crate::smp::offsets::SYSCALL_USER_R14,
-    off_user_r15    = const crate::smp::offsets::SYSCALL_USER_R15,
-    off_user_rdi    = const crate::smp::offsets::SYSCALL_USER_RDI,
-    off_user_rsi    = const crate::smp::offsets::SYSCALL_USER_RSI,
-    off_user_rdx    = const crate::smp::offsets::SYSCALL_USER_RDX,
-    off_user_r8     = const crate::smp::offsets::SYSCALL_USER_R8,
-    off_user_r9     = const crate::smp::offsets::SYSCALL_USER_R9,
-    off_user_r10    = const crate::smp::offsets::SYSCALL_USER_R10,
-    off_user_rflags = const crate::smp::offsets::SYSCALL_USER_RFLAGS,
+    off_stack_top         = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    off_user_rsp          = const crate::smp::offsets::SYSCALL_USER_RSP,
+    off_arg3              = const crate::smp::offsets::SYSCALL_ARG3,
+    off_task_snapshot_ptr = const crate::smp::offsets::CURRENT_SYSCALL_SNAPSHOT_PTR,
+    snap_user_rbx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBX,
+    snap_user_rbp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBP,
+    snap_user_r12    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R12,
+    snap_user_r13    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R13,
+    snap_user_r14    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R14,
+    snap_user_r15    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R15,
+    snap_user_rdi    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RDI,
+    snap_user_rsi    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSI,
+    snap_user_rdx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RDX,
+    snap_user_r8     = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R8,
+    snap_user_r9     = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R9,
+    snap_user_r10    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R10,
+    snap_user_rflags = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RFLAGS,
 );
 
 // ---------------------------------------------------------------------------
@@ -1644,7 +1687,7 @@ pub extern "C" fn syscall_handler(
             arg1,
             arg2,
             per_core_syscall_arg3(),
-            crate::smp::per_core().syscall_user_r8,
+            crate::task::current_task_syscall_snapshot().user_r8,
         ),
         SYMLINKAT => sys_symlinkat(arg0, arg1, arg2),
         READLINKAT => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
@@ -1662,7 +1705,7 @@ pub extern "C" fn syscall_handler(
         GETPID => sys_getpid(),
         CLONE => {
             let child_tidptr = per_core_syscall_arg3();
-            let tls = crate::smp::per_core().syscall_user_r8;
+            let tls = crate::task::current_task_syscall_snapshot().user_r8;
             sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
         }
         FORK => sys_fork(user_rip, user_rsp),
@@ -1728,14 +1771,14 @@ pub extern "C" fn syscall_handler(
         ACCEPT => sys_accept(arg0, arg1, arg2),
         SENDTO => {
             let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len = crate::smp::per_core().syscall_user_r9;
+            let addr_ptr = crate::task::current_task_syscall_snapshot().user_r8;
+            let addr_len = crate::task::current_task_syscall_snapshot().user_r9;
             sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
         }
         RECVFROM => {
             let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
+            let addr_ptr = crate::task::current_task_syscall_snapshot().user_r8;
+            let addr_len_ptr = crate::task::current_task_syscall_snapshot().user_r9;
             sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
         }
         SHUTDOWN => sys_shutdown_sock(arg0, arg1),
@@ -1749,12 +1792,12 @@ pub extern "C" fn syscall_handler(
         }
         SETSOCKOPT => {
             let optval_ptr = per_core_syscall_arg3();
-            let optlen = crate::smp::per_core().syscall_user_r8;
+            let optlen = crate::task::current_task_syscall_snapshot().user_r8;
             sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
         }
         GETSOCKOPT => {
             let optval_ptr = per_core_syscall_arg3();
-            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
+            let optlen_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
         }
         ACCEPT4 => {
@@ -1771,7 +1814,7 @@ pub extern "C" fn syscall_handler(
         PIPE => sys_pipe_with_flags(arg0, false),
         SELECT => {
             let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            let timeout_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_WAIT => {
@@ -1784,7 +1827,7 @@ pub extern "C" fn syscall_handler(
         }
         PSELECT6 => {
             let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            let timeout_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
@@ -1811,7 +1854,7 @@ pub extern "C" fn syscall_handler(
         ARCH_PRCTL => sys_linux_arch_prctl(arg0, arg1),
         REBOOT => sys_reboot(arg0),
         FUTEX => {
-            let val3 = crate::smp::per_core().syscall_user_r9;
+            let val3 = crate::task::current_task_syscall_snapshot().user_r9;
             sys_futex(arg0, arg1, arg2, val3)
         }
         SET_ROBUST_LIST => 0,
@@ -1873,7 +1916,7 @@ pub extern "C" fn syscall_handler(
                 arg1,
                 arg2,
                 per_core_syscall_arg3(),
-                crate::smp::per_core().syscall_user_r8,
+                crate::task::current_task_syscall_snapshot().user_r8,
             )
         }
         // -- device host (Phase 55b Track B) --

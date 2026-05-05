@@ -217,24 +217,27 @@ pub struct PerCoreData {
     /// Top of this core's kernel syscall stack for SYSCALL entry.
     pub syscall_stack_top: u64,
     /// User RSP saved by `syscall_entry` assembly stub.
+    ///
+    /// Stays per-core (rather than per-task like the rest of the snapshot)
+    /// because it is only consulted at syscall entry (before `sti`) and at
+    /// syscall return (after `cli`) — both windows have IRQs masked, so a
+    /// kernel-mode preempt cannot run another task's `syscall_entry` and
+    /// alias the slot.
     pub syscall_user_rsp: u64,
     /// R10 (syscall arg3) saved by `syscall_entry` assembly stub.
     pub syscall_arg3: u64,
-    /// Saved user callee-saved registers at syscall entry (for fork child restore).
-    pub syscall_user_rbx: u64,
-    pub syscall_user_rbp: u64,
-    pub syscall_user_r12: u64,
-    pub syscall_user_r13: u64,
-    pub syscall_user_r14: u64,
-    pub syscall_user_r15: u64,
-    /// Saved user caller-saved registers at syscall entry (Linux ABI preserves these).
-    pub syscall_user_rdi: u64,
-    pub syscall_user_rsi: u64,
-    pub syscall_user_rdx: u64,
-    pub syscall_user_r8: u64,
-    pub syscall_user_r9: u64,
-    pub syscall_user_r10: u64,
-    pub syscall_user_rflags: u64,
+    /// Phase 57e Bug #3 fix — pointer to the **current task's**
+    /// [`crate::task::TaskSyscallSnapshot`].  Updated by the dispatcher on
+    /// every dispatch, before `switch_context`.  The syscall-entry asm
+    /// loads this pointer and writes the user GPR snapshot through it, so
+    /// two tasks sharing a core can no longer alias the per-core slots.
+    /// `make_fork_ctx` and the syscall handlers that consume `r8`/`r9`/etc.
+    /// as extra args read the snapshot through this same pointer.
+    /// Raw pointer because the asm uses gs-relative indirection; the
+    /// snapshot itself lives in the [`crate::task::Task`] struct (heap,
+    /// stable address per Track B's `Vec<Box<Task>>` storage discipline).
+    /// Null only during very early boot before the first dispatch.
+    pub current_syscall_snapshot_ptr: core::cell::UnsafeCell<*mut crate::task::TaskSyscallSnapshot>,
 
     /// PID of the userspace process currently running on this core.
     /// 0 = no userspace process (kernel task context).
@@ -525,19 +528,9 @@ pub mod offsets {
     pub const SYSCALL_STACK_TOP: usize = core::mem::offset_of!(PerCoreData, syscall_stack_top);
     pub const SYSCALL_USER_RSP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsp);
     pub const SYSCALL_ARG3: usize = core::mem::offset_of!(PerCoreData, syscall_arg3);
-    pub const SYSCALL_USER_RBX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbx);
-    pub const SYSCALL_USER_RBP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbp);
-    pub const SYSCALL_USER_R12: usize = core::mem::offset_of!(PerCoreData, syscall_user_r12);
-    pub const SYSCALL_USER_R13: usize = core::mem::offset_of!(PerCoreData, syscall_user_r13);
-    pub const SYSCALL_USER_R14: usize = core::mem::offset_of!(PerCoreData, syscall_user_r14);
-    pub const SYSCALL_USER_R15: usize = core::mem::offset_of!(PerCoreData, syscall_user_r15);
-    pub const SYSCALL_USER_RDI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdi);
-    pub const SYSCALL_USER_RSI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsi);
-    pub const SYSCALL_USER_RDX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdx);
-    pub const SYSCALL_USER_R8: usize = core::mem::offset_of!(PerCoreData, syscall_user_r8);
-    pub const SYSCALL_USER_R9: usize = core::mem::offset_of!(PerCoreData, syscall_user_r9);
-    pub const SYSCALL_USER_R10: usize = core::mem::offset_of!(PerCoreData, syscall_user_r10);
-    pub const SYSCALL_USER_RFLAGS: usize = core::mem::offset_of!(PerCoreData, syscall_user_rflags);
+    /// Phase 57e Bug #3 fix — see [`PerCoreData::current_syscall_snapshot_ptr`].
+    pub const CURRENT_SYSCALL_SNAPSHOT_PTR: usize =
+        core::mem::offset_of!(PerCoreData, current_syscall_snapshot_ptr);
     pub const CURRENT_PID: usize = core::mem::offset_of!(PerCoreData, current_pid);
     pub const FORK_ENTRY_CTX: usize = core::mem::offset_of!(PerCoreData, fork_entry_ctx);
 }
@@ -634,19 +627,11 @@ pub fn init_bsp_per_core() {
         syscall_stack_top: bsp_stack_top,
         syscall_user_rsp: 0,
         syscall_arg3: 0,
-        syscall_user_rbx: 0,
-        syscall_user_rbp: 0,
-        syscall_user_r12: 0,
-        syscall_user_r13: 0,
-        syscall_user_r14: 0,
-        syscall_user_r15: 0,
-        syscall_user_rdi: 0,
-        syscall_user_rsi: 0,
-        syscall_user_rdx: 0,
-        syscall_user_r8: 0,
-        syscall_user_r9: 0,
-        syscall_user_r10: 0,
-        syscall_user_rflags: 0,
+        // Phase 57e Bug #3 fix — null until first dispatch sets it.
+        // syscall_entry asm dereferences this; if it fires before the
+        // dispatcher has run (impossible — userspace cannot syscall before
+        // init is dispatched) the kernel would fault on the null deref.
+        current_syscall_snapshot_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
         current_pid: AtomicU32::new(0),
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
@@ -759,19 +744,8 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         syscall_stack_top: kernel_stack_top,
         syscall_user_rsp: 0,
         syscall_arg3: 0,
-        syscall_user_rbx: 0,
-        syscall_user_rbp: 0,
-        syscall_user_r12: 0,
-        syscall_user_r13: 0,
-        syscall_user_r14: 0,
-        syscall_user_r15: 0,
-        syscall_user_rdi: 0,
-        syscall_user_rsi: 0,
-        syscall_user_rdx: 0,
-        syscall_user_r8: 0,
-        syscall_user_r9: 0,
-        syscall_user_r10: 0,
-        syscall_user_rflags: 0,
+        // Phase 57e Bug #3 fix — null until this AP's first dispatch.
+        current_syscall_snapshot_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
         current_pid: AtomicU32::new(0),
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,

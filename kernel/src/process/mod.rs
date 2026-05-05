@@ -1567,42 +1567,34 @@ pub(crate) fn make_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) -> ForkChild
         pid
     );
 
-    // Read ALL saved user registers from per-core data.
-    // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
-    // so the fork child must restore all of them.
-    let pc = crate::smp::per_core();
-    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10, rflags) = (
-        pc.syscall_user_rbx,
-        pc.syscall_user_rbp,
-        pc.syscall_user_r12,
-        pc.syscall_user_r13,
-        pc.syscall_user_r14,
-        pc.syscall_user_r15,
-        pc.syscall_user_rdi,
-        pc.syscall_user_rsi,
-        pc.syscall_user_rdx,
-        pc.syscall_user_r8,
-        pc.syscall_user_r9,
-        pc.syscall_user_r10,
-        pc.syscall_user_rflags,
-    );
+    // Read ALL saved user registers from the **current task's** snapshot.
+    // The Linux syscall ABI preserves all regs except RAX/RCX/R11, so the
+    // fork child must restore all of them.
+    //
+    // Phase 57e Bug #3 fix: pre-Bug-#3 these reads went to per-core slots
+    // in `PerCoreData`, which aliased between tasks under preempt-full's
+    // mid-syscall kernel-mode preempt and yielded stale values for
+    // `r14`/etc. in the fork child.  The snapshot is now per-task so
+    // `current_task_syscall_snapshot()` returns *this* task's user GPRs
+    // regardless of what other tasks ran on the same core in between.
+    let snap = crate::task::current_task_syscall_snapshot();
     ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
-        user_rbx: rbx,
-        user_rbp: rbp,
-        user_r12: r12,
-        user_r13: r13,
-        user_r14: r14,
-        user_r15: r15,
-        user_rdi: rdi,
-        user_rsi: rsi,
-        user_rdx: rdx,
-        user_r8: r8,
-        user_r9: r9,
-        user_r10: r10,
-        user_rflags: rflags,
+        user_rbx: snap.user_rbx,
+        user_rbp: snap.user_rbp,
+        user_r12: snap.user_r12,
+        user_r13: snap.user_r13,
+        user_r14: snap.user_r14,
+        user_r15: snap.user_r15,
+        user_rdi: snap.user_rdi,
+        user_rsi: snap.user_rsi,
+        user_rdx: snap.user_rdx,
+        user_r8: snap.user_r8,
+        user_r9: snap.user_r9,
+        user_r10: snap.user_r10,
+        user_rflags: snap.user_rflags,
     }
 }
 
@@ -1639,17 +1631,18 @@ pub(crate) fn make_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) -> Fo
 /// Caller-saved registers (rdi, rsi, rdx, r8, r9, r10) are zeroed
 /// because the clone wrapper sets up its own context.
 pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) -> ForkChildCtx {
-    let pc = crate::smp::per_core();
+    // Phase 57e Bug #3 fix — see make_fork_ctx for the rationale.
+    let snap = crate::task::current_task_syscall_snapshot();
     ForkChildCtx {
         pid,
         user_rip,
         user_rsp: child_stack,
-        user_rbx: pc.syscall_user_rbx,
-        user_rbp: pc.syscall_user_rbp,
-        user_r12: pc.syscall_user_r12,
-        user_r13: pc.syscall_user_r13,
-        user_r14: pc.syscall_user_r14,
-        user_r15: pc.syscall_user_r15,
+        user_rbx: snap.user_rbx,
+        user_rbp: snap.user_rbp,
+        user_r12: snap.user_r12,
+        user_r13: snap.user_r13,
+        user_r14: snap.user_r14,
+        user_r15: snap.user_r15,
         // Caller-saved registers — zeroed for clone child since the
         // clone wrapper (musl __clone) will set up its own context.
         user_rdi: 0,
@@ -1658,7 +1651,7 @@ pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64
         user_r8: 0,
         user_r9: 0,
         user_r10: 0,
-        user_rflags: pc.syscall_user_rflags,
+        user_rflags: snap.user_rflags,
     }
 }
 

@@ -3842,6 +3842,7 @@ pub fn run() -> ! {
             _task_resume_mode,
             _task_preempt_frame_ptr,
             task_fpu_state_ptr,
+            task_syscall_snapshot_ptr,
         ) = {
             let sched = scheduler_lock();
             if let Some(task) = sched.get_task(_task_idx) {
@@ -3870,6 +3871,7 @@ pub fn run() -> ! {
                         .get(_task_idx)
                         .map(|area| area.as_ref() as *const XSaveArea)
                         .unwrap_or(core::ptr::null()),
+                    task.syscall_snapshot.get(),
                 )
             } else {
                 (
@@ -3877,6 +3879,7 @@ pub fn run() -> ! {
                     ResumeMode::Initial,
                     core::ptr::null(),
                     core::ptr::null(),
+                    core::ptr::null_mut(),
                 )
             }
         };
@@ -3914,6 +3917,24 @@ pub fn run() -> ! {
             // mask IRQs anyway so `switch_context` jumps in with IF
             // observably whatever the chosen task's saved RFLAGS dictates.
             interrupts::disable();
+        }
+
+        // Phase 57e Bug #3 fix — publish the chosen task's
+        // [`crate::task::TaskSyscallSnapshot`] pointer to this core.  The
+        // syscall-entry asm and the syscall handlers that consume r8/r9
+        // and similar extra-arg slots dereference this pointer.  Update
+        // it inside the IRQ-masked window (we are between
+        // `retarget_preempt_count_to_task` and `switch_context`, IRQs
+        // disabled by the dispatch-prep fix and by the retarget itself)
+        // so no concurrent IRQ handler can observe a half-updated state.
+        if !task_syscall_snapshot_ptr.is_null() {
+            let pc = crate::smp::per_core();
+            // SAFETY: `current_syscall_snapshot_ptr` is per-core and only
+            // mutated here, with IRQs masked.  No other code path writes
+            // to it after early init.
+            unsafe {
+                *pc.current_syscall_snapshot_ptr.get() = task_syscall_snapshot_ptr;
+            }
         }
         if !task_fpu_state_ptr.is_null() {
             unsafe { restore_fpu_state(&*task_fpu_state_ptr) };
