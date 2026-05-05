@@ -2027,6 +2027,10 @@ fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extr
             reason,
             extra,
         );
+        // (No dump trigger here — dequeue-drop fires during normal
+        // boot-time races before userspace stabilises.  The
+        // stale-ready and stuck-no-waker paths are the meaningful
+        // signals.)
     }
 }
 
@@ -3591,6 +3595,22 @@ pub fn run() -> ! {
             crate::task::watchdog::watchdog_scan();
         }
 
+        // Phase 57e Bug #6 diagnostic: drain a deferred trace-ring dump
+        // requested by the dequeue-drop / stale-ready / stuck-no-waker
+        // paths.  Runs OUTSIDE any scheduler-context lock so the long
+        // serial-write phase doesn't extend lock-hold time.  BSP only
+        // because the dump iterates every core's ring.
+        if core_id == 0 && TRACE_DUMP_PENDING.swap(false, Ordering::AcqRel) {
+            log::warn!("[sched] dumping trace rings (deferred from earlier signal)");
+            // Bounded slice: keeps the serial-write window short so we don't
+            // extend the diagnostic-induced fault window.  256 entries per
+            // core × 4 cores = 1024 lines, ~10 ms at 115200 baud — short
+            // enough to finish before the next watchdog scan.
+            crate::trace::dump_trace_rings_recent(256);
+            #[cfg(feature = "sched-trace")]
+            crate::task::sched_trace::dump_sched_trace_rings();
+        }
+
         // Before picking next, wake any tasks whose `wake_deadline` has
         // elapsed. This is the task-context replacement for a timer-ISR
         // force-wake — it runs under `SCHEDULER.lock` already and cannot
@@ -3676,6 +3696,12 @@ pub fn run() -> ! {
                 stale_ticks,
                 last_ready
             );
+            // Phase 57e Bug #6 diagnostic: defer a trace dump on the first
+            // stale-ready of more than 1 s.  Earlier than the 30 s stuck
+            // watchdog, late enough to skip benign brief delays.
+            if stale_ticks >= 1000 && !TRACE_DUMP_FIRED.swap(true, Ordering::AcqRel) {
+                TRACE_DUMP_PENDING.store(true, Ordering::Release);
+            }
         }
 
         let (task_rsp, _task_idx) = match next {
@@ -4480,6 +4506,20 @@ pub fn sys_sched_getaffinity(pid: u32) -> i64 {
 /// Tick counter gating watchdog scans (BSP-only, matches `BALANCE_COUNTER`).
 static WATCHDOG_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Phase 57e Bug #6 diagnostic — set the first time the watchdog observes a
+/// `StuckNoWaker` task or a dequeue-drop fires, gating a one-shot trace-ring
+/// dump. Stays set for the remainder of the boot so we don't flood the log on
+/// repeated hits.
+static TRACE_DUMP_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Phase 57e Bug #6 diagnostic — set from inside scheduler-locked contexts to
+/// request the dispatch loop to emit a trace-ring dump on its next iteration.
+/// The dump itself runs OUTSIDE of any scheduler-context lock to avoid
+/// extending lock-hold time across thousands of `_panic_print` writes.
+static TRACE_DUMP_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Periodic stuck-task watchdog scan.
 ///
 /// Called from the BSP's scheduler dispatch loop on every iteration.
@@ -4564,6 +4604,13 @@ pub fn watchdog_scan() {
                     state,
                     stuck_ms,
                 );
+                // Phase 57e Bug #6 diagnostic: on the FIRST stuck-no-waker
+                // hit per boot, defer a trace-ring dump to the dispatch
+                // loop so we get the lost-wake protocol violation on serial
+                // without holding scheduler locks across the dump.
+                if !TRACE_DUMP_FIRED.swap(true, Ordering::AcqRel) {
+                    TRACE_DUMP_PENDING.store(true, Ordering::Release);
+                }
             }
             WatchdogVerdict::StuckDeadlineExpired => {
                 let stuck_ms = now.saturating_sub(*blocked_since);

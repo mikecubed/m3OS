@@ -50,22 +50,35 @@ pub fn trace_event(_event: kernel_core::trace_ring::TraceEvent) {}
 /// Compiles to nothing when the `trace` feature is off.
 #[cfg(feature = "trace")]
 pub fn dump_trace_rings() {
+    dump_trace_rings_recent(usize::MAX)
+}
+
+/// Dump only the most-recent `max_per_core` events from each core's ring.
+///
+/// Faster than [`dump_trace_rings`] for diagnostic paths that fire from a
+/// running kernel — keeps the non-preemptible serial-write window short
+/// and reduces the chance that a long dump destabilises an already-fragile
+/// kernel state.
+#[cfg(feature = "trace")]
+pub fn dump_trace_rings_recent(max_per_core: usize) {
     use crate::serial::_panic_print;
 
-    _panic_print(format_args!("=== TRACE RING DUMP ===\n"));
+    _panic_print(format_args!(
+        "=== TRACE RING DUMP (last {max_per_core} per core) ===\n"
+    ));
 
     let core_count = crate::smp::core_count();
     let mut any_events = false;
 
     for core_id in 0..core_count {
         if let Some(data) = crate::smp::get_core_data(core_id) {
+            _panic_print(format_args!("--- core={core_id} ---\n"));
             // Safety: UnsafeCell grants interior mutability. We only read.
             // In panic context, a concurrent writer on another core could
             // produce a torn entry, but this is acceptable for crash diagnostics.
-            // Uses for_each_chronological() to avoid heap allocation.
             let ring_ptr = data.trace_ring.get();
             unsafe {
-                (*ring_ptr).for_each_chronological(|entry| {
+                (*ring_ptr).for_each_recent(max_per_core, |entry| {
                     any_events = true;
                     _panic_print(format_args!("  [{}] core={} ", entry.tick, entry.core));
                     print_trace_event(&entry.event);

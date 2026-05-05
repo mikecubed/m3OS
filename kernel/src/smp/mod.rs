@@ -295,7 +295,7 @@ pub struct PerCoreData {
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
     #[cfg(feature = "trace")]
-    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<256>>,
+    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<4096>>,
 
     // ----- Phase 57a B.3: lock-ordering guard -----
     /// Set to `true` while this core holds `SCHEDULER.lock`.

@@ -45,7 +45,7 @@ mod inner {
     use kernel_core::trace_ring::SchedTrace;
 
     /// Number of entries per core in the sched-trace ring.
-    const SCHED_TRACE_RING_SIZE: usize = 256;
+    const SCHED_TRACE_RING_SIZE: usize = 4096;
 
     /// Minimal lock-free fixed-size ring for `SchedTrace` entries.
     ///

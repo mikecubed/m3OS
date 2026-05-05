@@ -240,6 +240,23 @@ impl<const N: usize> TraceRing<N> {
         }
     }
 
+    /// Iterate at most the last `max` entries in chronological order.
+    ///
+    /// Same shape as [`for_each_chronological`] but bounded — useful in
+    /// diagnostic dumps that must finish quickly to avoid extending the
+    /// non-preemptible window across thousands of serial writes.
+    pub fn for_each_recent(&self, max: usize, mut f: impl FnMut(&TraceEntry)) {
+        if self.count == 0 || max == 0 {
+            return;
+        }
+        let take = self.count.min(max);
+        let skip = self.count - take;
+        let start = if self.count < N { 0 } else { self.write_idx };
+        for i in skip..(skip + take) {
+            f(&self.buf[(start + i) % N]);
+        }
+    }
+
     /// Copy entries in chronological order into `dst`, returning the count written.
     ///
     /// Does not allocate. Suitable for `sys_ktrace` where entries must be
