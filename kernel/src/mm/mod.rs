@@ -398,26 +398,21 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
 pub fn free_process_page_table(cr3_phys: u64) {
     use alloc::vec::Vec;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
-    // Phase 57e Bug #7 diag — log every PT free with the immediate caller's
-    // file:line so we can correlate "who freed this PML4" against the
-    // frame-trace ring's allocation history.  Cheap (one log line per
-    // process exit / execve cleanup) and dropped when the residual closes.
-    let caller = core::panic::Location::caller();
-    log::info!(
-        "[free_pt] cr3_phys={:#x} caller={}:{}",
-        cr3_phys,
-        caller.file(),
-        caller.line()
-    );
-    // Phase 57e Session 8 — sanity check: free_process_page_table on the
-    // currently-active CR3 means CR3 is dangling once we return. That can
-    // only be intentional in restore_kernel_cr3 paths, never in execve's
-    // old-cr3 free.  Log loudly so the trace dump (when it fires) shows
-    // the lifecycle right next to the offending free.
+    // Phase 57e Session 8 — defensive sanity check.
+    //
+    // Freeing the currently-active CR3 leaves CR3 dangling on this core.
+    // The only legitimate caller (sys_exit, fault_kill_trampoline) calls
+    // `restore_kernel_cr3` first; execve switches via Cr3::write before
+    // the free.  If this fires we know an upstream bug — most likely a
+    // recurrence of Bug #7's stale `old_cr3_phys == new_cr3_phys` race.
+    //
+    // Kept after the fix landed because the cost is one Cr3::read per
+    // process exit and the WARN is silent under correct operation.
     {
         use x86_64::registers::control::Cr3;
         let (active_cr3, _) = Cr3::read();
         if active_cr3.start_address().as_u64() == cr3_phys {
+            let caller = core::panic::Location::caller();
             log::warn!(
                 "[free_pt] !!! cr3_phys={:#x} EQUALS active CR3 — caller={}:{}",
                 cr3_phys,
