@@ -218,11 +218,22 @@ pub struct PerCoreData {
     pub syscall_stack_top: u64,
     /// User RSP saved by `syscall_entry` assembly stub.
     ///
-    /// Stays per-core (rather than per-task like the rest of the snapshot)
-    /// because it is only consulted at syscall entry (before `sti`) and at
-    /// syscall return (after `cli`) — both windows have IRQs masked, so a
-    /// kernel-mode preempt cannot run another task's `syscall_entry` and
-    /// alias the slot.
+    /// Per-core for ABI reasons: the syscall-entry asm writes the slot via
+    /// gs-relative addressing (`SYSCALL_USER_RSP` offset), and the sysret
+    /// tail reads it the same way.  The canonical source of truth is the
+    /// per-task [`crate::task::TaskSyscallSnapshot::user_rsp`]; the per-core
+    /// slot is a mirror that is reliably refreshed from the per-task
+    /// snapshot on every dispatch with IRQs masked (see Phase 57e Bug #4
+    /// fix in `scheduler::run`, immediately before `switch_context`).
+    ///
+    /// Read sites:
+    ///  - syscall-entry / sysret asm (via `SYSCALL_USER_RSP`) — IRQs masked.
+    ///  - `snapshot_user_return_state()` inside `syscall_handler` — IRQs
+    ///    enabled at this point, but safe because the dispatcher already
+    ///    populated the slot from this task's per-task snapshot before
+    ///    handing control back, and a kernel-mode preempt that switches
+    ///    away will, on resume, re-mirror the slot from the per-task
+    ///    snapshot before any user-visible code runs.
     pub syscall_user_rsp: u64,
     /// R10 (syscall arg3) saved by `syscall_entry` assembly stub.
     pub syscall_arg3: u64,

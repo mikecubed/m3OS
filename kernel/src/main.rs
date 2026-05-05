@@ -183,7 +183,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         xsave.area_size_at_mask,
         xsave.xsaveopt
     );
-    unsafe { arch::x86_64::cpuid::enable_xsave_state() };
+    // `enable_xsave_state` updates CR4 and writes XCR0 via xsetbv.  Its
+    // safety contract requires IRQs disabled or single-threaded execution.
+    // The BSP is single-threaded here (boot_aps has not run), but interrupts
+    // are already enabled (line above), so wrap the privileged-register
+    // update in `without_interrupts` to honor the contract unconditionally
+    // and prevent an IRQ from observing partial CR4/XCR0 state.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        arch::x86_64::cpuid::enable_xsave_state()
+    });
     // Validate the static `XSAVE_AREA_SIZE` against the *enabled* mask size
     // (CPUID 0Dh.0.EBX re-read after `xsetbv`).  `area_size_at_mask` from the
     // probe was captured before XCR0 = 0x7 was set, so it reflects the reset

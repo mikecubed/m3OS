@@ -3215,8 +3215,19 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         // core").  `preempt_disable` keeps the waker pinned for the duration
         // of the spin and the subsequent `enqueue_to_core` call.
         preempt_disable();
-        while on_cpu_ref.load(Ordering::Acquire) {
-            core::hint::spin_loop();
+        // Phase 57e Track B.2 (review-resolution refinement): after
+        // `preempt_disable` we are pinned to the current core, but a
+        // preemption between the `waker_core` read above and reaching here
+        // could already have migrated us.  If migration moved us onto the
+        // wakee's `assigned_core`, the cross-core spin would deadlock on
+        // same-core (per the same-core escape comment above).  Re-check
+        // here after we are pinned and skip the spin in that case.  Limit
+        // the re-check to the cross-core branch to preserve the same-core
+        // fast path's zero-overhead profile.
+        if assigned_core != crate::smp::per_core().core_id {
+            while on_cpu_ref.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
         }
         preempt_enable();
     }
