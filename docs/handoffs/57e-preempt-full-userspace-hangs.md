@@ -1071,14 +1071,22 @@ The earlier "Bug #7 fix" moved `Cr3::read` to before `set_current_user_return`. 
 
 The lesson: under `preempt-full`, **anything that reads PROCESS_TABLE.addr_space.pml4_phys() AFTER the table has been mutated is suspect**. Use the captured-before-mutation Arc instead.
 
-### Validation observations
+### Validation observations (5-iteration loop after `22cd711`)
 
-After landing `d8db950`, multiple `cargo xtask smoke-test` runs under preempt-full confirm:
+| iter | outcome | kernel faults | free_pt !!! |
+| --- | --- | --- | --- |
+| 1 | Terminated (BlockedOnReply cascade, pid=21 stuck 171 s) | 0 | 0 |
+| 2 | PASSED on attempt 2 (10 s) | 0 | 0 |
+| 3 | Terminated (BlockedOnReply cascade) | 0 | 0 |
+| 4 | FAILED (prompt-ready gate timeout — slow boot) | 0 | 0 |
+| 5 | FAILED (prompt-ready gate timeout — slow boot) | 0 | 0 |
+
+After landing `d8db950`, the 5-iteration loop confirms:
 
 1. **Zero kernel page faults** across all attempts of all iterations. The `0xffff80000051ca18` / corrupted PML4[256] symptom is gone.
 2. **Zero `[free_pt] !!! cr3_phys EQUALS active CR3` warnings** — the defensive sanity check stays silent, confirming the active-CR3 race is closed.
-3. **Smoke-test is still intermittent**, but the failure mode has shifted: instead of the kernel-side slab UAF, runs that fail now hang on a `BlockedOnReply` watchdog cascade — `pid=18 BlockedOnWait` (smoke-runner waitpid'ing the tcc forkchild) and `pid=21 BlockedOnReply` (tcc subprocess waiting on IPC reply that never arrives).
-4. **Successful runs pass cleanly** (e.g. 51 s on attempt 3 of one early validation). Failures and successes alternate run-to-run.
+3. **Smoke-test is still intermittent (1/5 pass-rate)**, but the failure mode has shifted: runs that fail now either hang on the `BlockedOnReply` watchdog cascade (iters 1, 3 — same shape as Sessions 1–3 lost-wakeup) or time out the prompt-ready gate during slow boot (iters 4, 5).
+4. **Successful runs pass cleanly and quickly** (iter 2: 10 s on attempt 2).
 
 The `BlockedOnReply` cascade is **the same shape as the original Session 1–3 lost-wakeup symptom** (Bug #6 family), not a regression of the just-fixed Bug #7 slab UAF. Sessions 3–4 originally attributed the cascade to the slab UAF zombieing a non-BSP core (which created a partial-deadlock zombie when other cores depended on the dead core). With the UAF closed, the cascade should be gone — but it isn't, so a separate Bug #6 variant is still open.
 
@@ -1098,7 +1106,7 @@ This residual is **independent of the Session 8 fix** and was already present in
 | --- | --- |
 | (1) `run-gui` + `fb-takeover doom` renders | not verified |
 | (2) `run-gui` + TAB completion | not verified |
-| (3) `cargo xtask smoke-test` passes deterministically | pending validation |
+| (3) `cargo xtask smoke-test` passes deterministically | ❌ — 1/5 pass-rate; failures are Bug #8 (cascade + slow-boot), NOT the closed Bug #7 |
 | (4) `run-gui` 10-min soak | not verified |
 | (7) per-frame trace ring + page-fault dump | ✅ landed |
-| (8) UAF/double-allocate site identified and fixed | ✅ (`d8db950`); deterministic-pass count pending |
+| (8) Bug #7 frame UAF identified and fixed | ✅ (`d8db950`); 0 recurrences across 5-iter validation |
