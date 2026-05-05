@@ -1,8 +1,66 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status:** Headless `cargo xtask smoke-test` under `preempt-full` is intermittent. The Bug #6 fixes that landed (`init_task` halt, idle-task yield cfg-gate, `reply()` preempt_disable bracket, `deliver_message_and_wake` helper) close all three preempt-full-only livelock and lost-wake variants. The remaining intermittency is a **separate bug**: a slab-allocator page fault in `kernel_core::slab::SlabCache::allocate` on a non-BSP core that `hlt`'s only the faulting core; other cores then cascade into `BlockedOnReply` because their wake targets live in tasks now stranded on the dead core. See *Session 3 — resolution* and *Session 4 — slab UAF* below.
+**Status (branch tip `2e1bbc4`, end of Session 8):**
+
+- **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
+- **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
+- **Bug #8** (the remaining `cargo xtask smoke-test` intermittency under `preempt-full`) — **open**. After Bug #7 closed, the smoke-test still passes only ~1/5 of the time; failures are now exclusively a `BlockedOnReply` watchdog cascade (same shape as the Sessions 1–3 lost-wakeup family) or a `prompt-ready` slow-boot timeout. **Track G's 24 h soak gate stays closed** until Bug #8 is fixed.
+
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
+
+---
+
+## Quick-start for the next session — Bug #8
+
+### Reproducer
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+  cargo xtask smoke-test
+```
+
+Expect the smoke-test to pass on attempt 2 or 3 about 1 time in 5; otherwise it fails or terminates with one of the two patterns below in `/tmp/m3os-smoke-full.log` (the file holds the last failed attempt's serial because `M3OS_SMOKE_SERIAL_DUMP` writes only on error returns).
+
+### Two failure shapes (Bug #8)
+
+1. **`BlockedOnReply` cascade.** `pid=18 fork-child state=BlockedOnWait` (smoke-runner waitpid'ing the tcc forkchild) plus `pid=21 fork-child state=BlockedOnReply` (the tcc subprocess waiting for an IPC reply that never arrives). Stuck-since values run for 100+ s. This is the same shape as the original Sessions 1–3 lost-wakeup family — Sessions 3–4 attributed it to the slab UAF zombieing a non-BSP core, but with Bug #7 closed the cascade still reproduces, so a separate Bug #6 variant survives the F2-partial helper coverage. See *Session 8 — root cause identified and fixed* below for the validation table.
+2. **`prompt-ready` slow boot.** `syslogd: prompt-ready gate timed out` and `sshd: prompt-ready gate timed out` after `display_server: compose#1500` or so. The boot is healthy (display_server keeps composing) but userspace services don't reach their readiness gate within the smoke-test timeout. May be the same wakeup issue surfacing earlier in boot, or a separate scheduling-cadence effect.
+
+### Files to pre-load for Bug #8
+
+- `kernel/src/ipc/endpoint.rs:340..850` — multi-step send/recv paths NOT covered by the F2-partial `deliver_message_and_wake` helper (which only covers 11 simple sites in `endpoint.rs` and `cleanup.rs`).
+- `kernel/src/task/scheduler.rs:1271-1283` — `save_user_return_state`, the function that read PROCESS_TABLE during yield_now and caused Bug #7. Now that we know yield_now under preempt-full is the main offender, audit every other site that mutates process state for a similar "PROCESS_TABLE updated then synchronous yield reads stale snapshot" race.
+- `kernel/src/task/scheduler.rs:1041-1060` — `enqueue_to_core` (the IPI send site that Sessions 2–3 explored as the IPI livelock). The bare-coalesce experiment was reverted; a smarter coalesce or wake-source rate limit may be the right move.
+- `kernel/src/arch/x86_64/syscall/mod.rs:4263-4475` — `sys_execve` (with the Bug #7 fix at line ~4413). The same race shape may still exist in fork's CoW-clone path.
+- `/tmp/m3os-smoke-full.log` — capture from the most recent failing attempt of the reproducer above.
+
+### Diagnostic infrastructure already in tree
+
+The next session inherits a strong toolchain. Don't rebuild any of these:
+
+| Diagnostic | What it does | Source |
+|---|---|---|
+| `[mm] addr-space layout` boot log | One-shot at `mm::init` showing `KERNEL_PML4_PHYS`, bootloader phys-offset (with PML4 idx), heap range (with PML4 idx), and a collide flag. | `kernel/src/mm/mod.rs` (commit `8567dbc`) |
+| Page-fault PT-walk diagnostic (`[pf-diag]`) | Walks the four-level page table for the fault address from BOTH active CR3 PML4 and `KERNEL_PML4_PHYS`, printing each level's flags + addr. Wired into both ring-0 and ring-3 not-present fault paths. | `kernel/src/arch/x86_64/interrupts.rs` (commit `78417ee`) |
+| Per-frame allocate/free trace ring (`[frame-trace]`) | Global 16 384-entry ring keyed by physical frame address, recording every alloc/free with `#[track_caller]` location. Dumped on kernel page fault, filtered to the active CR3 frame's lifecycle. | `kernel/src/mm/frame_trace.rs`, wired in `frame_allocator.rs` (commit `b23a24c`) |
+| `[free_pt] !!!` defensive sanity check | WARN log if `free_process_page_table` is called with `cr3_phys == active CR3` (the Bug #7 race signature). Silent under correct operation. | `kernel/src/mm/mod.rs` (commits `b23a24c`, `22cd711`) |
+| `M3OS_SMOKE_SERIAL_DUMP=<path>` env var | `xtask smoke-test` writes full serial history to the path on every error return; trim threshold bumped from 192 KiB to 24 MiB so the deferred trace-ring dump fits. | `xtask/src/main.rs` (commit `d5da120`) |
+
+### Approach hints
+
+If you start with the cascade (Bug #8.1), the cleanest first step is to add `track_caller` chains through the 11 simple `deliver_message_and_wake` sites and grep for any other `deliver_message + wake_task_v2` pair the helper missed. The kernel scheduler trace ring (already enabled when `M3OS_KERNEL_FEATURES` includes `sched-trace`) records `WakeTask`, `RunQueueEnqueue`, `Dispatch` per core; on a stuck-no-waker watchdog hit the deferred trace dump fires automatically.
+
+If you start with the slow-boot pattern (Bug #8.2), it might just be the same lost-wakeup but on a different IPC pair (e.g. the syslogd readiness handshake to init), so the same fix may close both.
+
+### Acceptance criteria for closing Bug #8
+
+1. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes on attempt 1 (no retries) for **10 runs in a row**.
+2. Zero `(no waker registered)` watchdog warnings across those 10 runs.
+3. `cargo xtask check` stays green.
+
+When (1)–(3) pass, reopen Track G's 24 h soak gate (still gated on the `run-gui` doom + TAB criteria from the Sessions 1 reproducers, which were never re-verified after the Bug #7 fix).
 
 This handoff describes three reproducible userspace correctness failures that the previous handoff classified as "Bug #6 family — performance / quality, NOT correctness." The failure logs in `m3os-bad-term.log`, `m3os-freeze-term.log`, and `m3os.log` show that those warnings are not benign — they coincide with hangs that block forward progress. The classification needs to be revised and the underlying race fixed before Track G's 24 h soak gate can open.
 
