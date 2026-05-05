@@ -361,6 +361,103 @@ fn has_guard_marker(vaddr: u64) -> bool {
     }
 }
 
+/// Phase 57e diag: walk the page tables for `vaddr` from BOTH the active CR3
+/// PML4 and the kernel-original `KERNEL_PML4_PHYS`, printing each level.
+///
+/// Used from the page-fault handler to localise the slab UAF / spurious
+/// PTE-clear residual to one of:
+///   - Hyp #3 surviving: the active CR3's PML4[256] points at a different
+///     PDPT than KERNEL_PML4 (i.e. kernel-half sharing was lost).
+///   - Hyp #4: the walks converge but a leaf PTE / sub-table page is zero.
+///   - Hyp #4b: the PT frame itself was overwritten (unmapped from the walk
+///     by a parent-entry change rather than a leaf clear).
+///
+/// Output is best-effort and resilient to garbage page-table entries.
+fn dump_pte_walk_diagnostics(vaddr: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_off_va = VirtAddr::new(phys_off);
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let (cr3_frame, _) = Cr3::read_raw();
+    let active_pml4 = cr3_frame.start_address().as_u64();
+    let kernel_pml4 = crate::mm::kernel_pml4_phys();
+
+    _panic_print(format_args!(
+        "[pf-diag] vaddr={:#018x} idx=[p4={} p3={} p2={} p1={}] active_cr3={:#x} kernel_pml4={:#x}\n",
+        vaddr, p4, p3, p2, p1, active_pml4, kernel_pml4
+    ));
+
+    fn walk_one(label: &str, phys_off_va: VirtAddr, pml4_phys: u64, idx: [usize; 4]) {
+        let [p4, p3, p2, p1] = idx;
+        unsafe {
+            let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+            let e4 = &pml4[p4];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PML4[{}] flags={:?} addr={:#x}\n",
+                label,
+                p4,
+                e4.flags(),
+                e4.addr().as_u64()
+            ));
+            if !e4.flags().contains(PageTableFlags::PRESENT) {
+                return;
+            }
+            let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+            let e3 = &pdpt[p3];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PDPT[{}] flags={:?} addr={:#x}\n",
+                label,
+                p3,
+                e3.flags(),
+                e3.addr().as_u64()
+            ));
+            if !e3.flags().contains(PageTableFlags::PRESENT)
+                || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                return;
+            }
+            let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+            let e2 = &pd[p2];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PD  [{}] flags={:?} addr={:#x}\n",
+                label,
+                p2,
+                e2.flags(),
+                e2.addr().as_u64()
+            ));
+            if !e2.flags().contains(PageTableFlags::PRESENT)
+                || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                return;
+            }
+            let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+            let e1 = &pt[p1];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PT  [{}] flags={:?} addr={:#x}\n",
+                label,
+                p1,
+                e1.flags(),
+                e1.addr().as_u64()
+            ));
+        }
+    }
+
+    walk_one("active", phys_off_va, active_pml4, [p4, p3, p2, p1]);
+    if active_pml4 != kernel_pml4 {
+        walk_one("kernel", phys_off_va, kernel_pml4, [p4, p3, p2, p1]);
+    } else {
+        _panic_print(format_args!(
+            "[pf-diag] kernel: (same as active, walk omitted)\n"
+        ));
+    }
+}
+
 /// Public entry point for kernel-context VMA demand paging.
 ///
 /// Revalidates the current VMA metadata while holding the address-space
@@ -1022,6 +1119,14 @@ extern "x86-interrupt" fn page_fault_handler(
             "[int] RSP={:#x}\n",
             stack_frame.stack_pointer.as_u64()
         ));
+        // Phase 57e diag: not-present userspace faults on what should be a
+        // mapped code/data page are the same shape as the kernel slab UAF;
+        // dump the PTE walk to localise the missing-PTE level.
+        if !err.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+            && let Ok(fault_va) = addr
+        {
+            dump_pte_walk_diagnostics(fault_va.as_u64());
+        }
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
                 .current_task_idx
@@ -1074,6 +1179,9 @@ extern "x86-interrupt" fn page_fault_handler(
         "[int] KERNEL page fault — CR3=0x{:016x}\n",
         cr3_frame.start_address().as_u64()
     ));
+    if let Ok(fault_va) = addr {
+        dump_pte_walk_diagnostics(fault_va.as_u64());
+    }
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
     crate::hlt_loop();
