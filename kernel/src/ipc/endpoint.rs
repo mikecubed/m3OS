@@ -923,6 +923,18 @@ pub fn cancel_task_wait(task_id: TaskId) {
 ///
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
+    // Phase 57e Bug #6 (H7) — bracket the deliver+wake pair with
+    // preempt_disable/enable so `deliver_message`'s SchedulerGuard::drop does
+    // NOT zero-cross `preempt_count` between the two operations.  Without
+    // this, under preempt-full a synchronous `yield_now` from
+    // `preempt_enable`'s zero-crossing branch (`scheduler.rs:1693-1714`) can
+    // fire BEFORE `wake_task_v2` runs.  If the server then doesn't get
+    // re-dispatched in time (or at all), the caller is parked in
+    // BlockedOnReply with `pending_msg` set but never enqueued — the
+    // smoking gun is `[WARN] [sched] task pid=N state=BlockedOnReply
+    // stuck-since=N (no waker registered)`.  See F1 in
+    // docs/handoffs/57e-preempt-full-userspace-hangs.md.
+    crate::task::scheduler::preempt_disable();
     // Phase 54: transfer any reply bulk data from server → caller.
     transfer_bulk(server, caller);
     scheduler::deliver_message(caller, reply_msg);
@@ -937,6 +949,7 @@ pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
     // and the caller will observe it and skip blocking.
     // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
     let _ = crate::task::scheduler::wake_task_v2(caller);
+    crate::task::scheduler::preempt_enable();
 }
 
 /// Reply to the current caller and immediately receive the next message.
