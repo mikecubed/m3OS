@@ -311,12 +311,26 @@ Under `preempt-full`, all of `check_and_preempt_kernel`'s gates pass and a queue
 
 **Why simpler attempts didn't work** — A first attempt placed the disable *after* the second lock guard at `scheduler.rs:3860` (just before `retarget_preempt_count_to_task`). That closed only the trailing 28-line window; the address-space restore block (`:3666–:3804`) and the second lock-acquire block (`:3818–:3860`) ran with IRQs enabled, leaving a wide non-re-entrant window. A second attempt placed it right after `match next`. That left a tiny gap between the `pick_next` lock drop and the disable that, while small, is still exploitable when the LAPIC timer is firing at 1 ms and `set_current_task_idx` has already committed the dispatch. Only by disabling IRQs *before* the lock acquire — so that the lock's drop is a no-op — does the window collapse to zero.
 
-**What's still residual (not Bug #2)** — Under `preempt-full`, the boot now reaches every service in the smoke-test config (`syslogd`, `sshd`, `crond`, `console`, `kbd`, `display`, `term`, etc.) and runs userspace through several fork generations. The smoke-test failure now bubbles up at `SMOKE:tcc-version:PASS`, with kernel diagnostic warnings:
+**What's still residual (not Bug #2) — Bug #3: fork-child user GPR corruption under preempt-full**
 
-- `[WARN] [fault_kill] trampoline running for pid <N>` — userspace fault (kbd at one point, etc.) handled gracefully by the kernel.
-- `[WARN] [sched] dequeue-drop core=<C> idx=<I> pid=<P> reason=state-not-ready extra=0x2` — run-queue contains a stale entry for a task whose `state == BlockedOnRecv (0x2)`. The dispatcher correctly drops the entry; this is a benign log of a pre-existing or preempt-full-amplified state inconsistency.
+After the Bug #2 fix, the kernel boots all services and userspace runs through several fork generations. The remaining failure has a clean signature:
 
-These are separate from the original Bug #2 and likely either pre-existing soak quality issues or downstream effects of preempt-full's increased preemption pressure. They should be filed and tracked as their own item before the Track G 24 h soak is gated open.
+- *Every* fork-child of init that is supposed to `execve` a service page-faults at the same userspace RIP `0x4044c2` with `err=PageFaultErrorCode(USER_MODE)` and `CR2 ∈ {0x7f, 0x70, 0x229, 0x29a, 0x30f, 0x383, 0x3fa, 0x46d, …}`.
+- `addr2line` / `objdump` resolves `0x4044c2` to init's `ServiceManager::start_service+0x722`, instruction `mov 0x70(%r14), %rax` — load `&svc.<field at 0x70>` from a service-struct pointer.
+- The fault address minus `0x70` gives the value of `R14` at fault time. Across consecutive children: `R14 ∈ {0xF, 0, 0x1B9, 0x22A, 0x29F, 0x313, 0x38A, 0x3FD}` — clearly **corrupted small integers** rather than the valid service-struct pointer it should be (`rdi + idx * 0x148`).
+- Pattern is preempt-full-only. The default `cargo xtask run` produces zero faults over 30 s of operation.
+- Despite the per-process kills, init keeps respawning, the smoke-runner DOES emit every `SMOKE:*:PASS` marker eventually (visible in buffered output captured after the runner kills QEMU on a step timeout), so the failure has the shape of "live but very slow + extra child deaths" — not a panic, not a hang.
+
+The fork-children inherit init's address space (CoW) and run init's `start_service` code briefly between `fork()` and `execve()`. R14's corruption suggests one of the user GPRs is being mangled during a kernel-mode timer IRQ that fires while the child is in user mode — most likely a fault in the fork-child resume path or in the kernel-mode preempt of `fork()` syscall / `fork_child_trampoline` setup that leaves a stale `ForkEntryCtx` for the eventual user-mode `iretq`.
+
+Strict scoping: this is **not caused by the Bug #2 fix** and **not the same race**. It was simply not previously observable because Bug #2 double-faulted on init's first dispatch, well before any service-fork could occur.
+
+Companion warnings:
+
+- `[WARN] [fault_kill] trampoline running for pid <N>` — the page-fault handler's kill path. Each fork-child fault produces one of these.
+- `[WARN] [sched] dequeue-drop core=<C> idx=<I> pid=<P> reason=state-not-ready extra=0x2` — a stale run-queue entry for a task that has since transitioned to `BlockedOnRecv (0x2)`. The dispatcher correctly drops the entry and logs. Benign and downstream of the kill path above.
+
+This must be tracked as a follow-up before Track G's 24 h soak is gated open. See `docs/roadmap/tasks/57e-full-kernel-preemption-tasks.md` for the soak contract.
 
 **Verification** — In this session:
 
@@ -325,7 +339,15 @@ These are separate from the original Bug #2 and likely either pre-existing soak 
 3. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run` — boots cleanly through all services, runs for the full timeout window without a kernel fault. (Was: 100 % double-fault on init's first dispatch.)
 4. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` — boots through, fails much later at `SMOKE:tcc-version:PASS` (separate userspace issue).
 
-The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the residual userspace progression issue, and (4) is the Track G soak gate which can be reopened once (3)'s residual is also resolved.
+The remaining items in the original "Acceptance criteria for 'Bug #2 fixed'" section below are now (1) and (2) green; (3) still depends on the Bug #3 fork-child user-GPR corruption above, and (4) is the Track G soak gate which can be reopened once Bug #3 is also resolved.
+
+## Bug #3 next steps (not started)
+
+1. Reproduce with `sched-trace` enabled and look at preempt events around the fork-child's first dispatch. Specifically: did a kernel-mode preempt fire during the `fork()` syscall or during `fork_child_trampoline`?
+2. Instrument `enter_userspace_fork` (`kernel/src/arch/x86_64/mod.rs:216`) to log the full `ForkEntryCtx` contents immediately before it calls into `fork_enter_userspace` asm. Compare against the user RIP `0x4044c2` / corrupt R14 observed at fault.
+3. Audit `preempt_resume_to_user` (`kernel/src/arch/x86_64/interrupts.rs:706`) and the user-mode iretq frame construction. The GPR offsets check out on paper (matches `PreemptTrapFrameUser::to_preempt_frame`); the corruption could be at *save* time (timer IRQ during a stack push window) rather than restore.
+4. Bisect: temporarily make `check_and_preempt_kernel` always early-return (i.e. neuter kernel-mode preempt) under a debug feature flag and rerun the smoke-test. If the fork-child faults disappear, the bug is in the preempt-full kernel-mode preempt path, not in the user-mode resume path.
+5. Examine `dispatch_preempted_and_resume_kernel` (`kernel/src/arch/x86_64/interrupts.rs:876`) — the handoff originally flagged it as the highest-risk new asm under H4.
 
 ---
 
