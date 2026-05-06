@@ -2154,6 +2154,13 @@ pub fn peek_preempt_count_irq() -> i32 {
 static PREEMPT_LEAK_LOG_BUDGET: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(32);
 
+/// Phase 57e Bug #12 follow-up — sampling counter for `yield_now()` calls.
+/// `yield_now` logs `[yield-sample] n=N caller=file:line pid=P` every 100th
+/// invocation so the boot transcript reveals the busy-yielder distribution
+/// without needing a trace-ring dump.  See `yield_now` for the rationale.
+static YIELD_NOW_SAMPLE_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Phase 57b D.3 (debug) / Phase 57e Bug #9 (release) — at user-mode
 /// return, `preempt_count` MUST be zero.  In debug builds a non-zero
 /// value panics so the missed `preempt_enable` surfaces immediately.
@@ -2287,6 +2294,23 @@ pub fn yield_now() {
     // sleep TSC spin, etc.) by their source file:line, so a failure mode that
     // depends on the eager-yield in `preempt_enable` can be localised.
     let location = core::panic::Location::caller();
+    // Phase 57e Bug #12 sampled log — the trace ring only dumps on watchdog
+    // /panic triggers, which don't fire on a clean preempt-full lag run.
+    // Rate-limit one log per N yield_now invocations so the boot transcript
+    // shows a usable sample of the caller distribution.  The trade-off: 100
+    // is small enough to surface call-site distribution within a few hundred
+    // log lines, but large enough to not drown the serial console under
+    // sustained nanosleep / TSC-spin yield loops.
+    let n = YIELD_NOW_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n.is_multiple_of(100) {
+        log::info!(
+            "[yield-sample] n={} caller={}:{} pid={}",
+            n,
+            location.file(),
+            location.line(),
+            crate::process::current_pid(),
+        );
+    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
