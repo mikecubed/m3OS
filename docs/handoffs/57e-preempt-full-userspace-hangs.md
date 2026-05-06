@@ -1,12 +1,12 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (end of Session 16, after Bug #11 fix + un-revert of `962d787`):**
+**Status (end of Session 17, after Bug #12 bracket-shrink in `<this commit>`):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); `695f800`'s init_task halt cfg-gated to preempt-full only in Session 16 (commit `753a311`) to fix the voluntary-mode regression below.
-- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed**.  Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before disk I/O (commit `37b9d9c`); (b) FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` (commit `9292aec`, **revert in `962d787` itself reverted in `<this commit>`** after Session 16 bisection proved the regressions attributed to `9292aec` were actually pre-existing and traced to Bug #6 commits).  10-iter QEMU soak under `9292aec` passed 10/10 with retry, 9/10 attempt-1, 0 zero-tolerance fingerprints.
+- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed**.  Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before disk I/O (commit `37b9d9c`); (b) FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` (commit `9292aec`, **revert in `962d787` itself reverted in `6826deb`** after Session 16 bisection proved the regressions attributed to `9292aec` were actually pre-existing and traced to Bug #6 commits).  10-iter QEMU soak under `9292aec` passed 10/10 with retry, 9/10 attempt-1, 0 zero-tolerance fingerprints.
 - **Bug #10** (sporadic Doom-launch kernel-mode GPF — faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern, core 3 scheduler dispatch loop) — **open**.  Observed once in m3os.log under `9292aec`; did not reproduce on the second launch in the same session and has not reproduced in subsequent hardware testing.  Filed for follow-up; not blocking GUI use.
-- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, hardware-verified).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
-- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **open**.  Visible to user as input-to-screen latency.  Caused by Bug #6 / #8.1 fixes adding `preempt_disable` bracketing around every IPC `deliver_message + wake_task_v2` pair (1 site in `reply()`, 6 in send/recv/notif paths from `6b725f5`, 11 simple sites via `deliver_message_and_wake` helper from `3e3107c` and `da2e781`).  Fix path: shrink each bracket to cover exactly the deliver+wake atomic — see *Quick-start for Session 17* below.
+- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, **hardware re-test pending**).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
+- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **fix landed in `<this commit>`**, hardware re-test pending.  Root cause: Bug #6 / #8.1 fixes added `preempt_disable` brackets around every IPC `deliver_message + wake_task_v2` pair, but the brackets were over-broad — they enclosed `transfer_bulk` (per-task slot copy), `trace_event` (logging), and in the `recv_*` paths `deliver_message` to the *current* task (no wake counterpart).  Each non-load-bearing operation inside the bracket extends the IRQ-preempt-blocked window for no protection benefit.  Fix: shrink all 7 brackets in `kernel/src/ipc/endpoint.rs` (recv_msg, recv_msg_nowait, recv_msg_with_notif, send, call_msg, reply, send_with_cap) to the minimum atomic — `deliver_message + wake_task_v2` for receiver-wake sites, `complete_send + wake_task_v2` for sender-wake sites.  Validation: `cargo xtask check` green, 10-iter QEMU soak under `preempt-full` passes 10/10 with retry, 8/10 attempt-1, 0 zero-tolerance fingerprints (parity with Session 16 baseline).  See *Session 17 — Bug #12 bracket-shrink* below.
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
@@ -2398,3 +2398,89 @@ Bug #11 close lands in Session 16 (this commit).  Real-hardware re-test confirms
 3. **Bug #10 (sporadic Doom GPF)** — needs hardware-side reproducer; treat as low-priority background investigation.
 
 Track G's 24h soak gate stays closed pending Bug #9 + #12 closure and a clean hardware soak.
+
+---
+
+## Session 17 — Bug #12 bracket-shrink in `kernel/src/ipc/endpoint.rs`
+
+### TL;DR
+
+Shrunk every `preempt_disable`/`preempt_enable` bracket in `kernel/src/ipc/endpoint.rs` from "deliver + bulk + trace + wake" down to the minimum load-bearing atomic.  Applied to all 7 sites:
+
+| Site | Lines (pre-fix) | Load-bearing atomic | Moved out of bracket |
+|---|---|---|---|
+| `recv_msg` matched-sender | 380-398 | `complete_send + wake_task_v2` (sender wake) | `deliver_message`, `transfer_bulk`, `trace_event` |
+| `recv_msg_nowait` matched-sender | 498-511 | same | same |
+| `recv_msg_with_notif` matched-sender | 606-615 | same | `deliver_message`, `transfer_bulk` |
+| `send` matched-receiver | 753-772 | `deliver_message + wake_task_v2` (receiver wake) | `transfer_bulk`, `trace_event` |
+| `call_msg` matched-receiver | 877-889 | same | `transfer_bulk` |
+| `reply` | 955-981 | same (caller wake) | `transfer_bulk`, `trace_event` |
+| `send_with_cap` matched-receiver | 1108-1118 | same | `transfer_bulk`, `trace_event` |
+
+The `recv_*` insight (the key to the fix): in those paths the receiver is the **current** task — `deliver_message(receiver, ...)` writes to its own `pending_msg` slot and there is no wake counterpart for it.  Only the sender-side `complete_send + wake_task_v2` needs the Bug #6/#8.1 atomic protection.  Pre-fix code wrapped all of `deliver_message`, `transfer_bulk`, `trace_event`, *and* the sender-wake atomic in one bracket; this gated IRQ-driven preemption for the entire IPC pipeline cycle even though only the last two operations needed protection.
+
+For the send-style sites, `transfer_bulk` must precede `wake_task_v2` (recipient could otherwise observe `pending_msg` set without `pending_bulk`, surfacing as the `data[1] != 0 but pending_bulk slot empty` mismatch), but does not need to be inside the preempt bracket — its `take_bulk_data` and `deliver_bulk` calls touch independent per-task slots with no wake race.  Pull `transfer_bulk` out **before** `preempt_disable`; pull `trace_event` out anywhere (no scheduler interaction).
+
+### Why each bracket is now exactly two scheduler ops
+
+Every `preempt_disable` … `preempt_enable` block in `endpoint.rs` post-fix contains exactly the call pair the comment names:
+
+```rust
+crate::task::scheduler::preempt_disable();
+scheduler::deliver_message(receiver, msg);   // OR scheduler::complete_send(sender);
+let _ = crate::task::scheduler::wake_task_v2(target);
+crate::task::scheduler::preempt_enable();
+```
+
+Both `deliver_message` and `complete_send` internally take `scheduler_lock()` (an `IrqSafeMutex`).  The lock's drop calls `preempt_enable`, which under preempt-full zero-crosses `preempt_count` (no outer bracket) and synchronously fires `yield_now`.  Without the outer bracket, that yield can run BEFORE `wake_task_v2` — leaving the target with `pending_msg` set (or `send_completed=true`) but not enqueued.  The outer `preempt_disable` keeps `preempt_count` at 1 across the inner lock drop, so the inner zero-cross does not fire.  Once `wake_task_v2` finishes and the outer `preempt_enable` runs, the deferred yield can fire — but by then the target is on a run queue.
+
+`transfer_bulk` is two independent `scheduler_lock` acquires (one for `take_bulk_data(src)`, one for `deliver_bulk(dst, ...)`); each can zero-cross on drop.  That's harmless — yielding between or after them does not break any invariant because the bulk slots are independent state and no task is waiting on a particular order.  `trace_event` does not touch the scheduler.  Both can move outside the bracket.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| `cargo xtask check` (clippy + rustfmt + host tests) | ✅ green |
+| `cargo xtask smoke-test` under default voluntary | ✅ PASS (attempt 3, baseline retry behaviour) |
+| `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` | ✅ PASS (attempt 1) |
+| `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak --duration 10m --max-runs 10` | **10/10 with retry, 8/10 attempt-1, 0 failures** |
+| Soak zero-tolerance greps (Track G.1.b acceptance gate) | ✅ all 7 patterns count = 0 |
+| `cargo xtask test --test kernel` | ❌ pre-existing baseline failure in `kernel::mm::frame_allocator::tests::allocate_frame_hot_path_tolerates_reentrant_free` (double-fault on IST stack); **same failure at HEAD without Bug #12 changes** — not a regression, separate latent issue |
+
+Soak result: `/tmp/bug12-soak/soak-result.md` — Track G acceptance gate **PASS** by the harness's own criteria.
+
+### What this does NOT close
+
+Hardware re-test on `omarchy` is the last gate.  The hypothesis that input-to-screen latency comes from these brackets predicts a perceptible improvement in mouse + keyboard responsiveness on real hardware under preempt-full.  Until the user re-flashes the image and validates, the lag closure is theoretical.  The fix is risk-low (each bracket is now strictly tighter than pre-fix, and the QEMU soak shows no Bug #6/#8.1 regressions), but the latency improvement itself can only be confirmed on hardware.
+
+### Acceptance criteria for closing Bug #12
+
+1. ✅ `cargo xtask check` green.
+2. ✅ 10-iter `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak` passes with 0 zero-tolerance fingerprints.
+3. ⏳ Real-hardware GUI re-test on `omarchy` confirms perceptible reduction in mouse/keyboard input latency vs. pre-fix.
+4. ⏳ Real-hardware soak (no GPF, no `BlockedOnReply` cascade, no `stale-ready` watchdog) under preempt-full.
+
+When (3) and (4) pass, Bug #12 is closed and the only open Bug #N items are #10 (sporadic Doom GPF, no reproducer) — Track G's 24-hour soak gate can finally open.
+
+### If the fix regresses Bug #6/#8.1 on hardware
+
+If hardware re-test surfaces `[WARN] [sched] task pid=N state=BlockedOnReply stuck-since=N (no waker registered)` or stale-ready watchdog dumps, the bracket may have been shrunk too far for some path.  Diagnostic plan:
+
+1. Identify which IPC path holds the parked task.  Trace ring dump (already wired in scheduler.rs) names the syscall site.
+2. Re-widen ONLY that site's bracket — restore `transfer_bulk` and/or `deliver_message` inside the bracket for the affected path, leaving the other 6 sites tight.
+3. Document the path-specific reason in the comment block at the bracket.
+
+The 7 sites are independent — a regression in one does not require reverting all 7.
+
+### Quick-start for Session 18
+
+If Session 17's hardware re-test succeeds for Bug #11 + Bug #12:
+
+1. Run a 24-hour soak under `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak` on hardware (requires a long-running test rig).  Acceptance: 0 zero-tolerance fingerprints across the entire window.
+2. With the soak passing, declare Track G closed.  Phase 57e then has only Bug #10 (sporadic Doom GPF, no reproducer) outstanding — file as a separate follow-up phase or a Track H ticket and move forward to Phase 58.
+
+If hardware re-test surfaces lag improvement but a different fingerprint surfaces:
+
+1. Capture serial transcript.
+2. Diagnose with the existing trace ring infrastructure (per-core preempt trace ring, dispatch dump on stuck-task watchdog, frame trace ring for kernel page faults).
+3. Determine whether it's a Bug #6/#8.1 regression (re-widen the affected bracket) or a new failure mode (file as Bug #13 and triage).
