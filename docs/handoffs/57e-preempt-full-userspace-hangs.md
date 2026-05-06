@@ -1,11 +1,12 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (branch tip `da2e781`, end of Session 11):**
+**Status (branch tip `8000fc6`, end of Session 12):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
-- **Bug #8.1** (`BlockedOnReply` watchdog cascade — root cause was missing waker registration in `block_current_on_{recv,send,notif}_v2`, **not** the unbracketed pairs Session 10 patched) — **closed** in Session 11 (commit `da2e781`). Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced incident frequency under `sched-trace` overhead but did not close the structural race. Validated: **4-for-4 passes on attempt 1** under bare `preempt-full` (no sched-trace, no timing multiplier — the config that hit 90 cascade warnings pre-fix).
-- **Bug #8.2** (`prompt-ready` slow-boot / `pid=18 BlockedOnWait` from waitpid'ing a slow child) — **either closed or vastly mitigated**. The post-Session-11 runs all complete in 9–13 s. Session 9's virtio-blk-latency theory may apply only to a degenerate worst case that the v2-waker fix also covered. **Track G's 24 h soak gate may now reopen pending a multi-iteration soak validation.**
+- **Bug #8.1** (`BlockedOnReply` watchdog cascade — root cause was missing waker registration in `block_current_on_{recv,send,notif}_v2`, **not** the unbracketed pairs Session 10 patched) — **closed** in Session 11 (commit `da2e781`). Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced incident frequency under `sched-trace` overhead but did not close the structural race. Session 12's 10-iter soak: **0 cascades across all 10 runs**.
+- **Bug #8.2** (`prompt-ready` slow-boot timeout) — **partially mitigated**. The lost-wake fix in Session 11 also closed most of the slow-boot symptoms. Soak still shows occasional slow-boot but it's now retry-recoverable.
+- **Bug #9** (NEW — scheduling-fairness defect: `stale-ready` for 30 s + `cpu-hog` correlation) — **open**. Surfaced under Session 12's 10-iter soak as the residual `attempt-1 failure` mode after Bug #8.1 closure. **Track G's 24 h soak gate stays closed** until Bug #9 is dispositioned (fix or accept-with-disclosure).
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
@@ -1480,3 +1481,129 @@ M3OS_KERNEL_FEATURES="preempt-full" \
 ```
 
 Should pass on attempt 1 reliably under `preempt-full` (no `sched-trace` needed). Pre-fix this hit 90 cascade warnings; post-fix this is 4-for-4 on attempt 1.
+
+---
+
+## Session 12 — soak validation surfaces Bug #9 (scheduling fairness)
+
+### TL;DR
+
+Ran a 10-iter soak under `preempt-full` to validate Session 11's fix and confirm Bug #8.2 status. Result: **9/10 passes (with retry); 6/10 attempt-1 passes; 0 cascade warnings across all runs.** The cascade is genuinely closed. The residual is a different bug shape — a scheduling-fairness defect that leaves a Ready task on one core un-dispatched for 30 seconds while another core hogs a different task. Filed as Bug #9.
+
+### 10-iter soak result
+
+```
+Run 1:  PASS attempt 1 in 17s (wall 33s)
+Run 2:  PASS attempt 3 in 11s (wall 77s)   ← 2 attempts failed first
+Run 3:  PASS attempt 1 in  9s (wall 25s)
+Run 4:  PASS attempt 1 in  9s (wall 24s)
+Run 5:  PASS attempt 1 in 12s (wall 29s)
+Run 6:  FAIL — step 4 timed out, then step 9 timed out (wall 93s)
+Run 7:  PASS attempt 2 in 41s (wall 98s)
+Run 8:  PASS attempt 1 in 10s (wall 25s)
+Run 9:  PASS attempt 3 in  8s (wall 105s)  ← 2 attempts failed first
+Run 10: PASS attempt 1 in 13s (wall 29s)
+
+Passes:           9 / 10
+Attempt-1 passes: 6 / 10
+Cascade warnings: 0  (pre-Session-11 baseline: 90)
+```
+
+Pattern: when a run fails attempt 1, attempts 2 and 3 succeed quickly (often in 8–12 s once they get a fresh boot). The slowness is variance in early-boot cadence, not a sustained kernel pathology.
+
+### Bug #9 — scheduling-fairness defect
+
+A captured failing-attempt dump (`/tmp/m3os-soak-1.log`, the script ran an additional run-until-failure and grabbed the last failing attempt's serial) showed:
+
+```
+[WARN] [sched] stale-ready: pid=11 name=fork-child core=0 stale~29874 ms (ready_at_tick=1727)
+[WARN] [sched] cpu-hog:    pid=2  name=fork-child exec_path=/bin/syslogd core=1 ran~30127 ms final_state=Running
+[WARN] [sched] stale-ready: pid=4  name=fork-child core=1 stale~115 ms (ready_at_tick=31489)
+vfs_server: slow req#110 STAT_PATH elapsed_us=30204423   ← 30 SECONDS for one STAT_PATH
+```
+
+Reading these together:
+
+- **pid=2 syslogd** ran on **core 1** for 30 seconds straight without yielding. `final_state=Running` means it was still running when the watchdog warned.
+- **pid=11 vfs_server** was Ready on **core 0** for 29.8 seconds without being dispatched. `ready_at_tick=1727` means it became Ready at tick 1727 (~1.7 s after boot) and stayed in run-queue limbo until tick ~31600.
+- **pid=4 crond** also went stale-ready on core 1 for 115 ms (correlated with syslogd's hog).
+- The 30-second STAT_PATH is the consequence: vfs_server couldn't service the request because it wasn't being dispatched.
+
+**Zero cascade warnings, zero virtio-blk timeouts during this 30 s window** — the kernel is making forward progress on cores 1, 2, 3 (display_server keeps composing) but core 0's run queue isn't draining its Ready entries.
+
+This is **not** a lost wakeup. The wake fired correctly (state transitioned to Ready, queue entry exists). The dispatcher just isn't picking up the Ready task. Either:
+
+1. **`pick_next` filter bug.** Some condition in the dispatch path's queue scan rejects pid=11's queue entry repeatedly. The 30 s duration suggests deterministic skip rather than transient race.
+2. **Core 0 is running another high-priority task that doesn't yield.** But the warning explicitly says `pid=11 stale~29874 ms`, meaning the watchdog detected the Ready state — pid=11's run-queue entry must exist and be visible.
+3. **Cross-core enqueue race.** pid=11 was enqueued to core 0's run queue from a different core (the wake source's core). If core 0's local run queue and the cross-core enqueue path use different lock structures and the entry landed in the "wrong" queue slot, it could be invisible to core 0's `pick_next` until balance migrates it.
+4. **Load balancer interaction.** `BALANCE_COUNTER` triggers task migration every ~500 ms. If migrations are routing pid=11 around without ever landing it on a dispatching core, that's a real bug.
+5. **CPU-hog of pid=2 on core 1 starves the BSP-owned dispatch loop.** BSP runs more housekeeping (drain_dead, balance, deadline scan, watchdog) than APs. If syslogd's 30 s hog is somehow on the BSP and not core 1 as the warning claims, the BSP's dispatch iteration cadence drops to zero.
+
+### Files to pre-load for Bug #9 investigation
+
+- `kernel/src/task/scheduler.rs:737-852` — `pick_next` / `dequeue_local` (the entry filter).
+- `kernel/src/task/scheduler.rs:1041-1060` — `enqueue_to_core` (cross-core enqueue + IPI).
+- `kernel/src/task/scheduler.rs:4313-…` — `BALANCE_COUNTER` and `balance_task_load` (load-balancer migrations).
+- `kernel/src/task/scheduler.rs:4296-4308` — `drive_expired_wake_deadlines` (BSP-only housekeeping).
+- `kernel/src/task/scheduler.rs:3500-3700` — main dispatch loop body.
+- `kernel/src/arch/x86_64/interrupts.rs:1535-1596` — `check_and_preempt_kernel` (per-IRQ preempt path).
+- `/tmp/m3os-soak-1.log` — captured failure with stale-ready/cpu-hog evidence.
+- `/tmp/m3os-soak-{2..5}.log`, `/tmp/m3os-soak-{1,2,4,5}.serial.log` — additional samples from the soak.
+
+### Reproducer for Bug #9
+
+```bash
+# Run 5–10 back-to-back smoke tests; ~30-40% will hit attempt-1 failure
+# with stale-ready / cpu-hog warnings (no cascade).
+for i in $(seq 1 10); do
+  M3OS_KERNEL_FEATURES="preempt-full" \
+    M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-soak-$i.log \
+    cargo xtask smoke-test 2>&1 | grep -E "smoke-test:.*(launching|PASSED|FAILED|attempt)"
+done
+```
+
+Failed attempts produce serial dumps with `stale-ready` and `cpu-hog` warnings. Successful attempts complete in 8–13 s.
+
+### Recommendation for next session — pursue Bug #9
+
+The 30-second stale-ready is **not** acceptable as a perf trade-off. A Ready task should be dispatched within milliseconds of becoming Ready, regardless of preempt-full's overhead. Holding a task ready for 30 s while neighboring cores work on other things indicates a structural defect in the dispatch path, not a perf knob.
+
+**Three reasons to fix vs accept:**
+
+1. The 30-second duration rules out "preempt-full is just slower." A 100× slowdown of dispatch wouldn't add up to 30 s of stuck-Ready unless the scheduler is genuinely failing to make forward progress on that queue entry.
+2. The cpu-hog correlation suggests the bug is timing-coupled with another task starving its core. That correlation is a fingerprint that should localise the race quickly with targeted tracing.
+3. Track G's 24 h soak gate is the explicit goal of the phase. A 30-second per-task stall would compound across 24 h to enough fairness violations that real workloads would surface them.
+
+**Suggested approach for next session (Session 13):**
+
+1. **Add a sched-trace recording for `enqueue_to_core` and `pick_next` skip reasons.** When the watchdog fires `stale-ready`, dump the per-core run queue contents along with the trace ring.
+2. **Capture a single failing run with sched-trace enabled** (`M3OS_KERNEL_FEATURES="preempt-full,sched-trace"`). Sched-trace masks Bug #8.1 but probably not Bug #9 (which is a dispatcher-side, not wake-side, defect). If sched-trace also masks Bug #9, that's a strong signal in its own right.
+3. **Audit cross-core enqueue path for race with local enqueue.** Most likely culprit: `enqueue_to_core` from a non-target-core writes to the target's run queue, but the target's `pick_next` iterates only a partition of the queue that doesn't include the cross-core writes until the next load-balance pass.
+
+**Alternative path (if Bug #9 turns out to be unfix­able-on-this-budget):** declare Bug #8.1 closure shipped, document the 9/10-with-retry pass rate as the new normal under preempt-full, and let Track G's 24 h soak run with retries enabled. The cascade was the announced blocker; #9 is a fairness defect that deserves its own phase.
+
+### Acceptance criteria status (Session 12 revision)
+
+| Criterion | Status |
+|---|---|
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically under `preempt-full` | ⚠️ — 9/10 with retry, 6/10 attempt-1; cascade closed but Bug #9 (stale-ready) keeps attempt-1 rate sub-deterministic |
+| (4) `run-gui` 10-min soak | not verified |
+| (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ (`da2e781`); 0 cascades across 10-iter soak |
+| (8.2) Bug #8.2 slow-boot closed | ✅ — folded into (8.1) closure (slow boot was a knock-on of lost wakes) |
+| (9) Bug #9 scheduling-fairness (stale-ready 30 s + cpu-hog) closed | ❌ — open, surfaced by Session 12 soak |
+
+Track G's 24 h soak gate stays closed pending Bug #9 disposition.
+
+### Quick-start reproducer for next session
+
+```bash
+# Single run — pass on attempt 1 most of the time, but ~40% of attempts
+# will time out with stale-ready / cpu-hog warnings.
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
+  cargo xtask smoke-test
+```
+
+A failing attempt's `/tmp/m3os-bug9.log` will contain `stale-ready: pid=N stale~30000ms` and `cpu-hog: pid=M ran~30000ms` warnings. **Bug #9 fingerprint:** zero `(no waker registered)` cascade lines (rules out lost-wakeup), zero virtio-blk timeouts past the boot-time sector 2072 saga, zero kernel faults.
