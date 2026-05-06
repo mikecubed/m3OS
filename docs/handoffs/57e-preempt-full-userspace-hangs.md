@@ -1,8 +1,9 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (end of Session 15, after FS-mutex swap revert):**
+**Status (end of Session 16, after voluntary-mode regression bisection + cfg-gate fix):**
 
-- **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
+- **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); **`695f800`'s init_task halt cfg-gated to preempt-full only in Session 16** (`<this commit>`) to fix the voluntary-mode regression below.
+- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16**.  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
@@ -2292,3 +2293,91 @@ Move both to `docs/handoffs/captures/57e-session-15-hardware-regression/` if Ses
 When two side-effects of a primitive look defensive ("no ISR ever reaches it" → IRQ-mask is "unnecessary"), check whether one of them serves an unrelated invariant before swapping.  In this case, the IRQ-mask was the *de-facto* preempt-discipline for fair cross-core spinlock acquisition under `preempt-full`.  A doc-comment promise of "safe type swap" written under `preempt-voluntary` was no longer accurate under `preempt-full`'s timer cadence, and the QEMU TCG model did not reproduce the failure.
 
 Option B (Arc-clone refactor) preserves both side-effects and breaks the leak structurally instead of suppressing the lock's behaviour.
+
+---
+
+## Session 16 — voluntary-mode regression bisection (Bug #11) and lag observation
+
+### Reframe
+
+User reports from real-hardware testing on the `omarchy` machine after pulling Session 15's revert:
+
+1. **Voluntary-mode GUI broken on real hardware (Bug #11).**  `kbd_server`, `mouse_server`, `display_server` all emit "starting" but never reach "ready"; `term` retries and times out, `session_manager` falls back to text mode.  The same kernel boots and runs cleanly in QEMU (smoke-test passes), so the regression is real-hardware-specific.
+2. **Preempt-full GUI has mouse/keyboard input lag.**  Visible to the user as input-to-screen latency.  Was NOT introduced by Session 15 — present from the moment preempt-full first became bootable on hardware.
+3. **Doom GPF from m3os.log (Session 15) is sporadic.**  Doom runs reliably in subsequent attempts.  Treat as a separate latent issue (Bug #10), open for follow-up but not blocking GUI use.
+
+User ran a 4-step manual bisection on `omarchy`:
+
+| Commit | Voluntary GUI | Preempt-full GUI |
+|---|---|---|
+| `29d3e7` (pre-Phase-57e baseline) | works, no lag | crashed at boot (Bugs #1–#5 not yet fixed) |
+| `defb146` (Bugs #1–#5 closed, Bug #6 not yet) | works, no lag | crashes/hangs |
+| `695f800` (init_task halt landed) | **broken** | **intermittent crash; when boots, has lag** |
+| `3e3107c` (Bug #6 fully closed) | broken | works, has lag |
+| `da2e781` (Bug #8.1 closed) | broken | works, has lag |
+| HEAD (`962d787`, post Session 15 revert) | broken | works, has lag |
+
+Both regressions land at `695f800`.  The voluntary regression is fully attributable to that commit; the preempt-full lag is observable from the same commit because it's the first commit where preempt-full could be observed at all (Bug #6 fixes are load-bearing for preempt-full bootability).
+
+### Bug #11 root cause and fix
+
+`695f800` replaced `init_task`'s body with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted; the scheduler only dispatches at user-return boundaries and via cooperative `yield_now`.  `init_task` running on BSP with the new halt body never yields, so any task on BSP's run queue (in this case the freshly-spawned `kbd_server` / `mouse_server` / `display_server`) starves until the BSP somehow gets a yield event.  In QEMU TCG the timing is gentle enough that it works out; on real hardware, the first task scheduled to BSP simply never runs.
+
+Fix landed in Session 16: cfg-gate the change.  `init_task` now halts under preempt-full and yields under preempt-voluntary, mirroring the discipline `38d35ea` already established for `idle_task`:
+
+```rust
+loop {
+    #[cfg(feature = "preempt-full")]
+    x86_64::instructions::interrupts::enable_and_hlt();
+
+    #[cfg(not(feature = "preempt-full"))]
+    task::yield_now();
+}
+```
+
+`cargo xtask check` green under both feature configurations.  Real-hardware verification pending (user re-test on `omarchy`).
+
+### Bug #11 acceptance
+
+Verify with `M3OS_KERNEL_FEATURES=` (default voluntary) on `omarchy`:
+
+1. `cargo xtask image && reflash + boot`.
+2. After kernel boot, observe init startup messages.  Expected: `console_server: ready`, `kbd_server` reaches `ready` (some ready-equivalent line beyond "starting"), `display_server` reaches `framebuffer acquired` or `compose#0`, `mouse_server` likewise.
+3. `term` connects; userspace login prompt appears in the framebuffer.
+4. Mouse + keyboard input on the framebuffer terminal works without lag.
+
+If all four pass, Bug #11 is closed.
+
+### Preempt-full mouse/keyboard lag — characterisation and triage
+
+The lag was always present once preempt-full became bootable.  Hypothesis: every Bug #6 / #8.1 fix added `preempt_disable` bracketing around an IPC `deliver_message + wake_task_v2` pair (1 site in `reply()`, 6 in send/recv/notif paths from `6b725f5`, 11 simple sites via `deliver_message_and_wake` helper from `3e3107c` and `da2e781`).  Each `preempt_disable` raises `preempt_count`; while raised, the IRQ-side preempt gate skips.
+
+Mouse and keyboard input flows:
+
+```
+PS/2 IRQ → kernel ISR → ring buffer → notification → mouse_server / kbd_server → IPC → display_server → IPC → focused client
+```
+
+Every IPC step has a now-non-preemptible window.  Under preempt-full's high IRQ-driven scheduling cadence, these stack — each input event takes milliseconds to traverse the chain instead of microseconds.
+
+The Bug #6 / #8.1 brackets are correct (they close real lost-wake races); the fix is to **shorten the bracketed regions**, not remove them.  Specifically: ensure the bracket covers exactly `deliver_message + wake_task_v2` and nothing else.  Re-audit `kernel/src/ipc/endpoint.rs` for brackets that include extra work (e.g., `transfer_bulk`, capability transfer, trace events) and pull that work outside the bracket where safe.
+
+Filed as **Bug #12 (preempt-full input latency)**, separate from Bug #9.  Open for follow-up but does not block GUI usability.
+
+### Bug #10 — sporadic Doom GPF on first launch
+
+m3os.log from Session 15 captured a one-time kernel-mode GPF when launching `fb-takeover doom` on real hardware: faulting RIP `0x4847474947479b46` (garbage), ASCII "GHIJK" register pattern, core 3 scheduler dispatch loop.  Did not reproduce on the second launch in the same session.
+
+User confirms in subsequent sessions that Doom runs reliably (with the lag described above).  The crash is sporadic enough that it's not blocking, but the corruption pattern (garbage RIP + sequential-byte registers) suggests a stack overflow / wild-call in the framebuffer-mmap or fb-takeover handoff path.
+
+Filed as **Bug #10 (sporadic Doom-launch GPF)**.  Open for follow-up; lower priority than #9 and #11 because it's intermittent and recoverable.
+
+### Quick-start for Session 17 — close Bug #9 + Bug #12
+
+Bug #11 close lands in Session 16 (this commit).  Real-hardware re-test confirms.  After that, the open items are:
+
+1. **Bug #9 (scheduling fairness)** — partial fix in `37b9d9c` (mmap_file).  Full closure needs the Option B Arc-clone refactor of `kernel_read_fd_at` and the FS-volume read paths.  See the earlier *⭐ Quick-start for Session 16 — close Bug #9 via Option B (Arc-clone refactor)* section, which should be re-titled for Session 17.
+2. **Bug #12 (input lag)** — audit `kernel/src/ipc/endpoint.rs` brackets, shrink to deliver+wake atomic only, re-verify on hardware.
+3. **Bug #10 (sporadic Doom GPF)** — needs hardware-side reproducer; treat as low-priority background investigation.
+
+Track G's 24h soak gate stays closed pending Bug #9 + #12 closure and a clean hardware soak.

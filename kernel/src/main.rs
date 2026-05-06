@@ -322,15 +322,32 @@ fn init_task() -> ! {
     spawn_userspace_init();
 
     log::info!("[init] service set started — yielding");
-    // Phase 57e Bug #6 experiment: previously `loop { task::yield_now(); }`.
-    // Under preempt-full, that busy-yield was getting stuck in
-    // `preempt_enable`'s zero-crossing synchronous-yield branch
-    // (`scheduler.rs:1693-1714`) whenever cross-core IPC traffic kept
-    // setting `reschedule = true` on the core init_task ended up on,
-    // monopolising that core for 30+ seconds with no userspace progress.
-    // init_task has no work after service setup — halt it.
+    // Phase 57e Bug #6: under preempt-full, `loop { task::yield_now(); }`
+    // gets stuck in `preempt_enable`'s zero-crossing synchronous-yield
+    // branch (`scheduler.rs:1693-1714`) whenever cross-core IPC traffic
+    // keeps setting `reschedule = true` on the core init_task ended up
+    // on, monopolising that core for 30+ seconds with no userspace
+    // progress.  Halting solves it cleanly under preempt-full.
+    //
+    // BUT under preempt-voluntary, kernel-mode tasks are NOT preempted
+    // by the timer; they yield cooperatively.  init_task running on BSP
+    // with `loop { enable_and_hlt() }` would halt forever and never
+    // give the scheduler a yield-driven dispatch point — co-resident
+    // tasks on BSP's run queue would starve.  This was a regression
+    // observed on real hardware (kbd_server / mouse_server /
+    // display_server hanging at "starting" because their wake events
+    // landed on BSP and couldn't dispatch) — see
+    // `docs/handoffs/57e-preempt-full-userspace-hangs.md` Session 16.
+    //
+    // Cfg-gate the change: halt under preempt-full, yield under
+    // preempt-voluntary.  Same pattern `idle_task` uses (see commit
+    // `38d35ea`).
     loop {
+        #[cfg(feature = "preempt-full")]
         x86_64::instructions::interrupts::enable_and_hlt();
+
+        #[cfg(not(feature = "preempt-full"))]
+        task::yield_now();
     }
 }
 
