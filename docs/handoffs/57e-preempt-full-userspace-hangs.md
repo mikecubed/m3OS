@@ -1,12 +1,12 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (branch tip `1d764bc`, end of Session 14):**
+**Status (end of Session 15):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
-- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **mechanism deeply characterised; leak narrowed to IPC entry path; full fix deferred to Session 15**.
+- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **structural cause identified in Session 15** (any `IrqSafeMutex` held across a blocking call leaks `preempt_count`); **one site fixed** (`sys_mmap_file_backed`); **broader sites still open**, principally `kernel_read_fd_at`'s `FAT32_VOLUME`/`EXT2_VOLUME` lock held across `virtio_blk` I/O. **Full closure deferred to Session 16** — see *Session 15 — structural cause identified, partial fix landed* below.
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
@@ -15,7 +15,105 @@
 
 ---
 
-## ⭐ Quick-start for Session 15 — close Bug #9
+## ⭐ Quick-start for Session 16 — finish closing Bug #9
+
+### Recap
+
+Session 15 proved the structural cause of Bug #9: **any `IrqSafeMutex` whose guard outlives a call into `block_current_until` (typically via `virtio_blk::do_request`'s `block_current_until` wait, or any IPC/futex/wait block) leaves a `+1` in the holder's `preempt_count` after `block_current_until`'s post-resume `preempt_enable` runs.** The IRQ-side preempt gate (`peek_preempt_count_irq`) reads non-zero and refuses to preempt, so the running task monopolises its core for the entire syscall while co-resident Ready tasks starve.
+
+The leak is **not** specific to one syscall handler — it surfaces wherever the pattern "acquire IrqSafeMutex → call into a path that blocks on an IRQ → drop guard" exists. Fixing one site does not close the bug; the next site over inherits the same leak shape.
+
+Session 15 fixed `sys_mmap_file_backed` (`syscall/mod.rs:8606-8769`) which held `lock_page_tables()` across `kernel_read_fd_at` calls in the page-allocation loop. Validation (10-iter soak under bare `preempt-full`):
+
+| Run | Result | Attempt |
+|---|---|---|
+| 1 | PASS | 3 (2 retries) |
+| 2 | PASS | 1 ✓ |
+| 3 | PASS | 1 ✓ |
+| 4 | PASS | 2 (1 retry) |
+| 5 | PASS | 1 ✓ |
+| 6 | **FAIL** | all 3 |
+| 7 | PASS | 2 (1 retry) |
+| 8 | **FAIL** | all 3 |
+| 9 | PASS | 1 ✓ |
+| 10 | PASS | 1 ✓ |
+
+Pass-with-retry **8/10**, attempt-1 **5/10**, full-failures **2/10**. Comparable to the pre-fix Session 12 baseline (9/10, 6/10, 1/10). The fix removed a real but minor contributor; the dominant contributor (`kernel_read_fd_at` and the broader IPC paths that hold FS-volume locks across virtio_blk I/O) is still open.
+
+### Trace evidence (Session 15 post-fix run 8, `/tmp/m3os-bug9-fix/run-8.log`)
+
+```
+[WARN] [sched] dispatch-dump: pid=3 fork-child idx=10 state=Ready preempt_count=2
+[399] ENABLE  pre=2 post=1 caller=scheduler.rs:2870     ← block_current_until POST-RESUME exits at +1
+[400] DISABLE pre=1 post=2 caller=virtio_blk.rs:622     ← with_driver enters with leaked +1
+[401] ENABLE  pre=2 post=1 caller=virtio_blk.rs:627     ← with_driver exits, count back to 1
+[402] DISABLE pre=1 post=2 caller=scheduler.rs:307      ← IrqSafeMutex::lock from leaked 1
+... (count oscillates 1↔2 indefinitely; never returns to 0) ...
+```
+
+Same fingerprint as Session 14, just shifted off `sys_mmap_file_backed` to other paths.
+
+### The structural fix
+
+`kernel_read_fd_at` (`syscall/mod.rs:8387-8465`) holds `FAT32_VOLUME.lock()` (`IrqSafeMutex`) across `vol.read_file(...)`, which descends into `virtio_blk::do_request` → `block_current_until`. Same pattern for `EXT2_VOLUME` and likely many other places.
+
+`fs/fat32.rs:198-202` documents that `FAT32_VOLUME` is **never accessed from ISR context**:
+
+```rust
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// FAT32_VOLUME is only acquired from task context (mount, read/write
+/// syscalls); no ISR ever reaches it.  Type swap is a pure auto-deref
+/// change for callsites.
+pub static FAT32_VOLUME: IrqSafeMutex<Option<Fat32Volume>> = IrqSafeMutex::new(None);
+```
+
+The doc comment explicitly says the conversion to `spin::Mutex` is safe. The Phase 57b authors chose `IrqSafeMutex` defensively; under `preempt-full`, that defensive choice is now actively harmful.
+
+**Recommended Session 16 path — convert FS-volume mutexes from `IrqSafeMutex` to `spin::Mutex`:**
+
+1. `fs/fat32.rs:202` — `FAT32_VOLUME: IrqSafeMutex<Option<Fat32Volume>>` → `spin::Mutex<Option<Fat32Volume>>`
+2. `fs/fat32.rs:36` — `FAT32_PERMISSIONS: IrqSafeMutex<...>` → `spin::Mutex<...>`
+3. `fs/ext2.rs:69` — `EXT2_VOLUME: IrqSafeMutex<Option<Ext2Volume>>` → `spin::Mutex<...>`
+4. `fs/ext2.rs:60` — `Ext2Volume.block_cache: IrqSafeMutex<BTreeMap<...>>` → `spin::Mutex<...>`
+5. `fs/tmpfs.rs:33` — `TMPFS: IrqSafeMutex<Tmpfs>` → `spin::Mutex<Tmpfs>`
+
+The doc comment at each site already promises this is a pure auto-deref change. Verify by:
+
+- Greping for IRQ-context callers (`grep -rn "FAT32_VOLUME\|EXT2_VOLUME\|TMPFS\." kernel/src/ | grep -E "irq|interrupt|isr|handler"` — Session 15 confirmed none exist).
+- Running `cargo xtask check` (clippy + rustfmt + host tests) after each conversion.
+- Running the 10-iter soak under bare `preempt-full` — acceptance is 10/10 attempt-1 passes with **zero** `[sched] stale-ready` triggers.
+
+If 10/10 doesn't land cleanly, the next candidates to convert (in rough order of leak frequency) are: `process::PROCESS_TABLE` (held across many syscalls), `ipc::endpoint::ENDPOINTS` (already designed to release before scheduler calls — verify), `process::futex::FUTEX_TABLE`. Each one carries the same "no ISR context" property by design but should be verified before swapping.
+
+### Session 15 fix that did land (`<commit-pending>`)
+
+`sys_mmap_file_backed` (`kernel/src/arch/x86_64/syscall/mod.rs:8606-8769`) — restructured so `lock_page_tables()` is acquired ONLY around the actual page-table mutation, never across the alloc-and-`kernel_read_fd_at` loop. The lock window shrinks from "entire syscall" (potentially seconds × disk I/O) to "page-table mutation only" (microseconds). Three rollback paths preserved (OOM, I/O error, map-failure) all balance correctly via RAII.
+
+This is correct on its own merits even though it does not close Bug #9 — it removes one leak source and ensures `mmap_file`-heavy workloads no longer compound preempt_count by O(file-size-in-pages) into the leak.
+
+### Files to pre-load for Session 16
+
+- `kernel/src/fs/fat32.rs:198-202` — `FAT32_VOLUME` definition (doc-comment promises safe type swap).
+- `kernel/src/fs/fat32.rs:30-37` — `FAT32_PERMISSIONS`.
+- `kernel/src/fs/ext2.rs:55-69` — `EXT2_VOLUME` plus internal `block_cache`.
+- `kernel/src/fs/tmpfs.rs:24-37` — `TMPFS`.
+- `kernel/src/arch/x86_64/syscall/mod.rs:8387-8465` — `kernel_read_fd_at` (FAT32_VOLUME / EXT2_VOLUME held across `read_file`).
+- `kernel/src/task/scheduler.rs:300-353` — `IrqSafeMutex::lock` / `try_lock` (the preempt-disabling acquire path).
+- `/tmp/m3os-bug9-fix/run-{6,8}.log` — Session 15 captured failures with the post-fix Bug #9 fingerprint (preempt_count cycling 1↔2 around `virtio_blk.rs:622`).
+
+### Acceptance criteria for Session 16 closure
+
+1. `cargo xtask smoke-test` under `M3OS_KERNEL_FEATURES=preempt-full` passes attempt-1 for **10 runs in a row**.
+2. Zero `[sched] stale-ready watchdog` triggers across those 10 runs.
+3. Zero `[preempt] count=N pid=X at user-mode return — clamping` warnings.
+4. `cargo xtask check` stays green.
+5. `cargo xtask test` passes (kernel-in-QEMU tests).
+
+When (1)–(5) pass, reopen Track G's 24 h soak gate.
+
+---
+
+## ⭐ Original Quick-start for Session 15 — close Bug #9 (superseded by Session 15 findings above)
 
 ### Reproducer
 
@@ -1922,3 +2020,79 @@ Failing attempts produce `[sched] dispatch-dump:` blocks including per-task `pre
 | (9) Bug #9 scheduling-fairness closed | ⚠️ — caller history captured; leak narrowed to IPC entry path; full fix deferred to Session 15 (per-task ring + IPC entry instrumentation) |
 
 Track G's 24 h soak gate stays closed pending Bug #9 full closure.
+
+---
+
+## Session 15 — structural cause identified, partial fix landed
+
+### TL;DR
+
+Session 15 reframed Bug #9 from "an IPC entry path holds preempt_disable across `block_current_on_*_v2`" (Session 14 hypothesis) to the broader **"any `IrqSafeMutex` whose guard outlives a call into `block_current_until` leaks `preempt_count`"**. The leak is structural, not site-specific: every `IrqSafeMutex::lock()` raises `preempt_count`, every `block_current_until` switches a task out, and the IRQ-side preempt gate uses non-zero `preempt_count` to skip preempts. Holding such a guard across a `block_current_until` call therefore produces exactly the cycle Sessions 13–14 captured.
+
+One offending site was fixed (`sys_mmap_file_backed`'s `lock_page_tables()` held across `kernel_read_fd_at`). 10-iter soak confirms the fix is correct but not sufficient: pass rate **8/10 with retry, 5/10 attempt-1, 2 full failures** — comparable to the pre-fix Session 12 baseline (9/10, 6/10, 1/10). The dominant remaining contributor is `kernel_read_fd_at` itself, which holds `FAT32_VOLUME` / `EXT2_VOLUME` `IrqSafeMutex` across `read_file` (which descends into `virtio_blk::do_request`'s `block_current_until` wait).
+
+The recommended Session 16 path is documented at the top of this file under **"⭐ Quick-start for Session 16 — finish closing Bug #9"**: convert FS-volume mutexes from `IrqSafeMutex` to `spin::Mutex`. The doc-comments at each site already promise the conversion is safe (no ISR ever reaches them); under `preempt-full`, the defensive `IrqSafeMutex` choice is now actively harmful.
+
+### How Session 14's "IPC entry path" framing was wrong
+
+Session 14's Step 1 recommendation ("instrument IPC entries, find the syscall handler holding preempt_disable across IPC") was directionally right — the leak is from a held lock — but pinpointed the wrong scope. The leak source is **not** a single IPC entry; it is **any code path that combines an `IrqSafeMutex` guard with a downstream `block_current_until` call**, and there are many such paths.
+
+Specifically, Session 14 looked for `IrqSafeMutex` guards held across `block_current_on_*_v2` helpers and found none in `endpoint.rs`. Correct — those helpers are clean. But `block_current_until` is also called from `virtio_blk::do_request` (the disk completion wait) and other in-kernel waiters; ANY caller into those paths that holds an `IrqSafeMutex` carries the leak.
+
+### Static audit (Session 15 Phase A) — what was checked, what was found
+
+All 25 explicit `preempt_disable()` sites outside `kernel/src/task/scheduler.rs` audited for unmatched paths:
+
+| Site | Verdict |
+|---|---|
+| `kernel/src/ipc/endpoint.rs` (7 sites) | All bracketed `deliver_message + wake_task_v2` pairs balance correctly (Session 10 work) |
+| `kernel/src/blk/virtio_blk.rs:622` (`with_driver`) | Balanced via inner closure |
+| `kernel/src/mm/heap.rs:510` (`reclaim_allocator_local_caches`) | Balanced (early-return path has matching `preempt_enable`) |
+| `kernel/src/mm/slab.rs:463` (`collect_remote_frees`) | Balanced (early-return path has matching `preempt_enable`) |
+| `kernel/src/mm/frame_allocator.rs:920` (`drain_per_cpu_caches`) | Balanced (early-return path has matching `preempt_enable`) |
+| `kernel/src/iommu/intel.rs:249` (`wait_gsts_bit`) | Balanced via inner closure |
+| `kernel/src/iommu/intel.rs:381,409,653` | Balanced |
+| `kernel/src/iommu/amd.rs:346` | Balanced |
+| `kernel/src/arch/x86_64/ps2.rs:147` (`with_mouse_decoder`) | Balanced |
+| `kernel/src/arch/x86_64/apic.rs:448` (calibration) | Balanced (boot-time only) |
+| `kernel/src/arch/x86_64/interrupts.rs` (4 sites) | Balanced via inner closures |
+| `kernel/src/smp/{ipi,boot,mod,tlb}.rs` (5 sites) | Balanced |
+| `kernel/src/net/virtio_net.rs:488` | Balanced |
+| `kernel/src/rtc.rs:91` | Balanced |
+| `kernel/src/mm/mod.rs:123` (`lock_page_tables`) | Balanced via RAII (`PageTablePreemptRestore::drop`) |
+
+**No unmatched explicit `preempt_disable()` was found.** The leak comes from `IrqSafeMutex::lock()` (which calls `preempt_disable()` internally) and `mm::AddressSpace::lock_page_tables()` (which also calls `preempt_disable()`) being held across blocking calls.
+
+### Sites confirmed leaky by Session 15 trace evidence
+
+1. **`syscall/mod.rs:8606-8769` (`sys_mmap_file_backed`) — FIXED.** Held `lock_page_tables()` across `kernel_read_fd_at` in the page-allocation loop. Refactored so the lock covers only the actual page-table mutation; alloc + read run with no PT lock.
+2. **`syscall/mod.rs:8387-8465` (`kernel_read_fd_at`) — STILL LEAKY.** Holds `FAT32_VOLUME.lock()` (or `EXT2_VOLUME.lock()`) across `vol.read_file(...)`. Every disk-backed `sys_read`, every disk-backed `mmap_file` page (after the fix above), every `execve` ELF load page hits this leak.
+3. **All remaining `FAT32_VOLUME.lock()` / `EXT2_VOLUME.lock()` callsites in `syscall/mod.rs` (~25 of them) — STILL LEAKY** if any of the ops they perform call into virtio_blk-bound code.
+
+### Why the 10-iter soak rate didn't improve
+
+Tasks that hit the leak are dominated by callers of `kernel_read_fd_at` (vfs_server's read path on behalf of every userspace read), not callers of `sys_mmap_file_backed`. Removing the smaller contributor leaves the dominant one untouched. The soak rate is therefore essentially unchanged.
+
+A run-by-run comparison of trace fingerprints in `/tmp/m3os-bug9-fix/run-{6,8}.log` confirms: pid=3 in run 8 shows the canonical Bug #9 cycle (`pre=2 post=1 caller=scheduler.rs:2870` followed immediately by `pre=1 post=2 caller=virtio_blk.rs:622`) with the leak originating BEFORE `block_current_until`'s entry — same pre-fix shape as Session 14.
+
+### Acceptance criteria status (Session 15 revision)
+
+| Criterion | Status |
+|---|---|
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically under `preempt-full` | ⚠️ — 8/10 with retry, 5/10 attempt-1, 2 full failures; structural cause identified, partial fix landed, broader sites still open |
+| (4) `run-gui` 10-min soak | not verified |
+| (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ |
+| (8.2) Bug #8.2 slow-boot closed | ✅ |
+| (9) Bug #9 scheduling-fairness closed | ⚠️ — structural cause identified, one site fixed (`sys_mmap_file_backed`), broader sites (`kernel_read_fd_at` + ~25 `FAT32_VOLUME`/`EXT2_VOLUME` callsites) still open. Recommended fix path: convert FS-volume `IrqSafeMutex` to `spin::Mutex` (doc-comments already promise this is a safe type swap). |
+
+Track G's 24 h soak gate stays closed pending Bug #9 full closure.
+
+### Reproducer (unchanged)
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
+  cargo xtask smoke-test
+```

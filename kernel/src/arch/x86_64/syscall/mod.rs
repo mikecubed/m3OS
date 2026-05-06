@@ -8603,106 +8603,43 @@ fn sys_mmap_file_backed(
         let table = crate::process::PROCESS_TABLE.lock();
         table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
     };
-    let base = {
-        let _page_table_guard = addr_space
-            .as_ref()
-            .map(|addr_space| addr_space.lock_page_tables());
+    // Phase 57e Bug #9 — split the lifecycle so `lock_page_tables()` is held
+    // only across the page-table mutation, never across `kernel_read_fd_at`.
+    // The previous code held the guard for the entire alloc+read+map loop;
+    // each call to `kernel_read_fd_at` for a Fat32/Ext2 fd descends into
+    // `virtio_blk::do_request` → `block_current_until`, which switches out
+    // the task with `preempt_count >= 1` (the guard's +1).  When the task
+    // resumes, `block_current_until`'s post-resume `preempt_enable` only
+    // returns count to 1 — the guard's +1 persists.  The IRQ-side preempt
+    // gate (`peek_preempt_count_irq`) reads non-zero and refuses to preempt,
+    // so the running task monopolises its core for the entire syscall while
+    // co-resident Ready tasks starve.  See
+    // `docs/handoffs/57e-preempt-full-userspace-hangs.md` Sessions 13–14.
 
-        // Claim a virtual address range.
-        let base =
-            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
-                let current = if *mmap_next == 0 {
-                    ANON_MMAP_BASE
-                } else {
-                    *mmap_next
-                };
-                let end = current
-                    .checked_add(total_size)
-                    .filter(|v| *v <= 0x0000_8000_0000_0000)?;
-                *mmap_next = end;
-                Some(current)
-            }) {
-                Some(Some(base)) => base,
-                _ => return NEG_EINVAL,
+    // Claim a virtual address range — uses the shared-mm lock, not the
+    // page-table lock, so no preempt_disable is needed here.
+    let base =
+        match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            let current = if *mmap_next == 0 {
+                ANON_MMAP_BASE
+            } else {
+                *mmap_next
             };
-        let reservation_end = base + total_size;
-
-        // Get the process CR3 for the mapper.
-        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
-            Some(phys) => phys,
-            None => return NEG_EINVAL,
+            let end = current
+                .checked_add(total_size)
+                .filter(|v| *v <= 0x0000_8000_0000_0000)?;
+            *mmap_next = end;
+            Some(current)
+        }) {
+            Some(Some(base)) => base,
+            _ => return NEG_EINVAL,
         };
-        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
-            Ok(f) => f,
-            Err(_) => return NEG_EINVAL,
-        };
+    let reservation_end = base + total_size;
 
-        // Allocate frames, fill from file, map into page table.
-        let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
-        let mut page_buf = alloc::vec![0u8; 4096];
-
-        for i in 0..pages {
-            // Zero-before-exposure (D.4): user-visible mmap frame.
-            let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
-                Some(f) => f,
-                None => {
-                    log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
-                    // Roll back already-allocated frames.
-                    for f in &mapped_frames {
-                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-                    }
-                    let _ = crate::process::with_shared_mm_mut(
-                        pid,
-                        |_brk_current, mmap_next, _vma_tree| {
-                            if *mmap_next == reservation_end {
-                                *mmap_next = base;
-                            }
-                        },
-                    );
-                    return NEG_ENOMEM;
-                }
-            };
-
-            // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
-            let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-
-            let read_offset = file_offset + (i as usize) * 4096;
-            match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
-                Ok(n) if n > 0 => unsafe {
-                    core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
-                },
-                Ok(_) => {} // EOF or past-end page — leave zeroed
-                Err(e) => {
-                    // I/O error — clean up and abort.
-                    crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
-                    for f in &mapped_frames {
-                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-                    }
-                    let _ = crate::process::with_shared_mm_mut(
-                        pid,
-                        |_brk_current, mmap_next, _vma_tree| {
-                            if *mmap_next == reservation_end {
-                                *mmap_next = base;
-                            }
-                        },
-                    );
-                    return e as u64;
-                }
-            }
-
-            mapped_frames.push(frame);
-        }
-
-        // Map all frames into the process page table.
-        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
-        if unsafe {
-            crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
-        }
-        .is_err()
-        {
-            for f in &mapped_frames {
-                crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-            }
+    // Get the process CR3 for the mapper.
+    let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+        Some(phys) => phys,
+        None => {
             let _ =
                 crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
                     if *mmap_next == reservation_end {
@@ -8711,18 +8648,112 @@ fn sys_mmap_file_backed(
                 });
             return NEG_EINVAL;
         }
-
-        // Record the VMA while the page-table mutation lock is still held.
-        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
-            vma_tree.insert(crate::process::MemoryMapping {
-                start: base,
-                len: total_size,
-                prot,
-                flags,
-            });
-        });
-        base
     };
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = base;
+                    }
+                });
+            return NEG_EINVAL;
+        }
+    };
+
+    // Allocate frames and fill from file — NO page-table lock held.  The
+    // file read may block in virtio_blk for tens of ms per page; holding
+    // the page-table lock across that block is what caused Bug #9.
+    let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
+    let mut page_buf = alloc::vec![0u8; 4096];
+
+    for i in 0..pages {
+        // Zero-before-exposure (D.4): user-visible mmap frame.
+        let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
+            Some(f) => f,
+            None => {
+                log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let _ = crate::process::with_shared_mm_mut(
+                    pid,
+                    |_brk_current, mmap_next, _vma_tree| {
+                        if *mmap_next == reservation_end {
+                            *mmap_next = base;
+                        }
+                    },
+                );
+                return NEG_ENOMEM;
+            }
+        };
+
+        // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
+        let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
+
+        let read_offset = file_offset + (i as usize) * 4096;
+        match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
+            Ok(n) if n > 0 => unsafe {
+                core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
+            },
+            Ok(_) => {} // EOF or past-end page — leave zeroed
+            Err(e) => {
+                // I/O error — clean up and abort.
+                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let _ = crate::process::with_shared_mm_mut(
+                    pid,
+                    |_brk_current, mmap_next, _vma_tree| {
+                        if *mmap_next == reservation_end {
+                            *mmap_next = base;
+                        }
+                    },
+                );
+                return e as u64;
+            }
+        }
+
+        mapped_frames.push(frame);
+    }
+
+    // Map all frames into the process page table — guard held only here.
+    let map_failed = {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+        unsafe {
+            crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
+        }
+        .is_err()
+    };
+    if map_failed {
+        for f in &mapped_frames {
+            crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+        }
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            if *mmap_next == reservation_end {
+                *mmap_next = base;
+            }
+        });
+        return NEG_EINVAL;
+    }
+
+    // Record the VMA — uses the shared-mm lock, independent of the
+    // page-table lock.  Order (PT mutation before VMA insert) is preserved
+    // from the original code.
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+        vma_tree.insert(crate::process::MemoryMapping {
+            start: base,
+            len: total_size,
+            prot,
+            flags,
+        });
+    });
     if let Some(addr_space) = addr_space.as_ref() {
         crate::smp::tlb::tlb_shootdown_range(addr_space, base, base + total_size);
         addr_space.bump_generation();
