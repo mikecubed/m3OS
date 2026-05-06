@@ -1880,45 +1880,41 @@ pub fn preempt_enable() {
     // When `reschedule` is also set, record a pending reschedule so
     // the user-mode-return boundary can trigger the scheduler.
     //
-    // Under PREEMPT_VOLUNTARY (57d) we never call the scheduler from
-    // here — kernel-mode is non-preemptible and the calling site might
-    // be inside `without_interrupts`.  The flag is consumed in E.3 at
-    // the user-return boundary.
+    // Under both PREEMPT_VOLUNTARY (57d) and PREEMPT_FULL (57e), the
+    // zero-crossing branch records `preempt_resched_pending = true` and
+    // returns to the caller without touching the scheduler.  The flag is
+    // consumed by:
     //
-    // Under PREEMPT_FULL (57e Track F.2), kernel-mode IS preemptible,
-    // so a zero-crossing with `reschedule == true` *and* a preempt-safe
-    // calling context (IF == 1) drains the reschedule **immediately**
-    // by yielding into the scheduler, bringing the latency floor down
-    // to a single `yield_now` round trip.  The IF gate is critical: if
-    // a caller sits inside `without_interrupts`, dispatching here
-    // would resume the chosen task with IF = 0 until its next
-    // IRQ-disabled→enabled transition — silently breaking the
-    // "tasks resume with their own RFLAGS" invariant.
+    //   * the user-mode-return boundary (`assert_preempt_count_zero_at_user_return`),
+    //   * the timer-IRQ kernel-preempt path (`check_and_preempt_kernel`,
+    //     fires every 1 ms under preempt-full),
+    //   * the IPI-RESCHEDULE handler (cross-core wakes raise this on the
+    //     wakee's core directly via `enqueue_to_core`).
+    //
+    // Phase 57e Bug #12 follow-up: the original preempt-full branch yielded
+    // *immediately* here when `reschedule == true && IF == 1`, on the
+    // theory that draining the reschedule synchronously would minimise
+    // latency.  In practice the cumulative cost across a 4–6 hop input
+    // pipeline (kbd_server → display_server → term → kernel PTY → ion →
+    // term → display_server → framebuffer) was a context switch per
+    // bracket exit, and same-core wakes turned every `wake_task_v2` into a
+    // synchronous yield.  Hardware testing under preempt-full surfaced
+    // user-visible mouse/keyboard input latency that voluntary did not
+    // exhibit.  Deferring to the IRQ boundary caps the worst-case latency
+    // floor at one timer tick (1 ms) — well below perceptual thresholds —
+    // while letting tasks run their natural quantum and amortising the
+    // scheduler bookkeeping across multiple events.  The Bug #6 brackets
+    // around `deliver_message + wake_task_v2` remain load-bearing: they
+    // prevent `deliver_message`'s `SchedulerGuard::drop` from zero-crossing
+    // and recording the pending reschedule between the two operations
+    // (which would let a *later* IRQ pick up the flag and dispatch the
+    // wakee before the deliver had completed).
     let location = core::panic::Location::caller();
     #[cfg(feature = "preempt-voluntary")]
     {
         let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
         record_preempt_trace(2, prev, prev - 1, location);
         if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
-            #[cfg(feature = "preempt-full")]
-            {
-                if x86_64::instructions::interrupts::are_enabled() {
-                    // Clear both the pending flag and the per-core reschedule
-                    // request so the next IRQ or user-mode-return boundary
-                    // doesn't double-yield on a stale signal — the immediate
-                    // yield_now below is consuming this event now.  The
-                    // scheduler dispatch loop will swap `reschedule` itself
-                    // on its next iteration, but until then a concurrent IRQ
-                    // could observe the still-set flag and re-enter
-                    // `check_and_preempt_kernel` for redundant work.
-                    pc.preempt_resched_pending
-                        .store(false, core::sync::atomic::Ordering::Release);
-                    pc.reschedule
-                        .store(false, core::sync::atomic::Ordering::Release);
-                    yield_now();
-                    return;
-                }
-            }
             pc.preempt_resched_pending
                 .store(true, core::sync::atomic::Ordering::Release);
         }

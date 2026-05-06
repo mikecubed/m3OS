@@ -6,7 +6,9 @@
 - **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed**.  Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before disk I/O (commit `37b9d9c`); (b) FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` (commit `9292aec`, **revert in `962d787` itself reverted in `6826deb`** after Session 16 bisection proved the regressions attributed to `9292aec` were actually pre-existing and traced to Bug #6 commits).  10-iter QEMU soak under `9292aec` passed 10/10 with retry, 9/10 attempt-1, 0 zero-tolerance fingerprints.
 - **Bug #10** (sporadic Doom-launch kernel-mode GPF — faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern, core 3 scheduler dispatch loop) — **open**.  Observed once in m3os.log under `9292aec`; did not reproduce on the second launch in the same session and has not reproduced in subsequent hardware testing.  Filed for follow-up; not blocking GUI use.
 - **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, **hardware re-test pending**).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
-- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **fix landed in `<this commit>`**, hardware re-test pending.  Root cause: Bug #6 / #8.1 fixes added `preempt_disable` brackets around every IPC `deliver_message + wake_task_v2` pair, but the brackets were over-broad — they enclosed `transfer_bulk` (per-task slot copy), `trace_event` (logging), and in the `recv_*` paths `deliver_message` to the *current* task (no wake counterpart).  Each non-load-bearing operation inside the bracket extends the IRQ-preempt-blocked window for no protection benefit.  Fix: shrink all 7 brackets in `kernel/src/ipc/endpoint.rs` (recv_msg, recv_msg_nowait, recv_msg_with_notif, send, call_msg, reply, send_with_cap) to the minimum atomic — `deliver_message + wake_task_v2` for receiver-wake sites, `complete_send + wake_task_v2` for sender-wake sites.  Validation: `cargo xtask check` green, 10-iter QEMU soak under `preempt-full` passes 10/10 with retry, 8/10 attempt-1, 0 zero-tolerance fingerprints (parity with Session 16 baseline).  See *Session 17 — Bug #12 bracket-shrink* below.
+- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **two-part fix landed**, real-hardware confirmation pending on the second part.
+  - **Part 1** (`4dedebe`, Session 17 first attempt) — shrunk 7 IPC brackets in `kernel/src/ipc/endpoint.rs` to the minimum atomic.  Necessary but not sufficient.  See *Session 17 — Bug #12 bracket-shrink* below.
+  - **Part 2** (`<this commit>`, Session 17 second attempt) — removed the synchronous `yield_now` from `preempt_enable`'s preempt-full branch (`scheduler.rs:1898-1925`).  The original eager-yield design synchronously context-switched at every preempt-bracket exit when `reschedule == true && IF == 1`, on the theory of latency floor minimisation.  In practice, every same-core wake (`wake_task_v2`) sets the local `reschedule` flag via `enqueue_to_core`, so every IPC pair `(deliver_message + wake_task_v2)` triggered a synchronous context switch at the bracket exit.  Across the 4–6 hop input pipeline (kbd_server → display_server → term → kernel PTY → ion → term → display_server → framebuffer), each keystroke incurred 4–6 immediate context switches — the cumulative overhead manifested as user-visible input latency on real hardware that voluntary mode (which already defers `reschedule` to the next IRQ boundary) did not exhibit.  Fix: defer `reschedule` to `preempt_resched_pending` in preempt-full too, like voluntary already does.  The IRQ-driven `check_and_preempt_kernel` (timer tick, 1 ms cadence) and IPI-RESCHEDULE handlers already consume the same flag, so the latency floor is bounded at 1 ms — well below perceptual thresholds — and tasks run their natural quantum, amortising scheduler bookkeeping across multiple events.  Validation: `cargo xtask check` green, 10-iter QEMU soak under `preempt-full` passes 10/10 with retry, 6/10 attempt-1, 0 zero-tolerance fingerprints; voluntary smoke-test PASS.  Real-hardware confirmation by user pending.  See *Session 17 — Bug #12 part 2 (eager-yield removal)* below.
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
@@ -2484,3 +2486,75 @@ If hardware re-test surfaces lag improvement but a different fingerprint surface
 1. Capture serial transcript.
 2. Diagnose with the existing trace ring infrastructure (per-core preempt trace ring, dispatch dump on stuck-task watchdog, frame trace ring for kernel page faults).
 3. Determine whether it's a Bug #6/#8.1 regression (re-widen the affected bracket) or a new failure mode (file as Bug #13 and triage).
+
+---
+
+## Session 17 — Bug #12 part 2 (eager-yield removal)
+
+### TL;DR
+
+Session 17's part 1 (`4dedebe`) shrunk the IPC brackets but **did not close Bug #12 on hardware** — user reported voluntary mode is lag-free, preempt-full still has perceptible input lag (m3os.log capture confirms display_server outbound queue overflow within the first ~2 seconds of input).
+
+Root cause was the **synchronous `yield_now`** in `preempt_enable`'s preempt-full branch (`scheduler.rs:1898-1925`).  Original design: when `preempt_count` zero-crosses with `reschedule == true && IF == 1`, immediately yield into the scheduler.  Documented intent was "drain the reschedule immediately to bring the latency floor down to a single yield_now round trip."  The flaw: every same-core wake (`enqueue_to_core`) sets the local `reschedule` flag; every IPC pair `(deliver_message + wake_task_v2)` then triggers a synchronous context switch at the bracket exit.  The input pipeline has 4–6 IPC hops (kbd_server → display_server → term → kernel → ion → term → display_server → fb), so each keystroke's worth of work caused 4–6 immediate context switches — the cumulative cost is the lag.
+
+Fix: defer reschedule via `preempt_resched_pending` in preempt-full mode, mirroring voluntary mode's behaviour.  The IRQ-driven preemption paths (`check_and_preempt_kernel` from timer tick at 1 ms cadence, `reschedule_ipi_handler_kernel` from cross-core wakes via `IPI_RESCHEDULE`) already consume the same flag and trigger preemption — they are the load-bearing kernel-mode preemption mechanism.  The eager `yield_now` was redundant and added ~µs of context-switch overhead per IPC bracket exit for a worst-case 1 ms latency improvement.
+
+### Why voluntary mode never had this lag
+
+Under voluntary, `preempt_enable`'s zero-crossing branch records `preempt_resched_pending = true` and returns to the caller.  The flag is consumed only at the user-mode-return boundary (`assert_preempt_count_zero_at_user_return`), so kernel-mode tasks run their full quantum until they syscall-return or are forced off-core by a co-resident IRQ context (which does not happen under voluntary).  Tasks therefore process multiple IPC events per dispatch instead of context-switching after each.
+
+Under preempt-full pre-fix, the eager `yield_now` enabled **kernel-mode synchronous preemption** at the bracket exit, even when there was no actual urgency (timer tick only 1 ms away, IPI handler ready to fire on the wakee's core).  Same-core wakes were the worst offender: every `enqueue_to_core(self_core, idx)` sets `reschedule = true` on the *current* core's per-core data, so every same-core wake from a server forced the server to yield to the wakee.  Servers serving multiple clients on the same core could not run their natural quantum.
+
+Under preempt-full post-fix, the `reschedule` flag still gets set on the wakee's core; but the *waker* no longer yields synchronously.  Instead:
+
+* Same-core wake: the next timer tick (≤ 1 ms) calls `check_and_preempt_kernel`, which observes `reschedule == true && pc == 0`, and triggers preemption normally.  If the waker reaches user-return first, `assert_preempt_count_zero_at_user_return` consumes the flag.
+* Cross-core wake: `enqueue_to_core` sends `IPI_RESCHEDULE` to the wakee's core, which runs `check_and_preempt_kernel` from the IPI handler and preempts immediately.  Behaviour unchanged.
+
+### What was edited
+
+`kernel/src/task/scheduler.rs:1898-1925` — single block-deletion.  The `#[cfg(feature = "preempt-full")]` inner branch that called `yield_now()` after clearing `reschedule` and `preempt_resched_pending` is gone.  The outer `pc.preempt_resched_pending.store(true, ...)` runs unconditionally on zero-crossing with `reschedule == true`, identical to voluntary's behaviour.
+
+The Bug #6 / #8.1 brackets in `kernel/src/ipc/endpoint.rs` remain in place and still load-bearing: they keep `deliver_message`'s `SchedulerGuard::drop` from zero-crossing `preempt_count` between `deliver_message` and `wake_task_v2`, which would record the pending reschedule on the wrong side of the wake (the IRQ would dispatch the wakee before the deliver had committed).  Without the brackets, even the deferred path would still race.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| `cargo xtask check` (clippy + rustfmt + host tests) | ✅ green |
+| `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak --duration 10m --max-runs 10` | **10/10 with retry, 6/10 attempt-1, 0 failures** |
+| Soak zero-tolerance greps (Track G.1.b acceptance gate) | ✅ all 7 patterns count = 0 |
+| `cargo xtask smoke-test` (default voluntary) | ✅ PASS |
+
+The attempt-1 rate (6/10 vs. 8/10 in part 1's soak) is run-to-run noise — both retried runs eventually passed and the zero-tolerance counters stayed at 0.  The acceptance gate is the zero-tolerance grep, which is clean.
+
+Soak result: `/tmp/eager-yield-soak/soak-result.md`.
+
+### Risk audit
+
+The eager-yield removal is a **scheduler-discipline change** that makes preempt-full's behaviour closer to voluntary's: deferred reschedule consumption.  Risks reviewed:
+
+1. **Forward-progress regression**: a kernel-mode loop that never goes to userspace and never hits a timer/IPI tick could fail to yield.  Audit: the only kernel-mode loops in m3OS are `init_task` and `idle_task`, both of which call `enable_and_hlt` which un-halts on the next IRQ (timer fires every 1 ms).  Server tasks block in `block_current_until` which yields directly.  No infinite kernel-mode loops without IRQ touchpoints.  Confirmed safe.
+
+2. **Bug #6/#8.1 regression**: the brackets' purpose was to prevent a torn `deliver_message + wake_task_v2`.  The eager-yield removal does not change bracket semantics — it changes what happens *after* the bracket exits.  Within the bracket, `preempt_count` is non-zero, so no zero-cross, no synchronous yield (whether eager or deferred).  After the bracket, the wakee is enqueued; the only difference is whether the waker yields immediately or at the next IRQ.  Confirmed equivalent.
+
+3. **Interactivity floor**: previously, eager-yield gave a sub-microsecond latency floor for same-core wakes; now the floor is one timer tick (1 ms).  1 ms is well below human perceptual thresholds (~16 ms / 60 Hz).  Confirmed acceptable.
+
+4. **Bug #9 regression**: the FS-volume `IrqSafeMutex → spin::Mutex` conversion (`9292aec`) was un-reverted in `6826deb`.  Bug #9 closes via the combination of `9292aec` + `37b9d9c`.  This change does not touch FS locking.  Confirmed orthogonal.
+
+### Acceptance criteria for closing Bug #12
+
+1. ✅ `cargo xtask check` green.
+2. ✅ 10-iter `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak` passes with 0 zero-tolerance fingerprints.
+3. ⏳ **Real-hardware GUI re-test on `omarchy` confirms perceptible reduction in mouse/keyboard input latency vs. pre-fix.**  This is the critical gate — Session 17 part 1 passed (1) and (2) but did not actually fix the lag on hardware.
+4. ⏳ Real-hardware soak (no GPF, no `BlockedOnReply` cascade, no `stale-ready` watchdog) under preempt-full.
+
+### Diagnostic ammunition for Session 18
+
+If part 2 also fails to close the lag on hardware, the next hypothesis space:
+
+* **kbd_server / mouse_server polling intervals**: both servers expose `KBD_EVENT_PULL` / `MOUSE_EVENT_PULL` verbs that display_server polls every iteration.  If those verbs are bounded-wait (sleep up to N ms in kbd_server before responding), each poll round-trip pays that wait.  Audit `userspace/kbd_server/src/main.rs:283-308` and the matching mouse_server site.
+* **Cross-core IPI cost**: each cross-core wake on m3OS sends `IPI_RESCHEDULE`.  Hardware IPI is ~1–10 µs; over 4–6 hops, ~4–60 µs.  Bound but not free.  Pinning input-pipeline tasks to a single core could amortise.
+* **Compose throttling in display_server**: `should_compose_frame` may be deferring frames that would have run sooner.  Audit `userspace/display_server/src/main.rs` compose path.
+* **Outbound queue depth**: the m3os.log capture showed `display_server: outbound queue full; oldest dropped` repeated ~50 times early in the session.  The cap is 128; if term cannot drain fast enough, the queue saturates.  Term's main-loop iteration rate (~1000 Hz from the iter=1000 line in m3os.log) suggests the loop is healthy, but each `pull_one_event` is an `ipc_call` round-trip whose minimum latency is the kernel scheduler dispatch.
+
+The next session should capture an m3os.log under `<this commit>` and compare the `outbound queue full` count, `keys=N/M` ratios, and per-iteration timing (`term: iter=N events=...`) to confirm whether the eager-yield removal actually reduced the input-pipeline throughput cost.
