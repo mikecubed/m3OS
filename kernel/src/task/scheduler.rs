@@ -2736,22 +2736,26 @@ pub fn has_pending_message(id: TaskId) -> bool {
 /// Returns `true` if woken (`Woken` or `AlreadyTrue`), `false` on deadline
 /// (no deadline is set for IPC recv, so this is dead code for now).
 pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
-    use core::sync::atomic::AtomicBool;
-
-    // Fast path: message already delivered before we even try to block.
-    {
-        let sched = scheduler_lock();
-        if sched
-            .find(receiver)
-            .map(|idx| sched.tasks[idx].pending_msg.is_some())
-            .unwrap_or(false)
-        {
-            return true;
-        }
+    // Phase 57e Bug #8.1 — register the waker BEFORE the pending_msg check so
+    // a deliver_message that arrives between the check and block_current_until's
+    // state write sets `woken` via reply_waker, letting the recheck self-revert.
+    // Without this, block_current_until's stack-local AtomicBool was never set
+    // by anyone — wake_task_v2 from a sender's call_msg returned AlreadyAwake
+    // (because the receiver was still Running mid-recv-setup) and the receiver
+    // parked in BlockedOnRecv with pending_msg set but never woken. See
+    // docs/handoffs/57e-preempt-full-userspace-hangs.md Session 11.
+    let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    if !register_reply_waker(receiver, woken.clone()) {
+        return false;
     }
 
-    let woken = AtomicBool::new(false);
+    if has_pending_message(receiver) {
+        clear_reply_waker(receiver);
+        return true;
+    }
+
     let outcome = block_current_until(TaskState::BlockedOnRecv, &woken, None);
+    clear_reply_waker(receiver);
     match outcome {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
@@ -2771,22 +2775,20 @@ pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline set → dead code).
 pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
-    use core::sync::atomic::AtomicBool;
-
-    // Fast path: message already delivered.
-    {
-        let sched = scheduler_lock();
-        if sched
-            .find(receiver)
-            .map(|idx| sched.tasks[idx].pending_msg.is_some())
-            .unwrap_or(false)
-        {
-            return true;
-        }
+    // Phase 57e Bug #8.1 — same fix as block_current_on_recv_v2: register the
+    // waker BEFORE the pending_msg check so deliver_message wakes us.
+    let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    if !register_reply_waker(receiver, woken.clone()) {
+        return false;
     }
 
-    let woken = AtomicBool::new(false);
+    if has_pending_message(receiver) {
+        clear_reply_waker(receiver);
+        return true;
+    }
+
     let outcome = block_current_until(TaskState::BlockedOnNotif, &woken, None);
+    clear_reply_waker(receiver);
     match outcome {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
@@ -2806,28 +2808,35 @@ pub fn block_current_on_notif_v2(receiver: TaskId) -> bool {
 ///
 /// Returns `true` if woken, `false` on deadline (no deadline → dead code).
 pub fn block_current_on_send_v2(sender: TaskId) -> bool {
-    use core::sync::atomic::AtomicBool;
+    // Phase 57e Bug #8.1 — register the waker BEFORE the fast-path check so
+    // `complete_send` (extended in this session to set reply_waker if present)
+    // and `deliver_message` both wake us. See block_current_on_recv_v2 for
+    // the full rationale.
+    let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    if !register_reply_waker(sender, woken.clone()) {
+        return false;
+    }
 
-    // Fast path: send already completed (receiver picked us up) or error
-    // message delivered.
     {
         let mut sched = scheduler_lock();
         if let Some(idx) = sched.find(sender)
             && (sched.tasks[idx].pending_msg.is_some() || sched.tasks[idx].send_completed)
         {
             sched.tasks[idx].send_completed = false;
+            sched.tasks[idx].reply_waker = None;
             return true;
         }
     }
 
-    let woken = AtomicBool::new(false);
     let outcome = block_current_until(TaskState::BlockedOnSend, &woken, None);
 
-    // Clear send_completed flag after waking (mirrors v1 block_current_on_send_unless_completed).
+    // Clear send_completed flag and the registered waker after waking
+    // (mirrors v1 block_current_on_send_unless_completed).
     {
         let mut sched = scheduler_lock();
         if let Some(idx) = sched.find(sender) {
             sched.tasks[idx].send_completed = false;
+            sched.tasks[idx].reply_waker = None;
         }
     }
 
@@ -3381,6 +3390,13 @@ pub fn complete_send(id: TaskId) {
     let mut sched = scheduler_lock();
     if let Some(idx) = sched.find(id) {
         sched.tasks[idx].send_completed = true;
+        // Phase 57e Bug #8.1 — wake the registered waker (if the sender is
+        // mid-block_current_on_send_v2 setup) so the recheck self-reverts
+        // instead of parking forever. Symmetric to deliver_message's waker
+        // store at line ~3296.
+        if let Some(waker) = sched.tasks[idx].reply_waker.as_ref() {
+            waker.store(true, Ordering::Release);
+        }
     }
 }
 
