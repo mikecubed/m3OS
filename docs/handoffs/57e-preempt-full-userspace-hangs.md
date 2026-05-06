@@ -1,21 +1,169 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (end of Session 15):**
+**Status (end of Session 15, after FS-mutex swap revert):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
-- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed** in Session 15. Root cause: any `IrqSafeMutex` held across a `block_current_until`-blocking call leaks `preempt_count`. Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before `kernel_read_fd_at` (commit `37b9d9c`); (b) all five FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` — the doc-comments at each site already promised this was a safe type swap (commit `<pending>`). Validation: **10/10 with retry, 9/10 attempt-1, 0 full failures, 0 stale-ready watchdog hits, 0 `cpu-hog` warnings** across a 10-iter soak. The single attempt-1 retry was a slow-boot timeout (display_server start exceeded the 120 s smoke-test budget on attempt 1) — **not** the Bug #9 fingerprint.
+- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **structural cause identified, partial fix landed, second-pass attempt reverted**.  Session 15:
+  - Step 1 ✓ — `sys_mmap_file_backed` releases `lock_page_tables()` before `kernel_read_fd_at` (commit `37b9d9c`, kept).
+  - Step 2 ✗ — converted FS-volume mutexes (`FAT32_VOLUME`, `EXT2_VOLUME`, `TMPFS`, `FAT32_PERMISSIONS`, `Ext2Volume.block_cache`) from `IrqSafeMutex` → `spin::Mutex` (commit `9292aec`, **reverted in `<this commit>`** — caused massive GUI input lag and a kernel-mode GPF crash on real hardware; QEMU TCG soak hid the regression).  See *Session 15 — Step 2 attempted and reverted* below for full diagnosis.
+  - **Bug #10 (new) — kernel-mode GPF on real hardware** when launching `fb-takeover doom` under `9292aec`.  Faulting RIP `0x4847474947479b46` is garbage with ASCII "GHIJK" register pattern; classic stack-corruption / wild-call signature.  Reverting Step 2 should close it (the only difference vs `37b9d9c` is the FS mutex type) but **must be re-tested on real hardware after the revert lands** to confirm.  If it reproduces post-revert, it is a separate latent bug independent of the FS-mutex discipline.
+  - **Track G full closure path is now Option B (durable Arc-clone refactor of FS-volume read paths)**, not the type swap.  See *Quick-start for Session 16* below.
+- **Track G soak harness landed** (`cargo xtask soak`, commit `da4eb2e`).  Defaults to 24 h, configurable.  Captures per-run serial dumps and emits structured Markdown result with the Track G.1.b acceptance grep table.  Use it for Session 16 validation.
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
 
-**Track G's 24 h soak gate stays closed** until Bug #9 closes.
+**Track G's 24 h soak gate stays closed** until Bug #9 closes via Option B.  4-hour QEMU soak under `37b9d9c` passes 8/10 with retry, ~5/10 attempt-1, 2 full failures (matches Session 12 baseline).
 
 ---
 
-## ⭐ Quick-start for Session 16 — finish closing Bug #9
+## ⭐ Quick-start for Session 16 — close Bug #9 via Option B (Arc-clone refactor)
+
+### Why Option A failed
+
+Session 15 attempted the apparently-safe type swap `IrqSafeMutex` → `spin::Mutex` for the FS-volume mutexes, on the strength of the doc comment promising it was "a pure auto-deref change for callsites".  The 10-iter QEMU soak passed 10/10 (vs 8/10 before) and Bug #9 fingerprints disappeared cleanly.
+
+But on real hardware (`omarchy` test machine), Step 2 introduced **two regressions**:
+
+1. **Massive GUI input lag.**  `IrqSafeMutex` did two jobs: raise `preempt_count` (intended bug-fix target — leak source) AND mask IRQs (load-bearing for cross-core fairness).  Switching to `spin::Mutex` removed both.  Holders of `FAT32_VOLUME` / `EXT2_VOLUME` / `TMPFS` are now preemptible mid-critical-section under `preempt-full`'s 1 ms timer.  Other cores spinning on the lock wait through the holder's preemption duration — every disk/tmpfs touch became 1–10 ms of cross-core stall.  Cumulative effect: mouse and keyboard responsiveness collapsed.
+2. **Kernel-mode GPF when launching `fb-takeover doom`.**  Faulting RIP was garbage (`0x4847474947479b46`) with ASCII "GHIJK" register pattern — stack-corruption / wild-call signature.  Hit core 3's scheduler dispatch loop after Doom mapped its framebuffer and emitted two PTY lines.  Probable cause: a holder of a now-`spin::Mutex` got preempted mid-critical-section, breaking some downstream invariant that depended on "I run to completion atomically on this core".  QEMU TCG serializes vCPUs in a way that hid this; real-hardware concurrency exposed it.
+
+The QEMU 10-iter passed because TCG's vCPU serialization is a different concurrency model.  **Track G validation must include real-hardware soak before declaring closure.**
+
+### Why Option B is the right path
+
+Keep `IrqSafeMutex`'s preempt-discipline and IRQ-masking intact.  **Drop the guard before the blocking call** instead of suppressing what the lock does.  Pattern:
+
+```rust
+// Take the lock briefly, clone the Arc, drop guard, then call methods on the Arc.
+let vol: Option<Arc<Fat32Volume>> = {
+    let guard = FAT32_VOLUME.lock();   // IrqSafeMutex still — preempt_count +1, IF=0
+    guard.as_ref().cloned()             // Clone the Arc, NOT the volume
+};                                       // guard drops — preempt_count back to 0, IF restored
+match vol {
+    Some(v) => v.read_file(...),         // Now safe to block; preempt_count is 0
+    None => Err(...),
+}
+```
+
+This preserves both discipline AND closes the leak: when `block_current_until` runs inside `read_file`, the FS-volume guard is no longer alive, so the `+1` from the guard is no longer present in the leaked count.
+
+### Step-by-step
+
+**Step 1 — Wrap volumes in `Arc`.**  Three changes (no callsite changes needed beyond the read paths):
+
+```rust
+// kernel/src/fs/fat32.rs:202
+pub static FAT32_VOLUME: IrqSafeMutex<Option<Arc<Fat32Volume>>> = IrqSafeMutex::new(None);
+
+// kernel/src/fs/ext2.rs:69
+pub static EXT2_VOLUME: IrqSafeMutex<Option<Arc<Ext2Volume>>> = IrqSafeMutex::new(None);
+```
+
+The `Option<Volume>` → `Option<Arc<Volume>>` lift is mechanical.  `Fat32Volume` is `Send + Sync` (only contains `u64` fields and a copyable `Fat32Bpb`).  `Ext2Volume` already contains an inner `IrqSafeMutex<BTreeMap<u32, Vec<u8>>>` block_cache, so it's also `Send + Sync` — no field changes needed.
+
+The `mount_fat32` and `mount_ext2` paths construct the volume and assign:
+```rust
+*FAT32_VOLUME.lock() = Some(Arc::new(volume));
+```
+
+**Step 2 — Refactor read sites in `kernel_read_fd_at` (`syscall/mod.rs:8387-8465`).**  Two callsites:
+
+```rust
+FdBackend::Fat32Disk { start_cluster, file_size, .. } => {
+    let start_cluster = *start_cluster;
+    let file_size = *file_size;
+    if start_cluster < 2 || offset >= file_size as usize {
+        return Ok(0);
+    }
+    // Take the lock just long enough to clone the Arc.
+    let vol = {
+        let guard = crate::fs::fat32::FAT32_VOLUME.lock();
+        guard.as_ref().cloned()
+    };
+    match vol {
+        Some(v) => v.read_file(start_cluster, file_size, offset, buf)
+            .map_err(|_| NEG_EIO as i64),
+        None => Err(NEG_EIO as i64),
+    }
+}
+
+FdBackend::Ext2Disk { inode_num, .. } => {
+    let inode_num = *inode_num;
+    let vol = {
+        let guard = crate::fs::ext2::EXT2_VOLUME.lock();
+        guard.as_ref().cloned()
+    };
+    match vol {
+        Some(v) => match v.read_inode(inode_num) {
+            Ok(inode) => v.read_file_data(&inode, offset as u64, buf)
+                .map_err(|_| NEG_EIO as i64),
+            Err(_) => Err(NEG_EIO as i64),
+        },
+        None => Err(NEG_EIO as i64),
+    }
+}
+```
+
+**Step 3 — Audit and refactor every other `FAT32_VOLUME.lock()` / `EXT2_VOLUME.lock()` callsite** in `kernel/src/arch/x86_64/syscall/mod.rs`.  Session 15's grep found ~25 sites (lines 305, 329, 356, 378, 670, 685, 758, 767, 778, 823, 830, 841, 3674, 5328, 5389, 5785, 5859, 6285, 6296, 6320, plus the kernel_read_fd_at sites).  Each one needs the same lock-then-clone-then-drop treatment for **read paths**; **write paths** (`set_fat32_meta_and_save`, `vol.write_file`, `vol.update_dir_entry`) can stay as-is for now since writes are rare and the existing serialization is correct (the bigger issue is read-while-virtio-blk-blocks).
+
+Order of operations: do read paths first (closes the dominant Bug #9 contributor), validate via soak, then optionally clean up write paths if any residual fingerprints remain.
+
+**Step 4 — Refactor `Ext2Volume.block_cache` access.**  The cache miss path in `fs/ext2.rs:138-170` already does the right thing (allocate-outside-lock, take-lock-only-to-insert).  Audit `read_block` and `read_block_into_dst` to confirm no path holds the cache lock across `crate::blk::read_sectors`.  This was identified as a separate inner-mutex contributor; review carefully but most likely already correct.
+
+**Step 5 — TMPFS does not need changes** for Bug #9 closure.  TMPFS is in-memory; its `read_file` / `write_file` paths do NOT call `block_current_until` because there's no virtio_blk involvement.  TMPFS holders never block while held, so no leak path exists.  Leave `TMPFS: IrqSafeMutex<Tmpfs>` as-is.
+
+**Step 6 — FAT32_PERMISSIONS** is similar to TMPFS — purely in-memory `BTreeMap<String, Fat32FileMeta>`, no I/O while held.  Leave as `IrqSafeMutex`.
+
+### Validation
+
+Build green:
+```bash
+cargo xtask check
+```
+
+QEMU 10-iter soak (must pass 10/10 attempt-1 with zero zero-tolerance fingerprints):
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" cargo xtask soak --duration 30m --max-runs 10
+```
+The harness emits `target/soak/run-<ts>/soak-result.md` with the Track G.1.b grep table.  All zero-tolerance counters MUST be 0 for acceptance.
+
+**Real-hardware GUI smoke (NEW acceptance gate after the Session 15 regression):**
+1. Boot via `cargo xtask run-gui` (or write the image and boot on `omarchy`).
+2. Login.
+3. Open a few apps; type at the prompt; move the mouse — confirm no input lag.
+4. Run `fb-takeover doom`.  Doom must launch and run; **no GPF, no kernel page fault.**
+5. Exit Doom; framebuffer must restore cleanly.
+
+Add this to `docs/handoffs/57e-soak-result.md` as Track G.1.c — real-hardware smoke (mandatory before declaring G complete).
+
+24-hour soak (Track G.1):
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" cargo xtask soak  # default 24h
+```
+Acceptance: zero zero-tolerance fingerprints across the entire 24-hour window.
+
+### Files to pre-load for Session 16
+
+- `kernel/src/fs/fat32.rs:202` — `FAT32_VOLUME` (lift to `Arc<Fat32Volume>`).
+- `kernel/src/fs/ext2.rs:69` — `EXT2_VOLUME` (lift to `Arc<Ext2Volume>`).
+- `kernel/src/arch/x86_64/syscall/mod.rs:8387-8465` — `kernel_read_fd_at` (the dominant read path).
+- `kernel/src/arch/x86_64/syscall/mod.rs:305-841` — clustered read/write callsites (the rest of the audit set).
+- `kernel/src/blk/virtio_blk.rs:881-913` — `do_request` (the actual `block_current_until` site that creates the leak window).
+- `m3os.log`, `m3os2.log` — Session 15 real-hardware regression captures (kept in repo root for reference; can be moved to `docs/handoffs/captures/` after Session 16 closes).
+
+### Bug #10 (potential) — kernel-mode GPF on Doom startup
+
+If real-hardware testing post-revert still produces the GPF documented in Session 15's m3os.log (faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern, core 3 scheduler loop), it is a **separate latent bug** independent of the FS-mutex discipline.  Disposition: open as Bug #10 with the m3os.log capture and triage in Session 16 before the Option B work, since stack corruption can mask other regressions.
+
+If the GPF does NOT reproduce post-revert, it was caused by `9292aec`'s spin::Mutex preemption window and is closed by the revert.  Document the disposition in `docs/handoffs/57e-soak-result.md` either way.
+
+---
+
+## (Below: pre-Session-15 quick-start, kept for context — superseded by the section above)
 
 ### Recap
 
@@ -2075,7 +2223,7 @@ Tasks that hit the leak are dominated by callers of `kernel_read_fd_at` (vfs_ser
 
 A run-by-run comparison of trace fingerprints in `/tmp/m3os-bug9-fix/run-{6,8}.log` confirms: pid=3 in run 8 shows the canonical Bug #9 cycle (`pre=2 post=1 caller=scheduler.rs:2870` followed immediately by `pre=1 post=2 caller=virtio_blk.rs:622`) with the leak originating BEFORE `block_current_until`'s entry — same pre-fix shape as Session 14.
 
-### Acceptance criteria status (Session 15 revision)
+### Acceptance criteria status (Session 15 first revision)
 
 | Criterion | Status |
 |---|---|
@@ -2085,7 +2233,7 @@ A run-by-run comparison of trace fingerprints in `/tmp/m3os-bug9-fix/run-{6,8}.l
 | (4) `run-gui` 10-min soak | not verified |
 | (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ |
 | (8.2) Bug #8.2 slow-boot closed | ✅ |
-| (9) Bug #9 scheduling-fairness closed | ⚠️ — structural cause identified, one site fixed (`sys_mmap_file_backed`), broader sites (`kernel_read_fd_at` + ~25 `FAT32_VOLUME`/`EXT2_VOLUME` callsites) still open. Recommended fix path: convert FS-volume `IrqSafeMutex` to `spin::Mutex` (doc-comments already promise this is a safe type swap). |
+| (9) Bug #9 scheduling-fairness closed | ⚠️ — structural cause identified, one site fixed (`sys_mmap_file_backed`), broader sites (`kernel_read_fd_at` + ~25 `FAT32_VOLUME`/`EXT2_VOLUME` callsites) still open. *(Initial recommendation: convert FS-volume `IrqSafeMutex` to `spin::Mutex`; superseded after the Step 2 regression — see below.)* |
 
 Track G's 24 h soak gate stays closed pending Bug #9 full closure.
 
@@ -2096,3 +2244,51 @@ M3OS_KERNEL_FEATURES="preempt-full" \
   M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
   cargo xtask smoke-test
 ```
+
+---
+
+## Session 15 — Step 2 attempted and reverted
+
+### TL;DR
+
+Session 15 attempted the apparently-safe type swap `IrqSafeMutex` → `spin::Mutex` for the five FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`).  The doc comments at each site promised "no ISR ever reaches it; type swap is a pure auto-deref change for callsites".  Commit `9292aec` made the change.
+
+QEMU 10-iter validation passed cleanly: **10/10 with retry, 9/10 attempt-1, 0 full failures, 0 zero-tolerance fingerprints.**  Bug #9 declared closed.
+
+Real-hardware testing on the `omarchy` machine then exposed two regressions that the QEMU TCG soak hid:
+
+1. **Massive GUI input lag.**  Mouse and keyboard responsiveness collapsed.
+2. **Kernel-mode GPF when launching `fb-takeover doom`.**  Faulting RIP `0x4847474947479b46` is garbage with ASCII "GHIJK" register pattern — classic stack-corruption / wild-call signature on core 3's scheduler dispatch loop, after Doom mapped its framebuffer and emitted two PTY lines.
+
+`9292aec` was reverted (Session 15 final revert commit).  `37b9d9c` (the `sys_mmap_file_backed` fix) is kept.  Track G full-closure path was redirected to **Option B (Arc-clone refactor)** — see the *⭐ Quick-start for Session 16* section at the top of this doc.
+
+### Why the swap was wrong
+
+`IrqSafeMutex::lock()` does two things: raises `preempt_count` and masks IRQs.  The Bug #9 leak was caused by the first effect (`preempt_count` raise persisting past `block_current_until`'s post-resume `preempt_enable`).  The second effect (IRQ mask) was load-bearing for **cross-core fairness on real hardware**: while the lock is held, the holder cannot be timer-preempted, so other cores spinning on the lock do not have to wait through the holder's preemption duration.
+
+By switching to `spin::Mutex`, both effects were removed simultaneously.  Job 1 was the leak source (intended target).  Job 2 was load-bearing.  Without it:
+
+- Holders are now preemptible mid-critical-section under `preempt-full`'s 1 ms timer.
+- Other cores spinning on the lock wait through the holder's preemption duration (1–10 ms per spin cycle).
+- Cumulative effect: every disk/tmpfs touch in the system became 1–10 ms instead of µs, killing GUI responsiveness.
+
+The QEMU 10-iter soak passed because TCG's vCPU serialization is a different concurrency model — the cross-core spin storm cannot manifest the same way.  **Track G validation must include real-hardware soak before declaring closure.**
+
+### Why the GPF crash is a separate concern
+
+The Doom-launch GPF is consistent with "a holder of one of the now-`spin::Mutex` locks got timer-preempted mid-critical-section and broke a downstream invariant".  Most likely candidate: `Ext2Volume.block_cache` (held during the cache-miss read path — even though `read_block`'s outer lock-then-read-then-lock-then-insert pattern looks correct, there are sub-paths that may not).
+
+Reverting the type swap restores the IRQ-disable, eliminating the preemption window.  **The GPF should disappear with the revert.**  If it reproduces post-revert, it is a separate latent bug in the Doom / fb-takeover / framebuffer_mmap path independent of the FS-mutex discipline.  Open as Bug #10 if so.
+
+### Captured logs from the regression
+
+- `m3os.log` — first run, full kernel serial including the GPF crash diagnostic, the trace ring dump, and the cascade following core 3's `hlt_loop`.
+- `m3os2.log` — second run (Doom worked despite warnings).  The `BlockedOnWait stuck-since=` lines are benign — ion / fb-takeover waiting on Doom's exit via `waitpid`, not a Bug #8.1 cascade reopening.
+
+Move both to `docs/handoffs/captures/57e-session-15-hardware-regression/` if Session 16 closes Bug #9 cleanly.
+
+### Lesson for Session 16
+
+When two side-effects of a primitive look defensive ("no ISR ever reaches it" → IRQ-mask is "unnecessary"), check whether one of them serves an unrelated invariant before swapping.  In this case, the IRQ-mask was the *de-facto* preempt-discipline for fair cross-core spinlock acquisition under `preempt-full`.  A doc-comment promise of "safe type swap" written under `preempt-voluntary` was no longer accurate under `preempt-full`'s timer cadence, and the QEMU TCG model did not reproduce the failure.
+
+Option B (Arc-clone refactor) preserves both side-effects and breaks the leak structurally instead of suppressing the lock's behaviour.

@@ -18,7 +18,7 @@ use kernel_core::fs::ext2::{
     Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG,
 };
 
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 // ---------------------------------------------------------------------------
 // Ext2Volume (P28-T019)
@@ -54,29 +54,19 @@ pub struct Ext2Volume {
     /// Read-through block cache: block_num → data.
     /// Bounded to BLOCK_CACHE_MAX entries; no eviction (fill-and-hold).
     ///
-    /// Phase 57e Bug #9 — uses plain `spin::Mutex`, NOT `IrqSafeMutex`.
+    /// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
     /// The block cache is only touched from task context (read/write
-    /// syscalls dispatched through `EXT2_VOLUME`); no ISR ever reaches
-    /// it.  See `EXT2_VOLUME` doc comment for full rationale.
-    block_cache: Mutex<BTreeMap<u32, Vec<u8>>>,
+    /// syscalls dispatched through `EXT2_VOLUME`); no ISR ever reaches it.
+    block_cache: IrqSafeMutex<BTreeMap<u32, Vec<u8>>>,
 }
 
 /// Global mounted ext2 volume (set by mount_ext2).
 ///
-/// Phase 57e Bug #9 — uses plain `spin::Mutex`, NOT `IrqSafeMutex`.
-/// Reason: every `IrqSafeMutex::lock` raises `preempt_count`; if the
-/// guard outlives a `block_current_until` (which it does for every
-/// `read_inode` / `read_file_data` that descends into `virtio_blk`), the
-/// +1 leaks for the entire syscall.  The IRQ-side preempt gate
-/// (`peek_preempt_count_irq`) reads non-zero and refuses to preempt the
-/// holder, so the running task monopolises its core for the entire
-/// disk operation while co-resident Ready tasks starve — exactly the
-/// Bug #9 fingerprint Sessions 13–15 chased.  `EXT2_VOLUME` is only
-/// acquired from task context (mount, read/write/getdents syscalls);
-/// no ISR ever reaches it, so the preempt-disable side-effect of
-/// `IrqSafeMutex` is unnecessary defensive coverage that is now
-/// actively harmful.
-pub static EXT2_VOLUME: Mutex<Option<Ext2Volume>> = Mutex::new(None);
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// EXT2_VOLUME is only acquired from task context (mount, read/write/
+/// getdents syscalls); no ISR ever reaches it.  Type swap is a pure
+/// auto-deref change for callsites.
+pub static EXT2_VOLUME: IrqSafeMutex<Option<Ext2Volume>> = IrqSafeMutex::new(None);
 
 impl Ext2Volume {
     /// Mount an ext2 partition at the given base LBA (P28-T019).
@@ -121,7 +111,7 @@ impl Ext2Volume {
             block_size,
             sectors_per_block,
             superblock_raw: sb_raw,
-            block_cache: Mutex::new(BTreeMap::new()),
+            block_cache: IrqSafeMutex::new(BTreeMap::new()),
         })
     }
 

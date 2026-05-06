@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::fat32::{self, FAT_ENTRY_MASK, FAT_EOC, Fat32Bpb, Fat32DirEntry, Fat32Error};
 
-use spin::Mutex;
+use crate::task::scheduler::IrqSafeMutex;
 
 /// Maximum cluster chain length before we assume corruption.
 const MAX_CHAIN_LEN: usize = 65536;
@@ -29,14 +29,12 @@ pub struct Fat32FileMeta {
 /// In-memory permissions index for the FAT32 volume.
 /// Key is the relative path within /data (e.g. "etc/passwd").
 ///
-/// Phase 57e Bug #9 — uses plain `spin::Mutex`, not `IrqSafeMutex`.
-/// `FAT32_PERMISSIONS` is only acquired from task context (mount,
-/// syscall paths); no ISR ever reaches it, so the preempt-disable
-/// side-effect of `IrqSafeMutex` is unnecessary and (under
-/// `preempt-full`) leaks `preempt_count` when held across blocking
-/// calls — see the doc comment on `FAT32_VOLUME` below for full
-/// rationale.
-pub static FAT32_PERMISSIONS: Mutex<BTreeMap<String, Fat32FileMeta>> = Mutex::new(BTreeMap::new());
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline
+/// (lock raises `preempt_count`, drop lowers it).  FAT32_PERMISSIONS is
+/// only acquired from task context (mount, syscall paths); no ISR ever
+/// reaches it.  Type swap is a pure auto-deref change for callsites.
+pub static FAT32_PERMISSIONS: IrqSafeMutex<BTreeMap<String, Fat32FileMeta>> =
+    IrqSafeMutex::new(BTreeMap::new());
 
 /// Get metadata for a FAT32 file, returning defaults if not in the index.
 pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
@@ -197,20 +195,11 @@ pub struct Fat32Volume {
 
 /// Global mounted FAT32 volume (set by mount_fat32).
 ///
-/// Phase 57e Bug #9 — uses plain `spin::Mutex`, NOT `IrqSafeMutex`.
-/// Reason: every `IrqSafeMutex::lock` raises `preempt_count`; if the
-/// guard outlives a `block_current_until` (which it does for every
-/// `read_file` / `write_file` that descends into `virtio_blk`), the +1
-/// leaks for the entire syscall.  The IRQ-side preempt gate
-/// (`peek_preempt_count_irq`) reads non-zero and refuses to preempt the
-/// holder, so the running task monopolises its core for the entire
-/// disk operation while co-resident Ready tasks starve — exactly the
-/// Bug #9 fingerprint Sessions 13–15 chased.  `FAT32_VOLUME` is only
-/// acquired from task context (mount, read/write syscalls); no ISR
-/// ever reaches it, so the preempt-disable side-effect of
-/// `IrqSafeMutex` is unnecessary defensive coverage that is now
-/// actively harmful.
-pub static FAT32_VOLUME: Mutex<Option<Fat32Volume>> = Mutex::new(None);
+/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline.
+/// FAT32_VOLUME is only acquired from task context (mount, read/write
+/// syscalls); no ISR ever reaches it.  Type swap is a pure auto-deref
+/// change for callsites.
+pub static FAT32_VOLUME: IrqSafeMutex<Option<Fat32Volume>> = IrqSafeMutex::new(None);
 
 impl Fat32Volume {
     /// Mount a FAT32 partition at the given base LBA.
