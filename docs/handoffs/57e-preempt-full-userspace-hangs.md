@@ -1,9 +1,12 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (end of Session 16, after voluntary-mode regression bisection + cfg-gate fix):**
+**Status (end of Session 16, after Bug #11 fix + un-revert of `962d787`):**
 
-- **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); **`695f800`'s init_task halt cfg-gated to preempt-full only in Session 16** (`<this commit>`) to fix the voluntary-mode regression below.
-- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16**.  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
+- **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); `695f800`'s init_task halt cfg-gated to preempt-full only in Session 16 (commit `753a311`) to fix the voluntary-mode regression below.
+- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed**.  Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before disk I/O (commit `37b9d9c`); (b) FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` (commit `9292aec`, **revert in `962d787` itself reverted in `<this commit>`** after Session 16 bisection proved the regressions attributed to `9292aec` were actually pre-existing and traced to Bug #6 commits).  10-iter QEMU soak under `9292aec` passed 10/10 with retry, 9/10 attempt-1, 0 zero-tolerance fingerprints.
+- **Bug #10** (sporadic Doom-launch kernel-mode GPF — faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern, core 3 scheduler dispatch loop) — **open**.  Observed once in m3os.log under `9292aec`; did not reproduce on the second launch in the same session and has not reproduced in subsequent hardware testing.  Filed for follow-up; not blocking GUI use.
+- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, hardware-verified).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
+- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **open**.  Visible to user as input-to-screen latency.  Caused by Bug #6 / #8.1 fixes adding `preempt_disable` bracketing around every IPC `deliver_message + wake_task_v2` pair (1 site in `reply()`, 6 in send/recv/notif paths from `6b725f5`, 11 simple sites via `deliver_message_and_wake` helper from `3e3107c` and `da2e781`).  Fix path: shrink each bracket to cover exactly the deliver+wake atomic — see *Quick-start for Session 17* below.
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
@@ -2248,38 +2251,52 @@ M3OS_KERNEL_FEATURES="preempt-full" \
 
 ---
 
-## Session 15 — Step 2 attempted and reverted
+## Session 15 — Step 2 attempted, reverted, and un-reverted
 
-### TL;DR
+### TL;DR (corrected by Session 16)
 
-Session 15 attempted the apparently-safe type swap `IrqSafeMutex` → `spin::Mutex` for the five FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`).  The doc comments at each site promised "no ISR ever reaches it; type swap is a pure auto-deref change for callsites".  Commit `9292aec` made the change.
+Session 15 attempted the apparently-safe type swap `IrqSafeMutex` → `spin::Mutex` for the five FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`).  The doc comments at each site promised "no ISR ever reaches it; type swap is a pure auto-deref change for callsites".  Commit `9292aec` made the change.  QEMU 10-iter validation passed cleanly: **10/10 with retry, 9/10 attempt-1, 0 full failures, 0 zero-tolerance fingerprints**.
 
-QEMU 10-iter validation passed cleanly: **10/10 with retry, 9/10 attempt-1, 0 full failures, 0 zero-tolerance fingerprints.**  Bug #9 declared closed.
+Real-hardware testing on the `omarchy` machine then surfaced two issues that I attributed to `9292aec`:
 
-Real-hardware testing on the `omarchy` machine then exposed two regressions that the QEMU TCG soak hid:
+1. **Apparent GUI input lag** — eventually traced (Session 16 bisection) to Bug #6 commits (`695f800/d83ecc7/3e3107c`), NOT to `9292aec`.  Lag was present whenever preempt-full was bootable, regardless of the FS-mutex type.
+2. **Sporadic kernel-mode GPF when launching `fb-takeover doom`** (faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern).  Observed once.  Did not reproduce on the second Doom launch in the same session, and did not reproduce in any subsequent hardware testing under either `9292aec` or post-revert `962d787`.
 
-1. **Massive GUI input lag.**  Mouse and keyboard responsiveness collapsed.
-2. **Kernel-mode GPF when launching `fb-takeover doom`.**  Faulting RIP `0x4847474947479b46` is garbage with ASCII "GHIJK" register pattern — classic stack-corruption / wild-call signature on core 3's scheduler dispatch loop, after Doom mapped its framebuffer and emitted two PTY lines.
+I reverted `9292aec` in `962d787` based on those two observations.  **The revert was a mistake.**  Session 16's bisection proved both issues were pre-existing or unverified:
 
-`9292aec` was reverted (Session 15 final revert commit).  `37b9d9c` (the `sys_mmap_file_backed` fix) is kept.  Track G full-closure path was redirected to **Option B (Arc-clone refactor)** — see the *⭐ Quick-start for Session 16* section at the top of this doc.
+- The GUI lag bisects to Bug #6 (`695f800`), not `9292aec`.
+- The GPF was a one-time event with no reproducer; treating it as a regression caused by `9292aec` was speculation.
+- Hardware behaviour under `962d787` (post-revert) is identical to behaviour under `9292aec` (pre-revert) per user observation, confirming the revert had no real-hardware effect.
 
-### Why the swap was wrong
+The revert was **un-reverted** in this commit.  `9292aec`'s FS-mutex `IrqSafeMutex` → `spin::Mutex` swap is back in place.  Bug #9 closes by virtue of `37b9d9c` + `9292aec` together.
 
-`IrqSafeMutex::lock()` does two things: raises `preempt_count` and masks IRQs.  The Bug #9 leak was caused by the first effect (`preempt_count` raise persisting past `block_current_until`'s post-resume `preempt_enable`).  The second effect (IRQ mask) was load-bearing for **cross-core fairness on real hardware**: while the lock is held, the holder cannot be timer-preempted, so other cores spinning on the lock do not have to wait through the holder's preemption duration.
+### What was wrong with my "cross-core spin storm" reasoning
 
-By switching to `spin::Mutex`, both effects were removed simultaneously.  Job 1 was the leak source (intended target).  Job 2 was load-bearing.  Without it:
+I claimed `IrqSafeMutex`'s IRQ-mask was "load-bearing for cross-core fairness on real hardware" and that switching to `spin::Mutex` would create cross-core spin storms.  The user's testing showed identical lag in both states, falsifying that hypothesis.
 
-- Holders are now preemptible mid-critical-section under `preempt-full`'s 1 ms timer.
-- Other cores spinning on the lock wait through the holder's preemption duration (1–10 ms per spin cycle).
-- Cumulative effect: every disk/tmpfs touch in the system became 1–10 ms instead of µs, killing GUI responsiveness.
+A more careful analysis: under `preempt-full`, the cross-core spin storm I imagined would only manifest if (a) the timer preempts a `spin::Mutex` holder while another core is spinning on it AND (b) the spin duration is long enough to dominate the IPC pipeline cycle.  In practice, FS-volume locks are held for very short critical sections — even with timer preemption, the spin cycles are sub-microsecond.  The cumulative effect is negligible against the millisecond-scale Bug #6 IPC bracketing latency.
 
-The QEMU 10-iter soak passed because TCG's vCPU serialization is a different concurrency model — the cross-core spin storm cannot manifest the same way.  **Track G validation must include real-hardware soak before declaring closure.**
+The correct disposition: `IrqSafeMutex`'s IRQ-mask is *defensive* (the doc comments say "no ISR ever reaches it"), not load-bearing.  The doc comments were correct.  The type swap is fine.
 
-### Why the GPF crash is a separate concern
+### Bug #10 — sporadic Doom-launch GPF, status
 
-The Doom-launch GPF is consistent with "a holder of one of the now-`spin::Mutex` locks got timer-preempted mid-critical-section and broke a downstream invariant".  Most likely candidate: `Ext2Volume.block_cache` (held during the cache-miss read path — even though `read_block`'s outer lock-then-read-then-lock-then-insert pattern looks correct, there are sub-paths that may not).
+The GPF observation in m3os.log remains a single data point.  It did not reproduce on:
 
-Reverting the type swap restores the IRQ-disable, eliminating the preemption window.  **The GPF should disappear with the revert.**  If it reproduces post-revert, it is a separate latent bug in the Doom / fb-takeover / framebuffer_mmap path independent of the FS-mutex discipline.  Open as Bug #10 if so.
+- Second Doom launch, same session, `9292aec`.
+- Subsequent hardware testing under `9292aec`.
+- Hardware testing under `962d787` (post-revert).
+- Hardware testing under `753a311` (Bug #11 fix, pre un-revert).
+
+Without a reproducer, the cause is undiagnosable.  Filed as Bug #10, low priority, open for follow-up if it reproduces.  The corruption pattern (garbage RIP, sequential-byte registers, scheduler dispatch loop) suggests stack-overflow or wild-call somewhere in the Doom / fb-takeover / framebuffer_mmap path; the framebuffer mmap itself is the most recent code change in that path (`37b9d9c`'s mmap_file refactor) and worth a careful re-audit if it does reproduce.
+
+### Lesson
+
+Two methodological mistakes:
+
+1. **Treated a one-time observation as a reliable regression signal.**  The GPF appeared once; I should have asked for a reproducer before reverting.
+2. **Built a causal theory from speculation rather than evidence.**  My "cross-core spin storm" hypothesis was internally plausible but had no supporting data — the user's observation of identical behaviour pre- and post-revert immediately falsified it, and a proper bisection should have happened before any revert.
+
+The correct flow: bisect first, theorise second, revert only with evidence in hand.
 
 ### Captured logs from the regression
 

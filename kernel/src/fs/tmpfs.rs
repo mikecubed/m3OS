@@ -18,7 +18,7 @@
 //! the file level.
 #![allow(dead_code)]
 
-use crate::task::scheduler::IrqSafeMutex;
+use spin::Mutex;
 
 #[allow(unused_imports)]
 pub use kernel_core::fs::tmpfs::{MAX_FILE_SIZE, Tmpfs, TmpfsError, TmpfsStat};
@@ -26,11 +26,15 @@ pub use kernel_core::fs::tmpfs::{MAX_FILE_SIZE, Tmpfs, TmpfsError, TmpfsStat};
 /// Global tmpfs instance. Rooted at the tmpfs tree root; `/tmp` and `/run`
 /// are created as top-level children by [`init`].
 ///
-/// Phase 57b G.3 — IrqSafeMutex inherits Track F.1's preempt-discipline
-/// (lock raises `preempt_count`, drop lowers it).  TMPFS is only acquired
-/// from task context (init, syscall paths); no ISR ever reaches it.  Type
-/// swap is a pure auto-deref change for callsites.
-pub static TMPFS: IrqSafeMutex<Tmpfs> = IrqSafeMutex::new(Tmpfs::new());
+/// Phase 57e Bug #9 — TMPFS uses plain `spin::Mutex`, NOT `IrqSafeMutex`.
+/// Reason: every `IrqSafeMutex::lock` raises `preempt_count`; if the guard
+/// outlives a `block_current_until` (e.g. syscalls that descend into
+/// `virtio_blk` after consulting tmpfs), the +1 leaks for the entire
+/// syscall and the IRQ-side preempt gate refuses to preempt the holder,
+/// starving co-resident Ready tasks.  TMPFS is only acquired from task
+/// context (init, syscall paths); no ISR ever reaches it, so the
+/// preempt-disable side-effect of `IrqSafeMutex` is unnecessary.
+pub static TMPFS: Mutex<Tmpfs> = Mutex::new(Tmpfs::new());
 
 /// Populate the tmpfs tree with the standard mount-point directories.
 ///
