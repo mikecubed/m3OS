@@ -1928,12 +1928,37 @@ pub fn peek_preempt_count_irq() -> i32 {
 /// wires `IrqSafeMutex::lock` into `preempt_disable`, this assertion
 /// becomes the earliest possible detection of a missed
 /// `preempt_enable`.
-#[cfg(debug_assertions)]
+/// Phase 57e Bug #9 fix — release-build leak budget for the
+/// preempt-count-at-user-return clamp.  Bug #9 surfaced as a silent leak
+/// where some kernel-side path failed to balance `preempt_disable` /
+/// `preempt_enable`, leaving `preempt_count > 0` on a task that then
+/// returned to userspace.  The IRQ-side `peek_preempt_count_irq` check
+/// then suppressed user-mode preemption forever, starving co-resident
+/// Ready tasks (the "stale-ready 30 s + cpu-hog" Bug #9 fingerprint).
+///
+/// Until the leak is hunted down at its source, the user-return boundary
+/// clamps `preempt_count` to zero unconditionally and logs the first 32
+/// non-zero observations so the next forensic capture pinpoints the
+/// imbalance.  The clamp itself is correct by the same invariant that
+/// `preempt_frame_to_scheduler` already relies on: any kernel work that
+/// raised the counter must have lowered it before this boundary; a
+/// non-zero value is by definition a bug, and zeroing it cannot widen
+/// any race that wasn't already broken.
+static PREEMPT_LEAK_LOG_BUDGET: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(32);
+
+/// Phase 57b D.3 (debug) / Phase 57e Bug #9 (release) — at user-mode
+/// return, `preempt_count` MUST be zero.  In debug builds a non-zero
+/// value panics so the missed `preempt_enable` surfaces immediately.
+/// In release builds (where Bug #9 manifests) the helper clamps the
+/// counter to zero and logs the first 32 violations so the leak source
+/// can still be identified post-hoc, while the clamp prevents the
+/// IRQ-side preempt suppression that starves the rest of the system.
 #[inline]
 pub(crate) fn assert_preempt_count_zero_at_user_return() {
     // Per-core data may not be initialised in some early-boot panic paths
     // or in test context (test_main runs before init_bsp_per_core); skip
-    // the assertion if so.
+    // the check if so.
     let Some(pc) = crate::smp::try_per_core() else {
         return;
     };
@@ -1948,22 +1973,34 @@ pub(crate) fn assert_preempt_count_zero_at_user_return() {
     // dummy or a `Box<Task>::preempt_count` whose address is stable for
     // the task's lifetime.
     let count = unsafe { (*ptr).load(core::sync::atomic::Ordering::Relaxed) };
-    debug_assert!(
-        count == 0,
-        "preempt_count != 0 at user-mode return: {} (forgotten preempt_enable?)",
-        count,
-    );
+    if count == 0 {
+        return;
+    }
+    #[cfg(debug_assertions)]
+    {
+        debug_assert!(
+            count == 0,
+            "preempt_count != 0 at user-mode return: {} (forgotten preempt_enable?)",
+            count,
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let pid = crate::process::current_pid();
+        let n = PREEMPT_LEAK_LOG_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            log::warn!(
+                "[preempt] count={} pid={} at user-mode return — clamping to 0 (Bug #9 mitigation)",
+                count,
+                pid,
+            );
+        }
+        // Safety: same pointee invariant as the load above.
+        unsafe {
+            (*ptr).store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
 }
-
-/// Release-build no-op stub for
-/// [`assert_preempt_count_zero_at_user_return`].
-///
-/// In release builds the assertion is compiled out so user-mode return
-/// adds zero overhead.  Callers always invoke through the same name; the
-/// `cfg(debug_assertions)` selects between the live check and this stub.
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-pub(crate) fn assert_preempt_count_zero_at_user_return() {}
 
 // ---------------------------------------------------------------------------
 // Phase 57d Track G — deferred preemption check at user-return boundaries
@@ -4560,6 +4597,152 @@ static TRACE_DUMP_FIRED: core::sync::atomic::AtomicBool =
 static TRACE_DUMP_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Phase 57e Bug #9 diagnostic — set the first time the watchdog observes a
+/// `Ready` task that has been Ready for too long without being dispatched
+/// (stale-ready watchdog).  Gates a one-shot per-core run-queue + task-state
+/// dump so the next failure capture pinpoints whether the stale Ready task
+/// is on its assigned core's queue, on a different core's queue, or off-queue
+/// entirely; whether it has correct affinity / priority / saved_rsp; and what
+/// its assigned core is currently running.
+static DISPATCH_DUMP_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Phase 57e Bug #9 diagnostic — dump per-core run-queue contents and per-
+/// task scheduling state to the serial log.
+///
+/// Called from `watchdog_scan` (gated by `DISPATCH_DUMP_FIRED`) when a Ready
+/// task has been Ready for more than 5 seconds without being dispatched.  The
+/// dump records, for each core: the `current_task_idx`, the local
+/// `run_queue`'s task_idx list, and the running task's `preempt_count`.  For
+/// each task in `Ready` or `Running` state it logs pid / name / idx /
+/// assigned_core / priority / affinity / age-since-ready / age-since-migrated
+/// / on_cpu / saved_rsp.  This is the smallest data set that distinguishes
+/// the candidate Bug #9 mechanisms (queue-partition mismatch, missing IPI,
+/// stuck preempt_count, affinity drift, load-balance starvation).
+///
+/// Acquires `SCHEDULER.lock` briefly to snapshot task state, then releases
+/// it before walking per-core run queues so the dump never holds the
+/// scheduler lock while iterating IRQ-shared `run_queue` mutexes.
+fn dump_dispatch_state() {
+    let n_cores = crate::smp::core_count();
+
+    // Snapshot per-task state under SCHEDULER.lock.
+    struct TaskRow {
+        pid: u32,
+        name: &'static str,
+        idx: usize,
+        state: super::TaskState,
+        assigned_core: u8,
+        priority: u8,
+        affinity_mask: u64,
+        last_ready_tick: u64,
+        last_migrated_tick: u64,
+        on_cpu: bool,
+        preempt_count: i32,
+        saved_rsp: u64,
+    }
+
+    let mut rows: alloc::vec::Vec<TaskRow> = alloc::vec::Vec::new();
+    let idle_idxs: [Option<usize>; crate::smp::MAX_CORES];
+    {
+        let sched = scheduler_lock();
+        idle_idxs = sched.idle_tasks;
+        for (idx, task) in sched.tasks.iter().enumerate() {
+            if !matches!(
+                task.state,
+                super::TaskState::Ready | super::TaskState::Running
+            ) {
+                continue;
+            }
+            rows.push(TaskRow {
+                pid: task.pid,
+                name: task.name,
+                idx,
+                state: task.state,
+                assigned_core: task.assigned_core,
+                priority: task.priority,
+                affinity_mask: task.affinity_mask,
+                last_ready_tick: task.last_ready_tick,
+                last_migrated_tick: task.last_migrated_tick,
+                on_cpu: task.on_cpu.load(Ordering::Relaxed),
+                preempt_count: task.preempt_count.load(Ordering::Relaxed),
+                saved_rsp: task.saved_rsp,
+            });
+        }
+    }
+
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    log::warn!(
+        "[sched] dispatch-dump: now-tick={} cores={} ready/running tasks={}",
+        now,
+        n_cores,
+        rows.len()
+    );
+
+    // Per-core run queue + current task.
+    for core_id in 0..n_cores {
+        let Some(data) = crate::smp::get_core_data(core_id) else {
+            continue;
+        };
+        let cur = data.current_task_idx.load(Ordering::Relaxed);
+        let resched = data.reschedule.load(Ordering::Relaxed);
+        let pending = data.preempt_resched_pending.load(Ordering::Relaxed);
+        let online = data.is_online.load(Ordering::Acquire);
+        // Snapshot the run queue (with_run_queue handles preempt/IRQ
+        // discipline).  Convert to a small vec on the heap so we can log
+        // outside the lock.
+        let queue_snapshot: alloc::vec::Vec<usize> =
+            data.with_run_queue(|q| q.iter().copied().collect());
+        log::warn!(
+            "[sched] dispatch-dump: core={} online={} current_idx={} resched={} preempt_pending={} queue_len={} idle_idx={:?}",
+            core_id,
+            online,
+            cur,
+            resched,
+            pending,
+            queue_snapshot.len(),
+            idle_idxs[core_id as usize],
+        );
+        // Print the run queue contents in chunks of 8 to keep individual
+        // log lines short.
+        let mut i = 0;
+        while i < queue_snapshot.len() {
+            let end = core::cmp::min(i + 8, queue_snapshot.len());
+            log::warn!(
+                "[sched] dispatch-dump:   core={} q[{}..{}]={:?}",
+                core_id,
+                i,
+                end,
+                &queue_snapshot[i..end],
+            );
+            i = end;
+        }
+    }
+
+    // Per-task summary for Ready and Running tasks.
+    for row in &rows {
+        let age_ready = now.saturating_sub(row.last_ready_tick);
+        let age_migrated = now.saturating_sub(row.last_migrated_tick);
+        log::warn!(
+            "[sched] dispatch-dump: pid={} name={} idx={} state={:?} assigned_core={} priority={} affinity={:#x} ready_age~{}ms migrated_age~{}ms on_cpu={} preempt_count={} saved_rsp={:#x}",
+            row.pid,
+            row.name,
+            row.idx,
+            row.state,
+            row.assigned_core,
+            row.priority,
+            row.affinity_mask,
+            age_ready,
+            age_migrated,
+            row.on_cpu,
+            row.preempt_count,
+            row.saved_rsp,
+        );
+    }
+
+    log::warn!("[sched] dispatch-dump: end");
+}
+
 /// Periodic stuck-task watchdog scan.
 ///
 /// Called from the BSP's scheduler dispatch loop on every iteration.
@@ -4594,9 +4777,18 @@ pub fn watchdog_scan() {
     let mut warnings: [(u32, &'static str, super::TaskState, u64, Option<u64>); 8] =
         [(0, "", super::TaskState::Dead, 0, None); 8];
     let mut n_warn = 0usize;
+    // Phase 57e Bug #9 diagnostic — collect the first stale Ready task seen.
+    // Threshold matches the existing dispatch-path stale-ready warning's "more
+    // than 5 s" band (which is well past benign IPC churn but well below the
+    // 30 s stuck-no-waker watchdog) so the dump fires on the genuine fairness
+    // failure mode rather than transient enqueue races.
+    let mut stale_ready_pid: u32 = 0;
+    let mut stale_ready_name: &'static str = "";
+    let mut stale_ready_idx: usize = 0;
+    let mut stale_ready_age: u64 = 0;
     {
         let sched = scheduler_lock();
-        for task in sched.tasks.iter() {
+        for (idx, task) in sched.tasks.iter().enumerate() {
             let is_blocked = matches!(
                 task.state,
                 super::TaskState::BlockedOnRecv
@@ -4607,6 +4799,22 @@ pub fn watchdog_scan() {
                     | super::TaskState::BlockedOnWait
                     | super::TaskState::BlockedOnService
             );
+            // Phase 57e Bug #9 — Ready task that's been Ready for >5 s and
+            // is not an idle task indicates a fairness failure: dispatcher is
+            // not picking it up despite it being eligible.  Capture the first
+            // such finding; a dump is triggered after the lock is released.
+            if task.state == super::TaskState::Ready
+                && stale_ready_pid == 0
+                && !sched.idle_tasks.contains(&Some(idx))
+            {
+                let age = now.saturating_sub(task.last_ready_tick);
+                if age >= 5_000 {
+                    stale_ready_pid = task.pid;
+                    stale_ready_name = task.name;
+                    stale_ready_idx = idx;
+                    stale_ready_age = age;
+                }
+            }
             if !is_blocked {
                 continue;
             }
@@ -4628,6 +4836,20 @@ pub fn watchdog_scan() {
             }
         }
         // SCHEDULER.lock released here.
+    }
+
+    // Phase 57e Bug #9 — dump dispatch state once per boot when a stale Ready
+    // task is observed.  Runs after SCHEDULER.lock is released so it can re-
+    // acquire briefly inside the helper without nesting.
+    if stale_ready_pid != 0 && !DISPATCH_DUMP_FIRED.swap(true, Ordering::AcqRel) {
+        log::warn!(
+            "[sched] stale-ready watchdog: pid={} name={} idx={} ready-age~{}ms — dumping dispatch state",
+            stale_ready_pid,
+            stale_ready_name,
+            stale_ready_idx,
+            stale_ready_age,
+        );
+        dump_dispatch_state();
     }
 
     // Log after releasing the lock.

@@ -1,12 +1,12 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (branch tip `8000fc6`, end of Session 12):**
+**Status (Session 13 in progress):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — root cause was missing waker registration in `block_current_on_{recv,send,notif}_v2`, **not** the unbracketed pairs Session 10 patched) — **closed** in Session 11 (commit `da2e781`). Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced incident frequency under `sched-trace` overhead but did not close the structural race. Session 12's 10-iter soak: **0 cascades across all 10 runs**.
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **partially mitigated**. The lost-wake fix in Session 11 also closed most of the slow-boot symptoms. Soak still shows occasional slow-boot but it's now retry-recoverable.
-- **Bug #9** (NEW — scheduling-fairness defect: `stale-ready` for 30 s + `cpu-hog` correlation) — **open**. Surfaced under Session 12's 10-iter soak as the residual `attempt-1 failure` mode after Bug #8.1 closure. **Track G's 24 h soak gate stays closed** until Bug #9 is dispositioned (fix or accept-with-disclosure).
+- **Bug #9** (scheduling-fairness defect: `stale-ready` for 30 s + `cpu-hog` correlation) — **mechanism identified, partial mitigation landed, full fix deferred**. Session 13 confirmed the cause is a `preempt_count` leak on user tasks: leaked count > 0 makes the IRQ-side preempt gate (`peek_preempt_count_irq`) skip preempting both from user mode (`check_and_preempt_user`) and from kernel mode (`check_and_preempt_kernel`), monopolising the assigned core for 30+ s while co-resident Ready tasks starve. **Partial mitigation landed** — release-build clamp at user-mode return — but did NOT fully close the bug because leaked tasks stay parked in kernel mode and never reach the user-return boundary. **Track G's 24 h soak gate stays closed** until the leak source is found and fixed.
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
@@ -1607,3 +1607,132 @@ M3OS_KERNEL_FEATURES="preempt-full" \
 ```
 
 A failing attempt's `/tmp/m3os-bug9.log` will contain `stale-ready: pid=N stale~30000ms` and `cpu-hog: pid=M ran~30000ms` warnings. **Bug #9 fingerprint:** zero `(no waker registered)` cascade lines (rules out lost-wakeup), zero virtio-blk timeouts past the boot-time sector 2072 saga, zero kernel faults.
+
+---
+
+## Session 13 — Bug #9 mechanism identified (preempt_count leak); partial mitigation; full fix deferred
+
+### TL;DR
+
+Bug #9's mechanism is **a `preempt_count` leak on user tasks**.  Some kernel-side path takes a `preempt_disable` without a matching `preempt_enable`, leaving `preempt_count > 0` on a task that the dispatcher then resumes.  The IRQ-side preempt gate (`peek_preempt_count_irq`) reads the running task's `preempt_count` on every timer tick / reschedule IPI; when the value is non-zero, both `check_and_preempt_user` and `check_and_preempt_kernel` skip preempting.  The leaked task therefore monopolises its assigned core for 30+ s, while every co-resident Ready task on the same core's run queue starves — exactly the Session 12 fingerprint (`stale-ready: pid=2 ... core=0 stale~32138ms` + `cpu-hog: pid=21 tcc ... ran~32139ms final_state=Running`).
+
+A new dispatch-state diagnostic (`dump_dispatch_state`) wired into `watchdog_scan` proved the mechanism by capturing per-core run-queue contents and per-task `preempt_count` at the failure window.  Two failing-attempt dumps (`/tmp/m3os-bug9-repro/diag-{3,6}.log`) showed the *same* shape: pid=21 (tcc fork-child) Running on the cpu-hogged core with `preempt_count=1`, plus 2–3 other user tasks on the same core's run queue with leaked `preempt_count` values of 1 or 2.  Tasks with `preempt_count=0` were never blocked; tasks with `preempt_count>0` always were.
+
+A **partial mitigation** landed — release-build clamp on `assert_preempt_count_zero_at_user_return` — but a 10-iter soak showed it does NOT fully close the bug (1/10 attempts hung; 0 clamp warnings fired).  The reason: leaked tasks stay parked in kernel mode and never reach the user-return boundary.  The clamp can't observe a value it never sees.
+
+**Recommended next step:** instrument `preempt_disable` / `preempt_enable` with `track_caller` to record the call site of every imbalance, log the first N occurrences where `preempt_count` exceeds an expected nesting depth, then reproduce.  The dump captured pid=21's leak at +1, pid=19's at +2, pid=2's at +2 — repeatable across runs — so the leak source is deterministic and a single targeted capture should pinpoint it.
+
+### Forensic narrative
+
+1. **Reproducer.** `M3OS_KERNEL_FEATURES="preempt-full" M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log cargo xtask smoke-test` — pre-Session-13 baseline matched Session 12's 9/10 with retry, 6/10 attempt-1.
+
+2. **Initial trace (no instrumentation).** Run-5's failure log (Session 12 pattern) showed core 2's trace ring frozen at tick 1568 with `Dispatch task_idx=24 (pid=21 tcc)` as the last event — and then **fewer than 256 trace events for 32 seconds**.  The 4096-entry ring should have wrapped many times in 32 s of normal IPC + timer activity (10 ms AP timer × 32000 ms = 3200 expected preempts × ~4 events each = 12800 entries).  The actual <256 means **almost no preempt happened** on core 2.
+
+3. **Eliminated hypotheses.** No cross-core wakes targeted core 2 (ruled out enqueue race).  Held-lock watchdog (`HELD_LOCK_REGISTRY`) is empty (ruled out tracked-lock suppression).  Phys-offset and PML4[256] checks ruled out earlier (Sessions 5–8).
+
+4. **Diagnostic patch (`scheduler.rs`).** Added a single-shot `dump_dispatch_state` helper, wired into `watchdog_scan` to fire on the first Ready task with `last_ready_tick` more than 5 s old.  Dump records: per-core `current_task_idx` / `reschedule` / `preempt_pending` / `online` / `queue_len` / `idle_idx`; per-core `run_queue` contents (chunked to keep log lines short); per-task `pid` / `name` / `idx` / `state` / `assigned_core` / `priority` / `affinity_mask` / `ready_age` / `migrated_age` / `on_cpu` / **`preempt_count`** / `saved_rsp` for every Ready or Running task.
+
+5. **Captured failure shape (diag-3 and diag-6).**  Both runs showed:
+
+   ```
+   core=2 current_idx=25 queue=[24, 7]      (or core=3 in diag-6)
+   idx=25 (pid=20)  state=Running  preempt_count=1   ← the cpu-hogged task
+   idx=24 (pid=19)  state=Ready    preempt_count=2   ← starved co-resident
+   idx=7  serial-stdin  state=Ready  preempt_count=1
+   ```
+
+   Three tasks with non-zero `preempt_count` simultaneously, all on the same affected core, all the same task pids and idx assignments across two independent failing runs.  Saved_rsp values (e.g. `0x28001697730`) are deterministic between runs — the leak fires at the same point in tcc's compilation flow.
+
+6. **Mechanism (confirmed).**  When the running task has `preempt_count > 0`:
+
+   - `check_and_preempt_user` (timer / reschedule-IPI from ring 3) reads the count via `peek_preempt_count_irq` and bails: `if pc != 0 { return; }`.
+   - `check_and_preempt_kernel` (timer / reschedule-IPI from ring 0 under `preempt-full`) does the same check.
+
+   Both paths consume the `reschedule` flag (`swap(false, AcqRel)`) **but** suppress the actual preempt.  The Ready task on the same run queue therefore never gets dispatched.  The dispatcher only re-enters via cooperative `yield_now` or `block_current_until` from the running task itself — paths the running task is not taking because it's CPU-bound (or stuck in a kernel busy-wait that *also* doesn't yield).
+
+7. **Why this is `preempt-full`-only.**  Under `preempt-voluntary`, kernel-mode preemption never fires from a kernel-mode IRQ (no `check_and_preempt_kernel` body); the user-mode preempt path *does* check `preempt_count`, but the same `preempt_count > 0` condition is far less common because fewer kernel paths nest `preempt_disable` at user-trap-eligible points.  Under `preempt-full`, the additional `IrqSafeMutex::lock`-driven `preempt_disable` calls (Phase 57b F.1) widen the window where a leak can stick.
+
+### Partial mitigation landed (Session 13 in-progress patch)
+
+`kernel/src/task/scheduler.rs::assert_preempt_count_zero_at_user_return`:
+
+- Debug builds: existing `debug_assert!(count == 0, ...)` panic preserved.
+- Release builds: NEW.  When `count != 0` at user-mode return, log `[preempt] count={N} pid={X} at user-mode return — clamping to 0 (Bug #9 mitigation)` (budgeted to 32 occurrences) and force `preempt_count` to 0.  The user-return boundary is the canonical "kernel work has finished" point; a non-zero count there is by definition a leak, and clamping cannot widen any race that wasn't already broken.
+
+Plus: removed the `cfg(debug_assertions)` gates around the user-return assertion call sites in `kernel/src/arch/x86_64/interrupts.rs` (`assert_preempt_count_zero_on_return_to_user`, `timer_handler_user`, `reschedule_ipi_handler_user`) so the clamp runs in release builds too.  The other two call sites (`syscall/mod.rs:2051`, `syscall/mod.rs:2855`) were already unconditional.
+
+### Why the partial mitigation didn't fully close Bug #9
+
+10-iter validation soak under `preempt-full` post-clamp:
+
+| Run | Outcome | Notes |
+|---|---|---|
+| 1 | PASS attempt 2 (8 s) | |
+| 2 | PASS attempt 1 (9 s) | |
+| 3 | PASS attempt 1 (13 s) | |
+| **4** | **FAIL** | `pid=18 BlockedOnWait stuck-since=232471ms` — same Bug #9 fingerprint |
+| 5 | PASS attempt 2 (10 s) | |
+| 6 | PASS attempt 2 (8 s) | |
+| 7 | PASS attempt 2 (71 s) | |
+| 8 | PASS attempt 2 (7 s) | |
+| 9 | PASS attempt 1 (13 s) | |
+| 10 | PASS attempt 3 (12 s) | |
+
+Pre-fix baseline (Session 12): 9/10 with retry, 6/10 attempt-1.
+Post-clamp (this session): 9/10 with retry, **3/10 attempt-1**.
+
+Inspecting the failing run 4: zero `Bug #9 mitigation` warnings fired; the dispatch-dump again showed three tasks with leaked `preempt_count` (idx=25 pid=21 Running with count=1, idx=9 pid=2 Ready with count=2, idx=7 serial-stdin Ready with count=1).  None of these tasks reached user-mode return during the 32 s window — they stayed parked in kernel mode.  The clamp can only observe what passes through user-return; tasks blocked in kernel and never resumed to user mode are out of reach.
+
+The mitigation is still worth keeping (it's a strict improvement on the existing debug-only assertion and would catch *some* leaks that do reach user-return), but it does NOT close the bug on its own.
+
+### What this rules out
+
+- **Run-queue race / cross-core enqueue mismatch** (Session 12 candidates 1–3).  Run queues are populated correctly: the dump shows the Ready tasks are in their assigned core's `run_queue`.  The dispatcher's `pick_next` is being asked to run, it just keeps returning the same Running task because no preempt has fired.
+- **Load balancer fault** (candidate 4).  Tasks have correct `affinity_mask` / `assigned_core` / non-zero `saved_rsp`.  Migration cooldown is short enough to allow rebalancing; not the issue.
+- **BSP starvation** (candidate 5).  In the diag-6 dump the cpu-hogged core was core 2 (an AP), not BSP.  In the run-4 dump it was core 3 (also an AP).  Different APs in different runs.  BSP runs housekeeping fine; the bug is symmetric across cores.
+
+### Recommended next step (Session 14)
+
+**Instrument `preempt_disable` / `preempt_enable` to track imbalances by call site.**  Two specific changes:
+
+1. **Caller logging on suspicious depths.**  Add `track_caller` to both functions; log the first N (e.g. 32) call sites when `preempt_count` reaches a depth above the expected maximum (suggested threshold: `> 4`, since `block_current_until` legitimately nests up to `preempt_disable + IrqSafeMutex pi_lock + IrqSafeMutex scheduler_lock` = 3).
+2. **Per-task imbalance accounting.**  At `assert_preempt_count_zero_at_user_return`, when a non-zero count is observed, walk a small per-core ring buffer of recent `preempt_disable` callers and dump the mismatched ones.
+
+The leak is deterministic across runs (same pids, same task_idx, same `saved_rsp` values).  A single capture with caller instrumentation should isolate the leak.  Likely candidates to inspect first:
+
+- `kernel/src/mm/frame_allocator.rs:920-983` — `drain_per_cpu_caches` (preempt_disable around spin-wait on `DRAIN_PENDING`).
+- `kernel/src/mm/heap.rs:510-538` — `allocator_local_reclaim` (preempt_disable around `drain_per_cpu_caches` + `collect_remote_frees` + `reclaim_empty_slabs`).
+- `kernel/src/blk/virtio_blk.rs:621-628` — `with_driver` helper (preempt_disable wrapping the driver lock).
+- `kernel/src/task/scheduler.rs::block_current_until` — explicit `preempt_disable()` at function entry, with `preempt_enable()` calls scattered across early-return / self-revert / post-resume paths; if any path skips the enable (e.g. through a panic or an unforeseen control-flow) the leak originates here.
+
+### Files to pre-load for Session 14
+
+- `kernel/src/task/scheduler.rs` — `preempt_disable` (~line 1610), `preempt_enable` (~line 1659), `assert_preempt_count_zero_at_user_return` (clamp landed; instrument here), `dump_dispatch_state` (already landed; reuse the dump on imbalance), `block_current_until` (~line 2420; explicit preempt_disable/enable bracketing the lock-nested region and switch_context).
+- `kernel/src/mm/frame_allocator.rs:920-983` — `drain_per_cpu_caches`.
+- `kernel/src/mm/heap.rs:495-540` — `allocator_local_reclaim`.
+- `kernel/src/blk/virtio_blk.rs:621-628` — `with_driver`.
+- `/tmp/m3os-bug9-repro/diag-3.log`, `diag-6.log`, `fix-4.log` — the three failing dumps captured this session, with deterministic pid / task_idx / preempt_count assignments.
+
+### Reproducer (unchanged)
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
+  cargo xtask smoke-test
+```
+
+Failing attempts now also produce a `[sched] dispatch-dump:` block in `/tmp/m3os-bug9.log`, including the full per-core run-queue / per-task `preempt_count` snapshot.  Look for tasks with `preempt_count != 0` while not currently running a critical section — those are the leaked tasks.
+
+### Acceptance criteria status (Session 13 revision)
+
+| Criterion | Status |
+|---|---|
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically under `preempt-full` | ⚠️ — 9/10 with retry, 3/10 attempt-1; cascade closed; Bug #9 leak partially mitigated but not fully closed |
+| (4) `run-gui` 10-min soak | not verified |
+| (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ (`da2e781`) |
+| (8.2) Bug #8.2 slow-boot closed | ✅ — folded into (8.1) closure |
+| (9) Bug #9 scheduling-fairness closed | ⚠️ — mechanism identified (preempt_count leak), partial mitigation landed (user-return clamp), full fix deferred to Session 14 (caller-tracking instrumentation needed) |
+
+Track G's 24 h soak gate stays closed pending Bug #9 full closure.

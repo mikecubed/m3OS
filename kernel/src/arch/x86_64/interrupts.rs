@@ -94,7 +94,9 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 /// builds compile out the entire body via `cfg(debug_assertions)`.
 #[inline]
 fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 at user-return in release
+    // builds, panic on non-zero in debug builds.  Helper handles both modes;
+    // gate ring-3 only.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     }
@@ -108,8 +110,6 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
     {
         crate::task::signal_reschedule();
     }
-    #[cfg(not(debug_assertions))]
-    let _ = stack_frame;
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,7 +1627,8 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 in release builds; panic on
+    // non-zero in debug builds.  Helper handles the mode split.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
     unsafe {
@@ -2053,7 +2054,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline_user(frame);
     super::apic::lapic_eoi();
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 in release builds; panic on
+    // non-zero in debug builds.  Helper handles the mode split.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
     unsafe {
