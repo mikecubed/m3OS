@@ -1736,3 +1736,125 @@ Failing attempts now also produce a `[sched] dispatch-dump:` block in `/tmp/m3os
 | (9) Bug #9 scheduling-fairness closed | ⚠️ — mechanism identified (preempt_count leak), partial mitigation landed (user-return clamp), full fix deferred to Session 14 (caller-tracking instrumentation needed) |
 
 Track G's 24 h soak gate stays closed pending Bug #9 full closure.
+
+---
+
+## Session 14 — caller-tracking instrumentation; leak narrowed to IPC entry path
+
+### TL;DR
+
+Session 13's recommendation landed: `preempt_disable` and `preempt_enable` now use `#[track_caller]` and write to a per-core 1024-entry trace ring tagged with task_idx + pre/post counts.  `dump_dispatch_state` (the Session 13 watchdog dump) walks the rings on the failing task and prints the full caller history.  10-iter soak under `preempt-full` reproduced the bug 2 times in 10 with the new instrumentation captured cleanly.
+
+The captured trace shows a deterministic pattern: the FIRST visible entry on a leaked task is `ENABLE pre=2 post=1 caller=scheduler.rs:2870` — `block_current_until`'s post-resume `preempt_enable`.  Started at count=2, ended at count=1.  The matching `preempt_disable` at `scheduler.rs:2732` (`block_current_until`'s explicit disable) raised the count from 1 to 2.  **The OUTER 1 — present BEFORE block_current_until was called — is the unbalanced disable that we have not yet identified.**
+
+The leak source is therefore upstream of `block_current_until`, in one of the IPC entry paths that call `block_current_on_{recv,send,notif,reply}_v2`.  These v2 helpers themselves don't take preempt_disable; their callers must.
+
+### What landed
+
+`kernel/src/task/scheduler.rs`:
+
+1. **`#[track_caller]`** on both `preempt_disable` and `preempt_enable` — captures the immediate caller's `Location`.
+
+2. **Per-core trace ring (`PREEMPT_TRACE_RINGS[MAX_CORES]`, 1024 entries each)** — records `(task_idx, op, pre_count, post_count, file, line, tick)` on every disable / enable.  Lock-free per-core writes, racy (single-core writer, multi-core readers tolerate torn entries — diagnostic only).
+
+3. **`dump_preempt_trace_for_task(task_idx)`** — invoked from `dump_dispatch_state` for any task observed with non-zero `preempt_count` at the watchdog stale-ready trigger.  Walks all per-core rings, prints matching entries oldest-to-newest with caller location.
+
+4. **Immediate depth-exceeded warning** — when a `preempt_disable` would push the count above 4 (the legitimate maximum nesting depth of explicit-disable + IrqSafeMutex pi_lock + IrqSafeMutex scheduler_lock + IrqSafeMutex inner = 4), log `[preempt-depth] count=N caller=X:Y (pre=Z) — depth exceeds expected nesting` immediately.  Budget shared with Session 13's `Bug #9 mitigation` clamp.
+
+`cargo xtask check` stays green.
+
+### Captured failure shape
+
+10-iter soak under bare `preempt-full`: 9/10 with retry, ~5/10 attempt-1.  Two captured failing dumps (`/tmp/m3os-bug9-repro/instr2-{4,9}.log`).  Both show:
+
+- pid=20 or pid=21 (idx=25) Running on the cpu-hogged core with `preempt_count=1`.
+- pid=2 syslogd or pid=19 (idx=9 or 24) Ready with `preempt_count=2`.
+- `pid=0 serial-stdin` (idx=7) Ready with `preempt_count=1`.
+- All on the same core (core 2 or core 3 in different runs).
+- Same `saved_rsp` values across runs — deterministic.
+
+### Trace ring evidence (instr2-9.log, task_idx=9 = pid=2 syslogd)
+
+```
+[399] ENABLE  pre=2 post=1 caller=kernel/src/task/scheduler.rs:2870 tick=1970
+                                                             ^^^^
+       block_current_until's POST-RESUME preempt_enable.  Started at count=2,
+       ended at count=1.  The matching preempt_disable at scheduler.rs:2732
+       raised count from 1 to 2 (visible later in the ring).
+       The OUTER 1 is from somewhere upstream — the trace ring's oldest
+       visible entry already has count=2, so the underflow source is
+       beyond the 1024-entry window.
+[400] DISABLE pre=1 post=2 caller=kernel/src/blk/virtio_blk.rs:622  tick=1970
+                                       ^^^^^^^^^^^^^^^^
+       `with_driver` enter — adds 1 on top of the leaked 1.
+[401] ENABLE  pre=2 post=1 caller=kernel/src/blk/virtio_blk.rs:627  tick=1970
+       `with_driver` exit — removes its 1.  Count returns to 1, NOT 0.
+... (tight virtio_blk + scheduler-lock cycling, count stays oscillating
+     between 1 and 2, never returns to 0) ...
+[414] DISABLE pre=1 post=2 caller=kernel/src/task/scheduler.rs:2732 tick=1970
+       block_current_until's preempt_disable starting from count=1
+[415] DISABLE pre=2 post=3 caller=kernel/src/task/scheduler.rs:307  tick=1970
+       IrqSafeMutex::lock (pi_lock)
+[416] DISABLE pre=3 post=4 caller=kernel/src/task/scheduler.rs:307  tick=1970
+       IrqSafeMutex::lock (scheduler_lock — inner)  ← depth 4, max allowed
+[417] ENABLE  pre=1 post=0 caller=kernel/src/task/scheduler.rs:404  tick=1970
+       IrqSafeMutex::drop — count is now 1 (in trace POV) and goes to 0
+       BUT: there's a JUMP between 416 (count=4) and 417 (count=1).  The
+       intervening 3 enable ops happened OFF this core (or after task
+       switched out and back).  Either: the task was switched out at count=4
+       and resumed with count=1 (3 hidden decrements somewhere), OR the
+       trace dropped 3 entries.
+```
+
+### Working hypotheses (Session 14 → Session 15)
+
+The current trace narrows the leak to **one or both** of:
+
+1. **An unmatched `preempt_disable` upstream of the v2 IPC helpers.**  Some IPC entry path in `endpoint.rs` (or a caller of `endpoint.rs`'s `recv_msg` / `send_msg` / `call_msg` etc.) holds a `preempt_disable` across the call to `block_current_on_*_v2`.  The leaked `1` is whatever that upstream callsite is.  Look for:
+   - `IrqSafeMutex` guards held across `block_current_on_recv_v2` calls in `endpoint.rs`.
+   - Explicit `preempt_disable` calls in IPC paths that aren't paired before the v2 helper.
+   - The Session 10 helper `deliver_message_and_wake` which brackets `deliver_message` + `wake_task_v2` with `preempt_disable`/`preempt_enable` — verify all return paths balance.
+
+2. **Cross-task preempt_count clobbering during context switch.**  Lines 416 → 417 in the trace show count going from 4 to 1 with no visible enables in between.  If the dispatcher's switch-out path somehow decrements the OUTGOING task's preempt_count (e.g., via a misdirected `current_preempt_count_ptr`), the next time the task resumes its count would be lower than expected.  But if it lands on a count > 0 (e.g., a count of 1 instead of 0), the next IRQ-side preempt check fails.  Verify by reading `retarget_preempt_count_to_dummy` / `retarget_preempt_count_to_task` for any path that mutates the task's counter (rather than just the per-core pointer).
+
+Hypothesis 1 is more likely.  Hypothesis 2 would require a more invasive instrumentation (per-task ring instead of per-core) to confirm.
+
+### Next-session investigation plan (Session 15)
+
+**Step 1 — Add a per-task trace ring** (32 entries per Task struct), so the dump captures the COMPLETE recent history for the leaked task without being clobbered by other tasks' activity on the same core.  The current per-core ring (1024 entries) wraps within a single `tick` because the task does thousands of preempt ops per ms.
+
+**Step 2 — Instrument the IPC entry paths** in `endpoint.rs`.  Specifically: at the entry to `recv_msg`, `recv_msg_nowait`, `recv_msg_with_notif`, `send_msg`, `send_msg_nowait`, `call_msg`, `reply`, log `preempt_count` if non-zero.  This pinpoints which IPC call is being entered with a leaked count (i.e., the leak is upstream of IPC entry — a syscall handler).
+
+**Step 3 — Test with the user-return clamp re-enabled** to see whether clamping at user-return DOES catch the leak after it's been visible for a while.  Currently the clamp doesn't fire because the leaked tasks stay parked in kernel mode; if the leak source is in a syscall handler, the syscall return WILL go through user-return eventually, and the clamp will fire.
+
+### Files to pre-load for Session 15
+
+- `kernel/src/task/scheduler.rs:1610-1750` — `preempt_disable` / `preempt_enable` (current instrumentation; per-task ring goes here).
+- `kernel/src/task/mod.rs:540-700` — `Task` struct (add a `preempt_trace_ring: PreemptTraceRing` field here).
+- `kernel/src/ipc/endpoint.rs` — IPC entry points (`recv_msg`, `send_msg`, `call_msg`, `reply`, `recv_msg_with_notif`).  Look for paths that hold preempt_disable across v2 helper calls.
+- `kernel/src/arch/x86_64/syscall/mod.rs` — syscall dispatch (look for paths that take preempt_disable around the IPC syscalls).
+- `/tmp/m3os-bug9-repro/instr2-9.log`, `instr2-4.log` — the Session 14 captured failures with caller history.
+
+### Reproducer (unchanged)
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
+  cargo xtask smoke-test
+```
+
+Failing attempts produce `[sched] dispatch-dump:` blocks including per-task `preempt-trace` caller histories.  Look for `task_idx=N` blocks where the OLDEST visible entry already shows count > 0 — that task's leak source is upstream of the visible window.
+
+### Acceptance criteria status (Session 14 revision)
+
+| Criterion | Status |
+|---|---|
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically under `preempt-full` | ⚠️ — 9/10 with retry, ~5/10 attempt-1; Bug #9 mechanism deeply characterised, leak source upstream of block_current_until but not yet pinpointed |
+| (4) `run-gui` 10-min soak | not verified |
+| (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ |
+| (8.2) Bug #8.2 slow-boot closed | ✅ |
+| (9) Bug #9 scheduling-fairness closed | ⚠️ — caller history captured; leak narrowed to IPC entry path; full fix deferred to Session 15 (per-task ring + IPC entry instrumentation) |
+
+Track G's 24 h soak gate stays closed pending Bug #9 full closure.

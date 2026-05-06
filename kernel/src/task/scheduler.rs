@@ -1585,6 +1585,188 @@ fn record_preempt_ptr_update(
 // on zero-crossing is **explicitly deferred to Phase 57d**, see
 // `docs/roadmap/57d-voluntary-preemption.md`.
 
+// Phase 57e Bug #9 diagnostic — preempt_count caller-tracking ring.
+//
+// Records the call site of every `preempt_disable` / `preempt_enable` plus
+// the task_idx and pre/post counts.  Dumped from `dump_dispatch_state` for
+// any task observed with non-zero `preempt_count` at the watchdog
+// stale-ready trigger.  The ring is per-core so writes are uncontended;
+// reads are racy by design (we tolerate a few torn entries since this is
+// diagnostic-only).
+
+const PREEMPT_TRACE_RING_SIZE: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct PreemptTraceEntry {
+    /// Slot index of the task that owned `current_preempt_count_ptr` at the
+    /// moment of the op, or u32::MAX when the pointer targeted the per-core
+    /// dummy.
+    task_idx: u32,
+    /// 1 = preempt_disable, 2 = preempt_enable, 0 = empty.
+    op: u8,
+    /// Counter value BEFORE the op (so disable/enable pairs are visible).
+    pre_count: i16,
+    /// Counter value AFTER the op.
+    post_count: i16,
+    /// `Location::file()` of the immediate caller (via `#[track_caller]`).
+    file: &'static str,
+    /// `Location::line()` of the immediate caller.
+    line: u32,
+    /// Tick at which the op was recorded.
+    tick: u64,
+}
+
+const EMPTY_PREEMPT_TRACE_ENTRY: PreemptTraceEntry = PreemptTraceEntry {
+    task_idx: u32::MAX,
+    op: 0,
+    pre_count: 0,
+    post_count: 0,
+    file: "",
+    line: 0,
+    tick: 0,
+};
+
+struct PreemptTraceRing {
+    head: core::sync::atomic::AtomicUsize,
+    entries: core::cell::UnsafeCell<[PreemptTraceEntry; PREEMPT_TRACE_RING_SIZE]>,
+}
+
+unsafe impl Sync for PreemptTraceRing {}
+
+impl PreemptTraceRing {
+    const fn new() -> Self {
+        Self {
+            head: core::sync::atomic::AtomicUsize::new(0),
+            entries: core::cell::UnsafeCell::new(
+                [EMPTY_PREEMPT_TRACE_ENTRY; PREEMPT_TRACE_RING_SIZE],
+            ),
+        }
+    }
+
+    fn record(&self, entry: PreemptTraceEntry) {
+        let idx = self
+            .head
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            % PREEMPT_TRACE_RING_SIZE;
+        // SAFETY: per-core ring (writes uncontended on a single core); the
+        // racy-write tolerance comment above governs this access.  Writers
+        // run with IRQs masked at preempt-disable boundaries that already
+        // gated their callers, so a same-core ISR cannot tear a partial
+        // write here.
+        unsafe {
+            (*self.entries.get())[idx] = entry;
+        }
+    }
+
+    /// Snapshot the most recent `n` entries that match `task_idx`, in
+    /// chronological order (oldest → newest).  Returns the number of
+    /// matching entries written into `out`.
+    fn snapshot_matching(
+        &self,
+        task_idx: u32,
+        out: &mut [PreemptTraceEntry; PREEMPT_TRACE_RING_SIZE],
+    ) -> usize {
+        let head = self.head.load(core::sync::atomic::Ordering::Relaxed);
+        let mut n = 0usize;
+        // SAFETY: same as `record`.
+        let entries = unsafe { &*self.entries.get() };
+        // Walk the ring oldest → newest by reading from head forward modulo
+        // size (the slot at `head` is the oldest because head is a
+        // wrap-around write index).
+        for i in 0..PREEMPT_TRACE_RING_SIZE {
+            let entry = entries[(head + i) % PREEMPT_TRACE_RING_SIZE];
+            if entry.op == 0 {
+                continue;
+            }
+            if entry.task_idx == task_idx && n < out.len() {
+                out[n] = entry;
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+static PREEMPT_TRACE_RINGS: [PreemptTraceRing; crate::smp::MAX_CORES] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const RING: PreemptTraceRing = PreemptTraceRing::new();
+    [RING; crate::smp::MAX_CORES]
+};
+
+#[inline]
+fn record_preempt_trace(
+    op: u8,
+    pre: i32,
+    post: i32,
+    location: &'static core::panic::Location<'static>,
+) {
+    let Some(pc) = crate::smp::try_per_core() else {
+        return;
+    };
+    let core_id = pc.core_id as usize;
+    if core_id >= PREEMPT_TRACE_RINGS.len() {
+        return;
+    }
+    let task_idx = match get_current_task_idx() {
+        Some(i) => i as u32,
+        None => u32::MAX,
+    };
+    let entry = PreemptTraceEntry {
+        task_idx,
+        op,
+        pre_count: pre.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        post_count: post.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        file: location.file(),
+        line: location.line(),
+        tick: crate::arch::x86_64::interrupts::tick_count(),
+    };
+    PREEMPT_TRACE_RINGS[core_id].record(entry);
+}
+
+/// Dump the most recent `preempt_disable` / `preempt_enable` operations
+/// recorded for `task_idx` across all per-core rings.  Used by
+/// `dump_dispatch_state` when a task is observed with non-zero
+/// `preempt_count` so the next forensic capture can identify the unbalanced
+/// call site.
+fn dump_preempt_trace_for_task(task_idx: usize) {
+    let mut buf: [PreemptTraceEntry; PREEMPT_TRACE_RING_SIZE] =
+        [EMPTY_PREEMPT_TRACE_ENTRY; PREEMPT_TRACE_RING_SIZE];
+    let n_cores = crate::smp::core_count();
+    let mut total = 0usize;
+    for core_id in 0..n_cores {
+        let n = PREEMPT_TRACE_RINGS[core_id as usize].snapshot_matching(task_idx as u32, &mut buf);
+        if n == 0 {
+            continue;
+        }
+        for entry in &buf[..n] {
+            let op_label = match entry.op {
+                1 => "DISABLE",
+                2 => "ENABLE ",
+                _ => "?      ",
+            };
+            log::warn!(
+                "[sched] dispatch-dump:   preempt-trace core={} task_idx={} {} pre={} post={} caller={}:{} tick={}",
+                core_id,
+                entry.task_idx,
+                op_label,
+                entry.pre_count,
+                entry.post_count,
+                entry.file,
+                entry.line,
+                entry.tick,
+            );
+        }
+        total += n;
+    }
+    if total == 0 {
+        log::warn!(
+            "[sched] dispatch-dump:   preempt-trace task_idx={} (no entries — ring exhausted or never written)",
+            task_idx
+        );
+    }
+}
+
 /// Phase 57b D.2 — increment the per-task preempt-disable counter.
 ///
 /// Reads [`crate::smp::PerCoreData::current_preempt_count_ptr`] with
@@ -1607,6 +1789,7 @@ fn record_preempt_ptr_update(
 /// loop" bugs at the boundary instead of letting them silently overflow
 /// the counter.
 #[inline]
+#[track_caller]
 pub fn preempt_disable() {
     // Phase 57b F.1 — `IrqSafeMutex::lock` now calls this helper on every
     // lock acquisition, including a few callsites reachable before per-core
@@ -1634,7 +1817,27 @@ pub fn preempt_disable() {
     // `Box<Task>::preempt_count` whose address Track B's `Vec<Box<Task>>`
     // storage keeps stable for the task's lifetime.  In both cases the
     // pointee outlives this load.
-    let new_value = unsafe { (*ptr).fetch_add(1, core::sync::atomic::Ordering::Acquire) } + 1;
+    let prev = unsafe { (*ptr).fetch_add(1, core::sync::atomic::Ordering::Acquire) };
+    let new_value = prev + 1;
+    let location = core::panic::Location::caller();
+    record_preempt_trace(1, prev, new_value, location);
+    // Phase 57e Bug #9 — immediate warning when nesting exceeds the
+    // expected maximum (preempt_disable + IrqSafeMutex pi_lock + IrqSafeMutex
+    // scheduler_lock + IrqSafeMutex inner = 4).  A higher value indicates
+    // either a legitimate deeper nesting (worth knowing about) or an
+    // unbalanced disable that's accumulating — either way the next
+    // forensic capture wants the immediate caller.
+    if new_value >= 5
+        && PREEMPT_LEAK_LOG_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
+    {
+        log::warn!(
+            "[preempt-depth] count={} caller={}:{} (pre={}) — depth exceeds expected nesting",
+            new_value,
+            location.file(),
+            location.line(),
+            prev,
+        );
+    }
     debug_assert!(
         new_value <= 32,
         "preempt_disable depth exceeded the documented maximum of 32 \
@@ -1656,6 +1859,7 @@ pub fn preempt_disable() {
 /// Phase 57d.  See `docs/roadmap/57d-voluntary-preemption.md` for the
 /// design and the eventual zero-crossing wiring point.
 #[inline]
+#[track_caller]
 pub fn preempt_enable() {
     // Mirrors [`preempt_disable`]'s defensive `try_per_core` guard so the
     // F.1 wiring through `IrqSafeMutex::Drop` cannot panic on a path where
@@ -1690,9 +1894,11 @@ pub fn preempt_enable() {
     // would resume the chosen task with IF = 0 until its next
     // IRQ-disabled→enabled transition — silently breaking the
     // "tasks resume with their own RFLAGS" invariant.
+    let location = core::panic::Location::caller();
     #[cfg(feature = "preempt-voluntary")]
     {
         let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
+        record_preempt_trace(2, prev, prev - 1, location);
         if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
             #[cfg(feature = "preempt-full")]
             {
@@ -1720,7 +1926,8 @@ pub fn preempt_enable() {
     #[cfg(not(feature = "preempt-voluntary"))]
     // Safety: identical pointee invariant as [`preempt_disable`].
     unsafe {
-        (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
+        let prev = (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
+        record_preempt_trace(2, prev, prev - 1, location);
     }
 }
 
@@ -4738,6 +4945,13 @@ fn dump_dispatch_state() {
             row.preempt_count,
             row.saved_rsp,
         );
+        // Phase 57e Bug #9 — dump caller history for any task with a
+        // leaked preempt_count.  This is the deterministic capture that
+        // the next-session investigation needs to identify the
+        // unbalanced disable / enable call site.
+        if row.preempt_count != 0 {
+            dump_preempt_trace_for_task(row.idx);
+        }
     }
 
     log::warn!("[sched] dispatch-dump: end");
