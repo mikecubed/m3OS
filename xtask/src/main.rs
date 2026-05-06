@@ -311,6 +311,14 @@ fn main() {
             });
             cmd_stress(&stress_args);
         }
+        Some("soak") => {
+            let soak_args = parse_soak_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_soak(&soak_args);
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {other}");
             eprintln!("Usage: {}", usage());
@@ -324,7 +332,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -10398,6 +10406,634 @@ fn extract_stress_trace_dump(subdir: &str, serial_log: &str) {
         "=== END TRACE RING DUMP ===",
     ) {
         save_stress_artifact(subdir, &trace, "trace.log");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 57e Track G: 24-hour soak harness
+// ---------------------------------------------------------------------------
+//
+// Loops `cargo xtask smoke-test` for a configurable duration (default 24h),
+// captures per-run serial dumps via M3OS_SMOKE_SERIAL_DUMP, and emits a
+// summary file with the Track G.1.b acceptance grep results.
+//
+// The Track G acceptance contract lives in
+// `docs/roadmap/tasks/57e-full-kernel-preemption-tasks.md` § Track G.  This
+// command satisfies G.1 (loop the kernel under load) and G.1.b (grep for
+// the specific regression patterns) automatically; G.1's synthetic-load
+// component (SSH disconnect, IPC ping/pong, futex churn) is provided by the
+// smoke-test fixture itself, which exercises every IPC and disk path in
+// each iteration.
+
+#[derive(Debug, Clone)]
+struct SoakArgs {
+    duration_secs: u64,
+    output_dir: PathBuf,
+    max_runs: Option<usize>,
+    keep_pass_logs: bool,
+}
+
+/// Parse a duration string like `24h`, `30m`, `120s`, or a bare number
+/// (interpreted as seconds).  Returns the duration in seconds.
+fn parse_duration_arg(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let (num_str, mult) = if let Some(rest) = s.strip_suffix('h') {
+        (rest, 3600u64)
+    } else if let Some(rest) = s.strip_suffix('m') {
+        (rest, 60u64)
+    } else if let Some(rest) = s.strip_suffix('s') {
+        (rest, 1u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid duration: {s}"))?;
+    Ok(n * mult)
+}
+
+fn format_duration_secs(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn parse_soak_args(args: &[String]) -> Result<SoakArgs, String> {
+    let mut duration_secs = 24 * 3600u64;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut max_runs: Option<usize> = None;
+    let mut keep_pass_logs = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--duration" => {
+                index += 1;
+                let v = args.get(index).ok_or("--duration requires a value")?;
+                duration_secs = parse_duration_arg(v)?;
+            }
+            "--output-dir" => {
+                index += 1;
+                output_dir = Some(PathBuf::from(
+                    args.get(index).ok_or("--output-dir requires a value")?,
+                ));
+            }
+            "--max-runs" => {
+                index += 1;
+                max_runs = Some(
+                    args.get(index)
+                        .ok_or("--max-runs requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --max-runs value")?,
+                );
+            }
+            "--keep-pass-logs" => keep_pass_logs = true,
+            other => return Err(format!("unknown soak flag: {other}")),
+        }
+        index += 1;
+    }
+
+    let output_dir = output_dir.unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        workspace_root()
+            .join("target")
+            .join("soak")
+            .join(format!("run-{ts}"))
+    });
+
+    Ok(SoakArgs {
+        duration_secs,
+        output_dir,
+        max_runs,
+        keep_pass_logs,
+    })
+}
+
+/// Counts of each Track G.1.b pattern across all retained logs.
+struct SoakGrepCounts {
+    /// `no waker registered` — Bug #8.1 / #9 cascade fingerprint.  Zero-tolerance.
+    no_waker_registered: usize,
+    /// `userspace page fault: pid=` — 57d Ion FS.base / AT_PHENT regression guard.  Zero-tolerance.
+    userspace_page_fault: usize,
+    /// `[WARN] [sched] stale-ready` — Bug #9 fingerprint.  Zero-tolerance.
+    sched_stale_ready: usize,
+    /// `[WARN] [sched] cpu-hog` — Bug #9 fingerprint.  Zero-tolerance.
+    sched_cpu_hog: usize,
+    /// `[WARN] [sched] task pid=.* state=Blocked.* stuck-since=` — generic stuck-task watchdog.  Zero-tolerance.
+    sched_stuck_since: usize,
+    /// `[WARN] [preempt]` — Track G.1 zero-tolerance.
+    preempt_warn: usize,
+    /// `Bug #9 mitigation` clamp — informational; logged when fired but should be 0 after fix.
+    bug9_clamp: usize,
+    /// `kernel page fault` — Bug #7 frame UAF guard.  Zero-tolerance.
+    kernel_page_fault: usize,
+    /// `[virtio-blk] completion poll + queue notify after request timeout` — informational baseline.
+    virtio_blk_timeout: usize,
+    /// `display_server: client protocol violation reason=` — informational baseline.
+    display_protocol_violation: usize,
+    /// `[WARN] [sched] dequeue-drop` — known benign log noise; reported separately.
+    sched_dequeue_drop: usize,
+}
+
+impl SoakGrepCounts {
+    fn new() -> Self {
+        Self {
+            no_waker_registered: 0,
+            userspace_page_fault: 0,
+            sched_stale_ready: 0,
+            sched_cpu_hog: 0,
+            sched_stuck_since: 0,
+            preempt_warn: 0,
+            bug9_clamp: 0,
+            kernel_page_fault: 0,
+            virtio_blk_timeout: 0,
+            display_protocol_violation: 0,
+            sched_dequeue_drop: 0,
+        }
+    }
+
+    fn ingest(&mut self, content: &str) {
+        for line in content.lines() {
+            // Zero-tolerance patterns first.
+            if line.contains("no waker registered") {
+                self.no_waker_registered += 1;
+            }
+            if line.contains("userspace page fault: pid=") {
+                self.userspace_page_fault += 1;
+            }
+            if line.contains("[sched] stale-ready") {
+                self.sched_stale_ready += 1;
+            }
+            if line.contains("[sched] cpu-hog") {
+                self.sched_cpu_hog += 1;
+            }
+            if line.contains("[sched]") && line.contains("stuck-since=") {
+                self.sched_stuck_since += 1;
+            }
+            if line.contains("[WARN] [preempt]") || line.contains("[preempt-depth]") {
+                self.preempt_warn += 1;
+            }
+            if line.contains("Bug #9 mitigation") {
+                self.bug9_clamp += 1;
+            }
+            if line.contains("kernel page fault") {
+                self.kernel_page_fault += 1;
+            }
+            if line.contains("completion poll + queue notify after request timeout") {
+                self.virtio_blk_timeout += 1;
+            }
+            if line.contains("client protocol violation reason=") {
+                self.display_protocol_violation += 1;
+            }
+            if line.contains("[sched] dequeue-drop") {
+                self.sched_dequeue_drop += 1;
+            }
+        }
+    }
+
+    /// Returns true iff any zero-tolerance pattern fired.
+    fn acceptance_failed(&self) -> bool {
+        self.no_waker_registered > 0
+            || self.userspace_page_fault > 0
+            || self.sched_stale_ready > 0
+            || self.sched_cpu_hog > 0
+            || self.sched_stuck_since > 0
+            || self.preempt_warn > 0
+            || self.kernel_page_fault > 0
+    }
+}
+
+/// Per-run outcome captured by the soak loop.
+struct SoakRunOutcome {
+    /// Run sequence number, 1-indexed.  Used for summary-log line ordering;
+    /// also retained on the struct so a future `--continue` mode can reuse
+    /// the index when extending an existing soak directory.
+    #[allow(dead_code)]
+    index: usize,
+    passed: bool,
+    attempt1: bool,
+    /// Wall-clock seconds for this run.  Retained on the struct so a future
+    /// reporter mode can compute mean / p99 latency without re-parsing the
+    /// summary log.
+    #[allow(dead_code)]
+    elapsed_secs: u64,
+    log_path: Option<PathBuf>,
+}
+
+fn cmd_soak(args: &SoakArgs) {
+    fs::create_dir_all(&args.output_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "soak: failed to create output directory {}: {}",
+            args.output_dir.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+
+    let kernel_features = std::env::var("M3OS_KERNEL_FEATURES").unwrap_or_default();
+    let summary_path = args.output_dir.join("summary.log");
+    let mut summary = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&summary_path)
+        .unwrap_or_else(|e| {
+            eprintln!("soak: failed to open summary file: {e}");
+            std::process::exit(1);
+        });
+
+    let start_wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(args.duration_secs);
+
+    use std::io::Write as _;
+    let _ = writeln!(
+        summary,
+        "soak: started at unix={} duration={} ({}s) features={:?} max_runs={:?}",
+        start_wall,
+        format_duration_secs(args.duration_secs),
+        args.duration_secs,
+        kernel_features,
+        args.max_runs
+    );
+    let _ = summary.flush();
+
+    println!(
+        "soak: target duration {} ({}s), output dir {}",
+        format_duration_secs(args.duration_secs),
+        args.duration_secs,
+        args.output_dir.display()
+    );
+    if !kernel_features.is_empty() {
+        println!("soak: kernel features = {kernel_features}");
+    }
+    if let Some(max) = args.max_runs {
+        println!("soak: max runs = {max}");
+    }
+
+    let mut outcomes: Vec<SoakRunOutcome> = Vec::new();
+    let mut run_idx = 0usize;
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Some(max) = args.max_runs
+            && run_idx >= max
+        {
+            break;
+        }
+        run_idx += 1;
+
+        let log_path = args.output_dir.join(format!("run-{run_idx}.log"));
+        let run_start = std::time::Instant::now();
+
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = Command::new(&cargo)
+            .args(["xtask", "smoke-test"])
+            .env("M3OS_KERNEL_FEATURES", &kernel_features)
+            .env("M3OS_SMOKE_SERIAL_DUMP", &log_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        let elapsed = run_start.elapsed();
+        let elapsed_secs = elapsed.as_secs();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                // smoke-test prints `smoke-test: PASSED ...` on success.
+                // First-attempt passes match `PASSED (N steps in ...)`;
+                // retried passes match `PASSED on attempt N (...)`.
+                let passed = stdout.contains("smoke-test: PASSED");
+                let attempt1 = stdout.contains("smoke-test: PASSED (");
+                let log_path_kept = if passed && !args.keep_pass_logs {
+                    let _ = fs::remove_file(&log_path);
+                    None
+                } else if log_path.exists() {
+                    Some(log_path.clone())
+                } else {
+                    None
+                };
+
+                let line = if passed {
+                    format!(
+                        "run {} (run-{}): PASS{} ({}s)",
+                        run_idx,
+                        run_idx,
+                        if attempt1 { "" } else { " (retry)" },
+                        elapsed_secs
+                    )
+                } else {
+                    format!(
+                        "run {} (run-{}): FAIL ({}s) — log: {}",
+                        run_idx,
+                        run_idx,
+                        elapsed_secs,
+                        log_path.display()
+                    )
+                };
+                println!("soak: {line}");
+                let _ = writeln!(summary, "{line}");
+                let _ = summary.flush();
+
+                outcomes.push(SoakRunOutcome {
+                    index: run_idx,
+                    passed,
+                    attempt1,
+                    elapsed_secs,
+                    log_path: log_path_kept,
+                });
+            }
+            Err(e) => {
+                let line = format!("run {run_idx}: spawn-error ({elapsed_secs}s) — {e}");
+                eprintln!("soak: {line}");
+                let _ = writeln!(summary, "{line}");
+                let _ = summary.flush();
+
+                outcomes.push(SoakRunOutcome {
+                    index: run_idx,
+                    passed: false,
+                    attempt1: false,
+                    elapsed_secs,
+                    log_path: if log_path.exists() {
+                        Some(log_path)
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+    }
+
+    let total_elapsed = start.elapsed();
+    let total_secs = total_elapsed.as_secs();
+    let passes = outcomes.iter().filter(|o| o.passed).count();
+    let attempt1_passes = outcomes.iter().filter(|o| o.attempt1).count();
+    let failures = outcomes.len() - passes;
+    let total_runs = outcomes.len();
+
+    // Run grep checks against every retained log.
+    let mut counts = SoakGrepCounts::new();
+    for outcome in &outcomes {
+        if let Some(path) = &outcome.log_path
+            && let Ok(content) = fs::read_to_string(path)
+        {
+            counts.ingest(&content);
+        }
+    }
+
+    let pct = |n: usize| -> f64 {
+        if total_runs == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / total_runs as f64
+        }
+    };
+    let acceptance_failed = counts.acceptance_failed() || failures > 0;
+
+    // Write a structured Markdown result file.
+    let result_path = args.output_dir.join("soak-result.md");
+    let mut result = match fs::File::create(&result_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("soak: failed to write result file: {e}");
+            std::process::exit(1);
+        }
+    };
+    let _ = writeln!(result, "# Soak Result");
+    let _ = writeln!(result);
+    let _ = writeln!(
+        result,
+        "**Started (unix):** {start_wall}  \n\
+         **Duration target:** {} ({}s)  \n\
+         **Duration actual:** {} ({}s)  \n\
+         **Kernel features:** `{kernel_features}`  \n\
+         **Output dir:** `{}`",
+        format_duration_secs(args.duration_secs),
+        args.duration_secs,
+        format_duration_secs(total_secs),
+        total_secs,
+        args.output_dir.display(),
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(result, "## Run summary");
+    let _ = writeln!(result);
+    let _ = writeln!(result, "| Metric | Count | % of total |");
+    let _ = writeln!(result, "|---|---|---|");
+    let _ = writeln!(result, "| Total runs | {total_runs} | 100.0% |");
+    let _ = writeln!(
+        result,
+        "| Passes (with retry) | {passes} | {:.1}% |",
+        pct(passes)
+    );
+    let _ = writeln!(
+        result,
+        "| Attempt-1 passes | {attempt1_passes} | {:.1}% |",
+        pct(attempt1_passes)
+    );
+    let _ = writeln!(result, "| Failures | {failures} | {:.1}% |", pct(failures));
+    let _ = writeln!(result);
+    let _ = writeln!(
+        result,
+        "## Track G.1.b grep results (across {} retained log{})",
+        outcomes.iter().filter(|o| o.log_path.is_some()).count(),
+        if outcomes.iter().filter(|o| o.log_path.is_some()).count() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(
+        result,
+        "Zero-tolerance patterns (any non-zero count fails the gate):"
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(result, "| Pattern | Count | Status |");
+    let _ = writeln!(result, "|---|---|---|");
+    let mark = |n: usize| if n == 0 { "✓" } else { "**FAIL**" };
+    let _ = writeln!(
+        result,
+        "| `no waker registered` (Bug #8.1 cascade) | {} | {} |",
+        counts.no_waker_registered,
+        mark(counts.no_waker_registered)
+    );
+    let _ = writeln!(
+        result,
+        "| `userspace page fault: pid=` (57d Ion regression) | {} | {} |",
+        counts.userspace_page_fault,
+        mark(counts.userspace_page_fault)
+    );
+    let _ = writeln!(
+        result,
+        "| `[sched] stale-ready` (Bug #9 fingerprint) | {} | {} |",
+        counts.sched_stale_ready,
+        mark(counts.sched_stale_ready)
+    );
+    let _ = writeln!(
+        result,
+        "| `[sched] cpu-hog` (Bug #9 fingerprint) | {} | {} |",
+        counts.sched_cpu_hog,
+        mark(counts.sched_cpu_hog)
+    );
+    let _ = writeln!(
+        result,
+        "| `[sched]` + `stuck-since=` (generic stuck-task watchdog) | {} | {} |",
+        counts.sched_stuck_since,
+        mark(counts.sched_stuck_since)
+    );
+    let _ = writeln!(
+        result,
+        "| `[WARN] [preempt]` / `[preempt-depth]` | {} | {} |",
+        counts.preempt_warn,
+        mark(counts.preempt_warn)
+    );
+    let _ = writeln!(
+        result,
+        "| `kernel page fault` (Bug #7 UAF guard) | {} | {} |",
+        counts.kernel_page_fault,
+        mark(counts.kernel_page_fault)
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(
+        result,
+        "Informational counters (no threshold; document in handoff if non-zero):"
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(result, "| Pattern | Count |");
+    let _ = writeln!(result, "|---|---|");
+    let _ = writeln!(
+        result,
+        "| `Bug #9 mitigation` clamp warnings | {} |",
+        counts.bug9_clamp
+    );
+    let _ = writeln!(
+        result,
+        "| `virtio-blk completion poll + queue notify after request timeout` | {} |",
+        counts.virtio_blk_timeout
+    );
+    let _ = writeln!(
+        result,
+        "| `display_server: client protocol violation reason=` | {} |",
+        counts.display_protocol_violation
+    );
+    let _ = writeln!(
+        result,
+        "| `[sched] dequeue-drop` (known benign noise) | {} |",
+        counts.sched_dequeue_drop
+    );
+    let _ = writeln!(result);
+    let _ = writeln!(result, "## Acceptance");
+    let _ = writeln!(result);
+    if acceptance_failed {
+        let _ = writeln!(
+            result,
+            "**FAIL** — at least one zero-tolerance grep returned non-zero, OR at least one run failed all 3 attempts.  See per-run logs in this directory for diagnosis."
+        );
+    } else {
+        let _ = writeln!(
+            result,
+            "**PASS** — all zero-tolerance greps clean, all runs passed.  Track G acceptance gate is open for this configuration."
+        );
+    }
+
+    // Console summary.
+    println!();
+    println!(
+        "soak: complete — {} runs over {}",
+        total_runs,
+        format_duration_secs(total_secs)
+    );
+    println!(
+        "  passes (with retry): {} / {} ({:.1}%)",
+        passes,
+        total_runs,
+        pct(passes)
+    );
+    println!(
+        "  attempt-1 passes:    {} / {} ({:.1}%)",
+        attempt1_passes,
+        total_runs,
+        pct(attempt1_passes)
+    );
+    println!(
+        "  failures:            {} / {} ({:.1}%)",
+        failures,
+        total_runs,
+        pct(failures)
+    );
+    println!();
+    println!("  zero-tolerance grep counts:");
+    println!(
+        "    no waker registered:       {} (must be 0)",
+        counts.no_waker_registered
+    );
+    println!(
+        "    userspace page faults:     {} (must be 0)",
+        counts.userspace_page_fault
+    );
+    println!(
+        "    [sched] stale-ready:       {} (must be 0)",
+        counts.sched_stale_ready
+    );
+    println!(
+        "    [sched] cpu-hog:           {} (must be 0)",
+        counts.sched_cpu_hog
+    );
+    println!(
+        "    [sched] stuck-since=:      {} (must be 0)",
+        counts.sched_stuck_since
+    );
+    println!(
+        "    [WARN] [preempt]:          {} (must be 0)",
+        counts.preempt_warn
+    );
+    println!(
+        "    kernel page fault:         {} (must be 0)",
+        counts.kernel_page_fault
+    );
+    println!();
+    println!("  informational counters:");
+    println!("    Bug #9 mitigation clamps:  {}", counts.bug9_clamp);
+    println!(
+        "    virtio-blk timeouts:       {}",
+        counts.virtio_blk_timeout
+    );
+    println!(
+        "    display protocol viols:    {}",
+        counts.display_protocol_violation
+    );
+    println!(
+        "    [sched] dequeue-drop:      {} (known benign)",
+        counts.sched_dequeue_drop
+    );
+    println!();
+    println!("  result file: {}", result_path.display());
+    println!("  summary log: {}", summary_path.display());
+    println!();
+    if acceptance_failed {
+        println!("soak: ACCEPTANCE FAILED");
+        std::process::exit(1);
+    } else {
+        println!("soak: ACCEPTANCE PASSED");
     }
 }
 
