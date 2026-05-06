@@ -1,70 +1,134 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (Session 13 in progress):**
+**Status (branch tip `1d764bc`, end of Session 14):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
-- **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
-- **Bug #8.1** (`BlockedOnReply` watchdog cascade — root cause was missing waker registration in `block_current_on_{recv,send,notif}_v2`, **not** the unbracketed pairs Session 10 patched) — **closed** in Session 11 (commit `da2e781`). Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced incident frequency under `sched-trace` overhead but did not close the structural race. Session 12's 10-iter soak: **0 cascades across all 10 runs**.
-- **Bug #8.2** (`prompt-ready` slow-boot timeout) — **partially mitigated**. The lost-wake fix in Session 11 also closed most of the slow-boot symptoms. Soak still shows occasional slow-boot but it's now retry-recoverable.
-- **Bug #9** (scheduling-fairness defect: `stale-ready` for 30 s + `cpu-hog` correlation) — **mechanism identified, partial mitigation landed, full fix deferred**. Session 13 confirmed the cause is a `preempt_count` leak on user tasks: leaked count > 0 makes the IRQ-side preempt gate (`peek_preempt_count_irq`) skip preempting both from user mode (`check_and_preempt_user`) and from kernel mode (`check_and_preempt_kernel`), monopolising the assigned core for 30+ s while co-resident Ready tasks starve. **Partial mitigation landed** — release-build clamp at user-mode return — but did NOT fully close the bug because leaked tasks stay parked in kernel mode and never reach the user-return boundary. **Track G's 24 h soak gate stays closed** until the leak source is found and fixed.
+- **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
+- **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
+- **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
+- **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **mechanism deeply characterised; leak narrowed to IPC entry path; full fix deferred to Session 15**.
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
-**Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
+**Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
+
+**Track G's 24 h soak gate stays closed** until Bug #9 closes.
 
 ---
 
-## Quick-start for the next session — Bug #8
+## ⭐ Quick-start for Session 15 — close Bug #9
 
 ### Reproducer
 
 ```bash
-M3OS_KERNEL_FEATURES="preempt-full,sched-trace" \
-  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-bug9.log \
   cargo xtask smoke-test
 ```
 
-Expect the smoke-test to pass on attempt 2 or 3 about 1 time in 5; otherwise it fails or terminates with one of the two patterns below in `/tmp/m3os-smoke-full.log` (the file holds the last failed attempt's serial because `M3OS_SMOKE_SERIAL_DUMP` writes only on error returns).
+Expect ~5/10 attempt-1 passes, ~9/10 with retry.  Failing attempts produce a `[sched] dispatch-dump:` block in `/tmp/m3os-bug9.log` with full diagnostic state (Session 13's `dump_dispatch_state`) AND per-task `preempt-trace` caller histories (Session 14's per-core trace ring).  When you see the block, the bug fingerprint is unambiguous.
 
-### Two failure shapes (Bug #8)
+### Bug #9 fingerprint (deterministic across runs)
 
-1. **`BlockedOnReply` cascade.** `pid=18 fork-child state=BlockedOnWait` (smoke-runner waitpid'ing the tcc forkchild) plus `pid=21 fork-child state=BlockedOnReply` (the tcc subprocess waiting for an IPC reply that never arrives). Stuck-since values run for 100+ s. This is the same shape as the original Sessions 1–3 lost-wakeup family — Sessions 3–4 attributed it to the slab UAF zombieing a non-BSP core, but with Bug #7 closed the cascade still reproduces, so a separate Bug #6 variant survives the F2-partial helper coverage. See *Session 8 — root cause identified and fixed* below for the validation table.
-2. **`prompt-ready` slow boot.** `syslogd: prompt-ready gate timed out` and `sshd: prompt-ready gate timed out` after `display_server: compose#1500` or so. The boot is healthy (display_server keeps composing) but userspace services don't reach their readiness gate within the smoke-test timeout. May be the same wakeup issue surfacing earlier in boot, or a separate scheduling-cadence effect.
+```
+[sched] stale-ready watchdog: pid=N name=fork-child idx=I ready-age~Xms — dumping dispatch state
+...
+core=K current_idx=R queue=[T1, T2, ...]                ← K is one specific core; current_idx=R is RUNNING
+pid=A name=fork-child idx=R state=Running ... preempt_count=1 ...   ← idx=R holds the core
+pid=B name=fork-child idx=T1 state=Ready ... preempt_count=2 ...   ← starved Ready task
+pid=C ... idx=T2 state=Ready ... preempt_count=1 ...                 ← starved Ready task
+```
 
-### Files to pre-load for Bug #8
+**Two-three tasks on the same core all have non-zero `preempt_count` simultaneously**, with values 1 or 2.  The Running task with `preempt_count=1` cannot be preempted (the IRQ-side gate `peek_preempt_count_irq` reads non-zero and skips both `check_and_preempt_user` and `check_and_preempt_kernel`), so co-resident Ready tasks starve for 30+ s.  Pids and `task_idx` values reproduce identically between runs.
 
-- `kernel/src/ipc/endpoint.rs:340..850` — multi-step send/recv paths NOT covered by the F2-partial `deliver_message_and_wake` helper (which only covers 11 simple sites in `endpoint.rs` and `cleanup.rs`).
-- `kernel/src/task/scheduler.rs:1271-1283` — `save_user_return_state`, the function that read PROCESS_TABLE during yield_now and caused Bug #7. Now that we know yield_now under preempt-full is the main offender, audit every other site that mutates process state for a similar "PROCESS_TABLE updated then synchronous yield reads stale snapshot" race.
-- `kernel/src/task/scheduler.rs:1041-1060` — `enqueue_to_core` (the IPI send site that Sessions 2–3 explored as the IPI livelock). The bare-coalesce experiment was reverted; a smarter coalesce or wake-source rate limit may be the right move.
-- `kernel/src/arch/x86_64/syscall/mod.rs:4263-4475` — `sys_execve` (with the Bug #7 fix at line ~4413). The same race shape may still exist in fork's CoW-clone path.
-- `/tmp/m3os-smoke-full.log` — capture from the most recent failing attempt of the reproducer above.
+### What we know about the leak (the actionable narrowing)
 
-### Diagnostic infrastructure already in tree
+Session 14's per-core trace ring captured the canonical signature in `/tmp/m3os-bug9-repro/instr2-9.log`:
 
-The next session inherits a strong toolchain. Don't rebuild any of these:
+```
+[399] ENABLE  pre=2 post=1 caller=scheduler.rs:2870     ← block_current_until's POST-RESUME enable
+[400] DISABLE pre=1 post=2 caller=virtio_blk.rs:622     ← with_driver enter, on top of leaked 1
+[401] ENABLE  pre=2 post=1 caller=virtio_blk.rs:627     ← with_driver exit, returns to leaked 1
+... (count oscillates between 1 and 2; never returns to 0 in the visible window) ...
+[414] DISABLE pre=1 post=2 caller=scheduler.rs:2732     ← block_current_until's preempt_disable, pre=1
+[415] DISABLE pre=2 post=3 caller=scheduler.rs:307      ← pi_lock IrqSafeMutex::lock
+[416] DISABLE pre=3 post=4 caller=scheduler.rs:307      ← scheduler_lock IrqSafeMutex::lock
+```
 
-| Diagnostic | What it does | Source |
+**The smoking gun is `pre=1` at line 414**: `block_current_until`'s explicit `preempt_disable` on line 2732 is being called with the count already at 1.  `block_current_until` itself is balanced (preempt_enable at line 2870 fires after the matching `preempt_disable`), so the leaked `1` originated **upstream of `block_current_until`** and persists through the entire IPC operation.
+
+**The leak is in an IPC entry path that holds `preempt_disable` (or an `IrqSafeMutex` guard) across the call to `block_current_on_{recv,send,notif,reply}_v2`**.  These v2 helpers themselves don't take preempt_disable; their callers must.
+
+### Recommendation — concrete next steps for Session 15
+
+**Step 1 — Add IPC-entry preempt_count instrumentation.**  In `kernel/src/ipc/endpoint.rs`, at the very top of every public IPC entry (`recv_msg`, `recv_msg_nowait`, `recv_msg_with_notif`, `send_msg`, `send_msg_nowait`, `call_msg`, `reply`, `reply_recv`), log `preempt_count` if non-zero.  Budget the log to ~32 occurrences so it doesn't flood:
+
+```rust
+// Phase 57e Session 15 — Bug #9 leak isolation.  Log when an IPC entry
+// is reached with a non-zero preempt_count, identifying the syscall
+// handler that's holding preempt_disable across IPC.
+fn assert_preempt_count_zero_at_ipc_entry(name: &str) {
+    let pc = crate::task::scheduler::peek_preempt_count_irq();
+    if pc == 0 { return; }
+    let n = IPC_LEAK_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed);
+    if n > 0 {
+        log::warn!(
+            "[ipc-leak] {} entered with preempt_count={} pid={} — leak source upstream",
+            name, pc, crate::process::current_pid()
+        );
+    }
+}
+```
+
+Then run the reproducer.  The first warning pinpoints **which IPC entry is being called with a leaked count**; the leak source is in the syscall handler that called this IPC entry.
+
+**Step 2 — Trace the syscall handler.**  Once Step 1 names the IPC entry (say it's `recv_msg`), `grep -rn "recv_msg\b" kernel/src/arch/x86_64/syscall/` to find the syscall handlers that call into it.  For each candidate, look for an `IrqSafeMutex::lock` (or explicit `preempt_disable`) whose guard is held across the IPC call.  The fix is one of:
+
+- Drop the lock before the IPC call, re-acquire after.
+- Replace the `IrqSafeMutex` with a non-preempt-disabling lock if the critical section doesn't actually need IRQ protection.
+- Refactor to not hold any lock across blocking calls (the cleanest and most defensible fix).
+
+**Step 3 — Verify with the soak.**  Acceptance: `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes on attempt 1 for **10 runs in a row**, with zero `[ipc-leak]` warnings and zero `[sched] stale-ready watchdog` triggers.
+
+**Why NOT to add a per-task trace ring as Step 1 (alternative considered):** the per-core ring (1024 entries) already proves the leak is upstream of `block_current_until`.  Per-task ring would localise the disable→enable mismatch but is more invasive (modifies `Task` struct).  IPC-entry instrumentation is cheaper and directly answers "which syscall handler holds the leaking preempt_disable?".
+
+### Why the partial mitigations didn't close it
+
+- **Session 13's user-return clamp** (release-build `assert_preempt_count_zero_at_user_return` now zeroes the counter and logs) is correct in principle but never fires in the failing case because the leaked tasks stay parked in kernel mode (blocked on IPC) and never reach the user-return boundary.
+- **Session 14's caller-tracking** identified `block_current_until` as a participant but proved it's not the leak source itself — its `pre=1` entry shows the leak comes from upstream.
+
+### Diagnostic infrastructure already in tree (don't rebuild)
+
+| Diagnostic | What it does | Where |
 |---|---|---|
-| `[mm] addr-space layout` boot log | One-shot at `mm::init` showing `KERNEL_PML4_PHYS`, bootloader phys-offset (with PML4 idx), heap range (with PML4 idx), and a collide flag. | `kernel/src/mm/mod.rs` (commit `8567dbc`) |
-| Page-fault PT-walk diagnostic (`[pf-diag]`) | Walks the four-level page table for the fault address from BOTH active CR3 PML4 and `KERNEL_PML4_PHYS`, printing each level's flags + addr. Wired into both ring-0 and ring-3 not-present fault paths. | `kernel/src/arch/x86_64/interrupts.rs` (commit `78417ee`) |
-| Per-frame allocate/free trace ring (`[frame-trace]`) | Global 16 384-entry ring keyed by physical frame address, recording every alloc/free with `#[track_caller]` location. Dumped on kernel page fault, filtered to the active CR3 frame's lifecycle. | `kernel/src/mm/frame_trace.rs`, wired in `frame_allocator.rs` (commit `b23a24c`) |
-| `[free_pt] !!!` defensive sanity check | WARN log if `free_process_page_table` is called with `cr3_phys == active CR3` (the Bug #7 race signature). Silent under correct operation. | `kernel/src/mm/mod.rs` (commits `b23a24c`, `22cd711`) |
-| `M3OS_SMOKE_SERIAL_DUMP=<path>` env var | `xtask smoke-test` writes full serial history to the path on every error return; trim threshold bumped from 192 KiB to 24 MiB so the deferred trace-ring dump fits. | `xtask/src/main.rs` (commit `d5da120`) |
+| `dump_dispatch_state` watchdog dump | One-shot per boot when a Ready task is stale > 5 s.  Prints per-core run queues, per-task state / preempt_count / saved_rsp, plus `dump_preempt_trace_for_task` for any task with non-zero count. | `kernel/src/task/scheduler.rs` (commit `cdd0c0f`) |
+| Per-core preempt trace ring (1024 entries) | Records every `preempt_disable` / `preempt_enable` with `(task_idx, op, pre, post, file, line, tick)`.  Dumped from `dump_dispatch_state`. | `kernel/src/task/scheduler.rs` (commit `1d764bc`) |
+| User-return clamp + warning | Release-build clamp on `assert_preempt_count_zero_at_user_return` — logs `[preempt] count=N pid=X at user-mode return — clamping to 0 (Bug #9 mitigation)` (budgeted 32). | `kernel/src/task/scheduler.rs` (commit `cdd0c0f`) |
+| Depth-exceeded warning | Immediate `[preempt-depth] count=N caller=X:Y` when `preempt_disable` would push count above 4 (legitimate max nesting). | `kernel/src/task/scheduler.rs` (commit `1d764bc`) |
+| Trace-ring dispatch dump (existing) | Per-core scheduler trace ring (4096 entries / core) — `WakeTask`, `RunQueueEnqueue`, `Dispatch`, `SwitchOut`, `RecvBlock`, `CallBlock`, etc.  Dumped on stuck-no-waker watchdog hit. | `kernel/src/task/scheduler.rs` (commits `78417ee`, `8567dbc`, ...) |
+| `M3OS_SMOKE_SERIAL_DUMP=<path>` env var | `xtask smoke-test` writes full serial history to path on every error return. | `xtask/src/main.rs` (commit `d5da120`) |
+| `[mm] addr-space layout` boot log | One-shot at `mm::init` showing `KERNEL_PML4_PHYS` / phys_offset / heap range / collide flag. | `kernel/src/mm/mod.rs` (commit `8567dbc`) |
+| Page-fault PT-walk diagnostic (`[pf-diag]`) | Walks the four-level page table for fault address from active CR3 PML4 and `KERNEL_PML4_PHYS`. | `kernel/src/arch/x86_64/interrupts.rs` (commit `78417ee`) |
+| Per-frame allocate/free trace ring (`[frame-trace]`) | Global 16 384-entry ring keyed by physical frame address, dumped on kernel page fault. | `kernel/src/mm/frame_trace.rs` (commit `b23a24c`) |
+| `[free_pt] !!!` defensive sanity check | WARN if `free_process_page_table` is called with `cr3_phys == active CR3` (the Bug #7 race signature). | `kernel/src/mm/mod.rs` (commits `b23a24c`, `22cd711`) |
 
-### Approach hints
+### Files to pre-load for Session 15
 
-If you start with the cascade (Bug #8.1), the cleanest first step is to add `track_caller` chains through the 11 simple `deliver_message_and_wake` sites and grep for any other `deliver_message + wake_task_v2` pair the helper missed. The kernel scheduler trace ring (already enabled when `M3OS_KERNEL_FEATURES` includes `sched-trace`) records `WakeTask`, `RunQueueEnqueue`, `Dispatch` per core; on a stuck-no-waker watchdog hit the deferred trace dump fires automatically.
+- `kernel/src/ipc/endpoint.rs` — IPC entry points: `recv_msg`, `recv_msg_nowait`, `recv_msg_with_notif`, `send_msg`, `send_msg_nowait`, `call_msg`, `reply`.  Where the IPC-entry instrumentation goes.  Where to look for `IrqSafeMutex` guards held across blocking calls.
+- `kernel/src/arch/x86_64/syscall/mod.rs` — syscall dispatch.  Search for the IPC syscalls (`sys_ipc_*`) and trace what locks they hold across the IPC call.
+- `kernel/src/task/scheduler.rs:2620-2880` — `block_current_until` (preempt_disable at line ~2732, preempt_enable at lines ~2748 / 2845 / 2870).
+- `kernel/src/task/scheduler.rs:1610-1900` — `preempt_disable` / `preempt_enable` (with current trace instrumentation), `peek_preempt_count_irq`, `assert_preempt_count_zero_at_user_return` (with current Bug #9 release-build clamp).
+- `kernel/src/task/scheduler.rs:4720-4900` — `dump_dispatch_state`, `watchdog_scan` (stale-ready trigger).
+- `/tmp/m3os-bug9-repro/instr2-9.log`, `/tmp/m3os-bug9-repro/instr2-4.log` — Session 14 captured failures.  Use as reference for the trace pattern to expect.
 
-If you start with the slow-boot pattern (Bug #8.2), it might just be the same lost-wakeup but on a different IPC pair (e.g. the syslogd readiness handshake to init), so the same fix may close both.
+### Acceptance criteria for closing Bug #9
 
-### Acceptance criteria for closing Bug #8
+1. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes on attempt 1 for **10 runs in a row**.
+2. Zero `[sched] stale-ready watchdog` triggers across those 10 runs.
+3. Zero `[ipc-leak]` warnings (Step 1 instrumentation) across those 10 runs.
+4. Zero `[preempt] count=N pid=X at user-mode return — clamping` warnings across those 10 runs.
+5. `cargo xtask check` stays green.
 
-1. `M3OS_KERNEL_FEATURES=preempt-full cargo xtask smoke-test` passes on attempt 1 (no retries) for **10 runs in a row**.
-2. Zero `(no waker registered)` watchdog warnings across those 10 runs.
-3. `cargo xtask check` stays green.
-
-When (1)–(3) pass, reopen Track G's 24 h soak gate (still gated on the `run-gui` doom + TAB criteria from the Sessions 1 reproducers, which were never re-verified after the Bug #7 fix).
-
-This handoff describes three reproducible userspace correctness failures that the previous handoff classified as "Bug #6 family — performance / quality, NOT correctness." The failure logs in `m3os-bad-term.log`, `m3os-freeze-term.log`, and `m3os.log` show that those warnings are not benign — they coincide with hangs that block forward progress. The classification needs to be revised and the underlying race fixed before Track G's 24 h soak gate can open.
+When (1)–(5) pass, reopen Track G's 24 h soak gate.
 
 ---
 
