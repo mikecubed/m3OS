@@ -86,6 +86,13 @@ pub enum TraceEvent {
     YieldNow {
         task_idx: u32,
         core: u8,
+        /// Source file of the `yield_now()` call site.  Populated via
+        /// `#[track_caller]` / `core::panic::Location::caller()` so a
+        /// repeated yield-loop fingerprint identifies the exact kernel
+        /// function that's busy-yielding.  Phase 57e Bug #12 follow-up
+        /// after the eager-yield-removal regression.
+        caller_file: &'static str,
+        caller_line: u32,
     },
     BlockCurrent {
         task_idx: u32,

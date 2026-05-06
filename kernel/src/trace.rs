@@ -117,8 +117,13 @@ fn print_trace_event(event: &TraceEvent) {
         } => _panic_print(format_args!(
             "SwitchOut {{ task_idx: {task_idx}, core: {core}, saved_rsp: {saved_rsp:#x} }}"
         )),
-        TraceEvent::YieldNow { task_idx, core } => _panic_print(format_args!(
-            "YieldNow {{ task_idx: {task_idx}, core: {core} }}"
+        TraceEvent::YieldNow {
+            task_idx,
+            core,
+            caller_file,
+            caller_line,
+        } => _panic_print(format_args!(
+            "YieldNow {{ task_idx: {task_idx}, core: {core}, caller={caller_file}:{caller_line} }}"
         )),
         TraceEvent::BlockCurrent {
             task_idx,

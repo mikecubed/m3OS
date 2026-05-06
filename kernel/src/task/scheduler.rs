@@ -2279,7 +2279,14 @@ fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extr
 }
 
 /// Yield the current task back to the scheduler.
+#[track_caller]
 pub fn yield_now() {
+    // Phase 57e Bug #12 follow-up: capture the call site so the trace ring
+    // identifies WHICH kernel function is busy-yielding.  Surfaces yield-loops
+    // (`while cond { yield_now() }` patterns in `nanosleep_for`, the short-
+    // sleep TSC spin, etc.) by their source file:line, so a failure mode that
+    // depends on the eager-yield in `preempt_enable` can be localised.
+    let location = core::panic::Location::caller();
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
@@ -2323,6 +2330,8 @@ pub fn yield_now() {
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::YieldNow {
         task_idx: idx as u32,
         core: my_core as u8,
+        caller_file: location.file(),
+        caller_line: location.line(),
     });
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
