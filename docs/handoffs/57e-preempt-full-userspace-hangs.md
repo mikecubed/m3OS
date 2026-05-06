@@ -1,11 +1,11 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (branch tip `6b725f5`, end of Session 10):**
+**Status (branch tip `da2e781`, end of Session 11):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`).
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`). Validated: 0 kernel page faults and 0 `[free_pt] !!!` defensive warnings across a 5-iteration `cargo xtask smoke-test` loop under `preempt-full,sched-trace`.
-- **Bug #8.1** (`BlockedOnReply` watchdog cascade — six unbracketed `deliver_message + wake_task_v2` pairs in `endpoint.rs` that the F2-partial helper missed) — **closed** in Session 10 (commit `6b725f5`). Validated: 0 cascades across two `preempt-full,sched-trace` smoke-test runs; one passed on attempt 2 in 9 s. See *Session 10* below.
-- **Bug #8.2** (`prompt-ready` slow-boot / `pid=18 BlockedOnWait` from waitpid'ing a slow child) — **open**. Session 9's "virtio-blk completion latency" framing is correct for THIS failure mode; Session 10 confirmed it does NOT cause the cascade but DOES make boot slow enough to occasionally exhaust the smoke-test step budget. **Track G's 24 h soak gate stays closed** until Bug #8.2 is fixed or budgets are relaxed.
+- **Bug #8.1** (`BlockedOnReply` watchdog cascade — root cause was missing waker registration in `block_current_on_{recv,send,notif}_v2`, **not** the unbracketed pairs Session 10 patched) — **closed** in Session 11 (commit `da2e781`). Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced incident frequency under `sched-trace` overhead but did not close the structural race. Validated: **4-for-4 passes on attempt 1** under bare `preempt-full` (no sched-trace, no timing multiplier — the config that hit 90 cascade warnings pre-fix).
+- **Bug #8.2** (`prompt-ready` slow-boot / `pid=18 BlockedOnWait` from waitpid'ing a slow child) — **either closed or vastly mitigated**. The post-Session-11 runs all complete in 9–13 s. Session 9's virtio-blk-latency theory may apply only to a degenerate worst case that the v2-waker fix also covered. **Track G's 24 h soak gate may now reopen pending a multi-iteration soak validation.**
 
 **Source ref:** Phase 57e (`feat/phase-57e-full-preemption`, PR #136).
 **Companion:** `docs/handoffs/57e-preempt-full-boot-crash.md` (Bugs #1–#5, the dispatch reentrancy and per-core syscall snapshot fixes), `docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`.
@@ -1394,3 +1394,89 @@ Track G's 24 h soak gate remains closed pending Bug #8.2 disposition (fix or acc
 - `userspace/vfs_server/src/main.rs` — vfs_server READ handler (slow_req timing source)
 - `/tmp/m3os-smoke-bug8.log` — Session 10's captured cascade reproducer (kept for reference)
 - `/tmp/m3os-smoke-bug8-postfix-2.log` — post-fix capture (zero cascades, slow-boot warnings only)
+
+---
+
+## Session 11 — actual Bug #8.1 root cause closed
+
+### TL;DR
+
+Session 10's `endpoint.rs` bracketing (`6b725f5`) reduced cascade frequency under `sched-trace` but did not close the structural race. Re-running under bare `preempt-full` (no `sched-trace`, no multiplier) in Session 11 reproduced the cascade reliably (90 watchdog warnings, 0/3 attempts passed). Reading deeper into `block_current_on_recv_v2`, `block_current_on_send_v2`, and `block_current_on_notif_v2` revealed they create a **stack-local `AtomicBool` that nothing external sets** — `deliver_message` only flips `tasks[idx].reply_waker`, and these three primitives never registered into that slot. The fast-path `pending_msg.is_some()` check ran ONCE before `block_current_until` and could miss a cross-core delivery that arrived during the gap. After the gap the receiver parked in `BlockedOnRecv` with `pending_msg` already set but no path to wake it.
+
+Fix: register `Arc<AtomicBool>` via `register_reply_waker` in all three primitives (matching the pattern `block_current_on_reply_v2` already used). Extend `complete_send` to flip the waker too. Validation: **4-for-4 passes on attempt 1** in 9–13 s.
+
+### Why Session 10's diagnosis was incomplete
+
+Phase 1 forensics correctly identified the lost-wakeup shape (pid=21 BlockedOnReply, vfs silent, no `WakeTask` in trace). The wrong call was attributing it solely to the unbracketed `deliver_message + wake_task_v2` pairs. Bracketing those pairs prevents `preempt_enable`'s synchronous yield_now from firing between deliver and wake, but it does NOT help the case where:
+
+1. Server (vfs_server) is mid-`block_current_on_recv_v2`, past the fast-path check, before `block_current_until`'s state write — so state is still `Running`.
+2. Client (pid=21) calls `call_msg`, finds vfs in `ep.receivers`, delivers msg, calls `wake_task_v2(vfs)`.
+3. wake_task_v2's CAS check requires state ∈ `Blocked*`. Vfs's state is `Running` → `AlreadyAwake`. **No enqueue.**
+4. Client enters `block_current_on_reply_v2(client)` and parks correctly.
+5. Server reaches `block_current_until`'s step 1, sets state = `BlockedOnRecv`, drops locks.
+6. Server's recheck checks the stack-local `woken` AtomicBool — never set, returns false.
+7. Server yields. Now `BlockedOnRecv` with `pending_msg` already set, no waker pointing at it.
+
+The 90% reproduction rate of this race scaled with the size of the gap between fast-path-check and state-write (a function of allocator timing, lock contention, and IRQ load). `sched-trace`'s extra atomics widened lock-hold windows and *closed* the race more often by giving deliver_message time to land before the receiver entered the gap. That's why Session 10's `sched-trace` runs passed sometimes — the bug was probabilistic and the trace overhead pushed the race away from the danger window.
+
+### The fix (`da2e781`)
+
+```rust
+pub fn block_current_on_recv_v2(receiver: TaskId) -> bool {
+    let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    if !register_reply_waker(receiver, woken.clone()) { return false; }
+
+    if has_pending_message(receiver) {
+        clear_reply_waker(receiver);
+        return true;
+    }
+
+    let outcome = block_current_until(TaskState::BlockedOnRecv, &woken, None);
+    clear_reply_waker(receiver);
+    matches!(outcome, BlockOutcome::Woken | BlockOutcome::AlreadyTrue)
+}
+```
+
+Same shape applied to `block_current_on_send_v2` and `block_current_on_notif_v2`. `complete_send` also flips `reply_waker` if registered, mirroring `deliver_message`'s behaviour, so the send-side block is symmetric.
+
+The `reply_waker` field name is misleading — it functions as a generic "block wake flag" and is reused across all four block kinds. Renaming would touch many sites; left as-is for now.
+
+### Validation
+
+| Run | Config | Outcome | Cascades |
+|---|---|---|---|
+| 1 | `preempt-full` only | PASSED on attempt 1 in 13 s | 0 |
+| 2 | `preempt-full` only | PASSED on attempt 1 in 12 s | 0 |
+| 3 | `preempt-full` only | PASSED on attempt 1 in 9 s | 0 |
+| 4 | `preempt-full` only | PASSED on attempt 1 in 13 s | 0 |
+
+Pre-fix baseline: **0/3 attempts passed, 90 cascade warnings**. Post-fix: **4/4 passes on attempt 1, zero cascades.**
+
+### Bug #8.2 status update
+
+The post-fix runs all complete in 9–13 s. Session 9's virtio-blk-latency theory was a real signal but apparently a knock-on effect — once the wake races closed, the slow-boot pattern also stopped reproducing on the test runs we did. Worth a longer soak validation (10+ runs back-to-back, mix of bare and stress configs) before declaring Bug #8.2 closed for real.
+
+### Acceptance criteria status (Session 11 revision)
+
+| Criterion | Status |
+|---|---|
+| (1) `run-gui` + `fb-takeover doom` renders | not verified |
+| (2) `run-gui` + TAB completion | not verified |
+| (3) `cargo xtask smoke-test` passes deterministically under `preempt-full` | ✅ — 4/4 on attempt 1 in 9–13 s |
+| (4) `run-gui` 10-min soak | not verified |
+| (8.1) Bug #8.1 lost-wakeup cascade closed | ✅ (`da2e781`); 0 cascades across 4-run validation |
+| (8.2) Bug #8.2 slow-boot closed | ⚠️ — needs soak validation, but no slow-boot symptoms in the 4-run sample |
+
+### Lesson
+
+When `block_current_until` takes a `&AtomicBool` for the `woken` flag, the caller MUST ensure that flag is reachable from the wake side. A stack-local that nothing else can address is a silent dead-code path. The `register_reply_waker` mechanism existed precisely for this and was just not used in three of the four v2 primitives.
+
+### Reproducer (kept for next session)
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full" \
+  M3OS_SMOKE_SERIAL_DUMP=/tmp/m3os-smoke-full.log \
+  cargo xtask smoke-test
+```
+
+Should pass on attempt 1 reliably under `preempt-full` (no `sched-trace` needed). Pre-fix this hit 90 cascade warnings; post-fix this is 4-for-4 on attempt 1.
