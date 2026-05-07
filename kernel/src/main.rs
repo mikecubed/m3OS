@@ -325,23 +325,24 @@ fn init_task() -> ! {
     // Phase 57e Bug #6 (closed): the original `loop { task::yield_now(); }`
     // under preempt-full got stuck in `preempt_enable`'s zero-crossing
     // synchronous-yield branch.  Closed in 8b44442 (Bug #12 part 5) when
-    // the eager-yield branch was removed globally — preempt_enable now
-    // defers via preempt_resched_pending in both modes.
+    // the eager-yield branch was removed globally.
     //
-    // Phase 57e Bug #11 (closed): a previous `loop { enable_and_hlt() }`
-    // under preempt-full halted BSP forever and starved BSP-resident
-    // services because timer-driven kernel-mode preemption was the only
-    // path back to the scheduler — see Session 16.
+    // Phase 57e Bug #11 (closed): a `loop { enable_and_hlt() }` halts BSP
+    // and starves BSP-resident services if the only path back to the
+    // scheduler is timer-driven kernel-mode preemption.  Closed by both
+    // closing Bug #6 and (under voluntary) cooperatively yielding.
     //
-    // Phase 57e Bug #12 part 7 (a1bfe17): removed timer-driven kernel-mode
-    // preemption.  Pure `enable_and_hlt` would now hang under preempt-full
-    // *and* preempt-voluntary because no timer-driven path back to the
-    // scheduler remains for kernel-mode tasks.  Use the
-    // `enable_and_hlt(); yield_now();` pattern in both modes so
-    // init_task gives the scheduler a dispatch point on every loop
-    // iteration while still parking the CPU between work bursts.
+    // Phase 57e Bug #12 part 7 (a1bfe17 + this commit): drop the hlt
+    // that was added in eb1f13d.  hlt parks the BSP between yields,
+    // adding up to 1 ms of latency on every same-core wake (BSP can
+    // only re-yield after the next IRQ).  Voluntary mode had this
+    // pattern correct at 052010a: just yield_now(), no hlt.  Match
+    // voluntary's pattern in both modes — yes, it's a busy-yield loop
+    // (BSP doesn't sleep when fully idle), but the busy-yield is what
+    // kept voluntary lag-free, and the scheduler sees BSP's queue
+    // immediately on each iteration.  Power-saving tradeoffs can be
+    // revisited once the latency model is settled.
     loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
         task::yield_now();
     }
 }
