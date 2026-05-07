@@ -3995,13 +3995,6 @@ pub fn run() -> ! {
                     core_id
                 );
                 set_current_task_idx(Some(idx));
-                // Phase 57e Bug #12 part 6 — mirror start_tick to per-core
-                // data so the timer ISR's `check_and_preempt_kernel` can
-                // read the dispatch tick without acquiring scheduler_lock.
-                if let Some(pc) = crate::smp::try_per_core() {
-                    pc.current_dispatch_start_tick
-                        .store(now, core::sync::atomic::Ordering::Relaxed);
-                }
                 crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
                     task_idx: idx as u32,
                     core: core_id,
