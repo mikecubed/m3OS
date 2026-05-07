@@ -322,31 +322,26 @@ fn init_task() -> ! {
     spawn_userspace_init();
 
     log::info!("[init] service set started — yielding");
-    // Phase 57e Bug #6: under preempt-full, `loop { task::yield_now(); }`
-    // gets stuck in `preempt_enable`'s zero-crossing synchronous-yield
-    // branch (`scheduler.rs:1693-1714`) whenever cross-core IPC traffic
-    // keeps setting `reschedule = true` on the core init_task ended up
-    // on, monopolising that core for 30+ seconds with no userspace
-    // progress.  Halting solves it cleanly under preempt-full.
+    // Phase 57e Bug #6 (closed): the original `loop { task::yield_now(); }`
+    // under preempt-full got stuck in `preempt_enable`'s zero-crossing
+    // synchronous-yield branch.  Closed in 8b44442 (Bug #12 part 5) when
+    // the eager-yield branch was removed globally — preempt_enable now
+    // defers via preempt_resched_pending in both modes.
     //
-    // BUT under preempt-voluntary, kernel-mode tasks are NOT preempted
-    // by the timer; they yield cooperatively.  init_task running on BSP
-    // with `loop { enable_and_hlt() }` would halt forever and never
-    // give the scheduler a yield-driven dispatch point — co-resident
-    // tasks on BSP's run queue would starve.  This was a regression
-    // observed on real hardware (kbd_server / mouse_server /
-    // display_server hanging at "starting" because their wake events
-    // landed on BSP and couldn't dispatch) — see
-    // `docs/handoffs/57e-preempt-full-userspace-hangs.md` Session 16.
+    // Phase 57e Bug #11 (closed): a previous `loop { enable_and_hlt() }`
+    // under preempt-full halted BSP forever and starved BSP-resident
+    // services because timer-driven kernel-mode preemption was the only
+    // path back to the scheduler — see Session 16.
     //
-    // Cfg-gate the change: halt under preempt-full, yield under
-    // preempt-voluntary.  Same pattern `idle_task` uses (see commit
-    // `38d35ea`).
+    // Phase 57e Bug #12 part 7 (a1bfe17): removed timer-driven kernel-mode
+    // preemption.  Pure `enable_and_hlt` would now hang under preempt-full
+    // *and* preempt-voluntary because no timer-driven path back to the
+    // scheduler remains for kernel-mode tasks.  Use the
+    // `enable_and_hlt(); yield_now();` pattern in both modes so
+    // init_task gives the scheduler a dispatch point on every loop
+    // iteration while still parking the CPU between work bursts.
     loop {
-        #[cfg(feature = "preempt-full")]
         x86_64::instructions::interrupts::enable_and_hlt();
-
-        #[cfg(not(feature = "preempt-full"))]
         task::yield_now();
     }
 }
@@ -554,9 +549,14 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 /// a 30-second livelock equivalent to the Bug #6 init_task pattern.  Same
 /// mitigation: just halt.
 fn idle_task() -> ! {
+    // Phase 57e Bug #12 part 7 — yield in both modes.  Bug #6's eager-
+    // yield livelock is closed (8b44442); the `yield_now` is now a
+    // simple cooperative dispatch point.  Bug #12 part 7 (a1bfe17)
+    // removed timer-driven kernel-mode preemption, so a pure
+    // `enable_and_hlt` loop can no longer rely on the timer ISR to
+    // kick the scheduler — the explicit yield_now is now load-bearing.
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
-        #[cfg(not(feature = "preempt-full"))]
         task::yield_now();
     }
 }

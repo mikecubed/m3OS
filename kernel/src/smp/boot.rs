@@ -456,14 +456,15 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
 /// Idle task for AP cores — halts until an interrupt wakes the core,
 /// then yields back to the scheduler so newly ready tasks can run.
 ///
-/// See [`crate::idle_task`] for the rationale on the cfg-gated `yield_now`.
-/// Under `preempt-full` the yield triggers the same Bug #6 livelock that
-/// monopolises this core via `preempt_enable`'s zero-crossing branch when
-/// cross-core IPC keeps `reschedule` set.
+/// Phase 57e Bug #12 part 7 (a1bfe17): yield_now in both modes.  The
+/// Bug #6 eager-yield livelock is closed (8b44442 removed the eager-
+/// yield branch), and Bug #12 part 7 removed timer-driven kernel-mode
+/// preemption — so a pure `enable_and_hlt` loop can no longer rely on
+/// the timer to kick the scheduler when same-core wakes set
+/// `reschedule = true`.  The explicit `yield_now` is now load-bearing.
 fn ap_idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
-        #[cfg(not(feature = "preempt-full"))]
         crate::task::yield_now();
     }
 }
