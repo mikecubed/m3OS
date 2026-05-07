@@ -4625,10 +4625,26 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         if options & WNOHANG != 0 {
             break 0;
         }
+        // Phase 57e Bug #13 — defensive deadline backstop.
+        //
+        // The wake side (`wake_child_waiters` in `process/mod.rs`) is a raw
+        // `wait_woken.store(true)` + `wake_task_v2` pair without a preempt
+        // bracket and without a notification-object backed structure.  Under
+        // the eager-yield removal experiment (Bug #12 part 3, reverted in
+        // 1a25198), this surfaced as ion + child stuck in `BlockedOnWait` for
+        // 100+ seconds when child exit raced with parent's transition into
+        // the blocked state.  The Bug #12 part 4 fix (preempt_enable_no_resched
+        // for IPC brackets only) does NOT touch the waitpid wake path, so the
+        // race shape is currently latent — but a 1 s deadline backstop costs
+        // negligible polling overhead (one iteration per second when stuck)
+        // and provides forward-progress regardless of how the wake side
+        // evolves.  TICKS_PER_SEC = 1000, so 1000 ticks = 1 s.
+        let now_ticks = crate::arch::x86_64::interrupts::tick_count();
+        let deadline_ticks = now_ticks.saturating_add(1_000);
         let _ = crate::task::scheduler::block_current_until(
             crate::task::TaskState::BlockedOnWait,
             &wait_woken,
-            None,
+            Some(deadline_ticks),
         );
     }
 }
