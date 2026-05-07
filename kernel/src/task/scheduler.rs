@@ -1880,45 +1880,49 @@ pub fn preempt_enable() {
     // When `reschedule` is also set, record a pending reschedule so
     // the user-mode-return boundary can trigger the scheduler.
     //
-    // Under PREEMPT_VOLUNTARY (57d) we never call the scheduler from
-    // here — kernel-mode is non-preemptible and the calling site might
-    // be inside `without_interrupts`.  The flag is consumed in E.3 at
-    // the user-return boundary.
+    // Under both PREEMPT_VOLUNTARY (57d) and PREEMPT_FULL (57e Bug #12
+    // part 5), the zero-crossing branch records `preempt_resched_pending
+    // = true` and returns to the caller without touching the scheduler.
+    // The flag is consumed by:
     //
-    // Under PREEMPT_FULL (57e Track F.2), kernel-mode IS preemptible,
-    // so a zero-crossing with `reschedule == true` *and* a preempt-safe
-    // calling context (IF == 1) drains the reschedule **immediately**
-    // by yielding into the scheduler, bringing the latency floor down
-    // to a single `yield_now` round trip.  The IF gate is critical: if
-    // a caller sits inside `without_interrupts`, dispatching here
-    // would resume the chosen task with IF = 0 until its next
-    // IRQ-disabled→enabled transition — silently breaking the
-    // "tasks resume with their own RFLAGS" invariant.
+    //   * the user-mode-return boundary (`assert_preempt_count_zero_at_user_return`),
+    //   * the timer-IRQ kernel-preempt path (`check_and_preempt_kernel`,
+    //     fires every 1 ms under preempt-full),
+    //   * the IPI-RESCHEDULE handler (cross-core wakes raise the wakee's
+    //     core's flag directly via `enqueue_to_core` and IPI).
+    //
+    // Phase 57e Bug #12 part 5: the original preempt-full branch yielded
+    // *immediately* here when `reschedule == true && IF == 1`, on the
+    // theory of "drain reschedule immediately to bring latency floor to
+    // a single yield_now round trip".  In practice every same-core
+    // `wake_task_v2` (most IPC pairs) hit this branch and forced a
+    // synchronous context switch at every preempt-bracket exit, costing
+    // 4–6 forced switches per input-pipeline event under preempt-full
+    // and surfacing as user-visible mouse/keyboard input lag that
+    // voluntary mode (which already defers to user-return) does not
+    // exhibit.
+    //
+    // First removal attempt (cefa7fb) crashed login (pid 18) in a
+    // tight yield_now loop because the read syscall was busy-yielding
+    // on stdin.  That busy-yield was fixed in 538e650 (proper
+    // STDIN_WAITQUEUE block).  Second attempt (4c1c552, also reverted)
+    // surfaced a waitpid lost-wake deadlock (Bug #13) because
+    // `wake_child_waiters` lacked the `preempt_disable / preempt_enable_no_resched`
+    // bracket that protects every IPC wake site against a synchronous
+    // yield landing between the woken-flag store and the wake_task_v2
+    // CAS.  The wake-side bracket landed in 549584f; this third retry
+    // can defer the reschedule safely.
+    //
+    // The Bug #6 brackets around `deliver_message + wake_task_v2`
+    // remain load-bearing: within the bracket `preempt_count > 0`, so
+    // no zero-cross fires (eager or deferred), preserving the H7
+    // lost-wake protection.
     let location = core::panic::Location::caller();
     #[cfg(feature = "preempt-voluntary")]
     {
         let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
         record_preempt_trace(2, prev, prev - 1, location);
         if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
-            #[cfg(feature = "preempt-full")]
-            {
-                if x86_64::instructions::interrupts::are_enabled() {
-                    // Clear both the pending flag and the per-core reschedule
-                    // request so the next IRQ or user-mode-return boundary
-                    // doesn't double-yield on a stale signal — the immediate
-                    // yield_now below is consuming this event now.  The
-                    // scheduler dispatch loop will swap `reschedule` itself
-                    // on its next iteration, but until then a concurrent IRQ
-                    // could observe the still-set flag and re-enter
-                    // `check_and_preempt_kernel` for redundant work.
-                    pc.preempt_resched_pending
-                        .store(false, core::sync::atomic::Ordering::Release);
-                    pc.reschedule
-                        .store(false, core::sync::atomic::Ordering::Release);
-                    yield_now();
-                    return;
-                }
-            }
             pc.preempt_resched_pending
                 .store(true, core::sync::atomic::Ordering::Release);
         }
