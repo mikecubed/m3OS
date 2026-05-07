@@ -915,77 +915,11 @@ core::arch::global_asm!(
 // Calling convention: rdi = *const PreemptFrame.  Called only from
 // `dispatch_preempted_and_resume_kernel` with IRQs disabled.  Never returns.
 //
-// Gated on `preempt-full`: under voluntary mode no kernel-mode preempt
-// frames are ever produced, so the symbol is unreachable and excluded.
-
-#[cfg(feature = "preempt-full")]
-core::arch::global_asm!(
-    ".global preempt_resume_to_kernel",
-    "preempt_resume_to_kernel:",
-    // Save rip / cs / rflags into scratch BEFORE switching rsp — once we
-    // mov rsp we are no longer on the scheduler stack and pushes target the
-    // interrupted task's kernel stack.  rdi remains valid as the frame
-    // pointer because the frame lives in the heap-backed Task struct.
-    "mov rax, [rdi + 120]", // rip
-    "mov rbx, [rdi + 128]", // cs
-    "mov rcx, [rdi + 136]", // rflags
-    // Switch RSP to the interrupted task's kernel stack (the value the
-    // interrupted code had immediately before the IRQ fired).
-    "mov rsp, [rdi + 144]",
-    // Build the same-CPL iretq frame.  Push order: rflags first (highest
-    // address), cs middle, rip last (lowest, ends up at [rsp+0]).
-    "push rcx",
-    "push rbx",
-    "push rax",
-    // Restore GPRs from the frame.  Re-load rax/rbx/rcx (used as scratch
-    // above) and load rdi last (the frame pointer becomes invalid after).
-    "mov rax, [rdi + 0]",
-    "mov rbx, [rdi + 8]",
-    "mov rcx, [rdi + 16]",
-    "mov rdx, [rdi + 24]",
-    "mov rsi, [rdi + 32]",
-    "mov rbp, [rdi + 48]",
-    "mov r8,  [rdi + 56]",
-    "mov r9,  [rdi + 64]",
-    "mov r10, [rdi + 72]",
-    "mov r11, [rdi + 80]",
-    "mov r12, [rdi + 88]",
-    "mov r13, [rdi + 96]",
-    "mov r14, [rdi + 104]",
-    "mov r15, [rdi + 112]",
-    "mov rdi, [rdi + 40]",
-    "iretq",
-    //
-    // ---------------------------------------------------------------------------
-    // Phase 57e Track C.4 — dispatch_preempted_and_resume_kernel
-    //
-    // Mirror of `dispatch_preempted_and_resume` for kernel-mode preempted
-    // tasks.  Same scheduler-RSP publication discipline (the bug 57d D.3
-    // fixed) — diverges only in the final `jmp preempt_resume_to_kernel`.
-    //
-    // The shared `.Ldispatch_preempted_resume` label is reused as the ret
-    // target so both trampolines fall through to the same dispatch-loop
-    // epilogue when the task next yields back via switch_context.
-    //
-    // Args (SysV AMD64): rdi = per_sched_rsp_ptr, rsi = frame.
-    // PRECONDITION: IRQs must be disabled on entry.
-    // ---------------------------------------------------------------------------
-    ".global dispatch_preempted_and_resume_kernel",
-    "dispatch_preempted_and_resume_kernel:",
-    "lea rax, [rip + .Ldispatch_preempted_resume]",
-    "push rax",
-    "push rbx",
-    "push rbp",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "pushf",
-    "cli",
-    "mov [rdi], rsp",
-    "mov rdi, rsi",
-    "jmp preempt_resume_to_kernel",
-);
+// Phase 57e deferral cleanup (2026-05-07): the kernel-mode preempt-resume
+// asm stubs (`preempt_resume_to_kernel` and `dispatch_preempted_and_resume_kernel`)
+// were removed.  They were only reachable from the now-removed
+// `check_and_preempt_kernel` IRQ-side gate — see
+// `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
 
 // Rust-side declarations for the asm entry symbols (used when installing
 // into the IDT via `set_handler_addr`).
@@ -1013,25 +947,9 @@ unsafe extern "C" {
         per_sched_rsp_ptr: *mut u64,
         frame: *const kernel_core::preempt_frame::PreemptFrame,
     );
-    /// Phase 57e Track C.1 — resume a preempted kernel-mode (ring-0) task.
-    ///
-    /// Restores all 15 GPRs and a 3-field same-CPL iretq frame on the
-    /// interrupted task's kernel stack, then `iretq`s.  Never returns.
-    /// Called only from `dispatch_preempted_and_resume_kernel` asm.
-    #[cfg(feature = "preempt-full")]
-    #[allow(dead_code)]
-    pub fn preempt_resume_to_kernel(frame: *const kernel_core::preempt_frame::PreemptFrame) -> !;
-    /// Phase 57e Track C.4 — dispatch a preempted kernel-mode task.
-    ///
-    /// Identical structure to `dispatch_preempted_and_resume` (publishes the
-    /// scheduler RSP to `*per_sched_rsp_ptr` before the iretq path) — the
-    /// only divergence is the final tail-call to `preempt_resume_to_kernel`.
-    /// IRQs must be disabled on entry.
-    #[cfg(feature = "preempt-full")]
-    pub(crate) fn dispatch_preempted_and_resume_kernel(
-        per_sched_rsp_ptr: *mut u64,
-        frame: *const kernel_core::preempt_frame::PreemptFrame,
-    );
+    // Phase 57e deferral cleanup: `preempt_resume_to_kernel` and
+    // `dispatch_preempted_and_resume_kernel` removed (see global_asm
+    // block above and the post-mortem).
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,86 +1432,12 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
     crate::task::scheduler::preempt_to_scheduler(frame);
 }
 
-/// Phase 57e Track F.1 — kernel-mode counterpart of `check_and_preempt_user`.
-///
-/// Called from `timer_handler_kernel` and `reschedule_ipi_handler_kernel`
-/// after the IRQ's tick / EOI work is complete.  Differs from the user
-/// variant in two ways:
-///
-/// 1. **No group-exit redirect.**  Kernel-mode tasks do not have
-///    `group_exit_pending` semantics, and the same-CPL 3-field iretq frame
-///    has no `rsp` / `ss` to redirect through.  This asymmetry is
-///    structural, not an oversight (see the 57e doc Track F.1 acceptance).
-/// 2. **Captured kernel RSP threading.**  The asm stub passes the
-///    interrupted kernel RSP as a separate argument; we forward it to
-///    `preempt_to_scheduler_kernel` so the resume path can rebuild the
-///    same-CPL iretq frame on the original kernel stack.
-///
-/// # Safety
-/// Must be called with IRQs disabled (guaranteed by IRQ handler context).
-/// `frame` must point to a valid on-stack `PreemptTrapFrameKernel`.
-#[cfg(feature = "preempt-full")]
-unsafe fn check_and_preempt_kernel(
-    frame: &PreemptTrapFrameKernel,
-    captured_kernel_rsp: u64,
-    trigger: PreemptTrigger,
-) {
-    let pc = crate::task::scheduler::peek_preempt_count_irq();
-    if pc != 0 {
-        return; // kernel code holds a preempt-disable lock — do not preempt
-    }
-    let Some(core) = crate::smp::try_per_core() else {
-        return;
-    };
-    // Phase 57e early-boot guard.  Between `init_bsp_per_core` (per-core ready,
-    // `signal_reschedule` activates) and the first dispatch in
-    // `scheduler::run`, `current_task_idx == -1`.  Wakeups from notification /
-    // IPC paths can set `reschedule = true` in this window; without this guard
-    // the timer ISR would consume the flag and call
-    // `preempt_to_scheduler_kernel`, which panics in `preempt_frame_to_scheduler`
-    // ("no current task").  Bail without consuming the flag so the dispatch
-    // loop picks it up when it starts.
-    if crate::task::scheduler::get_current_task_idx().is_none() {
-        return;
-    }
-    let reschedule = core
-        .reschedule
-        .swap(false, core::sync::atomic::Ordering::AcqRel);
-    let pending = core
-        .preempt_resched_pending
-        .swap(false, core::sync::atomic::Ordering::AcqRel);
-    if !reschedule && !pending {
-        return; // no rescheduling requested
-    }
-    // Phase 57e Track D.3 — held-lock watchdog.  In release builds the
-    // watchdog returns `true` when a tracked lock is found held; we suppress
-    // the preempt in that case because dispatching with a held
-    // scheduler-context lock would deadlock on the next acquire on a
-    // different core.  In debug builds the watchdog panics so the
-    // discipline bug surfaces immediately rather than during the soak.
-    if crate::task::scheduler::kernel_preempt_watchdog(frame.rip) {
-        // Restore the flags we consumed above so the next IRQ-return or
-        // user-mode-return boundary can act on the still-pending reschedule
-        // request.  A concurrent set from another core wins; otherwise we put
-        // back what we took.
-        if reschedule {
-            core.reschedule
-                .store(true, core::sync::atomic::Ordering::Release);
-        }
-        if pending {
-            core.preempt_resched_pending
-                .store(true, core::sync::atomic::Ordering::Release);
-        }
-        return;
-    }
-    #[cfg(feature = "sched-trace")]
-    unsafe {
-        emit_preempt_trace(frame.rip, trigger, true);
-    }
-    #[cfg(not(feature = "sched-trace"))]
-    let _ = trigger;
-    crate::task::scheduler::preempt_to_scheduler_kernel(frame, captured_kernel_rsp);
-}
+// Phase 57e deferral cleanup (2026-05-07): `check_and_preempt_kernel`
+// removed.  It was the kernel-mode counterpart of
+// `check_and_preempt_user` and was called from `timer_handler_kernel`
+// and `reschedule_ipi_handler_kernel` under preempt-full.  Both call
+// sites are now early-return for the kernel-mode path; see the
+// post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
 ///
@@ -2089,12 +1933,14 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
 
 /// Phase 57d Track B — reschedule IPI handler, kernel path.
 ///
-/// Phase 57e Track F.1: under `preempt-full`, performs the same preempt
-/// check as `reschedule_ipi_handler_user` and tail-calls
-/// `preempt_to_scheduler_kernel` when conditions are met.  This is the
-/// trigger path 57e is expected to make qualitatively faster — under 57d
-/// voluntary, an IPI delivered to a kernel-mode core is ignored at the
-/// IRQ-return boundary; under 57e, it preempts immediately.
+/// Phase 57e deferral cleanup (2026-05-07): the `cfg(preempt-full)` branch
+/// that called `check_and_preempt_kernel` was removed.  An IPI delivered
+/// to a kernel-mode core now sets `reschedule = true` (via
+/// `signal_reschedule()`) and returns; the flag is consumed at the next
+/// user-mode return boundary (`check_and_preempt_user`) or at the
+/// running task's next cooperative yield/block point.  This matches
+/// Phase 57d voluntary's behaviour and is what the 2026-05-07 post-mortem
+/// concludes is the right model for m3OS's microkernel architecture.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
     frame: &mut PreemptTrapFrameKernel,
@@ -2110,15 +1956,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
     }
     crate::task::signal_reschedule();
     super::apic::lapic_eoi();
-    #[cfg(feature = "preempt-full")]
-    unsafe {
-        check_and_preempt_kernel(frame, captured_kernel_rsp, PreemptTrigger::RescheduleIpi);
-    }
-    #[cfg(not(feature = "preempt-full"))]
-    {
-        let _ = frame;
-        let _ = captured_kernel_rsp;
-    }
+    let _ = frame;
+    let _ = captured_kernel_rsp;
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).

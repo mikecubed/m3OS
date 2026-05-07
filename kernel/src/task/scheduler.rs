@@ -1965,104 +1965,17 @@ pub fn preempt_enable() {
 // coverage to every scheduler-context lock; the API is shaped to allow that
 // without changing the watchdog's call site or output format.
 
-/// Maximum number of locks tracked by the watchdog.  Sized to comfortably
-/// cover the canonical scheduler-context lock set (SCHEDULER, IRQ_REGISTRY,
-/// IPC_PORTS, …) plus headroom for ad-hoc opt-in tracking during debugging.
-#[cfg(feature = "preempt-full")]
-pub(crate) const WATCHDOG_TRACKED_LOCK_COUNT: usize = 16;
-
-/// Watchdog registry entry: `(name, holder_pid)`.
-///
-/// `holder_pid == 0` means "unheld" (PID 0 is the kernel idle task, which
-/// never acquires scheduler-context locks under the discipline).
-#[cfg(feature = "preempt-full")]
-#[allow(dead_code)]
-pub(crate) struct HeldLockSlot {
-    pub name: &'static str,
-    pub holder_pid: core::sync::atomic::AtomicU32,
-}
-
-#[cfg(feature = "preempt-full")]
-#[allow(dead_code)]
-impl HeldLockSlot {
-    pub const fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            holder_pid: core::sync::atomic::AtomicU32::new(0),
-        }
-    }
-}
-
-/// Static watchdog registry.  Empty by default — see the module-level
-/// commentary above for why.
-#[cfg(feature = "preempt-full")]
-#[allow(dead_code)]
-pub(crate) static HELD_LOCK_REGISTRY: [HeldLockSlot; 0] = [];
-
-/// Register the current task as the holder of `lock_idx` in the registry.
-/// No-op on out-of-range or unregistered indices.
-#[cfg(feature = "preempt-full")]
-#[allow(dead_code)]
-pub(crate) fn register_held_lock(lock_idx: usize) {
-    if lock_idx >= HELD_LOCK_REGISTRY.len() {
-        return;
-    }
-    let pid = crate::process::current_pid();
-    HELD_LOCK_REGISTRY[lock_idx]
-        .holder_pid
-        .store(pid, core::sync::atomic::Ordering::Release);
-}
-
-/// Clear the holder of `lock_idx` in the registry.  Pairs with
-/// `register_held_lock` at the matching `Drop`.
-#[cfg(feature = "preempt-full")]
-#[allow(dead_code)]
-pub(crate) fn release_held_lock(lock_idx: usize) {
-    if lock_idx >= HELD_LOCK_REGISTRY.len() {
-        return;
-    }
-    HELD_LOCK_REGISTRY[lock_idx]
-        .holder_pid
-        .store(0, core::sync::atomic::Ordering::Release);
-}
-
-/// Phase 57e Track D.3 — at kernel-mode preempt entry, scan the tracked-lock
-/// registry for the current pid.  If any match, emit a `[WARN] [preempt]
-/// kernel-mode preemption with held lock` line and (in debug builds) panic.
-///
-/// Returns `true` if a held lock was observed (caller should suppress the
-/// preempt for safety in release builds).  Returns `false` on the clean
-/// path; callers proceed with the preempt.
-///
-/// Currently always returns `false` because `HELD_LOCK_REGISTRY` is empty —
-/// see the module-level commentary.  The function is still wired into the
-/// IRQ-handler path so a future patch enabling tracked locks does not need
-/// to revisit the IRQ side.
-#[cfg(feature = "preempt-full")]
-pub(crate) fn kernel_preempt_watchdog(rip: u64) -> bool {
-    let pid = crate::process::current_pid();
-    if pid == 0 {
-        return false;
-    }
-    for slot in HELD_LOCK_REGISTRY.iter() {
-        if slot.holder_pid.load(core::sync::atomic::Ordering::Acquire) == pid {
-            log::warn!(
-                "[preempt] kernel-mode preemption with held lock pid={} lock={} rip={:#x}",
-                pid,
-                slot.name,
-                rip
-            );
-            #[cfg(debug_assertions)]
-            panic!(
-                "kernel_preempt_watchdog: pid={} held lock {} at preempt rip={:#x}",
-                pid, slot.name, rip
-            );
-            #[cfg(not(debug_assertions))]
-            return true;
-        }
-    }
-    false
-}
+// Phase 57e Track D.3 — held-lock watchdog removed.
+//
+// The Track D.3 held-lock watchdog (`HELD_LOCK_REGISTRY`,
+// `register_held_lock`, `release_held_lock`, `kernel_preempt_watchdog`)
+// existed solely to suppress a kernel-mode preemption when a tracked
+// scheduler-context lock was held — the only consumer was
+// `check_and_preempt_kernel` in `arch/x86_64/interrupts.rs`.  With
+// timer-driven kernel-mode preemption removed in the Phase 57e
+// deferral cleanup (see `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`),
+// the watchdog has no consumer; its registry was empty by design
+// (pre-deferral) so removal is functionally a no-op.
 
 // ---------------------------------------------------------------------------
 // Phase 57d F.1 — lock-free IRQ-context preempt count peek
@@ -2369,33 +2282,11 @@ pub fn preempt_to_scheduler(
     preempt_frame_to_scheduler(frame.to_preempt_frame())
 }
 
-/// Phase 57e Track C.0 — switch away from a preempted **kernel-mode** task.
-///
-/// Called from `timer_handler_kernel` and `reschedule_ipi_handler_kernel`
-/// (under `#[cfg(feature = "preempt-full")]`) when `preempt_count == 0` and
-/// `reschedule` is observed at the IRQ-return boundary in ring 0.
-///
-/// The 57d kernel-path asm stub already passes the captured kernel RSP as the
-/// second argument to the Rust handler; this shim builds a `PreemptFrame`
-/// from the on-stack `PreemptTrapFrameKernel` plus that captured RSP and
-/// delegates to the same `preempt_frame_to_scheduler` routine the user path
-/// uses.  All resume bookkeeping (`state = Ready`, `on_cpu = false`,
-/// `resume_mode = Preempted`, `Task::preempt_frame` write) lives in the
-/// shared routine — no `_kernel`-specific bookkeeping is duplicated here.
-///
-/// # Safety / divergence
-///
-/// Never returns.  `preempt_frame_to_scheduler` issues `switch_context` which
-/// jumps to the scheduler dispatch loop; the next dispatch goes through
-/// `preempt_resume_to_kernel` (3-field same-CPL `iretq`) rather than
-/// `switch_context`'s normal return path.
-#[cfg(feature = "preempt-full")]
-pub fn preempt_to_scheduler_kernel(
-    frame: &crate::arch::x86_64::preempt_trap_frame::PreemptTrapFrameKernel,
-    captured_kernel_rsp: u64,
-) -> ! {
-    preempt_frame_to_scheduler(frame.to_preempt_frame(captured_kernel_rsp))
-}
+// Phase 57e `preempt_to_scheduler_kernel` removed in the deferral cleanup.
+// It was the kernel-mode counterpart to `preempt_to_scheduler` and was
+// only called from `timer_handler_kernel` / `reschedule_ipi_handler_kernel`
+// under `cfg(feature = "preempt-full")`.  Both call sites are removed; see
+// `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
 
 /// Switch away from the current task using an already-materialised full
 /// userspace register frame.
@@ -4326,21 +4217,15 @@ pub fn run() -> ! {
                     );
                 }
             } else {
-                #[cfg(feature = "preempt-full")]
-                unsafe {
-                    crate::arch::x86_64::interrupts::dispatch_preempted_and_resume_kernel(
-                        per_core_scheduler_rsp_ptr(),
-                        _task_preempt_frame_ptr,
-                    );
-                }
-                // Under preempt-voluntary alone, a kernel-mode preempt frame
-                // (CS rpl == 0) must not exist — `timer_handler_kernel` and
-                // `reschedule_ipi_handler_kernel` early-return without
-                // building a PreemptFrame.  Reaching this branch indicates a
-                // discipline bug; panic in debug builds.
-                #[cfg(not(feature = "preempt-full"))]
+                // Phase 57e deferred (2026-05-07): kernel-mode preempt
+                // frames (CS rpl == 0) cannot occur — `timer_handler_kernel`
+                // and `reschedule_ipi_handler_kernel` no longer build
+                // PreemptFrames at all (they returned to early-return
+                // semantics like 57d voluntary).  Reaching this branch
+                // indicates a discipline bug; panic so the upstream
+                // regression surfaces immediately.
                 panic!(
-                    "kernel-mode preempt frame at dispatch with preempt-full disabled (cs={:#x})",
+                    "kernel-mode preempt frame at dispatch — preempt-full retired (cs={:#x})",
                     saved_cs
                 );
             }

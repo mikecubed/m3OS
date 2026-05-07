@@ -2589,7 +2589,7 @@ struct TestArgs {
     /// Features forwarded verbatim to `cargo build --tests` via `--features`.
     /// Accepts the same comma- or space-separated forms cargo does, including
     /// the `crate/feat` syntax used to enable a feature on a workspace member
-    /// (e.g. `kernel/preempt-full`).  Repeated `--features` flags accumulate.
+    /// (e.g. `kernel/sched-trace`).  Repeated `--features` flags accumulate.
     features: Vec<String>,
 }
 
