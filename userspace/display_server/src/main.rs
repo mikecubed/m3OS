@@ -659,16 +659,15 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             } else {
                 elapsed_us as u32
             };
-            // Phase 57d follow-up — diagnostic: count every compose
-            // path entry, separately from the writes-counter, so we
-            // can distinguish "compose loop alive but returns 0
-            // writes" (surface_damage and cursor_motion both false)
-            // from "compose loop never runs" (frame_tick stuck or
-            // display_server hung in input drain). Log the first 5
-            // entries individually so we see compose come up, then
-            // every 60 entries so the steady-state log doesn't drown
-            // the boot transcript. Includes the result tag so we
-            // know which arm fired.
+            // Phase 57d follow-up — boot-time compose visibility.
+            // Log the first 5 entries so we see compose come up and
+            // know which arm fired (ok0 / okN / err) on each.  The
+            // every-60 steady-state log was removed in the Phase 57e
+            // deferral cleanup (2026-05-07) — it generated thousands
+            // of identical lines per boot for no diagnostic value
+            // once the compose loop's liveness was no longer in
+            // question.  The Err path still emits a dedicated log
+            // line so a compose failure remains visible.
             let entry_count =
                 DIAG_COMPOSES_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
             let result_tag: &'static str = match &compose_result {
@@ -678,7 +677,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             };
             let writes_this = compose_result.as_ref().copied().unwrap_or(0);
             DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
-            if entry_count <= 5 || entry_count.is_multiple_of(60) {
+            if entry_count <= 5 {
                 let total_writes = DIAG_FB_WRITES.load(core::sync::atomic::Ordering::Relaxed);
                 let key_some =
                     input::DIAG_KEY_DRAINS_SOME.load(core::sync::atomic::Ordering::Relaxed);

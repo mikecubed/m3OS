@@ -224,7 +224,6 @@ fn program_main(_args: &[&str]) -> i32 {
     // Otherwise early key/mouse traffic can keep term draining display events
     // before the first `AttachSharedBuffer`, leaving the terminal invisible.
     renderer.compose();
-    let mut composes: u64 = 1;
     let mut last_compose_ms = clock.now_ms();
 
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
@@ -235,14 +234,12 @@ fn program_main(_args: &[&str]) -> i32 {
     // composes, so dropping a single frame's worth of compose calls
     // does not lose any glyphs — the next compose flushes everything.
 
-    // Phase 57d follow-up — diagnostic stat counters. Print one stat
-    // line every 1000 iters so we can confirm term's main loop is
-    // alive when display_server reports an outbound queue overflow,
-    // and bisect *which* of (PTY drain / event pull / compose / idle
-    // sleep) the loop is spending its time in. Ripped once the
-    // input-pipeline race is closed.
-    let mut iter_count: u64 = 0;
-    let mut events_pulled: u64 = 0;
+    // Phase 57d follow-up "term: iter=" / events_pulled / composes /
+    // pty_bytes stat-line diagnostic was removed in the Phase 57e
+    // deferral cleanup (2026-05-07) per its own comment ("Ripped once
+    // the input-pipeline race is closed").  The pty_bytes counter is
+    // retained because the prompt-ready gate consumes it; the rest
+    // are gone.
     let mut pty_bytes: u64 = 0;
     let mut prompt_ready_registered = false;
 
@@ -252,18 +249,6 @@ fn program_main(_args: &[&str]) -> i32 {
     loop {
         let mut did_work = false;
         let mut pty_drained_this_tick = false;
-        iter_count = iter_count.wrapping_add(1);
-        if iter_count.is_multiple_of(1000) {
-            syscall_lib::write_str(STDOUT_FILENO, "term: iter=");
-            log_u32(iter_count as u32);
-            syscall_lib::write_str(STDOUT_FILENO, " events=");
-            log_u32(events_pulled as u32);
-            syscall_lib::write_str(STDOUT_FILENO, " composes=");
-            log_u32(composes as u32);
-            syscall_lib::write_str(STDOUT_FILENO, " pty_bytes=");
-            log_u32(pty_bytes as u32);
-            syscall_lib::write_str(STDOUT_FILENO, "\n");
-        }
 
         // 5a. Drain the PTY primary fd. Nonblocking: -EAGAIN means
         //     no data this tick. 0 means the shell closed its end.
@@ -324,7 +309,6 @@ fn program_main(_args: &[&str]) -> i32 {
             match pull_one_event(display_handle, &mut event_buf) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
-                    events_pulled = events_pulled.saturating_add(1);
                     input_handler.translate(&ev, &mut writer);
                 }
                 PulledEvent::Disconnect => {
@@ -375,7 +359,6 @@ fn program_main(_args: &[&str]) -> i32 {
             ) {
                 renderer.compose();
                 last_compose_ms = now_ms;
-                composes = composes.saturating_add(1);
                 did_work = true;
             }
         }
