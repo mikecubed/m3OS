@@ -5196,8 +5196,38 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
             let nonblock = entry.nonblock;
+            // Phase 57e Bug #12 — replace the busy-yield loop with a
+            // proper waitqueue-based block.  The previous
+            // `loop { has_data || yield_now() }` shape was the dominant
+            // yield_now caller on real hardware (`m3os.log` 2026-05-07
+            // showed 95% of all yield_now calls coming from this site,
+            // pid 18 / login).  Under preempt-full each yield triggered
+            // an eager-yield in `preempt_enable`'s zero-cross branch,
+            // cascading the input pipeline through hundreds of
+            // unnecessary context switches per blocked read.
+            //
+            // STDIN_WAITQUEUE is woken by `stdin::push_char` and
+            // `stdin::signal_eof`; both run AFTER mutating the buffer
+            // so `has_data()` is ground truth.  The `woken` atomic
+            // closes the lost-wake window between the readiness scan
+            // and the block: if a wake fires after `has_data() == false`
+            // and before `block_current_until`, the wake sets `woken`
+            // and `block_current_until`'s early-bail returns
+            // `AlreadyTrue` without yielding.  `wake_all` drains the
+            // waiter queue per call so we re-register every iteration.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                // Reset and re-register before the readiness scan so any
+                // wake during the scan / block window sets our flag.
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::stdin::STDIN_WAITQUEUE.register(task_id, &woken);
+
                 if crate::stdin::has_data() {
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
                     let mut tmp = [0u8; 4096];
                     let n = crate::stdin::read(&mut tmp[..capped]);
                     if n > 0 {
@@ -5205,19 +5235,32 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             .and_then(|s| s.copy_from_kernel(&tmp[..n]))
                             .is_err()
                         {
-                            return NEG_EFAULT;
+                            break NEG_EFAULT;
                         }
-                        return n as u64;
+                        break n as u64;
                     }
+                    // n == 0: stdin EOF (read consumed the EOF flag).
+                    // Fall through to re-check on next iteration —
+                    // has_data will return false now and we'll either
+                    // return EAGAIN (nonblock) or block.
+                    continue;
                 }
                 if nonblock {
-                    return NEG_EAGAIN;
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
+                    break NEG_EAGAIN;
                 }
-                // Check for pending signals so Ctrl-C works while blocked.
                 if has_pending_signal() {
-                    return NEG_EINTR;
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
+                    break NEG_EINTR;
                 }
-                crate::task::yield_now();
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                // wake_all drained our entry; deregister is idempotent
+                // for safety in case wake_one was used.
+                crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
             }
         }
         FdBackend::Stdout => NEG_EBADF,
