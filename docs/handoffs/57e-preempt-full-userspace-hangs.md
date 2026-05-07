@@ -1,12 +1,17 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
-**Status (end of Session 17, after Bug #12 bracket-shrink in `<this commit>`):**
+**Status (end of Session 18, after Bug #12 stdin-block fix + eager-yield retry-and-revert):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); `695f800`'s init_task halt cfg-gated to preempt-full only in Session 16 (commit `753a311`) to fix the voluntary-mode regression below.
 - **Bug #9** (scheduling-fairness: `stale-ready` for 30 s + `cpu-hog` correlation) — **closed**.  Two-part fix: (a) `sys_mmap_file_backed` releases `lock_page_tables()` before disk I/O (commit `37b9d9c`); (b) FS-volume mutexes (`FAT32_VOLUME`, `FAT32_PERMISSIONS`, `EXT2_VOLUME`, `Ext2Volume.block_cache`, `TMPFS`) converted from `IrqSafeMutex` to `spin::Mutex` (commit `9292aec`, **revert in `962d787` itself reverted in `6826deb`** after Session 16 bisection proved the regressions attributed to `9292aec` were actually pre-existing and traced to Bug #6 commits).  10-iter QEMU soak under `9292aec` passed 10/10 with retry, 9/10 attempt-1, 0 zero-tolerance fingerprints.
 - **Bug #10** (sporadic Doom-launch kernel-mode GPF — faulting RIP `0x4847474947479b46`, ASCII "GHIJK" register pattern, core 3 scheduler dispatch loop) — **open**.  Observed once in m3os.log under `9292aec`; did not reproduce on the second launch in the same session and has not reproduced in subsequent hardware testing.  Filed for follow-up; not blocking GUI use.
-- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, **hardware re-test pending**).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  See *Session 16 — voluntary-mode regression bisection* below.
-- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **fix landed in `<this commit>`**, hardware re-test pending.  Root cause: Bug #6 / #8.1 fixes added `preempt_disable` brackets around every IPC `deliver_message + wake_task_v2` pair, but the brackets were over-broad — they enclosed `transfer_bulk` (per-task slot copy), `trace_event` (logging), and in the `recv_*` paths `deliver_message` to the *current* task (no wake counterpart).  Each non-load-bearing operation inside the bracket extends the IRQ-preempt-blocked window for no protection benefit.  Fix: shrink all 7 brackets in `kernel/src/ipc/endpoint.rs` (recv_msg, recv_msg_nowait, recv_msg_with_notif, send, call_msg, reply, send_with_cap) to the minimum atomic — `deliver_message + wake_task_v2` for receiver-wake sites, `complete_send + wake_task_v2` for sender-wake sites.  Validation: `cargo xtask check` green, 10-iter QEMU soak under `preempt-full` passes 10/10 with retry, 8/10 attempt-1, 0 zero-tolerance fingerprints (parity with Session 16 baseline).  See *Session 17 — Bug #12 bracket-shrink* below.
+- **Bug #11** (real-hardware voluntary-mode GUI regression — `kbd_server`, `mouse_server`, `display_server` hang at "starting") — **closed in Session 16** (`753a311`, **hardware-verified in Session 18**).  Root cause: `695f800` replaced `init_task`'s `loop { task::yield_now(); }` with `loop { enable_and_hlt(); }` unconditionally.  Under preempt-voluntary, kernel-mode tasks are not timer-preempted and rely on cooperative yield; halting `init_task` on BSP starved BSP-resident services.  Fix: cfg-gate so preempt-full halts (closes Bug #6) and preempt-voluntary yields (preserves cooperative scheduling).  Same pattern `38d35ea` already uses for `idle_task`.  User confirmed voluntary-mode boot is clean and lag-free.  See *Session 16 — voluntary-mode regression bisection* below.
+- **Bug #12** (preempt-full mouse/keyboard input lag on real hardware) — **partially mitigated, structural fix open**.  Three-part progression in Sessions 17–18:
+  - **Part 1 (`4dedebe`)**: shrink IPC brackets in `kernel/src/ipc/endpoint.rs` to load-bearing atomic only (`deliver_message + wake_task_v2` or `complete_send + wake_task_v2`).  Necessary but did not close the lag on hardware.  Kept.
+  - **Part 2 stdin-block (`538e650`)**: replace `read()` syscall's busy-yield loop on stdin/TTY backends with a proper `STDIN_WAITQUEUE` block via `block_current_until`.  Hardware diagnostic (`[yield-sample]` instrumentation in `7aed426`) showed this site as 95% of all `yield_now` calls (6159 of 6456 samples, all from pid 18 / login waiting at the username prompt).  Eliminated the dominant yield source; outbound queue overflow disappeared (was 50+, now 0); `dequeue-drop` warnings dropped from many to 8.  Kept.
+  - **Part 3 eager-yield removal retry (`4c1c552`, reverted in `1a25198`)**: removed the synchronous `yield_now` from `preempt_enable`'s preempt-full branch, deferring reschedule to `preempt_resched_pending`.  First attempt (`cefa7fb`) crashed login in a tight yield-loop; retry on top of the stdin fix was crash-free but **broke `waitpid` wake delivery** — ion (pid 19) and its child (pid 25) deadlocked in `BlockedOnWait` for 100+ seconds with "no waker registered", surfacing as broken keyboard echo (ion stuck in waitpid never read PTY echoes).  Doom worked because its single fork+wait pattern doesn't hit the wake race.  Reverted; eager-yield is structurally required for at least the child-exit notification path.
+  - **Lag still present on hardware** under the surviving combination (`538e650` + bracket-shrink + eager-yield kept).  Bug #13 filed for the structural fix.  See *Session 18 — Bug #12 partial mitigation, eager-yield retry, and Bug #13 root-cause lead* below.
+- **Bug #13** (`waitpid` lost-wake under eager-yield removal) — **open**, root-cause lead documented.  Filed in Session 18 after the eager-yield retry surfaced a `BlockedOnWait` deadlock that does not occur under voluntary mode (which already defers reschedule the same way).  The deadlock pattern (ion + child stuck, no waker registered, 100+s) suggests the child-exit notification path lacks a deadline or waker registration that the eager-yield was masking.  Closing Bug #13 unblocks the eager-yield removal and closes Bug #12 structurally.  See *Quick-start for Session 19* below.
 - **Bug #7** (frame UAF / PML4[256] corruption — the residual that Sessions 4–7 chased as "slab UAF") — **closed** in Session 8 (commits `d8db950`, `22cd711`).
 - **Bug #8.1** (`BlockedOnReply` watchdog cascade — missing waker registration in `block_current_on_{recv,send,notif}_v2`) — **closed** in Session 11 (commit `da2e781`).
 - **Bug #8.2** (`prompt-ready` slow-boot timeout) — **closed** as a knock-on of Bug #8.1.
@@ -2484,3 +2489,181 @@ If hardware re-test surfaces lag improvement but a different fingerprint surface
 1. Capture serial transcript.
 2. Diagnose with the existing trace ring infrastructure (per-core preempt trace ring, dispatch dump on stuck-task watchdog, frame trace ring for kernel page faults).
 3. Determine whether it's a Bug #6/#8.1 regression (re-widen the affected bracket) or a new failure mode (file as Bug #13 and triage).
+
+---
+
+## Session 18 — Bug #12 partial mitigation, eager-yield retry, and Bug #13 root-cause lead
+
+### TL;DR
+
+Session 18 ran on real hardware (`omarchy`) for the first time since Session 16's bisection.  Three landings + one revert:
+
+1. **Voluntary-mode boot is hardware-clean** (Bug #11 closed for real).  User-confirmed: kbd_server/mouse_server/display_server reach ready, term displays prompt, mouse/keyboard responsive.  No lag in voluntary.
+2. **`538e650` (stdin-block fix)** lands the dominant Bug #12 reduction.  Hardware m3os.log capture under preempt-full + bracket-shrink (`4dedebe`) showed 6159 of 6456 `[yield-sample]` lines (95%) tracing to a single source line: `kernel/src/arch/x86_64/syscall/mod.rs:5220` — the `read()` syscall handler's busy-yield loop on stdin/TTY backends, all from pid 18 (login) waiting at the username prompt.  Replaced with a proper `STDIN_WAITQUEUE` block via `block_current_until`.  Eliminated `display_server: outbound queue full` overflow (was 50+ lines per session, now 0); reduced total kernel `yield_now` calls from ~645,000 to ~19,500 per session; cleared most `dequeue-drop` noise.  System measurably healthier.
+3. **Lag NOT closed by `538e650` alone.**  Real-hardware re-test confirmed the lag persists.  Residual `[yield-sample]` distribution after the stdin fix shifted to IPC bracket exits (`endpoint.rs:908` / `:995`, ~28+24+23=75 samples) and `PreemptRestore::drop` (`scheduler.rs:404`, 55 samples for pid 2 / syslogd) — exactly the same-core wake sites the eager-yield is firing on every IPC pair.
+4. **Part 3 retry of eager-yield removal (`4c1c552`) — REVERTED in `1a25198`.**  With the stdin busy-yield fixed, the retry was crash-free (cefa7fb's pid 18 tight yield-loop crash signature did not reproduce), but introduced a **new failure mode: `BlockedOnWait` deadlock**.  ion (pid 19) and its child (pid 25) stuck in `BlockedOnWait` for 100+ seconds with "no waker registered".  User symptom: keyboard echo broken — typed chars don't appear on screen, but pressing Enter "processes the command properly" (presumably partial — the captured log shows the system is essentially deadlocked at the prompt loop).  Doom continued working (single fork+wait pattern doesn't trigger the race).  Reverted to restore working keyboard.
+
+### Hardware-confirmed yield-source distribution under `preempt-full`
+
+m3os.log capture (Session 18, under `4dedebe` + `7aed426` diagnostic) — 6456 `[yield-sample]` lines = ~645,600 total `yield_now()` calls during the session.  Distribution:
+
+| Caller | pid | Samples (×100 for actual count) | Identification |
+|---|---|---|---|
+| `syscall/mod.rs:5220` | 18 (login) | **6159 (95.4%)** | `read()` busy-yield on stdin/TTY |
+| `scheduler.rs:404` | 2 (syslogd) | 76 | `PreemptRestore::drop` (IrqSafeMutex release) eager-yield |
+| `scheduler.rs:404` | 18 (login) | 62 | same |
+| `endpoint.rs:908` | 7 (display_server) | 41 | `call_msg`'s deliver+wake bracket exit eager-yield |
+| `endpoint.rs:995` | 6 (kbd_server) | 26 | `reply`'s deliver+wake bracket exit eager-yield |
+| `scheduler.rs:1062` | 2, 18, ... | ~21 | `enqueue_to_core`'s same-core wake eager-yield |
+| `endpoint.rs:995` | 8 (mouse_server) | 15 | `reply` bracket exit eager-yield |
+| `syscall/mod.rs:3539` | 1 (init) | 15 | `nanosleep_for(0)` cooperative yield |
+
+After `538e650` (stdin fix), total samples dropped from 6456 to 195 — a 33× reduction.  Residual distribution:
+
+| Caller | pid | Samples (×100) | Identification |
+|---|---|---|---|
+| `scheduler.rs:404` | 2 (syslogd) | 55 | IPC bracket exit eager-yield |
+| `endpoint.rs:908` | 7 (display_server) | 28 | `call_msg` bracket exit eager-yield |
+| `endpoint.rs:995` | 8 (mouse_server) | 24 | `reply` bracket exit eager-yield |
+| `endpoint.rs:995` | 6 (kbd_server) | 23 | `reply` bracket exit eager-yield |
+| `scheduler.rs:1062` | 2 | 22 | `enqueue_to_core` same-core wake eager-yield |
+| `syscall/mod.rs:3539` | 1 | 22 | `nanosleep_for(0)` cooperative yield |
+
+The remaining yields are entirely IPC pipeline same-core wakes, confirming the original Bug #12 hypothesis.  But removing the eager-yield broke `waitpid` (Bug #13).
+
+### Bug #13 — `waitpid` lost-wake under eager-yield removal
+
+Symptom (under `4c1c552`, eager-yield removed, deferred to IRQ tick):
+
+```
+[WARN] [sched] task pid=19 name=fork-child state=BlockedOnWait stuck-since=32969ms (no waker registered)
+[WARN] [sched] task pid=25 name=fork-child state=BlockedOnWait stuck-since=32936ms (no waker registered)
+... (same pids, growing stuck time, every ~3s, for 100+ seconds total)
+```
+
+`pid=19` is ion (the shell, child of pid 17 = term).  `pid=25` is one of ion's children, never reached `execve` (still labelled `fork-child` — pre-execve trampoline state).  Both deadlocked: ion in `waitpid()` for pid 25, pid 25 itself blocked on something (possibly its own implicit wait or signal-wait).  "no waker registered" is the watchdog's verdict for `BlockedOnWait` tasks with `wake_deadline = None` (i.e., nothing will wake them automatically).
+
+Why this only manifests with eager-yield removed:
+
+* `waitpid()` (`syscall/mod.rs:4628`) calls `block_current_until(BlockedOnWait, &wait_woken, None)` — note **deadline = None**.  The task relies entirely on the wake side (child exit) setting `wait_woken` and calling `wake_task_v2`.
+* Child-exit's wake path runs `register_child_waiter` / `deregister_child_waiter` (`process/mod.rs`, search around the child reaper) and sets `wait_woken`.  Under eager-yield, the wake_task_v2 immediately context-switches to the parent on the same core — the wake is observed before any racing operation can interfere.  Under deferred-yield, the wake is enqueued for the next IRQ tick, but the parent's `wait_woken` flag check inside `block_current_until`'s pi-lock-protected critical section may have already passed by the time the IPI/timer-tick re-dispatches.
+* The `[WARN] no waker registered` message means `wake_deadline = None`.  Under voluntary, this works because the cooperative `yield_now` from the child's exit syscall path eventually dispatches the parent, even without a deadline.  Under `4c1c552`'s deferred preempt-full, the wake is timing-sensitive in a way that exposes the missing deadline as a structural fragility.
+
+Doom works because Doom's single fork-and-wait is one-shot — the wake always fires before any racing operation can dislodge it.  ion's command-execution flow involves multiple short-lived child processes (prompt rendering, tab completion, builtin helpers), each one a fresh chance for the race to fire.
+
+### Confirmed orthogonal: not a Bug #6 / #8.1 regression
+
+Bug #6 / #8.1 brackets in `kernel/src/ipc/endpoint.rs` remain intact.  The `BlockedOnWait` deadlock is not an IPC bracket race — it's a `waitpid`-specific notification path that the eager-yield was implicitly synchronising.
+
+### Why the IPC bracket-shrink (Part 1) did not close Bug #12
+
+Even after shrinking each IPC bracket to the minimum atomic, every same-core wake_task_v2 in the input pipeline triggers an eager-yield in `preempt_enable`'s zero-cross branch.  The pipeline has 4–6 hops per input event:
+
+```
+kbd_server → display_server (poll_key reply)
+mouse_server → display_server (poll_pointer reply)
+display_server → term (LABEL_CLIENT_EVENT_PULL reply)
+term → kernel PTY (write byte)
+ion → kernel PTY (read byte) → ECHO write
+term → kernel PTY (read echo)
+term → display_server (compose CommitSurface call chain)
+```
+
+Each `wake_task_v2` on the same core triggers a forced context switch.  The bracket shrink reduced the bracket *width* but not the *count* of same-core wakes.  Voluntary mode never triggers these synchronous yields (`preempt_enable` defers via `preempt_resched_pending`), so it's lag-free; preempt-full triggers all of them, so it's laggy.
+
+### Validation summary
+
+| Configuration | Build | QEMU soak | Hardware boot | Hardware lag | Hardware echo | Doom |
+|---|---|---|---|---|---|---|
+| Pre-Session-17 (`6826deb`) | ✅ | 10/10 retry | works | laggy | works | works |
+| Session 17 part 1 (`4dedebe`, bracket shrink) | ✅ | 10/10 retry | works | laggy | works | works |
+| Session 17 part 2 (`cefa7fb`, eager-yield removal) | ✅ | 10/10 retry | **CRASH** | n/a | n/a | n/a |
+| Session 17 reverted (`5f2cea2`) | ✅ | 10/10 retry | works | laggy | works | works |
+| Session 18 stdin (`538e650`) | ✅ | 5/5 attempt-1 | works | **still laggy** | works | works |
+| Session 18 retry (`4c1c552`) | ✅ | 5/5 retry | works | laggy | **BROKEN** (waitpid deadlock) | works |
+| Session 18 reverted (`1a25198`, current HEAD) | ✅ | (assumed clean) | works | **laggy (Bug #12 open)** | works | works |
+
+### Captured logs
+
+* `m3os.log` (Session 18 first capture, under `7aed426`): 6456 yield-samples, dominant caller `syscall/mod.rs:5220` (login stdin busy-yield).
+* `m3os.log` (Session 18 second capture, under `538e650`): 195 yield-samples, residual is IPC bracket exits.  Outbound queue overflow eliminated.
+* `m3os.log` (Session 18 third capture, under `4c1c552`): 107 stuck/stale warnings, deadlock signature `BlockedOnWait stuck-since=32969ms (no waker registered)` for pid 19 + pid 25.  Trace ring dump shows continued WakeTask events for other tasks but ion + pid 25 stay stuck.
+* `m3os.log` (current, after `1a25198` revert): not yet captured.  Expected: matches Session 18 second capture.
+
+Move all three captures to `docs/handoffs/captures/57e-session-18/` once Session 19 closes Bug #13.
+
+---
+
+## ⭐ Quick-start for Session 19 — close Bug #13 (`waitpid` lost-wake under deferred-yield)
+
+### Why this is the right next step
+
+Closing Bug #13 unblocks the eager-yield removal (Bug #12 part 3 retry) without the `BlockedOnWait` regression.  With the eager-yield removed, the input pipeline runs at natural-quantum throughput — Bug #12 closes structurally.
+
+The alternative (per-call-site `preempt_enable_no_resched` for IPC brackets only) is faster but leaves a latent fragility in any other path that hits the same wake-race shape.  Bug #13 likely indicates a structural missing deadline in the `waitpid` / child-exit notification path that voluntary mode has been implicitly masking via cooperative yield timing — fixing it makes the whole scheduler robust under deferred-yield, not just the bug-of-the-day.
+
+### Diagnostic plan
+
+**Step 1 — Reproduce the deadlock under QEMU.**  Apply `4c1c552` (the reverted commit) on top of HEAD, build with `M3OS_KERNEL_FEATURES=preempt-full`, boot via `cargo xtask run-gui`, log in as root, run `ls` (or any command that ion forks for).  Expected: similar `BlockedOnWait stuck-since=...` warnings within 30 s.  If reproduced, the bug is QEMU-visible and faster to iterate on than hardware.
+
+If QEMU does not reproduce (the previous Session 17 / 18 QEMU soaks under `cefa7fb` and `4c1c552` both passed clean — the smoke-test path doesn't fork as aggressively as ion does), use `M3OS_KERNEL_FEATURES=preempt-full cargo xtask run-gui` and interact manually.
+
+**Step 2 — Dump dispatch state when the deadlock fires.**  The watchdog already does this on stale-ready (>1 s in `WatchdogVerdict::StuckNoWaker`).  In the third Session 18 capture we got a trace ring dump.  For Session 19, also enable `sched-trace` for the structured state-transition log:
+
+```bash
+M3OS_KERNEL_FEATURES="preempt-full sched-trace" cargo xtask run-gui --fresh
+```
+
+The sched-trace ring records `(pid, old_state, new_state, caller_file:line, tick)` for every block/wake.  When ion enters `BlockedOnWait`, the trace shows the call site that drove the transition (`syscall/mod.rs:4629`).  When the child exits, the wake should appear as `BlockedOnWait → Ready` with the wake call site (somewhere in `process/mod.rs`'s child-reaper).  If the wake **never appears** for ion under `4c1c552`, that confirms the lost-wake — and the missing wake is the bug.
+
+**Step 3 — Identify where child-exit wakes the parent's `wait_woken` flag.**  Search `kernel/src/process/mod.rs` for `wake_child_waiters`, `wait_woken`, `register_child_waiter`, `deregister_child_waiter`.  The child-exit syscall (`sys_exit`, `sys_exit_group`) calls into the process table to flag the child as exited and notify the parent.  Critical sites:
+
+* The child-side: `do_exit` or equivalent that marks `Process::exit_code` and notifies the parent.
+* The parent-side: where `wait_woken` is set and `wake_task_v2(parent_id)` is called.
+
+The fix is almost certainly one of:
+
+(a) **Add a deadline to `block_current_until`** in the `waitpid` syscall.  Even a long deadline (say, 5 s) provides a backstop against lost wakes.  The deadline scanner re-checks the wait condition periodically; if `wait_woken` is true, the parent unblocks; otherwise it re-blocks.  Trade-off: 5 s worst-case wakeup latency for a parent waiting on a child that exited mid-wake.  Acceptable if deadlock is the alternative.
+
+(b) **Audit the wake side for an unprotected race window.**  Specifically: between the child's exit syscall setting `wait_woken` and calling `wake_task_v2`, is there a path where the parent observes `wait_woken == false` AND has not yet set `Task::state = BlockedOnWait`?  If yes, the wake delivers to a Running task (no-op), and the parent then blocks forever.  Fix: bracket the wake side with `preempt_disable` similar to the Bug #6 IPC bracket pattern.
+
+(c) **Use a notification object instead of a raw atomic flag.**  The kernel's notification infrastructure (`crate::ipc::notification`) handles the lost-wake race correctly under both voluntary and deferred-yield modes.  Migrate `waitpid` to use a notification capability for child-exit signalling.  Larger change but architecturally cleanest.
+
+**Step 4 — Validate the fix.**
+
+* QEMU soak: `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak --duration 10m --max-runs 10`.  Should still pass 10/10 with retry, 0 zero-tolerance fingerprints.
+* Hardware test (`omarchy`):
+  1. Apply Bug #13 fix.
+  2. Apply `4c1c552` (eager-yield removal) on top.
+  3. Boot under `preempt-full`, log in, run `ls`, type at the prompt.
+  4. Expected: no `BlockedOnWait stuck-since=...` warnings, keyboard echo works, mouse/keyboard input is responsive (no lag).
+* Run Doom — should still launch and run cleanly.
+
+### Files to pre-load for Session 19
+
+* `kernel/src/arch/x86_64/syscall/mod.rs:4500-4640` — `sys_wait4` (the waitpid syscall handler).  The `block_current_until(BlockedOnWait, &wait_woken, None)` call site to inspect.
+* `kernel/src/process/mod.rs` — search for `wake_child_waiters`, `register_child_waiter`, `deregister_child_waiter`, `wait_woken`, `do_exit`, `mark_task_dead_by_pid`, `cleanup_child`.  The child-exit notification path and its wake side.
+* `kernel/src/task/scheduler.rs:1862-1932` — `preempt_enable` (the eager-yield branch we want to remove for Bug #12 closure).  The cfg-gated `#[cfg(feature = "preempt-full")]` block at lines 1903-1921 is the change point.
+* `kernel/src/task/scheduler.rs:2673-2895` — `block_current_until` (the wait primitive).  Step-3 condition recheck and step-4 yield path.
+* `kernel/src/task/scheduler.rs:3333-3540` — `wake_task_v2`.  The pi-lock CAS that pairs with `block_current_until`'s state write.
+* `m3os.log` (Session 18 captures) — pre-deadlock and deadlock state for reference.
+
+### Acceptance criteria for closing Bug #13
+
+1. ✅ `cargo xtask check` green.
+2. ✅ 10-iter `M3OS_KERNEL_FEATURES=preempt-full cargo xtask soak` passes 0 zero-tolerance fingerprints.
+3. ⏳ QEMU `run-gui` repro shows no `BlockedOnWait stuck-since=` watchdog warnings during 30-second interactive session that exercises ion's command-execution flow.
+4. ⏳ Hardware test on `omarchy` with eager-yield removal (`4c1c552`) re-applied: keyboard echo works, no `waitpid` deadlock, mouse/keyboard responsive (Bug #12 closes).
+5. ⏳ Hardware soak under `preempt-full` for ≥1 hour: no `BlockedOnWait` warnings, no other zero-tolerance fingerprints.
+
+When (3)–(5) pass, Bug #13 closes AND Bug #12 closes structurally.  The only remaining open item is Bug #10 (sporadic Doom GPF, no reproducer), which can move to a Track H follow-up phase, and Track G's 24 h soak gate finally opens.
+
+### Backstop — alternative path if Bug #13 is structurally hard
+
+If the `waitpid` notification path turns out to require a major refactor, the fast alternative is **Option #1** (per-call-site `preempt_enable_no_resched`):
+
+1. Introduce `preempt_enable_no_resched()` in `scheduler.rs` next to `preempt_enable`.  Identical semantics except it never calls `yield_now` even on zero-cross with `reschedule == true` — it always defers via `preempt_resched_pending`.
+2. In `kernel/src/ipc/endpoint.rs`, change the 7 IPC bracket exits' `preempt_enable()` to `preempt_enable_no_resched()`.  These are the input-pipeline bottleneck per the Session 18 yield-sample distribution.
+3. Leave every other `preempt_enable` callsite (including `block_current_until`, `wake_task_v2`, `enqueue_to_core`, `PreemptRestore::drop`) untouched.  `waitpid`'s wake path keeps its current synchronous-yield delivery.
+
+Trade-off: targets the lag at the IPC layer without touching `waitpid`.  Latent fragility remains — any future code path that adds a `preempt_disable / wake / preempt_enable` triple may discover a similar wake-race shape, and the Bug #13 root cause stays unfixed.  Acceptable as a stopgap to close Bug #12 if Session 19 cannot complete the full Bug #13 fix.
