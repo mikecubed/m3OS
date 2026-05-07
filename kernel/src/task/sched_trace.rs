@@ -45,7 +45,10 @@ mod inner {
     use kernel_core::trace_ring::SchedTrace;
 
     /// Number of entries per core in the sched-trace ring.
-    const SCHED_TRACE_RING_SIZE: usize = 4096;
+    /// Size 128 — same stack-overflow rationale as `PerCoreData::trace_ring`;
+    /// see the comment at `kernel/src/smp/mod.rs` (search "TraceRing<128>").
+    /// Phase 57e deferral cleanup, 2026-05-07.
+    const SCHED_TRACE_RING_SIZE: usize = 128;
 
     /// Minimal lock-free fixed-size ring for `SchedTrace` entries.
     ///

@@ -1100,15 +1100,12 @@ extern "x86-interrupt" fn page_fault_handler(
     if let Ok(fault_va) = addr {
         dump_pte_walk_diagnostics(fault_va.as_u64());
     }
-    // Phase 57e diag — for kernel-half not-present faults (e.g. PML4
-    // corruption like Session 6's 0x17eb000 case) the active CR3's
-    // physical frame itself is the suspect.  Dump its alloc/free trace.
-    let active_cr3 = cr3_frame.start_address().as_u64();
-    _panic_print(format_args!(
-        "[pf-diag] frame-trace history for active CR3={:#x}:\n",
-        active_cr3
-    ));
-    crate::mm::frame_trace::dump_for_frame(active_cr3, 32);
+    // Phase 57e diag — the per-frame allocate/free trace ring (`mm::frame_trace`)
+    // that originally dumped the active CR3 history here was retired alongside
+    // the Phase 57e deferral cleanup (its sole purpose was diagnosing Bug #7,
+    // closed in d8db950).  The static 512 KiB ring + per-allocation recording
+    // also broke `kernel::mm::frame_allocator::tests::allocate_frame_hot_path_tolerates_reentrant_free`.
+    let _ = cr3_frame;
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
     crate::hlt_loop();

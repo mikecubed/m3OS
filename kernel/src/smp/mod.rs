@@ -294,8 +294,25 @@ pub struct PerCoreData {
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
+    ///
+    /// Size 128 (not 4096, not 256) — the bootloader's 80 KiB kernel stack
+    /// can't hold a `Box::new(PerCoreData { ... })` literal whose `trace_ring`
+    /// alone is more than ~10 KiB, because debug builds don't elide the
+    /// construct-on-stack-then-memcpy-to-heap intermediate.  At 4096 entries
+    /// the inline ring was ~224 KiB and overflowed the stack on every
+    /// `init_bsp_per_core` call (the symptom: double-fault inside
+    /// `kernel::mm::frame_allocator::tests::allocate_frame_hot_path_tolerates_reentrant_free`,
+    /// RSP near the unmapped phys-offset boundary, CR2 = phys 0x438 unmapped).
+    /// At 256 entries the ring is ~14 KiB after the YieldNow `caller_file`
+    /// fields landed (568e5f6) — still tight enough to overflow when combined
+    /// with the rest of `PerCoreData` and active stack frames.  128 entries
+    /// (~7 KiB) is the largest size that comfortably fits the test harness's
+    /// stack budget in debug builds.  If a future workload needs deeper
+    /// history, swap to `Box<TraceRing<N>>` initialised via `Box::new_zeroed`
+    /// so the ring lives directly on the heap with no stack-resident copy.
+    /// Phase 57e deferral cleanup, 2026-05-07.
     #[cfg(feature = "trace")]
-    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<4096>>,
+    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<128>>,
 
     // ----- Phase 57a B.3: lock-ordering guard -----
     /// Set to `true` while this core holds `SCHEDULER.lock`.

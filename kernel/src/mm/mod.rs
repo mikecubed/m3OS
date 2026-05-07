@@ -5,7 +5,6 @@ pub mod debug;
 pub mod dma;
 pub mod elf;
 pub mod frame_allocator;
-pub mod frame_trace;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;

@@ -554,17 +554,7 @@ pub fn init_buddy() {
 /// The refill path batch-allocates from `FRAME_ALLOCATOR`. It does **not**
 /// sleep, but it may spin on the global allocator lock and it performs exactly
 /// one refill attempt before returning `None`.
-#[track_caller]
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    let caller = core::panic::Location::caller();
-    let result = allocate_frame_inner();
-    if let Some(frame) = result.as_ref() {
-        super::frame_trace::record_alloc(frame.start_address().as_u64(), caller);
-    }
-    result
-}
-
-fn allocate_frame_inner() -> Option<PhysFrame<Size4KiB>> {
     if crate::smp::is_per_core_ready() {
         let result = x86_64::instructions::interrupts::without_interrupts(|| {
             match with_local_page_cache(|cache| {
@@ -646,7 +636,6 @@ fn allocate_frame_inner() -> Option<PhysFrame<Size4KiB>> {
 /// (heap, DMA, page tables) may use [`allocate_frame`] instead.
 ///
 /// See module-level docs for the full zero-before-exposure invariant.
-#[track_caller]
 pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
     let frame = allocate_frame()?;
     let phys_offset = cached_phys_offset();
@@ -670,18 +659,11 @@ pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
 /// allocator-local reclaim sequence so slab magazines / depots can also return
 /// hidden pages before the allocation gives up.
 #[allow(dead_code)]
-#[track_caller]
 pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
-    let caller = core::panic::Location::caller();
     if let Some(frame) = with_frame_alloc_irq_safe(|alloc| alloc.allocate_contiguous(order)) {
         if REFCOUNT_INIT.load(Ordering::Acquire) {
             refcount_inc(frame.start_address().as_u64());
         }
-        super::frame_trace::record_alloc_contig(
-            frame.start_address().as_u64(),
-            order as u8,
-            caller,
-        );
         return Some(frame);
     }
 
@@ -692,7 +674,6 @@ pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         refcount_inc(frame.start_address().as_u64());
     }
-    super::frame_trace::record_alloc_contig(frame.start_address().as_u64(), order as u8, caller);
     Some(frame)
 }
 
@@ -701,7 +682,6 @@ pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
 /// Zeroed-allocation variant of [`allocate_contiguous`] for user-visible
 /// contiguous mappings.
 #[allow(dead_code)]
-#[track_caller]
 pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
     let frame = allocate_contiguous(order)?;
     let page_count = 1u64 << order;
@@ -739,9 +719,7 @@ pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
 /// Does **not** zero the frame — the zero-before-exposure invariant is
 /// enforced on the allocation side via [`allocate_frame_zeroed`]. Panics on
 /// double-free (frame already on the free list).
-#[track_caller]
 pub fn free_frame(phys: u64) {
-    super::frame_trace::record_free(phys, core::panic::Location::caller());
     if !release_last_reference(phys) {
         return;
     }
@@ -788,9 +766,7 @@ pub fn free_frame(phys: u64) {
 ///
 /// Used by allocator-local reclaim when a hidden slab page has already been
 /// selected for immediate surfacing back to the global pool.
-#[track_caller]
 pub(crate) fn free_frame_direct(phys: u64) {
-    super::frame_trace::record_free_direct(phys, core::panic::Location::caller());
     if !release_last_reference(phys) {
         return;
     }
@@ -802,9 +778,7 @@ pub(crate) fn free_frame_direct(phys: u64) {
 /// Decrements refcount for the base frame. Frees the entire block when the
 /// count reaches zero.  Does **not** zero — see [`allocate_contiguous_zeroed`].
 #[allow(dead_code)]
-#[track_caller]
 pub fn free_contiguous(phys: u64, order: usize) {
-    super::frame_trace::record_free_contig(phys, order as u8, core::panic::Location::caller());
     if !release_last_reference(phys) {
         return;
     }
