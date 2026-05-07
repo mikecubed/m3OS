@@ -1401,24 +1401,21 @@ pub fn wake_child_waiters(parent_pid: Pid) {
         // Phase 57e Bug #13 — bracket the woken-flag store and the
         // wake_task_v2 call so an intervening `preempt_count` zero-cross
         // inside `wake_task_v2`'s `scheduler_lock()` acquire/drop cannot
-        // eager-yield to the just-marked wakee BEFORE `wake_task_v2`'s
-        // CAS commits the `BlockedOnWait → Ready` transition.  Without
-        // the bracket, a same-core eager-yield on the inner `sched_lock`
-        // drop hands the CPU to the parent (which is now in
-        // `BlockedOnWait`) before the wakeup transition lands; the
-        // parent self-reverts via the woken-flag fast path or stays
-        // parked, depending on the exact interleaving — under deferred-
-        // yield (Phase 57e Bug #12 part 3 retry) this surfaced as
-        // ion + child stuck in `BlockedOnWait` for 100+ s on real
-        // hardware.  Mirrors the Bug #6 / #8.1 IPC bracket pattern in
-        // `kernel/src/ipc/endpoint.rs`.  Uses `preempt_enable_no_resched`
-        // so the bracket exit defers the reschedule rather than
-        // eager-yielding back into the same window the bracket exists
-        // to protect.
+        // synchronously hand the CPU to the just-marked wakee BEFORE
+        // `wake_task_v2`'s CAS commits the `BlockedOnWait → Ready`
+        // transition.  Without the bracket, a same-core synchronous
+        // dispatch on the inner `sched_lock` drop hands the CPU to the
+        // parent (which is now in `BlockedOnWait`) before the wakeup
+        // transition lands; the parent self-reverts via the woken-flag
+        // fast path or stays parked, depending on the exact
+        // interleaving — under deferred-yield (Phase 57e Bug #12 part 3
+        // retry) this surfaced as ion + child stuck in `BlockedOnWait`
+        // for 100+ s on real hardware.  Mirrors the Bug #6 / #8.1 IPC
+        // bracket pattern in `kernel/src/ipc/endpoint.rs`.
         crate::task::scheduler::preempt_disable();
         waiter.woken.store(true, Ordering::Release);
         let _ = crate::task::scheduler::wake_task_v2(waiter.task_id);
-        crate::task::scheduler::preempt_enable_no_resched();
+        crate::task::scheduler::preempt_enable();
     }
 }
 

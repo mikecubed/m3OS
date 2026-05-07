@@ -1907,7 +1907,7 @@ pub fn preempt_enable() {
     // on stdin.  That busy-yield was fixed in 538e650 (proper
     // STDIN_WAITQUEUE block).  Second attempt (4c1c552, also reverted)
     // surfaced a waitpid lost-wake deadlock (Bug #13) because
-    // `wake_child_waiters` lacked the `preempt_disable / preempt_enable_no_resched`
+    // `wake_child_waiters` lacked the `preempt_disable / preempt_enable`
     // bracket that protects every IPC wake site against a synchronous
     // yield landing between the woken-flag store and the wake_task_v2
     // CAS.  The wake-side bracket landed in 549584f; this third retry
@@ -1923,67 +1923,6 @@ pub fn preempt_enable() {
         let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
         record_preempt_trace(2, prev, prev - 1, location);
         if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
-            pc.preempt_resched_pending
-                .store(true, core::sync::atomic::Ordering::Release);
-        }
-    }
-    #[cfg(not(feature = "preempt-voluntary"))]
-    // Safety: identical pointee invariant as [`preempt_disable`].
-    unsafe {
-        let prev = (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release);
-        record_preempt_trace(2, prev, prev - 1, location);
-    }
-}
-
-/// Decrement `preempt_count` and *always* defer any pending reschedule.
-///
-/// Identical to [`preempt_enable`] except that, under `preempt-full`, the
-/// zero-crossing branch never calls `yield_now` — it always records a
-/// pending reschedule via `preempt_resched_pending` so the next IRQ-driven
-/// preemption boundary (timer tick at 1 ms, IPI_RESCHEDULE handler) drains
-/// it.  Use this in IPC bracket exits where the eager-yield costs more than
-/// it saves: every same-core `wake_task_v2` in the input pipeline (4–6 hops
-/// per input event) was forcing a synchronous context switch under
-/// `preempt-full`, surfacing as user-visible mouse/keyboard input lag that
-/// `preempt-voluntary` (which already defers to user-return) does not
-/// exhibit.  See Phase 57e Bug #12 in
-/// `docs/handoffs/57e-preempt-full-userspace-hangs.md`.
-///
-/// Forward-progress is preserved: if the wake target is on a different
-/// core, `enqueue_to_core` already sends `IPI_RESCHEDULE` and the target's
-/// `check_and_preempt_kernel` consumes the deferred flag immediately.  If
-/// the wake target is the same core, the next 1 ms timer tick consumes the
-/// flag.  Worst-case delivery latency is therefore one timer tick — well
-/// below perceptual thresholds — while letting the IPC pipeline run its
-/// natural quantum instead of context-switching at every hop.
-///
-/// The Bug #6 / #8.1 brackets around `deliver_message + wake_task_v2`
-/// remain load-bearing: within the bracket `preempt_count > 0`, so no
-/// zero-cross fires (eager or deferred), preserving the H7 lost-wake
-/// protection.  Only the bracket *exit* changes — defer instead of yield.
-///
-/// Lock-free by mandate (same rationale as [`preempt_disable`]): no
-/// `scheduler_lock()`, no `IrqSafeMutex::lock()`.
-#[inline]
-#[track_caller]
-pub fn preempt_enable_no_resched() {
-    let Some(pc) = crate::smp::try_per_core() else {
-        return;
-    };
-    let ptr = pc
-        .current_preempt_count_ptr
-        .load(core::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
-        return;
-    }
-    let location = core::panic::Location::caller();
-    #[cfg(feature = "preempt-voluntary")]
-    {
-        // Safety: identical pointee invariant as [`preempt_disable`].
-        let prev = unsafe { (*ptr).fetch_sub(1, core::sync::atomic::Ordering::Release) };
-        record_preempt_trace(2, prev, prev - 1, location);
-        if prev == 1 && pc.reschedule.load(core::sync::atomic::Ordering::Relaxed) {
-            // Always defer — never eager-yield, even under preempt-full.
             pc.preempt_resched_pending
                 .store(true, core::sync::atomic::Ordering::Release);
         }

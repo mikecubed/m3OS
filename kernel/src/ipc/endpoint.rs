@@ -399,17 +399,17 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 // (`deliver_message` to current task, `transfer_bulk`,
                 // `trace_event`) no longer blocks IRQ-driven preemption.
                 //
-                // Bug #12 part 4: bracket exits use `preempt_enable_no_resched`
-                // so the zero-cross does not eager-yield under preempt-full.
-                // The IPC pipeline has 4–6 same-core wakes per input event;
-                // each eager-yield was a forced context switch surfacing as
-                // user-visible input lag.  Forward progress is preserved by
-                // the IRQ-driven preempt path which consumes the deferred flag.
+                // Bug #12 part 5: `preempt_enable` itself now defers the
+                // reschedule globally (no eager-yield), so the bracket exit
+                // is safe to leave as plain `preempt_enable`.  The bracket
+                // is still load-bearing for the H7 lost-wake protection —
+                // it pins the holder above zero-cross between
+                // `complete_send` and `wake_task_v2`.
                 crate::task::scheduler::preempt_disable();
                 scheduler::complete_send(pending.task);
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
-                crate::task::scheduler::preempt_enable_no_resched();
+                crate::task::scheduler::preempt_enable();
             }
         }
         None => {
@@ -526,7 +526,7 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
         let _ = crate::task::scheduler::wake_task_v2(pending.task);
         // Bug #12 part 4: defer reschedule instead of eager-yielding.
-        crate::task::scheduler::preempt_enable_no_resched();
+        crate::task::scheduler::preempt_enable();
     }
 
     scheduler::take_message(receiver)
@@ -632,7 +632,7 @@ pub fn recv_msg_with_notif(
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
                 // Bug #12 part 4: defer reschedule instead of eager-yielding.
-                crate::task::scheduler::preempt_enable_no_resched();
+                crate::task::scheduler::preempt_enable();
             }
 
             match scheduler::take_message(receiver) {
@@ -796,7 +796,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
-            crate::task::scheduler::preempt_enable_no_resched();
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -916,7 +916,7 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
-            crate::task::scheduler::preempt_enable_no_resched();
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // Server not yet waiting — we're already enqueued above with
@@ -1004,7 +1004,7 @@ pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
     // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
     let _ = crate::task::scheduler::wake_task_v2(caller);
     // Bug #12 part 4: defer reschedule instead of eager-yielding.
-    crate::task::scheduler::preempt_enable_no_resched();
+    crate::task::scheduler::preempt_enable();
     // ep is u32::MAX because reply() operates on a caller TaskId, not an
     // endpoint — the reply capability was already consumed by the caller.
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ReplyDeliver {
@@ -1149,7 +1149,7 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
             // Bug #12 part 4: defer reschedule instead of eager-yielding.
-            crate::task::scheduler::preempt_enable_no_resched();
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
