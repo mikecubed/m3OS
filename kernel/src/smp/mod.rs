@@ -339,6 +339,21 @@ pub struct PerCoreData {
     /// that retarget store / counter-helper load can use `Release` / `Acquire`
     /// ordering for cross-core visibility on retarget boundaries.
     pub current_preempt_count_ptr: AtomicPtr<AtomicI32>,
+
+    // ----- Phase 57e Bug #12 part 6: kernel-mode preempt quantum -----
+    /// Tick value (`TICKS_PER_SEC = 1000`) at which the currently-running task
+    /// was dispatched on this core.  Read by `check_and_preempt_kernel` (in
+    /// `arch::x86_64::interrupts`) to skip kernel-mode preemption when the
+    /// task has not yet had its minimum quantum.
+    ///
+    /// Updated by the scheduler dispatch path (`scheduler::run`) right after
+    /// `Task::start_tick` is set; mirrors that field per-core so the timer
+    /// ISR can read it without acquiring `scheduler_lock` 1000 times per
+    /// second per core.  `Relaxed` ordering is sufficient: the value is
+    /// only read by the *same core* that wrote it (timer ISR fires on the
+    /// core whose task we're checking), so the write→read happens-before
+    /// is guaranteed by program order.
+    pub current_dispatch_start_tick: core::sync::atomic::AtomicU64,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -662,6 +677,7 @@ pub fn init_bsp_per_core() {
         current_preempt_count_ptr: AtomicPtr::new(
             &SCHED_PREEMPT_COUNT_DUMMY[0] as *const AtomicI32 as *mut AtomicI32,
         ),
+        current_dispatch_start_tick: core::sync::atomic::AtomicU64::new(0),
     }));
 
     // Fill self-pointer and store in global array.
@@ -776,6 +792,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         current_preempt_count_ptr: AtomicPtr::new(
             &SCHED_PREEMPT_COUNT_DUMMY[core_id as usize] as *const AtomicI32 as *mut AtomicI32,
         ),
+        current_dispatch_start_tick: core::sync::atomic::AtomicU64::new(0),
     }));
 
     unsafe {

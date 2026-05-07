@@ -1556,6 +1556,37 @@ unsafe fn check_and_preempt_kernel(
     if crate::task::scheduler::get_current_task_idx().is_none() {
         return;
     }
+    // Phase 57e Bug #12 part 6 — kernel-mode preempt quantum.
+    //
+    // The input pipeline (kbd_server, display_server, term, ion) spends
+    // most of its time in syscalls.  Under preempt-full's 1 ms timer
+    // tick, every same-core wake (4-6 hops per input event) was racing
+    // with the next tick to either (a) be observed by the wakee mid-
+    // syscall, or (b) preempt the wakee BEFORE it can finish its current
+    // small unit of work — the latter compounding context-switch
+    // overhead, TLB churn, and cache misses across the pipeline and
+    // surfacing as user-visible input lag that voluntary mode (which
+    // never preempts kernel-mode) does not exhibit.
+    //
+    // Mirrors Linux's CFS minimum-granularity floor: a kernel-mode task
+    // gets at least `KERNEL_PREEMPT_QUANTUM_TICKS` of uninterrupted
+    // execution before it can be preempted.  Below that, leave the
+    // reschedule / pending flags set so the next tick re-checks; once
+    // ran_ticks >= quantum, we fall through to the swap-and-preempt
+    // path.  Timer-driven preemption stays bounded (worst-case latency
+    // = 1 timer tick after quantum elapses) while the input pipeline
+    // runs at voluntary-mode-equivalent throughput.
+    //
+    // 4 ms matches the Linux CFS sched_min_granularity_ns default.
+    const KERNEL_PREEMPT_QUANTUM_TICKS: u64 = 4;
+    let now_tick = crate::arch::x86_64::interrupts::tick_count();
+    let dispatch_tick = core
+        .current_dispatch_start_tick
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let ran_ticks = now_tick.saturating_sub(dispatch_tick);
+    if ran_ticks < KERNEL_PREEMPT_QUANTUM_TICKS {
+        return; // task hasn't had its quantum yet — flags stay set
+    }
     let reschedule = core
         .reschedule
         .swap(false, core::sync::atomic::Ordering::AcqRel);
