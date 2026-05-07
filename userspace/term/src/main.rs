@@ -264,15 +264,10 @@ fn program_main(_args: &[&str]) -> i32 {
                     syscall_lib::write_str(STDOUT_FILENO, "TERM_SMOKE:prompt-ready\n");
                 }
             }
-            // Phase 57d follow-up — diagnostic for the "backspace doesn't
-            // erase" symptom. After prompt-ready (so we skip noisy boot
-            // output) log a short hex dump of each PTY read so the next
-            // boot transcript reveals which sequence the active shell
-            // actually sends on backspace. Rate-limited so a long
-            // command (`seq 1 1000` etc.) does not flood the log.
-            if prompt_ready_registered {
-                log_pty_bytes(&pty_buf[..n as usize]);
-            }
+            // Phase 57d follow-up "backspace doesn't erase" PTY hex-dump
+            // diagnostic was removed in the Phase 57e deferral cleanup
+            // (2026-05-07).  The shell's backspace sequence was settled;
+            // 30 hex-dump lines per boot earned no ongoing value.
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
@@ -413,76 +408,6 @@ impl PtyWriter for PrimaryFdWriter {
 #[cfg(not(test))]
 fn wait_for_shell_dependencies() -> bool {
     syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
-}
-
-/// Phase 57d follow-up — diagnostic budget for `log_pty_bytes`.
-/// Each PTY read after prompt-ready costs one budget unit; once
-/// exhausted, the dump is silent so a sustained command output does
-/// not flood the boot transcript. Sized for ~30 typical interactive
-/// edits which is enough to capture the shell's exact backspace
-/// sequence without burying the rest of the run.
-#[cfg(not(test))]
-static PTY_BYTE_LOG_BUDGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(30);
-
-/// Phase 57d follow-up — log the first 32 bytes of one PTY read as a
-/// hex dump, with the actual length prefix. The user's transcript
-/// then reveals exactly which bytes the shell emitted, which is the
-/// answer to "which backspace sequence does my shell use?".
-#[cfg(not(test))]
-fn log_pty_bytes(bytes: &[u8]) {
-    if PTY_BYTE_LOG_BUDGET
-        .fetch_update(
-            core::sync::atomic::Ordering::Relaxed,
-            core::sync::atomic::Ordering::Relaxed,
-            |remaining| remaining.checked_sub(1),
-        )
-        .is_err()
-    {
-        return;
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "term: pty-read len=");
-    log_u32(bytes.len() as u32);
-    syscall_lib::write_str(STDOUT_FILENO, " hex=");
-    let n = bytes.len().min(32);
-    for &b in &bytes[..n] {
-        let mut out = [0u8; 2];
-        out[0] = hex_nibble(b >> 4);
-        out[1] = hex_nibble(b & 0x0F);
-        if let Ok(s) = core::str::from_utf8(&out) {
-            syscall_lib::write_str(STDOUT_FILENO, s);
-        }
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-}
-
-#[cfg(not(test))]
-fn hex_nibble(v: u8) -> u8 {
-    match v {
-        0..=9 => b'0' + v,
-        10..=15 => b'a' + (v - 10),
-        _ => b'?',
-    }
-}
-
-/// Phase 57d follow-up — minimal u32 → decimal serial log helper for
-/// the diagnostic stat lines in the main loop. No alloc dependency.
-#[cfg(not(test))]
-fn log_u32(mut value: u32) {
-    let mut buf = [0u8; 10];
-    let mut idx = buf.len();
-    if value == 0 {
-        idx -= 1;
-        buf[idx] = b'0';
-    } else {
-        while value != 0 {
-            idx -= 1;
-            buf[idx] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-    }
-    if let Ok(s) = core::str::from_utf8(&buf[idx..]) {
-        syscall_lib::write_str(STDOUT_FILENO, s);
-    }
 }
 
 /// Monotonic clock for [`Bell::ring`]. Tiny wrapper around

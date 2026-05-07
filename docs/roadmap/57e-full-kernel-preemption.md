@@ -75,6 +75,70 @@ This is why the design notes recommend deferring 57e until 57c/57d have been run
 - Why latency improvements are per-trigger rather than uniform: cross-core reschedule-IPI wakeup and safe `preempt_enable` zero-crossing paths can drop into the microsecond range under `PREEMPT_FULL` because they fire an immediate switch when kernel mode is preemptible; same-core wakeups remain bounded by the next timer tick (no self-IPI exists), and timer-only preemption is naturally tick-bounded.
 - How to incrementally validate `PREEMPT_FULL`: enable the flag, run the regression suite, soak for 24 hours, then enable it for a release.
 
+## Learning Outcomes (post-deferral, 2026-05-07)
+
+After 18 debugging sessions and 13 distinct bugs, the implementation reached a plateau where every additional fix either reverted a previous fix or surfaced a new bug elsewhere. The deferral decision (and the path chosen instead) come down to four discoveries that the original Learning Goals did not anticipate. They are the durable lessons from this phase, independent of whether the feature is ever re-attempted.
+
+### What we tried
+
+The full implementation that PR #136 landed (Tracks A through F + J, behind `preempt-full`):
+
+- Timer-driven kernel-mode preemption via `check_and_preempt_kernel`, called from `timer_handler_kernel` and `reschedule_ipi_handler_kernel`.
+- Eager-yield zero-crossing branch in `preempt_enable` so a wake setting `reschedule == true` fired a synchronous `yield_now` immediately if `preempt_count` reached zero with `IF == 1`.
+- Kernel-mode preempt-frame plumbing (`PreemptTrapFrameKernel`, `preempt_resume_to_kernel`, `dispatch_preempted_and_resume_kernel`) so a preempted kernel-mode task could resume via same-CPL `iretq` from a saved register frame.
+- `kernel_preempt_watchdog` (Track D.3) intended to suppress preemption when a tracked scheduler-context lock was held — registry empty by design, since the canonical scheduler-context locks were already `IrqSafeMutex` (which raises `preempt_count`).
+
+After PR #136 landed, debugging Bugs #6–#13 added eight further fixes (the IPC bracket exits in `endpoint.rs`, the `wake_child_waiters` wake bracket, the `sys_waitpid` 1 s deadline backstop, the `init_task` 50 ms reap-loop sleep, the `stdin_feeder` waitqueue block, the eager-yield removal, the init/idle `yield_now`-after-`hlt` fixup, and the 4 ms quantum experiment that was reverted within the same session).
+
+### Why it didn't work — four discoveries
+
+1. **`signal_reschedule()` is called unconditionally on every timer tick.** This was deliberate under voluntary mode (the flag sits until consumed at the user-mode return boundary). Under preempt-full it meant `check_and_preempt_kernel` consumed the flag *on the same tick*, preempting every kernel-mode task at every 1 ms boundary regardless of whether any wake event actually fired. The input pipeline's typically-microsecond syscalls were forced through unnecessary mid-syscall context switches at every quantum — strictly more work than voluntary mode does, with no compensating benefit. This was not a bug in the implementation; it was an architectural mismatch between the way the rest of the kernel uses the flag (rotation hint at the user-mode boundary) and the way preempt-full was reading it (immediate-preempt request).
+
+2. **A naive quantum threshold delays the wakee, not the waker.** The first reaction to discovery #1 was to add a minimum-granularity floor (4 ms, matching Linux CFS `sched_min_granularity_ns`): only preempt a kernel-mode task if it has run for at least the quantum. This made the lag *worse*. A genuine cross-core wake to a kernel-mode task running on a busy core had to wait up to the quantum for the running task to be preempted past it; `mouse_server`'s outbound queue overflowed 4–7 × more events than under no quantum (mdrops jumped from 24-38 to 166 in the test session). The same threshold pattern that bounds kernel-mode hogs in CFS pessimises wake-delivery latency for short syscalls. CFS's design assumption — long syscalls are common, short ones are rare — is inverted in a microkernel.
+
+3. **Microkernels move the work `CONFIG_PREEMPT` was designed to bound.** `CONFIG_PREEMPT` exists in Linux because filesystems, drivers, and network stacks live in kernel mode and routinely take 1 ms+ in syscall handlers (page-table walks, lock acquisition over disk I/O, complex memory reclaim). m3OS already moved that work to userspace servers (`vfs_server`, `display_server`, `audio_server`, the userspace driver-host). Kernel-mode work in m3OS is mostly capability checks, IPC routing, page-fault dispatch, syscall return — microsecond operations that yield naturally. The "1 ms syscall blocks other tasks" problem `CONFIG_PREEMPT` solves is a problem the rest of the m3OS architecture was designed to *not have*. Adding `CONFIG_PREEMPT` was solving a problem we don't have, while paying its overhead on every tick.
+
+4. **QEMU TCG masked the regression for thirteen sessions.** The 24-hour soak passed under TCG for most of Bug #12's life. TCG's serialised vCPU execution is a different concurrency shape than real cores — wake-race interleavings that would have surfaced on hardware did not surface in TCG. Bug #11 and Bug #12 both required real-hardware testing on the `omarchy` test machine to surface. The implication for any future preemption-model phase: real-hardware soak must be a per-track gate, not a post-merge verification.
+
+### Why this was the wrong path
+
+The four discoveries above compose into the architectural conclusion: **timer-driven kernel-mode preemption is a poor fit for a microkernel**. The benefit it provides (bounding latency from long-running kernel paths) is a benefit aimed at monolithic kernels where the long-running paths are unavoidable. m3OS has very few of those paths — and the ones it has (mostly mmap of file-backed regions over disk I/O, fork's page-table copy, exec's binary load) are concrete, narrow, and addressable individually rather than via a global preemption model.
+
+Linux supports `CONFIG_PREEMPT_NONE`, `_VOLUNTARY`, `_PREEMPT`, `_RT`, and `_DYNAMIC` precisely because the cost-benefit varies by workload. Most desktop/server distributions ship `_NONE` (RHEL server) or `_VOLUNTARY` (Ubuntu/Fedora desktop). `CONFIG_PREEMPT` is for low-latency desktop kernels and `PREEMPT_RT` is for hard real-time. As far as we can tell, Redox follows the same cooperative-kernel pattern microkernels typically do. The microkernel argument for *not* having full kernel preemption is that the work that would have benefited has already been moved; the implementation cost remains, but the value does not.
+
+The 18-session implementation cycle was not wasted. It produced real, lasting hardening of the SMP discipline that survives the deferral. But the headline goal — kernel-mode preemption mid-syscall on a 1 ms timer — was always going to be paying for capacity m3OS does not need.
+
+### What we are doing instead
+
+**Today (the 2026-05-07 cleanup state):** voluntary kernel preemption with cross-core IPI fast-path. User-mode tasks are preempted at the 1 ms timer tick (Phase 57d). Kernel-mode tasks run cooperatively — yielding via IPC blocks, deadline-based sleeps, syscall returns. Cross-core wakes deliver via IPI but no longer preempt the receiver mid-syscall (the IPI sets `reschedule = true` and is consumed at the next user-mode return boundary, exactly like voluntary mode). The `preempt-full` Cargo feature flag is retired and every `cfg(feature = "preempt-full")` site has been removed.
+
+The SMP discipline infrastructure is retained:
+
+- `preempt_count` per-task counter and per-core retarget (Phase 57b C.1 / C.2 / C.3).
+- `IrqSafeMutex` F.1 wiring (`preempt_disable` on lock, `preempt_enable` on `Drop`).
+- `preempt_enable` deferred-reschedule semantics (`preempt_resched_pending` flag, consumed at user-mode return boundary).
+- The Phase 57a wake protocol (`block_current_until` with absolute tick deadline; `wake_task_v2` with pi_lock + `on_cpu` cross-core spin-wait; `enqueue_to_core` with cross-core IPI).
+- The IPC bracket exits in `kernel/src/ipc/endpoint.rs` and the wake bracket on `wake_child_waiters` (Bug #6 / #8.1 / #12 / #13 race-shape closures).
+- The 1 s `sys_waitpid` deadline backstop (Bug #13).
+- The `init_task` 50 ms reap-loop sleep (Bug #12) and the `stdin_feeder` waitqueue block (Bug #12).
+
+**If a future workload genuinely needs lower kernel-mode latency** (a hard-real-time audio path, a kernel-hosted graphics driver), the architecturally-honest extension path is **`cond_resched`-style explicit yield points** — Linux's `PREEMPT_VOLUNTARY` mechanism, not its `CONFIG_PREEMPT`:
+
+1. Identify the specific kernel paths that legitimately run uninterrupted for >1 ms (page-fault handling, large-buffer `copy_from_user` / `copy_to_user`, fork's page-table copy, exec's binary load).
+2. Insert explicit `task::cond_resched()` calls at safe points inside those paths — points where `preempt_count == 0`, no spin lock is held, and the task is in a state where re-dispatch is safe.
+3. The `preempt-voluntary` feature flag and `preempt_resched_pending` infrastructure are the foundation; both are retained from the 57e cleanup.
+
+This approach costs zero unconditional overhead (no per-tick preempt check), bounds latency at the granularity the workload requires, and is the path Linux ships in `PREEMPT_VOLUNTARY` desktops. Under this future model the "preempt-full" name returns as a misleading legacy term — a dedicated phase document for the `cond_resched` work would set its own scope and call it something honest like "PREEMPT_VOLUNTARY+ explicit yield points" or "kernel-path latency bounding".
+
+### The durable lessons
+
+- **Architectural mismatches are easier to spot in retrospect than in design.** The four discoveries above were not visible in the original Phase 57e design doc; they only surfaced under sustained debugging on real hardware. The early "this should work" intuition rested on the assumption that what works for Linux works for m3OS — which is true for many things and wrong for this one.
+- **Real-hardware testing must be a per-track gate, not a post-merge verification.** QEMU TCG's deterministic vCPU serialisation hid Bug #12 (and Bug #11) for the entire QEMU-only soak window. The procedural fix is to require a "real-hardware GUI smoke" acceptance gate on every track that touches the scheduler, IPC protocol, or wake protocol.
+- **The preempt-discipline work survives the preemption-model decision.** `preempt_count`, `IrqSafeMutex` F.1, the wake brackets, and the deferred-reschedule semantics are all preempt-model-independent. The 18 sessions of bug-finding produced lasting hardening of the SMP discipline even as the headline feature was unwound.
+- **Sampled-log instrumentation pays for itself.** The `[yield-sample]` instrumentation pointed at each successive dominant yield source after every fix landed. Per-fix iteration without it would have been blind.
+
+For the full bug-by-bug history, the structural-fix hypotheses that were tried, and the post-mortem action items, see [`docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`](../post-mortems/2026-05-07-57e-preempt-full-deferred.md). The 18-session debugging log is preserved at [`docs/handoffs/57e-preempt-full-userspace-hangs.md`](../handoffs/57e-preempt-full-userspace-hangs.md) for any future attempt.
+
 ## Feature Scope
 
 ### Make the kernel handlers preemptible (the headline decision change)
