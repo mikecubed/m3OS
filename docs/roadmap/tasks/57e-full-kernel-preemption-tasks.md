@@ -18,8 +18,8 @@ After 18 debugging sessions and 13 distinct bugs, real-hardware testing on `omar
 - **Track D (dispatch reentrancy audit + held-lock watchdog):** D.1 audit retained; **D.3 watchdog removed** (only consumer was `check_and_preempt_kernel`, also removed).
 - **Track E (latency benchmarks):** retained for repurposing — could anchor Phase 57d soak benchmarks.
 - **Track F (activate kernel-mode preemption):** **reverted** in the cleanup. `timer_handler_kernel` and `reschedule_ipi_handler_kernel` no longer call `check_and_preempt_kernel` under preempt-full.
-- **Track G (Bug #9 FS-mutex fairness):** **independent follow-up**, decoupled from 57e disposition. The Option B Arc-clone refactor for `FAT32_VOLUME` / `EXT2_VOLUME` read paths remains valid work.
-- **Track H (Bug #10 sporadic Doom GPF):** **independent follow-up**, one observation unreproduced, kept open.
+- **Track G (Bug #9 FS-mutex fairness):** **independent follow-up**, decoupled from 57e disposition. The Option B Arc-clone refactor for `FAT32_VOLUME` / `EXT2_VOLUME` read paths remains valid work. Pickup handoff: [`docs/handoffs/57e-bug9-bug10-followup.md`](../../handoffs/57e-bug9-bug10-followup.md).
+- **Track H (Bug #10 sporadic Doom GPF):** **independent follow-up**, one observation unreproduced, kept open. Pickup handoff: same as above.
 - **Track J (FXSAVE→XSAVE migration):** **retained**. AVX support is independent of the kernel preemption model.
 
 The full pre-deferral track table is preserved below. Where a track is "removed" or "reverted" above, the table entry describes what *was* there before the cleanup; treat the table as historical.

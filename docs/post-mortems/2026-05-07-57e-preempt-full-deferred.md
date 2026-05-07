@@ -382,10 +382,11 @@ below) without re-introducing a feature flag.
   inclusion in the phase-doc template.)
 * [ ] Track G (Bug #9 FS-mutex fairness — Option B Arc-clone
   refactor) remains open as a separate follow-up. Independent of
-  57e disposition.
+  57e disposition. Pickup handoff:
+  [`docs/handoffs/57e-bug9-bug10-followup.md`](../handoffs/57e-bug9-bug10-followup.md).
 * [ ] Bug #10 (sporadic Doom-launch kernel-mode GPF, one
   observation, not reproduced) remains open. Independent of 57e
-  disposition.
+  disposition. Pickup handoff: same as above.
 
 ## Future work
 
