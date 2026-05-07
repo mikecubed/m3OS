@@ -2158,13 +2158,6 @@ pub fn peek_preempt_count_irq() -> i32 {
 static PREEMPT_LEAK_LOG_BUDGET: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(32);
 
-/// Phase 57e Bug #12 follow-up — sampling counter for `yield_now()` calls.
-/// `yield_now` logs `[yield-sample] n=N caller=file:line pid=P` every 100th
-/// invocation so the boot transcript reveals the busy-yielder distribution
-/// without needing a trace-ring dump.  See `yield_now` for the rationale.
-static YIELD_NOW_SAMPLE_COUNTER: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-
 /// Phase 57b D.3 (debug) / Phase 57e Bug #9 (release) — at user-mode
 /// return, `preempt_count` MUST be zero.  In debug builds a non-zero
 /// value panics so the missed `preempt_enable` surfaces immediately.
@@ -2292,29 +2285,12 @@ fn log_dequeue_filter_drop(core_id: u8, idx: usize, reason: &str, pid: u32, extr
 /// Yield the current task back to the scheduler.
 #[track_caller]
 pub fn yield_now() {
-    // Phase 57e Bug #12 follow-up: capture the call site so the trace ring
-    // identifies WHICH kernel function is busy-yielding.  Surfaces yield-loops
-    // (`while cond { yield_now() }` patterns in `nanosleep_for`, the short-
-    // sleep TSC spin, etc.) by their source file:line, so a failure mode that
-    // depends on the eager-yield in `preempt_enable` can be localised.
+    // `#[track_caller]` captures the caller's source location for the
+    // YieldNow trace event (consumed in trace-ring dumps).  The Phase
+    // 57e Bug #12 [yield-sample] sampled-log instrumentation that
+    // lived here was removed in the post-mortem cleanup — see
+    // `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
     let location = core::panic::Location::caller();
-    // Phase 57e Bug #12 sampled log — the trace ring only dumps on watchdog
-    // /panic triggers, which don't fire on a clean preempt-full lag run.
-    // Rate-limit one log per N yield_now invocations so the boot transcript
-    // shows a usable sample of the caller distribution.  The trade-off: 100
-    // is small enough to surface call-site distribution within a few hundred
-    // log lines, but large enough to not drown the serial console under
-    // sustained nanosleep / TSC-spin yield loops.
-    let n = YIELD_NOW_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if n.is_multiple_of(100) {
-        log::info!(
-            "[yield-sample] n={} caller={}:{} pid={}",
-            n,
-            location.file(),
-            location.line(),
-            crate::process::current_pid(),
-        );
-    }
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
