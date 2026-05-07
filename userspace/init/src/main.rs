@@ -2494,15 +2494,18 @@ pub extern "C" fn _start() -> ! {
             mgr.write_status_file();
         }
 
-        // Yield once if no child was reaped. A single yield is cheap — the
-        // scheduler hands the CPU to other runnable tasks, then returns here.
-        // Using `nanosleep_for(0, 0)` is a compatible "yield" on this kernel:
-        // `sys_nanosleep` treats the zero-duration case as a cooperative yield.
-        // We intentionally avoid a timed sleep (even 100 ms) because the
-        // kernel's long-sleep path uses a TSC-yield loop that on a contended
-        // single core keeps PID 1 "running" and starves `serial-stdin`.
+        // Sleep ~50 ms if no child was reaped.  The kernel's `sys_nanosleep`
+        // (Phase 57b F.5) blocks the task via `block_current_until` for any
+        // duration ≥ 1 ms — no TSC-yield loop, no CPU burn — so init parks
+        // until either a SIGCHLD wakes it (handled by `wake_child_waiters`
+        // bracket landed in Phase 57e Bug #13) or the deadline elapses.
+        // 50 ms is responsive enough for control commands and status-file
+        // updates while keeping PID 1's CPU footprint near zero, freeing
+        // the input pipeline (kbd_server / display_server / term / ion)
+        // from contention on `PROCESS_TABLE.lock()` that init's previous
+        // busy-yield loop produced once per scheduler quantum.
         if ret <= 0 {
-            nanosleep_for(0, 0);
+            let _ = nanosleep_for(0, 50_000_000);
         }
     }
 }
