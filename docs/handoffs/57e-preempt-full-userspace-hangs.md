@@ -1,5 +1,13 @@
 # Phase 57e — `preempt-full` Userspace Hangs Handoff
 
+> **OUTCOME (2026-05-07): Phase 57e Deferred.** After 18 debugging sessions and 13 distinct bugs documented in this handoff, real-hardware testing confirmed the `PREEMPT_FULL`-equivalent timer-driven kernel-mode preemption could not be made lag-free without effectively reverting to voluntary mode's behaviour. The phase is deferred; the `preempt-full` Cargo feature flag is retired; the kernel-mode preempt code paths are removed.
+>
+> **The SMP discipline infrastructure produced during the 57e cycle is retained** (preempt_count + IrqSafeMutex F.1 wiring, wake-bracket race-shape closures in `endpoint.rs` and `wake_child_waiters`, the `sys_waitpid` 1 s deadline backstop, the init reap-loop sleep, the stdin_feeder waitqueue block). Those fixes are preempt-model-independent and harden the SMP layer against the same race shapes that surfaced under preempt-full.
+>
+> **For the deferral rationale, structural reasons, and future-work pointer (Linux `PREEMPT_VOLUNTARY`-style `cond_resched` explicit yield points), see [`docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`](../post-mortems/2026-05-07-57e-preempt-full-deferred.md).**
+>
+> The body below is **preserved as historical reference** — 18 sessions of bug analysis, race-shape diagnosis, and fix attempts. It is goldmine for any future attempt at the feature; treat it as such, not as a current handoff. The "Quick-start for Session N" sections that propose next steps were superseded by the deferral decision.
+
 **Status (end of Session 18, after Bug #12 stdin-block fix + eager-yield retry-and-revert):**
 
 - **Bug #6 family** (preempt_enable zero-cross synchronous yield, three variants) — **closed** in Session 3 (commits `695f800`, `38d35ea`, `d83ecc7`, `3e3107c`); `695f800`'s init_task halt cfg-gated to preempt-full only in Session 16 (commit `753a311`) to fix the voluntary-mode regression below.

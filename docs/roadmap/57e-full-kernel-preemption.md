@@ -1,10 +1,44 @@
 # Phase 57e — Full Kernel Preemption (PREEMPT_FULL)
 
-**Status:** Planned
+**Status:** **Deferred (2026-05-07)** — see [post-mortem](../post-mortems/2026-05-07-57e-preempt-full-deferred.md). Phase reduced in scope to "voluntary kernel preemption with cross-core IPI fast-path" (the actual outcome). The timer-driven kernel-mode preemption code path is removed and the `preempt-full` Cargo feature flag is retired. The SMP discipline infrastructure produced during the 57e cycle (`preempt_count` per-task counter, `IrqSafeMutex` F.1 wiring, the wake-bracket race-shape closures in `endpoint.rs` / `wake_child_waiters`, the `sys_waitpid` 1 s deadline backstop) survives because it is preempt-model-independent. **Original goals retained below for historical context.**
 **Source Ref:** phase-57e
 **Depends on:** Phase 57b (Preemption Foundation) ✅, Phase 57c (Kernel Busy-Wait Audit and Conversion) ✅, Phase 57d (Voluntary Preemption) — functional ✅; gates I.2 (24-hour post-flip soak) and I.3 (`preempt-voluntary` flag removal) must close before 57e starts (see task-list Track 0).
 **Builds on:** Drops the `from_user` check from the IRQ-return preemption point introduced in 57d.  Once dropped, every kernel-mode IRQ-return becomes a potential preemption point — and the 57b `preempt_count` discipline becomes load-bearing for kernel-mode safety, not just user-mode.
 **Primary Components:** `kernel/src/arch/x86_64/interrupts.rs` (replace 57d's early-return in `timer_handler_kernel` / `reschedule_ipi_handler_kernel` with the same preempt check the user handlers run; extend the existing `global_asm!` block with `preempt_resume_to_kernel` and `dispatch_preempted_and_resume_kernel`), `kernel/src/task/scheduler.rs` (`preempt_to_scheduler_kernel` Rust shim, kernel-mode preempt invariants, kernel-mode `preempt_enable` immediate zero-crossing with IF-enabled gate, FXSAVE→XSAVE migration in `save_fpu_state`/`restore_fpu_state`), `kernel/src/arch/x86_64/cpuid.rs` (XSAVE feature detection), `kernel/src/smp/boot.rs` and `kernel/src/main.rs` (CR4.OSXSAVE + XCR0 wiring on BSP and APs).
+
+## Outcome (2026-05-07 deferral)
+
+Phase 57e is **deferred** after 18 debugging sessions and 13 distinct bugs. Real-hardware testing on the `omarchy` machine confirmed that timer-driven kernel-mode preemption — the headline behaviour the phase set out to add — could not be made lag-free without effectively reverting to voluntary mode's behaviour. The structural reasons are documented in detail in the [post-mortem](../post-mortems/2026-05-07-57e-preempt-full-deferred.md); two summaries:
+
+1. `timer_handler_kernel` calls `signal_reschedule()` unconditionally on every 1 ms tick. Under voluntary the flag is consumed at the user-mode-return boundary; under preempt-full `check_and_preempt_kernel` consumed it on the same tick, preempting every kernel-mode task at every 1 ms boundary regardless of whether any wake event actually fired. For a microkernel with microsecond-scale syscalls, this is unconditional overhead for no benefit.
+2. A naive quantum threshold makes the lag worse, not better, because it delays the wakee waiting for the waker to be preempted past its quantum. Cross-core IPI delivery is the right primitive for low-latency wake delivery; timer-driven kernel-mode preemption pessimises it.
+
+Microkernels generally don't need full kernel preemption — the work `CONFIG_PREEMPT` bounds in monolithic kernels (filesystem, drivers, network stack) is already in userspace servers in m3OS. Linux supports `CONFIG_PREEMPT_NONE`, `_VOLUNTARY`, `_PREEMPT`, `_RT`, and `_DYNAMIC` precisely because the cost-benefit varies by workload; most distributions ship `_NONE` or `_VOLUNTARY`. Redox follows the same cooperative-kernel pattern.
+
+**Surviving from the 57e cycle** (preempt-model-independent, retained):
+- `preempt_count` per-task counter and per-core retarget infrastructure (Phase 57b C.1 / C.2 / C.3).
+- `IrqSafeMutex` F.1 wiring (preempt_disable on lock, preempt_enable on Drop).
+- `preempt_enable` deferred-reschedule semantics (`preempt_resched_pending` flag).
+- `block_current_until` with absolute tick deadline; `wake_task_v2` with pi_lock + on_cpu cross-core spin-wait; `enqueue_to_core` with cross-core IPI.
+- IPC bracket exits in `kernel/src/ipc/endpoint.rs` (Bug #6 / #8.1 / #12 part 4).
+- Wake bracket on `wake_child_waiters` (Bug #13, `549584f`).
+- 1 s `sys_waitpid` deadline backstop (Bug #13, `9c39291`).
+- `init_task` 50 ms reap-loop sleep (Bug #12, `052010a`).
+- `stdin_feeder` waitqueue block (Bug #12, `538e650`).
+
+**Removed in the 2026-05-07 cleanup**:
+- `check_and_preempt_kernel` and its callers in `timer_handler_kernel` / `reschedule_ipi_handler_kernel`.
+- `preempt_to_scheduler_kernel`, `dispatch_preempted_and_resume_kernel`, kernel-mode preempt-frame plumbing.
+- `kernel_preempt_watchdog` (Track D.3).
+- `preempt-full` Cargo feature flag and every `cfg(feature = "preempt-full")` site.
+- `[yield-sample]` instrumentation (was Bug #12 debugging aid, now noise).
+
+**Future work**: if a future workload needs lower kernel-mode latency, the architecturally-honest path is `cond_resched`-style explicit yield points (Linux's `PREEMPT_VOLUNTARY` mechanism, not its `CONFIG_PREEMPT`). The `preempt-voluntary` flag and `preempt_resched_pending` infrastructure are the foundation; both are retained from this cleanup. See post-mortem § Future Work.
+
+---
+
+**Original phase goals (preserved for historical reference; not applicable):**
+
 
 ## Milestone Goal
 

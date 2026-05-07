@@ -1,9 +1,28 @@
 # Phase 57e — Full Kernel Preemption (PREEMPT_FULL): Task List
 
-**Status:** Implementation landed (Tracks A–F + J shipped behind `preempt-full` feature flag, default OFF); Tracks 0, G, H deferred — see PR #136 (v0.57.5) and the per-track status below
+**Status:** **Phase Deferred (2026-05-07)** — see [post-mortem](../../post-mortems/2026-05-07-57e-preempt-full-deferred.md). Tracks A–F + J shipped behind `preempt-full` did not produce a usable `PREEMPT_FULL` mode on real hardware; the feature flag is being retired and the kernel-mode preempt code paths are being removed. Tracks G (Bug #9 FS-mutex fairness) and H (Bug #10 sporadic Doom GPF) survive as independent follow-ups, decoupled from the 57e disposition. SMP discipline infrastructure produced during the 57e cycle (preempt_count, IrqSafeMutex F.1 wiring, the wake-bracket race-shape closures, `sys_waitpid` deadline backstop) is **retained** because it is preempt-model-independent. **Original tracks retained below for historical reference.**
 **Source Ref:** phase-57e
 **Depends on:** Phase 57b ✅, Phase 57c ✅, Phase 57d (functional ✅; gates I.2 and I.3 deferred — see Track 0)
-**Goal:** Drop the `from_user` check from 57d's IRQ-return preemption point.  Kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Per-trigger latency floors improve over the 57d baseline; cross-core IPI wakeup is the only path expected to drop into the microsecond range.  This is the **stretch goal** of the 57b/c/d/e programme — the realistic 1.0 release target is `PREEMPT_VOLUNTARY` parity at end of 57d.
+**Goal:** ~~Drop the `from_user` check from 57d's IRQ-return preemption point.~~ Original goal not achieved on real hardware. See [post-mortem](../../post-mortems/2026-05-07-57e-preempt-full-deferred.md) for the structural reasons (`signal_reschedule()` semantics + asymmetric quantum-threshold delay) and the future-work pointer (Linux `PREEMPT_VOLUNTARY`-style `cond_resched` explicit yield points).
+
+## Outcome (2026-05-07 deferral)
+
+After 18 debugging sessions and 13 distinct bugs, real-hardware testing on `omarchy` confirmed the headline behaviour could not be made lag-free without effectively reverting to voluntary mode's behaviour. The implementation is being unwound; the SMP discipline work it produced is being kept.
+
+**Per-track disposition:**
+
+- **Track 0 (prelude — 57d I.2, I.3 gates):** N/A. The cleanup unwinds 57e back to voluntary; 57d's own I.2 / I.3 follow-up remains open as a Phase 57d task, not blocked by 57e disposition.
+- **Track A (audit):** retained as historical reference (`docs/handoffs/57e-kernel-preempt-audit.md`, `docs/handoffs/57e-dispatch-reentrancy.md`).
+- **Track B (preempt_disable wrapping):** **retained**. The 9 wrapped sites are still load-bearing for `IrqSafeMutex` F.1 discipline regardless of preemption model.
+- **Track C (kernel-mode dispatch resume infrastructure):** **removed** in the 2026-05-07 cleanup. `preempt_resume_to_kernel`, `dispatch_preempted_and_resume_kernel`, `preempt_to_scheduler_kernel`, the kernel-mode `PreemptTrapFrameKernel` plumbing.
+- **Track D (dispatch reentrancy audit + held-lock watchdog):** D.1 audit retained; **D.3 watchdog removed** (only consumer was `check_and_preempt_kernel`, also removed).
+- **Track E (latency benchmarks):** retained for repurposing — could anchor Phase 57d soak benchmarks.
+- **Track F (activate kernel-mode preemption):** **reverted** in the cleanup. `timer_handler_kernel` and `reschedule_ipi_handler_kernel` no longer call `check_and_preempt_kernel` under preempt-full.
+- **Track G (Bug #9 FS-mutex fairness):** **independent follow-up**, decoupled from 57e disposition. The Option B Arc-clone refactor for `FAT32_VOLUME` / `EXT2_VOLUME` read paths remains valid work.
+- **Track H (Bug #10 sporadic Doom GPF):** **independent follow-up**, one observation unreproduced, kept open.
+- **Track J (FXSAVE→XSAVE migration):** **retained**. AVX support is independent of the kernel preemption model.
+
+The full pre-deferral track table is preserved below. Where a track is "removed" or "reverted" above, the table entry describes what *was* there before the cleanup; treat the table as historical.
 
 In addition, this phase migrates kernel FPU state save/restore from `fxsave64`/`fxrstor64` to `xsave64`/`xrstor64` (Track J) so AVX YMM state survives context switches.  57e increases switch frequency under load; without xsave, hosted binaries that emit AVX (modern Rust/LLVM, musl ports, ion shell, audio_server pipeline) accumulate silent FP corruption.  The work is mechanical and folded into 57e because the same 24-hour soak validates both changes.
 
