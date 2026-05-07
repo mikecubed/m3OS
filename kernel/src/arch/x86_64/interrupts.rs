@@ -1671,15 +1671,39 @@ pub unsafe extern "C" fn timer_handler_kernel(
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
-    #[cfg(feature = "preempt-full")]
-    unsafe {
-        check_and_preempt_kernel(frame, captured_kernel_rsp, PreemptTrigger::Timer);
-    }
-    #[cfg(not(feature = "preempt-full"))]
-    {
-        let _ = frame;
-        let _ = captured_kernel_rsp;
-    }
+    // Phase 57e Bug #12 part 7 — drop timer-driven kernel-mode preemption.
+    //
+    // The unconditional `signal_reschedule()` above sets `reschedule = true`
+    // on every 1 ms timer tick.  Under voluntary mode (no
+    // `check_and_preempt_kernel` exists), the flag sits until the running
+    // task transitions to user mode, where `check_and_preempt_user` consumes
+    // it — kernel-mode tasks run uninterrupted, the lag-free pattern the
+    // user confirmed on real hardware.
+    //
+    // Under preempt-full's prior shape, `check_and_preempt_kernel` consumed
+    // the flag on the same tick, preempting every kernel-mode task on
+    // every 1 ms boundary — even when there was no actual wake event,
+    // because the flag had been set by THIS tick's `signal_reschedule`.
+    // The input pipeline's typically-microsecond syscalls were getting
+    // unnecessary mid-syscall context switches at every quantum, surfacing
+    // as user-visible input lag (and getting strictly worse with the 4 ms
+    // quantum experiment in 17099f6, reverted in 5ff8a35, because that
+    // delayed the WAKEE rather than the WAKER).
+    //
+    // Cross-core wake delivery is preserved by `reschedule_ipi_handler_kernel`
+    // (Phase 57e Track F.1), which keeps `check_and_preempt_kernel` for the
+    // RescheduleIpi trigger — an IPI fires *only* when there is an actual
+    // cross-core wake (`enqueue_to_core` sends `IPI_RESCHEDULE` only when
+    // the target differs from the caller's core).  Same-core wakes wait
+    // for the running task's natural yield (matches voluntary's behaviour).
+    //
+    // Trade-off: a kernel-mode task that hogs the CPU without yielding is
+    // not bounded by the timer.  Same as voluntary.  All current m3OS
+    // kernel-mode work yields cooperatively (IPC blocks, deadline-based
+    // sleeps, syscall returns); hog-bounding can be added back as a longer
+    // quantum (e.g. 100 ms) if a future workload introduces a hog.
+    let _ = frame;
+    let _ = captured_kernel_rsp;
 }
 
 // ---------------------------------------------------------------------------
