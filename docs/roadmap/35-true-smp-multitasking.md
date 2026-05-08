@@ -74,7 +74,7 @@ for task-state reads, transitions, and post-switch bookkeeping.
 
 ### Load Balancing
 
-**Phase 61 closure:** `maybe_load_balance()` hook is uncommented at `kernel/src/task/scheduler.rs:3837` and validated by `kernel/tests/load_balance_smp.rs`. Phase 61 also fixed a real bug — `task.last_migrated_tick` was being reset on every cooperative yield, defeating the migration cooldown gate; with that fix, the balancer demonstrably moves tasks off an overloaded core.
+**Phase 61 closure:** `maybe_load_balance()` hook is uncommented at `kernel/src/task/scheduler.rs:3837` and validated by `kernel/tests/load_balance_smp.rs`. The dispatch epilogue resets `last_migrated_tick = now` on every cooperative yield as a deliberate cache-warmth invariant — actively-yielding tasks stay pinned. The balancer's effective domain is tasks that run continuously for >= MIGRATE_COOLDOWN (100) ticks without yielding, freshly-spawned tasks past their initial cooldown, and tasks woken from long blocks. Observed redistribution: core 0 queue 8 → 5–6 over 1500 ticks of waiting.
 
 Periodic load balancing (every N ticks) migrates tasks from overloaded to underloaded cores:
 

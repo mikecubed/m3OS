@@ -61,23 +61,19 @@ Cross-core tests then call `boot_aps_if_available()`. The prelude omits userspac
 
 The Phase 35 E.1 plan's `queue_length: AtomicU32` counter was deliberately NOT added: `VecDeque::len()` is O(1), the lock is already held for the read, and a parallel counter would create a second source of truth that drifts on every enqueue/dequeue mistake.
 
-### Track B — load-balance correctness test + bug fix
+### Track B — load-balance correctness test (and what we learned about the design)
 
-`kernel/tests/load_balance_smp.rs` boots the kernel via the Track 0b prelude, boots APs, spawns 8 CPU-bound workers all initially on core 0 via the new `task::scheduler::spawn_on_core(entry, name, core_id)` helper, waits for several `BALANCE_COUNTER` cycles, then asserts that workers were redistributed.
+`kernel/tests/load_balance_smp.rs` boots the kernel via the Track 0b prelude, boots APs, spawns 8 CPU-bound workers all initially on core 0 via the new `task::scheduler::spawn_on_core(entry, name, core_id)` helper, waits for several `BALANCE_COUNTER` cycles, then asserts core 0's queue length shrank.
 
-Implementing this test surfaced the load-balancer silent-no-op bug. The fix:
+Implementing this test taught us the design intent of `last_migrated_tick`. An earlier Phase 61 commit (798677b) read the dispatch-epilogue line `task.last_migrated_tick = now` as a bug — without it, `maybe_load_balance` migrated tasks aggressively. But that commit also caused a kernel page fault under fork-bomb load (ion exiting Doom; post-mortem in PR thread). The reset is deliberate: it implements a **cache-warmth invariant**. Actively-yielding tasks are "hot" on their current core, and both `maybe_load_balance` and `try_steal` (work stealing in `pick_next_task`) gate migration on `tick - last_migrated_tick >= MIGRATE_COOLDOWN` (100 ticks). Resetting on every yield keeps hot tasks pinned.
 
-```rust
-// kernel/src/task/scheduler.rs, dispatch epilogue (was line 4419)
-if task.state == TaskState::Running {
-    task.state = TaskState::Ready;
-    task.last_ready_tick = now;
-    // task.last_migrated_tick = now;  // <-- REMOVED (was the bug)
-    Some((task.assigned_core, sidx))
-}
-```
+The load balancer's effective domain is therefore:
 
-`last_migrated_tick` is now updated only at spawn time (task assignment) and inside `maybe_load_balance` after a successful migration — its actual semantic. Confirmed via the test: core 0 goes from 8 to ≤4 in 600 ticks, three other cores receive load.
+  - tasks freshly spawned (eligible 100 ticks after spawn, if they don't yield);
+  - tasks woken from a block of 100+ ticks;
+  - tasks running continuously for 100+ ticks without yielding (the classic "needs to be balanced" signal — they're starving other tasks on their core).
+
+Track B's test workers therefore spin for 150 ticks between yields to qualify. Observed: core 0 queue goes 8 → 5–6 over 1500 ticks of waiting.
 
 ### Track C.1 — TLB-shootdown wiring verification
 

@@ -195,7 +195,7 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Acceptance:**
 - [x] `maybe_load_balance()` implements queue comparison and one-task migration logic
 - [x] Migrated tasks update `assigned_core` and re-enter the destination core's queue
-- [x] Phase 61 closure: hook is uncommented at `kernel/src/task/scheduler.rs:3837` (BSP, every 50 ticks). SMP load-balance correctness test in `kernel/tests/load_balance_smp.rs`. Phase 61 also fixed a real silent-no-op bug — `task.last_migrated_tick` was being reset on every yield, defeating the migration cooldown gate; with that fix, the balancer demonstrably redistributes imbalanced workloads.
+- [x] Phase 61 closure: hook is uncommented at `kernel/src/task/scheduler.rs:3837` (BSP, every 50 ticks). SMP load-balance correctness test in `kernel/tests/load_balance_smp.rs`. The dispatch epilogue resets `task.last_migrated_tick = now` on every cooperative yield as a deliberate cache-warmth invariant: actively-yielding tasks stay pinned to their current core. The balancer's effective domain is therefore tasks that have run continuously for >= MIGRATE_COOLDOWN (100) ticks without yielding, freshly-spawned tasks past their initial cooldown, or tasks woken from a long block. The test workers spin 150 ticks between yields to qualify; observed core 0 queue 8 → ~5–6 over 1500 ticks.
 
 ### E.3 — Prevent migration of affinity-pinned tasks
 **File:** `kernel/src/task/scheduler.rs`
