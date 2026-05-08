@@ -1,8 +1,8 @@
-# Phase 59 - Cross-Compiled Toolchains
+# Phase 78 - Cross-Compiled Toolchains
 
 **Status:** Planned
-**Source Ref:** phase-59
-**Depends on:** Phase 36 (Expanded Memory) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 58 (Release 1.0 Gate) ✅
+**Source Ref:** phase-78
+**Depends on:** Phase 36 (Expanded Memory) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 77 (Release 1.0 Gate) ✅
 **Builds on:** Turns the existing Rust cross-compilation and ports baseline into a broader post-1.0 developer-toolchain story with larger bundled host-built binaries such as git, Python, and Clang
 **Primary Components:** xtask/src/main.rs, ports, kernel/initrd or disk image layout, userspace Rust std pipeline, docs/git-roadmap.md, docs/python-roadmap.md, docs/clang-llvm-roadmap.md
 
@@ -53,7 +53,7 @@ Document how the build pipeline stages, caches, installs, and validates these la
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Release-boundary baseline | Phase 58 has already separated 1.0 commitments from 1.x growth | Add the missing support-boundary documentation first |
+| Release-boundary baseline | Phase 77 has already separated 1.0 commitments from 1.x growth | Add the missing support-boundary documentation first |
 | Runtime baseline | Phases 36, 44, and 45 are stable enough for large binaries and installable software | Pull missing memory or packaging cleanup into this phase |
 | Image-layout baseline | The system has a documented place for large toolchains and their libraries | Add the missing filesystem or staging-layout work |
 | Validation baseline | There is a repeatable way to prove git, Python, and Clang work in the supported environment | Add the missing post-build validation steps |
@@ -75,7 +75,7 @@ The toolchains matter only if they fit the supported developer workflow on m3OS.
 ## How This Builds on Earlier Phases
 
 - Builds on Phase 44's Rust cross-compilation baseline and Phase 45's ports and package layout.
-- Depends on Phase 58 so this larger ecosystem work is clearly treated as post-1.0 growth instead of hidden release debt.
+- Depends on Phase 77 so this larger ecosystem work is clearly treated as post-1.0 growth instead of hidden release debt.
 - Prepares the ground for richer networked developer workflows in the next phases.
 
 ## Implementation Outline
@@ -88,7 +88,7 @@ The toolchains matter only if they fit the supported developer workflow on m3OS.
 
 ## Learning Documentation Requirement
 
-- Create `docs/59-cross-compiled-toolchains.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/78-cross-compiled-toolchains.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the staging flow, install layout, memory/disk implications, and how git, Python, and Clang fit the post-1.0 developer story.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -109,7 +109,7 @@ The toolchains matter only if they fit the supported developer workflow on m3OS.
 
 ## Companion Task List
 
-- Phase 59 task list — defer until implementation planning begins.
+- Phase 78 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 
