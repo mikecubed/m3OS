@@ -602,6 +602,35 @@ pub struct Task {
     /// `sys_getrusage(RUSAGE_CHILDREN)` to populate `ru_stime`.
     /// Phase 61 Track E.1.
     pub child_system_ticks: u64,
+    /// Phase 61 Track E.4 — page-fault and ctxsw counters for `getrusage(2)`.
+    ///
+    /// Minor faults — fault successfully resolved in-memory (e.g., CoW page
+    /// duplication, demand-zero allocation). No backing-store I/O.
+    /// Incremented from `page_fault_handler` after resolution.
+    pub minor_faults: u64,
+    /// Major faults — fault required a backing-store read (page-in from
+    /// disk-backed `mmap`, swap-in). Incremented from `page_fault_handler`
+    /// when the resolution path involved disk I/O. In Phase 61 the
+    /// disk-backed mmap path is incomplete, so this counter stays at 0
+    /// in practice; the field is present so the API surface is stable.
+    pub major_faults: u64,
+    /// Voluntary context switches — task explicitly yielded
+    /// (`yield_now`, IPC block, futex sleep, etc.). Incremented inside
+    /// `yield_now` before the switch.
+    pub voluntary_ctxsw: u64,
+    /// Involuntary context switches — task was preempted by the timer IRQ
+    /// or rescheduled by an external waker. Incremented from the
+    /// timer-IRQ preempt path before the switch.
+    pub involuntary_ctxsw: u64,
+    /// Reaped-descendants minor-fault accumulator. Updated at zombie-reap
+    /// alongside the time accumulators, recursive accumulation rule.
+    pub child_minor_faults: u64,
+    /// Reaped-descendants major-fault accumulator.
+    pub child_major_faults: u64,
+    /// Reaped-descendants voluntary-ctxsw accumulator.
+    pub child_voluntary_ctxsw: u64,
+    /// Reaped-descendants involuntary-ctxsw accumulator.
+    pub child_involuntary_ctxsw: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,8 +701,6 @@ impl Task {
             affinity_mask: u64::MAX, // Can run on any core
             user_ticks: 0,
             system_ticks: 0,
-            child_user_ticks: 0,
-            child_system_ticks: 0,
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,
@@ -705,6 +732,18 @@ impl Task {
             syscall_snapshot: core::cell::UnsafeCell::new(TaskSyscallSnapshot::default()),
             resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
             reply_waker: None,
+            // Phase 61 Track E.1 — children CPU-time accumulators.
+            child_user_ticks: 0,
+            child_system_ticks: 0,
+            // Phase 61 Track E.4 — rusage event counters (own + child).
+            minor_faults: 0,
+            major_faults: 0,
+            voluntary_ctxsw: 0,
+            involuntary_ctxsw: 0,
+            child_minor_faults: 0,
+            child_major_faults: 0,
+            child_voluntary_ctxsw: 0,
+            child_involuntary_ctxsw: 0,
         }
     }
 

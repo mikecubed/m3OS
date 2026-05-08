@@ -4601,6 +4601,10 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     crate::task::scheduler::current_task_accumulate_child_times(
                         z_user, z_sys, z_cuser, z_csys,
                     );
+                    // Phase 61 Track E.4: same recursive accumulation rule
+                    // for rusage event counters (page faults + ctxsw).
+                    let z_rusage = crate::task::scheduler::rusage_counters_for_pid(pid);
+                    crate::task::scheduler::current_task_accumulate_child_rusage(z_rusage);
                     table.reap(pid);
                     Some((pid, Some(code), false))
                 }

@@ -2302,6 +2302,8 @@ pub fn yield_now() {
             sched.tasks.len()
         );
         accumulate_ticks(&mut sched, idx);
+        // Phase 61 Track E.4: cooperative yield → voluntary ctxsw.
+        sched.tasks[idx].voluntary_ctxsw = sched.tasks[idx].voluntary_ctxsw.saturating_add(1);
         // Keep state as Running — the scheduler will set Ready + enqueue AFTER
         // switch_context saves the RSP.
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
@@ -2391,6 +2393,8 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
             }
         };
         accumulate_ticks(&mut sched, idx);
+        // Phase 61 Track E.4: timer-IRQ / IPI preempt → involuntary ctxsw.
+        sched.tasks[idx].involuntary_ctxsw = sched.tasks[idx].involuntary_ctxsw.saturating_add(1);
         let preempt_count_ptr: *const core::sync::atomic::AtomicI32 =
             &raw const sched.tasks[idx].preempt_count;
         if let Some(urs) = sched.tasks[idx].user_return.as_mut() {
@@ -2541,6 +2545,143 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
         }
     }
     (user, system, child_user, child_system)
+}
+
+/// Phase 61 Track E.4 — rusage event-counter snapshot for one pid's full
+/// thread group. Returns a `RusageCounters` of `(own, child)` pairs for
+/// minor faults, major faults, voluntary ctxsw, involuntary ctxsw — eight
+/// values total — summed across every task in the group. Used by
+/// `sys_waitpid` (alongside [`task_times_for_pid`]) to drive the recursive
+/// accumulation at the zombie-reap site.
+#[derive(Default, Clone, Copy)]
+pub struct RusageCounters {
+    pub minor_faults: u64,
+    pub major_faults: u64,
+    pub voluntary_ctxsw: u64,
+    pub involuntary_ctxsw: u64,
+    pub child_minor_faults: u64,
+    pub child_major_faults: u64,
+    pub child_voluntary_ctxsw: u64,
+    pub child_involuntary_ctxsw: u64,
+}
+
+pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
+    let sched = scheduler_lock();
+    let mut out = RusageCounters::default();
+    for task in sched.tasks.iter() {
+        if task.pid == pid {
+            out.minor_faults = out.minor_faults.saturating_add(task.minor_faults);
+            out.major_faults = out.major_faults.saturating_add(task.major_faults);
+            out.voluntary_ctxsw = out.voluntary_ctxsw.saturating_add(task.voluntary_ctxsw);
+            out.involuntary_ctxsw = out.involuntary_ctxsw.saturating_add(task.involuntary_ctxsw);
+            out.child_minor_faults = out
+                .child_minor_faults
+                .saturating_add(task.child_minor_faults);
+            out.child_major_faults = out
+                .child_major_faults
+                .saturating_add(task.child_major_faults);
+            out.child_voluntary_ctxsw = out
+                .child_voluntary_ctxsw
+                .saturating_add(task.child_voluntary_ctxsw);
+            out.child_involuntary_ctxsw = out
+                .child_involuntary_ctxsw
+                .saturating_add(task.child_involuntary_ctxsw);
+        }
+    }
+    out
+}
+
+/// Return the calling task's own rusage counters
+/// `(minor_faults, major_faults, voluntary_ctxsw, involuntary_ctxsw)`.
+/// Used by `sys_getrusage(RUSAGE_SELF)`. Phase 61 Track E.4.
+pub fn current_task_rusage_self() -> Option<(u64, u64, u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let t = &sched.tasks[idx];
+    Some((
+        t.minor_faults,
+        t.major_faults,
+        t.voluntary_ctxsw,
+        t.involuntary_ctxsw,
+    ))
+}
+
+/// Return the calling task's children rusage counters
+/// `(minor_faults, major_faults, voluntary_ctxsw, involuntary_ctxsw)`.
+/// Used by `sys_getrusage(RUSAGE_CHILDREN)`. Phase 61 Track E.4.
+pub fn current_task_rusage_children() -> Option<(u64, u64, u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let t = &sched.tasks[idx];
+    Some((
+        t.child_minor_faults,
+        t.child_major_faults,
+        t.child_voluntary_ctxsw,
+        t.child_involuntary_ctxsw,
+    ))
+}
+
+/// Accumulate a reaped zombie's rusage counters into the calling task's
+/// child_* accumulator fields. Recursive accumulation rule (mirrors
+/// [`current_task_accumulate_child_times`]). Phase 61 Track E.4.
+pub fn current_task_accumulate_child_rusage(zombie: RusageCounters) -> bool {
+    let Some(idx) = get_current_task_idx() else {
+        return false;
+    };
+    let mut sched = scheduler_lock();
+    let parent = &mut sched.tasks[idx];
+    parent.child_minor_faults = parent
+        .child_minor_faults
+        .saturating_add(zombie.minor_faults)
+        .saturating_add(zombie.child_minor_faults);
+    parent.child_major_faults = parent
+        .child_major_faults
+        .saturating_add(zombie.major_faults)
+        .saturating_add(zombie.child_major_faults);
+    parent.child_voluntary_ctxsw = parent
+        .child_voluntary_ctxsw
+        .saturating_add(zombie.voluntary_ctxsw)
+        .saturating_add(zombie.child_voluntary_ctxsw);
+    parent.child_involuntary_ctxsw = parent
+        .child_involuntary_ctxsw
+        .saturating_add(zombie.involuntary_ctxsw)
+        .saturating_add(zombie.child_involuntary_ctxsw);
+    true
+}
+
+/// Increment the running task's `minor_faults` (or `major_faults` if
+/// `major == true`) counter by 1. Called from the page-fault handler
+/// after a successful resolution. Phase 61 Track E.4.
+pub fn current_task_record_page_fault(major: bool) {
+    let Some(idx) = get_current_task_idx() else {
+        return;
+    };
+    let mut sched = scheduler_lock();
+    if let Some(task) = sched.tasks.get_mut(idx) {
+        if major {
+            task.major_faults = task.major_faults.saturating_add(1);
+        } else {
+            task.minor_faults = task.minor_faults.saturating_add(1);
+        }
+    }
+}
+
+/// Increment the running task's `voluntary_ctxsw` (when `voluntary == true`)
+/// or `involuntary_ctxsw` counter by 1. Called from the cooperative
+/// `yield_now` path and from the timer-IRQ-driven preempt path immediately
+/// before the context switch. Phase 61 Track E.4.
+pub fn current_task_record_ctxsw(voluntary: bool) {
+    let Some(idx) = get_current_task_idx() else {
+        return;
+    };
+    let mut sched = scheduler_lock();
+    if let Some(task) = sched.tasks.get_mut(idx) {
+        if voluntary {
+            task.voluntary_ctxsw = task.voluntary_ctxsw.saturating_add(1);
+        } else {
+            task.involuntary_ctxsw = task.involuntary_ctxsw.saturating_add(1);
+        }
+    }
 }
 
 /// Return the accumulated user/system tick counts for the current task's

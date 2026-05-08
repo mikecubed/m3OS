@@ -985,6 +985,11 @@ extern "x86-interrupt" fn page_fault_handler(
             // the CoW path serializes its page-table mutation under the
             // current address-space lock before issuing TLB shootdowns.
             if resolve_cow_fault(fault_addr_u64) {
+                // Phase 61 Track E.4: CoW resolution is the canonical
+                // minor-fault site (no backing-store I/O). Major faults
+                // require the disk-backed mmap path which is not yet
+                // wired; the major counter stays at 0 in practice today.
+                crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }

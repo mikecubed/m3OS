@@ -120,3 +120,78 @@ fn child_times_recursive_accumulation_rule() {
 
     kernel::serial_println!("[e1-test] recursive child-time accumulation rule verified");
 }
+
+#[test_case]
+fn rusage_counters_increment_and_accumulate() {
+    use kernel::task::scheduler::{
+        RusageCounters, current_task_accumulate_child_rusage, current_task_record_ctxsw,
+        current_task_record_page_fault, current_task_rusage_children, current_task_rusage_self,
+    };
+
+    // Snapshot the starting counters — the test runner may have already
+    // executed yield_now and other paths that increment counters before
+    // this body runs, so we treat them as a baseline rather than asserting
+    // they are zero. Phase 61 Track E.4.
+    let (start_minor, start_major, start_vol, start_invol) =
+        current_task_rusage_self().expect("current task should exist");
+
+    // Two minor faults, one major.
+    current_task_record_page_fault(false);
+    current_task_record_page_fault(false);
+    current_task_record_page_fault(true);
+
+    // Three voluntary, one involuntary.
+    current_task_record_ctxsw(true);
+    current_task_record_ctxsw(true);
+    current_task_record_ctxsw(true);
+    current_task_record_ctxsw(false);
+
+    let (minor, major, vol, invol) = current_task_rusage_self().unwrap();
+    assert_eq!(
+        minor.saturating_sub(start_minor),
+        2,
+        "minor_faults delta after 2 minor records",
+    );
+    assert_eq!(
+        major.saturating_sub(start_major),
+        1,
+        "major_faults delta after 1 major record",
+    );
+    assert_eq!(
+        vol.saturating_sub(start_vol),
+        3,
+        "voluntary_ctxsw delta after 3 records",
+    );
+    assert_eq!(
+        invol.saturating_sub(start_invol),
+        1,
+        "involuntary_ctxsw delta after 1 record",
+    );
+
+    // Now exercise the recursive accumulation rule for the children path.
+    let (cm0, cM0, cv0, cI0) = current_task_rusage_children().unwrap();
+
+    let zombie_a = RusageCounters {
+        minor_faults: 7,
+        major_faults: 1,
+        voluntary_ctxsw: 4,
+        involuntary_ctxsw: 2,
+        child_minor_faults: 3, // already-reaped grandchild
+        child_major_faults: 0,
+        child_voluntary_ctxsw: 1,
+        child_involuntary_ctxsw: 0,
+    };
+    assert!(current_task_accumulate_child_rusage(zombie_a));
+
+    let (cm1, cM1, cv1, cI1) = current_task_rusage_children().unwrap();
+    assert_eq!(
+        cm1 - cm0,
+        7 + 3,
+        "recursive minor: zombie own + zombie child"
+    );
+    assert_eq!(cM1 - cM0, 1 + 0, "recursive major");
+    assert_eq!(cv1 - cv0, 4 + 1, "recursive voluntary ctxsw");
+    assert_eq!(cI1 - cI0, 2 + 0, "recursive involuntary ctxsw");
+
+    kernel::serial_println!("[e4-test] rusage counter increment + recursive accumulation verified");
+}
