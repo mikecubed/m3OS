@@ -54,14 +54,14 @@
 **Why it matters:** `task_cache` has been declared at 512 bytes since Phase 33 C.3 but has never carried real load — only one in-kernel `#[test_case]` (`fd_cache`-based, at `kernel/src/main.rs:1330-1370`) exercises a named cache. B.1 wires `task_cache` into the actual `Task` allocation path.
 
 **Acceptance:**
-- [ ] `core::mem::size_of::<Task>()` measured and recorded as a `const_assert!` (or equivalent compile-time check) at the allocation site.
-- [ ] If `size_of::<Task>() > 512`, `task_cache` slot size in `kernel/src/mm/slab.rs:333` raised to the next power of two that fits, with a comment citing the assertion.
-- [ ] `slab_page_alloc` at `kernel/src/mm/slab.rs:292` made `pub(crate)` so the scheduler can pass it as the page-allocator callback to `.allocate(...)`.
-- [ ] A `SlabBox<T>` newtype is introduced (in a new module, e.g. `kernel/src/mm/slab_box.rs`) holding `(NonNull<T>, &'static IrqSafeMutex<SlabCache>)`. Its `Drop` impl calls `core::ptr::drop_in_place(self.ptr.as_ptr())` then `cache.lock().free(self.ptr.as_ptr() as usize)`. It exposes `Deref<Target = T>` and `DerefMut`. (`Box::from_raw` cannot be reused because the global allocator's `dealloc` does not know about the slab cache.)
-- [ ] Both `Box::new(task)` sites at `kernel/src/task/scheduler.rs:1097` and `:3651` replaced with `SlabBox::<Task>::new_in(&caches().task_cache, task)` (or equivalent). The scheduler's `tasks: Vec<Box<Task>>` field is changed to `tasks: Vec<SlabBox<Task>>`.
-- [ ] All scheduler code paths that read `&self.tasks[i]` or `&mut self.tasks[i]` continue to compile unchanged because `SlabBox<T>` exposes `Deref`/`DerefMut` to `T`.
-- [ ] `cargo xtask test` passes with no regression.
-- [ ] `cargo test -p kernel-core` passes with at least one new test exercising slab alloc/free/reuse for a `size_of::<Task>()`-sized object (the test uses a raw byte buffer, not a real `Task`, because `Task` carries kernel-only globals).
+- [x] `core::mem::size_of::<Task>()` measured and recorded as a `const_assert!` (or equivalent compile-time check) at the allocation site (`kernel/src/task/scheduler.rs` post-`alloc_task_slot`).
+- [x] If `size_of::<Task>() > 512`, `task_cache` slot size in `kernel/src/mm/slab.rs:333` raised to the next power of two that fits, with a comment citing the assertion. Bumped to 1024 via new `TASK_CACHE_SLOT_SIZE` const.
+- [x] `slab_page_alloc` at `kernel/src/mm/slab.rs:292` made `pub(crate)` so the scheduler can pass it as the page-allocator callback to `.allocate(...)`.
+- [x] A `SlabBox<T>` newtype is introduced (in a new module, e.g. `kernel/src/mm/slab_box.rs`) holding `(NonNull<T>, &'static IrqSafeMutex<SlabCache>)`. Its `Drop` impl calls `core::ptr::drop_in_place(self.ptr.as_ptr())` then `cache.lock().free(self.ptr.as_ptr() as usize)`. It exposes `Deref<Target = T>` and `DerefMut`. (`Box::from_raw` cannot be reused because the global allocator's `dealloc` does not know about the slab cache.)
+- [x] Both `Box::new(task)` sites at `kernel/src/task/scheduler.rs:1097` and `:3651` replaced with `SlabBox::<Task>::new_in(&caches().task_cache, task)` (or equivalent). The scheduler's `tasks: Vec<Box<Task>>` field is changed to `tasks: Vec<SlabBox<Task>>`.
+- [x] All scheduler code paths that read `&self.tasks[i]` or `&mut self.tasks[i]` continue to compile unchanged because `SlabBox<T>` exposes `Deref`/`DerefMut` to `T`.
+- [x] `cargo xtask test` passes with no regression.
+- [x] `cargo test -p kernel-core` passes with at least one new test exercising slab alloc/free/reuse for a `size_of::<Task>()`-sized object (the test uses a raw byte buffer, not a real `Task`, because `Task` carries kernel-only globals).
 
 ### B.2 — Migrate `XSaveArea` to a new `xsave_cache`
 

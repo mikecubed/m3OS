@@ -551,9 +551,21 @@ fn set_current_task_idx(idx: Option<usize>) {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct Scheduler {
-    /// Addresses of `Task` instances are stable for the task's lifetime. Per-CPU dispatch state (`current_preempt_count_ptr`) caches raw pointers into `Task::preempt_count` and relies on this stability. The outer `Vec` may reallocate when growing; the inner `Box` keeps each `Task` at a fixed heap address regardless.
-    #[allow(clippy::vec_box)]
-    tasks: Vec<Box<Task>>,
+    /// Addresses of `Task` instances are stable for the task's lifetime.
+    /// Per-CPU dispatch state (`current_preempt_count_ptr`) caches raw
+    /// pointers into `Task::preempt_count` and relies on this stability.
+    /// The outer `Vec` may reallocate when growing; the inner [`SlabBox`]
+    /// keeps each `Task` at a fixed slab-cache slot address regardless.
+    ///
+    /// Phase 60 — migrated from `Vec<Box<Task>>` to `Vec<SlabBox<Task>>`.
+    /// Each `Task` is now allocated from
+    /// [`crate::mm::slab::KernelSlabCaches::task_cache`] rather than the
+    /// global heap.  Drop semantics are unchanged: `SlabBox::drop` runs
+    /// `Task::drop` via `core::ptr::drop_in_place` then returns the slot to
+    /// the same cache.  Address stability follows from the slab's per-slot
+    /// in-place storage; reuse via the scheduler's `free_list` continues to
+    /// preserve the slot's address across `*tasks[idx] = task` overwrites.
+    tasks: Vec<crate::mm::slab_box::SlabBox<Task>>,
     /// Per-task FPU/SIMD state, indexed in lock-step with `tasks`.
     #[allow(clippy::vec_box)]
     fpu_states: Vec<Box<XSaveArea>>,
@@ -1094,11 +1106,28 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         idx
     } else {
         let idx = sched.tasks.len();
-        sched.tasks.push(Box::new(task));
+        sched
+            .tasks
+            .push(crate::mm::slab_box::SlabBox::<Task>::new_in(
+                &crate::mm::slab::caches().task_cache,
+                task,
+            ));
         sched.fpu_states.push(Box::new(XSaveArea::new()));
         idx
     }
 }
+
+// Phase 60 — `Task` is allocated out of
+// [`crate::mm::slab::KernelSlabCaches::task_cache`].  Catch struct-size
+// drift at compile time so a future field addition that pushes the size
+// past the cache slot fails the build with a clear message rather than
+// silently corrupting an adjacent slot.
+const _: () = assert!(
+    core::mem::size_of::<Task>() <= crate::mm::slab::TASK_CACHE_SLOT_SIZE,
+    "Task exceeds task_cache slot size; bump TASK_CACHE_SLOT_SIZE in \
+     kernel/src/mm/slab.rs to the next power of two and update both this \
+     assertion and the cache initialisation in slab::init()",
+);
 
 /// Spawn a new kernel task. The task is assigned to the least-loaded core
 /// and enqueued to that core's run queue.
@@ -3648,7 +3677,12 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
         let mut filler = Task::new(test_task_entry, "test-filler");
         // TODO(57a-C/D): route through pi_lock + with_block_state
         filler.state = TaskState::Dead;
-        sched.tasks.push(Box::new(filler));
+        sched
+            .tasks
+            .push(crate::mm::slab_box::SlabBox::<Task>::new_in(
+                &crate::mm::slab::caches().task_cache,
+                filler,
+            ));
     }
 
     let mut task = Task::new(test_task_entry, "test-cleanup");

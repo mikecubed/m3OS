@@ -1000,4 +1000,74 @@ mod tests {
         assert_eq!(cache.reclaim_empty(|_| {}), 1);
         assert_eq!(cache.stats().total_slabs, 0);
     }
+
+    // Phase 60 Track B.1 — Task-cache regression.
+    //
+    // Phase 60 routes every `Task` allocation through
+    // `KernelSlabCaches::task_cache` (slot size 1024 bytes — see
+    // `kernel/src/mm/slab.rs::TASK_CACHE_SLOT_SIZE`).  This host-side test
+    // exercises alloc/free/reuse on a slab cache configured with the same
+    // slot size and page size.  It uses raw byte buffers because the real
+    // `Task` type carries kernel-only globals and cannot be constructed
+    // outside the kernel binary; the regression target is the slab API
+    // contract, not `Task` semantics.
+    #[test]
+    fn task_sized_slab_cache_alloc_free_reuse() {
+        const TASK_SLOT_SIZE: usize = 1024;
+        const PAGE_SIZE: usize = 4096;
+
+        let mut pool = PagePool::new(PAGE_SIZE);
+        let mut cache = SlabCache::new(TASK_SLOT_SIZE, PAGE_SIZE);
+        let slots_per_page = PAGE_SIZE / TASK_SLOT_SIZE;
+
+        // Phase 1: fill one full page worth of slots.
+        let mut addrs = Vec::new();
+        for _ in 0..slots_per_page {
+            addrs.push(
+                cache
+                    .allocate(&mut pool.allocator())
+                    .expect("Task-sized slab allocate should succeed within first page"),
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.total_slabs, 1, "first page should hold every slot");
+        assert_eq!(stats.active_objects, slots_per_page);
+        assert_eq!(stats.free_slots, 0);
+
+        // Phase 2: free every slot and verify the page becomes reclaimable.
+        for &addr in &addrs {
+            cache.free(addr);
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.active_objects, 0);
+        assert_eq!(stats.free_slots, slots_per_page);
+
+        // Phase 3: reuse — re-allocating after free should hit the same
+        // slots in LIFO order without growing the slab page count.
+        let prev_total = cache.stats().total_slabs;
+        let mut reused = Vec::new();
+        for _ in 0..slots_per_page {
+            reused.push(
+                cache
+                    .allocate(&mut pool.allocator())
+                    .expect("post-free reuse should not grow slab page count"),
+            );
+        }
+        assert_eq!(
+            cache.stats().total_slabs,
+            prev_total,
+            "reuse must not allocate a second page"
+        );
+
+        // Confirm every reused slot address is one of the originally-freed
+        // addresses (LIFO match, but order is implementation detail — assert
+        // set membership instead).
+        for addr in &reused {
+            assert!(
+                addrs.contains(addr),
+                "reused slot {:#x} not from original allocation set",
+                addr
+            );
+        }
+    }
 }
