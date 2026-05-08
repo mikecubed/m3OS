@@ -1388,6 +1388,7 @@ mod syscall_nr {
     // -- time --
     pub const NANOSLEEP: u64 = 35;
     pub const GETTIMEOFDAY: u64 = 96;
+    pub const GETRUSAGE: u64 = 98; // Phase 61 Track E.3
     pub const TIMES: u64 = 100;
     pub const CLOCK_GETTIME: u64 = 228;
 
@@ -1726,7 +1727,14 @@ pub extern "C" fn syscall_handler(
         }
         FORK => sys_fork(user_rip, user_rsp),
         EXECVE => sys_execve(arg0, arg1, arg2),
-        WAIT4 => sys_waitpid(arg0, arg1, arg2),
+        WAIT4 => {
+            // Phase 61 Track E.3: 4th argument (rusage_ptr) lives in r10 at
+            // syscall entry; per_core_syscall_arg3 reads it via the
+            // task-local snapshot.
+            let rusage_ptr = per_core_syscall_arg3();
+            sys_wait4(arg0, arg1, arg2, rusage_ptr)
+        }
+        GETRUSAGE => sys_getrusage(arg0 as i32, arg1),
         UMASK => sys_umask(arg0),
         GETUID => sys_linux_getuid(),
         GETGID => sys_linux_getgid(),
@@ -3700,6 +3708,166 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 ///   offset 16: tms_cutime — children user CPU time
 ///   offset 24: tms_cstime — children system CPU time
 /// Returns: clock ticks since boot.
+/// Phase 61 Track E.3 — `getrusage(who, usage_ptr)` (Linux syscall 98).
+///
+/// `who` selects the source counters:
+///   * `RUSAGE_SELF`     ( 0): calling task's own counters.
+///   * `RUSAGE_CHILDREN` (-1): calling task's reaped-children accumulators.
+///   * `RUSAGE_THREAD`   ( 1): same as `RUSAGE_SELF` (one-task-per-process
+///     for now; Phase 61 keeps this distinction simple).
+///   * any other value: returns `-EINVAL`.
+///
+/// `usage_ptr` is the userspace address of a 144-byte `struct rusage`
+/// (Linux x86_64 layout). Phase 61 populates the four time fields and the
+/// four event-count fields delivered by Track E.4; the remaining 10 fields
+/// stay zeroed (they require post-1.0 instrumentation — see the design
+/// doc's Deferred Until Later section).
+pub(super) fn sys_getrusage(who: i32, usage_ptr: u64) -> u64 {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+
+    let (user_ticks, system_ticks, minor, major, nvcsw, nivcsw) = match who {
+        RUSAGE_SELF | RUSAGE_THREAD => {
+            let (u, s) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+            let (mi, ma, vol, invol) =
+                crate::task::scheduler::current_task_rusage_self().unwrap_or((0, 0, 0, 0));
+            (u, s, mi, ma, vol, invol)
+        }
+        RUSAGE_CHILDREN => {
+            let (u, s) = crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
+            let (mi, ma, vol, invol) =
+                crate::task::scheduler::current_task_rusage_children().unwrap_or((0, 0, 0, 0));
+            (u, s, mi, ma, vol, invol)
+        }
+        _ => return NEG_EINVAL,
+    };
+
+    if usage_ptr != 0
+        && let Err(_e) = write_rusage(
+            usage_ptr,
+            user_ticks,
+            system_ticks,
+            minor,
+            major,
+            nvcsw,
+            nivcsw,
+        )
+    {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+/// Phase 61 Track E.3 — `wait4(pid, status_ptr, options, rusage_ptr)`
+/// (Linux syscall 61, replacing the Phase 11 `waitpid` mapping for the
+/// same number).
+///
+/// Reuses [`sys_waitpid`]'s wait/scan/reap logic; on a successful reap, if
+/// `rusage_ptr` is non-zero, writes a 144-byte Linux `struct rusage`
+/// populated from the reaped child's accumulated tick + counter totals
+/// (Track E.1 + Track E.4 fields). Userspace toolchains (musl, glibc)
+/// route both `waitpid(2)` and `wait4(2)` through this syscall — without
+/// the rusage write the latter silently lost data on every call.
+pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64) -> u64 {
+    // Snapshot the calling task's RUSAGE_CHILDREN counters BEFORE the reap
+    // so that after sys_waitpid runs (which accumulates the zombie's
+    // counters into the parent's child_*), we can compute the delta and
+    // write that to the rusage_ptr — the rusage value Linux writes is the
+    // reaped-just-now subtree, not the parent's running totals.
+    //
+    // If sys_waitpid blocks and a different child gets reaped before we
+    // resume, the delta still reflects ALL children reaped during this
+    // wait4 call — which is the intended Linux semantics.
+    let (cu_before, cs_before) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
+    let (cm_before, cmaj_before, cv_before, civ_before) =
+        crate::task::scheduler::current_task_rusage_children().unwrap_or((0, 0, 0, 0));
+
+    let result = sys_waitpid(pid, status_ptr, options);
+
+    // sys_waitpid returns the reaped pid on success, or a negative errno
+    // (encoded as a high u64). 0 = WNOHANG with nothing to reap. We only
+    // write rusage on a successful reap (positive pid return).
+    let reaped_pid = result as i64;
+    if reaped_pid <= 0 || rusage_ptr == 0 {
+        return result;
+    }
+
+    let (cu_after, cs_after) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((cu_before, cs_before));
+    let (cm_after, cmaj_after, cv_after, civ_after) =
+        crate::task::scheduler::current_task_rusage_children().unwrap_or((
+            cm_before,
+            cmaj_before,
+            cv_before,
+            civ_before,
+        ));
+
+    let user_ticks = cu_after.saturating_sub(cu_before);
+    let system_ticks = cs_after.saturating_sub(cs_before);
+    let minor = cm_after.saturating_sub(cm_before);
+    let major = cmaj_after.saturating_sub(cmaj_before);
+    let nvcsw = cv_after.saturating_sub(cv_before);
+    let nivcsw = civ_after.saturating_sub(civ_before);
+
+    if write_rusage(
+        rusage_ptr,
+        user_ticks,
+        system_ticks,
+        minor,
+        major,
+        nvcsw,
+        nivcsw,
+    )
+    .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    result
+}
+
+/// Phase 61 Track E.3 — write a 144-byte Linux `struct rusage` to
+/// `usage_ptr`. `user_ticks` / `system_ticks` are converted to
+/// `timeval` via 1 tick = 1 ms (m3OS's LAPIC timer is configured for
+/// 1 ms periodic). The four event-count fields populate
+/// `ru_minflt` / `ru_majflt` / `ru_nvcsw` / `ru_nivcsw`; the remaining
+/// 10 fields are zeroed.
+fn write_rusage(
+    usage_ptr: u64,
+    user_ticks: u64,
+    system_ticks: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    nvcsw: u64,
+    nivcsw: u64,
+) -> Result<(), ()> {
+    // 1 tick = 1 ms = 1_000 microseconds (LAPIC timer periodic 1 ms).
+    let user_us = user_ticks.saturating_mul(1_000);
+    let system_us = system_ticks.saturating_mul(1_000);
+
+    let mut bytes = [0u8; 144];
+    // ru_utime
+    bytes[0..8].copy_from_slice(&((user_us / 1_000_000) as i64).to_ne_bytes()); // tv_sec
+    bytes[8..16].copy_from_slice(&((user_us % 1_000_000) as i64).to_ne_bytes()); // tv_usec
+    // ru_stime
+    bytes[16..24].copy_from_slice(&((system_us / 1_000_000) as i64).to_ne_bytes()); // tv_sec
+    bytes[24..32].copy_from_slice(&((system_us % 1_000_000) as i64).to_ne_bytes()); // tv_usec
+    // ru_maxrss(32) / ru_ixrss(40) / ru_idrss(48) / ru_isrss(56) — zeroed.
+    // ru_minflt(64), ru_majflt(72)
+    bytes[64..72].copy_from_slice(&(minor_faults as i64).to_ne_bytes());
+    bytes[72..80].copy_from_slice(&(major_faults as i64).to_ne_bytes());
+    // ru_nswap(80) / ru_inblock(88) / ru_oublock(96) /
+    // ru_msgsnd(104) / ru_msgrcv(112) / ru_nsignals(120) — zeroed.
+    // ru_nvcsw(128), ru_nivcsw(136)
+    bytes[128..136].copy_from_slice(&(nvcsw as i64).to_ne_bytes());
+    bytes[136..144].copy_from_slice(&(nivcsw as i64).to_ne_bytes());
+
+    UserSliceWo::new(usage_ptr, bytes.len())
+        .and_then(|s| s.copy_from_kernel(&bytes))
+        .map_err(|_| ())
+}
+
 pub(super) fn sys_times(buf_ptr: u64) -> u64 {
     let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
     // Phase 61 Track E.1: tms_cutime / tms_cstime now read the calling task's
