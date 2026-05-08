@@ -15,6 +15,7 @@
 | D | `vfs_server` mount-point routing: `MountTable`, forward-to-fat_server path | C | Planned |
 | E | Regression suite: write/read, getdents, stat, unlink, restart-persistence | D | Planned |
 | F | Phase 54 design doc + task doc closure; audit Red Flag #14 closure note | E | Planned |
+| G | Documentation and Release | F | Planned |
 
 ---
 
@@ -179,6 +180,37 @@
 
 **Acceptance:**
 - [ ] FAT server track acceptance items reference "(real implementation in Phase 65)".
+
+---
+
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/65-fat-server-implementation.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a standalone reference explaining how FAT32 moved from a kernel-embedded implementation to a supervised userspace service, and why the SRP boundary between `fat_server` and the kernel VFS matters.
+
+**Acceptance:**
+- [ ] `docs/65-fat-server-implementation.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 65`, `**Status:** Planned`, `**Source Ref:** phase-65`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining the ENOSYS-stub-to-real-FAT32 transition and the userspace boundary.
+- [ ] Key Files table cites `userspace/fat_server/src/dispatch.rs`, `userspace/fat_server/src/fd_table.rs`, `kernel-core/src/fat32/volume.rs`, `kernel-core/src/fat32/block.rs`, and `userspace/vfs_server/src/mount.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/65-fat-server-implementation.md` and `docs/roadmap/tasks/65-fat-server-implementation-tasks.md`.
+
+### G.2 — Bump kernel version to 0.65.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.65.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.65.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.65.0` recommended at phase merge
 
 ---
 

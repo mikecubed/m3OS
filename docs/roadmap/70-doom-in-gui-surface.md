@@ -16,6 +16,8 @@ the mouse-pointer-reset residual documented in `docs/appendix/fb-takeover-tiers.
 § "Known Tier 1 reclaim residuals" are resolved structurally because there is no
 longer a takeover.
 
+Applying SOLID's Liskov Substitution Principle, DOOM after this phase is interchangeable with `term` or `gfx-demo` behind the surface-buffer protocol — any client that speaks `SurfaceCreate` / `BufferCreate` / `Commit` can take DOOM's slot. The Phase 56 `LayoutPolicy` and `SurfaceRole` abstractions remain untouched (Open/Closed Principle): DOOM's render-path change requires zero modifications to compositor core. The test pyramid runs doomgeneric unit tests on the host, a surface-buffer protocol smoke in `kernel-core`, and the full-game concurrent-instance smoke in QEMU as the top tier.
+
 ## Why This Phase Exists
 
 Tier 1 (`fb-takeover` wrapper + `SYS_FB_YIELD` / `SYS_FB_REACQUIRE`) was the

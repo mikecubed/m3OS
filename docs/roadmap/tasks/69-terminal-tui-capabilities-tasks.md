@@ -17,6 +17,7 @@
 | F | Cursor styling: DECSCUSR state, cursor-render shape selection | B | Planned |
 | G | Validation: nvim, tmux, htop, less, mc integration smoke | B, C, D, E, F | Planned |
 | H | Documentation updates: Phase 22b, 29, 57 cross-refs; appendix escape-sequence reference | G | Planned |
+| I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.69.0 | H | Planned |
 
 ---
 
@@ -252,6 +253,45 @@
 - [ ] File lists every escape sequence `term` implements after Phase 69, grouped by category (cursor movement, SGR, DEC private modes, OSC, mouse).
 - [ ] File cross-references `m3os-term.ti` as the machine-readable source of truth.
 - [ ] Deferred sequences (Kitty keyboard protocol, bracketed paste, sixel) are listed with a note.
+
+---
+
+---
+
+## Track I — Documentation and Release
+
+### I.1 — Create the aligned legacy learning doc
+
+**File:** `docs/69-terminal-tui-capabilities.md`
+**Symbol:** N/A (new learning doc)
+**Why it matters:** Learners need a single document that explains the Phase 69 terminal-capability expansion in approachable terms, citing the concrete files this phase touches and linking back to the design and task docs.
+
+**Acceptance:**
+- [ ] `docs/69-terminal-tui-capabilities.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 69`, `**Status:** Planned`, `**Source Ref:** phase-69`, `**Supersedes Legacy Doc:** new`)
+- [ ] Overview paragraph explains in learner-friendly terms why TUI capabilities matter and what the phase delivers (no jargon dump)
+- [ ] "What This Doc Covers" list enumerates terminfo, alternate-screen, 256-color SGR, SIGWINCH, mouse reporting, and cursor styling
+- [ ] "Core Implementation" prose walks through the parser → screen → render → PTY data flow in plain language
+- [ ] "Key Files" table cites `xtask/terminfo/m3os-term.ti`, `userspace/term/src/parser.rs`, `userspace/term/src/screen.rs`, `userspace/term/src/mouse.rs`, `userspace/term/src/render.rs`, and `kernel/src/tty/mod.rs`
+- [ ] "Related Roadmap Docs" links both `docs/roadmap/69-terminal-tui-capabilities.md` and `docs/roadmap/tasks/69-terminal-tui-capabilities-tasks.md`
+
+### I.2 — Bump kernel version to 0.69.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.69.0"`
+- [ ] `Cargo.lock` regenerated to reflect the new version
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.69.0`
+- [ ] `docs/roadmap/README.md` row for Phase 69 updated to reflect Completed status at ship
+- [ ] `cargo xtask check` passes after the version bump
+- [ ] Git tag `v0.69.0` recommended at phase merge
 
 ---
 

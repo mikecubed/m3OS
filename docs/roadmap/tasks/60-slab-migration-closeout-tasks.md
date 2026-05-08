@@ -14,6 +14,7 @@
 | C | Measure global heap relief under 60-second IPC workload | B | Planned |
 | D | Regression suite — full QEMU + host tests after each migration | B | Planned |
 | E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Planned |
+| F | Documentation and Release | B C D E | Planned |
 
 ---
 
@@ -160,6 +161,45 @@
 - [ ] Phase 33 design doc "Shipped state" audit note updated to replace the "not broadly migrated" sentence with a factual record of the Phase 60 migration.
 - [ ] Phase 33 design doc `Status:` field remains `Complete` (no demotion needed — the infrastructure was complete; the migration gap is now closed).
 - [ ] Phase 60 design doc and task doc cross-reference back to Phase 33 C.4.
+
+---
+
+---
+
+## Track F — Documentation and Release
+
+### F.1 — Create the aligned legacy learning doc
+
+**File:** `docs/60-slab-migration-closeout.md`
+**Symbol:** new file
+**Why it matters:** The doc-template "aligned legacy learning doc" form gives a learner-friendly companion to the design + task docs. Every shipped phase has one (or has a deliberate exception). This file is created from the template in `docs/appendix/doc-templates.md` § "Template: aligned legacy learning doc".
+
+**Acceptance:**
+- [ ] `docs/60-slab-migration-closeout.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present)
+- [ ] Overview paragraph is learner-friendly and explains the phase outcome in plain language
+- [ ] "What This Doc Covers" lists 3+ concrete topics
+- [ ] "Core Implementation" is written for a learner who has not read the design or task doc
+- [ ] "Key Files" table cites the actual files this phase touches
+- [ ] "How This Phase Differs From Later Memory Work" (or analogous heading specific to this phase) is filled in
+- [ ] "Related Roadmap Docs" links the design and task docs
+
+### F.2 — Bump kernel version to 0.60.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md` (any version annotations)
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]` section
+**Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (per audit Red Flag — `AGENTS.md` was found stale at `v0.51.0` during the 2026-05-08 audit).
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.60.0"`
+- [ ] `Cargo.lock` regenerated (`cargo generate-lockfile` or similar)
+- [ ] `AGENTS.md` "Kernel v0.60.0" reference updated
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag suggestion: `v0.60.0` (tag at phase merge, not at task-checkbox tick)
 
 ---
 

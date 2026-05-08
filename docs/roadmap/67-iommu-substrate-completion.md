@@ -76,7 +76,11 @@ A `SupervisedSpawn` helper starts the NVMe driver binary under the test supervis
 
 ## Implementation Outline
 
-1. Implement AMD-Vi event log drain in `amd.rs`; add `install_fault_handler`; add `AmdViFaultEvent` decoder in `kernel-core`.
+The AMD-Vi and VT-d branches share structural symmetry: both expose a fault-reporting path, both require a flush-invalidation pipeline, and both need a domain-grouping table. Abstract where natural — `kernel-core::iommu` should contain the pure-logic decoder and IVRS parser shared by both branches, while `kernel/src/iommu/amd.rs` and `kernel/src/iommu/intel.rs` retain the hardware-specific ISR and ring management. Avoid duplicating the event-log drain loop shape across the two files.
+
+Follow TDD for the pure-logic components: write host-side tests for `decode_event_log_entry` (covering all seven `AmdViFaultCode` variants) and `parse_ivhd_entries` (alias entries, device-all) before integrating them into the kernel ISR. The isolation tests in Track F are the QEMU top of this test pyramid — they cannot replace the host-side decoder tests.
+
+1. Write host-side tests for `AmdViFaultEvent` decoder and IVRS alias parser in `kernel-core`; then implement `install_fault_handler` and `drain_event_log` in `amd.rs`.
 2. Implement VT-d queued invalidation ring; wire `flush_domain`/`flush_iotlb`/`flush_context` to submit descriptors.
 3. Add scalable-mode page-table construction behind runtime capability check.
 4. Parse IVRS alias and grouping entries; implement `group_bdf_domains`.

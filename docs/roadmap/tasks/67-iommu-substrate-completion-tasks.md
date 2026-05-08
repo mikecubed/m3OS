@@ -16,6 +16,7 @@
 | E | AMD-Vi multi-BDF domain grouping via IVRS alias entries | A | Planned |
 | F | Isolation tests: `SupervisedSpawn` + `CapHandle::inject_foreign_dma` harness | None | Planned |
 | G | Phase 55a + 55c design docs and task docs updated | A, B, C, D, E, F | Planned |
+| H | Documentation and Release | G | Planned |
 
 ---
 
@@ -187,6 +188,37 @@
 
 **Acceptance:**
 - [ ] Isolation test track acceptance items note "(implemented in Phase 67)".
+
+---
+
+---
+
+## Track H — Documentation and Release
+
+### H.1 — Create the aligned legacy learning doc
+
+**File:** `docs/67-iommu-substrate-completion.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a self-contained reference for the IOMMU completion items — AMD-Vi fault dispatch, VT-d queued invalidation, scalable mode, multi-BDF grouping — without conflating them with Phase 55a's initial bring-up or future ARM SMMU work.
+
+**Acceptance:**
+- [ ] `docs/67-iommu-substrate-completion.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 67`, `**Status:** Planned`, `**Source Ref:** phase-67`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining what Phase 55a left incomplete and what this phase closes.
+- [ ] Key Files table cites `kernel/src/iommu/amd.rs`, `kernel/src/iommu/intel.rs`, `kernel-core/src/iommu/amd.rs`, `kernel-core/src/iommu/ivrs.rs`, and `userspace/drivers/nvme/tests/isolation.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/67-iommu-substrate-completion.md` and `docs/roadmap/tasks/67-iommu-substrate-completion-tasks.md`.
+
+### H.2 — Bump kernel version to 0.67.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.67.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.67.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.67.0` recommended at phase merge
 
 ---
 

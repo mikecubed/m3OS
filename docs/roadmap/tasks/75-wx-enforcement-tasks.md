@@ -16,6 +16,7 @@
 | E | Migration validation — all existing binaries | A–C | Planned |
 | F | Phase 11 and Phase 36 design doc updates | E | Planned |
 | G | Test binary for W^X scenarios | B, C | Planned |
+| H | Documentation and Release | A–G | Planned |
 
 ---
 
@@ -175,6 +176,44 @@
 
 ---
 
+---
+
+## Track H — Documentation and Release
+
+### H.1 — Create the aligned legacy learning doc
+
+**File:** `docs/75-wx-enforcement.md`
+**Symbol:** N/A
+**Why it matters:** A learner-friendly doc scoped to Phase 75 consolidates the W^X enforcement story — ELF loader, `mprotect` guard, heap/stack NX, and the JIT exception pattern — in one place, so readers do not need to cross-reference Phase 11, Phase 36, and Phase 80 documentation.
+
+**Acceptance:**
+- [ ] File exists at `docs/75-wx-enforcement.md`
+- [ ] All required template fields populated: `**Aligned Roadmap Phase:** Phase 75`, `**Status:** Planned`, `**Source Ref:** phase-75`, `**Supersedes Legacy Doc:** new`
+- [ ] Overview is learner-friendly (explains what W^X is and why it matters before describing the implementation)
+- [ ] Key Files table cites real files this phase touches: `kernel/src/elf/loader.rs`, `kernel/src/mm/user_space.rs`, `kernel/src/syscall/mm.rs`, `docs/appendix/architecture-and-syscalls.md`, `userspace/tests/wx_violation/src/main.rs`
+- [ ] Related Roadmap Docs links `docs/roadmap/75-wx-enforcement.md` and `docs/roadmap/tasks/75-wx-enforcement-tasks.md`
+
+### H.2 — Bump kernel version to 0.75.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-version bump per shipped phase; the 2026-05-08 audit found `AGENTS.md` stale and discipline in version tracking signals a complete, shippable phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.75.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger it)
+- [ ] `AGENTS.md` "Kernel v0.75.0" updated
+- [ ] `docs/roadmap/README.md` Phase 75 row Status updated to "Complete" at merge time
+- [ ] `cargo xtask check` passes
+- [ ] Git tag `v0.75.0` recommended at phase merge
+
+---
+
 ## Documentation Notes
 
 - Track A's `map_segment` change is the most load-bearing; it touches every binary load path and must be tested with `doom`, `term`, `init`, and `sh0` specifically (as the widest ELF variety in the tree).
@@ -182,3 +221,4 @@
 - Track C must cover both `brk` and `mmap`; omitting one leaves a hole that attackers can exploit.
 - The `// Phase 6+ deferred` comment in `kernel/src/mm/user_space.rs` is the specific textual marker from the audit (§ E1); its removal is an explicit deliverable of Track A.2.
 - Track G's JIT-pattern test (second bullet in G.1) is the positive-case proof that the enforcement does not break future JIT use; it is as important as the negative case.
+- Track H.1 learning doc should be authored after Track G so it can cite the actual test binary paths and serial-output snippets as concrete examples.

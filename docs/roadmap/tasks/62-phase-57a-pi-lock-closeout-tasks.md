@@ -15,6 +15,7 @@
 | D | `preempt_count == 0` first-return assertion | B C | Planned |
 | E | Regression suite + 30-minute PREEMPT_VOLUNTARY soak | B C D | Planned |
 | F | Phase 57a/57b doc updates; Phase 57e post-mortem cross-reference | E | Planned |
+| G | Documentation and Release | E F | Planned |
 
 ---
 
@@ -186,6 +187,45 @@
 **Acceptance:**
 - [ ] `Status:` reads `Complete` (changed by Phase 58 Track A.3, confirmed here).
 - [ ] A one-line note in the "Acceptance Criteria" section references Phase 62 as the phase that closed Tracks C/D.
+
+---
+
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/62-phase-57a-pi-lock-closeout.md`
+**Symbol:** new file
+**Why it matters:** The doc-template "aligned legacy learning doc" form gives a learner-friendly companion to the design + task docs. Every shipped phase has one (or has a deliberate exception). This file is created from the template in `docs/appendix/doc-templates.md` § "Template: aligned legacy learning doc".
+
+**Acceptance:**
+- [ ] `docs/62-phase-57a-pi-lock-closeout.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present)
+- [ ] Overview paragraph is learner-friendly and explains the phase outcome in plain language
+- [ ] "What This Doc Covers" lists 3+ concrete topics
+- [ ] "Core Implementation" is written for a learner who has not read the design or task doc
+- [ ] "Key Files" table cites the actual files this phase touches
+- [ ] "How This Phase Differs From Later Scheduler Work" (or analogous heading specific to this phase) is filled in
+- [ ] "Related Roadmap Docs" links the design and task docs
+
+### G.2 — Bump kernel version to 0.62.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md` (any version annotations)
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]` section
+**Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (per audit Red Flag — `AGENTS.md` was found stale at `v0.51.0` during the 2026-05-08 audit).
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.62.0"`
+- [ ] `Cargo.lock` regenerated (`cargo generate-lockfile` or similar)
+- [ ] `AGENTS.md` "Kernel v0.62.0" reference updated
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag suggestion: `v0.62.0` (tag at phase merge, not at task-checkbox tick)
 
 ---
 

@@ -18,6 +18,7 @@
 | G | Configuration file and hot reload | D, E, F | Planned |
 | H | Validation and integration | A–G | Planned |
 | I | Phase 56 design doc update | H | Planned |
+| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | Planned |
 
 ---
 
@@ -319,6 +320,45 @@
 - [ ] Phase 56 "Deferred Until Later" section lists multi-toplevel tiling and workspaces as delivered in Phase 72
 - [ ] Phase 56 "Primary Components" note references `userspace/lib/layout/` as Phase 72's addition
 - [ ] Phase 56 design doc status field remains unchanged (Complete)
+
+---
+
+---
+
+## Track J — Documentation and Release
+
+### J.1 — Create the aligned legacy learning doc
+
+**File:** `docs/72-compositor-tiling-workspaces.md`
+**Symbol:** N/A (new learning doc)
+**Why it matters:** Learners need a document that explains how a tiling window manager is built as pure userspace policy on top of a compositor substrate, what the `LayoutPolicy` trait boundary means, and how workspaces and chord keybinds fit together.
+
+**Acceptance:**
+- [ ] `docs/72-compositor-tiling-workspaces.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 72`, `**Status:** Planned`, `**Source Ref:** phase-72`, `**Supersedes Legacy Doc:** new`)
+- [ ] Overview explains in learner-friendly terms how the `LayoutPolicy` trait is the Open/Closed boundary that allows new layouts to plug in without touching compositor core
+- [ ] "What This Doc Covers" list enumerates multi-toplevel rendering, layout policies, workspace state machine, chord engine, borders/gaps, AF_UNIX control socket, and TOML config hot-reload
+- [ ] "Core Implementation" prose walks through the compose loop extension, `WorkspaceManager`, and `BindTable` lookup in plain language, noting that all work is kernel-free Rust
+- [ ] "Key Files" table cites `userspace/lib/layout/src/lib.rs`, `userspace/display_server/src/compositor.rs`, `userspace/display_server/src/workspace.rs`, `userspace/display_server/src/keybind.rs`, `userspace/display_server/src/control.rs`, and `userspace/m3ctl/src/main.rs`
+- [ ] "Related Roadmap Docs" links both `docs/roadmap/72-compositor-tiling-workspaces.md` and `docs/roadmap/tasks/72-compositor-tiling-workspaces-tasks.md`
+
+### J.2 — Bump kernel version to 0.72.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.72.0"`
+- [ ] `Cargo.lock` regenerated to reflect the new version
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.72.0`
+- [ ] `docs/roadmap/README.md` row for Phase 72 updated to reflect Completed status at ship
+- [ ] `cargo xtask check` passes after the version bump
+- [ ] Git tag `v0.72.0` recommended at phase merge
 
 ---
 

@@ -87,6 +87,8 @@ The user-mode return path already checks `preempt_count` to decide whether to ca
 
 ## Implementation Outline
 
+The `pi_lock` + `with_block_state` abstraction embodies the Open/Closed Principle: the four bare `task.state` stores are modifications to the block/wake protocol at sites that were supposed to be closed to direct mutation — routing them through `with_block_state` is the correction that makes the abstraction uniformly closed to bypass. For Track C, write a host-side `kernel-core` test that models the Option-B Arc-clone pattern for each callsite shape before applying it to the kernel; this TDD pass catches incorrect Arc-clone ordering at the host level — where iteration is instant — before exercising the QEMU path.
+
 1. Track A: inventory all four `TODO` sites and the ~25 guard-across-block sites; produce `docs/handoffs/62a-pi-lock-inventory.md`.
 2. Track B: route site at line 829 (reaper path) through `pi_lock` + `with_block_state`; run `cargo xtask test`.
 3. Track B: route sites at lines 3649, 3656 (deadline scanner) through `pi_lock` + `with_block_state`; run `cargo xtask test`.

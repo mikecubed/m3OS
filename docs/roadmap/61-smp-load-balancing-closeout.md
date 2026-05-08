@@ -86,6 +86,8 @@ The canonical design: the wait queue `head` lives in the `PipeBuf` or `Endpoint`
 
 ## Implementation Outline
 
+For Tracks A and B, follow a TDD approach: write the failing `test_load_balance_distributes_tasks` test (or a host-side `kernel-core` model test for the queue-length counter logic) before uncommenting `maybe_load_balance`. The test becomes the specification; uncommenting the call and adding the threshold constant is the implementation step. Run `cargo xtask test` as the QEMU smoke gate after each step to prevent silent regressions from accumulating across the five tracks.
+
 1. Track A: add `AtomicUsize` queue-length counter to each `PerCpuScheduler`; update enqueue/dequeue to maintain it.
 2. Track B: uncomment `maybe_load_balance()`; add threshold constant; fix any compilation errors; run `cargo xtask test`.
 3. Track C: wire `tlb_shootdown` IPI into `munmap`; run SMP memory-map test.

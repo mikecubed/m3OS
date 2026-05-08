@@ -15,6 +15,8 @@ successful login drops to a `term` session running as the authenticated user, wi
 back-off after three failures. Headless (serial-only) boots retain the existing
 autologin path for administration.
 
+Following TDD, the greeter input loop and `passwd_lib` integration are host-tested before QEMU integration — the backoff state machine is pure logic that proptest covers well. Applying DI (SOLID's Dependency Inversion), greeter calls through an `auth_backend` trait so the test harness substitutes a mock verifier; the production path binds `passwd_lib::verify`. Applying SRP, greeter owns authentication and emits a session descriptor, while `session_manager` owns the spawn-under-UID step — neither knows the internals of the other.
+
 ## Why This Phase Exists
 
 The Phase 57 session boot sequence was deliberately minimal: `session_manager`

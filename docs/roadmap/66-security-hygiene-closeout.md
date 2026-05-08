@@ -72,9 +72,15 @@ Receive the four relocated functions. `process/mod.rs` retains `pub(crate)` re-e
 
 ## Implementation Outline
 
-1. Add S_ISVTX mode bit constant to `kernel-core`; implement `check_sticky` in `kernel/src/fs/vfs.rs`.
+Each item in this phase is deliberately narrow in scope (SRP): `check_sticky` touches only the VFS unlink/rename path; `shadow_write_atomic` touches only credential write paths; `FdFlags` touches only descriptor construction; the four wrapper relocations touch only module boundaries. Keep each change isolated — resist combining them into omnibus commits, as mixed diffs obscure both review and bisection.
+
+The `shadow_write_atomic` temp-file-rename pattern is the canonical DRY target for this phase: both `passwd` and `adduser` previously duplicated the direct write path independently. The shared `userspace/lib/shadow` crate eliminates that duplication once and ensures any future credential-writing binary inherits the atomic behavior automatically.
+
+Follow TDD for the sticky-bit check: write the four unit tests (`check_sticky` with bit clear, bit set + owner match, bit set + dir owner match, bit set + neither) in `kernel-core::fs::mode` before implementing the kernel VFS hook. The QEMU integration test is the top of the pyramid, not a substitute for the host-side cases.
+
+1. Write host-side `check_sticky` unit tests in `kernel-core::fs::mode`; then add S_ISVTX constant and implement `check_sticky` in `kernel/src/fs/vfs.rs`.
 2. Set S_ISVTX on `/tmp` in the disk image builder.
-3. Create `userspace/lib/shadow` crate with `shadow_write_atomic`; update `passwd` and `adduser`.
+3. Create `userspace/lib/shadow` crate with `shadow_write_atomic`; update `passwd` and `adduser` to import from the shared crate.
 4. Add `FdFlags::CLOEXEC` and `FileStatusFlags::NONBLOCK` to `FileDescription`; wire into `open`, `openat`, `openat2`, `vfs_service_open`, `execve`, `read`, `write`.
 5. Move the four layer-crossing wrappers to their owning modules.
 6. Upgrade the pre-seeded image password hash format.

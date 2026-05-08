@@ -76,8 +76,12 @@ A 2-byte header added to each `KeyEvent` message carries the format version. `kb
 
 ## Implementation Outline
 
-1. Add `flush_subscriber_ring` to `control.rs`; call from all four `publish_*` functions.
-2. Implement `DamageTracker` in `compose.rs`; wire into `mark_dirty` surface hook and cursor motion path.
+The `ModifierSide` wire format extension is a natural Interface Segregation example: rather than expanding every key event with a full modifier bitmap, the protocol adds only the single field that differentiates L/R chords — nothing more. The versioned header and `Either` backward-compatible default ensure old clients are not broken by the extension. Any future modifier extension (e.g., relative pointer, tablet pressure) should follow the same additive pattern rather than redesigning the wire format.
+
+Follow TDD for `DamageTracker`: write the five unit tests (empty, single rect, two non-overlapping, two overlapping, full-repaint flag) against the pure-logic struct before wiring it into `compose`. The compose integration test is the QEMU-level smoke gate, not a substitute for the rect-merge unit tests.
+
+1. Write `DamageTracker` unit tests; then implement `DamageTracker` in `compose.rs` and wire into `mark_dirty` and cursor motion path.
+2. Add `flush_subscriber_ring` to `control.rs`; call from all four `publish_*` functions.
 3. Extend `KeyEvent` wire format with `ModifierSide`; bump version; update `kbd_server` encoder and decoder.
 4. Extend init manifest parser to support comma-separated `depends=`; implement dependency-ordered start in supervisor loop; add cycle detection.
 5. Add `on-restart=` field to manifest parser and supervisor action dispatch.

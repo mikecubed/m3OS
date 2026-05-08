@@ -92,12 +92,14 @@ The file exists but has an empty result table. Track G populates: start time, en
 
 ## Implementation Outline
 
+Phase 59 is the manual-validation tier of the test pyramid: host-side `kernel-core` unit tests are the wide automated base; `cargo xtask test` QEMU smoke tests are the middle tier; and the QEMU interactive sessions in Tracks A–J are the narrow top requiring human judgment. Keeping track of which tier each item belongs to prevents re-running automated tests as manual ones and vice versa.
+
 1. Run Track G (57b soak) first — it is time-bounded (30 minutes) and its result unblocks Phase 62 Track F.
 2. Run Track F (Phase 24 reboot persistence) — 30 minutes, single-item, quick win.
 3. Run Track E (Phase 22b ANSI parser) — 1 hour, visual tests, confirm sh0 regression.
 4. Run Track A (Phase 30 telnetd) — 2–3 hours, 16 items, host-side telnet client.
 5. Run Track D (Phase 43 SSH) — 2–3 hours, 3 items, host-side `ssh` client.
-6. Write and run Track H (Phase 34 RTC automated test).
+6. Write and run Track H (Phase 34 RTC automated test). For Track H and I, write the failing automated test first in `kernel-core` (host side) before wiring the QEMU harness entry — the host test is the specification that the QEMU run must satisfy.
 7. Write and run Track I (Phase 39 AF_UNIX automated test).
 8. Run Track B (Phase 31 TCC) — 4–6 hours, including self-hosting attempt.
 9. Run Track C (Phase 32 build tools + sh0) — 4–6 hours.

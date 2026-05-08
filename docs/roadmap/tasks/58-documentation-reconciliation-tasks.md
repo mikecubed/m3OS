@@ -16,6 +16,7 @@
 | E | Top-level post-1.0 docs cleanup — archive or fold seven docs | — | Planned |
 | F | Subdirectory consolidation — merge handoff dirs, archive evaluation | — | Planned |
 | G | Validation — confirm all edited headers are internally consistent | A B C D E F | Planned |
+| H | Documentation and Release | G | Planned |
 
 ---
 
@@ -260,6 +261,45 @@
 - [ ] For every design doc edited: every entry in `Depends on:` that references a completed phase carries a `✅`.
 - [ ] Roadmap README rows updated for all phases changed in this phase.
 - [ ] `cargo xtask check` (clippy + rustfmt) passes — no source files were changed by this phase, but verify no doc changes introduced broken links in any Rust doc-comment.
+
+---
+
+---
+
+## Track H — Documentation and Release
+
+### H.1 — Create the aligned legacy learning doc
+
+**File:** `docs/58-documentation-reconciliation.md`
+**Symbol:** new file
+**Why it matters:** The doc-template "aligned legacy learning doc" form gives a learner-friendly companion to the design + task docs. Every shipped phase has one (or has a deliberate exception). This file is created from the template in `docs/appendix/doc-templates.md` § "Template: aligned legacy learning doc".
+
+**Acceptance:**
+- [ ] `docs/58-documentation-reconciliation.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present)
+- [ ] Overview paragraph is learner-friendly and explains the phase outcome in plain language
+- [ ] "What This Doc Covers" lists 3+ concrete topics
+- [ ] "Core Implementation" is written for a learner who has not read the design or task doc
+- [ ] "Key Files" table cites the actual files this phase touches
+- [ ] "How This Phase Differs From Later Documentation Work" (or analogous heading specific to this phase) is filled in
+- [ ] "Related Roadmap Docs" links the design and task docs
+
+### H.2 — Bump kernel version to 0.58.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md` (any version annotations)
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]` section
+**Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (per audit Red Flag — `AGENTS.md` was found stale at `v0.51.0` during the 2026-05-08 audit).
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.58.0"`
+- [ ] `Cargo.lock` regenerated (`cargo generate-lockfile` or similar)
+- [ ] `AGENTS.md` "Kernel v0.58.0" reference updated
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag suggestion: `v0.58.0` (tag at phase merge, not at task-checkbox tick)
 
 ---
 

@@ -18,6 +18,7 @@
 | G | Desktop background client (`userspace/wallpaper/`) | Phase 72 ✅ | Planned |
 | H | Build pipeline, service configs, session integration | C–G | Planned |
 | I | Validation | A–H | Planned |
+| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.73.0 | I | Planned |
 
 ---
 
@@ -292,6 +293,45 @@
 - [ ] Opening a `term` window shows the slide+fade animation at 60 fps with no visible tearing
 - [ ] `m3ctl lock` covers the screen with the lockscreen stub; Enter dismisses it; other keys do not reach `term`
 - [ ] Rounded corners and drop shadows are visible on all windows when enabled in config
+
+---
+
+---
+
+## Track J — Documentation and Release
+
+### J.1 — Create the aligned legacy learning doc
+
+**File:** `docs/73-compositor-polish.md`
+**Symbol:** N/A (new learning doc)
+**Why it matters:** Learners need a document explaining how the omarchy-aesthetic desktop is assembled from independent Layer-shell and Toplevel clients, how the animation engine produces smooth frame transitions without GPU access, and how each client relates to the Phase 72 compositor substrate.
+
+**Acceptance:**
+- [ ] `docs/73-compositor-polish.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 73`, `**Status:** Planned`, `**Source Ref:** phase-73`, `**Supersedes Legacy Doc:** new`)
+- [ ] Overview explains in learner-friendly terms how `bar`, `launcher`, `notifyd`, `lockscreen`, and `wallpaper` are normal compositor clients using Layer-shell roles — not part of the compositor itself — and why this SRP split matters
+- [ ] "What This Doc Covers" list enumerates the animation engine, decoration layer, status bar, launcher, notification daemon, lockscreen stub, and desktop background client
+- [ ] "Core Implementation" prose walks through the `AnimationEngine::tick` → `compose_frame` → damage-region pipeline and the Layer surface rendering order for each client
+- [ ] "Key Files" table cites `userspace/display_server/src/animation.rs`, `userspace/display_server/src/decoration.rs`, `userspace/bar/src/main.rs`, `userspace/launcher/src/main.rs`, `userspace/notifyd/src/main.rs`, `userspace/lockscreen/src/main.rs`, and `userspace/wallpaper/src/main.rs`
+- [ ] "Related Roadmap Docs" links both `docs/roadmap/73-compositor-polish.md` and `docs/roadmap/tasks/73-compositor-polish-tasks.md`
+
+### J.2 — Bump kernel version to 0.73.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.73.0"`
+- [ ] `Cargo.lock` regenerated to reflect the new version
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.73.0`
+- [ ] `docs/roadmap/README.md` row for Phase 73 updated to reflect Completed status at ship
+- [ ] `cargo xtask check` passes after the version bump
+- [ ] Git tag `v0.73.0` recommended at phase merge
 
 ---
 

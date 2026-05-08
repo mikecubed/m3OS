@@ -72,13 +72,20 @@ A new `MountTable` in `vfs_server` maps path prefixes to service capability endp
 
 ## Implementation Outline
 
-1. Move `kernel/src/fs/fat32/` to `kernel-core/src/fat32/`; add a `BlockDevice` trait abstracting the I/O layer; add feature gates for host-test vs. kernel use.
-2. Implement `FdTable` and `FatFile` wrapper in `fat_server`.
-3. Implement `dispatch.rs` verb arms: Open, Read, Write, Seek, Close, Getdents, Stat, Unlink, Rename.
-4. Wire `Fat32Volume` to a `RemoteBlockDevice` client in `fat_server`'s init path.
-5. Extend `vfs_server` with `MountTable` and forward logic for FAT32 path prefix.
-6. Write regression tests.
-7. Update Phase 54 design doc and task doc with closure note; close audit Red Flag #14.
+This phase is a canonical SRP example: FAT32 operations belong entirely in `fat_server`, not in the kernel. The kernel retains only a thin call-through to `kernel-core::fat32` for its own mount path; all policy (FD tracking, mount routing, client isolation) lives in the supervised userspace service. Keep this boundary sharp — resist any temptation to add helper logic back to the kernel VFS during the lift.
+
+Follow TDD for the `kernel-core::fat32` lift: write the `MemBlockDevice`-backed unit tests for BPB parsing, FAT chain traversal, and write-then-read round-trips before porting any code from the kernel. Eight host-testable tests must pass before connecting `Fat32Volume` to a `RemoteBlockDevice` in QEMU.
+
+The `shadow_write_atomic` pattern used in Phase 66 for credential stores parallels the flush discipline required here: `handle_write` must flush dirty sectors to `RemoteBlockDevice` before returning `Ok`, ensuring the block device (not `fat_server`'s process memory) is the authoritative store.
+
+1. Write host-side `MemBlockDevice` tests for BPB parsing, FAT chain walk, write/read round-trip, getdents, stat, unlink, rename before moving any source file.
+2. Move `kernel/src/fs/fat32/` to `kernel-core/src/fat32/`; add a `BlockDevice` trait abstracting the I/O layer; add feature gates for host-test vs. kernel use.
+3. Implement `FdTable` and `FatFile` wrapper in `fat_server`.
+4. Implement `dispatch.rs` verb arms: Open, Read, Write, Seek, Close, Getdents, Stat, Unlink, Rename.
+5. Wire `Fat32Volume` to a `RemoteBlockDevice` client in `fat_server`'s init path.
+6. Extend `vfs_server` with `MountTable` and forward logic for FAT32 path prefix.
+7. Write regression tests.
+8. Update Phase 54 design doc and task doc with closure note; close audit Red Flag #14.
 
 ## Acceptance Criteria
 

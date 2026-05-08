@@ -10,6 +10,8 @@
 
 `display_server` becomes a tiling compositor that can run four or more GUI applications simultaneously, arrange them under configurable layout policies (master/stack, dwindle, grid, tabbed, fullscreen), separate them across up to nine numbered workspaces per output, and respond to `SUPER+`-chord keybinds without any kernel changes beyond the Phase 56 substrate.
 
+The `LayoutPolicy` trait is the OCP boundary: new layouts plug in without modifying compositor core, which is precisely the Goal A architecture described in `docs/appendix/gui/tiling-compositor-path.md`. Applying SRP, layout math, workspace state, keybind dispatch, and the compose loop each live in their own module with no cross-cutting globals. Applying DRY, gaps and borders are computed once per relayout pass — not per frame — and the result is cached until the next relayout event. Layout policies are pure logic with no I/O, making them straightforwardly host-testable via `cargo test -p layout`; workspace state is a small state machine verified by unit tests before QEMU integration.
+
 ## Why This Phase Exists
 
 Phase 56 delivered the architectural substrate — one userspace process owns the framebuffer, clients submit surfaces via the native IPC protocol, focus-aware input routing works. But it is a single-Toplevel system: only one app can realistically occupy the display at a time, there is no concept of workspaces, and the keybind system does not support modifier chords.

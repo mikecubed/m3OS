@@ -15,6 +15,7 @@
 | D | Init manifest `depends=` multi-service support and dependency-ordered start | None | Planned |
 | E | Distinct `on-restart=` supervisor directive | D | Planned |
 | F | Phase 56 design doc + task doc updated; status flipped Complete; Red Flag #7 closure | A, B, C, D, E | Planned |
+| G | Documentation and Release | F | Planned |
 
 ---
 
@@ -168,6 +169,37 @@
 **Acceptance:**
 - [ ] The five completion-gap task items each note "(closed in Phase 68)".
 - [ ] No other Phase 56 acceptance items are changed.
+
+---
+
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/68-display-server-closeout.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a focused reference for the five Phase 56 completion gaps — event push transmission, damage tracking, ModifierSide wire format, manifest depends=, on-restart= directive — without merging them into the broader Phase 56 display-server architecture narrative.
+
+**Acceptance:**
+- [ ] `docs/68-display-server-closeout.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 68`, `**Status:** Planned`, `**Source Ref:** phase-68`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining the five gaps closed and why Phase 56 was only nominally complete before this phase.
+- [ ] Key Files table cites `userspace/display_server/src/control.rs`, `userspace/display_server/src/compose.rs`, `kernel-core/src/display/protocol.rs`, `userspace/kbd_server/src/ps2.rs`, and `userspace/init/src/manifest.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/68-display-server-closeout.md` and `docs/roadmap/tasks/68-display-server-closeout-tasks.md`.
+
+### G.2 — Bump kernel version to 0.68.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.68.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.68.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.68.0` recommended at phase merge
 
 ---
 

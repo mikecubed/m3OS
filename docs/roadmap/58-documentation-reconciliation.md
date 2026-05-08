@@ -92,11 +92,11 @@ Phase 55a's design doc reports the VT-d MMIO `CTRL.RST` issue as open. Phase 55c
 1. Run Track A: edit Status fields in the six drifted design docs (55a, 55b, 56, 57a, 57d, 57b) and Phase 35's missing header fields.
 2. Write Phase 51 task doc (Track B.1); write Phase 13 task doc (Track B.2).
 3. Write Phase 22b design doc (Track C.1); write Phase 42b design doc (Track C.2).
-4. Walk Phases 42b, 43b, 43c, 46, 47 task docs: for each unchecked item, either flip to `[x]` with a code/test citation, or convert to `[ ] — Deferred: <phase>` with an explicit owner (Track A.2 closure).
+4. Walk Phases 42b, 43b, 43c, 46, 47 task docs: for each unchecked item, either flip to `[x]` with a code/test citation, or convert to `[ ] — Deferred: <phase>` with an explicit owner (Track A.2 closure). This eliminates the duplicated pattern of unchecked rows for shipped features — a DRY violation in the doc corpus — by establishing one authoritative completion record per item.
 5. Reconcile Phase 19 design doc (Complete) versus task doc (all six tracks "Not started"): read `kernel/src/signal/` and flip appropriate checkboxes or demote design-doc status (Track A.1 closure).
 6. Update `AGENTS.md` version string to v0.57.x (Track A.3).
 7. Fix `docs/06-ipc.md` Supersedes field; refresh `docs/16-network.md` and `docs/22-tty-terminal.md` body content; fix `docs/56-display-and-input-architecture.md` Status (Track D).
-8. Run Track E: archive or fold the seven post-1.0 top-level docs.
+8. Run Track E: archive or fold the seven post-1.0 top-level docs. Per YAGNI: do not write task docs for phases that already have a complete design doc closure record and no open acceptance items — those phases do not benefit from a task doc created after the fact.
 9. Run Track F: move `docs/handoff/` file into `docs/handoffs/`, update cross-references, archive `docs/evaluation/` and `docs/shell/brush-integration-analysis.md`.
 10. Run Track G: scan all edited headers for consistency with the roadmap README; update README rows.
 

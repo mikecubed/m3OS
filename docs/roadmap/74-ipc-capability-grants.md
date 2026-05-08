@@ -16,6 +16,8 @@ Phase 6 shipped synchronous rendezvous IPC and noted two explicit deferrals at `
 
 The Phase 72 multi-app compositor is the forcing function: large surface buffers (a 1920×1080 RGBA buffer is ~8 MB) traveling via inline copy on every frame budget will dominate system time. Page-grant transport eliminates the copy. Capability grants let a client prove framebuffer ownership to `display_server` without a separate syscall round-trip. IPC timeouts let servers handle slow clients without blocking the entire compositor compose loop.
 
+SOLID/Liskov: any IPC consumer — `fat_server`, `audio_server`, `display_server` — can substitute page-grant bulk transport for the existing inline-copy path because both satisfy the same bulk-transfer interface abstracted in Phase 55c; no caller needs to know which transport is in use. DRY: today those three servers each carry a hand-rolled inline-copy path; the page-grant primitive introduced here is the single implementation they all adopt, eliminating duplicated buffer-management logic. TDD: the capability-table copy arithmetic in `ipc_transfer_caps` is pure logic and host-testable in `kernel-core`; page-grant page-table mutations and the timeout race are exercised via QEMU smoke tests using the Phase 57a timer wheel.
+
 ## Learning Goals
 
 - Understand how capability table entries are transferred between processes through IPC messages

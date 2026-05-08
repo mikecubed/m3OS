@@ -15,6 +15,7 @@
 | D | Text-fallback motion: reverse-order stop of display-server children | C | Planned |
 | E | `m3ctl session-state` reports authentic `ServiceState` | A | Planned |
 | F | Phase 57 design doc + task doc closure note | D, E | Planned |
+| G | Documentation and Release | F | Planned |
 
 ---
 
@@ -130,6 +131,37 @@
 **Acceptance:**
 - [ ] Track F items for `stop()` and `restart()` include a parenthetical "(real implementation in Phase 64)".
 - [ ] No other Phase 57 acceptance items are changed.
+
+---
+
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/64-session-manager-lifecycle.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a concise reference explaining what real supervisor lifecycle management looks like — PID tracking, two-phase stop, restart budgets — without conflating it with Phase 57's stub behavior or future socket-activation work.
+
+**Acceptance:**
+- [ ] `docs/64-session-manager-lifecycle.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 64`, `**Status:** Planned`, `**Source Ref:** phase-64`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining the move from unconditional Ack stubs to real SIGTERM/SIGKILL lifecycle.
+- [ ] Key Files table cites `userspace/session_manager/src/table.rs`, `userspace/session_manager/src/lifecycle.rs`, `userspace/session_manager/src/recover.rs`, and `userspace/session_manager/src/control.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/64-session-manager-lifecycle.md` and `docs/roadmap/tasks/64-session-manager-lifecycle-tasks.md`.
+
+### G.2 — Bump kernel version to 0.64.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.64.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.64.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.64.0` recommended at phase merge
 
 ---
 

@@ -17,6 +17,7 @@
 | F | Concurrent-instance regression: two DOOM windows run simultaneously | B, C | Planned |
 | G | Documentation updates: `fb-takeover-tiers.md`, Phase 47 doc | F | Planned |
 | H | `SYS_FB_YIELD` / `SYS_FB_REACQUIRE` deprecation log warns | E | Planned |
+| I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.70.0 | G, H | Planned |
 
 ---
 
@@ -186,6 +187,45 @@
 - [ ] `SYS_FB_REACQUIRE` (`0x101D`) dispatch arm emits a matching `log::warn!`.
 - [ ] Both syscalls continue to function correctly after the warn is added.
 - [ ] The warn is visible in the serial log when `fb-takeover` is invoked.
+
+---
+
+---
+
+## Track I — Documentation and Release
+
+### I.1 — Create the aligned legacy learning doc
+
+**File:** `docs/70-doom-in-gui-surface.md`
+**Symbol:** N/A (new learning doc)
+**Why it matters:** Learners need a document that explains how DOOM transitioned from a direct-framebuffer program to a compositor client, what changed in `dg_m3os.c`, and why the Tier 3 architecture eliminates the Tier 1 residual bugs.
+
+**Acceptance:**
+- [ ] `docs/70-doom-in-gui-surface.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 70`, `**Status:** Planned`, `**Source Ref:** phase-70`, `**Supersedes Legacy Doc:** new`)
+- [ ] Overview explains the fb-takeover Tier 1 residuals and why Tier 3 solves them structurally, in learner-friendly terms
+- [ ] "What This Doc Covers" list enumerates `dg_m3os.c` surface-buffer rewrite, palette LUT blit, input rewiring, `fb-takeover` deprecation, and concurrent-instance correctness
+- [ ] "Core Implementation" prose describes the `DG_Init` → `DG_DrawFrame` → `DG_GetKey` data flow after the rewrite
+- [ ] "Key Files" table cites `userspace/doom/dg_m3os.c`, `kernel-core/src/display/protocol.rs`, `userspace/fb-takeover/src/main.rs`, and `kernel/src/arch/x86_64/syscall/mod.rs`
+- [ ] "Related Roadmap Docs" links both `docs/roadmap/70-doom-in-gui-surface.md` and `docs/roadmap/tasks/70-doom-in-gui-surface-tasks.md`
+
+### I.2 — Bump kernel version to 0.70.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.70.0"`
+- [ ] `Cargo.lock` regenerated to reflect the new version
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.70.0`
+- [ ] `docs/roadmap/README.md` row for Phase 70 updated to reflect Completed status at ship
+- [ ] `cargo xtask check` passes after the version bump
+- [ ] Git tag `v0.70.0` recommended at phase merge
 
 ---
 

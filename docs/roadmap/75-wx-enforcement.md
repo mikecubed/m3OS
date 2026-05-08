@@ -16,6 +16,8 @@ The current ELF loader in `kernel/src/mm/user_space.rs` maps all code segments w
 
 W^X is a foundational memory safety guarantee present in every modern OS since OpenBSD 3.3 (2003). It costs nothing at runtime (no extra page faults on normal code execution) and eliminates an entire class of memory-corruption exploit primitives. It must be in place before Phase 80 (Node.js) and Phase 81 (Claude Code) introduce JIT compilation, which requires a documented exception path.
 
+SRP: the ELF loader's sole concern is splitting PT_LOAD segments by `p_flags`; a single `mprotect` validator then enforces W^X uniformly across all later `mmap`/`mprotect` calls — no scattered permission checks elsewhere in the kernel. TDD: `is_wx_violation(prot)` is a pure predicate that host-tests trivially in `kernel-core`; the kernel-side enforcement is validated in QEMU with a two-case test binary — the negative case (`mprotect(PROT_WRITE | PROT_EXEC)` → `EINVAL`) and the positive case (the JIT `RW-` → `R-X` toggle) together prove that enforcement is both present and non-breaking.
+
 ## Learning Goals
 
 - Understand how x86_64 page-table `NX` bits enforce non-executable mappings at the hardware level

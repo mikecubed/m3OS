@@ -72,7 +72,11 @@ Queries the `session_manager` control socket and prints the `ServiceState` for e
 
 ## Implementation Outline
 
-1. Define `ServiceEntry`, `ServiceState`, and `ServiceTable` in a new `table.rs` module.
+Apply TDD: write host-side unit tests for `ServiceTable` state transitions, the SIGTERM grace-period state machine, and budget-exhaustion paths in `kernel-core::session::policy` before implementing any of the lifecycle machinery. This catches edge cases (nonexistent PID, budget-zero corner, double-stop) without requiring QEMU.
+
+Respect YAGNI strictly: this phase delivers real start, stop, restart, and text-fallback — nothing more. Per-user unit files, socket activation, cgroup isolation, and time-windowed budgets are listed as deferred and must not be added here even if they seem low-cost.
+
+1. Define `ServiceEntry`, `ServiceState`, and `ServiceTable` in a new `table.rs` module; write host-side unit tests first.
 2. Wire `ServiceTable` into the `session_manager` event loop so every spawn records a PID.
 3. Implement `stop_service` in `lifecycle.rs` with SIGTERM, 5-second grace, SIGKILL, and `sys_waitpid`.
 4. Implement `restart_service` with budget counters; transition to `Failed` on budget exhaustion.

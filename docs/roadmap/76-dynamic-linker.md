@@ -16,6 +16,8 @@ Every m3OS binary today is statically linked: the runtime, libc, and all depende
 
 The audit (§ F6) identified dynamic linking as a Stage-3 gap. Phase 75 W^X enforcement is a prerequisite because a dynamic linker's relocation pass must map GOT/PLT as `RW-` and text as `R-X`; the W^X machinery must be correct before the linker exercises it. The `wayland-gap-analysis.md` document lists dynamic linking as the first prerequisite for every Wayland path.
 
+SOLID/SRP: the dynamic linker lives entirely in userspace (`ld.so`) and the kernel contributes only `PT_INTERP` loading and auxiliary vector construction — a clean boundary with a single concern on each side. Dependency inversion: `ld.so` resolves `DT_NEEDED` against `LD_LIBRARY_PATH` before the standard search paths, meaning the runtime composition strategy is injected at launch rather than baked into the binary at compile time. TDD: auxiliary vector parsing is pure logic that host-tests cleanly in `kernel-core`; for `dlopen`/`dlsym`/`dlclose`, write failing host tests against a fixture `.so` first, then implement until they pass — musl's own test suite transfers directly if the port route is taken.
+
 ## Learning Goals
 
 - Understand how a dynamic linker resolves `DT_NEEDED` entries from `PT_DYNAMIC` and loads shared objects

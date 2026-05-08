@@ -76,14 +76,17 @@ Extended to: (1) boot the kernel under QEMU with the AC'97 device present, (2) w
 
 ## Implementation Outline
 
-1. Audit the Phase 55b MMIO map for BAR1 (NABM block); verify bus address and size match QEMU AC'97 register map.
-2. Implement BDL setup in `device.rs`: allocate one DMA page, fill 32 BDL entries pointing into the PCM ring, set IOC on the last entry, write NABM `PCM_OUT_BDBAR`.
-3. Write `stream.rs` `start_dma()`, `advance_lvi()`, `retire_completed(civ)`, and `handle_underrun()`.
-4. Add `kernel-core/audio/counters.rs` `FrameCounter`; wire into `audio_server` IRQ handler.
-5. Extend `audio-smoke` xtask gate to sample `FrameCounter` and assert advancement.
-6. Add audible-bell path in `term`: BEL byte invokes `audio_client::bell()` which submits a 440 Hz, 50 ms tone.
-7. Add bell sub-test to `audio-smoke`.
-8. Update Phase 57 design doc with a closure note referencing this phase.
+Follow a TDD-first order: write the `kernel-core` host-side tests for `FrameCounter`, BDL ring accounting, and wraparound before touching `device.rs` or `stream.rs`. Once those tests pass on the host, implement the NABM register writes and wire the IRQ handler. Only then extend the QEMU `audio-smoke` gate to assert frame consumption — this ordering ensures every behavioral invariant is machine-checked before hardware integration.
+
+1. Write host-side tests in `kernel-core/audio/` for `FrameCounter` semantics, BDL ring-buffer accounting, and CIV wraparound — all must pass before any `device.rs` change.
+2. Audit the Phase 55b MMIO map for BAR1 (NABM block); verify bus address and size match QEMU AC'97 register map.
+3. Implement BDL setup in `device.rs`: allocate one DMA page, fill 32 BDL entries pointing into the PCM ring, set IOC on the last entry, write NABM `PCM_OUT_BDBAR`.
+4. Write `stream.rs` `start_dma()`, `advance_lvi()`, `retire_completed(civ)`, and `handle_underrun()`.
+5. Add `kernel-core/audio/counters.rs` `FrameCounter`; wire into `audio_server` IRQ handler.
+6. Extend `audio-smoke` xtask gate to sample `FrameCounter` and assert advancement.
+7. Add audible-bell path in `term`: BEL byte invokes `audio_client::bell()` which submits a 440 Hz, 50 ms tone.
+8. Add bell sub-test to `audio-smoke`.
+9. Update Phase 57 design doc with a closure note referencing this phase.
 
 ## Acceptance Criteria
 

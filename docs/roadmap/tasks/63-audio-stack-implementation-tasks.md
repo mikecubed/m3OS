@@ -16,6 +16,7 @@
 | E | Audible-bell smoke: `term` BEL byte → `audio_client::bell()` → PCM frames | D | Planned |
 | F | Phase 57 design doc + task doc closure note | E | Planned |
 | G | Multi-client EBUSY regression guard | A | Planned |
+| H | Documentation and Release | F, G | Planned |
 
 ---
 
@@ -177,6 +178,37 @@
 **Acceptance:**
 - [ ] Test opens one `audio_client` connection (succeeds), opens a second (expects `-EBUSY`).
 - [ ] Test runs via `cargo xtask test --test audio_multi_client` in QEMU.
+
+---
+
+---
+
+## Track H — Documentation and Release
+
+### H.1 — Create the aligned legacy learning doc
+
+**File:** `docs/63-audio-stack-implementation.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a standalone, phase-scoped reference that explains real PCM emission via AC'97 NABM registers without mixing in Phase 57 stub context or future HDA details.
+
+**Acceptance:**
+- [ ] `docs/63-audio-stack-implementation.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 63`, `**Status:** Planned`, `**Source Ref:** phase-63`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining what changed from Phase 57's stub to real PCM emission.
+- [ ] Key Files table cites `userspace/audio_server/src/device.rs`, `userspace/audio_server/src/stream.rs`, `kernel-core/src/audio/counters.rs`, and `xtask/src/main.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/63-audio-stack-implementation.md` and `docs/roadmap/tasks/63-audio-stack-implementation-tasks.md`.
+
+### H.2 — Bump kernel version to 0.63.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.63.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.63.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.63.0` recommended at phase merge
 
 ---
 

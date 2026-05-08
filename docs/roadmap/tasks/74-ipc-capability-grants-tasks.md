@@ -15,6 +15,7 @@
 | D | Many-to-one notification binding (`sys_notif_bind`) | Phase 55c ✅ | Planned |
 | E | Documentation updates and deferral comment removal | A–D | Planned |
 | F | Optional bulk-path migration for existing servers | B | Planned |
+| G | Documentation and Release | A–F | Planned |
 
 ---
 
@@ -220,6 +221,44 @@
 
 ---
 
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/74-ipc-capability-grants.md`
+**Symbol:** N/A
+**Why it matters:** A learner-friendly doc scoped to Phase 74 gives readers a single coherent entry point for the capability-grant and page-grant primitives without having to cross-reference Phase 6, Phase 55a, and Phase 55c.
+
+**Acceptance:**
+- [ ] File exists at `docs/74-ipc-capability-grants.md`
+- [ ] All required template fields populated: `**Aligned Roadmap Phase:** Phase 74`, `**Status:** Planned`, `**Source Ref:** phase-74`, `**Supersedes Legacy Doc:** new`
+- [ ] Overview is learner-friendly (explains what capability grants and page grants are before describing how they work)
+- [ ] Key Files table cites real files this phase touches: `kernel/src/ipc/mod.rs`, `kernel/src/ipc/page_grant.rs`, `kernel/src/ipc/notification.rs`, `userspace/syscall-lib/src/ipc.rs`, `userspace/syscall-lib/src/notification.rs`
+- [ ] Related Roadmap Docs links `docs/roadmap/74-ipc-capability-grants.md` and `docs/roadmap/tasks/74-ipc-capability-grants-tasks.md`
+
+### G.2 — Bump kernel version to 0.74.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-version bump per shipped phase; the 2026-05-08 audit found `AGENTS.md` stale and discipline in version tracking signals a complete, shippable phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.74.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger it)
+- [ ] `AGENTS.md` "Kernel v0.74.0" updated
+- [ ] `docs/roadmap/README.md` Phase 74 row Status updated to "Complete" at merge time
+- [ ] `cargo xtask check` passes
+- [ ] Git tag `v0.74.0` recommended at phase merge
+
+---
+
 ## Documentation Notes
 
 - Track A's `IpcMessage` struct change is an ABI break; all in-tree callers must be audited before the PR merges. The audit list should be attached as a comment in the commit.
@@ -227,3 +266,4 @@
 - Track C's race between timeout and IPC delivery is the most subtle correctness concern in this phase; the acceptance criteria require both orderings to be tested.
 - Track D closes two items from the Phase 55c "Deferred Until Later" section; those doc updates belong in Track E.
 - Track F is explicitly optional for Phase 74 completion; Tracks A–E are the blocking deliverables.
+- Track G.1 learning doc should be authored after Tracks A–E are complete so it accurately reflects the shipped implementation details.

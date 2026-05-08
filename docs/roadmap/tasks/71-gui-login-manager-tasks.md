@@ -17,6 +17,7 @@
 | F | `session_manager` integration: greeter spawn, stdout capture, UID propagation, `term` exec | D | Planned |
 | G | Init manifest update: headless autologin preserved; graphical path routes to greeter | F | Planned |
 | H | Documentation: Phase 27, 48, 57 cross-refs; `phase-57-session-entry.md` update | F, G | Planned |
+| I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.71.0 | H | Planned |
 
 ---
 
@@ -277,6 +278,45 @@
 - [ ] Phase 48 doc notes that the trust-floor 3-failure/5 s backoff is implemented in `userspace/greeter/src/auth.rs`.
 - [ ] Phase 57 doc notes that the autologin-as-root path was superseded by the Phase 71 greeter for graphical sessions; headless autologin is documented as preserved.
 - [ ] `docs/appendix/phase-57-session-entry.md` updated with the new boot sequence and greeter → session_manager → user-term handoff.
+
+---
+
+---
+
+## Track I — Documentation and Release
+
+### I.1 — Create the aligned legacy learning doc
+
+**File:** `docs/71-gui-login-manager.md`
+**Symbol:** N/A (new learning doc)
+**Why it matters:** Learners need a document explaining how the graphical login manager works, why it is a compositor client rather than a kernel service, and how UID propagation connects the greeter's auth decision to the user's `term` session.
+
+**Acceptance:**
+- [ ] `docs/71-gui-login-manager.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 71`, `**Status:** Planned`, `**Source Ref:** phase-71`, `**Supersedes Legacy Doc:** new`)
+- [ ] Overview explains in learner-friendly terms why the graphical login manager replaces autologin-as-root and how it fits into the Phase 57 boot sequence
+- [ ] "What This Doc Covers" list enumerates the greeter binary, background image decoding, auth loop with backoff, session descriptor protocol, UID propagation via setuid, and headless autologin preservation
+- [ ] "Core Implementation" prose walks through the greeter → session descriptor → session_manager → `term` handoff in plain language, including the trust-floor backoff
+- [ ] "Key Files" table cites `userspace/greeter/src/main.rs`, `userspace/greeter/src/auth.rs`, `userspace/greeter/src/image.rs`, `userspace/greeter/src/input.rs`, `userspace/session_manager/src/boot.rs`, and `kernel-core/src/passwd/mod.rs`
+- [ ] "Related Roadmap Docs" links both `docs/roadmap/71-gui-login-manager.md` and `docs/roadmap/tasks/71-gui-login-manager-tasks.md`
+
+### I.2 — Bump kernel version to 0.71.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.71.0"`
+- [ ] `Cargo.lock` regenerated to reflect the new version
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.71.0`
+- [ ] `docs/roadmap/README.md` row for Phase 71 updated to reflect Completed status at ship
+- [ ] `cargo xtask check` passes after the version bump
+- [ ] Git tag `v0.71.0` recommended at phase merge
 
 ---
 

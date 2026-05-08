@@ -82,6 +82,10 @@ Virtual memory regions are allocated on each `mmap` call. Under Phase 54's serve
 
 ## Implementation Outline
 
+Each family migration follows a TDD cycle: write the failing host-side `kernel-core` unit test for the slab alloc/free/reuse path first; implement the migration until the host test passes; then run `cargo xtask test` as the QEMU smoke gate. This discipline catches Drop-ordering bugs at the host level — where iteration is fast — before they reach the QEMU harness.
+
+Each `SlabCache<T>` instance holds responsibility for exactly one object family (Single Responsibility Principle): `FD_ENTRY_CACHE` owns `FdEntry` lifecycle, `TASK_CACHE` owns `Task` lifecycle, and so on. Adding a new object family never requires modifying an existing cache — it is an extension, not a modification (Open/Closed Principle). This SRP + OCP structure makes the migration safe to stage one family at a time with an independent regression run after each.
+
 1. Run Track A: audit call sites, confirm the five target families, record the ranked table.
 2. Migrate `FdEntry` (Track B.1) — smallest and most self-contained; run Track D regression.
 3. Migrate `Notification` (Track B.2); run Track D regression.

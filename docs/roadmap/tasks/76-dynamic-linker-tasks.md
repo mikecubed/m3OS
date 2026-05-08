@@ -16,6 +16,7 @@
 | E | `xtask` `.so` build pipeline and disk placement | Phase 31 ✅ | Planned |
 | F | Test applications (`dynlink_hello`, `dlopen_test`) | B, C, E | Planned |
 | G | Phase 11 and Phase 12 design doc updates | F | Planned |
+| H | Documentation and Release | A–G | Planned |
 
 ---
 
@@ -249,6 +250,44 @@
 
 ---
 
+---
+
+## Track H — Documentation and Release
+
+### H.1 — Create the aligned legacy learning doc
+
+**File:** `docs/76-dynamic-linker.md`
+**Symbol:** N/A
+**Why it matters:** Dynamic linking is architecturally new ground for m3OS; a learner-friendly doc that walks through `PT_INTERP`, auxiliary vector, `ld.so` bring-up, GOT/PLT, and `dlopen`/`dlsym` in one place prevents readers from having to reconstruct the full picture from ELF spec sections and musl source comments.
+
+**Acceptance:**
+- [ ] File exists at `docs/76-dynamic-linker.md`
+- [ ] All required template fields populated: `**Aligned Roadmap Phase:** Phase 76`, `**Status:** Planned`, `**Source Ref:** phase-76`, `**Supersedes Legacy Doc:** new`
+- [ ] Overview is learner-friendly (explains why dynamic linking exists and what `PT_INTERP` means before describing implementation details)
+- [ ] Key Files table cites real files this phase touches: `kernel/src/elf/loader.rs`, `userspace/ld-musl-x86_64.so.1/src/dynlink.rs`, `userspace/ld-musl-x86_64.so.1/src/reloc.rs`, `userspace/ld-musl-x86_64.so.1/src/dl.rs`, `xtask/src/main.rs`, `userspace/tests/dynlink_hello/src/main.rs`, `userspace/tests/dlopen_test/src/main.rs`
+- [ ] Related Roadmap Docs links `docs/roadmap/76-dynamic-linker.md` and `docs/roadmap/tasks/76-dynamic-linker-tasks.md`
+
+### H.2 — Bump kernel version to 0.76.0
+
+**Files:**
+- `kernel/Cargo.toml`
+- `Cargo.lock`
+- `AGENTS.md`
+- `docs/roadmap/README.md`
+
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-version bump per shipped phase; the 2026-05-08 audit found `AGENTS.md` stale and discipline in version tracking signals a complete, shippable phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.76.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger it)
+- [ ] `AGENTS.md` "Kernel v0.76.0" updated
+- [ ] `docs/roadmap/README.md` Phase 76 row Status updated to "Complete" at merge time
+- [ ] `cargo xtask check` passes
+- [ ] Git tag `v0.76.0` recommended at phase merge
+
+---
+
 ## Documentation Notes
 
 - Track A's auxiliary vector layout must exactly match what musl `_dlstart` expects at process start; the musl source's `arch/x86_64/crt_arch.h` and `ldso/dynlink.c:_dlstart` are the authoritative references.
@@ -256,3 +295,4 @@
 - Track B.4's PLT trampoline is x86_64 assembly; it must preserve all caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`, `xmm0–xmm7`) before calling the Rust symbol-resolution code.
 - Track E.2 must run `cargo xtask clean` in the PR CI step to ensure the disk is recreated with `/lib/ld-musl-x86_64.so.1`; otherwise the disk from a previous build is reused and the test binary cannot find the interpreter.
 - Track F's two test binaries are the acceptance gate; they replace any manual QEMU session as the reproducible proof of dynamic linking correctness.
+- Track H.1 learning doc should be authored after Track F so it can cite the actual test binary serial output as concrete examples of a successful dynamic link.

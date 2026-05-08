@@ -10,6 +10,8 @@
 
 m3OS gains a complete omarchy-aesthetic desktop: a persistent status bar showing workspace indicators, window title, and clock; a `SUPER+SPACE` fuzzy launcher; a notification daemon with timed pop-ups; software-rendered window-open/workspace-slide animations; optional rounded corners and drop shadows; and a lockscreen stub that blocks input until dismissed. Every component is a native m3OS client; none requires Wayland.
 
+Applying SRP, `bar`, `launcher`, and `notifyd` are independent clients of the Phase 72 control socket — none are embedded in `display_server`; changes to one do not risk the others. The test pyramid has animation timing curves as pure-math host tests, per-frame damage-rect math verifiable in `kernel-core` unit tests, and the full visual scenario as the QEMU top tier.
+
 ## Why This Phase Exists
 
 Phase 72 delivers the structural tiling compositor — layout, workspaces, chord bindings, control socket. But a bare tiling compositor with no visible status context, no quick launch path, and no animation feels like an unfinished prototype. The omarchy aesthetic is defined as much by its smooth transitions and minimal chrome as by its tiling geometry.

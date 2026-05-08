@@ -15,6 +15,7 @@
 | D | Relocate four layer-crossing wrappers out of `process/mod.rs` | None | Planned |
 | E | Pre-seeded image password hash format upgrade | B | Planned |
 | F | Phase 48 + Phase 54a design docs + task docs updated; Phase 54a flipped Complete | A, B, C, D, E | Planned |
+| G | Documentation and Release | F | Planned |
 
 ---
 
@@ -189,6 +190,37 @@
 **Acceptance:**
 - [ ] Both files have `**Status:** Complete`.
 - [ ] A closure note references Phase 66 for the implementation.
+
+---
+
+---
+
+## Track G — Documentation and Release
+
+### G.1 — Create the aligned legacy learning doc
+
+**File:** `docs/66-security-hygiene-closeout.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a focused reference for the five security trust-floor items — sticky-bit, atomic shadow writes, CLOEXEC, wrapper relocation, hash format — without mixing in Phase 48 foundation context or future MAC/ACL work.
+
+**Acceptance:**
+- [ ] `docs/66-security-hygiene-closeout.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 66`, `**Status:** Planned`, `**Source Ref:** phase-66`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining the security trust-floor gaps closed in this phase.
+- [ ] Key Files table cites `kernel/src/fs/vfs.rs`, `userspace/lib/shadow/src/lib.rs`, `kernel/src/fs/file.rs`, `kernel/src/process/mod.rs`, and `userspace/passwd/src/main.rs`.
+- [ ] Related Roadmap Docs links `docs/roadmap/66-security-hygiene-closeout.md` and `docs/roadmap/tasks/66-security-hygiene-closeout-tasks.md`.
+
+### G.2 — Bump kernel version to 0.66.0
+
+**Files:** `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`
+**Symbol:** `version` in `kernel/Cargo.toml` `[package]`
+**Why it matters:** Project convention is one minor-bump per shipped phase; keeping the version cursor accurate ensures `AGENTS.md` and the README reflect the real state of the kernel at any given phase.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `version = "0.66.0"`
+- [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
+- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.66.0`
+- [ ] `cargo xtask check` passes after the bump
+- [ ] Git tag `v0.66.0` recommended at phase merge
 
 ---
 
