@@ -32,11 +32,11 @@
 **Why it matters:** The design doc declares Complete; the task doc's Track Layout shows all six tracks Not started. Either signals work and the task doc is a documentation failure, or they don't and Phase 19 must be demoted — which would cascade to Phases 21, 29, 30, 43.
 
 **Acceptance:**
-- [ ] Read `kernel/src/signal/` and the signal-related syscalls in `kernel/src/arch/x86_64/syscall/mod.rs` and identify which of the six tracks (A: mask, B: sigframe, C: sigreturn, D: sigaltstack, E: rt_sigaction, F: validation) have landed code.
-- [ ] For each track with landed code, flip the corresponding checkboxes to `[x]` with a file+symbol citation.
-- [ ] For any track with no landed code, convert to `[ ] — Deferred: post-1.0` with an explanation.
-- [ ] Design-doc `Status:` field agrees with the resulting task-doc Track Layout.
-- [ ] If Phase 19's Status is demoted from Complete: `Depends on:` lines in the design docs for Phases 21, 29, 30, and 43 are updated to drop the `✅` next to Phase 19, and any acceptance items in those four task docs that explicitly cite Phase 19 features are converted to `[ ] — Blocked: Phase 19 demoted`. If Phase 19 stays Complete, this item is closed with a one-line justification noting no cascade was needed.
+- [x] Read `kernel/src/signal/` and the signal-related syscalls in `kernel/src/arch/x86_64/syscall/mod.rs` and identify which of the six tracks (A: mask, B: sigframe, C: sigreturn, D: sigaltstack, E: rt_sigaction, F: validation) have landed code.
+- [x] For each track with landed code, flip the corresponding checkboxes to `[x]` with a file+symbol citation. *(Phase 19 task doc is in legacy pipe-table form — table-format conversion deferred to post-1.0 per Track B.3 scope; reconciled by flipping Track Layout statuses and adding a verification section with citations.)*
+- [x] For any track with no landed code, convert to `[ ] — Deferred: post-1.0` with an explanation. *(Only `rt_sigpending` (Track A subset) was missing; recorded under "Deferred Until Later" in `docs/roadmap/tasks/19-signal-handlers-tasks.md`.)*
+- [x] Design-doc `Status:` field agrees with the resulting task-doc Track Layout. *(Both now Complete.)*
+- [x] If Phase 19's Status is demoted from Complete: `Depends on:` lines in the design docs for Phases 21, 29, 30, and 43 are updated to drop the `✅` next to Phase 19, and any acceptance items in those four task docs that explicitly cite Phase 19 features are converted to `[ ] — Blocked: Phase 19 demoted`. If Phase 19 stays Complete, this item is closed with a one-line justification noting no cascade was needed. *(Phase 19 stayed Complete; no cascade needed.)*
 
 ### A.2 — Flip universally-unchecked task docs for Phases 42b, 43b, 43c, 46, 47
 
