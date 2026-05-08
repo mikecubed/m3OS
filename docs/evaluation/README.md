@@ -1,5 +1,7 @@
 # m3OS Evaluation
 
+> Archived 2026-05-08 — scoped to v0.47.0; not maintained against later phases. Refer to current phase docs for up-to-date evaluation criteria.
+
 This directory captures a repo-wide evaluation of m3OS as of this review pass, updated against the current base through Phase 47 / `v0.47.0`: what is already strong, what is still missing, what blocks a safer and more usable system, and what a realistic GUI path would look like. Because phases 1-47 are now the shipped base, anything still rough in that scope should be read as a maturity gap in current behavior, not as hidden future work.
 
 ## Executive verdict

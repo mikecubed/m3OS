@@ -254,10 +254,10 @@ The default disposition is "archive with dated note." If during implementation a
 **Why it matters:** Two parallel directories exist for the same content type. The singular has 1 file, the plural has 21. Every internal doc that links to `docs/handoff/` gets a broken reference after the merge.
 
 **Acceptance:**
-- [ ] File from `docs/handoff/` moved into `docs/handoffs/`.
-- [ ] `docs/handoff/` directory removed.
-- [ ] Every cross-reference in the corpus to `docs/handoff/` updated to `docs/handoffs/`.
-- [ ] `grep -r 'docs/handoff[^s]'` returns no results in the repo root.
+- [x] File from `docs/handoff/` moved into `docs/handoffs/`.
+- [x] `docs/handoff/` directory removed.
+- [x] Every cross-reference in the corpus to `docs/handoff/` updated to `docs/handoffs/`.
+- [x] `grep -r 'docs/handoff[^s]'` returns no results in the repo root. *(Aside from this Phase 58 task doc and design doc themselves, which describe the migration action by name. Track G's final-validation grep excludes those self-referential narrative paths.)*
 
 ### F.2 — Archive `docs/evaluation/` and `docs/shell/brush-integration-analysis.md`
 
@@ -269,9 +269,9 @@ The default disposition is "archive with dated note." If during implementation a
 **Why it matters:** `docs/evaluation/README.md` is scoped to v0.47.0 (~10 phases stale). `docs/shell/brush-integration-analysis.md` is dated 2026-03-26 (~15 phases stale). Both mislead readers about the current state.
 
 **Acceptance (archive-only — neither doc is on the active path so refresh is not justified):**
-- [ ] `docs/evaluation/README.md` has a prominent first-body-line header: `> Archived 2026-05-08 — scoped to v0.47.0; not maintained against later phases. Refer to current phase docs for up-to-date evaluation criteria.`
-- [ ] `docs/shell/brush-integration-analysis.md` has a prominent first-body-line header: `> Archived 2026-05-08 — original analysis dated 2026-03-26 and not maintained. See `docs/22-tty-terminal.md` and `docs/roadmap/29-pty-and-jobs.md` for the current shell + PTY documentation.`
-- [ ] Neither file's body content is otherwise modified — the goal is to flag staleness, not rewrite v0.47-era analysis.
+- [x] `docs/evaluation/README.md` has a prominent first-body-line header: `> Archived 2026-05-08 — scoped to v0.47.0; not maintained against later phases. Refer to current phase docs for up-to-date evaluation criteria.`
+- [x] `docs/shell/brush-integration-analysis.md` has a prominent first-body-line header pointing to current shell + PTY docs (`docs/22-tty-terminal.md` and `docs/roadmap/29-pty-subsystem.md` — note: the task spec referenced `29-pty-and-jobs.md`, but the actual filename is `29-pty-subsystem.md`).
+- [x] Neither file's body content is otherwise modified — the goal is to flag staleness, not rewrite v0.47-era analysis.
 
 ---
 

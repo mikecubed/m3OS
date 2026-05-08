@@ -1,5 +1,7 @@
 # brush Shell Integration Analysis
 
+> Archived 2026-05-08 — original analysis dated 2026-03-26 and not maintained. See `docs/22-tty-terminal.md` and `docs/roadmap/29-pty-subsystem.md` for the current shell + PTY documentation.
+
 > **Date**: 2026-03-26  
 > **Subject**: Feasibility of integrating [brush](https://github.com/reubeno/brush)
 > (Bourne Rusty Shell) into m3OS as the userspace shell  

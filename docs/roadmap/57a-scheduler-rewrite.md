@@ -3,7 +3,7 @@
 **Status:** Complete
 **Source Ref:** phase-57a
 **Depends on:** Phase 4 (Tasking) ✅, Phase 6 (IPC Core) ✅, Phase 35 (True SMP) ✅, Phase 50 (IPC Completion) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
-**Builds on:** Replaces the multi-flag block/wake protocol (`switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT[core]`) introduced incrementally through Phases 4, 6, 35, and 50. Eliminates the lost-wake bug class catalogued in `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and re-confirmed by the `feat/phase-57-impl` graphical-stack regression in `docs/handoff/2026-04-28-graphical-stack-startup.md`.
+**Builds on:** Replaces the multi-flag block/wake protocol (`switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT[core]`) introduced incrementally through Phases 4, 6, 35, and 50. Eliminates the lost-wake bug class catalogued in `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and re-confirmed by the `feat/phase-57-impl` graphical-stack regression in `docs/handoffs/2026-04-28-graphical-stack-startup.md`.
 **Primary Components:** `kernel/src/task/scheduler.rs` (block/wake primitives, dispatch switch-out handler, deadline scanner), `kernel-core/src/sched_model.rs` (new pure-logic state machine + host tests), `kernel/src/ipc/` (call/recv/reply rendezvous), `kernel/src/arch/x86_64/syscall/mod.rs` (syscall block sites), `kernel/src/main.rs::serial_stdin_feeder_task` (notification-based wait migration), `userspace/audio_server`, `userspace/syslogd` (secondary fixes carried in this phase).
 
 ## Milestone Goal

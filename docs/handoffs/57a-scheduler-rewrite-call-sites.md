@@ -18,7 +18,7 @@ and `scan_expired_wake_deadlines`. Without a complete inventory, a partial
 migration leaves a mix of v1 and v2 protocol that produces the same race
 class documented in
 `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and
-`docs/handoff/2026-04-28-graphical-stack-startup.md`. This catalogue is
+`docs/handoffs/2026-04-28-graphical-stack-startup.md`. This catalogue is
 the source of truth for Track F's migration progress: every row below maps
 to a Track F sub-task, and F.7 (delete v1 functions) cannot land until
 every row is migrated.
