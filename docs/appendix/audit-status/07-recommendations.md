@@ -138,6 +138,18 @@ These read identically in the docs but mean very different things.
 
 ---
 
+## R4-update — phases drafted (2026-05-08)
+
+R4 ("cut new remediation phases for the open-but-unowned work") has been acted on. The new phase set is **Phases 58–76**, drafted as a single PR with design + task docs following the project's templates. The previous Phases 58–62 are renumbered to **77–81**. See `docs/roadmap/README.md` for the updated phase tables and dependency graph.
+
+The drafted phases group into three layers:
+
+1. **Cleanup phases (58–68)** — close audit-identified gaps. Phase 58 (Documentation Reconciliation) must precede the others because the rest of the audit's blockers depend on a trustworthy phase-status baseline.
+2. **Capability expansion phases (69–73)** — TUI, DOOM in-GUI, GUI login, compositor tiling, compositor polish. User-priority items that fold the surviving capability gaps in `findings/09` and the user's own requests.
+3. **Architectural phases (74–76)** — IPC capability grants and bulk transfers, W^X enforcement, dynamic linker. Each closes a long-deferred item and unblocks downstream platform work (Phase 80 Node.js needs dynamic linking; Phase 73 compositor polish benefits from page-grant bulk transfer; W^X is a 1.0 trust-floor item).
+
+Phase 77 (Release 1.0 Gate) becomes meaningful once Phases 58–73 close. Phases 74–76 are conditionally pre-1.0 (depending on whether the project decides W^X / dynamic linking are 1.0 commitments or post-1.0 expansions).
+
 ## R10 — Auditor's verdict
 
 **The project is in significantly better shape than this audit's red-flag count would suggest.** Most of the flags are documentation drift, not functional defects. The architectural decisions (microkernel boundary, IOMMU substrate, ring-3 drivers, preemption programme) are sound. The 52a/b/c/d closure pattern is exemplary — the project has demonstrated it can recognise drift and write explicit closure phases. 52d is the model.

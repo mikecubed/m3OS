@@ -1,8 +1,8 @@
-# Phase 60 - Networking and GitHub
+# Phase 79 - Networking and GitHub
 
 **Status:** Planned
-**Source Ref:** phase-60
-**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 48 (Security Foundation) ✅, Phase 59 (Cross-Compiled Toolchains) ✅
+**Source Ref:** phase-79
+**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 48 (Security Foundation) ✅, Phase 78 (Cross-Compiled Toolchains) ✅
 **Builds on:** Extends the post-1.0 developer platform from local toolchains into authenticated outbound networking, DNS resolution, git remote workflows, and GitHub CLI use
 **Primary Components:** userspace network tooling, getrandom()/entropy path, GitHub CLI integration, git transport support, docs/github-cli-roadmap.md, docs/git-roadmap.md
 
@@ -35,7 +35,7 @@ Make the supported transport path for GitHub CLI, git remotes, and other outboun
 
 ### git remote workflows
 
-Extend the local git baseline from Phase 59 to remote clone, fetch, push, and related workflows on the supported services.
+Extend the local git baseline from Phase 78 to remote clone, fetch, push, and related workflows on the supported services.
 
 ### GitHub CLI integration
 
@@ -54,7 +54,7 @@ Bundle and validate the GitHub CLI path used for repository, issue, PR, and CI i
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
 | Security baseline | Phase 48's entropy and default-security repairs are complete and trusted | Pull missing RNG or credential-handling work into this phase |
-| Tooling baseline | Phase 59 local git and other developer tools are working reliably | Add the missing local-tool cleanup before remote workflows |
+| Tooling baseline | Phase 78 local git and other developer tools are working reliably | Add the missing local-tool cleanup before remote workflows |
 | Network/runtime baseline | The supported networking and threading substrate can carry the chosen tools | Add the missing runtime or resolver support instead of assuming it |
 | Support-boundary baseline | The project has documented what remote workflows it actually supports | Add the missing support-matrix updates before closing |
 
@@ -74,7 +74,7 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 59's local toolchain story by extending it into real collaboration workflows.
+- Builds on Phase 78's local toolchain story by extending it into real collaboration workflows.
 - Depends on Phase 48 because network-facing developer tools raise the bar for entropy and credentials.
 - Reuses earlier network, crypto, threading, and I/O groundwork without pulling those phases back into the release-critical path.
 
@@ -88,7 +88,7 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 
 ## Learning Documentation Requirement
 
-- Create `docs/60-networking-and-github.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/79-networking-and-github.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the resolver path, HTTPS trust model, git remote integration, and GitHub CLI workflow.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -109,7 +109,7 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 
 ## Companion Task List
 
-- Phase 60 task list — defer until implementation planning begins.
+- Phase 79 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 
@@ -119,7 +119,7 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 
 ## Inherited Follow-ups from Earlier Phases
 
-- **Phase 55c follow-through for userspace `EAGAIN` visibility** — Phase 55c pulled the old Phase 55b `sys_net_send` / `sendto()` restart-surfacing gap forward because the pre-1.0 ring-3 driver story now depends on it. Phase 60 should treat that userspace-visible `EAGAIN` contract as baseline behavior and build future networking work on top of it rather than reopening ownership.
+- **Phase 55c follow-through for userspace `EAGAIN` visibility** — Phase 55c pulled the old Phase 55b `sys_net_send` / `sendto()` restart-surfacing gap forward because the pre-1.0 ring-3 driver story now depends on it. Phase 79 should treat that userspace-visible `EAGAIN` contract as baseline behavior and build future networking work on top of it rather than reopening ownership.
 
 ## Deferred Until Later
 

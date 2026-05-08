@@ -177,18 +177,62 @@ flowchart TD
     P57b --> P57e["Phase 57e<br/>Full Kernel Preemption"]
     P57c --> P57e
     P57d --> P57e
-    P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
-    P55c --> P58
-    P57 -.->|optional local-system branch| P58
-    P57a -.->|graphical-stack readiness| P58
-    P57c -.->|graphical-stack reliability| P58
-    P57d -.->|graphical-stack reliability| P58
+    P57e -.->|deferred 2026-05-07| P57end((Phase 57e<br/>deferred))
 
-    %% Post-1.0 platform growth
-    P58 --> P59["Phase 59<br/>Cross-Compiled Toolchains"]
-    P59 --> P60["Phase 60<br/>Networking and GitHub"]
-    P60 --> P61["Phase 61<br/>Node.js"]
-    P61 --> P62["Phase 62<br/>Claude Code"]
+    %% Pre-1.0 cleanup phases (close audit-identified gaps)
+    P57e --> P58["Phase 58<br/>Documentation Reconciliation"]
+    P58 --> P59["Phase 59<br/>Validation Backlog"]
+    P58 --> P60["Phase 60<br/>Slab Migration Closeout"]
+    P58 --> P61["Phase 61<br/>SMP Load Balancing Closeout"]
+    P58 --> P62["Phase 62<br/>Phase 57a Pi-Lock Closeout"]
+    P58 --> P63["Phase 63<br/>Audio Stack Implementation"]
+    P58 --> P64["Phase 64<br/>Session Manager Lifecycle"]
+    P58 --> P65["Phase 65<br/>fat_server Implementation"]
+    P58 --> P66["Phase 66<br/>Security & Hygiene Closeout"]
+    P58 --> P67["Phase 67<br/>IOMMU Substrate Completion"]
+    P58 --> P68["Phase 68<br/>Display Server Closeout"]
+
+    %% Capability expansion phases
+    P63 --> P69["Phase 69<br/>Terminal TUI Capabilities"]
+    P68 --> P69
+    P68 --> P70["Phase 70<br/>DOOM In-GUI Surface<br/>(fb-takeover Tier 3)"]
+    P64 --> P71["Phase 71<br/>GUI Login Manager"]
+    P68 --> P71
+    P68 --> P72["Phase 72<br/>Compositor: Tiling + Workspaces"]
+    P71 --> P72
+    P72 --> P73["Phase 73<br/>Compositor: Polish<br/>(bar / launcher / notifyd / animations)"]
+    P74["Phase 74<br/>IPC Capability Grants<br/>+ Bulk Transfers"]
+    P67 --> P74
+    P75["Phase 75<br/>W^X Enforcement"]
+    P76["Phase 76<br/>Dynamic Linker"]
+    P75 --> P76
+
+    %% Release gate (renumbered)
+    P59 --> P77["Phase 77<br/>Release 1.0 Gate"]
+    P60 --> P77
+    P61 --> P77
+    P62 --> P77
+    P63 --> P77
+    P64 --> P77
+    P65 --> P77
+    P66 --> P77
+    P67 --> P77
+    P68 --> P77
+    P69 --> P77
+    P70 --> P77
+    P71 --> P77
+    P72 --> P77
+    P73 --> P77
+    P75 --> P77
+    P74 -.->|optional pre-1.0| P77
+    P76 -.->|optional pre-1.0| P77
+
+    %% Post-1.0 platform growth (renumbered from 59-62)
+    P77 --> P78["Phase 78<br/>Cross-Compiled Toolchains"]
+    P78 --> P79["Phase 79<br/>Networking and GitHub"]
+    P79 --> P80["Phase 80<br/>Node.js"]
+    P76 -.-> P80
+    P80 --> P81["Phase 81<br/>Claude Code"]
 ```
 
 ## Milestone Summary
@@ -312,16 +356,52 @@ flowchart TD
 | 57c | Kernel Busy-Wait Audit and Conversion | Catalogue every kernel busy-spin; convert hot/unbounded sites to block+wake pairs; document hardware-bounded sites with bounds and citations.  Independent of 57b — provides direct user-pain relief for cooperative-starvation | **Complete** | `phase-57c` | [Phase 57c](./57c-kernel-busy-wait-conversion.md) | [Tasks](./tasks/57c-kernel-busy-wait-conversion-tasks.md) |
 | 57d | Voluntary Preemption (PREEMPT_VOLUNTARY) | IRQ-return preemption check for user-mode tasks; user-mode CPU-bound tasks become preemptible within one timer tick.  Kernel mode remains non-preemptible | **Complete** | `phase-57d` | [Phase 57d](./57d-voluntary-preemption.md) | [Tasks](./tasks/57d-voluntary-preemption-tasks.md) |
 | 57e | Full Kernel Preemption (PREEMPT_FULL) — stretch | Drop the `from_user` check; kernel-mode code becomes preemptible at any point where `preempt_count == 0`.  Cross-core reschedule-IPI wakeup latency improves measurably; same-core, timer-only, and `preempt_enable` zero-crossing paths benchmark separately and must not regress.  Adds same-CPL `iretq` resume, kernel-RSP capture, per-CPU access audit, kernel-mode `preempt_enable` immediacy | **Deferred (2026-05-07)** — see [post-mortem](../post-mortems/2026-05-07-57e-preempt-full-deferred.md) | `phase-57e` | [Phase 57e](./57e-full-kernel-preemption.md) | [Tasks](./tasks/57e-full-kernel-preemption-tasks.md) |
-| 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |
 
-### Post-1.0 Platform Growth (planned)
+### Pre-1.0 Cleanup Phases (post-57e; close audit-identified gaps before Release 1.0)
+
+These phases were drafted 2026-05-08 in response to the phase-completion audit (`docs/appendix/audit-status/`). Each closes a specific category of audit-identified blocker. Phase 58 must precede the others because the audit's status reconciliation is itself a precondition for trusting downstream phase claims.
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 59 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-59` | [Phase 59](./59-cross-compiled-toolchains.md) | Deferred until implementation planning |
-| 60 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-60` | [Phase 60](./60-networking-and-github.md) | Deferred until implementation planning |
-| 61 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-61` | [Phase 61](./61-nodejs.md) | Deferred until implementation planning |
-| 62 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-62` | [Phase 62](./62-claude-code.md) | Deferred until implementation planning |
+| 58 | Documentation Reconciliation Pass | Walk every phase doc, flip Status fields to match reality, write the missing task docs (Phases 13, 22b, 42b), close Phases 51 and 52, retire/refresh stale legacy docs, consolidate handoff dirs | Planned | `phase-58` | [Phase 58](./58-documentation-reconciliation.md) | [Tasks](./tasks/58-documentation-reconciliation-tasks.md) |
+| 59 | Validation Backlog | Run every "manual QEMU test" deferred from Phases 30/31/32/43/22b/24/57b/34/39/10; record results; flip task-doc checkboxes | Planned | `phase-59` | [Phase 59](./59-validation-backlog.md) | [Tasks](./tasks/59-validation-backlog-tasks.md) |
+| 60 | Phase 33 Slab Migration Closeout | Migrate hot kernel object families (Task, Endpoint, Notification, FdEntry) onto the slab-cache infrastructure that landed in Phase 33 but was never used. Closes audit Red Flag #4 | Planned | `phase-60` | [Phase 60](./60-slab-migration-closeout.md) | [Tasks](./tasks/60-slab-migration-closeout-tasks.md) |
+| 61 | Phase 35 SMP Load Balancing Closeout | Uncomment `maybe_load_balance()`, add per-run-queue length counter, wire `tlb_shootdown` into `munmap`. Closes audit Red Flag #3 + Phase 25 P25-T033 | Planned | `phase-61` | [Phase 61](./61-smp-load-balancing-closeout.md) | [Tasks](./tasks/61-smp-load-balancing-closeout-tasks.md) |
+| 62 | Phase 57a Pi-Lock Closeout | Land pi_lock + with_block_state at the four `TODO(57a-C/D)` scheduler sites; Bug #9 Option-B Arc-clone fix for ~25 callsites; record 57b soak result | Planned | `phase-62` | [Phase 62](./62-phase-57a-pi-lock-closeout.md) | [Tasks](./tasks/62-phase-57a-pi-lock-closeout-tasks.md) |
+| 63 | Phase 57 Audio Stack Implementation | Real PCM emission for `audio_server` (replace accounting-only `Ac97Backend`); audio-smoke gate asserts frame consumption end-to-end. Closes audit § B1 / F1 | Planned | `phase-63` | [Phase 63](./63-audio-stack-implementation.md) | [Tasks](./tasks/63-audio-stack-implementation-tasks.md) |
+| 64 | Phase 57 Session Manager Lifecycle | Real `start/stop/restart` (replace unconditional-Ack stubs); SIGCHLD-based lifecycle; restart budget; text-fallback motion. Closes audit § B2 / F2 | Planned | `phase-64` | [Phase 64](./64-session-manager-lifecycle.md) | [Tasks](./tasks/64-session-manager-lifecycle-tasks.md) |
+| 65 | Phase 54 fat_server Implementation | Real FAT32 operations in `fat_server` (replace permanent ENOSYS stub); routed via `vfs_server`. Closes audit Red Flag #14 (Phase 54 dimension) | Planned | `phase-65` | [Phase 65](./65-fat-server-implementation.md) | [Tasks](./tasks/65-fat-server-implementation-tasks.md) |
+| 66 | Security & Hygiene Closeout | `/tmp` sticky-bit, atomic shadow writes, CLOEXEC plumbing on `open`/`openat`, four `*_pub` wrapper relocations, pre-seeded image hash format upgrade. Closes audit § F4/F5/C6 + Phase 54a | Planned | `phase-66` | [Phase 66](./66-security-hygiene-closeout.md) | [Tasks](./tasks/66-security-hygiene-closeout-tasks.md) |
+| 67 | Phase 55a IOMMU Substrate Completion | AMD-Vi fault ISR, VT-d scalable mode, VT-d queued invalidation, AMD-Vi multi-BDF domains, replace 4 `todo!()` isolation tests with real harness. Closes audit § C7/E3 | Planned | `phase-67` | [Phase 67](./67-iommu-substrate-completion.md) | [Tasks](./tasks/67-iommu-substrate-completion-tasks.md) |
+| 68 | Phase 56 Display Server Closeout | D-E4 subscription-push wire transmission, compositor damage tracking, D-A0 modifier-key wire format, D-F1a mouse_server depends-on. Closes audit § C5 + flips Phase 56 to Complete | Planned | `phase-68` | [Phase 68](./68-display-server-closeout.md) | [Tasks](./tasks/68-display-server-closeout-tasks.md) |
+
+### Capability Expansion Phases (pre-1.0; user-priority)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 69 | Terminal TUI Capabilities | terminfo entry, alternate screen buffer, 256-color/truecolor SGR, SIGWINCH propagation, X10/SGR mouse reporting, cursor styling. Enables nvim/tmux/htop. Closes audit § B8 / F7 | Planned | `phase-69` | [Phase 69](./69-terminal-tui-capabilities.md) | [Tasks](./tasks/69-terminal-tui-capabilities-tasks.md) |
+| 70 | DOOM In-GUI Surface (fb-takeover Tier 3) | DOOM becomes a regular `display_server` client; multiple instances run concurrently; fb-takeover wrapper retires. Implements Tier 3 from `docs/appendix/fb-takeover-tiers.md` | Planned | `phase-70` | [Phase 70](./70-doom-in-gui-surface.md) | [Tasks](./tasks/70-doom-in-gui-surface-tasks.md) |
+| 71 | GUI Login Manager | Greeter as a regular display_server client with PNG/BMP background image; per-user UID propagation through `session_manager`; replaces autologin-as-root for graphical sessions | Planned | `phase-71` | [Phase 71](./71-gui-login-manager.md) | [Tasks](./tasks/71-gui-login-manager-tasks.md) |
+| 72 | Compositor: Multi-Toplevel + Tiling Layout + Workspaces | Multiple toplevel clients tile under master/dwindle/spiral/grid policies; N numbered workspaces per output; chord engine; gaps + borders. Implements `tiling-compositor-path.md` Goal A | Planned | `phase-72` | [Phase 72](./72-compositor-tiling-workspaces.md) | [Tasks](./tasks/72-compositor-tiling-workspaces-tasks.md) |
+| 73 | Compositor: Polish (bar / launcher / notifications / animations) | Native status bar, fuzzy-find launcher, notification daemon, animation engine (slide/fade), rounded corners + drop shadows. omarchy-aesthetic desktop | Planned | `phase-73` | [Phase 73](./73-compositor-polish.md) | [Tasks](./tasks/73-compositor-polish-tasks.md) |
+| 74 | IPC Capability Grants and Bulk Transfers | `sys_cap_grant` via IPC, page-grant bulk-data transport (closes Phase 56 D-B4), IPC timeouts, many-to-one notification binding. Closes audit § E2 + Phase 6+/Phase 7+ deferrals | Planned | `phase-74` | [Phase 74](./74-ipc-capability-grants.md) | [Tasks](./tasks/74-ipc-capability-grants-tasks.md) |
+| 75 | W^X Enforcement | Userspace code pages mapped R-X (no `WRITABLE`); `mprotect` rejects `PROT_WRITE \| PROT_EXEC`; ELF loader splits text/data segments. Closes audit § E1 | Planned | `phase-75` | [Phase 75](./75-wx-enforcement.md) | [Tasks](./tasks/75-wx-enforcement-tasks.md) |
+| 76 | Dynamic Linker / Shared Libraries | `PT_INTERP` honored; `ld.so` (musl-based); `dlopen`/`dlsym`/`dlclose`; build system supports `.so` outputs. Required for toolkit GUI apps and Phase 80 Node.js. Closes audit § F6 | Planned | `phase-76` | [Phase 76](./76-dynamic-linker.md) | [Tasks](./tasks/76-dynamic-linker-tasks.md) |
+
+### Release Gate (renumbered from Phase 58)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 77 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-77` | [Phase 77](./77-release-1-0-gate.md) | Deferred until implementation planning |
+
+### Post-1.0 Platform Growth (renumbered from 59-62)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 78 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-78` | [Phase 78](./78-cross-compiled-toolchains.md) | Deferred until implementation planning |
+| 79 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-79` | [Phase 79](./79-networking-and-github.md) | Deferred until implementation planning |
+| 80 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-80` | [Phase 80](./80-nodejs.md) | Deferred until implementation planning |
+| 81 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-81` | [Phase 81](./81-claude-code.md) | Deferred until implementation planning |
 
 ## Suggested Delivery Rhythm
 
@@ -423,15 +503,40 @@ gantt
     Scheduler Rewrite       :done, p57a, after p57, 1
     Preemption Foundation   :done, p57b, after p57a, 1
     Busy-Wait Conversion    :done, p57c, after p57a, 1
-    Voluntary Preemption    :p57d, after p57b, 1
-    Full Kernel Preemption  :p57e, after p57d, 1
-    Release 1.0 Gate        :p58, after p55c, 1
+    Voluntary Preemption    :done, p57d, after p57b, 1
+    Full Kernel Preemption  :crit, p57e, after p57d, 1
+
+    section Pre-1.0 Cleanup (audit-driven)
+    Documentation Reconciliation     :p58, after p57e, 1
+    Validation Backlog               :p59, after p58, 1
+    Slab Migration Closeout          :p60, after p58, 1
+    SMP Load Balancing Closeout      :p61, after p58, 1
+    Phase 57a Pi-Lock Closeout       :p62, after p58, 1
+    Audio Stack Implementation       :p63, after p58, 1
+    Session Manager Lifecycle        :p64, after p58, 1
+    fat_server Implementation        :p65, after p58, 1
+    Security & Hygiene Closeout      :p66, after p58, 1
+    IOMMU Substrate Completion       :p67, after p58, 1
+    Display Server Closeout          :p68, after p58, 1
+
+    section Capability Expansion (pre-1.0)
+    Terminal TUI Capabilities :p69, after p63, 1
+    DOOM In-GUI Surface       :p70, after p68, 1
+    GUI Login Manager         :p71, after p68, 1
+    Compositor: Tiling + Workspaces :p72, after p71, 1
+    Compositor: Polish        :p73, after p72, 1
+    IPC Capability Grants     :p74, after p67, 1
+    W^X Enforcement           :p75, after p58, 1
+    Dynamic Linker            :p76, after p75, 1
+
+    section Release Gate
+    Release 1.0 Gate          :p77, after p73, 1
 
     section Post-1.0 Platform Growth (planned)
-    Cross-Compiled Toolchains :p59, after p58, 1
-    Networking and GitHub     :p60, after p59, 1
-    Node.js                   :p61, after p60, 1
-    Claude Code               :p62, after p61, 1
+    Cross-Compiled Toolchains :p78, after p77, 1
+    Networking and GitHub     :p79, after p78, 1
+    Node.js                   :p80, after p79, 1
+    Claude Code               :p81, after p80, 1
 ```
 
 ## Required Documentation for Every Phase

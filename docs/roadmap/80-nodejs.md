@@ -1,8 +1,8 @@
-# Phase 61 - Node.js
+# Phase 80 - Node.js
 
 **Status:** Planned
-**Source Ref:** phase-61
-**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 59 (Cross-Compiled Toolchains) ✅, Phase 60 (Networking and GitHub) ✅
+**Source Ref:** phase-80
+**Depends on:** Phase 37 (I/O Multiplexing) ✅, Phase 40 (Threading) ✅, Phase 42 (Crypto Primitives) ✅, Phase 78 (Cross-Compiled Toolchains) ✅, Phase 79 (Networking and GitHub) ✅
 **Builds on:** Extends the post-1.0 developer platform into a heavier managed runtime with JIT, async I/O, and package-management expectations that stress more of the system than the earlier toolchain phases
 **Primary Components:** Node.js runtime build pipeline, libuv integration expectations, V8 memory behavior, npm packaging path, docs/nodejs-roadmap.md
 
@@ -74,7 +74,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 59's toolchain packaging and Phase 60's outbound network/trust path.
+- Builds on Phase 78's toolchain packaging and Phase 79's outbound network/trust path.
 - Stresses the earlier memory, I/O, threading, and crypto work in a more demanding runtime.
 - Prepares the final CLI-agent milestone by making npm and a supported Node environment available inside m3OS.
 
@@ -88,7 +88,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Learning Documentation Requirement
 
-- Create `docs/61-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/80-nodejs.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the chosen Node configuration, runtime expectations, event-loop integration, npm path, and explicit non-goals.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -109,7 +109,7 @@ The runtime only becomes strategically useful once the package path needed for l
 
 ## Companion Task List
 
-- Phase 61 task list — defer until implementation planning begins.
+- Phase 80 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

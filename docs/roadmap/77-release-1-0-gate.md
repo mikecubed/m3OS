@@ -1,7 +1,7 @@
-# Phase 58 - Release 1.0 Gate
+# Phase 77 - Release 1.0 Gate
 
 **Status:** Planned
-**Source Ref:** phase-58
+**Source Ref:** phase-77
 **Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55c (Ring-3 Driver Correctness Closure)
 **Builds on:** Converts the convergence, hardening, and hardware work into an explicit release promise, while giving the project a disciplined place to decide whether the local-system branch is in scope for 1.0 or deferred to 1.x
 **Primary Components:** docs/roadmap/README.md, README.md, docs/README.md, xtask validation flows, release and support-matrix documentation
@@ -92,7 +92,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 - Builds on Phase 55's hardware promise and Phase 55c's ring-3 driver correctness closure as additional supported-target evidence beyond the Phase 53 QEMU reference.
 - Optionally includes the local-system milestones from Phase 47 and Phases 56-57 if the project chooses the broader release target.
 - Creates the stable boundary after which later ecosystem work can clearly be called 1.x growth instead of hidden release debt.
-- Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 58 can close.
+- Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 77 can close.
 
 ## Implementation Outline
 
@@ -105,7 +105,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## Learning Documentation Requirement
 
-- Create `docs/58-release-1-0-gate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/77-release-1-0-gate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the support matrix, validation gate bundle, headless-vs-local-system decision, and how the phase keeps scope honest.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -127,7 +127,7 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## Companion Task List
 
-- Phase 58 task list — defer until implementation planning begins.
+- Phase 77 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 
