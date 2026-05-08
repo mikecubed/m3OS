@@ -39,6 +39,36 @@ pub fn wake_pipe(pipe_id: usize) {
     }
 }
 
+/// Register a task with the given pipe's wait queue. Used by Phase 61
+/// Track F (sys_read / sys_write blocking-pipe path) to mirror the
+/// existing `STDIN_WAITQUEUE.register / sleep / deregister` pattern at
+/// `kernel/src/arch/x86_64/syscall/mod.rs`'s stdin direct-read arm.
+///
+/// Safe no-op if the pipe id is invalid (the pipe has been freed mid-call,
+/// for instance) — the subsequent `pipe_read` / `pipe_write` will return
+/// EOF / EPIPE and the syscall will exit on its normal error path rather
+/// than parking forever.
+pub fn pipe_register_waiter(
+    pipe_id: usize,
+    task_id: kernel_core::types::TaskId,
+    woken: &alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+) {
+    let wqs = PIPE_WAITQUEUES.lock();
+    if let Some(Some(wq)) = wqs.get(pipe_id) {
+        wq.register(task_id, woken);
+    }
+}
+
+/// Deregister a previously-registered waiter on the given pipe's wait
+/// queue. Idempotent — if the wait queue was drained by `wake_all` or
+/// the pipe was freed, the call is a no-op.
+pub fn pipe_deregister_waiter(pipe_id: usize, task_id: kernel_core::types::TaskId) {
+    let wqs = PIPE_WAITQUEUES.lock();
+    if let Some(Some(wq)) = wqs.get(pipe_id) {
+        wq.deregister(task_id);
+    }
+}
+
 /// Allocate a new pipe and return its ID.
 ///
 /// The pipe is created with `reader_count=0, writer_count=0`.

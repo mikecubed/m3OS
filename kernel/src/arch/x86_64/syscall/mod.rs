@@ -5604,12 +5604,31 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let pipe_id = *pipe_id;
             let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
-            // Yield-loop until data is available or writer closes.
+            // Phase 61 Track F — blocking-pipe read uses
+            // `PIPE_WAITQUEUES[pipe_id].sleep()` instead of the previous
+            // `loop { pipe_read; yield_now }` polling. Mirrors the stdin
+            // direct-read pattern earlier in this file (`STDIN_WAITQUEUE
+            // .register / sleep / deregister`). `wake_pipe` is called from
+            // both `pipe_write` (data available) and the close paths
+            // (reader/writer EOF), so the sleep is always woken when the
+            // condition that would let `pipe_read` return changes.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::pipe::pipe_register_waiter(pipe_id, task_id, &woken);
+
                 let mut tmp = [0u8; 4096];
                 match crate::pipe::pipe_read(pipe_id, &mut tmp[..capped]) {
-                    Ok(0) => return 0, // EOF
+                    Ok(0) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
+                        return 0; // EOF
+                    }
                     Ok(n) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                         if UserSliceWo::new(buf_ptr, tmp[..n].len())
                             .and_then(|s| s.copy_from_kernel(&tmp[..n]))
                             .is_err()
@@ -5620,12 +5639,25 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     Err(_would_block) => {
                         if nonblock {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EAGAIN;
                         }
                         if has_pending_signal() {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EINTR;
                         }
-                        crate::task::yield_now();
+                        // Park until `wake_pipe(pipe_id)` fires from a
+                        // matching `pipe_write` / close. The `woken` flag
+                        // closes the lost-wake window between the readiness
+                        // scan and the block (same discipline as stdin).
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnRecv,
+                            &woken,
+                            None,
+                        );
+                        // wake_all drained our entry; deregister is
+                        // idempotent for safety.
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                     }
                 }
             }
@@ -6151,24 +6183,52 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             {
                 return NEG_EFAULT;
             }
-            // Yield-loop until space is available or reader closes.
+            // Phase 61 Track F — blocking-pipe write uses
+            // `PIPE_WAITQUEUES[pipe_id].sleep()` instead of the previous
+            // `loop { pipe_write; yield_now }` polling. `wake_pipe` is
+            // called from `pipe_read` after a successful read drains
+            // capacity, so the sleep is always woken when the buffer
+            // shrinks. EPIPE (`Err(false)`) returns immediately without
+            // entering the wait queue — no sleep needed when the reader
+            // is gone.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::pipe::pipe_register_waiter(pipe_id, task_id, &woken);
+
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
-                    Ok(n) => return n as u64,
+                    Ok(n) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
+                        return n as u64;
+                    }
                     Err(false) => {
                         // Reader closed — EPIPE.
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                         const NEG_EPIPE: u64 = (-32_i64) as u64;
                         return NEG_EPIPE;
                     }
                     Err(true) => {
                         if nonblock {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EAGAIN;
                         }
-                        // Would block — yield and retry.
                         if has_pending_signal() {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EINTR;
                         }
-                        crate::task::yield_now();
+                        // Park until `wake_pipe(pipe_id)` fires from a
+                        // matching `pipe_read` (data drained → space
+                        // available) or close.
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnSend,
+                            &woken,
+                            None,
+                        );
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                     }
                 }
             }
