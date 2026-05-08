@@ -11,10 +11,10 @@
 |---|---|---|---|
 | A | Audit `Box::new`/`Arc::new` sites; rank and document candidates and non-candidates | — | Done |
 | B | Migrate `Task` and `XSaveArea` to slab caches | A | Done |
-| C | Measure global-heap relief under 60-second IPC workload | B | In Progress |
+| C | Measure global-heap relief under 60-second IPC workload | B | Done |
 | D | Regression suite — full QEMU + host tests after each migration | B | Done |
-| E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Planned |
-| F | Documentation and Release | B C D E | Planned |
+| E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Done |
+| F | Documentation and Release | B C D E | In Progress |
 
 ---
 
@@ -130,12 +130,12 @@
 **Why it matters:** Phase 33 C.4 is the audit's Red Flag #4 / Blocker C2. C.4's acceptance bar is "At least two frequently allocated kernel object types use slab-backed allocation paths" — Phase 60 delivers exactly two (`Task` and `XSaveArea`), satisfying the bar honestly.
 
 **Acceptance:**
-- [ ] `docs/roadmap/tasks/33-kernel-memory-tasks.md` C.4 changed from `[ ] Deferred` to `[x] Migrated in Phase 60 — see docs/handoffs/60c-slab-heap-measurement.md` for `Task` and `XSaveArea`.
-- [ ] `docs/roadmap/tasks/33-kernel-memory-tasks.md` track C status row in the Track Layout table updated from "Done (C.4 migration deferred)" to "Done".
-- [ ] `docs/roadmap/tasks/33-kernel-memory-tasks.md` "Deferred Follow-ups" header line updated to remove `C.4 broad slab-backed object migration`.
-- [ ] `docs/roadmap/33-kernel-memory-improvements.md` "Shipped state" audit note (currently lines 68-69) updated to replace "the main hot kernel object families were not broadly migrated" with a factual record citing Phase 60's audit conclusion (most candidate families use inline slot arrays; `Task` + `XSaveArea` migrated).
-- [ ] `docs/roadmap/33-kernel-memory-improvements.md` `Status:` field remains `Complete` (no demotion needed — the infrastructure was complete; the two-family migration bar is now satisfied).
-- [ ] Phase 60 design doc and task doc cross-reference back to Phase 33 C.4.
+- [x] `docs/roadmap/tasks/33-kernel-memory-tasks.md` C.4 changed from `[ ] Deferred` to `[x] Migrated in Phase 60 — see docs/handoffs/60c-slab-heap-measurement.md` for `Task` and `XSaveArea`.
+- [x] `docs/roadmap/tasks/33-kernel-memory-tasks.md` track C status row in the Track Layout table updated from "Done (C.4 migration deferred)" to "Done".
+- [x] `docs/roadmap/tasks/33-kernel-memory-tasks.md` "Deferred Follow-ups" header line updated to remove `C.4 broad slab-backed object migration`.
+- [x] `docs/roadmap/33-kernel-memory-improvements.md` "Shipped state" audit note updated to replace the "not broadly migrated" wording with a factual record citing Phase 60's audit conclusion.
+- [x] `docs/roadmap/33-kernel-memory-improvements.md` `Status:` field remains `Complete` (no demotion needed — the infrastructure was complete; the two-family migration bar is now satisfied).
+- [x] Phase 60 design doc and task doc cross-reference back to Phase 33 C.4 (already present in Source Ref / Depends on rows).
 
 ---
 
