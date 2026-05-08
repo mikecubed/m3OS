@@ -60,7 +60,7 @@ Already implemented (no new work needed):
 | B | AP bootstrap (trampoline + startup) | A | **Done** |
 | C | Per-core scheduler | A | **Done** (BSP-only dispatch; per-core syscall deferred) |
 | D | IPI infrastructure | B | **Done** |
-| E | TLB shootdown | C, D | **Done** (handler+API; munmap hook deferred) |
+| E | TLB shootdown | C, D | **Done** |
 | F | Spinlock audit and SMP hardening | B, C | **Done** (audit complete; BSP-only mitigation) |
 | G | Validation and documentation | D, E, F | **Done** |
 
@@ -153,6 +153,8 @@ cached.
 | P25-T033 | Hook `tlb_shootdown()` into `munmap` / page-table unmap paths: any page removal that affects a shared address space must trigger a shootdown |
 | P25-T034 | Optimize: skip the IPI if only one core is online (single-core fast path using `invlpg` alone) |
 
+**Phase 61 closure (P25-T033 + P25-T045):** `tlb_shootdown_range()` is wired into `sys_linux_munmap` at `kernel/src/arch/x86_64/syscall/mod.rs:8981` (post-batch shootdown over the full unmapped range). The cross-reference comment at the call site cites P25-T033 closure for future grep-ability.
+
 ## Track F — Spinlock Audit and SMP Hardening
 
 Audit every global `Mutex` and `static mut` for correctness under concurrent
@@ -190,7 +192,7 @@ access from multiple cores.
 These items are explicitly out of scope for Phase 25:
 
 - NUMA-aware memory allocation
-- CPU affinity (`sched_setaffinity`)
+- ~~CPU affinity (`sched_setaffinity`)~~ — shipped in Phase 35 F.2 (`sys_sched_setaffinity` / `sys_sched_getaffinity`)
 - Real-time scheduling classes
 - CPU frequency scaling (P-states)
 - CPU hotplug

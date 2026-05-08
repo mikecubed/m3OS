@@ -74,6 +74,8 @@ for task-state reads, transitions, and post-switch bookkeeping.
 
 ### Load Balancing
 
+**Phase 61 closure:** `maybe_load_balance()` hook is uncommented at `kernel/src/task/scheduler.rs:3837` and validated by `kernel/tests/load_balance_smp.rs`. Phase 61 also fixed a real bug — `task.last_migrated_tick` was being reset on every cooperative yield, defeating the migration cooldown gate; with that fix, the balancer demonstrably moves tasks off an overloaded core.
+
 Periodic load balancing (every N ticks) migrates tasks from overloaded to underloaded cores:
 
 1. Each core tracks its queue length.
@@ -118,6 +120,8 @@ wakes it when the lock is released, instead of spinning.
 
 ### Wait Queues
 
+**Phase 61 closure (partial):** Pipe `sys_read` / `sys_write` direct-read blocking on `PIPE_WAITQUEUES` is scheduled for Phase 61 Track F (the syscall-layer change replaces the polling `yield_now()` loop with `WaitQueue.sleep()`). IPC endpoint queues retain their bespoke payload-carrying design as their final form; Phase 35 G.3 is reframed as won't-do (replacing them with generic `WaitQueue<TaskId>` would split message storage from blocking for no functional gain). Cross-core wakeup correctness for both paths is exercised by tests under `kernel/tests/`.
+
 Add per-resource wait queues instead of the current "change state and hope the
 scheduler notices" approach:
 
@@ -136,6 +140,8 @@ impl WaitQueue {
 Attach wait queues to: pipes, sockets, IPC endpoints, mutexes, notifications.
 
 ### Time Accounting
+
+**Phase 61 closure:** Per-tick CS-based user/system tick split correctly attributes ring-3 vs ring-0 time; child `tms_cutime` / `tms_cstime` populated via the recursive accumulation rule at the `sys_waitpid` zombie-reap site; `sys_wait4` and `sys_getrusage` syscalls added with the four event-counter fields populated (`ru_minflt`, `ru_majflt`, `ru_nvcsw`, `ru_nivcsw`).
 
 Track per-task and per-core time:
 - User time (ticks spent in ring 3)
@@ -202,7 +208,7 @@ balancing, affinity) without CFS's virtual runtime model or cgroup integration.
 - NUMA-aware scheduling
 - CPU bandwidth throttling (cgroups)
 - Tickless idle (NO_HZ)
-- Kernel preemption
+- Kernel preemption — voluntary kernel preemption shipped in Phases 57b/57d; full timer-driven kernel-mode preemption attempted in Phase 57e and re-deferred 2026-05-07 (see post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`).
 - SCHED_DEADLINE (earliest deadline first)
 - CPU hotplug
 - Power-aware scheduling (race-to-idle, frequency scaling)
