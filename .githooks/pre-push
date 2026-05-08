@@ -25,6 +25,13 @@
 # launches a fresh QEMU. The push is rejected only when a test fails both
 # in the suite *and* on its own. See post-mortem
 # docs/post-mortems/2026-04-24-ingress-task-starvation.md, Lessons.
+#
+# Kernel-tests gate added 2026-05-08 after the trace-ring stack-overflow
+# bug (commit 92537db) rode this branch for two days because pre-push only
+# ran smoke-test + regression — `cargo xtask test` exercises a different
+# set of QEMU binaries (kernel-mode unit tests, preempt_voluntary,
+# preempt_user_stress, xsave_avx, etc.) that neither smoke-test nor
+# regression cover. Same retry-on-isolate flake pattern as regression.
 
 set -e
 
@@ -47,8 +54,52 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
     exit 1
 fi
 
+# Allocate temp logs up front and install a single EXIT trap.  Each gate
+# below writes into its own log; the trap cleans both whether the script
+# exits cleanly or aborts.
+test_log="$(mktemp)"
+regression_log="$(mktemp)"
+trap 'rm -f "$test_log" "$regression_log"' EXIT
+
 echo "pre-push: running cargo xtask smoke-test..."
 cargo xtask smoke-test --timeout 300
+
+echo "pre-push: running cargo xtask test..."
+# Same retry-on-isolate pattern as regression below.  The kernel-test
+# suite runs each binary in its own QEMU instance but back-to-back in
+# one xtask invocation; resource contention can produce spurious
+# timeouts on the same documented harness-flake shape.  Re-run any
+# failed binary in isolation; only fail the gate when it still fails
+# on a fresh QEMU.
+set +e
+cargo xtask test --timeout 90 2>&1 | tee "$test_log"
+test_status=${PIPESTATUS:-$?}
+set -e
+if [ "$test_status" -ne 0 ]; then
+    # cargo xtask test prints `Test <name>-<hash>: FAILED ...` per failed
+    # binary; strip the trailing `-<hex>` to get the cargo `--test` name.
+    failed_tests="$(grep -E '^Test [a-z0-9_]+-[0-9a-f]+: FAILED' "$test_log" \
+                    | sed -E 's/^Test ([a-z0-9_]+)-[0-9a-f]+: FAILED.*/\1/' \
+                    | sort -u)"
+    if [ -z "$failed_tests" ]; then
+        echo "pre-push: cargo xtask test failed but no per-test FAILED lines parsed" >&2
+        exit 1
+    fi
+    echo "pre-push: kernel-test failures detected — re-running flakes in isolation:"
+    for t in $failed_tests; do echo "          - $t"; done
+    real_failures=""
+    for t in $failed_tests; do
+        echo "pre-push: isolated re-run: $t"
+        if ! cargo xtask test --test "$t" --timeout 90; then
+            real_failures="$real_failures $t"
+        fi
+    done
+    if [ -n "$real_failures" ]; then
+        echo "pre-push: kernel-test failures persisted in isolation:$real_failures" >&2
+        exit 1
+    fi
+    echo "pre-push: all kernel-test failures passed in isolation — treating as harness flakiness."
+fi
 
 echo "pre-push: running cargo xtask device-smoke --device nvme --iommu..."
 cargo xtask device-smoke --device nvme --iommu --timeout 90
@@ -64,8 +115,6 @@ echo "pre-push: running cargo xtask regression..."
 # real failure if it still fails on a fresh QEMU. This preserves the
 # regression gate's authority over genuine regressions while keeping the
 # pre-push hook stable against the documented harness flakiness.
-regression_log="$(mktemp)"
-trap 'rm -f "$regression_log"' EXIT
 # `set -e` would abort on the first failed cargo xtask invocation; disable
 # it for the suite run so we can capture the per-test FAIL lines from the
 # log and decide whether to retry them in isolation.

@@ -94,7 +94,9 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 /// builds compile out the entire body via `cfg(debug_assertions)`.
 #[inline]
 fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame) {
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 at user-return in release
+    // builds, panic on non-zero in debug builds.  Helper handles both modes;
+    // gate ring-3 only.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     }
@@ -108,8 +110,6 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
     {
         crate::task::signal_reschedule();
     }
-    #[cfg(not(debug_assertions))]
-    let _ = stack_frame;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +358,103 @@ fn has_guard_marker(vaddr: u64) -> bool {
         }
         let pt: &PageTable = &*(phys_offset_va + pd[p2_idx].addr().as_u64()).as_ptr::<PageTable>();
         pt[p1_idx].flags().contains(PageTableFlags::BIT_10)
+    }
+}
+
+/// Phase 57e diag: walk the page tables for `vaddr` from BOTH the active CR3
+/// PML4 and the kernel-original `KERNEL_PML4_PHYS`, printing each level.
+///
+/// Used from the page-fault handler to localise the slab UAF / spurious
+/// PTE-clear residual to one of:
+///   - Hyp #3 surviving: the active CR3's PML4[256] points at a different
+///     PDPT than KERNEL_PML4 (i.e. kernel-half sharing was lost).
+///   - Hyp #4: the walks converge but a leaf PTE / sub-table page is zero.
+///   - Hyp #4b: the PT frame itself was overwritten (unmapped from the walk
+///     by a parent-entry change rather than a leaf clear).
+///
+/// Output is best-effort and resilient to garbage page-table entries.
+fn dump_pte_walk_diagnostics(vaddr: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_off_va = VirtAddr::new(phys_off);
+    let p4 = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3 = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1 = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let (cr3_frame, _) = Cr3::read_raw();
+    let active_pml4 = cr3_frame.start_address().as_u64();
+    let kernel_pml4 = crate::mm::kernel_pml4_phys();
+
+    _panic_print(format_args!(
+        "[pf-diag] vaddr={:#018x} idx=[p4={} p3={} p2={} p1={}] active_cr3={:#x} kernel_pml4={:#x}\n",
+        vaddr, p4, p3, p2, p1, active_pml4, kernel_pml4
+    ));
+
+    fn walk_one(label: &str, phys_off_va: VirtAddr, pml4_phys: u64, idx: [usize; 4]) {
+        let [p4, p3, p2, p1] = idx;
+        unsafe {
+            let pml4: &PageTable = &*(phys_off_va + pml4_phys).as_ptr::<PageTable>();
+            let e4 = &pml4[p4];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PML4[{}] flags={:?} addr={:#x}\n",
+                label,
+                p4,
+                e4.flags(),
+                e4.addr().as_u64()
+            ));
+            if !e4.flags().contains(PageTableFlags::PRESENT) {
+                return;
+            }
+            let pdpt: &PageTable = &*(phys_off_va + e4.addr().as_u64()).as_ptr::<PageTable>();
+            let e3 = &pdpt[p3];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PDPT[{}] flags={:?} addr={:#x}\n",
+                label,
+                p3,
+                e3.flags(),
+                e3.addr().as_u64()
+            ));
+            if !e3.flags().contains(PageTableFlags::PRESENT)
+                || e3.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                return;
+            }
+            let pd: &PageTable = &*(phys_off_va + e3.addr().as_u64()).as_ptr::<PageTable>();
+            let e2 = &pd[p2];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PD  [{}] flags={:?} addr={:#x}\n",
+                label,
+                p2,
+                e2.flags(),
+                e2.addr().as_u64()
+            ));
+            if !e2.flags().contains(PageTableFlags::PRESENT)
+                || e2.flags().contains(PageTableFlags::HUGE_PAGE)
+            {
+                return;
+            }
+            let pt: &PageTable = &*(phys_off_va + e2.addr().as_u64()).as_ptr::<PageTable>();
+            let e1 = &pt[p1];
+            _panic_print(format_args!(
+                "[pf-diag] {}: PT  [{}] flags={:?} addr={:#x}\n",
+                label,
+                p1,
+                e1.flags(),
+                e1.addr().as_u64()
+            ));
+        }
+    }
+
+    walk_one("active", phys_off_va, active_pml4, [p4, p3, p2, p1]);
+    if active_pml4 != kernel_pml4 {
+        walk_one("kernel", phys_off_va, kernel_pml4, [p4, p3, p2, p1]);
+    } else {
+        _panic_print(format_args!(
+            "[pf-diag] kernel: (same as active, walk omitted)\n"
+        ));
     }
 }
 
@@ -794,6 +891,36 @@ core::arch::global_asm!(
     "ret",
 );
 
+// ---------------------------------------------------------------------------
+// Phase 57e Track C.1 / C.4 — preempt_resume_to_kernel + dispatch_preempted_and_resume_kernel
+// ---------------------------------------------------------------------------
+//
+// Same-CPL iretq resume: the CPU pops only `rip / cs / rflags` (3 fields,
+// 24 bytes) and does **not** swap rsp/ss.  Therefore RSP must already point
+// at the interrupted task's kernel stack at the moment of iretq.  This
+// routine's structure differs from `preempt_resume_to_user` in two ways:
+//
+//   1. We must `mov rsp, preempt_frame.rsp` BEFORE pushing the iretq frame
+//      so the 3-field push lands at the correct location on the interrupted
+//      kernel stack.
+//   2. The iretq frame is 3 fields (rflags / cs / rip) instead of 5
+//      (rflags / cs / rip / rsp / ss).
+//
+// Stack-safety note: the 24 bytes the iretq pushes occupy what was
+// originally the CPU-pushed IRQ frame on the interrupted kernel stack
+// (between `captured_kernel_rsp - 24` and `captured_kernel_rsp - 1`).
+// That region was the same scratch area the CPU wrote when the IRQ fired,
+// so no live kernel-stack data is overwritten.
+//
+// Calling convention: rdi = *const PreemptFrame.  Called only from
+// `dispatch_preempted_and_resume_kernel` with IRQs disabled.  Never returns.
+//
+// Phase 57e deferral cleanup (2026-05-07): the kernel-mode preempt-resume
+// asm stubs (`preempt_resume_to_kernel` and `dispatch_preempted_and_resume_kernel`)
+// were removed.  They were only reachable from the now-removed
+// `check_and_preempt_kernel` IRQ-side gate — see
+// `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
+
 // Rust-side declarations for the asm entry symbols (used when installing
 // into the IDT via `set_handler_addr`).
 unsafe extern "C" {
@@ -820,6 +947,9 @@ unsafe extern "C" {
         per_sched_rsp_ptr: *mut u64,
         frame: *const kernel_core::preempt_frame::PreemptFrame,
     );
+    // Phase 57e deferral cleanup: `preempt_resume_to_kernel` and
+    // `dispatch_preempted_and_resume_kernel` removed (see global_asm
+    // block above and the post-mortem).
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1037,14 @@ extern "x86-interrupt" fn page_fault_handler(
             "[int] RSP={:#x}\n",
             stack_frame.stack_pointer.as_u64()
         ));
+        // Phase 57e diag: not-present userspace faults on what should be a
+        // mapped code/data page are the same shape as the kernel slab UAF;
+        // dump the PTE walk to localise the missing-PTE level.
+        if !err.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+            && let Ok(fault_va) = addr
+        {
+            dump_pte_walk_diagnostics(fault_va.as_u64());
+        }
         if crate::smp::is_per_core_ready() {
             let task_idx = crate::smp::per_core()
                 .current_task_idx
@@ -959,6 +1097,15 @@ extern "x86-interrupt" fn page_fault_handler(
         "[int] KERNEL page fault — CR3=0x{:016x}\n",
         cr3_frame.start_address().as_u64()
     ));
+    if let Ok(fault_va) = addr {
+        dump_pte_walk_diagnostics(fault_va.as_u64());
+    }
+    // Phase 57e diag — the per-frame allocate/free trace ring (`mm::frame_trace`)
+    // that originally dumped the active CR3 history here was retired alongside
+    // the Phase 57e deferral cleanup (its sole purpose was diagnosing Bug #7,
+    // closed in d8db950).  The static 512 KiB ring + per-allocation recording
+    // also broke `kernel::mm::frame_allocator::tests::allocate_frame_hot_path_tolerates_reentrant_free`.
+    let _ = cr3_frame;
     panic_diag::dump_crash_context();
     crate::trace::dump_trace_rings();
     crate::hlt_loop();
@@ -1210,11 +1357,18 @@ pub enum PreemptTrigger {
 ///
 /// Only compiled under `cfg(feature = "sched-trace")`. Zero overhead in
 /// the default build.
+///
+/// Phase 57e Track F.3: encodes `kernel_mode` into bit 7 of the trigger
+/// discriminant (low 7 bits = `PreemptTrigger`, high bit = `kernel_mode`).
+/// The existing `SchedTrace` schema (`pid` / `old_state` / `new_state`) is
+/// preserved unchanged; downstream tooling that already reads `new_state`
+/// continues to see the trigger discriminant after masking with `0x7F`.
 #[cfg(feature = "sched-trace")]
-fn emit_preempt_trace(frame: &PreemptTrapFrameUser, trigger: PreemptTrigger) {
+fn emit_preempt_trace(rip: u64, trigger: PreemptTrigger, kernel_mode: bool) {
+    let new_state = (trigger as u8) | if kernel_mode { 0x80 } else { 0 };
     // Repurpose sched_trace::record: pid=preempted_rip (truncated to u32),
-    // old_state=255 (preempt sentinel), new_state=trigger discriminant.
-    crate::task::sched_trace::record(frame.rip as u32, 255, trigger as u8);
+    // old_state=255 (preempt sentinel), new_state=encoded trigger+kernel_mode.
+    crate::task::sched_trace::record(rip as u32, 255, new_state);
 }
 
 /// Check the four voluntary-preemption conditions and, if met, preempt the
@@ -1268,12 +1422,19 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
     // All conditions met — capture and preempt.
     #[cfg(feature = "sched-trace")]
     unsafe {
-        emit_preempt_trace(frame, trigger);
+        emit_preempt_trace(frame.rip, trigger, false);
     }
     #[cfg(not(feature = "sched-trace"))]
     let _ = trigger;
     crate::task::scheduler::preempt_to_scheduler(frame);
 }
+
+// Phase 57e deferral cleanup (2026-05-07): `check_and_preempt_kernel`
+// removed.  It was the kernel-mode counterpart of
+// `check_and_preempt_user` and was called from `timer_handler_kernel`
+// and `reschedule_ipi_handler_kernel` under preempt-full.  Both call
+// sites are now early-return for the kernel-mode path; see the
+// post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.
 
 /// Phase 57d Track B — timer handler, user (ring 3) path.
 ///
@@ -1307,7 +1468,8 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 in release builds; panic on
+    // non-zero in debug builds.  Helper handles the mode split.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
     unsafe {
@@ -1320,10 +1482,20 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
 /// Called from the `timer_entry` naked stub when the interrupted context was
 /// ring 0.  `captured_kernel_rsp` is the RSP value the interrupted kernel
 /// code had immediately before the interrupt fired.
+///
+/// Under `preempt-voluntary` only, this handler runs the tick / EOI /
+/// reschedule-flag work and returns — kernel-mode preemption is structurally
+/// absent (57d behaviour preserved).
+///
+/// Under `preempt-full` (Phase 57e Track F.1), the handler additionally
+/// performs the same preempt check as the user-path handler and tail-calls
+/// `preempt_to_scheduler_kernel` when all conditions are met.  The group-exit
+/// redirect is intentionally **not** applied on this path — see
+/// `check_and_preempt_kernel` for the asymmetry rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_handler_kernel(
-    _frame: &mut PreemptTrapFrameKernel,
-    _captured_kernel_rsp: u64,
+    frame: &mut PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
 ) {
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1340,6 +1512,39 @@ pub unsafe extern "C" fn timer_handler_kernel(
                 .notify_end_of_interrupt(InterruptIndex::Timer as u8);
         }
     }
+    // Phase 57e Bug #12 part 7 — drop timer-driven kernel-mode preemption.
+    //
+    // The unconditional `signal_reschedule()` above sets `reschedule = true`
+    // on every 1 ms timer tick.  Under voluntary mode (no
+    // `check_and_preempt_kernel` exists), the flag sits until the running
+    // task transitions to user mode, where `check_and_preempt_user` consumes
+    // it — kernel-mode tasks run uninterrupted, the lag-free pattern the
+    // user confirmed on real hardware.
+    //
+    // Under preempt-full's prior shape, `check_and_preempt_kernel` consumed
+    // the flag on the same tick, preempting every kernel-mode task on
+    // every 1 ms boundary — even when there was no actual wake event,
+    // because the flag had been set by THIS tick's `signal_reschedule`.
+    // The input pipeline's typically-microsecond syscalls were getting
+    // unnecessary mid-syscall context switches at every quantum, surfacing
+    // as user-visible input lag (and getting strictly worse with the 4 ms
+    // quantum experiment in 17099f6, reverted in 5ff8a35, because that
+    // delayed the WAKEE rather than the WAKER).
+    //
+    // Cross-core wake delivery is preserved by `reschedule_ipi_handler_kernel`
+    // (Phase 57e Track F.1), which keeps `check_and_preempt_kernel` for the
+    // RescheduleIpi trigger — an IPI fires *only* when there is an actual
+    // cross-core wake (`enqueue_to_core` sends `IPI_RESCHEDULE` only when
+    // the target differs from the caller's core).  Same-core wakes wait
+    // for the running task's natural yield (matches voluntary's behaviour).
+    //
+    // Trade-off: a kernel-mode task that hogs the CPU without yielding is
+    // not bounded by the timer.  Same as voluntary.  All current m3OS
+    // kernel-mode work yields cooperatively (IPC blocks, deadline-based
+    // sleeps, syscall returns); hog-bounding can be added back as a longer
+    // quantum (e.g. 100 ms) if a future workload introduces a hog.
+    let _ = frame;
+    let _ = captured_kernel_rsp;
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,7 +1919,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline_user(frame);
     super::apic::lapic_eoi();
-    #[cfg(debug_assertions)]
+    // Phase 57e Bug #9 — clamp preempt_count to 0 in release builds; panic on
+    // non-zero in debug builds.  Helper handles the mode split.
     crate::task::scheduler::assert_preempt_count_zero_at_user_return();
     #[cfg(feature = "preempt-voluntary")]
     unsafe {
@@ -1723,10 +1929,19 @@ pub unsafe extern "C" fn reschedule_ipi_handler_user(frame: &mut PreemptTrapFram
 }
 
 /// Phase 57d Track B — reschedule IPI handler, kernel path.
+///
+/// Phase 57e deferral cleanup (2026-05-07): the `cfg(preempt-full)` branch
+/// that called `check_and_preempt_kernel` was removed.  An IPI delivered
+/// to a kernel-mode core now sets `reschedule = true` (via
+/// `signal_reschedule()`) and returns; the flag is consumed at the next
+/// user-mode return boundary (`check_and_preempt_user`) or at the
+/// running task's next cooperative yield/block point.  This matches
+/// Phase 57d voluntary's behaviour and is what the 2026-05-07 post-mortem
+/// concludes is the right model for m3OS's microkernel architecture.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
-    _frame: &mut PreemptTrapFrameKernel,
-    _captured_kernel_rsp: u64,
+    frame: &mut PreemptTrapFrameKernel,
+    captured_kernel_rsp: u64,
 ) {
     if let Some(pc) = crate::smp::try_per_core() {
         let n = pc
@@ -1738,6 +1953,8 @@ pub unsafe extern "C" fn reschedule_ipi_handler_kernel(
     }
     crate::task::signal_reschedule();
     super::apic::lapic_eoi();
+    let _ = frame;
+    let _ = captured_kernel_rsp;
 }
 
 /// TLB shootdown IPI handler (vector 0xFD).

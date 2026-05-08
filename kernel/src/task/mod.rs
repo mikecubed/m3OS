@@ -236,22 +236,49 @@ pub struct TaskBlockState {
 // Task structure
 // ---------------------------------------------------------------------------
 
+/// Per-task XSAVE area used by the dispatch boundary's
+/// `save_fpu_state` / `restore_fpu_state` helpers.
+///
+/// Phase 57e Track J: replaces the prior 512-byte 16-aligned `FxSaveArea`
+/// (FXSAVE legacy region only).  The expanded layout covers x87 + SSE + AVX
+/// state — the legacy region is the same first 512 bytes so the existing
+/// `XSTATE_BV` init sequence still produces the architectural defaults; the
+/// header sits at offset 512 (`XSTATE_BV` itself at 512, `XCOMP_BV` at 520),
+/// and the AVX YMM_HI region starts at offset 576.
+///
+/// Required alignment is 64 bytes (Intel SDM Vol 1 §13.4).
+///
+/// The static size [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes)
+/// is checked at boot against the runtime CPUID-reported size; if a future
+/// CPUID change ever reports a larger area, the kernel panics at boot rather
+/// than silently truncating saved state.
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
-pub struct FxSaveArea {
-    bytes: [u8; 512],
+#[repr(C, align(64))]
+pub struct XSaveArea {
+    bytes: [u8; crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE],
 }
 
-impl FxSaveArea {
+impl XSaveArea {
     pub const fn new() -> Self {
-        let mut bytes = [0u8; 512];
-        // x87 control word = default 0x037f, MXCSR = default 0x1f80.
+        let mut bytes = [0u8; crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE];
+        // Legacy region defaults — same byte layout as the prior FxSaveArea
+        // so a freshly-restored task observes the architectural FPU/SSE
+        // defaults rather than zeroed control words.
+        // x87 control word = 0x037F (offset 0).
         bytes[0] = 0x7f;
         bytes[1] = 0x03;
+        // MXCSR = 0x1F80 (offset 24).
         bytes[24] = 0x80;
         bytes[25] = 0x1f;
+        // MXCSR mask = 0xFFFF (offset 28).
         bytes[28] = 0xff;
         bytes[29] = 0xff;
+        // Header region (offsets 512-575): XSTATE_BV cleared.  The xsave init
+        // optimisation interprets a clear `XSTATE_BV` as "no state in
+        // modified-from-init form", so xrstor will load architectural defaults
+        // for every component — exactly what we want for a freshly-allocated
+        // task.  XCOMP_BV stays clear (we use the standard XSAVE format, not
+        // compacted; xrstor selects format based on bit 63 of XCOMP_BV).
         Self { bytes }
     }
 
@@ -261,6 +288,141 @@ impl FxSaveArea {
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.bytes.as_mut_ptr()
+    }
+}
+
+/// Phase 57e Bug #3 fix — per-task user GPR snapshot.
+///
+/// The Linux x86_64 syscall ABI preserves all GPRs except `rax`/`rcx`/`r11`,
+/// so the kernel must save the user side of those registers before running
+/// any syscall body that may yield, fork, or signal.  Pre-Bug-#3 the kernel
+/// kept these slots in `PerCoreData`, which was safe under preempt-voluntary
+/// (a task in `syscall_handler` could only be preempted at user-return
+/// boundaries) but unsafe under preempt-full: a mid-syscall kernel-mode
+/// preempt lets a different task's `syscall_entry` overwrite the per-core
+/// slots on the same core, so when the original task resumes its `fork()`
+/// (or any handler that re-reads `r8`/`r9`/etc. as extra syscall args) it
+/// sees stale values from another task.  The fork child then iretqs into
+/// userspace with corrupt GPRs and faults.
+///
+/// Putting the snapshot per-task removes the aliasing entirely: the
+/// dispatcher publishes a pointer to *the current task's* snapshot into
+/// `PerCoreData::current_syscall_snapshot_ptr` on every dispatch, and
+/// `syscall_entry` saves the user GPRs through that pointer.  Two tasks on
+/// the same core can no longer share a slot.
+///
+/// `#[repr(C)]` pins the field offsets so the syscall-entry asm can use
+/// literal `[ptr + SNAP_*]` addressing.  The `OFF_*` constants in this
+/// module document the offsets the asm relies on.
+#[repr(C)]
+#[derive(Default)]
+pub struct TaskSyscallSnapshot {
+    pub user_rbx: u64,    // 0
+    pub user_rbp: u64,    // 8
+    pub user_r12: u64,    // 16
+    pub user_r13: u64,    // 24
+    pub user_r14: u64,    // 32
+    pub user_r15: u64,    // 40
+    pub user_rdi: u64,    // 48
+    pub user_rsi: u64,    // 56
+    pub user_rdx: u64,    // 64
+    pub user_r8: u64,     // 72
+    pub user_r9: u64,     // 80
+    pub user_r10: u64,    // 88
+    pub user_rflags: u64, // 96
+    /// Phase 57e Bug #4 fix — user RSP at SYSCALL entry.
+    ///
+    /// The asm was originally only saving user RSP to a per-core slot
+    /// (`PerCoreData::syscall_user_rsp`).  Under preempt-full a kernel-
+    /// mode preempt firing in the window between the per-core save and
+    /// `snapshot_user_return_state()`'s read of it would let another
+    /// task's `syscall_entry` overwrite the per-core slot, so the
+    /// preempted task's `task.user_return.user_rsp` was populated with a
+    /// foreign value when its syscall handler eventually got around to
+    /// running.  At sysret the bad RSP would land the resumed user task
+    /// on a stranger's stack, with the next `ret`/instruction-fetch
+    /// hitting garbage.
+    ///
+    /// Storing user RSP per-task and rebuilding the per-core slot from
+    /// the snapshot on every dispatch closes the window: the snapshot
+    /// is touched *only* by the owning task's `syscall_entry` (during
+    /// the IRQs-masked prologue) so no aliasing is possible.
+    pub user_rsp: u64, // 104
+}
+
+/// Byte offsets within `TaskSyscallSnapshot`.  The syscall-entry asm
+/// references these as `[task_snapshot_ptr + SNAP_*]`.
+pub mod task_syscall_snapshot_offsets {
+    use super::TaskSyscallSnapshot;
+    use core::mem::offset_of;
+
+    pub const SNAP_USER_RBX: usize = offset_of!(TaskSyscallSnapshot, user_rbx);
+    pub const SNAP_USER_RBP: usize = offset_of!(TaskSyscallSnapshot, user_rbp);
+    pub const SNAP_USER_R12: usize = offset_of!(TaskSyscallSnapshot, user_r12);
+    pub const SNAP_USER_R13: usize = offset_of!(TaskSyscallSnapshot, user_r13);
+    pub const SNAP_USER_R14: usize = offset_of!(TaskSyscallSnapshot, user_r14);
+    pub const SNAP_USER_R15: usize = offset_of!(TaskSyscallSnapshot, user_r15);
+    pub const SNAP_USER_RDI: usize = offset_of!(TaskSyscallSnapshot, user_rdi);
+    pub const SNAP_USER_RSI: usize = offset_of!(TaskSyscallSnapshot, user_rsi);
+    pub const SNAP_USER_RDX: usize = offset_of!(TaskSyscallSnapshot, user_rdx);
+    pub const SNAP_USER_R8: usize = offset_of!(TaskSyscallSnapshot, user_r8);
+    pub const SNAP_USER_R9: usize = offset_of!(TaskSyscallSnapshot, user_r9);
+    pub const SNAP_USER_R10: usize = offset_of!(TaskSyscallSnapshot, user_r10);
+    pub const SNAP_USER_RFLAGS: usize = offset_of!(TaskSyscallSnapshot, user_rflags);
+    pub const SNAP_USER_RSP: usize = offset_of!(TaskSyscallSnapshot, user_rsp);
+}
+
+/// Read a snapshot of the **current task's** user GPRs as captured by the
+/// most recent `syscall_entry` on this core.
+///
+/// Replaces the per-core `pc.syscall_user_*` reads that pre-Bug-#3 code
+/// did directly.  The pointer is published by the dispatcher on every
+/// dispatch (`scheduler::run`) and stays valid for the lifetime of the
+/// task on this core; under preempt-full it survives mid-syscall
+/// kernel-mode preemption because each task has its own snapshot.
+///
+/// Returns a copy by value — callers should not hold a reference across
+/// IRQ-enable boundaries (a same-core preempt could re-dispatch, but the
+/// pointer would be re-pointed at *this* task's snapshot before this code
+/// resumes anyway, so the pointee is stable; the by-value copy just keeps
+/// the borrow checker happy without extra `unsafe`).
+///
+/// Panics in debug builds if the per-core pointer is null (would only
+/// happen during very early boot before the first dispatch).
+pub fn current_task_syscall_snapshot() -> TaskSyscallSnapshot {
+    let pc = crate::smp::per_core();
+    // SAFETY: `current_syscall_snapshot_ptr` is per-core, written only by
+    // the dispatcher with IRQs masked.  Reading the raw pointer value is
+    // a single aligned load.  Dereferencing it: the pointee is the
+    // current task's `Task::syscall_snapshot`, which lives in a
+    // `Vec<Box<Task>>` slot that is stable for the task's lifetime
+    // (Track B's storage discipline).  The current task cannot have its
+    // snapshot freed while it is the current task on this core.
+    let ptr = unsafe { *pc.current_syscall_snapshot_ptr.get() };
+    debug_assert!(
+        !ptr.is_null(),
+        "current_task_syscall_snapshot called before first dispatch"
+    );
+    if ptr.is_null() {
+        return TaskSyscallSnapshot::default();
+    }
+    unsafe {
+        TaskSyscallSnapshot {
+            user_rbx: (*ptr).user_rbx,
+            user_rbp: (*ptr).user_rbp,
+            user_r12: (*ptr).user_r12,
+            user_r13: (*ptr).user_r13,
+            user_r14: (*ptr).user_r14,
+            user_r15: (*ptr).user_r15,
+            user_rdi: (*ptr).user_rdi,
+            user_rsi: (*ptr).user_rsi,
+            user_rdx: (*ptr).user_rdx,
+            user_r8: (*ptr).user_r8,
+            user_r9: (*ptr).user_r9,
+            user_r10: (*ptr).user_r10,
+            user_rflags: (*ptr).user_rflags,
+            user_rsp: (*ptr).user_rsp,
+        }
     }
 }
 
@@ -400,6 +562,22 @@ pub struct Task {
     /// `PREEMPT_FRAME_OFFSET_*` constants exported from that module — the
     /// assembly stub uses those offsets directly.
     pub preempt_frame: kernel_core::preempt_frame::PreemptFrame,
+    /// Phase 57e Bug #3 fix — per-task user GPR snapshot written by
+    /// `syscall_entry` and read by `make_fork_ctx` and the syscall handlers
+    /// that consume r8/r9/etc. as extra args.  See `TaskSyscallSnapshot`'s
+    /// doc comment for the full hazard analysis.  The dispatcher publishes
+    /// `&task.syscall_snapshot` into `PerCoreData::current_syscall_snapshot_ptr`
+    /// on every dispatch so the asm and Rust paths agree on which task's
+    /// snapshot is "current".
+    ///
+    /// `UnsafeCell` because the field is mutated through a raw pointer from
+    /// asm (which the borrow checker cannot see) and from Rust handlers
+    /// reading their own task's snapshot — both are single-writer for the
+    /// duration of any syscall, since IRQs are masked at entry/exit and a
+    /// kernel-mode preempt of *this* task can only resume on a core whose
+    /// `current_syscall_snapshot_ptr` has been re-pointed back at *this*
+    /// task by the dispatch path.
+    pub syscall_snapshot: core::cell::UnsafeCell<TaskSyscallSnapshot>,
     /// Phase 57d D.1 — which resume path the scheduler uses for this task.
     ///
     /// `Preempted` → `preempt_resume_to_user` (full restore + `iretq`).
@@ -508,6 +686,7 @@ impl Task {
             // entry, and 57d/57e's resume routines read it back to issue
             // `iretq` to the preempted instruction.
             preempt_frame: kernel_core::preempt_frame::PreemptFrame::default(),
+            syscall_snapshot: core::cell::UnsafeCell::new(TaskSyscallSnapshot::default()),
             resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
             reply_waker: None,
         }

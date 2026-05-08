@@ -403,7 +403,8 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             endpoint::reply(task_id, caller_id, reply);
             // Read buf_len from the 6th syscall register (r9), capped at
             // MAX_BULK_LEN to match ipc_recv_msg's bounds.
-            let buf_len = crate::smp::per_core().syscall_user_r9;
+            // Phase 57e Bug #3 fix — per-task snapshot, see crate::task.
+            let buf_len = crate::task::current_task_syscall_snapshot().user_r9;
             ipc_recv_msg(task_id, ep_id, arg3, arg4, buf_len)
         }
         _ => u64::MAX,

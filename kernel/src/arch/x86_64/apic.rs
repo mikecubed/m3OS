@@ -436,10 +436,20 @@ fn calibrate_lapic_timer() -> u32 {
         // 10 ms (the configured countdown period).  This spin runs once during
         // LAPIC timer calibration at boot; it is not attributable to any user
         // workload.
-        // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+        //
+        // Phase 57e Track B.2: `calibrate_lapic_timer` runs at BSP init
+        // before any task is dispatched, so `preempt_disable` is a no-op
+        // here — the wrapper is preserved for discipline only.  Critically,
+        // the calibration measurement depends on a precise 10 ms wall-clock
+        // window; a kernel-mode preemption would extend `tsc_end - tsc_start`
+        // and silently corrupt the calibration.  Wrapping with
+        // `preempt_disable` future-proofs the calibration against any
+        // refactor that runs it after userspace is live.
+        crate::task::scheduler::preempt_disable();
         while pit_gate.read() & 0x20 == 0 {
             core::hint::spin_loop();
         }
+        crate::task::scheduler::preempt_enable();
 
         // Snapshot TSC immediately after the 10ms window ends.
         let tsc_end = core::arch::x86_64::_rdtsc();

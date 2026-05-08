@@ -86,6 +86,13 @@ pub enum TraceEvent {
     YieldNow {
         task_idx: u32,
         core: u8,
+        /// Source file of the `yield_now()` call site.  Populated via
+        /// `#[track_caller]` / `core::panic::Location::caller()` so a
+        /// repeated yield-loop fingerprint identifies the exact kernel
+        /// function that's busy-yielding.  Phase 57e Bug #12 follow-up
+        /// after the eager-yield-removal regression.
+        caller_file: &'static str,
+        caller_line: u32,
     },
     BlockCurrent {
         task_idx: u32,
@@ -236,6 +243,23 @@ impl<const N: usize> TraceRing<N> {
         }
         let start = if self.count < N { 0 } else { self.write_idx };
         for i in 0..self.count {
+            f(&self.buf[(start + i) % N]);
+        }
+    }
+
+    /// Iterate at most the last `max` entries in chronological order.
+    ///
+    /// Same shape as [`for_each_chronological`] but bounded — useful in
+    /// diagnostic dumps that must finish quickly to avoid extending the
+    /// non-preemptible window across thousands of serial writes.
+    pub fn for_each_recent(&self, max: usize, mut f: impl FnMut(&TraceEntry)) {
+        if self.count == 0 || max == 0 {
+            return;
+        }
+        let take = self.count.min(max);
+        let skip = self.count - take;
+        let start = if self.count < N { 0 } else { self.write_idx };
+        for i in skip..(skip + take) {
             f(&self.buf[(start + i) % N]);
         }
     }

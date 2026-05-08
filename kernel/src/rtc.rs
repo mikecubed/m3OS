@@ -81,6 +81,14 @@ impl RtcSnapshot {
 pub fn read_rtc() -> (u32, u32, u32, u32, u32, u32) {
     // Step 1-4: Read registers twice and compare; retry if they differ
     // (ensures we did not read mid-update).
+    //
+    // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
+    // mid-`read_rtc` could migrate the task and cross an RTC update boundary
+    // between the two RtcSnapshot reads, doubling the chance of an aborted
+    // round.  The double-read retry loop already handles inconsistency, but
+    // wrapping the entire function in `preempt_disable` keeps the read
+    // single-core and bounds the worst case to one update cycle.
+    crate::task::scheduler::preempt_disable();
     let snap = {
         let mut result = None;
         for _ in 0..MAX_RETRIES {
@@ -113,6 +121,7 @@ pub fn read_rtc() -> (u32, u32, u32, u32, u32, u32) {
             RtcSnapshot::read()
         })
     };
+    crate::task::scheduler::preempt_enable();
 
     let mut second = snap.second as u32;
     let mut minute = snap.minute as u32;

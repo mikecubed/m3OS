@@ -872,19 +872,31 @@ use super::gdt;
 // PerCoreData — user code cannot change it: no FSGSBASE, no wrmsr in ring 3).
 // The Rust-side helpers below read from per-core data.
 
-/// Read the per-core `syscall_arg3` (R10 at SYSCALL entry).
+/// Read the current task's syscall arg3 (R10 at SYSCALL entry).
+///
+/// Phase 57e Bug #4 follow-up — was `pc.syscall_arg3` per-core; the
+/// per-core slot has the same mid-syscall-preempt aliasing hazard
+/// Bugs #3/#4 closed for `syscall_user_*`/`syscall_user_rsp`. The
+/// snapshot's `user_r10` is the same value (also written by the asm
+/// prologue) and is per-task, so reading from there eliminates the
+/// hazard with no asm change.
 pub(super) fn per_core_syscall_arg3() -> u64 {
-    crate::smp::per_core().syscall_arg3
+    crate::task::current_task_syscall_snapshot().user_r10
 }
 
-/// Read the per-core R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
+/// Read the current task's R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
+///
+/// Phase 57e Bug #3 fix — was `pc.syscall_user_r8` per-core; aliased
+/// across tasks under preempt-full's mid-syscall kernel-mode preempt.
 fn per_core_syscall_user_r8() -> u64 {
-    crate::smp::per_core().syscall_user_r8
+    crate::task::current_task_syscall_snapshot().user_r8
 }
 
-/// Read the per-core R9 saved at SYSCALL entry (syscall arg5 = offset for mmap).
+/// Read the current task's R9 saved at SYSCALL entry (syscall arg5 = offset for mmap).
+///
+/// Phase 57e Bug #3 fix — see [`per_core_syscall_user_r8`].
 fn per_core_syscall_user_r9() -> u64 {
-    crate::smp::per_core().syscall_user_r9
+    crate::task::current_task_syscall_snapshot().user_r9
 }
 
 /// Read the per-core `syscall_stack_top`.
@@ -1070,22 +1082,26 @@ extern "C" fn syscall_return_maybe_preempt(saved_frame: *const u8, syscall_resul
 
 global_asm!(
     // Per-core field offsets (computed at compile time via offset_of!).
-    ".equ OFF_STACK_TOP,   {off_stack_top}",
-    ".equ OFF_USER_RSP,    {off_user_rsp}",
-    ".equ OFF_ARG3,        {off_arg3}",
-    ".equ OFF_USER_RBX,    {off_user_rbx}",
-    ".equ OFF_USER_RBP,    {off_user_rbp}",
-    ".equ OFF_USER_R12,    {off_user_r12}",
-    ".equ OFF_USER_R13,    {off_user_r13}",
-    ".equ OFF_USER_R14,    {off_user_r14}",
-    ".equ OFF_USER_R15,    {off_user_r15}",
-    ".equ OFF_USER_RDI,    {off_user_rdi}",
-    ".equ OFF_USER_RSI,    {off_user_rsi}",
-    ".equ OFF_USER_RDX,    {off_user_rdx}",
-    ".equ OFF_USER_R8,     {off_user_r8}",
-    ".equ OFF_USER_R9,     {off_user_r9}",
-    ".equ OFF_USER_R10,    {off_user_r10}",
-    ".equ OFF_USER_RFLAGS, {off_user_rflags}",
+    ".equ OFF_STACK_TOP,           {off_stack_top}",
+    ".equ OFF_USER_RSP,            {off_user_rsp}",
+    ".equ OFF_ARG3,                {off_arg3}",
+    // Phase 57e Bug #3 fix — pointer-to-task-snapshot indirection.
+    ".equ OFF_TASK_SNAPSHOT_PTR,   {off_task_snapshot_ptr}",
+    // Field offsets within `TaskSyscallSnapshot` (target of the indirection).
+    ".equ SNAP_USER_RBX,    {snap_user_rbx}",
+    ".equ SNAP_USER_RBP,    {snap_user_rbp}",
+    ".equ SNAP_USER_R12,    {snap_user_r12}",
+    ".equ SNAP_USER_R13,    {snap_user_r13}",
+    ".equ SNAP_USER_R14,    {snap_user_r14}",
+    ".equ SNAP_USER_R15,    {snap_user_r15}",
+    ".equ SNAP_USER_RDI,    {snap_user_rdi}",
+    ".equ SNAP_USER_RSI,    {snap_user_rsi}",
+    ".equ SNAP_USER_RDX,    {snap_user_rdx}",
+    ".equ SNAP_USER_R8,     {snap_user_r8}",
+    ".equ SNAP_USER_R9,     {snap_user_r9}",
+    ".equ SNAP_USER_R10,    {snap_user_r10}",
+    ".equ SNAP_USER_RFLAGS, {snap_user_rflags}",
+    ".equ SNAP_USER_RSP,    {snap_user_rsp}",
 
     ".global syscall_entry",
     "syscall_entry:",
@@ -1102,22 +1118,35 @@ global_asm!(
     "mov rsp, gs:[OFF_STACK_TOP]",
     "cld",
 
-    // --- Save user callee-saved registers to per-core data ---
-    "mov gs:[OFF_USER_RBX], rbx",
-    "mov gs:[OFF_USER_RBP], rbp",
-    "mov gs:[OFF_USER_R12], r12",
-    "mov gs:[OFF_USER_R13], r13",
-    "mov gs:[OFF_USER_R14], r14",
-    "mov gs:[OFF_USER_R15], r15",
-
-    // --- Save user caller-saved registers (Linux ABI preserves these) ---
-    "mov gs:[OFF_USER_RDI], rdi",
-    "mov gs:[OFF_USER_RSI], rsi",
-    "mov gs:[OFF_USER_RDX], rdx",
-    "mov gs:[OFF_USER_R8],  r8",
-    "mov gs:[OFF_USER_R9],  r9",
-    "mov gs:[OFF_USER_R10], r10",
-    "mov gs:[OFF_USER_RFLAGS], r11",
+    // --- Save user GPRs to the **current task's** TaskSyscallSnapshot ---
+    //
+    // Phase 57e Bug #3 fix: under preempt-full, mid-syscall kernel-mode
+    // preemption can let a different task's `syscall_entry` run on this
+    // core; per-core slots would alias.  The dispatcher publishes
+    // `&task.syscall_snapshot` into `current_syscall_snapshot_ptr` on
+    // every dispatch, so each task's user GPRs land in its own snapshot
+    // and `make_fork_ctx` / `r8`/`r9`-arg consumers read the correct
+    // task's values regardless of what other tasks ran in between.
+    //
+    // We can't use `rax` as the scratch pointer (it holds the syscall
+    // number); use `r11` instead — it's the user RFLAGS, but we have
+    // already pushed it on the kernel stack a moment from now and the
+    // sysret path restores it from there.  No: we have *not* yet pushed
+    // it.  Use a different scratch.  `rcx` holds the user RIP and is
+    // also live until pushed.  Safest: spill `rax` briefly, do the
+    // saves, then restore `rax`.  That keeps the syscall number live
+    // across the sequence without consuming an extra GPR.
+    //
+    // Actually simpler: do the indirected stores using a single scratch
+    // grabbed AFTER the kernel-stack pushes (where the syscall number
+    // is already at a known offset on the stack).  Move the snapshot
+    // saves to *after* the pushes so we have free scratch registers.
+    //
+    // But the pushes also push rcx (user RIP) and r11 (user RFLAGS).
+    // Those get saved on the stack regardless.  Push order picked so
+    // the kernel stack has the same layout the sysret path expects.
+    //
+    // Push first, then do the snapshot save with a free scratch.
 
     // --- Save return address and user flags on stack ---
     "push rcx", // user RIP
@@ -1139,12 +1168,40 @@ global_asm!(
     "push r8",
     "push r9",
 
+    // --- Now mirror the user GPR snapshot into the current task's slot.
+    //     `rax` is the syscall number, must survive.  `rcx` is user RIP
+    //     (now on the kernel stack at known offset, restored before
+    //     sysret).  Use `rcx` as the scratch pointer to the snapshot —
+    //     it's clobbered by the upcoming `mov rcx, rdx` arg-shuffle
+    //     anyway, so no extra spill needed.
+    "mov rcx, gs:[OFF_TASK_SNAPSHOT_PTR]",
+    "mov [rcx + SNAP_USER_RBX],    rbx",
+    "mov [rcx + SNAP_USER_RBP],    rbp",
+    "mov [rcx + SNAP_USER_R12],    r12",
+    "mov [rcx + SNAP_USER_R13],    r13",
+    "mov [rcx + SNAP_USER_R14],    r14",
+    "mov [rcx + SNAP_USER_R15],    r15",
+    "mov [rcx + SNAP_USER_RDI],    rdi",
+    "mov [rcx + SNAP_USER_RSI],    rsi",
+    "mov [rcx + SNAP_USER_RDX],    rdx",
+    "mov [rcx + SNAP_USER_R8],     r8",
+    "mov [rcx + SNAP_USER_R9],     r9",
+    "mov [rcx + SNAP_USER_R10],    r10",
+    "mov [rcx + SNAP_USER_RFLAGS], r11",
+
     // --- Set up SysV arguments for syscall_handler ---
     // Save r10 (arg3) to per-core data for kernel-side access.
     "mov gs:[OFF_ARG3], r10",
     // Load r8 (user_rip) BEFORE overwriting rcx.
     "mov r8, [rsp + 104]",         // user_rip (5th param)
     "mov r9, gs:[OFF_USER_RSP]",   // user_rsp (6th param)
+    // Phase 57e Bug #4 fix — save user_rsp to the per-task snapshot so
+    // a kernel-mode preempt firing before `snapshot_user_return_state`
+    // runs cannot leave `task.user_return.user_rsp` populated from
+    // another task's per-core slot.  `rcx` still holds the snapshot
+    // pointer (next instruction `mov rcx, rdx` clobbers it for the
+    // SysV arg shuffle).
+    "mov [rcx + SNAP_USER_RSP], r9",
     "mov rcx, rdx",                // arg2
     "mov rdx, rsi",                // arg1
     "mov rsi, rdi",                // arg0
@@ -1187,22 +1244,24 @@ global_asm!(
     "mov rsp, gs:[OFF_USER_RSP]",
     "sysretq",
 
-    off_stack_top   = const crate::smp::offsets::SYSCALL_STACK_TOP,
-    off_user_rsp    = const crate::smp::offsets::SYSCALL_USER_RSP,
-    off_arg3        = const crate::smp::offsets::SYSCALL_ARG3,
-    off_user_rbx    = const crate::smp::offsets::SYSCALL_USER_RBX,
-    off_user_rbp    = const crate::smp::offsets::SYSCALL_USER_RBP,
-    off_user_r12    = const crate::smp::offsets::SYSCALL_USER_R12,
-    off_user_r13    = const crate::smp::offsets::SYSCALL_USER_R13,
-    off_user_r14    = const crate::smp::offsets::SYSCALL_USER_R14,
-    off_user_r15    = const crate::smp::offsets::SYSCALL_USER_R15,
-    off_user_rdi    = const crate::smp::offsets::SYSCALL_USER_RDI,
-    off_user_rsi    = const crate::smp::offsets::SYSCALL_USER_RSI,
-    off_user_rdx    = const crate::smp::offsets::SYSCALL_USER_RDX,
-    off_user_r8     = const crate::smp::offsets::SYSCALL_USER_R8,
-    off_user_r9     = const crate::smp::offsets::SYSCALL_USER_R9,
-    off_user_r10    = const crate::smp::offsets::SYSCALL_USER_R10,
-    off_user_rflags = const crate::smp::offsets::SYSCALL_USER_RFLAGS,
+    off_stack_top         = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    off_user_rsp          = const crate::smp::offsets::SYSCALL_USER_RSP,
+    off_arg3              = const crate::smp::offsets::SYSCALL_ARG3,
+    off_task_snapshot_ptr = const crate::smp::offsets::CURRENT_SYSCALL_SNAPSHOT_PTR,
+    snap_user_rbx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBX,
+    snap_user_rbp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RBP,
+    snap_user_r12    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R12,
+    snap_user_r13    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R13,
+    snap_user_r14    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R14,
+    snap_user_r15    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R15,
+    snap_user_rdi    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RDI,
+    snap_user_rsi    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSI,
+    snap_user_rdx    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RDX,
+    snap_user_r8     = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R8,
+    snap_user_r9     = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R9,
+    snap_user_r10    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_R10,
+    snap_user_rflags = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RFLAGS,
+    snap_user_rsp    = const crate::task::task_syscall_snapshot_offsets::SNAP_USER_RSP,
 );
 
 // ---------------------------------------------------------------------------
@@ -1644,7 +1703,7 @@ pub extern "C" fn syscall_handler(
             arg1,
             arg2,
             per_core_syscall_arg3(),
-            crate::smp::per_core().syscall_user_r8,
+            crate::task::current_task_syscall_snapshot().user_r8,
         ),
         SYMLINKAT => sys_symlinkat(arg0, arg1, arg2),
         READLINKAT => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
@@ -1662,7 +1721,7 @@ pub extern "C" fn syscall_handler(
         GETPID => sys_getpid(),
         CLONE => {
             let child_tidptr = per_core_syscall_arg3();
-            let tls = crate::smp::per_core().syscall_user_r8;
+            let tls = crate::task::current_task_syscall_snapshot().user_r8;
             sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
         }
         FORK => sys_fork(user_rip, user_rsp),
@@ -1728,14 +1787,14 @@ pub extern "C" fn syscall_handler(
         ACCEPT => sys_accept(arg0, arg1, arg2),
         SENDTO => {
             let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len = crate::smp::per_core().syscall_user_r9;
+            let addr_ptr = crate::task::current_task_syscall_snapshot().user_r8;
+            let addr_len = crate::task::current_task_syscall_snapshot().user_r9;
             sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
         }
         RECVFROM => {
             let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
+            let addr_ptr = crate::task::current_task_syscall_snapshot().user_r8;
+            let addr_len_ptr = crate::task::current_task_syscall_snapshot().user_r9;
             sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
         }
         SHUTDOWN => sys_shutdown_sock(arg0, arg1),
@@ -1749,12 +1808,12 @@ pub extern "C" fn syscall_handler(
         }
         SETSOCKOPT => {
             let optval_ptr = per_core_syscall_arg3();
-            let optlen = crate::smp::per_core().syscall_user_r8;
+            let optlen = crate::task::current_task_syscall_snapshot().user_r8;
             sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
         }
         GETSOCKOPT => {
             let optval_ptr = per_core_syscall_arg3();
-            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
+            let optlen_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
         }
         ACCEPT4 => {
@@ -1771,7 +1830,7 @@ pub extern "C" fn syscall_handler(
         PIPE => sys_pipe_with_flags(arg0, false),
         SELECT => {
             let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            let timeout_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_WAIT => {
@@ -1784,7 +1843,7 @@ pub extern "C" fn syscall_handler(
         }
         PSELECT6 => {
             let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            let timeout_ptr = crate::task::current_task_syscall_snapshot().user_r8;
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
@@ -1811,7 +1870,7 @@ pub extern "C" fn syscall_handler(
         ARCH_PRCTL => sys_linux_arch_prctl(arg0, arg1),
         REBOOT => sys_reboot(arg0),
         FUTEX => {
-            let val3 = crate::smp::per_core().syscall_user_r9;
+            let val3 = crate::task::current_task_syscall_snapshot().user_r9;
             sys_futex(arg0, arg1, arg2, val3)
         }
         SET_ROBUST_LIST => 0,
@@ -1873,7 +1932,7 @@ pub extern "C" fn syscall_handler(
                 arg1,
                 arg2,
                 per_core_syscall_arg3(),
-                crate::smp::per_core().syscall_user_r8,
+                crate::task::current_task_syscall_snapshot().user_r8,
             )
         }
         // -- device host (Phase 55b Track B) --
@@ -4323,9 +4382,70 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
         use x86_64::registers::control::{Cr3, Cr3Flags};
-        // Capture old CR3 before switching so we can free its frames after.
-        let (old_cr3, _) = Cr3::read();
-        let old_cr3_phys = old_cr3.start_address().as_u64();
+        // Read kstack/fs_base from PROCESS_TABLE first; these don't depend
+        // on CR3 and we want them in scope for `set_current_user_return`
+        // which we run BEFORE `Cr3::write` (Bug #5 fix below).
+        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
+            .lock()
+            .find(pid)
+            .map(|p| (p.kernel_stack_top, p.fs_base))
+            .unwrap_or((0, 0));
+
+        // Phase 57e Bug #7 fix — derive `old_cr3_phys` from the
+        // already-captured `_old_addr_space` Arc, NOT from `Cr3::read`.
+        //
+        // After `proc.addr_space = Some(new_addr_space)` at the
+        // PROCESS_TABLE update earlier in this function, any
+        // `save_user_return_state(...)` call (yield_now / block path,
+        // including the synchronous `yield_now` that
+        // `reset_current_task_fpu_state`'s `scheduler_lock` drop can
+        // trigger via `preempt_enable` zero-crossing under preempt-full)
+        // reads `current_user_return_addr_space_snapshot(pid)` from
+        // PROCESS_TABLE — which now returns *new* cr3 — and overwrites
+        // `urs.cr3_phys = new_cr3`.  The next dispatcher restore loads
+        // `Cr3 = new_cr3` so when execve resumes and reads `Cr3::read()`
+        // it gets `new_cr3`, making `old_cr3_phys == new_cr3` and
+        // causing `free_process_page_table(old_cr3_phys)` below to free
+        // the just-allocated PML4 while CR3 still points at it.
+        //
+        // The Arc captured before any PROCESS_TABLE mutation is the
+        // race-free source of truth for the pre-execve CR3.
+        let old_cr3_phys = _old_addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.pml4_phys().as_u64())
+            .unwrap_or(0);
+
+        // Phase 57e Bug #5 fix — publish the new `UserReturnState`
+        // BEFORE switching CR3.
+        //
+        // Pre-fix order was `Cr3::write(new_cr3)` then
+        // `set_current_user_return(... cr3_phys: new_cr3 ...)`.  Under
+        // preempt-full a kernel-mode timer/IPI firing in the window
+        // between those two calls leaves `task.user_return.cr3_phys`
+        // pointing at the **old** address space (set by
+        // `snapshot_user_return_state` at syscall entry).  When the
+        // dispatcher resumes this task it restores Cr3 from the stale
+        // urs, so when execve continues and `iretq`'s to ring 3 at
+        // the new entry point, the page is unmapped in the OLD cr3 →
+        // INSTRUCTION_FETCH page fault at the binary's `_start`.
+        //
+        // Publishing urs first makes the dispatcher's restore always
+        // pick the new cr3.  Cases:
+        //   - preempt before urs publish: urs unchanged (old cr3),
+        //     dispatch restores old cr3, iretq back here, retry both.
+        //   - preempt after urs publish, before Cr3::write: urs has
+        //     new cr3, dispatch restores new cr3, Cr3::write is a
+        //     no-op when execve resumes.
+        //   - preempt after Cr3::write: both states are new — fine.
+        // No state can disagree.
+        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
+            user_rsp,
+            kernel_stack_top: kstack_top,
+            fs_base,
+            cr3_phys: new_cr3.start_address().as_u64(),
+            addr_space_gen: new_addr_space.generation(),
+        });
+
         Cr3::write(new_cr3, Cr3Flags::empty());
         if crate::smp::is_per_core_ready() {
             let pc = crate::smp::per_core();
@@ -4345,24 +4465,14 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         // Free the old page table's user-space frames now that CR3 no longer
         // points to it. The bump allocator makes this a no-op today; the
         // real reclamation happens in Phase 13 when a free list is added.
-        crate::mm::free_process_page_table(old_cr3_phys);
+        if old_cr3_phys != 0 {
+            crate::mm::free_process_page_table(old_cr3_phys);
+        }
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
-        let (kstack_top, fs_base) = crate::process::PROCESS_TABLE
-            .lock()
-            .find(pid)
-            .map(|p| (p.kernel_stack_top, p.fs_base))
-            .unwrap_or((0, 0));
         if kstack_top != 0 {
             crate::smp::set_current_core_kernel_stack(kstack_top);
             set_per_core_syscall_stack_top(kstack_top);
         }
-        crate::task::scheduler::set_current_user_return(crate::task::UserReturnState {
-            user_rsp,
-            kernel_stack_top: kstack_top,
-            fs_base,
-            cr3_phys: new_cr3.start_address().as_u64(),
-            addr_space_gen: new_addr_space.generation(),
-        });
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
@@ -4515,10 +4625,26 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         if options & WNOHANG != 0 {
             break 0;
         }
+        // Phase 57e Bug #13 — defensive deadline backstop.
+        //
+        // The wake side (`wake_child_waiters` in `process/mod.rs`) is a raw
+        // `wait_woken.store(true)` + `wake_task_v2` pair without a preempt
+        // bracket and without a notification-object backed structure.  Under
+        // the eager-yield removal experiment (Bug #12 part 3, reverted in
+        // 1a25198), this surfaced as ion + child stuck in `BlockedOnWait` for
+        // 100+ seconds when child exit raced with parent's transition into
+        // the blocked state.  The Bug #12 part 4 fix (preempt_enable_no_resched
+        // for IPC brackets only) does NOT touch the waitpid wake path, so the
+        // race shape is currently latent — but a 1 s deadline backstop costs
+        // negligible polling overhead (one iteration per second when stuck)
+        // and provides forward-progress regardless of how the wake side
+        // evolves.  TICKS_PER_SEC = 1000, so 1000 ticks = 1 s.
+        let now_ticks = crate::arch::x86_64::interrupts::tick_count();
+        let deadline_ticks = now_ticks.saturating_add(1_000);
         let _ = crate::task::scheduler::block_current_until(
             crate::task::TaskState::BlockedOnWait,
             &wait_woken,
-            None,
+            Some(deadline_ticks),
         );
     }
 }
@@ -5086,8 +5212,38 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
             let nonblock = entry.nonblock;
+            // Phase 57e Bug #12 — replace the busy-yield loop with a
+            // proper waitqueue-based block.  The previous
+            // `loop { has_data || yield_now() }` shape was the dominant
+            // yield_now caller on real hardware (`m3os.log` 2026-05-07
+            // showed 95% of all yield_now calls coming from this site,
+            // pid 18 / login).  Under preempt-full each yield triggered
+            // an eager-yield in `preempt_enable`'s zero-cross branch,
+            // cascading the input pipeline through hundreds of
+            // unnecessary context switches per blocked read.
+            //
+            // STDIN_WAITQUEUE is woken by `stdin::push_char` and
+            // `stdin::signal_eof`; both run AFTER mutating the buffer
+            // so `has_data()` is ground truth.  The `woken` atomic
+            // closes the lost-wake window between the readiness scan
+            // and the block: if a wake fires after `has_data() == false`
+            // and before `block_current_until`, the wake sets `woken`
+            // and `block_current_until`'s early-bail returns
+            // `AlreadyTrue` without yielding.  `wake_all` drains the
+            // waiter queue per call so we re-register every iteration.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                // Reset and re-register before the readiness scan so any
+                // wake during the scan / block window sets our flag.
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::stdin::STDIN_WAITQUEUE.register(task_id, &woken);
+
                 if crate::stdin::has_data() {
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
                     let mut tmp = [0u8; 4096];
                     let n = crate::stdin::read(&mut tmp[..capped]);
                     if n > 0 {
@@ -5095,19 +5251,32 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             .and_then(|s| s.copy_from_kernel(&tmp[..n]))
                             .is_err()
                         {
-                            return NEG_EFAULT;
+                            break NEG_EFAULT;
                         }
-                        return n as u64;
+                        break n as u64;
                     }
+                    // n == 0: stdin EOF (read consumed the EOF flag).
+                    // Fall through to re-check on next iteration —
+                    // has_data will return false now and we'll either
+                    // return EAGAIN (nonblock) or block.
+                    continue;
                 }
                 if nonblock {
-                    return NEG_EAGAIN;
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
+                    break NEG_EAGAIN;
                 }
-                // Check for pending signals so Ctrl-C works while blocked.
                 if has_pending_signal() {
-                    return NEG_EINTR;
+                    crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
+                    break NEG_EINTR;
                 }
-                crate::task::yield_now();
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                // wake_all drained our entry; deregister is idempotent
+                // for safety in case wake_one was used.
+                crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
             }
         }
         FdBackend::Stdout => NEG_EBADF,
@@ -8493,106 +8662,43 @@ fn sys_mmap_file_backed(
         let table = crate::process::PROCESS_TABLE.lock();
         table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
     };
-    let base = {
-        let _page_table_guard = addr_space
-            .as_ref()
-            .map(|addr_space| addr_space.lock_page_tables());
+    // Phase 57e Bug #9 — split the lifecycle so `lock_page_tables()` is held
+    // only across the page-table mutation, never across `kernel_read_fd_at`.
+    // The previous code held the guard for the entire alloc+read+map loop;
+    // each call to `kernel_read_fd_at` for a Fat32/Ext2 fd descends into
+    // `virtio_blk::do_request` → `block_current_until`, which switches out
+    // the task with `preempt_count >= 1` (the guard's +1).  When the task
+    // resumes, `block_current_until`'s post-resume `preempt_enable` only
+    // returns count to 1 — the guard's +1 persists.  The IRQ-side preempt
+    // gate (`peek_preempt_count_irq`) reads non-zero and refuses to preempt,
+    // so the running task monopolises its core for the entire syscall while
+    // co-resident Ready tasks starve.  See
+    // `docs/handoffs/57e-preempt-full-userspace-hangs.md` Sessions 13–14.
 
-        // Claim a virtual address range.
-        let base =
-            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
-                let current = if *mmap_next == 0 {
-                    ANON_MMAP_BASE
-                } else {
-                    *mmap_next
-                };
-                let end = current
-                    .checked_add(total_size)
-                    .filter(|v| *v <= 0x0000_8000_0000_0000)?;
-                *mmap_next = end;
-                Some(current)
-            }) {
-                Some(Some(base)) => base,
-                _ => return NEG_EINVAL,
+    // Claim a virtual address range — uses the shared-mm lock, not the
+    // page-table lock, so no preempt_disable is needed here.
+    let base =
+        match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            let current = if *mmap_next == 0 {
+                ANON_MMAP_BASE
+            } else {
+                *mmap_next
             };
-        let reservation_end = base + total_size;
-
-        // Get the process CR3 for the mapper.
-        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
-            Some(phys) => phys,
-            None => return NEG_EINVAL,
+            let end = current
+                .checked_add(total_size)
+                .filter(|v| *v <= 0x0000_8000_0000_0000)?;
+            *mmap_next = end;
+            Some(current)
+        }) {
+            Some(Some(base)) => base,
+            _ => return NEG_EINVAL,
         };
-        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
-            Ok(f) => f,
-            Err(_) => return NEG_EINVAL,
-        };
+    let reservation_end = base + total_size;
 
-        // Allocate frames, fill from file, map into page table.
-        let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
-        let mut page_buf = alloc::vec![0u8; 4096];
-
-        for i in 0..pages {
-            // Zero-before-exposure (D.4): user-visible mmap frame.
-            let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
-                Some(f) => f,
-                None => {
-                    log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
-                    // Roll back already-allocated frames.
-                    for f in &mapped_frames {
-                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-                    }
-                    let _ = crate::process::with_shared_mm_mut(
-                        pid,
-                        |_brk_current, mmap_next, _vma_tree| {
-                            if *mmap_next == reservation_end {
-                                *mmap_next = base;
-                            }
-                        },
-                    );
-                    return NEG_ENOMEM;
-                }
-            };
-
-            // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
-            let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-
-            let read_offset = file_offset + (i as usize) * 4096;
-            match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
-                Ok(n) if n > 0 => unsafe {
-                    core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
-                },
-                Ok(_) => {} // EOF or past-end page — leave zeroed
-                Err(e) => {
-                    // I/O error — clean up and abort.
-                    crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
-                    for f in &mapped_frames {
-                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-                    }
-                    let _ = crate::process::with_shared_mm_mut(
-                        pid,
-                        |_brk_current, mmap_next, _vma_tree| {
-                            if *mmap_next == reservation_end {
-                                *mmap_next = base;
-                            }
-                        },
-                    );
-                    return e as u64;
-                }
-            }
-
-            mapped_frames.push(frame);
-        }
-
-        // Map all frames into the process page table.
-        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
-        if unsafe {
-            crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
-        }
-        .is_err()
-        {
-            for f in &mapped_frames {
-                crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-            }
+    // Get the process CR3 for the mapper.
+    let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
+        Some(phys) => phys,
+        None => {
             let _ =
                 crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
                     if *mmap_next == reservation_end {
@@ -8601,18 +8707,112 @@ fn sys_mmap_file_backed(
                 });
             return NEG_EINVAL;
         }
-
-        // Record the VMA while the page-table mutation lock is still held.
-        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
-            vma_tree.insert(crate::process::MemoryMapping {
-                start: base,
-                len: total_size,
-                prot,
-                flags,
-            });
-        });
-        base
     };
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = base;
+                    }
+                });
+            return NEG_EINVAL;
+        }
+    };
+
+    // Allocate frames and fill from file — NO page-table lock held.  The
+    // file read may block in virtio_blk for tens of ms per page; holding
+    // the page-table lock across that block is what caused Bug #9.
+    let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
+    let mut page_buf = alloc::vec![0u8; 4096];
+
+    for i in 0..pages {
+        // Zero-before-exposure (D.4): user-visible mmap frame.
+        let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
+            Some(f) => f,
+            None => {
+                log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let _ = crate::process::with_shared_mm_mut(
+                    pid,
+                    |_brk_current, mmap_next, _vma_tree| {
+                        if *mmap_next == reservation_end {
+                            *mmap_next = base;
+                        }
+                    },
+                );
+                return NEG_ENOMEM;
+            }
+        };
+
+        // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
+        let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
+
+        let read_offset = file_offset + (i as usize) * 4096;
+        match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
+            Ok(n) if n > 0 => unsafe {
+                core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
+            },
+            Ok(_) => {} // EOF or past-end page — leave zeroed
+            Err(e) => {
+                // I/O error — clean up and abort.
+                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let _ = crate::process::with_shared_mm_mut(
+                    pid,
+                    |_brk_current, mmap_next, _vma_tree| {
+                        if *mmap_next == reservation_end {
+                            *mmap_next = base;
+                        }
+                    },
+                );
+                return e as u64;
+            }
+        }
+
+        mapped_frames.push(frame);
+    }
+
+    // Map all frames into the process page table — guard held only here.
+    let map_failed = {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+        unsafe {
+            crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
+        }
+        .is_err()
+    };
+    if map_failed {
+        for f in &mapped_frames {
+            crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+        }
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            if *mmap_next == reservation_end {
+                *mmap_next = base;
+            }
+        });
+        return NEG_EINVAL;
+    }
+
+    // Record the VMA — uses the shared-mm lock, independent of the
+    // page-table lock.  Order (PT mutation before VMA insert) is preserved
+    // from the original code.
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+        vma_tree.insert(crate::process::MemoryMapping {
+            start: base,
+            len: total_size,
+            prot,
+            flags,
+        });
+    });
     if let Some(addr_space) = addr_space.as_ref() {
         crate::smp::tlb::tlb_shootdown_range(addr_space, base, base + total_size);
         addr_space.bump_generation();

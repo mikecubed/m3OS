@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.57.4"
+version = "0.57.5"
 edition = "2024"
 
 [dependencies]
@@ -32,6 +32,12 @@ sched-trace = []
 # gates once the 24-hour post-flip soak (I.2) passes. Until then, the gates remain as
 # rollback safety. See docs/roadmap/tasks/57d-voluntary-preemption-tasks.md § I.3.
 preempt-voluntary = []
+# Phase 57e — Full Kernel Preemption (PREEMPT_FULL): RETIRED.
+# Phase 57e is deferred (2026-05-07) — see
+# `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`.  The
+# `preempt-full` feature flag and every cfg(feature = "preempt-full")
+# site in the kernel were removed in the deferral cleanup.  The
+# preempt-voluntary discipline below is now the only preemption model.
 # When `hardened` is enabled, the `sys_block_read` whitelist is restricted to
 # production storage servers only (vfs_server, fat_server). Without this flag,
 # test binaries such as `nvme-crash-smoke` are also permitted, which allows

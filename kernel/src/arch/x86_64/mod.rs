@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 
 pub mod apic;
+pub mod cpuid;
 pub mod gdt;
 pub mod interrupts;
 pub mod preempt_trap_frame;

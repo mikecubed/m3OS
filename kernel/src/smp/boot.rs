@@ -271,7 +271,15 @@ fn delay_us(us: u64) {
     // HW-bounded: ≤ `us` µs; used only during AP startup IPI sequence (Intel
     // SDM Vol 3A §8.4.4, 'AP Initialization').  LAPIC timer countdown is a
     // one-shot hardware register; no software agent drives it.
-    // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
+    //
+    // Phase 57e Track B.2: `delay_us` only runs during AP boot orchestration
+    // — the BSP holds the boot lock at this point and the scheduler has not
+    // yet handed CPU to user tasks.  The `preempt_disable` wrapper is
+    // therefore a no-op (per-core data may be initialised but no preemption
+    // can fire here yet); we keep the discipline regardless so any future
+    // refactor that calls `delay_us` from a runtime context inherits the
+    // correct migration guard.
+    crate::task::scheduler::preempt_disable();
     loop {
         let current = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
         let elapsed = start.wrapping_sub(current) as u64;
@@ -280,6 +288,7 @@ fn delay_us(us: u64) {
         }
         core::hint::spin_loop();
     }
+    crate::task::scheduler::preempt_enable();
 }
 
 // ---------------------------------------------------------------------------
@@ -389,11 +398,21 @@ pub fn boot_aps() {
 
 /// Rust entry point for APs, called from the trampoline.
 extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
-    // Load BSP's CR4 value to match feature flags (PGE, etc.).
+    // Load BSP's CR4 value to match feature flags (PGE, OSXSAVE, etc.).  The
+    // BSP set CR4.OSXSAVE during `kernel_main` (Phase 57e Track J) so this AP
+    // observes it set immediately after the load.
     let bsp_cr4 =
         unsafe { core::ptr::read_volatile((TRAMPOLINE_PHYS + DATA_CR4 as u64) as *const u64) };
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) bsp_cr4, options(nostack));
+    }
+
+    // Phase 57e Track J — write this AP's XCR0 to the 1.0 mask
+    // (x87 + SSE + AVX).  XCR0 is per-core: CR4.OSXSAVE was inherited from the
+    // BSP via the trampoline copy above, but XCR0 itself was not set yet on
+    // this core, so xsave64 / xrstor64 would fault until this call lands.
+    unsafe {
+        crate::arch::x86_64::cpuid::enable_xsave_state();
     }
 
     let data = unsafe { &*per_core_data_ptr };
@@ -436,6 +455,13 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
 
 /// Idle task for AP cores — halts until an interrupt wakes the core,
 /// then yields back to the scheduler so newly ready tasks can run.
+///
+/// Phase 57e Bug #12 part 7 (a1bfe17): yield_now in both modes.  The
+/// Bug #6 eager-yield livelock is closed (8b44442 removed the eager-
+/// yield branch), and Bug #12 part 7 removed timer-driven kernel-mode
+/// preemption — so a pure `enable_and_hlt` loop can no longer rely on
+/// the timer to kick the scheduler when same-core wakes set
+/// `reschedule = true`.  The explicit `yield_now` is now load-bearing.
 fn ap_idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();

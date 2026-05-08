@@ -240,17 +240,27 @@ impl VtdUnit {
 
     /// Poll GSTS until `bit` becomes set or the bound expires.
     fn wait_gsts_bit(&self, bit: u32) -> Result<(), IommuError> {
-        for _ in 0..GSTS_POLL_LIMIT {
-            if (self.read_u32(VtdRegs::GSTS) & bit) != 0 {
-                return Ok(());
+        // Phase 57e Track B.2: under PREEMPT_FULL, a kernel-mode preemption
+        // mid-spin would migrate this task to another core, leaving the GSTS
+        // observation pending on a different MMIO mapping in the worst case.
+        // VT-d configuration runs once at unit bring-up but the bit-poll
+        // pattern is reused for runtime invalidations, so the wrapper applies
+        // unconditionally.
+        crate::task::scheduler::preempt_disable();
+        let result = (|| {
+            for _ in 0..GSTS_POLL_LIMIT {
+                if (self.read_u32(VtdRegs::GSTS) & bit) != 0 {
+                    return Ok(());
+                }
+                // HW-bounded: VT-d hardware updates GSTS within ~1 µs of receiving the
+                // write (Intel VT-d Architecture Specification §11.4.4, 'Global Status
+                // Register').  No IRQ-on-completion mechanism exists for GSTS updates.
+                core::hint::spin_loop();
             }
-            // HW-bounded: VT-d hardware updates GSTS within ~1 µs of receiving the
-            // write (Intel VT-d Architecture Specification §11.4.4, 'Global Status
-            // Register').  No IRQ-on-completion mechanism exists for GSTS updates.
-            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
-            core::hint::spin_loop();
-        }
-        Err(IommuError::HardwareFault)
+            Err(IommuError::HardwareFault)
+        })();
+        crate::task::scheduler::preempt_enable();
+        result
     }
 
     // ---- Table-page allocation -----------------------------------------
@@ -365,15 +375,20 @@ impl VtdUnit {
     fn invalidate_context_cache_global(&self) {
         self.write_u64(VtdRegs::CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
         // Wait for ICC bit (63) to clear.
+        // Phase 57e Track B.2: see `wait_gsts_bit` for the migration-safety
+        // rationale.  Invalidations may run from any task context (e.g. when
+        // a userspace driver re-binds a device), so the wrapper is required.
+        crate::task::scheduler::preempt_disable();
         for _ in 0..GSTS_POLL_LIMIT {
             if (self.read_u64(VtdRegs::CCMD) & CCMD_ICC) == 0 {
+                crate::task::scheduler::preempt_enable();
                 return;
             }
             // HW-bounded: VT-d hardware clears ICC (bit 63 of CCMD_REG) after
             // context-cache invalidation completes (Intel VT-d spec §11.4.4).
-            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
             core::hint::spin_loop();
         }
+        crate::task::scheduler::preempt_enable();
     }
 
     /// Issue a global IOTLB invalidation via the register path.
@@ -390,15 +405,18 @@ impl VtdUnit {
         let cmd_offset = iotlb_base + IOTLB_REG;
         let value = IOTLB_IVT | IOTLB_IIRG_GLOBAL;
         self.write_u64(cmd_offset, value);
+        // Phase 57e Track B.2: same rationale as `invalidate_context_cache_global`.
+        crate::task::scheduler::preempt_disable();
         for _ in 0..GSTS_POLL_LIMIT {
             if (self.read_u64(cmd_offset) & IOTLB_IVT) == 0 {
+                crate::task::scheduler::preempt_enable();
                 return;
             }
             // HW-bounded: VT-d hardware clears IVT (bit 63 of IOTLB_REG) after IOTLB
             // invalidation completes (Intel VT-d spec §11.4.4).
-            // preempt_disable() wrapper added in Phase 57e Track B (load-bearing for PREEMPT_FULL only).
             core::hint::spin_loop();
         }
+        crate::task::scheduler::preempt_enable();
     }
 
     // ---- Page-table walk/install ---------------------------------------

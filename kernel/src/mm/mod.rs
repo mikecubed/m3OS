@@ -203,6 +203,29 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // Store physical memory offset globally so other modules can rebuild the mapper.
     PHYS_OFFSET.call_once(|| phys_offset);
 
+    // Phase 57e diag (slab UAF Hyp #2): log address-space layout so we can
+    // verify the bootloader's Mapping::Dynamic phys-offset does not collide
+    // with HEAP_START..HEAP_MAX_SIZE at PML4[256].
+    {
+        let kernel_pml4 = *KERNEL_PML4_PHYS.get().expect("KERNEL_PML4_PHYS set above");
+        let heap_start = heap::HEAP_START as u64;
+        let heap_end = heap_start + heap::HEAP_MAX_SIZE as u64;
+        let pml4_idx = |va: u64| ((va >> 39) & 0x1FF) as usize;
+        let phys_off_pml4 = pml4_idx(phys_offset);
+        let heap_pml4 = pml4_idx(heap_start);
+        let collide = phys_off_pml4 == heap_pml4;
+        log::info!(
+            "[mm] addr-space layout: KERNEL_PML4_PHYS={:#x} phys_offset={:#x} (PML4[{}]) heap={:#x}..{:#x} (PML4[{}]) collide={}",
+            kernel_pml4,
+            phys_offset,
+            phys_off_pml4,
+            heap_start,
+            heap_end,
+            heap_pml4,
+            collide,
+        );
+    }
+
     memory_map::init(static_regions);
     frame_allocator::init(static_regions, phys_offset);
 
@@ -370,9 +393,33 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
 /// `cr3_phys` must be the physical address of a valid, now-unreachable PML4
 /// that is no longer loaded in CR3. No other code may access the page table
 /// after this call.
+#[track_caller]
 pub fn free_process_page_table(cr3_phys: u64) {
     use alloc::vec::Vec;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
+    // Phase 57e Session 8 — defensive sanity check.
+    //
+    // Freeing the currently-active CR3 leaves CR3 dangling on this core.
+    // The only legitimate caller (sys_exit, fault_kill_trampoline) calls
+    // `restore_kernel_cr3` first; execve switches via Cr3::write before
+    // the free.  If this fires we know an upstream bug — most likely a
+    // recurrence of Bug #7's stale `old_cr3_phys == new_cr3_phys` race.
+    //
+    // Kept after the fix landed because the cost is one Cr3::read per
+    // process exit and the WARN is silent under correct operation.
+    {
+        use x86_64::registers::control::Cr3;
+        let (active_cr3, _) = Cr3::read();
+        if active_cr3.start_address().as_u64() == cr3_phys {
+            let caller = core::panic::Location::caller();
+            log::warn!(
+                "[free_pt] !!! cr3_phys={:#x} EQUALS active CR3 — caller={}:{}",
+                cr3_phys,
+                caller.file(),
+                caller.line()
+            );
+        }
+    }
     let phys_off = VirtAddr::new(phys_offset());
     let kernel_pml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
 

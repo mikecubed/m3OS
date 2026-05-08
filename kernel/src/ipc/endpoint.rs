@@ -337,9 +337,11 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                         log::warn!(
                             "[ipc] recv_msg: capability table full, unblocking sender without reply"
                         );
-                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ = scheduler::deliver_message_and_wake(
+                            pending.task,
+                            Message::new(u64::MAX),
+                        );
                         return Message::new(u64::MAX);
                     }
                 }
@@ -357,9 +359,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
                 // Wake the sender with an error so it doesn't block forever.
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return Message::new(u64::MAX);
             }
             // Phase 56 close-out — communicate the assigned reply-cap handle
@@ -376,7 +377,10 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             if let Some(handle) = reply_cap_handle {
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
-            // Deliver the message to the receiver now that all caps are in place.
+            // Deliver the message to the receiver now that all caps are in
+            // place.  The receiver is the CURRENT task, so no wake counterpart
+            // exists for `deliver_message`; the recipient will read its own
+            // `pending_msg` via `take_message` after this match arm returns.
             scheduler::deliver_message(receiver, pending.msg);
             let _ = transfer_bulk(pending.task, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
@@ -384,9 +388,28 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 ep: ep_id.0 as u32,
             });
             if !pending.wants_reply {
+                // Phase 57e Bug #12 — bracket only the load-bearing
+                // `complete_send + wake_task_v2` atomic.  `complete_send`
+                // drops `scheduler_lock`; without the bracket, that drop's
+                // `preempt_enable` can zero-cross `preempt_count` and
+                // synchronously yield under preempt-full before `wake_task_v2`
+                // runs, leaving the sender with `send_completed=true` but not
+                // enqueued (Bug #8 lost-wakeup).  Shrunk from the original
+                // Phase 57e Bug #8 bracket so non-load-bearing work
+                // (`deliver_message` to current task, `transfer_bulk`,
+                // `trace_event`) no longer blocks IRQ-driven preemption.
+                //
+                // Bug #12 part 5: `preempt_enable` itself now defers the
+                // reschedule globally (no eager-yield), so the bracket exit
+                // is safe to leave as plain `preempt_enable`.  The bracket
+                // is still load-bearing for the H7 lost-wake protection —
+                // it pins the holder above zero-cross between
+                // `complete_send` and `wake_task_v2`.
+                crate::task::scheduler::preempt_disable();
                 scheduler::complete_send(pending.task);
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                crate::task::scheduler::preempt_enable();
             }
         }
         None => {
@@ -458,9 +481,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
                 log::warn!(
                     "[ipc] recv_msg_nowait: capability table full, unblocking sender without reply"
                 );
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return Some(Message::new(u64::MAX));
             }
         }
@@ -476,9 +498,8 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         if let Some(handle) = reply_cap_handle {
             let _ = scheduler::remove_task_cap(receiver, handle);
         }
-        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+        let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
         return Some(Message::new(u64::MAX));
     }
 
@@ -489,6 +510,10 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         pending.msg = pending.msg.with_reply_cap_handle(handle);
     }
 
+    // Receiver is the current task — `deliver_message` and `transfer_bulk`
+    // touch its own slots and have no wake counterpart, so they sit outside
+    // the bracket.  Only `complete_send + wake_task_v2` (the sender wake)
+    // needs the Bug #8 atomic protection.  See `recv_msg` for full rationale.
     scheduler::deliver_message(receiver, pending.msg);
     let _ = transfer_bulk(pending.task, receiver);
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
@@ -496,9 +521,12 @@ pub fn recv_msg_nowait(receiver: TaskId, ep_id: EndpointId) -> Option<Message> {
         ep: ep_id.0 as u32,
     });
     if !pending.wants_reply {
+        crate::task::scheduler::preempt_disable();
         scheduler::complete_send(pending.task);
         // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
         let _ = crate::task::scheduler::wake_task_v2(pending.task);
+        // Bug #12 part 4: defer reschedule instead of eager-yielding.
+        crate::task::scheduler::preempt_enable();
     }
 
     scheduler::take_message(receiver)
@@ -565,9 +593,11 @@ pub fn recv_msg_with_notif(
                     Ok(handle) => Some(handle),
                     Err(_) => {
                         log::warn!("[ipc] recv_msg_with_notif: cap table full");
-                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ = scheduler::deliver_message_and_wake(
+                            pending.task,
+                            Message::new(u64::MAX),
+                        );
                         return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
                     }
                 }
@@ -579,9 +609,8 @@ pub fn recv_msg_with_notif(
                 if let Some(handle) = reply_cap_handle {
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
-                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
             }
 
@@ -593,12 +622,17 @@ pub fn recv_msg_with_notif(
                 pending.msg = pending.msg.with_reply_cap_handle(handle);
             }
 
+            // Receiver is current task — see `recv_msg` for the rationale on
+            // why only `complete_send + wake_task_v2` lives inside the bracket.
             scheduler::deliver_message(receiver, pending.msg);
             let _ = transfer_bulk(pending.task, receiver);
             if !pending.wants_reply {
+                crate::task::scheduler::preempt_disable();
                 scheduler::complete_send(pending.task);
                 // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
                 let _ = crate::task::scheduler::wake_task_v2(pending.task);
+                // Bug #12 part 4: defer reschedule instead of eager-yielding.
+                crate::task::scheduler::preempt_enable();
             }
 
             match scheduler::take_message(receiver) {
@@ -737,19 +771,32 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
 
     match matched_receiver {
         Some(receiver) => {
-            scheduler::deliver_message(receiver, msg);
+            // Bulk must finish before the receiver wakes (otherwise the
+            // recipient could read its pending_msg before `pending_bulk` is in
+            // place, surfacing the `data[1] != 0 but pending_bulk slot empty`
+            // mismatch).  It does not need to live inside the preempt bracket.
             transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
+            // Phase 57e Bug #12 — minimum atomic: `deliver_message + wake_task_v2`.
+            // `deliver_message`'s `SchedulerGuard::drop` would zero-cross
+            // `preempt_count` and synchronously yield under preempt-full
+            // between the two operations without this bracket, surfacing as
+            // the H7 lost-wakeup signature (Bug #8).
+            //
             // Best-effort wake: the receiver may still be Running if send()
             // races between the receiver enqueueing itself and actually
-            // blocking.  In that case wake_task() correctly returns false
-            // and the receiver will observe the delivered message and skip
-            // blocking.
+            // blocking.  In that case wake_task_v2 correctly returns
+            // `Untouched` and the receiver will observe the delivered message
+            // and skip blocking.
+            crate::task::scheduler::preempt_disable();
+            scheduler::deliver_message(receiver, msg);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Bug #12 part 4: defer reschedule instead of eager-yielding.
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -847,17 +894,29 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                         // Endpoint was closed or destroyed; wake receiver with an
                         // explicit IPC error so it does not remain stranded.
                         drop(reg);
-                        scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                        let _ = crate::task::scheduler::wake_task_v2(receiver);
+                        // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                        let _ =
+                            scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
                     }
                     return Message::new(u64::MAX);
                 }
             };
-            scheduler::deliver_message(receiver, msg.with_reply_cap_handle(reply_cap_handle));
+            // Bulk must finish before the server wakes (see `send`).
+            // Outside the preempt bracket: it touches per-task slots that
+            // have no wake counterpart.
             transfer_bulk(caller, receiver);
+            // Phase 57e Bug #12 — minimum atomic: `deliver_message + wake_task_v2`.
+            // Without the bracket, a synchronous yield_now from
+            // `deliver_message`'s SchedulerGuard::drop can leave the server
+            // with `pending_msg` + `reply_waker` set but not enqueued; the
+            // caller then blocks in `BlockedOnReply` and the server never
+            // dispatches (Bug #8 cascade).
+            crate::task::scheduler::preempt_disable();
+            scheduler::deliver_message(receiver, msg.with_reply_cap_handle(reply_cap_handle));
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Bug #12 part 4: defer reschedule instead of eager-yielding.
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             // Server not yet waiting — we're already enqueued above with
@@ -923,20 +982,35 @@ pub fn cancel_task_wait(task_id: TaskId) {
 ///
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
-    // Phase 54: transfer any reply bulk data from server → caller.
+    // Phase 54: transfer any reply bulk data from server → caller.  Must
+    // finish before the caller wakes (caller could otherwise observe
+    // pending_msg without bulk).  Outside the preempt bracket — independent
+    // state, no wake race.
     transfer_bulk(server, caller);
+    // Phase 57e Bug #12 — minimum atomic: `deliver_message + wake_task_v2`.
+    // Without the bracket, a synchronous `yield_now` from
+    // `deliver_message`'s SchedulerGuard::drop can fire BEFORE `wake_task_v2`
+    // runs.  If the server then doesn't get re-dispatched in time, the
+    // caller is parked in `BlockedOnReply` with `pending_msg` set but never
+    // enqueued — the smoking gun is `[WARN] [sched] task pid=N
+    // state=BlockedOnReply stuck-since=N (no waker registered)`.  See F1 in
+    // docs/handoffs/57e-preempt-full-userspace-hangs.md.
+    //
+    // Can legitimately race with the caller still transitioning into its
+    // reply-blocked state.  If that happens, the reply is already pending
+    // and the caller will observe it and skip blocking.
+    crate::task::scheduler::preempt_disable();
     scheduler::deliver_message(caller, reply_msg);
+    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
+    let _ = crate::task::scheduler::wake_task_v2(caller);
+    // Bug #12 part 4: defer reschedule instead of eager-yielding.
+    crate::task::scheduler::preempt_enable();
     // ep is u32::MAX because reply() operates on a caller TaskId, not an
     // endpoint — the reply capability was already consumed by the caller.
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ReplyDeliver {
         caller_idx: caller.0 as u32,
         ep: u32::MAX,
     });
-    // Can legitimately race with the caller still transitioning into its
-    // reply-blocked state.  If that happens, the reply is already pending
-    // and the caller will observe it and skip blocking.
-    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-    let _ = crate::task::scheduler::wake_task_v2(caller);
 }
 
 /// Reply to the current caller and immediately receive the next message.
@@ -1058,20 +1132,24 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                     ep.receivers.push_front(receiver);
                 } else {
                     drop(reg);
-                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
-                    // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-                    let _ = crate::task::scheduler::wake_task_v2(receiver);
+                    // Phase 57e Bug #6 (F2): atomic deliver+wake.
+                    let _ = scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
                 }
                 return false;
             }
-            scheduler::deliver_message(receiver, msg);
+            // Bulk before wake (see `send`).  Outside the preempt bracket.
             transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
+            // Phase 57e Bug #12 — minimum atomic: `deliver_message + wake_task_v2`.
+            crate::task::scheduler::preempt_disable();
+            scheduler::deliver_message(receiver, msg);
             // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
             let _ = crate::task::scheduler::wake_task_v2(receiver);
+            // Bug #12 part 4: defer reschedule instead of eager-yielding.
+            crate::task::scheduler::preempt_enable();
         }
         None => {
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {

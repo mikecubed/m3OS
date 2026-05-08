@@ -164,6 +164,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
+    // Phase 57e Track J — enable XSAVE/AVX state preservation on the BSP.
+    //
+    // CPUID probe runs first so the kernel can panic with a clear message on
+    // pre-2011 CPUs (no OSXSAVE).  `enable_xsave_state` then sets CR4.OSXSAVE
+    // and writes XCR0 = x87+SSE+AVX = 0x7.
+    //
+    // Ordering matters: this must happen *before* `smp::boot::boot_aps()` so
+    // every AP picks up CR4.OSXSAVE = 1 from the trampoline's `DATA_CR4` slot
+    // (the trampoline reads BSP CR4 at install time, see kernel/src/smp/boot.rs).
+    // APs still need to set XCR0 themselves — XCR0 is per-core and not part
+    // of CR4 — handled in `ap_entry`.
+    let xsave = arch::x86_64::cpuid::probe();
+    log::info!(
+        "[xsave] supported components={:#x} max_area={} probe_xcr0_area={} xsaveopt={}",
+        xsave.supported_components,
+        xsave.max_area_size,
+        xsave.area_size_at_mask,
+        xsave.xsaveopt
+    );
+    // `enable_xsave_state` updates CR4 and writes XCR0 via xsetbv.  Its
+    // safety contract requires IRQs disabled or single-threaded execution.
+    // The BSP is single-threaded here (boot_aps has not run), but interrupts
+    // are already enabled (line above), so wrap the privileged-register
+    // update in `without_interrupts` to honor the contract unconditionally
+    // and prevent an IRQ from observing partial CR4/XCR0 state.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        arch::x86_64::cpuid::enable_xsave_state()
+    });
+    // Validate the static `XSAVE_AREA_SIZE` against the *enabled* mask size
+    // (CPUID 0Dh.0.EBX re-read after `xsetbv`).  `area_size_at_mask` from the
+    // probe was captured before XCR0 = 0x7 was set, so it reflects the reset
+    // mask and is unsuitable for the size assertion.
+    let enabled_area = arch::x86_64::cpuid::enabled_area_size();
+    log::info!("[xsave] post-enable XCR0 area={enabled_area}");
+    assert!(
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE >= enabled_area,
+        "XSAVE_AREA_SIZE ({}) is smaller than CPUID-required area for enabled XCR0 ({})",
+        arch::x86_64::cpuid::XSAVE_AREA_SIZE,
+        enabled_area
+    );
+
     // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
     // driver has been deleted; device-specific 82540EM code now lives in
     // `userspace/drivers/e1000`. The kernel registers only virtio-net here;
@@ -281,6 +322,26 @@ fn init_task() -> ! {
     spawn_userspace_init();
 
     log::info!("[init] service set started — yielding");
+    // Phase 57e Bug #6 (closed): the original `loop { task::yield_now(); }`
+    // under preempt-full got stuck in `preempt_enable`'s zero-crossing
+    // synchronous-yield branch.  Closed in 8b44442 (Bug #12 part 5) when
+    // the eager-yield branch was removed globally.
+    //
+    // Phase 57e Bug #11 (closed): a `loop { enable_and_hlt() }` halts BSP
+    // and starves BSP-resident services if the only path back to the
+    // scheduler is timer-driven kernel-mode preemption.  Closed by both
+    // closing Bug #6 and (under voluntary) cooperatively yielding.
+    //
+    // Phase 57e Bug #12 part 7 (a1bfe17 + this commit): drop the hlt
+    // that was added in eb1f13d.  hlt parks the BSP between yields,
+    // adding up to 1 ms of latency on every same-core wake (BSP can
+    // only re-yield after the next IRQ).  Voluntary mode had this
+    // pattern correct at 052010a: just yield_now(), no hlt.  Match
+    // voluntary's pattern in both modes — yes, it's a busy-yield loop
+    // (BSP doesn't sleep when fully idle), but the busy-yield is what
+    // kept voluntary lag-free, and the scheduler sees BSP's queue
+    // immediately on each iteration.  Power-saving tradeoffs can be
+    // revisited once the latency model is settled.
     loop {
         task::yield_now();
     }
@@ -472,7 +533,20 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 // Phase 54: ring-0 fat_server_task and vfs_server_task removed.
 // These are now userspace processes (userspace/fat_server, userspace/vfs_server).
 
-/// Idle task: halts the CPU between timer ticks.
+/// Idle task: halts the CPU between timer ticks, then explicitly yields.
+///
+/// Under voluntary preemption (the only mode after Phase 57e was deferred
+/// — see `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`),
+/// the timer IRQ handler only sets `reschedule`; it does not dispatch.
+/// A pure `enable_and_hlt` loop would therefore hlt again as soon as the
+/// IRQ returned, instead of running the task that the IPI was meant to
+/// wake.  The explicit `yield_now` after the wake is load-bearing — it
+/// turns the IRQ-set `reschedule` into an actual scheduler dispatch.
+///
+/// History: an earlier `preempt-full` mode handled this on IRQ-return via
+/// `check_and_preempt_kernel`, but that path was removed when 57e was
+/// deferred (commit a1bfe17 retired timer-driven kernel-mode preemption,
+/// commit d8278ca retired the feature flag).
 fn idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();

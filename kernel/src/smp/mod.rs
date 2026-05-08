@@ -217,24 +217,38 @@ pub struct PerCoreData {
     /// Top of this core's kernel syscall stack for SYSCALL entry.
     pub syscall_stack_top: u64,
     /// User RSP saved by `syscall_entry` assembly stub.
+    ///
+    /// Per-core for ABI reasons: the syscall-entry asm writes the slot via
+    /// gs-relative addressing (`SYSCALL_USER_RSP` offset), and the sysret
+    /// tail reads it the same way.  The canonical source of truth is the
+    /// per-task [`crate::task::TaskSyscallSnapshot::user_rsp`]; the per-core
+    /// slot is a mirror that is reliably refreshed from the per-task
+    /// snapshot on every dispatch with IRQs masked (see Phase 57e Bug #4
+    /// fix in `scheduler::run`, immediately before `switch_context`).
+    ///
+    /// Read sites:
+    ///  - syscall-entry / sysret asm (via `SYSCALL_USER_RSP`) — IRQs masked.
+    ///  - `snapshot_user_return_state()` inside `syscall_handler` — IRQs
+    ///    enabled at this point, but safe because the dispatcher already
+    ///    populated the slot from this task's per-task snapshot before
+    ///    handing control back, and a kernel-mode preempt that switches
+    ///    away will, on resume, re-mirror the slot from the per-task
+    ///    snapshot before any user-visible code runs.
     pub syscall_user_rsp: u64,
     /// R10 (syscall arg3) saved by `syscall_entry` assembly stub.
     pub syscall_arg3: u64,
-    /// Saved user callee-saved registers at syscall entry (for fork child restore).
-    pub syscall_user_rbx: u64,
-    pub syscall_user_rbp: u64,
-    pub syscall_user_r12: u64,
-    pub syscall_user_r13: u64,
-    pub syscall_user_r14: u64,
-    pub syscall_user_r15: u64,
-    /// Saved user caller-saved registers at syscall entry (Linux ABI preserves these).
-    pub syscall_user_rdi: u64,
-    pub syscall_user_rsi: u64,
-    pub syscall_user_rdx: u64,
-    pub syscall_user_r8: u64,
-    pub syscall_user_r9: u64,
-    pub syscall_user_r10: u64,
-    pub syscall_user_rflags: u64,
+    /// Phase 57e Bug #3 fix — pointer to the **current task's**
+    /// [`crate::task::TaskSyscallSnapshot`].  Updated by the dispatcher on
+    /// every dispatch, before `switch_context`.  The syscall-entry asm
+    /// loads this pointer and writes the user GPR snapshot through it, so
+    /// two tasks sharing a core can no longer alias the per-core slots.
+    /// `make_fork_ctx` and the syscall handlers that consume `r8`/`r9`/etc.
+    /// as extra args read the snapshot through this same pointer.
+    /// Raw pointer because the asm uses gs-relative indirection; the
+    /// snapshot itself lives in the [`crate::task::Task`] struct (heap,
+    /// stable address per Track B's `Vec<Box<Task>>` storage discipline).
+    /// Null only during very early boot before the first dispatch.
+    pub current_syscall_snapshot_ptr: core::cell::UnsafeCell<*mut crate::task::TaskSyscallSnapshot>,
 
     /// PID of the userspace process currently running on this core.
     /// 0 = no userspace process (kernel task context).
@@ -280,8 +294,25 @@ pub struct PerCoreData {
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
+    ///
+    /// Size 128 (not 4096, not 256) — the bootloader's 80 KiB kernel stack
+    /// can't hold a `Box::new(PerCoreData { ... })` literal whose `trace_ring`
+    /// alone is more than ~10 KiB, because debug builds don't elide the
+    /// construct-on-stack-then-memcpy-to-heap intermediate.  At 4096 entries
+    /// the inline ring was ~224 KiB and overflowed the stack on every
+    /// `init_bsp_per_core` call (the symptom: double-fault inside
+    /// `kernel::mm::frame_allocator::tests::allocate_frame_hot_path_tolerates_reentrant_free`,
+    /// RSP near the unmapped phys-offset boundary, CR2 = phys 0x438 unmapped).
+    /// At 256 entries the ring is ~14 KiB after the YieldNow `caller_file`
+    /// fields landed (568e5f6) — still tight enough to overflow when combined
+    /// with the rest of `PerCoreData` and active stack frames.  128 entries
+    /// (~7 KiB) is the largest size that comfortably fits the test harness's
+    /// stack budget in debug builds.  If a future workload needs deeper
+    /// history, swap to `Box<TraceRing<N>>` initialised via `Box::new_zeroed`
+    /// so the ring lives directly on the heap with no stack-resident copy.
+    /// Phase 57e deferral cleanup, 2026-05-07.
     #[cfg(feature = "trace")]
-    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<256>>,
+    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<128>>,
 
     // ----- Phase 57a B.3: lock-ordering guard -----
     /// Set to `true` while this core holds `SCHEDULER.lock`.
@@ -525,19 +556,9 @@ pub mod offsets {
     pub const SYSCALL_STACK_TOP: usize = core::mem::offset_of!(PerCoreData, syscall_stack_top);
     pub const SYSCALL_USER_RSP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsp);
     pub const SYSCALL_ARG3: usize = core::mem::offset_of!(PerCoreData, syscall_arg3);
-    pub const SYSCALL_USER_RBX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbx);
-    pub const SYSCALL_USER_RBP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbp);
-    pub const SYSCALL_USER_R12: usize = core::mem::offset_of!(PerCoreData, syscall_user_r12);
-    pub const SYSCALL_USER_R13: usize = core::mem::offset_of!(PerCoreData, syscall_user_r13);
-    pub const SYSCALL_USER_R14: usize = core::mem::offset_of!(PerCoreData, syscall_user_r14);
-    pub const SYSCALL_USER_R15: usize = core::mem::offset_of!(PerCoreData, syscall_user_r15);
-    pub const SYSCALL_USER_RDI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdi);
-    pub const SYSCALL_USER_RSI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsi);
-    pub const SYSCALL_USER_RDX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdx);
-    pub const SYSCALL_USER_R8: usize = core::mem::offset_of!(PerCoreData, syscall_user_r8);
-    pub const SYSCALL_USER_R9: usize = core::mem::offset_of!(PerCoreData, syscall_user_r9);
-    pub const SYSCALL_USER_R10: usize = core::mem::offset_of!(PerCoreData, syscall_user_r10);
-    pub const SYSCALL_USER_RFLAGS: usize = core::mem::offset_of!(PerCoreData, syscall_user_rflags);
+    /// Phase 57e Bug #3 fix — see [`PerCoreData::current_syscall_snapshot_ptr`].
+    pub const CURRENT_SYSCALL_SNAPSHOT_PTR: usize =
+        core::mem::offset_of!(PerCoreData, current_syscall_snapshot_ptr);
     pub const CURRENT_PID: usize = core::mem::offset_of!(PerCoreData, current_pid);
     pub const FORK_ENTRY_CTX: usize = core::mem::offset_of!(PerCoreData, fork_entry_ctx);
 }
@@ -634,19 +655,11 @@ pub fn init_bsp_per_core() {
         syscall_stack_top: bsp_stack_top,
         syscall_user_rsp: 0,
         syscall_arg3: 0,
-        syscall_user_rbx: 0,
-        syscall_user_rbp: 0,
-        syscall_user_r12: 0,
-        syscall_user_r13: 0,
-        syscall_user_r14: 0,
-        syscall_user_r15: 0,
-        syscall_user_rdi: 0,
-        syscall_user_rsi: 0,
-        syscall_user_rdx: 0,
-        syscall_user_r8: 0,
-        syscall_user_r9: 0,
-        syscall_user_r10: 0,
-        syscall_user_rflags: 0,
+        // Phase 57e Bug #3 fix — null until first dispatch sets it.
+        // syscall_entry asm dereferences this; if it fires before the
+        // dispatcher has run (impossible — userspace cannot syscall before
+        // init is dispatched) the kernel would fault on the null deref.
+        current_syscall_snapshot_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
         current_pid: AtomicU32::new(0),
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
@@ -759,19 +772,8 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         syscall_stack_top: kernel_stack_top,
         syscall_user_rsp: 0,
         syscall_arg3: 0,
-        syscall_user_rbx: 0,
-        syscall_user_rbp: 0,
-        syscall_user_r12: 0,
-        syscall_user_r13: 0,
-        syscall_user_r14: 0,
-        syscall_user_r15: 0,
-        syscall_user_rdi: 0,
-        syscall_user_rsi: 0,
-        syscall_user_rdx: 0,
-        syscall_user_r8: 0,
-        syscall_user_r9: 0,
-        syscall_user_r10: 0,
-        syscall_user_rflags: 0,
+        // Phase 57e Bug #3 fix — null until this AP's first dispatch.
+        current_syscall_snapshot_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
         current_pid: AtomicU32::new(0),
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
