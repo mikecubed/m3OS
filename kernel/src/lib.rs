@@ -50,6 +50,7 @@ pub mod smp;
 pub mod stdin;
 pub mod syscall;
 pub mod task;
+pub mod test_prelude;
 #[cfg(test)]
 pub mod testing;
 pub mod time;

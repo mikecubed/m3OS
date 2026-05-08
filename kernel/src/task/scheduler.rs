@@ -4534,7 +4534,7 @@ static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// only if `longest_len > shortest_len + BALANCE_THRESHOLD`. Phase 61 B.1 named
 /// the previously-anonymous `2` so that `kernel/tests/load_balance_smp.rs` can
 /// derive its assertion bound from the same source.
-pub(crate) const BALANCE_THRESHOLD: usize = 2;
+pub const BALANCE_THRESHOLD: usize = 2;
 
 /// Called from the BSP's scheduler loop at `kernel/src/task/scheduler.rs:3837`,
 /// every `BALANCE_COUNTER % 50 == 0` ticks (~500ms at 100 Hz). Reads each
