@@ -1372,6 +1372,49 @@ mod tests {
         );
     }
 
+    /// Phase 60 B.2 — Verify the new `xsave_cache` slot allocates and frees.
+    ///
+    /// Independent of the `task_cache` migration: the production
+    /// `xsave_cache` is exercised on every task spawn via
+    /// `alloc_task_slot`, but this smoke test confirms the named-cache
+    /// API remains usable at the slab level after the new member was added
+    /// to `KernelSlabCaches`.
+    #[test_case]
+    fn xsave_slab_cache_alloc_free() {
+        let caches = crate::mm::slab::caches();
+        let mut xsave_cache = caches.xsave_cache.lock();
+
+        let stats_before = xsave_cache.stats();
+
+        // Allocate 4 objects (one full page worth at 832-byte slots — page
+        // is 4096, so 4096/832 = 4 slots per page with leftover padding).
+        let mut addrs = alloc::vec::Vec::new();
+        for _ in 0..4 {
+            let addr = xsave_cache
+                .allocate(&mut || {
+                    let frame = crate::mm::frame_allocator::allocate_frame()?;
+                    Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
+                })
+                .expect("xsave_cache alloc failed");
+            addrs.push(addr);
+        }
+
+        let stats_during = xsave_cache.stats();
+        assert_eq!(stats_during.active_objects, stats_before.active_objects + 4);
+
+        for addr in addrs {
+            xsave_cache.free(addr as usize);
+        }
+
+        let stats_after = xsave_cache.stats();
+        assert_eq!(stats_after.active_objects, stats_before.active_objects);
+        serial_println!(
+            "xsave slab test: allocated {} objects (slot size {} bytes)",
+            4,
+            crate::mm::slab::XSAVE_CACHE_SLOT_SIZE,
+        );
+    }
+
     /// F: Verify frame statistics are consistent.
     #[test_case]
     fn frame_stats_consistent() {

@@ -1070,4 +1070,61 @@ mod tests {
             );
         }
     }
+
+    // Phase 60 Track B.2 — XSaveArea-cache regression.
+    //
+    // `xsave_cache` is sized to `XSAVE_AREA_SIZE = 832` bytes (see
+    // `kernel/src/mm/slab.rs::XSAVE_CACHE_SLOT_SIZE` and
+    // `kernel/src/arch/x86_64/cpuid.rs::XSAVE_AREA_SIZE`).  This host-side
+    // test mirrors the Task-cache regression at the XSaveArea slot size:
+    // alloc/free/reuse cycles must hit the same slot addresses without
+    // growing the slab page count.
+    #[test]
+    fn xsave_sized_slab_cache_alloc_free_reuse() {
+        const XSAVE_SLOT_SIZE: usize = 832;
+        const PAGE_SIZE: usize = 4096;
+
+        let mut pool = PagePool::new(PAGE_SIZE);
+        let mut cache = SlabCache::new(XSAVE_SLOT_SIZE, PAGE_SIZE);
+        let slots_per_page = PAGE_SIZE / XSAVE_SLOT_SIZE; // = 4
+
+        let mut addrs = Vec::new();
+        for _ in 0..slots_per_page {
+            addrs.push(
+                cache
+                    .allocate(&mut pool.allocator())
+                    .expect("XSaveArea-sized slab allocate should succeed within first page"),
+            );
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.total_slabs, 1);
+        assert_eq!(stats.active_objects, slots_per_page);
+
+        for &addr in &addrs {
+            cache.free(addr);
+        }
+        assert_eq!(cache.stats().active_objects, 0);
+
+        let prev_total = cache.stats().total_slabs;
+        let mut reused = Vec::new();
+        for _ in 0..slots_per_page {
+            reused.push(
+                cache
+                    .allocate(&mut pool.allocator())
+                    .expect("post-free reuse should not grow slab page count"),
+            );
+        }
+        assert_eq!(
+            cache.stats().total_slabs,
+            prev_total,
+            "reuse must not allocate a second page"
+        );
+        for addr in &reused {
+            assert!(
+                addrs.contains(addr),
+                "reused slot {:#x} not from original allocation set",
+                addr
+            );
+        }
+    }
 }

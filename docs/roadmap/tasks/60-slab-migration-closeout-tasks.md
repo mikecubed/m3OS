@@ -10,9 +10,9 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Audit `Box::new`/`Arc::new` sites; rank and document candidates and non-candidates | — | Done |
-| B | Migrate `Task` and `XSaveArea` to slab caches | A | In Progress |
-| C | Measure global-heap relief under 60-second IPC workload | B | Planned |
-| D | Regression suite — full QEMU + host tests after each migration | B | Planned |
+| B | Migrate `Task` and `XSaveArea` to slab caches | A | Done |
+| C | Measure global-heap relief under 60-second IPC workload | B | In Progress |
+| D | Regression suite — full QEMU + host tests after each migration | B | Done |
 | E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Planned |
 | F | Documentation and Release | B C D E | Planned |
 
@@ -70,12 +70,12 @@
 **Why it matters:** `XSaveArea` is allocated 1:1 with `Task` (once per task spawn). It is the second-largest hot heap-allocated kernel object after `Task`. Without a dedicated cache it stays on the global heap even after B.1 lands.
 
 **Acceptance:**
-- [ ] `xsave_cache: IrqSafeMutex<SlabCache>` added to `KernelSlabCaches` in `kernel/src/mm/slab.rs` (struct definition currently at lines 274-286).
-- [ ] `xsave_cache` initialised in `pub fn init()` (currently at `kernel/src/mm/slab.rs:319-340`) sized to `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE` (832 bytes — verify the const at `kernel/src/arch/x86_64/cpuid.rs:42`).
-- [ ] Both `Box::new(XSaveArea::new())` sites at `kernel/src/task/scheduler.rs:1092` and `:1098` replaced with `SlabBox::<XSaveArea>::new_in(&caches().xsave_cache, XSaveArea::new())`. The scheduler's `fpu_states: Vec<Box<XSaveArea>>` field is changed to `fpu_states: Vec<SlabBox<XSaveArea>>`.
-- [ ] `all_slab_stats()` (`kernel/src/mm/slab.rs:849`) extended to include `xsave_cache` stats; the smoke-test path in `kernel/src/main.rs` extended to exercise it.
-- [ ] `cargo xtask test` passes with no regression.
-- [ ] `cargo test -p kernel-core` passes with at least one new test exercising slab alloc/free/reuse for an `XSAVE_AREA_SIZE`-sized object.
+- [x] `xsave_cache: IrqSafeMutex<SlabCache>` added to `KernelSlabCaches` in `kernel/src/mm/slab.rs`.
+- [x] `xsave_cache` initialised in `pub fn init()` sized to `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE` (832 bytes) via new `XSAVE_CACHE_SLOT_SIZE` const.
+- [x] Both `Box::new(XSaveArea::new())` sites at `kernel/src/task/scheduler.rs:1092` and `:1098` replaced with `SlabBox::<XSaveArea>::new_in(&caches().xsave_cache, XSaveArea::new())`. The scheduler's `fpu_states: Vec<Box<XSaveArea>>` field is changed to `fpu_states: Vec<SlabBox<XSaveArea>>`.
+- [x] `all_slab_stats()` extended to include `xsave_cache` stats; meminfo formatter and the smoke-test path in `kernel/src/main.rs` (new `xsave_slab_cache_alloc_free` test_case) extended to exercise it.
+- [x] `cargo xtask test` passes with no regression.
+- [x] `cargo test -p kernel-core` passes with at least one new test exercising slab alloc/free/reuse for an `XSAVE_AREA_SIZE`-sized object.
 
 ---
 
@@ -108,11 +108,11 @@
 **Why it matters:** Slab migration changes the allocator path for two of the most lifecycle-critical kernel objects. A miscounted Drop or size mismatch causes a use-after-free or heap corruption.
 
 **Acceptance:**
-- [ ] `cargo xtask test` passes with zero regressions after B.1.
-- [ ] `cargo xtask test` passes with zero regressions after B.2.
-- [ ] `cargo test -p kernel-core` passes with the two new per-family slab unit tests added in B.1 and B.2.
-- [ ] `cargo xtask check` (clippy `-D warnings` + rustfmt) passes after each migration.
-- [ ] Any new `unsafe` block introduced by the slab-allocation helper has an adjacent `// SAFETY:` comment explaining the invariant.
+- [x] `cargo xtask test` passes with zero regressions after B.1.
+- [x] `cargo xtask test` passes with zero regressions after B.2.
+- [x] `cargo test -p kernel-core` passes with the two new per-family slab unit tests added in B.1 and B.2.
+- [x] `cargo xtask check` (clippy `-D warnings` + rustfmt) passes after each migration.
+- [x] Any new `unsafe` block introduced by the slab-allocation helper has an adjacent `// SAFETY:` comment explaining the invariant.
 
 ---
 

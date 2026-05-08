@@ -56,15 +56,23 @@ impl<T> SlabBox<T> {
     /// returns `None` on cache exhaustion; this constructor turns that into
     /// an explicit panic with a clear message.
     pub fn new_in(cache: &'static IrqSafeMutex<SlabCache>, value: T) -> Self {
-        // Compile-time alignment check.  The slab cache's per-slot alignment
-        // is determined by its `object_size` (which must be a multiple of
-        // `align_of::<usize>`), so the compiler-checked condition is that
-        // `T`'s required alignment does not exceed `usize`'s alignment.
-        // Larger-aligned types are rejected at compile time.
+        // Compile-time alignment check.  The slab cache's backing page is
+        // page-aligned (4096), and consecutive slots within the page are at
+        // multiples of `object_size`.  Slot addresses are therefore aligned
+        // to `gcd(4096, object_size)`, which always ≥ `align_of::<usize>`
+        // (the slab API enforces `object_size % align_of::<usize>() == 0`)
+        // and is `≥ align_of::<T>()` whenever the caller has sized the
+        // cache to a multiple of `align_of::<T>()`.
+        //
+        // Page size (4096) is the upper bound for any slab-backed slot
+        // alignment.  Higher-aligned types cannot be slab-allocated and are
+        // rejected at compile time.  The runtime `debug_assert!` below
+        // additionally catches a caller mis-sizing the cache so
+        // `object_size` is not a multiple of `align_of::<T>()`.
         const {
             assert!(
-                align_of::<T>() <= align_of::<usize>(),
-                "SlabBox<T>: T's alignment must not exceed usize's alignment"
+                align_of::<T>() <= 4096,
+                "SlabBox<T>: T's alignment must not exceed page size (4096)"
             );
         }
 

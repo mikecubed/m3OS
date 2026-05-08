@@ -220,8 +220,8 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::{boxed::Box, sync::Arc};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
@@ -567,8 +567,14 @@ pub(crate) struct Scheduler {
     /// preserve the slot's address across `*tasks[idx] = task` overwrites.
     tasks: Vec<crate::mm::slab_box::SlabBox<Task>>,
     /// Per-task FPU/SIMD state, indexed in lock-step with `tasks`.
-    #[allow(clippy::vec_box)]
-    fpu_states: Vec<Box<XSaveArea>>,
+    ///
+    /// Phase 60 — migrated from `Vec<Box<XSaveArea>>` to
+    /// `Vec<SlabBox<XSaveArea>>`.  Each [`XSaveArea`] is allocated from
+    /// [`crate::mm::slab::KernelSlabCaches::xsave_cache`] (slot size
+    /// `XSAVE_CACHE_SLOT_SIZE`, sourced from
+    /// `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`).  Allocation is 1:1
+    /// with `tasks` so `xsave_cache`'s hit rate tracks task spawns.
+    fpu_states: Vec<crate::mm::slab_box::SlabBox<XSaveArea>>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
@@ -1101,7 +1107,12 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         if idx < sched.fpu_states.len() {
             *sched.fpu_states[idx] = XSaveArea::new();
         } else {
-            sched.fpu_states.push(Box::new(XSaveArea::new()));
+            sched
+                .fpu_states
+                .push(crate::mm::slab_box::SlabBox::<XSaveArea>::new_in(
+                    &crate::mm::slab::caches().xsave_cache,
+                    XSaveArea::new(),
+                ));
         }
         idx
     } else {
@@ -1112,7 +1123,12 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
                 &crate::mm::slab::caches().task_cache,
                 task,
             ));
-        sched.fpu_states.push(Box::new(XSaveArea::new()));
+        sched
+            .fpu_states
+            .push(crate::mm::slab_box::SlabBox::<XSaveArea>::new_in(
+                &crate::mm::slab::caches().xsave_cache,
+                XSaveArea::new(),
+            ));
         idx
     }
 }
@@ -1127,6 +1143,18 @@ const _: () = assert!(
     "Task exceeds task_cache slot size; bump TASK_CACHE_SLOT_SIZE in \
      kernel/src/mm/slab.rs to the next power of two and update both this \
      assertion and the cache initialisation in slab::init()",
+);
+
+// Phase 60 — `XSaveArea` is allocated out of
+// [`crate::mm::slab::KernelSlabCaches::xsave_cache`].  The cache slot size
+// is derived from `crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`, which is
+// the same constant `XSaveArea` uses for its inner `[u8; _]` payload — so
+// the assertion below holds by construction.  Kept as a tripwire in case a
+// future refactor splits the constants.
+const _: () = assert!(
+    core::mem::size_of::<XSaveArea>() <= crate::mm::slab::XSAVE_CACHE_SLOT_SIZE,
+    "XSaveArea exceeds xsave_cache slot size; bump XSAVE_CACHE_SLOT_SIZE / \
+     XSAVE_AREA_SIZE so the cache fits the struct"
 );
 
 /// Spawn a new kernel task. The task is assigned to the least-loaded core

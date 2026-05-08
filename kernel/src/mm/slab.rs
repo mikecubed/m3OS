@@ -303,6 +303,18 @@ pub struct KernelSlabCaches {
     pub pipe_cache: IrqSafeMutex<SlabCache>,
     /// 256-byte objects.  Audit records that `UnixSocket`s live in slot tables.
     pub socket_cache: IrqSafeMutex<SlabCache>,
+    /// Object slot size for the per-task FPU/SIMD save area
+    /// ([`crate::task::XSaveArea`]).
+    ///
+    /// Phase 60 — added alongside `task_cache` migration.  Allocated 1:1
+    /// with `Task` (see `kernel/src/task/scheduler.rs::alloc_task_slot`),
+    /// so `xsave_cache`'s hit rate tracks task spawns directly.  Slot size
+    /// is `XSAVE_CACHE_SLOT_SIZE`, sourced from
+    /// [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes — the
+    /// `XSaveArea` struct is `#[repr(C, align(64))]` over a fixed-size byte
+    /// array; the slot size is a multiple of 64 so slot addresses retain
+    /// the type's alignment).
+    pub xsave_cache: IrqSafeMutex<SlabCache>,
 }
 
 /// Phase 60 — slot size for [`KernelSlabCaches::task_cache`].
@@ -310,6 +322,15 @@ pub struct KernelSlabCaches {
 /// Public so the scheduler-side `const _: () = assert!` can read it
 /// alongside `core::mem::size_of::<Task>()`.
 pub const TASK_CACHE_SLOT_SIZE: usize = 1024;
+
+/// Phase 60 — slot size for [`KernelSlabCaches::xsave_cache`].
+///
+/// Sourced from [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (currently
+/// 832 bytes — sufficient for x87 + SSE + AVX state on any CPU m3OS
+/// supports).  The constant is re-exported here so the slab subsystem owns
+/// the cache-sizing relationship explicitly without a cross-module import
+/// at the cache-init site.
+pub const XSAVE_CACHE_SLOT_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
 
 static SLAB_CACHES: spin::Once<KernelSlabCaches> = spin::Once::new();
 
@@ -367,6 +388,7 @@ pub fn init() {
         endpoint_cache: IrqSafeMutex::new(SlabCache::new(128, 4096)),
         pipe_cache: IrqSafeMutex::new(SlabCache::new(4096, 4096)),
         socket_cache: IrqSafeMutex::new(SlabCache::new(256, 4096)),
+        xsave_cache: IrqSafeMutex::new(SlabCache::new(XSAVE_CACHE_SLOT_SIZE, 4096)),
     });
     log::info!("[mm] slab caches initialized (13 size classes + depots)");
 }
@@ -875,6 +897,8 @@ pub struct AllSlabStats {
     pub endpoint: kernel_core::slab::SlabStats,
     pub pipe: kernel_core::slab::SlabStats,
     pub socket: kernel_core::slab::SlabStats,
+    /// Phase 60 — XSaveArea cache stats, allocated 1:1 with `Task`.
+    pub xsave: kernel_core::slab::SlabStats,
 }
 
 /// Returns a snapshot of all named slab cache statistics.
@@ -886,6 +910,7 @@ pub fn all_slab_stats() -> AllSlabStats {
         endpoint: c.endpoint_cache.lock().stats(),
         pipe: c.pipe_cache.lock().stats(),
         socket: c.socket_cache.lock().stats(),
+        xsave: c.xsave_cache.lock().stats(),
     }
 }
 
