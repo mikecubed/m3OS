@@ -321,6 +321,31 @@ fn init_task() -> ! {
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
     spawn_userspace_init();
 
+    // Phase 60 Track C — One-shot diagnostic.  After every kernel-side
+    // spawn() and the userspace init handoff, log task_cache and
+    // xsave_cache state so `cargo xtask run` traces carry a verbatim
+    // record of production-path slab activity.  Matches the data captured
+    // for the Phase 60 measurement handoff
+    // (`docs/handoffs/60c-slab-heap-measurement.md`).
+    {
+        let caches = mm::slab::caches();
+        let task_stats = caches.task_cache.lock().stats();
+        let xsave_stats = caches.xsave_cache.lock().stats();
+        let heap = mm::heap::heap_stats();
+        log::info!(
+            "[phase60] task_cache slabs={} active={} free={} | xsave_cache slabs={} active={} free={} | heap used={}KiB free={}KiB slab_pages={}",
+            task_stats.total_slabs,
+            task_stats.active_objects,
+            task_stats.free_slots,
+            xsave_stats.total_slabs,
+            xsave_stats.active_objects,
+            xsave_stats.free_slots,
+            heap.used_bytes / 1024,
+            heap.free_bytes / 1024,
+            heap.slab_pages,
+        );
+    }
+
     log::info!("[init] service set started — yielding");
     // Phase 57e Bug #6 (closed): the original `loop { task::yield_now(); }`
     // under preempt-full got stuck in `preempt_enable`'s zero-crossing
@@ -1369,6 +1394,71 @@ mod tests {
             "slab test: allocated {} objects using {} page(s)",
             10,
             page_counter
+        );
+    }
+
+    /// Phase 60 Track C — Heap-relief diagnostic.
+    ///
+    /// Snapshots `task_cache` / `xsave_cache` activity once the test
+    /// scheduler has spawned its workload so the serial output from
+    /// `cargo xtask test` carries a verbatim record for the Phase 60
+    /// measurement handoff (`docs/handoffs/60c-slab-heap-measurement.md`).
+    #[test_case]
+    fn phase60_heap_relief_stats_dump() {
+        let caches = crate::mm::slab::caches();
+        let task_stats = caches.task_cache.lock().stats();
+        let xsave_stats = caches.xsave_cache.lock().stats();
+        serial_println!(
+            "[phase60] task_cache slabs={} active={} free={} | xsave_cache slabs={} active={} free={}",
+            task_stats.total_slabs,
+            task_stats.active_objects,
+            task_stats.free_slots,
+            xsave_stats.total_slabs,
+            xsave_stats.active_objects,
+            xsave_stats.free_slots,
+        );
+    }
+
+    /// Phase 60 B.2 — Verify the new `xsave_cache` slot allocates and frees.
+    ///
+    /// Independent of the `task_cache` migration: the production
+    /// `xsave_cache` is exercised on every task spawn via
+    /// `alloc_task_slot`, but this smoke test confirms the named-cache
+    /// API remains usable at the slab level after the new member was added
+    /// to `KernelSlabCaches`.
+    #[test_case]
+    fn xsave_slab_cache_alloc_free() {
+        let caches = crate::mm::slab::caches();
+        let mut xsave_cache = caches.xsave_cache.lock();
+
+        let stats_before = xsave_cache.stats();
+
+        // Allocate 4 objects (one full page worth at 832-byte slots — page
+        // is 4096, so 4096/832 = 4 slots per page with leftover padding).
+        let mut addrs = alloc::vec::Vec::new();
+        for _ in 0..4 {
+            let addr = xsave_cache
+                .allocate(&mut || {
+                    let frame = crate::mm::frame_allocator::allocate_frame()?;
+                    Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
+                })
+                .expect("xsave_cache alloc failed");
+            addrs.push(addr);
+        }
+
+        let stats_during = xsave_cache.stats();
+        assert_eq!(stats_during.active_objects, stats_before.active_objects + 4);
+
+        for addr in addrs {
+            xsave_cache.free(addr as usize);
+        }
+
+        let stats_after = xsave_cache.stats();
+        assert_eq!(stats_after.active_objects, stats_before.active_objects);
+        serial_println!(
+            "xsave slab test: allocated {} objects (slot size {} bytes)",
+            4,
+            crate::mm::slab::XSAVE_CACHE_SLOT_SIZE,
         );
     }
 

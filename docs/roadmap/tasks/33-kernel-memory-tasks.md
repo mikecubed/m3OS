@@ -5,7 +5,7 @@
 **Depends on:** Phase 17 (Memory Reclamation) ✅, Phase 25 (SMP) ✅
 **Builds on:** Extends Phase 17 refcounted frame reclamation and Phase 25 TLB shootdown, while replacing the earlier free-list frame allocator and `munmap()` stub.
 **Goal:** Make the kernel memory subsystem robust and efficient: OOM-resilient heap, buddy frame allocator, slab caches for kernel objects, working `munmap()`, userspace heap coalescing, and memory statistics reporting.
-**Deferred Follow-ups:** A.4 dedicated OOM QEMU stress test, C.4 broad slab-backed object migration, D.4 userspace `munmap` loop binary, E.3 userspace heap coalescing binary, G.2 full memory stress test.
+**Deferred Follow-ups:** A.4 dedicated OOM QEMU stress test, D.4 userspace `munmap` loop binary, E.3 userspace heap coalescing binary, G.2 full memory stress test. (C.4 closed in Phase 60 — see `docs/handoffs/60c-slab-heap-measurement.md`.)
 
 ## Prerequisite Analysis
 
@@ -42,7 +42,7 @@ Phase 33 added or replaced the following:
 |---|---|---|---|
 | A | OOM retry: wrap global allocator to retry after heap growth | — | Done (A.4 QEMU test deferred) |
 | B | Buddy frame allocator: replace free-list with buddy system | — | Done |
-| C | Slab allocator: fixed-size caches for kernel objects | B | Done (C.4 migration deferred) |
+| C | Slab allocator: fixed-size caches for kernel objects | B | Done |
 | D | Working `munmap()`: frame reclamation + TLB shootdown | B | Done (D.4 test binary deferred) |
 | E | Userspace heap coalescing in `BrkAllocator` | — | Done (E.3 test binary deferred) |
 | F | Kernel heap statistics and reporting | A, C | Done |
@@ -208,12 +208,12 @@ This track adds slab-cache infrastructure on top of the buddy allocator, prepari
 **Symbol:** `KernelSlabCaches`
 **Why it matters:** Migrating hot kernel objects to slab caches is the follow-on step that would replace generic heap allocation for the most frequent fixed-size structures.
 
-**Deferred:** The slab-cache infrastructure is in place, but the broad object-allocation migration from the original plan remains deferred.
+**Migrated in Phase 60** — see `docs/handoffs/60c-slab-heap-measurement.md` and the design doc at `docs/roadmap/60-slab-migration-closeout.md`. Phase 60's Track A audit (`docs/handoffs/60a-allocation-audit.md`) confirmed that most "candidate" object families (`FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`) are stored inline in fixed-size slot arrays and therefore are not slab-migration candidates without a prior architectural refactor; the two genuinely heap-allocated hot kernel object families — `Task` and `XSaveArea` — were migrated to `task_cache` and a new `xsave_cache`, exactly satisfying this acceptance bar's "at least two" target.
 
 **Acceptance:**
-- [ ] At least two frequently allocated kernel object types use slab-backed allocation paths
-- [ ] Those migrated objects avoid general-purpose heap traversal on their fast allocation path
-- [ ] Existing tests continue to pass after the migration work lands
+- [x] At least two frequently allocated kernel object types use slab-backed allocation paths (Phase 60: `Task` → `task_cache`, `XSaveArea` → `xsave_cache`)
+- [x] Those migrated objects avoid general-purpose heap traversal on their fast allocation path (`SlabBox<T>` routes both alloc and free through the named cache; `cargo xtask run` measurement shows `task_cache.active = xsave_cache.active = 9` while pre-migration shows `task_cache.active = 0`)
+- [x] Existing tests continue to pass after the migration work lands (`cargo xtask test` 7/7, `cargo test -p kernel-core` green with two new alloc/free/reuse tests)
 
 ---
 
@@ -414,7 +414,6 @@ This track verifies that the new allocators, `munmap()` behavior, and reporting 
 ## Deferred Follow-ups
 
 - **A.4** — Add a dedicated QEMU OOM stress test for `RetryAllocator`.
-- **C.4** — Migrate hot kernel objects from generic heap allocation to slab caches.
 - **D.4** — Add a userspace regression binary for repeated `mmap()`/`munmap()` cycles.
 - **E.3** — Add a userspace regression binary that proves coalescing restores large allocations.
 - **G.2** — Add a full end-to-end memory stress test spanning allocators, mappings, and reclamation.

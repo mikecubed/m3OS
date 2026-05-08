@@ -65,9 +65,19 @@ Each slab cache:
 - Grows by allocating additional pages when the free-list is empty.
 - Optionally returns empty pages to the frame allocator.
 
-**Shipped state (audited in Phase 53a):** The slab-cache infrastructure and direct
-cache tests landed, but the main hot kernel object families were not broadly migrated
-to use it. Most kernel allocations still flow through the global linked-list heap.
+**Shipped state (audited in Phase 53a, closed in Phase 60):** The slab-cache
+infrastructure and direct cache tests landed in Phase 33; Phase 53a put the
+per-CPU magazine layer under the size-class fast path. Phase 60's Track A
+audit (`docs/handoffs/60a-allocation-audit.md`) found that most "candidate"
+kernel object families (`FdEntry`, `Endpoint`, `Notification`, `Pipe`,
+`UnixSocket`) are stored inline in fixed-size slot arrays — a different
+(equally valid) form of allocator avoidance that does not benefit from
+slab-cache migration without a prior architectural refactor. The two
+genuinely heap-allocated hot kernel object families — `Task` and
+`XSaveArea` — were migrated to `task_cache` and a new `xsave_cache` in
+Phase 60 via the `SlabBox<T>` newtype, satisfying Track C.4's "at least
+two frequently allocated kernel object types" acceptance bar with a
+recorded measurement (`docs/handoffs/60c-slab-heap-measurement.md`).
 
 ### Buddy Allocator for Page-Granularity Allocations
 

@@ -265,31 +265,82 @@ fn size_class_state_ready() -> bool {
 
 /// Pre-configured slab caches for common kernel object sizes.
 ///
-/// These caches are infrastructure for future migration of kernel object
-/// allocations (Phase 33, Track C.4 — deferred).
+/// Phase 60 — `task_cache` now backs every `Task` allocation via
+/// [`crate::mm::slab_box::SlabBox`] / `caches().task_cache.lock().allocate(...)`
+/// in `kernel/src/task/scheduler.rs`.  The `task_cache` slot size was bumped
+/// from 512 → `TASK_CACHE_SLOT_SIZE` to fit the current `Task` struct (a
+/// `const _: () = assert!` on `size_of::<Task>()` next to the allocation
+/// site catches future drift).  The remaining named caches (`fd_cache`,
+/// `endpoint_cache`, `pipe_cache`, `socket_cache`) are still infrastructure
+/// for hypothetical future migration; the Phase 60 audit
+/// (`docs/handoffs/60a-allocation-audit.md`) explains why each of those
+/// families is presently stored inline in slot arrays and is not a
+/// migration candidate without a prior architectural refactor.
 ///
 /// Phase 57b G.4 — each cache is wrapped in [`IrqSafeMutex`] so it inherits
 /// Track F.1's preempt-discipline.  Task-context only.
 #[allow(dead_code)]
 pub struct KernelSlabCaches {
-    /// 512-byte objects (e.g. task control blocks).
+    /// Object slot size for the [`crate::task::scheduler::Task`] cache.
+    ///
+    /// Phase 60 — bumped from 512 → 1024 because `core::mem::size_of::<Task>()`
+    /// exceeds 512 bytes after the Phase 57b/d preempt-frame and per-task
+    /// syscall-snapshot fields landed.  The exact `Task` size is asserted at
+    /// compile time in `kernel/src/task/scheduler.rs` via
+    /// `const _: () = assert!(size_of::<Task>() <= TASK_CACHE_SLOT_SIZE)`.
+    /// 1024 is the next power-of-two that fits and leaves comfortable
+    /// headroom for incremental field additions before the next bump.
     pub task_cache: IrqSafeMutex<SlabCache>,
-    /// 64-byte objects (e.g. file descriptors).
+    /// 64-byte objects.  Currently exercised only by the
+    /// `slab_cache_alloc_free` smoke test (`kernel/src/main.rs`); the audit
+    /// records that production `FdEntry`s live inline in
+    /// `[Option<FdEntry>; MAX_FDS]` per process.
     pub fd_cache: IrqSafeMutex<SlabCache>,
-    /// 128-byte objects (e.g. IPC endpoints).
+    /// 128-byte objects.  Audit records that `Endpoint`s live inline in
+    /// `EndpointRegistry::slots: Vec<Option<Endpoint>>`.
     pub endpoint_cache: IrqSafeMutex<SlabCache>,
-    /// 4096-byte objects (e.g. pipe buffers).
+    /// 4096-byte objects.  Audit records that `Pipe`s live in slot tables.
     pub pipe_cache: IrqSafeMutex<SlabCache>,
-    /// 256-byte objects (e.g. socket structures).
+    /// 256-byte objects.  Audit records that `UnixSocket`s live in slot tables.
     pub socket_cache: IrqSafeMutex<SlabCache>,
+    /// Object slot size for the per-task FPU/SIMD save area
+    /// ([`crate::task::XSaveArea`]).
+    ///
+    /// Phase 60 — added alongside `task_cache` migration.  Allocated 1:1
+    /// with `Task` (see `kernel/src/task/scheduler.rs::alloc_task_slot`),
+    /// so `xsave_cache`'s hit rate tracks task spawns directly.  Slot size
+    /// is `XSAVE_CACHE_SLOT_SIZE`, sourced from
+    /// [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (832 bytes — the
+    /// `XSaveArea` struct is `#[repr(C, align(64))]` over a fixed-size byte
+    /// array; the slot size is a multiple of 64 so slot addresses retain
+    /// the type's alignment).
+    pub xsave_cache: IrqSafeMutex<SlabCache>,
 }
+
+/// Phase 60 — slot size for [`KernelSlabCaches::task_cache`].
+///
+/// Public so the scheduler-side `const _: () = assert!` can read it
+/// alongside `core::mem::size_of::<Task>()`.
+pub const TASK_CACHE_SLOT_SIZE: usize = 1024;
+
+/// Phase 60 — slot size for [`KernelSlabCaches::xsave_cache`].
+///
+/// Sourced from [`crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE`] (currently
+/// 832 bytes — sufficient for x87 + SSE + AVX state on any CPU m3OS
+/// supports).  The constant is re-exported here so the slab subsystem owns
+/// the cache-sizing relationship explicitly without a cross-module import
+/// at the cache-init site.
+pub const XSAVE_CACHE_SLOT_SIZE: usize = crate::arch::x86_64::cpuid::XSAVE_AREA_SIZE;
 
 static SLAB_CACHES: spin::Once<KernelSlabCaches> = spin::Once::new();
 
 /// Page allocator callback for slab caches: obtains a virtual-address page
 /// backed by a physical frame.
-#[allow(dead_code)]
-fn slab_page_alloc() -> Option<usize> {
+///
+/// Phase 60 — made `pub(crate)` so [`crate::mm::slab_box::SlabBox`] can pass
+/// it as the page-allocator callback to `cache.allocate(...)` from outside
+/// this module.
+pub(crate) fn slab_page_alloc() -> Option<usize> {
     let frame = crate::mm::frame_allocator::allocate_frame()?;
     Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
 }
@@ -328,13 +379,16 @@ pub fn init() {
         })
     });
 
-    // Named caches (backward compatibility).
+    // Named caches.  Phase 60 wires `task_cache` through the real `Task`
+    // allocation path in `kernel/src/task/scheduler.rs` via
+    // `crate::mm::slab_box::SlabBox`.
     SLAB_CACHES.call_once(|| KernelSlabCaches {
-        task_cache: IrqSafeMutex::new(SlabCache::new(512, 4096)),
+        task_cache: IrqSafeMutex::new(SlabCache::new(TASK_CACHE_SLOT_SIZE, 4096)),
         fd_cache: IrqSafeMutex::new(SlabCache::new(64, 4096)),
         endpoint_cache: IrqSafeMutex::new(SlabCache::new(128, 4096)),
         pipe_cache: IrqSafeMutex::new(SlabCache::new(4096, 4096)),
         socket_cache: IrqSafeMutex::new(SlabCache::new(256, 4096)),
+        xsave_cache: IrqSafeMutex::new(SlabCache::new(XSAVE_CACHE_SLOT_SIZE, 4096)),
     });
     log::info!("[mm] slab caches initialized (13 size classes + depots)");
 }
@@ -843,6 +897,8 @@ pub struct AllSlabStats {
     pub endpoint: kernel_core::slab::SlabStats,
     pub pipe: kernel_core::slab::SlabStats,
     pub socket: kernel_core::slab::SlabStats,
+    /// Phase 60 — XSaveArea cache stats, allocated 1:1 with `Task`.
+    pub xsave: kernel_core::slab::SlabStats,
 }
 
 /// Returns a snapshot of all named slab cache statistics.
@@ -854,6 +910,7 @@ pub fn all_slab_stats() -> AllSlabStats {
         endpoint: c.endpoint_cache.lock().stats(),
         pipe: c.pipe_cache.lock().stats(),
         socket: c.socket_cache.lock().stats(),
+        xsave: c.xsave_cache.lock().stats(),
     }
 }
 
