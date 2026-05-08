@@ -195,3 +195,69 @@ fn rusage_counters_increment_and_accumulate() {
 
     kernel::serial_println!("[e4-test] rusage counter increment + recursive accumulation verified");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 61 Track E.2 — per-tick CS-based user/system tick split
+// ---------------------------------------------------------------------------
+
+#[test_case]
+fn per_tick_sampling_increments_system_ticks_for_kernel_task() {
+    // The test runner task is a kernel task — when it executes, it does so
+    // in ring 0. Per-tick CPU sampling at the timer IRQ
+    // (`tick_account_current_task(false)` when the interrupted CS is
+    // ring 0) increments `system_ticks` for every timer tick that hits
+    // while this task is running. Sample wall-clock ticks; spin
+    // (non-yielding) for several timer ticks; verify `system_ticks`
+    // increased.
+    //
+    // Pre-Phase 61 (Track E.2), `accumulate_ticks` attributed all elapsed
+    // time to `user_ticks` regardless of ring, making this assertion
+    // false. The Phase 35 H.2 acceptance line was stale until now.
+
+    let (u0, s0) = kernel::task::scheduler::current_task_times().unwrap();
+    let start = kernel::arch::x86_64::interrupts::tick_count();
+
+    // Stay running (no yield) for ~150 ticks. Timer IRQ fires every tick;
+    // each fire while we're executing here is attributed to system_ticks.
+    while kernel::arch::x86_64::interrupts::tick_count().saturating_sub(start) < 150 {
+        for _ in 0..1_000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    let (u1, s1) = kernel::task::scheduler::current_task_times().unwrap();
+    kernel::serial_println!(
+        "[e2-test] before: user={} system={}; after: user={} system={}",
+        u0,
+        s0,
+        u1,
+        s1
+    );
+
+    // system_ticks must have advanced — the runner is a kernel task that
+    // ran continuously for ~150 timer ticks of wall time, every tick
+    // attributed to ring 0.
+    assert!(
+        s1 > s0,
+        "system_ticks did not advance during kernel-mode execution: \
+         {s0} -> {s1} (Track E.2 — per-tick CS sampling)",
+    );
+
+    // user_ticks must not increase from kernel-only execution. (A small
+    // delta could in principle occur if the test runner was somehow
+    // scheduled in ring 3 — but kernel tasks never enter ring 3, so this
+    // upper bound pins the contract.)
+    assert_eq!(
+        u0, u1,
+        "user_ticks should not advance during pure kernel-mode execution: \
+         {u0} -> {u1} (Track E.2 — per-tick CS sampling)",
+    );
+
+    kernel::serial_println!(
+        "[e2-test] per-tick CS sampling for kernel-mode tasks verified: \
+         system_ticks {} -> {} (delta {})",
+        s0,
+        s1,
+        s1 - s0
+    );
+}

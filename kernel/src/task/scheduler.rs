@@ -1309,15 +1309,70 @@ pub fn spawn_idle(entry: fn() -> !) {
     spawn_idle_for_core(entry, 0);
 }
 
-/// Accumulate elapsed ticks for the current task.
+/// Phase 61 Track E.2 — no-op stub retained for callsite stability.
 ///
-/// Currently all ticks are attributed to `user_ticks`. Splitting ticks into
-/// user vs system (ring 3 vs ring 0) requires tracking the syscall-entry
-/// boundary and is deferred to a future phase.
-fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
-    let now = crate::arch::x86_64::interrupts::tick_count();
-    let elapsed = now.saturating_sub(sched.tasks[idx].start_tick);
-    sched.tasks[idx].user_ticks += elapsed;
+/// Pre-Phase 61: this function added the running task's elapsed ticks to
+/// `user_ticks` on every yield / preempt. The behaviour was wrong — it
+/// attributed ALL elapsed time to user mode regardless of the actual
+/// ring the task spent its time in, which made Phase 35 H.2's
+/// `system_ticks increases during syscall handling` claim false. CPU
+/// time accounting now uses per-tick CS-based sampling driven from the
+/// timer IRQ handler (`tick_account_current_task` in
+/// `kernel/src/arch/x86_64/interrupts.rs`): each timer tick the
+/// running task gets +1 user or +1 system based on the ring of the
+/// interrupted CS, which matches Linux's `CONFIG_TICK_CPU_ACCOUNTING`
+/// model and makes both `tms_utime` and `tms_stime` accurate to the
+/// timer-tick granularity.
+///
+/// Kept as a no-op rather than removed so callers in `yield_now` and
+/// `preempt_frame_to_scheduler` need no edits.
+fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
+    // No-op — per-tick sampling at the timer IRQ owns user / system tick
+    // attribution post-Phase 61 Track E.2.
+}
+
+/// Phase 61 Track E.2 — per-tick CPU-time accounting for the currently
+/// running task on the calling core. Called from the timer IRQ handler
+/// (both ring-3 and ring-0 paths) once per tick. Matches Linux's
+/// `CONFIG_TICK_CPU_ACCOUNTING` semantics.
+///
+/// `in_user_mode == true` increments `user_ticks` by 1 (interrupted in
+/// ring 3); `false` increments `system_ticks` by 1 (interrupted in ring 0,
+/// i.e. inside a syscall handler or kernel work).
+///
+/// Skips the idle task (priority 30) and any task that is no longer
+/// `Running`. The function is best-effort and silently no-ops when no
+/// current task is present (early boot, between dispatches, etc.) — in
+/// particular, it bails before reading `per_core` if SMP per-core data
+/// is not yet ready, which can happen during the early-boot window
+/// between `arch::enable_interrupts()` and `smp::init_bsp_per_core()`.
+pub fn tick_account_current_task(in_user_mode: bool) {
+    if !crate::smp::is_per_core_ready() {
+        return;
+    }
+    let Some(idx) = get_current_task_idx() else {
+        return;
+    };
+    let mut sched = scheduler_lock();
+    if let Some(task) = sched.tasks.get_mut(idx) {
+        // Skip the idle task — its time is not interesting and counting
+        // it would falsely inflate `system_ticks` whenever the CPU is
+        // halted in `enable_and_hlt`.
+        if task.priority == 30 {
+            return;
+        }
+        // Defensive: if for any reason the current task is not Running
+        // (state-machine race during a transition), don't attribute the
+        // tick. Same convention as `accumulate_ticks` had.
+        if task.state != TaskState::Running {
+            return;
+        }
+        if in_user_mode {
+            task.user_ticks = task.user_ticks.saturating_add(1);
+        } else {
+            task.system_ticks = task.system_ticks.saturating_add(1);
+        }
+    }
 }
 
 fn current_user_return_addr_space_snapshot(pid: u32) -> (u64, u64) {
