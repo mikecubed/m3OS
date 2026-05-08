@@ -84,7 +84,7 @@
 **Why it matters:** Phase 35's design doc violates the template (missing two required header fields). Note: the 2026-05-08 audit also flagged `AGENTS.md` as stale at v0.51.0, but the file has since been refreshed to v0.57.0; the only remaining `AGENTS.md` change for this phase is the v0.58.0 bump in H.2.
 
 **Acceptance:**
-- [ ] `docs/roadmap/35-true-smp-multitasking.md` has `Status:` and `Source Ref: phase-35` as the first two header lines.
+- [x] `docs/roadmap/35-true-smp-multitasking.md` has `Status:` and `Source Ref: phase-35` as the first two header lines.
 
 ---
 
