@@ -248,9 +248,9 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Symbol:** `pipe_read`, `pipe_write`
 **Why it matters:** This follow-up would replace the earlier Phase 14 pipe would-block path with an explicit per-resource wait queue.
 **Acceptance:**
-- [ ] Pending Phase 61 Track F — `pipe_read`/`pipe_write` would-block path replacement with `WaitQueue` remains scheduled for completion in Track F (the scope was confirmed and a real bug surfaced via Track B's load-balance test took priority within the same PR).
-- [ ] Pending Phase 61 Track F — pipe sleep/wake integration with `WaitQueue`.
-- [ ] Pending Phase 61 Track F — cross-core pipe wake behavior validation lands alongside Track F.
+- [x] Phase 61 closure: `sys_read` / `sys_write` pipe paths now register on `PIPE_WAITQUEUES` and call `block_current_until(BlockedOnRecv/Send, &woken)` instead of yield-polling. See `kernel/src/arch/x86_64/syscall/mod.rs` `FdBackend::PipeRead` / `PipeWrite` arms.
+- [x] Phase 61 closure: integration done in Track F; verified by `kernel/tests/pipe_wakeup_smp.rs` — observed 1-tick cross-core wake latency from `pipe_write` → reader resumption.
+- [x] Phase 61 closure: cross-core pipe wakeup validated by `kernel/tests/pipe_wakeup_smp.rs` against the object-attached `PIPE_WAITQUEUES` (`kernel/src/pipe.rs:32`) and the new blocking-sleep path.
 
 ### G.3 — Attach wait queues to IPC endpoints
 **File:** `kernel/src/ipc/endpoint.rs`
