@@ -8974,6 +8974,11 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     let freed_count = unmapped_addrs.len();
 
     // SMP TLB shootdown: batch invalidation for the entire unmapped range.
+    // Phase 25 P25-T033 closure (verified Phase 61 C.1): this call wires
+    // tlb_shootdown_range into sys_linux_munmap; the per-page unmap loop above
+    // defers its local TLB flush (`flush.ignore()`) so the entire range is
+    // invalidated in a single batched IPI here. Cross-core regression test:
+    // kernel/tests/munmap_tlb_smp.rs.
     if !unmapped_addrs.is_empty() {
         let range_start = *unmapped_addrs.iter().min().unwrap();
         let range_end = *unmapped_addrs.iter().max().unwrap() + 4096;

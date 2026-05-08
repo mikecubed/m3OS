@@ -4530,9 +4530,24 @@ fn drive_expired_wake_deadlines() {
 /// (~500ms at 100 Hz).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Called from the BSP's scheduler loop. Every 50 ticks (~500ms), checks
-/// queue imbalance and migrates one task if the longest queue exceeds the
-/// shortest by >2. Tasks that were recently migrated are skipped (cooldown).
+/// Threshold for when load balancing kicks in: a queue is considered imbalanced
+/// only if `longest_len > shortest_len + BALANCE_THRESHOLD`. Phase 61 B.1 named
+/// the previously-anonymous `2` so that `kernel/tests/load_balance_smp.rs` can
+/// derive its assertion bound from the same source.
+pub(crate) const BALANCE_THRESHOLD: usize = 2;
+
+/// Called from the BSP's scheduler loop at `kernel/src/task/scheduler.rs:3837`,
+/// every `BALANCE_COUNTER % 50 == 0` ticks (~500ms at 100 Hz). Reads each
+/// core's run-queue length via `CoreData::with_run_queue(|q| q.len())` and
+/// migrates one task per cycle when `longest_len > shortest_len +
+/// BALANCE_THRESHOLD`. Recently-migrated tasks are skipped (`MIGRATE_COOLDOWN`).
+///
+/// Phase 61 A.1 design note: queue length is read directly from the per-core
+/// `VecDeque<usize>` under `with_run_queue` rather than maintained as a
+/// parallel `AtomicU32` counter (the form Phase 35 E.1 originally planned).
+/// `VecDeque::len()` is O(1), the lock is already held for the read, and a
+/// parallel counter would create a second source of truth that drifts on every
+/// `enqueue` / `dequeue` mistake. The simpler design is the final design.
 pub fn maybe_load_balance() {
     let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if !cnt.is_multiple_of(50) {
@@ -4562,8 +4577,8 @@ pub fn maybe_load_balance() {
             }
         }
     }
-    if longest_len <= shortest_len + 2 {
-        return; // Balanced enough — require > 2 difference to avoid thrashing.
+    if longest_len <= shortest_len + BALANCE_THRESHOLD {
+        return; // Balanced enough — require > BALANCE_THRESHOLD diff to avoid thrash.
     }
     let current_tick = crate::arch::x86_64::interrupts::tick_count();
     // Migrate one task from longest to shortest.
