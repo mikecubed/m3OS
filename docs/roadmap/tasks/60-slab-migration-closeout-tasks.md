@@ -1,6 +1,6 @@
 # Phase 60 — Phase 33 Slab Migration Closeout: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-60
 **Depends on:** Phase 33 (Kernel Memory Improvements) ✅, Phase 53a (Kernel Memory Modernization) ✅, Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Goal:** Audit every kernel `Box::new` / `Arc::new` site, document why most "candidate" object families (`FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`, `MemoryMapping`) are stored inline in slot arrays or BTreeMap nodes and therefore not slab-migration candidates, then migrate the two genuinely heap-allocated hot kernel object families (`Task` and `XSaveArea`) onto the existing `KernelSlabCaches` infrastructure. Measure global-heap relief using `heap_stats()` + `all_slab_stats()`. Flip Phase 33 task-doc C.4 (`docs/roadmap/tasks/33-kernel-memory-tasks.md`) from `[ ] Deferred` to `[x]` with a measurement citation.
@@ -9,8 +9,8 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit `Box::new`/`Arc::new` sites; rank and document candidates and non-candidates | — | Planned |
-| B | Migrate `Task` and `XSaveArea` to slab caches | A | Planned |
+| A | Audit `Box::new`/`Arc::new` sites; rank and document candidates and non-candidates | — | Done |
+| B | Migrate `Task` and `XSaveArea` to slab caches | A | In Progress |
 | C | Measure global-heap relief under 60-second IPC workload | B | Planned |
 | D | Regression suite — full QEMU + host tests after each migration | B | Planned |
 | E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Planned |
@@ -37,11 +37,11 @@
 **Why it matters:** The original Phase 60 plan named five "hottest object families" without verifying that each was actually heap-allocated. Track A replaces that assumption with a written audit. The audit doc is the durable record that prevents future phases from repeating the same mistake.
 
 **Acceptance:**
-- [ ] `grep -rn 'Box::new\|Arc::new' kernel/src/` output captured and each site classified by: type allocated, frequency tier (per-syscall / per-process / per-CPU / once-at-boot), fixed-size-ness, and current allocator path.
-- [ ] `docs/handoffs/60a-allocation-audit.md` created with a ranked table of all sites.
-- [ ] The audit explicitly lists `FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket` as inline-slot-array non-candidates with the file:line of each slot-array storage site, and `MemoryMapping` as a BTreeMap-node non-candidate.
-- [ ] The audit explicitly lists `Task` and `XSaveArea` as the two confirmed migration candidates, with `kernel/src/task/scheduler.rs:1092, 1097, 1098, 3651` cited.
-- [ ] The audit notes that kernel stacks (`kernel/src/process/mod.rs:987`, `KERNEL_STACK_SIZE = 32 KiB`) are buddy-sized rather than slab-sized and explicitly defer them to a post-1.0 stack pool.
+- [x] `grep -rn 'Box::new\|Arc::new' kernel/src/` output captured and each site classified by: type allocated, frequency tier (per-syscall / per-process / per-CPU / once-at-boot), fixed-size-ness, and current allocator path.
+- [x] `docs/handoffs/60a-allocation-audit.md` created with a ranked table of all sites.
+- [x] The audit explicitly lists `FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket` as inline-slot-array non-candidates with the file:line of each slot-array storage site, and `MemoryMapping` as a BTreeMap-node non-candidate.
+- [x] The audit explicitly lists `Task` and `XSaveArea` as the two confirmed migration candidates, with `kernel/src/task/scheduler.rs:1092, 1097, 1098, 3651` cited.
+- [x] The audit notes that kernel stacks (`kernel/src/process/mod.rs:987`, `KERNEL_STACK_SIZE = 32 KiB`) are buddy-sized rather than slab-sized and explicitly defer them to a post-1.0 stack pool.
 
 ---
 
