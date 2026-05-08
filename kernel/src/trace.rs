@@ -59,13 +59,22 @@ pub fn dump_trace_rings() {
 /// running kernel — keeps the non-preemptible serial-write window short
 /// and reduces the chance that a long dump destabilises an already-fragile
 /// kernel state.
+///
+/// `max_per_core == usize::MAX` is treated as a sentinel meaning "all
+/// events" (used by [`dump_trace_rings`]) and the header is adjusted
+/// accordingly so the output reads naturally rather than printing the
+/// literal sentinel.
 #[cfg(feature = "trace")]
 pub fn dump_trace_rings_recent(max_per_core: usize) {
     use crate::serial::_panic_print;
 
-    _panic_print(format_args!(
-        "=== TRACE RING DUMP (last {max_per_core} per core) ===\n"
-    ));
+    if max_per_core == usize::MAX {
+        _panic_print(format_args!("=== TRACE RING DUMP (all per core) ===\n"));
+    } else {
+        _panic_print(format_args!(
+            "=== TRACE RING DUMP (last {max_per_core} per core) ===\n"
+        ));
+    }
 
     let core_count = crate::smp::core_count();
     let mut any_events = false;

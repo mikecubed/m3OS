@@ -533,29 +533,21 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 // Phase 54: ring-0 fat_server_task and vfs_server_task removed.
 // These are now userspace processes (userspace/fat_server, userspace/vfs_server).
 
-/// Idle task: halts the CPU between timer ticks.
+/// Idle task: halts the CPU between timer ticks, then explicitly yields.
 ///
-/// Under `preempt-voluntary` we explicitly yield after the IRQ that woke us
-/// finishes — the IRQ handler only sets `reschedule`, it does not dispatch,
-/// so without the yield we'd hlt again instead of running the task that the
-/// IPI was meant to wake.
+/// Under voluntary preemption (the only mode after Phase 57e was deferred
+/// — see `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`),
+/// the timer IRQ handler only sets `reschedule`; it does not dispatch.
+/// A pure `enable_and_hlt` loop would therefore hlt again as soon as the
+/// IRQ returned, instead of running the task that the IPI was meant to
+/// wake.  The explicit `yield_now` after the wake is load-bearing — it
+/// turns the IRQ-set `reschedule` into an actual scheduler dispatch.
 ///
-/// Under `preempt-full` the kernel-mode preempt path in
-/// `check_and_preempt_kernel` already dispatches on IRQ-return when
-/// `reschedule` is set, so the yield is redundant.  Worse, the
-/// `SchedulerGuard::drop` inside `yield_now` hits `preempt_enable`'s
-/// zero-crossing branch (`scheduler.rs:1693-1714`); if cross-core IPC keeps
-/// setting `reschedule` on this core, that branch synchronously calls
-/// `yield_now` again and the scheduler picks idle as the only ready task —
-/// a 30-second livelock equivalent to the Bug #6 init_task pattern.  Same
-/// mitigation: just halt.
+/// History: an earlier `preempt-full` mode handled this on IRQ-return via
+/// `check_and_preempt_kernel`, but that path was removed when 57e was
+/// deferred (commit a1bfe17 retired timer-driven kernel-mode preemption,
+/// commit d8278ca retired the feature flag).
 fn idle_task() -> ! {
-    // Phase 57e Bug #12 part 7 — yield in both modes.  Bug #6's eager-
-    // yield livelock is closed (8b44442); the `yield_now` is now a
-    // simple cooperative dispatch point.  Bug #12 part 7 (a1bfe17)
-    // removed timer-driven kernel-mode preemption, so a pure
-    // `enable_and_hlt` loop can no longer rely on the timer ISR to
-    // kick the scheduler — the explicit yield_now is now load-bearing.
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
         task::yield_now();

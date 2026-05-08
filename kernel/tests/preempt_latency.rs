@@ -4,19 +4,26 @@
 #![test_runner(test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-//! Phase 57e Track E — per-trigger preemption-latency benchmarks.
+//! Phase 57e Track E — per-trigger preemption-latency benchmark scaffolding
+//! (historical; preserved as `#[ignore]` stubs).
 //!
-//! Four benchmarks measure structurally different trigger paths because
-//! dropping the 57d `from_user` check affects them by very different amounts.
-//! Each benchmark establishes a 57d baseline first (run with `preempt-full`
-//! *off*) and then measures under 57e (run with `preempt-full` *on*).
+//! These four benchmarks were originally written to compare the deferred
+//! `preempt-full` mode against voluntary preemption.  Phase 57e was deferred
+//! in favour of voluntary-only (see
+//! `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`) and the
+//! `preempt-full` Cargo feature was retired (commit d8278ca).  The benchmark
+//! scaffolding is kept under voluntary-only framing because the trigger paths
+//! themselves (cross-core IPI wakeup, same-core wakeup, timer tick,
+//! `preempt_enable` zero-crossing) still describe meaningful latency
+//! windows for the current voluntary model and any future `cond_resched`-style
+//! explicit-yield work.
 //!
-//! | Bench | Trigger path | 57e expectation |
+//! | Bench | Trigger path | What it would measure under voluntary |
 //! |---|---|---|
-//! | E.1 | Cross-core reschedule-IPI wakeup | ≥10× P95 drop (microsecond range) |
-//! | E.2 | Same-core wakeup (futex) | No regression vs 57d |
-//! | E.3 | Timer-only kernel-mode preemption | < 1.5 × `1000 / TICKS_PER_SEC` ms |
-//! | E.4 | `preempt_enable` zero-crossing | Microsecond range when preempt-safe |
+//! | E.1 | Cross-core reschedule-IPI wakeup | Wake-to-dispatch latency on the wakee core |
+//! | E.2 | Same-core wakeup (futex) | Wake-to-yield latency on the running core |
+//! | E.3 | Timer-only kernel-mode rotation | Tick-to-yield latency at the user-mode-return boundary |
+//! | E.4 | `preempt_enable` zero-crossing | Latency from deferred-yield consumption to dispatch |
 //!
 //! # Live tests vs. `#[ignore]` stubs
 //!
@@ -32,7 +39,7 @@
 //! (timestamp source, percentile aggregator) so a future activator has a
 //! green baseline to extend.
 //!
-//! Source ref: phase-57e-track-E
+//! Source ref: phase-57e-track-E (retained under voluntary-only framing)
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 use core::alloc::{GlobalAlloc, Layout};
