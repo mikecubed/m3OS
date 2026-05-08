@@ -1,6 +1,6 @@
 # Phase 57d — Voluntary Preemption (PREEMPT_VOLUNTARY)
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57d
 **Depends on:** Phase 3 (Interrupts) ✅, Phase 4 (Tasking) ✅, Phase 25 (SMP) ✅, Phase 35 (True SMP) ✅, Phase 57a (Scheduler Block/Wake Protocol Rewrite) ✅, Phase 57b (Preemption Foundation) ✅
 **Builds on:** Activates the 57b foundation: the timer IRQ handler is extended to fire `preempt_to_scheduler` whenever the interrupted code is in user mode, `preempt_count == 0`, and the per-core `reschedule` flag is set.  The 57b `PreemptFrame` save area becomes live; the 57b `preempt_count` discipline becomes load-bearing.

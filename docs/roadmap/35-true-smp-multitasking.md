@@ -1,4 +1,10 @@
-# Phase 35 - True SMP Multitasking
+# Phase 35 — True SMP Multitasking
+
+**Status:** Complete
+**Source Ref:** phase-35
+**Depends on:** Phase 25 (SMP) ✅
+**Builds on:** Removes Phase 25's BSP-only syscall dispatch by making syscall stacks and user-state registers per-core; adds per-CPU run queues with load balancing and task priorities on top of the Phase 25 scheduler.
+**Primary Components:** kernel/src/arch/x86_64/syscall/, kernel/src/cpu.rs (`PerCoreData`), kernel/src/task/scheduler.rs, kernel/src/task/run_queue.rs
 
 ## Milestone Goal
 

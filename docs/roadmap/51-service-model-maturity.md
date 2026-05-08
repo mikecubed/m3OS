@@ -1,6 +1,8 @@
 # Phase 51 - Service Model Maturity
 
-**Status:** In Progress
+> **Phase 58 closure note (2026-05-08):** Phase 51 was originally written as a separate "harden Phase 46's service model" increment. In practice, Phase 46's actual implementation absorbed the maturity work that this doc anticipated — see Phase 46's task-doc verification section in `docs/roadmap/tasks/46-system-services-tasks.md` (added by Phase 58 Track A.2). The five Phase 51 acceptance criteria below all map to shipped Phase 46 capabilities: stable service-definition contract (`userspace/init/src/main.rs::ServiceDef`), trusted restart/status semantics (`ServiceStatus`, `try_transition`, `maybe_restart_service`), deterministic shutdown (`shutdown_services`, `next_stoppable`), coherent logging path (`syslogd` + `logger`), and a documented onboarding path for later extracted services (used by Phase 52a–52d, Phase 55b ring-3 drivers, and Phase 56 `display_server`/`kbd_server`/`mouse_server`). No separate Phase 51 task doc was ever authored; the README row is updated to reflect the merge.
+
+**Status:** Complete (folded into Phase 46 — see "Phase 58 closure note" below)
 **Source Ref:** phase-51
 **Depends on:** Phase 39 (Unix Domain Sockets) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 50 (IPC Completion) ✅
 **Builds on:** Hardens and extends the Phase 46 service manager, logging, and admin surface so later extracted services can be supervised like real first-class system components
@@ -113,7 +115,7 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 
 ## Companion Task List
 
-- [Phase 51 Task List](./tasks/51-service-model-maturity-tasks.md)
+- No standalone Phase 51 task doc — the maturity work was verified shipped through Phase 46's task doc (`docs/roadmap/tasks/46-system-services-tasks.md`) during the Phase 58 reconciliation pass.
 
 ## How Real OS Implementations Differ
 

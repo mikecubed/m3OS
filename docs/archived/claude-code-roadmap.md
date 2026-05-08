@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — tooling-meta plan; not implementation-blocking. Original content preserved below for historical reference.
+
 # Road to Claude Code on m3OS
 
 This document details the path to running Claude Code -- Anthropic's AI

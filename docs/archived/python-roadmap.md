@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — post-1.0 language port plan. Original content preserved below for historical reference.
+
 # Road to Python on m3OS
 
 This document details the path to running CPython inside m3OS via

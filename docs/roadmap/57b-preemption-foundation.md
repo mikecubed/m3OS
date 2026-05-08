@@ -1,6 +1,6 @@
 # Phase 57b — Preemption Foundation
 
-**Status:** Complete pending soak (PR #132)
+**Status:** Complete (post-merge soak tracked as a Phase 59 Track G item)
 **Source Ref:** phase-57b
 **Depends on:** Phase 4 (Tasking) ✅, Phase 25 (SMP) ✅, Phase 35 (True SMP) ✅, Phase 57a (Scheduler Block/Wake Protocol Rewrite) ✅
 **Builds on:** Extends the Phase 4 `switch_context` contract with a separate full-register-save path used only by preemption. Adds per-task preempt-discipline counters that wrap every existing `IrqSafeMutex` callsite from Phases 4–57a.

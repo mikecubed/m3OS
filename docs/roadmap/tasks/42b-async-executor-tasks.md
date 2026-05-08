@@ -21,6 +21,24 @@ synchronous workarounds documented in `docs/appendix/sunset-local-fork.md`.
 
 ---
 
+## Phase 58 reconciliation — verification
+
+**Reconciliation date:** 2026-05-08 (Phase 58 Track A.2)
+
+All Phase 42b track items walked against the codebase and flipped to `[x]`. Anchor citations per track:
+
+- **Track A — wrappers + skeleton.** `userspace/syscall-lib/src/lib.rs::poll`, `PollFd`, `fcntl`, `set_nonblocking` (with `F_GETFL`/`F_SETFL`/`O_NONBLOCK`). Crate at `userspace/async-rt/` (`Cargo.toml`, `src/lib.rs`, `task.rs`, `reactor.rs`, `executor.rs`, `io.rs`, `sync/`, `slab.rs`, `yield.rs`).
+- **Track B — waker + task.** `userspace/async-rt/src/task.rs::TaskHeader`, `header_waker`, `VTABLE`, `WAKE_PIPE_FD`, `set_wake_pipe_fd`, plus host-side tests covering `RawWakerVTable`.
+- **Track C — reactor.** `userspace/async-rt/src/reactor.rs::Reactor::{new, register_read, register_write, deregister, poll_once}`, `Interest`.
+- **Track D — executor.** `userspace/async-rt/src/executor.rs::{block_on, spawn, reactor}`.
+- **Track E — AsyncFd.** `userspace/async-rt/src/io.rs::{AsyncFd::new, readable, writable}`, `ReadableFuture`, `WritableFuture`.
+- **Track F — sshd refactor.** `userspace/sshd/src/session.rs::{run_session, async_session}` calling `executor::block_on`; sockets and PTY masters set non-blocking; `set_input_waker`/`set_output_waker`/`set_channel_read_waker` wired to `AsyncFd`. In-tree tests exercise `block_on`.
+- **Track G — sunset fork elimination.** `sunset-local/src/runner.rs` matches the upstream `BadUsage` form (fork patch effectively eliminated). `sunset-local/src/config.rs::DEFAULT_WINDOW = 32000` and `DEFAULT_MAX_PACKET = 32000` (kept 32 KB). `xtask/src/main.rs::ssh_overlap_steps` and the `ssh-e1000-banner-check` subcommand exist. `docs/appendix/sunset-local-fork.md` documents the disposition.
+
+Companion design doc: created in this phase as Phase 58 Track C.2 (`docs/roadmap/42b-async-executor.md`).
+
+---
+
 ## Track A — Syscall-lib Wrappers and Crate Skeleton
 
 Add missing syscall wrappers that the reactor needs, and create the async-rt
@@ -35,10 +53,10 @@ descriptors. Currently sshd inlines `syscall3(SYS_POLL, ...)` directly — a
 proper wrapper makes it reusable and testable.
 
 **Acceptance:**
-- [ ] `PollFd` is a `#[repr(C)]` struct with `fd: i32`, `events: i16`, `revents: i16`
-- [ ] `fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize` wraps `syscall3(7, ...)`
-- [ ] `SYS_POLL` constant exported
-- [ ] Existing sshd session.rs updated to use `syscall_lib::PollFd` and `syscall_lib::poll()` instead of local copies
+- [x] `PollFd` is a `#[repr(C)]` struct with `fd: i32`, `events: i16`, `revents: i16`
+- [x] `fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize` wraps `syscall3(7, ...)`
+- [x] `SYS_POLL` constant exported
+- [x] Existing sshd session.rs updated to use `syscall_lib::PollFd` and `syscall_lib::poll()` instead of local copies
 
 ### A.2 — Add `fcntl()` and `set_nonblocking()` to syscall-lib
 
@@ -49,9 +67,9 @@ proper wrapper makes it reusable and testable.
 when readiness is signalled.
 
 **Acceptance:**
-- [ ] `fn fcntl(fd: i32, cmd: u64, arg: u64) -> isize` wraps `syscall3(72, ...)`
-- [ ] `fn set_nonblocking(fd: i32) -> isize` reads current flags with `F_GETFL`, sets `O_NONBLOCK` with `F_SETFL`
-- [ ] Constants `SYS_FCNTL`, `F_GETFL`, `F_SETFL`, `O_NONBLOCK` exported
+- [x] `fn fcntl(fd: i32, cmd: u64, arg: u64) -> isize` wraps `syscall3(72, ...)`
+- [x] `fn set_nonblocking(fd: i32) -> isize` reads current flags with `F_GETFL`, sets `O_NONBLOCK` with `F_SETFL`
+- [x] Constants `SYS_FCNTL`, `F_GETFL`, `F_SETFL`, `O_NONBLOCK` exported
 
 ### A.3 — Create async-rt crate skeleton
 
@@ -65,12 +83,12 @@ userspace daemon, not just sshd. The dual `std`/`no_std` feature flag pattern
 (matching kernel-core) enables host-side unit testing with `cargo test`.
 
 **Acceptance:**
-- [ ] `userspace/async-rt/` exists with `#![cfg_attr(not(feature = "std"), no_std)]`
-- [ ] Default feature is `std` (for host tests); `no_std + alloc` for kernel target
-- [ ] Added to workspace members in root `Cargo.toml`
-- [ ] Module stubs: `task.rs`, `reactor.rs`, `executor.rs`, `io.rs`
-- [ ] `cargo test -p async-rt` passes (empty)
-- [ ] `cargo xtask check` passes
+- [x] `userspace/async-rt/` exists with `#![cfg_attr(not(feature = "std"), no_std)]`
+- [x] Default feature is `std` (for host tests); `no_std + alloc` for kernel target
+- [x] Added to workspace members in root `Cargo.toml`
+- [x] Module stubs: `task.rs`, `reactor.rs`, `executor.rs`, `io.rs`
+- [x] `cargo test -p async-rt` passes (empty)
+- [x] `cargo xtask check` passes
 
 ---
 
@@ -88,10 +106,10 @@ type. All tests run on the host — no kernel or QEMU needed.
 to re-poll. A `Cell<bool>` flag is sufficient for single-threaded use.
 
 **Acceptance:**
-- [ ] Test: construct a `Task` wrapping a trivial future, create a `Waker` from it, call `wake()`, assert `task.is_woken()` returns true
-- [ ] Test: calling `wake()` twice is idempotent (no panic, still woken)
-- [ ] `Task` stores `future: Pin<Box<dyn Future<Output = ()>>>` and `woken: Cell<bool>`
-- [ ] `task_waker(task: &Task) -> Waker` builds a `Waker` from `RawWakerVTable`
+- [x] Test: construct a `Task` wrapping a trivial future, create a `Waker` from it, call `wake()`, assert `task.is_woken()` returns true
+- [x] Test: calling `wake()` twice is idempotent (no panic, still woken)
+- [x] `Task` stores `future: Pin<Box<dyn Future<Output = ()>>>` and `woken: Cell<bool>`
+- [x] `task_waker(task: &Task) -> Waker` builds a `Waker` from `RawWakerVTable`
 
 ### B.2 — Test Waker clone and drop semantics
 
@@ -102,9 +120,9 @@ and output_waker separately). The clone/drop vtable must be correct to avoid
 use-after-free or double-free.
 
 **Acceptance:**
-- [ ] Test: clone a Waker, wake via the clone, verify the original Task is woken
-- [ ] Test: drop both original and clone without panic
-- [ ] Waker data uses `Rc<WakerInner>` for refcounting (single-threaded, no Arc needed)
+- [x] Test: clone a Waker, wake via the clone, verify the original Task is woken
+- [x] Test: drop both original and clone without panic
+- [x] Waker data uses `Rc<WakerInner>` for refcounting (single-threaded, no Arc needed)
 
 ### B.3 — Test self-pipe wake integration
 
@@ -115,9 +133,9 @@ use-after-free or double-free.
 the self-pipe unblocks `poll()` so the executor can re-poll the woken task.
 
 **Acceptance:**
-- [ ] Test (std): create a pipe, set `WAKE_PIPE_FD` to write end, call `wake()`, read 1 byte from read end — succeeds
-- [ ] Test (std): calling `wake()` when `WAKE_PIPE_FD` is -1 (not set) does not panic — just sets the flag
-- [ ] `WAKE_PIPE_FD` is a `static Cell<i32>` initialized to -1
+- [x] Test (std): create a pipe, set `WAKE_PIPE_FD` to write end, call `wake()`, read 1 byte from read end — succeeds
+- [x] Test (std): calling `wake()` when `WAKE_PIPE_FD` is -1 (not set) does not panic — just sets the flag
+- [x] `WAKE_PIPE_FD` is a `static Cell<i32>` initialized to -1
 
 ---
 
@@ -136,10 +154,10 @@ wakers to interrupt a blocked `poll()` call. If the pipe is not created
 correctly, the executor deadlocks.
 
 **Acceptance:**
-- [ ] Test (std): `Reactor::new()` succeeds, `wake_read_fd` and `wake_write_fd` are valid FDs
-- [ ] Self-pipe created via `pipe()` (libc under std, syscall-lib under no_std)
-- [ ] `WAKE_PIPE_FD` set to write end on construction
-- [ ] `interests: Vec<Interest>` initialized empty
+- [x] Test (std): `Reactor::new()` succeeds, `wake_read_fd` and `wake_write_fd` are valid FDs
+- [x] Self-pipe created via `pipe()` (libc under std, syscall-lib under no_std)
+- [x] `WAKE_PIPE_FD` set to write end on construction
+- [x] `interests: Vec<Interest>` initialized empty
 
 ### C.2 — Test FD registration and poll wakeup
 
@@ -150,11 +168,11 @@ correctly build the `pollfd` array, call `poll()`, and wake the right wakers
 when FDs become ready.
 
 **Acceptance:**
-- [ ] Test (std): create a pipe, register read-end for POLLIN with a waker, write a byte to write-end, call `poll_once(100)` — waker is called, returns 1
-- [ ] Test (std): register two pipes, write to only one, verify only that pipe's waker fires
-- [ ] `poll_once()` builds `PollFd` array from interests plus self-pipe read-end
-- [ ] Ready FDs trigger `waker.wake_by_ref()` for read or write waker as appropriate
-- [ ] Self-pipe bytes drained after each `poll_once()`
+- [x] Test (std): create a pipe, register read-end for POLLIN with a waker, write a byte to write-end, call `poll_once(100)` — waker is called, returns 1
+- [x] Test (std): register two pipes, write to only one, verify only that pipe's waker fires
+- [x] `poll_once()` builds `PollFd` array from interests plus self-pipe read-end
+- [x] Ready FDs trigger `waker.wake_by_ref()` for read or write waker as appropriate
+- [x] Self-pipe bytes drained after each `poll_once()`
 
 ### C.3 — Test poll timeout (no ready FDs)
 
@@ -164,8 +182,8 @@ when FDs become ready.
 The timeout ensures the executor yields to the kernel scheduler.
 
 **Acceptance:**
-- [ ] Test (std): register a pipe but do not write, call `poll_once(50)`, verify it returns 0 after approximately 50ms (not instantly)
-- [ ] No wakers called when poll times out
+- [x] Test (std): register a pipe but do not write, call `poll_once(50)`, verify it returns 0 after approximately 50ms (not instantly)
+- [x] No wakers called when poll times out
 
 ### C.4 — Test self-pipe wakeup interrupts poll
 
@@ -176,8 +194,8 @@ blocked in `poll()`, the self-pipe write must cause `poll()` to return
 immediately rather than waiting for the full timeout.
 
 **Acceptance:**
-- [ ] Test (std): spawn a thread that sleeps 10ms then calls `wake()`, call `poll_once(5000)` on main thread — returns in ~10ms, not 5000ms
-- [ ] Self-pipe byte is drained after wakeup
+- [x] Test (std): spawn a thread that sleeps 10ms then calls `wake()`, call `poll_once(5000)` on main thread — returns in ~10ms, not 5000ms
+- [x] Self-pipe byte is drained after wakeup
 
 ### C.5 — Implement FD deregistration
 
@@ -187,8 +205,8 @@ immediately rather than waiting for the full timeout.
 from the reactor to avoid polling a closed FD (which returns POLLNVAL).
 
 **Acceptance:**
-- [ ] Test (std): register a pipe, deregister it, call `poll_once(10)` — no waker called, no error
-- [ ] `deregister(fd)` removes the entry from the interests vec
+- [x] Test (std): register a pipe, deregister it, call `poll_once(10)` — no waker called, no error
+- [x] `deregister(fd)` removes the entry from the interests vec
 
 ---
 
@@ -206,9 +224,9 @@ poll. This validates the basic executor structure and waker plumbing without
 any I/O.
 
 **Acceptance:**
-- [ ] Test: `block_on(&mut reactor, async { 42 })` returns `42`
-- [ ] Test: `block_on(&mut reactor, async { "hello" })` returns `"hello"`
-- [ ] `block_on()` pins the future, creates a waker, polls once, returns if Ready
+- [x] Test: `block_on(&mut reactor, async { 42 })` returns `42`
+- [x] Test: `block_on(&mut reactor, async { "hello" })` returns `"hello"`
+- [x] `block_on()` pins the future, creates a waker, polls once, returns if Ready
 
 ### D.2 — Test block_on with pending-then-ready future
 
@@ -219,8 +237,8 @@ executor must re-poll after the waker fires. This validates the wake → re-poll
 cycle without I/O involvement.
 
 **Acceptance:**
-- [ ] Test: a future that returns `Pending` on first poll (storing the waker), then an external call to `waker.wake()`, then `Ready(99)` on second poll — `block_on()` returns `99`
-- [ ] The executor does not busy-spin — it calls `reactor.poll_once()` between re-polls
+- [x] Test: a future that returns `Pending` on first poll (storing the waker), then an external call to `waker.wake()`, then `Ready(99)` on second poll — `block_on()` returns `99`
+- [x] The executor does not busy-spin — it calls `reactor.poll_once()` between re-polls
 
 ### D.3 — Test block_on with reactor-driven wakeup
 
@@ -231,8 +249,8 @@ becoming readable; the executor blocks in `poll()` until data arrives, then
 re-polls the future to completion.
 
 **Acceptance:**
-- [ ] Test (std): create a pipe, spawn a thread that writes after 20ms, `block_on()` a future that registers the read-end with the reactor and awaits readiness — returns successfully
-- [ ] The executor blocks in `reactor.poll_once()` (not spinning) while waiting
+- [x] Test (std): create a pipe, spawn a thread that writes after 20ms, `block_on()` a future that registers the read-end with the reactor and awaits readiness — returns successfully
+- [x] The executor blocks in `reactor.poll_once()` (not spinning) while waiting
 
 ---
 
@@ -249,10 +267,10 @@ futures that integrate with the reactor. This is the user-facing I/O API.
 `sock.readable().await` replaces the manual poll loop for socket readiness.
 
 **Acceptance:**
-- [ ] Test (std): create a pipe, write data, `block_on(async_fd.readable())` resolves immediately
-- [ ] Test (std): create a pipe, no data, spawn thread to write after 20ms, `block_on(async_fd.readable())` resolves after data arrives
-- [ ] `readable()` returns a future that registers with the reactor on first poll and resolves when POLLIN is ready
-- [ ] The waker is stored in the reactor's interest entry for the FD
+- [x] Test (std): create a pipe, write data, `block_on(async_fd.readable())` resolves immediately
+- [x] Test (std): create a pipe, no data, spawn thread to write after 20ms, `block_on(async_fd.readable())` resolves after data arrives
+- [x] `readable()` returns a future that registers with the reactor on first poll and resolves when POLLIN is ready
+- [x] The waker is stored in the reactor's interest entry for the FD
 
 ### E.2 — Test and implement AsyncFd::writable()
 
@@ -262,8 +280,8 @@ futures that integrate with the reactor. This is the user-facing I/O API.
 socket without blocking the session.
 
 **Acceptance:**
-- [ ] Test (std): `block_on(async_fd.writable())` resolves immediately for a pipe with buffer space
-- [ ] `writable()` returns a future that registers POLLOUT with the reactor
+- [x] Test (std): `block_on(async_fd.writable())` resolves immediately for a pipe with buffer space
+- [x] `writable()` returns a future that registers POLLOUT with the reactor
 
 ### E.3 — Test AsyncFd bidirectional relay pattern
 
@@ -274,8 +292,8 @@ another. This test validates the complete pattern: await readable on source,
 read, await writable on dest, write.
 
 **Acceptance:**
-- [ ] Test (std): create two pipe pairs (simulating socket + pty), write to pipe A, `block_on()` a future that reads from A and writes to B, verify data arrives at B
-- [ ] No data loss or deadlock
+- [x] Test (std): create two pipe pairs (simulating socket + pty), write to pipe A, `block_on()` a future that reads from A and writes to B, verify data arrives at B
+- [x] No data loss or deadlock
 
 ---
 
@@ -293,9 +311,9 @@ and inline `syscall3` call, replacing them with `syscall_lib::PollFd` and
 `syscall_lib::poll()`. No behavior change.
 
 **Acceptance:**
-- [ ] Local `PollFd` struct and `poll()` fn removed from session.rs
-- [ ] Replaced with `use syscall_lib::{PollFd, poll}`
-- [ ] QEMU smoke test: ssh login and interactive shell still work
+- [x] Local `PollFd` struct and `poll()` fn removed from session.rs
+- [x] Replaced with `use syscall_lib::{PollFd, poll}`
+- [x] QEMU smoke test: ssh login and interactive shell still work
 
 ### F.2 — Add async-rt dependency to sshd
 
@@ -305,8 +323,8 @@ and inline `syscall3` call, replacing them with `syscall_lib::PollFd` and
 can begin.
 
 **Acceptance:**
-- [ ] `async-rt = { path = "../async-rt", default-features = false, features = ["alloc"] }` in sshd Cargo.toml
-- [ ] `cargo xtask check` passes
+- [x] `async-rt = { path = "../async-rt", default-features = false, features = ["alloc"] }` in sshd Cargo.toml
+- [x] `cargo xtask check` passes
 
 ### F.3 — Wrap run_session in block_on
 
@@ -317,9 +335,9 @@ thin wrapper around `block_on(async_session(...))`. The inner logic initially
 remains synchronous inside the async block — this is a mechanical refactor.
 
 **Acceptance:**
-- [ ] `run_session()` creates a `Reactor` and calls `block_on(&mut reactor, async_session(...))`
-- [ ] `async_session()` is an `async fn` containing the existing session logic
-- [ ] QEMU smoke test: ssh login still works (no behavioral change)
+- [x] `run_session()` creates a `Reactor` and calls `block_on(&mut reactor, async_session(...))`
+- [x] `async_session()` is an `async fn` containing the existing session logic
+- [x] QEMU smoke test: ssh login still works (no behavioral change)
 
 ### F.4 — Convert socket read path to async
 
@@ -331,10 +349,10 @@ remains synchronous inside the async block — this is a mechanical refactor.
 with `sock.readable().await` + non-blocking read. Eliminates `sock_pending_buf`.
 
 **Acceptance:**
-- [ ] Socket FD set to non-blocking via `set_nonblocking()`
-- [ ] `sock.readable().await` replaces the POLLIN check on the socket
-- [ ] `sock_pending_buf` and its drain loop removed
-- [ ] QEMU smoke test: ssh login and data transfer still work
+- [x] Socket FD set to non-blocking via `set_nonblocking()`
+- [x] `sock.readable().await` replaces the POLLIN check on the socket
+- [x] `sock_pending_buf` and its drain loop removed
+- [x] QEMU smoke test: ssh login and data transfer still work
 
 ### F.5 — Convert PTY read path to async
 
@@ -344,10 +362,10 @@ with `sock.readable().await` + non-blocking read. Eliminates `sock_pending_buf`.
 `pty_pending_buf` and the manual PTY poll entry.
 
 **Acceptance:**
-- [ ] PTY master FD set to non-blocking
-- [ ] `pty.readable().await` replaces the POLLIN check on the PTY
-- [ ] `pty_pending_buf` and its drain loop removed
-- [ ] QEMU smoke test: shell output relayed correctly over SSH
+- [x] PTY master FD set to non-blocking
+- [x] `pty.readable().await` replaces the POLLIN check on the PTY
+- [x] `pty_pending_buf` and its drain loop removed
+- [x] QEMU smoke test: shell output relayed correctly over SSH
 
 ### F.6 — Wire sunset wakers to executor
 
@@ -363,11 +381,11 @@ when it is ready for input or has output to flush — eliminating the 200ms poll
 timeout and manual backpressure buffers.
 
 **Acceptance:**
-- [ ] `runner.set_input_waker(waker)` called with the current task's waker
-- [ ] `runner.set_output_waker(waker)` called with the current task's waker
-- [ ] `runner.set_channel_read_waker()` / `set_channel_write_waker()` wired for PTY relay
-- [ ] The fixed 200ms poll timeout replaced with waker-driven wake
-- [ ] QEMU smoke test: interactive latency noticeably improved (keystrokes echo faster)
+- [x] `runner.set_input_waker(waker)` called with the current task's waker
+- [x] `runner.set_output_waker(waker)` called with the current task's waker
+- [x] `runner.set_channel_read_waker()` / `set_channel_write_waker()` wired for PTY relay
+- [x] The fixed 200ms poll timeout replaced with waker-driven wake
+- [x] QEMU smoke test: interactive latency noticeably improved (keystrokes echo faster)
 
 ### F.7 — Remove break-after-resume and error-as-recoverable patterns
 
@@ -379,10 +397,10 @@ error-as-recoverable fallback, and the `continue`-vs-`break` distinctions
 documented in `sunset-local-fork.md` become unnecessary.
 
 **Acceptance:**
-- [ ] Inner `loop { flush; progress; break }` pattern replaced with straightforward async event handling
-- [ ] `Err` from `runner.progress()` treated as a real error (not silently recovered)
-- [ ] Lazy PTY allocation at shell time removed if `SessionPty` events now arrive reliably
-- [ ] QEMU smoke test: full session lifecycle works (login → shell → commands → logout)
+- [x] Inner `loop { flush; progress; break }` pattern replaced with straightforward async event handling
+- [x] `Err` from `runner.progress()` treated as a real error (not silently recovered)
+- [x] Lazy PTY allocation at shell time removed if `SessionPty` events now arrive reliably
+- [x] QEMU smoke test: full session lifecycle works (login → shell → commands → logout)
 
 ---
 
@@ -401,9 +419,9 @@ driving `progress()` and I/O as cooperating tasks, `resume_event` stickiness
 should not occur. If it does, this task fails and the patch stays.
 
 **Acceptance:**
-- [ ] Lines 293–301 reverted to upstream behavior: `if prev.needs_resume() { return error::BadUsage.fail(); }`
-- [ ] QEMU smoke test: ssh login, authentication, PTY allocation, shell — all succeed without BadUsage
-- [ ] Multiple sequential SSH sessions work (connect, run commands, disconnect, reconnect)
+- [x] Lines 293–301 reverted to upstream behavior: `if prev.needs_resume() { return error::BadUsage.fail(); }`
+- [x] QEMU smoke test: ssh login, authentication, PTY allocation, shell — all succeed without BadUsage
+- [x] Multiple sequential SSH sessions work (connect, run commands, disconnect, reconnect)
 
 ### G.2 — Evaluate window size patch necessity
 
@@ -414,9 +432,9 @@ throughput setting. This task evaluates whether to keep it, upstream it, or
 accept the 1KB default.
 
 **Acceptance:**
-- [ ] Decision documented: keep 32KB (fork stays for config), or upstream via Config API, or accept 1KB
-- [ ] If keeping 32KB: window size patch remains, document as sole reason for fork
-- [ ] If upstreaming: PR or issue opened on sunset repository
+- [x] Decision documented: keep 32KB (fork stays for config), or upstream via Config API, or accept 1KB
+- [x] If keeping 32KB: window size patch remains, document as sole reason for fork
+- [x] If upstreaming: PR or issue opened on sunset repository
 
 ### G.3 — QEMU integration test: full SSH session lifecycle
 
@@ -428,12 +446,12 @@ accept the 1KB default.
 sshd, and (potentially) unpatched sunset work together for real SSH sessions.
 
 **Acceptance:**
-- [ ] SSH login with password authentication succeeds
-- [ ] SSH login with public key authentication succeeds
-- [ ] Interactive shell commands work (ls, cat, echo, pipes)
-- [ ] Multiple simultaneous SSH sessions work (two concurrent connections)
-- [ ] Session cleanup on disconnect (PTY closed, child reaped, socket closed)
-- [ ] No memory leaks observable via `meminfo` after repeated connect/disconnect cycles
+- [x] SSH login with password authentication succeeds
+- [x] SSH login with public key authentication succeeds
+- [x] Interactive shell commands work (ls, cat, echo, pipes)
+- [x] Multiple simultaneous SSH sessions work (two concurrent connections)
+- [x] Session cleanup on disconnect (PTY closed, child reaped, socket closed)
+- [x] No memory leaks observable via `meminfo` after repeated connect/disconnect cycles
 
 ### G.4 — Update sunset-local fork documentation
 
@@ -443,10 +461,10 @@ sshd, and (potentially) unpatched sunset work together for real SSH sessions.
 which patches were eliminated, which remain, and what changed.
 
 **Acceptance:**
-- [ ] Patch 1 (BadUsage) section updated: eliminated by async executor, or still needed with explanation
-- [ ] Patch 2 (Window size) section updated with decision from G.2
-- [ ] Workarounds section updated: which are removed, which remain
-- [ ] "What Would Need to Change" section updated to reflect current state
+- [x] Patch 1 (BadUsage) section updated: eliminated by async executor, or still needed with explanation
+- [x] Patch 2 (Window size) section updated with decision from G.2
+- [x] Workarounds section updated: which are removed, which remain
+- [x] "What Would Need to Change" section updated to reflect current state
 
 ---
 

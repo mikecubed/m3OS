@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — post-1.0 tooling plan; not implementation-blocking. Original content preserved below for historical reference.
+
 # Road to git on m3OS
 
 This document details the path to running git natively inside m3OS. git is

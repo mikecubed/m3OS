@@ -56,7 +56,7 @@ The audit is **not** an indictment of the project's direction — the architectu
 | `05-cross-cutting-bugs-and-followups.md` | Open bug-doc residuals and follow-up trackers |
 | `06-pre-1.0-blocker-list.md` | Prioritised list of actionable items between current state and a credible 1.0 |
 | `07-recommendations.md` | Proposed status corrections, doc-template fixes, and remediation phase candidates |
-| `08-supplemental-findings.md` | **Supplemental pass 2026-05-08** — covers the missed subdirs (`docs/debug/`, `docs/evaluation/`, `docs/handoff/`, `docs/handoffs/`, `docs/post-mortems/`, `docs/research/`, `docs/shell/`, top-level legacy `docs/*.md`). 3 new 🛑 blockers + 3 new 🔴 items + 1 audit residual closed |
+| `08-supplemental-findings.md` | **Supplemental pass 2026-05-08** — covers the missed subdirs (`docs/debug/`, `docs/evaluation/`, `docs/handoff/` (singular, since merged into `docs/handoffs/`), `docs/handoffs/`, `docs/post-mortems/`, `docs/research/`, `docs/shell/`, top-level legacy `docs/*.md`). 3 new 🛑 blockers + 3 new 🔴 items + 1 audit residual closed |
 | `findings/01-*.md` … `findings/07-*.md` | Underlying raw research from the original audit |
 | `findings/08-postmortems-and-handoffs.md` | Supplemental — post-mortems, handoffs, debug |
 | `findings/09-evaluation-research-shell.md` | Supplemental — evaluation, research, shell |

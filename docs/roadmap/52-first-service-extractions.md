@@ -1,6 +1,8 @@
 # Phase 52 - First Service Extractions
 
-**Status:** In Progress
+> **Phase 58 closure note (2026-05-08):** Phase 52 has been an umbrella phase since the kernel-side work was sequenced as 52a (Reliability Fixes), 52b (Structural Hardening), 52c (Architecture Evolution), and 52d (Completion and Roadmap Alignment). All four sub-phases shipped with `Status: Complete`, and the first userspace service extractions (`console_server`, `kbd_server`, `mouse_server` per Phase 56; `audio_server`, `term`, `session_manager` per Phase 57; ring-3 NVMe and e1000 drivers per Phase 55b) all landed on top of that kernel base. Phase 52 itself is therefore Complete by virtue of those sub-phases delivering its scope. Phase 51 (Service Model Maturity), which Phase 52 originally listed as a dependency, was folded into Phase 46's actual implementation; see the Phase 51 closure note in `docs/roadmap/51-service-model-maturity.md` for that disposition.
+
+**Status:** Complete (umbrella for sub-phases 52a–52d — see "Phase 58 closure note" above)
 **Source Ref:** phase-52
 **Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅
 **Builds on:** Uses the finished IPC path and matured service model to move the first genuinely important kernel-resident services into restartable ring-3 processes

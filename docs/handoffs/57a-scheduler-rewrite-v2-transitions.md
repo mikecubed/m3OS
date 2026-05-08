@@ -161,7 +161,7 @@ Rows = `TaskState` variants (using exact Rust variant names from
 | Event | Next state | Side effects | Invariant | Locks held |
 |-------|-----------|--------------|-----------|------------|
 | `block` | Not reachable | A `BlockedOnReply` task is off-CPU. | — | — |
-| `wake` | Ready | Under `pi_lock`: CAS `BlockedOnReply → Ready`; `wake_deadline.take()`; release `pi_lock`. Acquire `SCHEDULER.lock`; spin-wait if `on_cpu==true`; `enqueue_to_core`; IPI if cross-core. Returns `Woken`. | The `BlockedOnReply` → `Ready` CAS is the fix for the display_server / mouse_server race documented in `docs/handoff/2026-04-28-graphical-stack-startup.md` §"Hypotheses ranked" hypothesis 1. No v1 deferred-enqueue flag path. | `pi_lock` for CAS; then `SCHEDULER.lock` for enqueue |
+| `wake` | Ready | Under `pi_lock`: CAS `BlockedOnReply → Ready`; `wake_deadline.take()`; release `pi_lock`. Acquire `SCHEDULER.lock`; spin-wait if `on_cpu==true`; `enqueue_to_core`; IPI if cross-core. Returns `Woken`. | The `BlockedOnReply` → `Ready` CAS is the fix for the display_server / mouse_server race documented in `docs/handoffs/2026-04-28-graphical-stack-startup.md` §"Hypotheses ranked" hypothesis 1. No v1 deferred-enqueue flag path. | `pi_lock` for CAS; then `SCHEDULER.lock` for enqueue |
 | `scan_expired` | Ready | Under `SCHEDULER.lock` (caller holds it): `wake_deadline ≤ now`; `wake_deadline.take()`; `state ← Ready`; enqueued after lock release. | Deadline expiry on a reply-blocked task (rare; only if a reply-wait has a timeout) is handled identically to other Blocked variants. | `SCHEDULER.lock` (held by caller) |
 
 ---

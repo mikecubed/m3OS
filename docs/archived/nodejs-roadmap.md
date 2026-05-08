@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — post-1.0 language port plan. Original content preserved below for historical reference.
+
 # Road to Node.js on m3OS
 
 This document details the path to running Node.js inside m3OS via

@@ -116,7 +116,7 @@
 
 ---
 
-### docs/handoff/2026-04-28-graphical-stack-startup.md
+### docs/handoffs/2026-04-28-graphical-stack-startup.md
 
 **What:** Detailed debugging handoff for the Phase 57 graphical-stack startup regression (cursor stuck at (0,0) or kbd_server dead on core 3). Documents 8 failed placement-tweak attempts, identifies the serial-stdin feeder halt-loop as the core-3 parking mechanism, and concludes the highest-confidence root cause is the lost-wake bug class in `block_current_unless_woken*` (per `docs/handoffs/2026-04-25-scheduler-design-comparison.md`).
 

@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — post-1.0 tooling plan; not implementation-blocking. Original content preserved below for historical reference.
+
 # Road to GitHub CLI (gh) on m3OS
 
 This document details the path to running the GitHub CLI (`gh`) inside m3OS.

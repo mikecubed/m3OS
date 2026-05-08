@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — post-1.0 toolchain plan; no shipped phase covers it. Original content preserved below for historical reference.
+
 # Road to Clang/LLVM on m3OS
 
 This document details the path to running Clang/LLVM on m3OS. The strategy is

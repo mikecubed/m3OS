@@ -2,7 +2,8 @@
 
 **Depends on:** Phase 18 (Directory and VFS) ✅
 **Branch:** `phase-19-signal-handlers`
-**Status:** Not started
+**Status:** Complete (reconciled 2026-05-08; see "Phase 58 reconciliation — verification" section below)
+**Source Ref:** phase-19
 **Goal:** Enable userspace programs to install and execute signal handlers via
 the signal trampoline mechanism. Implement `sigreturn`, `rt_sigprocmask`,
 `sigaltstack`, and the `sigframe` delivery path so ring-3 code can catch signals,
@@ -45,12 +46,12 @@ Already implemented (no new work needed):
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Signal mask + rt_sigprocmask | — | Not started |
-| B | sigframe layout + handler dispatch | A | Not started |
-| C | sigreturn syscall | B | Not started |
-| D | sigaltstack | B | Not started |
-| E | rt_sigaction upgrade + sa_restorer | B | Not started |
-| F | Validation and tests | A, B, C, D, E | Not started |
+| A | Signal mask + rt_sigprocmask | — | Complete (rt_sigpending deferred — see below) |
+| B | sigframe layout + handler dispatch | A | Complete |
+| C | sigreturn syscall | B | Complete |
+| D | sigaltstack | B | Complete |
+| E | rt_sigaction upgrade + sa_restorer | B | Complete |
+| F | Validation and tests | A, B, C, D, E | Complete |
 
 ---
 
@@ -148,10 +149,27 @@ Validate signal handler delivery end-to-end and verify all acceptance criteria.
 
 ---
 
+## Phase 58 reconciliation — verification
+
+**Reconciliation date:** 2026-05-08 (Phase 58 Track A.1)
+**Audit input:** `kernel/src/signal.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`, `kernel/src/process/mod.rs`, `userspace/signal-test/`
+
+The original task doc was written before any code shipped and was never refreshed. All six tracks shipped against `kernel/src/signal.rs` (single file rather than the `kernel/src/signal/` directory the prereq analysis anticipated). Citations:
+
+- **Track A — signal mask + rt_sigprocmask.** `sys_rt_sigprocmask` at `kernel/src/arch/x86_64/syscall/mod.rs::sys_rt_sigprocmask` (syscall 14). Per-process state `Process::pending_signals` and `Process::blocked_signals` (`kernel/src/process/mod.rs`). Re-checks pending deliveries on `SIG_UNBLOCK`. **rt_sigpending is not wired** — see "Deferred Until Later" below.
+- **Track B — sigframe layout + handler dispatch.** `setup_signal_frame` at `kernel/src/signal.rs::setup_signal_frame` builds a 560-byte musl-compatible `rt_sigframe` (siginfo + ucontext + sigcontext + sigmask). Delivery is invoked from the syscall return path; the `signal_actions` lookup is in `kernel/src/arch/x86_64/syscall/mod.rs`.
+- **Track C — sigreturn.** `sys_sigreturn` at `kernel/src/arch/x86_64/syscall/mod.rs::sys_sigreturn` (syscall 15, diverging `-> !`). Validates canonicality, restores GPRs and sigmask via `kernel/src/signal.rs::restore_sigframe`.
+- **Track D — sigaltstack.** `sys_sigaltstack` at `kernel/src/arch/x86_64/syscall/mod.rs::sys_sigaltstack` (syscall 131). State `Process::alt_stack_{base,size,flags}`. Constants `SS_ONSTACK`/`SS_DISABLE`. Enforces `MINSIGSTKSZ`, canonical-userspace bounds, and the EPERM "cannot replace while on stack" rule.
+- **Track E — rt_sigaction.** `sys_rt_sigaction` at `kernel/src/arch/x86_64/syscall/mod.rs::sys_rt_sigaction` (syscall 13) plus the 32-byte `encode_rt_sigaction` serializer. Rejects handlers without `SA_RESTORER`; refuses SIGKILL/SIGSTOP; atomic on `oldact` faults via the `sigaction_get`/`sigaction_set` round-trip. Backed by `Process::signal_actions: [SignalAction; 32]` and the cross-thread `Arc<IrqSafeMutex<…>>` shared table.
+- **Track F — validation.** Userspace integration test `userspace/signal-test/signal-test.c` covers six cases (SIGINT handler, mask block/unblock, SIGKILL/SIGSTOP rejection, auto-mask re-entry, sigaction atomicity on EFAULT, exec-time disposition reset). Driven by the QEMU regression harness `signal_reset_steps()` in `xtask/src/main.rs` (registered as smoke test `signal-reset`).
+
+**Note on doc format:** Phase 19's task doc retains the legacy pipe-table form. Per the Phase 58 design doc, only Phase 16 was converted to checkbox form in this phase; Phases 17/18/20/22/23/25/28/29 (and 19 by extension) are deferred to post-1.0. The reconciliation here flips the top-level Status and Track Layout statuses without converting the per-task table.
+
 ## Deferred Until Later
 
 These items are explicitly out of scope for Phase 19:
 
+- **`rt_sigpending`** — not implemented (no SIGPENDING dispatch entry; `userspace/signal-test` does not exercise it). Defer to post-1.0 unless a downstream caller surfaces a need.
 - Real-time signals (`SIGRTMIN` through `SIGRTMAX`) and `sigqueue`
 - `signalfd` — receiving signals as readable file descriptors
 - FPU / SSE / AVX state save and restore in the sigframe

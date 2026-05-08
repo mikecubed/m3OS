@@ -20,7 +20,7 @@ SMP reschedule IPI, a scan that fires between block-entry and handler
 execution), the latched flag and the task's actual blockedness desynchronise,
 producing the lost-wake bug class catalogued in
 `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and
-`docs/handoff/2026-04-28-graphical-stack-startup.md`.
+`docs/handoffs/2026-04-28-graphical-stack-startup.md`.
 
 This table is the regression test contract for the v2 rewrite: the cells that
 were already correct must have equivalent v2 cells; the cells annotated as
@@ -95,7 +95,7 @@ five `Blocked*` variants share the same transitions.
 |-------|-----------|--------------|-----------|------|
 | `block` | Not reachable | Task is already blocked and off-CPU. | — | No |
 | `wake` | (Blocked\*, so=T, was=T) — **LOST-WAKE PATH** | Under `SCHEDULER.lock`: `wake_deadline.take()` (ACTIVE_WAKE_DEADLINES--); `wake_after_switch ← true`. Returns `(enqueue=None, woke=true)`. No enqueue. | Lock is `SCHEDULER.lock`. Wake is deferred to `dispatch_switch_out`. If `dispatch_switch_out` does not run promptly, or if a second block call overwrites `was` before the handler observes it, the wake is lost. **See `docs/handoffs/2026-04-25-scheduler-design-comparison.md` §"The specific invariant Linux maintains that m3OS violates" and the re-block scenario.** | **YES** |
-| `scan_expired` | (Blocked\*, so=T, was=T) — **LOST-WAKE PATH** | Under `SCHEDULER.lock` (caller holds it): `wake_deadline.take()` (ACTIVE_WAKE_DEADLINES--); `wake_after_switch ← true`; `last_migrated_tick ← now`. No enqueue. | Lock is `SCHEDULER.lock`. Same deferred-enqueue race as `wake` in this row. **See `docs/handoffs/2026-04-25-scheduler-design-comparison.md` §"The specific invariant Linux maintains that m3OS violates"** and `docs/handoff/2026-04-28-graphical-stack-startup.md` §"Hypotheses ranked" (hypothesis 1). | **YES** |
+| `scan_expired` | (Blocked\*, so=T, was=T) — **LOST-WAKE PATH** | Under `SCHEDULER.lock` (caller holds it): `wake_deadline.take()` (ACTIVE_WAKE_DEADLINES--); `wake_after_switch ← true`; `last_migrated_tick ← now`. No enqueue. | Lock is `SCHEDULER.lock`. Same deferred-enqueue race as `wake` in this row. **See `docs/handoffs/2026-04-25-scheduler-design-comparison.md` §"The specific invariant Linux maintains that m3OS violates"** and `docs/handoffs/2026-04-28-graphical-stack-startup.md` §"Hypotheses ranked" (hypothesis 1). | **YES** |
 | `dispatch_switch_out` | (Blocked\*, so=F, was=F) | Under `SCHEDULER.lock`: `task.saved_rsp ← saved_rsp`; `so ← false`; `wake_after_switch` is `false` — no enqueue. Task remains Blocked. | Lock is `SCHEDULER.lock`. This is the correct path: block is stable, wake has not arrived yet. | No |
 
 ### Row 4 — (Blocked\*, so=T, was=T)
@@ -147,7 +147,7 @@ The two cells that exhibit the lost-wake bug class are:
 
 Both are cited in:
 - `docs/handoffs/2026-04-25-scheduler-design-comparison.md` — "The specific invariant Linux maintains that m3OS violates" and the re-block scenario (steps 1–6 in that section).
-- `docs/handoff/2026-04-28-graphical-stack-startup.md` — §"Hypotheses ranked" hypothesis 1: "display_server.poll_mouse calls ipc_call(mouse_handle, MOUSE_EVENT_PULL, 0), which blocks display_server in BlockedOnReply. When mouse_server's reply races with display_server's switch-out under the switching_out / wake_after_switch protocol, the wake is lost."
+- `docs/handoffs/2026-04-28-graphical-stack-startup.md` — §"Hypotheses ranked" hypothesis 1: "display_server.poll_mouse calls ipc_call(mouse_handle, MOUSE_EVENT_PULL, 0), which blocks display_server in BlockedOnReply. When mouse_server's reply races with display_server's switch-out under the switching_out / wake_after_switch protocol, the wake is lost."
 
 ---
 

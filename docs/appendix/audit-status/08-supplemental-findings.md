@@ -162,7 +162,7 @@ The supplemental pass surfaces a structural insight: **`docs/` is heterogeneous 
 | `docs/appendix/` | Ad hoc, kept | Generally accurate |
 | `docs/post-mortems/` | Per-incident, kept | Authoritative for closure |
 | `docs/handoffs/` (plural) | Per-handoff, kept | Authoritative for in-flight state; some result tables empty |
-| `docs/handoff/` (singular) | Per-handoff, 1 file only | Likely deprecated (single file: 2026-04-28-graphical-stack-startup) |
+| `docs/handoff/` (singular, since merged into `docs/handoffs/` in Phase 58) | Per-handoff, was 1 file only | Deprecated; consolidated into the plural directory (single original file: 2026-04-28-graphical-stack-startup) |
 | `docs/debug/` | Per-bug, 1 file only | Cited but not maintained |
 | `docs/evaluation/` | Quarterly-ish | ~10 phases stale (v0.47.0 baseline) |
 | `docs/research/` | Ad hoc | Recent (`post-phase-57 evaluation/` is 2026-04-29 — most accurate runtime snapshot) |
@@ -172,7 +172,7 @@ The supplemental pass surfaces a structural insight: **`docs/` is heterogeneous 
 
 **Recommended cleanup pass (additional R-recommendation, R11):**
 1. Treat `docs/research/post-phase-57 evaluation/` as the canonical post-Phase-57 state snapshot until a successor lands.
-2. Migrate `docs/handoff/` (singular) into `docs/handoffs/` (plural) and remove the empty directory; or vice-versa.
+2. Migrate `docs/handoff/` (singular) into `docs/handoffs/` (plural) and remove the empty directory. *(Closed in Phase 58 Track F.)*
 3. Either retire the top-level legacy docs (their roadmap/ counterparts are authoritative) or refresh them to match the aligned-template baseline.
 4. Either retire the seven top-level post-1.0 roadmap docs or fold them into Phase 59–62 design docs.
 5. Either refresh `docs/evaluation/` and `docs/shell/` or mark them archived with a date.
