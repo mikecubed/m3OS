@@ -1,6 +1,6 @@
 # Phase 60 — Phase 33 Slab Migration Closeout: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-60
 **Depends on:** Phase 33 (Kernel Memory Improvements) ✅, Phase 53a (Kernel Memory Modernization) ✅, Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Goal:** Audit every kernel `Box::new` / `Arc::new` site, document why most "candidate" object families (`FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`, `MemoryMapping`) are stored inline in slot arrays or BTreeMap nodes and therefore not slab-migration candidates, then migrate the two genuinely heap-allocated hot kernel object families (`Task` and `XSaveArea`) onto the existing `KernelSlabCaches` infrastructure. Measure global-heap relief using `heap_stats()` + `all_slab_stats()`. Flip Phase 33 task-doc C.4 (`docs/roadmap/tasks/33-kernel-memory-tasks.md`) from `[ ] Deferred` to `[x]` with a measurement citation.
@@ -14,7 +14,7 @@
 | C | Measure global-heap relief under 60-second IPC workload | B | Done |
 | D | Regression suite — full QEMU + host tests after each migration | B | Done |
 | E | Phase 33 design doc + task doc updated to mark C.4 closed | B C D | Done |
-| F | Documentation and Release | B C D E | In Progress |
+| F | Documentation and Release | B C D E | Done |
 
 ---
 
@@ -148,13 +148,13 @@
 **Why it matters:** The doc-template "aligned legacy learning doc" form gives a learner-friendly companion to the design + task docs. Every shipped phase has one (or has a deliberate exception). This file is created from the template in `docs/appendix/doc-templates.md` § "Template: aligned legacy learning doc".
 
 **Acceptance:**
-- [ ] `docs/60-slab-migration-closeout.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present).
-- [ ] Overview paragraph is learner-friendly and explains the phase outcome in plain language, including the audit finding that most "candidate" families turned out to be inline-slot-array non-candidates.
-- [ ] "What This Doc Covers" lists 3+ concrete topics (the audit, `Task`/`XSaveArea` migrations, measurement).
-- [ ] "Core Implementation" is written for a learner who has not read the design or task doc.
-- [ ] "Key Files" table cites the actual files this phase touches (`kernel/src/mm/slab.rs`, `kernel/src/task/scheduler.rs`, the audit + measurement handoff docs).
-- [ ] "How This Phase Differs From Later Memory Work" explains why most kernel object families are inline-stored and why that is a different (equally valid) form of allocator avoidance.
-- [ ] "Related Roadmap Docs" links the design and task docs.
+- [x] `docs/60-slab-migration-closeout.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present).
+- [x] Overview paragraph is learner-friendly and explains the phase outcome in plain language, including the audit finding that most "candidate" families turned out to be inline-slot-array non-candidates.
+- [x] "What This Doc Covers" lists 3+ concrete topics (the audit, `Task`/`XSaveArea` migrations, measurement).
+- [x] "Core Implementation" is written for a learner who has not read the design or task doc.
+- [x] "Key Files" table cites the actual files this phase touches (`kernel/src/mm/slab.rs`, `kernel/src/task/scheduler.rs`, the audit + measurement handoff docs).
+- [x] "How This Phase Differs From Later Memory Work" explains why most kernel object families are inline-stored and why that is a different (equally valid) form of allocator avoidance.
+- [x] "Related Roadmap Docs" links the design and task docs.
 
 ### F.2 — Bump kernel version to 0.60.0
 
@@ -168,10 +168,10 @@
 **Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The current `kernel/Cargo.toml` version is `0.58.0` (Phases 58 and 59 were documentation-only); Phase 60 is the first code-touching phase since the bump and moves the kernel to `0.60.0`.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.60.0"`.
-- [ ] `Cargo.lock` regenerated (`cargo generate-lockfile` or `cargo build` updates it).
-- [ ] `AGENTS.md` "Kernel v0.58.0" reference updated to "Kernel v0.60.0".
-- [ ] `cargo xtask check` passes after the bump.
+- [x] `kernel/Cargo.toml` `version = "0.60.0"`.
+- [x] `Cargo.lock` regenerated (`cargo build` updated it; `kernel` entry now reads `version = "0.60.0"`).
+- [x] `AGENTS.md` "Kernel v0.58.0" reference updated to "Kernel v0.60.0".
+- [x] `cargo xtask check` passes after the bump.
 - [ ] Git tag suggestion: `v0.60.0` (tag at phase merge, not at task-checkbox tick).
 
 ---
