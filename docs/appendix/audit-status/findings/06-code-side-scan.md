@@ -1,5 +1,14 @@
 # Findings: Code-Side Stub and Shortcut Scan
 
+> **Validation pass 2026-05-08.** Re-checked against the post-`ad7d9b2` (PR #136) tree. Changes since this finding's original snapshot (2026-05-07):
+> - **`TODO(57a-C/D)` pi_lock markers** — still present, 4 sites, line numbers shifted: now `kernel/src/task/scheduler.rs:829, 3649, 3656, 3855` (were 829, 3782, 3789, 3988).
+> - **Tick-multiplier bug callouts not in this finding** but flagged in `02-deferred-and-shortcuts.md` and `06-pre-1.0-blocker-list.md` C8 — closed by PR #136 Track G.3.
+> - **`TODO(subscription-push)` in display server** — still present at lines 670, 690, 696, 703.
+> - **`fat_server` ENOSYS stub** — still present (`userspace/fat_server/src/main.rs:67`).
+> - **NVMe isolation `todo!()` scaffolds** — still present at lines 85, 112, 139, 171.
+> - **AMD-Vi fault ISR TODO**, VT-d scalable mode false, queued invalidation deferred, multi-BDF AMD-Vi domains — all unchanged.
+
+
 ## Summary counts
 
 - TODO markers: 22 (kernel: 8, userspace: 9, kernel-core: 5, xtask: 0)

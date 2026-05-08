@@ -27,7 +27,7 @@ This is a catalogue. Not every entry is a problem; some are honestly-deferred wo
 
 ### Kernel ring-0 (`kernel/src/`)
 
-1. **Scheduler — pi_lock wiring missing.** `kernel/src/task/scheduler.rs:829, 3782, 3789, 3988` carry `// TODO(57a-C/D): route through pi_lock + with_block_state` markers. Four sites mutate `task.state` (Dead/Ready/Running) with bare stores, bypassing the protocol Phase 57a Tracks C/D were supposed to land. The pi_lock primitive does not exist at these callsites.
+1. **Scheduler — pi_lock wiring missing.** `kernel/src/task/scheduler.rs:829, 3649, 3656, 3855` (post-rebase line numbers; pre-merge they were 829, 3782, 3789, 3988) carry `// TODO(57a-C/D): route through pi_lock + with_block_state` markers. Four sites mutate `task.state` (Dead/Ready/Running) with bare stores, bypassing the protocol Phase 57a Tracks C/D were supposed to land. The pi_lock primitive does not exist at these callsites. (Validation pass 2026-05-08: still present after Phase 57e deferred.)
 
 2. **Scheduler — global lock on dispatch hot path.** `kernel/src/task/scheduler.rs:28-30` module doc: *"True per-core scheduling (where the dispatch hot path never acquires a global lock) is deferred to a future phase."* No phase number assigned.
 

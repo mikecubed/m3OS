@@ -4,6 +4,13 @@
 **Audited:** 2026-05-07
 **Auditor:** Claude (Sonnet 4.6), structured read of all primary docs + supporting appendices
 
+> **Validation pass 2026-05-08.** PR #136 (`ad7d9b2`) squash-merged `Phase 57e — Deferred (full kernel preemption) + SMP discipline hardening` onto main. Material changes vs. this finding's original snapshot:
+> - **Phase 57e is now Deferred.** Post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`. The "Bug #12 / Bug #13 active work" framing in the original snapshot is superseded; both bugs were resolved as part of the deferral cleanup. Their fixes (init_task 50 ms reap-loop sleep, stdin_feeder waitqueue block, IPC bracket exits, `wake_child_waiters` wake-side bracket, `sys_waitpid` 1 s deadline backstop) survive as preempt-model-independent SMP discipline hardening.
+> - **`preempt-full` Cargo flag retired**, `check_and_preempt_kernel` and `preempt_to_scheduler_kernel` removed. The XSAVE migration content in this finding is now historical.
+> - **Five `× 10` / `÷ 10` tick-multiplier bugs flagged in §57a are fixed** (Track G.3). Comments now read `— G.3 fix` in scheduler.rs and syscall/mod.rs.
+> - **Status drift unchanged or worsened**: 57a still says Planned in design doc, 57d now also says Planned in design doc despite PR #134 merging, 57b's "pending soak (PR #132)" qualifier is stale because PR #132 has merged.
+> - **`TODO(57a-C/D)` pi_lock markers** still present at 4 sites — line numbers shifted from {829, 3782, 3789, 3988} to {829, 3649, 3656, 3855}.
+
 ---
 
 ## Phase 55 — Hardware Substrate

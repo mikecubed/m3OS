@@ -4,6 +4,8 @@ A "red flag" in this audit means **the project's claim about a phase materially 
 
 The 16 items below are ranked by severity. The 🛑 / 🔴 / 🟠 / 🟡 tags match the ones in `01-completion-truth-matrix.md`.
 
+> **Validation pass 2026-05-08.** After PR #136 squash-merged Phase 57e — Deferred onto `main`, the audit was rebased and re-checked against the new state. Only Red Flag #7 widened (57d added; 57b's "pending soak" qualifier became stale) and Red Flag #16 partially closed (Bug #12 / Bug #13 are now resolved as part of the deferral cleanup; pi_lock TODOs survived). The five tick-multiplier bugs the audit flagged in §04 / §06 were also closed by PR #136.
+
 ---
 
 ## 🛑 1. Phase 19 — design doc Complete, task doc all six tracks Not started
@@ -91,20 +93,22 @@ Either interpretation makes the task docs untrustworthy. The 33–47 range has t
 
 ---
 
-## 🛑 7. Phases 55a, 55b, 56, 57a — design docs say "Planned" while every downstream phase treats them as done
+## 🛑 7. Phases 55a, 55b, 56, 57a, 57d — design docs say "Planned" while README and downstream phases treat them as done; 57b "pending soak (PR #132)" qualifier is stale
 
-**Evidence:** `findings/05-hardware-display-preemption.md` § Status Metadata Inconsistencies.
+**Evidence:** `findings/05-hardware-display-preemption.md` § Status Metadata Inconsistencies + validation pass 2026-05-08.
 
-| Phase | Status in design doc | Contradicting evidence |
-|---|---|---|
-| 55a | Planned | 55c and 56 list 55a as `✅`; AGENTS.md describes IOMMU as operational |
-| 55b | Planned | 55c, 56, 57 list 55b as `✅`; AGENTS.md describes ring-3 drivers as operational |
-| 56 | Planned | Completion-gaps doc closing checklist fully ticked; kernel bumped to 0.56.0; 9/9 closing boxes checked |
-| 57a | Planned | AGENTS.md describes scheduler rewrite as complete; 57b/57c list 57a as `✅` |
+| Phase | Design-doc Status | README Status | Contradicting evidence |
+|---|---|---|---|
+| 55a | Planned | (Complete row) | 55c and 56 list 55a as `✅`; AGENTS.md describes IOMMU as operational |
+| 55b | Planned | (Complete row) | 55c, 56, 57 list 55b as `✅`; AGENTS.md describes ring-3 drivers as operational |
+| 56 | Planned | (Complete row) | Completion-gaps doc closing checklist fully ticked; kernel bumped to 0.56.0; 9/9 closing boxes checked |
+| 57a | Planned | **Complete** | PR #129 (`4c72e34`) merged; AGENTS.md describes scheduler rewrite as complete; 57b/57c list 57a as `✅` |
+| 57d | Planned | **Complete** | PR #134 (`797ed0c`) merged; PREEMPT_VOLUNTARY is now the production preemption model after 57e deferral |
+| 57b | Complete pending soak (PR #132) | Complete pending soak | PR #132 (`f39ca13`) has squash-merged; the "pending soak" qualifier is stale and no soak-result document exists |
 
-**Why it matters:** The design-doc status field is the most prominent place a reader looks. When AGENTS.md and downstream phases consistently disagree with the status field, the README is no longer a reliable source of truth — readers must learn which fields to ignore.
+**Why it matters:** The design-doc status field is the most prominent place a reader looks. When AGENTS.md, the README, and downstream phases consistently disagree with the design-doc status field, the README is no longer a reliable source of truth — readers must learn which fields to ignore. The validation pass on 2026-05-08 confirms the drift is widening, not closing: 57d joined the list when its PR landed without a design-doc Status flip.
 
-**Recommended action:** Flip these four phases' status fields to "Complete" (or "Complete (with caveats)" where appropriate). If any of the four genuinely is not complete, the downstream phases that depend on it must be demoted.
+**Recommended action:** Flip these phases' design-doc Status fields to match the README (`Complete` for 55a/55b/56/57a/57b/57d). For 57b specifically, drop the "pending soak (PR #132)" qualifier or replace it with a one-line soak-result note. If any of the six is genuinely not complete, the downstream phases that depend on it must be demoted.
 
 ---
 
@@ -183,16 +187,21 @@ Either interpretation makes the task docs untrustworthy. The 33–47 range has t
 
 ---
 
-## 🟠 16. Phase 57a — pi_lock wiring missing at 4 scheduler sites; Phase 57b soak result undocumented
+## 🟠 16. Phase 57a — pi_lock wiring missing at 4 scheduler sites; Phase 57b "pending soak (PR #132)" qualifier stale (Bug #12 / #13 closed by 57e deferral)
 
-**Evidence:** `findings/05-hardware-display-preemption.md` § Phase 57a/57b + `findings/06-code-side-scan.md` § Kernel ring-0.
+**Evidence:** `findings/05-hardware-display-preemption.md` § Phase 57a/57b + `findings/06-code-side-scan.md` § Kernel ring-0 + validation pass 2026-05-08.
 
-- Four `// TODO(57a-C/D): route through pi_lock + with_block_state` markers in `kernel/src/task/scheduler.rs` at lines 829, 3782, 3789, 3988 — bare `task.state = ...` stores bypassing the abstraction Phase 57a Tracks C/D were supposed to deliver.
-- Phase 57b status is "Complete pending soak (PR #132)". Acceptance requires "A 30-minute soak with `cargo xtask run-gui --fresh` produces zero panics from this assertion." No soak result document exists in any accessible doc.
+- Four `// TODO(57a-C/D): route through pi_lock + with_block_state` markers in `kernel/src/task/scheduler.rs` at lines **829, 3649, 3656, 3855** (post-rebase line numbers; previously 829, 3782, 3789, 3988 pre-merge) — bare `task.state = ...` stores bypassing the abstraction Phase 57a Tracks C/D were supposed to deliver.
+- Phase 57b design-doc status still reads "Complete pending soak (PR #132)" but PR #132 (`f39ca13`) has squash-merged. No soak result document exists. The `preempt_count` discipline + `IrqSafeMutex` F.1 wiring are now load-bearing for the SMP discipline hardening that survived the 57e deferral.
 
-**Why it matters:** Phase 57e (Full Kernel Preemption) is in active development on the current branch. Its safety depends on the `preempt_count` discipline established by 57b — and on the pi_lock + with_block_state protocol established by 57a. Both have outstanding integrity gaps. The git log shows recent fixes for Bug #12 and Bug #13 in 57e commits, suggesting active stress is exposing exactly the kinds of races these abstractions are meant to prevent.
+**Closed by the 2026-05-07 57e deferral** (`ad7d9b2`):
+- Bug #12 (kernel-mode preempt quantum / `preempt_enable` deferral, multi-part) — fixes retained as preempt-model-independent (init_task 50 ms reap-loop sleep, stdin_feeder waitqueue block, IPC bracket exits in `endpoint.rs`).
+- Bug #13 (`wake_child_waiters` wake-side bracketing) — fix retained (`549584f`); 1 s `sys_waitpid` deadline backstop added (`9c39291`).
+- Five `× 10` / `÷ 10` tick-multiplier bugs — fixed in 57a Track G.3 (comments now read `— G.3 fix`).
 
-**Recommended action:** Either run the 57b soak and record the result, or remove the "pending soak" qualifier with rationale. Land the four pi_lock callsites before 57e closes.
+**Why it matters (revised):** With Phase 57e deferred, the immediate pressure on the pi_lock wiring is lower — under voluntary kernel preemption the bare `task.state = ...` stores are less likely to interact with a preemption window. But the four sites are still genuine integrity gaps: the abstraction Phase 57a Tracks C/D were supposed to deliver was not delivered uniformly, and the project has now committed to PREEMPT_VOLUNTARY as its 1.0 model, so the abstraction matters for ongoing SMP correctness even without full kernel preemption.
+
+**Recommended action:** Land the four pi_lock callsites in a Phase 57a follow-up (`57a Track C/D closure`). Update Phase 57b's design-doc Status to drop the "pending soak (PR #132)" qualifier or replace with a one-line soak-result note. The Bug #12 / #13 fixes are now reflected in the post-mortem at `docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md` and need no further action.
 
 ---
 
