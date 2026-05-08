@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Kernel v0.60.0 with functional userspace (init, shell, coreutils, networking, SMP, storage, signals, editor, multi-user, PTY, telnet/SSH servers, crypto, musl cross-compilation, ports system, service manager, IPC, audio, graphical session, terminal emulator), real-hardware storage via NVMe and networking via Intel e1000 (classic 82540EM) on top of the VirtIO baseline, the Phase 55a IOMMU substrate (ACPI DMAR/IVRS parsing, per-device VT-d and AMD-Vi translation domains, IOMMU-routed `DmaBuffer<T>` with an identity-fallback for non-IOMMU platforms), ring-3 driver hosting (capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers with `RemoteBlockDevice`/`RemoteNic` kernel facades — Phase 55b), Phase 55c ring-3 driver correctness closure (bound-notification event multiplexing, IOMMU BAR identity coverage, userspace EAGAIN visibility during driver restart), the Phase 56 ring-3 display server with focus-aware input dispatch, layer-shell-equivalent surface roles, and a control socket (`display_server` owns the framebuffer via `sys_fb_acquire`; `kbd_server` / `mouse_server` publish typed `KeyEvent` / `PointerEvent` to a focus-aware dispatcher; `Toplevel` / `Layer` / `Cursor` surface roles with anchor / exclusive-zone / keyboard-interactivity semantics; `m3ctl`-style control socket on a separate AF_UNIX path), and Phase 57 audio + local-session (`audio_server` ring-3 supervised driver claiming Intel 82801AA AC'97 `0x8086:0x2415` over the Phase 55b device-host primitives with single-client PCM-out via the `audio_client` library; `session_manager` orchestrating the fixed boot sequence `display_server` → `kbd_server` → `mouse_server` → `audio_server` → `term` with a typed `text-fallback` recovery contract; `term` graphical terminal emulator composing PTY + ANSI parser + Phase 56 client surfaces + audio bell). See `docs/appendix/codebase-map.md` for full workspace and source layout.
+**m3OS** (technical name: `m3os`) is a bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Kernel v0.60.0 with functional userspace (init, shell, coreutils, networking, SMP, storage, signals, editor, multi-user, PTY, telnet/SSH servers, crypto, musl cross-compilation, ports system, service manager, IPC, audio, graphical session, terminal emulator), real-hardware storage via NVMe and networking via Intel e1000 (classic 82540EM) on top of the VirtIO baseline, the Phase 55a IOMMU substrate (ACPI DMAR/IVRS parsing, per-device VT-d and AMD-Vi translation domains, IOMMU-routed `DmaBuffer<T>` with an identity-fallback for non-IOMMU platforms), ring-3 driver hosting (capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers with `RemoteBlockDevice`/`RemoteNic` kernel facades — Phase 55b), Phase 55c ring-3 driver correctness closure (bound-notification event multiplexing, IOMMU BAR identity coverage, userspace EAGAIN visibility during driver restart), the Phase 56 ring-3 display server with focus-aware input dispatch, layer-shell-equivalent surface roles, and a control socket (`display_server` owns the framebuffer via `sys_fb_acquire`; `kbd_server` / `mouse_server` publish typed `KeyEvent` / `PointerEvent` to a focus-aware dispatcher; `Toplevel` / `Layer` / `Cursor` surface roles with anchor / exclusive-zone / keyboard-interactivity semantics; `m3ctl`-style control socket on a separate AF_UNIX path), and Phase 57 audio + local-session (`audio_server` ring-3 supervised driver claiming Intel 82801AA AC'97 `0x8086:0x2415` over the Phase 55b device-host primitives with single-client PCM-out via the `audio_client` library; `session_manager` orchestrating the fixed boot sequence `display_server` → `kbd_server` → `mouse_server` → `audio_server` → `term` with a typed `text-fallback` recovery contract; `term` graphical terminal emulator composing PTY + ANSI parser + Phase 56 client surfaces + audio bell). See `docs/appendix/codebase-map.md` for full workspace and source layout.
 
 ## Build & Run
 
@@ -96,12 +96,12 @@ Adding a new userspace binary requires changes in **four** places. Missing any o
 3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Generated binaries are staged by `xtask` under `target/generated-initrd/`; checked-in static initrd assets remain under `kernel/initrd/`. Without the ramdisk entry, `execve` returns ENOENT.
 4. **Service config (if daemon)** — add a `.conf` file to the ext2 data disk builder in `xtask/src/main.rs` (`populate_ext2_files` function) AND to the `KNOWN_CONFIGS` fallback list in `userspace/init/src/main.rs`. Run `cargo xtask clean` to recreate the disk.
 
-
 ## Critical Conventions
 
 ### Target flags — do not remove
 
 In `.cargo/config.toml` / target spec:
+
 - `"disable-redzone": true` — hardware interrupts use the stack; removing this causes silent stack corruption
 - `"-mmx,-sse"` — disables SIMD to avoid FPU state save/restore on context switches
 - `"panic-strategy": "abort"` — no unwinding; panics halt the machine
@@ -119,6 +119,7 @@ All crates use Rust **edition 2024** — the body of an `unsafe fn` is *not* imp
 ### IPC model — read the doc before touching `kernel/src/ipc/`
 
 Synchronous rendezvous + async notification objects (seL4-style):
+
 - Server-to-server: sync `call`/`reply_recv`
 - IRQ/vsync: `Notification` objects (word-sized bitfield, safe to signal from interrupt handlers)
 - Bulk data: page capability grants, never IPC payloads
@@ -196,6 +197,7 @@ All roadmap docs must follow the templates in `docs/appendix/doc-templates.md`. 
 | Roadmap README row | `docs/roadmap/README.md` | Phase, Theme, Primary Outcome, Status, Source Ref, Milestone link, Tasks link |
 
 Rules:
+
 - Never create a task doc without all template sections populated.
 - Never create a design doc missing Status, Source Ref, Depends on, or Builds on.
 - Task acceptance items must be concrete and measurable — no vague "works correctly".
