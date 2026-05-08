@@ -2682,9 +2682,21 @@ fn build_test_binaries(test_name: Option<&str>, features: &[String]) -> Vec<Path
     build_pdpmake();
     build_doom();
 
+    // Build kernel integration tests in release mode (matches the production
+    // kernel build profile). Phase 61 Track 0a discovery: the kernel hot path
+    // contains numerous `debug_assert!` and `unsafe` precondition checks that
+    // are valid in release but fire under the stricter debug profile (e.g.
+    // unaligned `*mut T::write` on the AP boot trampoline; scheduler RSP
+    // initialised lazily via `switch_context` rather than eagerly). Building
+    // tests in release matches the harness to the production binary so live
+    // SMP tests exercise the same code path users actually run, and avoids
+    // sinking the closeout phase into a long tail of debug-only fixups.
+    // `assert!` / `assert_eq!` / `panic!` in test files all still fire
+    // because they do not depend on `debug_assertions`.
     let mut build_args = vec![
         "build",
         "--tests",
+        "--release",
         "--package",
         "kernel",
         "--target",

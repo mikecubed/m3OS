@@ -1188,6 +1188,32 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     enqueue_to_core(core, idx);
 }
 
+/// Spawn a new kernel task on a specific core. Used by Phase 61 SMP
+/// integration tests to deterministically create initial run-queue imbalance
+/// (load-balance regression test) and to pin reader/writer tasks across
+/// cores (cross-core wakeup tests).
+///
+/// Unlike [`spawn_on_current_core`], does not require a current-task
+/// context — safe to call from the BSP entry function before
+/// [`run`] is invoked.
+///
+/// Panics if `core_id` is outside the SMP topology range.
+pub fn spawn_on_core(entry: fn() -> !, name: &'static str, core_id: u8) {
+    assert!(
+        (core_id as usize) < crate::smp::MAX_CORES,
+        "spawn_on_core: core_id {core_id} out of range",
+    );
+    let mut task = Task::new(entry, name);
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    task.assigned_core = core_id;
+    task.last_migrated_tick = now;
+    task.last_ready_tick = now;
+    let mut sched = scheduler_lock();
+    let idx = alloc_task_slot(&mut sched, task);
+    drop(sched);
+    enqueue_to_core(core_id, idx);
+}
+
 /// Spawn a fork/clone child task with its userspace entry context attached
 /// directly to the task instead of a global queue.
 pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) -> u8 {
@@ -4387,10 +4413,20 @@ pub fn run() -> ! {
                     }
                     // Re-enqueue if the task yielded (still Running); blocked/dead
                     // tasks will be re-enqueued by wake_task_v2 after their waker fires.
+                    //
+                    // Phase 61 Track B fix: do NOT reset `last_migrated_tick` here.
+                    // The field exists to skip tasks within `MIGRATE_COOLDOWN` ticks
+                    // of their last actual migration (anti-thrashing). Resetting it
+                    // on every cooperative yield meant CPU-bound tasks that yield
+                    // frequently (the common case) were never eligible for migration,
+                    // so `maybe_load_balance` could fire every 50 ticks and never
+                    // actually move anything — an unobserved no-op load balancer.
+                    // Surfaced by `kernel/tests/load_balance_smp.rs`. The field is
+                    // updated only at spawn time (task assignment) and inside
+                    // `maybe_load_balance` after a successful migration.
                     if task.state == TaskState::Running {
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
-                        task.last_migrated_tick = now;
                         Some((task.assigned_core, sidx))
                     } else {
                         None
