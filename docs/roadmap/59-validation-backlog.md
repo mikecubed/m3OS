@@ -4,7 +4,7 @@
 **Source Ref:** phase-59
 **Depends on:** Phase 58 (Documentation Reconciliation Pass) ✅, Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Builds on:** All phases whose task docs carry deferred manual-QEMU validation items. Phase 59 does not add features; it runs the manual and semi-automated validation sessions that earlier phases deferred behind "run in QEMU once" annotations.
-**Primary Components:** QEMU test harness (`cargo xtask test`, `cargo xtask run`), `docs/roadmap/tasks/` (source phase task docs that carry the deferred items), `docs/handoffs/57b-soak-gate.md` (soak result record), `kernel/src/arch/x86_64/tests/` (RTC automated test scaffold), `kernel/src/net/` (AF_UNIX integration test scaffold)
+**Primary Components:** QEMU test harness (`cargo xtask test`, `cargo xtask run`), `docs/roadmap/tasks/` (source phase task docs that carry the deferred items), `docs/handoffs/57b-soak-gate.md` (soak result record), `kernel/tests/` (top-level kernel integration test directory — RTC and AF_UNIX automated tests added here), `userspace/unix-socket-test/` (existing AF_UNIX smoke binary that the new kernel-resident test mirrors)
 
 ## Milestone Goal
 
@@ -48,11 +48,11 @@ Phase 43 G.1 (password auth), G.2 (pubkey auth), and G.3 (Wireshark traffic insp
 
 ### Track E — Phase 22b ANSI Parser Visual Tests
 
-Phase 22b Track F has 7 items, every one marked "Deferred (manual QEMU visual test)". Includes the critical regression check P22b-T046: sh0 still works correctly in cooked-mode echo after ANSI parser changes.
+Phase 22b Track F has 11 P22b-T### rows total; 7 (T040–T046) are marked `Deferred (manual QEMU visual test)` and are this track's scope. Includes the critical regression check P22b-T046: sh0 still works correctly in cooked-mode echo after ANSI parser changes. **Note on doc format:** Phase 22b's task doc uses the legacy pipe-table format, not checkboxes — Phase 58 Track B.3 deferred conversion of legacy task docs (other than Phase 16) to post-1.0. The implementer updates each row's `Status` cell instead of flipping `[ ]` → `[x]`.
 
 ### Track F — Phase 24 Reboot Persistence
 
-P24-T043 (reboot, remount, verify persisted file survives) is unchecked. This is the single unrun test item for Phase 24. Estimated: 30 minutes in QEMU.
+P24-T043 (reboot, remount, verify persisted file survives) is the single core unrun test item for Phase 24; the immediately-following P24-T044 (host-side visibility check via `losetup -P` + `mount`) is also deferred and may be folded into the same QEMU session. Estimated: 30 minutes. **Note on doc format:** Phase 24's task doc uses the legacy pipe-table format — same format-conversion deferral as Track E above; the implementer updates the row's `Status` cell.
 
 ### Track G — Phase 57b 30-Minute Soak
 
@@ -60,11 +60,11 @@ Phase 57b's acceptance gate (PR #132) requires a 30-minute soak test under SMP l
 
 ### Track H — Phase 34 Automated RTC Test
 
-Phase 34 E.2 requires an automated QEMU RTC accuracy test. This track writes the test code in the `cargo xtask test` scaffold, runs it, and flips E.2's checkbox.
+Phase 34 E.2 requires an automated QEMU RTC accuracy test. This track writes a new `kernel/tests/rtc_accuracy.rs` test binary (kernel integration tests live at the top-level `kernel/tests/` directory; existing peers include `bound_recv.rs`, `preempt_latency.rs`, `xsave_avx.rs`), runs it via `cargo xtask test --test rtc_accuracy`, and flips E.2's checkbox.
 
 ### Track I — Phase 39 AF_UNIX Integration Test
 
-Phase 39 J.1 requires an automated AF_UNIX integration test covering at minimum `SOCK_STREAM` connect/send/recv across two processes. This track writes and runs the test.
+Phase 39 J.1 currently carries `[x]` items with a deferral note ("existing test harness uses kernel-level `#[test_case]` only; userspace test binary is built and embedded in initrd for manual/smoke testing"). This track closes that deferral by writing `kernel/tests/unix_socket.rs` (the file path J.1 already cites) and porting the coverage of `userspace/unix-socket-test/src/main.rs` — `socketpair`, named `SOCK_STREAM` + `SOCK_DGRAM`, `accept`/`connect`/`send`/`recv`, `shutdown` — into the kernel-resident `cargo xtask test` harness, then re-citing J.1 against the new file.
 
 ### Track J — Phase 10 Real-Hardware Secure Boot
 
@@ -78,11 +78,11 @@ All manual QEMU tests produce a log artifact by running `cargo xtask run` with s
 
 ### `cargo xtask test` Harness
 
-Automated tests use the ISA debug-exit convention: write `0x10` to port `0xf4` for success, `0x11` for failure. The RTC test (H) and AF_UNIX test (I) each become a named test binary added to the `bins` array in `xtask/src/main.rs` with `needs_alloc = false` (kernel-resident tests) or added to `kernel-core` host tests.
+Automated tests use the ISA debug-exit convention: write `0x10` to port `0xf4` for success, `0x11` for failure (see `QEMU_EXIT_SUCCESS` / `QEMU_EXIT_FAILURE` in `xtask/src/main.rs`). Kernel integration tests live as standalone `no_std` binaries in `kernel/tests/`, each declaring `#![test_runner(test_runner)]` with `#[test_case]`-tagged functions; `build_test_binaries` discovers them automatically — no `bins`-array edit is required for the RTC test (H) or AF_UNIX test (I). Pure-logic helpers used by these tests live in `kernel-core` (e.g., the existing `kernel_core::preempt_model` used by `kernel/tests/preempt_voluntary.rs`).
 
 ### `docs/handoffs/57b-soak-gate.md`
 
-The file exists but has an empty result table. Track G populates: start time, end time, QEMU SMP configuration, observed panics (if any), max observed preemption latency (from serial log), and a pass/fail verdict.
+The file exists with a documented procedure (`cargo xtask run-gui --fresh` for 30 minutes with synthetic IPC + futex + notification load on ≥4 cores), four explicit pass criteria (zero `preempt_count != 0` panics, no new `[WARN] [sched]` lines vs. the pre-57b baseline, no deadlocks, clean shutdown), and an empty 5-column result-tracking table (`Date | Operator | Duration | Result | Notes`). Track G runs the procedure, evaluates the pass criteria, and appends one row to the table — extra detail (start/end times, QEMU command line if non-default, panic count, log artifact reference) goes into the `Notes` column rather than expanding the table schema.
 
 ## How This Builds on Earlier Phases
 
