@@ -108,7 +108,9 @@ Either interpretation makes the task docs untrustworthy. The 33–47 range has t
 
 **Why it matters:** The design-doc status field is the most prominent place a reader looks. When AGENTS.md, the README, and downstream phases consistently disagree with the design-doc status field, the README is no longer a reliable source of truth — readers must learn which fields to ignore. The validation pass on 2026-05-08 confirms the drift is widening, not closing: 57d joined the list when its PR landed without a design-doc Status flip.
 
-**Recommended action:** Flip these phases' design-doc Status fields to match the README (`Complete` for 55a/55b/56/57a/57b/57d). For 57b specifically, drop the "pending soak (PR #132)" qualifier or replace it with a one-line soak-result note. If any of the six is genuinely not complete, the downstream phases that depend on it must be demoted.
+**Recommended action:** Flip these phases' design-doc Status fields to match the README (`Complete` for 55a/55b/56/57a/57b/57d). For 57b specifically, drop the "pending soak (PR #132)" qualifier or replace it with a one-line soak-result note (note: `docs/handoffs/57b-soak-gate.md` exists with an empty result table — the soak has never been run; this is a real gate, not just a doc gap). If any of the six is genuinely not complete, the downstream phases that depend on it must be demoted.
+
+**Supplemental pass 2026-05-08 — additional drift in legacy `docs/*.md`:** The top-level legacy doc `docs/56-display-and-input-architecture.md` also carries `Status: Planned` while both the roadmap design doc and the README treat the phase as Complete — Phase 56's drift is now four-deep (legacy doc, design doc, README row, AGENTS.md narrative — only the latter two agree). Additionally, two legacy docs have correct Status fields but **stale body content** contradicting later-phase work: `docs/16-network.md` still describes the network stack as kernel-mode-temporary (Phase 54 migrated UDP policy), and `docs/22-tty-terminal.md` still describes PTY as "skeleton stubs" (Phase 29 implemented the full PTY subsystem). Below 🛑 severity (headers align; only bodies stale) but confirms the corpus-wide doc-staleness pattern.
 
 ---
 
@@ -169,13 +171,23 @@ Either interpretation makes the task docs untrustworthy. The 33–47 range has t
 
 ---
 
-## 🟠 14. `fat_server` is a permanent ENOSYS stub but Phase 54 is Complete
+## 🛑 14. Stub services declared Complete — `fat_server` (Phase 54), and **`audio_server` + `session_manager` (Phase 57)** as the supplemental pass surfaced
 
-**Evidence:** `findings/06-code-side-scan.md` § Userspace. `userspace/fat_server/src/main.rs:67` — entire service replies `-ENOSYS` to every request. The Phase 54 userspace FAT storage server is supervised, registered, and deployed but does nothing.
+**Evidence (Phase 54):** `findings/06-code-side-scan.md` § Userspace. `userspace/fat_server/src/main.rs:67` — entire service replies `-ENOSYS` to every request. The Phase 54 userspace FAT storage server is supervised, registered, and deployed but does nothing.
 
-**Why it matters:** Phase 54 (Deep Serverization) claims storage-and-VFS extraction. The FAT-server slice is listed as one of the extracted services. The slice is structurally extracted (a service is registered) but functionally non-existent. VFS callers hitting `fat_server` get a clean errno but no data.
+**Evidence (Phase 57, supplemental pass 2026-05-08):** `docs/research/post-phase-57 evaluation/01-phase-57-progress.md` (2026-04-29) — the most accurate runtime state snapshot in the corpus.
 
-**Recommended action:** Either implement the FAT operations in `fat_server` (real Phase 54 work) or remove the supervised stub and document that FAT migration was deferred.
+- **`audio_server` Ac97Backend submits frames for accounting only — no PCM reaches hardware.** The `audio-smoke` xtask gate checks that `audio_server.conf` loads, not that PCM frames are consumed.
+- **`session_manager` `start/stop/restart` return `Ack` unconditionally** — the lifecycle orchestration that Phase 57's text-fallback recovery contract depends on does not actually run. F.4 stop() calls are logging-only stubs (corroborated in `docs/handoffs/`).
+
+**Why it matters:** This is now a **pattern**, not a one-off. Three services across two phases are declared Complete while replying cleanly to requests they don't service. Phase 54's FAT stub was already known when Phase 57 closed — yet Phase 57 shipped two more services with the same shape. The pattern is now load-bearing: `AGENTS.md` and the README cite "audio output for the local graphical session" as a Phase 57 capability, and the runtime evidence says it's not.
+
+This is an escalation from 🟠 to 🛑 for Red Flag #14 because:
+1. The pattern is recurring (a project culture concern, not a single-feature concern).
+2. The evidence is independent (one finding from code review, one from runtime evaluation).
+3. The headline goal of Phase 57 ("audible output and a useful client baseline") is not met.
+
+**Recommended action:** For each stub service, decide: implement, demote-to-known-limitation, or remove. Document the decision in the phase doc. For Phase 57 specifically, consider opening a Phase 57h ("audio + session_manager actual implementation") on the precedent of 52d/54a.
 
 ---
 

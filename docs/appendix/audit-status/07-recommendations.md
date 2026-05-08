@@ -154,6 +154,29 @@ The remediation cost is bounded: ~6–10 weeks of focused work, most of it docum
 
 ---
 
+## R11 — Corpus-wide doc-hygiene cleanup (added 2026-05-08 supplemental pass)
+
+**Problem:** `docs/` is heterogeneous and not all subdirectories are maintained at the same cadence. The supplemental pass surfaced concrete staleness:
+- `docs/evaluation/README.md` scoped to v0.47.0 (~10 phases stale).
+- `docs/shell/brush-integration-analysis.md` (2026-03-26) ~15 phases stale.
+- Seven top-level post-1.0 roadmap docs (clang-llvm/claude-code/git/github-cli/nodejs/python/rust-crate-acceleration) all use a `Today (Phase 32)` baseline — 20+ phases stale; `rust-crate-acceleration.md` is fully superseded by completed Phases 41–47.
+- `docs/handoff/` (singular, 1 file) and `docs/handoffs/` (plural, 21 files) are parallel directories with overlapping purpose.
+- Two legacy docs (`docs/16-network.md`, `docs/22-tty-terminal.md`) carry correct Status fields but stale body content.
+- `docs/06-ipc.md` references a nonexistent `docs/06-ipc-core.md` in its Supersedes field.
+
+**Recommendation:**
+1. Treat `docs/research/post-phase-57 evaluation/` as the canonical post-Phase-57 state snapshot until a successor lands. (It is currently the most accurate state-of-the-system doc in the corpus.)
+2. Migrate `docs/handoff/` (singular) into `docs/handoffs/` (plural); remove the empty directory.
+3. Either retire the seven top-level post-1.0 roadmap docs (their content is superseded by Phase 59–62 design docs) or convert each into a stub that points at the Phase 59–62 doc.
+4. Refresh body content of `docs/16-network.md` and `docs/22-tty-terminal.md`, or mark them archived with a date.
+5. Refresh `docs/evaluation/README.md` and `docs/shell/` or mark them archived.
+6. Fix `docs/06-ipc.md` Supersedes field (point at the actual current doc or remove the field).
+
+**Effort:** 2–3 days for a full cleanup pass.
+**Owner:** doc-cleanup PR (R11) bundled with R2 status reconciliation.
+
+---
+
 ## Summary table — actions and ownership
 
 | ID | Action | Severity | Effort | Owner |
@@ -161,10 +184,11 @@ The remediation cost is bounded: ~6–10 weeks of focused work, most of it docum
 | R1 | Adopt doc-truth rule | — | 1 hour | Project lead |
 | R2 | One-shot status reconciliation PR | 🛑 | 2–3 days | One engineer |
 | R3 | Validation-must-be-checked gate | — | Process | Project lead |
-| R4 | Cut Phases 55d, 56b, 57f; clarify Phase 58 | 🔴 | 4–5 weeks | Phase owners |
+| R4 | Cut Phases 55d, 56b, 57f, 57g, 57h, 48b; clarify Phase 58 | 🔴 | 6–8 weeks | Phase owners |
 | R5 | Resolve `Phase N+ deferred` markers | 🟠 | 1 day | One engineer |
 | R6 | Keep `findings/` in-tree | — | 0 hours | This PR |
 | R7 | Add doc-template linter | 🟡 | 1 day | One engineer |
 | R8 | Test AGENTS.md version + capability claims | 🟡 | 1–2 hours | One engineer |
 | R9 | Extract known-limitations doc | 🟠 | 1 day + ongoing | One engineer |
-| R10 | Auditor's verdict — defer 1.0 until R2 + B-section done | 🛑 | (see above) | Project lead |
+| R10 | Auditor's verdict — defer 1.0 until R2 + B-section + F-section done | 🛑 | (see above) | Project lead |
+| R11 | Corpus-wide doc-hygiene cleanup | 🟡 | 2–3 days | One engineer |
