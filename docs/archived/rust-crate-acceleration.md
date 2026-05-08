@@ -1,3 +1,5 @@
+> Archived 2026-05-08 — fully superseded by completed Phases 41–47. Original content preserved below for historical reference.
+
 # Rust Crate Acceleration for m3OS Roadmap
 
 This document analyzes which post-Phase 33 roadmap items can be accelerated

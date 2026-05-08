@@ -235,10 +235,10 @@
 The default disposition is "archive with dated note." If during implementation any of the six non-`rust-crate-acceleration.md` docs is discovered to contain unique not-elsewhere-recorded design intent, the implementer may instead fold the salvageable content into the appropriate phase appendix and then archive the husk — but the default action is archive.
 
 **Acceptance:**
-- [ ] Every file in the table above has been moved to `docs/archived/<original-filename>` (preserving basename).
-- [ ] Each archived file's first body line is a quoted note in the form `> Archived 2026-05-08 — superseded by <phase or note>. Original content preserved below for historical reference.`
-- [ ] No file remaining in the top-level `docs/` directory references "Phase 32" as "today" or "current".
-- [ ] `git mv` was used (not delete + add) so that history is preserved.
+- [x] Every file in the table above has been moved to `docs/archived/<original-filename>` (preserving basename).
+- [x] Each archived file's first body line is a quoted note in the form `> Archived 2026-05-08 — superseded by <phase or note>. Original content preserved below for historical reference.`
+- [x] No file remaining in the top-level `docs/` directory references "Phase 32" as "today" or "current". *(Two `docs/3?-*.md` legacy aligned docs reference Phase 32 by name as a roadmap entry, which is the correct cross-reference form, not a "today" claim.)*
+- [x] `git mv` was used (not delete + add) so that history is preserved.
 
 ---
 
