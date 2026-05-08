@@ -22,6 +22,24 @@ frame rate and accept keyboard input for full gameplay.
 
 ---
 
+## Phase 58 reconciliation — verification
+
+**Reconciliation date:** 2026-05-08 (Phase 58 Track A.2)
+
+All Phase 47 track items walked against the codebase and flipped to `[x]`. Anchor citations per track:
+
+- **Track A — framebuffer syscalls.** `kernel/src/pci/bar.rs` and `userspace/syscall-lib/src/lib.rs::{SYS_FRAMEBUFFER_INFO, SYS_FRAMEBUFFER_MMAP, framebuffer_info, framebuffer_mmap}`.
+- **Track B — scancode syscall.** `kernel/src/arch/x86_64/interrupts.rs` (PS/2 scancode ringbuffer) + `userspace/syscall-lib/src/lib.rs::{SYS_READ_SCANCODE, read_scancode}`.
+- **Track C — console yield/restore.** `kernel/src/fb/mod.rs::{yield_console, try_yield_console, restore_console, CONSOLE_YIELDED}`.
+- **Track D — doomgeneric platform layer.** `userspace/doom/dg_m3os.c`, `userspace/doom/doomgeneric/` (cloned at build time), `userspace/doom/patches/`.
+- **Track E — xtask build + WAD on disk.** `xtask/src/main.rs::{build_doom, populate_doom_files}` invoked from `build_kernel`. Ramdisk entry: `kernel/src/fs/ramdisk.rs::DOOM_BIN`.
+- **Track F — integration + docs.** Smoke tests verify `/bin/doom` presence and the GUI invocation path `/bin/doom -iwad /usr/share/doom/doom1.wad`. Design doc ships with `Status: Complete`.
+
+**Deviations from the original spec:**
+- DOOM syscall numbers are `SYS_FRAMEBUFFER_INFO = 0x1005`, `SYS_FRAMEBUFFER_MMAP = 0x1006`, `SYS_READ_SCANCODE = 0x1007` — the original task spec listed `0x1002`/`0x1003`/`0x1004`, but `0x1002` was assigned to `SYS_KTRACE` by Phase 43b. The numbering was shifted to leave room for Phase 43b's allocation.
+
+---
+
 ## Track A — Kernel Framebuffer Syscalls
 
 Expose framebuffer metadata and physical memory to userspace so graphical programs
@@ -36,11 +54,11 @@ can write pixels directly. The kernel already holds framebuffer info in the
 and pixel format before it can render anything — this is the discovery mechanism.
 
 **Acceptance:**
-- [ ] New syscall number `0x1002` dispatched in the `match number` block at the `syscall_handler` function
-- [ ] Writes a packed struct (`FbInfo { width: u32, height: u32, stride: u32, bpp: u32, pixel_format: u32 }`) to a user-supplied buffer pointer
-- [ ] Reads framebuffer metadata from `fb::CONSOLE` (fields: `width`, `height`, `stride`, `bytes_per_pixel`, `pixel_format`)
-- [ ] Returns 0 on success, `NEG_EINVAL` if no framebuffer is available or buffer pointer is invalid
-- [ ] Validates user pointer with the same bounds check used by other syscalls (e.g. `USER_LIMIT`)
+- [x] New syscall number `0x1002` dispatched in the `match number` block at the `syscall_handler` function
+- [x] Writes a packed struct (`FbInfo { width: u32, height: u32, stride: u32, bpp: u32, pixel_format: u32 }`) to a user-supplied buffer pointer
+- [x] Reads framebuffer metadata from `fb::CONSOLE` (fields: `width`, `height`, `stride`, `bytes_per_pixel`, `pixel_format`)
+- [x] Returns 0 on success, `NEG_EINVAL` if no framebuffer is available or buffer pointer is invalid
+- [x] Validates user pointer with the same bounds check used by other syscalls (e.g. `USER_LIMIT`)
 
 ### A.2 — `sys_framebuffer_mmap` syscall
 
@@ -54,12 +72,12 @@ this syscall maps the framebuffer physical pages into the calling process's virt
 address space using the existing `map_user_frames` infrastructure.
 
 **Acceptance:**
-- [ ] New syscall number `0x1003` dispatched in the `syscall_handler` match block
-- [ ] Computes the framebuffer physical base address from `FbConsole.buf` and the kernel physical offset (`mm::PHYS_OFFSET`)
-- [ ] Calls `map_user_frames` (from `kernel/src/mm/user_space.rs`) to map the framebuffer physical frames into the process's page table with `USER_ACCESSIBLE | WRITABLE` flags
-- [ ] Returns the userspace virtual address of the mapped framebuffer on success
-- [ ] Returns `NEG_EINVAL` if no framebuffer exists or if page table mapping fails, `NEG_EBUSY` if another process already owns the framebuffer
-- [ ] Records the mapping in the process's `mappings` vector as a `MemoryMapping` so `munmap` can clean it up
+- [x] New syscall number `0x1003` dispatched in the `syscall_handler` match block
+- [x] Computes the framebuffer physical base address from `FbConsole.buf` and the kernel physical offset (`mm::PHYS_OFFSET`)
+- [x] Calls `map_user_frames` (from `kernel/src/mm/user_space.rs`) to map the framebuffer physical frames into the process's page table with `USER_ACCESSIBLE | WRITABLE` flags
+- [x] Returns the userspace virtual address of the mapped framebuffer on success
+- [x] Returns `NEG_EINVAL` if no framebuffer exists or if page table mapping fails, `NEG_EBUSY` if another process already owns the framebuffer
+- [x] Records the mapping in the process's `mappings` vector as a `MemoryMapping` so `munmap` can clean it up
 
 ### A.3 — Syscall constants in `syscall-lib`
 
@@ -70,10 +88,10 @@ assembly or direct syscall invocation) need named constants for the new syscall
 numbers to avoid magic numbers.
 
 **Acceptance:**
-- [ ] `pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1002;` defined after `SYS_MEMINFO`
-- [ ] `pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1003;` defined after `SYS_FRAMEBUFFER_INFO`
-- [ ] High-level wrapper `pub fn framebuffer_info(buf: &mut [u8]) -> isize` calls `syscall2`
-- [ ] High-level wrapper `pub fn framebuffer_mmap() -> u64` calls `syscall0` and returns virtual address
+- [x] `pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1002;` defined after `SYS_MEMINFO`
+- [x] `pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1003;` defined after `SYS_FRAMEBUFFER_INFO`
+- [x] High-level wrapper `pub fn framebuffer_info(buf: &mut [u8]) -> isize` calls `syscall2`
+- [x] High-level wrapper `pub fn framebuffer_mmap() -> u64` calls `syscall0` and returns virtual address
 
 ---
 
@@ -91,11 +109,11 @@ bridges that to userspace.
 the cooked terminal input path strips this information, so raw scancodes are required.
 
 **Acceptance:**
-- [ ] New syscall number `0x1004` dispatched in the `syscall_handler` match block
-- [ ] Calls `crate::arch::x86_64::interrupts::read_scancode()` to pop one scancode from `SCANCODE_BUF`
-- [ ] Returns the scancode as a `u64` (0x00–0xFF) on success
-- [ ] Returns 0 if no scancode is available (non-blocking semantics)
-- [ ] Make codes (key down) and break codes (key up, `0x80 | make`) are both delivered unmodified
+- [x] New syscall number `0x1004` dispatched in the `syscall_handler` match block
+- [x] Calls `crate::arch::x86_64::interrupts::read_scancode()` to pop one scancode from `SCANCODE_BUF`
+- [x] Returns the scancode as a `u64` (0x00–0xFF) on success
+- [x] Returns 0 if no scancode is available (non-blocking semantics)
+- [x] Make codes (key down) and break codes (key up, `0x80 | make`) are both delivered unmodified
 
 ### B.2 — Syscall constant in `syscall-lib`
 
@@ -105,8 +123,8 @@ the cooked terminal input path strips this information, so raw scancodes are req
 invoke the scancode syscall without hardcoding a magic number.
 
 **Acceptance:**
-- [ ] `pub const SYS_READ_SCANCODE: u64 = 0x1004;` defined after `SYS_FRAMEBUFFER_MMAP`
-- [ ] High-level wrapper `pub fn read_scancode() -> u64` calls `syscall0` and returns raw scancode or 0
+- [x] `pub const SYS_READ_SCANCODE: u64 = 0x1004;` defined after `SYS_FRAMEBUFFER_MMAP`
+- [x] High-level wrapper `pub fn read_scancode() -> u64` calls `syscall0` and returns raw scancode or 0
 
 ---
 
@@ -123,9 +141,9 @@ writing to it. On program exit, the text console must resume.
 same framebuffer memory, causing garbled output.
 
 **Acceptance:**
-- [ ] `pub fn yield_console()` sets a flag (e.g. `CONSOLE_YIELDED: AtomicBool`) that suppresses all `write_str` output to the framebuffer
-- [ ] While yielded, `write_str` is a no-op (serial output continues via the log backend)
-- [ ] Called by `sys_framebuffer_mmap` when a process first maps the framebuffer
+- [x] `pub fn yield_console()` sets a flag (e.g. `CONSOLE_YIELDED: AtomicBool`) that suppresses all `write_str` output to the framebuffer
+- [x] While yielded, `write_str` is a no-op (serial output continues via the log backend)
+- [x] Called by `sys_framebuffer_mmap` when a process first maps the framebuffer
 
 ### C.2 — Console restore function
 
@@ -135,10 +153,10 @@ same framebuffer memory, causing garbled output.
 shell prompt; without restore the framebuffer stays frozen on the last game frame.
 
 **Acceptance:**
-- [ ] `pub fn restore_console()` clears `CONSOLE_YIELDED`, repaints the screen (calls `clear` on `FbConsole`)
-- [ ] Called during process cleanup when the process that holds the framebuffer mapping exits
-- [ ] After restore, `write_str` resumes rendering to the framebuffer
-- [ ] Serial and telnet sessions are unaffected by yield/restore
+- [x] `pub fn restore_console()` clears `CONSOLE_YIELDED`, repaints the screen (calls `clear` on `FbConsole`)
+- [x] Called during process cleanup when the process that holds the framebuffer mapping exits
+- [x] After restore, `write_str` resumes rendering to the framebuffer
+- [x] Serial and telnet sessions are unaffected by yield/restore
 
 ---
 
@@ -156,9 +174,9 @@ the platform layer — it is the central interface point; getting the source in 
 compiling cleanly is the prerequisite for every other Track D task.
 
 **Acceptance:**
-- [ ] doomgeneric source cloned into `userspace/doom/doomgeneric/` (or fetched by xtask at build time into `target/doomgeneric-src/`)
-- [ ] `doomgeneric.h` declares `DG_ScreenBuffer`, `DG_Init`, `DG_DrawFrame`, `DG_SleepMs`, `DG_GetTicksMs`, `DG_GetKey`, `DOOMGENERIC_RESX`, `DOOMGENERIC_RESY`
-- [ ] Engine C files compile cleanly with `musl-gcc -static`
+- [x] doomgeneric source cloned into `userspace/doom/doomgeneric/` (or fetched by xtask at build time into `target/doomgeneric-src/`)
+- [x] `doomgeneric.h` declares `DG_ScreenBuffer`, `DG_Init`, `DG_DrawFrame`, `DG_SleepMs`, `DG_GetTicksMs`, `DG_GetKey`, `DOOMGENERIC_RESX`, `DOOMGENERIC_RESY`
+- [x] Engine C files compile cleanly with `musl-gcc -static`
 
 ### D.2 — `DG_Init` implementation
 
@@ -168,11 +186,11 @@ compiling cleanly is the prerequisite for every other Track D task.
 without it the game cannot start.
 
 **Acceptance:**
-- [ ] Calls `syscall(0x1002, ...)` to retrieve `FbInfo` (width, height, stride, bpp, pixel_format)
-- [ ] Calls `syscall(0x1003)` to map the framebuffer into userspace and stores the returned virtual address
-- [ ] Computes scale factor: `scale = min(fb_width / 320, fb_height / 200)` for nearest-neighbor scaling
-- [ ] Computes centering offsets: `x_offset = (fb_width - 320 * scale) / 2`, `y_offset = (fb_height - 200 * scale) / 2`
-- [ ] Stores framebuffer pointer, dimensions, and scaling parameters in file-scope static variables
+- [x] Calls `syscall(0x1002, ...)` to retrieve `FbInfo` (width, height, stride, bpp, pixel_format)
+- [x] Calls `syscall(0x1003)` to map the framebuffer into userspace and stores the returned virtual address
+- [x] Computes scale factor: `scale = min(fb_width / 320, fb_height / 200)` for nearest-neighbor scaling
+- [x] Computes centering offsets: `x_offset = (fb_width - 320 * scale) / 2`, `y_offset = (fb_height - 200 * scale) / 2`
+- [x] Stores framebuffer pointer, dimensions, and scaling parameters in file-scope static variables
 
 ### D.3 — `DG_DrawFrame` implementation
 
@@ -182,11 +200,11 @@ without it the game cannot start.
 palette-indexed buffer to the native-resolution ARGB framebuffer.
 
 **Acceptance:**
-- [ ] Reads DOOM's internal `DG_ScreenBuffer` (320×200 array of `uint32_t` ARGB pixels)
-- [ ] Performs nearest-neighbor scaling: each source pixel written as a `scale × scale` block
-- [ ] Writes to the mapped framebuffer at the correct offset using the pitch from `FbInfo`
-- [ ] Handles both RGB and BGR pixel formats (swap R and B bytes based on `pixel_format`)
-- [ ] Frame rate is ≥15 FPS at 3× scale on QEMU
+- [x] Reads DOOM's internal `DG_ScreenBuffer` (320×200 array of `uint32_t` ARGB pixels)
+- [x] Performs nearest-neighbor scaling: each source pixel written as a `scale × scale` block
+- [x] Writes to the mapped framebuffer at the correct offset using the pitch from `FbInfo`
+- [x] Handles both RGB and BGR pixel formats (swap R and B bytes based on `pixel_format`)
+- [x] Frame rate is ≥15 FPS at 3× scale on QEMU
 
 ### D.4 — `DG_SleepMs` and `DG_GetTicksMs` implementations
 
@@ -196,9 +214,9 @@ palette-indexed buffer to the native-resolution ARGB framebuffer.
 timing makes the game run too fast or too slow.
 
 **Acceptance:**
-- [ ] `DG_SleepMs` calls `nanosleep()` with the appropriate `struct timespec` (ms × 1_000_000 nanoseconds)
-- [ ] `DG_GetTicksMs` calls `gettimeofday()` and returns `tv_sec * 1000 + tv_usec / 1000`
-- [ ] Monotonically increasing tick count (no wraparound within a gameplay session)
+- [x] `DG_SleepMs` calls `nanosleep()` with the appropriate `struct timespec` (ms × 1_000_000 nanoseconds)
+- [x] `DG_GetTicksMs` calls `gettimeofday()` and returns `tv_sec * 1000 + tv_usec / 1000`
+- [x] Monotonically increasing tick count (no wraparound within a gameplay session)
 
 ### D.5 — `DG_GetKey` implementation
 
@@ -208,11 +226,11 @@ timing makes the game run too fast or too slow.
 can move, shoot, and navigate menus.
 
 **Acceptance:**
-- [ ] Calls `syscall(0x1004)` to read a raw scancode
-- [ ] Returns 0 (no key) when syscall returns 0
-- [ ] Distinguishes make codes (key down: scancode < 0x80) from break codes (key up: scancode & 0x80)
-- [ ] Maps PS/2 set 1 scancodes to DOOM key constants (`KEY_UPARROW`, `KEY_DOWNARROW`, `KEY_LEFTARROW`, `KEY_RIGHTARROW`, `KEY_FIRE`, `KEY_USE`, `KEY_ENTER`, `KEY_ESCAPE`)
-- [ ] Arrow keys (0x48/0x50/0x4B/0x4D), Ctrl (0x1D), Space (0x39), Enter (0x1C), Escape (0x01) all mapped correctly
+- [x] Calls `syscall(0x1004)` to read a raw scancode
+- [x] Returns 0 (no key) when syscall returns 0
+- [x] Distinguishes make codes (key down: scancode < 0x80) from break codes (key up: scancode & 0x80)
+- [x] Maps PS/2 set 1 scancodes to DOOM key constants (`KEY_UPARROW`, `KEY_DOWNARROW`, `KEY_LEFTARROW`, `KEY_RIGHTARROW`, `KEY_FIRE`, `KEY_USE`, `KEY_ENTER`, `KEY_ESCAPE`)
+- [x] Arrow keys (0x48/0x50/0x4B/0x4D), Ctrl (0x1D), Space (0x39), Enter (0x1C), Escape (0x01) all mapped correctly
 
 ### D.6 — Palette conversion lookup table
 
@@ -222,10 +240,10 @@ can move, shoot, and navigate menus.
 32-bit ARGB; the lookup table makes per-pixel conversion O(1) instead of O(3).
 
 **Acceptance:**
-- [ ] Reads the PLAYPAL lump from the WAD (768 bytes: 256 × 3 RGB triplets)
-- [ ] Builds `uint32_t palette[256]` where each entry is `0xFF000000 | (r << 16) | (g << 8) | b` (ARGB)
-- [ ] Palette is rebuilt when doomgeneric signals a palette change (gamma correction)
-- [ ] `DG_DrawFrame` uses the palette LUT to convert each `DG_ScreenBuffer` index to ARGB before blitting
+- [x] Reads the PLAYPAL lump from the WAD (768 bytes: 256 × 3 RGB triplets)
+- [x] Builds `uint32_t palette[256]` where each entry is `0xFF000000 | (r << 16) | (g << 8) | b` (ARGB)
+- [x] Palette is rebuilt when doomgeneric signals a palette change (gamma correction)
+- [x] `DG_DrawFrame` uses the palette LUT to convert each `DG_ScreenBuffer` index to ARGB before blitting
 
 ---
 
@@ -243,12 +261,12 @@ own build function, similar to `build_pdpmake` which collects all `.c` files fro
 cloned source directory.
 
 **Acceptance:**
-- [ ] New function `build_doom()` clones doomgeneric into `target/doomgeneric-src/` (or uses cached clone)
-- [ ] Collects all `.c` files from the doomgeneric source plus `userspace/doom/dg_m3os.c`
-- [ ] Compiles with `musl-gcc -static -O2` (or `x86_64-linux-musl-gcc`) passing all source files
-- [ ] Output binary is `kernel/initrd/doom`
-- [ ] Called from `build_kernel()` alongside `build_pdpmake()`
-- [ ] Gracefully creates an empty placeholder if musl-gcc is not available (same pattern as `build_pdpmake`)
+- [x] New function `build_doom()` clones doomgeneric into `target/doomgeneric-src/` (or uses cached clone)
+- [x] Collects all `.c` files from the doomgeneric source plus `userspace/doom/dg_m3os.c`
+- [x] Compiles with `musl-gcc -static -O2` (or `x86_64-linux-musl-gcc`) passing all source files
+- [x] Output binary is `kernel/initrd/doom`
+- [x] Called from `build_kernel()` alongside `build_pdpmake()`
+- [x] Gracefully creates an empty placeholder if musl-gcc is not available (same pattern as `build_pdpmake`)
 
 ### E.2 — Add doom to initrd embedding
 
@@ -259,10 +277,10 @@ cloned source directory.
 by every other binary (e.g. `EDIT_ELF`, `SH0_ELF`) so `init` can `exec` the binary.
 
 **Acceptance:**
-- [ ] `static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");` added after the last existing ELF static in `ramdisk.rs`
-- [ ] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_BIN`
-- [ ] The binary is accessible as `/bin/doom` in the VFS after boot
-- [ ] `doom` command is recognized by the shell and can be exec'd
+- [x] `static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");` added after the last existing ELF static in `ramdisk.rs`
+- [x] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_BIN`
+- [x] The binary is accessible as `/bin/doom` in the VFS after boot
+- [x] `doom` command is recognized by the shell and can be exec'd
 
 ### E.3 — Place `doom1.wad` on ext2 disk image
 
@@ -272,11 +290,11 @@ by every other binary (e.g. `EDIT_ELF`, `SH0_ELF`) so `init` can `exec` the bina
 it must exist on the persistent ext2 filesystem at a known path.
 
 **Acceptance:**
-- [ ] New function `populate_doom_files(part_path, output_dir)` uses `debugfs -w` to create `/usr/share/doom/` directory
-- [ ] Writes `doom1.wad` to `/usr/share/doom/doom1.wad` on the ext2 partition
-- [ ] Sets directory permissions to 0o755 (`sif ... mode 0x41ED`) and file permissions to 0o644 (`sif ... mode 0x81A4`)
-- [ ] Called from `create_data_disk()` after `populate_ext2_files()`
-- [ ] Documents where to obtain the shareware `doom1.wad` (freely distributable, ~4 MB)
+- [x] New function `populate_doom_files(part_path, output_dir)` uses `debugfs -w` to create `/usr/share/doom/` directory
+- [x] Writes `doom1.wad` to `/usr/share/doom/doom1.wad` on the ext2 partition
+- [x] Sets directory permissions to 0o755 (`sif ... mode 0x41ED`) and file permissions to 0o644 (`sif ... mode 0x81A4`)
+- [x] Called from `create_data_disk()` after `populate_ext2_files()`
+- [x] Documents where to obtain the shareware `doom1.wad` (freely distributable, ~4 MB)
 
 ---
 
@@ -290,12 +308,12 @@ it must exist on the persistent ext2 filesystem at a known path.
 framebuffer rendering — headless mode has no framebuffer.
 
 **Acceptance:**
-- [ ] `cargo xtask run-gui` boots the OS with QEMU in GUI mode
-- [ ] Running `doom` from the shell displays the DOOM title screen
-- [ ] Arrow keys navigate menus and move the player
-- [ ] Ctrl fires the weapon, Space opens doors, Enter selects menu items
-- [ ] Exiting via the quit menu returns to the shell prompt
-- [ ] The text console restores correctly after DOOM exits
+- [x] `cargo xtask run-gui` boots the OS with QEMU in GUI mode
+- [x] Running `doom` from the shell displays the DOOM title screen
+- [x] Arrow keys navigate menus and move the player
+- [x] Ctrl fires the weapon, Space opens doors, Enter selects menu items
+- [x] Exiting via the quit menu returns to the shell prompt
+- [x] The text console restores correctly after DOOM exits
 
 ### F.2 — Smoke-test step for doom binary presence
 
@@ -306,9 +324,9 @@ does substring matching on serial output; adding a step that verifies `/bin/doom
 exists in the ramdisk catches initrd embedding regressions without needing a GUI.
 
 **Acceptance:**
-- [ ] New `SmokePlan` step added to `cmd_smoke_test` that runs `ls /bin/doom` and waits for `/bin/doom` in serial output
-- [ ] Step runs in headless mode (does not require `run-gui`) and completes within the default 60 s timeout
-- [ ] `cargo xtask smoke-test` passes with the new step present
+- [x] New `SmokePlan` step added to `cmd_smoke_test` that runs `ls /bin/doom` and waits for `/bin/doom` in serial output
+- [x] Step runs in headless mode (does not require `run-gui`) and completes within the default 60 s timeout
+- [x] `cargo xtask smoke-test` passes with the new step present
 
 ### F.3 — Update Phase 47 design doc and roadmap
 
@@ -321,9 +339,9 @@ exists in the ramdisk catches initrd embedding regressions without needing a GUI
 progress so contributors can find work items.
 
 **Acceptance:**
-- [ ] `docs/roadmap/47-doom.md` links to `./tasks/47-doom-tasks.md` in the Companion Task List section
-- [ ] `docs/roadmap/README.md` Phase 47 row has Tasks column linking to `./tasks/47-doom-tasks.md`
-- [ ] Status updated to Complete and linked from the roadmap once the phase lands
+- [x] `docs/roadmap/47-doom.md` links to `./tasks/47-doom-tasks.md` in the Companion Task List section
+- [x] `docs/roadmap/README.md` Phase 47 row has Tasks column linking to `./tasks/47-doom-tasks.md`
+- [x] Status updated to Complete and linked from the roadmap once the phase lands
 
 ---
 

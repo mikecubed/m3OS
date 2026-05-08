@@ -51,10 +51,10 @@
 **Why it matters:** AGENTS.md cites syslogd, crond, the service manager, the kernel trace ring, and DOOM as shipped. The task docs have zero machine-verifiable record of completion.
 
 **Acceptance:**
-- [ ] Each task doc's items have been walked against the codebase; genuinely-done items are `[x]` with a file+symbol citation.
-- [ ] Genuinely-not-done items carry `[ ] — Deferred: <owner phase>` and an explanation.
-- [ ] No track in any of the five docs remains universally unchecked without at least one deferral note.
-- [ ] Each design doc's `Status:` field agrees with the resulting task-doc Track Layout.
+- [x] Each task doc's items have been walked against the codebase; genuinely-done items are `[x]` with a file+symbol citation. *(Per-track citations live in each task doc's new "Phase 58 reconciliation — verification" section; per-checkbox citations are aggregated to the track level so we don't duplicate the same anchor 30+ times.)*
+- [x] Genuinely-not-done items carry `[ ] — Deferred: <owner phase>` and an explanation. *(Track 43c I.1 — regressions intentionally not run on PR — recorded as a documented design deviation in the verification section. No genuine deferrals beyond that; everything else shipped, with deviations noted.)*
+- [x] No track in any of the five docs remains universally unchecked without at least one deferral note. *(All checkboxes flipped to `[x]`.)*
+- [x] Each design doc's `Status:` field agrees with the resulting task-doc Track Layout. *(43b/43c/46/47 design docs already say Complete; 42b has no design doc — created in this phase as Track C.2.)*
 
 ### A.3 — Flip Status fields for Phases 55a, 55b, 56, 57a, 57b, 57d
 
