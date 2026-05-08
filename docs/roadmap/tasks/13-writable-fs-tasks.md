@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | tmpfs (RAM-backed in-memory filesystem) | — | ✅ Complete |
 | B | FAT32 write path (file create / append / delete, directory ops) | — | ✅ Complete |
-| C | VFS dispatch + `WriteableFs` trait | A, B | ✅ Complete |
+| C | VFS dispatch (FdBackend::VfsService → vfs_server path routing) | A, B | ✅ Complete |
 | D | Syscall surface (`write`, `creat`, `mkdir`, `unlink`, `rmdir`, `rename`, `truncate`, `fsync`) | C | ✅ Complete |
 | E | Validation and integration tests | A, B, C, D | ✅ Complete |
 
@@ -19,13 +19,14 @@
 
 ## Track A — tmpfs
 
-In-memory filesystem backed by kernel-allocated pages, mounted at `/tmp` during init.
+In-memory filesystem mounted at `/tmp` during init. Pure-logic core lives in `kernel-core/src/fs/tmpfs.rs` (host-testable); the kernel binding sits in `kernel/src/fs/tmpfs.rs`.
 
-- [x] tmpfs filesystem implementation: `kernel/src/fs/tmpfs.rs`.
-- [x] Hash-map-of-path-to-page-list backing store; `mkdir`, `create`, `write`, `read`, `unlink`, `rmdir` all routed through tmpfs's `WriteableFs` impl.
-- [x] tmpfs mounted at `/tmp` during init in `kernel/src/fs/mod.rs`.
-- [x] `fsync` on tmpfs is a no-op (all data lives in RAM).
-- [x] Frame allocation for file data uses the Phase 3 frame allocator (no separate cache).
+- [x] tmpfs pure-logic core: `kernel-core/src/fs/tmpfs.rs::Tmpfs` (root + walk helpers); kernel binding: `kernel/src/fs/tmpfs.rs`.
+- [x] Backing store is a directory tree of `TmpfsNode` variants (`File`/`Dir`/`Symlink`); `DirData::children` is `BTreeMap<String, TmpfsNode>`; `FileData::content` is `Vec<u8>` (per-file inline buffer, capped at 16 MiB by `MAX_FILE_SIZE`).
+- [x] `mkdir`, `create`, `write`, `read`, `unlink`, `rmdir`, `symlink`, `stat` operations on the `Tmpfs` type.
+- [x] tmpfs mounted at `/tmp` during init by the userspace `vfs_server`.
+- [x] `fsync` on tmpfs is a no-op (all data lives in RAM-resident `Vec<u8>` buffers).
+- [x] File content allocation uses ordinary heap `Vec<u8>` rather than a dedicated frame-allocator pool; the original design-doc "kernel-allocated pages" prose was a planning aspiration that did not survive into the shipped implementation.
 
 ## Track B — FAT32 Write Path
 
@@ -38,13 +39,14 @@ Extend the Phase 8 read-only FAT32 driver to support writes. Either kernel-side 
 - [x] FAT32 `fsync` flushes dirty sectors to the block device.
 - [x] FAT32 write path tolerates writing past the end of a file (cluster allocation kicks in).
 
-## Track C — VFS Dispatch + WriteableFs Trait
+## Track C — VFS Dispatch
 
-VFS gains a `WriteableFs` trait alongside the existing `ReadableFs`; mount-point routing dispatches writes to the correct backend.
+The Phase 13 design doc speculated about a `WriteableFs` trait alongside `ReadableFs`; the shipped implementation took a different shape. Write dispatch goes through a single `FdBackend::VfsService` variant on the kernel side, and the userspace `vfs_server` performs path-based routing to the correct backend (tmpfs, FAT32, ext2) using concrete per-backend types rather than a generic write trait.
 
-- [x] `WriteableFs` trait defined in `kernel-core/src/fs/` (or equivalent VFS module). Implemented for tmpfs and FAT32.
-- [x] VFS dispatch in `kernel/src/fs/vfs.rs` and `userspace/vfs_server/` routes write calls to the correct backend by mount point.
-- [x] Mount table records whether each mount supports writes; read-only mounts return `EROFS` on write attempts.
+- [x] `FdBackend::VfsService { service_handle, .. }` in `kernel/src/process/mod.rs::FdBackend` is the kernel-side dispatch point; `sys_read` / `sys_write` / `sys_open` route to it.
+- [x] `userspace/vfs_server/src/main.rs` owns path dispatch and routes write requests to the appropriate backend (tmpfs / ext2 / FAT32) based on mount table lookup.
+- [x] Mount table records mount point + backend type; read-only mounts surface `EROFS` on write attempts.
+- [x] (Design-doc aspiration not shipped) — a generic `WriteableFs` trait with `impl WriteableFs for Tmpfs` / `impl WriteableFs for Fat32` was discussed but not implemented; backends are concrete types invoked from `vfs_server` rather than dyn-dispatched through a trait.
 
 ## Track D — Syscall Surface
 
@@ -72,11 +74,16 @@ POSIX write-oriented syscalls dispatched through the VFS.
 
 This task doc was missing prior to Phase 58. The roadmap README row for Phase 13 read "Tasks: not yet created"; the reconciliation phase walked the existing design doc's five acceptance criteria and the shipping codebase, then authored this task doc against them. Anchor citations:
 
-- **tmpfs:** `kernel/src/fs/tmpfs.rs`, mounted at `/tmp` from `kernel/src/fs/mod.rs`.
+- **tmpfs:** pure-logic core at `kernel-core/src/fs/tmpfs.rs::Tmpfs` (with `BTreeMap<String, TmpfsNode>` directory children and `Vec<u8>` file content; not a hash-map-of-path-to-page-list as the original design-doc prose implied), kernel binding at `kernel/src/fs/tmpfs.rs`, mounted at `/tmp` by `userspace/vfs_server/`.
 - **FAT32 write:** `kernel/src/fs/fat32.rs` (kernel-side) and `userspace/fat_server/` (extracted server).
-- **VFS dispatch:** `kernel/src/fs/vfs.rs` and `userspace/vfs_server/`.
+- **VFS dispatch:** `FdBackend::VfsService` in `kernel/src/process/mod.rs` plus path-based routing in `userspace/vfs_server/src/main.rs` — concrete-backend dispatch, *not* a `WriteableFs`/`ReadableFs` trait pair (the design-doc trait language did not survive into the shipped code).
 - **Syscall surface:** `kernel/src/arch/x86_64/syscall/mod.rs` plus `userspace/syscall-lib/src/lib.rs` wrappers.
 - **Validation:** `userspace/tmpfs-test/` test program; FAT32 round-trip exercised by the boot service-config write/read cycle.
+
+**Deviations from the original Phase 13 design doc** (recorded for traceability):
+
+- The design doc described a `WriteableFs` trait alongside the existing `ReadableFs`. The shipped implementation routes writes through a single `FdBackend::VfsService` variant + `vfs_server` path dispatch; no generic write trait was ever introduced. Backends (tmpfs, ext2, FAT32) are concrete types selected by mount-table lookup.
+- The design doc described tmpfs as "stores file data as kernel page lists with no disk involvement". The shipped implementation stores file content as a per-file `Vec<u8>` (heap-allocated, capped at `MAX_FILE_SIZE = 16 MiB`); directory children are `BTreeMap<String, TmpfsNode>`. Frame allocation is the ordinary heap allocator's responsibility — there is no dedicated page-list pool.
 
 Phase 13 also predates Phase 24 (Persistent Storage) and Phase 28 (ext2 Filesystem). Persistent storage today is ext2-on-disk (`kernel/src/fs/ext2.rs`); FAT32 remains supported for the EFI System Partition and for cross-OS data sharing.
 

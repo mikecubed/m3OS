@@ -178,7 +178,7 @@ The remediation cost is bounded: ~6–10 weeks of focused work, most of it docum
 
 **Recommendation:**
 1. Treat `docs/research/post-phase-57 evaluation/` as the canonical post-Phase-57 state snapshot until a successor lands. (It is currently the most accurate state-of-the-system doc in the corpus.)
-2. Migrate `docs/handoffs/` (singular) into `docs/handoffs/` (plural); remove the empty directory.
+2. Migrate `docs/handoff/` (singular) into `docs/handoffs/` (plural); remove the empty directory. *(Closed in Phase 58 Track F.)*
 3. Either retire the seven top-level post-1.0 roadmap docs (their content is superseded by Phase 59–62 design docs) or convert each into a stub that points at the Phase 59–62 doc.
 4. Refresh body content of `docs/16-network.md` and `docs/22-tty-terminal.md`, or mark them archived with a date.
 5. Refresh `docs/evaluation/README.md` and `docs/shell/` or mark them archived.
