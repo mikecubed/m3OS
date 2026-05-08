@@ -70,10 +70,10 @@
 **Why it matters:** All six design docs read "Planned" while AGENTS.md, the README, and all downstream dependency chains treat them as Complete. The drift is four-deep for Phase 56 alone.
 
 **Acceptance:**
-- [ ] 55a, 55b, 56, 57a, 57d: `Status:` changed to `Complete`.
-- [ ] 57b: `Status:` changed to `Complete`; stale "pending soak (PR #132)" qualifier removed or replaced with a one-line note pointing to Phase 59 Track G for soak result.
-- [ ] Phase 55a's "Known Open Bug" section receives a cross-reference noting that 55c R2 claims closure of the VT-d MMIO `CTRL.RST` issue.
-- [ ] Roadmap README rows for 55a, 55b, 56, 57a, 57b, 57d updated to match.
+- [x] 55a, 55b, 56, 57a, 57d: `Status:` changed to `Complete`.
+- [x] 57b: `Status:` changed to `Complete`; stale "pending soak (PR #132)" qualifier removed or replaced with a one-line note pointing to Phase 59 Track G for soak result.
+- [x] Phase 55a's "Known Open Bug" section receives a cross-reference noting that 55c R2 claims closure of the VT-d MMIO `CTRL.RST` issue.
+- [x] Roadmap README rows for 55a, 55b, 56, 57a, 57b, 57d updated to match.
 
 ### A.4 — Add missing header fields to Phase 35 design doc
 

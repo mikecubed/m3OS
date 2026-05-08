@@ -1,6 +1,6 @@
 # Phase 57a — Scheduler Block/Wake Protocol Rewrite
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-57a
 **Depends on:** Phase 4 (Tasking) ✅, Phase 6 (IPC Core) ✅, Phase 35 (True SMP) ✅, Phase 50 (IPC Completion) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
 **Builds on:** Replaces the multi-flag block/wake protocol (`switching_out`, `wake_after_switch`, `PENDING_SWITCH_OUT[core]`) introduced incrementally through Phases 4, 6, 35, and 50. Eliminates the lost-wake bug class catalogued in `docs/handoffs/2026-04-25-scheduler-design-comparison.md` and re-confirmed by the `feat/phase-57-impl` graphical-stack regression in `docs/handoff/2026-04-28-graphical-stack-startup.md`.

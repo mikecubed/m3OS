@@ -1,6 +1,6 @@
 # Phase 55a - IOMMU Substrate
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-55a
 **Depends on:** Phase 55 (Hardware Substrate) ✅
 **Builds on:** Closes the DMA-isolation gap intentionally deferred from Phase 55, routing Phase 55's `DmaBuffer<T>` allocation through per-device VT-d / AMD-Vi mappings so the hardware-access layer can protect the kernel from device-initiated memory corruption.
@@ -97,6 +97,7 @@ DMAR / IVRS tables describe reserved memory regions (typically firmware GPU fram
 ## Known Open Bug — must close before Phase 58
 
 - **VT-d MMIO translation drops driver `CTRL.RST` writes under `--iommu`.** Surfaced by Phase 55b's tighter `cargo xtask device-smoke --device {nvme,e1000} --iommu` assertions. The per-device domain setup does not install identity-mapped MMIO windows for each claimed device's BAR regions, so ring-3 drivers' MMIO resets are silently lost under active VT-d translation. Full diagnosis, reproduction, and acceptance criteria in [`docs/appendix/phase-55b-residuals.md`](../appendix/phase-55b-residuals.md) (item R2). **This must close before the Phase 58 1.0 gate ships its "IOMMU-isolated ring-3 drivers" claim.**
+  - **Status (2026-05-08):** Closed by [Phase 55c R2 — IOMMU MMIO Identity Coverage](./55c-ring-3-driver-correctness-closure.md). Every claimed-device BAR is now identity-mapped in the device's IOMMU domain; `cargo xtask device-smoke --device {nvme,e1000} --iommu` pass end-to-end. Retained here for historical traceability — see Phase 55c § R2 for the resolution.
 
 ## Deferred Until Later
 
