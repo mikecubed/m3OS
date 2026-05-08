@@ -2521,6 +2521,71 @@ pub fn current_task_times() -> Option<(u64, u64)> {
     Some((sched.tasks[idx].user_ticks, sched.tasks[idx].system_ticks))
 }
 
+/// Sum the per-task tick fields of every task belonging to the given `pid`.
+/// Returns `(user_ticks, system_ticks, child_user_ticks, child_system_ticks)`
+/// summed across all tasks (POSIX thread group). Used by `sys_waitpid` to
+/// accumulate a reaped zombie's CPU time into the parent's `child_*` fields.
+/// Phase 61 Track E.1.
+pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
+    let sched = scheduler_lock();
+    let mut user = 0u64;
+    let mut system = 0u64;
+    let mut child_user = 0u64;
+    let mut child_system = 0u64;
+    for task in sched.tasks.iter() {
+        if task.pid == pid {
+            user = user.saturating_add(task.user_ticks);
+            system = system.saturating_add(task.system_ticks);
+            child_user = child_user.saturating_add(task.child_user_ticks);
+            child_system = child_system.saturating_add(task.child_system_ticks);
+        }
+    }
+    (user, system, child_user, child_system)
+}
+
+/// Return the accumulated user/system tick counts for the current task's
+/// reaped descendants (`child_user_ticks`, `child_system_ticks`). Phase 61
+/// Track E.1 — used by `sys_times` for `tms_cutime`/`tms_cstime` and by
+/// `sys_getrusage(RUSAGE_CHILDREN)` for `ru_utime`/`ru_stime`.
+pub fn current_task_child_times() -> Option<(u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    Some((
+        sched.tasks[idx].child_user_ticks,
+        sched.tasks[idx].child_system_ticks,
+    ))
+}
+
+/// Accumulate a reaped zombie's CPU time into the calling task's
+/// `child_user_ticks` / `child_system_ticks` fields. POSIX `times(2)` and
+/// `wait*(2)` require recursive accumulation: a parent who reaps a child
+/// inherits both that child's own time AND any time the child itself
+/// previously accumulated from reaping grandchildren. Phase 61 Track E.1.
+///
+/// Returns `false` if the calling context has no current task (e.g., called
+/// before scheduler init); otherwise returns `true` after updating.
+pub fn current_task_accumulate_child_times(
+    zombie_user_ticks: u64,
+    zombie_system_ticks: u64,
+    zombie_child_user_ticks: u64,
+    zombie_child_system_ticks: u64,
+) -> bool {
+    let Some(idx) = get_current_task_idx() else {
+        return false;
+    };
+    let mut sched = scheduler_lock();
+    let parent = &mut sched.tasks[idx];
+    parent.child_user_ticks = parent
+        .child_user_ticks
+        .saturating_add(zombie_user_ticks)
+        .saturating_add(zombie_child_user_ticks);
+    parent.child_system_ticks = parent
+        .child_system_ticks
+        .saturating_add(zombie_system_ticks)
+        .saturating_add(zombie_child_system_ticks);
+    true
+}
+
 /// Return the [`TaskId`] of the task currently running on this core.
 pub fn current_task_id() -> Option<TaskId> {
     let idx = get_current_task_idx()?;

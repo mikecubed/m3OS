@@ -588,6 +588,20 @@ pub struct Task {
     /// `wake_task_v2`, closing the "reply arrived just before park" lost-wake
     /// window.
     pub reply_waker: Option<Arc<core::sync::atomic::AtomicBool>>,
+    /// Accumulated user-mode ticks of this task's reaped descendants
+    /// (children + recursively-reaped grandchildren). Updated at the
+    /// zombie-reap point in `sys_waitpid`. Read by `sys_times` to populate
+    /// `tms_cutime` and by `sys_getrusage(RUSAGE_CHILDREN)` to populate
+    /// `ru_utime`. Phase 61 Track E.1.
+    ///
+    /// Placed AFTER `preempt_frame` to preserve `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`.
+    pub child_user_ticks: u64,
+    /// Accumulated system-mode ticks of this task's reaped descendants.
+    /// Updated at the zombie-reap point alongside `child_user_ticks`.
+    /// Read by `sys_times` to populate `tms_cstime` and by
+    /// `sys_getrusage(RUSAGE_CHILDREN)` to populate `ru_stime`.
+    /// Phase 61 Track E.1.
+    pub child_system_ticks: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +672,8 @@ impl Task {
             affinity_mask: u64::MAX, // Can run on any core
             user_ticks: 0,
             system_ticks: 0,
+            child_user_ticks: 0,
+            child_system_ticks: 0,
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,

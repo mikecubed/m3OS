@@ -3702,12 +3702,16 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 /// Returns: clock ticks since boot.
 pub(super) fn sys_times(buf_ptr: u64) -> u64 {
     let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+    // Phase 61 Track E.1: tms_cutime / tms_cstime now read the calling task's
+    // accumulated reaped-descendants tick counts (was hard-coded zero).
+    let (child_user_ticks, child_system_ticks) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
     if buf_ptr != 0 {
         let mut bytes = [0u8; 32]; // 4 × i64
         bytes[0..8].copy_from_slice(&(user_ticks as i64).to_ne_bytes()); // tms_utime
         bytes[8..16].copy_from_slice(&(system_ticks as i64).to_ne_bytes()); // tms_stime
-        bytes[16..24].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cutime (children — not tracked yet)
-        bytes[24..32].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cstime
+        bytes[16..24].copy_from_slice(&(child_user_ticks as i64).to_ne_bytes()); // tms_cutime
+        bytes[24..32].copy_from_slice(&(child_system_ticks as i64).to_ne_bytes()); // tms_cstime
         if UserSliceWo::new(buf_ptr, bytes.len())
             .and_then(|s| s.copy_from_kernel(&bytes))
             .is_err()
@@ -4583,6 +4587,20 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     Some((pid, found_code, true)) // stopped
                 } else {
                     let code = found_code.unwrap_or(0);
+                    // Phase 61 Track E.1: accumulate the reaped zombie's CPU
+                    // time into the calling task's `child_*` fields. POSIX
+                    // requires recursive accumulation (zombie's own ticks +
+                    // zombie's accumulated children-ticks) so a parent who
+                    // reaps a child inherits the entire reaped subtree's
+                    // total CPU time. Must run BEFORE table.reap(pid)
+                    // because reap() drops the process record; the task
+                    // ticks are looked up by pid from the scheduler's task
+                    // table (independent of the process table).
+                    let (z_user, z_sys, z_cuser, z_csys) =
+                        crate::task::scheduler::task_times_for_pid(pid);
+                    crate::task::scheduler::current_task_accumulate_child_times(
+                        z_user, z_sys, z_cuser, z_csys,
+                    );
                     table.reap(pid);
                     Some((pid, Some(code), false))
                 }
