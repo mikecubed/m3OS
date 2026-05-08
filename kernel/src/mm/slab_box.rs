@@ -11,7 +11,7 @@
 //! and routing the eventual `Drop` back through the same cache's `.free()`.
 
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of};
+use core::mem::align_of;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
@@ -66,9 +66,12 @@ impl<T> SlabBox<T> {
         //
         // Page size (4096) is the upper bound for any slab-backed slot
         // alignment.  Higher-aligned types cannot be slab-allocated and are
-        // rejected at compile time.  The runtime `debug_assert!` below
+        // rejected at compile time.  The runtime `assert!` below
         // additionally catches a caller mis-sizing the cache so
-        // `object_size` is not a multiple of `align_of::<T>()`.
+        // `object_size` is not a multiple of `align_of::<T>()`; this must
+        // remain a hard assert (not `debug_assert!`) because the subsequent
+        // `core::ptr::write` would be UB on a misaligned slot in release
+        // builds.
         const {
             assert!(
                 align_of::<T>() <= 4096,
@@ -82,7 +85,7 @@ impl<T> SlabBox<T> {
                 .allocate(&mut crate::mm::slab::slab_page_alloc)
                 .expect("SlabBox: slab cache exhausted")
         };
-        debug_assert!(
+        assert!(
             addr != 0 && addr.is_multiple_of(align_of::<T>()),
             "SlabBox: slab cache returned misaligned address {:#x}",
             addr
@@ -102,14 +105,6 @@ impl<T> SlabBox<T> {
             cache,
             _marker: PhantomData,
         }
-    }
-}
-
-impl<T: ?Sized> SlabBox<T> {
-    /// Returns the size of the cache slot used to back this allocation.
-    #[allow(dead_code)]
-    pub fn slot_size(&self) -> usize {
-        size_of::<*mut T>() // for type-erased ?Sized; not meaningful for trait objects.
     }
 }
 
