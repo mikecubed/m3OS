@@ -83,7 +83,7 @@ the host without kernel dependencies.
 **Why it matters:** Each core needs its own ring to avoid lock contention; the ring must be sized to hold enough events to cover a typical fork+dispatch+fault sequence.
 
 **Acceptance:**
-- [x] `trace_ring: TraceRing<256>` field added to `PerCoreData`
+- [x] `trace_ring: TraceRing<128>` field added to `PerCoreData` *(shipped size is 128, not the originally-spec'd 256 — see Phase 58 verification deviation note above)*
 - [x] Initialized to `TraceRing::new()` in BSP and AP init paths
 - [x] Accessible via `per_core().trace_ring` from any kernel code on that core
 

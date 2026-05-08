@@ -54,7 +54,7 @@ can write pixels directly. The kernel already holds framebuffer info in the
 and pixel format before it can render anything — this is the discovery mechanism.
 
 **Acceptance:**
-- [x] New syscall number `0x1002` dispatched in the `match number` block at the `syscall_handler` function
+- [x] New syscall number `0x1005` dispatched in the `match number` block at the `syscall_handler` function *(shifted from the originally-spec'd `0x1002` — see Phase 58 verification deviation note above; `0x1002` was claimed first by Phase 43b's `SYS_KTRACE`)*
 - [x] Writes a packed struct (`FbInfo { width: u32, height: u32, stride: u32, bpp: u32, pixel_format: u32 }`) to a user-supplied buffer pointer
 - [x] Reads framebuffer metadata from `fb::CONSOLE` (fields: `width`, `height`, `stride`, `bytes_per_pixel`, `pixel_format`)
 - [x] Returns 0 on success, `NEG_EINVAL` if no framebuffer is available or buffer pointer is invalid
@@ -72,7 +72,7 @@ this syscall maps the framebuffer physical pages into the calling process's virt
 address space using the existing `map_user_frames` infrastructure.
 
 **Acceptance:**
-- [x] New syscall number `0x1003` dispatched in the `syscall_handler` match block
+- [x] New syscall number `0x1006` dispatched in the `syscall_handler` match block
 - [x] Computes the framebuffer physical base address from `FbConsole.buf` and the kernel physical offset (`mm::PHYS_OFFSET`)
 - [x] Calls `map_user_frames` (from `kernel/src/mm/user_space.rs`) to map the framebuffer physical frames into the process's page table with `USER_ACCESSIBLE | WRITABLE` flags
 - [x] Returns the userspace virtual address of the mapped framebuffer on success
@@ -88,8 +88,8 @@ assembly or direct syscall invocation) need named constants for the new syscall
 numbers to avoid magic numbers.
 
 **Acceptance:**
-- [x] `pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1002;` defined after `SYS_MEMINFO`
-- [x] `pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1003;` defined after `SYS_FRAMEBUFFER_INFO`
+- [x] `pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1005;` defined after `SYS_MEMINFO`
+- [x] `pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;` defined after `SYS_FRAMEBUFFER_INFO`
 - [x] High-level wrapper `pub fn framebuffer_info(buf: &mut [u8]) -> isize` calls `syscall2`
 - [x] High-level wrapper `pub fn framebuffer_mmap() -> u64` calls `syscall0` and returns virtual address
 
@@ -109,7 +109,7 @@ bridges that to userspace.
 the cooked terminal input path strips this information, so raw scancodes are required.
 
 **Acceptance:**
-- [x] New syscall number `0x1004` dispatched in the `syscall_handler` match block
+- [x] New syscall number `0x1007` dispatched in the `syscall_handler` match block
 - [x] Calls `crate::arch::x86_64::interrupts::read_scancode()` to pop one scancode from `SCANCODE_BUF`
 - [x] Returns the scancode as a `u64` (0x00–0xFF) on success
 - [x] Returns 0 if no scancode is available (non-blocking semantics)
@@ -123,7 +123,7 @@ the cooked terminal input path strips this information, so raw scancodes are req
 invoke the scancode syscall without hardcoding a magic number.
 
 **Acceptance:**
-- [x] `pub const SYS_READ_SCANCODE: u64 = 0x1004;` defined after `SYS_FRAMEBUFFER_MMAP`
+- [x] `pub const SYS_READ_SCANCODE: u64 = 0x1007;` defined after `SYS_FRAMEBUFFER_MMAP`
 - [x] High-level wrapper `pub fn read_scancode() -> u64` calls `syscall0` and returns raw scancode or 0
 
 ---
@@ -186,8 +186,8 @@ compiling cleanly is the prerequisite for every other Track D task.
 without it the game cannot start.
 
 **Acceptance:**
-- [x] Calls `syscall(0x1002, ...)` to retrieve `FbInfo` (width, height, stride, bpp, pixel_format)
-- [x] Calls `syscall(0x1003)` to map the framebuffer into userspace and stores the returned virtual address
+- [x] Calls `syscall(0x1005, ...)` to retrieve `FbInfo` (width, height, stride, bpp, pixel_format)
+- [x] Calls `syscall(0x1006)` to map the framebuffer into userspace and stores the returned virtual address
 - [x] Computes scale factor: `scale = min(fb_width / 320, fb_height / 200)` for nearest-neighbor scaling
 - [x] Computes centering offsets: `x_offset = (fb_width - 320 * scale) / 2`, `y_offset = (fb_height - 200 * scale) / 2`
 - [x] Stores framebuffer pointer, dimensions, and scaling parameters in file-scope static variables
@@ -226,7 +226,7 @@ timing makes the game run too fast or too slow.
 can move, shoot, and navigate menus.
 
 **Acceptance:**
-- [x] Calls `syscall(0x1004)` to read a raw scancode
+- [x] Calls `syscall(0x1007)` to read a raw scancode
 - [x] Returns 0 (no key) when syscall returns 0
 - [x] Distinguishes make codes (key down: scancode < 0x80) from break codes (key up: scancode & 0x80)
 - [x] Maps PS/2 set 1 scancodes to DOOM key constants (`KEY_UPARROW`, `KEY_DOWNARROW`, `KEY_LEFTARROW`, `KEY_RIGHTARROW`, `KEY_FIRE`, `KEY_USE`, `KEY_ENTER`, `KEY_ESCAPE`)
@@ -347,7 +347,7 @@ progress so contributors can find work items.
 
 ## Documentation Notes
 
-- Phase 47 adds three new custom syscalls (`0x1002`–`0x1004`) in the `0x1000+` m3OS
+- Phase 47 adds three new custom syscalls (`0x1005`–`0x1007`) in the `0x1000+` m3OS
   extension range, continuing the numbering after `SYS_MEMINFO` (`0x1001`).
 - The framebuffer was previously kernel-only (`fb::CONSOLE` in `kernel/src/fb/mod.rs`);
   these changes expose it to userspace for the first time.

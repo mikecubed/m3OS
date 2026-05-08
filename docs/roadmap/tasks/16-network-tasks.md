@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Source Ref:** phase-16
-**Depends on:** Phase 12 (POSIX Compat), Phase 15 (Hardware Discovery)
+**Depends on:** Phase 12 (POSIX Compat) ✅, Phase 15 (Hardware Discovery) ✅
 **Goal:** Implement a minimal TCP/IP network stack over virtio-net so the OS can
 ping, send/receive UDP datagrams, and open/accept TCP connections.
 

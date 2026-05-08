@@ -172,7 +172,7 @@ The remediation cost is bounded: ~6–10 weeks of focused work, most of it docum
 - `docs/evaluation/README.md` scoped to v0.47.0 (~10 phases stale).
 - `docs/shell/brush-integration-analysis.md` (2026-03-26) ~15 phases stale.
 - Seven top-level post-1.0 roadmap docs (clang-llvm/claude-code/git/github-cli/nodejs/python/rust-crate-acceleration) all use a `Today (Phase 32)` baseline — 20+ phases stale; `rust-crate-acceleration.md` is fully superseded by completed Phases 41–47.
-- `docs/handoffs/` (singular, 1 file) and `docs/handoffs/` (plural, 21 files) are parallel directories with overlapping purpose.
+- `docs/handoff/` (singular, 1 file at audit time — since merged into `docs/handoffs/` in Phase 58 Track F) and `docs/handoffs/` (plural, 21 files at audit time) were parallel directories with overlapping purpose.
 - Two legacy docs (`docs/16-network.md`, `docs/22-tty-terminal.md`) carry correct Status fields but stale body content.
 - `docs/06-ipc.md` references a nonexistent `docs/06-ipc-core.md` in its Supersedes field.
 

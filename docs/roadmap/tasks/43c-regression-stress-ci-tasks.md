@@ -327,10 +327,10 @@ Configure GitHub Actions workflows to run regressions on PR and stress nightly.
 **Why it matters:** The current PR workflow runs only `cargo xtask check` and `cargo xtask smoke-test`; adding regressions catches race conditions before merge without significantly increasing CI time.
 
 **Acceptance:**
-- [x] New step after smoke-test: `cargo xtask regression`
-- [x] Runs all registered regressions (fork-overlap, ipc-wake, pty-overlap)
-- [x] Total added CI time < 120 seconds (3 regressions at ~30s each)
-- [x] Failure blocks PR merge
+- [ ] — Deferred (by design): No `cargo xtask regression` step on PR workflow. `.github/workflows/pr.yml` runs only `cargo xtask check`; smoke and regression are explicitly kept on developer hardware and on the nightly workflow per the comment at the top of `pr.yml`. The functional behaviour ships in I.2 (nightly).
+- [ ] — Deferred (by design): no PR-level regression coverage; tracked via the I.2 nightly job below.
+- [ ] — Deferred (by design): CI-time budget not relevant when the step does not run on PR.
+- [ ] — Deferred (by design): PR-level merge block intentionally not enabled for regression failures; nightly results drive follow-up work.
 
 ### I.2 — Add nightly stress workflow
 
