@@ -96,7 +96,7 @@
 ### D.1 — Run Phase 43 G.1 password auth, G.2 pubkey auth, G.3 traffic inspection
 
 **Files:**
-- `docs/roadmap/tasks/43-ssh-tasks.md` (or equivalent task doc path)
+- `docs/roadmap/tasks/43-ssh-server-tasks.md`
 - `docs/handoffs/59d-ssh-validation.md` (new log artifact)
 
 **Symbol:** G.1, G.2, G.3 checkbox items
@@ -119,18 +119,18 @@
 ### E.1 — Run Phase 22b Track F validation (7 visual items)
 
 **Files:**
-- `docs/roadmap/tasks/22b-ansi-parser-enhancement-tasks.md`
+- `docs/roadmap/tasks/22b-ansi-escape-tasks.md`
 - `docs/handoffs/59e-ansi-parser-validation.md` (new log artifact)
 
-**Symbol:** Track F items including P22b-T046 (sh0 cooked-mode regression)
+**Symbol:** Track F items P22b-T040 through P22b-T046 (the 7 "Deferred (manual QEMU visual test)" rows) — note: this task doc uses the legacy **pipe-table** format, not checkboxes. The implementer updates each row's `Status` cell from `Deferred (manual QEMU visual test)` to `Done (Phase 59 Track E.1, log: docs/handoffs/59e-ansi-parser-validation.md)` rather than flipping `[ ]` → `[x]`. Phase 58 Track B.3 deferred the format conversion of legacy task docs (other than Phase 16) to post-1.0.
 **Why it matters:** P22b-T046 is the regression check for whether the ANSI parser changes broke sh0's cooked-mode echo and line discipline. It was deferred despite being the most basic correctness check.
 
 **Acceptance:**
 - [ ] `cargo xtask run` executed; sh0 interactive session started.
 - [ ] P22b-T046: sh0 accepts input characters, echoes them, and processes line discipline (backspace, Ctrl-C) correctly.
-- [ ] At least 5 of the 7 Track F visual items verified against `cargo xtask run` session output.
+- [ ] At least 5 of the 7 Track F visual items (P22b-T040–P22b-T046) verified against `cargo xtask run` session output.
 - [ ] Serial/framebuffer log artifact captured to `docs/handoffs/59e-ansi-parser-validation.md`.
-- [ ] Phase 22b Track F checkboxes updated.
+- [ ] Phase 22b Track F pipe-table `Status` cells updated for each verified row (not `[x]` checkboxes — see Symbol field above).
 - [ ] Phase 22b design doc closure note added.
 
 ---
@@ -143,7 +143,7 @@
 - `docs/roadmap/tasks/24-persistent-storage-tasks.md`
 - `docs/handoffs/59f-persistence-validation.md` (new log artifact)
 
-**Symbol:** P24-T043
+**Symbol:** P24-T043 (and optionally P24-T044 — host-side visibility check via `losetup -P` + `mount`, also currently deferred). Note: this task doc uses the legacy **pipe-table** format, not checkboxes. The implementer updates the row's `Status` cell from `deferred (requires interactive QEMU)` to `Done (Phase 59 Track F.1, log: docs/handoffs/59f-persistence-validation.md)` rather than flipping `[ ]` → `[x]`.
 **Why it matters:** Proves that writes to the ext2 data disk survive a QEMU reboot — the core Phase 24 persistence claim.
 
 **Acceptance:**
@@ -151,7 +151,7 @@
 - [ ] QEMU rebooted (or `sys_reboot` called); system comes back up without `--fresh`.
 - [ ] Written file found intact on remount — verified via `cat` or `ls` in sh0.
 - [ ] Log captured to `docs/handoffs/59f-persistence-validation.md`.
-- [ ] P24-T043 checkbox flipped to `[x]`.
+- [ ] P24-T043 pipe-table `Status` cell updated (not `[x]` — see Symbol field above).
 - [ ] Phase 24 design doc receives a closure note.
 
 ---
@@ -161,14 +161,14 @@
 ### G.1 — Run the soak and populate `57b-soak-gate.md`
 
 **File:** `docs/handoffs/57b-soak-gate.md`
-**Symbol:** result table (start time, end time, QEMU config, observed panics, max preemption latency, verdict)
-**Why it matters:** PR #132 acceptance gate requires this soak. The table is empty. Phase 62 Track F cross-references this result when updating Phase 57b's design doc.
+**Symbol:** "Result tracking" table (existing columns: `Date | Operator | Duration | Result | Notes`).
+**Why it matters:** PR #132 acceptance gate requires this soak. The table is currently empty. Phase 62 Track F cross-references this result when updating Phase 57b's design doc.
 
 **Acceptance:**
-- [ ] `cargo xtask run` with SMP=2 (or configured AP count) running for 30 minutes wall-clock time.
-- [ ] Serial log monitored; any panic or OOPS logged.
-- [ ] `docs/handoffs/57b-soak-gate.md` result table populated: start time, end time, QEMU command line, observed panics (count + description or "none"), pass/fail verdict.
-- [ ] If the soak fails: kernel panic captured in log, bug report filed, verdict = fail.
+- [ ] `cargo xtask run-gui --fresh` (per the soak-gate doc's documented procedure) running for 30 minutes wall-clock time, with synthetic IPC + futex + notification load on ≥4 cores.
+- [ ] Serial log monitored against the four pass criteria the soak-gate doc enumerates (zero `preempt_count != 0 at user-mode return` panics; no new `[WARN] [sched]` lines vs. pre-57b baseline; no deadlocks; clean shutdown).
+- [ ] `docs/handoffs/57b-soak-gate.md` Result-tracking table row appended: `Date`, `Operator`, `Duration` (= 30m), `Result` (Pass / Fail), `Notes` (QEMU command line if non-default, observed panics or "none", reference to log artifact). The Notes column carries the additional detail (start/end times, QEMU config, panic count) so the existing 5-column schema does not need to change.
+- [ ] If the soak fails: kernel panic captured in log per the soak-gate doc's "Failure handling" section, bug report filed, Result = Fail.
 - [ ] Phase 57b task doc receives a cross-reference to the soak gate doc.
 
 ---
@@ -178,8 +178,8 @@
 ### H.1 — Write and integrate the RTC accuracy automated test
 
 **Files:**
-- `kernel/src/arch/x86_64/tests/rtc_accuracy.rs` (new test file)
-- `xtask/src/main.rs` (add test to the harness)
+- `kernel/tests/rtc_accuracy.rs` (new test file — kernel integration tests live in the top-level `kernel/tests/` directory; existing peers: `bound_recv.rs`, `preempt_latency.rs`, `preempt_user_stress.rs`, `preempt_voluntary.rs`, `sched_fuzz.rs`, `xsave_avx.rs`)
+- `xtask/src/main.rs` (`build_test_binaries` discovers new files in `kernel/tests/` automatically; no list edit required, but verify the test boots through `qemu_test_args_with_devices`)
 - `docs/roadmap/tasks/34-real-time-clock-tasks.md`
 
 **Symbol:** `test_rtc_read_accuracy` (new), E.2 checkbox item
@@ -187,7 +187,7 @@
 
 **Acceptance:**
 - [ ] Test binary reads CMOS RTC time at boot, waits ~1 s (using TSC or APIC timer), reads again; asserts elapsed time is within ±200 ms.
-- [ ] `cargo xtask test --test rtc_accuracy` passes (QEMU exits with code 0x21).
+- [ ] `cargo xtask test --test rtc_accuracy` passes (QEMU exits with code `0x10` per `QEMU_EXIT_SUCCESS` in `xtask/src/main.rs`).
 - [ ] Phase 34 task-doc E.2 checkbox flipped to `[x]` with the test binary name as citation.
 - [ ] Phase 34 design doc closure note updated.
 
@@ -198,17 +198,17 @@
 ### I.1 — Write and integrate the AF_UNIX integration test
 
 **Files:**
-- `kernel/src/net/tests/unix_integration.rs` (new test file) or userspace test pair
-- `xtask/src/main.rs` (add test to harness)
+- `kernel/tests/unix_socket.rs` (new test file — matches the file path Phase 39 J.1 already cites; kernel integration tests live in `kernel/tests/`, not `kernel/src/net/tests/`)
+- `xtask/src/main.rs` (test binary discovered automatically by `build_test_binaries` from `kernel/tests/`)
 - `docs/roadmap/tasks/39-unix-domain-sockets-tasks.md`
 
-**Symbol:** `test_unix_stream_roundtrip` (new), J.1 checkbox item
-**Why it matters:** Phase 39 J.1 requires an automated AF_UNIX integration test. The kernel-internal `SOCK_STREAM` connect/send/recv path has not been exercised in the automated test suite.
+**Symbol:** `unix_socket_test` (per Phase 39 J.1 spec); supersedes the J.1 deferral note that records "existing test harness uses kernel-level `#[test_case]` only; userspace test binary is built and embedded in initrd for manual/smoke testing". Reference implementation already lives at `userspace/unix-socket-test/src/main.rs` (covers `socketpair`, named stream + datagram, `accept`/`connect`/`send`/`recv`, `shutdown`); the kernel-resident test binary should mirror its coverage using `kernel-core` pure-logic helpers where possible.
+**Why it matters:** Phase 39 J.1 is currently `[x]` with a deferral note rather than a real automated test. Phase 59 closes the deferral.
 
 **Acceptance:**
-- [ ] Test spawns a server task listening on a UNIX domain socket and a client task that connects, sends a fixed payload, and receives an echo.
-- [ ] `cargo xtask test --test unix_integration` passes.
-- [ ] Phase 39 task-doc J.1 checkbox flipped to `[x]`.
+- [ ] Test spawns a server task listening on a UNIX domain socket and a client task that connects, sends a fixed payload, and receives an echo. Coverage equivalent to `userspace/unix-socket-test/src/main.rs`'s test set (or that test is invoked from the integration test as a userspace child).
+- [ ] `cargo xtask test --test unix_socket` passes (QEMU exits with `0x10`).
+- [ ] Phase 39 task-doc J.1 deferral notes replaced with a positive citation to the new `kernel/tests/unix_socket.rs` (the existing `[x] (deferred — …)` items become `[x] (verified Phase 59 Track I.1, kernel/tests/unix_socket.rs)`).
 - [ ] Phase 39 design doc closure note updated.
 
 ---
