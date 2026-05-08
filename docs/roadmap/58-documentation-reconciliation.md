@@ -1,6 +1,6 @@
 # Phase 58 — Documentation Reconciliation Pass
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-58
 **Depends on:** Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Builds on:** All phases 1–57e. This phase does not add kernel features; it brings the entire doc corpus into agreement with the audited state of the codebase as of the 2026-05-08 audit.

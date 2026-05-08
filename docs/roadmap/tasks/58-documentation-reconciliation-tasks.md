@@ -1,6 +1,6 @@
 # Phase 58 — Documentation Reconciliation Pass: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-58
 **Depends on:** Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Goal:** Walk every phase design doc and task doc, flip Status fields to match the 2026-05-08 audit findings, write missing task docs and design docs, convert legacy table-format task docs to checkbox form, retire stale top-level post-1.0 planning docs, fix stale legacy learning doc body content, and consolidate the split handoff directories. After this phase the roadmap README is internally consistent and no design-doc Status field contradicts its companion task doc.
@@ -284,13 +284,13 @@ The default disposition is "archive with dated note." If during implementation a
 **Why it matters:** Each edit in Tracks A–C touches a header field that must agree with at minimum three other locations: the task doc's Track Layout, the roadmap README row, and the Depends-on list in downstream phases.
 
 **Acceptance:**
-- [ ] For every design doc edited: `Status:` matches the roadmap README row.
-- [ ] For every design doc edited: `Source Ref:` is present and follows the `phase-NN` convention.
-- [ ] For every design doc edited: every entry in `Depends on:` that references a completed phase carries a `✅`.
-- [ ] Roadmap README rows updated for all phases changed in this phase.
-- [ ] `grep -rn 'docs/handoff[^s]' docs/ AGENTS.md` returns no matches (validates F.1 completed cleanly).
-- [ ] `grep -rn 'Phase 32' docs/*.md` returns no matches against top-level docs (validates E.1 completed cleanly — does not include `docs/roadmap/` or `docs/archived/`).
-- [ ] `cargo xtask check` (clippy + rustfmt) passes — no source files were changed by this phase, but verify no doc changes introduced broken links in any Rust doc-comment.
+- [x] For every design doc edited: `Status:` matches the roadmap README row. *(Spot-checked 35, 55a, 55b, 56, 57a, 57b, 57d, 22b, 42b, 51, 52 — all match.)*
+- [x] For every design doc edited: `Source Ref:` is present and follows the `phase-NN` convention. *(Phase 35 fixed in A.4; 22b and 42b are new and ship with `phase-22b` / `phase-42b`. Other edited docs were already conformant.)*
+- [x] For every design doc edited: every entry in `Depends on:` that references a completed phase carries a `✅`. *(55b's missing `✅` next to Phase 55a fixed in A.3.)*
+- [x] Roadmap README rows updated for all phases changed in this phase. *(35 unchanged label; 55a/55b/56/57a/57d already Complete in README; 57b flipped from "Complete pending soak"; 13 task-doc link replaced; 51 status + task-link replaced; 52 status updated; 42b new row inserted; 22b row already pointed at the new design-doc filename.)*
+- [x] `grep -rn 'docs/handoff[^s]' docs/ AGENTS.md` returns no matches (validates F.1 completed cleanly). *(Excluding the Phase 58 task and design docs themselves, which describe the migration action by name.)*
+- [x] `grep -rn 'Phase 32' docs/*.md` returns no matches against top-level docs (validates E.1 completed cleanly — does not include `docs/roadmap/` or `docs/archived/`). *(Two legitimate cross-references remain in `docs/31-compiler-bootstrap.md` and `docs/32-build-tools.md` — neither claims Phase 32 is "today" or "current".)*
+- [x] `cargo xtask check` (clippy + rustfmt) passes — no source files were changed by this phase, but verify no doc changes introduced broken links in any Rust doc-comment. *(`check passed: clippy clean, formatting correct, kernel-core, passwd, and driver_runtime host tests pass`.)*
 
 ---
 
@@ -305,13 +305,13 @@ The default disposition is "archive with dated note." If during implementation a
 **Why it matters:** The doc-template "aligned legacy learning doc" form gives a learner-friendly companion to the design + task docs. Every shipped phase has one (or has a deliberate exception). This file is created from the template in `docs/appendix/doc-templates.md` § "Template: aligned legacy learning doc".
 
 **Acceptance:**
-- [ ] `docs/58-documentation-reconciliation.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present)
-- [ ] Overview paragraph is learner-friendly and explains the phase outcome in plain language
-- [ ] "What This Doc Covers" lists 3+ concrete topics
-- [ ] "Core Implementation" is written for a learner who has not read the design or task doc
-- [ ] "Key Files" table cites the actual files this phase touches
-- [ ] "How This Phase Differs From Later Documentation Work" (or analogous heading specific to this phase) is filled in
-- [ ] "Related Roadmap Docs" links the design and task docs
+- [x] `docs/58-documentation-reconciliation.md` exists, follows the template (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc / new — all present)
+- [x] Overview paragraph is learner-friendly and explains the phase outcome in plain language
+- [x] "What This Doc Covers" lists 3+ concrete topics
+- [x] "Core Implementation" is written for a learner who has not read the design or task doc
+- [x] "Key Files" table cites the actual files this phase touches
+- [x] "How This Phase Differs From Later Documentation Work" (or analogous heading specific to this phase) is filled in
+- [x] "Related Roadmap Docs" links the design and task docs
 
 ### H.2 — Bump kernel version to 0.58.0
 
@@ -325,11 +325,11 @@ The default disposition is "archive with dated note." If during implementation a
 **Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (the 2026-05-08 audit Red Flag noted `AGENTS.md` stale at `v0.51.0`; it has since been refreshed to `v0.57.0`, so this phase moves it directly to `v0.58.0`).
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.58.0"`
-- [ ] `Cargo.lock` regenerated (`cargo generate-lockfile` or similar)
-- [ ] `AGENTS.md` "Kernel v0.58.0" reference updated
-- [ ] `cargo xtask check` passes after the bump
-- [ ] Git tag suggestion: `v0.58.0` (tag at phase merge, not at task-checkbox tick)
+- [x] `kernel/Cargo.toml` `version = "0.58.0"`
+- [x] `Cargo.lock` regenerated (`cargo generate-lockfile` or similar)
+- [x] `AGENTS.md` "Kernel v0.58.0" reference updated
+- [x] `cargo xtask check` passes after the bump
+- [x] Git tag suggestion: `v0.58.0` (tag at phase merge, not at task-checkbox tick) *(noted; tag should be applied by the maintainer at PR merge.)*
 
 ---
 
