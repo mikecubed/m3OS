@@ -1535,7 +1535,7 @@ pub fn send_sigchld_to_parent(child_pid: Pid) {
 // ---------------------------------------------------------------------------
 
 /// Context passed from `sys_fork` to `fork_child_trampoline`.
-pub(crate) struct ForkChildCtx {
+pub struct ForkChildCtx {
     pub(crate) pid: Pid,
     pub(crate) user_rip: u64,
     pub(crate) user_rsp: u64,
