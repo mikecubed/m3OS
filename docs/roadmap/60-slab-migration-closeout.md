@@ -3,106 +3,112 @@
 **Status:** Planned
 **Source Ref:** phase-60
 **Depends on:** Phase 33 (Kernel Memory Improvements) ✅, Phase 53a (Kernel Memory Modernization) ✅, Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
-**Builds on:** Delivers the Phase 33 headline deliverable that was scaffolded but never landed — broad migration of hot kernel object families from the global linked-list heap onto the slab caches introduced in Phase 33 and enhanced (per-CPU magazines) in Phase 53a.
-**Primary Components:** `kernel/src/mm/slab.rs` (existing slab-cache infrastructure), `kernel/src/task/scheduler.rs` (`Task` struct allocation), `kernel/src/ipc/` (`Endpoint`, `Notification` object allocation), `kernel/src/fs/` (`FdEntry`, `FileDescription` allocation), `kernel/src/mm/` (`VmRegion` allocation), `kernel-core/src/` (host-side slab tests)
+**Builds on:** Delivers the migration half of Phase 33's slab-cache deliverable. Phase 33 shipped `KernelSlabCaches` with named members (`task_cache`, `fd_cache`, `endpoint_cache`, `pipe_cache`, `socket_cache`) but only `task_cache`'s allocation path was ever exercised — and only by a smoke test in `kernel/src/main.rs`. Phase 53a layered per-CPU magazines on top. Phase 60 routes the genuinely heap-allocated hot kernel objects through those caches.
+**Primary Components:** `kernel/src/mm/slab.rs` (existing `KernelSlabCaches` infrastructure, plus a new `xsave_cache` member added by this phase), `kernel/src/task/scheduler.rs` (`Task` and `XSaveArea` allocation sites at lines 1092, 1097, 1098, 3651), `kernel/src/task/mod.rs` (`Task` and `XSaveArea` struct definitions; `KERNEL_STACK_SIZE`), `kernel/src/process/mod.rs` (kernel-stack allocation site at line 987 — audited and explicitly deferred), `kernel-core/src/slab.rs` (host-side slab tests).
 
 ## Milestone Goal
 
-The five hottest kernel object families — `Task`, `Endpoint`, `Notification`, `FdEntry`, and `VmRegion` — are allocated from typed slab caches rather than the global linked-list heap. Kernel heap fragmentation under a sustained workload (50 tasks, active IPC) is measurably reduced. Phase 33's Task C.4 checkbox ("broad object-allocation migration") is flipped from `[ ] Deferred` to `[x]`, with the slab-cache utilization measurement recorded in a handoff note.
+The two genuinely heap-allocated hot kernel object families — `Task` and `XSaveArea` — are allocated from typed slab caches rather than the global linked-list heap. A Track-A audit produces a written record of why every other family the original Phase 60 plan named (`FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`) is **not** a slab-migration candidate: each is stored inline in a fixed-size slot array, which is a different (and equally legitimate) form of allocator avoidance. Phase 33 task-doc C.4 — whose acceptance bar is "at least two frequently allocated kernel object types use slab-backed allocation paths" — is flipped from `[ ] Deferred` to `[x]` with a citation to this phase's measurement note.
 
 ## Why This Phase Exists
 
-Phase 33's design doc and task doc both state that the slab *infrastructure* shipped but the broad object-family migration was deferred. Phase 53a added per-CPU page caches and magazine-based slab layers but also did not perform the migration. As of the 2026-05-08 audit, most kernel allocations still flow through the global linked-list heap despite the slab cache having been available for multiple major phases. The Phase 33 row in the roadmap README claims "buddy + slab + working munmap" as the primary outcome; the audit notes that the slab contribution to that outcome is the infrastructure only, not the allocation migration that would justify it as a delivered feature.
+The 2026-05-08 roadmap audit flagged Phase 33 C.4 as deferred. The original Phase 60 plan named five "hottest object families" for migration: `Task`, `Endpoint`, `Notification`, `FdEntry`, `VmRegion`. A grep-driven audit during the readiness review of those plans revealed three things:
 
-This matters for a 1.0 release for two reasons: (1) the slab infrastructure is carrying no production load, meaning its correctness is not exercised by the workloads users encounter; (2) the global heap's fragmentation under IPC-heavy workloads is a latent reliability risk for long-running sessions.
+1. Only `Task` (and its 1:1 companion `XSaveArea`) is genuinely allocated through `Box::new(...)` on the hot path. The other four families are stored inline in fixed-size slot arrays: `FdEntry` in `[Option<FdEntry>; MAX_FDS]` per process, `Endpoint` in `EndpointRegistry.slots`, `Notification` in a 64-slot ISR-safe atomic pool, `Pipe` in a slot table, `UnixSocket` similarly. Migrating them to slabs would first require a refactor that boxes each entry — a bigger architectural change than Phase 60's scope.
+2. `VmRegion` does not exist as a kernel struct. The actual virtual-memory-area type is `kernel_core::mm::MemoryMapping` stored inside a `BTreeMap<u64, MemoryMapping>` (`VmaTree`). The BTreeMap nodes hold many entries per allocation, so per-mapping slab caching is not the natural fit.
+3. The slab API the original plan assumed (`slab_alloc!(FAMILY_CACHE)` macros with per-family `lazy_static`s) does not exist. The actual API in `kernel/src/mm/slab.rs` exposes `caches().NAME_cache.lock().allocate(&mut page_alloc_callback)` returning `Option<usize>` (raw address) and `.free(addr)`, plus a class-based magazine fast-path used by the global allocator backing. The page-allocator callback wires the named-cache request to `frame_allocator::allocate_frame()`; a private helper `slab_page_alloc()` already exists in `kernel/src/mm/slab.rs:292` for this purpose.
 
-Phase 60 is bounded to the migration of the five families audited as hottest by allocation frequency. It does not redesign the slab API (that is Phase 53a's domain) and it does not add new slab features.
+The honest accounting is: most kernel object families already avoid the global heap by living in fixed-size slot arrays. The remaining heap-allocated hot objects are `Task` and its 1:1 `XSaveArea`. Routing those two through `task_cache` and a new `xsave_cache` is the cleanest closure of Phase 33 C.4 without inventing prerequisite refactors.
+
+This matters for a 1.0 release because (a) Phase 33's task doc claims slab caches are infrastructure-complete with migration deferred — Phase 60 closes the migration gap honestly rather than pretending five families are migration-ready; and (b) the existing per-family caches (`task_cache`, `fd_cache`, `endpoint_cache`, `pipe_cache`, `socket_cache`) are presently dead code except for a single in-kernel `#[test_case]` that exercises `fd_cache` (`kernel/src/main.rs:1330-1370`) — wiring `task_cache` into the real `Task` allocation path proves the Phase 53a per-CPU magazine layer works under production load.
 
 ## Learning Goals
 
-- How to identify allocation hotspots in a `no_std` kernel without profiling infrastructure — using call-site analysis and object lifetime patterns.
-- What makes a kernel object family a good candidate for slab caching: fixed-size, high-allocation-frequency, short-to-medium lifetime.
-- How to wire a `slab_alloc!`/`slab_free!` pair into a Rust `struct` without changing the type's public API.
-- How to measure heap fragmentation and slab utilization from inside the kernel (using the existing debug serial port).
+- How to identify genuine heap-allocation hot spots in a `no_std` kernel by grepping `Box::new` / `Arc::new` and classifying each by: (a) is it on a hot path, (b) is it a fixed-size object, (c) does it have a corresponding slot-array alternative already.
+- Why a fixed-size slot array (`[Option<T>; N]`) is functionally equivalent to a slab cache for many kernel-object families — and when one is preferable to the other.
+- How to wire `caches().X_cache.lock().allocate(&mut page_alloc_callback)` / `.free(addr)` into a Rust struct allocation site without changing the struct's public API.
+- How to measure global-heap relief from inside the kernel using the existing `heap_stats()` and `all_slab_stats()` debug surfaces.
 
 ## Feature Scope
 
 ### Track A — Audit and Selection
 
-Walk every kernel allocation site in `kernel/src/` and classify each allocated type by: size, allocation frequency (call-site count as a proxy), and whether the type is fixed-size. Produce a ranked table of candidate families. Confirm that the five target families (`Task`, `Endpoint`, `Notification`, `FdEntry`, `VmRegion`) are in the top tier, and record the full table in a handoff note for future phases.
+Walk every `Box::new` and `Arc::new` site in `kernel/src/`. Classify each by: type allocated, allocation frequency tier (per-syscall, per-process, per-CPU, once-at-boot), fixed-size-ness, and current allocator path. Record the full table in `docs/handoffs/60a-allocation-audit.md`. The deliverable explicitly documents that `FdEntry`, `Endpoint`, `Notification`, `Pipe`, and `UnixSocket` are stored inline in slot arrays and therefore not slab candidates, and that `MemoryMapping` lives inside a `BTreeMap` whose node allocator is not a per-object slab fit. The audit confirms `Task` and `XSaveArea` as the only hot heap-allocated families that match the "fixed-size, hot, currently on global heap" criteria.
 
 ### Track B — Per-Family Slab Migration
 
-For each of the five target families, replace all `Box::new(...)` / global-heap alloc calls with `slab_alloc!(FAMILY_CACHE)` and the corresponding Drop path with `slab_free!(FAMILY_CACHE, ptr)`. Where the type has a derived `Drop` that also frees child allocations, the slab-free must happen after the child drops, not before.
+Two real migrations:
 
-Each family migration is a separate sub-task with its own compilation check and host-side test run. Families with cross-references to one another (e.g., `Task` holds an `FdEntry` table) are migrated in dependency order: `FdEntry` before `Task`.
+**B.1 `Task`** — `sched.tasks.push(Box::new(task))` at `kernel/src/task/scheduler.rs:1097` and `:3651` is replaced with a `SlabBox<Task>` newtype that wraps a raw pointer obtained from `caches().task_cache.lock().allocate(&mut slab_page_alloc)`, with `core::ptr::write` to initialise the slot. `SlabBox<T>`'s `Drop` impl runs `core::ptr::drop_in_place(self.ptr)` then returns the slot to the owning cache via `.free(addr)`. (A plain `Box::from_raw` cannot be reused here because the global allocator's `dealloc` does not know about the slab cache.) `Vec<Box<Task>>` becomes `Vec<SlabBox<Task>>`; access via `Deref`/`DerefMut` is unchanged. The existing cache is sized at 512 bytes; B.1 first asserts `core::mem::size_of::<Task>()` and resizes the cache if needed before wiring the call site. B.1 also makes `slab_page_alloc` (currently `fn` at `kernel/src/mm/slab.rs:292`) `pub(crate)` so the helper is reachable from the scheduler.
+
+**B.2 `XSaveArea`** — `sched.fpu_states.push(Box::new(XSaveArea::new()))` at `:1092` and `:1098` allocates 1:1 with `Task`. B.2 adds a new `xsave_cache: IrqSafeMutex<SlabCache>` member to `KernelSlabCaches` (sized to `XSAVE_AREA_SIZE` from `kernel/src/arch/x86_64/cpuid.rs:42`, currently 832 bytes) and converts `Vec<Box<XSaveArea>>` to `Vec<SlabBox<XSaveArea>>` using the same helper pattern.
+
+The scheduler's `Vec` storage form changes from `Box<T>` to `SlabBox<T>` for both families; the public surface (`Deref`, `DerefMut`, indexing) is identical. Drop ordering for `Task` is unchanged because `SlabBox::drop` invokes `drop_in_place` (which runs `Task`'s field-drop chain in declaration order) before returning the slot to the cache.
 
 ### Track C — Heap Relief Measurement
 
-After all five families are migrated, run a measurement pass: boot QEMU with `cargo xtask run`, start 50 tasks (using the existing `cargo xtask test` harness or a new stress script), run IPC-heavy workload for 60 seconds, and capture the global heap's free-list depth and the slab caches' hit rates from the kernel's serial debug dump. Record in `docs/handoffs/60c-slab-heap-measurement.md`.
+After both migrations land, capture before/after measurements using the existing `kernel::mm::heap::heap_stats()` and `kernel::mm::slab::all_slab_stats()` surfaces. Boot QEMU with `cargo xtask run`, fork 50 tasks, run a 60-second IPC workload, and record the global heap free-list state plus `task_cache` and `xsave_cache` hit rates from the kernel serial dump. Record in `docs/handoffs/60c-slab-heap-measurement.md`.
 
-The goal is not a specific number; it is a before/after comparison that confirms the migrated families are no longer consuming global heap.
+The goal is a recorded before/after comparison confirming that the migrated families no longer consume global heap. No specific numeric target — the measurement is the deliverable.
 
 ### Track D — Regression Suite
 
-Run `cargo xtask test` (all QEMU tests) and `cargo test -p kernel-core` (host-side slab unit tests) after each family migration. No regression in any existing test is acceptable. Add at minimum one new host-side `kernel-core` unit test per migrated family that exercises alloc/free/reuse through the slab path.
+Run `cargo xtask test` (full QEMU suite including SMP) and `cargo test -p kernel-core` after B.1 and again after B.2. No regression in any existing test is acceptable. Add at minimum one new host-side `kernel-core` unit test exercising `Task`-sized and `XSaveArea`-sized slab alloc/free/reuse cycles (the test uses raw byte buffers because `Task` and `XSaveArea` carry kernel-only globals — the test exercises the allocation path, not the type semantics).
 
 ### Track E — Phase 33 Doc Closure
 
-Flip Phase 33 task-doc C.4 from the current deferral note to `[x]` with a citation to this phase and the measurement handoff note. Update Phase 33's design doc audit note to replace "The slab-cache infrastructure and direct cache tests landed, but the main hot kernel object families were not broadly migrated" with the actual migration record.
+Flip `docs/roadmap/tasks/33-kernel-memory-tasks.md` C.4 from `[ ] Deferred` to `[x] Migrated in Phase 60 — see docs/handoffs/60c-slab-heap-measurement.md`. C.4's acceptance bar is "At least two frequently allocated kernel object types use slab-backed allocation paths"; Phase 60 delivers exactly two (`Task` and `XSaveArea`), satisfying the bar without overcommitting. Update `docs/roadmap/33-kernel-memory-improvements.md` audit note to replace "the main hot kernel object families were not broadly migrated" with a factual record citing Phase 60's audit conclusion (most families use slot arrays; `Task` + `XSaveArea` migrated).
+
+### Track F — Documentation and Release
+
+Aligned legacy learning doc (`docs/60-slab-migration-closeout.md`) and kernel version bump from `0.58.0` to `0.60.0` in `kernel/Cargo.toml`, `Cargo.lock`, and `AGENTS.md`.
 
 ## Important Components and How They Work
 
-### `kernel/src/mm/slab.rs`
+### `kernel/src/mm/slab.rs` — `KernelSlabCaches`
 
-The existing slab infrastructure (Phase 33 + 53a) provides a `SlabCache<T>` type backed by the buddy allocator. Each cache holds a free list of fixed-size slots. The per-CPU magazine layer (Phase 53a) makes `slab_alloc` lock-free on the common path. The `slab_alloc!` / `slab_free!` macros wrap the cache in a lazy static and provide the typed interface.
+The existing `KernelSlabCaches` struct (Phase 33 C.3) holds named `IrqSafeMutex<SlabCache>` members. Each cache backs a fixed-size class. The Phase 53a per-CPU magazine layer sits in front of the size-class caches (used by the global allocator); the named caches expose the lower-level direct API: `caches().task_cache.lock().allocate(&mut slab_page_alloc)` returns `Some(addr: usize)` or `None` on exhaustion; `.free(addr)` returns the slot. There is no `slab_alloc!`/`slab_free!` macro layer — Phase 60 introduces a small `SlabBox<T>` helper (constructed in B.1, reused by B.2) that owns a slab-allocated slot and frees it through the cache on drop.
 
-### `Task` allocation
+Phase 60 adds one new member, `xsave_cache`, to this struct. No API change to existing callers.
 
-`Task` structs are currently allocated via `Box::new(Task { ... })` at `fork` / `exec` time. The migration replaces this with a slab-allocated slot. `Task` is large (includes scheduler fields, file descriptor table handle, signal state); ensuring the slab slot size matches the current `Task` size is the primary correctness concern.
+### `Task` allocation (`kernel/src/task/scheduler.rs:1097, 3651`)
 
-### `Endpoint` and `Notification` allocation
+`Task` structs are heap-allocated via `Box::new(task)` then pushed into the scheduler's `Vec<Box<Task>>`. The migration replaces the `Box::new` with `task_cache.lock().allocate(&mut slab_page_alloc)` + `core::ptr::write` of the `Task` into the returned slot, wrapped in a `SlabBox<Task>` newtype whose `Drop` impl runs `Task::drop` then returns the slot to `task_cache` via `.free(addr)`. The scheduler's `Vec` is changed to hold `SlabBox<Task>` rather than `Box<Task>`; the access pattern through `Deref`/`DerefMut` is unchanged.
 
-IPC objects are allocated at `sys_endpoint_create` / `sys_notification_create` time. These are small fixed-size structs and are the highest-frequency allocation sites in IPC-heavy workloads.
+### `XSaveArea` allocation (`kernel/src/task/scheduler.rs:1092, 1098`)
 
-### `FdEntry` allocation
+`XSaveArea` is the per-task FPU/SSE/AVX save area. Allocated 1:1 with `Task` and pushed into a parallel `Vec<Box<XSaveArea>>` that B.2 converts to `Vec<SlabBox<XSaveArea>>`. `XSAVE_AREA_SIZE` is a compile-time `const` in `kernel/src/arch/x86_64/cpuid.rs` (currently 832 bytes); the cache is sized to that constant when `xsave_cache` is added to `init()` in `kernel/src/mm/slab.rs`.
 
-Each open file descriptor allocates an `FdEntry`. Long-running server processes (sshd, display_server) accumulate hundreds of these. The slab cache amortizes the per-file-open allocation cost.
+### `kernel-core/src/slab.rs` — pure logic
 
-### `VmRegion` allocation
-
-Virtual memory regions are allocated on each `mmap` call. Under Phase 54's serverized network stack, each new connection results in several `mmap` calls. Migrating `VmRegion` to the slab reduces heap pressure from connection churn.
+The slab-cache data structure is pure logic in `kernel-core` and host-testable. Phase 60's new `kernel-core` tests verify alloc/free/reuse with object sizes matching `Task` and `XSaveArea`.
 
 ## How This Builds on Earlier Phases
 
-- Extends Phase 33 by finally delivering the object-migration half of its headline feature.
-- Extends Phase 53a by putting the per-CPU magazine layer under real production load.
-- Does not change the `SlabCache<T>` API — only adds call sites.
-- Addresses the audit's Red Flag #4 and Blocker C2 directly.
+- Phase 33 shipped `KernelSlabCaches` with named members but never wired the named-cache API into a real allocation path. Phase 60 wires `task_cache` and adds `xsave_cache`.
+- Phase 53a put the per-CPU magazine layer under the size-class fast path used by the global allocator. The magazine layer also fronts the named caches — Phase 60's measurement validates that magazine behaviour under production load.
+- Does not change the `SlabCache<T>` API.
+- Closes the audit's Red Flag #4 / Blocker C2 by delivering Phase 33 C.4's "at least two object families" bar honestly.
 
 ## Implementation Outline
 
-Each family migration follows a TDD cycle: write the failing host-side `kernel-core` unit test for the slab alloc/free/reuse path first; implement the migration until the host test passes; then run `cargo xtask test` as the QEMU smoke gate. This discipline catches Drop-ordering bugs at the host level — where iteration is fast — before they reach the QEMU harness.
-
-Each `SlabCache<T>` instance holds responsibility for exactly one object family (Single Responsibility Principle): `FD_ENTRY_CACHE` owns `FdEntry` lifecycle, `TASK_CACHE` owns `Task` lifecycle, and so on. Adding a new object family never requires modifying an existing cache — it is an extension, not a modification (Open/Closed Principle). This SRP + OCP structure makes the migration safe to stage one family at a time with an independent regression run after each.
-
-1. Run Track A: audit call sites, confirm the five target families, record the ranked table.
-2. Migrate `FdEntry` (Track B.1) — smallest and most self-contained; run Track D regression.
-3. Migrate `Notification` (Track B.2); run Track D regression.
-4. Migrate `Endpoint` (Track B.3); run Track D regression.
-5. Migrate `VmRegion` (Track B.4); run Track D regression.
-6. Migrate `Task` (Track B.5) — largest and most complex; run full Track D suite.
-7. Run Track C: 60-second IPC workload, capture before/after heap measurement.
-8. Run Track E: flip Phase 33 C.4, update design doc audit note.
+1. Track A: walk `kernel/src/` `Box::new` / `Arc::new` sites, classify each, write the audit doc. Record explicit non-candidates (`FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`, `MemoryMapping`) with the structural reason each is excluded.
+2. Track B.1: assert `Task` size, resize `task_cache` if needed, migrate `tasks.push(Box::new(...))` at scheduler.rs:1097 and :3651. Run Track D regression.
+3. Track B.2: add `xsave_cache` to `KernelSlabCaches`, sized to `XSAVE_AREA_SIZE`. Migrate `fpu_states.push(Box::new(...))` at scheduler.rs:1092 and :1098. Run Track D regression.
+4. Track C: 60-second IPC workload, capture `heap_stats()` + `all_slab_stats()` before and after, record in handoff.
+5. Track E: flip Phase 33 C.4, update Phase 33 audit note.
+6. Track F: aligned legacy doc + version bump.
 
 ## Acceptance Criteria
 
-- All five families (`Task`, `Endpoint`, `Notification`, `FdEntry`, `VmRegion`) allocate from slab caches, not the global linked-list heap.
-- `cargo xtask test` passes with no regression after all five migrations.
-- `cargo test -p kernel-core` passes with at least five new per-family slab unit tests.
-- `docs/handoffs/60c-slab-heap-measurement.md` contains a before/after heap fragmentation comparison confirming reduced global-heap usage.
-- Phase 33 task-doc C.4 is `[x]` citing this phase and the measurement doc.
-- Phase 33 design doc audit note updated to reflect the migration landing.
+- `Task` allocates from `task_cache` (cache-size-checked against `core::mem::size_of::<Task>()`).
+- `XSaveArea` allocates from a new `xsave_cache` member of `KernelSlabCaches` sized to `XSAVE_AREA_SIZE`.
+- `cargo xtask test` and `cargo test -p kernel-core` pass with no regression.
+- `docs/handoffs/60a-allocation-audit.md` exists and documents why `FdEntry`, `Endpoint`, `Notification`, `Pipe`, `UnixSocket`, and `MemoryMapping` are not slab-migration candidates.
+- `docs/handoffs/60c-slab-heap-measurement.md` contains before/after `heap_stats()` and `all_slab_stats()` output confirming reduced global-heap usage for `Task` and `XSaveArea`.
+- `docs/roadmap/tasks/33-kernel-memory-tasks.md` C.4 is `[x]` citing this phase and the measurement doc.
+- `docs/roadmap/33-kernel-memory-improvements.md` audit note updated to reflect the actual migration record.
+- `kernel/Cargo.toml` version is `0.60.0`; `AGENTS.md` reflects the bump.
 
 ## Companion Task List
 
@@ -110,13 +116,15 @@ Each `SlabCache<T>` instance holds responsibility for exactly one object family 
 
 ## How Real OS Implementations Differ
 
-- Linux's SLUB/SLAB allocators are integrated at the kernel startup path; every major type has a `kmem_cache` declared at compile time. m3OS's lazy-static approach is a practical simplification for a learning OS.
-- Production kernels use `kmemleak` and `kasan` to verify that every slab-allocated object is freed correctly. m3OS does not have these tools; the regression suite and manual inspection are the equivalents.
-- Linux slab caches expose `/proc/slabinfo` for runtime monitoring. m3OS exposes the equivalent via a serial debug dump on SIGQUIT equivalent; post-1.0, this could be surfaced via a syscall.
+- Linux SLUB declares a `kmem_cache` per major type at compile time and routes every kernel object family through it. m3OS uses the simpler hybrid of fixed-size slot arrays (for low-cardinality kernel-managed pools like endpoints and notifications) plus slab caches (for genuinely heap-allocated hot objects). Both forms avoid the global heap; Phase 60 documents the split honestly.
+- Production kernels run `kmemleak` and `kasan` to verify slab discipline. m3OS relies on `cargo xtask test` regression and the host-side `kernel-core` unit tests as functional equivalents for now.
+- Linux exposes `/proc/slabinfo`. m3OS exposes `all_slab_stats()` via the kernel serial debug dump; surfacing this through a syscall is post-1.0 work.
 
 ## Deferred Until Later
 
-- Migrating lower-frequency object families (socket state, page-table entries, capability-table entries) — post-1.0 backlog.
-- Implementing `/proc/slabinfo` equivalent as a kernel debug interface — post-1.0.
-- SLAB_HWCACHE_ALIGN equivalent (cache-line alignment for hot objects) — post-1.0 performance work.
+- Migrating kernel stacks (`Box::new([0u8; KERNEL_STACK_SIZE])` at `kernel/src/process/mod.rs:987`) to a slab — `KERNEL_STACK_SIZE` is 32 KiB (8 pages), which is a buddy-allocator-sized region, not a slab fit. A dedicated stack pool is post-1.0 work.
+- Refactoring `FdEntry`, `Endpoint`, `Notification`, `Pipe`, or `UnixSocket` away from their slot-array storage form — the slot arrays are not a defect, they are a deliberate ISR-safety / capacity-bound design choice. Any future refactor would be a separate phase with its own design rationale.
+- Per-`MemoryMapping` slab caching — the BTreeMap node allocator already amortises per-mapping cost; replacing the BTreeMap with a custom slab-backed structure is post-1.0 performance work.
+- Implementing `/proc/slabinfo` equivalent as a syscall — post-1.0.
+- `SLAB_HWCACHE_ALIGN` equivalent (cache-line alignment for hot objects) — post-1.0 performance work.
 - Automated fragmentation regression test in CI — post-1.0.
