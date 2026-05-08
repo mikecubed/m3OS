@@ -12,7 +12,7 @@ A single PR that walks every phase design doc and task doc in the roadmap, flips
 
 ## Why This Phase Exists
 
-The 2026-05-08 audit found sixteen distinct categories of doc-versus-reality drift: design docs marked "Planned" for phases whose code landed months ago, task docs with universally unchecked checkboxes for phases declared Complete, missing task docs, missing design docs, legacy learning docs with stale body content, seven top-level post-1.0 planning docs still referencing a Phase 32 baseline, a split handoff directory, and evaluation docs scoped to v0.47.0. Each discrepancy reduces the README's trustworthiness as a release-gate checklist. Phases 59–62 close functional gaps; this phase is a prerequisite because it establishes which functional gaps are real and which are documentation failures.
+The 2026-05-08 audit found multiple categories of doc-versus-reality drift, addressed by Tracks A–F of this phase: design docs marked "Planned" for phases whose code landed months ago (Track A), task docs with universally unchecked checkboxes for phases declared Complete (Track A.2), missing task docs (Track B.1, B.2), pipe-table task docs that violate the checkbox template (Track B.3), missing design docs (Track C), legacy learning docs with stale body content (Track D), seven top-level post-1.0 planning docs still referencing a Phase 32 baseline (Track E), a split handoff directory and evaluation docs scoped to v0.47.0 (Track F). Each discrepancy reduces the README's trustworthiness as a release-gate checklist. Phases 59–62 close functional gaps; this phase is a prerequisite because it establishes which functional gaps are real and which are documentation failures.
 
 ## Learning Goals
 
@@ -31,9 +31,9 @@ Flip `Status:` fields in design docs for all phases where the field contradicts 
 - Phase 42b design doc: must be created before its Status can be set.
 - Phase 35 design doc: add missing `Status:` and `Source Ref:` header fields.
 
-### Track B — Missing Task Docs
+### Track B — Missing / Stale Task Docs
 
-Write retroactive task docs for phases that lack them entirely. Phase 13 (Writable FS) has acceptance criteria in its design doc but no task doc — the README explicitly says "Tasks: not yet created." Phase 51 (Service Model Maturity) has a design doc but no task doc and no closure record.
+Write retroactive task docs for phases that lack them entirely, and convert the one in-template-violation task doc flagged by the audit. Phase 13 (Writable FS) has acceptance criteria in its design doc but no task doc — the README explicitly says "Tasks: not yet created." Phase 51 (Service Model Maturity) has a design doc but no task doc and no closure record. Phase 16 (Network Stack) has a task doc but it uses pipe tables (P16-T001 through P16-T073) instead of the template-required `- [x]`/`- [ ]` checkbox form; converting it is the only Phase 16 work in this phase. The remaining table-format task docs (Phases 17, 18, 20, 22, 23, 25, 28, 29) were not flagged as red flags and are deferred to post-1.0 (see Deferred Until Later).
 
 ### Track C — Missing Design Docs
 
@@ -75,7 +75,7 @@ The README row template requires: Phase, Theme, Primary Outcome, Status, Source 
 
 ### `AGENTS.md` version string
 
-Currently reads v0.51.0; current kernel version is 0.57.x. This is an explicit acceptance item in Phase 54a Task C.4 (still Planned). Updating it here closes the five-minute item and keeps AGENTS.md consistent with the rest of the doc corpus.
+The 2026-05-08 audit flagged `AGENTS.md` as stale at v0.51.0 (Phase 54a Task C.4). The file has since been refreshed to v0.57.0 in an interim commit, so Track A.4 no longer touches `AGENTS.md`. Track H.2 of this phase performs the v0.58.0 bump as part of phase closure.
 
 ### Phase 55a "Known Open Bug" section
 
@@ -89,16 +89,16 @@ Phase 55a's design doc reports the VT-d MMIO `CTRL.RST` issue as open. Phase 55c
 
 ## Implementation Outline
 
-1. Run Track A: edit Status fields in the six drifted design docs (55a, 55b, 56, 57a, 57d, 57b) and Phase 35's missing header fields.
-2. Write Phase 51 task doc (Track B.1); write Phase 13 task doc (Track B.2).
+1. Run Track A: edit Status fields in the six drifted design docs (55a, 55b, 56, 57a, 57d, 57b) and add Phase 35's missing header fields (Track A.4). Note: the audit's `AGENTS.md` v0.51.0 red flag has already been resolved (file now reads v0.57.0); the v0.58.0 bump in H.2 is the only remaining `AGENTS.md` change.
+2. Write Phase 13 task doc (Track B.1); write or close Phase 51 task doc (Track B.2); convert Phase 16 task doc from pipe-table to checkbox format (Track B.3).
 3. Write Phase 22b design doc (Track C.1); write Phase 42b design doc (Track C.2).
-4. Walk Phases 42b, 43b, 43c, 46, 47 task docs: for each unchecked item, either flip to `[x]` with a code/test citation, or convert to `[ ] — Deferred: <phase>` with an explicit owner (Track A.2 closure). This eliminates the duplicated pattern of unchecked rows for shipped features — a DRY violation in the doc corpus — by establishing one authoritative completion record per item.
-5. Reconcile Phase 19 design doc (Complete) versus task doc (all six tracks "Not started"): read `kernel/src/signal/` and flip appropriate checkboxes or demote design-doc status (Track A.1 closure).
-6. Update `AGENTS.md` version string to v0.57.x (Track A.3).
-7. Fix `docs/06-ipc.md` Supersedes field; refresh `docs/16-network.md` and `docs/22-tty-terminal.md` body content; fix `docs/56-display-and-input-architecture.md` Status (Track D).
-8. Run Track E: archive or fold the seven post-1.0 top-level docs. Per YAGNI: do not write task docs for phases that already have a complete design doc closure record and no open acceptance items — those phases do not benefit from a task doc created after the fact.
-9. Run Track F: move `docs/handoff/` file into `docs/handoffs/`, update cross-references, archive `docs/evaluation/` and `docs/shell/brush-integration-analysis.md`.
-10. Run Track G: scan all edited headers for consistency with the roadmap README; update README rows.
+4. Walk Phases 42b, 43b, 43c, 46, 47 task docs: for each unchecked item, either flip to `[x]` with a code/test citation, or convert to `[ ] — Deferred: <phase>` with an explicit owner (Track A.2 closure).
+5. Reconcile Phase 19 design doc (Complete) versus task doc (all six tracks "Not started"): read `kernel/src/signal/` and flip appropriate checkboxes or demote design-doc status (Track A.1 closure). If demotion happens, propagate the cascade to Phases 21, 29, 30, 43 per A.1 acceptance.
+6. Fix `docs/06-ipc.md` Supersedes field; refresh `docs/16-network.md` and `docs/22-tty-terminal.md` body content; fix `docs/56-display-and-input-architecture.md` Status (Track D).
+7. Run Track E: archive the seven post-1.0 top-level docs into `docs/archived/` per the disposition table in the task doc.
+8. Run Track F: move `docs/handoff/` file into `docs/handoffs/`, update cross-references, archive `docs/evaluation/` and `docs/shell/brush-integration-analysis.md`.
+9. Run Track G: scan all edited headers for consistency with the roadmap README; update README rows; verify `grep` validation gates pass.
+10. Run Track H: write the aligned legacy learning doc and bump the kernel version to v0.58.0.
 
 ## Acceptance Criteria
 
@@ -107,15 +107,15 @@ Phase 55a's design doc reports the VT-d MMIO `CTRL.RST` issue as open. Phase 55c
 - Phases 42b, 43b, 43c, 46, 47 task docs have no universally-unchecked tracks without explicit deferral notes.
 - Phase 19 design-doc Status and task-doc Track Layout table are internally consistent.
 - Phase 13 task doc exists with at minimum the five acceptance criteria from the design doc, each checked or explicitly deferred.
-- Phase 16 task doc items are in `[x]`/`[ ]` format.
-- Phase 22b design doc exists with all required header fields.
-- Phase 42b design doc exists with all required header fields.
+- Phase 16 task doc rows P16-T001–P16-T073 are converted to `[x]`/`[ ]` form with file+symbol citations or explicit deferral notes.
+- Phase 22b design doc exists with all required header fields and 11 template H2 sections populated.
+- Phase 42b design doc exists with all required header fields and 11 template H2 sections populated.
 - Phase 35 design doc has `Status:` and `Source Ref:` fields.
-- `AGENTS.md` version string reads v0.57.x or later.
+- `AGENTS.md` version string reads v0.58.0 (bumped by H.2; the audit's v0.51.0 red flag was already resolved before this phase began).
 - `docs/06-ipc.md` Supersedes field references an existing file.
-- `docs/handoff/` (singular) directory no longer exists as a separate path.
-- `docs/evaluation/` is either refreshed to current phase baseline or contains an explicit archive note with date.
-- Seven top-level post-1.0 docs are either archived or folded; none still reference Phase 32 as "today".
+- `docs/handoff/` (singular) directory no longer exists as a separate path; `grep -rn 'docs/handoff[^s]' docs/ AGENTS.md` returns no matches.
+- `docs/evaluation/README.md` carries the "Archived 2026-05-08" header per F.2.
+- Seven top-level post-1.0 docs are archived to `docs/archived/` per the disposition table in E.1; `grep -rn 'Phase 32' docs/*.md` against top-level files returns no matches.
 
 ## Companion Task List
 
@@ -132,4 +132,4 @@ Phase 55a's design doc reports the VT-d MMIO `CTRL.RST` issue as open. Phase 55c
 - Actually running validation tests that would verify unchecked checkboxes — that is Phase 59's scope.
 - Closing functional gaps in Phases 33, 35, 57a — those are Phases 60, 61, 62.
 - Implementing the `doc-check` CI hook that would prevent future Status drift — post-1.0.
-- Writing missing task docs for phases marked Complete that use the no-checkbox table format (Phases 17, 18, 20, 22, 23, 25, 28, 29) but were not flagged as red flags — post-1.0 backlog.
+- Converting the no-checkbox table-format task docs for Phases 17, 18, 20, 22, 23, 25, 28, 29 to checkbox form. These were not flagged as red flags by the 2026-05-08 audit and are deferred to post-1.0. (Phase 16 is the one exception in this category — it was flagged and is converted by Track B.3 of this phase.)

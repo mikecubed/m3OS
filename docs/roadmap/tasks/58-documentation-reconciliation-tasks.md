@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | Status reconciliation — flip drifted design-doc Status fields | — | Planned |
-| B | Missing task docs — write Phase 13 and Phase 51 task docs | A | Planned |
+| B | Missing/stale task docs — write Phase 13 and Phase 51 task docs; convert Phase 16 to checkbox format | A | Planned |
 | C | Missing design docs — write Phase 22b and Phase 42b design docs | A | Planned |
 | D | Stale legacy content — fix body content and Supersedes fields | A | Planned |
 | E | Top-level post-1.0 docs cleanup — archive or fold seven docs | — | Planned |
@@ -36,6 +36,7 @@
 - [ ] For each track with landed code, flip the corresponding checkboxes to `[x]` with a file+symbol citation.
 - [ ] For any track with no landed code, convert to `[ ] — Deferred: post-1.0` with an explanation.
 - [ ] Design-doc `Status:` field agrees with the resulting task-doc Track Layout.
+- [ ] If Phase 19's Status is demoted from Complete: `Depends on:` lines in the design docs for Phases 21, 29, 30, and 43 are updated to drop the `✅` next to Phase 19, and any acceptance items in those four task docs that explicitly cite Phase 19 features are converted to `[ ] — Blocked: Phase 19 demoted`. If Phase 19 stays Complete, this item is closed with a one-line justification noting no cascade was needed.
 
 ### A.2 — Flip universally-unchecked task docs for Phases 42b, 43b, 43c, 46, 47
 
@@ -74,18 +75,16 @@
 - [ ] Phase 55a's "Known Open Bug" section receives a cross-reference noting that 55c R2 claims closure of the VT-d MMIO `CTRL.RST` issue.
 - [ ] Roadmap README rows for 55a, 55b, 56, 57a, 57b, 57d updated to match.
 
-### A.4 — Add missing header fields to Phase 35 design doc and update AGENTS.md
+### A.4 — Add missing header fields to Phase 35 design doc
 
 **Files:**
 - `docs/roadmap/35-true-smp-multitasking.md`
-- `AGENTS.md`
 
-**Symbol:** `Status:`, `Source Ref:` in Phase 35; version string in AGENTS.md
-**Why it matters:** Phase 35's design doc violates the template (missing two required header fields). AGENTS.md version string reads v0.51.0; current kernel is 0.57.x. Updating AGENTS.md closes Phase 54a Task C.4.
+**Symbol:** `Status:`, `Source Ref:` in Phase 35
+**Why it matters:** Phase 35's design doc violates the template (missing two required header fields). Note: the 2026-05-08 audit also flagged `AGENTS.md` as stale at v0.51.0, but the file has since been refreshed to v0.57.0; the only remaining `AGENTS.md` change for this phase is the v0.58.0 bump in H.2.
 
 **Acceptance:**
 - [ ] `docs/roadmap/35-true-smp-multitasking.md` has `Status:` and `Source Ref: phase-35` as the first two header lines.
-- [ ] `AGENTS.md` version string is updated to v0.57.x or later.
 
 ---
 
@@ -108,8 +107,9 @@
 **Files:**
 - `docs/roadmap/51-service-model-maturity.md`
 - `docs/roadmap/tasks/51-service-model-maturity-tasks.md` (new or merged)
+- `docs/roadmap/52d-*.md` (closure-note edit, file glob — locate the actual Phase 52d design doc)
 
-**Symbol:** (new file, or explicit merge note in 51 design doc)
+**Symbol:** (new file, or explicit merge note in 51 design doc; closure-note paragraph in Phase 52d design doc)
 **Why it matters:** Phase 51 is marked In Progress with no task doc. Phase 52 and later phases list 51 as a dependency but it was never formally closed. Either write the task doc and run acceptance gates, or add a merge paragraph to the 51 design doc explaining the scope folded into 52d and mark it Complete.
 
 **Acceptance:**
@@ -117,6 +117,18 @@
 - [ ] Phase 51 `Status:` field is either `Complete` (if items verified) or `Deferred: see Phase 52d` (if merged).
 - [ ] Phase 52 design doc has a companion closure note consistent with the Phase 51 disposition.
 - [ ] README row for Phase 51 updated to reflect final status.
+
+### B.3 — Convert Phase 16 task doc from pipe-table to checkbox format
+
+**File:** `docs/roadmap/tasks/16-network-tasks.md`
+**Symbol:** P16-T001 through P16-T073 task rows
+**Why it matters:** Phase 16's task doc uses pipe tables with no checkboxes (73 rows). The doc-template authority (`docs/appendix/doc-templates.md` § "Template: phase task doc") requires `- [x]`/`- [ ]` checkbox items. Phase 16 was the only table-format task doc flagged by the 2026-05-08 audit as a red flag (Phases 17, 18, 20, 22, 23, 25, 28, 29 also use the legacy format but are deferred to post-1.0 per Track H — see Deferred Until Later in the design doc). Converting Phase 16 here closes the Goal's "convert legacy table-format task docs to checkbox form" commitment.
+
+**Acceptance:**
+- [ ] All 73 P16-T### rows are restructured into `- [x]` (verified shipped) or `- [ ] — Deferred: <owner phase>` (not shipped) form.
+- [ ] Verified items carry a file+symbol citation (e.g., `kernel/src/net/virtio_net.rs::VirtioNet::receive`).
+- [ ] Track Layout table at the top of the file is preserved.
+- [ ] Design-doc `Status:` for Phase 16 (currently Complete) agrees with the resulting checkbox state — every Track A–G row in the layout has at least one verified `[x]` item, or the design doc is demoted.
 
 ---
 
@@ -129,7 +141,7 @@
 **Why it matters:** Phase 22b has only a task doc. The template requires a companion design doc. Without it, the phase's rationale, feature scope, and implementation choices are not recorded.
 
 **Acceptance:**
-- [ ] File `docs/roadmap/22b-ansi-parser-enhancement.md` exists with all 14 template sections populated (not stubbed).
+- [ ] File `docs/roadmap/22b-ansi-parser-enhancement.md` exists with all 11 template H2 sections populated, not stubbed (Milestone Goal, Why This Phase Exists, Learning Goals, Feature Scope, Important Components and How They Work, How This Builds on Earlier Phases, Implementation Outline, Acceptance Criteria, Companion Task List, How Real OS Implementations Differ, Deferred Until Later — see `docs/appendix/doc-templates.md` § "Template: phase design doc").
 - [ ] Required header fields present: `Status`, `Source Ref: phase-22b`, `Depends on`, `Builds on`, `Primary Components`.
 - [ ] README row for Phase 22b updated to link the new design doc.
 
@@ -140,7 +152,7 @@
 **Why it matters:** Phase 42b has only a task doc. Downstream phases (43b, 43c, 46, 47) depend on 42b's async executor infrastructure; without a design doc the rationale and interface contract are unrecorded.
 
 **Acceptance:**
-- [ ] File `docs/roadmap/42b-async-executor.md` exists with all 14 template sections populated.
+- [ ] File `docs/roadmap/42b-async-executor.md` exists with all 11 template H2 sections populated, not stubbed (see C.1 acceptance for the section list and template reference).
 - [ ] Required header fields present: `Status`, `Source Ref: phase-42b`, `Depends on`, `Builds on`, `Primary Components`.
 - [ ] README row for Phase 42b updated to link the new design doc.
 
@@ -208,10 +220,25 @@
 **Symbol:** entire file content
 **Why it matters:** All seven still reference "Today (Phase 32)" as their baseline, ~20 phases stale. `rust-crate-acceleration.md` is fully superseded by completed Phases 41–47.
 
+**Disposition (decided up-front to avoid per-file judgement during implementation):**
+
+| File | Disposition | Rationale |
+|---|---|---|
+| `rust-crate-acceleration.md` | Move to `docs/archived/` with a dated supersession note pointing at Phases 41–47 | Fully superseded; no unique content remains |
+| `clang-llvm-roadmap.md` | Move to `docs/archived/` with dated note | Toolchain plan; no shipped phase covers it; defer reactivation to post-1.0 |
+| `claude-code-roadmap.md` | Move to `docs/archived/` with dated note | Tooling-meta doc, not implementation-blocking |
+| `git-roadmap.md` | Move to `docs/archived/` with dated note | Same as above |
+| `github-cli-roadmap.md` | Move to `docs/archived/` with dated note | Same as above |
+| `nodejs-roadmap.md` | Move to `docs/archived/` with dated note | Post-1.0 language port plan |
+| `python-roadmap.md` | Move to `docs/archived/` with dated note | Post-1.0 language port plan |
+
+The default disposition is "archive with dated note." If during implementation any of the six non-`rust-crate-acceleration.md` docs is discovered to contain unique not-elsewhere-recorded design intent, the implementer may instead fold the salvageable content into the appropriate phase appendix and then archive the husk — but the default action is archive.
+
 **Acceptance:**
-- [ ] `docs/rust-crate-acceleration.md` is either deleted or moved to `docs/archived/` with a dated note explaining supersession by Phases 41–47.
-- [ ] The remaining six docs are either (a) updated with a current-phase baseline, (b) moved to `docs/archived/` with a dated note, or (c) folded into the relevant phase appendix.
-- [ ] None of the seven files remaining in `docs/` still references "Phase 32" as current.
+- [ ] Every file in the table above has been moved to `docs/archived/<original-filename>` (preserving basename).
+- [ ] Each archived file's first body line is a quoted note in the form `> Archived 2026-05-08 — superseded by <phase or note>. Original content preserved below for historical reference.`
+- [ ] No file remaining in the top-level `docs/` directory references "Phase 32" as "today" or "current".
+- [ ] `git mv` was used (not delete + add) so that history is preserved.
 
 ---
 
@@ -241,9 +268,10 @@
 **Symbol:** README or index entry in each
 **Why it matters:** `docs/evaluation/README.md` is scoped to v0.47.0 (~10 phases stale). `docs/shell/brush-integration-analysis.md` is dated 2026-03-26 (~15 phases stale). Both mislead readers about the current state.
 
-**Acceptance:**
-- [ ] `docs/evaluation/README.md` either updated with a v0.57.x scope note or amended with a prominent "Archived — v0.47.0 era" header.
-- [ ] `docs/shell/brush-integration-analysis.md` either updated or amended with a prominent "Archived — 2026-03-26" header and a pointer to the current shell documentation.
+**Acceptance (archive-only — neither doc is on the active path so refresh is not justified):**
+- [ ] `docs/evaluation/README.md` has a prominent first-body-line header: `> Archived 2026-05-08 — scoped to v0.47.0; not maintained against later phases. Refer to current phase docs for up-to-date evaluation criteria.`
+- [ ] `docs/shell/brush-integration-analysis.md` has a prominent first-body-line header: `> Archived 2026-05-08 — original analysis dated 2026-03-26 and not maintained. See `docs/22-tty-terminal.md` and `docs/roadmap/29-pty-and-jobs.md` for the current shell + PTY documentation.`
+- [ ] Neither file's body content is otherwise modified — the goal is to flag staleness, not rewrite v0.47-era analysis.
 
 ---
 
@@ -260,6 +288,8 @@
 - [ ] For every design doc edited: `Source Ref:` is present and follows the `phase-NN` convention.
 - [ ] For every design doc edited: every entry in `Depends on:` that references a completed phase carries a `✅`.
 - [ ] Roadmap README rows updated for all phases changed in this phase.
+- [ ] `grep -rn 'docs/handoff[^s]' docs/ AGENTS.md` returns no matches (validates F.1 completed cleanly).
+- [ ] `grep -rn 'Phase 32' docs/*.md` returns no matches against top-level docs (validates E.1 completed cleanly — does not include `docs/roadmap/` or `docs/archived/`).
 - [ ] `cargo xtask check` (clippy + rustfmt) passes — no source files were changed by this phase, but verify no doc changes introduced broken links in any Rust doc-comment.
 
 ---
@@ -292,7 +322,7 @@
 - `docs/roadmap/README.md` (any version annotations)
 
 **Symbol:** `version` field in `kernel/Cargo.toml` `[package]` section
-**Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (per audit Red Flag — `AGENTS.md` was found stale at `v0.51.0` during the 2026-05-08 audit).
+**Why it matters:** Phase closure is signalled by a kernel version bump per project convention. Each new phase moves the project from `0.<previous>.x` to `0.<NN>.0`. The `AGENTS.md` "Kernel v0.X.Y" reference must move with it (the 2026-05-08 audit Red Flag noted `AGENTS.md` stale at `v0.51.0`; it has since been refreshed to `v0.57.0`, so this phase moves it directly to `v0.58.0`).
 
 **Acceptance:**
 - [ ] `kernel/Cargo.toml` `version = "0.58.0"`
