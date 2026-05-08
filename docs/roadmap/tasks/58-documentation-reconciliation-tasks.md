@@ -167,8 +167,8 @@
 **Why it matters:** The field references `docs/06-ipc-core.md`, which does not exist. Readers following the cross-reference get a 404.
 
 **Acceptance:**
-- [ ] `Supersedes Legacy Doc:` field updated to reference the actual existing file (likely `docs/roadmap/06-ipc-core.md` or removed if no predecessor exists).
-- [ ] No broken cross-reference remains in the file.
+- [x] `Supersedes Legacy Doc:` field updated to reference the actual existing file (likely `docs/roadmap/06-ipc-core.md` or removed if no predecessor exists). *(Field rewritten to record that the pre-restructure `docs/06-ipc-core.md` was merged into this file by PR #65 (`dbedda4`); the self-reference to `docs/06-ipc.md` was removed.)*
+- [x] No broken cross-reference remains in the file.
 
 ### D.2 — Refresh `docs/16-network.md` body content
 
@@ -177,9 +177,9 @@
 **Why it matters:** Still describes the network stack as kernel-mode-temporary. Phase 54 migrated UDP policy to a userspace `udp_server`; the doc has not been updated.
 
 **Acceptance:**
-- [ ] Body content no longer describes the network stack as kernel-mode-temporary.
-- [ ] Phase 54 migration to userspace UDP server is acknowledged.
-- [ ] `Status:` and `Aligned Roadmap Phase:` header fields are accurate.
+- [x] Body content no longer describes the network stack as kernel-mode-temporary. *(Top-of-doc Note reworded to "post-Phase 54" form; calls out Phase 54 UDP migration and Phase 55b ring-3 driver host.)*
+- [x] Phase 54 migration to userspace UDP server is acknowledged.
+- [x] `Status:` and `Aligned Roadmap Phase:` header fields are accurate. *(Both already correct: Status = Complete, Aligned Roadmap Phase = Phase 16.)*
 
 ### D.3 — Refresh `docs/22-tty-terminal.md` body content
 
@@ -188,9 +188,9 @@
 **Why it matters:** Still describes PTY as "skeleton stubs". Phase 29 implemented the full PTY subsystem including `openpty`, `tcsetattr`, and job-control plumbing.
 
 **Acceptance:**
-- [ ] Body content no longer describes PTY as skeleton stubs.
-- [ ] Phase 29 full PTY subsystem is described accurately.
-- [ ] `Status:` header agrees with Phase 29/22 completion state.
+- [x] Body content no longer describes PTY as skeleton stubs. *(Phase 22 baseline kept as historical context, but a "Status (post-Phase 29)" note now sits at the top of the PTY Skeleton Stubs section pointing to `docs/roadmap/29-pty-subsystem.md` as the current source of truth.)*
+- [x] Phase 29 full PTY subsystem is described accurately. *(Note enumerates `posix_openpt`, `grantpt`/`unlockpt`/`ptsname`, `tcsetattr`, `tcsetpgrp`/`tcgetpgrp` job control as the Phase 29 deliverables.)*
+- [x] `Status:` header agrees with Phase 29/22 completion state. *(Already correct: Phase 22 Status = Complete; Phase 29 also Complete.)*
 
 ### D.4 — Fix `docs/56-display-and-input-architecture.md` (legacy) Status field
 
@@ -199,8 +199,8 @@
 **Why it matters:** Reads "Planned" while both the roadmap design doc and AGENTS.md treat Phase 56 as Complete. This is the fourth location of Phase 56 status drift.
 
 **Acceptance:**
-- [ ] `Status:` field updated to `Complete`.
-- [ ] No other header field in the file contradicts the Phase 56 completion state.
+- [x] `Status:` field updated to `Complete`.
+- [x] No other header field in the file contradicts the Phase 56 completion state.
 
 ---
 

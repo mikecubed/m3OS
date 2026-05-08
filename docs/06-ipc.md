@@ -3,7 +3,7 @@
 **Aligned Roadmap Phase:** Phase 6
 **Status:** Complete
 **Source Ref:** phase-06
-**Supersedes Legacy Docs:** `docs/06-ipc.md` (design rationale), `docs/06-ipc-core.md` (implementation)
+**Supersedes Legacy Docs:** Pre-restructure `docs/06-ipc-core.md` (implementation, no longer present) — merged into this file by PR #65 (`dbedda4`).
 
 ## Overview
 

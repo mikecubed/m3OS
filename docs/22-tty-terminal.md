@@ -9,8 +9,9 @@ m3OS. It covers the line discipline that sits between raw keyboard input
 and userspace `read()`, the `termios` struct and its ABI compatibility,
 the `ioctl` interface for querying and modifying terminal settings, the
 `FdBackend::DeviceTTY` abstraction that makes `isatty()` work, and the
-PTY skeleton stubs that will support terminal multiplexers in a later
-phase.
+PTY skeleton stubs that Phase 29 (PTY Subsystem) later replaced with the
+full subsystem (see "PTY Skeleton Stubs" below for the Phase 22 baseline
+and the Phase 29 follow-on).
 
 ## What a TTY Is and Why It Exists
 
@@ -719,6 +720,14 @@ pub fn read(dst: &mut [u8]) -> usize {
 EOF flag, ensuring a clean slate when switching terminal modes.
 
 ## PTY Skeleton Stubs
+
+> **Status (post-Phase 29):** This section describes the Phase 22 baseline only.
+> Phase 29 (PTY Subsystem, `docs/roadmap/29-pty-subsystem.md`) replaced these
+> stubs with the full PTY data path: `posix_openpt`, `grantpt`/`unlockpt`/`ptsname`,
+> `tcsetattr` on the slave side, and full job-control plumbing (`tcsetpgrp`,
+> `tcgetpgrp`). The skeleton text below is preserved as a record of what Phase 22
+> originally shipped; current behaviour is described in the Phase 29 design and
+> task docs.
 
 Phase 22 allocates a monotonic PTY pair ID counter and defines three
 new `FdBackend` variants, but defers the actual read/write data path:
