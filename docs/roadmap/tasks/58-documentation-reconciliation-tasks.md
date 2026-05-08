@@ -97,10 +97,10 @@
 **Why it matters:** Phase 13 (Writable FS) is the only phase among the 60+ that has a design doc but no task doc. The README explicitly says "Tasks: not yet created". Phase is marked Complete.
 
 **Acceptance:**
-- [ ] File `docs/roadmap/tasks/13-writable-fs-tasks.md` exists with all required header fields (`Status`, `Source Ref`, `Depends on`, `Goal`).
-- [ ] Track Layout table lists at minimum the tracks implied by the design doc's five acceptance criteria.
-- [ ] Each acceptance criterion from the design doc appears as a checkbox item with a file+symbol citation or explicit deferral note.
-- [ ] README row for Phase 13 updated to link the new task doc.
+- [x] File `docs/roadmap/tasks/13-writable-fs-tasks.md` exists with all required header fields (`Status`, `Source Ref`, `Depends on`, `Goal`).
+- [x] Track Layout table lists at minimum the tracks implied by the design doc's five acceptance criteria. *(Five tracks A–E covering tmpfs, FAT32 write, VFS dispatch, syscall surface, validation.)*
+- [x] Each acceptance criterion from the design doc appears as a checkbox item with a file+symbol citation or explicit deferral note.
+- [x] README row for Phase 13 updated to link the new task doc.
 
 ### B.2 — Write or close Phase 51 task doc
 
@@ -113,10 +113,10 @@
 **Why it matters:** Phase 51 is marked In Progress with no task doc. Phase 52 and later phases list 51 as a dependency but it was never formally closed. Either write the task doc and run acceptance gates, or add a merge paragraph to the 51 design doc explaining the scope folded into 52d and mark it Complete.
 
 **Acceptance:**
-- [ ] Either a task doc `51-service-model-maturity-tasks.md` exists with checkboxes walked, OR the 51 design doc has an explicit closure paragraph stating which acceptance items folded into which later phase.
-- [ ] Phase 51 `Status:` field is either `Complete` (if items verified) or `Deferred: see Phase 52d` (if merged).
-- [ ] Phase 52 design doc has a companion closure note consistent with the Phase 51 disposition.
-- [ ] README row for Phase 51 updated to reflect final status.
+- [x] Either a task doc `51-service-model-maturity-tasks.md` exists with checkboxes walked, OR the 51 design doc has an explicit closure paragraph stating which acceptance items folded into which later phase. *(Closure paragraph added; Phase 51's five acceptance items map to shipped Phase 46 capabilities in `userspace/init/`, `userspace/syslogd/`, `userspace/coreutils-rs/`. The "merge target" is Phase 46 (where the actual implementation lived), not Phase 52d (which is kernel-side completion).)*
+- [x] Phase 51 `Status:` field is either `Complete` (if items verified) or `Deferred: see Phase 52d` (if merged). *(Set to `Complete (folded into Phase 46 — see "Phase 58 closure note" below)`. Items verified, not deferred.)*
+- [x] Phase 52 design doc has a companion closure note consistent with the Phase 51 disposition. *(Phase 52 closure note added; flips Status to `Complete (umbrella for sub-phases 52a–52d)` and references the Phase 51 closure for context.)*
+- [x] README row for Phase 51 updated to reflect final status. *(Row 333 — `Complete (folded into Phase 46)` with the broken `[Tasks]` link replaced by `[merged into Phase 46 tasks]`. Phase 52 row also updated to `Complete (umbrella for 52a–52d)`.)*
 
 ### B.3 — Convert Phase 16 task doc from pipe-table to checkbox format
 
@@ -125,10 +125,10 @@
 **Why it matters:** Phase 16's task doc uses pipe tables with no checkboxes (73 rows). The doc-template authority (`docs/appendix/doc-templates.md` § "Template: phase task doc") requires `- [x]`/`- [ ]` checkbox items. Phase 16 was the only table-format task doc flagged by the 2026-05-08 audit as a red flag (Phases 17, 18, 20, 22, 23, 25, 28, 29 also use the legacy format but are deferred to post-1.0 per Track H — see Deferred Until Later in the design doc). Converting Phase 16 here closes the Goal's "convert legacy table-format task docs to checkbox form" commitment.
 
 **Acceptance:**
-- [ ] All 73 P16-T### rows are restructured into `- [x]` (verified shipped) or `- [ ] — Deferred: <owner phase>` (not shipped) form.
-- [ ] Verified items carry a file+symbol citation (e.g., `kernel/src/net/virtio_net.rs::VirtioNet::receive`).
-- [ ] Track Layout table at the top of the file is preserved.
-- [ ] Design-doc `Status:` for Phase 16 (currently Complete) agrees with the resulting checkbox state — every Track A–G row in the layout has at least one verified `[x]` item, or the design doc is demoted.
+- [x] All 73 P16-T### rows are restructured into `- [x]` (verified shipped) or `- [ ] — Deferred: <owner phase>` (not shipped) form.
+- [x] Verified items carry a file+symbol citation (e.g., `kernel/src/net/virtio_net.rs::VirtioNet::receive`).
+- [x] Track Layout table at the top of the file is preserved.
+- [x] Design-doc `Status:` for Phase 16 (currently Complete) agrees with the resulting checkbox state — every Track A–G row in the layout has at least one verified `[x]` item, or the design doc is demoted. *(All 73 P16-T### rows verified shipped; design-doc Status remains Complete and now agrees with the per-item state. Original deferred bullets (TCP retransmit/congestion, IPv6, DNS, TLS, etc.) preserved as 10 explicit `- [ ] — Deferred` entries.)*
 
 ---
 
@@ -141,9 +141,9 @@
 **Why it matters:** Phase 22b has only a task doc. The template requires a companion design doc. Without it, the phase's rationale, feature scope, and implementation choices are not recorded.
 
 **Acceptance:**
-- [ ] File `docs/roadmap/22b-ansi-parser-enhancement.md` exists with all 11 template H2 sections populated, not stubbed (Milestone Goal, Why This Phase Exists, Learning Goals, Feature Scope, Important Components and How They Work, How This Builds on Earlier Phases, Implementation Outline, Acceptance Criteria, Companion Task List, How Real OS Implementations Differ, Deferred Until Later — see `docs/appendix/doc-templates.md` § "Template: phase design doc").
-- [ ] Required header fields present: `Status`, `Source Ref: phase-22b`, `Depends on`, `Builds on`, `Primary Components`.
-- [ ] README row for Phase 22b updated to link the new design doc.
+- [x] File `docs/roadmap/22b-ansi-parser-enhancement.md` exists with all 11 template H2 sections populated, not stubbed (Milestone Goal, Why This Phase Exists, Learning Goals, Feature Scope, Important Components and How They Work, How This Builds on Earlier Phases, Implementation Outline, Acceptance Criteria, Companion Task List, How Real OS Implementations Differ, Deferred Until Later — see `docs/appendix/doc-templates.md` § "Template: phase design doc").
+- [x] Required header fields present: `Status`, `Source Ref: phase-22b`, `Depends on`, `Builds on`, `Primary Components`.
+- [x] README row for Phase 22b updated to link the new design doc.
 
 ### C.2 — Write Phase 42b design doc
 
@@ -152,9 +152,9 @@
 **Why it matters:** Phase 42b has only a task doc. Downstream phases (43b, 43c, 46, 47) depend on 42b's async executor infrastructure; without a design doc the rationale and interface contract are unrecorded.
 
 **Acceptance:**
-- [ ] File `docs/roadmap/42b-async-executor.md` exists with all 11 template H2 sections populated, not stubbed (see C.1 acceptance for the section list and template reference).
-- [ ] Required header fields present: `Status`, `Source Ref: phase-42b`, `Depends on`, `Builds on`, `Primary Components`.
-- [ ] README row for Phase 42b updated to link the new design doc.
+- [x] File `docs/roadmap/42b-async-executor.md` exists with all 11 template H2 sections populated, not stubbed (see C.1 acceptance for the section list and template reference).
+- [x] Required header fields present: `Status`, `Source Ref: phase-42b`, `Depends on`, `Builds on`, `Primary Components`.
+- [x] README row for Phase 42b updated to link the new design doc. *(Row added between Phase 42 and Phase 43; Phase 42b previously had no row at all.)*
 
 ---
 
