@@ -2258,9 +2258,39 @@ fn spawn_smoke_runner() -> i32 {
         write_str(STDOUT_FILENO, "init: failed to fork smoke-runner\n");
         return -1;
     }
-    write_str(STDOUT_FILENO, "init: smoke-runner pid=");
-    write_u64(STDOUT_FILENO, pid as u64);
-    write_str(STDOUT_FILENO, "\n");
+    // Format the pid line into a stack buffer and emit as a single
+    // write() so kernel/userspace output racing on the serial port (under
+    // KVM, where SMP-fast scheduling makes per-syscall interleaving
+    // visible) does not slice the smoke-runner's `SMOKE:auth:BEGIN`
+    // marker apart from this line.
+    let mut buf = [0u8; 64];
+    let prefix = b"init: smoke-runner pid=";
+    let mut n_buf = [0u8; 20];
+    let mut nlen = 0usize;
+    {
+        let mut p = pid as u64;
+        if p == 0 {
+            n_buf[19] = b'0';
+            nlen = 1;
+        } else {
+            let mut i = 20;
+            while p > 0 {
+                i -= 1;
+                n_buf[i] = b'0' + (p % 10) as u8;
+                p /= 10;
+                nlen += 1;
+            }
+        }
+    }
+    let n_start = 20 - nlen;
+    let mut total = 0usize;
+    buf[..prefix.len()].copy_from_slice(prefix);
+    total += prefix.len();
+    buf[total..total + nlen].copy_from_slice(&n_buf[n_start..20]);
+    total += nlen;
+    buf[total] = b'\n';
+    total += 1;
+    let _ = write(STDOUT_FILENO, &buf[..total]);
     pid as i32
 }
 

@@ -416,22 +416,70 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Emit `SMOKE:<stage>:<verdict>\n` (optionally with a trailing message)
+/// as a single `write()` syscall.
+///
+/// The smoke-test harness pattern-matches on these literal lines. Under
+/// fast (KVM) timing, multiple `write_str()` calls can be sliced apart by
+/// other userspace processes that share the serial port (init's
+/// smoke-runner pid log; display_server's compose log; etc.) — every
+/// userspace `write()` only takes SERIAL1 for its own bytes, so a kernel
+/// IRQ-context log or another userspace `write()` between two of our
+/// writes leaves a sliced line on the wire (`SMOKE:5auth19:PASS`).
+/// Single `write()` per logical line eliminates the slice surface for the
+/// patterns the harness depends on.
+fn write_marker(stage: &str, verdict: &str, msg: Option<&str>) {
+    let mut buf = [0u8; 256];
+    let mut total = 0usize;
+    let prefix = b"SMOKE:";
+    let stage_b = stage.as_bytes();
+    let verdict_b = verdict.as_bytes();
+    let msg_b = msg.unwrap_or("").as_bytes();
+
+    let need = prefix.len() + stage_b.len() + 1 + verdict_b.len() + msg_b.len() + 1;
+    if need > buf.len() {
+        // Fallback to the legacy multi-write path if a message is too long
+        // to fit; long-message verdicts are rare and the diagnostic value
+        // outweighs the small interleave risk.
+        write_str(STDOUT_FILENO, "SMOKE:");
+        write_str(STDOUT_FILENO, stage);
+        write_str(STDOUT_FILENO, ":");
+        write_str(STDOUT_FILENO, verdict);
+        if let Some(m) = msg
+            && !m.is_empty()
+        {
+            write_str(STDOUT_FILENO, m);
+        }
+        write_str(STDOUT_FILENO, "\n");
+        return;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix);
+    total += prefix.len();
+    buf[total..total + stage_b.len()].copy_from_slice(stage_b);
+    total += stage_b.len();
+    buf[total] = b':';
+    total += 1;
+    buf[total..total + verdict_b.len()].copy_from_slice(verdict_b);
+    total += verdict_b.len();
+    if !msg_b.is_empty() {
+        buf[total..total + msg_b.len()].copy_from_slice(msg_b);
+        total += msg_b.len();
+    }
+    buf[total] = b'\n';
+    total += 1;
+    let _ = syscall_lib::write(STDOUT_FILENO, &buf[..total]);
+}
+
 fn pass(stage: &str) {
-    write_str(STDOUT_FILENO, "SMOKE:");
-    write_str(STDOUT_FILENO, stage);
-    write_str(STDOUT_FILENO, ":PASS\n");
+    write_marker(stage, "PASS", None);
 }
 
 fn begin(stage: &str) {
-    write_str(STDOUT_FILENO, "SMOKE:");
-    write_str(STDOUT_FILENO, stage);
-    write_str(STDOUT_FILENO, ":BEGIN\n");
+    write_marker(stage, "BEGIN", None);
 }
 
 fn skip(stage: &str) {
-    write_str(STDOUT_FILENO, "SMOKE:");
-    write_str(STDOUT_FILENO, stage);
-    write_str(STDOUT_FILENO, ":SKIP\n");
+    write_marker(stage, "SKIP", None);
 }
 
 fn marker_present(path: &[u8]) -> bool {
@@ -440,11 +488,23 @@ fn marker_present(path: &[u8]) -> bool {
 }
 
 fn fail(stage: &str, msg: &str, code: i32) -> i32 {
-    write_str(STDOUT_FILENO, "SMOKE:");
-    write_str(STDOUT_FILENO, stage);
-    write_str(STDOUT_FILENO, ":FAIL ");
-    write_str(STDOUT_FILENO, msg);
-    write_str(STDOUT_FILENO, "\n");
+    // Format `SMOKE:<stage>:FAIL <msg>` as a single write. See `write_marker`
+    // for why this matters under fast (KVM) timing.
+    let mut full = [0u8; 8]; // " " separator if needed
+    full[0] = b' ';
+    let _ = full;
+    let mut joined_buf = [0u8; 256];
+    let space = b" ";
+    let total_msg_len = space.len() + msg.len();
+    if total_msg_len + 32 < joined_buf.len() {
+        joined_buf[..space.len()].copy_from_slice(space);
+        joined_buf[space.len()..space.len() + msg.len()].copy_from_slice(msg.as_bytes());
+        // SAFETY: bytes written above are ASCII (space + msg's caller-provided text).
+        let joined = unsafe { core::str::from_utf8_unchecked(&joined_buf[..total_msg_len]) };
+        write_marker(stage, "FAIL", Some(joined));
+    } else {
+        write_marker(stage, "FAIL", None);
+    }
     code
 }
 

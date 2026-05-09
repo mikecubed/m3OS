@@ -4195,7 +4195,15 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     if let Some(parent_exec_path) = current_exec_path_for_debug()
         && is_interactive_debug_exec_path(parent_exec_path.as_str())
     {
-        log::info!(
+        // Downgraded from INFO to DEBUG: these per-fork audit lines from
+        // interactive shells (ion / sh0) interleaved with userspace SMOKE:
+        // markers under fast (KVM) timing because each USERSPACE write
+        // takes SERIAL1 only for its own bytes — a kernel `log::info!`
+        // firing between two userspace `write()`s splits the user line.
+        // The Phase 57 kbd_server-silent-fail diagnostic this was added
+        // for is closed; re-enable at INFO if a similar diagnostic is
+        // needed.
+        log::debug!(
             "[proc] fork: parent_pid={} parent_exec={} child_pid={}",
             parent_pid,
             parent_exec_path,
@@ -4542,7 +4550,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
     if is_interactive_debug_exec_path(name) {
-        log::info!("[proc] execve: pid={} path={}", pid, name);
+        // Downgraded from INFO to DEBUG — see matching note in the fork
+        // logger above. Service-supervisor debug aid that's no longer the
+        // active debug surface.
+        log::debug!("[proc] execve: pid={} path={}", pid, name);
     }
     #[cfg(feature = "exec-trace")]
     log::info!(
@@ -7204,7 +7215,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             Ok(id) => id,
             Err(()) => return NEG_ENOSPC,
         };
-        log::info!("[pty] allocated PTY pair {}", pty_id);
+        log::debug!("[pty] allocated PTY pair {}", pty_id);
         let entry = FdEntry {
             backend: FdBackend::PtyMaster { pty_id },
             offset: 0,
@@ -12009,7 +12020,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
             let create_mode = ((mode as u16) & 0o7777) & !current_umask();
             return match vol.create_directory(parent_ino, dir_name, create_mode, mk_euid, mk_egid) {
                 Ok(_) => {
-                    log::info!("[mkdir] {} (ext2)", name);
+                    log::debug!("[mkdir] {} (ext2)", name);
                     0
                 }
                 Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
@@ -12048,7 +12059,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
                     mk_egid,
                 ) {
                     Ok(_) => {
-                        log::info!("[mkdir] {} (ext2)", name);
+                        log::debug!("[mkdir] {} (ext2)", name);
                         0
                     }
                     Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
@@ -12074,7 +12085,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
                 };
                 return match vol.mkdir(parent_cluster, dir_name) {
                     Ok(_) => {
-                        log::info!("[mkdir] {} (fat32)", name);
+                        log::debug!("[mkdir] {} (fat32)", name);
                         let (_, _, mk_euid2, mk_egid2) = current_process_ids();
                         let create_mode = ((mode as u16) & 0o7777) & !current_umask();
                         crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, create_mode);
@@ -12101,7 +12112,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let create_mode = ((mode as u16) & 0o7777) & !current_umask();
     match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, create_mode) {
         Ok(()) => {
-            log::info!("[mkdir] {}", name);
+            log::debug!("[mkdir] {}", name);
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
@@ -12207,7 +12218,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
             let file_name = parts.last().copied().unwrap_or(rel);
             return match vol.delete_file(parent_ino, file_name) {
                 Ok(()) => {
-                    log::info!("[unlink] {} (ext2)", name);
+                    log::debug!("[unlink] {} (ext2)", name);
                     0
                 }
                 Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
@@ -12240,7 +12251,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
                 let file_name = parts.last().copied().unwrap_or(rel);
                 return match vol.delete_file(parent_ino, file_name) {
                     Ok(()) => {
-                        log::info!("[unlink] {} (ext2)", name);
+                        log::debug!("[unlink] {} (ext2)", name);
                         0
                     }
                     Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
@@ -12267,7 +12278,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
                 };
                 return match vol.unlink(parent_cluster, file_name) {
                     Ok(()) => {
-                        log::info!("[unlink] {} (fat32)", name);
+                        log::debug!("[unlink] {} (fat32)", name);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::NotFound) => NEG_ENOENT,
@@ -12290,7 +12301,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
     match tmpfs.unlink(rel) {
         Ok(()) => {
-            log::info!("[unlink] {}", name);
+            log::debug!("[unlink] {}", name);
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
