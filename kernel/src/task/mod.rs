@@ -46,7 +46,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
 use crate::ipc::{CapabilityTable, Message};
 
@@ -71,6 +71,7 @@ pub use kernel_core::preempt_frame::{
 };
 
 pub mod blocking_mutex;
+pub mod kstack;
 pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
@@ -102,8 +103,6 @@ pub(crate) fn try_lock_scheduler() -> Option<scheduler::SchedulerGuard<'static>>
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 
 // ---------------------------------------------------------------------------
 // Task ID
@@ -521,7 +520,12 @@ pub struct Task {
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
-    _stack: Option<Box<[u8]>>,
+    ///
+    /// Backed by a static `.bss` pool ([`kstack::KernelStack`]) rather than
+    /// the kernel heap so stack memory cannot alias with any other heap
+    /// allocation. See `docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md`
+    /// for the failure mode this isolation closes.
+    _stack: Option<kstack::KernelStack>,
 
     // ---------------------------------------------------------------------------
     // Phase 57a B.2 — per-task pi_lock (shadow lock, migration window)
@@ -682,8 +686,9 @@ impl Task {
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
         let id = TaskId(NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
 
-        let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
-        let saved_rsp = init_stack(&mut stack, entry);
+        let mut stack =
+            kstack::KernelStack::alloc().expect("kernel stack pool exhausted (MAX_TASKS reached)");
+        let saved_rsp = init_stack(stack.as_mut_slice(), entry);
 
         Task {
             id,
@@ -749,11 +754,7 @@ impl Task {
 
     /// Return the base and top addresses of this task's kernel stack, if allocated.
     pub fn stack_bounds(&self) -> Option<(u64, u64)> {
-        self._stack.as_ref().map(|s| {
-            let base = s.as_ptr() as u64;
-            let top = base + s.len() as u64;
-            (base, top)
-        })
+        self._stack.as_ref().map(|s| s.bounds())
     }
 
     // ---------------------------------------------------------------------------

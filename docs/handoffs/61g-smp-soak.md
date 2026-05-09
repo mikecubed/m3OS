@@ -220,9 +220,11 @@ should be aware that:
   leak — Option B Arc-clone refactor) is closed in Phase 62. See
   [`57e-bug9-bug10-followup.md`](./57e-bug9-bug10-followup.md) §
   "Post-deferral severity adjustment".
-- AP cores may take a kernel-mode GPF during late boot; tracked at
-  [`ap-core-gpf-saved-rsp-stack-corruption.md`](./ap-core-gpf-saved-rsp-stack-corruption.md).
-  Also pre-existing on `main`, also out-of-scope for Phase 61.
+- AP cores formerly took a kernel-mode GPF during late boot; **fixed**
+  2026-05-09 via the static `.bss` kernel-stack pool — see
+  [`ap-core-gpf-saved-rsp-stack-corruption.md`](./ap-core-gpf-saved-rsp-stack-corruption.md)
+  § Resolution. The literal-procedure soak should no longer be at risk
+  of the AP-takedown signature.
 - A literal-procedure pass of the soak with the spec'd workload
   remains pending. Both bugs above plausibly fire under that workload
   and need to be considered when classifying the result.

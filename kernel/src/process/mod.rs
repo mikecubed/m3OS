@@ -107,8 +107,6 @@ pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
 // Re-export stack size from task module so we have a single source of truth.
 // ---------------------------------------------------------------------------
 
-use crate::task::KERNEL_STACK_SIZE;
-
 // ---------------------------------------------------------------------------
 // PID type and allocator
 // ---------------------------------------------------------------------------
@@ -976,21 +974,20 @@ impl Process {
 
 /// Allocate a kernel stack for a new process and return its top address.
 ///
-/// The stack is a heap-allocated `[u8; KERNEL_STACK_SIZE]` array that is
-/// intentionally leaked (`Box::into_raw`) so the memory is never freed.
-/// Process cleanup (and proper stack deallocation) is deferred to a later
-/// phase.
+/// The stack is claimed from [`crate::task::kstack`]'s static `.bss` pool,
+/// which guarantees the backing memory cannot alias with any kernel-heap
+/// allocation. The slot is intentionally never released — process cleanup
+/// (and proper stack deallocation) is deferred to a later phase, matching
+/// the prior `Box::into_raw` behaviour.
+///
+/// Routing through the pool (rather than the heap) closes the AP-core
+/// saved-frame corruption tracked in
+/// `docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md`: the original
+/// failure was a kernel-stack allocation that shared physical memory with a
+/// formatted log line. Pool-backed stacks live in `.bss`, which the heap
+/// allocator never sees.
 fn alloc_kernel_stack() -> u64 {
-    // Allocate as a fixed-size array so the allocation is contiguous and
-    // properly aligned.  Box::into_raw prevents the destructor from running.
-    let stack: alloc::boxed::Box<[u8; KERNEL_STACK_SIZE]> =
-        alloc::boxed::Box::new([0u8; KERNEL_STACK_SIZE]);
-    let ptr = alloc::boxed::Box::into_raw(stack) as *mut u8;
-    // The top of the stack is one byte past the last element, aligned down
-    // to a 16-byte boundary for the SysV AMD64 ABI (kernel-stack RSP0 and
-    // SYSCALL stack must be 16-byte aligned for call instructions).
-    let top = (ptr as u64) + KERNEL_STACK_SIZE as u64;
-    top & !15
+    crate::task::kstack::alloc_leaked_top()
 }
 
 /// Public wrapper for `alloc_kernel_stack` — used by `sys_clone_thread`.

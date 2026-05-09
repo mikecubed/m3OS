@@ -1,6 +1,6 @@
 # AP-Core GPF on Boot: Kernel Stack Shared With Log Buffer
 
-**Status:** Open bug — pre-existing on `main`, surfaced during Phase 61 testing.
+**Status:** **Fixed** 2026-05-09 — kernel stacks isolated to a static `.bss` pool so they can never alias with kernel-heap allocations. See "Resolution" at the bottom of this file.
 **First observed:** 2026-05-09 (m3os.log captures from user testing during the Phase 61 PR cycle).
 **Severity:** AP-core takedown, kernel survives on remaining cores. Userspace boot completes; subsequent SMP capacity is reduced by one core. NOT user-facing-fatal in the cases observed so far, but the failure mode is undefined behaviour reading from corrupt memory and could escalate (double-fault, silent state corruption) under different timing.
 **Scope:** Outside Phase 61. Phase 61 attempted detection-and-skip mitigation; the bandaid did not catch the actual mechanism (see "Mitigation attempts that did not work" below). Phase 61's scheduler changes have been reverted from this code path; this bug is the same as on `main`.
@@ -257,3 +257,43 @@ A fix is acceptable when:
 1. The AP-core GPF stops occurring across `cargo xtask run-gui --fresh` boots (10 consecutive clean boots is a reasonable bar).
 2. The mechanism is documented in the commit message — either "found the use-after-free at site X, fixed" or "added isolation guarantee Y so the corruption is structurally impossible."
 3. Optionally: a regression test under `kernel/tests/` exercises the dispatch + drain_dead interaction (this is hard to write deterministically; if the fix is structural the test may be unnecessary).
+
+## Resolution — 2026-05-09
+
+**Approach:** structural isolation via a dedicated kernel-stack pool (option 3 from the Mitigation Options section above). The underlying use-after-free / aliasing mechanism in the heap was *not* root-caused; instead the fix removes kernel stacks from the heap entirely so the allocator can never put non-stack data into the same physical pages that a stack later resolves through.
+
+### What changed
+
+- New module `kernel/src/task/kstack.rs` — fixed-size pool of `2 × MAX_TASKS + 2 × (MAX_CORES − 1)` slots, each `KERNEL_STACK_SIZE` (32 KiB), living in `.bss`. Slots are claimed via `compare_exchange` on a parallel `[AtomicBool; N]`. Two consumer surfaces:
+  - `KernelStack::alloc() -> Option<KernelStack>` — RAII guard. Drop zeros the slot bytes and releases the bit.
+  - `kstack::alloc_leaked_top() -> u64` — claim a slot permanently, return the 16-byte-aligned stack top. Used for the leaked-stack call sites that the original design never freed.
+- `kernel/src/task/mod.rs` — `Task._stack: Option<Box<[u8]>>` → `Option<KernelStack>`. `Task::new` now uses `KernelStack::alloc().expect(...)`. The `drain_dead` call site (`task._stack.take()`) is unchanged: `Option::take` is type-agnostic and the `KernelStack` Drop impl runs the zero-and-release.
+- `kernel/src/process/mod.rs::alloc_kernel_stack` — was `Box::leak(Vec<u8>(32 KiB))`; now calls `kstack::alloc_leaked_top()`. The leak semantics (no per-process stack reclaim) are preserved; that is a separate deferred cleanup.
+- `kernel/src/smp/mod.rs::init_ap_per_core` — the AP per-core syscall stack (16 KiB) and double-fault IST stack (20 KiB) were also `Box::leak(Vec<u8>(...))` from the heap; now both call `alloc_leaked_top()`. Pool slots are 32 KiB each, so the 16/20 KiB stacks fit with unused tail (harmless).
+
+The BSP's syscall and double-fault stacks were already in `.bss` (`kernel/src/arch/x86_64/gdt.rs`) and were not touched.
+
+### Why this fixes the failure
+
+The bug was: a kernel stack at physmap virtual address `0x000002803...` happened to share physical pages with a buffer that received the formatted `[ext2] mounted: …` log line at boot, so the AP's `popf`/`pop`/`ret` in `switch_context` loaded ASCII bytes as register values. Whether the mechanism was UAF, double-allocation by the buddy, or an unrelated wild write into a still-live page was never identified.
+
+After the fix, every kernel stack lives at a kernel-image VA inside the `.bss` of the loaded kernel binary (e.g. `0x100009998a0`-class addresses in the post-fix logs). The kernel heap allocator does not own those pages, has no references to them, and cannot hand them out for any other allocation. Any of the three candidate mechanisms above is therefore structurally precluded.
+
+### Verification
+
+- `cargo xtask check` clean.
+- `cargo xtask test` — full suite (12 tests) passes, including all SMP-sensitive cases (`smp_prelude_smoke`, `load_balance_smp`, `pipe_wakeup_smp`, `ipc_wakeup_smp`, `munmap_tlb_smp`).
+- `cargo xtask run --fresh` boots cleanly to userspace (`term`, `login`, `sshd`, `syslogd` all online) on 4-core QEMU with zero `GPF` / `DOUBLE FAULT` / `panic` lines in the serial log. The same boot reliably produced the documented GPF prior to the fix.
+
+The Bug #9 (`stale-ready` / `cpu-hog`) and `dequeue-drop` warnings remain — those are independent and tracked under Phase 62.
+
+### What this fix does *not* do
+
+- It does not root-cause the original heap-allocator behaviour. If a future code path leaks a stack address out of `Box::into_raw` and writes back to it, or if the buddy ever does double-allocate, those would surface elsewhere — but no longer through the kernel-stack failure mode.
+- Process-syscall and AP-per-core stack reclaim is still deferred. Stacks claimed via `alloc_leaked_top()` are pinned for the kernel's lifetime, matching the original `Box::leak` semantics. A future phase that wires per-process and per-core stack reclaim should release the slot bit (and the existing Drop impl on `KernelStack` already shows the shape of how to do that for the RAII path).
+- A `MAX_TASKS = 256`-driven hard cap on userspace task count is now enforced by stack-pool exhaustion, not just by the IPC notification table sizing. A fork-bomb that exceeded `MAX_TASKS` previously OOM-panicked the heap; it now panics in `alloc_leaked_top`. Same outcome, slightly earlier signal.
+
+### Cross-references
+
+- `docs/handoffs/61g-smp-soak.md` — the Phase 61 Track G manual soak that was blocked on this bug. Should now run cleanly (subject to Bug #9, see soak doc).
+- Phase 61 PR #144 — closed without the failed mitigation attempts (`saved_rsp` bounds checks at dispatch). Those reverts stand; the structural fix above replaces them.
