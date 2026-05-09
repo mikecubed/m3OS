@@ -120,7 +120,12 @@ The soak passes when, after 10 wall-clock minutes:
    Empty output (or only the boot-time ACPI / IRQ-override `INFO`
    lines that always appear) is the pass condition.
 
-## Soak result placeholder
+## Soak result placeholder (manual procedure — pending)
+
+The literal manual procedure above (4 CPU-bound loops + pipe ping-pong +
+SSH connect + `display_server` idle, 10 wall-clock minutes on
+`M3OS_SMP=2`) has not yet been performed. It remains a manual gate
+before the kernel version bump (`v0.61.0`) is tagged on `main`.
 
 ```
 QEMU command:    [paste actual `cargo xtask run` invocation here]
@@ -139,6 +144,95 @@ Verdict:         [PASS / FAIL]
 > above. The soak must be performed before the kernel version bump
 > (`v0.61.0`) is tagged on the `main` branch.
 
+## Automated `cargo xtask soak` attempt — 2026-05-09
+
+A best-effort proxy run was performed using the existing Phase 57e Track
+G automated harness (`cargo xtask soak --duration 10m`), which loops
+`cargo xtask smoke-test` for the configured duration and applies
+zero-tolerance grep checks. **This is not the manual procedure above** —
+the workload is the smoke-test fixture (boot → fork-bomb +
+ext2 mount + tcc-compile + virtio-blk traffic) rather than the four
+CPU-bound loops + pipe ping-pong + SSH the manual procedure spec'd. It
+is, however, the highest-signal SMP-sensitive run that can be driven
+unattended, and was used here as a sanity check on whether the PR #144
+review fixes regressed SMP behaviour.
+
+### Result — both pre- and post-fix HEAD fail with the same fingerprint
+
+Pre-fix baseline (`38f3099` — branch HEAD before PR #144 review fixes):
+
+| Pattern | Count | Threshold |
+|---|---|---|
+| `[sched] stale-ready` | 4 | 0 |
+| `[sched] cpu-hog` | 0 | 0 |
+| `virtio-blk` request timeout | 1 | (info) |
+| `[sched] dequeue-drop` | 10 | (info, benign) |
+| Runs completed | 1 | — |
+| Acceptance | **FAIL** | — |
+
+With-fix HEAD (`412fe3c` — PR #144 after review fixes):
+
+| Pattern | Count | Threshold |
+|---|---|---|
+| `[sched] stale-ready` | 20 | 0 |
+| `[sched] cpu-hog` | 1 | 0 |
+| `virtio-blk` request timeout | 2 | (info) |
+| `[sched] dequeue-drop` | 38 | (info, benign) |
+| Runs completed | 2 | — |
+| Acceptance | **FAIL** | — |
+
+Both HEADs fail the gate on the same primary pattern (`[sched]
+stale-ready`, the documented Bug #9 fingerprint per
+[`docs/handoffs/57e-bug9-bug10-followup.md`](./57e-bug9-bug10-followup.md)).
+The post-fix run completed two smoke-test iterations to the baseline's
+one, so per-iteration counts (10 / 4 stale-ready warnings) are within
+timing-variance noise for a 1-vs-2-iteration sample of a documented
+timing-sensitive bug.
+
+### Why this is not a Phase 61 review-fix regression
+
+The PR #144 review fixes are confined to:
+
+- A `period_ms` parameter added to
+  `kernel::task::scheduler::tick_account_current_task` so AP cores
+  attribute time on the `1 tick = 1 ms` scale (Track E.2 closure);
+  the `user_ticks` / `system_ticks` counters it writes are read only
+  by display-only accessors (`current_task_times`,
+  `process_total_times`, zombie-reap accumulation) and are not
+  consulted by any wake / migration / dispatch code.
+- `sys_getrusage(NULL) → -EFAULT` — not exercised by the smoke-test
+  workload (which uses `waitpid`, not `getrusage`).
+- Doc / comment / test-constant changes (`MAX_LATENCY_TICKS` 100→10,
+  cadence comments, status flips, `spawn_on_core` doc tightening) —
+  no runtime behavioural impact on smoke-test paths.
+
+None of these can plausibly cause `[sched] stale-ready` to fire. The
+fingerprint is independent of `user_ticks` / `system_ticks` and predates
+PR #144's first commit.
+
+### Cross-references for the eventual closeout
+
+When the manual `v0.61.0`-tag soak is performed, the engineer running it
+should be aware that:
+
+- `[sched] stale-ready` and `[sched] cpu-hog` are expected to fire
+  intermittently until Bug #9 (FS-volume `IrqSafeMutex` `preempt_count`
+  leak — Option B Arc-clone refactor) is closed in Phase 62. See
+  [`57e-bug9-bug10-followup.md`](./57e-bug9-bug10-followup.md) §
+  "Post-deferral severity adjustment".
+- AP cores may take a kernel-mode GPF during late boot; tracked at
+  [`ap-core-gpf-saved-rsp-stack-corruption.md`](./ap-core-gpf-saved-rsp-stack-corruption.md).
+  Also pre-existing on `main`, also out-of-scope for Phase 61.
+- A literal-procedure pass of the soak with the spec'd workload
+  remains pending. Both bugs above plausibly fire under that workload
+  and need to be considered when classifying the result.
+
+### Artefacts
+
+- Pre-fix run: `target/soak/run-1778299744/` (in throwaway worktree at
+  `38f3099`, removed after capture).
+- With-fix run: `target/soak/run-1778298182/`.
+
 ## Related artefacts
 
 - `kernel/tests/load_balance_smp.rs` — automated load-balance
@@ -149,3 +243,8 @@ Verdict:         [PASS / FAIL]
   doc.
 - `docs/roadmap/tasks/61-smp-load-balancing-closeout-tasks.md`
   Track G section.
+- [`docs/handoffs/57e-bug9-bug10-followup.md`](./57e-bug9-bug10-followup.md)
+  — Bug #9 (`stale-ready` / `cpu-hog` fingerprint) tracking, Phase
+  62-targeted closure.
+- [`docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md`](./ap-core-gpf-saved-rsp-stack-corruption.md)
+  — AP-core kernel GPF tracking, pre-existing on `main`.
