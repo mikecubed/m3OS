@@ -1470,13 +1470,27 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> isize {
 }
 
 /// Wait for a child process. Returns the PID of the child that changed state.
+///
+/// Internally invokes Linux's `wait4` (syscall #61) with `rusage = NULL`.
+/// Phase 61 Track E.3 widened the kernel-side dispatch from
+/// `sys_waitpid(pid, status, options)` to
+/// `sys_wait4(pid, status, options, rusage_ptr)`. The kernel reads
+/// `rusage_ptr` from `r10` regardless of how many arguments userspace
+/// passed; if we use a 3-arg `syscall3`, `r10` carries stale register
+/// data and the kernel tries to write a `struct rusage` to a garbage
+/// address — typically returning `EFAULT`. Pass an explicit
+/// `r10 = 0` (NULL) so the kernel's `rusage_ptr == 0` short-circuit
+/// skips the write. This bug surfaced under KVM (where `-cpu host`
+/// leaves `r10` holding real prior-syscall state); under TCG `r10`
+/// often happened to be zero already, hiding the breakage.
 pub fn waitpid(pid: i32, status: &mut i32, options: i32) -> isize {
     unsafe {
-        syscall3(
+        syscall4(
             SYS_WAITPID,
             pid as u64,
             status as *mut i32 as u64,
             options as u64,
+            0, // rusage_ptr = NULL — waitpid does not return rusage
         ) as isize
     }
 }
