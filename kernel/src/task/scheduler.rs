@@ -1352,8 +1352,13 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// = 1 ms` scale (`TICKS_PER_SEC = 1000`) regardless of which core the
 /// task ran on, so values stay consistent across migration.
 ///
-/// Skips the idle task (priority 30) and any task that is no longer
-/// `Running`. The function is best-effort and silently no-ops when no
+/// Skips the idle task (identified via `Scheduler::idle_tasks`, NOT via
+/// `priority == 30`) and any task that is no longer `Running`. The
+/// numeric priority value is unsafe as an idle marker because `sys_nice`
+/// clamps user priorities into `0..=30`, so a normal task that calls
+/// `nice(+N)` can legitimately reach 30 — using `priority == 30` to
+/// skip accounting would silently zero out `times(2)` / `getrusage(2)`
+/// for any heavily-niced user task. The function is best-effort and silently no-ops when no
 /// current task is present (early boot, between dispatches, etc.) — in
 /// particular, it bails before reading `per_core` if SMP per-core data
 /// is not yet ready, which can happen during the early-boot window
@@ -1379,11 +1384,14 @@ pub fn tick_account_current_task(in_user_mode: bool, period_ms: u64) {
     let Some(mut sched) = try_scheduler_lock() else {
         return;
     };
+    // Skip the idle task — its time is not interesting and counting it
+    // would falsely inflate `system_ticks` whenever the CPU is halted in
+    // `enable_and_hlt`. Detected via the dedicated `idle_tasks` set, NOT
+    // `priority == 30`, because `sys_nice` clamps user priorities into
+    // `0..=30` and a normal user task can legitimately end up at 30.
+    let is_idle = sched.idle_tasks.contains(&Some(idx));
     if let Some(task) = sched.tasks.get_mut(idx) {
-        // Skip the idle task — its time is not interesting and counting
-        // it would falsely inflate `system_ticks` whenever the CPU is
-        // halted in `enable_and_hlt`.
-        if task.priority == 30 {
+        if is_idle {
             return;
         }
         // Defensive: if for any reason the current task is not Running

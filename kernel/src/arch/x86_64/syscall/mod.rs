@@ -4760,25 +4760,15 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     Some((pid, found_code, true)) // stopped
                 } else {
                     let code = found_code.unwrap_or(0);
-                    // Phase 61 Track E.1: accumulate the reaped zombie's CPU
-                    // time into the calling task's `child_*` fields. POSIX
-                    // requires recursive accumulation (zombie's own ticks +
-                    // zombie's accumulated children-ticks) so a parent who
-                    // reaps a child inherits the entire reaped subtree's
-                    // total CPU time. Must run BEFORE table.reap(pid)
-                    // because reap() drops the process record; the task
-                    // ticks are looked up by pid from the scheduler's task
-                    // table (independent of the process table).
-                    let (z_user, z_sys, z_cuser, z_csys) =
-                        crate::task::scheduler::task_times_for_pid(pid);
-                    crate::task::scheduler::current_task_accumulate_child_times(
-                        z_user, z_sys, z_cuser, z_csys,
-                    );
-                    // Phase 61 Track E.4: same recursive accumulation rule
-                    // for rusage event counters (page faults + ctxsw).
-                    let z_rusage = crate::task::scheduler::rusage_counters_for_pid(pid);
-                    crate::task::scheduler::current_task_accumulate_child_rusage(z_rusage);
-                    table.reap(pid);
+                    // Phase 61 Track E.1/E.4 lock-order note: scheduler
+                    // accumulation helpers and `table.reap(pid)` MUST run
+                    // outside this PROCESS_TABLE lock scope. The scheduler
+                    // dispatch path (`scheduler.rs::dispatch_for_core`)
+                    // acquires `PROCESS_TABLE` while holding `SCHEDULER`,
+                    // so calling any scheduler-locking helper here would
+                    // create an ABBA inversion. We return the reapable
+                    // pid+code and run accumulation + reap after the
+                    // `result` scope exits below.
                     Some((pid, Some(code), false))
                 }
             } else {
@@ -4787,6 +4777,23 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
+            // Phase 61 Track E.1/E.4 — recursive child-time and child-rusage
+            // accumulation, plus the actual zombie reap. Runs OUTSIDE the
+            // PROCESS_TABLE lock scope above to avoid ABBA against the
+            // scheduler dispatch path (scheduler.rs acquires PROCESS_TABLE
+            // while holding SCHEDULER). The scheduler-side task entries
+            // for the reaped pid are looked up independently of
+            // PROCESS_TABLE, so the table.reap() can safely follow.
+            if !stopped {
+                let (z_user, z_sys, z_cuser, z_csys) =
+                    crate::task::scheduler::task_times_for_pid(child_pid);
+                crate::task::scheduler::current_task_accumulate_child_times(
+                    z_user, z_sys, z_cuser, z_csys,
+                );
+                let z_rusage = crate::task::scheduler::rusage_counters_for_pid(child_pid);
+                crate::task::scheduler::current_task_accumulate_child_rusage(z_rusage);
+                crate::process::PROCESS_TABLE.lock().reap(child_pid);
+            }
             if let Some(task_id) = wait_task {
                 crate::process::deregister_child_waiter(calling_pid, task_id);
             }
