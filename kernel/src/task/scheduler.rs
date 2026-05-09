@@ -4236,19 +4236,34 @@ pub fn run() -> ! {
                 // skip this dispatch iteration; the outer loop's `continue`
                 // (line "None => continue") will pick another task.
                 //
-                // Idle tasks have a fixed stack and are exempt — their
-                // saved_rsp is set once at spawn and never replaced. The
-                // existing pick_next() debug_assert at line 779 covers
-                // the idle-zero case.
+                // **Limited to kernel tasks (`pid == 0`).** Userspace
+                // tasks legitimately have `saved_rsp` outside their own
+                // `Task._stack` bounds: when a userspace task yields
+                // mid-syscall via `yield_now()`, the saved RSP points
+                // at the per-core kernel stack (`gs:OFF_STACK_TOP`),
+                // not the task's stack. The same applies to
+                // `Preempted`-mode resumption (TSS.RSP0 stack). The
+                // observed corruption case is in kernel tasks (AP idle,
+                // serial-stdin, init kernel task) — those always run on
+                // their own `_stack` and a saved_rsp outside it is
+                // unambiguously bad. Refining the check for userspace
+                // tasks (would need a per-core stack-range query) is
+                // future work.
+                //
+                // Idle tasks (`priority == 30`) are kernel tasks; they
+                // are caught by this check but their saved_rsp is set
+                // once at spawn and never replaced, so a corruption
+                // there is a real bug worth surfacing.
                 //
                 // For Preempted-mode tasks, the saved_rsp is on the
                 // process kernel stack (TSS.RSP0 stack), not the task
-                // kernel stack — `stack_bounds` returns the task stack,
-                // so skip the check in that case (mirrors the
+                // kernel stack — skip the check (mirrors the
                 // debug_assert below at line 4461).
                 let resume_mode =
                     ResumeMode::from(sched.tasks[idx].resume_mode.load(Ordering::Acquire));
-                if resume_mode != ResumeMode::Preempted
+                let task_pid = sched.tasks[idx].pid;
+                if task_pid == 0
+                    && resume_mode != ResumeMode::Preempted
                     && let Some((base, top)) = sched.tasks[idx].stack_bounds()
                     && (rsp < base || rsp >= top)
                 {
