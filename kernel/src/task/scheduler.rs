@@ -547,6 +547,50 @@ fn set_current_task_idx(idx: Option<usize>) {
         .store(val, Ordering::Relaxed);
 }
 
+/// Cache a stable pointer to the running task on this core, or null when
+/// switching out. Mirrors [`set_current_task_idx`] but exposes the Task
+/// address so IRQ-context helpers (CPU-time sampler, page-fault rusage
+/// updater) can mutate the running task's atomic counters without taking
+/// the scheduler lock.
+///
+/// The pointer is safe to deref from any context as long as it is non-null
+/// — a task's storage in `Vec<SlabBox<Task>>` keeps its address stable for
+/// the task's lifetime, and we never expose the pointer past `current_task_ptr`
+/// being cleared on switch-out (Release-paired with Acquire load below).
+fn set_current_task_ptr(task: Option<&crate::task::Task>) {
+    let raw = match task {
+        Some(t) => t as *const crate::task::Task as *mut crate::task::Task,
+        None => core::ptr::null_mut(),
+    };
+    crate::smp::per_core()
+        .current_task_ptr
+        .store(raw, Ordering::Release);
+}
+
+/// Read the cached running-task pointer for this core. Returns `None` when
+/// the scheduler loop is running (between dispatches).
+#[inline]
+pub(crate) fn current_task_ptr() -> Option<&'static crate::task::Task> {
+    if !crate::smp::is_per_core_ready() {
+        return None;
+    }
+    let raw = crate::smp::per_core()
+        .current_task_ptr
+        .load(Ordering::Acquire);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer was published by `set_current_task_ptr` from a
+        // dispatch site holding the scheduler lock and pointing at a Task
+        // inside `Vec<SlabBox<Task>>` whose address is stable for the task's
+        // lifetime. The lifetime is `'static` because the Vec itself is
+        // `static SCHEDULER` and the Task slot is never reused while it is
+        // the current task on any core (the dispatcher clears the pointer on
+        // switch-out before another task can take the slot).
+        Some(unsafe { &*raw })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler struct
 // ---------------------------------------------------------------------------
@@ -1104,14 +1148,10 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // location.  Critically, the `Box` itself is NOT replaced — its
         // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
+        // Counters are inside the new `task` value being move-assigned
+        // (zero-initialised by `Task::new`), so this in-place replacement
+        // automatically resets them — no separate reset step needed.
         *sched.tasks[idx] = task;
-        // Phase 61 Track E.4 refactor: per-task tick / fault counters live in
-        // the lock-free `rusage::RUSAGE` table rather than on Task itself.
-        // Reset the slot's counters so the new task does not inherit the
-        // terminated task's totals.
-        if let Some(entry) = crate::task::rusage::get(idx) {
-            entry.reset();
-        }
         if idx < sched.fpu_states.len() {
             *sched.fpu_states[idx] = XSaveArea::new();
         } else {
@@ -1382,39 +1422,33 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// 2026-05-09 from a kernel GPF observed under fork-bomb load (m3os.log
 /// post-Doom-launch series).
 pub fn tick_account_current_task(in_user_mode: bool, period_ms: u64) {
-    if !crate::smp::is_per_core_ready() {
-        return;
-    }
-    let Some(idx) = get_current_task_idx() else {
-        return;
-    };
-    // Lock-free: the per-task counters live in [`crate::task::rusage::RUSAGE`],
-    // a static `[AtomicU64; MAX_TASKS]`-shaped table. No scheduler lock from
-    // IRQ context — that lock contention was the cause of the
-    // `vfs_server: slow req` tail latency the docs/handoffs/61g-smp-soak.md
-    // diag run identified. The idle-task skip and Running-state guard the
-    // previous lock-holding version applied are dropped intentionally:
+    // Linux's `task_struct.utime` model: the per-task `AtomicU64` counter
+    // is written exclusively by the CPU currently running this task, so the
+    // hardware atomic-RMW is uncontended (no cross-CPU coherence traffic),
+    // no scheduler lock is taken, and there is no false sharing because
+    // each Task lives in its own `SlabBox<Task>` larger than a cache line.
     //
-    // - Idle tasks accumulate ticks in their own RUSAGE entry, which nobody
+    // Idle-task skip and Running-state guard the legacy lock-holding
+    // version applied are dropped intentionally:
+    //
+    // - Idle tasks accumulate ticks on their own Task struct, which nobody
     //   ever reads (idle tasks never call `getrusage` / `times`). Other
     //   tasks' counters are unaffected.
     // - The Running-state guard was defensive against a state-machine race;
-    //   under lock-free sampling the worst case is one tick attributed to a
-    //   task that transitioned out of Running between `get_current_task_idx`
-    //   and `fetch_add`. Statistical samplers tolerate this — same contract
-    //   as `CONFIG_TICK_CPU_ACCOUNTING` in Linux.
-    let Some(entry) = crate::task::rusage::get(idx) else {
+    //   under lock-free sampling the worst case is one sample attributed to
+    //   a task that transitioned out of Running between the
+    //   `current_task_ptr` load and the `fetch_add`. Statistical samplers
+    //   tolerate this — same contract as `CONFIG_TICK_CPU_ACCOUNTING` in
+    //   Linux.
+    let Some(task) = current_task_ptr() else {
         return;
     };
-    if in_user_mode {
-        entry
-            .user_ticks
-            .fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
+    let counter = if in_user_mode {
+        &task.user_ticks
     } else {
-        entry
-            .system_ticks
-            .fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
-    }
+        &task.system_ticks
+    };
+    counter.fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn current_user_return_addr_space_snapshot(pid: u32) -> (u64, u64) {
@@ -2415,6 +2449,7 @@ pub fn yield_now() {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         idx
     };
     // Store idx so the dispatch handler can save RSP and re-enqueue after switch_context.
@@ -2504,6 +2539,7 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         (idx, preempt_count_ptr)
     };
     // The preemption gates only enter this path from user/syscall-return
@@ -2618,12 +2654,11 @@ pub fn task_label_for_id(task_id: TaskId) -> Option<(u32, &'static str)> {
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;
-    let entry = crate::task::rusage::get(idx)?;
+    let sched = scheduler_lock();
+    let t = &sched.tasks[idx];
     Some((
-        entry.user_ticks.load(core::sync::atomic::Ordering::Relaxed),
-        entry
-            .system_ticks
-            .load(core::sync::atomic::Ordering::Relaxed),
+        t.user_ticks.load(core::sync::atomic::Ordering::Relaxed),
+        t.system_ticks.load(core::sync::atomic::Ordering::Relaxed),
     ))
 }
 
@@ -2638,17 +2673,13 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
     let mut system = 0u64;
     let mut child_user = 0u64;
     let mut child_system = 0u64;
-    for (idx, task) in sched.tasks.iter().enumerate() {
+    for task in sched.tasks.iter() {
         if task.pid == pid {
-            if let Some(entry) = crate::task::rusage::get(idx) {
-                user = user
-                    .saturating_add(entry.user_ticks.load(core::sync::atomic::Ordering::Relaxed));
-                system = system.saturating_add(
-                    entry
-                        .system_ticks
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                );
-            }
+            user = user.saturating_add(task.user_ticks.load(core::sync::atomic::Ordering::Relaxed));
+            system = system.saturating_add(
+                task.system_ticks
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
             child_user = child_user.saturating_add(task.child_user_ticks);
             child_system = child_system.saturating_add(task.child_system_ticks);
         }
@@ -2677,20 +2708,16 @@ pub struct RusageCounters {
 pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
     let sched = scheduler_lock();
     let mut out = RusageCounters::default();
-    for (idx, task) in sched.tasks.iter().enumerate() {
+    for task in sched.tasks.iter() {
         if task.pid == pid {
-            if let Some(entry) = crate::task::rusage::get(idx) {
-                out.minor_faults = out.minor_faults.saturating_add(
-                    entry
-                        .minor_faults
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                );
-                out.major_faults = out.major_faults.saturating_add(
-                    entry
-                        .major_faults
-                        .load(core::sync::atomic::Ordering::Relaxed),
-                );
-            }
+            out.minor_faults = out.minor_faults.saturating_add(
+                task.minor_faults
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+            out.major_faults = out.major_faults.saturating_add(
+                task.major_faults
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
             out.voluntary_ctxsw = out.voluntary_ctxsw.saturating_add(task.voluntary_ctxsw);
             out.involuntary_ctxsw = out.involuntary_ctxsw.saturating_add(task.involuntary_ctxsw);
             out.child_minor_faults = out
@@ -2715,16 +2742,11 @@ pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
 /// Used by `sys_getrusage(RUSAGE_SELF)`. Phase 61 Track E.4.
 pub fn current_task_rusage_self() -> Option<(u64, u64, u64, u64)> {
     let idx = get_current_task_idx()?;
-    let entry = crate::task::rusage::get(idx)?;
     let sched = scheduler_lock();
     let t = &sched.tasks[idx];
     Some((
-        entry
-            .minor_faults
-            .load(core::sync::atomic::Ordering::Relaxed),
-        entry
-            .major_faults
-            .load(core::sync::atomic::Ordering::Relaxed),
+        t.minor_faults.load(core::sync::atomic::Ordering::Relaxed),
+        t.major_faults.load(core::sync::atomic::Ordering::Relaxed),
         t.voluntary_ctxsw,
         t.involuntary_ctxsw,
     ))
@@ -2785,23 +2807,17 @@ pub fn current_task_accumulate_child_rusage(zombie: RusageCounters) -> bool {
 /// Skipping the increment loses one fault count under contention,
 /// which is acceptable for a statistical counter.
 pub fn current_task_record_page_fault(major: bool) {
-    let Some(idx) = get_current_task_idx() else {
+    // Lock-free atomic increment on the running task's own counter — see
+    // `tick_account_current_task` for the full rationale.
+    let Some(task) = current_task_ptr() else {
         return;
     };
-    // Lock-free atomic increment in the [`crate::task::rusage::RUSAGE`]
-    // table — see `tick_account_current_task` for the full rationale.
-    let Some(entry) = crate::task::rusage::get(idx) else {
-        return;
-    };
-    if major {
-        entry
-            .major_faults
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let counter = if major {
+        &task.major_faults
     } else {
-        entry
-            .minor_faults
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
+        &task.minor_faults
+    };
+    counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Increment the running task's `voluntary_ctxsw` (when `voluntary == true`)
@@ -3120,6 +3136,7 @@ pub fn block_current_until(
                 addr_space_snapshot.1,
             );
             set_current_task_idx(None);
+            set_current_task_ptr(None);
             // scheduler_lock released.
         }
         // pi_lock released.
@@ -3177,6 +3194,15 @@ pub fn block_current_until(
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
+        // Re-publish the Task pointer so IRQ-context CPU-time / rusage
+        // helpers attribute samples to this task once more. SlabBox keeps
+        // the Task at a stable heap address, so the pointer obtained under
+        // the lock remains valid for the task's lifetime.
+        let task_ptr: *const crate::task::Task = {
+            let sched = scheduler_lock();
+            &*sched.tasks[idx] as *const _
+        };
+        set_current_task_ptr(Some(unsafe { &*task_ptr }));
         let outcome = if already_expired {
             BlockOutcome::DeadlineExpired
         } else {
@@ -3444,6 +3470,7 @@ pub fn mark_current_dead() -> ! {
         // E.1: mark RSP-publication window.
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         idx
     };
     PENDING_REENQUEUE[crate::smp::per_core().core_id as usize].store(idx as i32, Ordering::Release);
@@ -4303,6 +4330,11 @@ pub fn run() -> ! {
                     core_id
                 );
                 set_current_task_idx(Some(idx));
+                // Cache the Task pointer for IRQ-context CPU-time / rusage
+                // accounting (lock-free local-CPU writes; Linux's per-CPU
+                // `current` pointer pattern). The address is stable for the
+                // task's lifetime via `Vec<SlabBox<Task>>` storage.
+                set_current_task_ptr(Some(task));
                 crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
                     task_idx: idx as u32,
                     core: core_id,

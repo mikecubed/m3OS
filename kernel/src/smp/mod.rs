@@ -203,6 +203,14 @@ pub struct PerCoreData {
     /// Index of the task currently running on this core in the global task vec.
     /// -1 means no task (scheduler loop is running).
     pub current_task_idx: core::sync::atomic::AtomicI32,
+    /// Pointer to the [`crate::task::Task`] currently running on this core,
+    /// or null when the scheduler loop is running. Set/cleared by the
+    /// dispatch path next to `current_task_idx` (under the same scheduler
+    /// lock acquisition that reads `tasks[idx]`'s stable address). Read by
+    /// IRQ-context CPU-time and rusage helpers so they can mutate the
+    /// running task's atomic counters without touching the scheduler lock
+    /// (Linux's `task_struct` per-CPU `current` pointer pattern).
+    pub current_task_ptr: AtomicPtr<crate::task::Task>,
     /// LAPIC virtual base address (phys_offset + LAPIC phys addr).
     /// Stored here so APs can access it without touching kernel statics.
     pub lapic_virt_base: u64,
@@ -648,6 +656,7 @@ pub fn init_bsp_per_core() {
         scheduler_rsp: core::cell::UnsafeCell::new(0), // set when scheduler loop starts
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
+        current_task_ptr: AtomicPtr::new(core::ptr::null_mut()),
         lapic_virt_base,
         lapic_ticks_per_ms: lapic_tpm,
         run_queue: spin::Mutex::new(VecDeque::new()),
@@ -763,6 +772,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         scheduler_rsp: core::cell::UnsafeCell::new(0),
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
+        current_task_ptr: AtomicPtr::new(core::ptr::null_mut()),
         lapic_virt_base: {
             let phys = crate::acpi::local_apic_address() as u64;
             crate::mm::phys_offset() + phys
