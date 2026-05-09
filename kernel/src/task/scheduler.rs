@@ -39,10 +39,11 @@
 //!
 //! ## Load balancing (Phase 52c A.4)
 //!
-//! The BSP runs `maybe_load_balance()` every 50 scheduler ticks (~500 ms
-//! at 100 Hz). If the longest run queue exceeds the shortest by more than
-//! 2 entries, one task is migrated — skipping any task whose
-//! `last_migrated_tick` is within `MIGRATE_COOLDOWN` (100 ticks / ~1 s).
+//! The BSP runs `maybe_load_balance()` every 50 scheduler-loop iterations
+//! (~50 ms with `TICKS_PER_SEC = 1000` and a 1 ms BSP LAPIC period). If the
+//! longest run queue exceeds the shortest by more than 2 entries, one task
+//! is migrated — skipping any task whose `last_migrated_tick` is within
+//! `MIGRATE_COOLDOWN` (100 ticks / ~100 ms).
 //!
 //! ## Dead-slot recycling (Phase 52c A.3)
 //!
@@ -1197,7 +1198,11 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
 /// context — safe to call from the BSP entry function before
 /// [`run`] is invoked.
 ///
-/// Panics if `core_id` is outside the SMP topology range.
+/// Panics if `core_id >= MAX_CORES`. Note this is the compile-time core
+/// cap, not the runtime online count: callers (currently only the Phase 61
+/// SMP tests, which pass core 0 / 1 after `init_minimal_smp` +
+/// `boot_aps_if_available` have brought those cores online) are responsible
+/// for ensuring `core_id` corresponds to an online core.
 pub fn spawn_on_core(entry: fn() -> !, name: &'static str, core_id: u8) {
     assert!(
         (core_id as usize) < crate::smp::MAX_CORES,
@@ -1336,9 +1341,16 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// (both ring-3 and ring-0 paths) once per tick. Matches Linux's
 /// `CONFIG_TICK_CPU_ACCOUNTING` semantics.
 ///
-/// `in_user_mode == true` increments `user_ticks` by 1 (interrupted in
-/// ring 3); `false` increments `system_ticks` by 1 (interrupted in ring 0,
-/// i.e. inside a syscall handler or kernel work).
+/// `in_user_mode == true` adds `period_ms` to `user_ticks` (interrupted in
+/// ring 3); `false` adds `period_ms` to `system_ticks` (interrupted in
+/// ring 0, i.e. inside a syscall handler or kernel work).
+///
+/// `period_ms` is the calling core's local LAPIC timer period in
+/// milliseconds: BSP runs at 1 ms per tick, APs run at 10 ms per tick (see
+/// `kernel/src/smp/boot.rs::ap_lapic_init_from`). Scaling by the local
+/// period keeps `tms_utime` / `tms_stime` accurate in the unified `1 tick
+/// = 1 ms` scale (`TICKS_PER_SEC = 1000`) regardless of which core the
+/// task ran on, so values stay consistent across migration.
 ///
 /// Skips the idle task (priority 30) and any task that is no longer
 /// `Running`. The function is best-effort and silently no-ops when no
@@ -1357,7 +1369,7 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// `CONFIG_TICK_CPU_ACCOUNTING`-equivalent contract. Diagnosed
 /// 2026-05-09 from a kernel GPF observed under fork-bomb load (m3os.log
 /// post-Doom-launch series).
-pub fn tick_account_current_task(in_user_mode: bool) {
+pub fn tick_account_current_task(in_user_mode: bool, period_ms: u64) {
     if !crate::smp::is_per_core_ready() {
         return;
     }
@@ -1381,9 +1393,9 @@ pub fn tick_account_current_task(in_user_mode: bool) {
             return;
         }
         if in_user_mode {
-            task.user_ticks = task.user_ticks.saturating_add(1);
+            task.user_ticks = task.user_ticks.saturating_add(period_ms);
         } else {
-            task.system_ticks = task.system_ticks.saturating_add(1);
+            task.system_ticks = task.system_ticks.saturating_add(period_ms);
         }
     }
 }
@@ -4864,7 +4876,10 @@ fn drive_expired_wake_deadlines() {
     }
 }
 
-/// (~500ms at 100 Hz).
+/// Increments once per BSP scheduler-loop iteration; `maybe_load_balance`
+/// runs the balance pass when the counter is a multiple of 50
+/// (~50 ms with the 1 ms BSP LAPIC period and a roughly per-tick scheduler
+/// loop).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Threshold for when load balancing kicks in: a queue is considered imbalanced
@@ -4874,10 +4889,11 @@ static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 pub const BALANCE_THRESHOLD: usize = 2;
 
 /// Called from the BSP's scheduler loop at `kernel/src/task/scheduler.rs:3837`,
-/// every `BALANCE_COUNTER % 50 == 0` ticks (~500ms at 100 Hz). Reads each
-/// core's run-queue length via `CoreData::with_run_queue(|q| q.len())` and
-/// migrates one task per cycle when `longest_len > shortest_len +
-/// BALANCE_THRESHOLD`. Recently-migrated tasks are skipped (`MIGRATE_COOLDOWN`).
+/// every `BALANCE_COUNTER % 50 == 0` iterations (~50 ms with `TICKS_PER_SEC
+/// = 1000` and a 1 ms BSP LAPIC period). Reads each core's run-queue length
+/// via `CoreData::with_run_queue(|q| q.len())` and migrates one task per
+/// cycle when `longest_len > shortest_len + BALANCE_THRESHOLD`.
+/// Recently-migrated tasks are skipped (`MIGRATE_COOLDOWN`).
 ///
 /// Phase 61 A.1 design note: queue length is read directly from the per-core
 /// `VecDeque<usize>` under `with_run_queue` rather than maintained as a

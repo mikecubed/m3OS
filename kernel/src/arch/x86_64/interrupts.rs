@@ -1466,8 +1466,11 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
     // Phase 61 Track E.2 — per-tick CPU-time sampling. The interrupted
     // task was in ring 3, so this tick is attributed to user_ticks.
     // Runs on every core (not just BSP) because every core's timer tick
-    // is an independent sample of THAT core's running task.
-    crate::task::scheduler::tick_account_current_task(true);
+    // is an independent sample of THAT core's running task. Scale the
+    // increment by the local LAPIC period so AP cores (10 ms) and the BSP
+    // (1 ms) attribute time on the same `1 tick = 1 ms` scale.
+    let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
+    crate::task::scheduler::tick_account_current_task(true, period_ms);
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline_user(frame);
     if USING_APIC.load(Ordering::Relaxed) {
@@ -1515,8 +1518,10 @@ pub unsafe extern "C" fn timer_handler_kernel(
     }
     // Phase 61 Track E.2 — per-tick CPU-time sampling. The interrupted
     // task was in ring 0 (kernel mode — typically inside a syscall),
-    // so this tick is attributed to system_ticks.
-    crate::task::scheduler::tick_account_current_task(false);
+    // so this tick is attributed to system_ticks. See the matching note
+    // in `timer_handler_user` for the BSP/AP period scaling.
+    let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
+    crate::task::scheduler::tick_account_current_task(false, period_ms);
     crate::task::signal_reschedule();
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();

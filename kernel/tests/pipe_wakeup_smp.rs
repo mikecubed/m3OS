@@ -249,7 +249,7 @@ fn cross_core_pipe_wakeup_within_latency_budget() {
     // Phase 61 Track D.1 acceptance — the task list calls for ≤100 ticks
     // initially, tightened to ≤10 ticks once Track F lands. Track F
     // landed in the same PR; assert the tight bound.
-    const MAX_LATENCY_TICKS: u64 = 100;
+    const MAX_LATENCY_TICKS: u64 = 10;
     assert!(
         latency <= MAX_LATENCY_TICKS,
         "cross-core pipe wakeup latency {latency} ticks exceeds budget {MAX_LATENCY_TICKS} \

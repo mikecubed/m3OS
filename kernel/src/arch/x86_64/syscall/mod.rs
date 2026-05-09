@@ -3722,10 +3722,17 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 /// four event-count fields delivered by Track E.4; the remaining 10 fields
 /// stay zeroed (they require post-1.0 instrumentation — see the design
 /// doc's Deferred Until Later section).
+///
+/// A null `usage_ptr` returns `-EFAULT` per Linux `getrusage(2)` semantics
+/// (unlike `wait4(2)`, which treats the rusage pointer as optional).
 pub(super) fn sys_getrusage(who: i32, usage_ptr: u64) -> u64 {
     const RUSAGE_SELF: i32 = 0;
     const RUSAGE_CHILDREN: i32 = -1;
     const RUSAGE_THREAD: i32 = 1;
+
+    if usage_ptr == 0 {
+        return NEG_EFAULT;
+    }
 
     let (user_ticks, system_ticks, minor, major, nvcsw, nivcsw) = match who {
         RUSAGE_SELF | RUSAGE_THREAD => {
@@ -3743,17 +3750,15 @@ pub(super) fn sys_getrusage(who: i32, usage_ptr: u64) -> u64 {
         _ => return NEG_EINVAL,
     };
 
-    if usage_ptr != 0
-        && let Err(_e) = write_rusage(
-            usage_ptr,
-            user_ticks,
-            system_ticks,
-            minor,
-            major,
-            nvcsw,
-            nivcsw,
-        )
-    {
+    if let Err(_e) = write_rusage(
+        usage_ptr,
+        user_ticks,
+        system_ticks,
+        minor,
+        major,
+        nvcsw,
+        nivcsw,
+    ) {
         return NEG_EFAULT;
     }
     0
