@@ -1346,6 +1346,17 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// particular, it bails before reading `per_core` if SMP per-core data
 /// is not yet ready, which can happen during the early-boot window
 /// between `arch::enable_interrupts()` and `smp::init_bsp_per_core()`.
+///
+/// **IRQ-context lock discipline:** uses `try_scheduler_lock`, NEVER
+/// blocks. If the running task on this core (or any task on any core)
+/// is currently holding `SCHEDULER_INNER`, the timer ISR fires, this
+/// function would `lock()` and spin forever — same-core deadlock —
+/// because the holder cannot release while preempted by us. `try_lock`
+/// returns `None` in that window; we drop the tick. Per-tick sampling
+/// is statistical: occasional misses do not violate the
+/// `CONFIG_TICK_CPU_ACCOUNTING`-equivalent contract. Diagnosed
+/// 2026-05-09 from a kernel GPF observed under fork-bomb load (m3os.log
+/// post-Doom-launch series).
 pub fn tick_account_current_task(in_user_mode: bool) {
     if !crate::smp::is_per_core_ready() {
         return;
@@ -1353,7 +1364,9 @@ pub fn tick_account_current_task(in_user_mode: bool) {
     let Some(idx) = get_current_task_idx() else {
         return;
     };
-    let mut sched = scheduler_lock();
+    let Some(mut sched) = try_scheduler_lock() else {
+        return;
+    };
     if let Some(task) = sched.tasks.get_mut(idx) {
         // Skip the idle task — its time is not interesting and counting
         // it would falsely inflate `system_ticks` whenever the CPU is
@@ -2707,11 +2720,21 @@ pub fn current_task_accumulate_child_rusage(zombie: RusageCounters) -> bool {
 /// Increment the running task's `minor_faults` (or `major_faults` if
 /// `major == true`) counter by 1. Called from the page-fault handler
 /// after a successful resolution. Phase 61 Track E.4.
+///
+/// **IRQ-context lock discipline:** uses `try_scheduler_lock`, NEVER
+/// blocks — same rationale as `tick_account_current_task`. The page
+/// fault handler runs in interrupt context; if a task on this core
+/// already holds `SCHEDULER_INNER`, a `lock()` here would spin-deadlock
+/// because the holder cannot release while preempted by the fault.
+/// Skipping the increment loses one fault count under contention,
+/// which is acceptable for a statistical counter.
 pub fn current_task_record_page_fault(major: bool) {
     let Some(idx) = get_current_task_idx() else {
         return;
     };
-    let mut sched = scheduler_lock();
+    let Some(mut sched) = try_scheduler_lock() else {
+        return;
+    };
     if let Some(task) = sched.tasks.get_mut(idx) {
         if major {
             task.major_faults = task.major_faults.saturating_add(1);
@@ -2722,14 +2745,23 @@ pub fn current_task_record_page_fault(major: bool) {
 }
 
 /// Increment the running task's `voluntary_ctxsw` (when `voluntary == true`)
-/// or `involuntary_ctxsw` counter by 1. Called from the cooperative
-/// `yield_now` path and from the timer-IRQ-driven preempt path immediately
-/// before the context switch. Phase 61 Track E.4.
+/// or `involuntary_ctxsw` counter by 1. Phase 61 Track E.4.
+///
+/// **Note:** the production callers in `yield_now` and
+/// `preempt_frame_to_scheduler` increment the counters directly inside
+/// the existing `scheduler_lock` critical section (the callsites are
+/// not in IRQ context themselves but already hold the lock); this
+/// helper is retained for any caller that needs the ctxsw record from
+/// a context where the scheduler lock may already be held elsewhere.
+/// Uses `try_scheduler_lock` for the same IRQ-context safety reasons
+/// as `tick_account_current_task`.
 pub fn current_task_record_ctxsw(voluntary: bool) {
     let Some(idx) = get_current_task_idx() else {
         return;
     };
-    let mut sched = scheduler_lock();
+    let Some(mut sched) = try_scheduler_lock() else {
+        return;
+    };
     if let Some(task) = sched.tasks.get_mut(idx) {
         if voluntary {
             task.voluntary_ctxsw = task.voluntary_ctxsw.saturating_add(1);
