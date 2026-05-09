@@ -4221,87 +4221,38 @@ pub fn run() -> ! {
         // iteration's top-of-loop `enable_and_hlt`/`enable` re-enables
         // IRQs in the scheduler context.
         interrupts::disable();
-        let mut corrupted_dispatch_log: Option<(usize, u32, &'static str, u64, u64, u64)> = None;
         let next = {
             let mut sched = scheduler_lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
-                // Phase 61 follow-up (kernel-stability fix) — validate
-                // `saved_rsp` falls within the chosen task's kernel stack
-                // BEFORE we commit the dispatch. A task whose `saved_rsp`
-                // got overwritten with garbage (observed in practice when
-                // a freed task slot's stack memory is reused by the slab
-                // / log allocator: dispatching such a task `popf`s and
-                // `ret`s from log-text bytes and triggers a kernel-mode
-                // GPF that takes out the core). Mark the task Dead and
-                // skip this dispatch iteration; the outer loop's `continue`
-                // (line "None => continue") will pick another task.
-                //
-                // Idle tasks have a fixed stack and are exempt — their
-                // saved_rsp is set once at spawn and never replaced. The
-                // existing pick_next() debug_assert at line 779 covers
-                // the idle-zero case.
-                //
-                // For Preempted-mode tasks, the saved_rsp is on the
-                // process kernel stack (TSS.RSP0 stack), not the task
-                // kernel stack — `stack_bounds` returns the task stack,
-                // so skip the check in that case (mirrors the
-                // debug_assert below at line 4461).
-                let resume_mode =
-                    ResumeMode::from(sched.tasks[idx].resume_mode.load(Ordering::Acquire));
-                if resume_mode != ResumeMode::Preempted
-                    && let Some((base, top)) = sched.tasks[idx].stack_bounds()
-                    && (rsp < base || rsp >= top)
-                {
-                    let task = &mut sched.tasks[idx];
-                    corrupted_dispatch_log = Some((idx, task.pid, task.name, rsp, base, top));
-                    task.state = TaskState::Dead;
-                    task.saved_rsp = 0;
-                    None
-                } else {
-                    let now = crate::arch::x86_64::interrupts::tick_count();
-                    let is_idle = sched.idle_tasks.contains(&Some(idx));
-                    let task = &mut sched.tasks[idx];
-                    let stale_ticks = now.saturating_sub(task.last_ready_tick);
-                    // 50 ticks ≈ 500 ms at 100 Hz — catches the 1-second hang
-                    // pattern without spamming on normal brief waits.
-                    if stale_ticks >= 50 && !is_idle {
-                        stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
-                    }
-                    // TODO(57a-C/D): route through pi_lock + with_block_state
-                    task.state = TaskState::Running;
-                    task.start_tick = now;
-                    debug_assert!(
-                        task.state == TaskState::Running,
-                        "dispatch: task idx={} not Running after mark on core {}",
-                        idx,
-                        core_id
-                    );
-                    set_current_task_idx(Some(idx));
-                    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
-                        task_idx: idx as u32,
-                        core: core_id,
-                        rsp,
-                    });
-                    Some((rsp, idx))
+                let now = crate::arch::x86_64::interrupts::tick_count();
+                let is_idle = sched.idle_tasks.contains(&Some(idx));
+                let task = &mut sched.tasks[idx];
+                let stale_ticks = now.saturating_sub(task.last_ready_tick);
+                // 50 ticks ≈ 500 ms at 100 Hz — catches the 1-second hang
+                // pattern without spamming on normal brief waits.
+                if stale_ticks >= 50 && !is_idle {
+                    stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
                 }
+                // TODO(57a-C/D): route through pi_lock + with_block_state
+                task.state = TaskState::Running;
+                task.start_tick = now;
+                debug_assert!(
+                    task.state == TaskState::Running,
+                    "dispatch: task idx={} not Running after mark on core {}",
+                    idx,
+                    core_id
+                );
+                set_current_task_idx(Some(idx));
+                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
+                    task_idx: idx as u32,
+                    core: core_id,
+                    rsp,
+                });
+                Some((rsp, idx))
             } else {
                 None
             }
         };
-
-        if let Some((idx, pid, name, rsp, base, top)) = corrupted_dispatch_log {
-            log::warn!(
-                "[sched] dispatch: task idx={} pid={} name={} saved_rsp={:#x} \
-                 outside stack [{:#x}..{:#x}] on core {} — marked Dead, skipping",
-                idx,
-                pid,
-                name,
-                rsp,
-                base,
-                top,
-                core_id,
-            );
-        }
 
         if let Some((pid, name, last_ready, stale_ticks)) = stale_info {
             // stale_ticks is already in ms: TICKS_PER_SEC = 1000, so 1 tick = 1 ms.
