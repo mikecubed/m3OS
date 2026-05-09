@@ -1105,6 +1105,13 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
         *sched.tasks[idx] = task;
+        // Phase 61 Track E.4 refactor: per-task tick / fault counters live in
+        // the lock-free `rusage::RUSAGE` table rather than on Task itself.
+        // Reset the slot's counters so the new task does not inherit the
+        // terminated task's totals.
+        if let Some(entry) = crate::task::rusage::get(idx) {
+            entry.reset();
+        }
         if idx < sched.fpu_states.len() {
             *sched.fpu_states[idx] = XSaveArea::new();
         } else {
@@ -1381,30 +1388,32 @@ pub fn tick_account_current_task(in_user_mode: bool, period_ms: u64) {
     let Some(idx) = get_current_task_idx() else {
         return;
     };
-    let Some(mut sched) = try_scheduler_lock() else {
+    // Lock-free: the per-task counters live in [`crate::task::rusage::RUSAGE`],
+    // a static `[AtomicU64; MAX_TASKS]`-shaped table. No scheduler lock from
+    // IRQ context — that lock contention was the cause of the
+    // `vfs_server: slow req` tail latency the docs/handoffs/61g-smp-soak.md
+    // diag run identified. The idle-task skip and Running-state guard the
+    // previous lock-holding version applied are dropped intentionally:
+    //
+    // - Idle tasks accumulate ticks in their own RUSAGE entry, which nobody
+    //   ever reads (idle tasks never call `getrusage` / `times`). Other
+    //   tasks' counters are unaffected.
+    // - The Running-state guard was defensive against a state-machine race;
+    //   under lock-free sampling the worst case is one tick attributed to a
+    //   task that transitioned out of Running between `get_current_task_idx`
+    //   and `fetch_add`. Statistical samplers tolerate this — same contract
+    //   as `CONFIG_TICK_CPU_ACCOUNTING` in Linux.
+    let Some(entry) = crate::task::rusage::get(idx) else {
         return;
     };
-    // Skip the idle task — its time is not interesting and counting it
-    // would falsely inflate `system_ticks` whenever the CPU is halted in
-    // `enable_and_hlt`. Detected via the dedicated `idle_tasks` set, NOT
-    // `priority == 30`, because `sys_nice` clamps user priorities into
-    // `0..=30` and a normal user task can legitimately end up at 30.
-    let is_idle = sched.idle_tasks.contains(&Some(idx));
-    if let Some(task) = sched.tasks.get_mut(idx) {
-        if is_idle {
-            return;
-        }
-        // Defensive: if for any reason the current task is not Running
-        // (state-machine race during a transition), don't attribute the
-        // tick. Same convention as `accumulate_ticks` had.
-        if task.state != TaskState::Running {
-            return;
-        }
-        if in_user_mode {
-            task.user_ticks = task.user_ticks.saturating_add(period_ms);
-        } else {
-            task.system_ticks = task.system_ticks.saturating_add(period_ms);
-        }
+    if in_user_mode {
+        entry
+            .user_ticks
+            .fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        entry
+            .system_ticks
+            .fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2609,8 +2618,13 @@ pub fn task_label_for_id(task_id: TaskId) -> Option<(u32, &'static str)> {
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;
-    let sched = scheduler_lock();
-    Some((sched.tasks[idx].user_ticks, sched.tasks[idx].system_ticks))
+    let entry = crate::task::rusage::get(idx)?;
+    Some((
+        entry.user_ticks.load(core::sync::atomic::Ordering::Relaxed),
+        entry
+            .system_ticks
+            .load(core::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 /// Sum the per-task tick fields of every task belonging to the given `pid`.
@@ -2624,10 +2638,17 @@ pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
     let mut system = 0u64;
     let mut child_user = 0u64;
     let mut child_system = 0u64;
-    for task in sched.tasks.iter() {
+    for (idx, task) in sched.tasks.iter().enumerate() {
         if task.pid == pid {
-            user = user.saturating_add(task.user_ticks);
-            system = system.saturating_add(task.system_ticks);
+            if let Some(entry) = crate::task::rusage::get(idx) {
+                user = user
+                    .saturating_add(entry.user_ticks.load(core::sync::atomic::Ordering::Relaxed));
+                system = system.saturating_add(
+                    entry
+                        .system_ticks
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                );
+            }
             child_user = child_user.saturating_add(task.child_user_ticks);
             child_system = child_system.saturating_add(task.child_system_ticks);
         }
@@ -2656,10 +2677,20 @@ pub struct RusageCounters {
 pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
     let sched = scheduler_lock();
     let mut out = RusageCounters::default();
-    for task in sched.tasks.iter() {
+    for (idx, task) in sched.tasks.iter().enumerate() {
         if task.pid == pid {
-            out.minor_faults = out.minor_faults.saturating_add(task.minor_faults);
-            out.major_faults = out.major_faults.saturating_add(task.major_faults);
+            if let Some(entry) = crate::task::rusage::get(idx) {
+                out.minor_faults = out.minor_faults.saturating_add(
+                    entry
+                        .minor_faults
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                );
+                out.major_faults = out.major_faults.saturating_add(
+                    entry
+                        .major_faults
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                );
+            }
             out.voluntary_ctxsw = out.voluntary_ctxsw.saturating_add(task.voluntary_ctxsw);
             out.involuntary_ctxsw = out.involuntary_ctxsw.saturating_add(task.involuntary_ctxsw);
             out.child_minor_faults = out
@@ -2684,11 +2715,16 @@ pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
 /// Used by `sys_getrusage(RUSAGE_SELF)`. Phase 61 Track E.4.
 pub fn current_task_rusage_self() -> Option<(u64, u64, u64, u64)> {
     let idx = get_current_task_idx()?;
+    let entry = crate::task::rusage::get(idx)?;
     let sched = scheduler_lock();
     let t = &sched.tasks[idx];
     Some((
-        t.minor_faults,
-        t.major_faults,
+        entry
+            .minor_faults
+            .load(core::sync::atomic::Ordering::Relaxed),
+        entry
+            .major_faults
+            .load(core::sync::atomic::Ordering::Relaxed),
         t.voluntary_ctxsw,
         t.involuntary_ctxsw,
     ))
@@ -2752,15 +2788,19 @@ pub fn current_task_record_page_fault(major: bool) {
     let Some(idx) = get_current_task_idx() else {
         return;
     };
-    let Some(mut sched) = try_scheduler_lock() else {
+    // Lock-free atomic increment in the [`crate::task::rusage::RUSAGE`]
+    // table — see `tick_account_current_task` for the full rationale.
+    let Some(entry) = crate::task::rusage::get(idx) else {
         return;
     };
-    if let Some(task) = sched.tasks.get_mut(idx) {
-        if major {
-            task.major_faults = task.major_faults.saturating_add(1);
-        } else {
-            task.minor_faults = task.minor_faults.saturating_add(1);
-        }
+    if major {
+        entry
+            .major_faults
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        entry
+            .minor_faults
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

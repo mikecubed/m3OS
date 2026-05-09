@@ -72,6 +72,7 @@ pub use kernel_core::preempt_frame::{
 
 pub mod blocking_mutex;
 pub mod kstack;
+pub mod rusage;
 pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
@@ -463,10 +464,21 @@ pub struct Task {
     /// CPU affinity mask (Phase 35): one bit per core (max 64 cores).
     /// Default: all bits set (can run on any core).
     pub affinity_mask: u64,
-    /// Ticks spent in ring 3 (user mode). Updated on context switch.
-    pub user_ticks: u64,
-    /// Ticks spent in ring 0 (syscall handling). Updated on context switch.
-    pub system_ticks: u64,
+    // Phase 61 refactor: `user_ticks` / `system_ticks` moved to the
+    // lock-free [`rusage::RUSAGE`] table indexed by this task's
+    // scheduler-vec slot. The IRQ-context per-tick sampler used to take
+    // `try_scheduler_lock` to mutate these fields, which competed with the
+    // IPC dispatcher and produced the `vfs_server: slow req` tail latency
+    // tracked in `docs/handoffs/61g-smp-soak.md`.
+    //
+    // The fields are replaced with named padding (16 bytes total) so
+    // `preempt_frame`'s offset stays at `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`
+    // (448) — the Phase 57d assembly entry stub depends on that constant.
+    // Alternative would be reordering and updating both the assertion and
+    // the matching asm offsets in the same commit; padding is the smaller
+    // surgical move.
+    _pad_user_ticks: u64,
+    _pad_system_ticks: u64,
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
     /// Tick at which this task was last migrated to a different core (Phase 52c).
@@ -606,18 +618,10 @@ pub struct Task {
     /// `sys_getrusage(RUSAGE_CHILDREN)` to populate `ru_stime`.
     /// Phase 61 Track E.1.
     pub child_system_ticks: u64,
-    /// Phase 61 Track E.4 — page-fault and ctxsw counters for `getrusage(2)`.
-    ///
-    /// Minor faults — fault successfully resolved in-memory (e.g., CoW page
-    /// duplication, demand-zero allocation). No backing-store I/O.
-    /// Incremented from `page_fault_handler` after resolution.
-    pub minor_faults: u64,
-    /// Major faults — fault required a backing-store read (page-in from
-    /// disk-backed `mmap`, swap-in). Incremented from `page_fault_handler`
-    /// when the resolution path involved disk I/O. In Phase 61 the
-    /// disk-backed mmap path is incomplete, so this counter stays at 0
-    /// in practice; the field is present so the API surface is stable.
-    pub major_faults: u64,
+    // Phase 61 refactor: `minor_faults` / `major_faults` moved to the
+    // lock-free [`rusage::RUSAGE`] table — same reason as the tick
+    // counters above. `current_task_record_page_fault` is now a lock-free
+    // atomic increment.
     /// Voluntary context switches — task explicitly yielded
     /// (`yield_now`, IPC block, futex sleep, etc.). Incremented inside
     /// `yield_now` before the switch.
@@ -704,8 +708,9 @@ impl Task {
             pid: 0,                  // Set by fork_child_trampoline for userspace tasks
             priority: 20,            // Normal priority (middle of 10-29 range)
             affinity_mask: u64::MAX, // Can run on any core
-            user_ticks: 0,
-            system_ticks: 0,
+            // user_ticks / system_ticks live in `rusage::RUSAGE[idx]`.
+            _pad_user_ticks: 0,
+            _pad_system_ticks: 0,
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,
@@ -741,8 +746,7 @@ impl Task {
             child_user_ticks: 0,
             child_system_ticks: 0,
             // Phase 61 Track E.4 — rusage event counters (own + child).
-            minor_faults: 0,
-            major_faults: 0,
+            // minor_faults / major_faults live in `rusage::RUSAGE[idx]`.
             voluntary_ctxsw: 0,
             involuntary_ctxsw: 0,
             child_minor_faults: 0,
