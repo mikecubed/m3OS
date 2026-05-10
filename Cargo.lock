@@ -103,6 +103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-stats"
+version = "0.63.0"
+dependencies = [
+ "audio_client",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "audio_client"
 version = "0.57.0"
 dependencies = [

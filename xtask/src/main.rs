@@ -87,6 +87,9 @@ const QEMU_EXIT_FAILURE: i32 = 0x23;
 const SMOKE_EXIT_AUDIO_DEMO_FAILED: i32 = 60;
 const SMOKE_EXIT_SESSION_NOT_RUNNING: i32 = 61;
 const SMOKE_EXIT_SESSION_RECOVERY_FAILED: i32 = 62;
+/// Phase 63 Track E.1: bell-smoke failed to observe `frames_consumed > 0`
+/// after injecting a BEL byte into the running `term` session.
+const SMOKE_EXIT_BELL_SMOKE_FAILED: i32 = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -315,6 +318,19 @@ fn main() {
                 });
             cmd_session_recover_smoke(&smoke_args);
         }
+        // Phase 63 Track E.1: BEL → audio path end-to-end smoke.
+        // Boots with WAV AC'97 backend, waits for term to show its
+        // prompt-ready sentinel, injects a BEL byte, then runs
+        // `audio-stats` and waits for AUDIO_STATS:PASS (frames_consumed > 0).
+        Some("bell-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("bell-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_bell_smoke(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -368,7 +384,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -503,6 +519,11 @@ fn build_userspace_bins() {
         // pulls in `kernel-core` (audio protocol codec) at the alloc
         // feature level for shared types.
         ("audio-demo", "audio-demo", true),
+        // Phase 63 Track E.1 — one-shot audio stats CLI.  Used by the
+        // `bell-smoke` harness to verify `frames_consumed > 0` after a
+        // BEL byte is injected.  `needs_alloc = true` for the same
+        // reason as `audio-demo` (audio_client → kernel-core).
+        ("audio-stats", "audio-stats", true),
         // Phase 57 Track G — graphical terminal emulator. `needs_alloc
         // = true` because the binary links `kernel-core` (font
         // provider, ANSI parser) and uses `alloc` types in the screen
@@ -6082,6 +6103,195 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
             let _ = child.wait();
             eprintln!("session-recover-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_SESSION_RECOVERY_FAILED);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 63 Track E.1 — bell-smoke step list, QEMU arg builder, and command
+// ---------------------------------------------------------------------------
+
+/// Phase 63 Track E.1 — smoke step list for `cargo xtask bell-smoke`.
+///
+/// ## Scope
+///
+/// Verifies that the BEL → `AudioClientBellSink` → `audio_client::submit_frames`
+/// → `Ac97Backend` path (Phase 57 G.6, wired and tested) actually advances
+/// `frames_consumed` once the real AC'97 backend (Phase 63 A/B) is live.
+///
+/// ## Steps
+///
+/// 1. Wait for the kernel boot marker.
+/// 2. Wait for `session_manager: session.boot: state=running` — this confirms
+///    the full startup chain (display_server → kbd_server → mouse_server →
+///    audio_server → term) completed.
+/// 3. Wait for `TERM_SMOKE:ready` — term has entered its event loop.
+/// 4. Wait for `TERM_SMOKE:prompt-ready` — PTY has delivered enough bytes
+///    that the shell prompt is visible (the bell client is open).
+/// 5. `Send` a BEL byte (`printf '\x07'\n`) to QEMU stdin. The
+///    shell's stdout echoes the command; term's ANSI parser sees the BEL
+///    byte and calls `Bell::ring` → `AudioClientBellSink::play`.
+/// 6. `Sleep` 200 ms to give the AC'97 backend time to consume the 1440-byte
+///    30 ms bell tone into the BDL ring before we query stats.
+/// 7. `Send` `audio-stats\n` to run the stats helper binary from the shell.
+/// 8. Wait for `AUDIO_STATS:PASS` — the helper emitted
+///    `frames_consumed > 0` and printed its sentinel.
+///
+/// ## Failure modes
+///
+/// - If the BEL path does not reach `audio_client::submit_frames`, no frames
+///   are submitted and `audio_server`'s `frames_consumed` stays at zero.
+///   `audio-stats` prints `AUDIO_STATS:FAIL:consumed=0` and the wait for
+///   `AUDIO_STATS:PASS` times out → smoke fails with
+///   `SMOKE_EXIT_BELL_SMOKE_FAILED`.
+/// - If the `Ac97Backend` regresses (e.g. reverted to the Phase 57 accounting
+///   stub), `frames_submitted` advances but `frames_consumed` does not. Same
+///   failure path.
+/// - If `audio_server` is absent, `audio-stats` fails to connect and prints an
+///   error, never reaching `AUDIO_STATS:PASS`.
+fn bell_smoke_steps() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/bell-smoke: kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "session_manager: session.boot: state=running",
+            timeout_secs: 120,
+            label: "guest/bell-smoke: session_manager reaches state=running",
+        },
+        SmokeStep::Wait {
+            pattern: "TERM_SMOKE:ready",
+            timeout_secs: 60,
+            label: "guest/bell-smoke: term event loop started",
+        },
+        SmokeStep::Wait {
+            pattern: "TERM_SMOKE:prompt-ready",
+            timeout_secs: 30,
+            label: "guest/bell-smoke: term prompt is ready",
+        },
+        // Inject a BEL byte via the serial console. The shell echoes it;
+        // term's ANSI parser delivers it to Bell::ring → AudioClientBellSink.
+        SmokeStep::Send {
+            input: "printf '\\x07'\n",
+            label: "guest/bell-smoke: inject BEL byte into term",
+        },
+        // Give the AC'97 backend 200 ms to DMA the 1440-byte bell tone
+        // through the BDL ring so frames_consumed advances before we query.
+        SmokeStep::Sleep { millis: 200 },
+        // Run the stats helper to query frames_consumed via GetStats.
+        SmokeStep::Send {
+            input: "audio-stats\n",
+            label: "guest/bell-smoke: run audio-stats helper",
+        },
+        // Wait for AUDIO_STATS:PASS — the helper confirmed frames_consumed > 0.
+        SmokeStep::Wait {
+            pattern: "AUDIO_STATS:PASS",
+            timeout_secs: 10,
+            label: "guest/bell-smoke: frames_consumed > 0 after BEL",
+        },
+    ]
+}
+
+/// Build the QEMU arg vector for the bell-smoke.
+///
+/// Uses the same WAV audio backend as [`audio_smoke_qemu_args`] so
+/// the smoke is deterministic (no host PulseAudio required) and the
+/// recorded WAV can optionally be inspected for non-silence. The WAV
+/// file is written to `<smoke_dir>/bell-smoke.wav` to avoid colliding
+/// with the `audio-smoke` run's `audio.wav` when both smokes are run
+/// in the same CI job.
+///
+/// The session-smoke QEMU flags are included (full session startup:
+/// display_server + kbd + mouse + audio_server + term) because
+/// bell-smoke requires `term` to be running.
+fn bell_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // WAV backend for deterministic CI — same pattern as audio_smoke_qemu_args.
+    let wav_path = smoke_dir.join("bell-smoke.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+fn cmd_bell_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    // Prepare output directory for the WAV recording.
+    let smoke_dir = prepare_audio_smoke_dir();
+
+    let ovmf = find_ovmf();
+    let qemu_args = bell_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = bell_smoke_steps();
+
+    println!(
+        "bell-smoke: launching QEMU with AC'97 WAV backend (timeout {}s)",
+        args.timeout_secs
+    );
+    println!(
+        "bell-smoke: WAV output → {}",
+        smoke_dir.join("bell-smoke.wav").display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("bell-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("bell-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_BELL_SMOKE_FAILED);
         }
     }
 }
@@ -12969,12 +13179,13 @@ mod tests {
 
     #[test]
     fn smoke_exit_codes_are_distinct() {
-        // H.1 / H.2 / H.3 acceptance: each smoke fails with a distinct
-        // exit code so CI can route a regression to the right tracker.
+        // H.1 / H.2 / H.3 / Phase 63 E.1 acceptance: each smoke fails with
+        // a distinct exit code so CI can route a regression to the right tracker.
         let codes = [
             SMOKE_EXIT_AUDIO_DEMO_FAILED,
             SMOKE_EXIT_SESSION_NOT_RUNNING,
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
+            SMOKE_EXIT_BELL_SMOKE_FAILED,
         ];
         for (i, &a) in codes.iter().enumerate() {
             for &b in &codes[i + 1..] {
@@ -12986,6 +13197,129 @@ mod tests {
             assert_ne!(a, QEMU_EXIT_SUCCESS);
             assert_ne!(a, QEMU_EXIT_FAILURE);
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 63 Track E.1 — bell-smoke step list and QEMU arg assertions.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn bell_smoke_steps_inject_bel_and_wait_for_consumed_nonzero() {
+        // E.1 acceptance: the smoke step list must:
+        // (a) send a BEL byte (`printf '\x07'\n`) to QEMU stdin so term's
+        //     ANSI parser triggers Bell::ring → AudioClientBellSink,
+        // (b) wait for `AUDIO_STATS:PASS` — the audio-stats helper confirmed
+        //     that frames_consumed advanced to > 0.
+        let steps = bell_smoke_steps();
+
+        // (a) BEL injection step must be present with the correct input.
+        let bel_input = send_input_for_label(&steps, "guest/bell-smoke: inject BEL byte into term")
+            .expect("bell-smoke steps must include a Send step to inject BEL into term");
+        assert!(
+            bel_input.contains("\\x07"),
+            "BEL-inject step must send the \\x07 escape, got {bel_input:?}"
+        );
+
+        // (b) The AUDIO_STATS:PASS wait must follow.
+        let pass_pattern =
+            wait_pattern_for_label(&steps, "guest/bell-smoke: frames_consumed > 0 after BEL")
+                .expect(
+                    "bell-smoke steps must wait for AUDIO_STATS:PASS \
+                     (frames_consumed > 0 confirmed by audio-stats helper)",
+                );
+        assert_eq!(
+            pass_pattern, "AUDIO_STATS:PASS",
+            "bell-smoke must wait for the AUDIO_STATS:PASS sentinel"
+        );
+
+        // The audio-stats command send step must also be present.
+        let stats_input = send_input_for_label(&steps, "guest/bell-smoke: run audio-stats helper")
+            .expect("bell-smoke steps must include a Send step to run audio-stats");
+        assert!(
+            stats_input.contains("audio-stats"),
+            "audio-stats Send step must invoke the binary, got {stats_input:?}"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_uses_ac97_qemu_audio_flags() {
+        // E.1 acceptance: bell-smoke uses the WAV audio backend for
+        // deterministic CI (no host PulseAudio dependency). The `-device AC97`
+        // entry must pin the PCI slot with `addr=0x5` matching the sentinel
+        // BDF in `audio_server::SENTINEL_DEVICE`.
+        let smoke_dir = Path::new("target/audio-smoke");
+        let args = bell_smoke_qemu_args(
+            smoke_dir,
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            /* display */ false,
+        );
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        // Must use WAV backend with `id=snd0`.
+        let audiodev_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-audiodev")
+            .expect("bell-smoke argv must contain `-audiodev`");
+        let audiodev_val = strs[audiodev_idx + 1];
+        assert!(
+            audiodev_val.starts_with("wav,id=snd0,path="),
+            "bell-smoke `-audiodev` must be `wav,id=snd0,path=...` (WAV backend for CI), \
+             got {audiodev_val:?}"
+        );
+
+        // WAV file must be inside the smoke dir.
+        assert!(
+            audiodev_val.contains("bell-smoke.wav"),
+            "bell-smoke WAV path must contain `bell-smoke.wav`, got {audiodev_val:?}"
+        );
+
+        // Must attach the AC97 device with the sentinel PCI slot.
+        let device_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-device" && w[1].starts_with("AC97,"))
+            .expect("bell-smoke argv must contain `-device AC97,...`");
+        let device_val = strs[device_idx + 1];
+        assert!(
+            device_val.contains("audiodev=snd0"),
+            "bell-smoke `-device AC97` must reference `audiodev=snd0`, got {device_val:?}"
+        );
+        assert!(
+            device_val.contains("addr=0x5"),
+            "bell-smoke `-device AC97` must pin PCI slot via `addr=0x5`, got {device_val:?}"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_steps_wait_for_session_running_before_term() {
+        // bell-smoke requires the full session startup chain to complete
+        // before injecting the BEL — without audio_server running,
+        // AudioClientBellSink would fail to connect.
+        let steps = bell_smoke_steps();
+        let session_pattern = wait_pattern_for_label(
+            &steps,
+            "guest/bell-smoke: session_manager reaches state=running",
+        )
+        .expect("bell-smoke must wait for session_manager: session.boot: state=running");
+        assert_eq!(
+            session_pattern, "session_manager: session.boot: state=running",
+            "bell-smoke must gate on the session running sentinel before any BEL injection"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_steps_wait_for_term_prompt_ready() {
+        // bell-smoke must wait for the term prompt-ready sentinel before
+        // injecting the BEL, because Bell::ring uses AudioClientBellSink
+        // which is only constructed after term's event loop opens the stream.
+        let steps = bell_smoke_steps();
+        let prompt_pattern =
+            wait_pattern_for_label(&steps, "guest/bell-smoke: term prompt is ready")
+                .expect("bell-smoke must wait for TERM_SMOKE:prompt-ready before BEL injection");
+        assert_eq!(
+            prompt_pattern, "TERM_SMOKE:prompt-ready",
+            "bell-smoke must gate on TERM_SMOKE:prompt-ready before injecting BEL"
+        );
     }
 
     // ----------------------------------------------------------------

@@ -1,0 +1,14 @@
+[package]
+name = "audio-stats"
+version = "0.63.0"
+edition = "2024"
+description = "Phase 63 Track E.1 — one-shot audio stats CLI. Sends GetStats to audio_server via audio.cmd and prints AUDIO_STATS:consumed=<N> underruns=<M>, then AUDIO_STATS:PASS (frames_consumed > 0) or AUDIO_STATS:FAIL:consumed=0."
+
+[[bin]]
+name = "audio-stats"
+path = "src/main.rs"
+
+[dependencies]
+audio_client = { path = "../lib/audio_client" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../kernel-core", default-features = false }

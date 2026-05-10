@@ -243,6 +243,13 @@ static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 // Intentionally not registered as a service (one-shot, not daemon).
 static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
 
+// Phase 63 Track E.1: audio-stats one-shot — queries audio_server via
+// ControlCommand(GetStats) and prints AUDIO_STATS:consumed=<N> underruns=<M>
+// followed by AUDIO_STATS:PASS or AUDIO_STATS:FAIL:consumed=0.  Used by
+// the bell-smoke harness to verify frames_consumed > 0 after a BEL byte.
+// Not a daemon — no .conf entry.
+static AUDIO_STATS_ELF: &[u8] = generated_initrd_asset!("audio-stats");
+
 // Phase 57 Track G: term — graphical terminal emulator. Exposed under
 // /bin so `session_manager` (and `init` via `term.conf`) can launch it
 // via the standard service-config path (`command=/bin/term`).
@@ -429,6 +436,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "audio-demo",
         RamdiskNode::File {
             content: AUDIO_DEMO_ELF,
+        },
+    ),
+    // Phase 63 Track E.1: audio-stats one-shot stats CLI.
+    (
+        "audio-stats",
+        RamdiskNode::File {
+            content: AUDIO_STATS_ELF,
         },
     ),
     // Phase 57 Track G: term — graphical terminal emulator (the first

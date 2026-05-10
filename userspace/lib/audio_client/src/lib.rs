@@ -15,6 +15,8 @@
 //! - [`AudioClient::drain`] — block until every submitted frame has
 //!   been consumed by the device.
 //! - [`AudioClient::close`] — close the stream and release the slot.
+//! - [`AudioClient::get_stats`] — query playback statistics from the server
+//!   (frames submitted / consumed, underrun count).
 //! - [`AudioClientError`] — typed error returned by every verb.
 //!
 //! Anything else is private. The protocol byte format is private to
@@ -26,8 +28,8 @@
 extern crate alloc;
 
 use kernel_core::audio::{
-    AudioError, ChannelLayout, ClientMessage, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError,
-    SampleRate, ServerMessage,
+    AudioControlCommand, AudioControlEvent, AudioError, ChannelLayout, ClientMessage,
+    MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate, ServerMessage,
 };
 
 /// Service name used by `audio_server` to register its command
@@ -135,6 +137,26 @@ mod heapless_buf {
             &self.bytes[..self.len]
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AudioStats
+// ---------------------------------------------------------------------------
+
+/// Snapshot of audio_server playback statistics, returned by
+/// [`AudioClient::get_stats`].
+///
+/// Phase 63 Track E.1: used by `audio-stats` (the smoke-helper binary)
+/// and the `bell-smoke` xtask step to verify that `frames_consumed`
+/// advances after a BEL byte is delivered to `term`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioStats {
+    /// Number of buffer underruns since server start.
+    pub underrun_count: u32,
+    /// Total PCM frames submitted to the ring by all clients.
+    pub frames_submitted: u64,
+    /// Total PCM frames consumed by the AC'97 DMA engine.
+    pub frames_consumed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +274,33 @@ impl<S: AudioSocket> AudioClient<S> {
                 Ok(())
             }
             ServerMessage::OpenError(err) => Err(AudioClientError::Server(err)),
+            _ => Err(AudioClientError::UnexpectedReply),
+        }
+    }
+
+    /// Query the audio_server for current playback statistics.
+    ///
+    /// Sends `ControlCommand(GetStats)` to the control socket and returns
+    /// the decoded [`AudioStats`]. Can be called whether or not a stream
+    /// is currently open — the server tracks global stats across all
+    /// streams on its registry.
+    ///
+    /// Phase 63 Track E.1: used by `audio-stats` and the `bell-smoke`
+    /// harness to verify that `frames_consumed` advances after a BEL byte.
+    pub fn get_stats(&mut self) -> Result<AudioStats, AudioClientError> {
+        let mut frame = [0u8; MAX_REQUEST_BYTES];
+        let n = ClientMessage::ControlCommand(AudioControlCommand::GetStats).encode(&mut frame)?;
+        let reply = self.socket.call(&frame[..n], &[])?;
+        match decode_server_message(reply.as_slice())? {
+            ServerMessage::ControlEvent(AudioControlEvent::Stats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
+            }) => Ok(AudioStats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
+            }),
             _ => Err(AudioClientError::UnexpectedReply),
         }
     }

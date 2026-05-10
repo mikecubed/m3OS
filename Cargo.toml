@@ -91,6 +91,8 @@ members = [
     "userspace/lib/audio_client",
     # Phase 57 Track E.2 — userspace audio reference demo
     "userspace/audio-demo",
+    # Phase 63 Track E.1 — one-shot audio stats CLI for the bell-smoke harness
+    "userspace/audio-stats",
     # Phase 57 Track G — graphical terminal emulator
     "userspace/term",
 ]
