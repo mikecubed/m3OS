@@ -107,7 +107,6 @@ name = "audio-stats"
 version = "0.63.0"
 dependencies = [
  "audio_client",
- "kernel-core",
  "syscall-lib",
 ]
 
@@ -154,6 +153,15 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "bell-test"
+version = "0.63.0"
+dependencies = [
+ "audio_client",
+ "syscall-lib",
+ "term",
+]
 
 [[package]]
 name = "bit-set"

@@ -329,6 +329,25 @@ impl AudioClient<SyscallSocket> {
         let socket = SyscallSocket::connect()?;
         Self::open_with_socket(socket, format, layout, rate)
     }
+
+    /// Connect to `audio_server` **without** opening a PCM stream.
+    ///
+    /// Looks up `SERVICE_NAME` (`"audio.cmd"`) and returns a client bound
+    /// to the control socket. No `Open` message is sent, so the server's
+    /// single-client slot is not consumed. The only verb that makes sense
+    /// on a control-only client is [`AudioClient::get_stats`] —
+    /// `submit_frames`, `drain`, and `close` will all return
+    /// [`AudioClientError::NotOpen`].
+    ///
+    /// Phase 63 Track E.1: used by `audio-stats` and `bell-test` to query
+    /// `frames_consumed` without perturbing the audio device state.
+    pub fn connect() -> Result<Self, AudioClientError> {
+        let socket = SyscallSocket::connect()?;
+        Ok(Self {
+            socket,
+            stream_id: None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

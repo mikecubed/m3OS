@@ -245,10 +245,17 @@ static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
 
 // Phase 63 Track E.1: audio-stats one-shot — queries audio_server via
 // ControlCommand(GetStats) and prints AUDIO_STATS:consumed=<N> underruns=<M>
-// followed by AUDIO_STATS:PASS or AUDIO_STATS:FAIL:consumed=0.  Used by
-// the bell-smoke harness to verify frames_consumed > 0 after a BEL byte.
-// Not a daemon — no .conf entry.
+// followed by AUDIO_STATS:PASS or AUDIO_STATS:FAIL:consumed=0.  General-purpose
+// stats query tool. Not a daemon — no .conf entry.
 static AUDIO_STATS_ELF: &[u8] = generated_initrd_asset!("audio-stats");
+
+// Phase 63 Track E.1: bell-test one-shot — exercises the Bell::ring →
+// AudioClientBellSink → audio_client::submit_frames path directly from sh0,
+// bypassing the kbd_server routing gap. Prints BELL_TEST:consumed=<N>
+// underruns=<M> followed by BELL_TEST:PASS (frames_consumed > 0) or
+// BELL_TEST:FAIL:consumed=0.  Used by the bell-smoke harness.
+// Not a daemon — no .conf entry.
+static BELL_TEST_ELF: &[u8] = generated_initrd_asset!("bell-test");
 
 // Phase 57 Track G: term — graphical terminal emulator. Exposed under
 // /bin so `session_manager` (and `init` via `term.conf`) can launch it
@@ -443,6 +450,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "audio-stats",
         RamdiskNode::File {
             content: AUDIO_STATS_ELF,
+        },
+    ),
+    // Phase 63 Track E.1: bell-test — bell path exerciser for the bell-smoke harness.
+    (
+        "bell-test",
+        RamdiskNode::File {
+            content: BELL_TEST_ELF,
         },
     ),
     // Phase 57 Track G: term — graphical terminal emulator (the first

@@ -17,17 +17,17 @@
 //! AUDIO_STATS:FAIL:consumed=0
 //! ```
 //!
-//! The `AUDIO_STATS:PASS` / `AUDIO_STATS:FAIL:consumed=0` sentinels are
-//! the patterns the `bell-smoke` xtask step waits for. The detail line
-//! (`consumed=<N>`) is always emitted first for CI log diagnostics.
+//! The detail line (`consumed=<N>`) is always emitted first for CI log
+//! diagnostics.
 //!
-//! ## Why a separate binary
+//! ## Why no Open
 //!
-//! `audio-demo` plays a tone — it does not expose a plain stats query.
-//! `audio_server` does not log stats to serial on its own. A one-shot
-//! binary that opens the control socket and prints the stats is the
-//! lightest path that avoids touching the server or demo code while
-//! giving the smoke harness a serial-visible sentinel.
+//! `GetStats` is a control-plane verb: `audio_server` handles it via
+//! `AudioControlCommand::GetStats` independently of any open PCM stream.
+//! Calling `Open` before `GetStats` is unnecessary and perturbs the
+//! server's single-slot state — it temporarily occupies the device slot,
+//! preventing any other client from opening while we are querying. The
+//! fix uses `AudioClient::connect()` to bind only the control socket.
 //!
 //! ## Usage
 //!
@@ -49,7 +49,6 @@ extern crate alloc;
 use core::alloc::Layout;
 
 use audio_client::{AudioClient, AudioClientError};
-use kernel_core::audio::{ChannelLayout, PcmFormat, SampleRate};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -71,20 +70,20 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
-    // Open a client handle — stats are available before any PCM stream
-    // is opened.  `AudioClient::open` negotiates the stream format with
-    // the server; we use the same default format as `audio-demo` so the
-    // Open→GetStats→Close sequence is protocol-correct.
-    let mut client =
-        match AudioClient::open(PcmFormat::S16Le, ChannelLayout::Stereo, SampleRate::Hz48000) {
-            Ok(c) => c,
-            Err(err) => {
-                write_str("audio-stats: error: ");
-                write_error(err);
-                write_str("\n");
-                return 2;
-            }
-        };
+    // Connect to the control socket only — no PCM stream is opened.
+    // `AudioClient::connect()` binds the IPC endpoint without issuing
+    // `Open`, so the server's single-slot state is not perturbed and
+    // any other client (e.g. term's AudioClientBellSink) can continue
+    // to hold the slot while we query stats.
+    let mut client = match AudioClient::connect() {
+        Ok(c) => c,
+        Err(err) => {
+            write_str("audio-stats: error: ");
+            write_error(err);
+            write_str("\n");
+            return 2;
+        }
+    };
 
     let stats = match client.get_stats() {
         Ok(s) => s,
@@ -92,7 +91,6 @@ fn program_main(_args: &[&str]) -> i32 {
             write_str("audio-stats: get_stats error: ");
             write_error(err);
             write_str("\n");
-            let _ = client.close();
             return 2;
         }
     };
@@ -104,8 +102,6 @@ fn program_main(_args: &[&str]) -> i32 {
     write_str(" underruns=");
     write_u32(stats.underrun_count);
     write_str("\n");
-
-    let _ = client.close();
 
     if stats.frames_consumed > 0 {
         syscall_lib::write_str(STDOUT_FILENO, "AUDIO_STATS:PASS\n");

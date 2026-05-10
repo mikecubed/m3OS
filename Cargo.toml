@@ -93,6 +93,9 @@ members = [
     "userspace/audio-demo",
     # Phase 63 Track E.1 — one-shot audio stats CLI for the bell-smoke harness
     "userspace/audio-stats",
+    # Phase 63 Track E.1 — bell path exerciser: calls Bell::ring via AudioClientBellSink,
+    # queries get_stats(), and prints BELL_TEST:PASS / BELL_TEST:FAIL for the bell-smoke harness
+    "userspace/bell-test",
     # Phase 57 Track G — graphical terminal emulator
     "userspace/term",
 ]

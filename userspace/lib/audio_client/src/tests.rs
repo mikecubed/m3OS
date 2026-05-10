@@ -367,7 +367,50 @@ fn protocol_error_lifts_into_audio_client_error() {
     assert_eq!(err, AudioClientError::Protocol(ProtocolError::Truncated));
 }
 
-// ---------------- Phase 63 Track E.1: get_stats() ----------------
+// ---------------- Phase 63 Track E.1: control-only connect + get_stats() ----------------
+
+/// Verify that a `new_with_socket` (control-only, no stream) client can
+/// call `get_stats()` successfully. This mirrors the production
+/// `AudioClient::connect()` path used by `audio-stats` and `bell-test`.
+#[test]
+fn get_stats_without_open_stream_succeeds() {
+    // Phase 63 E.1 acceptance: get_stats() must work without a prior Open.
+    // `new_with_socket` constructs a client with stream_id = None,
+    // matching what `AudioClient::connect()` produces.
+    let mut socket = MockSocket::new();
+    // No Opened reply needed — no Open is sent.
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 1,
+        frames_submitted: 4800,
+        frames_consumed: 4800,
+    }));
+    let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
+    // stream_id must be None — confirm this is a "control-only" client.
+    assert_eq!(
+        client.stream_id(),
+        None,
+        "control-only client must have no stream_id"
+    );
+    let stats = client
+        .get_stats()
+        .expect("get_stats must succeed without open stream");
+    assert_eq!(stats.frames_consumed, 4800);
+    assert_eq!(stats.frames_submitted, 4800);
+    assert_eq!(stats.underrun_count, 1);
+    // Only one frame sent (GetStats — no Open).
+    assert_eq!(
+        client.socket.sent.len(),
+        1,
+        "control-only get_stats must send exactly one frame (no Open)"
+    );
+    let (decoded, _) =
+        ClientMessage::decode(&client.socket.sent[0].frame).expect("GetStats frame must decode");
+    assert_eq!(
+        decoded,
+        ClientMessage::ControlCommand(AudioControlCommand::GetStats),
+        "sole frame must be ControlCommand(GetStats)"
+    );
+}
 
 #[test]
 fn get_stats_returns_consumed_and_underruns_from_server() {
