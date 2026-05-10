@@ -828,15 +828,39 @@ impl Task {
     ///
     /// # Lock ordering
     ///
-    /// Unlike [`Task::with_block_state`], this helper does NOT debug-assert
-    /// that `scheduler_lock` is unheld — it is the documented exception path.
-    /// The caller asserts (via the inline NOTE) why `pi_lock` acquisition is
-    /// safe at that specific site.
+    /// Unlike [`Task::with_block_state`] (which debug-asserts that
+    /// `scheduler_lock` is *unheld*), this helper debug-asserts the
+    /// **inverse** invariant — that `scheduler_lock` *is* held by this CPU
+    /// — so misuse outside the documented exception sites is caught in
+    /// debug builds. The visibility is also narrowed to `pub(crate)` so
+    /// only kernel-internal code (the four scheduler sites listed above)
+    /// can reach this exception path.
     #[inline]
-    pub fn with_block_state_locked_scheduler<R>(
+    pub(crate) fn with_block_state_locked_scheduler<R>(
         &self,
         f: impl FnOnce(&mut TaskBlockState) -> R,
     ) -> R {
+        // Phase 62 (PR #146 review fix): inverse of `with_block_state`'s
+        // assertion. `with_block_state` panics if `scheduler_lock` IS held;
+        // this helper panics if it is NOT held — confirming the caller is at
+        // a documented exception site (one of the four `// NOTE: Phase 62
+        // Track B` sites in `kernel/src/task/scheduler.rs`) and not using
+        // this as a drop-in for `with_block_state`. Mirrors the lenient
+        // `unwrap_or(true)` pattern: if per-CPU data isn't yet available
+        // (very-early-boot), defer to the caller's correctness — the four
+        // documented sites all run after per-core init, so this branch
+        // should never fire there.
+        debug_assert!(
+            crate::smp::try_per_core()
+                .map(|c| c
+                    .holds_scheduler_lock
+                    .load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(true),
+            "with_block_state_locked_scheduler called without SCHEDULER.lock \
+             held — this helper is the documented lock-order exception path \
+             for sites that already hold scheduler_lock(); use \
+             Task::with_block_state instead"
+        );
         let mut guard = self.pi_lock.lock();
         f(&mut guard)
     }
