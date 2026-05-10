@@ -65,11 +65,17 @@ use bootloader_api::BootInfo;
 /// 2. GDT + IDT (`arch::init`).
 /// 3. Frame allocator + heap (`mm::init`) — boot_info is consumed here.
 /// 4. PCI enumeration (required so APIC discovery sees IO-APIC entries).
-/// 5. Hardware interrupts enabled.
-/// 6. ACPI table discovery (RSDP → MADT) for AP and IO-APIC topology.
-/// 7. Local APIC + IO-APIC bring-up (skipped if MADT absent — uniprocessor).
-/// 8. Per-core data for the BSP (`gs_base` set so `per_core()` does not panic).
+/// 5. ACPI table discovery (RSDP → MADT) for AP and IO-APIC topology.
+/// 6. Local APIC + IO-APIC bring-up (skipped if MADT absent — uniprocessor).
+/// 7. Per-core data for the BSP (`gs_base` set so `per_core()` does not panic).
+/// 8. Hardware interrupts enabled.
 /// 9. CPUID probe + XSAVE state enable (required for context switch).
+///
+/// `acpi::init` runs **before** `enable_interrupts` so that the timer-IRQ
+/// path's `tick_account_current_task` → `is_bsp()` → `local_apic_address()`
+/// chain cannot panic on the very first tick (the MADT must be parsed
+/// before any LAPIC register read). This matches the order used by the
+/// production `kernel_main_entry`.
 ///
 /// Does **not** boot Application Processors. Tests that need cross-core
 /// behavior should call [`boot_aps_if_available`] after this returns.
@@ -85,17 +91,18 @@ pub fn init_minimal_smp(boot_info: &'static mut BootInfo) {
 
     crate::pci::init();
 
-    // SAFETY: arch::init() loaded the IDT; mm::init() set up the heap; this
-    // is the canonical point for unmasking IRQs (matches the production
-    // boot sequence in kernel_main_entry).
-    unsafe { crate::arch::enable_interrupts() };
-
     crate::acpi::init(rsdp_addr);
     if crate::acpi::io_apic_address().is_some() {
         crate::arch::x86_64::apic::init();
     }
 
     crate::smp::init_bsp_per_core();
+
+    // SAFETY: arch::init() loaded the IDT; mm::init() set up the heap; ACPI
+    // and APIC are now up so the timer ISR's `is_bsp()` call can read the
+    // LAPIC ID safely. This is the canonical point for unmasking IRQs
+    // (matches the production boot sequence in kernel_main_entry).
+    unsafe { crate::arch::enable_interrupts() };
 
     let _xsave = crate::arch::x86_64::cpuid::probe();
     // SAFETY: enable_xsave_state writes CR4.OSXSAVE and XCR0 via xsetbv.

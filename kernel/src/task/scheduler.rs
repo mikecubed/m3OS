@@ -1399,17 +1399,13 @@ fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
 /// = 1 ms` scale (`TICKS_PER_SEC = 1000`) regardless of which core the
 /// task ran on, so values stay consistent across migration.
 ///
-/// Skips the idle task (identified via `Scheduler::idle_tasks`, NOT via
-/// `priority == 30`) and any task that is no longer `Running`. The
-/// numeric priority value is unsafe as an idle marker because `sys_nice`
-/// clamps user priorities into `0..=30`, so a normal task that calls
-/// `nice(+N)` can legitimately reach 30 — using `priority == 30` to
-/// skip accounting would silently zero out `times(2)` / `getrusage(2)`
-/// for any heavily-niced user task. The function is best-effort and silently no-ops when no
-/// current task is present (early boot, between dispatches, etc.) — in
-/// particular, it bails before reading `per_core` if SMP per-core data
-/// is not yet ready, which can happen during the early-boot window
-/// between `arch::enable_interrupts()` and `smp::init_bsp_per_core()`.
+/// Idle-task skip and Running-state guard are intentionally **not**
+/// applied (see the implementation note for rationale). The function is
+/// best-effort and silently no-ops when no current task is present
+/// (early boot, between dispatches, etc.) — in particular, it bails
+/// before reading `per_core` if SMP per-core data is not yet ready,
+/// which can happen during the early-boot window between
+/// `arch::enable_interrupts()` and `smp::init_bsp_per_core()`.
 ///
 /// **IRQ-context lock discipline:** uses `try_scheduler_lock`, NEVER
 /// blocks. If the running task on this core (or any task on any core)

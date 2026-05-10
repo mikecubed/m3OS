@@ -502,9 +502,6 @@ fn marker_present(path: &[u8]) -> bool {
 fn fail(stage: &str, msg: &str, code: i32) -> i32 {
     // Format `SMOKE:<stage>:FAIL <msg>` as a single write. See `write_marker`
     // for why this matters under fast (KVM) timing.
-    let mut full = [0u8; 8]; // " " separator if needed
-    full[0] = b' ';
-    let _ = full;
     let mut joined_buf = [0u8; 256];
     let space = b" ";
     let total_msg_len = space.len() + msg.len();

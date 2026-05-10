@@ -3816,7 +3816,14 @@ pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64
     let nvcsw = cv_after.saturating_sub(cv_before);
     let nivcsw = civ_after.saturating_sub(civ_before);
 
-    if write_rusage(
+    // Best-effort write — the child has already been reaped at this
+    // point, so we cannot fail the syscall. Mirrors how `sys_waitpid`
+    // treats `status_ptr` write failure (see the `let _ = UserSliceWo`
+    // block in `sys_waitpid`). Userspace that passed an unmapped
+    // `rusage_ptr` simply observes a successful reap with a stale
+    // rusage buffer — better than retrying on -EFAULT and re-reaping
+    // (impossible, the child is gone) or zombie-leaking the child.
+    let _ = write_rusage(
         rusage_ptr,
         user_ticks,
         system_ticks,
@@ -3824,11 +3831,7 @@ pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64
         major,
         nvcsw,
         nivcsw,
-    )
-    .is_err()
-    {
-        return NEG_EFAULT;
-    }
+    );
     result
 }
 
