@@ -1531,12 +1531,28 @@ fn build_tcc() -> Option<PathBuf> {
 
     // Copy musl libc.a and CRT objects to both /usr/lib/ and the triplet path
     // /usr/lib/x86_64-linux-musl/ (TCC searches the triplet path first for CRT).
-    let musl_lib = Path::new("/usr/lib/x86_64-linux-musl");
+    //
+    // Source locations differ by host distro:
+    //   - Debian / Ubuntu (`musl-dev` package):
+    //       /usr/lib/x86_64-linux-musl/{libc.a,crt1.o,crti.o,crtn.o}
+    //   - Arch / Omarchy (`musl` package):
+    //       /usr/lib/musl/lib/{libc.a,crt1.o,crti.o,crtn.o}
+    //
+    // Try the Debian multiarch path first (historical default), then fall
+    // back to the Arch layout. Add new layouts here as we encounter them
+    // (NixOS / Fedora / etc.) rather than asking operators to symlink.
+    let musl_lib_search: &[&Path] = &[
+        Path::new("/usr/lib/x86_64-linux-musl"),
+        Path::new("/usr/lib/musl/lib"),
+    ];
     fs::create_dir_all(staging.join("usr/lib/x86_64-linux-musl")).expect("create triplet lib dir");
     let crt_files = ["libc.a", "crt1.o", "crti.o", "crtn.o"];
     for name in &crt_files {
-        let src = musl_lib.join(name);
-        if src.exists() {
+        let src = musl_lib_search.iter().find_map(|dir| {
+            let p = dir.join(name);
+            p.exists().then_some(p)
+        });
+        if let Some(src) = src {
             // Copy to /usr/lib/
             let dst = staging.join(format!("usr/lib/{name}"));
             fs::copy(&src, &dst).unwrap_or_else(|e| {
@@ -1547,9 +1563,19 @@ fn build_tcc() -> Option<PathBuf> {
             fs::copy(&src, &dst_triplet).unwrap_or_else(|e| {
                 panic!("failed to copy {name} to triplet path: {e}");
             });
-            println!("tcc: {name} → staging/usr/lib/ + triplet");
+            println!(
+                "tcc: {name} → staging/usr/lib/ + triplet (from {})",
+                src.parent().unwrap().display()
+            );
         } else {
-            eprintln!("warning: musl {name} not found at {}", src.display());
+            eprintln!(
+                "warning: musl {name} not found in any of: {}",
+                musl_lib_search
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
 
@@ -1561,16 +1587,30 @@ fn build_tcc() -> Option<PathBuf> {
         println!("tcc: libtcc1.a → staging/usr/lib/tcc/libtcc1.a");
     }
 
-    // Copy musl headers recursively.
-    let musl_include = Path::new("/usr/include/x86_64-linux-musl");
-    if musl_include.is_dir() {
+    // Copy musl headers recursively. Same distro-dependent search as
+    // for the lib objects above:
+    //   - Debian / Ubuntu: /usr/include/x86_64-linux-musl
+    //   - Arch / Omarchy:  /usr/lib/musl/include
+    let musl_include_search: &[&Path] = &[
+        Path::new("/usr/include/x86_64-linux-musl"),
+        Path::new("/usr/lib/musl/include"),
+    ];
+    let musl_include = musl_include_search.iter().find(|p| p.is_dir());
+    if let Some(musl_include) = musl_include {
         copy_dir_recursive(musl_include, &staging.join("usr/include"))
             .expect("failed to copy musl headers");
-        println!("tcc: musl headers → staging/usr/include/");
+        println!(
+            "tcc: musl headers → staging/usr/include/ (from {})",
+            musl_include.display()
+        );
     } else {
         eprintln!(
-            "warning: musl headers not found at {}",
-            musl_include.display()
+            "warning: musl headers not found in any of: {}",
+            musl_include_search
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
