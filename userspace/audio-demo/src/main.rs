@@ -59,7 +59,7 @@ extern crate alloc;
 
 use core::alloc::Layout;
 
-use audio_client::{AudioClient, AudioClientError};
+use audio_client::{AudioClient, AudioClientError, AudioStats};
 use kernel_core::audio::{ChannelLayout, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -130,6 +130,18 @@ fn program_main(_args: &[&str]) -> i32 {
         return 4;
     }
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:drained\n");
+
+    // D.2: query the server for consumption stats before closing the stream.
+    // The sentinel line `AUDIO_DEMO:stats consumed=<N> underruns=<M>` is
+    // parsed by the audio-smoke harness to assert frames_consumed > 0.
+    let stats = match client.get_stats() {
+        Ok(s) => s,
+        Err(err) => {
+            log_error("get_stats", err);
+            return 6;
+        }
+    };
+    log_stats(stats);
 
     if let Err(err) = client.close() {
         log_error("close", err);
@@ -274,6 +286,52 @@ fn build_quarter_sine_lut() -> [i16; LUT_LEN] {
         };
     }
     lut
+}
+
+// ---------------------------------------------------------------------------
+// Stats logging — D.2 sentinel parsed by the audio-smoke harness
+// ---------------------------------------------------------------------------
+
+/// Print the `AUDIO_DEMO:stats consumed=<N> underruns=<M>` sentinel.
+///
+/// The line shape is locked for Track E / WaitLineNotMatching compatibility:
+/// `consumed=` reads `AudioStats::frames_consumed`; `underruns=` reads
+/// `AudioStats::underrun_count`. The sentinel label words are intentionally
+/// shorter than the wire field names so the output stays human-readable.
+///
+/// Uses a minimal integer-to-string helper to stay `no_std` / alloc-free.
+fn log_stats(stats: AudioStats) {
+    syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:stats consumed=");
+    write_u64(stats.frames_consumed);
+    syscall_lib::write_str(STDOUT_FILENO, " underruns=");
+    write_u32(stats.underrun_count);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+/// Write a `u64` decimal integer to stdout without heap allocation.
+fn write_u64(mut n: u64) {
+    // Build digits in reverse, then write forward.
+    let mut buf = [0u8; 20]; // 2^64 fits in 20 decimal digits
+    let mut len = 0;
+    if n == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while n > 0 {
+        buf[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    buf[..len].reverse();
+    // Safety: all bytes are ASCII digits.
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
+    }
+}
+
+/// Write a `u32` decimal integer to stdout without heap allocation.
+fn write_u32(n: u32) {
+    write_u64(n as u64);
 }
 
 // ---------------------------------------------------------------------------

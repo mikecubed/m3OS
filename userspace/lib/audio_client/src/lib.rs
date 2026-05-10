@@ -26,8 +26,8 @@
 extern crate alloc;
 
 use kernel_core::audio::{
-    AudioError, ChannelLayout, ClientMessage, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError,
-    SampleRate, ServerMessage,
+    AudioControlCommand, AudioControlEvent, AudioError, ChannelLayout, ClientMessage,
+    MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate, ServerMessage,
 };
 
 /// Service name used by `audio_server` to register its command
@@ -77,6 +77,26 @@ impl From<ProtocolError> for AudioClientError {
     fn from(err: ProtocolError) -> Self {
         AudioClientError::Protocol(err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// AudioStats — returned by AudioClient::get_stats
+// ---------------------------------------------------------------------------
+
+/// Snapshot of audio-server stream statistics returned by
+/// [`AudioClient::get_stats`].
+///
+/// Field names and types mirror the wire `AudioControlEvent::Stats` payload
+/// from `kernel_core::audio::protocol` so Track E's consumers can pattern-match
+/// directly without renaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioStats {
+    /// Number of BDL underrun events since the stream opened.
+    pub underrun_count: u32,
+    /// Total PCM frames submitted by the client since the stream was opened.
+    pub frames_submitted: u64,
+    /// Total PCM frames consumed by the hardware DMA engine.
+    pub frames_consumed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +272,36 @@ impl<S: AudioSocket> AudioClient<S> {
                 Ok(())
             }
             ServerMessage::OpenError(err) => Err(AudioClientError::Server(err)),
+            _ => Err(AudioClientError::UnexpectedReply),
+        }
+    }
+
+    /// Query the audio server for current stream stats.
+    ///
+    /// Issues `ClientMessage::ControlCommand(GetStats)` and decodes the
+    /// `ServerMessage::ControlEvent(Stats { ... })` reply. The stream
+    /// does not need to be open — `GetStats` is a control-plane verb that
+    /// may be issued at any time after a successful [`AudioClient::open`]
+    /// call and before `close` consumes the client.
+    ///
+    /// Returns `Err(NotOpen)` if no stream was opened.
+    pub fn get_stats(&mut self) -> Result<AudioStats, AudioClientError> {
+        if self.stream_id.is_none() {
+            return Err(AudioClientError::NotOpen);
+        }
+        let mut frame = [0u8; MAX_REQUEST_BYTES];
+        let n = ClientMessage::ControlCommand(AudioControlCommand::GetStats).encode(&mut frame)?;
+        let reply = self.socket.call(&frame[..n], &[])?;
+        match decode_server_message(reply.as_slice())? {
+            ServerMessage::ControlEvent(AudioControlEvent::Stats {
+                frames_consumed,
+                frames_submitted,
+                underrun_count,
+            }) => Ok(AudioStats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
+            }),
             _ => Err(AudioClientError::UnexpectedReply),
         }
     }
