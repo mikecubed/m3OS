@@ -376,14 +376,14 @@ fn get_stats_returns_consumed_and_underrun_counts() {
     );
 }
 
-#[test]
-fn get_stats_before_open_returns_not_open() {
-    // D.2 acceptance: `get_stats()` without a prior open must return NotOpen.
-    let socket = MockSocket::new();
-    let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
-    let result = client.get_stats();
-    assert_eq!(result.err(), Some(AudioClientError::NotOpen));
-}
+// NOTE: An earlier `get_stats_before_open_returns_not_open` test asserted
+// that `get_stats()` without a prior `Open` would return `NotOpen`. Phase 63
+// Track E.1 changed `get_stats()` from a stream-bound verb to a control-plane
+// verb so that `audio-stats` and `bell-test` can query stats without ever
+// opening a PCM stream (see `AudioClient::connect()` and
+// `get_stats_without_open_stream_succeeds` below). The old assertion
+// contradicts that contract and has been removed; the control-plane shape is
+// covered by `get_stats_without_open_stream_succeeds`.
 
 #[test]
 fn get_stats_unexpected_reply_returns_unexpected_reply() {

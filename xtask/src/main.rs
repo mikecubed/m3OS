@@ -3788,15 +3788,26 @@ fn run_smoke_script(
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
 
-                    // Find any complete line (newline-terminated) that contains `pattern`.
+                    // Find the first complete (newline-terminated) line that contains `pattern`.
+                    // Iterate with `split_inclusive('\n')` and a running byte cursor so the
+                    // drain offset is anchored to the line currently under inspection — using
+                    // `s.find(line)` would return the *first* occurrence of that text in the
+                    // buffer, which can sit inside a different earlier line.
                     let search = |s: &str| -> Option<(bool, usize)> {
-                        for line in s.lines() {
-                            if line.contains(pattern) {
-                                let failed = line.contains(bad_substring);
-                                // Compute end offset past the newline.
-                                let found_at = s.find(line).unwrap_or(0) + line.len();
-                                return Some((!failed, found_at));
+                        let mut cursor = 0usize;
+                        for segment in s.split_inclusive('\n') {
+                            // Only consider complete lines (ones terminated by '\n').
+                            let segment_end = cursor + segment.len();
+                            if segment.ends_with('\n') {
+                                let line = segment.trim_end_matches('\n');
+                                if line.contains(pattern) {
+                                    let failed = line.contains(bad_substring);
+                                    // segment_end already includes the trailing newline,
+                                    // so the drain consumes the full matched line.
+                                    return Some((!failed, segment_end));
+                                }
                             }
+                            cursor = segment_end;
                         }
                         None
                     };
@@ -6177,7 +6188,20 @@ fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
         let chunk_size =
             u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
         let chunk_start = offset + 8;
-        let chunk_end = chunk_start.saturating_add(chunk_size);
+        // The declared chunk must fit within the file; reject truncated/corrupt WAVs
+        // rather than masking them as "silent" via a clipped slice.
+        let chunk_end = chunk_start
+            .checked_add(chunk_size)
+            .ok_or_else(|| format!("WAV file {} chunk size overflows usize", path.display()))?;
+        if chunk_end > data.len() {
+            return Err(format!(
+                "WAV file {} is truncated: chunk at offset {} declares size {} but file has only {} bytes",
+                path.display(),
+                offset,
+                chunk_size,
+                data.len()
+            ));
+        }
 
         if id == b"data" {
             data_offset = Some(chunk_start);
@@ -6185,7 +6209,19 @@ fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
             break;
         }
         // Align to even boundary per RIFF spec.
-        let aligned = chunk_end + (chunk_size & 1);
+        let aligned = chunk_end.checked_add(chunk_size & 1).ok_or_else(|| {
+            format!(
+                "WAV file {} chunk alignment overflows usize",
+                path.display()
+            )
+        })?;
+        if aligned <= offset {
+            return Err(format!(
+                "WAV file {} contains a non-advancing chunk at offset {}",
+                path.display(),
+                offset
+            ));
+        }
         offset = aligned;
     }
 
@@ -6203,11 +6239,14 @@ fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
         ));
     }
 
-    let pcm_bytes = &data[data_start..data_start.saturating_add(data_len).min(data.len())];
+    // chunk_end <= data.len() was enforced above; this slice is exact.
+    let pcm_bytes = &data[data_start..data_start + data_len];
     let mut non_silent: usize = 0;
     for chunk in pcm_bytes.chunks_exact(2) {
         let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        if sample.abs() > 100 {
+        // `i16::MIN.abs()` would overflow; widen to i32 so full-scale negative
+        // samples are counted correctly rather than panicking on debug builds.
+        if i32::from(sample).abs() > 100 {
             non_silent += 1;
         }
     }
@@ -10963,13 +11002,22 @@ fn run_smoke_steps_with_capture(
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
 
+                    // Iterate with `split_inclusive('\n')` and a running byte cursor so the
+                    // drain offset is anchored to the line currently under inspection — using
+                    // `s.find(line)` would return the *first* occurrence of that text in the
+                    // buffer, which can sit inside a different earlier line.
                     let search = |s: &str| -> Option<(bool, usize)> {
-                        for line in s.lines() {
-                            if line.contains(pattern) {
-                                let failed = line.contains(bad_substring);
-                                let found_at = s.find(line).unwrap_or(0) + line.len();
-                                return Some((!failed, found_at));
+                        let mut cursor = 0usize;
+                        for segment in s.split_inclusive('\n') {
+                            let segment_end = cursor + segment.len();
+                            if segment.ends_with('\n') {
+                                let line = segment.trim_end_matches('\n');
+                                if line.contains(pattern) {
+                                    let failed = line.contains(bad_substring);
+                                    return Some((!failed, segment_end));
+                                }
                             }
+                            cursor = segment_end;
                         }
                         None
                     };

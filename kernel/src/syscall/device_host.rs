@@ -3110,10 +3110,27 @@ pub fn sys_device_pio_read(dev_cap: u32, bar_index: u8, offset: u32, width: u8) 
     }
 
     // ---- Port I/O (privileged; userspace cannot execute in/out) -----------
-    let port = region.port_base().wrapping_add(offset as u16);
-    // SAFETY: We validated capability ownership, BAR type, and offset range
-    // above. Only the owning driver process (ring-3, not ring-0) can reach
-    // this path; the kernel performs the I/O on the driver's behalf.
+    // Defense-in-depth: `validate_pio_access` only checks `offset + width <=
+    // bar_size`; it does not bound the resulting absolute port in the 16-bit
+    // I/O address space. A malformed PIO BAR with `port_base + size > 65536`
+    // could still produce a u16 wrap when added to `offset`, hitting the wrong
+    // I/O ports. Reject both `offset > u16::MAX` and any `port_base + offset
+    // + (width - 1) > u16::MAX` with `-ERANGE`.
+    let offset_u16: u16 = match u16::try_from(offset) {
+        Ok(v) => v,
+        Err(_) => return NEG_ERANGE,
+    };
+    let port = match region.port_base().checked_add(offset_u16) {
+        Some(p) => p,
+        None => return NEG_ERANGE,
+    };
+    if port.checked_add((width - 1) as u16).is_none() {
+        return NEG_ERANGE;
+    }
+    // SAFETY: We validated capability ownership, BAR type, offset range, and
+    // absolute port range above. Only the owning driver process (ring-3, not
+    // ring-0) can reach this path; the kernel performs the I/O on the
+    // driver's behalf.
     let value: u32 = unsafe {
         match width {
             1 => u32::from(x86_64::instructions::port::PortReadOnly::<u8>::new(port).read()),
@@ -3196,10 +3213,24 @@ pub fn sys_device_pio_write(
     }
 
     // ---- Port I/O (privileged; userspace cannot execute in/out) -----------
-    let port = region.port_base().wrapping_add(offset as u16);
-    // SAFETY: We validated capability ownership, BAR type, and offset range
-    // above. Only the owning driver process (ring-3, not ring-0) can reach
-    // this path; the kernel performs the I/O on the driver's behalf.
+    // Defense-in-depth: see `sys_device_pio_read` for the rationale. Reject
+    // offsets that don't fit in u16 and absolute ports that wrap the 16-bit
+    // I/O address space with `-ERANGE` before issuing the `out` instruction.
+    let offset_u16: u16 = match u16::try_from(offset) {
+        Ok(v) => v,
+        Err(_) => return NEG_ERANGE,
+    };
+    let port = match region.port_base().checked_add(offset_u16) {
+        Some(p) => p,
+        None => return NEG_ERANGE,
+    };
+    if port.checked_add((width - 1) as u16).is_none() {
+        return NEG_ERANGE;
+    }
+    // SAFETY: We validated capability ownership, BAR type, offset range, and
+    // absolute port range above. Only the owning driver process (ring-3, not
+    // ring-0) can reach this path; the kernel performs the I/O on the
+    // driver's behalf.
     unsafe {
         match width {
             1 => x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(value as u8),
