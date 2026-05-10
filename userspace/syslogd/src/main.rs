@@ -41,9 +41,13 @@ fn program_main(_args: &[&str]) -> i32 {
     // arrives. Without this, a busy fork-bomb workload can starve us
     // long enough that smoke-runner's `wait_for_file_contains` timeout
     // (15 s) elapses before we even read the marker off `/dev/log`.
-    // Priority 5 is mid-real-time — well above any user task without
-    // crowding the BSP idle (priority 30) or other RT services.
-    // Negative `nice` values are root-only; syslogd runs as root.
+    //
+    // m3OS priority is inverse: 0 = highest, 30 = lowest (BSP idle).
+    // `nice(-15)` from the default 20 lands at priority 5 — mid
+    // real-time, leaving headroom (0..=4) for any harder-RT services.
+    // Reaching the RT band (0..=9) requires root: `sys_nice` clamps
+    // non-root callers up to 10. syslogd runs as root, so the result
+    // is the requested 5.
     let _ = syscall_lib::nice(-15);
 
     // Ensure /var/log exists.

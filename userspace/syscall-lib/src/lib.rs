@@ -1106,6 +1106,7 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
 // fcntl constants
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_FSYNC: u64 = 74;
+pub const SYS_NICE: u64 = 34;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
 pub const O_NONBLOCK: u64 = 0x800;
@@ -1350,12 +1351,14 @@ pub fn fsync(fd: i32) -> isize {
 /// Adjust the calling task's scheduler priority by `increment`.
 ///
 /// Negative values raise priority (Linux convention). The kernel clamps
-/// the result into `0..=30` and rejects real-time priorities (`< 10`)
-/// for non-root callers. Returns the new priority on success, or a
-/// negative value on failure. Useful for system services that need to
-/// preempt regular tasks (syslogd, schedulers, watchdogs).
+/// the result into `0..=30`; non-root callers that would land in the
+/// real-time band (`0..=9`) are silently clamped up to priority 10
+/// instead of being rejected with an error. Returns the new priority
+/// on success, or a negative value on failure. Useful for system
+/// services that need to preempt regular tasks (syslogd, schedulers,
+/// watchdogs).
 pub fn nice(increment: i32) -> isize {
-    unsafe { syscall1(34, increment as u64) as isize }
+    unsafe { syscall1(SYS_NICE, increment as u64) as isize }
 }
 
 // ===========================================================================
