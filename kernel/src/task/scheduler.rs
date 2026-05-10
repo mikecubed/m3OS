@@ -889,8 +889,20 @@ impl Scheduler {
                         self.tasks[idx].pid,
                         self.tasks[idx].name
                     );
-                    // TODO(57a-C/D): route through pi_lock + with_block_state
+                    // NOTE: Phase 62 Track B — Shape β
+                    // (with_block_state_locked_scheduler).
+                    // Structural safety: the task is being removed from the
+                    // run queue in the same SCHEDULER critical section
+                    // (`q.remove(i)` two lines below). The only competing
+                    // pi_lock acquirer (`wake_task_v2`) CASes `Blocked* →
+                    // Ready` and never `Ready → Dead`, so it cannot race
+                    // this canonical write.
+                    self.tasks[idx].with_block_state_locked_scheduler(|bs| {
+                        bs.state = TaskState::Dead;
+                        bs.wake_deadline = None;
+                    });
                     self.tasks[idx].state = TaskState::Dead;
+                    self.tasks[idx].wake_deadline = None;
                     q.remove(i);
                     continue;
                 }
@@ -4105,7 +4117,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
     let mut sched = scheduler_lock();
     while sched.tasks.len() <= idx {
         let mut filler = Task::new(test_task_entry, "test-filler");
-        // TODO(57a-C/D): route through pi_lock + with_block_state
+        // NOTE: Phase 62 Track B — Shape β
+        // (with_block_state_locked_scheduler).
+        // Structural safety: `filler` is freshly constructed and has not
+        // yet been pushed into `sched.tasks`; no other CPU can observe it,
+        // so the pi_lock acquire is uncontended.
+        filler.with_block_state_locked_scheduler(|bs| {
+            bs.state = TaskState::Dead;
+        });
         filler.state = TaskState::Dead;
         sched
             .tasks
@@ -4117,7 +4136,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
 
     let mut task = Task::new(test_task_entry, "test-cleanup");
     task.id = task_id;
-    // TODO(57a-C/D): route through pi_lock + with_block_state
+    // NOTE: Phase 62 Track B — Shape β (with_block_state_locked_scheduler).
+    // Structural safety: `task` is a freshly-constructed local that is about
+    // to overwrite `*sched.tasks[idx]` under SCHEDULER. No live wake path
+    // targets the local `task` value before the in-place mutation publishes
+    // it; the slot's previous occupant's pi_lock is independent.
+    task.with_block_state_locked_scheduler(|bs| {
+        bs.state = TaskState::Ready;
+    });
     task.state = TaskState::Ready;
     // In-place mutation matches `alloc_task_slot`: the `Box` heap address is
     // preserved across overwrite so any raw pointer captured into the prior
@@ -4316,8 +4342,23 @@ pub fn run() -> ! {
                 if stale_ticks >= 50 && !is_idle {
                     stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
                 }
-                // TODO(57a-C/D): route through pi_lock + with_block_state
+                // NOTE: Phase 62 Track B — Shape β
+                // (with_block_state_locked_scheduler).
+                // Structural safety: at dispatch time IRQs are disabled and
+                // SCHEDULER is held. The only competing pi_lock acquirer is
+                // `wake_task_v2`, whose CAS only ever transitions
+                // `Blocked* → Ready` — it never targets `Ready → Running` or
+                // `idle → Running`, so it cannot race this canonical write.
+                // The pi_lock acquire here serializes the canonical state
+                // mirror against `wake_task_v2`'s CAS so any concurrent
+                // wake observes the publish-order before this dispatch
+                // commits.
+                task.with_block_state_locked_scheduler(|bs| {
+                    bs.state = TaskState::Running;
+                    bs.wake_deadline = None;
+                });
                 task.state = TaskState::Running;
+                task.wake_deadline = None;
                 task.start_tick = now;
                 debug_assert!(
                     task.state == TaskState::Running,
