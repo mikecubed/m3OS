@@ -244,6 +244,20 @@ The rewrite is split across nine tracks. Tracks A and B are the foundation (must
 - TDD: every code change has a corresponding test that was added before the implementation. PR commit history shows test-first ordering.
 - SOLID, DRY, documented invariants, lock-ordering, migration safety, observability — see Engineering Practice Requirements above.
 
+### Phase 62 closure
+
+Tracks C (pi_lock routing of the four `TODO(57a-C/D)` sites in
+`kernel/src/task/scheduler.rs`) and D (Option-B/C guard fix for every
+`block_current_until` callsite that holds an `IrqSafeMutex` guard) were
+left at a time-budget boundary in this phase and are closed by Phase 62
+— see [`docs/roadmap/62-phase-57a-pi-lock-closeout.md`](./62-phase-57a-pi-lock-closeout.md)
+and [`docs/handoffs/62a-pi-lock-inventory.md`](../handoffs/62a-pi-lock-inventory.md).
+Phase 62 introduces a `Task::with_block_state_locked_scheduler` helper
+for the four sites that already hold `scheduler_lock()` (Shape β) and
+records that the kernel-wide `block_current_until` audit returned zero
+LEAK verdicts (the FS-volume mutex type swap from `IrqSafeMutex` to
+`spin::Mutex` had already closed the dominant Bug #9 contributor).
+
 ## Companion Task List
 
 - [Phase 57a Task List](./tasks/57a-scheduler-rewrite-tasks.md)

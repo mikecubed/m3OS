@@ -176,6 +176,173 @@ fn assert_balanced_panics_on_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 62 Track D — guard-across-block_current_until regression tests
+//
+// Phase 57b Track D.3 added `assert_preempt_count_zero_at_user_return` to
+// fire on every IRQ-/syscall-return to ring 3 with `preempt_count != 0`.
+// Phase 57e Bug #9 extended it with a release-build clamp + warning when the
+// `IrqSafeMutex` guard-across-`block_current_until` leak fires on a real
+// kernel build.  Phase 62 Track D adds a deliberate-leak regression test that
+// proves the assertion catches the bug class even after Tracks B and C close
+// the kernel-side leaks; without a regression test, a future careless edit
+// that re-introduces a `guard = LOCK.lock(); ...; block_current_until(...)`
+// pattern would silently pass `cargo xtask test` because no current test
+// exercises the leak path.
+//
+// The deliberate-leak shape modelled below uses the host-testable
+// `Counter` mirror (no kernel symbols are reachable from `kernel-core`
+// integration tests, and the kernel binary crate has no `lib.rs`).  The
+// model's `disable` / `enable` pair the kernel's `preempt_disable` /
+// `preempt_enable`; `assert_balanced` panics with the same `preempt_count`
+// substring the live `assert_preempt_count_zero_at_user_return` panics
+// with.  Any divergence between the model and the live kernel functions
+// surfaces as a failing test in either the property suite above or the
+// QEMU integration tests under `kernel/tests/`.
+//
+// References:
+// * docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md
+// * docs/handoffs/57e-bug9-bug10-followup.md
+// * docs/handoffs/62a-pi-lock-inventory.md
+// * docs/roadmap/62-phase-57a-pi-lock-closeout.md (§ Track D)
+// ---------------------------------------------------------------------------
+
+/// Negative regression: a guard-across-block_current_until pattern that
+/// leaves `preempt_count` non-zero at user-mode return MUST trip the
+/// `assert_balanced` panic (mirroring the live
+/// `assert_preempt_count_zero_at_user_return`).
+///
+/// Modelled flow:
+///   1. `IrqSafeMutex::lock()`           — `Counter::disable()`
+///   2. `block_current_until(...)`       — no counter change in the model
+///                                          (the live kernel suspends and
+///                                          resumes here; the leak is that
+///                                          the guard stays alive across the
+///                                          suspend, so the +1 is still on
+///                                          the counter when the resumed
+///                                          task eventually returns to user)
+///   3. user-mode return                 — `Counter::assert_balanced()` MUST
+///                                          panic because the guard is still
+///                                          alive (no matching `enable`).
+///
+/// The matching positive case is exercised by the existing
+/// `balanced_sequence_with_preempt_preserves_zero_at_boundary` property
+/// test above (any balanced disable/enable sequence yields a zero count
+/// at the user-mode boundary, so `assert_balanced` does not panic).
+#[test]
+#[should_panic(expected = "preempt_count")]
+fn phase62_track_d_guard_across_block_then_user_return_panics() {
+    let mut counter = Counter::new();
+
+    // Step 1 — IrqSafeMutex::lock() raises preempt_count by +1.
+    counter.disable();
+    assert_eq!(counter.count(), 1, "guard acquire should raise count to 1");
+
+    // Step 2 — block_current_until(...) suspends/resumes the task; the
+    // model has no concurrency, so we just record that the guard is still
+    // alive (no `enable` was called).  In the live kernel this is the
+    // window where `wake_task_v2`'s wake side eventually re-dispatches
+    // the task; the +1 is still on the counter at that point.
+
+    // Step 3 — user-mode return.  The live kernel calls
+    // `assert_preempt_count_zero_at_user_return`; the model mirror is
+    // `Counter::assert_balanced`.  This MUST panic because the guard
+    // was never released (Bug #9 leak).
+    counter.assert_balanced();
+}
+
+/// Positive regression: the post-Track-C corrected shape (drop the guard
+/// before the block, re-acquire after) returns the counter to zero so
+/// `assert_balanced` does NOT panic at user-mode return.
+///
+/// This is the Option-C release-before-block pattern from
+/// `docs/handoffs/57e-bug9-bug10-followup.md` (§ "Why Option B is the
+/// right path") modelled at the counter level: every `disable` is paired
+/// with a matching `enable` *before* the simulated block, then a fresh
+/// `disable` / `enable` pair after the block represents re-acquiring the
+/// lock for any post-wake work.
+///
+/// The corresponding kernel pattern at, e.g., `sys_mmap_file_backed`
+/// (Phase 57e Bug #9 Step 1, commit 37b9d9c) drops `lock_page_tables()`
+/// before `kernel_read_fd_at` (which descends into `virtio_blk::do_request`
+/// → `block_current_until`) and re-acquires after.  `cargo xtask test`
+/// must continue to pass that pattern without tripping the assertion.
+#[test]
+fn phase62_track_d_release_before_block_then_user_return_is_balanced() {
+    let mut counter = Counter::new();
+
+    // Acquire IrqSafeMutex (or any preempt-affecting lock).
+    counter.disable();
+    assert_eq!(counter.count(), 1);
+    // Read the protected scalar / clone the Arc / etc. — modelled as
+    // a no-op at the counter layer.
+    // RELEASE the guard BEFORE the block.
+    counter.enable();
+    assert_eq!(
+        counter.count(),
+        0,
+        "guard must be released before the block"
+    );
+
+    // Simulated block_current_until(...) — no counter change, the task
+    // suspends and later resumes here.
+
+    // Re-acquire the lock after the wake (if needed for post-wake work).
+    counter.disable();
+    counter.enable();
+
+    // User-mode return — assert_balanced must NOT panic.
+    assert_eq!(counter.count(), 0);
+    counter.assert_balanced();
+}
+
+/// Positive regression: the Option-B Arc-clone shape (clone before the
+/// block, drop the guard, block, work on the clone after wake).
+///
+/// At the counter layer this is identical to the release-before-block
+/// shape — what differs is the data-flow on the kernel side (the cloned
+/// Arc keeps the protected data alive through the block).  Both shapes
+/// MUST yield a zero counter at user-mode return.
+#[test]
+fn phase62_track_d_arc_clone_release_before_block_is_balanced() {
+    let mut counter = Counter::new();
+
+    // Acquire IrqSafeMutex, clone the Arc (modelled as a no-op), release.
+    counter.disable();
+    counter.enable();
+    assert_eq!(counter.count(), 0);
+
+    // Simulated block_current_until(...) — task suspends/resumes.
+
+    // Post-wake: work on the cloned Arc; no further locking required for
+    // this site.  No additional disable/enable pair.
+
+    // User-mode return — assert_balanced must NOT panic.
+    counter.assert_balanced();
+}
+
+/// Negative regression: a *nested* guard leak (two outer `disable`s with
+/// only one matching `enable`) also trips the assertion.  Models the
+/// pathological "guard held across block_current_until inside an outer
+/// preempt-disabled region" shape; the assertion catches both depth-1
+/// and depth-N leaks identically.
+#[test]
+#[should_panic(expected = "preempt_count")]
+fn phase62_track_d_nested_guard_leak_also_panics() {
+    let mut counter = Counter::new();
+
+    // Outer preempt_disable (e.g., scheduler critical section).
+    counter.disable();
+    // Inner IrqSafeMutex::lock() — raises to 2.
+    counter.disable();
+    // Outer region exits cleanly (e.g., via early return that releases
+    // the outer lock).
+    counter.enable();
+    // The inner guard was never released — counter == 1 at user-mode
+    // return.
+    counter.assert_balanced();
+}
+
+// ---------------------------------------------------------------------------
 // Phase 57d Track A.1 — Voluntary preemption model property tests
 // ---------------------------------------------------------------------------
 

@@ -804,6 +804,66 @@ impl Task {
         let mut guard = self.pi_lock.lock();
         f(&mut guard)
     }
+
+    /// Like [`Task::with_block_state`], but for sites that already hold
+    /// `scheduler_lock()` (the inner lock) and need to acquire `pi_lock`
+    /// (the outer lock) for an atomic state mutation.
+    ///
+    /// Per the canonical Linux `p->pi_lock` → `rq->lock` ordering, acquiring
+    /// `pi_lock` while the run-queue lock is held inverts the lock order and
+    /// is normally a deadlock risk. This helper is reserved for sites where
+    /// a **structural-safety argument** rules out concurrent waker contention:
+    ///
+    /// - The task being mutated is not visible from another CPU (test setup,
+    ///   freshly-constructed tasks before `push`), or
+    /// - The mutation runs under IRQ-disabled `scheduler_lock` and the
+    ///   competing waker class (`wake_task_v2`'s `Blocked* → Ready` CAS)
+    ///   cannot target the state being written here (`Ready → Dead` queue-scan
+    ///   cleanup, or `Ready`/idle `→ Running` dispatch publish).
+    ///
+    /// Each call site MUST carry an inline `// NOTE:` comment explaining
+    /// which structural-safety argument applies. See
+    /// `docs/handoffs/62a-pi-lock-inventory.md` for the per-site reasoning
+    /// at the four Phase 57a Tracks C/D closure sites this helper unblocks.
+    ///
+    /// # Lock ordering
+    ///
+    /// Unlike [`Task::with_block_state`] (which debug-asserts that
+    /// `scheduler_lock` is *unheld*), this helper debug-asserts the
+    /// **inverse** invariant — that `scheduler_lock` *is* held by this CPU
+    /// — so misuse outside the documented exception sites is caught in
+    /// debug builds. The visibility is also narrowed to `pub(crate)` so
+    /// only kernel-internal code (the four scheduler sites listed above)
+    /// can reach this exception path.
+    #[inline]
+    pub(crate) fn with_block_state_locked_scheduler<R>(
+        &self,
+        f: impl FnOnce(&mut TaskBlockState) -> R,
+    ) -> R {
+        // Phase 62 (PR #146 review fix): inverse of `with_block_state`'s
+        // assertion. `with_block_state` panics if `scheduler_lock` IS held;
+        // this helper panics if it is NOT held — confirming the caller is at
+        // a documented exception site (one of the four `// NOTE: Phase 62
+        // Track B` sites in `kernel/src/task/scheduler.rs`) and not using
+        // this as a drop-in for `with_block_state`. Mirrors the lenient
+        // `unwrap_or(true)` pattern: if per-CPU data isn't yet available
+        // (very-early-boot), defer to the caller's correctness — the four
+        // documented sites all run after per-core init, so this branch
+        // should never fire there.
+        debug_assert!(
+            crate::smp::try_per_core()
+                .map(|c| c
+                    .holds_scheduler_lock
+                    .load(core::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(true),
+            "with_block_state_locked_scheduler called without SCHEDULER.lock \
+             held — this helper is the documented lock-order exception path \
+             for sites that already hold scheduler_lock(); use \
+             Task::with_block_state instead"
+        );
+        let mut guard = self.pi_lock.lock();
+        f(&mut guard)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -889,8 +889,20 @@ impl Scheduler {
                         self.tasks[idx].pid,
                         self.tasks[idx].name
                     );
-                    // TODO(57a-C/D): route through pi_lock + with_block_state
+                    // NOTE: Phase 62 Track B — Shape β
+                    // (with_block_state_locked_scheduler).
+                    // Structural safety: the task is being removed from the
+                    // run queue in the same SCHEDULER critical section
+                    // (`q.remove(i)` two lines below). The only competing
+                    // pi_lock acquirer (`wake_task_v2`) CASes `Blocked* →
+                    // Ready` and never `Ready → Dead`, so it cannot race
+                    // this canonical write.
+                    self.tasks[idx].with_block_state_locked_scheduler(|bs| {
+                        bs.state = TaskState::Dead;
+                        bs.wake_deadline = None;
+                    });
                     self.tasks[idx].state = TaskState::Dead;
+                    self.tasks[idx].wake_deadline = None;
                     q.remove(i);
                     continue;
                 }
@@ -3736,14 +3748,20 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     let post_lock = {
         let pi_lock_ref = unsafe { &*pi_lock_ptr };
         let mut guard = pi_lock_ref.lock();
-        let mut sched = scheduler_lock();
 
-        // Identity revalidation — slot may have been recycled.
-        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
-            return WakeOutcome::AlreadyAwake;
-        }
-
-        // CAS check (canonical state).
+        // Phase 62 (PR #146 review fix): the AlreadyAwake fast path must NOT
+        // acquire `scheduler_lock` while holding `pi_lock`. The four
+        // `with_block_state_locked_scheduler` sites in this file hold
+        // `scheduler_lock` and need this task's `pi_lock`; if we acquired
+        // `pi_lock` here and then waited on `scheduler_lock`, we would form an
+        // ABBA deadlock against those sites whenever a speculative wake
+        // (e.g. `serial::wake_feeder_task` from the COM1 RX ISR) targets a
+        // task that is currently `Ready` or `Running`. Check state under
+        // `pi_lock` alone and early-return without taking `scheduler_lock`.
+        // (`pi_lock` protects `state`, so this check is consistent without
+        // `scheduler_lock`. If the slot was recycled between step 1 and now,
+        // the recycled task's state is unrelated to `id` and AlreadyAwake is
+        // the correct response either way.)
         let prev_state_u8 = guard.state as u8;
         if !matches!(
             guard.state,
@@ -3757,6 +3775,31 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         ) {
             return WakeOutcome::AlreadyAwake;
         }
+
+        let mut sched = scheduler_lock();
+
+        // Identity revalidation — slot may have been recycled.
+        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
+            return WakeOutcome::AlreadyAwake;
+        }
+
+        // Re-check state after taking `scheduler_lock`: another wake_task_v2
+        // racer cannot have changed `guard.state` (we still hold `pi_lock`),
+        // but the slot identity check above may have rejected the original
+        // task; a recycled task's `state` is now stale relative to `id`.
+        debug_assert!(
+            matches!(
+                guard.state,
+                TaskState::BlockedOnRecv
+                    | TaskState::BlockedOnSend
+                    | TaskState::BlockedOnReply
+                    | TaskState::BlockedOnNotif
+                    | TaskState::BlockedOnFutex
+                    | TaskState::BlockedOnWait
+                    | TaskState::BlockedOnService
+            ),
+            "wake_task_v2: state changed under held pi_lock — invariant broken"
+        );
 
         // Atomic canonical + scheduler-visible writes.
         guard.state = TaskState::Ready;
@@ -4105,7 +4148,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
     let mut sched = scheduler_lock();
     while sched.tasks.len() <= idx {
         let mut filler = Task::new(test_task_entry, "test-filler");
-        // TODO(57a-C/D): route through pi_lock + with_block_state
+        // NOTE: Phase 62 Track B — Shape β
+        // (with_block_state_locked_scheduler).
+        // Structural safety: `filler` is freshly constructed and has not
+        // yet been pushed into `sched.tasks`; no other CPU can observe it,
+        // so the pi_lock acquire is uncontended.
+        filler.with_block_state_locked_scheduler(|bs| {
+            bs.state = TaskState::Dead;
+        });
         filler.state = TaskState::Dead;
         sched
             .tasks
@@ -4117,7 +4167,14 @@ pub(crate) fn install_test_task_idx(task_id: TaskId, idx: usize) {
 
     let mut task = Task::new(test_task_entry, "test-cleanup");
     task.id = task_id;
-    // TODO(57a-C/D): route through pi_lock + with_block_state
+    // NOTE: Phase 62 Track B — Shape β (with_block_state_locked_scheduler).
+    // Structural safety: `task` is a freshly-constructed local that is about
+    // to overwrite `*sched.tasks[idx]` under SCHEDULER. No live wake path
+    // targets the local `task` value before the in-place mutation publishes
+    // it; the slot's previous occupant's pi_lock is independent.
+    task.with_block_state_locked_scheduler(|bs| {
+        bs.state = TaskState::Ready;
+    });
     task.state = TaskState::Ready;
     // In-place mutation matches `alloc_task_slot`: the `Box` heap address is
     // preserved across overwrite so any raw pointer captured into the prior
@@ -4316,8 +4373,23 @@ pub fn run() -> ! {
                 if stale_ticks >= 50 && !is_idle {
                     stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
                 }
-                // TODO(57a-C/D): route through pi_lock + with_block_state
+                // NOTE: Phase 62 Track B — Shape β
+                // (with_block_state_locked_scheduler).
+                // Structural safety: at dispatch time IRQs are disabled and
+                // SCHEDULER is held. The only competing pi_lock acquirer is
+                // `wake_task_v2`, whose CAS only ever transitions
+                // `Blocked* → Ready` — it never targets `Ready → Running` or
+                // `idle → Running`, so it cannot race this canonical write.
+                // The pi_lock acquire here serializes the canonical state
+                // mirror against `wake_task_v2`'s CAS so any concurrent
+                // wake observes the publish-order before this dispatch
+                // commits.
+                task.with_block_state_locked_scheduler(|bs| {
+                    bs.state = TaskState::Running;
+                    bs.wake_deadline = None;
+                });
                 task.state = TaskState::Running;
+                task.wake_deadline = None;
                 task.start_tick = now;
                 debug_assert!(
                     task.state == TaskState::Running,
