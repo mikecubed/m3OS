@@ -1,6 +1,6 @@
 # Phase 57b — Preemption Foundation
 
-**Status:** Complete (post-merge soak tracked as a Phase 59 Track G item)
+**Status:** Complete (30-minute soak pending — to be run as Phase 62 Track E.2 / Phase 59 Track G; result will populate `docs/handoffs/57b-soak-gate.md`)
 **Source Ref:** phase-57b
 **Depends on:** Phase 4 (Tasking) ✅, Phase 25 (SMP) ✅, Phase 35 (True SMP) ✅, Phase 57a (Scheduler Block/Wake Protocol Rewrite) ✅
 **Builds on:** Extends the Phase 4 `switch_context` contract with a separate full-register-save path used only by preemption. Adds per-task preempt-discipline counters that wrap every existing `IrqSafeMutex` callsite from Phases 4–57a.
@@ -205,6 +205,12 @@ The top-of-file doc block (currently documenting the `pi_lock`/`SCHEDULER.lock` 
 - **Reuses Phase 25 / 35 (SMP)** `PerCoreData` for the existing `reschedule` flag (consumed by 57d) and the `holds_scheduler_lock` sentinel from 57a.
 - **Reuses Phase 57a's `IrqSafeMutex`** as the single integration point for the spinlock-raises-`preempt_count` discipline.  Every callsite that already migrated to `IrqSafeMutex` in 57a inherits preempt-discipline for free.
 - **Reuses Phase 43c (Regression and Stress)** infrastructure for the soak test that confirms `preempt_count` returns to 0 over a 30-minute load.
+
+### Related Reading
+
+- [`docs/post-mortems/2026-05-07-57e-preempt-full-deferred.md`](../post-mortems/2026-05-07-57e-preempt-full-deferred.md) — full preemption-model history (57c voluntary preempt → 57d planned full preempt → 57e deferred). The Phase 57e post-mortem documents why kernel-mode timer preemption was deferred indefinitely and how that decision down-grades Bug #9 (the `IrqSafeMutex`-guard-across-`block_current_until` leak) from operational severity to a pure logic bug. Read alongside Phase 62's pi-lock closeout for the complete preemption-discipline narrative.
+- [`docs/handoffs/57e-bug9-bug10-followup.md`](../handoffs/57e-bug9-bug10-followup.md) — Bug #9 mechanism, why Option-A type-swap failed in practice, and the Option-B / Option-C fix shapes used when needed (audited zero-LEAK in Phase 62 Track A.2).
+- [`docs/roadmap/62-phase-57a-pi-lock-closeout.md`](./62-phase-57a-pi-lock-closeout.md) — Phase 62 (closes Phase 57a Tracks C/D pi_lock routing + records the Track A.2 zero-LEAK audit + adds the Track D guard-leak regression test that proves `assert_preempt_count_zero_at_user_return` catches a deliberate leak).
 
 ## Implementation Outline
 
