@@ -123,33 +123,15 @@ pub struct Pio<T> {
 impl<T> Pio<T> {
     /// Map PIO BAR `bar_index` of `handle`'s claimed device.
     ///
-    /// Returns a [`Pio<T>`] on success. Unlike [`crate::mmio::Mmio::map`],
-    /// this performs no address-space modification — the kernel records the
-    /// BAR index alongside the device cap and validates it on every
-    /// subsequent syscall. The function probes the BAR by issuing a zero-
-    /// width validation read (width=0 → EINVAL → but verifying ownership)
-    /// is unnecessary; the kernel validates at access time. We just store
-    /// the cap and index.
-    ///
-    /// Fails with [`DriverRuntimeError::Device(DeviceHostError::InvalidBarIndex)`]
-    /// if `bar_index` is out of range for the device.
+    /// Returns a [`Pio<T>`] storing the device-cap handle plus the BAR index.
+    /// No address-space modification is performed — PIO BARs are not mapped
+    /// into the process address space. The kernel validates BAR ownership,
+    /// BAR type (must be PIO), and offset+width bounds on every subsequent
+    /// `sys_device_pio_read`/`sys_device_pio_write` call, so no probe read
+    /// is needed here. Issuing a probe read at construction time is
+    /// explicitly forbidden: some registers are clear-on-read and a probe
+    /// would introduce a side effect that the caller did not request.
     pub fn map(handle: &DeviceHandle, bar_index: u8) -> Result<Self, DriverRuntimeError> {
-        // Validate that the handle is a real capability by performing
-        // a probe read (u8 read at offset 0). If the BAR is not PIO
-        // or is out of range, the kernel returns an error. If the BAR
-        // is valid, we discard the probe value and return the wrapper.
-        //
-        // SAFETY: raw_sys_device_pio_read is a syscall — arguments are
-        // plain integers, return is an isize.
-        let probe = unsafe { raw_sys_device_pio_read(handle.cap(), bar_index, 0, 1) };
-        // The probe can succeed (≥ 0) or fail:
-        // - Success: BAR is accessible.
-        // - -ENOSYS (host/test stub): return a dummy wrapper for compilation.
-        // - Other negative: propagate as an error.
-        if probe < 0 && probe != -38 {
-            // -38 is ENOSYS — the stub path; all other negatives are real errors.
-            return Err(crate::syscall_backend::decode_errno_common(probe as i32));
-        }
         Ok(Self {
             device_cap: handle.cap(),
             bar_index,
@@ -279,15 +261,15 @@ impl kernel_core::driver_runtime::contract::PioContract for SyscallBackend {
         window.read_u32(offset)
     }
 
-    fn write_u8(&self, window: &Self::PioWindow, offset: usize, value: u8) {
+    fn write_u8(&mut self, window: &Self::PioWindow, offset: usize, value: u8) {
         window.write_u8(offset, value);
     }
 
-    fn write_u16(&self, window: &Self::PioWindow, offset: usize, value: u16) {
+    fn write_u16(&mut self, window: &Self::PioWindow, offset: usize, value: u16) {
         window.write_u16(offset, value);
     }
 
-    fn write_u32(&self, window: &Self::PioWindow, offset: usize, value: u32) {
+    fn write_u32(&mut self, window: &Self::PioWindow, offset: usize, value: u32) {
         window.write_u32(offset, value);
     }
 }
@@ -305,17 +287,15 @@ mod tests {
 
     use super::*;
 
-    use core::cell::RefCell;
-
     /// Minimal in-process PIO double: stores (offset, value, width) tuples for
     /// write assertions and a byte-buffer for read-back.
     ///
-    /// Uses `RefCell` for interior mutability so `write_u*` can mutate state
-    /// through `&self` without undefined behaviour.
+    /// `write_u*` now takes `&mut self` (matching `PioContract`), so direct
+    /// field mutation replaces the `RefCell` interior-mutability workaround.
     struct MockPioBackend {
-        data: RefCell<[u8; 256]>,
+        data: [u8; 256],
         /// Accumulated writes — (offset, value, width) for assertion.
-        writes: RefCell<Vec<(usize, u32, u8)>>,
+        writes: Vec<(usize, u32, u8)>,
     }
 
     /// Opaque PIO window handle for MockPioBackend — holds only the bar index.
@@ -326,13 +306,13 @@ mod tests {
     impl MockPioBackend {
         fn new() -> Self {
             Self {
-                data: RefCell::new([0u8; 256]),
-                writes: RefCell::new(Vec::new()),
+                data: [0u8; 256],
+                writes: Vec::new(),
             }
         }
 
         fn writes_snapshot(&self) -> Vec<(usize, u32, u8)> {
-            self.writes.borrow().clone()
+            self.writes.clone()
         }
     }
 
@@ -365,47 +345,41 @@ mod tests {
         }
 
         fn read_u8(&self, _window: &Self::PioWindow, offset: usize) -> u8 {
-            self.data.borrow()[offset]
+            self.data[offset]
         }
 
         fn read_u16(&self, _window: &Self::PioWindow, offset: usize) -> u16 {
-            let data = self.data.borrow();
-            u16::from_le_bytes([data[offset], data[offset + 1]])
+            u16::from_le_bytes([self.data[offset], self.data[offset + 1]])
         }
 
         fn read_u32(&self, _window: &Self::PioWindow, offset: usize) -> u32 {
-            let data = self.data.borrow();
             u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
+                self.data[offset],
+                self.data[offset + 1],
+                self.data[offset + 2],
+                self.data[offset + 3],
             ])
         }
 
-        fn write_u8(&self, _window: &Self::PioWindow, offset: usize, value: u8) {
-            self.data.borrow_mut()[offset] = value;
-            self.writes.borrow_mut().push((offset, u32::from(value), 1));
+        fn write_u8(&mut self, _window: &Self::PioWindow, offset: usize, value: u8) {
+            self.data[offset] = value;
+            self.writes.push((offset, u32::from(value), 1));
         }
 
-        fn write_u16(&self, _window: &Self::PioWindow, offset: usize, value: u16) {
+        fn write_u16(&mut self, _window: &Self::PioWindow, offset: usize, value: u16) {
             let bytes = value.to_le_bytes();
-            let mut data = self.data.borrow_mut();
-            data[offset] = bytes[0];
-            data[offset + 1] = bytes[1];
-            drop(data);
-            self.writes.borrow_mut().push((offset, u32::from(value), 2));
+            self.data[offset] = bytes[0];
+            self.data[offset + 1] = bytes[1];
+            self.writes.push((offset, u32::from(value), 2));
         }
 
-        fn write_u32(&self, _window: &Self::PioWindow, offset: usize, value: u32) {
+        fn write_u32(&mut self, _window: &Self::PioWindow, offset: usize, value: u32) {
             let bytes = value.to_le_bytes();
-            let mut data = self.data.borrow_mut();
-            data[offset] = bytes[0];
-            data[offset + 1] = bytes[1];
-            data[offset + 2] = bytes[2];
-            data[offset + 3] = bytes[3];
-            drop(data);
-            self.writes.borrow_mut().push((offset, value, 4));
+            self.data[offset] = bytes[0];
+            self.data[offset + 1] = bytes[1];
+            self.data[offset + 2] = bytes[2];
+            self.data[offset + 3] = bytes[3];
+            self.writes.push((offset, value, 4));
         }
     }
 
@@ -427,7 +401,7 @@ mod tests {
         let mut backend = MockPioBackend::new();
         let handle = ();
         let window = <MockPioBackend as PioContract>::map(&mut backend, &handle, 0).unwrap();
-        <MockPioBackend as PioContract>::write_u8(&backend, &window, 0, 0xAB);
+        <MockPioBackend as PioContract>::write_u8(&mut backend, &window, 0, 0xAB);
         let v = <MockPioBackend as PioContract>::read_u8(&backend, &window, 0);
         assert_eq!(v, 0xAB);
     }
@@ -437,7 +411,7 @@ mod tests {
         let mut backend = MockPioBackend::new();
         let handle = ();
         let window = <MockPioBackend as PioContract>::map(&mut backend, &handle, 0).unwrap();
-        <MockPioBackend as PioContract>::write_u16(&backend, &window, 16, 0xBEEF);
+        <MockPioBackend as PioContract>::write_u16(&mut backend, &window, 16, 0xBEEF);
         let v = <MockPioBackend as PioContract>::read_u16(&backend, &window, 16);
         assert_eq!(v, 0xBEEF);
     }
@@ -447,7 +421,7 @@ mod tests {
         let mut backend = MockPioBackend::new();
         let handle = ();
         let window = <MockPioBackend as PioContract>::map(&mut backend, &handle, 0).unwrap();
-        <MockPioBackend as PioContract>::write_u32(&backend, &window, 32, 0xDEAD_BEEF);
+        <MockPioBackend as PioContract>::write_u32(&mut backend, &window, 32, 0xDEAD_BEEF);
         let v = <MockPioBackend as PioContract>::read_u32(&backend, &window, 32);
         assert_eq!(v, 0xDEAD_BEEF);
     }
@@ -457,9 +431,9 @@ mod tests {
         let mut backend = MockPioBackend::new();
         let handle = ();
         let window = <MockPioBackend as PioContract>::map(&mut backend, &handle, 0).unwrap();
-        <MockPioBackend as PioContract>::write_u8(&backend, &window, 0, 0x01);
-        <MockPioBackend as PioContract>::write_u16(&backend, &window, 2, 0x0202);
-        <MockPioBackend as PioContract>::write_u32(&backend, &window, 8, 0x0304_0506);
+        <MockPioBackend as PioContract>::write_u8(&mut backend, &window, 0, 0x01);
+        <MockPioBackend as PioContract>::write_u16(&mut backend, &window, 2, 0x0202);
+        <MockPioBackend as PioContract>::write_u32(&mut backend, &window, 8, 0x0304_0506);
         let writes = backend.writes_snapshot();
         assert_eq!(writes.len(), 3);
         assert_eq!(writes[0], (0, 0x01, 1));

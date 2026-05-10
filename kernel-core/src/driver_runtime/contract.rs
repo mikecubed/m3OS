@@ -404,11 +404,11 @@ pub trait PioContract: DeviceHandleContract {
     fn read_u32(&self, window: &Self::PioWindow, offset: usize) -> u32;
 
     /// 8-bit register write at `offset` within the window.
-    fn write_u8(&self, window: &Self::PioWindow, offset: usize, value: u8);
+    fn write_u8(&mut self, window: &Self::PioWindow, offset: usize, value: u8);
     /// 16-bit register write at `offset` within the window.
-    fn write_u16(&self, window: &Self::PioWindow, offset: usize, value: u16);
+    fn write_u16(&mut self, window: &Self::PioWindow, offset: usize, value: u16);
     /// 32-bit register write at `offset` within the window.
-    fn write_u32(&self, window: &Self::PioWindow, offset: usize, value: u32);
+    fn write_u32(&mut self, window: &Self::PioWindow, offset: usize, value: u32);
 }
 
 #[cfg(test)]
