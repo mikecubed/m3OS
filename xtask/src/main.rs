@@ -16,6 +16,24 @@ const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`."
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
 const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04";
 
+/// Userspace `#![no_std]` crates whose `[cfg(test)]` modules can build and run
+/// on the host (`x86_64-unknown-linux-gnu`) target. `xtask check` runs each of
+/// them so a regression in any one blocks merges the same way kernel-core,
+/// passwd, and driver_runtime do today.
+///
+/// `term` builds via its `[lib]` target — the binary is `#![no_main]` and
+/// cannot link on the host, so `--lib` is required to skip the bin.
+///
+/// Each entry is `(package, extra cargo args)`. `passwd` is intentionally not
+/// listed here; it needs `--no-default-features --features host-tests --test
+/// passwd_host` and remains in its dedicated block above.
+const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
+    ("audio_client", &[]),
+    ("surface_buffer", &[]),
+    ("crypto-lib", &[]),
+    ("term", &["--lib"]),
+];
+
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
 ///
 /// Phase 55a Track F.1: the IOMMU-specific device arguments appended
@@ -2749,6 +2767,39 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 63 review-resolution: userspace library host tests previously
+    // ran only on demand. They are now part of `xtask check` so that
+    // breakage in any one of them blocks merges the same way kernel-core
+    // and driver_runtime breakage does. Each entry uses the lib
+    // (`x86_64-unknown-linux-gnu`) target because the production crates
+    // are `#![no_std]` and only the `[cfg(test)]` modules pull in `std`.
+    for (pkg, extra_args) in USERSPACE_LIB_HOST_TEST_PACKAGES {
+        let mut args: Vec<&str> = vec![
+            "test",
+            "--package",
+            pkg,
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ];
+        args.extend_from_slice(extra_args);
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args(&args)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn {pkg} host tests: {e}"));
+        if !status.success() {
+            eprintln!(
+                "{pkg} host tests failed — rerun `cargo test -p {pkg} --target {KERNEL_CORE_HOST_TARGET}{}`",
+                if extra_args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", extra_args.join(" "))
+                }
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -2762,7 +2813,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, and driver_runtime host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, surface_buffer, crypto-lib, and term host tests pass"
     );
 }
 
