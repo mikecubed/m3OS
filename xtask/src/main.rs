@@ -2981,7 +2981,14 @@ struct SmokeTestArgs {
 
 fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     let mut display = false;
-    let mut timeout_secs = 120u64;
+    // Per-attempt budget. Multiplied by 1, 1.5, 2 across the three retries
+    // (so the default 300s yields 300 / 450 / 600s attempts, ~17 minutes
+    // total). Calibrated for slower hosts running the in-guest TCC
+    // compile under TCG; faster hosts (and KVM) usually finish in well
+    // under one attempt's budget. Override with `--timeout <secs>` or
+    // skip the heaviest step entirely with
+    // `M3OS_SMOKE_SKIP_TCC_COMPILE=1`.
+    let mut timeout_secs = 300u64;
     let mut kvm = false;
 
     let mut index = 0;
@@ -5093,6 +5100,18 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     }
 
     eprintln!("smoke-test: FAILED after {MAX_ATTEMPTS} attempts\n{last_err}");
+    // Heuristic: if the final attempt died inside the tcc-compile step the
+    // most likely culprit is in-guest TCC just being too slow for the host's
+    // throughput. Surface the documented escape hatch so the operator does
+    // not have to dig through xtask source to find it.
+    if last_err.contains("SMOKE:tcc-compile") {
+        eprintln!(
+            "\nhint: tcc-compile is the longest step (real cc inside the guest).\n\
+             For slower hosts:\n  \
+               cargo xtask smoke-test --kvm --timeout 600   # bump per-attempt budget to 600/900/1200s\n  \
+               M3OS_SMOKE_SKIP_TCC_COMPILE=1 cargo xtask smoke-test --kvm   # skip the compile (still validates the rest)"
+        );
+    }
     std::process::exit(1);
 }
 
