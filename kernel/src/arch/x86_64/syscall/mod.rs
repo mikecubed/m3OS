@@ -1527,6 +1527,7 @@ mod syscall_nr {
     pub use kernel_core::device_host::syscalls::{
         DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_DMA_ALLOC,
         SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP,
+        SYS_DEVICE_PIO_READ, SYS_DEVICE_PIO_WRITE,
     };
 }
 
@@ -2019,6 +2020,49 @@ pub extern "C" fn syscall_handler(
                     arg0 as u32,
                     arg1 as u32,
                     arg2 as u32,
+                ) as u64
+            }
+        }
+        SYS_DEVICE_PIO_READ => {
+            // Signature (Phase 63 Track Z.2):
+            //   sys_device_pio_read(dev_cap: u32, bar_index: u8, offset: u32, width: u8) -> isize.
+            // dev_cap is u32, bar_index is u8, offset is u32, width is u8.
+            // Reject out-of-range values before truncation.
+            if arg0 > u64::from(u32::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u32::MAX)
+                || per_core_syscall_arg3() > u64::from(u8::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_pio_read(
+                    arg0 as u32,
+                    arg1 as u8,
+                    arg2 as u32,
+                    per_core_syscall_arg3() as u8,
+                ) as u64
+            }
+        }
+        SYS_DEVICE_PIO_WRITE => {
+            // Signature (Phase 63 Track Z.2):
+            //   sys_device_pio_write(dev_cap: u32, bar_index: u8, offset: u32, value: u32, width: u8) -> isize.
+            // dev_cap is u32, bar_index is u8, offset is u32, value is u32, width is u8.
+            // arg0=dev_cap, arg1=bar_index, arg2=offset, arg3=value, arg4(r8)=width.
+            let arg4 = crate::task::current_task_syscall_snapshot().user_r8;
+            if arg0 > u64::from(u32::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u32::MAX)
+                || per_core_syscall_arg3() > u64::from(u32::MAX)
+                || arg4 > u64::from(u8::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_pio_write(
+                    arg0 as u32,
+                    arg1 as u8,
+                    arg2 as u32,
+                    per_core_syscall_arg3() as u32,
+                    arg4 as u8,
                 ) as u64
             }
         }

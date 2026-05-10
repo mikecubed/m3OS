@@ -43,6 +43,25 @@ pub const SYS_DEVICE_DMA_HANDLE_INFO: u64 = 0x1123;
 /// `syscall_numbers_are_pinned_in_the_device_host_block()` below.
 pub const SYS_DEVICE_IRQ_SUBSCRIBE: u64 = 0x1124;
 
+/// Read a value from an I/O-port BAR of a claimed device.
+/// Phase 63 Track Z.1 — `sys_device_pio_read(dev_cap, bar_index, offset, width) -> isize`.
+///
+/// Returns the port value zero-extended into the low bits on success, or a
+/// negative errno. `width` must be 1, 2, or 4; any other value returns
+/// `-EINVAL`. The BAR must be a PIO BAR; MMIO BARs return `-EINVAL`.
+/// `offset + width` must fit within the BAR size; an out-of-range access
+/// returns `-ERANGE`.
+pub const SYS_DEVICE_PIO_READ: u64 = 0x1125;
+
+/// Write a value to an I/O-port BAR of a claimed device.
+/// Phase 63 Track Z.1 — `sys_device_pio_write(dev_cap, bar_index, offset, value, width) -> isize`.
+///
+/// Returns 0 on success, or a negative errno. `width` must be 1, 2, or 4;
+/// any other value returns `-EINVAL`. The BAR must be a PIO BAR; MMIO BARs
+/// return `-EINVAL`. `offset + width` must fit within the BAR size; an
+/// out-of-range access returns `-ERANGE`.
+pub const SYS_DEVICE_PIO_WRITE: u64 = 0x1126;
+
 /// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
 /// to request that the kernel allocate a fresh `Notification` object on the
 /// caller's behalf, rather than binding the IRQ to an existing notification
@@ -62,7 +81,7 @@ pub const DEVICE_HOST_BASE: u64 = SYS_DEVICE_CLAIM;
 ///
 /// Adjust upward when adding new device-host syscalls; the Track B acceptance
 /// items pin this constant as the authoritative upper bound.
-pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_IRQ_SUBSCRIBE;
+pub const DEVICE_HOST_LAST: u64 = SYS_DEVICE_PIO_WRITE;
 
 #[cfg(test)]
 mod tests {
@@ -77,6 +96,9 @@ mod tests {
         assert_eq!(SYS_DEVICE_DMA_ALLOC, 0x1122);
         assert_eq!(SYS_DEVICE_DMA_HANDLE_INFO, 0x1123);
         assert_eq!(SYS_DEVICE_IRQ_SUBSCRIBE, 0x1124);
+        // Phase 63 Track Z.1 — PIO syscalls appended after IRQ_SUBSCRIBE.
+        assert_eq!(SYS_DEVICE_PIO_READ, 0x1125);
+        assert_eq!(SYS_DEVICE_PIO_WRITE, 0x1126);
     }
 
     #[test]
@@ -87,6 +109,8 @@ mod tests {
             SYS_DEVICE_DMA_ALLOC,
             SYS_DEVICE_DMA_HANDLE_INFO,
             SYS_DEVICE_IRQ_SUBSCRIBE,
+            SYS_DEVICE_PIO_READ,
+            SYS_DEVICE_PIO_WRITE,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -105,6 +129,8 @@ mod tests {
             SYS_DEVICE_DMA_ALLOC,
             SYS_DEVICE_DMA_HANDLE_INFO,
             SYS_DEVICE_IRQ_SUBSCRIBE,
+            SYS_DEVICE_PIO_READ,
+            SYS_DEVICE_PIO_WRITE,
         ];
         for n in all {
             assert!(
@@ -112,6 +138,16 @@ mod tests {
                 "syscall {n:#x} outside device-host block"
             );
         }
+    }
+
+    #[test]
+    fn pio_syscalls_follow_irq_subscribe_without_gap() {
+        // Phase 63 Track Z.1 pin: PIO numbers must be contiguous with
+        // IRQ_SUBSCRIBE so the block stays dense per the Phase 55b numbering
+        // discipline.
+        assert_eq!(SYS_DEVICE_PIO_READ, SYS_DEVICE_IRQ_SUBSCRIBE + 1);
+        assert_eq!(SYS_DEVICE_PIO_WRITE, SYS_DEVICE_PIO_READ + 1);
+        assert_eq!(DEVICE_HOST_LAST, SYS_DEVICE_PIO_WRITE);
     }
 
     #[test]

@@ -361,6 +361,56 @@ pub trait IrqNotificationContract: DeviceHandleContract {
     ) -> Result<Self::IrqNotif, DriverRuntimeError>;
 }
 
+// ---------------------------------------------------------------------------
+// PioContract — Phase 63 Track Z.3
+// ---------------------------------------------------------------------------
+
+/// Map and access an I/O-port (PIO) BAR on a claimed device.
+///
+/// AC'97 BARs are I/O-space in real ICH silicon and in QEMU's `-device AC97`
+/// emulation. The PIO variants come in 8-, 16-, and 32-bit widths to match
+/// the natural register widths. Unlike [`MmioContract`], 64-bit accesses are
+/// absent — AC'97 PIO registers are at most 32 bits wide, and `inq`/`outq`
+/// are non-standard.
+///
+/// Observable behavior every implementation satisfies:
+///
+/// - [`PioContract::map`] against a live handle for a PIO BAR returns a
+///   window; `map` against a released handle returns `NotClaimed`; `map`
+///   against an MMIO BAR returns `InvalidBarIndex`.
+/// - Each `write_{u8,u16,u32}` followed by a matching-width read at the same
+///   offset returns the written value (for device-emulated registers that
+///   implement read-back).
+/// - `read_*` and `write_*` do not return a result — they follow port I/O
+///   semantics where an out-of-range port causes a `#GP` at the kernel
+///   privilege level; the wrapper layer validates offsets up front.
+pub trait PioContract: DeviceHandleContract {
+    /// Opaque per-backend PIO window handle.
+    type PioWindow;
+
+    /// Map PIO BAR `bar` for the claimed device `handle`. See trait docs for
+    /// error cases.
+    fn map(
+        &mut self,
+        handle: &Self::Handle,
+        bar: u8,
+    ) -> Result<Self::PioWindow, DriverRuntimeError>;
+
+    /// 8-bit register read at `offset` within the window.
+    fn read_u8(&self, window: &Self::PioWindow, offset: usize) -> u8;
+    /// 16-bit register read at `offset` within the window.
+    fn read_u16(&self, window: &Self::PioWindow, offset: usize) -> u16;
+    /// 32-bit register read at `offset` within the window.
+    fn read_u32(&self, window: &Self::PioWindow, offset: usize) -> u32;
+
+    /// 8-bit register write at `offset` within the window.
+    fn write_u8(&mut self, window: &Self::PioWindow, offset: usize, value: u8);
+    /// 16-bit register write at `offset` within the window.
+    fn write_u16(&mut self, window: &Self::PioWindow, offset: usize, value: u16);
+    /// 32-bit register write at `offset` within the window.
+    fn write_u32(&mut self, window: &Self::PioWindow, offset: usize, value: u32);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

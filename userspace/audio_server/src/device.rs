@@ -673,6 +673,98 @@ pub struct StatsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Ac97PioBus — Phase 63 Track Z.4
+// ---------------------------------------------------------------------------
+
+/// Production [`MmioOps`] adapter that dispatches register accesses to the
+/// two AC'97 PIO BARs via the Phase 63 `sys_device_pio_read` /
+/// `sys_device_pio_write` syscalls.
+///
+/// AC'97 BARs are I/O-space in real ICH silicon and in QEMU's `-device AC97`
+/// emulation — the existing `sys_device_mmio_map` path filters them out.
+/// `Ac97PioBus` holds one [`driver_runtime::Pio<()>`] per BAR and dispatches
+/// each [`MmioOps`] call to the right handle strictly by the `bar` parameter.
+/// No shared state exists between the two handles.
+///
+/// Use [`Ac97PioBus::new`] to construct — it performs both `Pio::map` calls
+/// and returns an error if either fails (e.g. the device is not claimed or
+/// the BAR is not PIO).
+#[cfg(not(test))]
+pub struct Ac97PioBus {
+    /// BAR0 — Native Audio Mixer (NAM) PIO window.
+    nam: driver_runtime::Pio<()>,
+    /// BAR1 — Native Audio Bus Master (NABM) PIO window.
+    nabm: driver_runtime::Pio<()>,
+}
+
+#[cfg(not(test))]
+impl Ac97PioBus {
+    /// Construct an `Ac97PioBus` by mapping both AC'97 PIO BARs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::Internal`] if either [`driver_runtime::Pio::map`]
+    /// call fails (e.g. the device is not claimed, the BAR index is wrong, or
+    /// the BAR is MMIO rather than PIO).
+    pub fn new(device: &driver_runtime::DeviceHandle) -> Result<Self, AudioError> {
+        let nam = driver_runtime::Pio::map(device, BAR_NAM).map_err(|_| AudioError::Internal)?;
+        let nabm = driver_runtime::Pio::map(device, BAR_NABM).map_err(|_| AudioError::Internal)?;
+        Ok(Self { nam, nabm })
+    }
+}
+
+#[cfg(not(test))]
+impl MmioOps for Ac97PioBus {
+    fn read_u8(&self, bar: u8, offset: usize) -> u8 {
+        match bar {
+            BAR_NAM => self.nam.read_u8(offset),
+            BAR_NABM => self.nabm.read_u8(offset),
+            _ => 0,
+        }
+    }
+
+    fn read_u16(&self, bar: u8, offset: usize) -> u16 {
+        match bar {
+            BAR_NAM => self.nam.read_u16(offset),
+            BAR_NABM => self.nabm.read_u16(offset),
+            _ => 0,
+        }
+    }
+
+    fn read_u32(&self, bar: u8, offset: usize) -> u32 {
+        match bar {
+            BAR_NAM => self.nam.read_u32(offset),
+            BAR_NABM => self.nabm.read_u32(offset),
+            _ => 0,
+        }
+    }
+
+    fn write_u8(&self, bar: u8, offset: usize, value: u8) {
+        match bar {
+            BAR_NAM => self.nam.write_u8(offset, value),
+            BAR_NABM => self.nabm.write_u8(offset, value),
+            _ => {}
+        }
+    }
+
+    fn write_u16(&self, bar: u8, offset: usize, value: u16) {
+        match bar {
+            BAR_NAM => self.nam.write_u16(offset, value),
+            BAR_NABM => self.nabm.write_u16(offset, value),
+            _ => {}
+        }
+    }
+
+    fn write_u32(&self, bar: u8, offset: usize, value: u32) {
+        match bar {
+            BAR_NAM => self.nam.write_u32(offset, value),
+            BAR_NABM => self.nabm.write_u32(offset, value),
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — Track D.2 host coverage
 // ---------------------------------------------------------------------------
 
