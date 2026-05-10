@@ -40,9 +40,9 @@ Track A.1 / A.3 / B.1 / B.2 / C.1 / C.2 / G.1 from earlier drafts of this plan a
 | A | Replace `cfg(not(test)) Ac97Backend` stub with real BDL/PCM-ring DMA + register init | Z | Complete |
 | B | `submit_frames` copies into PCM ring, posts BDL entry, advances LVI through PIO | A | Complete |
 | C | QEMU `-audiodev` selection: PulseAudio for `run-gui`, WAV for `audio-smoke` | None | Complete |
-| D | `audio-smoke` asserts `frames_consumed` advance via `GetStats`, plus non-silent WAV | A, B, C | In Progress |
-| E | End-to-end BEL/audio-demo verification against real backend | A, B, C | In Progress |
-| F | Phase 57 design + task doc closure notes | D, E | Planned |
+| D | `audio-smoke` asserts `frames_consumed` advance via `GetStats`, plus non-silent WAV | A, B, C | Complete |
+| E | End-to-end BEL/audio-demo verification against real backend | A, B, C | Complete |
+| F | Phase 57 design + task doc closure notes | D, E | In Progress |
 | H | Phase 63 design + release wiring (kernel version bump, learning doc) | F | Planned |
 
 ---
