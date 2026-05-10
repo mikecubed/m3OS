@@ -27,16 +27,12 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// one and silently drop settings.
 pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
-/// Phase 57 H.5 — verbatim audio command-line surface from the A.1
-/// audio-target memo (`docs/appendix/phase-57-audio-target-choice.md`).
+/// Phase 57 H.5 / Phase 63 C.1 — headless audio flags (no host sink required).
 ///
-/// Headless safety: `-audiodev none,id=snd0` does not bind a host audio
-/// sink, so `cargo xtask run-gui` works in CI environments without
-/// PulseAudio. A developer who wants audible output can override the
-/// backend at runtime via `QEMU_AUDIO_DRV=pa cargo xtask run-gui`
-/// (QEMU env-var precedence rules apply). The `-device AC97,audiodev=snd0`
-/// pair is the chosen first audio target — Intel 82801AA AC'97
-/// (`0x8086:0x2415`).
+/// Used by `cargo xtask run` (headless) and `cargo xtask run-gui --no-audio`.
+/// `-audiodev none,id=snd0` discards every frame so the run never requires
+/// a host PulseAudio daemon — safe for CI environments and developer machines
+/// without audio hardware.
 ///
 /// `addr=0x5` pins the PCI slot to 0:5.0 so the matching `audio_server`
 /// `SENTINEL_BDF` (in `userspace/audio_server/src/lib.rs`) finds the
@@ -44,12 +40,35 @@ pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=o
 /// 5 is the first free slot and the `audio_server` claim path matches
 /// it exactly.
 ///
-/// The constant is referenced from `cmd_run_gui` (default: enabled) and
-/// pinned by xtask unit tests so any future deviation from the memo
-/// surfaces at `cargo test -p xtask` time, not at QEMU launch time.
-pub const AC97_QEMU_AUDIO_FLAGS: &[&str] = &[
+/// Pinned by `ac97_qemu_audio_flags_headless_pinned` xtask unit test.
+pub const AC97_QEMU_AUDIO_FLAGS_HEADLESS: &[&str] = &[
     "-audiodev",
     "none,id=snd0",
+    "-device",
+    "AC97,audiodev=snd0,addr=0x5",
+];
+
+/// Phase 63 C.1 — GUI audio flags: PulseAudio on Linux, `none` elsewhere.
+///
+/// On Linux hosts `cargo xtask run-gui` defaults to `-audiodev pa,id=snd0`
+/// so AC'97 frames are audible through the host PulseAudio daemon.
+/// On non-Linux hosts the backend falls back to `none` and a warning is
+/// printed at launch time (the xtask never fails to launch).
+///
+/// Detection uses `cfg!(target_os = "linux")` (a bool expression) rather than
+/// `#[cfg]` so the constant compiles on every platform — both branches are
+/// always type-checked, keeping cross-compilation for CI safe.
+///
+/// Pinned by `ac97_qemu_audio_flags_gui_pinned` xtask unit test.
+pub const AC97_QEMU_AUDIO_FLAGS_GUI: &[&str] = &[
+    "-audiodev",
+    // cfg!(target_os = "linux") selects "pa,id=snd0" on Linux and
+    // "none,id=snd0" elsewhere; both branches compile on all platforms.
+    if cfg!(target_os = "linux") {
+        "pa,id=snd0"
+    } else {
+        "none,id=snd0"
+    },
     "-device",
     "AC97,audiodev=snd0,addr=0x5",
 ];
@@ -2379,14 +2398,15 @@ fn launch_qemu_with_devices(uefi_image: &Path, display_mode: QemuDisplayMode, de
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
-/// Phase 57 H.5: GUI launcher that optionally appends [`AC97_QEMU_AUDIO_FLAGS`]
-/// for `cargo xtask run-gui` (default: audio enabled, `--no-audio` opts out).
+/// Phase 57 H.5 / Phase 63 C.1: GUI launcher that optionally appends
+/// [`AC97_QEMU_AUDIO_FLAGS_GUI`] for `cargo xtask run-gui` (default: audio
+/// enabled, `--no-audio` opts out).
 ///
-/// The audio flags are appended to the arg list assembled by
-/// [`qemu_run_args_with_devices`]; the existing
-/// `pcspk-audiodev=noaudio` machine option and `-audiodev none,id=noaudio`
-/// PC-speaker binding are preserved verbatim so non-audio runs continue to
-/// match today's behavior byte-for-byte.
+/// With audio enabled the GUI flags select PulseAudio on Linux so frames are
+/// audible; on non-Linux hosts they fall back to `none` with a printed warning.
+/// The existing `pcspk-audiodev=noaudio` machine option and
+/// `-audiodev none,id=noaudio` PC-speaker binding are preserved verbatim
+/// so non-audio runs continue to match today's behavior byte-for-byte.
 fn launch_qemu_with_devices_audio(
     uefi_image: &Path,
     display_mode: QemuDisplayMode,
@@ -2396,7 +2416,7 @@ fn launch_qemu_with_devices_audio(
     let ovmf = find_ovmf();
     let mut args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
     if with_audio {
-        append_ac97_audio_flags(&mut args);
+        append_ac97_audio_flags_gui(&mut args);
     }
 
     if display_mode == QemuDisplayMode::Gui {
@@ -2413,13 +2433,33 @@ fn launch_qemu_with_devices_audio(
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
-/// Append the Phase 57 [`AC97_QEMU_AUDIO_FLAGS`] to a QEMU arg vector.
+/// Append [`AC97_QEMU_AUDIO_FLAGS_HEADLESS`] to a QEMU arg vector.
 ///
-/// Centralised so the production launcher and the xtask unit tests
-/// share one definition — see `run_gui_with_audio_emits_ac97_device_flags`
-/// for the contract assertion.
-fn append_ac97_audio_flags(args: &mut Vec<String>) {
-    args.extend(AC97_QEMU_AUDIO_FLAGS.iter().map(|s| (*s).to_string()));
+/// Used by `audio_smoke_qemu_args` and any headless launcher that needs
+/// the AC'97 device present but discards all audio output.
+fn append_ac97_audio_flags_headless(args: &mut Vec<String>) {
+    args.extend(
+        AC97_QEMU_AUDIO_FLAGS_HEADLESS
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+}
+
+/// Append [`AC97_QEMU_AUDIO_FLAGS_GUI`] to a QEMU arg vector.
+///
+/// On Linux hosts this selects PulseAudio (`pa,id=snd0`) so frames are
+/// audible. On non-Linux hosts the constant already resolves to
+/// `none,id=snd0` (see the `cfg!()` expression inside the const), and a
+/// warning is printed so the developer knows output is muted — the launch
+/// never fails due to a missing audio backend.
+fn append_ac97_audio_flags_gui(args: &mut Vec<String>) {
+    if !cfg!(target_os = "linux") {
+        println!(
+            "audio: PulseAudio is only available on Linux hosts; \
+             falling back to `-audiodev none,id=snd0` (no audible output)"
+        );
+    }
+    args.extend(AC97_QEMU_AUDIO_FLAGS_GUI.iter().map(|s| (*s).to_string()));
 }
 
 #[cfg(test)]
@@ -2456,7 +2496,7 @@ fn qemu_run_gui_args_for_test(
 ) -> Vec<String> {
     let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Gui, devices);
     if with_audio {
-        append_ac97_audio_flags(&mut args);
+        append_ac97_audio_flags_gui(&mut args);
     }
     args
 }
@@ -5665,12 +5705,22 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
     ]
 }
 
-/// Build the QEMU arg vector for the audio smoke. Hostfwd is stripped
-/// the same way `cmd_device_smoke` strips it so parallel CI lanes do
-/// not collide on host ports 2222/2323. The Phase 57 audio flags
-/// ([`AC97_QEMU_AUDIO_FLAGS`]) are appended so the AC'97 emulation is
-/// live for the duration of the boot.
-fn audio_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+/// Build the QEMU arg vector for the audio smoke.
+///
+/// Hostfwd is stripped the same way `cmd_device_smoke` strips it so parallel
+/// CI lanes do not collide on host ports 2222/2323.
+///
+/// Phase 63 C.2: instead of the headless `none` backend, the smoke emits
+/// `-audiodev wav,id=snd0,path=<smoke_dir>/audio.wav` so CI can verify
+/// audible output by inspecting the recorded WAV file after the run.
+/// The `id=snd0` value matches the `-device AC97,audiodev=snd0` flag
+/// appended below, so QEMU wires them together correctly.
+fn audio_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
     let display_mode = if display {
         QemuDisplayMode::Gui
     } else {
@@ -5683,7 +5733,38 @@ fn audio_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<S
             *arg = "user,id=net0".to_string();
         }
     }
-    append_ac97_audio_flags(&mut qemu_args);
+    // Phase 63 C.2: WAV backend so the smoke harness can verify non-silent
+    // output by reading the recorded file after QEMU exits.
+    let wav_path = smoke_dir.join("audio.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Build the QEMU arg vector for session-smoke and session-recover-smoke.
+///
+/// Shares the hostfwd-stripping logic with [`audio_smoke_qemu_args`] but
+/// uses the headless audio backend (`none,id=snd0`) because these smokes
+/// gate on session startup state, not audio frame emission — WAV output
+/// is unnecessary overhead for CI session checks.
+fn session_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
     qemu_args
 }
 
@@ -5705,13 +5786,20 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
         false,
     );
 
+    // Phase 63 C.2: prepare the smoke output directory and WAV path.
+    let smoke_dir = prepare_audio_smoke_dir();
+
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = audio_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
     let steps = audio_smoke_steps();
 
     println!(
         "audio-smoke: launching QEMU with AC'97 audio device (timeout {}s)",
         args.timeout_secs
+    );
+    println!(
+        "audio-smoke: WAV output → {}",
+        smoke_dir.join("audio.wav").display()
     );
 
     let mut child = Command::new("qemu-system-x86_64")
@@ -5739,6 +5827,55 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
         }
     }
+}
+
+/// Phase 63 C.2: prepare the audio smoke output directory.
+///
+/// Creates `target/audio-smoke/` if it does not exist, removes any prior
+/// `audio.wav` from a previous run, and verifies the directory is writable
+/// by creating a probe file. Exits with an error message if the directory
+/// cannot be created or is not writable so the user gets a clear diagnosis
+/// rather than a cryptic QEMU failure.
+fn prepare_audio_smoke_dir() -> PathBuf {
+    let root = workspace_root();
+    let smoke_dir = root.join("target/audio-smoke");
+
+    if let Err(e) = fs::create_dir_all(&smoke_dir) {
+        eprintln!(
+            "audio-smoke: cannot create output directory {}: {e}",
+            smoke_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Remove any WAV from a prior run so the smoke gate always reads a fresh file.
+    let wav_path = smoke_dir.join("audio.wav");
+    if wav_path.exists() {
+        if let Err(e) = fs::remove_file(&wav_path) {
+            eprintln!(
+                "audio-smoke: cannot remove prior audio.wav {}: {e}",
+                wav_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Verify writability with a probe file before launching QEMU.
+    let probe = smoke_dir.join(".write_probe");
+    match fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+        }
+        Err(e) => {
+            eprintln!(
+                "audio-smoke: output directory {} is not writable: {e}",
+                smoke_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    smoke_dir
 }
 
 /// Phase 57 H.2 — smoke step list for `cargo xtask session-smoke`.
@@ -5811,7 +5948,7 @@ fn cmd_session_smoke(args: &SmokeBootArgs) {
     );
 
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
     let steps = session_smoke_steps();
 
     println!(
@@ -5911,7 +6048,7 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
     );
 
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
     let steps = session_recover_smoke_steps();
 
     println!(
@@ -12786,23 +12923,48 @@ mod tests {
 
     #[test]
     fn audio_smoke_qemu_args_include_ac97_flags() {
-        // H.5 acceptance: the same AC97 audio device flags reused by
-        // the audio-smoke command via the centralised constant. This
-        // pins that audio-smoke does not silently drop the AC97 flags.
+        // Phase 63 C.2 acceptance: audio-smoke emits `-audiodev wav,id=snd0,path=...`
+        // and `-device AC97,audiodev=snd0,addr=0x5`. The WAV path must live inside
+        // the smoke directory and `id=snd0` must match between `-audiodev` and
+        // `-device AC97,audiodev=snd0` so QEMU wires them together.
+        let smoke_dir = Path::new("target/audio-smoke");
         let args = audio_smoke_qemu_args(
+            smoke_dir,
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             /* display */ false,
         );
         let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut i = 0;
-        for &want in AC97_QEMU_AUDIO_FLAGS {
-            let rel = strs[i..]
-                .iter()
-                .position(|a| *a == want)
-                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from audio-smoke argv"));
-            i += rel + 1;
-        }
+
+        // The `-audiodev` entry must be the WAV backend with `id=snd0`.
+        let audiodev_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-audiodev")
+            .expect("audio-smoke argv must contain `-audiodev`");
+        let audiodev_val = strs[audiodev_idx + 1];
+        assert!(
+            audiodev_val.starts_with("wav,id=snd0,path="),
+            "audio-smoke `-audiodev` must be `wav,id=snd0,path=...`, got {audiodev_val:?}"
+        );
+        assert!(
+            audiodev_val.contains("audio.wav"),
+            "audio-smoke WAV path must end with `audio.wav`, got {audiodev_val:?}"
+        );
+
+        // The `-device` entry must reference `audiodev=snd0` (same id).
+        let device_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-device" && w[1].starts_with("AC97,"))
+            .expect("audio-smoke argv must contain `-device AC97,...`");
+        let device_val = strs[device_idx + 1];
+        assert!(
+            device_val.contains("audiodev=snd0"),
+            "audio-smoke `-device AC97` must reference `audiodev=snd0`, got {device_val:?}"
+        );
+        assert!(
+            device_val.contains("addr=0x5"),
+            "audio-smoke `-device AC97` must pin PCI slot via `addr=0x5`, got {device_val:?}"
+        );
     }
 
     #[test]
@@ -12827,33 +12989,31 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 57 H.5: `cargo xtask run-gui` audio plumbing tests (RED).
+    // Phase 57 H.5 / Phase 63 C.1: `cargo xtask run-gui` audio plumbing.
     //
-    // The constant `AC97_QEMU_AUDIO_FLAGS` pins the Phase 57 audio
-    // command-line surface verbatim per the A.1 audio-target memo
-    // (`docs/appendix/phase-57-audio-target-choice.md`). A single
-    // named constant keeps the contract auditable: any deviation from
-    // the documented flags will surface here before reaching CI.
+    // Phase 63 C.1 splits the single `AC97_QEMU_AUDIO_FLAGS` constant into
+    // two:
+    //   - `AC97_QEMU_AUDIO_FLAGS_HEADLESS`: `none,id=snd0` — used by the
+    //     audio-smoke WAV args builder is the headless fallback (no host sink).
+    //   - `AC97_QEMU_AUDIO_FLAGS_GUI`: `pa,id=snd0` on Linux, `none,id=snd0`
+    //     on other hosts — used by `run-gui` so audio is audible on Linux.
     //
-    // Headless smoke uses `none,id=snd0` so the smoke harness does not
-    // require a host audio sink. `run-gui` reuses the same flags so a
-    // developer who explicitly wants audible output can override via
-    // `QEMU_AUDIO_DRV=pa cargo xtask run-gui` (QEMU env-var override).
+    // Both constants keep `AC97,audiodev=snd0,addr=0x5` unchanged so the
+    // `audio_server` sentinel-BDF path is unaffected.
+    //
     // The `--no-audio` opt-out skips the AC97 device entirely while
     // preserving the legacy `pcspk-audiodev=noaudio` PC-speaker binding
     // so non-audio runs match today's behavior byte-for-byte.
     // ----------------------------------------------------------------
 
     #[test]
-    fn ac97_qemu_audio_flags_pinned_per_a1_memo() {
-        // A.1 memo: `-device AC97,audiodev=snd0` plus a paired
-        // `-audiodev` line. Headless safety pins the backend to
-        // `none,id=snd0` (no host audio sink required). `addr=0x5`
-        // pins the PCI slot to 0:5.0 so the matching `audio_server`
-        // `SENTINEL_BDF` finds the device deterministically (slot 3
-        // is e1000, slot 4 is nvme).
+    fn ac97_qemu_audio_flags_headless_pinned() {
+        // Phase 63 C.1: headless constant is still `none,id=snd0` — no host
+        // audio sink required. `addr=0x5` pins the PCI slot to 0:5.0 so the
+        // matching `audio_server` `SENTINEL_BDF` finds the device
+        // deterministically (slot 3 is e1000, slot 4 is nvme).
         assert_eq!(
-            AC97_QEMU_AUDIO_FLAGS,
+            AC97_QEMU_AUDIO_FLAGS_HEADLESS,
             &[
                 "-audiodev",
                 "none,id=snd0",
@@ -12864,9 +13024,36 @@ mod tests {
     }
 
     #[test]
+    fn ac97_qemu_audio_flags_gui_pinned() {
+        // Phase 63 C.1: GUI constant selects PulseAudio on Linux and falls
+        // back to `none` elsewhere. The `-device` pair is unchanged so the
+        // audio_server sentinel-BDF path is unaffected regardless of host.
+        let expected_audiodev = if cfg!(target_os = "linux") {
+            "pa,id=snd0"
+        } else {
+            "none,id=snd0"
+        };
+        assert_eq!(
+            AC97_QEMU_AUDIO_FLAGS_GUI,
+            &[
+                "-audiodev",
+                expected_audiodev,
+                "-device",
+                "AC97,audiodev=snd0,addr=0x5",
+            ]
+        );
+        // Both constants must share the same `-device` line.
+        assert_eq!(
+            AC97_QEMU_AUDIO_FLAGS_GUI[2..],
+            AC97_QEMU_AUDIO_FLAGS_HEADLESS[2..],
+            "GUI and HEADLESS flags must share identical `-device` arguments"
+        );
+    }
+
+    #[test]
     fn run_gui_with_audio_emits_ac97_device_flags() {
-        // Acceptance H.5: `run-gui` adds the chosen-target's QEMU
-        // `-audiodev` and `-device` flags by default.
+        // Phase 63 C.1 acceptance: `run-gui` emits the GUI audio flags
+        // (PulseAudio on Linux, `none` elsewhere) by default.
         let args = qemu_run_gui_args_for_test(
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
@@ -12874,13 +13061,13 @@ mod tests {
             /* with_audio */ true,
         );
         let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Every audio-flag entry must appear in argv, in order.
+        // Every GUI audio-flag entry must appear in argv, in order.
         let mut i = 0;
-        for &want in AC97_QEMU_AUDIO_FLAGS {
+        for &want in AC97_QEMU_AUDIO_FLAGS_GUI {
             let rel = strs[i..]
                 .iter()
                 .position(|a| *a == want)
-                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from run-gui argv"));
+                .unwrap_or_else(|| panic!("AC97 GUI flag {want:?} missing from run-gui argv"));
             i += rel + 1;
         }
     }
