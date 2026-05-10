@@ -3068,6 +3068,26 @@ enum SmokeStep {
         timeout_secs: u64,
         label: &'static str,
     },
+    /// Wait for either a pass line or a fail line, whichever appears first.
+    ///
+    /// Introduced for Phase 63 D.1 fix: replaces the plain `Wait` for
+    /// `AUDIO_DEMO:PASS` so that `AUDIO_DEMO:FAIL stage=` is caught
+    /// immediately rather than letting the step time out generically.
+    ///
+    /// Behaviour:
+    /// - If a line containing `pass_pattern` is found → step passes.
+    /// - If a line starting with `fail_prefix` is found → the rest of
+    ///   the matched line (after `fail_prefix`) is captured and the
+    ///   step exits via `exit_code_on_fail` with the captured text in
+    ///   the error message.
+    /// - If neither is found within `timeout_secs` → generic timeout error.
+    WaitPassOrFail {
+        pass_pattern: &'static str,
+        fail_prefix: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+        exit_code_on_fail: i32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -3812,6 +3832,91 @@ fn run_smoke_script(
                             return Err(format!(
                                 "QEMU exited while waiting for step {}: {label}\n\
                                  expected pattern: \"{pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+                }
+            }
+
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                timeout_secs,
+                label,
+                exit_code_on_fail,
+            } => {
+                println!(
+                    "[step {}] wait-pass-or-fail: {label} ({}s)",
+                    step_num, timeout_secs
+                );
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    // Check pass first, then fail.
+                    if let Some((mode, match_end)) =
+                        find_serial_match(&stripped, &cleaned, pass_pattern)
+                    {
+                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                        break;
+                    }
+                    // Scan for a line starting with fail_prefix.
+                    let fail_capture = cleaned
+                        .lines()
+                        .chain(stripped.lines())
+                        .find_map(|line| line.strip_prefix(*fail_prefix).map(str::to_owned));
+                    if let Some(captured) = fail_capture {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let msg = format!(
+                            "audio-demo failed at stage: {captured}\n\
+                             (step {} — {label})",
+                            step_num
+                        );
+                        eprintln!("{msg}");
+                        std::process::exit(*exit_code_on_fail);
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} timed out: {label}\n\
+                             expected pass pattern: \"{pass_pattern}\"\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
+
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            if stripped.contains(pass_pattern) && remaining == 0 {
+                                serial_buf.clear();
+                                break;
+                            }
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}: {label}\n\
+                                 expected pass pattern: \"{pass_pattern}\"\n\
                                  last serial output:\n{tail}",
                                 step_num
                             ));
@@ -5829,12 +5934,16 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
             input: "audio-demo\n",
             label: "guest/audio: launch audio-demo",
         },
-        // D.1: wait for the PASS sentinel. 30 s covers the 1-second tone
-        // plus codec initialisation latency inside QEMU TCG.
-        SmokeStep::Wait {
-            pattern: "AUDIO_DEMO:PASS",
+        // D.1: wait for the PASS sentinel, but also intercept FAIL immediately.
+        // 30 s covers the 1-second tone plus codec initialisation latency
+        // inside QEMU TCG. On `AUDIO_DEMO:FAIL stage=...` the harness exits
+        // with SMOKE_EXIT_AUDIO_DEMO_FAILED and surfaces the failing stage.
+        SmokeStep::WaitPassOrFail {
+            pass_pattern: "AUDIO_DEMO:PASS",
+            fail_prefix: "AUDIO_DEMO:FAIL stage=",
             timeout_secs: 30,
             label: "guest/audio: audio-demo PASS sentinel",
+            exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
         },
         // D.2: wait for the stats line and assert frames_consumed > 0.
         // `bad_substring` catches `consumed=0 ` (trailing space before
@@ -10678,6 +10787,68 @@ fn run_smoke_steps_with_capture(
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
+
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                timeout_secs,
+                label,
+                exit_code_on_fail,
+            } => {
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    if let Some((mode, match_end)) =
+                        find_serial_match(&stripped, &cleaned, pass_pattern)
+                    {
+                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                        break;
+                    }
+                    let fail_capture = cleaned
+                        .lines()
+                        .chain(stripped.lines())
+                        .find_map(|line| line.strip_prefix(*fail_prefix).map(str::to_owned));
+                    if let Some(captured) = fail_capture {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let msg = format!(
+                            "audio-demo failed at stage: {captured}\n\
+                             (step {} — {label})",
+                            step_num
+                        );
+                        eprintln!("{msg}");
+                        std::process::exit(*exit_code_on_fail);
+                    }
+
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.try_recv() {
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                        return Err(format!(
+                            "timeout waiting for '{pass_pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
+                            step_num
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         }
     }
 
@@ -11673,7 +11844,8 @@ mod tests {
             match step {
                 SmokeStep::Wait { label, .. }
                 | SmokeStep::Send { label, .. }
-                | SmokeStep::WaitLineNotMatching { label, .. } => out.push(*label),
+                | SmokeStep::WaitLineNotMatching { label, .. }
+                | SmokeStep::WaitPassOrFail { label, .. } => out.push(*label),
                 SmokeStep::WaitEither {
                     label,
                     extra_steps_a,
@@ -11722,6 +11894,13 @@ mod tests {
                 SmokeStep::Wait { pattern, label, .. } if *label == target_label => {
                     return Some(*pattern);
                 }
+                SmokeStep::WaitPassOrFail {
+                    pass_pattern,
+                    label,
+                    ..
+                } if *label == target_label => {
+                    return Some(*pass_pattern);
+                }
                 SmokeStep::WaitEither {
                     pattern_a,
                     label,
@@ -11752,6 +11931,11 @@ mod tests {
         for step in steps {
             match step {
                 SmokeStep::Wait {
+                    timeout_secs,
+                    label,
+                    ..
+                } if *label == target_label => return Some(*timeout_secs),
+                SmokeStep::WaitPassOrFail {
                     timeout_secs,
                     label,
                     ..
@@ -13384,6 +13568,68 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn audio_smoke_steps_wait_pass_or_fail_step_is_present() {
+        // D.1 fix acceptance: audio_smoke_steps must replace the plain Wait
+        // for AUDIO_DEMO:PASS with a WaitPassOrFail that catches FAIL lines.
+        let steps = audio_smoke_steps();
+        let step = steps.iter().find(|s| {
+            matches!(
+                s,
+                SmokeStep::WaitPassOrFail {
+                    label,
+                    ..
+                } if *label == "guest/audio: audio-demo PASS sentinel"
+            )
+        });
+        let step = step.expect(
+            "audio_smoke_steps must have a WaitPassOrFail step labelled \
+             'guest/audio: audio-demo PASS sentinel'",
+        );
+        match step {
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                exit_code_on_fail,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(*pass_pattern, "AUDIO_DEMO:PASS");
+                assert_eq!(*fail_prefix, "AUDIO_DEMO:FAIL stage=");
+                assert_eq!(
+                    *exit_code_on_fail, SMOKE_EXIT_AUDIO_DEMO_FAILED,
+                    "exit_code_on_fail must be SMOKE_EXIT_AUDIO_DEMO_FAILED"
+                );
+                assert!(*timeout_secs >= 30, "timeout must be at least 30s");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn wait_pass_or_fail_captures_stage_from_fail_line() {
+        // D.1 fix acceptance: when a serial buffer contains
+        // `AUDIO_DEMO:FAIL stage=drain` the captured stage text must be
+        // "drain variant=Server" (everything after the fail_prefix).
+        //
+        // This test exercises the capture logic inline (no QEMU process)
+        // so it runs on the host as a pure unit test.
+        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=drain variant=Server\n";
+        let captured = serial_output
+            .lines()
+            .find_map(|line| line.strip_prefix(fail_prefix).map(str::to_owned));
+        assert!(
+            captured.is_some(),
+            "fail line must be captured from serial output"
+        );
+        let captured = captured.unwrap();
+        assert!(
+            captured.contains("drain"),
+            "captured stage must contain 'drain', got: {captured:?}"
+        );
     }
 
     /// Build a minimal valid RIFF/WAVE file with S16LE PCM data.

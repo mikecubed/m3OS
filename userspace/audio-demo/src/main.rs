@@ -59,7 +59,7 @@ extern crate alloc;
 
 use core::alloc::Layout;
 
-use audio_client::{AudioClient, AudioClientError, Stats};
+use audio_client::{AudioClient, AudioClientError, AudioStats};
 use kernel_core::audio::{ChannelLayout, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
@@ -294,13 +294,17 @@ fn build_quarter_sine_lut() -> [i16; LUT_LEN] {
 
 /// Print the `AUDIO_DEMO:stats consumed=<N> underruns=<M>` sentinel.
 ///
-/// The line is parsed by `audio_smoke_steps` to assert `frames_consumed > 0`.
+/// The line shape is locked for Track E / WaitLineNotMatching compatibility:
+/// `consumed=` reads `AudioStats::frames_consumed`; `underruns=` reads
+/// `AudioStats::underrun_count`. The sentinel label words are intentionally
+/// shorter than the wire field names so the output stays human-readable.
+///
 /// Uses a minimal integer-to-string helper to stay `no_std` / alloc-free.
-fn log_stats(stats: Stats) {
+fn log_stats(stats: AudioStats) {
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:stats consumed=");
-    write_u64(stats.consumed);
+    write_u64(stats.frames_consumed);
     syscall_lib::write_str(STDOUT_FILENO, " underruns=");
-    write_u32(stats.underruns);
+    write_u32(stats.underrun_count);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 

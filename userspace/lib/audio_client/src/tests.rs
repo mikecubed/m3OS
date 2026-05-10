@@ -361,8 +361,9 @@ fn get_stats_returns_consumed_and_underrun_counts() {
     }));
     let mut client = open_stereo(socket).expect("open ok");
     let stats = client.get_stats().expect("get_stats ok");
-    assert_eq!(stats.consumed, 1024);
-    assert_eq!(stats.underruns, 3);
+    assert_eq!(stats.frames_consumed, 1024);
+    assert_eq!(stats.frames_submitted, 1024);
+    assert_eq!(stats.underrun_count, 3);
 
     // Verify the wire frame was a GetStats control command.
     let sock = &client.socket;
@@ -399,19 +400,22 @@ fn get_stats_unexpected_reply_returns_unexpected_reply() {
 
 // D.2 acceptance: AUDIO_DEMO:stats consumed=<N> underruns=<M> line shape.
 // This test verifies the sentinel format via a programmatic round-trip:
-// Stats { consumed: 48000, underruns: 0 } should produce a string
-// containing "consumed=48000 underruns=0".
+// AudioStats { frames_consumed: 48000, underrun_count: 0 } should produce
+// a string containing "consumed=48000 underruns=0" (wire-field names read
+// by the demo, sentinel names unchanged for Track E compatibility).
 #[test]
 fn stats_struct_fields_are_accessible_for_sentinel_formatting() {
-    use super::Stats;
-    let s = Stats {
-        consumed: 48_000,
-        underruns: 0,
+    use super::AudioStats;
+    let s = AudioStats {
+        frames_consumed: 48_000,
+        frames_submitted: 48_000,
+        underrun_count: 0,
     };
     // The demo formats: "AUDIO_DEMO:stats consumed=<N> underruns=<M>\n"
-    // We just confirm the fields are correct values.
-    assert_eq!(s.consumed, 48_000);
-    assert_eq!(s.underruns, 0);
+    // (reading frames_consumed and underrun_count from AudioStats).
+    assert_eq!(s.frames_consumed, 48_000);
+    assert_eq!(s.frames_submitted, 48_000);
+    assert_eq!(s.underrun_count, 0);
 }
 
 // ---------------- DRY: protocol bytes only declared once ----------------

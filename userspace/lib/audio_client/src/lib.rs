@@ -80,21 +80,23 @@ impl From<ProtocolError> for AudioClientError {
 }
 
 // ---------------------------------------------------------------------------
-// Stats — returned by AudioClient::get_stats
+// AudioStats — returned by AudioClient::get_stats
 // ---------------------------------------------------------------------------
 
 /// Snapshot of audio-server stream statistics returned by
 /// [`AudioClient::get_stats`].
 ///
-/// `consumed` counts PCM frames the AC'97 DMA engine has committed to the
-/// hardware BDL since the stream was opened. `underruns` counts how many
-/// times the BDL ran dry before the client refilled it.
+/// Field names and types mirror the wire `AudioControlEvent::Stats` payload
+/// from `kernel_core::audio::protocol` so Track E's consumers can pattern-match
+/// directly without renaming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stats {
-    /// Total PCM frames consumed by the hardware DMA engine.
-    pub consumed: u64,
+pub struct AudioStats {
     /// Number of BDL underrun events since the stream opened.
-    pub underruns: u32,
+    pub underrun_count: u32,
+    /// Total PCM frames submitted by the client since the stream was opened.
+    pub frames_submitted: u64,
+    /// Total PCM frames consumed by the hardware DMA engine.
+    pub frames_consumed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +285,7 @@ impl<S: AudioSocket> AudioClient<S> {
     /// call and before `close` consumes the client.
     ///
     /// Returns `Err(NotOpen)` if no stream was opened.
-    pub fn get_stats(&mut self) -> Result<Stats, AudioClientError> {
+    pub fn get_stats(&mut self) -> Result<AudioStats, AudioClientError> {
         if self.stream_id.is_none() {
             return Err(AudioClientError::NotOpen);
         }
@@ -293,11 +295,12 @@ impl<S: AudioSocket> AudioClient<S> {
         match decode_server_message(reply.as_slice())? {
             ServerMessage::ControlEvent(AudioControlEvent::Stats {
                 frames_consumed,
+                frames_submitted,
                 underrun_count,
-                ..
-            }) => Ok(Stats {
-                consumed: frames_consumed,
-                underruns: underrun_count,
+            }) => Ok(AudioStats {
+                underrun_count,
+                frames_submitted,
+                frames_consumed,
             }),
             _ => Err(AudioClientError::UnexpectedReply),
         }
