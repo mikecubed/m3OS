@@ -37,8 +37,8 @@ Track A.1 / A.3 / B.1 / B.2 / C.1 / C.2 / G.1 from earlier drafts of this plan a
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | Z | Privileged PIO syscall + `Pio<T>` driver_runtime wrapper + AC'97 PIO `MmioOps` impl | None | Complete |
-| A | Replace `cfg(not(test)) Ac97Backend` stub with real BDL/PCM-ring DMA + register init | Z | In Progress |
-| B | `submit_frames` copies into PCM ring, posts BDL entry, advances LVI through PIO | A | Planned |
+| A | Replace `cfg(not(test)) Ac97Backend` stub with real BDL/PCM-ring DMA + register init | Z | Complete |
+| B | `submit_frames` copies into PCM ring, posts BDL entry, advances LVI through PIO | A | In Progress |
 | C | QEMU `-audiodev` selection: PulseAudio for `run-gui`, WAV for `audio-smoke` | None | Complete |
 | D | `audio-smoke` asserts `frames_consumed` advance via `GetStats`, plus non-silent WAV | A, B, C | Planned |
 | E | End-to-end BEL/audio-demo verification against real backend | A, B, C | Planned |
