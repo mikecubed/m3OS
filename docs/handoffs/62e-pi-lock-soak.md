@@ -9,7 +9,7 @@
 
 Phase 62 Tracks B and D add small but invariant-relevant changes:
 
-- Track B introduces `Task::with_block_state_locked_scheduler` and applies it at four sites in `kernel/src/task/scheduler.rs` (sites 892, 4108, 4120, 4319). One of those sites is the dispatch hot path (every context switch goes through it), so any defect would manifest under sustained load.
+- Track B introduces `Task::with_block_state_locked_scheduler` and applies it at four sites in `kernel/src/task/scheduler.rs`. The four sites are anchored by `// NOTE: Phase 62 Track B` comments and live in `pick_next` (queue-scan zero-saved_rsp drop), `install_test_task_idx` (`#[cfg(test)]` filler init and slot overwrite), and the per-core dispatch loop. Locate them with `grep -n 'NOTE: Phase 62 Track B' kernel/src/task/scheduler.rs`. The dispatch site is the hot path (every context switch goes through it), so any defect would manifest under sustained load.
 - Track D adds host-side regression tests but does not modify any kernel runtime code.
 
 The 30-minute soak is the runtime confirmation that Track B's scheduler-internal changes do not introduce panics, deadlocks, or scheduler regressions under sustained multi-core load. Phase 62 Track E.2 reuses the canonical Phase 57b Track H.4 / Phase 59 Track G soak procedure verbatim so the result is directly comparable to any future baseline.

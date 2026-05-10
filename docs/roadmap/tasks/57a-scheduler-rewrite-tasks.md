@@ -146,7 +146,7 @@ These gates are enforced by review and CI; tasks that fail them block the phase.
 
 **Acceptance:**
 - [ ] `Task::pi_lock: Spinlock<TaskBlockState>` field, initialised at task construction with the task's initial `TaskState`.
-- [x] All existing `task.state = ...` writes are migrated under a TODO comment to be replaced in Tracks C/D. (TODO comments closed by Phase 62 Track B at `kernel/src/task/scheduler.rs:892, 4108, 4120, 4319` via the new `Task::with_block_state_locked_scheduler` helper. See `docs/handoffs/62a-pi-lock-inventory.md`.)
+- [x] All existing `task.state = ...` writes are migrated under a TODO comment to be replaced in Tracks C/D. (TODO comments closed by Phase 62 Track B in `kernel/src/task/scheduler.rs` — four sites in `pick_next`, `install_test_task_idx` (×2), and the per-core dispatch loop, all anchored by `// NOTE: Phase 62 Track B` comments. Locate them with `grep -n 'NOTE: Phase 62 Track B' kernel/src/task/scheduler.rs`. They route through the new `Task::with_block_state_locked_scheduler` helper. See `docs/handoffs/62a-pi-lock-inventory.md`.)
 - [ ] Existing `cargo xtask test` passes (no semantic change yet — the lock is acquired but transitions still go through v1 code).
 
 ### B.3 — Lock-ordering documentation and debug assertion

@@ -25,16 +25,43 @@ at the time; this inventory broadens the survey kernel-wide.
 
 ## A.1 — Four `TODO(57a-C/D)` Sites
 
-`grep -n 'TODO(57a' kernel/src/task/scheduler.rs` against HEAD of
-`feat/phase-62-pi-lock-closeout` (commit pending — verify line numbers
-have not drifted before committing the Track B fix):
+Originally enumerated by `grep -n 'TODO(57a' kernel/src/task/scheduler.rs`
+during inventory; after Track B closure these are anchored by the
+`// NOTE: Phase 62 Track B` comments and locatable with
+`grep -n 'NOTE: Phase 62 Track B' kernel/src/task/scheduler.rs`. The
+table below uses function-name + grep anchors instead of bare line
+numbers, since line numbers drift as the file evolves.
 
-| # | Line | Function | Context | Holds `scheduler_lock()`? | Lock-order resolution |
-|---|------|----------|---------|---------------------------|----------------------|
-| 1 | 892  | `pick_next` (queue scan) | drops a `Ready` task with `saved_rsp == 0` to `Dead` during local-queue scan | **YES** (`scheduler_lock()` is the inner lock) | Cannot `with_block_state` directly (would invert). Use the **release-and-reacquire** shape: drop `scheduler_lock()`, take pi_lock + reacquire scheduler_lock, write both `TaskBlockState.state` and `Task::state`, restart the scan after — OR — note that the task is already being removed from the run queue at this site (`q.remove(i)` follows the state write), so no other CPU can wake it before the dispatch loop drops `scheduler_lock()` further down. The defensive cleanup runs once per scheduling tick under IRQ-disabled scheduler_lock — the structural-safety argument supports a documented direct mutation here. |
-| 2 | 4108 | `install_test_task_idx` (`#[cfg(test)]`) | filler `Task` initialization before `push` into `sched.tasks` | **YES** (`scheduler_lock()`), but task is not yet in `sched.tasks` | Task is freshly constructed; not visible from any other CPU. Direct `with_block_state` on the local `filler` Task is safe (uncontended) **before** `push` — once pushed, scheduler_lock is the visibility boundary. Apply `with_block_state` for uniformity. |
-| 3 | 4120 | `install_test_task_idx` (`#[cfg(test)]`) | in-place overwrite of `*sched.tasks[idx]` | **YES** (`scheduler_lock()`) | Same lock-order constraint as Site 1. Either reuse Site 1's release-and-reacquire shape, or note that this overwrite happens during test setup with no live wake path. The test scaffolding already contains a comment about the in-place mutation matching `alloc_task_slot`'s heap-stable address. |
-| 4 | 4319 | `dispatch` (per-core dispatch loop) | sets the picked task `state = TaskState::Running` while `scheduler_lock()` held with IRQs disabled | **YES** (`scheduler_lock()`) — and IRQs are disabled at this site | Same lock-order constraint as Site 1. The dispatch path is the every-context-switch hot path; release-and-reacquire would cost two extra lock cycles per context switch. Document the structural-safety argument: at dispatch time IRQs are disabled, the task is being transitioned **from** `Ready`/idle states **to** `Running`, and `wake_task_v2` (the only waker that takes pi_lock) would CAS `Blocked* → Ready` and never `Ready → Running` — there is no concurrent waker that can race the `Running` write here. Apply `with_block_state` on the freshly-picked task **before** publishing through `set_current_task_idx`. |
+| # | Anchor | Function | Context | Holds `scheduler_lock()`? | Lock-order resolution |
+|---|--------|----------|---------|---------------------------|----------------------|
+| 1 | `pick_next` zero-`saved_rsp` cleanup (search: `dropping ready task idx`) | `pick_next` (queue scan) | drops a `Ready` task with `saved_rsp == 0` to `Dead` during local-queue scan | **YES** (`scheduler_lock()` is the inner lock) | Cannot `with_block_state` directly (would invert). Use the **release-and-reacquire** shape: drop `scheduler_lock()`, take pi_lock + reacquire scheduler_lock, write both `TaskBlockState.state` and `Task::state`, restart the scan after — OR — note that the task is already being removed from the run queue at this site (`q.remove(i)` follows the state write), so no other CPU can wake it before the dispatch loop drops `scheduler_lock()` further down. The defensive cleanup runs once per scheduling tick under IRQ-disabled scheduler_lock — the structural-safety argument supports a documented direct mutation here. |
+| 2 | `install_test_task_idx` filler init (`#[cfg(test)]`; first NOTE in fn) | `install_test_task_idx` | filler `Task` initialization before `push` into `sched.tasks` | **YES** (`scheduler_lock()`), but task is not yet in `sched.tasks` | Task is freshly constructed; not visible from any other CPU. Direct `with_block_state` on the local `filler` Task is safe (uncontended) **before** `push` — once pushed, scheduler_lock is the visibility boundary. Apply `with_block_state` for uniformity. |
+| 3 | `install_test_task_idx` in-place overwrite (`#[cfg(test)]`; second NOTE in fn) | `install_test_task_idx` | in-place overwrite of `*sched.tasks[idx]` | **YES** (`scheduler_lock()`) | Same lock-order constraint as Site 1. Either reuse Site 1's release-and-reacquire shape, or note that this overwrite happens during test setup with no live wake path. The test scaffolding already contains a comment about the in-place mutation matching `alloc_task_slot`'s heap-stable address. |
+| 4 | per-core dispatch loop (search: `not Running after mark on core`) | `dispatch` (per-core dispatch loop) | sets the picked task `state = TaskState::Running` while `scheduler_lock()` held with IRQs disabled | **YES** (`scheduler_lock()`) — and IRQs are disabled at this site | Same lock-order constraint as Site 1. The dispatch path is the every-context-switch hot path; release-and-reacquire would cost two extra lock cycles per context switch. Document the structural-safety argument: at dispatch time IRQs are disabled, the task is being transitioned **from** `Ready`/idle states **to** `Running`, and `wake_task_v2` (the only waker that takes pi_lock) would CAS `Blocked* → Ready` and never `Ready → Running` — there is no concurrent waker that can race the `Running` write here. Apply `with_block_state` on the freshly-picked task **before** publishing through `set_current_task_idx`. |
+
+### A.1 Addendum — PR #146 review-fix (`wake_task_v2` AlreadyAwake fast path)
+
+The Phase 62 Track B helper relies on a **structural-safety argument**
+about wake-side races, but the original `wake_task_v2` implementation
+acquired `pi_lock` then `scheduler_lock` *unconditionally* — including
+on the AlreadyAwake fast path (state ≠ `Blocked*`). That created a real
+ABBA lock-order inversion against Sites 1 and 4: a CPU dispatching task
+T (holding `scheduler_lock`, needing `pi_lock(T)`) could deadlock with a
+CPU running `wake_task_v2(T)` between its step-1 `scheduler_lock` drop
+and its step-2 `scheduler_lock` re-acquire, if step 2 had already taken
+`pi_lock(T)`. `serial::wake_feeder_task` (called from the COM1 RX ISR,
+which doesn't know whether the feeder is currently `Ready` or `Blocked*`)
+is a real speculative caller that exercises this path.
+
+The fix (committed as part of the Phase 62 closure on PR #146) moves
+`wake_task_v2`'s state check inside the `pi_lock`-only critical section
+so the AlreadyAwake fast path returns *before* acquiring `scheduler_lock`.
+With the fast-path early return in place, `wake_task_v2` only ever
+acquires `scheduler_lock` while holding `pi_lock` for tasks that are
+genuinely `Blocked*` — which by construction excludes Sites 1 and 4
+(both target `Ready` tasks) and excludes Sites 2 and 3 (target tasks
+not yet visible cross-CPU). The structural-safety argument is now
+backed by a lock-acquisition argument as well.
 
 ### A.1 Conclusion
 

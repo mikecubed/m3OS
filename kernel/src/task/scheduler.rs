@@ -3748,14 +3748,20 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
     let post_lock = {
         let pi_lock_ref = unsafe { &*pi_lock_ptr };
         let mut guard = pi_lock_ref.lock();
-        let mut sched = scheduler_lock();
 
-        // Identity revalidation — slot may have been recycled.
-        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
-            return WakeOutcome::AlreadyAwake;
-        }
-
-        // CAS check (canonical state).
+        // Phase 62 (PR #146 review fix): the AlreadyAwake fast path must NOT
+        // acquire `scheduler_lock` while holding `pi_lock`. The four
+        // `with_block_state_locked_scheduler` sites in this file hold
+        // `scheduler_lock` and need this task's `pi_lock`; if we acquired
+        // `pi_lock` here and then waited on `scheduler_lock`, we would form an
+        // ABBA deadlock against those sites whenever a speculative wake
+        // (e.g. `serial::wake_feeder_task` from the COM1 RX ISR) targets a
+        // task that is currently `Ready` or `Running`. Check state under
+        // `pi_lock` alone and early-return without taking `scheduler_lock`.
+        // (`pi_lock` protects `state`, so this check is consistent without
+        // `scheduler_lock`. If the slot was recycled between step 1 and now,
+        // the recycled task's state is unrelated to `id` and AlreadyAwake is
+        // the correct response either way.)
         let prev_state_u8 = guard.state as u8;
         if !matches!(
             guard.state,
@@ -3769,6 +3775,31 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         ) {
             return WakeOutcome::AlreadyAwake;
         }
+
+        let mut sched = scheduler_lock();
+
+        // Identity revalidation — slot may have been recycled.
+        if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
+            return WakeOutcome::AlreadyAwake;
+        }
+
+        // Re-check state after taking `scheduler_lock`: another wake_task_v2
+        // racer cannot have changed `guard.state` (we still hold `pi_lock`),
+        // but the slot identity check above may have rejected the original
+        // task; a recycled task's `state` is now stale relative to `id`.
+        debug_assert!(
+            matches!(
+                guard.state,
+                TaskState::BlockedOnRecv
+                    | TaskState::BlockedOnSend
+                    | TaskState::BlockedOnReply
+                    | TaskState::BlockedOnNotif
+                    | TaskState::BlockedOnFutex
+                    | TaskState::BlockedOnWait
+                    | TaskState::BlockedOnService
+            ),
+            "wake_task_v2: state changed under held pi_lock — invariant broken"
+        );
 
         // Atomic canonical + scheduler-visible writes.
         guard.state = TaskState::Ready;
