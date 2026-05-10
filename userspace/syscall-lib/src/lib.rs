@@ -1347,6 +1347,17 @@ pub fn fsync(fd: i32) -> isize {
     unsafe { syscall1(SYS_FSYNC, fd as u64) as isize }
 }
 
+/// Adjust the calling task's scheduler priority by `increment`.
+///
+/// Negative values raise priority (Linux convention). The kernel clamps
+/// the result into `0..=30` and rejects real-time priorities (`< 10`)
+/// for non-root callers. Returns the new priority on success, or a
+/// negative value on failure. Useful for system services that need to
+/// preempt regular tasks (syslogd, schedulers, watchdogs).
+pub fn nice(increment: i32) -> isize {
+    unsafe { syscall1(34, increment as u64) as isize }
+}
+
 // ===========================================================================
 // High-level wrappers — ioctl, lseek, termios, signals
 // ===========================================================================

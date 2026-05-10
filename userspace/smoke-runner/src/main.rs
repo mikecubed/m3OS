@@ -161,7 +161,12 @@ fn inject_and_verify_log_marker(command_output: &mut [u8]) -> Result<(), i32> {
     let logger_argv = [LOGGER_ARGV0.as_ptr(), marker_cstr.as_ptr(), ptr::null()];
     run_command_expect_success("log", LOGGER_PATH, &logger_argv, command_output)?;
 
-    if !wait_for_file_contains(SYSTEM_LOG_PATH, marker, 15) {
+    // Poll at 100 ms intervals for up to ~15 s. The previous 1-second
+    // cadence wasted up to 900 ms after a marker arrived between polls;
+    // tighter granularity catches the marker on the first read after
+    // syslogd writes (which now `fsync`s, see
+    // userspace/syslogd/src/main.rs).
+    if !wait_for_file_contains(SYSTEM_LOG_PATH, marker, 150) {
         return Err(fail("log", "marker missing from /var/log/messages", 9));
     }
 
@@ -207,14 +212,21 @@ fn write_decimal_into(buf: &mut [u8], mut n: u64) -> usize {
     digits
 }
 
+/// Poll `path` for `needle`, sleeping 100 ms between attempts.
+///
+/// Total budget = `attempts × 100 ms`. The fine-grained sleep matters for
+/// the syslog-marker check (see `inject_and_verify_log_marker`) where the
+/// writer's flush completes asynchronously and we want to observe it on
+/// the next read rather than wait up to 1 s for the next poll cycle.
 fn wait_for_file_contains(path: &[u8], needle: &[u8], attempts: usize) -> bool {
+    const SLEEP_NS: u32 = 100_000_000; // 100 ms
     for _ in 0..attempts {
         if let Ok(found) = file_contains(path, needle)
             && found
         {
             return true;
         }
-        let _ = syscall_lib::nanosleep(1);
+        let _ = syscall_lib::nanosleep_for(0, SLEEP_NS);
     }
     false
 }
