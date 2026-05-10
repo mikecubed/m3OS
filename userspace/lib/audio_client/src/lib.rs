@@ -26,8 +26,8 @@
 extern crate alloc;
 
 use kernel_core::audio::{
-    AudioError, ChannelLayout, ClientMessage, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError,
-    SampleRate, ServerMessage,
+    AudioControlCommand, AudioControlEvent, AudioError, ChannelLayout, ClientMessage,
+    MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate, ServerMessage,
 };
 
 /// Service name used by `audio_server` to register its command
@@ -77,6 +77,24 @@ impl From<ProtocolError> for AudioClientError {
     fn from(err: ProtocolError) -> Self {
         AudioClientError::Protocol(err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stats — returned by AudioClient::get_stats
+// ---------------------------------------------------------------------------
+
+/// Snapshot of audio-server stream statistics returned by
+/// [`AudioClient::get_stats`].
+///
+/// `consumed` counts PCM frames the AC'97 DMA engine has committed to the
+/// hardware BDL since the stream was opened. `underruns` counts how many
+/// times the BDL ran dry before the client refilled it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// Total PCM frames consumed by the hardware DMA engine.
+    pub consumed: u64,
+    /// Number of BDL underrun events since the stream opened.
+    pub underruns: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +270,35 @@ impl<S: AudioSocket> AudioClient<S> {
                 Ok(())
             }
             ServerMessage::OpenError(err) => Err(AudioClientError::Server(err)),
+            _ => Err(AudioClientError::UnexpectedReply),
+        }
+    }
+
+    /// Query the audio server for current stream stats.
+    ///
+    /// Issues `ClientMessage::ControlCommand(GetStats)` and decodes the
+    /// `ServerMessage::ControlEvent(Stats { ... })` reply. The stream
+    /// does not need to be open — `GetStats` is a control-plane verb that
+    /// may be issued at any time after a successful [`AudioClient::open`]
+    /// call and before `close` consumes the client.
+    ///
+    /// Returns `Err(NotOpen)` if no stream was opened.
+    pub fn get_stats(&mut self) -> Result<Stats, AudioClientError> {
+        if self.stream_id.is_none() {
+            return Err(AudioClientError::NotOpen);
+        }
+        let mut frame = [0u8; MAX_REQUEST_BYTES];
+        let n = ClientMessage::ControlCommand(AudioControlCommand::GetStats).encode(&mut frame)?;
+        let reply = self.socket.call(&frame[..n], &[])?;
+        match decode_server_message(reply.as_slice())? {
+            ServerMessage::ControlEvent(AudioControlEvent::Stats {
+                frames_consumed,
+                underrun_count,
+                ..
+            }) => Ok(Stats {
+                consumed: frames_consumed,
+                underruns: underrun_count,
+            }),
             _ => Err(AudioClientError::UnexpectedReply),
         }
     }

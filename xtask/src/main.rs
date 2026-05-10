@@ -87,6 +87,11 @@ const QEMU_EXIT_FAILURE: i32 = 0x23;
 const SMOKE_EXIT_AUDIO_DEMO_FAILED: i32 = 60;
 const SMOKE_EXIT_SESSION_NOT_RUNNING: i32 = 61;
 const SMOKE_EXIT_SESSION_RECOVERY_FAILED: i32 = 62;
+/// Phase 63 D.3: the recorded WAV file exists but is silent (fewer than
+/// 5% of samples exceed the `|sample| > 100` threshold). Distinct from
+/// `SMOKE_EXIT_AUDIO_DEMO_FAILED` (63 = script failure, 63+1 would collide;
+/// use 63 for the WAV-silence gate so CI can route to the right tracker).
+const SMOKE_EXIT_WAV_SILENT: i32 = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -3050,6 +3055,19 @@ enum SmokeStep {
         extra_steps_a: &'static [SmokeStep],
         extra_steps_b: &'static [SmokeStep],
     },
+    /// Wait for a line containing `pattern`, then assert the matched line
+    /// does NOT also contain `bad_substring`.
+    ///
+    /// Introduced for Phase 63 D.2: wait for
+    /// `AUDIO_DEMO:stats consumed=<N>` and fail if N is zero by checking
+    /// that the line does not contain `consumed=0 ` or `consumed=0\n`.
+    /// This avoids a full regex engine for a single tightly-scoped check.
+    WaitLineNotMatching {
+        pattern: &'static str,
+        bad_substring: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -3695,6 +3713,110 @@ fn run_smoke_script(
                 };
                 for extra in inject.iter().rev() {
                     queue.push_front(extra);
+                }
+            }
+
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                label,
+            } => {
+                println!(
+                    "[step {}] wait-line-not-matching: {label} ({}s)",
+                    step_num, timeout_secs
+                );
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    // Find any complete line (newline-terminated) that contains `pattern`.
+                    let search = |s: &str| -> Option<(bool, usize)> {
+                        for line in s.lines() {
+                            if line.contains(pattern) {
+                                let failed = line.contains(bad_substring);
+                                // Compute end offset past the newline.
+                                let found_at = s.find(line).unwrap_or(0) + line.len();
+                                return Some((!failed, found_at));
+                            }
+                        }
+                        None
+                    };
+                    let result = search(&cleaned).or_else(|| search(&stripped));
+
+                    if let Some((ok, match_end)) = result {
+                        if ok {
+                            // Drain consumed output.
+                            let cut = match_end.min(serial_buf.len());
+                            serial_buf.drain(..cut);
+                            break;
+                        } else {
+                            // Pattern matched but line also contained bad_substring.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "step {} assertion failed: {label}\n\
+                                 pattern \"{pattern}\" matched a line containing \
+                                 bad_substring \"{bad_substring}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} timed out: {label}\n\
+                             expected pattern: \"{pattern}\"\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
+
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            // On final-step disconnect check for the pattern.
+                            if remaining == 0 {
+                                for line in stripped.lines() {
+                                    if line.contains(pattern) {
+                                        if !line.contains(bad_substring) {
+                                            serial_buf.clear();
+                                            // break out of outer loop
+                                            return Ok(());
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}: {label}\n\
+                                 expected pattern: \"{pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -5702,6 +5824,28 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 90,
             label: "guest/audio: init loaded audio_server.conf",
         },
+        // D.1: invoke the audio-demo reference client via init's shell.
+        SmokeStep::Send {
+            input: "audio-demo\n",
+            label: "guest/audio: launch audio-demo",
+        },
+        // D.1: wait for the PASS sentinel. 30 s covers the 1-second tone
+        // plus codec initialisation latency inside QEMU TCG.
+        SmokeStep::Wait {
+            pattern: "AUDIO_DEMO:PASS",
+            timeout_secs: 30,
+            label: "guest/audio: audio-demo PASS sentinel",
+        },
+        // D.2: wait for the stats line and assert frames_consumed > 0.
+        // `bad_substring` catches `consumed=0 ` (trailing space before
+        // `underruns=`) — a zero-consumed count proves the DMA engine
+        // never advanced the BDL, which is the regression Track A.2 guards.
+        SmokeStep::WaitLineNotMatching {
+            pattern: "AUDIO_DEMO:stats consumed=",
+            bad_substring: "consumed=0 ",
+            timeout_secs: 5,
+            label: "guest/audio: frames_consumed non-zero",
+        },
     ]
 }
 
@@ -5827,6 +5971,123 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
         }
     }
+
+    // Phase 63 D.3: after QEMU exits, verify the recorded WAV is non-silent.
+    // This is the host-side proof that QEMU's audio backend received real PCM
+    // frames from the AC'97 engine (not just accounting counters).
+    let wav_path = smoke_dir.join("audio.wav");
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => {
+            println!("audio-smoke: WAV non-silent check PASSED");
+        }
+        Err(msg) => {
+            eprintln!("audio-smoke: WAV non-silent check FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+/// Phase 63 D.3: assert a WAV file at `path` is non-silent.
+///
+/// Parses the RIFF/WAVE header to locate the PCM data chunk, interprets
+/// the samples as little-endian `i16`, and asserts that at least 5% of
+/// samples have `|sample| > 100` (well above the WAV zero-silence noise
+/// floor). QEMU's `wav` audio backend emits PCM_S16LE at whatever rate
+/// the AC'97 engine requests; the threshold is format-independent.
+///
+/// Returns `Err` with a human-readable message if:
+/// - the file cannot be read,
+/// - the header is not valid RIFF/WAVE,
+/// - the data chunk has zero samples, or
+/// - fewer than 5% of samples are non-silent.
+fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
+    let data =
+        fs::read(path).map_err(|e| format!("cannot read WAV file {}: {e}", path.display()))?;
+
+    // RIFF header: "RIFF" (4) + file_size (4) + "WAVE" (4) = 12 bytes.
+    if data.len() < 12 {
+        return Err(format!(
+            "WAV file {} is too short ({} bytes) to contain a RIFF header",
+            path.display(),
+            data.len()
+        ));
+    }
+    if &data[0..4] != b"RIFF" {
+        return Err(format!(
+            "WAV file {} does not start with RIFF magic",
+            path.display()
+        ));
+    }
+    if &data[8..12] != b"WAVE" {
+        return Err(format!(
+            "WAV file {} is missing WAVE format tag",
+            path.display()
+        ));
+    }
+
+    // Walk sub-chunks starting at offset 12. Each sub-chunk is:
+    //   chunk_id (4 bytes) + chunk_size (4 bytes LE) + chunk_data (chunk_size bytes)
+    // We need the "fmt " chunk (to confirm PCM) and the "data" chunk.
+    let mut offset = 12usize;
+    let mut data_offset: Option<usize> = None;
+    let mut data_size: Option<usize> = None;
+
+    while offset + 8 <= data.len() {
+        let id = &data[offset..offset + 4];
+        let chunk_size =
+            u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_start = offset + 8;
+        let chunk_end = chunk_start.saturating_add(chunk_size);
+
+        if id == b"data" {
+            data_offset = Some(chunk_start);
+            data_size = Some(chunk_size);
+            break;
+        }
+        // Align to even boundary per RIFF spec.
+        let aligned = chunk_end + (chunk_size & 1);
+        offset = aligned;
+    }
+
+    let data_start =
+        data_offset.ok_or_else(|| format!("WAV file {} has no 'data' chunk", path.display()))?;
+    let data_len = data_size
+        .ok_or_else(|| format!("WAV file {} 'data' chunk size missing", path.display()))?;
+
+    // PCM_S16LE: 2 bytes per sample.
+    let n_samples = data_len / 2;
+    if n_samples == 0 {
+        return Err(format!(
+            "WAV file {} 'data' chunk is empty (0 samples)",
+            path.display()
+        ));
+    }
+
+    let pcm_bytes = &data[data_start..data_start.saturating_add(data_len).min(data.len())];
+    let mut non_silent: usize = 0;
+    for chunk in pcm_bytes.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        if sample.abs() > 100 {
+            non_silent += 1;
+        }
+    }
+
+    // At least 5% of samples must be non-silent.
+    let threshold_pct = 5u64;
+    let non_silent_pct = (non_silent as u64 * 100) / n_samples as u64;
+    if non_silent_pct < threshold_pct {
+        return Err(format!(
+            "WAV file {} is effectively silent: only {non_silent_pct}% of {n_samples} \
+             samples have |sample| > 100 (threshold: {threshold_pct}%)",
+            path.display()
+        ));
+    }
+
+    println!(
+        "audio-smoke: WAV check PASSED — {non_silent_pct}% non-silent samples \
+         ({non_silent}/{n_samples})"
+    );
+    Ok(())
 }
 
 /// Phase 63 C.2: prepare the audio smoke output directory.
@@ -10349,6 +10610,74 @@ fn run_smoke_steps_with_capture(
                     queue.push_front(extra);
                 }
             }
+
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                label,
+            } => {
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    let search = |s: &str| -> Option<(bool, usize)> {
+                        for line in s.lines() {
+                            if line.contains(pattern) {
+                                let failed = line.contains(bad_substring);
+                                let found_at = s.find(line).unwrap_or(0) + line.len();
+                                return Some((!failed, found_at));
+                            }
+                        }
+                        None
+                    };
+                    let result = search(&cleaned).or_else(|| search(&stripped));
+
+                    if let Some((ok, match_end)) = result {
+                        if ok {
+                            let cut = match_end.min(serial_buf.len());
+                            serial_buf.drain(..cut);
+                            break;
+                        } else {
+                            let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                            return Err(format!(
+                                "step {} assertion failed: {label}\n\
+                                 pattern \"{pattern}\" matched a line containing \
+                                 bad_substring \"{bad_substring}\"\n\
+                                 last serial output:\n{last_lines}",
+                                step_num
+                            ));
+                        }
+                    }
+
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.try_recv() {
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                        return Err(format!(
+                            "timeout waiting for '{pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
+                            step_num
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         }
     }
 
@@ -11342,7 +11671,9 @@ mod tests {
         let mut out = Vec::new();
         for step in steps {
             match step {
-                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => out.push(*label),
+                SmokeStep::Wait { label, .. }
+                | SmokeStep::Send { label, .. }
+                | SmokeStep::WaitLineNotMatching { label, .. } => out.push(*label),
                 SmokeStep::WaitEither {
                     label,
                     extra_steps_a,
@@ -12969,12 +13300,13 @@ mod tests {
 
     #[test]
     fn smoke_exit_codes_are_distinct() {
-        // H.1 / H.2 / H.3 acceptance: each smoke fails with a distinct
+        // H.1 / H.2 / H.3 / D.3 acceptance: each smoke fails with a distinct
         // exit code so CI can route a regression to the right tracker.
         let codes = [
             SMOKE_EXIT_AUDIO_DEMO_FAILED,
             SMOKE_EXIT_SESSION_NOT_RUNNING,
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
+            SMOKE_EXIT_WAV_SILENT,
         ];
         for (i, &a) in codes.iter().enumerate() {
             for &b in &codes[i + 1..] {
@@ -12985,6 +13317,163 @@ mod tests {
         for &a in &codes {
             assert_ne!(a, QEMU_EXIT_SUCCESS);
             assert_ne!(a, QEMU_EXIT_FAILURE);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 63 D.1 / D.2 / D.3 — audio-smoke step list + WAV assertions.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn audio_smoke_steps_run_audio_demo_and_wait_for_pass() {
+        // D.1 acceptance: after the `init: loaded service 'audio_server'`
+        // step, `audio_smoke_steps` must send `audio-demo\n` to the guest
+        // shell and then wait for the `AUDIO_DEMO:PASS` sentinel.
+        let steps = audio_smoke_steps();
+
+        // The Send step must inject `audio-demo\n`.
+        let send_input = send_input_for_label(&steps, "guest/audio: launch audio-demo")
+            .expect("audio-smoke must have a Send step labelled 'guest/audio: launch audio-demo'");
+        assert_eq!(send_input, "audio-demo\n");
+
+        // The Wait step must wait for the PASS sentinel.
+        let pattern = wait_pattern_for_label(&steps, "guest/audio: audio-demo PASS sentinel")
+            .expect("audio-smoke must wait for AUDIO_DEMO:PASS");
+        assert_eq!(pattern, "AUDIO_DEMO:PASS");
+    }
+
+    #[test]
+    fn audio_smoke_steps_wait_for_nonzero_consumed_stats() {
+        // D.2 acceptance: after AUDIO_DEMO:PASS the step list must
+        // contain a `WaitLineNotMatching` that waits for
+        // `AUDIO_DEMO:stats consumed=` and fails if the line contains
+        // `consumed=0 ` (zero frames consumed).
+        let steps = audio_smoke_steps();
+
+        // Find the WaitLineNotMatching step.
+        let step = steps.iter().find(|s| {
+            matches!(
+                s,
+                SmokeStep::WaitLineNotMatching {
+                    label,
+                    ..
+                } if *label == "guest/audio: frames_consumed non-zero"
+            )
+        });
+        let step = step.expect(
+            "audio-smoke must have a WaitLineNotMatching step labelled \
+             'guest/audio: frames_consumed non-zero'",
+        );
+
+        match step {
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(
+                    *pattern, "AUDIO_DEMO:stats consumed=",
+                    "stats step must wait for the consumed= sentinel"
+                );
+                assert_eq!(
+                    *bad_substring, "consumed=0 ",
+                    "stats step must reject lines with consumed=0 (zero frames)"
+                );
+                assert!(*timeout_secs >= 5, "stats step timeout must be at least 5s");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Build a minimal valid RIFF/WAVE file with S16LE PCM data.
+    ///
+    /// `samples` is the raw i16 sample data. Channel count / sample rate
+    /// are not encoded (the WAV checker only needs the data chunk).
+    fn build_test_wav(samples: &[i16]) -> Vec<u8> {
+        let num_bytes = samples.len() * 2;
+        // RIFF header (12) + fmt chunk (24) + data chunk header (8) + data.
+        let total_size = 12 + 24 + 8 + num_bytes;
+        let mut out = Vec::with_capacity(total_size);
+
+        // RIFF header.
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((total_size - 8) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+
+        // fmt chunk (PCM = audio format 1, stereo, 48000 Hz, S16LE).
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&2u16.to_le_bytes()); // channels
+        out.extend_from_slice(&48000u32.to_le_bytes()); // sample rate
+        out.extend_from_slice(&(48000u32 * 2 * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&4u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+        // data chunk.
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(num_bytes as u32).to_le_bytes());
+        for &s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+
+        out
+    }
+
+    #[test]
+    fn assert_wav_non_silent_passes_for_synthesized_sine() {
+        // D.3 acceptance: a 440 Hz sine at ~30% amplitude over 1024 samples
+        // must have well above 5% non-silent samples (|sample| > 100).
+        use std::f64::consts::PI;
+        let n = 1024usize;
+        let samples: Vec<i16> = (0..n)
+            .map(|i| {
+                let angle = 2.0 * PI * 440.0 * (i as f64) / 48000.0;
+                (angle.sin() * 10000.0) as i16
+            })
+            .collect();
+
+        let wav_bytes = build_test_wav(&samples);
+
+        // Write to a temp file.
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_sine_440hz.wav");
+        std::fs::write(&path, &wav_bytes).expect("write test wav");
+
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            result.is_ok(),
+            "assert_wav_non_silent must pass for a 440 Hz sine wave, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn assert_wav_non_silent_fails_for_silent_wav() {
+        // D.3 acceptance: a WAV with all-zero samples must fail with a message
+        // containing the observed percentage of non-silent samples.
+        let samples = vec![0i16; 1024];
+        let wav_bytes = build_test_wav(&samples);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_silent.wav");
+        std::fs::write(&path, &wav_bytes).expect("write silent wav");
+
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match result {
+            Err(msg) => {
+                // Error message must include the percentage of non-silent samples.
+                assert!(
+                    msg.contains("0%") || msg.contains("silent"),
+                    "error message must report the observed percentage, got: {msg:?}"
+                );
+            }
+            Ok(()) => panic!("assert_wav_non_silent must fail for a silent WAV"),
         }
     }
 
