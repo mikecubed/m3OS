@@ -439,3 +439,135 @@ fn protocol_error_lifts_into_audio_client_error() {
     let err: AudioClientError = ProtocolError::Truncated.into();
     assert_eq!(err, AudioClientError::Protocol(ProtocolError::Truncated));
 }
+
+// ---------------- Phase 63 Track E.1: control-only connect + get_stats() ----------------
+
+/// Verify that a `new_with_socket` (control-only, no stream) client can
+/// call `get_stats()` successfully. This mirrors the production
+/// `AudioClient::connect()` path used by `audio-stats` and `bell-test`.
+#[test]
+fn get_stats_without_open_stream_succeeds() {
+    // Phase 63 E.1 acceptance: get_stats() must work without a prior Open.
+    // `new_with_socket` constructs a client with stream_id = None,
+    // matching what `AudioClient::connect()` produces.
+    let mut socket = MockSocket::new();
+    // No Opened reply needed — no Open is sent.
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 1,
+        frames_submitted: 4800,
+        frames_consumed: 4800,
+    }));
+    let mut client: AudioClient<MockSocket> = AudioClient::new_with_socket(socket);
+    // stream_id must be None — confirm this is a "control-only" client.
+    assert_eq!(
+        client.stream_id(),
+        None,
+        "control-only client must have no stream_id"
+    );
+    let stats = client
+        .get_stats()
+        .expect("get_stats must succeed without open stream");
+    assert_eq!(stats.frames_consumed, 4800);
+    assert_eq!(stats.frames_submitted, 4800);
+    assert_eq!(stats.underrun_count, 1);
+    // Only one frame sent (GetStats — no Open).
+    assert_eq!(
+        client.socket.sent.len(),
+        1,
+        "control-only get_stats must send exactly one frame (no Open)"
+    );
+    let (decoded, _) =
+        ClientMessage::decode(&client.socket.sent[0].frame).expect("GetStats frame must decode");
+    assert_eq!(
+        decoded,
+        ClientMessage::ControlCommand(AudioControlCommand::GetStats),
+        "sole frame must be ControlCommand(GetStats)"
+    );
+}
+
+#[test]
+fn get_stats_returns_consumed_and_underruns_from_server() {
+    // Phase 63 E.1 acceptance: get_stats() sends ControlCommand(GetStats)
+    // and returns the decoded AudioStats struct from the server reply.
+    let mut socket = MockSocket::new();
+    // Server must first acknowledge the Open.
+    socket.push_reply_msg(ServerMessage::Opened { stream_id: 1 });
+    // Server returns stats with non-zero frames_consumed.
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 3,
+        frames_submitted: 9600,
+        frames_consumed: 7200,
+    }));
+    let mut client = open_stereo(socket).expect("open ok");
+    let stats = client.get_stats().expect("get_stats ok");
+    assert_eq!(stats.frames_consumed, 7200);
+    assert_eq!(stats.frames_submitted, 9600);
+    assert_eq!(stats.underrun_count, 3);
+}
+
+#[test]
+fn get_stats_zero_consumed_is_valid_before_frames_submitted() {
+    // get_stats() must not error on frames_consumed == 0. The bell-smoke
+    // assertion happens *after* BEL injection; before that the count is
+    // legitimately zero.
+    let mut socket = MockSocket::new();
+    socket.push_reply_msg(ServerMessage::Opened { stream_id: 1 });
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 0,
+        frames_submitted: 0,
+        frames_consumed: 0,
+    }));
+    let mut client = open_stereo(socket).expect("open ok");
+    let stats = client
+        .get_stats()
+        .expect("get_stats must not error on zero counts");
+    assert_eq!(stats.frames_consumed, 0);
+    assert_eq!(stats.underrun_count, 0);
+}
+
+#[test]
+fn get_stats_encodes_control_command_get_stats_on_wire() {
+    // The get_stats() verb must encode ControlCommand(GetStats) as the
+    // request frame — the server decodes this to dispatch_client → StatsRequested.
+    let mut socket = MockSocket::new();
+    socket.push_reply_msg(ServerMessage::Opened { stream_id: 1 });
+    socket.push_reply_msg(ServerMessage::ControlEvent(AudioControlEvent::Stats {
+        underrun_count: 0,
+        frames_submitted: 0,
+        frames_consumed: 0,
+    }));
+    let mut client = open_stereo(socket).expect("open ok");
+    let _ = client.get_stats().expect("get_stats ok");
+
+    // sent[0] = open, sent[1] = get_stats
+    let sock = client.socket;
+    assert_eq!(
+        sock.sent.len(),
+        2,
+        "exactly two frames must be sent (Open + GetStats)"
+    );
+    let (decoded, _) = ClientMessage::decode(&sock.sent[1].frame)
+        .expect("GetStats frame must be a valid ClientMessage");
+    assert_eq!(
+        decoded,
+        ClientMessage::ControlCommand(AudioControlCommand::GetStats),
+        "get_stats() must encode ControlCommand(GetStats)"
+    );
+}
+
+#[test]
+fn get_stats_unexpected_reply_returns_error() {
+    // If the server sends an unexpected message instead of ControlEvent(Stats),
+    // get_stats() must return UnexpectedReply rather than panic.
+    let mut socket = MockSocket::new();
+    socket.push_reply_msg(ServerMessage::Opened { stream_id: 1 });
+    // Send a DrainAck where a ControlEvent(Stats) is expected.
+    socket.push_reply_msg(ServerMessage::DrainAck);
+    let mut client = open_stereo(socket).expect("open ok");
+    let result = client.get_stats();
+    assert_eq!(
+        result.err(),
+        Some(AudioClientError::UnexpectedReply),
+        "get_stats() must return UnexpectedReply on a non-Stats server reply"
+    );
+}

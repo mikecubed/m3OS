@@ -15,6 +15,8 @@
 //! - [`AudioClient::drain`] — block until every submitted frame has
 //!   been consumed by the device.
 //! - [`AudioClient::close`] — close the stream and release the slot.
+//! - [`AudioClient::get_stats`] — query playback statistics from the server
+//!   (frames submitted / consumed, underrun count).
 //! - [`AudioClientError`] — typed error returned by every verb.
 //!
 //! Anything else is private. The protocol byte format is private to
@@ -276,27 +278,23 @@ impl<S: AudioSocket> AudioClient<S> {
         }
     }
 
-    /// Query the audio server for current stream stats.
+    /// Query the audio_server for current playback statistics.
     ///
-    /// Issues `ClientMessage::ControlCommand(GetStats)` and decodes the
-    /// `ServerMessage::ControlEvent(Stats { ... })` reply. The stream
-    /// does not need to be open — `GetStats` is a control-plane verb that
-    /// may be issued at any time after a successful [`AudioClient::open`]
-    /// call and before `close` consumes the client.
-    ///
-    /// Returns `Err(NotOpen)` if no stream was opened.
+    /// Sends `ControlCommand(GetStats)` to the control socket and returns
+    /// the decoded [`AudioStats`]. Can be called whether or not a stream
+    /// is currently open — the server tracks global stats and `GetStats`
+    /// is a control-plane verb that does not require a prior `Open` call.
+    /// `audio-demo` issues `GetStats` after `drain`; `audio-stats` and
+    /// `bell-test` issue it without ever calling `Open`.
     pub fn get_stats(&mut self) -> Result<AudioStats, AudioClientError> {
-        if self.stream_id.is_none() {
-            return Err(AudioClientError::NotOpen);
-        }
         let mut frame = [0u8; MAX_REQUEST_BYTES];
         let n = ClientMessage::ControlCommand(AudioControlCommand::GetStats).encode(&mut frame)?;
         let reply = self.socket.call(&frame[..n], &[])?;
         match decode_server_message(reply.as_slice())? {
             ServerMessage::ControlEvent(AudioControlEvent::Stats {
-                frames_consumed,
-                frames_submitted,
                 underrun_count,
+                frames_submitted,
+                frames_consumed,
             }) => Ok(AudioStats {
                 underrun_count,
                 frames_submitted,
@@ -329,6 +327,25 @@ impl AudioClient<SyscallSocket> {
     ) -> Result<Self, AudioClientError> {
         let socket = SyscallSocket::connect()?;
         Self::open_with_socket(socket, format, layout, rate)
+    }
+
+    /// Connect to `audio_server` **without** opening a PCM stream.
+    ///
+    /// Looks up `SERVICE_NAME` (`"audio.cmd"`) and returns a client bound
+    /// to the control socket. No `Open` message is sent, so the server's
+    /// single-client slot is not consumed. The only verb that makes sense
+    /// on a control-only client is [`AudioClient::get_stats`] —
+    /// `submit_frames`, `drain`, and `close` will all return
+    /// [`AudioClientError::NotOpen`].
+    ///
+    /// Phase 63 Track E.1: used by `audio-stats` and `bell-test` to query
+    /// `frames_consumed` without perturbing the audio device state.
+    pub fn connect() -> Result<Self, AudioClientError> {
+        let socket = SyscallSocket::connect()?;
+        Ok(Self {
+            socket,
+            stream_id: None,
+        })
     }
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "bell-test"
+version = "0.63.0"
+edition = "2024"
+description = "Phase 63 Track E.1 — one-shot bell path exerciser. Constructs AudioClientBellSink and calls Bell::ring(), then queries AudioStats to confirm frames_consumed > 0. Prints BELL_TEST:PASS or BELL_TEST:FAIL for the bell-smoke harness."
+
+[[bin]]
+name = "bell-test"
+path = "src/main.rs"
+
+[dependencies]
+audio_client = { path = "../lib/audio_client" }
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# `term` is required for `term::bell::{Bell, AudioClientBellSink}`.
+# The `os-binary` feature gate is enabled here so that `AudioClientBellSink`
+# (gated on `cfg(all(not(test), feature = "os-binary"))`) is compiled in
+# when bell-test builds as an OS binary.
+term = { path = "../term", features = ["os-binary"] }
