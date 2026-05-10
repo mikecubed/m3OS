@@ -36,6 +36,20 @@ fn program_main(_args: &[&str]) -> i32 {
 
     wait_for_prompt_ready();
 
+    // Bump priority above the normal-task floor (default 20) into the
+    // real-time band so we get dispatched promptly when a UDP datagram
+    // arrives. Without this, a busy fork-bomb workload can starve us
+    // long enough that smoke-runner's `wait_for_file_contains` timeout
+    // (15 s) elapses before we even read the marker off `/dev/log`.
+    //
+    // m3OS priority is inverse: 0 = highest, 30 = lowest (BSP idle).
+    // `nice(-15)` from the default 20 lands at priority 5 — mid
+    // real-time, leaving headroom (0..=4) for any harder-RT services.
+    // Reaching the RT band (0..=9) requires root: `sys_nice` clamps
+    // non-root callers up to 10. syslogd runs as root, so the result
+    // is the requested 5.
+    let _ = syscall_lib::nice(-15);
+
     // Ensure /var/log exists.
     ensure_log_dirs();
 
@@ -231,6 +245,13 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
                 let len = format_log_line(&mut line_buf, priority, body);
                 if len > 0 {
                     syscall_lib::write(msg_fd, &line_buf[..len]);
+                    // Force the bytes through any vfs-server-side caching so
+                    // a reader (e.g. smoke-runner waiting on a marker)
+                    // observes the new line on its very next read attempt.
+                    // Without this, the bytes can sit in vfs cache for
+                    // arbitrary time, racing the smoke-test
+                    // `wait_for_file_contains` budget.
+                    let _ = syscall_lib::fsync(msg_fd);
                 }
                 drained += 1;
                 if drained >= MAX_SOCKET_DRAIN_PER_LOOP {

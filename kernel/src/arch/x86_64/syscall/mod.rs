@@ -1388,6 +1388,7 @@ mod syscall_nr {
     // -- time --
     pub const NANOSLEEP: u64 = 35;
     pub const GETTIMEOFDAY: u64 = 96;
+    pub const GETRUSAGE: u64 = 98; // Phase 61 Track E.3
     pub const TIMES: u64 = 100;
     pub const CLOCK_GETTIME: u64 = 228;
 
@@ -1726,7 +1727,14 @@ pub extern "C" fn syscall_handler(
         }
         FORK => sys_fork(user_rip, user_rsp),
         EXECVE => sys_execve(arg0, arg1, arg2),
-        WAIT4 => sys_waitpid(arg0, arg1, arg2),
+        WAIT4 => {
+            // Phase 61 Track E.3: 4th argument (rusage_ptr) lives in r10 at
+            // syscall entry; per_core_syscall_arg3 reads it via the
+            // task-local snapshot.
+            let rusage_ptr = per_core_syscall_arg3();
+            sys_wait4(arg0, arg1, arg2, rusage_ptr)
+        }
+        GETRUSAGE => sys_getrusage(arg0 as i32, arg1),
         UMASK => sys_umask(arg0),
         GETUID => sys_linux_getuid(),
         GETGID => sys_linux_getgid(),
@@ -3700,14 +3708,186 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 ///   offset 16: tms_cutime — children user CPU time
 ///   offset 24: tms_cstime — children system CPU time
 /// Returns: clock ticks since boot.
+/// Phase 61 Track E.3 — `getrusage(who, usage_ptr)` (Linux syscall 98).
+///
+/// `who` selects the source counters:
+///   * `RUSAGE_SELF`     ( 0): calling task's own counters.
+///   * `RUSAGE_CHILDREN` (-1): calling task's reaped-children accumulators.
+///   * `RUSAGE_THREAD`   ( 1): same as `RUSAGE_SELF` (one-task-per-process
+///     for now; Phase 61 keeps this distinction simple).
+///   * any other value: returns `-EINVAL`.
+///
+/// `usage_ptr` is the userspace address of a 144-byte `struct rusage`
+/// (Linux x86_64 layout). Phase 61 populates the four time fields and the
+/// four event-count fields delivered by Track E.4; the remaining 10 fields
+/// stay zeroed (they require post-1.0 instrumentation — see the design
+/// doc's Deferred Until Later section).
+///
+/// A null `usage_ptr` returns `-EFAULT` per Linux `getrusage(2)` semantics
+/// (unlike `wait4(2)`, which treats the rusage pointer as optional).
+pub(super) fn sys_getrusage(who: i32, usage_ptr: u64) -> u64 {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+
+    if usage_ptr == 0 {
+        return NEG_EFAULT;
+    }
+
+    let (user_ticks, system_ticks, minor, major, nvcsw, nivcsw) = match who {
+        RUSAGE_SELF | RUSAGE_THREAD => {
+            let (u, s) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+            let (mi, ma, vol, invol) =
+                crate::task::scheduler::current_task_rusage_self().unwrap_or((0, 0, 0, 0));
+            (u, s, mi, ma, vol, invol)
+        }
+        RUSAGE_CHILDREN => {
+            let (u, s) = crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
+            let (mi, ma, vol, invol) =
+                crate::task::scheduler::current_task_rusage_children().unwrap_or((0, 0, 0, 0));
+            (u, s, mi, ma, vol, invol)
+        }
+        _ => return NEG_EINVAL,
+    };
+
+    if let Err(_e) = write_rusage(
+        usage_ptr,
+        user_ticks,
+        system_ticks,
+        minor,
+        major,
+        nvcsw,
+        nivcsw,
+    ) {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+/// Phase 61 Track E.3 — `wait4(pid, status_ptr, options, rusage_ptr)`
+/// (Linux syscall 61, replacing the Phase 11 `waitpid` mapping for the
+/// same number).
+///
+/// Reuses [`sys_waitpid`]'s wait/scan/reap logic; on a successful reap, if
+/// `rusage_ptr` is non-zero, writes a 144-byte Linux `struct rusage`
+/// populated from the reaped child's accumulated tick + counter totals
+/// (Track E.1 + Track E.4 fields). Userspace toolchains (musl, glibc)
+/// route both `waitpid(2)` and `wait4(2)` through this syscall — without
+/// the rusage write the latter silently lost data on every call.
+pub(super) fn sys_wait4(pid: u64, status_ptr: u64, options: u64, rusage_ptr: u64) -> u64 {
+    // Snapshot the calling task's RUSAGE_CHILDREN counters BEFORE the reap
+    // so that after sys_waitpid runs (which accumulates the zombie's
+    // counters into the parent's child_*), we can compute the delta and
+    // write that to the rusage_ptr — the rusage value Linux writes is the
+    // reaped-just-now subtree, not the parent's running totals.
+    //
+    // If sys_waitpid blocks and a different child gets reaped before we
+    // resume, the delta still reflects ALL children reaped during this
+    // wait4 call — which is the intended Linux semantics.
+    let (cu_before, cs_before) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
+    let (cm_before, cmaj_before, cv_before, civ_before) =
+        crate::task::scheduler::current_task_rusage_children().unwrap_or((0, 0, 0, 0));
+
+    let result = sys_waitpid(pid, status_ptr, options);
+
+    // sys_waitpid returns the reaped pid on success, or a negative errno
+    // (encoded as a high u64). 0 = WNOHANG with nothing to reap. We only
+    // write rusage on a successful reap (positive pid return).
+    let reaped_pid = result as i64;
+    if reaped_pid <= 0 || rusage_ptr == 0 {
+        return result;
+    }
+
+    let (cu_after, cs_after) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((cu_before, cs_before));
+    let (cm_after, cmaj_after, cv_after, civ_after) =
+        crate::task::scheduler::current_task_rusage_children().unwrap_or((
+            cm_before,
+            cmaj_before,
+            cv_before,
+            civ_before,
+        ));
+
+    let user_ticks = cu_after.saturating_sub(cu_before);
+    let system_ticks = cs_after.saturating_sub(cs_before);
+    let minor = cm_after.saturating_sub(cm_before);
+    let major = cmaj_after.saturating_sub(cmaj_before);
+    let nvcsw = cv_after.saturating_sub(cv_before);
+    let nivcsw = civ_after.saturating_sub(civ_before);
+
+    // Best-effort write — the child has already been reaped at this
+    // point, so we cannot fail the syscall. Mirrors how `sys_waitpid`
+    // treats `status_ptr` write failure (see the `let _ = UserSliceWo`
+    // block in `sys_waitpid`). Userspace that passed an unmapped
+    // `rusage_ptr` simply observes a successful reap with a stale
+    // rusage buffer — better than retrying on -EFAULT and re-reaping
+    // (impossible, the child is gone) or zombie-leaking the child.
+    let _ = write_rusage(
+        rusage_ptr,
+        user_ticks,
+        system_ticks,
+        minor,
+        major,
+        nvcsw,
+        nivcsw,
+    );
+    result
+}
+
+/// Phase 61 Track E.3 — write a 144-byte Linux `struct rusage` to
+/// `usage_ptr`. `user_ticks` / `system_ticks` are converted to
+/// `timeval` via 1 tick = 1 ms (m3OS's LAPIC timer is configured for
+/// 1 ms periodic). The four event-count fields populate
+/// `ru_minflt` / `ru_majflt` / `ru_nvcsw` / `ru_nivcsw`; the remaining
+/// 10 fields are zeroed.
+fn write_rusage(
+    usage_ptr: u64,
+    user_ticks: u64,
+    system_ticks: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    nvcsw: u64,
+    nivcsw: u64,
+) -> Result<(), ()> {
+    // 1 tick = 1 ms = 1_000 microseconds (LAPIC timer periodic 1 ms).
+    let user_us = user_ticks.saturating_mul(1_000);
+    let system_us = system_ticks.saturating_mul(1_000);
+
+    let mut bytes = [0u8; 144];
+    // ru_utime
+    bytes[0..8].copy_from_slice(&((user_us / 1_000_000) as i64).to_ne_bytes()); // tv_sec
+    bytes[8..16].copy_from_slice(&((user_us % 1_000_000) as i64).to_ne_bytes()); // tv_usec
+    // ru_stime
+    bytes[16..24].copy_from_slice(&((system_us / 1_000_000) as i64).to_ne_bytes()); // tv_sec
+    bytes[24..32].copy_from_slice(&((system_us % 1_000_000) as i64).to_ne_bytes()); // tv_usec
+    // ru_maxrss(32) / ru_ixrss(40) / ru_idrss(48) / ru_isrss(56) — zeroed.
+    // ru_minflt(64), ru_majflt(72)
+    bytes[64..72].copy_from_slice(&(minor_faults as i64).to_ne_bytes());
+    bytes[72..80].copy_from_slice(&(major_faults as i64).to_ne_bytes());
+    // ru_nswap(80) / ru_inblock(88) / ru_oublock(96) /
+    // ru_msgsnd(104) / ru_msgrcv(112) / ru_nsignals(120) — zeroed.
+    // ru_nvcsw(128), ru_nivcsw(136)
+    bytes[128..136].copy_from_slice(&(nvcsw as i64).to_ne_bytes());
+    bytes[136..144].copy_from_slice(&(nivcsw as i64).to_ne_bytes());
+
+    UserSliceWo::new(usage_ptr, bytes.len())
+        .and_then(|s| s.copy_from_kernel(&bytes))
+        .map_err(|_| ())
+}
+
 pub(super) fn sys_times(buf_ptr: u64) -> u64 {
     let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+    // Phase 61 Track E.1: tms_cutime / tms_cstime now read the calling task's
+    // accumulated reaped-descendants tick counts (was hard-coded zero).
+    let (child_user_ticks, child_system_ticks) =
+        crate::task::scheduler::current_task_child_times().unwrap_or((0, 0));
     if buf_ptr != 0 {
         let mut bytes = [0u8; 32]; // 4 × i64
         bytes[0..8].copy_from_slice(&(user_ticks as i64).to_ne_bytes()); // tms_utime
         bytes[8..16].copy_from_slice(&(system_ticks as i64).to_ne_bytes()); // tms_stime
-        bytes[16..24].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cutime (children — not tracked yet)
-        bytes[24..32].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cstime
+        bytes[16..24].copy_from_slice(&(child_user_ticks as i64).to_ne_bytes()); // tms_cutime
+        bytes[24..32].copy_from_slice(&(child_system_ticks as i64).to_ne_bytes()); // tms_cstime
         if UserSliceWo::new(buf_ptr, bytes.len())
             .and_then(|s| s.copy_from_kernel(&bytes))
             .is_err()
@@ -4018,7 +4198,15 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     if let Some(parent_exec_path) = current_exec_path_for_debug()
         && is_interactive_debug_exec_path(parent_exec_path.as_str())
     {
-        log::info!(
+        // Downgraded from INFO to DEBUG: these per-fork audit lines from
+        // interactive shells (ion / sh0) interleaved with userspace SMOKE:
+        // markers under fast (KVM) timing because each USERSPACE write
+        // takes SERIAL1 only for its own bytes — a kernel `log::info!`
+        // firing between two userspace `write()`s splits the user line.
+        // The Phase 57 kbd_server-silent-fail diagnostic this was added
+        // for is closed; re-enable at INFO if a similar diagnostic is
+        // needed.
+        log::debug!(
             "[proc] fork: parent_pid={} parent_exec={} child_pid={}",
             parent_pid,
             parent_exec_path,
@@ -4365,7 +4553,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
     if is_interactive_debug_exec_path(name) {
-        log::info!("[proc] execve: pid={} path={}", pid, name);
+        // Downgraded from INFO to DEBUG — see matching note in the fork
+        // logger above. Service-supervisor debug aid that's no longer the
+        // active debug surface.
+        log::debug!("[proc] execve: pid={} path={}", pid, name);
     }
     #[cfg(feature = "exec-trace")]
     log::info!(
@@ -4583,7 +4774,15 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     Some((pid, found_code, true)) // stopped
                 } else {
                     let code = found_code.unwrap_or(0);
-                    table.reap(pid);
+                    // Phase 61 Track E.1/E.4 lock-order note: scheduler
+                    // accumulation helpers and `table.reap(pid)` MUST run
+                    // outside this PROCESS_TABLE lock scope. The scheduler
+                    // dispatch path (`scheduler.rs::dispatch_for_core`)
+                    // acquires `PROCESS_TABLE` while holding `SCHEDULER`,
+                    // so calling any scheduler-locking helper here would
+                    // create an ABBA inversion. We return the reapable
+                    // pid+code and run accumulation + reap after the
+                    // `result` scope exits below.
                     Some((pid, Some(code), false))
                 }
             } else {
@@ -4592,6 +4791,23 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
+            // Phase 61 Track E.1/E.4 — recursive child-time and child-rusage
+            // accumulation, plus the actual zombie reap. Runs OUTSIDE the
+            // PROCESS_TABLE lock scope above to avoid ABBA against the
+            // scheduler dispatch path (scheduler.rs acquires PROCESS_TABLE
+            // while holding SCHEDULER). The scheduler-side task entries
+            // for the reaped pid are looked up independently of
+            // PROCESS_TABLE, so the table.reap() can safely follow.
+            if !stopped {
+                let (z_user, z_sys, z_cuser, z_csys) =
+                    crate::task::scheduler::task_times_for_pid(child_pid);
+                crate::task::scheduler::current_task_accumulate_child_times(
+                    z_user, z_sys, z_cuser, z_csys,
+                );
+                let z_rusage = crate::task::scheduler::rusage_counters_for_pid(child_pid);
+                crate::task::scheduler::current_task_accumulate_child_rusage(z_rusage);
+                crate::process::PROCESS_TABLE.lock().reap(child_pid);
+            }
             if let Some(task_id) = wait_task {
                 crate::process::deregister_child_waiter(calling_pid, task_id);
             }
@@ -5414,12 +5630,31 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let pipe_id = *pipe_id;
             let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
-            // Yield-loop until data is available or writer closes.
+            // Phase 61 Track F — blocking-pipe read uses
+            // `PIPE_WAITQUEUES[pipe_id].sleep()` instead of the previous
+            // `loop { pipe_read; yield_now }` polling. Mirrors the stdin
+            // direct-read pattern earlier in this file (`STDIN_WAITQUEUE
+            // .register / sleep / deregister`). `wake_pipe` is called from
+            // both `pipe_write` (data available) and the close paths
+            // (reader/writer EOF), so the sleep is always woken when the
+            // condition that would let `pipe_read` return changes.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::pipe::pipe_register_waiter(pipe_id, task_id, &woken);
+
                 let mut tmp = [0u8; 4096];
                 match crate::pipe::pipe_read(pipe_id, &mut tmp[..capped]) {
-                    Ok(0) => return 0, // EOF
+                    Ok(0) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
+                        return 0; // EOF
+                    }
                     Ok(n) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                         if UserSliceWo::new(buf_ptr, tmp[..n].len())
                             .and_then(|s| s.copy_from_kernel(&tmp[..n]))
                             .is_err()
@@ -5430,12 +5665,25 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     Err(_would_block) => {
                         if nonblock {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EAGAIN;
                         }
                         if has_pending_signal() {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EINTR;
                         }
-                        crate::task::yield_now();
+                        // Park until `wake_pipe(pipe_id)` fires from a
+                        // matching `pipe_write` / close. The `woken` flag
+                        // closes the lost-wake window between the readiness
+                        // scan and the block (same discipline as stdin).
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnRecv,
+                            &woken,
+                            None,
+                        );
+                        // wake_all drained our entry; deregister is
+                        // idempotent for safety.
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                     }
                 }
             }
@@ -5961,24 +6209,52 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             {
                 return NEG_EFAULT;
             }
-            // Yield-loop until space is available or reader closes.
+            // Phase 61 Track F — blocking-pipe write uses
+            // `PIPE_WAITQUEUES[pipe_id].sleep()` instead of the previous
+            // `loop { pipe_write; yield_now }` polling. `wake_pipe` is
+            // called from `pipe_read` after a successful read drains
+            // capacity, so the sleep is always woken when the buffer
+            // shrinks. EPIPE (`Err(false)`) returns immediately without
+            // entering the wait queue — no sleep needed when the reader
+            // is gone.
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EINTR,
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             loop {
+                woken.store(false, core::sync::atomic::Ordering::Release);
+                crate::pipe::pipe_register_waiter(pipe_id, task_id, &woken);
+
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
-                    Ok(n) => return n as u64,
+                    Ok(n) => {
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
+                        return n as u64;
+                    }
                     Err(false) => {
                         // Reader closed — EPIPE.
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                         const NEG_EPIPE: u64 = (-32_i64) as u64;
                         return NEG_EPIPE;
                     }
                     Err(true) => {
                         if nonblock {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EAGAIN;
                         }
-                        // Would block — yield and retry.
                         if has_pending_signal() {
+                            crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                             return NEG_EINTR;
                         }
-                        crate::task::yield_now();
+                        // Park until `wake_pipe(pipe_id)` fires from a
+                        // matching `pipe_read` (data drained → space
+                        // available) or close.
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnSend,
+                            &woken,
+                            None,
+                        );
+                        crate::pipe::pipe_deregister_waiter(pipe_id, task_id);
                     }
                 }
             }
@@ -6942,7 +7218,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             Ok(id) => id,
             Err(()) => return NEG_ENOSPC,
         };
-        log::info!("[pty] allocated PTY pair {}", pty_id);
+        log::debug!("[pty] allocated PTY pair {}", pty_id);
         let entry = FdEntry {
             backend: FdBackend::PtyMaster { pty_id },
             offset: 0,
@@ -8974,6 +9250,11 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     let freed_count = unmapped_addrs.len();
 
     // SMP TLB shootdown: batch invalidation for the entire unmapped range.
+    // Phase 25 P25-T033 closure (verified Phase 61 C.1): this call wires
+    // tlb_shootdown_range into sys_linux_munmap; the per-page unmap loop above
+    // defers its local TLB flush (`flush.ignore()`) so the entire range is
+    // invalidated in a single batched IPI here. Cross-core regression test:
+    // kernel/tests/munmap_tlb_smp.rs.
     if !unmapped_addrs.is_empty() {
         let range_start = *unmapped_addrs.iter().min().unwrap();
         let range_end = *unmapped_addrs.iter().max().unwrap() + 4096;
@@ -11742,7 +12023,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
             let create_mode = ((mode as u16) & 0o7777) & !current_umask();
             return match vol.create_directory(parent_ino, dir_name, create_mode, mk_euid, mk_egid) {
                 Ok(_) => {
-                    log::info!("[mkdir] {} (ext2)", name);
+                    log::debug!("[mkdir] {} (ext2)", name);
                     0
                 }
                 Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
@@ -11781,7 +12062,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
                     mk_egid,
                 ) {
                     Ok(_) => {
-                        log::info!("[mkdir] {} (ext2)", name);
+                        log::debug!("[mkdir] {} (ext2)", name);
                         0
                     }
                     Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
@@ -11807,7 +12088,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
                 };
                 return match vol.mkdir(parent_cluster, dir_name) {
                     Ok(_) => {
-                        log::info!("[mkdir] {} (fat32)", name);
+                        log::debug!("[mkdir] {} (fat32)", name);
                         let (_, _, mk_euid2, mk_egid2) = current_process_ids();
                         let create_mode = ((mode as u16) & 0o7777) & !current_umask();
                         crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, create_mode);
@@ -11834,7 +12115,7 @@ pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let create_mode = ((mode as u16) & 0o7777) & !current_umask();
     match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, create_mode) {
         Ok(()) => {
-            log::info!("[mkdir] {}", name);
+            log::debug!("[mkdir] {}", name);
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
@@ -11940,7 +12221,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
             let file_name = parts.last().copied().unwrap_or(rel);
             return match vol.delete_file(parent_ino, file_name) {
                 Ok(()) => {
-                    log::info!("[unlink] {} (ext2)", name);
+                    log::debug!("[unlink] {} (ext2)", name);
                     0
                 }
                 Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
@@ -11973,7 +12254,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
                 let file_name = parts.last().copied().unwrap_or(rel);
                 return match vol.delete_file(parent_ino, file_name) {
                     Ok(()) => {
-                        log::info!("[unlink] {} (ext2)", name);
+                        log::debug!("[unlink] {} (ext2)", name);
                         0
                     }
                     Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
@@ -12000,7 +12281,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
                 };
                 return match vol.unlink(parent_cluster, file_name) {
                     Ok(()) => {
-                        log::info!("[unlink] {} (fat32)", name);
+                        log::debug!("[unlink] {} (fat32)", name);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::NotFound) => NEG_ENOENT,
@@ -12023,7 +12304,7 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
     match tmpfs.unlink(rel) {
         Ok(()) => {
-            log::info!("[unlink] {}", name);
+            log::debug!("[unlink] {}", name);
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,

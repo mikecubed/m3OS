@@ -39,10 +39,11 @@
 //!
 //! ## Load balancing (Phase 52c A.4)
 //!
-//! The BSP runs `maybe_load_balance()` every 50 scheduler ticks (~500 ms
-//! at 100 Hz). If the longest run queue exceeds the shortest by more than
-//! 2 entries, one task is migrated — skipping any task whose
-//! `last_migrated_tick` is within `MIGRATE_COOLDOWN` (100 ticks / ~1 s).
+//! The BSP runs `maybe_load_balance()` every 50 scheduler-loop iterations
+//! (~50 ms with `TICKS_PER_SEC = 1000` and a 1 ms BSP LAPIC period). If the
+//! longest run queue exceeds the shortest by more than 2 entries, one task
+//! is migrated — skipping any task whose `last_migrated_tick` is within
+//! `MIGRATE_COOLDOWN` (100 ticks / ~100 ms).
 //!
 //! ## Dead-slot recycling (Phase 52c A.3)
 //!
@@ -544,6 +545,50 @@ fn set_current_task_idx(idx: Option<usize>) {
     crate::smp::per_core()
         .current_task_idx
         .store(val, Ordering::Relaxed);
+}
+
+/// Cache a stable pointer to the running task on this core, or null when
+/// switching out. Mirrors [`set_current_task_idx`] but exposes the Task
+/// address so IRQ-context helpers (CPU-time sampler, page-fault rusage
+/// updater) can mutate the running task's atomic counters without taking
+/// the scheduler lock.
+///
+/// The pointer is safe to deref from any context as long as it is non-null
+/// — a task's storage in `Vec<SlabBox<Task>>` keeps its address stable for
+/// the task's lifetime, and we never expose the pointer past `current_task_ptr`
+/// being cleared on switch-out (Release-paired with Acquire load below).
+fn set_current_task_ptr(task: Option<&crate::task::Task>) {
+    let raw = match task {
+        Some(t) => t as *const crate::task::Task as *mut crate::task::Task,
+        None => core::ptr::null_mut(),
+    };
+    crate::smp::per_core()
+        .current_task_ptr
+        .store(raw, Ordering::Release);
+}
+
+/// Read the cached running-task pointer for this core. Returns `None` when
+/// the scheduler loop is running (between dispatches).
+#[inline]
+pub(crate) fn current_task_ptr() -> Option<&'static crate::task::Task> {
+    if !crate::smp::is_per_core_ready() {
+        return None;
+    }
+    let raw = crate::smp::per_core()
+        .current_task_ptr
+        .load(Ordering::Acquire);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: the pointer was published by `set_current_task_ptr` from a
+        // dispatch site holding the scheduler lock and pointing at a Task
+        // inside `Vec<SlabBox<Task>>` whose address is stable for the task's
+        // lifetime. The lifetime is `'static` because the Vec itself is
+        // `static SCHEDULER` and the Task slot is never reused while it is
+        // the current task on any core (the dispatcher clears the pointer on
+        // switch-out before another task can take the slot).
+        Some(unsafe { &*raw })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1148,9 @@ fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
         // location.  Critically, the `Box` itself is NOT replaced — its
         // address stays stable.
         crate::ipc::notification::clear_bound_task(idx);
+        // Counters are inside the new `task` value being move-assigned
+        // (zero-initialised by `Task::new`), so this in-place replacement
+        // automatically resets them — no separate reset step needed.
         *sched.tasks[idx] = task;
         if idx < sched.fpu_states.len() {
             *sched.fpu_states[idx] = XSaveArea::new();
@@ -1186,6 +1234,36 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(core, idx);
+}
+
+/// Spawn a new kernel task on a specific core. Used by Phase 61 SMP
+/// integration tests to deterministically create initial run-queue imbalance
+/// (load-balance regression test) and to pin reader/writer tasks across
+/// cores (cross-core wakeup tests).
+///
+/// Unlike [`spawn_on_current_core`], does not require a current-task
+/// context — safe to call from the BSP entry function before
+/// [`run`] is invoked.
+///
+/// Panics if `core_id >= MAX_CORES`. Note this is the compile-time core
+/// cap, not the runtime online count: callers (currently only the Phase 61
+/// SMP tests, which pass core 0 / 1 after `init_minimal_smp` +
+/// `boot_aps_if_available` have brought those cores online) are responsible
+/// for ensuring `core_id` corresponds to an online core.
+pub fn spawn_on_core(entry: fn() -> !, name: &'static str, core_id: u8) {
+    assert!(
+        (core_id as usize) < crate::smp::MAX_CORES,
+        "spawn_on_core: core_id {core_id} out of range",
+    );
+    let mut task = Task::new(entry, name);
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    task.assigned_core = core_id;
+    task.last_migrated_tick = now;
+    task.last_ready_tick = now;
+    let mut sched = scheduler_lock();
+    let idx = alloc_task_slot(&mut sched, task);
+    drop(sched);
+    enqueue_to_core(core_id, idx);
 }
 
 /// Spawn a fork/clone child task with its userspace entry context attached
@@ -1283,15 +1361,90 @@ pub fn spawn_idle(entry: fn() -> !) {
     spawn_idle_for_core(entry, 0);
 }
 
-/// Accumulate elapsed ticks for the current task.
+/// Phase 61 Track E.2 — no-op stub retained for callsite stability.
 ///
-/// Currently all ticks are attributed to `user_ticks`. Splitting ticks into
-/// user vs system (ring 3 vs ring 0) requires tracking the syscall-entry
-/// boundary and is deferred to a future phase.
-fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
-    let now = crate::arch::x86_64::interrupts::tick_count();
-    let elapsed = now.saturating_sub(sched.tasks[idx].start_tick);
-    sched.tasks[idx].user_ticks += elapsed;
+/// Pre-Phase 61: this function added the running task's elapsed ticks to
+/// `user_ticks` on every yield / preempt. The behaviour was wrong — it
+/// attributed ALL elapsed time to user mode regardless of the actual
+/// ring the task spent its time in, which made Phase 35 H.2's
+/// `system_ticks increases during syscall handling` claim false. CPU
+/// time accounting now uses per-tick CS-based sampling driven from the
+/// timer IRQ handler (`tick_account_current_task` in
+/// `kernel/src/arch/x86_64/interrupts.rs`): each timer tick the
+/// running task gets +1 user or +1 system based on the ring of the
+/// interrupted CS, which matches Linux's `CONFIG_TICK_CPU_ACCOUNTING`
+/// model and makes both `tms_utime` and `tms_stime` accurate to the
+/// timer-tick granularity.
+///
+/// Kept as a no-op rather than removed so callers in `yield_now` and
+/// `preempt_frame_to_scheduler` need no edits.
+fn accumulate_ticks(_sched: &mut Scheduler, _idx: usize) {
+    // No-op — per-tick sampling at the timer IRQ owns user / system tick
+    // attribution post-Phase 61 Track E.2.
+}
+
+/// Phase 61 Track E.2 — per-tick CPU-time accounting for the currently
+/// running task on the calling core. Called from the timer IRQ handler
+/// (both ring-3 and ring-0 paths) once per tick. Matches Linux's
+/// `CONFIG_TICK_CPU_ACCOUNTING` semantics.
+///
+/// `in_user_mode == true` adds `period_ms` to `user_ticks` (interrupted in
+/// ring 3); `false` adds `period_ms` to `system_ticks` (interrupted in
+/// ring 0, i.e. inside a syscall handler or kernel work).
+///
+/// `period_ms` is the calling core's local LAPIC timer period in
+/// milliseconds: BSP runs at 1 ms per tick, APs run at 10 ms per tick (see
+/// `kernel/src/smp/boot.rs::ap_lapic_init_from`). Scaling by the local
+/// period keeps `tms_utime` / `tms_stime` accurate in the unified `1 tick
+/// = 1 ms` scale (`TICKS_PER_SEC = 1000`) regardless of which core the
+/// task ran on, so values stay consistent across migration.
+///
+/// Idle-task skip and Running-state guard are intentionally **not**
+/// applied (see the implementation note for rationale). The function is
+/// best-effort and silently no-ops when no current task is present
+/// (early boot, between dispatches, etc.) — in particular, it bails
+/// before reading `per_core` if SMP per-core data is not yet ready,
+/// which can happen during the early-boot window between
+/// `arch::enable_interrupts()` and `smp::init_bsp_per_core()`.
+///
+/// **IRQ-context lock discipline:** uses `try_scheduler_lock`, NEVER
+/// blocks. If the running task on this core (or any task on any core)
+/// is currently holding `SCHEDULER_INNER`, the timer ISR fires, this
+/// function would `lock()` and spin forever — same-core deadlock —
+/// because the holder cannot release while preempted by us. `try_lock`
+/// returns `None` in that window; we drop the tick. Per-tick sampling
+/// is statistical: occasional misses do not violate the
+/// `CONFIG_TICK_CPU_ACCOUNTING`-equivalent contract. Diagnosed
+/// 2026-05-09 from a kernel GPF observed under fork-bomb load (m3os.log
+/// post-Doom-launch series).
+pub fn tick_account_current_task(in_user_mode: bool, period_ms: u64) {
+    // Linux's `task_struct.utime` model: the per-task `AtomicU64` counter
+    // is written exclusively by the CPU currently running this task, so the
+    // hardware atomic-RMW is uncontended (no cross-CPU coherence traffic),
+    // no scheduler lock is taken, and there is no false sharing because
+    // each Task lives in its own `SlabBox<Task>` larger than a cache line.
+    //
+    // Idle-task skip and Running-state guard the legacy lock-holding
+    // version applied are dropped intentionally:
+    //
+    // - Idle tasks accumulate ticks on their own Task struct, which nobody
+    //   ever reads (idle tasks never call `getrusage` / `times`). Other
+    //   tasks' counters are unaffected.
+    // - The Running-state guard was defensive against a state-machine race;
+    //   under lock-free sampling the worst case is one sample attributed to
+    //   a task that transitioned out of Running between the
+    //   `current_task_ptr` load and the `fetch_add`. Statistical samplers
+    //   tolerate this — same contract as `CONFIG_TICK_CPU_ACCOUNTING` in
+    //   Linux.
+    let Some(task) = current_task_ptr() else {
+        return;
+    };
+    let counter = if in_user_mode {
+        &task.user_ticks
+    } else {
+        &task.system_ticks
+    };
+    counter.fetch_add(period_ms, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn current_user_return_addr_space_snapshot(pid: u32) -> (u64, u64) {
@@ -2276,6 +2429,8 @@ pub fn yield_now() {
             sched.tasks.len()
         );
         accumulate_ticks(&mut sched, idx);
+        // Phase 61 Track E.4: cooperative yield → voluntary ctxsw.
+        sched.tasks[idx].voluntary_ctxsw = sched.tasks[idx].voluntary_ctxsw.saturating_add(1);
         // Keep state as Running — the scheduler will set Ready + enqueue AFTER
         // switch_context saves the RSP.
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
@@ -2290,6 +2445,7 @@ pub fn yield_now() {
             addr_space_snapshot.1,
         );
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         idx
     };
     // Store idx so the dispatch handler can save RSP and re-enqueue after switch_context.
@@ -2365,6 +2521,8 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
             }
         };
         accumulate_ticks(&mut sched, idx);
+        // Phase 61 Track E.4: timer-IRQ / IPI preempt → involuntary ctxsw.
+        sched.tasks[idx].involuntary_ctxsw = sched.tasks[idx].involuntary_ctxsw.saturating_add(1);
         let preempt_count_ptr: *const core::sync::atomic::AtomicI32 =
             &raw const sched.tasks[idx].preempt_count;
         if let Some(urs) = sched.tasks[idx].user_return.as_mut() {
@@ -2377,6 +2535,7 @@ pub fn preempt_frame_to_scheduler(preempt_frame: kernel_core::preempt_frame::Pre
         // E.1: mark RSP-publication window (cleared by dispatch epilogue).
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         (idx, preempt_count_ptr)
     };
     // The preemption gates only enter this path from user/syscall-return
@@ -2492,7 +2651,239 @@ pub fn task_label_for_id(task_id: TaskId) -> Option<(u32, &'static str)> {
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;
     let sched = scheduler_lock();
-    Some((sched.tasks[idx].user_ticks, sched.tasks[idx].system_ticks))
+    let t = &sched.tasks[idx];
+    Some((
+        t.user_ticks.load(core::sync::atomic::Ordering::Relaxed),
+        t.system_ticks.load(core::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// Sum the per-task tick fields of every task belonging to the given `pid`.
+/// Returns `(user_ticks, system_ticks, child_user_ticks, child_system_ticks)`
+/// summed across all tasks (POSIX thread group). Used by `sys_waitpid` to
+/// accumulate a reaped zombie's CPU time into the parent's `child_*` fields.
+/// Phase 61 Track E.1.
+pub fn task_times_for_pid(pid: u32) -> (u64, u64, u64, u64) {
+    let sched = scheduler_lock();
+    let mut user = 0u64;
+    let mut system = 0u64;
+    let mut child_user = 0u64;
+    let mut child_system = 0u64;
+    for task in sched.tasks.iter() {
+        if task.pid == pid {
+            user = user.saturating_add(task.user_ticks.load(core::sync::atomic::Ordering::Relaxed));
+            system = system.saturating_add(
+                task.system_ticks
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+            child_user = child_user.saturating_add(task.child_user_ticks);
+            child_system = child_system.saturating_add(task.child_system_ticks);
+        }
+    }
+    (user, system, child_user, child_system)
+}
+
+/// Phase 61 Track E.4 — rusage event-counter snapshot for one pid's full
+/// thread group. Returns a `RusageCounters` of `(own, child)` pairs for
+/// minor faults, major faults, voluntary ctxsw, involuntary ctxsw — eight
+/// values total — summed across every task in the group. Used by
+/// `sys_waitpid` (alongside [`task_times_for_pid`]) to drive the recursive
+/// accumulation at the zombie-reap site.
+#[derive(Default, Clone, Copy)]
+pub struct RusageCounters {
+    pub minor_faults: u64,
+    pub major_faults: u64,
+    pub voluntary_ctxsw: u64,
+    pub involuntary_ctxsw: u64,
+    pub child_minor_faults: u64,
+    pub child_major_faults: u64,
+    pub child_voluntary_ctxsw: u64,
+    pub child_involuntary_ctxsw: u64,
+}
+
+pub fn rusage_counters_for_pid(pid: u32) -> RusageCounters {
+    let sched = scheduler_lock();
+    let mut out = RusageCounters::default();
+    for task in sched.tasks.iter() {
+        if task.pid == pid {
+            out.minor_faults = out.minor_faults.saturating_add(
+                task.minor_faults
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+            out.major_faults = out.major_faults.saturating_add(
+                task.major_faults
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+            out.voluntary_ctxsw = out.voluntary_ctxsw.saturating_add(task.voluntary_ctxsw);
+            out.involuntary_ctxsw = out.involuntary_ctxsw.saturating_add(task.involuntary_ctxsw);
+            out.child_minor_faults = out
+                .child_minor_faults
+                .saturating_add(task.child_minor_faults);
+            out.child_major_faults = out
+                .child_major_faults
+                .saturating_add(task.child_major_faults);
+            out.child_voluntary_ctxsw = out
+                .child_voluntary_ctxsw
+                .saturating_add(task.child_voluntary_ctxsw);
+            out.child_involuntary_ctxsw = out
+                .child_involuntary_ctxsw
+                .saturating_add(task.child_involuntary_ctxsw);
+        }
+    }
+    out
+}
+
+/// Return the calling task's own rusage counters
+/// `(minor_faults, major_faults, voluntary_ctxsw, involuntary_ctxsw)`.
+/// Used by `sys_getrusage(RUSAGE_SELF)`. Phase 61 Track E.4.
+pub fn current_task_rusage_self() -> Option<(u64, u64, u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let t = &sched.tasks[idx];
+    Some((
+        t.minor_faults.load(core::sync::atomic::Ordering::Relaxed),
+        t.major_faults.load(core::sync::atomic::Ordering::Relaxed),
+        t.voluntary_ctxsw,
+        t.involuntary_ctxsw,
+    ))
+}
+
+/// Return the calling task's children rusage counters
+/// `(minor_faults, major_faults, voluntary_ctxsw, involuntary_ctxsw)`.
+/// Used by `sys_getrusage(RUSAGE_CHILDREN)`. Phase 61 Track E.4.
+pub fn current_task_rusage_children() -> Option<(u64, u64, u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    let t = &sched.tasks[idx];
+    Some((
+        t.child_minor_faults,
+        t.child_major_faults,
+        t.child_voluntary_ctxsw,
+        t.child_involuntary_ctxsw,
+    ))
+}
+
+/// Accumulate a reaped zombie's rusage counters into the calling task's
+/// child_* accumulator fields. Recursive accumulation rule (mirrors
+/// [`current_task_accumulate_child_times`]). Phase 61 Track E.4.
+pub fn current_task_accumulate_child_rusage(zombie: RusageCounters) -> bool {
+    let Some(idx) = get_current_task_idx() else {
+        return false;
+    };
+    let mut sched = scheduler_lock();
+    let parent = &mut sched.tasks[idx];
+    parent.child_minor_faults = parent
+        .child_minor_faults
+        .saturating_add(zombie.minor_faults)
+        .saturating_add(zombie.child_minor_faults);
+    parent.child_major_faults = parent
+        .child_major_faults
+        .saturating_add(zombie.major_faults)
+        .saturating_add(zombie.child_major_faults);
+    parent.child_voluntary_ctxsw = parent
+        .child_voluntary_ctxsw
+        .saturating_add(zombie.voluntary_ctxsw)
+        .saturating_add(zombie.child_voluntary_ctxsw);
+    parent.child_involuntary_ctxsw = parent
+        .child_involuntary_ctxsw
+        .saturating_add(zombie.involuntary_ctxsw)
+        .saturating_add(zombie.child_involuntary_ctxsw);
+    true
+}
+
+/// Increment the running task's `minor_faults` (or `major_faults` if
+/// `major == true`) counter by 1. Called from the page-fault handler
+/// after a successful resolution. Phase 61 Track E.4.
+///
+/// **IRQ-context lock discipline:** uses `try_scheduler_lock`, NEVER
+/// blocks — same rationale as `tick_account_current_task`. The page
+/// fault handler runs in interrupt context; if a task on this core
+/// already holds `SCHEDULER_INNER`, a `lock()` here would spin-deadlock
+/// because the holder cannot release while preempted by the fault.
+/// Skipping the increment loses one fault count under contention,
+/// which is acceptable for a statistical counter.
+pub fn current_task_record_page_fault(major: bool) {
+    // Lock-free atomic increment on the running task's own counter — see
+    // `tick_account_current_task` for the full rationale.
+    let Some(task) = current_task_ptr() else {
+        return;
+    };
+    let counter = if major {
+        &task.major_faults
+    } else {
+        &task.minor_faults
+    };
+    counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Increment the running task's `voluntary_ctxsw` (when `voluntary == true`)
+/// or `involuntary_ctxsw` counter by 1. Phase 61 Track E.4.
+///
+/// **Note:** the production callers in `yield_now` and
+/// `preempt_frame_to_scheduler` increment the counters directly inside
+/// the existing `scheduler_lock` critical section (the callsites are
+/// not in IRQ context themselves but already hold the lock); this
+/// helper is retained for any caller that needs the ctxsw record from
+/// a context where the scheduler lock may already be held elsewhere.
+/// Uses `try_scheduler_lock` for the same IRQ-context safety reasons
+/// as `tick_account_current_task`.
+pub fn current_task_record_ctxsw(voluntary: bool) {
+    let Some(idx) = get_current_task_idx() else {
+        return;
+    };
+    let Some(mut sched) = try_scheduler_lock() else {
+        return;
+    };
+    if let Some(task) = sched.tasks.get_mut(idx) {
+        if voluntary {
+            task.voluntary_ctxsw = task.voluntary_ctxsw.saturating_add(1);
+        } else {
+            task.involuntary_ctxsw = task.involuntary_ctxsw.saturating_add(1);
+        }
+    }
+}
+
+/// Return the accumulated user/system tick counts for the current task's
+/// reaped descendants (`child_user_ticks`, `child_system_ticks`). Phase 61
+/// Track E.1 — used by `sys_times` for `tms_cutime`/`tms_cstime` and by
+/// `sys_getrusage(RUSAGE_CHILDREN)` for `ru_utime`/`ru_stime`.
+pub fn current_task_child_times() -> Option<(u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = scheduler_lock();
+    Some((
+        sched.tasks[idx].child_user_ticks,
+        sched.tasks[idx].child_system_ticks,
+    ))
+}
+
+/// Accumulate a reaped zombie's CPU time into the calling task's
+/// `child_user_ticks` / `child_system_ticks` fields. POSIX `times(2)` and
+/// `wait*(2)` require recursive accumulation: a parent who reaps a child
+/// inherits both that child's own time AND any time the child itself
+/// previously accumulated from reaping grandchildren. Phase 61 Track E.1.
+///
+/// Returns `false` if the calling context has no current task (e.g., called
+/// before scheduler init); otherwise returns `true` after updating.
+pub fn current_task_accumulate_child_times(
+    zombie_user_ticks: u64,
+    zombie_system_ticks: u64,
+    zombie_child_user_ticks: u64,
+    zombie_child_system_ticks: u64,
+) -> bool {
+    let Some(idx) = get_current_task_idx() else {
+        return false;
+    };
+    let mut sched = scheduler_lock();
+    let parent = &mut sched.tasks[idx];
+    parent.child_user_ticks = parent
+        .child_user_ticks
+        .saturating_add(zombie_user_ticks)
+        .saturating_add(zombie_child_user_ticks);
+    parent.child_system_ticks = parent
+        .child_system_ticks
+        .saturating_add(zombie_system_ticks)
+        .saturating_add(zombie_child_system_ticks);
+    true
 }
 
 /// Return the [`TaskId`] of the task currently running on this core.
@@ -2741,6 +3132,7 @@ pub fn block_current_until(
                 addr_space_snapshot.1,
             );
             set_current_task_idx(None);
+            set_current_task_ptr(None);
             // scheduler_lock released.
         }
         // pi_lock released.
@@ -2798,6 +3190,15 @@ pub fn block_current_until(
         }
         // Restore current_task_idx so callers see us as Running again.
         set_current_task_idx(Some(idx));
+        // Re-publish the Task pointer so IRQ-context CPU-time / rusage
+        // helpers attribute samples to this task once more. SlabBox keeps
+        // the Task at a stable heap address, so the pointer obtained under
+        // the lock remains valid for the task's lifetime.
+        let task_ptr: *const crate::task::Task = {
+            let sched = scheduler_lock();
+            &*sched.tasks[idx] as *const _
+        };
+        set_current_task_ptr(Some(unsafe { &*task_ptr }));
         let outcome = if already_expired {
             BlockOutcome::DeadlineExpired
         } else {
@@ -3065,6 +3466,7 @@ pub fn mark_current_dead() -> ! {
         // E.1: mark RSP-publication window.
         sched.tasks[idx].on_cpu.store(true, Ordering::Release);
         set_current_task_idx(None);
+        set_current_task_ptr(None);
         idx
     };
     PENDING_REENQUEUE[crate::smp::per_core().core_id as usize].store(idx as i32, Ordering::Release);
@@ -3924,6 +4326,11 @@ pub fn run() -> ! {
                     core_id
                 );
                 set_current_task_idx(Some(idx));
+                // Cache the Task pointer for IRQ-context CPU-time / rusage
+                // accounting (lock-free local-CPU writes; Linux's per-CPU
+                // `current` pointer pattern). The address is stable for the
+                // task's lifetime via `Vec<SlabBox<Task>>` storage.
+                set_current_task_ptr(Some(task));
                 crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
                     task_idx: idx as u32,
                     core: core_id,
@@ -4387,6 +4794,24 @@ pub fn run() -> ! {
                     }
                     // Re-enqueue if the task yielded (still Running); blocked/dead
                     // tasks will be re-enqueued by wake_task_v2 after their waker fires.
+                    //
+                    // Phase 61 Track B note: the `last_migrated_tick = now` reset
+                    // on every cooperative yield is **intentional**. It implements
+                    // a cache-warmth invariant — actively-yielding tasks are "hot"
+                    // on their current core, so neither `maybe_load_balance` nor
+                    // `try_steal` should migrate them. Both paths gate on
+                    // `tick - last_migrated < MIGRATE_COOLDOWN`; resetting the
+                    // field on each yield keeps hot tasks pinned. A previous
+                    // Phase 61 commit (798677b) read this as a bug and removed
+                    // the line, which made every active task migration-eligible
+                    // and caused a kernel page fault under fork-bomb load (ion
+                    // exiting Doom: post-mortem in m3os.log dated 2026-05-08).
+                    // Reverted in the same phase. The load balancer's effective
+                    // domain is therefore freshly-spawned, freshly-woken, or
+                    // freshly-stolen tasks — `kernel/tests/load_balance_smp.rs`
+                    // creates the imbalance via `spawn_on_core(_, _, 0)` which
+                    // sets `last_migrated_tick` at spawn time, satisfying the
+                    // cooldown after 100 ticks.
                     if task.state == TaskState::Running {
                         task.state = TaskState::Ready;
                         task.last_ready_tick = now;
@@ -4527,12 +4952,31 @@ fn drive_expired_wake_deadlines() {
     }
 }
 
-/// (~500ms at 100 Hz).
+/// Increments once per BSP scheduler-loop iteration; `maybe_load_balance`
+/// runs the balance pass when the counter is a multiple of 50
+/// (~50 ms with the 1 ms BSP LAPIC period and a roughly per-tick scheduler
+/// loop).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Called from the BSP's scheduler loop. Every 50 ticks (~500ms), checks
-/// queue imbalance and migrates one task if the longest queue exceeds the
-/// shortest by >2. Tasks that were recently migrated are skipped (cooldown).
+/// Threshold for when load balancing kicks in: a queue is considered imbalanced
+/// only if `longest_len > shortest_len + BALANCE_THRESHOLD`. Phase 61 B.1 named
+/// the previously-anonymous `2` so that `kernel/tests/load_balance_smp.rs` can
+/// derive its assertion bound from the same source.
+pub const BALANCE_THRESHOLD: usize = 2;
+
+/// Called from the BSP's scheduler loop at `kernel/src/task/scheduler.rs:3837`,
+/// every `BALANCE_COUNTER % 50 == 0` iterations (~50 ms with `TICKS_PER_SEC
+/// = 1000` and a 1 ms BSP LAPIC period). Reads each core's run-queue length
+/// via `CoreData::with_run_queue(|q| q.len())` and migrates one task per
+/// cycle when `longest_len > shortest_len + BALANCE_THRESHOLD`.
+/// Recently-migrated tasks are skipped (`MIGRATE_COOLDOWN`).
+///
+/// Phase 61 A.1 design note: queue length is read directly from the per-core
+/// `VecDeque<usize>` under `with_run_queue` rather than maintained as a
+/// parallel `AtomicU32` counter (the form Phase 35 E.1 originally planned).
+/// `VecDeque::len()` is O(1), the lock is already held for the read, and a
+/// parallel counter would create a second source of truth that drifts on every
+/// `enqueue` / `dequeue` mistake. The simpler design is the final design.
 pub fn maybe_load_balance() {
     let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if !cnt.is_multiple_of(50) {
@@ -4562,8 +5006,8 @@ pub fn maybe_load_balance() {
             }
         }
     }
-    if longest_len <= shortest_len + 2 {
-        return; // Balanced enough — require > 2 difference to avoid thrashing.
+    if longest_len <= shortest_len + BALANCE_THRESHOLD {
+        return; // Balanced enough — require > BALANCE_THRESHOLD diff to avoid thrash.
     }
     let current_tick = crate::arch::x86_64::interrupts::tick_count();
     // Migrate one task from longest to shortest.

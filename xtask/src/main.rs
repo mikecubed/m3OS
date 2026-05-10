@@ -101,6 +101,15 @@ struct DeviceSet {
     audio: bool,
     /// Enable the emulated Intel VT-d IOMMU (`--iommu`).
     iommu: bool,
+    /// Run QEMU under KVM hardware virtualization instead of TCG. Set via
+    /// `--kvm` or `M3OS_KVM=1`. Requires `/dev/kvm` on the host (Linux,
+    /// VT-x / AMD-V). When set, the launcher passes `-enable-kvm -cpu host`
+    /// instead of the default `-cpu qemu64,+xsave,+avx,+xsaveopt`. Expect
+    /// roughly an order-of-magnitude speedup on CPU- or syscall-heavy
+    /// paths; see `docs/post-mortems/2026-05-09-phase-61-tick-accounting-slow-req.md`
+    /// for context (TCG `rdmsr` cost was a notable contributor to that
+    /// regression's tail latency).
+    kvm: bool,
 }
 
 /// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
@@ -129,10 +138,18 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
             apply_device_flag(name, &mut devices)?;
         } else if arg == "--iommu" {
             devices.iommu = true;
+        } else if arg == "--kvm" {
+            devices.kvm = true;
         } else {
             remaining.push(arg.clone());
         }
         index += 1;
+    }
+
+    // Env-var alias for the same flag — useful for CI scripts that don't
+    // want to thread `--kvm` through every xtask invocation.
+    if !devices.kvm && std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        devices.kvm = true;
     }
 
     Ok((devices, remaining))
@@ -332,7 +349,8 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000|audio [--iommu] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+     Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
 fn workspace_root() -> PathBuf {
@@ -1513,12 +1531,28 @@ fn build_tcc() -> Option<PathBuf> {
 
     // Copy musl libc.a and CRT objects to both /usr/lib/ and the triplet path
     // /usr/lib/x86_64-linux-musl/ (TCC searches the triplet path first for CRT).
-    let musl_lib = Path::new("/usr/lib/x86_64-linux-musl");
+    //
+    // Source locations differ by host distro:
+    //   - Debian / Ubuntu (`musl-dev` package):
+    //       /usr/lib/x86_64-linux-musl/{libc.a,crt1.o,crti.o,crtn.o}
+    //   - Arch / Omarchy (`musl` package):
+    //       /usr/lib/musl/lib/{libc.a,crt1.o,crti.o,crtn.o}
+    //
+    // Try the Debian multiarch path first (historical default), then fall
+    // back to the Arch layout. Add new layouts here as we encounter them
+    // (NixOS / Fedora / etc.) rather than asking operators to symlink.
+    let musl_lib_search: &[&Path] = &[
+        Path::new("/usr/lib/x86_64-linux-musl"),
+        Path::new("/usr/lib/musl/lib"),
+    ];
     fs::create_dir_all(staging.join("usr/lib/x86_64-linux-musl")).expect("create triplet lib dir");
     let crt_files = ["libc.a", "crt1.o", "crti.o", "crtn.o"];
     for name in &crt_files {
-        let src = musl_lib.join(name);
-        if src.exists() {
+        let src = musl_lib_search.iter().find_map(|dir| {
+            let p = dir.join(name);
+            p.exists().then_some(p)
+        });
+        if let Some(src) = src {
             // Copy to /usr/lib/
             let dst = staging.join(format!("usr/lib/{name}"));
             fs::copy(&src, &dst).unwrap_or_else(|e| {
@@ -1529,9 +1563,19 @@ fn build_tcc() -> Option<PathBuf> {
             fs::copy(&src, &dst_triplet).unwrap_or_else(|e| {
                 panic!("failed to copy {name} to triplet path: {e}");
             });
-            println!("tcc: {name} → staging/usr/lib/ + triplet");
+            println!(
+                "tcc: {name} → staging/usr/lib/ + triplet (from {})",
+                src.parent().unwrap().display()
+            );
         } else {
-            eprintln!("warning: musl {name} not found at {}", src.display());
+            eprintln!(
+                "warning: musl {name} not found in any of: {}",
+                musl_lib_search
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
 
@@ -1543,16 +1587,30 @@ fn build_tcc() -> Option<PathBuf> {
         println!("tcc: libtcc1.a → staging/usr/lib/tcc/libtcc1.a");
     }
 
-    // Copy musl headers recursively.
-    let musl_include = Path::new("/usr/include/x86_64-linux-musl");
-    if musl_include.is_dir() {
+    // Copy musl headers recursively. Same distro-dependent search as
+    // for the lib objects above:
+    //   - Debian / Ubuntu: /usr/include/x86_64-linux-musl
+    //   - Arch / Omarchy:  /usr/lib/musl/include
+    let musl_include_search: &[&Path] = &[
+        Path::new("/usr/include/x86_64-linux-musl"),
+        Path::new("/usr/lib/musl/include"),
+    ];
+    let musl_include = musl_include_search.iter().find(|p| p.is_dir());
+    if let Some(musl_include) = musl_include {
         copy_dir_recursive(musl_include, &staging.join("usr/include"))
             .expect("failed to copy musl headers");
-        println!("tcc: musl headers → staging/usr/include/");
+        println!(
+            "tcc: musl headers → staging/usr/include/ (from {})",
+            musl_include.display()
+        );
     } else {
         eprintln!(
-            "warning: musl headers not found at {}",
-            musl_include.display()
+            "warning: musl headers not found in any of: {}",
+            musl_include_search
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -2074,6 +2132,9 @@ fn qemu_args_with_devices(
     } else {
         None
     };
+    if devices.kvm {
+        warn_if_kvm_unavailable();
+    }
     qemu_args_with_devices_resolved(
         uefi_image,
         ovmf,
@@ -2081,6 +2142,36 @@ fn qemu_args_with_devices(
         devices,
         nvme_path.as_deref(),
     )
+}
+
+/// One-time stderr warning when `--kvm` is requested but `/dev/kvm` is not
+/// usable (missing, wrong permissions, or KVM module not loaded). QEMU
+/// itself will fail loudly with `Could not access KVM kernel module` once
+/// it tries to open the device, so this just adds a friendly hint upstream.
+fn warn_if_kvm_unavailable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let path = std::path::Path::new("/dev/kvm");
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "warning: --kvm requested but /dev/kvm is not usable: {e}\n\
+                 hint: ensure the host CPU has VT-x/AMD-V enabled in BIOS, the\n\
+                 `kvm_intel` or `kvm_amd` module is loaded, and your user is in\n\
+                 the `kvm` group (`sudo usermod -aG kvm $USER`, then re-login).\n\
+                 QEMU will likely fail to start with -enable-kvm; remove --kvm\n\
+                 to fall back to TCG emulation."
+            );
+        }
+    }
 }
 
 /// Pure QEMU argument assembly with optional Phase 55 device overrides.
@@ -2115,16 +2206,35 @@ fn qemu_args_with_devices_resolved(
         "1024".to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
-        // Phase 57e Track J: advertise XSAVE + AVX + XSAVEOPT so the kernel
-        // can enable CR4.OSXSAVE + XCR0 = 0x7 at boot.  The BSP CPUID probe
-        // (kernel/src/arch/x86_64/cpuid.rs) requires CPUID.1.ECX[26] (XSAVE)
-        // and the AVX state component in CPUID.0Dh.0.EDX:EAX; the kernel
-        // panics otherwise per the 1.0 hardware floor (Sandy Bridge /
-        // Bulldozer 2011+).  The default QEMU `qemu64` model lacks these
-        // architectural feature bits.
-        "-cpu".to_string(),
-        "qemu64,+xsave,+avx,+xsaveopt".to_string(),
     ];
+
+    // CPU model and accelerator: KVM uses the host CPU directly for
+    // near-native performance; TCG (default) uses the explicit `qemu64`
+    // model with the XSAVE/AVX/XSAVEOPT feature bits the kernel's BSP
+    // CPUID probe (kernel/src/arch/x86_64/cpuid.rs) requires per the 1.0
+    // hardware floor.
+    if devices.kvm {
+        // `-cpu host` exposes every host-supported feature to the guest;
+        // any modern x86 host running KVM has XSAVE/AVX (Sandy Bridge
+        // 2011+) so the kernel's CPUID probe is satisfied without
+        // explicit `+xsave,+avx` flags. KVM also runs `rdmsr` and other
+        // serializing instructions at near-native speed, eliminating one
+        // of the cost contributors documented in
+        // `docs/post-mortems/2026-05-09-phase-61-tick-accounting-slow-req.md`.
+        args.extend([
+            "-enable-kvm".to_string(),
+            "-cpu".to_string(),
+            "host".to_string(),
+        ]);
+    } else {
+        // Phase 57e Track J: advertise XSAVE + AVX + XSAVEOPT so the kernel
+        // can enable CR4.OSXSAVE + XCR0 = 0x7 at boot.  The default QEMU
+        // `qemu64` model lacks these architectural feature bits.
+        args.extend([
+            "-cpu".to_string(),
+            "qemu64,+xsave,+avx,+xsaveopt".to_string(),
+        ]);
+    }
 
     match display_mode {
         QemuDisplayMode::Headless => {
@@ -2682,9 +2792,21 @@ fn build_test_binaries(test_name: Option<&str>, features: &[String]) -> Vec<Path
     build_pdpmake();
     build_doom();
 
+    // Build kernel integration tests in release mode (matches the production
+    // kernel build profile). Phase 61 Track 0a discovery: the kernel hot path
+    // contains numerous `debug_assert!` and `unsafe` precondition checks that
+    // are valid in release but fire under the stricter debug profile (e.g.
+    // unaligned `*mut T::write` on the AP boot trampoline; scheduler RSP
+    // initialised lazily via `switch_context` rather than eagerly). Building
+    // tests in release matches the harness to the production binary so live
+    // SMP tests exercise the same code path users actually run, and avoids
+    // sinking the closeout phase into a long tail of debug-only fixups.
+    // `assert!` / `assert_eq!` / `panic!` in test files all still fire
+    // because they do not depend on `debug_assertions`.
     let mut build_args = vec![
         "build",
         "--tests",
+        "--release",
         "--package",
         "kernel",
         "--target",
@@ -2894,16 +3016,26 @@ enum SmokeStep {
 struct SmokeTestArgs {
     display: bool,
     timeout_secs: u64,
+    kvm: bool,
 }
 
 fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     let mut display = false;
-    let mut timeout_secs = 120u64;
-    let mut index = 0;
+    // Per-attempt budget. Multiplied by 1, 1.5, 2 across the three retries
+    // (so the default 300s yields 300 / 450 / 600s attempts, ~17 minutes
+    // total). Calibrated for slower hosts running the in-guest TCC
+    // compile under TCG; faster hosts (and KVM) usually finish in well
+    // under one attempt's budget. Override with `--timeout <secs>` or
+    // skip the heaviest step entirely with
+    // `M3OS_SMOKE_SKIP_TCC_COMPILE=1`.
+    let mut timeout_secs = 300u64;
+    let mut kvm = false;
 
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--display" => display = true,
+            "--kvm" => kvm = true,
             "--timeout" => {
                 index += 1;
                 timeout_secs = args
@@ -2917,9 +3049,15 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
         index += 1;
     }
 
+    // Env-var alias matches the `extract_device_flags` parsing.
+    if !kvm && std::env::var_os("M3OS_KVM").is_some_and(|v| v != "0" && !v.is_empty()) {
+        kvm = true;
+    }
+
     Ok(SmokeTestArgs {
         display,
         timeout_secs,
+        kvm,
     })
 }
 
@@ -4921,7 +5059,9 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = qemu_args(&uefi_image, &ovmf, display_mode);
+    let mut devices = DeviceSet::default();
+    devices.kvm = smoke_args.kvm;
+    let mut args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
     for arg in args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") {
@@ -5000,6 +5140,18 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     }
 
     eprintln!("smoke-test: FAILED after {MAX_ATTEMPTS} attempts\n{last_err}");
+    // Heuristic: if the final attempt died inside the tcc-compile step the
+    // most likely culprit is in-guest TCC just being too slow for the host's
+    // throughput. Surface the documented escape hatch so the operator does
+    // not have to dig through xtask source to find it.
+    if last_err.contains("SMOKE:tcc-compile") {
+        eprintln!(
+            "\nhint: tcc-compile is the longest step (real cc inside the guest).\n\
+             For slower hosts:\n  \
+               cargo xtask smoke-test --kvm --timeout 600   # bump per-attempt budget to 600/900/1200s\n  \
+               M3OS_SMOKE_SKIP_TCC_COMPILE=1 cargo xtask smoke-test --kvm   # skip the compile (still validates the rest)"
+        );
+    }
     std::process::exit(1);
 }
 
@@ -8217,6 +8369,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 audio: false,
                 iommu: false,
+                kvm: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -8251,6 +8404,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 audio: false,
                 iommu: false,
+                kvm: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -8282,6 +8436,7 @@ fn regression_tests() -> Vec<RegressionTest> {
             e1000: true,
             audio: false,
             iommu: false,
+            kvm: false,
         },
         wants_debug_crash_marker: false,
         wants_readback_marker: false,
@@ -8310,6 +8465,7 @@ fn regression_tests() -> Vec<RegressionTest> {
                 e1000: false,
                 audio: false,
                 iommu: false,
+                kvm: false,
             },
             wants_debug_crash_marker: false,
             wants_readback_marker: false,
@@ -11270,6 +11426,7 @@ mod tests {
                 e1000: true,
                 audio: false,
                 iommu: false,
+                kvm: false,
             },
         );
         assert!(
@@ -11298,6 +11455,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: false,
+                kvm: false,
             },
             Some(fake_nvme),
         );
@@ -11338,6 +11496,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: true,
+                kvm: false,
             },
             Some(fake_nvme),
         );
@@ -11378,6 +11537,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: true,
+                kvm: false,
             },
             Some(Path::new("/tmp/m3os-test-nvme-rootdisk-never-created.img")),
         );
@@ -11430,6 +11590,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: true,
+                kvm: false,
             },
             None,
         );
@@ -11487,6 +11648,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: true,
+                kvm: false,
             },
             None,
         );
@@ -11517,6 +11679,7 @@ mod tests {
                 e1000: false,
                 audio: false,
                 iommu: true,
+                kvm: false,
             },
             None,
         );
@@ -11717,12 +11880,14 @@ mod tests {
             e1000: true,
             audio: false,
             iommu: false,
+            kvm: false,
         });
         let iommu = device_smoke_steps(DeviceSet {
             nvme: true,
             e1000: true,
             audio: false,
             iommu: true,
+            kvm: false,
         });
 
         assert_eq!(smoke_step_labels(&iommu), smoke_step_labels(&base));

@@ -203,6 +203,14 @@ pub struct PerCoreData {
     /// Index of the task currently running on this core in the global task vec.
     /// -1 means no task (scheduler loop is running).
     pub current_task_idx: core::sync::atomic::AtomicI32,
+    /// Pointer to the [`crate::task::Task`] currently running on this core,
+    /// or null when the scheduler loop is running. Set/cleared by the
+    /// dispatch path next to `current_task_idx` (under the same scheduler
+    /// lock acquisition that reads `tasks[idx]`'s stable address). Read by
+    /// IRQ-context CPU-time and rusage helpers so they can mutate the
+    /// running task's atomic counters without touching the scheduler lock
+    /// (Linux's `task_struct` per-CPU `current` pointer pattern).
+    pub current_task_ptr: AtomicPtr<crate::task::Task>,
     /// LAPIC virtual base address (phys_offset + LAPIC phys addr).
     /// Stored here so APs can access it without touching kernel statics.
     pub lapic_virt_base: u64,
@@ -648,6 +656,7 @@ pub fn init_bsp_per_core() {
         scheduler_rsp: core::cell::UnsafeCell::new(0), // set when scheduler loop starts
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
+        current_task_ptr: AtomicPtr::new(core::ptr::null_mut()),
         lapic_virt_base,
         lapic_ticks_per_ms: lapic_tpm,
         run_queue: spin::Mutex::new(VecDeque::new()),
@@ -704,9 +713,14 @@ pub fn init_bsp_per_core() {
 
 /// Populate `PerCoreData` for an AP.
 ///
-/// Allocates a fresh TSS, kernel stack, and double-fault stack on the heap.
-/// Returns a raw pointer to the initialized data (stored in `PER_CORE_DATA`).
+/// Allocates a fresh TSS plus a per-core syscall stack and double-fault
+/// stack. The two stacks are claimed from the static `.bss` pool in
+/// [`crate::task::kstack`] rather than the kernel heap, so they cannot
+/// alias with any other heap allocation — see
+/// `docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md` for the
+/// failure mode that motivated the change.
 ///
+/// Returns a raw pointer to the initialized data (stored in `PER_CORE_DATA`).
 /// Called from the BSP before sending SIPI to the AP.
 pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
     assert!(
@@ -714,15 +728,11 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         "core_id {} exceeds MAX_CORES",
         core_id
     );
-    // Allocate stacks.
-    let kernel_stack = Box::leak(alloc::vec![0u8; SYSCALL_STACK_SIZE].into_boxed_slice());
-    // Align stack top to 16 bytes (x86-64 ABI requirement).
-    let kernel_stack_top = ((kernel_stack.as_ptr() as u64) + SYSCALL_STACK_SIZE as u64) & !0xF;
-
-    let double_fault_stack =
-        Box::leak(alloc::vec![0u8; DOUBLE_FAULT_STACK_SIZE].into_boxed_slice());
-    let double_fault_stack_top =
-        (double_fault_stack.as_ptr() as u64) + DOUBLE_FAULT_STACK_SIZE as u64;
+    // Pool slots are 32 KiB each — larger than `SYSCALL_STACK_SIZE` (16 KiB)
+    // and `DOUBLE_FAULT_STACK_SIZE` (20 KiB), so the stacks fit comfortably
+    // and the unused portion below `top` is harmless.
+    let kernel_stack_top = crate::task::kstack::alloc_leaked_top();
+    let double_fault_stack_top = crate::task::kstack::alloc_leaked_top();
 
     // Allocate and configure TSS.
     let tss = Box::into_raw(Box::new({
@@ -762,6 +772,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         scheduler_rsp: core::cell::UnsafeCell::new(0),
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
+        current_task_ptr: AtomicPtr::new(core::ptr::null_mut()),
         lapic_virt_base: {
             let phys = crate::acpi::local_apic_address() as u64;
             crate::mm::phys_offset() + phys

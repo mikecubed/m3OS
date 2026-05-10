@@ -453,7 +453,7 @@ fn large_alloc(layout: &Layout) -> *mut u8 {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct AllocatorLocalReclaimStats {
+pub struct AllocatorLocalReclaimStats {
     pub remote_free_objects: usize,
     pub magazine_objects: usize,
     pub depot_objects: usize,
@@ -901,14 +901,14 @@ fn try_grow_on_oom_for_layout(layout: Layout) -> bool {
 }
 
 /// Attempt to grow the heap on OOM (simple 1 MiB attempt).
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn try_grow_on_oom() -> bool {
     grow_heap(1024 * 1024).is_ok()
 }
 
 /// Returns whether the size-class allocator is active (post-cutover).
 #[inline]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn is_size_class_active() -> bool {
     SIZE_CLASS_ACTIVE.load(Ordering::Acquire)
 }

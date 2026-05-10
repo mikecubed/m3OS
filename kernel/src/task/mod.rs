@@ -46,7 +46,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 
 use crate::ipc::{CapabilityTable, Message};
 
@@ -71,6 +71,7 @@ pub use kernel_core::preempt_frame::{
 };
 
 pub mod blocking_mutex;
+pub mod kstack;
 pub mod sched_trace;
 pub mod scheduler;
 pub mod wait_queue;
@@ -82,7 +83,7 @@ pub use scheduler::{
     block_current_on_send_v2, block_current_until, current_task_id, deliver_bulk, deliver_message,
     insert_cap, mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
     server_endpoint, set_current_task_pid, set_current_user_return, set_server_endpoint,
-    signal_reschedule, spawn, spawn_fork_task, spawn_idle, spawn_idle_for_core,
+    signal_reschedule, spawn, spawn_fork_task, spawn_idle, spawn_idle_for_core, spawn_on_core,
     spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data,
     take_current_task_fork_ctx, take_message, task_cap, wake_task_v2, yield_now,
 };
@@ -102,8 +103,6 @@ pub(crate) fn try_lock_scheduler() -> Option<scheduler::SchedulerGuard<'static>>
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 
 // ---------------------------------------------------------------------------
 // Task ID
@@ -464,10 +463,22 @@ pub struct Task {
     /// CPU affinity mask (Phase 35): one bit per core (max 64 cores).
     /// Default: all bits set (can run on any core).
     pub affinity_mask: u64,
-    /// Ticks spent in ring 3 (user mode). Updated on context switch.
-    pub user_ticks: u64,
-    /// Ticks spent in ring 0 (syscall handling). Updated on context switch.
-    pub system_ticks: u64,
+    /// Wall-clock milliseconds the task has spent in ring 3.
+    ///
+    /// Phase 61 refactor history: pre-refactor was `u64` mutated under the
+    /// scheduler lock from the timer ISR (heavy contention, caused
+    /// `vfs_server: slow req` tail latency). Then briefly moved to a static
+    /// global `[TaskRusage; MAX_TASKS]` table — that fixed the lock but
+    /// introduced false-sharing between adjacent slots. Now back here as
+    /// `AtomicU64`, written lock-free from the timer ISR only by the CPU
+    /// currently running this task (Linux's `task_struct.utime` model). The
+    /// `#[repr(transparent)]` of `AtomicU64` over `u64` means
+    /// `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` (448) is preserved without
+    /// padding.
+    pub user_ticks: core::sync::atomic::AtomicU64,
+    /// Wall-clock milliseconds the task has spent in ring 0. Same access
+    /// discipline as [`user_ticks`].
+    pub system_ticks: core::sync::atomic::AtomicU64,
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
     /// Tick at which this task was last migrated to a different core (Phase 52c).
@@ -521,7 +532,12 @@ pub struct Task {
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
-    _stack: Option<Box<[u8]>>,
+    ///
+    /// Backed by a static `.bss` pool ([`kstack::KernelStack`]) rather than
+    /// the kernel heap so stack memory cannot alias with any other heap
+    /// allocation. See `docs/handoffs/ap-core-gpf-saved-rsp-stack-corruption.md`
+    /// for the failure mode this isolation closes.
+    _stack: Option<kstack::KernelStack>,
 
     // ---------------------------------------------------------------------------
     // Phase 57a B.2 — per-task pi_lock (shadow lock, migration window)
@@ -588,6 +604,50 @@ pub struct Task {
     /// `wake_task_v2`, closing the "reply arrived just before park" lost-wake
     /// window.
     pub reply_waker: Option<Arc<core::sync::atomic::AtomicBool>>,
+    /// Accumulated user-mode ticks of this task's reaped descendants
+    /// (children + recursively-reaped grandchildren). Updated at the
+    /// zombie-reap point in `sys_waitpid`. Read by `sys_times` to populate
+    /// `tms_cutime` and by `sys_getrusage(RUSAGE_CHILDREN)` to populate
+    /// `ru_utime`. Phase 61 Track E.1.
+    ///
+    /// Placed AFTER `preempt_frame` to preserve `EXPECTED_TASK_PREEMPT_FRAME_OFFSET`.
+    pub child_user_ticks: u64,
+    /// Accumulated system-mode ticks of this task's reaped descendants.
+    /// Updated at the zombie-reap point alongside `child_user_ticks`.
+    /// Read by `sys_times` to populate `tms_cstime` and by
+    /// `sys_getrusage(RUSAGE_CHILDREN)` to populate `ru_stime`.
+    /// Phase 61 Track E.1.
+    pub child_system_ticks: u64,
+    /// Phase 61 Track E.4 — page-fault counters for `getrusage(2)`.
+    ///
+    /// Minor faults — fault successfully resolved in-memory (e.g., CoW page
+    /// duplication, demand-zero allocation). No backing-store I/O.
+    /// Incremented from `page_fault_handler` after resolution. Same access
+    /// discipline as [`user_ticks`] / [`system_ticks`] above: lock-free
+    /// atomic written only by the CPU running this task.
+    pub minor_faults: core::sync::atomic::AtomicU64,
+    /// Major faults — fault required a backing-store read (page-in from
+    /// disk-backed `mmap`, swap-in). In Phase 61 the disk-backed mmap path
+    /// is incomplete, so this counter stays at 0 in practice; the field is
+    /// present so the API surface is stable.
+    pub major_faults: core::sync::atomic::AtomicU64,
+    /// Voluntary context switches — task explicitly yielded
+    /// (`yield_now`, IPC block, futex sleep, etc.). Incremented inside
+    /// `yield_now` before the switch.
+    pub voluntary_ctxsw: u64,
+    /// Involuntary context switches — task was preempted by the timer IRQ
+    /// or rescheduled by an external waker. Incremented from the
+    /// timer-IRQ preempt path before the switch.
+    pub involuntary_ctxsw: u64,
+    /// Reaped-descendants minor-fault accumulator. Updated at zombie-reap
+    /// alongside the time accumulators, recursive accumulation rule.
+    pub child_minor_faults: u64,
+    /// Reaped-descendants major-fault accumulator.
+    pub child_major_faults: u64,
+    /// Reaped-descendants voluntary-ctxsw accumulator.
+    pub child_voluntary_ctxsw: u64,
+    /// Reaped-descendants involuntary-ctxsw accumulator.
+    pub child_involuntary_ctxsw: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -639,8 +699,9 @@ impl Task {
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
         let id = TaskId(NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
 
-        let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
-        let saved_rsp = init_stack(&mut stack, entry);
+        let mut stack =
+            kstack::KernelStack::alloc().expect("kernel stack pool exhausted (MAX_TASKS reached)");
+        let saved_rsp = init_stack(stack.as_mut_slice(), entry);
 
         Task {
             id,
@@ -656,8 +717,8 @@ impl Task {
             pid: 0,                  // Set by fork_child_trampoline for userspace tasks
             priority: 20,            // Normal priority (middle of 10-29 range)
             affinity_mask: u64::MAX, // Can run on any core
-            user_ticks: 0,
-            system_ticks: 0,
+            user_ticks: core::sync::atomic::AtomicU64::new(0),
+            system_ticks: core::sync::atomic::AtomicU64::new(0),
             start_tick: 0,
             last_migrated_tick: 0,
             last_ready_tick: 0,
@@ -689,16 +750,24 @@ impl Task {
             syscall_snapshot: core::cell::UnsafeCell::new(TaskSyscallSnapshot::default()),
             resume_mode: core::sync::atomic::AtomicU8::new(ResumeMode::Initial as u8),
             reply_waker: None,
+            // Phase 61 Track E.1 — children CPU-time accumulators.
+            child_user_ticks: 0,
+            child_system_ticks: 0,
+            // Phase 61 Track E.4 — rusage event counters (own + child).
+            minor_faults: core::sync::atomic::AtomicU64::new(0),
+            major_faults: core::sync::atomic::AtomicU64::new(0),
+            voluntary_ctxsw: 0,
+            involuntary_ctxsw: 0,
+            child_minor_faults: 0,
+            child_major_faults: 0,
+            child_voluntary_ctxsw: 0,
+            child_involuntary_ctxsw: 0,
         }
     }
 
     /// Return the base and top addresses of this task's kernel stack, if allocated.
     pub fn stack_bounds(&self) -> Option<(u64, u64)> {
-        self._stack.as_ref().map(|s| {
-            let base = s.as_ptr() as u64;
-            let top = base + s.len() as u64;
-            (base, top)
-        })
+        self._stack.as_ref().map(|s| s.bounds())
     }
 
     // ---------------------------------------------------------------------------

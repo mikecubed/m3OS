@@ -177,13 +177,21 @@ fn install_trampoline() {
         }
     }
 
-    // Write the GDTR pseudo-descriptor.
+    // Write the GDTR pseudo-descriptor. Phase 61 Track 0a fix: the
+    // u32 base lives at offset 2 (which is u16-aligned but not u32-aligned),
+    // so use `write_unaligned` to honor Rust's strict pointer-alignment
+    // contract. x86 tolerates unaligned stores at the hardware level, but
+    // `*mut T::write` carries a debug-only alignment assertion that fires
+    // when the kernel test harness builds in debug mode (the production
+    // build optimised the assertion out, so this never showed up before
+    // the kernel-as-lib refactor exposed this code path to integration
+    // tests). Behavior is identical on real hardware.
     let gdtr_virt = (phys_off + TRAMPOLINE_PHYS + DATA_GDTR as u64) as *mut u8;
     let gdt_limit = (gdt.len() * 8 - 1) as u16;
     let gdt_base = (TRAMPOLINE_PHYS + DATA_GDT as u64) as u32;
     unsafe {
-        (gdtr_virt as *mut u16).write(gdt_limit);
-        (gdtr_virt.add(2) as *mut u32).write(gdt_base);
+        (gdtr_virt as *mut u16).write_unaligned(gdt_limit);
+        (gdtr_virt.add(2) as *mut u32).write_unaligned(gdt_base);
     }
 
     // Write the kernel PML4 physical address.

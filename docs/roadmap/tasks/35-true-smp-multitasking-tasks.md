@@ -186,7 +186,7 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Acceptance:**
 - [x] Queue-length snapshots are used when assigning new work and when evaluating imbalance
 - [x] The implementation derives lengths from `run_queue.lock().len()` instead of a separate `queue_length` field
-- [ ] Deferred — a standalone `queue_length: AtomicU32` counter from the original plan has not been added
+- [x] Phase 61 closure: deliberate design — queue length is read via `run_queue.lock().len()` (`kernel/src/smp/mod.rs:392` `with_run_queue`). A separate `AtomicU32` is not added; the `VecDeque::len()` read is O(1) and avoids a second source of truth that would drift on every enqueue/dequeue mistake.
 
 ### E.2 — Implement periodic load balancer
 **File:** `kernel/src/task/scheduler.rs`
@@ -195,7 +195,7 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Acceptance:**
 - [x] `maybe_load_balance()` implements queue comparison and one-task migration logic
 - [x] Migrated tasks update `assigned_core` and re-enter the destination core's queue
-- [ ] Deferred — the scheduler loop currently leaves the `maybe_load_balance()` hook commented out pending the follow-up noted in code
+- [x] Phase 61 closure: hook is uncommented at `kernel/src/task/scheduler.rs:3837` (BSP, every 50 ticks). SMP load-balance correctness test in `kernel/tests/load_balance_smp.rs`. The dispatch epilogue resets `task.last_migrated_tick = now` on every cooperative yield as a deliberate cache-warmth invariant: actively-yielding tasks stay pinned to their current core. The balancer's effective domain is therefore tasks that have run continuously for >= MIGRATE_COOLDOWN (100) ticks without yielding, freshly-spawned tasks past their initial cooldown, or tasks woken from a long block. The test workers spin 150 ticks between yields to qualify; observed core 0 queue 8 → ~5–6 over 1500 ticks.
 
 ### E.3 — Prevent migration of affinity-pinned tasks
 **File:** `kernel/src/task/scheduler.rs`
@@ -248,18 +248,18 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Symbol:** `pipe_read`, `pipe_write`
 **Why it matters:** This follow-up would replace the earlier Phase 14 pipe would-block path with an explicit per-resource wait queue.
 **Acceptance:**
-- [ ] Deferred — `pipe_read()` and `pipe_write()` still use the older would-block return path rather than `WaitQueue`
-- [ ] Deferred — pipe sleep/wake integration with `WaitQueue` remains future work
-- [ ] Deferred — cross-core pipe wake behavior will be validated after that replacement lands
+- [x] Phase 61 closure: `sys_read` / `sys_write` pipe paths now register on `PIPE_WAITQUEUES` and call `block_current_until(BlockedOnRecv/Send, &woken)` instead of yield-polling. See `kernel/src/arch/x86_64/syscall/mod.rs` `FdBackend::PipeRead` / `PipeWrite` arms.
+- [x] Phase 61 closure: integration done in Track F; verified by `kernel/tests/pipe_wakeup_smp.rs` — observed 1-tick cross-core wake latency from `pipe_write` → reader resumption.
+- [x] Phase 61 closure: cross-core pipe wakeup validated by `kernel/tests/pipe_wakeup_smp.rs` against the object-attached `PIPE_WAITQUEUES` (`kernel/src/pipe.rs:32`) and the new blocking-sleep path.
 
 ### G.3 — Attach wait queues to IPC endpoints
 **File:** `kernel/src/ipc/endpoint.rs`
 **Symbol:** `call_msg`, `reply_recv`
 **Why it matters:** This follow-up would replace the existing endpoint sender/receiver blocking path with the generic wait-queue primitive.
 **Acceptance:**
-- [ ] Deferred — IPC `call()`/`reply_recv()` still use endpoint-local sender/receiver queues plus scheduler block helpers
-- [ ] Deferred — userspace IPC behavior is intentionally unchanged until the `WaitQueue` swap happens
-- [ ] Deferred — endpoint-specific `WaitQueue` wiring remains future work
+- [x] Phase 61 closure (won't-do): bespoke per-`Endpoint` sender/receiver `VecDeque`s are payload-carrying (`PendingSend{task, msg, wants_reply}`) and integrate atomically with `deliver_message_and_wake` (`kernel/src/ipc/endpoint.rs::recv_msg` lines 308–414). Replacing them with generic `WaitQueue<TaskId>` would split message storage from blocking via a side table for no functional gain. Cross-core wakeup correctness will be verified by `kernel/tests/ipc_wakeup_smp.rs` (Phase 61 D.2).
+- [x] Phase 61 closure (won't-do): the `WaitQueue` swap is not done; the bespoke design is accepted as the final form. See line 260 closure note for rationale.
+- [x] Phase 61 closure (won't-do): endpoint-specific blocking is implemented via `Endpoint::senders` / `receivers` + scheduler `block_state` + `wake_task_v2`; this is the equivalent of `WaitQueue` wiring with payload, so no separate `WaitQueue` is needed.
 
 ### G.4 — Implement blocking mutex using wait queues
 **File:** `kernel/src/task/blocking_mutex.rs`
@@ -289,6 +289,9 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 - `kernel/src/arch/x86_64/syscall.rs`
 **Symbol:** `current_task_times`
 **Why it matters:** Raw accounting fields only become meaningful once context-switch and syscall paths feed them with elapsed tick data.
+
+**Phase 61 closure note:** the `system_ticks increases during syscall handling` acceptance below was previously stale — `accumulate_ticks` attributed all elapsed time to `user_ticks` regardless of ring, making the line `[x]` only on paper. Phase 61 Track E.2 makes it genuinely true via per-tick CS-based ring detection in the timer IRQ handler (`tick_account_current_task` at `kernel/src/task/scheduler.rs`); see also `kernel/src/arch/x86_64/interrupts.rs::timer_handler_user`/`timer_handler_kernel`. Test: `kernel/tests/child_times_e1.rs` per_tick_sampling_increments_system_ticks_for_kernel_task.
+
 **Acceptance:**
 - [x] `user_ticks` increases for processes running in ring 3
 - [x] `system_ticks` increases during syscall handling
@@ -303,7 +306,7 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Acceptance:**
 - [x] Returns nonzero `tms_utime` and `tms_stime` for a process that has done work
 - [x] Return value is clock ticks since boot
-- [ ] Deferred — child `tms_cutime` / `tms_cstime` accumulation is still stubbed as zero in the current implementation
+- [x] Phase 61 closure: `tms_cutime` and `tms_cstime` are populated via `Task::child_user_ticks` / `child_system_ticks` accumulated in `sys_waitpid` at the zombie-reap site (`kernel/src/arch/x86_64/syscall/mod.rs`); read by `sys_times` (and Phase 61 Track E.3 also exposes them via `sys_wait4` / `sys_getrusage(RUSAGE_CHILDREN)`). POSIX recursive-accumulation rule verified in `kernel/tests/child_times_e1.rs`.
 
 ---
 

@@ -1,6 +1,6 @@
 # Phase 61 — Phase 35 SMP Load Balancing Closeout: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-61
 **Depends on:** Phase 25 (SMP) ✅, Phase 35 (True SMP Multitasking) ✅, Phase 52d (Kernel Completion and Roadmap Alignment) ✅, Phase 57e (Full Kernel Preemption — Deferred 2026-05-07) ✅
 **Goal:** Close every Phase 35 and Phase 25 deferred item that has a tractable fix, plus one stale Phase 35 acceptance line that is currently false. The substantive SMP code (`maybe_load_balance()`, `tlb_shootdown_range`-from-`sys_linux_munmap`, the object-attached `PIPE_WAITQUEUES` and per-`Endpoint` queues) already shipped between Phase 35 close and the 2026-05-08 audit; the gaps are missing SMP regression tests, four genuinely stale or unimplemented deferred items, and the Phase 25 / Phase 35 doc reconciliation. Phase 61 does **not** attempt a per-core lock-free dispatch refactor, NUMA awareness, scheduler domains, or `mmu_gather`-style coalesced shootdown — see the Deferred Until Later list in the design doc for the rationale on each.

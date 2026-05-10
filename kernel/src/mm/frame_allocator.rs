@@ -113,14 +113,14 @@ impl PerCpuPageCache {
 
     /// Returns `true` if the cache contains no frames.
     #[inline]
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns `true` if the cache is at capacity.
     #[inline]
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn is_full(&self) -> bool {
         self.count as usize >= PER_CPU_PAGE_CACHE_CAP
     }

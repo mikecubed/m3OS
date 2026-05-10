@@ -1,7 +1,27 @@
 [package]
 name = "kernel"
-version = "0.60.0"
+version = "0.61.0"
 edition = "2024"
+
+# Phase 61 Track 0a — kernel is built as both a library (so `kernel/tests/*.rs`
+# integration tests can `use kernel::...` to reach scheduler / SMP / pipe
+# internals) and a standalone `no_std` `no_main` binary. Neither target makes
+# sense as a `cargo test` target on its own:
+#   - The library has no `#[panic_handler]` (the binary owns it).
+#   - The binary's `cfg(test)` test-runner path references `kernel::testing`,
+#     which is only present when the library is itself compiled with
+#     `cfg(test)` — a configuration that does not match how integration tests
+#     link against the lib.
+# Disable both `cargo test` targets; QEMU integration tests under
+# `kernel/tests/*.rs` are the supported test path (`cargo xtask test`).
+[lib]
+test = false
+doctest = false
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
 
 [dependencies]
 bootloader_api = "0.11.15"

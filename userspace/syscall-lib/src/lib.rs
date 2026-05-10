@@ -1106,6 +1106,7 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
 // fcntl constants
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_FSYNC: u64 = 74;
+pub const SYS_NICE: u64 = 34;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
 pub const O_NONBLOCK: u64 = 0x800;
@@ -1347,6 +1348,19 @@ pub fn fsync(fd: i32) -> isize {
     unsafe { syscall1(SYS_FSYNC, fd as u64) as isize }
 }
 
+/// Adjust the calling task's scheduler priority by `increment`.
+///
+/// Negative values raise priority (Linux convention). The kernel clamps
+/// the result into `0..=30`; non-root callers that would land in the
+/// real-time band (`0..=9`) are silently clamped up to priority 10
+/// instead of being rejected with an error. Returns the new priority
+/// on success, or a negative value on failure. Useful for system
+/// services that need to preempt regular tasks (syslogd, schedulers,
+/// watchdogs).
+pub fn nice(increment: i32) -> isize {
+    unsafe { syscall1(SYS_NICE, increment as u64) as isize }
+}
+
 // ===========================================================================
 // High-level wrappers — ioctl, lseek, termios, signals
 // ===========================================================================
@@ -1470,13 +1484,27 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> isize {
 }
 
 /// Wait for a child process. Returns the PID of the child that changed state.
+///
+/// Internally invokes Linux's `wait4` (syscall #61) with `rusage = NULL`.
+/// Phase 61 Track E.3 widened the kernel-side dispatch from
+/// `sys_waitpid(pid, status, options)` to
+/// `sys_wait4(pid, status, options, rusage_ptr)`. The kernel reads
+/// `rusage_ptr` from `r10` regardless of how many arguments userspace
+/// passed; if we use a 3-arg `syscall3`, `r10` carries stale register
+/// data and the kernel tries to write a `struct rusage` to a garbage
+/// address — typically returning `EFAULT`. Pass an explicit
+/// `r10 = 0` (NULL) so the kernel's `rusage_ptr == 0` short-circuit
+/// skips the write. This bug surfaced under KVM (where `-cpu host`
+/// leaves `r10` holding real prior-syscall state); under TCG `r10`
+/// often happened to be zero already, hiding the breakage.
 pub fn waitpid(pid: i32, status: &mut i32, options: i32) -> isize {
     unsafe {
-        syscall3(
+        syscall4(
             SYS_WAITPID,
             pid as u64,
             status as *mut i32 as u64,
             options as u64,
+            0, // rusage_ptr = NULL — waitpid does not return rusage
         ) as isize
     }
 }

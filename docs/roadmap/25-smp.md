@@ -87,6 +87,8 @@ it steals work from the busiest core's queue (simple work stealing).
 
 ### TLB Shootdown
 
+**Phase 61 closure:** shootdown wired into `sys_linux_munmap` at `kernel/src/arch/x86_64/syscall/mod.rs:8981` (post-batch over the full unmapped range). P25-T033 closure cross-reference comment lives at the call site.
+
 When a page mapping is removed (e.g., via `munmap`), the kernel sends a shootdown
 IPI to every core that might have cached the stale TLB entry. The IPI handler
 invalidates the relevant TLB entries on the receiving core.
@@ -139,7 +141,7 @@ invalidates the relevant TLB entries on the receiving core.
 ## Deferred Until Later
 
 - NUMA-aware memory allocation
-- CPU affinity (`sched_setaffinity`)
+- ~~CPU affinity (`sched_setaffinity`)~~ — shipped in Phase 35 F.2
 - real-time scheduling classes
 - CPU frequency scaling (P-states)
 - CPU hotplug
