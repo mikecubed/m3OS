@@ -129,41 +129,7 @@ TDD-first: write host-side tests for the new PIO syscall (input validation, widt
 
 ## Manual Smoke Checklist
 
-> **Note (Phase 63 Track E.2):** This checklist will be migrated into
-> `docs/63-audio-stack-implementation.md` when Track H creates that document.
-> It is placed here as a findable placeholder in the meantime.
-
-The headless `cargo xtask audio-smoke` and `cargo xtask bell-smoke` gates
-provide CI-deterministic coverage. The steps below confirm human-audible
-output on the host audio device — the final proof that the AC'97 backend
-emits real PCM rather than just advancing software counters.
-
-### Step 1 — Audible 440 Hz tone via `audio-demo`
-
-1. Run `cargo xtask run-gui` (default audio: PulseAudio on Linux, `none`
-   elsewhere).
-2. Wait for the `term` graphical terminal prompt to appear.
-3. Type `/bin/audio-demo` and press Enter.
-4. **Expected:** A 1-second 440 Hz tone is audible on the host audio device.
-   Serial output shows `AUDIO_DEMO:PASS`.
-
-### Step 2 — Audible BEL beep via `printf '\x07'`
-
-1. In the same `term` session from Step 1 (or re-launch with
-   `cargo xtask run-gui`).
-2. Type `printf '\x07'` and press Enter.
-3. **Expected:** A short audible beep (~30 ms at 880 Hz, per Phase 57 G.6
-   `BELL_TONE_FREQ_HZ` / `BELL_DURATION_MS`) is heard on the host audio
-   device.
-
-### Failure interpretation
-
-| Symptom | Likely cause |
-|---|---|
-| No tone from `audio-demo`, `AUDIO_DEMO:PASS` absent | `audio_server` stub mode (AC'97 device not present in QEMU) |
-| Tone inaudible but `AUDIO_DEMO:PASS` printed | Host audio sink not configured (check `pa` vs `none` backend) |
-| BEL step silent, `AUDIO_STATS:FAIL:consumed=0` | Bell wiring not reaching `Ac97Backend`; check `term::bell::AudioClientBellSink` |
-| `cargo xtask run-gui` no audio at all | Missing `--no-audio` was not passed; check QEMU `-audiodev` in build log |
+See [`docs/63-audio-stack-implementation.md`](../63-audio-stack-implementation.md#manual-smoke-checklist) for the audible-tone and BEL-beep verification steps. The headless `cargo xtask audio-smoke` and `cargo xtask bell-smoke` gates cover the deterministic CI surface; the manual checklist closes the audible-on-host loop.
 
 ## How Real OS Implementations Differ
 

@@ -1,6 +1,6 @@
 # Phase 63 — Audio Stack Implementation: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-63
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
 **Goal:** Make the Phase 57 audio stack actually emit PCM to hardware so a user can hear the BEL bell and `audio-demo` tone. Replace the `cfg(not(test)) Ac97Backend` accounting stub in `userspace/audio_server/src/device.rs:559-664` with a real backend that drives the existing Phase 57 register-poking helpers (`init_controller`, `open_pcm_out_stream`, `handle_pcm_out_irq`, `Ac97Logic`) over a new privileged PIO syscall path; switch the QEMU launchers to a real `audiodev` backend; and extend `cargo xtask audio-smoke` to assert frame consumption end-to-end via the existing `AudioControlCommand::GetStats` verb.
@@ -42,8 +42,8 @@ Track A.1 / A.3 / B.1 / B.2 / C.1 / C.2 / G.1 from earlier drafts of this plan a
 | C | QEMU `-audiodev` selection: PulseAudio for `run-gui`, WAV for `audio-smoke` | None | Complete |
 | D | `audio-smoke` asserts `frames_consumed` advance via `GetStats`, plus non-silent WAV | A, B, C | Complete |
 | E | End-to-end BEL/audio-demo verification against real backend | A, B, C | Complete |
-| F | Phase 57 design + task doc closure notes | D, E | In Progress |
-| H | Phase 63 design + release wiring (kernel version bump, learning doc) | F | Planned |
+| F | Phase 57 design + task doc closure notes | D, E | Complete |
+| H | Phase 63 design + release wiring (kernel version bump, learning doc) | F | Complete |
 
 ---
 

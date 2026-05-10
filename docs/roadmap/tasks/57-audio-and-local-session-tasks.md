@@ -577,9 +577,9 @@ Phase 57 transitional note (per worktree spec): `audio_server` and `term` usersp
 **Why it matters:** A regression in any of A.1, B.*, C.*, D.*, or E.* is observable here before it reaches the field. The smoke harness does not require a real audio fixture: it asserts the driver-level `frames_consumed` counter advances under `-audiodev none,id=…`, which is a deterministic, scriptable signal.
 
 **Acceptance:**
-- [x] Boots `cargo xtask run` headless; runs `audio-demo`; reads the `audio.stream` stats verb. **(simpler variant landed: asserts `init: loaded service 'audio_server'` instead of running audio-demo. The full audio-demo round-trip is blocked upstream by (1) the `audio_server.conf` `depends=display_server` ↔ `display_server.conf` `name=display` mismatch and (2) the AC97/NVMe BDF collision at `0:4.0`. Both are out of Track H scope; the simpler variant proves the Phase 57 four-step new-binary convention is wired through to `init`'s service-config parser, which is the regression signal Track H needs.)**
-- [ ] Asserts `frames_consumed >= frames_submitted` within a documented timeout. **(stretch goal — requires the upstream fixes; documented in `audio_smoke_steps`'s function-level docs.)**
-- [x] Fails with a distinct exit code if any assertion does not hold. **(`SMOKE_EXIT_AUDIO_DEMO_FAILED = 60`, distinct from H.2's `61` and H.3's `62`.)**
+- [x] Boots `cargo xtask run` headless; runs `audio-demo`; reads the `audio.stream` stats verb. **(extended in Phase 63 to run `audio-demo` end-to-end and assert `AUDIO_DEMO:PASS`, with the FAIL stage surfaced via the new `SmokeStep::WaitPassOrFail` variant.)**
+- [x] Asserts `frames_consumed >= frames_submitted` within a documented timeout. **(extended in Phase 63 to assert `AUDIO_DEMO:stats consumed=<N>` is non-zero via the existing `AudioControlCommand::GetStats` verb, plus a non-silent recorded WAV (`assert_wav_non_silent`, ≥5% samples `|x|>100`, exit code `SMOKE_EXIT_WAV_SILENT = 63`).)**
+- [x] Fails with a distinct exit code if any assertion does not hold. **(`SMOKE_EXIT_AUDIO_DEMO_FAILED = 60`, distinct from H.2's `61` and H.3's `62`; Phase 63 added `SMOKE_EXIT_WAV_SILENT = 63` and `SMOKE_EXIT_BELL_SMOKE_FAILED = 64`.)**
 - [x] Mirrors the `scripts/ssh_e1000_banner_check.sh` reference shape. **(single command, single observable, distinct exit code.)**
 
 ### H.2 — Session entry smoke test (`cargo xtask session-smoke`)
