@@ -401,6 +401,103 @@ pub fn handle_pcm_out_irq<M: MmioOps>(
 }
 
 // ---------------------------------------------------------------------------
+// PCM-ring slot stride — derived from ring + BDL constants
+// ---------------------------------------------------------------------------
+
+/// Number of bytes per PCM-ring slot. The PCM ring is divided into
+/// `BDL_ENTRIES` equal slots; each submission occupies one or more
+/// contiguous slots.
+pub const PCM_SLOT_STRIDE: usize = DEFAULT_PCM_RING_BYTES / BDL_ENTRIES;
+
+/// A single silence slot — one BDL entry's worth of zero PCM data.
+/// Used by the underrun-recovery path to re-arm the BDL without
+/// introducing audible clicks.
+pub const SILENCE_FRAME: [u8; PCM_SLOT_STRIDE] = [0u8; PCM_SLOT_STRIDE];
+
+// ---------------------------------------------------------------------------
+// submit_frames_inner — pure copy + BDL-post helper
+// ---------------------------------------------------------------------------
+
+/// Copy `bytes` into the PCM ring DMA region and post one or more BDL
+/// entries. Pure logic — takes raw slices so host tests can drive it
+/// without a real [`DmaBuffer`].
+///
+/// # Rules
+///
+/// - `bytes.len()` must be a non-zero multiple of [`PCM_SLOT_STRIDE`].
+///   A submission smaller than one slot returns
+///   [`AudioError::InvalidArgument`]; a submission that is not a
+///   multiple of the stride also returns `InvalidArgument`.
+/// - Each slot is checked for BDL-full before the copy starts; if the
+///   first slot would overflow the ring the function returns
+///   [`AudioError::WouldBlock`] without copying any bytes.
+/// - Returns the total number of bytes copied on success.
+///
+/// # Arguments
+///
+/// - `bytes` — caller-supplied PCM data (S16Le).
+/// - `pcm_ring` — mutable reference to the full PCM ring DMA region
+///   (`DEFAULT_PCM_RING_BYTES` bytes).
+/// - `pcm_ring_iova` — device-visible IOVA base of `pcm_ring`.
+/// - `bdl_iova` — device-visible IOVA base of the BDL DMA buffer.
+///   Used to compute the `bdl_iova_offset` argument for
+///   [`Ac97Logic::submit_buffer`].
+/// - `logic` — mutable reference to the BDL ring state machine.
+pub fn submit_frames_inner(
+    bytes: &[u8],
+    pcm_ring: &mut [u8; DEFAULT_PCM_RING_BYTES],
+    pcm_ring_iova: u64,
+    bdl_iova: u64,
+    logic: &mut Ac97Logic,
+) -> Result<usize, AudioError> {
+    // Partial-slot submissions are not supported in Phase 63.
+    if bytes.len() < PCM_SLOT_STRIDE || bytes.len() % PCM_SLOT_STRIDE != 0 {
+        return Err(AudioError::InvalidArgument);
+    }
+
+    let num_slots = bytes.len() / PCM_SLOT_STRIDE;
+
+    // Check BDL capacity upfront before copying any data.
+    // We need `num_slots` free BDL entries; each slot that would be
+    // in-flight counts as one. If there are not enough free slots
+    // for even the first chunk, return WouldBlock.
+    let in_flight = logic.head.wrapping_sub(logic.tail);
+    let free_slots = BDL_ENTRIES.saturating_sub(in_flight);
+    if free_slots == 0 {
+        return Err(AudioError::WouldBlock);
+    }
+
+    // Submit as many complete slots as the BDL can accept.
+    let slots_to_submit = num_slots.min(free_slots);
+    let mut total_copied = 0usize;
+
+    for i in 0..slots_to_submit {
+        let head = logic.head % BDL_ENTRIES;
+        let slot_byte_offset = head * PCM_SLOT_STRIDE;
+        let src_offset = i * PCM_SLOT_STRIDE;
+
+        // Copy into the PCM ring DMA region at the correct slot.
+        pcm_ring[slot_byte_offset..slot_byte_offset + PCM_SLOT_STRIDE]
+            .copy_from_slice(&bytes[src_offset..src_offset + PCM_SLOT_STRIDE]);
+
+        // Compute addresses for `submit_buffer`.
+        let bdl_iova_offset = bdl_iova + (head * core::mem::size_of::<BufferDescriptor>()) as u64;
+        let slot_phys_addr = (pcm_ring_iova + slot_byte_offset as u64) as u32;
+        let samples = PCM_SLOT_STRIDE / 2; // S16Le — 2 bytes per sample
+
+        // Post the BDL entry. `submit_buffer` validates and updates
+        // `lvi`; it cannot fail here because we pre-checked capacity.
+        logic
+            .submit_buffer(bdl_iova_offset, slot_phys_addr, samples)
+            .map_err(|_| AudioError::Internal)?;
+
+        total_copied += PCM_SLOT_STRIDE;
+    }
+
+    Ok(total_copied)
+}
+
+// ---------------------------------------------------------------------------
 // Ac97Logic — pure-state companion to `Ac97Backend`
 // ---------------------------------------------------------------------------
 
@@ -671,11 +768,22 @@ impl AudioBackend for Ac97Backend {
         if stream_id != Self::PCM_OUT_STREAM_ID || !self.stream_open {
             return Err(AudioError::InvalidArgument);
         }
-        // Track B wires the real copy-into-PCM-ring path.  Phase 63 Track A
-        // leaves `submit_frames` as a counter-only stub so the trait compiles
-        // and the stream registry can call it; the byte accounting is tracked
-        // through `Ac97Logic::submit_buffer` which Track B will call.
-        Ok(bytes.len())
+        // Delegate to the pure helper so the ring-copy logic is host-testable.
+        // Capture IOVAs before the mutable borrows to satisfy the borrow checker.
+        let pcm_ring_iova = self.pcm_ring.iova();
+        let bdl_iova = self.bdl.iova();
+        let pcm_ring_slice: &mut [u8; DEFAULT_PCM_RING_BYTES] = &mut self.pcm_ring;
+        let n = submit_frames_inner(
+            bytes,
+            pcm_ring_slice,
+            pcm_ring_iova,
+            bdl_iova,
+            &mut self.logic,
+        )?;
+        // Write the updated LVI to the hardware register.
+        self.bus
+            .write_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::LVI, self.logic.lvi());
+        Ok(n)
     }
 
     fn drain(&mut self, stream_id: u32) -> Result<(), AudioError> {
@@ -1503,5 +1611,203 @@ mod tests {
             civ, 5,
             "CIV must be read from BAR_NABM at PCM_OUT_BASE + CIV offset"
         );
+    }
+
+    // -- B.1: submit_frames_inner — PCM-ring copy + BDL-post -----------------
+
+    /// B.1(a): bytes are copied into the PCM ring at the correct slot offset.
+    /// The first submission must land at `head=0 × PCM_SLOT_STRIDE = 0`.
+    #[test]
+    fn submit_frames_inner_copies_bytes_to_correct_slot_offset() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        // Fill submission with a recognisable pattern.
+        let mut submission = [0u8; PCM_SLOT_STRIDE];
+        for (i, b) in submission.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        submit_frames_inner(
+            &submission,
+            &mut pcm_ring,
+            /*pcm_ring_iova=*/ 0x0010_0000,
+            /*bdl_iova=*/ 0x0020_0000,
+            &mut logic,
+        )
+        .expect("submit must succeed");
+
+        // Head was 0 before the call, so slot 0 (offset 0) was used.
+        assert_eq!(
+            &pcm_ring[0..PCM_SLOT_STRIDE],
+            &submission[..],
+            "bytes must be at slot 0 (offset 0)"
+        );
+    }
+
+    /// B.1(a): after the first submission the second submission lands at
+    /// slot index 1, i.e., byte offset `PCM_SLOT_STRIDE`.
+    #[test]
+    fn submit_frames_inner_uses_next_slot_for_second_submission() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let first = [0xAAu8; PCM_SLOT_STRIDE];
+        let second = [0xBBu8; PCM_SLOT_STRIDE];
+
+        submit_frames_inner(&first, &mut pcm_ring, 0x1000_0000, 0x2000_0000, &mut logic)
+            .expect("first submit");
+        submit_frames_inner(&second, &mut pcm_ring, 0x1000_0000, 0x2000_0000, &mut logic)
+            .expect("second submit");
+
+        assert_eq!(
+            &pcm_ring[0..PCM_SLOT_STRIDE],
+            &first[..],
+            "slot 0 must hold the first submission"
+        );
+        assert_eq!(
+            &pcm_ring[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE],
+            &second[..],
+            "slot 1 must hold the second submission"
+        );
+    }
+
+    /// B.1(b): after a successful call, `Ac97Logic::submit_buffer` was
+    /// driven with the correct IOVA and sample count.
+    #[test]
+    fn submit_frames_inner_posts_bdl_entry_with_correct_iova_and_samples() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let pcm_ring_iova: u64 = 0x0010_0000;
+        let bdl_iova: u64 = 0x0020_0000;
+
+        let data = [0u8; PCM_SLOT_STRIDE];
+        submit_frames_inner(&data, &mut pcm_ring, pcm_ring_iova, bdl_iova, &mut logic)
+            .expect("submit");
+
+        // The BDL entry at slot 0 should have been posted.
+        let entry0 = logic.bdl()[0];
+        let expected_phys_addr = pcm_ring_iova as u32; // slot 0 is at base IOVA
+        assert_eq!(
+            { entry0.phys_addr },
+            expected_phys_addr,
+            "phys_addr must be pcm_ring_iova + 0 (slot 0)"
+        );
+        let expected_samples = (PCM_SLOT_STRIDE / 2) as u16; // S16Le
+        assert_eq!(
+            { entry0.samples },
+            expected_samples,
+            "samples must be PCM_SLOT_STRIDE / 2"
+        );
+        // LVI must have advanced to 0 after the first submit.
+        assert_eq!(logic.lvi(), 0, "LVI must be 0 after first slot");
+    }
+
+    /// B.1(b): LVI advances correctly after two submissions.
+    #[test]
+    fn submit_frames_inner_lvi_advances_after_each_slot() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let data = [0u8; PCM_SLOT_STRIDE];
+
+        submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic).expect("first");
+        assert_eq!(logic.lvi(), 0, "LVI=0 after slot 0");
+
+        submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic).expect("second");
+        assert_eq!(logic.lvi(), 1, "LVI=1 after slot 1");
+    }
+
+    /// B.1(d): partial-slot submission (bytes.len() < PCM_SLOT_STRIDE)
+    /// must return `InvalidArgument`.
+    #[test]
+    fn submit_frames_inner_partial_slot_returns_invalid_argument() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let partial = [0u8; PCM_SLOT_STRIDE - 1];
+        let err = submit_frames_inner(&partial, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
+            .expect_err("partial slot must be rejected");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    /// B.1(d): zero-length submission must also return `InvalidArgument`.
+    #[test]
+    fn submit_frames_inner_zero_len_returns_invalid_argument() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let err = submit_frames_inner(&[], &mut pcm_ring, 0x1000, 0x2000, &mut logic)
+            .expect_err("zero len must be rejected");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    /// B.1(d): non-multiple-of-stride submission must return
+    /// `InvalidArgument` even when larger than one slot.
+    #[test]
+    fn submit_frames_inner_non_stride_multiple_returns_invalid_argument() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        // PCM_SLOT_STRIDE + 1 is not a multiple of PCM_SLOT_STRIDE.
+        let odd = alloc::vec![0u8; PCM_SLOT_STRIDE + 1];
+        let err = submit_frames_inner(&odd, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
+            .expect_err("non-multiple stride must be rejected");
+        assert_eq!(err, AudioError::InvalidArgument);
+    }
+
+    /// B.1(e): when the BDL is full, submit must return `WouldBlock`
+    /// without copying any bytes.
+    #[test]
+    fn submit_frames_inner_bdl_full_returns_would_block() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        // Fill all BDL slots via submit_buffer directly.
+        for i in 0..BDL_ENTRIES {
+            logic
+                .submit_buffer(
+                    (i * core::mem::size_of::<BufferDescriptor>()) as u64,
+                    i as u32 * PCM_SLOT_STRIDE as u32,
+                    PCM_SLOT_STRIDE / 2,
+                )
+                .expect("fill BDL");
+        }
+        let data = [0u8; PCM_SLOT_STRIDE];
+        let err = submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
+            .expect_err("BDL full must yield WouldBlock");
+        assert_eq!(err, AudioError::WouldBlock);
+    }
+
+    /// B.1(f): a two-slot submission is split into two BDL entries,
+    /// and the function returns the total bytes copied (2 × slot stride).
+    #[test]
+    fn submit_frames_inner_over_slot_splits_into_multiple_entries() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut logic = Ac97Logic::new();
+        let mut data = alloc::vec![0u8; 2 * PCM_SLOT_STRIDE];
+        // Write distinct patterns into each slot.
+        for b in data[0..PCM_SLOT_STRIDE].iter_mut() {
+            *b = 0xCC;
+        }
+        for b in data[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE].iter_mut() {
+            *b = 0xDD;
+        }
+
+        let n = submit_frames_inner(&data, &mut pcm_ring, 0x0010_0000, 0x0020_0000, &mut logic)
+            .expect("two-slot submit must succeed");
+
+        assert_eq!(n, 2 * PCM_SLOT_STRIDE, "must return total bytes copied");
+        assert_eq!(logic.lvi(), 1, "LVI must be 1 after two BDL entries");
+        // Both slots must have been written.
+        assert_eq!(
+            &pcm_ring[0..PCM_SLOT_STRIDE],
+            &data[0..PCM_SLOT_STRIDE],
+            "slot 0 pattern"
+        );
+        assert_eq!(
+            &pcm_ring[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE],
+            &data[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE],
+            "slot 1 pattern"
+        );
+    }
+
+    /// B.1: SILENCE_FRAME is exactly one slot stride of zero bytes.
+    #[test]
+    fn silence_frame_is_one_slot_stride_of_zeros() {
+        assert_eq!(SILENCE_FRAME.len(), PCM_SLOT_STRIDE);
+        assert!(SILENCE_FRAME.iter().all(|&b| b == 0));
     }
 }

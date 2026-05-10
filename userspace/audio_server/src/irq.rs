@@ -321,6 +321,10 @@ pub fn apply_irq_event(event: crate::device::IrqEvent, streams: &mut StreamRegis
             // stats update at this layer.
         }
         IrqEvent::Underrun => {
+            // Bump the underrun counter exactly once per event.  The
+            // io loop must then call `repost_silence_after_underrun` to
+            // re-arm the BDL; those two steps are separate so the
+            // underrun_count is never double-counted.
             streams.record_underrun();
         }
         IrqEvent::FifoError => {
@@ -329,6 +333,36 @@ pub fn apply_irq_event(event: crate::device::IrqEvent, streams: &mut StreamRegis
         }
         IrqEvent::None => {}
     }
+}
+
+/// Re-arm the BDL after an underrun by submitting one silence slot.
+///
+/// Called by the io loop immediately after [`apply_irq_event`] returns
+/// `IrqEvent::Underrun`.  Because [`crate::device::IrqEvent::Underrun`]
+/// is only produced when `Ac97Logic` observed FIFOE on an *empty* ring
+/// (`head == tail`), posting one silence slot is always safe — the ring
+/// has room and the device will start consuming from the new entry.
+///
+/// The call goes through `StreamRegistry::submit` so
+/// `stream.stats.frames_submitted` advances — the underrun-recovery
+/// slot counts as a submitted frame from the caller's perspective.
+///
+/// # No double-count
+///
+/// `apply_irq_event` already incremented `underrun_count` for this
+/// event; this function must *not* bump it again.  It only posts audio
+/// data; the stats counter update is the caller's responsibility before
+/// this call.
+pub fn repost_silence_after_underrun(
+    backend: &mut dyn AudioBackend,
+    stream_id: u32,
+    streams: &mut StreamRegistry,
+) {
+    use crate::device::SILENCE_FRAME;
+    // `submit` may return `WouldBlock` if — against the invariant — the
+    // BDL somehow has no room; ignore that gracefully rather than
+    // panicking in the IRQ handler path.
+    let _ = streams.submit(backend, stream_id, &SILENCE_FRAME);
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +657,43 @@ mod tests {
         apply_irq_event(IrqEvent::None, &mut reg);
         let s = reg.stats();
         assert_eq!(s.underrun_count, 0);
+    }
+
+    // -- B.2: repost_silence_after_underrun ----------------------------------
+
+    /// B.2: open → simulate `IrqEvent::Underrun` → assert `frames_submitted`
+    /// advances by exactly one slot's worth of zero bytes.
+    #[test]
+    fn repost_silence_after_underrun_advances_frames_submitted_by_one_slot() {
+        use super::repost_silence_after_underrun;
+        use crate::device::PCM_SLOT_STRIDE;
+
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let stream_id = open_stereo(&mut reg, &mut b);
+
+        // Precondition: no frames submitted yet.
+        assert_eq!(reg.stats().frames_submitted, 0);
+
+        // Simulate an underrun event: apply_irq_event bumps underrun_count.
+        apply_irq_event(IrqEvent::Underrun, &mut reg);
+        assert_eq!(reg.stats().underrun_count, 1, "underrun_count must be 1");
+
+        // Repost one silence slot.
+        repost_silence_after_underrun(&mut b, stream_id, &mut reg);
+
+        // frames_submitted must advance by exactly PCM_SLOT_STRIDE bytes.
+        assert_eq!(
+            reg.stats().frames_submitted,
+            PCM_SLOT_STRIDE as u64,
+            "frames_submitted must advance by one slot stride of silence"
+        );
+        // underrun_count must remain at 1 — no double-count.
+        assert_eq!(
+            reg.stats().underrun_count,
+            1,
+            "underrun_count must not be double-incremented by repost"
+        );
     }
 
     // -- io-loop discipline check -----------------------------------------
