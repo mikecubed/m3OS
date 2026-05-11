@@ -14126,7 +14126,8 @@ mod tests {
         // a 10 s timeout. If `bell-test` emits `BELL_TEST:FAIL:consumed=0`
         // the wait for BELL_TEST:PASS times out (or we catch the FAIL
         // sentinel explicitly). Either way the smoke exits with
-        // SMOKE_EXIT_BELL_SMOKE_FAILED (code 63).
+        // SMOKE_EXIT_BELL_SMOKE_FAILED (code 64; 63 is
+        // SMOKE_EXIT_WAV_SILENT — the assertion below pins both).
         //
         // We validate the constant and step structure here rather than
         // simulating a full QEMU run, which would require a mock process.

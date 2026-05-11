@@ -375,15 +375,24 @@ pub trait IrqNotificationContract: DeviceHandleContract {
 ///
 /// Observable behavior every implementation satisfies:
 ///
-/// - [`PioContract::map`] against a live handle for a PIO BAR returns a
-///   window; `map` against a released handle returns `NotClaimed`; `map`
-///   against an MMIO BAR returns `InvalidBarIndex`.
+/// - [`PioContract::map`] is side-effect-free: it stores the device-cap
+///   handle plus the BAR index and returns a window without issuing any
+///   port I/O. PIO BARs are not memory-mapped, and probing at map time is
+///   explicitly forbidden — several AC'97 registers are clear-on-read and
+///   a probe would mutate device state the caller did not request. As a
+///   consequence, BAR-type errors (MMIO BAR) and cap-state errors
+///   (released handle) surface on the first `read_*` / `write_*` call,
+///   not at `map`. The fallible return type leaves room for future
+///   probe-free validation, but production implementations satisfy the
+///   contract by returning `Ok` for all map calls.
 /// - Each `write_{u8,u16,u32}` followed by a matching-width read at the same
 ///   offset returns the written value (for device-emulated registers that
 ///   implement read-back).
 /// - `read_*` and `write_*` do not return a result — they follow port I/O
 ///   semantics where an out-of-range port causes a `#GP` at the kernel
-///   privilege level; the wrapper layer validates offsets up front.
+///   privilege level; the wrapper layer validates offsets up front and
+///   the syscall-backed wrapper surfaces kernel errnos via
+///   `debug_assert!` in debug builds.
 pub trait PioContract: DeviceHandleContract {
     /// Opaque per-backend PIO window handle.
     type PioWindow;

@@ -140,11 +140,24 @@ impl<T> Pio<T> {
     }
 
     /// Read an 8-bit register at `offset` within this BAR.
+    ///
+    /// PIO ports follow infallible read semantics by trait design (see
+    /// `PioContract`), but the kernel syscall path can still return
+    /// `-EBADF` / `-EINVAL` / `-ERANGE` if the wrapper was constructed
+    /// with stale state or invoked with an out-of-range offset. In debug
+    /// builds we surface those failures via `debug_assert!` so latent
+    /// bugs are not papered over as silent zeros; release builds keep the
+    /// infallible-by-contract shape.
     #[inline]
     pub fn read_u8(&self, offset: usize) -> u8 {
         // SAFETY: device_cap and bar_index were validated at construction.
         let rc =
             unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 1) };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_read u8 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
         if rc < 0 { 0 } else { rc as u8 }
     }
 
@@ -154,6 +167,11 @@ impl<T> Pio<T> {
         // SAFETY: see read_u8.
         let rc =
             unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 2) };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_read u16 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
         if rc < 0 { 0 } else { rc as u16 }
     }
 
@@ -163,46 +181,74 @@ impl<T> Pio<T> {
         // SAFETY: see read_u8.
         let rc =
             unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 4) };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_read u32 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
         if rc < 0 { 0 } else { rc as u32 }
     }
 
     /// Write an 8-bit register at `offset` within this BAR.
+    ///
+    /// As with the read methods: infallible by trait contract, but the
+    /// underlying syscall can fail with `-EBADF` / `-EINVAL` / `-ERANGE`.
+    /// `debug_assert!` surfaces those failures in debug builds so they
+    /// don't silently become register-write no-ops.
     #[inline]
     pub fn write_u8(&self, offset: usize, value: u8) {
         // SAFETY: device_cap and bar_index were validated at construction.
-        unsafe {
+        let rc = unsafe {
             raw_sys_device_pio_write(
                 self.device_cap,
                 self.bar_index,
                 offset as u32,
                 u32::from(value),
                 1,
-            );
-        }
+            )
+        };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_write u8 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
+        let _ = rc;
     }
 
     /// Write a 16-bit register at `offset` within this BAR.
     #[inline]
     pub fn write_u16(&self, offset: usize, value: u16) {
         // SAFETY: see write_u8.
-        unsafe {
+        let rc = unsafe {
             raw_sys_device_pio_write(
                 self.device_cap,
                 self.bar_index,
                 offset as u32,
                 u32::from(value),
                 2,
-            );
-        }
+            )
+        };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_write u16 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
+        let _ = rc;
     }
 
     /// Write a 32-bit register at `offset` within this BAR.
     #[inline]
     pub fn write_u32(&self, offset: usize, value: u32) {
         // SAFETY: see write_u8.
-        unsafe {
-            raw_sys_device_pio_write(self.device_cap, self.bar_index, offset as u32, value, 4);
-        }
+        let rc = unsafe {
+            raw_sys_device_pio_write(self.device_cap, self.bar_index, offset as u32, value, 4)
+        };
+        debug_assert!(
+            rc >= 0,
+            "sys_device_pio_write u32 failed: errno={rc}, bar={}, offset={offset:#x}",
+            self.bar_index
+        );
+        let _ = rc;
     }
 
     /// Device-cap handle stored by this wrapper.

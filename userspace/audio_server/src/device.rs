@@ -350,6 +350,23 @@ pub fn init_controller<M: MmioOps>(mmio: &M) -> Result<(), AudioError> {
     Ok(())
 }
 
+/// Verify that the DMA range `[iova, iova + size)` fits entirely within the
+/// low 4 GiB so AC'97's 32-bit BDBAR / BDL `phys_addr` fields can address it
+/// without silent truncation.
+///
+/// Returns `AudioError::Internal` if the range spills above `u32::MAX + 1`.
+/// Phase 63 review-resolution: the kernel DMA allocator returns 64-bit IOVAs;
+/// passing one whose high half is non-zero to the AC'97 controller would aim
+/// bus-mastering at unrelated memory and either corrupt RAM or hang the DMA
+/// engine. The check is alloc-free and runs once per buffer at `Ac97Backend::init`.
+pub fn check_iova_fits_u32(iova: u64, size: usize) -> Result<(), AudioError> {
+    let end = iova.checked_add(size as u64).ok_or(AudioError::Internal)?;
+    if end > (u32::MAX as u64) + 1 {
+        return Err(AudioError::Internal);
+    }
+    Ok(())
+}
+
 /// Open the PCM-out stream by programming `BDBAR → LVI = 0 → CR.RPBM`
 /// in that order. Acceptance pins BDBAR before LVI before CR run-bit.
 pub fn open_pcm_out_stream<M: MmioOps>(mmio: &M, bdl_iova: u64) -> Result<(), AudioError> {
@@ -703,11 +720,21 @@ impl Ac97Backend {
             )
             .map_err(|_| AudioError::Internal)?;
 
+        // AC'97 bus mastering is 32-bit: BDBAR is a 32-bit register and BDL
+        // entries carry 32-bit `phys_addr` fields. The kernel DMA allocator
+        // returns 64-bit IOVAs, so we must verify both DMA buffers land
+        // entirely within the low 4 GiB before programming the controller.
+        // Without this check, an allocation above 4 GiB would silently
+        // truncate to u32 and aim the device at unrelated memory.
+        let bdl_iova = bdl.iova();
+        let pcm_ring_iova = pcm_ring.iova();
+        check_iova_fits_u32(bdl_iova, bdl_size)?;
+        check_iova_fits_u32(pcm_ring_iova, DEFAULT_PCM_RING_BYTES)?;
+
         // Step 4: reset + configure the codec (RESET → volumes → VRA → rate).
         init_controller(&bus)?;
 
         // Step 5: arm the BDL and start the bus master (CR.RR → BDBAR → LVI → CR.RPBM).
-        let bdl_iova = bdl.iova();
         open_pcm_out_stream(&bus, bdl_iova)?;
 
         Ok(Self {
@@ -947,6 +974,52 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::cell::RefCell;
+
+    // -- check_iova_fits_u32 ----------------------------------------------
+    //
+    // Phase 63 review-resolution: AC'97 BDBAR and BDL `phys_addr` are 32-bit.
+    // `Ac97Backend::init` must reject DMA allocations that spill above 4 GiB
+    // so the controller never bus-masters from a silently-truncated address.
+
+    #[test]
+    fn check_iova_fits_u32_accepts_low_dma_buffer() {
+        // A typical kernel DMA allocation at 1 MiB with a 16 KiB ring.
+        assert_eq!(check_iova_fits_u32(0x0010_0000, 16 * 1024), Ok(()));
+    }
+
+    #[test]
+    fn check_iova_fits_u32_accepts_buffer_ending_exactly_at_4gib() {
+        // The last legal range: ends at exactly u32::MAX + 1 = 1 << 32.
+        let size: usize = 256;
+        let iova: u64 = (1u64 << 32) - size as u64;
+        assert_eq!(check_iova_fits_u32(iova, size), Ok(()));
+    }
+
+    #[test]
+    fn check_iova_fits_u32_rejects_buffer_crossing_4gib_boundary() {
+        // Starts below 4 GiB but ends one byte above: would silently
+        // truncate to 0 when cast to u32, aiming DMA at unrelated memory.
+        let iova: u64 = (1u64 << 32) - 1;
+        assert_eq!(check_iova_fits_u32(iova, 2), Err(AudioError::Internal));
+    }
+
+    #[test]
+    fn check_iova_fits_u32_rejects_buffer_fully_above_4gib() {
+        assert_eq!(
+            check_iova_fits_u32(1u64 << 33, 16 * 1024),
+            Err(AudioError::Internal)
+        );
+    }
+
+    #[test]
+    fn check_iova_fits_u32_rejects_overflow_on_add() {
+        // iova near u64::MAX + huge size — must surface as Internal,
+        // not panic on the addition.
+        assert_eq!(
+            check_iova_fits_u32(u64::MAX - 5, 100),
+            Err(AudioError::Internal)
+        );
+    }
 
     // -- FakeMmio ----------------------------------------------------------
     //
