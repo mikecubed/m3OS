@@ -29,6 +29,7 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// passwd_host` and remains in its dedicated block above.
 const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_client", &[]),
+    ("audio_server", &[]),
     ("surface_buffer", &[]),
     ("crypto-lib", &[]),
     ("term", &["--lib"]),
@@ -2813,7 +2814,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, surface_buffer, crypto-lib, and term host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, and term host tests pass"
     );
 }
 
