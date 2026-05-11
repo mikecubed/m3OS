@@ -139,20 +139,49 @@ impl<T> Pio<T> {
         })
     }
 
+    /// Convert `offset: usize` to the `u32` shape the kernel syscall ABI
+    /// expects, surfacing the truncation case rather than silently wrapping.
+    ///
+    /// Returns `None` (after a `debug_assert!`) when `offset > u32::MAX`.
+    /// The kernel-side validator only sees the truncated value, so without
+    /// this guard a stray oversized offset would still pass `offset + width
+    /// <= bar_size` (since `offset` wraps to a small number) and would then
+    /// access the wrong port — the same class of silent corruption the
+    /// `port_base + offset` u16 wrap previously suffered.
+    #[inline]
+    fn offset_as_u32(&self, offset: usize) -> Option<u32> {
+        match u32::try_from(offset) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                debug_assert!(
+                    false,
+                    "Pio offset {offset:#x} does not fit in u32 (bar={})",
+                    self.bar_index
+                );
+                None
+            }
+        }
+    }
+
     /// Read an 8-bit register at `offset` within this BAR.
     ///
     /// PIO ports follow infallible read semantics by trait design (see
     /// `PioContract`), but the kernel syscall path can still return
-    /// `-EBADF` / `-EINVAL` / `-ERANGE` if the wrapper was constructed
-    /// with stale state or invoked with an out-of-range offset. In debug
-    /// builds we surface those failures via `debug_assert!` so latent
-    /// bugs are not papered over as silent zeros; release builds keep the
-    /// infallible-by-contract shape.
+    /// `-EBADF` / `-EINVAL` / `-ERANGE` if the wrapper holds stale state
+    /// or `offset` is out of range. In debug builds we surface those
+    /// failures via `debug_assert!` so latent bugs are not papered over
+    /// as silent zeros; release builds keep the infallible-by-contract
+    /// shape and fall back to 0.
     #[inline]
     pub fn read_u8(&self, offset: usize) -> u8 {
-        // SAFETY: device_cap and bar_index were validated at construction.
-        let rc =
-            unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 1) };
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return 0;
+        };
+        // SAFETY: device_cap was obtained from a live DeviceHandle. The
+        // kernel re-validates the capability, BAR ownership, BAR type
+        // (PIO), and `offset + width <= bar_size` on every access; this
+        // wrapper holds no invariants of its own.
+        let rc = unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset_u32, 1) };
         debug_assert!(
             rc >= 0,
             "sys_device_pio_read u8 failed: errno={rc}, bar={}, offset={offset:#x}",
@@ -164,9 +193,11 @@ impl<T> Pio<T> {
     /// Read a 16-bit register at `offset` within this BAR.
     #[inline]
     pub fn read_u16(&self, offset: usize) -> u16 {
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return 0;
+        };
         // SAFETY: see read_u8.
-        let rc =
-            unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 2) };
+        let rc = unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset_u32, 2) };
         debug_assert!(
             rc >= 0,
             "sys_device_pio_read u16 failed: errno={rc}, bar={}, offset={offset:#x}",
@@ -178,9 +209,11 @@ impl<T> Pio<T> {
     /// Read a 32-bit register at `offset` within this BAR.
     #[inline]
     pub fn read_u32(&self, offset: usize) -> u32 {
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return 0;
+        };
         // SAFETY: see read_u8.
-        let rc =
-            unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset as u32, 4) };
+        let rc = unsafe { raw_sys_device_pio_read(self.device_cap, self.bar_index, offset_u32, 4) };
         debug_assert!(
             rc >= 0,
             "sys_device_pio_read u32 failed: errno={rc}, bar={}, offset={offset:#x}",
@@ -197,12 +230,15 @@ impl<T> Pio<T> {
     /// don't silently become register-write no-ops.
     #[inline]
     pub fn write_u8(&self, offset: usize, value: u8) {
-        // SAFETY: device_cap and bar_index were validated at construction.
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return;
+        };
+        // SAFETY: see read_u8.
         let rc = unsafe {
             raw_sys_device_pio_write(
                 self.device_cap,
                 self.bar_index,
-                offset as u32,
+                offset_u32,
                 u32::from(value),
                 1,
             )
@@ -218,12 +254,15 @@ impl<T> Pio<T> {
     /// Write a 16-bit register at `offset` within this BAR.
     #[inline]
     pub fn write_u16(&self, offset: usize, value: u16) {
-        // SAFETY: see write_u8.
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return;
+        };
+        // SAFETY: see read_u8.
         let rc = unsafe {
             raw_sys_device_pio_write(
                 self.device_cap,
                 self.bar_index,
-                offset as u32,
+                offset_u32,
                 u32::from(value),
                 2,
             )
@@ -239,9 +278,12 @@ impl<T> Pio<T> {
     /// Write a 32-bit register at `offset` within this BAR.
     #[inline]
     pub fn write_u32(&self, offset: usize, value: u32) {
-        // SAFETY: see write_u8.
+        let Some(offset_u32) = self.offset_as_u32(offset) else {
+            return;
+        };
+        // SAFETY: see read_u8.
         let rc = unsafe {
-            raw_sys_device_pio_write(self.device_cap, self.bar_index, offset as u32, value, 4)
+            raw_sys_device_pio_write(self.device_cap, self.bar_index, offset_u32, value, 4)
         };
         debug_assert!(
             rc >= 0,
@@ -515,5 +557,37 @@ mod tests {
             _marker: PhantomData,
         };
         drop(w); // must not panic
+    }
+
+    /// In-range offsets (≤ u32::MAX) convert without surprise.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn pio_offset_in_range_converts_to_u32() {
+        let w = Pio::<()> {
+            device_cap: 1,
+            bar_index: 0,
+            _marker: PhantomData,
+        };
+        assert_eq!(w.offset_as_u32(0), Some(0));
+        assert_eq!(w.offset_as_u32(0xFFFF), Some(0xFFFF));
+        assert_eq!(w.offset_as_u32(u32::MAX as usize), Some(u32::MAX));
+    }
+
+    /// Oversize `offset` (>u32::MAX) must not silently truncate. The wrapper
+    /// fires `debug_assert!` so any release-mode call site that drifted in
+    /// stops issuing a syscall with a wrapped offset that the kernel would
+    /// happily range-check against the truncated value (same class of bug as
+    /// the `port_base + offset` u16 wrap fixed in the prior round).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "does not fit in u32")]
+    fn pio_offset_above_u32_max_panics_in_debug() {
+        let w = Pio::<()> {
+            device_cap: 1,
+            bar_index: 0,
+            _marker: PhantomData,
+        };
+        let oversize: usize = (u32::MAX as usize).wrapping_add(1);
+        let _ = w.offset_as_u32(oversize);
     }
 }

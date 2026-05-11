@@ -314,6 +314,19 @@ impl IpcBackend for SyscallBackend {
     }
 
     fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {
+        // Refuse to issue `ipc_reply` with handle `0`. `RecvFrame` documents
+        // `reply_cap_handle == 0` as "the sender used `send` rather than
+        // `call`, so no reply is expected." The kernel's syscall-4 handler
+        // (`kernel/src/ipc/mod.rs`) atomically *removes* the cap at the
+        // supplied handle before type-checking it as `Capability::Reply`, so
+        // calling through with `0` would silently delete whatever cap is at
+        // slot 0 (often the server's endpoint cap) before the match arm
+        // returns `u64::MAX`. Surface the contract violation here instead.
+        if self.last_reply_cap_handle == 0 {
+            return Err(crate::DriverRuntimeError::Device(
+                kernel_core::device_host::DeviceHostError::Internal,
+            ));
+        }
         let rc = syscall_lib::ipc_reply(self.last_reply_cap_handle, label, data0);
         if rc == u64::MAX {
             return Err(crate::DriverRuntimeError::Device(
@@ -562,5 +575,24 @@ mod tests {
         msg.data[0] = 0b1010;
         let decoded = SyscallBackend::decode_recv_result(1, msg, alloc::vec![0u8; 8]);
         assert_eq!(decoded, RecvResult::Notification(0b1010));
+    }
+
+    /// `SyscallBackend::reply` must refuse `last_reply_cap_handle == 0` so it
+    /// never invokes `ipc_reply(0, …)`, which the kernel implements by
+    /// atomically *removing* whatever cap is in slot 0 before type-checking.
+    /// Without this guard a `send`-shaped peer (which leaves
+    /// `RecvFrame::reply_cap_handle = 0` per the docs on that field) could
+    /// silently delete the server's endpoint cap.
+    #[test]
+    fn syscall_backend_reply_refuses_zero_handle() {
+        let mut backend = SyscallBackend::new();
+        // SyscallBackend::new() initializes last_reply_cap_handle to 0; no
+        // recv() has run, so the next reply must short-circuit instead of
+        // syscalling.
+        let err = <SyscallBackend as IpcBackend>::reply(&mut backend, 42, 7);
+        assert!(
+            err.is_err(),
+            "reply with last_reply_cap_handle == 0 must surface an error"
+        );
     }
 }
