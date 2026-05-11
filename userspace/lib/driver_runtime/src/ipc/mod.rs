@@ -232,11 +232,27 @@ impl SyscallBackend {
     }
 }
 
-impl IpcBackend for SyscallBackend {
-    fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError> {
+impl SyscallBackend {
+    /// `recv` variant that lets the caller specify the bulk-recv buffer
+    /// capacity instead of using the default [`MAX_BULK_RECV`] (1522 B,
+    /// sized for net frames). Audio drivers need 64 KiB to hold a single
+    /// `SubmitFrames` PCM payload — the default would silently truncate
+    /// the bulk down to 1522 bytes, and `decode_recv_result` would then
+    /// hand `submit_frames_inner` a 1522-byte slice instead of the
+    /// 64 KiB the client sent.
+    ///
+    /// Phase 63 driver-host fix: introduced for `audio_server` because
+    /// audio is the first driver class whose IPC payload exceeds the
+    /// net frame size. Block / net drivers continue to use [`recv`] and
+    /// pay only the 1522-byte heap allocation per loop iteration.
+    pub fn recv_with_capacity(
+        &mut self,
+        endpoint: EndpointCap,
+        capacity: usize,
+    ) -> Result<RecvResult, crate::DriverRuntimeError> {
         use alloc::vec;
         let mut msg = syscall_lib::IpcMessage::new(0);
-        let mut buf = vec![0u8; Self::MAX_BULK_RECV];
+        let mut buf = vec![0u8; capacity];
         let rc = syscall_lib::ipc_recv_msg(endpoint.raw(), &mut msg, &mut buf);
         if rc == u64::MAX {
             return Err(crate::DriverRuntimeError::Device(
@@ -244,6 +260,12 @@ impl IpcBackend for SyscallBackend {
             ));
         }
         Ok(Self::decode_recv_result(rc, msg, buf))
+    }
+}
+
+impl IpcBackend for SyscallBackend {
+    fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvResult, crate::DriverRuntimeError> {
+        self.recv_with_capacity(endpoint, Self::MAX_BULK_RECV)
     }
 
     fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {
