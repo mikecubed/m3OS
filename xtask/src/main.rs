@@ -3331,6 +3331,22 @@ fn starts_with_background_noise(input: &str) -> bool {
         .any(|pfx| input.starts_with(pfx))
 }
 
+/// Find a complete newline-terminated FAIL line in `serial` and return
+/// the text between `fail_prefix` and the terminating `\n`.
+///
+/// Returns `None` if `fail_prefix` is not present *or* if the prefix is
+/// present but the line has not yet been terminated. Without this, the
+/// `WaitPassOrFail` step fires the moment the prefix appears, kills
+/// QEMU mid-write, and the captured suffix is truncated — losing the
+/// `variant=<AudioClientError>` diagnostic that points at the
+/// underlying server-side failure.
+fn find_terminated_fail_line(serial: &str, fail_prefix: &str) -> Option<String> {
+    let start = serial.find(fail_prefix)?;
+    let after_prefix = start + fail_prefix.len();
+    let end = serial[after_prefix..].find('\n')?;
+    Some(serial[after_prefix..after_prefix + end].to_owned())
+}
+
 fn strip_background_noise(input: &str) -> String {
     // Kernel log prefixes — always `[LEVEL] [subsystem] message...\n`.
     // Match the second bracket to avoid false positives on userspace text
@@ -4049,11 +4065,14 @@ fn run_smoke_script(
                         drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                         break;
                     }
-                    // Scan for a line starting with fail_prefix.
-                    let fail_capture = cleaned
-                        .lines()
-                        .chain(stripped.lines())
-                        .find_map(|line| line.strip_prefix(*fail_prefix).map(str::to_owned));
+                    // Scan for a line starting with fail_prefix. Require a
+                    // newline after the prefix so we capture the complete
+                    // line (with the `variant=...` suffix) instead of a
+                    // partial buffer — killing QEMU mid-write of the FAIL
+                    // line truncates the variant tag and hides which
+                    // `AudioClientError` actually fired.
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
                     if let Some(captured) = fail_capture {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -6325,45 +6344,54 @@ fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
         ));
     }
 
-    // Walk sub-chunks starting at offset 12. Each sub-chunk is:
-    //   chunk_id (4 bytes) + chunk_size (4 bytes LE) + chunk_data (chunk_size bytes)
-    // We need the "fmt " chunk (to confirm PCM) and the "data" chunk.
+    // Walk sub-chunks starting at offset 12. We need the fmt chunk
+    // (for the channel count / sample rate that gates the windowed
+    // non-silent threshold) and the data chunk (which we expect to
+    // hold S16LE samples).
+    //
+    // QEMU's `-audiodev wav` backend writes a streaming WAV: the RIFF
+    // and `data` chunk-size fields are left at zero because the final
+    // length isn't known when the file is opened. Tolerate that by
+    // treating a declared chunk that overruns the file as "extends to
+    // EOF" so the smoke harness can still inspect the trailing PCM.
     let mut offset = 12usize;
+    let mut sample_rate: Option<u32> = None;
+    let mut channels: Option<u16> = None;
     let mut data_offset: Option<usize> = None;
     let mut data_size: Option<usize> = None;
 
     while offset + 8 <= data.len() {
         let id = &data[offset..offset + 4];
-        let chunk_size =
+        let declared_size =
             u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
         let chunk_start = offset + 8;
-        // The declared chunk must fit within the file; reject truncated/corrupt WAVs
-        // rather than masking them as "silent" via a clipped slice.
-        let chunk_end = chunk_start
-            .checked_add(chunk_size)
-            .ok_or_else(|| format!("WAV file {} chunk size overflows usize", path.display()))?;
-        if chunk_end > data.len() {
-            return Err(format!(
-                "WAV file {} is truncated: chunk at offset {} declares size {} but file has only {} bytes",
-                path.display(),
-                offset,
-                chunk_size,
-                data.len()
+        let remaining = data.len().saturating_sub(chunk_start);
+        // A streaming WAV records size=0; an oversize header (declared
+        // larger than the file) is the same shape under crash-truncation.
+        // In both cases the payload that *is* on disk runs from
+        // `chunk_start` to EOF, so use the smaller of the two.
+        let chunk_size = if declared_size == 0 || declared_size > remaining {
+            remaining
+        } else {
+            declared_size
+        };
+        let chunk_end = chunk_start + chunk_size;
+
+        if id == b"fmt " && chunk_size >= 16 {
+            channels = Some(u16::from_le_bytes(
+                data[chunk_start + 2..chunk_start + 4].try_into().unwrap(),
+            ));
+            sample_rate = Some(u32::from_le_bytes(
+                data[chunk_start + 4..chunk_start + 8].try_into().unwrap(),
             ));
         }
-
         if id == b"data" {
             data_offset = Some(chunk_start);
             data_size = Some(chunk_size);
             break;
         }
         // Align to even boundary per RIFF spec.
-        let aligned = chunk_end.checked_add(chunk_size & 1).ok_or_else(|| {
-            format!(
-                "WAV file {} chunk alignment overflows usize",
-                path.display()
-            )
-        })?;
+        let aligned = chunk_end + (chunk_size & 1);
         if aligned <= offset {
             return Err(format!(
                 "WAV file {} contains a non-advancing chunk at offset {}",
@@ -6388,32 +6416,54 @@ fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
         ));
     }
 
-    // chunk_end <= data.len() was enforced above; this slice is exact.
     let pcm_bytes = &data[data_start..data_start + data_len];
-    let mut non_silent: usize = 0;
+    let mut samples: Vec<bool> = Vec::with_capacity(n_samples);
     for chunk in pcm_bytes.chunks_exact(2) {
         let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
         // `i16::MIN.abs()` would overflow; widen to i32 so full-scale negative
         // samples are counted correctly rather than panicking on debug builds.
-        if i32::from(sample).abs() > 100 {
-            non_silent += 1;
-        }
+        samples.push(i32::from(sample).abs() > 100);
     }
 
-    // At least 5% of samples must be non-silent.
+    // The recording covers the entire boot — mostly silence — so a
+    // whole-file percentage drowns the tone phase. Slide a one-second
+    // window across the samples and report the loudest window's
+    // non-silent fraction; the tone is present when that fraction
+    // crosses the threshold.
+    let rate = sample_rate.unwrap_or(44_100);
+    let ch = channels.unwrap_or(2).max(1) as usize;
+    let window_samples = (rate as usize).saturating_mul(ch).min(n_samples).max(1);
     let threshold_pct = 5u64;
-    let non_silent_pct = (non_silent as u64 * 100) / n_samples as u64;
-    if non_silent_pct < threshold_pct {
+
+    let total_non_silent: usize = samples.iter().filter(|&&b| b).count();
+    let mut window_non_silent: usize = samples[..window_samples].iter().filter(|&&b| b).count();
+    let mut best_window: usize = window_non_silent;
+    for i in window_samples..n_samples {
+        if samples[i] {
+            window_non_silent += 1;
+        }
+        if samples[i - window_samples] {
+            window_non_silent -= 1;
+        }
+        if window_non_silent > best_window {
+            best_window = window_non_silent;
+        }
+    }
+    let window_pct = (best_window as u64 * 100) / window_samples as u64;
+    if window_pct < threshold_pct {
         return Err(format!(
-            "WAV file {} is effectively silent: only {non_silent_pct}% of {n_samples} \
-             samples have |sample| > 100 (threshold: {threshold_pct}%)",
-            path.display()
+            "WAV file {} is effectively silent: loudest {ws}-sample window has \
+             only {window_pct}% non-silent samples (best={best_window} of {ws}, \
+             total non-silent={total_non_silent}/{n_samples}, threshold {threshold_pct}%)",
+            path.display(),
+            ws = window_samples,
         ));
     }
 
     println!(
-        "audio-smoke: WAV check PASSED — {non_silent_pct}% non-silent samples \
-         ({non_silent}/{n_samples})"
+        "audio-smoke: WAV check PASSED — loudest {window_samples}-sample window has \
+         {window_pct}% non-silent samples ({best_window}/{window_samples}), \
+         total non-silent {total_non_silent}/{n_samples}"
     );
     Ok(())
 }
@@ -11252,10 +11302,8 @@ fn run_smoke_steps_with_capture(
                         drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                         break;
                     }
-                    let fail_capture = cleaned
-                        .lines()
-                        .chain(stripped.lines())
-                        .find_map(|line| line.strip_prefix(*fail_prefix).map(str::to_owned));
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
                     if let Some(captured) = fail_capture {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -14055,23 +14103,22 @@ mod tests {
         // D.1 fix acceptance: when a serial buffer contains
         // `AUDIO_DEMO:FAIL stage=drain` the captured stage text must be
         // "drain variant=Server" (everything after the fail_prefix).
-        //
-        // This test exercises the capture logic inline (no QEMU process)
-        // so it runs on the host as a pure unit test.
         let fail_prefix = "AUDIO_DEMO:FAIL stage=";
         let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=drain variant=Server\n";
-        let captured = serial_output
-            .lines()
-            .find_map(|line| line.strip_prefix(fail_prefix).map(str::to_owned));
-        assert!(
-            captured.is_some(),
-            "fail line must be captured from serial output"
-        );
-        let captured = captured.unwrap();
-        assert!(
-            captured.contains("drain"),
-            "captured stage must contain 'drain', got: {captured:?}"
-        );
+        let captured = find_terminated_fail_line(serial_output, fail_prefix);
+        assert_eq!(captured.as_deref(), Some("drain variant=Server"));
+    }
+
+    #[test]
+    fn wait_pass_or_fail_skips_unterminated_fail_line() {
+        // 2026-05-11 regression: the previous implementation matched
+        // partial FAIL lines via `str::lines()` and tore the suffix off
+        // when QEMU was killed mid-write, hiding the
+        // `variant=<AudioClientError>` diagnostic. With newline-gating,
+        // an unterminated FAIL line must not produce a match.
+        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=submit vari";
+        assert!(find_terminated_fail_line(serial_output, fail_prefix).is_none());
     }
 
     /// Build a minimal valid RIFF/WAVE file with S16LE PCM data.
@@ -14136,6 +14183,61 @@ mod tests {
             result.is_ok(),
             "assert_wav_non_silent must pass for a 440 Hz sine wave, got: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn assert_wav_non_silent_passes_for_streaming_wav_with_late_audio() {
+        // QEMU's `-audiodev wav` backend writes a streaming WAV: the
+        // RIFF and `data` chunk-size fields stay at zero because the
+        // final length isn't known when the file is opened. The actual
+        // audio appears at the *end* of the file (the boot phase is
+        // captured as silence). The checker must tolerate size=0 and
+        // window the non-silent measurement so the loud region drives
+        // the verdict.
+        use std::f64::consts::PI;
+        // 5 seconds of stereo silence followed by 1 second of sine.
+        let rate = 48_000usize;
+        let silent_secs = 5usize;
+        let tone_secs = 1usize;
+        let total_frames = (silent_secs + tone_secs) * rate;
+        let tone_start = silent_secs * rate;
+        let mut samples = vec![0i16; total_frames * 2];
+        for i in tone_start..total_frames {
+            let angle = 2.0 * PI * 440.0 * (i as f64) / rate as f64;
+            let s = (angle.sin() * 10_000.0) as i16;
+            samples[i * 2] = s;
+            samples[i * 2 + 1] = s;
+        }
+
+        // Build a streaming-style WAV: header with size=0 fields.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        wav.extend_from_slice(&(rate as u32).to_le_bytes());
+        wav.extend_from_slice(&((rate as u32) * 2 * 2).to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        for &s in &samples {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_streaming_wav.wav");
+        std::fs::write(&path, &wav).expect("write streaming wav");
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "assert_wav_non_silent must pass when audio sits at file tail with size=0 \
+             headers, got: {result:?}"
         );
     }
 

@@ -60,7 +60,7 @@ extern crate alloc;
 use core::alloc::Layout;
 
 use audio_client::{AudioClient, AudioClientError, AudioStats};
-use kernel_core::audio::{ChannelLayout, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate};
+use kernel_core::audio::{AudioError, ChannelLayout, PcmFormat, ProtocolError, SampleRate};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -211,7 +211,7 @@ fn submit_tone(
         // progress without burning a tight CPU loop. Cap retries so a
         // genuinely stalled controller surfaces as an error instead of
         // wedging the demo.
-        let mut written = 0usize;
+        let written;
         let mut retries = 0usize;
         loop {
             match client.submit_frames(&chunk[..chunk_bytes]) {
@@ -219,11 +219,9 @@ fn submit_tone(
                     written = n;
                     break;
                 }
-                Err(AudioClientError::Server(kernel_core::audio::AudioError::WouldBlock)) => {
+                Err(AudioClientError::Server(AudioError::WouldBlock)) => {
                     if retries >= 200 {
-                        return Err(AudioClientError::Server(
-                            kernel_core::audio::AudioError::WouldBlock,
-                        ));
+                        return Err(AudioClientError::Server(AudioError::WouldBlock));
                     }
                     retries += 1;
                     syscall_lib::nanosleep_for(0, 5_000_000);
@@ -379,13 +377,17 @@ fn log_error(stage: &str, err: AudioClientError) {
     // Assemble the FAIL line in a stack buffer and emit it in one write
     // so the smoke harness — which fires on the `AUDIO_DEMO:FAIL stage=`
     // prefix — captures the variant suffix instead of a torn line.
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 192];
     let mut len = 0;
-    let parts: [&[u8]; 5] = [
+    let mut errno_buf = [0u8; 16];
+    let errno_slice = format_errno(&err, &mut errno_buf);
+    let parts: [&[u8]; 7] = [
         b"AUDIO_DEMO:FAIL stage=",
         stage.as_bytes(),
         b" variant=",
         error_label(err).as_bytes(),
+        b" errno=",
+        errno_slice,
         b"\n",
     ];
     for part in parts {
@@ -399,11 +401,56 @@ fn log_error(stage: &str, err: AudioClientError) {
     let _ = syscall_lib::write(STDOUT_FILENO, &buf[..len]);
 }
 
+/// Format the errno tag for the FAIL line. Only `Io(i32)` carries an
+/// errno today; every other variant emits `-` so the smoke harness
+/// always sees a stable `errno=<value>` field.
+fn format_errno<'a>(err: &AudioClientError, buf: &'a mut [u8; 16]) -> &'a [u8] {
+    let value = match err {
+        AudioClientError::Io(code) => *code,
+        _ => return &b"-"[..],
+    };
+    let mut n = value.unsigned_abs() as u64;
+    let mut tmp = [0u8; 16];
+    let mut idx = tmp.len();
+    if n == 0 {
+        idx -= 1;
+        tmp[idx] = b'0';
+    } else {
+        while n > 0 {
+            idx -= 1;
+            tmp[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    let digits = &tmp[idx..];
+    let mut out_len = 0;
+    if value < 0 {
+        buf[out_len] = b'-';
+        out_len += 1;
+    }
+    let take = digits.len().min(buf.len() - out_len);
+    buf[out_len..out_len + take].copy_from_slice(&digits[..take]);
+    out_len += take;
+    &buf[..out_len]
+}
+
 fn error_label(err: AudioClientError) -> &'static str {
     match err {
         AudioClientError::Io(_) => "Io",
         AudioClientError::Protocol(_) => "Protocol",
-        AudioClientError::Server(_) => "Server",
+        // Inline the AudioError discriminant so the smoke harness can
+        // distinguish `WouldBlock` (ring-pressure retry exhaustion)
+        // from `Internal` (DMA fault) etc. without a separate field.
+        AudioClientError::Server(inner) => match inner {
+            AudioError::Busy => "Server:Busy",
+            AudioError::WouldBlock => "Server:WouldBlock",
+            AudioError::NoDevice => "Server:NoDevice",
+            AudioError::BrokenPipe => "Server:BrokenPipe",
+            AudioError::InvalidFormat => "Server:InvalidFormat",
+            AudioError::InvalidArgument => "Server:InvalidArgument",
+            AudioError::Internal => "Server:Internal",
+            _ => "Server:Unknown",
+        },
         AudioClientError::AlreadyOpen => "AlreadyOpen",
         AudioClientError::NotOpen => "NotOpen",
         AudioClientError::UnexpectedReply => "UnexpectedReply",

@@ -14,48 +14,67 @@ related:
 
 > **Doc title note**: filename still says `audio-irq-wake-race` from the
 > first issue this thread tracked. The wake-race is fixed (`f1573bd`),
-> the AC'97 IRQ pipeline is fixed (this session), and the file is kept
-> under the same name so existing references don't break. The active
-> investigation now is the QEMU `-audiodev wav` backend recording an
-> empty data chunk despite our driver advancing `frames_consumed`.
+> the AC'97 IRQ pipeline is fixed (`58bbbc8`), the WAV-silent issue is
+> fixed (this session), and the file is kept under the same name so
+> existing references don't break. The remaining concern is a low-rate
+> intermittent IPC failure on the first `SubmitFrames` call.
 
-## ⚠ Status update (2026-05-11 — second session)
+## ⚠ Status update (2026-05-11 — third session)
 
-**`audio-smoke` step list now PASSES end-to-end.** `audio-demo` runs
-through `Open → SubmitFrames → Drain → GetStats → Close → PASS`,
-audio_server programs the AC'97 BDL ring, the controller actually
-consumes the buffers (`CIV` advances, vector `0x62` fires), and
-`frames_consumed` reads back at ~88,000–91,000 across runs.
-
-**The only remaining failure is the WAV non-silent assertion**:
-QEMU's `-audiodev wav` backend creates the file with a valid RIFF
-header but writes a zero-length `data` chunk. The smoke command
-returns `SMOKE_EXIT_WAV_SILENT` (= 63).
+**`audio-smoke` now PASSES end-to-end on most runs.** The step list
+reaches `AUDIO_DEMO:PASS` with `frames_consumed > 0`, and the WAV
+non-silent assertion now succeeds — the loudest 1-second window shows
+~88% non-silent samples (~78K/88K @ 44.1 kHz stereo).
 
 ```
 [step 16] wait-line-not-matching: guest/audio: frames_consumed non-zero (5s)
 audio-smoke: PASSED (16 steps in 33s)
-audio-smoke: WAV non-silent check FAILED
-WAV file /…/target/audio-smoke/audio.wav 'data' chunk is empty (0 samples)
-exit=63
+audio-smoke: WAV check PASSED — loudest 88200-sample window has 88% non-silent samples (78010/88200), total non-silent 78010/2426858
+audio-smoke: WAV non-silent check PASSED
 ```
 
-The driver path is healthy. The remaining issue is a QEMU AC'97 ↔ wav
-backend integration question.
+**Why the previous "empty data chunk" diagnosis was wrong.** QEMU's
+`-audiodev wav` backend writes a *streaming* WAV: it leaves the RIFF
+and `data` chunk-size fields at zero because the final length isn't
+known when the file is opened. The actual PCM appears at the *end* of
+the file — boot phase is captured as silence. The old checker read
+the declared size, saw 0, and bailed before scanning the bytes that
+were really on disk. A `hexdump` of the file confirmed the tone is
+present, near the tail, at the expected ~0.3 amplitude (max abs
+~8.9K of 32.7K i16 range).
+
+**Remaining intermittent failure (~10–20% of runs).** The first
+`audio-demo` `SubmitFrames` call sometimes returns
+`AudioClientError::Io(-32)` (`EPIPE`-shaped), which is the audio_client
+mapping for `ipc_call_buf` returning `u64::MAX`. The new FAIL line:
+
+```
+audio-demo failed at stage: submit variant=Io errno=-32
+```
+
+When this fires, the step list fails at step 15 and the WAV check
+never runs. The smoke harness now waits for a newline-terminated FAIL
+line before killing QEMU so the `variant=` and `errno=` fields are
+always preserved. See **What's still flaky** below for the
+hypotheses.
 
 ## TL;DR (current state)
 
-- Pre-session: `audio-demo` never ran — keystrokes hit `m3OS login:`.
-  audio_server parked in `BlockedOnNotif` waiting for a client that
-  never connected. The handoff blamed the AC'97 IRQ pipeline; the real
-  set of bugs was much wider.
-- Post-session: 10 bugs across the IPC/driver_runtime/audio_server
-  stack fixed. AC'97 IRQs DO fire. Backend reports `frames_consumed >
-  0`. Smoke step list PASSes.
-- Open: WAV recording is empty. Our driver thinks it shipped 88K+
-  samples through the BDL, QEMU's wav backend disagrees. Either QEMU
-  is silently dropping the audio, or our PCM bytes never make it onto
-  the AC'97 codec data path even though the BDL is being walked.
+- Pre-session-1: `audio-demo` never ran — keystrokes hit `m3OS login:`.
+  10 IPC/driver_runtime/audio_server bugs fixed in `58bbbc8`.
+- Pre-session-2 (this session): step list PASSed, but WAV non-silent
+  failed with `'data' chunk is empty (0 samples)`. Driver-side
+  evidence (CIV advancing, IRQs firing, `frames_consumed ~= 88K`)
+  said the audio was getting through.
+- Post-session-2: WAV checker rewritten to (a) tolerate
+  `data_size == 0` headers by treating "rest of file" as the data
+  payload, and (b) report the loudest sliding-window non-silent
+  percentage instead of a whole-file average (which was always
+  drowned by boot-phase silence). End-to-end PASS confirmed on 8/10
+  runs.
+- Open: ~10–20% intermittent `Io(-32)` from the first submit's
+  `ipc_call_buf`. Not blocking on the WAV check; blocks the step
+  list. New diagnostic (`errno=`) added — see follow-up plan.
 
 ## Reproduction
 
@@ -65,14 +84,22 @@ git pull
 M3OS_SMOKE_SERIAL_DUMP=/tmp/serial.log cargo xtask audio-smoke
 ```
 
-Expected output (current):
+Expected output on a clean run (~80–90% of runs):
 
 ```
 [step 15] wait-pass-or-fail: guest/audio: audio-demo PASS sentinel (30s)
 [step 16] wait-line-not-matching: guest/audio: frames_consumed non-zero (5s)
 audio-smoke: PASSED (16 steps in 33s)
-audio-smoke: WAV non-silent check FAILED
-WAV file /home/.../target/audio-smoke/audio.wav 'data' chunk is empty (0 samples)
+audio-smoke: WAV check PASSED — loudest 88200-sample window has 88% non-silent samples (78010/88200), total non-silent 78010/2426858
+audio-smoke: WAV non-silent check PASSED
+```
+
+Expected output on an intermittent submit failure (~10–20% of runs):
+
+```
+[step 15] wait-pass-or-fail: guest/audio: audio-demo PASS sentinel (30s)
+audio-demo failed at stage: submit variant=Io errno=-32
+(step 15 — guest/audio: audio-demo PASS sentinel)
 ```
 
 Look for these markers in `/tmp/serial.log` to confirm the driver path
@@ -84,10 +111,15 @@ is healthy:
 - `AUDIO_DEMO:PASS`
 - `AUDIO_DEMO:stats consumed=N underruns=0` with `N > 0` (typically ~88,000–91,000)
 
+The WAV file should be ~4.8 MB at 44.1 kHz stereo (QEMU's wav backend
+defaults — it rate-converts from our 48 kHz codec setting). Audio
+content sits in the last ~1 second of the file; the rest is captured
+boot silence.
+
 If a previous regression resurfaces, see "Bugs already closed" below
 for the failure signature each one produced.
 
-## Bugs closed in the 2026-05-11 session
+## Bugs closed in earlier 2026-05-11 sessions
 
 These all fired in series — each fix uncovered the next one. None of
 them were the AC'97 IRQ delivery the original handoff blamed.
@@ -114,126 +146,104 @@ Validation tools added (kept in tree):
   (stuck-no-waker), it now also prints non-zero device IRQ counters.
   Future regressions in the same area can be triaged with one log scan.
 
-## What's actually still broken — empty WAV under QEMU AC'97 + wav
+## Bugs closed in this 2026-05-11 session (third)
 
-After the driver-side close-out, the failure mode is:
+| # | Layer | Symptom | Fix |
+|---|-------|---------|-----|
+| 11 | `xtask::assert_wav_non_silent` | QEMU's `-audiodev wav` backend leaves the RIFF/`data` chunk-size fields at zero (streaming WAV). The previous checker read `data_size`, saw 0, and bailed with `'data' chunk is empty (0 samples)` — even though ~78K non-silent samples were sitting near the file's tail | (a) When `data_size == 0` or the declared size overruns the file, treat the rest of the file as the PCM payload. (b) Replace the whole-file 5%-non-silent threshold with a sliding 1-second window — the whole-file average was always drowned by boot silence (xtask/src/main.rs:`assert_wav_non_silent`) |
+| 12 | `xtask::WaitPassOrFail` | The harness fired the moment `AUDIO_DEMO:FAIL stage=` appeared in the buffer, killing QEMU mid-write of the rest of the line. The captured suffix was truncated (`stage=submi`, `stage=submit v`, …) so the `variant=<AudioClientError>` diagnostic was permanently lost | Require a newline after the prefix before triggering — new `find_terminated_fail_line` helper, used at both call sites. Two new tests pin the terminated/unterminated cases (xtask/src/main.rs) |
+| 13 | `audio-demo::error_label` | `AudioClientError::Server(_)` was reported as a flat `"Server"` — the inner `AudioError` discriminant (which distinguishes `WouldBlock` from `Internal` etc.) was unobservable from smoke output | Expand the label to `Server:Busy` / `Server:WouldBlock` / … and append `errno=<i32>` for `Io(errno)` variants — the latter immediately revealed the intermittent failure was `Io(-32)` from `ipc_call_buf` returning `u64::MAX` (audio-demo/src/main.rs) |
 
-- audio_server's `Ac97Logic` reports `frames_consumed = 88,832`
-  (varies run-to-run between ~87,800 and ~91,400 — consistent with one
-  ring's worth of slot-completion counts)
-- AC'97 vector `0x62` fires (we observed it in early-session diag logs)
-- Hardware `CIV` advances past every BDL slot we post (`PICB` cycles
-  through the 256-sample range each time)
-- BDL phys_addr fields are correct (32-bit IOVAs in low 4 GiB,
-  validated by `check_iova_fits_u32`)
-- BUT: `target/audio-smoke/audio.wav` ends with a valid RIFF header
-  followed by a zero-length `data` chunk
+## What's still flaky — `Io(-32)` on first `SubmitFrames` (~10–20%)
 
-Either:
+The remaining gap is an intermittent IPC failure. Across 10 back-to-back
+runs in this session: 8 PASS end-to-end, 2 fail with
+`audio-demo failed at stage: submit variant=Io errno=-32`.
 
-A) **QEMU's wav backend isn't actually wired to the AC'97 codec
-   output path under our config.** Possible: a missing `-audiodev`
-   flag combination, an AC'97 model option we're not setting, or
-   a QEMU version where `AC97 + wav` was broken upstream.
+`Io(-32)` is the `audio_client::SyscallSocket::call` branch:
 
-B) **Our codec is mute or programmed at a rate the wav backend
-   discards.** The driver writes `MASTER_VOLUME = 0x0202` and
-   `PCM_OUT_VOLUME = 0x0202` (≈ -3 dB, mute clear) and 48 kHz to
-   `PCM_FRONT_DAC_RATE` after enabling VRA — looks correct, but the
-   wav-side actually-getting-samples question is open.
+```rust
+let reply_label = syscall_lib::ipc_call_buf(
+    self.endpoint, LABEL_AUDIO_CMD, LABEL_AUDIO_CMD, &combined[..total],
+);
+if reply_label == u64::MAX {
+    return Err(AudioClientError::Io(-32)); // EPIPE-shaped
+}
+```
 
-C) **The BDL slots get walked but our PCM data isn't being read.**
-   Could be a DMA-coherency / IOMMU translation issue: the BDL
-   `phys_addr` is a 32-bit IOVA but the device-host's
-   `dma_alloc.identity` log line shows the IOVA and the physical
-   address are the same, so this seems unlikely.
+`ipc_call_buf == u64::MAX` is the kernel's "send failed" sentinel —
+the call never reached audio_server. The most plausible candidates,
+in rough order:
 
-D) **AC'97's CIV advances on a free-running timer regardless of
-   sample availability**, so our `frames_consumed` is fool's gold
-   and the codec was never actually pumping anything — but that
-   contradicts the IRQ firing on completion.
+A) **audio_server still parked in `recv` from the previous
+   `Open` reply** when audio-demo's first `SubmitFrames` syscall
+   reaches the kernel, but in a state where the send path treats the
+   endpoint as "no receiver" rather than queuing. The bound-notification
+   fix in `f1573bd` covers stale wake tokens but not necessarily
+   `u64::MAX` returns from `ipc_call_buf`.
 
-## Concrete next-step plan
+B) **Bulk payload size + queue depth interaction.** Submit ships a
+   `frame_header (16 B) + 8 KiB PCM = 8208 B` bulk payload. Even
+   though `MAX_BULK_LEN = 80 KiB`, the kernel may reject under some
+   transient send-queue / receiver-not-ready combination.
 
-Pick the cheapest experiment first.
+C) **driver_runtime reply-cap reuse.** The Bug #2 fix in
+   `58bbbc8` moved audio_server to dynamic `reply_cap_handle` from
+   `msg.data[3]`. If a prior verb leaks the reply cap slot, the next
+   `recv` could land the new reply cap somewhere unexpected — but
+   that should surface in audio_server, not in the *client* side
+   ipc_call.
 
-### Hypothesis A — `-audiodev wav` is misconfigured / unsupported
+### Diagnostic next steps
 
-1. **Check QEMU version for known AC97+wav bugs.**
-   `qemu-system-x86_64 --version`. Search QEMU changelog for AC97
-   regressions around the installed version.
-2. **Try `-audiodev pa` against PipeWire.** The user confirmed
-   PipeWire-only (no PulseAudio daemon). PipeWire ships
-   `pipewire-pulse` as a separate package on most distros; if it's
-   installed, `pa` may transparently route through PipeWire. On a
-   bare PipeWire install without `pipewire-pulse`, this won't help —
-   but it's a one-flag test.
-3. **Try `-audiodev sdl` or `-audiodev alsa`** if available, just to
-   confirm the AC'97 ↔ audiodev path works for SOME backend. If
-   nothing produces samples, the bug is QEMU-side AC'97 emulation.
-4. **Switch to `-device intel-hda` + `-device hda-output`** instead
-   of AC97 — newer device, better-tested in QEMU. This is a larger
-   change because the driver class is different, but isolates whether
-   the issue is AC97-specific.
-
-### Hypothesis B/C — driver isn't actually shipping audible PCM
-
-5. **Dump a few BDL entries + the first few PCM bytes after submit.**
-   Confirm they aren't zero. `audio-demo`'s sine is non-silent by
-   construction, but a stride/copy bug could be replacing them with
-   zeros.
-6. **Disable `submit_frames_inner`'s ring-copy and write a static
-   non-zero pattern to every PCM ring slot.** If WAV stays silent,
-   the issue is downstream of the ring. If WAV gets data, the issue
-   is in the BDL ↔ ring linkage.
-7. **Read `GLOB_CNT` (NABM 0x2C) and ensure GIE / cold-reset bits
-   are set the way QEMU expects.** We never write `GLOB_CNT`; the
-   default may or may not be enough. The `GLOB_STA` we read post-open
-   shows `0x100` (PCR — Primary Codec Ready), so the codec is past
-   reset, but `GIE` (bit 0 of `GLOB_CNT`) is a separate question.
-
-### Hypothesis D — observe-irq overcounts
-
-8. **Compare `frames_consumed` against `(SAMPLE_RATE × duration)`.**
-   `audio-demo` ships ~1 second of stereo S16Le at 48 kHz =
-   `48000 × 2 = 96000` samples. Reported `frames_consumed` is ~88K.
-   Order-of-magnitude correct, suggests we're not over-counting.
-   But: the unit might be "samples" vs "stereo frames" — clarify
-   in `Ac97Logic::observe_irq`.
-
-### Step-by-step recommended order
-
-1. Run audio-smoke once with `M3OS_SMOKE_SERIAL_DUMP=/tmp/serial.log
-   cargo xtask audio-smoke 2>&1 | tee /tmp/smoke.log` and confirm
-   the current state matches this doc.
-2. Check QEMU version: `qemu-system-x86_64 --version`.
-3. Try the `pa` audiodev experiment (one-line change in
-   `xtask/src/main.rs:audio_smoke_qemu_args`).
-4. If `pa` produces audible samples, the bug is `wav`-specific and
-   we should consider switching the smoke to capture via `pa`-into-
-   `parec` or similar, OR file a QEMU bug.
-5. If `pa` is also silent, the bug is AC'97-side. Move to
-   Hypothesis B: dump BDL + ring contents post-submit.
+1. **Capture a serial log of an `Io(-32)` run.** Run the smoke in a
+   loop until it surfaces, then look for:
+   - The last audio_server line before the demo failure — was it
+     mid-`recv` from `Open`?
+   - Any `[WARN] [ipc]` or `state-not-ready` entries near the
+     `AUDIO_DEMO:opened` line that signal a send-side reject?
+   - The kernel-side IPC trace ring if it dumped (the
+     `stuck-no-waker` path also dumps device IRQ counters now).
+2. **Add a kernel-side reason byte for `ipc_call`'s `u64::MAX`
+   return.** Today the syscall is a binary success/fail. A typed
+   error (`-EPIPE` vs `-EAGAIN` vs `-ENOENT`) would narrow A vs B vs C.
+3. **Audit audio_server's recv-loop transition** between `Open`'s
+   `reply()` and the next `recv()`. The window where a new `call`
+   from the demo could see "no receiver" is the most likely
+   integration seam.
+4. **Audit client-side retry**. If the kernel's `u64::MAX` is
+   semantically "would block on send", the audio-demo could treat
+   `Io(-32)` as a `WouldBlock`-equivalent and retry up to N times.
+   The `WouldBlock` retry path at audio-demo/src/main.rs:222
+   already exists for the server-side WouldBlock case; extending it
+   to `Io(-32)` is a 5-line change that would also confirm the
+   diagnosis (if the retry succeeds, this is a recv-window race).
 
 ## Files to read first
 
-In this order, for the empty-WAV bug:
+In this order, for the residual `Io(-32)` intermittency:
 
 1. **This document.**
-2. `userspace/audio_server/src/device.rs:355-410` — `init_controller`
-   and `open_pcm_out_stream`. NAM mixer writes (volume, VRA, DAC
-   rate) and NABM bus-master writes (BDBAR, LVI, CR.RPBM).
-3. `userspace/audio_server/src/device.rs:495-560` — `submit_frames_inner`,
-   the BDL programming and PCM ring-copy hot path.
-4. `userspace/audio_server/src/device.rs:840-880` — `poll_completed_buffers`
-   (the CIV-based fallback for non-IRQ environments) and the
-   `submit_frames` + `poll_frames_consumed` trait impls.
-5. `xtask/src/main.rs:6151-6177` — `audio_smoke_qemu_args`. The QEMU
-   args we pass: `-audiodev wav,id=snd0,path=…` and
-   `-device AC97,audiodev=snd0,addr=0x5`.
-6. `xtask/src/main.rs:6303-6418` — `assert_wav_non_silent`. The
-   format-validity + 5%-non-silent-samples check that's currently
-   failing.
+2. `userspace/lib/audio_client/src/lib.rs:380-423` — `SyscallSocket::call`,
+   the only producer of `AudioClientError::Io(-32)` and `Io(-5)`.
+3. `userspace/audio-demo/src/main.rs:204-240` — `submit_tone`'s
+   per-chunk loop and the `WouldBlock` retry. Candidate for
+   extending the retry to `Io(-32)`.
+4. `kernel/src/ipc/mod.rs` — `ipc_call_buf` and the conditions
+   under which it returns `u64::MAX`. Look for the "no receiver"
+   / "would block on send" branches and consider exposing a
+   typed reason byte.
+5. `userspace/audio_server/src/irq.rs` — `run_io_loop`, the
+   `recv → handle → reply → recv` cycle. The transition from
+   `Open`'s reply back to `recv` is the candidate race window.
+
+For the now-resolved WAV-silent issue (kept for context):
+
+1. `xtask/src/main.rs:assert_wav_non_silent` — windowed checker.
+2. `xtask/src/main.rs:audio_smoke_qemu_args` — the QEMU args we
+   pass: `-audiodev wav,id=snd0,path=…` and
+   `-device AC97,audiodev=snd0,addr=0x5`. Note QEMU's wav backend
+   defaults to 44.1 kHz S16 stereo regardless of our codec rate.
 
 ## Key constants (current state)
 
@@ -253,22 +263,24 @@ In this order, for the empty-WAV bug:
 
 ## What I tried that didn't pan out
 
-For the post-session WAV-silent issue (the active investigation):
+For the post-session WAV-silent issue (now resolved):
 
 - **Adding ring-debug register dumps in `submit_frames`** — confirmed
   CR=0x1d, BDBAR is correct, LVI advances each submit, CIV advances
   (we saw 0x01 mid-submit, 0x1f after IRQ). All evidence the device
   is consuming what we post.
 - **Looking for `GLOB_CNT` writes** — there are none. Possible cause
-  but not yet tested.
+  but ultimately not needed; the silent-WAV diagnosis was wrong.
 
 ## What's covered by tests
 
 - 73 host-side tests pass (`cargo xtask check`)
-- All 6 audio-smoke step-list shape tests pass
-  (`cargo test -p xtask --target x86_64-unknown-linux-gnu audio_smoke`)
-- 3 consecutive `audio-smoke` runs all hit `frames_consumed` between
-  87,808 and 91,392 — driver-side consistency confirmed
+- 9 audio-smoke step-list / WAV / wait-pass-or-fail shape tests pass
+  (`cargo test -p xtask --target x86_64-unknown-linux-gnu`)
+- Sample WAV at `target/audio-smoke/audio.wav` after a passing run:
+  4.85 MB, 44.1 kHz S16 stereo, ~78K non-silent samples in the
+  loudest 1-second window (max abs amplitude ~8.9K of 32.7K, matches
+  the 0.3-of-full-scale tone the demo emits)
 
 ## Out of scope
 
@@ -288,11 +300,16 @@ For the post-session WAV-silent issue (the active investigation):
 
 ## Done-when
 
-- `cargo xtask audio-smoke` exits 0 — both the step list AND the
-  WAV non-silent check pass.
-- The recorded WAV file at `target/audio-smoke/audio.wav` has at
-  least 5% of samples with `|sample| > 100`.
+- (Already true on a passing run) `cargo xtask audio-smoke` exits 0 —
+  both the step list AND the WAV non-silent check pass.
+- (Already true) The recorded WAV at `target/audio-smoke/audio.wav`
+  has a 1-second window with at least 5% of samples > |100| (this
+  session typically reports ~88%).
 - (Already true) `frames_consumed > 0` reported by `audio-demo`'s
   stats line.
 - (Already true) AC'97 IRQ vector `0x62` fires at least once during
   audio-demo's submit phase.
+- **Still open**: `cargo xtask audio-smoke` is reliable
+  enough to wire into the pre-push hook. Today: 80–90% pass rate.
+  Closing the `Io(-32)` intermittency above gets us to ≥99% — a
+  level that justifies CI-gating.
