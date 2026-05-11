@@ -67,30 +67,17 @@ pub const AC97_QEMU_AUDIO_FLAGS_HEADLESS: &[&str] = &[
     "AC97,audiodev=snd0,addr=0x5",
 ];
 
-/// Phase 63 C.1 — GUI audio flags: PulseAudio on Linux, `none` elsewhere.
+/// Phase 63 C.1 — GUI audio: shared `-device` line for the AC'97 controller.
 ///
-/// On Linux hosts `cargo xtask run-gui` defaults to `-audiodev pa,id=snd0`
-/// so AC'97 frames are audible through the host PulseAudio daemon.
-/// On non-Linux hosts the backend falls back to `none` and a warning is
-/// printed at launch time (the xtask never fails to launch).
+/// The `-audiodev` half is computed at launch time by [`gui_audiodev_flag`]
+/// because the right host backend (`pipewire`, `pa`, or `none`) depends on
+/// which audio daemon is actually reachable on the host — modern Linux
+/// distros (Arch / Omarchy / Fedora) ship PipeWire without the
+/// `pipewire-pulse` shim, so a hard-coded `pa,id=snd0` causes QEMU to exit
+/// silently when the pulse socket isn't available.
 ///
-/// Detection uses `cfg!(target_os = "linux")` (a bool expression) rather than
-/// `#[cfg]` so the constant compiles on every platform — both branches are
-/// always type-checked, keeping cross-compilation for CI safe.
-///
-/// Pinned by `ac97_qemu_audio_flags_gui_pinned` xtask unit test.
-pub const AC97_QEMU_AUDIO_FLAGS_GUI: &[&str] = &[
-    "-audiodev",
-    // cfg!(target_os = "linux") selects "pa,id=snd0" on Linux and
-    // "none,id=snd0" elsewhere; both branches compile on all platforms.
-    if cfg!(target_os = "linux") {
-        "pa,id=snd0"
-    } else {
-        "none,id=snd0"
-    },
-    "-device",
-    "AC97,audiodev=snd0,addr=0x5",
-];
+/// Pinned by `ac97_qemu_audio_device_pinned` xtask unit test.
+pub const AC97_QEMU_AUDIO_DEVICE_FLAGS: &[&str] = &["-device", "AC97,audiodev=snd0,addr=0x5"];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -2453,15 +2440,17 @@ fn launch_qemu_with_devices(uefi_image: &Path, display_mode: QemuDisplayMode, de
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
-/// Phase 57 H.5 / Phase 63 C.1: GUI launcher that optionally appends
-/// [`AC97_QEMU_AUDIO_FLAGS_GUI`] for `cargo xtask run-gui` (default: audio
-/// enabled, `--no-audio` opts out).
+/// Phase 57 H.5 / Phase 63 C.1: GUI launcher that optionally appends the
+/// AC'97 audio flags via [`append_ac97_audio_flags_gui`] for
+/// `cargo xtask run-gui` (default: audio enabled, `--no-audio` opts out).
 ///
-/// With audio enabled the GUI flags select PulseAudio on Linux so frames are
-/// audible; on non-Linux hosts they fall back to `none` with a printed warning.
-/// The existing `pcspk-audiodev=noaudio` machine option and
-/// `-audiodev none,id=noaudio` PC-speaker binding are preserved verbatim
-/// so non-audio runs continue to match today's behavior byte-for-byte.
+/// With audio enabled the GUI launcher probes the host at startup for a
+/// reachable PipeWire / PulseAudio socket and falls back to silent
+/// `-audiodev none,id=snd0` if neither is available — never failing the
+/// launch on a missing audio daemon. The existing `pcspk-audiodev=noaudio`
+/// machine option and `-audiodev none,id=noaudio` PC-speaker binding are
+/// preserved verbatim so non-audio runs continue to match today's
+/// behavior byte-for-byte.
 fn launch_qemu_with_devices_audio(
     uefi_image: &Path,
     display_mode: QemuDisplayMode,
@@ -2500,21 +2489,107 @@ fn append_ac97_audio_flags_headless(args: &mut Vec<String>) {
     );
 }
 
-/// Append [`AC97_QEMU_AUDIO_FLAGS_GUI`] to a QEMU arg vector.
+/// Append the `-audiodev` + `-device AC97,…` pair for `cargo xtask run-gui`
+/// (audio enabled).
 ///
-/// On Linux hosts this selects PulseAudio (`pa,id=snd0`) so frames are
-/// audible. On non-Linux hosts the constant already resolves to
-/// `none,id=snd0` (see the `cfg!()` expression inside the const), and a
-/// warning is printed so the developer knows output is muted — the launch
-/// never fails due to a missing audio backend.
+/// The `-audiodev` driver is chosen at launch time by [`gui_audiodev_flag`]:
+/// on Linux it prefers `pipewire` (QEMU 8.1+ native backend) when the
+/// PipeWire socket exists, then falls back to `pa` if the PulseAudio socket
+/// is reachable, and finally to `none` (with a printed warning) so the
+/// launch never fails just because no host audio daemon is available.
+/// On non-Linux hosts the driver is `none` and a warning is printed.
+///
+/// The `-device AC97,audiodev=snd0,addr=0x5` line comes from
+/// [`AC97_QEMU_AUDIO_DEVICE_FLAGS`] and is pinned by an xtask test so the
+/// `audio_server` `SENTINEL_BDF` PCI-slot match stays stable.
 fn append_ac97_audio_flags_gui(args: &mut Vec<String>) {
+    args.extend(gui_audiodev_flag());
+    args.extend(
+        AC97_QEMU_AUDIO_DEVICE_FLAGS
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+}
+
+/// Phase 63 hotfix: probe the host for a usable QEMU audio backend and
+/// return the matching `-audiodev <driver>,id=snd0` arg pair.
+///
+/// Probe order on Linux: `pipewire` (QEMU 8.1+ native) → `pa` (PulseAudio)
+/// → `none` (silent fallback). For each candidate the function checks both
+/// (a) that QEMU was built with the driver (parsed from
+/// `qemu-system-x86_64 -audiodev help`) and (b) that the corresponding
+/// daemon socket exists under `$XDG_RUNTIME_DIR`. If neither is reachable
+/// — common on PipeWire-only setups without the `pipewire-pulse` shim —
+/// the function emits `none,id=snd0` and prints a hint so the developer
+/// knows AC'97 frames will be discarded rather than audible.
+fn gui_audiodev_flag() -> Vec<String> {
+    let driver = detect_gui_audio_driver();
+    vec!["-audiodev".to_string(), format!("{driver},id=snd0")]
+}
+
+fn detect_gui_audio_driver() -> &'static str {
     if !cfg!(target_os = "linux") {
         println!(
-            "audio: PulseAudio is only available on Linux hosts; \
+            "audio: PipeWire/PulseAudio probing is only supported on Linux hosts; \
              falling back to `-audiodev none,id=snd0` (no audible output)"
         );
+        return "none";
     }
-    args.extend(AC97_QEMU_AUDIO_FLAGS_GUI.iter().map(|s| (*s).to_string()));
+
+    let runtime_dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            println!(
+                "audio: $XDG_RUNTIME_DIR is unset, cannot probe for PipeWire/PulseAudio sockets; \
+                 falling back to `-audiodev none,id=snd0` (no audible output)"
+            );
+            return "none";
+        }
+    };
+
+    let supported = qemu_supported_audiodev_drivers();
+
+    // Order matters: prefer PipeWire's native QEMU backend (no pulse shim
+    // required), then fall back to PulseAudio, finally to silent `none`.
+    let candidates: &[(&str, &str)] = &[("pipewire", "pipewire-0"), ("pa", "pulse/native")];
+
+    for (driver, socket_rel) in candidates {
+        let socket_path = runtime_dir.join(socket_rel);
+        if supported.iter().any(|s| s == driver) && socket_path.exists() {
+            return driver;
+        }
+    }
+
+    println!(
+        "audio: no reachable PipeWire or PulseAudio socket found in {runtime}; \
+         falling back to `-audiodev none,id=snd0`. AC'97 frames will be discarded \
+         (not audible). Install `pipewire-pulse` or start `pulseaudio` for audible output, \
+         or pass `--no-audio` to silence this probe.",
+        runtime = runtime_dir.display(),
+    );
+    "none"
+}
+
+/// Parse `qemu-system-x86_64 -audiodev help` to learn which audio backends
+/// the host's QEMU was compiled with. Returns an empty list if QEMU is not
+/// on `$PATH`; callers then degrade to `none`.
+fn qemu_supported_audiodev_drivers() -> Vec<String> {
+    let output = match Command::new("qemu-system-x86_64")
+        .args(["-audiodev", "help"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // QEMU emits "Available audio drivers:" followed by one driver name
+    // per line. Tolerant parsing skips blank lines and any header line
+    // containing a colon so we work across QEMU versions.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(':'))
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -14270,19 +14345,22 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 57 H.5 / Phase 63 C.1: `cargo xtask run-gui` audio plumbing.
+    // Phase 57 H.5 / Phase 63 C.1 / Phase 63 hotfix: `cargo xtask run-gui`
+    // audio plumbing.
     //
-    // Phase 63 C.1 splits the single `AC97_QEMU_AUDIO_FLAGS` constant into
-    // two:
-    //   - `AC97_QEMU_AUDIO_FLAGS_HEADLESS`: `none,id=snd0` — used by the
-    //     audio-smoke WAV args builder is the headless fallback (no host sink).
-    //   - `AC97_QEMU_AUDIO_FLAGS_GUI`: `pa,id=snd0` on Linux, `none,id=snd0`
-    //     on other hosts — used by `run-gui` so audio is audible on Linux.
+    // - `AC97_QEMU_AUDIO_FLAGS_HEADLESS`: `none,id=snd0` — used by the
+    //   audio-smoke WAV args builder; safe headless fallback (no host sink).
+    // - `AC97_QEMU_AUDIO_DEVICE_FLAGS`: shared `-device AC97,…` line used by
+    //   both headless and GUI launch paths.
+    // - `gui_audiodev_flag()`: probes the host at launch time and emits
+    //   `-audiodev <pipewire|pa|none>,id=snd0`. The hard-coded `pa,id=snd0`
+    //   from the original Phase 63 C.1 commit broke `cargo xtask run-gui`
+    //   on PipeWire-only hosts (Arch / Omarchy / Fedora) without the
+    //   `pipewire-pulse` shim — QEMU exited silently when the pulse socket
+    //   wasn't reachable. The probe-then-fallback design keeps the launch
+    //   path unconditionally safe.
     //
-    // Both constants keep `AC97,audiodev=snd0,addr=0x5` unchanged so the
-    // `audio_server` sentinel-BDF path is unaffected.
-    //
-    // The `--no-audio` opt-out skips the AC97 device entirely while
+    // The `--no-audio` opt-out still skips the AC97 device entirely while
     // preserving the legacy `pcspk-audiodev=noaudio` PC-speaker binding
     // so non-audio runs match today's behavior byte-for-byte.
     // ----------------------------------------------------------------
@@ -14305,52 +14383,65 @@ mod tests {
     }
 
     #[test]
-    fn ac97_qemu_audio_flags_gui_pinned() {
-        // Phase 63 C.1: GUI constant selects PulseAudio on Linux and falls
-        // back to `none` elsewhere. The `-device` pair is unchanged so the
-        // audio_server sentinel-BDF path is unaffected regardless of host.
-        let expected_audiodev = if cfg!(target_os = "linux") {
-            "pa,id=snd0"
-        } else {
-            "none,id=snd0"
-        };
+    fn ac97_qemu_audio_device_pinned() {
+        // The shared `-device AC97,…,addr=0x5` line stays stable so the
+        // audio_server sentinel-BDF path resolves regardless of which
+        // backend the GUI launcher selects at probe time.
         assert_eq!(
-            AC97_QEMU_AUDIO_FLAGS_GUI,
-            &[
-                "-audiodev",
-                expected_audiodev,
-                "-device",
-                "AC97,audiodev=snd0,addr=0x5",
-            ]
+            AC97_QEMU_AUDIO_DEVICE_FLAGS,
+            &["-device", "AC97,audiodev=snd0,addr=0x5"]
         );
-        // Both constants must share the same `-device` line.
+        // The headless flags must contain the device line verbatim so the
+        // two launch paths cannot drift on the PCI BDF.
         assert_eq!(
-            AC97_QEMU_AUDIO_FLAGS_GUI[2..],
-            AC97_QEMU_AUDIO_FLAGS_HEADLESS[2..],
-            "GUI and HEADLESS flags must share identical `-device` arguments"
+            &AC97_QEMU_AUDIO_FLAGS_HEADLESS[2..],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS,
+            "headless flags and shared device flags must agree on the AC97 line"
+        );
+    }
+
+    #[test]
+    fn gui_audiodev_flag_emits_recognized_driver() {
+        // Phase 63 hotfix: regardless of host, the probe must emit a
+        // syntactically valid `-audiodev <driver>,id=snd0` pair, with
+        // <driver> in the known-safe set.
+        let flag = gui_audiodev_flag();
+        assert_eq!(flag.len(), 2, "expected exactly `-audiodev <value>` pair");
+        assert_eq!(flag[0], "-audiodev");
+        let allowed = ["pipewire,id=snd0", "pa,id=snd0", "none,id=snd0"];
+        assert!(
+            allowed.contains(&flag[1].as_str()),
+            "driver value {value:?} must be one of {allowed:?}",
+            value = flag[1],
         );
     }
 
     #[test]
     fn run_gui_with_audio_emits_ac97_device_flags() {
-        // Phase 63 C.1 acceptance: `run-gui` emits the GUI audio flags
-        // (PulseAudio on Linux, `none` elsewhere) by default.
+        // Phase 63 C.1 acceptance, hotfixed: `run-gui` emits some
+        // `-audiodev <driver>,id=snd0` pair followed by the AC97 device
+        // line, regardless of which backend the host probe picked.
         let args = qemu_run_gui_args_for_test(
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             DeviceSet::default(),
             /* with_audio */ true,
         );
-        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Every GUI audio-flag entry must appear in argv, in order.
-        let mut i = 0;
-        for &want in AC97_QEMU_AUDIO_FLAGS_GUI {
-            let rel = strs[i..]
-                .iter()
-                .position(|a| *a == want)
-                .unwrap_or_else(|| panic!("AC97 GUI flag {want:?} missing from run-gui argv"));
-            i += rel + 1;
-        }
+        // `-audiodev <something>,id=snd0` must appear.
+        let audiodev_idx = args
+            .windows(2)
+            .position(|w| w[0] == "-audiodev" && w[1].ends_with(",id=snd0"))
+            .expect("run-gui must emit `-audiodev <driver>,id=snd0`");
+        // The shared AC97 device line must follow it (in argv order).
+        let device_window = args[audiodev_idx + 2..].windows(2).position(|w| {
+            w[0] == AC97_QEMU_AUDIO_DEVICE_FLAGS[0] && w[1] == AC97_QEMU_AUDIO_DEVICE_FLAGS[1]
+        });
+        assert!(
+            device_window.is_some(),
+            "run-gui must emit `{} {}` after the audiodev pair",
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[0],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[1],
+        );
     }
 
     #[test]
