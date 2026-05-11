@@ -95,10 +95,30 @@ pub fn dispatch_message(
             format,
             layout,
             rate,
-        } => match streams.try_open(backend, *format, *layout, *rate) {
-            Ok(id) => DispatchOutcome::Opened { stream_id: id },
-            Err(e) => DispatchOutcome::OpenError(e),
-        },
+        } => {
+            // 2026-05-11 stale-stream fix: if a stream is already open
+            // (the previous client died without sending `Close` — e.g.,
+            // the documented `Io(-32)` intermittency aborts
+            // `audio-demo` mid-`SubmitFrames`), close it first so the
+            // new `Open` lands on a clean backend. This is the
+            // protocol-level companion to the io loop's `force_release`
+            // takeover: both paths exist because the audio_server has
+            // no cap-revocation hook and uses a fixed
+            // `LABEL_AUDIO_CMD` for every audio-demo invocation, so
+            // `client_id` (`frame.label`) can't distinguish two
+            // consecutive demo processes. Without this branch,
+            // `try_open` hits `Ac97Backend.stream_open == true` and
+            // returns `Busy` indefinitely until audio_server is
+            // restarted.
+            if let Some(s) = streams.open.as_ref() {
+                let stale_id = s.stream_id;
+                let _ = streams.close(backend, stale_id);
+            }
+            match streams.try_open(backend, *format, *layout, *rate) {
+                Ok(id) => DispatchOutcome::Opened { stream_id: id },
+                Err(e) => DispatchOutcome::OpenError(e),
+            }
+        }
         ClientMessage::SubmitFrames { len } => {
             // The bulk payload (the actual PCM bytes) rides the same
             // socket immediately after the encoded frame — the io
@@ -602,20 +622,36 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_open_when_already_open_returns_open_error_busy() {
-        // Second `Open` while the registry holds a stream returns
-        // `OpenError(Busy)` — the protocol surface for the
-        // single-stream constraint.
+    fn dispatch_open_when_already_open_takes_over_and_returns_opened() {
+        // 2026-05-11 stale-stream fix: an `Open` arriving while a
+        // stream is already open is treated as a takeover — the
+        // previous session is closed and a fresh stream id is
+        // allocated. This replaces the old `Busy` semantics so that
+        // a client that died mid-protocol (e.g., the documented
+        // `Io(-32)` aborting `audio-demo` between `Open` and
+        // `Close`) doesn't permanently wedge the server. The fixed
+        // `LABEL_AUDIO_CMD` means the io loop's client_id-based
+        // `force_release` takeover can't distinguish two
+        // consecutive demo processes — this protocol-level path is
+        // what actually unblocks them.
         let mut reg = StreamRegistry::new();
         let mut b = FakeBackend::new();
-        let _ = open_stereo(&mut reg, &mut b);
+        let first_id = open_stereo(&mut reg, &mut b);
         let msg = ClientMessage::Open {
             format: PcmFormat::S16Le,
             layout: ChannelLayout::Stereo,
             rate: SampleRate::Hz48000,
         };
         let outcome = dispatch_message(&msg, &mut reg, &mut b);
-        assert_eq!(outcome, DispatchOutcome::OpenError(AudioError::Busy));
+        match outcome {
+            DispatchOutcome::Opened { stream_id } => {
+                assert_ne!(
+                    stream_id, first_id,
+                    "takeover must allocate a fresh stream id so backend state is reset"
+                );
+            }
+            other => panic!("expected Opened, got {other:?}"),
+        }
     }
 
     #[test]

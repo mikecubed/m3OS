@@ -226,6 +226,22 @@ fn submit_tone(
                     retries += 1;
                     syscall_lib::nanosleep_for(0, 5_000_000);
                 }
+                // 2026-05-11 IPC-intermittency retry: `Io(-32)` is the
+                // audio_client mapping for `ipc_call_buf` returning
+                // `u64::MAX` on the send path — a documented transient
+                // race in the kernel IPC layer (see handoff). Without
+                // this retry the demo aborts on ~10–20% of submits, and
+                // even with the server-side takeover the next demo run
+                // is the only way to recover. Treat it like a transient
+                // would-block: short backoff, bounded retries, then
+                // surface the error.
+                Err(AudioClientError::Io(-32)) => {
+                    if retries >= 200 {
+                        return Err(AudioClientError::Io(-32));
+                    }
+                    retries += 1;
+                    syscall_lib::nanosleep_for(0, 5_000_000);
+                }
                 Err(other) => return Err(other),
             }
         }
