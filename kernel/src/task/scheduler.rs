@@ -3953,26 +3953,33 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
         // locks drop. `log::warn!` invoked while holding `pi_lock` +
         // `scheduler_lock` deadlocks against logger / serial paths
         // that may also want one of those locks.
-        let log_blocked_on_reply = prev_state_u8 == TaskState::BlockedOnReply as u8;
-        let had_pending = if log_blocked_on_reply {
-            sched.tasks[idx].pending_msg.is_some()
-        } else {
-            false
-        };
+        //
+        // Filter at the capture site: only the UNPAIRED wakes
+        // (`prev_state == BlockedOnReply && pending_msg.is_none()`)
+        // are the actual spurious-wake bug we're hunting. A legit
+        // `endpoint::reply` always calls `deliver_message` BEFORE
+        // `wake_task_v2`, so `pending_msg.is_some()` at the CAS — and
+        // we want those out of the budget so the rare unpaired wakes
+        // are not crowded out by routine reply traffic.
+        let log_unpaired_reply_wake = prev_state_u8 == TaskState::BlockedOnReply as u8
+            && sched.tasks[idx].pending_msg.is_none();
 
         // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
         // for use after both locks drop.
         let assigned: u8 = sched.tasks[idx].assigned_core;
         let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        (assigned, on_cpu_ptr, log_blocked_on_reply, had_pending)
+        (assigned, on_cpu_ptr, log_unpaired_reply_wake)
         // SCHEDULER.lock released, then pi_lock released.
     };
-    let (assigned_core, on_cpu_ptr, log_blocked_on_reply, had_pending) = post_lock;
+    let (assigned_core, on_cpu_ptr, log_unpaired_reply_wake) = post_lock;
 
     // Phase 63 audio handoff follow-up — emit the deferred BlockedOnReply
     // wake diag now that both `pi_lock` and `scheduler_lock` are released.
-    if log_blocked_on_reply {
-        log_wake_blocked_on_reply(id, caller_loc, had_pending);
+    // `has_pending=false` is implicit in the filter: the diag only fires
+    // when prev_state was BlockedOnReply AND pending_msg was None at the
+    // CAS — the actually-spurious shape.
+    if log_unpaired_reply_wake {
+        log_wake_blocked_on_reply(id, caller_loc, false);
     }
 
     // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
