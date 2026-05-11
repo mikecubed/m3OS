@@ -3285,6 +3285,7 @@ pub fn block_current_until(
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     let woken = Arc::new(AtomicBool::new(false));
     if !register_reply_waker(caller, woken.clone()) {
+        log_spurious_block_wake(caller, "reply_v2:register_failed", None, false, false);
         return false;
     }
 
@@ -3298,7 +3299,25 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     }
 
     let outcome = block_current_until(TaskState::BlockedOnReply, &woken, None);
+    // Phase 63 audio handoff follow-up — capture wake state BEFORE clearing
+    // the reply waker so a racing producer cannot mutate the flag between
+    // our observation and the log line. If the block returned Woken /
+    // AlreadyTrue but pending_msg is still None, we are looking at the
+    // spurious-wake bug — log enough state to distinguish "wake flag set
+    // without delivery" (deliver_message bypassed) from "wake flag unset
+    // but task resumed anyway" (wake_task_v2 without setting the flag).
+    let pending_at_clear = has_pending_message(caller);
+    let woken_flag = woken.load(core::sync::atomic::Ordering::Acquire);
     clear_reply_waker(caller);
+    if matches!(outcome, BlockOutcome::Woken | BlockOutcome::AlreadyTrue) && !pending_at_clear {
+        log_spurious_block_wake(
+            caller,
+            "reply_v2:no_pending_at_clear",
+            Some(outcome),
+            woken_flag,
+            pending_at_clear,
+        );
+    }
 
     // Regardless of the outcome, the caller (call_msg) will call take_message()
     // to confirm message delivery. We report true for Woken/AlreadyTrue, false
@@ -3307,6 +3326,60 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
     }
+}
+
+/// Phase 63 audio handoff follow-up — rate-limited diagnostic for the
+/// spurious-wake race the IPC `call_msg:no_reply_message` log site
+/// (`kernel/src/ipc/mod.rs::log_ipc_umax`) flagged across audio, term,
+/// kbd, and mouse protocols. Separate budget from `IPC_UMAX_DIAG_BUDGET`
+/// so the two sites don't compete for the same cap.
+///
+/// Discriminator semantics:
+///
+/// - `reply_v2:register_failed` — `register_reply_waker` couldn't find
+///   the caller in the scheduler. Should be rare; means
+///   `block_current_on_reply_v2` returned `false` without ever blocking
+///   and the caller saw `take_message → None`.
+/// - `reply_v2:no_pending_at_clear` — block returned `Woken` or
+///   `AlreadyTrue` but `has_pending_message` is `false` at clear time.
+///   Combined with `woken_flag`:
+///     * `woken_flag = true` and `pending = false` → some path set the
+///       `reply_waker` flag without storing a `pending_msg` (e.g.
+///       `complete_send`'s shared flag, or a stale waker from a prior
+///       block primitive).
+///     * `woken_flag = false` (outcome must be `Woken` since
+///       `AlreadyTrue` requires the flag) → impossible by construction
+///       in the current primitive; would indicate a memory-ordering
+///       bug between `block_current_until`'s post-resume load and the
+///       wake-side store.
+static SPURIOUS_BLOCK_WAKE_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(32);
+
+fn log_spurious_block_wake(
+    caller: TaskId,
+    site: &'static str,
+    outcome: Option<BlockOutcome>,
+    woken_flag: bool,
+    pending_at_clear: bool,
+) {
+    if SPURIOUS_BLOCK_WAKE_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[sched] spurious block wake: task={} site={} outcome={:?} woken_flag={} pending_at_clear={}",
+        caller.0,
+        site,
+        outcome,
+        woken_flag,
+        pending_at_clear,
+    );
 }
 
 fn register_reply_waker(id: TaskId, waker: Arc<AtomicBool>) -> bool {
