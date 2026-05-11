@@ -445,10 +445,13 @@ pub const SILENCE_FRAME: [u8; PCM_SLOT_STRIDE] = [0u8; PCM_SLOT_STRIDE];
 ///   A submission smaller than one slot returns
 ///   [`AudioError::InvalidArgument`]; a submission that is not a
 ///   multiple of the stride also returns `InvalidArgument`.
-/// - Each slot is checked for BDL-full before the copy starts; if the
-///   first slot would overflow the ring the function returns
-///   [`AudioError::WouldBlock`] without copying any bytes.
-/// - Returns the total number of bytes copied on success.
+/// - BDL capacity is checked for the **entire** submission before any
+///   copy. If the BDL cannot hold every requested slot the function
+///   returns [`AudioError::WouldBlock`] without copying any bytes or
+///   posting any descriptors. This matches `audio_client`'s
+///   all-or-nothing submit contract — partial accepts are surfaced as
+///   `WouldBlock`, never as a short `Ok(n < bytes.len())`.
+/// - Returns `Ok(bytes.len())` on success.
 ///
 /// # Arguments
 ///
@@ -456,6 +459,14 @@ pub const SILENCE_FRAME: [u8; PCM_SLOT_STRIDE] = [0u8; PCM_SLOT_STRIDE];
 /// - `pcm_ring` — mutable reference to the full PCM ring DMA region
 ///   (`DEFAULT_PCM_RING_BYTES` bytes).
 /// - `pcm_ring_iova` — device-visible IOVA base of `pcm_ring`.
+/// - `bdl_dma` — mutable reference to the DMA-backed BDL the AC'97
+///   controller actually reads via BDBAR. Each posted descriptor is
+///   mirrored into this array immediately after the logic-side
+///   `submit_buffer` succeeds, so the hardware never DMAs from a
+///   stale/zero entry. `Ac97Logic::bdl` is the in-process mirror; the
+///   DMA buffer is the device-visible truth — the two must stay in
+///   lockstep, which is enforced here by writing both from the same
+///   loop body.
 /// - `bdl_iova` — device-visible IOVA base of the BDL DMA buffer.
 ///   Used to compute the `bdl_iova_offset` argument for
 ///   [`Ac97Logic::submit_buffer`].
@@ -464,6 +475,7 @@ pub fn submit_frames_inner(
     bytes: &[u8],
     pcm_ring: &mut [u8; DEFAULT_PCM_RING_BYTES],
     pcm_ring_iova: u64,
+    bdl_dma: &mut [BufferDescriptor; BDL_ENTRIES],
     bdl_iova: u64,
     logic: &mut Ac97Logic,
 ) -> Result<usize, AudioError> {
@@ -474,21 +486,21 @@ pub fn submit_frames_inner(
 
     let num_slots = bytes.len() / PCM_SLOT_STRIDE;
 
-    // Check BDL capacity upfront before copying any data.
-    // We need `num_slots` free BDL entries; each slot that would be
-    // in-flight counts as one. If there are not enough free slots
-    // for even the first chunk, return WouldBlock.
+    // All-or-nothing: require enough BDL room for the *whole* submission
+    // before touching the ring. `audio_client::submit_frames` documents
+    // that a successful submit returns `bytes.len()` exactly — partial
+    // accepts are not a thing, backpressure is surfaced as `WouldBlock`
+    // and the caller retries. Accepting a prefix here would silently
+    // drop the tail of the PCM payload.
     let in_flight = logic.head.wrapping_sub(logic.tail);
     let free_slots = BDL_ENTRIES.saturating_sub(in_flight);
-    if free_slots == 0 {
+    if free_slots < num_slots {
         return Err(AudioError::WouldBlock);
     }
 
-    // Submit as many complete slots as the BDL can accept.
-    let slots_to_submit = num_slots.min(free_slots);
     let mut total_copied = 0usize;
 
-    for i in 0..slots_to_submit {
+    for i in 0..num_slots {
         let head = logic.head % BDL_ENTRIES;
         let slot_byte_offset = head * PCM_SLOT_STRIDE;
         let src_offset = i * PCM_SLOT_STRIDE;
@@ -507,6 +519,13 @@ pub fn submit_frames_inner(
         logic
             .submit_buffer(bdl_iova_offset, slot_phys_addr, samples)
             .map_err(|_| AudioError::Internal)?;
+
+        // Mirror the descriptor `submit_buffer` just wrote into the
+        // DMA-backed BDL. AC'97 DMAs descriptors from the buffer
+        // pointed at by BDBAR, not from the in-process `logic.bdl`
+        // mirror — without this write the controller would replay
+        // zeroed/stale entries.
+        bdl_dma[head] = logic.bdl[head];
 
         total_copied += PCM_SLOT_STRIDE;
     }
@@ -797,13 +816,16 @@ impl AudioBackend for Ac97Backend {
         }
         // Delegate to the pure helper so the ring-copy logic is host-testable.
         // Capture IOVAs before the mutable borrows to satisfy the borrow checker.
+        // `pcm_ring`, `bdl`, and `logic` are disjoint fields, so three simultaneous
+        // mut borrows are allowed; the helper writes the PCM ring and mirrors BDL
+        // descriptors in lockstep with `logic.bdl`.
         let pcm_ring_iova = self.pcm_ring.iova();
         let bdl_iova = self.bdl.iova();
-        let pcm_ring_slice: &mut [u8; DEFAULT_PCM_RING_BYTES] = &mut self.pcm_ring;
         let n = submit_frames_inner(
             bytes,
-            pcm_ring_slice,
+            &mut self.pcm_ring,
             pcm_ring_iova,
+            &mut self.bdl,
             bdl_iova,
             &mut self.logic,
         )?;
@@ -1688,11 +1710,22 @@ mod tests {
 
     // -- B.1: submit_frames_inner — PCM-ring copy + BDL-post -----------------
 
+    /// Helper: a zeroed BDL DMA mirror for test setups. Matches the
+    /// layout `Ac97Backend.bdl` would have at boot before any submit.
+    fn fresh_bdl_dma() -> [BufferDescriptor; BDL_ENTRIES] {
+        [BufferDescriptor {
+            phys_addr: 0,
+            samples: 0,
+            flags: 0,
+        }; BDL_ENTRIES]
+    }
+
     /// B.1(a): bytes are copied into the PCM ring at the correct slot offset.
     /// The first submission must land at `head=0 × PCM_SLOT_STRIDE = 0`.
     #[test]
     fn submit_frames_inner_copies_bytes_to_correct_slot_offset() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         // Fill submission with a recognisable pattern.
         let mut submission = [0u8; PCM_SLOT_STRIDE];
@@ -1703,6 +1736,7 @@ mod tests {
             &submission,
             &mut pcm_ring,
             /*pcm_ring_iova=*/ 0x0010_0000,
+            &mut bdl_dma,
             /*bdl_iova=*/ 0x0020_0000,
             &mut logic,
         )
@@ -1721,14 +1755,29 @@ mod tests {
     #[test]
     fn submit_frames_inner_uses_next_slot_for_second_submission() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         let first = [0xAAu8; PCM_SLOT_STRIDE];
         let second = [0xBBu8; PCM_SLOT_STRIDE];
 
-        submit_frames_inner(&first, &mut pcm_ring, 0x1000_0000, 0x2000_0000, &mut logic)
-            .expect("first submit");
-        submit_frames_inner(&second, &mut pcm_ring, 0x1000_0000, 0x2000_0000, &mut logic)
-            .expect("second submit");
+        submit_frames_inner(
+            &first,
+            &mut pcm_ring,
+            0x1000_0000,
+            &mut bdl_dma,
+            0x2000_0000,
+            &mut logic,
+        )
+        .expect("first submit");
+        submit_frames_inner(
+            &second,
+            &mut pcm_ring,
+            0x1000_0000,
+            &mut bdl_dma,
+            0x2000_0000,
+            &mut logic,
+        )
+        .expect("second submit");
 
         assert_eq!(
             &pcm_ring[0..PCM_SLOT_STRIDE],
@@ -1747,13 +1796,21 @@ mod tests {
     #[test]
     fn submit_frames_inner_posts_bdl_entry_with_correct_iova_and_samples() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         let pcm_ring_iova: u64 = 0x0010_0000;
         let bdl_iova: u64 = 0x0020_0000;
 
         let data = [0u8; PCM_SLOT_STRIDE];
-        submit_frames_inner(&data, &mut pcm_ring, pcm_ring_iova, bdl_iova, &mut logic)
-            .expect("submit");
+        submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            pcm_ring_iova,
+            &mut bdl_dma,
+            bdl_iova,
+            &mut logic,
+        )
+        .expect("submit");
 
         // The BDL entry at slot 0 should have been posted.
         let entry0 = logic.bdl()[0];
@@ -1777,13 +1834,30 @@ mod tests {
     #[test]
     fn submit_frames_inner_lvi_advances_after_each_slot() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         let data = [0u8; PCM_SLOT_STRIDE];
 
-        submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic).expect("first");
+        submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect("first");
         assert_eq!(logic.lvi(), 0, "LVI=0 after slot 0");
 
-        submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic).expect("second");
+        submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect("second");
         assert_eq!(logic.lvi(), 1, "LVI=1 after slot 1");
     }
 
@@ -1792,10 +1866,18 @@ mod tests {
     #[test]
     fn submit_frames_inner_partial_slot_returns_invalid_argument() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         let partial = [0u8; PCM_SLOT_STRIDE - 1];
-        let err = submit_frames_inner(&partial, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
-            .expect_err("partial slot must be rejected");
+        let err = submit_frames_inner(
+            &partial,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect_err("partial slot must be rejected");
         assert_eq!(err, AudioError::InvalidArgument);
     }
 
@@ -1803,8 +1885,9 @@ mod tests {
     #[test]
     fn submit_frames_inner_zero_len_returns_invalid_argument() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
-        let err = submit_frames_inner(&[], &mut pcm_ring, 0x1000, 0x2000, &mut logic)
+        let err = submit_frames_inner(&[], &mut pcm_ring, 0x1000, &mut bdl_dma, 0x2000, &mut logic)
             .expect_err("zero len must be rejected");
         assert_eq!(err, AudioError::InvalidArgument);
     }
@@ -1814,11 +1897,19 @@ mod tests {
     #[test]
     fn submit_frames_inner_non_stride_multiple_returns_invalid_argument() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         // PCM_SLOT_STRIDE + 1 is not a multiple of PCM_SLOT_STRIDE.
         let odd = alloc::vec![0u8; PCM_SLOT_STRIDE + 1];
-        let err = submit_frames_inner(&odd, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
-            .expect_err("non-multiple stride must be rejected");
+        let err = submit_frames_inner(
+            &odd,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect_err("non-multiple stride must be rejected");
         assert_eq!(err, AudioError::InvalidArgument);
     }
 
@@ -1827,6 +1918,7 @@ mod tests {
     #[test]
     fn submit_frames_inner_bdl_full_returns_would_block() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         // Fill all BDL slots via submit_buffer directly.
         for i in 0..BDL_ENTRIES {
@@ -1839,8 +1931,15 @@ mod tests {
                 .expect("fill BDL");
         }
         let data = [0u8; PCM_SLOT_STRIDE];
-        let err = submit_frames_inner(&data, &mut pcm_ring, 0x1000, 0x2000, &mut logic)
-            .expect_err("BDL full must yield WouldBlock");
+        let err = submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect_err("BDL full must yield WouldBlock");
         assert_eq!(err, AudioError::WouldBlock);
     }
 
@@ -1849,6 +1948,7 @@ mod tests {
     #[test]
     fn submit_frames_inner_over_slot_splits_into_multiple_entries() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
         let mut data = alloc::vec![0u8; 2 * PCM_SLOT_STRIDE];
         // Write distinct patterns into each slot.
@@ -1859,8 +1959,15 @@ mod tests {
             *b = 0xDD;
         }
 
-        let n = submit_frames_inner(&data, &mut pcm_ring, 0x0010_0000, 0x0020_0000, &mut logic)
-            .expect("two-slot submit must succeed");
+        let n = submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            0x0010_0000,
+            &mut bdl_dma,
+            0x0020_0000,
+            &mut logic,
+        )
+        .expect("two-slot submit must succeed");
 
         assert_eq!(n, 2 * PCM_SLOT_STRIDE, "must return total bytes copied");
         assert_eq!(logic.lvi(), 1, "LVI must be 1 after two BDL entries");
@@ -1875,6 +1982,130 @@ mod tests {
             &data[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE],
             "slot 1 pattern"
         );
+    }
+
+    /// B.1(g) — review #148 thread PRRT...A8x2_: every BDL descriptor posted
+    /// via `submit_frames_inner` is mirrored into the DMA-backed BDL the
+    /// AC'97 controller reads via BDBAR. Without this mirror the device
+    /// would DMA from zeroed/stale entries even though `Ac97Logic` advanced.
+    #[test]
+    fn submit_frames_inner_mirrors_bdl_into_dma_buffer() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
+        let mut logic = Ac97Logic::new();
+        let pcm_ring_iova: u64 = 0x0010_0000;
+        let bdl_iova: u64 = 0x0020_0000;
+
+        let data = alloc::vec![0u8; 3 * PCM_SLOT_STRIDE];
+        submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            pcm_ring_iova,
+            &mut bdl_dma,
+            bdl_iova,
+            &mut logic,
+        )
+        .expect("three-slot submit");
+
+        // The first three DMA descriptors must equal `logic.bdl[..3]`
+        // field-for-field — anything else means the hardware would see a
+        // different ring than the logic-side mirror.
+        for idx in 0..3 {
+            let dma_entry = bdl_dma[idx];
+            let logic_entry = logic.bdl()[idx];
+            assert_eq!(
+                { dma_entry.phys_addr },
+                { logic_entry.phys_addr },
+                "slot {idx} phys_addr must match the logic mirror"
+            );
+            assert_eq!(
+                { dma_entry.samples },
+                { logic_entry.samples },
+                "slot {idx} samples must match the logic mirror"
+            );
+            assert_eq!(
+                { dma_entry.flags },
+                { logic_entry.flags },
+                "slot {idx} flags must match the logic mirror"
+            );
+            // Sanity: the posted descriptor is not the all-zero default.
+            assert_ne!({ dma_entry.samples }, 0, "slot {idx} must be non-empty");
+        }
+        // Slots beyond the submission must remain zeroed in the DMA buffer.
+        for idx in 3..BDL_ENTRIES {
+            let dma_entry = bdl_dma[idx];
+            assert_eq!({ dma_entry.phys_addr }, 0, "slot {idx} must remain zero");
+            assert_eq!({ dma_entry.samples }, 0, "slot {idx} must remain zero");
+        }
+    }
+
+    /// B.1(h) — review #148 thread PRRT...A8x3J: when the BDL has *some*
+    /// room but not enough for the *whole* submission, `submit_frames_inner`
+    /// must return `WouldBlock` without copying or posting anything. This
+    /// matches the `audio_client::submit_frames` documented contract
+    /// (successful submit returns `bytes.len()`; backpressure is
+    /// `WouldBlock`, never a short success).
+    #[test]
+    fn submit_frames_inner_partial_fit_returns_would_block_without_writes() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
+        let mut logic = Ac97Logic::new();
+
+        // Pre-fill BDL_ENTRIES - 1 slots so exactly one slot is free.
+        for i in 0..(BDL_ENTRIES - 1) {
+            logic
+                .submit_buffer(
+                    (i * core::mem::size_of::<BufferDescriptor>()) as u64,
+                    0xDEAD_0000 | (i as u32),
+                    PCM_SLOT_STRIDE / 2,
+                )
+                .expect("pre-fill");
+        }
+        // Snapshot the producer state so we can confirm it is unchanged
+        // after the rejected submit.
+        let head_before = logic.head;
+        let tail_before = logic.tail;
+        let lvi_before = logic.lvi();
+        let frames_submitted_before = logic.frames_submitted();
+
+        // Two-slot submission requires 2 free slots; only 1 is available.
+        let data = alloc::vec![0xEEu8; 2 * PCM_SLOT_STRIDE];
+        // Mark the PCM ring with a sentinel so we can prove it stayed put.
+        for b in pcm_ring.iter_mut() {
+            *b = 0x42;
+        }
+        let err = submit_frames_inner(
+            &data,
+            &mut pcm_ring,
+            0x0010_0000,
+            &mut bdl_dma,
+            0x0020_0000,
+            &mut logic,
+        )
+        .expect_err("partial-fit submit must reject before writing");
+
+        assert_eq!(err, AudioError::WouldBlock);
+        // Producer state unchanged.
+        assert_eq!(logic.head, head_before, "head must not advance");
+        assert_eq!(logic.tail, tail_before, "tail must not advance");
+        assert_eq!(logic.lvi(), lvi_before, "lvi must not advance");
+        assert_eq!(
+            logic.frames_submitted(),
+            frames_submitted_before,
+            "frames_submitted must not advance"
+        );
+        // PCM ring still holds the sentinel — nothing was copied.
+        assert!(
+            pcm_ring.iter().all(|&b| b == 0x42),
+            "PCM ring must be untouched on WouldBlock"
+        );
+        // The next free DMA slot is the one logic.head modulo BDL_ENTRIES,
+        // which was set up to be slot `BDL_ENTRIES - 1`. That slot must
+        // still be zero — proof we did not mirror a descriptor anywhere.
+        let free_idx = head_before % BDL_ENTRIES;
+        let free_dma = bdl_dma[free_idx];
+        assert_eq!({ free_dma.phys_addr }, 0, "free DMA slot must be zero");
+        assert_eq!({ free_dma.samples }, 0, "free DMA slot must be zero");
     }
 
     /// B.1: SILENCE_FRAME is exactly one slot stride of zero bytes.

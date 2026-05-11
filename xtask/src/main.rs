@@ -3845,6 +3845,13 @@ fn run_smoke_script(
                     // drain offset is anchored to the line currently under inspection — using
                     // `s.find(line)` would return the *first* occurrence of that text in the
                     // buffer, which can sit inside a different earlier line.
+                    //
+                    // The returned offset is in *stripped* or *cleaned* coordinates depending
+                    // on which buffer matched; we hand it to `drain_serial_through_match`
+                    // along with the `SerialMatchMode` so it can translate back into the raw
+                    // `serial_buf` index space before draining. Draining `serial_buf` with a
+                    // stripped/cleaned offset directly skews the buffer because `strip_ansi`
+                    // and `strip_background_noise` change string length.
                     let search = |s: &str| -> Option<(bool, usize)> {
                         let mut cursor = 0usize;
                         for segment in s.split_inclusive('\n') {
@@ -3863,13 +3870,17 @@ fn run_smoke_script(
                         }
                         None
                     };
-                    let result = search(&cleaned).or_else(|| search(&stripped));
+                    let result = search(&cleaned)
+                        .map(|(ok, end)| (ok, SerialMatchMode::Cleaned, end))
+                        .or_else(|| {
+                            search(&stripped).map(|(ok, end)| (ok, SerialMatchMode::Stripped, end))
+                        });
 
-                    if let Some((ok, match_end)) = result {
+                    if let Some((ok, mode, match_end)) = result {
                         if ok {
-                            // Drain consumed output.
-                            let cut = match_end.min(serial_buf.len());
-                            serial_buf.drain(..cut);
+                            // Drain consumed output, translating stripped/cleaned offsets
+                            // back into raw-buffer indices before cutting.
+                            drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                             break;
                         } else {
                             // Pattern matched but line also contained bad_substring.
@@ -11058,6 +11069,13 @@ fn run_smoke_steps_with_capture(
                     // drain offset is anchored to the line currently under inspection — using
                     // `s.find(line)` would return the *first* occurrence of that text in the
                     // buffer, which can sit inside a different earlier line.
+                    //
+                    // The returned offset is in *stripped* or *cleaned* coordinates depending
+                    // on which buffer matched; we hand it to `drain_serial_through_match`
+                    // along with the `SerialMatchMode` so it can translate back into the raw
+                    // `serial_buf` index space before draining. Draining `serial_buf` with a
+                    // stripped/cleaned offset directly skews the buffer because `strip_ansi`
+                    // and `strip_background_noise` change string length.
                     let search = |s: &str| -> Option<(bool, usize)> {
                         let mut cursor = 0usize;
                         for segment in s.split_inclusive('\n') {
@@ -11073,12 +11091,17 @@ fn run_smoke_steps_with_capture(
                         }
                         None
                     };
-                    let result = search(&cleaned).or_else(|| search(&stripped));
+                    let result = search(&cleaned)
+                        .map(|(ok, end)| (ok, SerialMatchMode::Cleaned, end))
+                        .or_else(|| {
+                            search(&stripped).map(|(ok, end)| (ok, SerialMatchMode::Stripped, end))
+                        });
 
-                    if let Some((ok, match_end)) = result {
+                    if let Some((ok, mode, match_end)) = result {
                         if ok {
-                            let cut = match_end.min(serial_buf.len());
-                            serial_buf.drain(..cut);
+                            // Translate stripped/cleaned offsets back into raw-buffer
+                            // indices before cutting.
+                            drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
                             break;
                         } else {
                             let last_lines = tail_lines(&strip_ansi(serial_history), 80);
