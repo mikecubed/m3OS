@@ -1,48 +1,71 @@
 ---
 status: open
 branch: feat/phase-63-audio-stack-implementation
-last-known-good-commit: ada4f6a
+last-known-good-commit: f1573bd
 date: 2026-05-11
-component: kernel/ipc (recv_msg_with_notif) / kernel/task/scheduler (block_current_on_notif_v2) / userspace audio_server
+component: userspace audio_server (Ac97Backend) / kernel device-host IRQ routing
 related:
   - docs/handoffs/2026-04-25-scheduler-design-comparison.md
   - docs/63-audio-stack-implementation.md
   - docs/handoffs/2026-04-28-graphical-stack-startup.md
 ---
 
-# Handoff — Phase 63 audio IRQ / scheduler-v2 wake race
+# Handoff — Phase 63 audio AC'97 IRQ pipeline
 
-## TL;DR
+> **Doc title note**: filename still says `audio-irq-wake-race` from when
+> that *was* the bug. The wake-race is fixed (`f1573bd`); the file is
+> kept under the same name so existing references don't break, but the
+> active investigation in this doc is now the AC'97 IRQ delivery path.
 
-`cargo xtask audio-smoke` and `cargo xtask run-gui` (with audio enabled)
-both fail to play any audio because `audio_server`, once it claims the
-AC'97 PCI device and subscribes to its IRQ, ends up in one of two
-failure modes:
+## ⚠ Status update (2026-05-11)
 
-1. **`audio_server: recv failed`** every ~7s of boot, init's
-   `restart=on-failure max_restart=3` policy burns the budget, then
-   audio_server is permanently down → `frames_consumed` stays at 0.
-2. **`task pid=16 name=fork-child state=BlockedOnNotif stuck-since=Nms
-   (no waker registered)`** — audio_server is parked on a notification
-   waiting for an IRQ that never fires.
+**The original spurious-wake symptom this doc was opened for is FIXED**
+in `f1573bd` (Codex-authored, codex-rescue session
+`019e15d7-5a1c-7c20-a50d-10b223b3084a`). Root cause was hypothesis C
+from the original analysis: a stale ISR wake token in
+`isr_wake_queue` survives `recv_msg_with_notif`'s fast-path drain and
+is later converted into a wake on a task that has no message and no
+pending bits, returning `u64::MAX` from the syscall.
 
-The smoking gun is in
-[`kernel/src/ipc/endpoint.rs:678-696`](../../kernel/src/ipc/endpoint.rs):
-`recv_msg_with_notif` calls `block_current_on_notif_v2`, returns
-`woken=true`, then both `take_message` and `drain_bits` are empty, so
-the function returns `Message::new(u64::MAX)` (the "spurious wake"
-debug-assert path). The kernel hands `u64::MAX` back to userspace and
-audio_server's io loop treats that as a fatal error.
+The fix sits in `kernel/src/task/scheduler.rs` (the per-core
+`isr_wake_queue` drain loop) and a new helper
+`bound_pending_bits_for_task` in `kernel/src/ipc/notification.rs` —
+when a queued wake target is `BlockedOnNotif` AND `pending_msg=None`
+AND its bound notification has 0 pending bits, the wake is dropped
+because that combination uniquely identifies a stale token. ~25 lines,
+no new locks, no new allocations.
 
-e1000 / nvme do **not** observe this race because their IRQs fire
-frequently enough to mask it; audio_server has long idle periods and
-hits the race on essentially every recv once the AC'97 IRQ binding is
-active.
+`audio-smoke` no longer logs `audio_server: recv failed`. **However,
+`audio-smoke` still fails** — audio_server now correctly stays in
+`BlockedOnNotif` waiting for an AC'97 IRQ, and that IRQ never arrives.
+This is a fundamentally different bug (AC'97 controller programming /
+QEMU interrupt routing / IRQ delivery to the bound notification) and
+needs its own focused investigation. The "Concrete next-step plan"
+section below is rewritten for this new bug; the original spurious-
+wake plan is preserved at the end for historical context.
 
-The four recent commits fix the surrounding plumbing so the bug is now
-isolated to the kernel scheduler-v2 + bound-notification interaction
-(see "Already done" below). What's left is a kernel-side investigation
-of the wake-without-condition race.
+## TL;DR (post-fix state)
+
+`cargo xtask audio-smoke` still times out. After `f1573bd` the failure
+mode is now:
+
+- audio_server claims AC'97 (`8086:2415` at `0000:00:05.0`)
+- audio_server subscribes to legacy INTx line 10 → kernel allocates
+  vector 0x62, routes via I/O APIC
+- audio_server enters `run_io_loop` and parks in `BlockedOnNotif`
+- audio-demo runs, sends `Open` → audio_server wakes, replies → idle
+- audio-demo sends `SubmitFrames` (64 KiB PCM) → audio_server wakes,
+  fills BDL, writes LVI, replies → idle
+- The AC'97 controller (with `CR.RPBM | LVBIE | FEIE | IOCE` set and a
+  populated BDL) **never raises an IRQ on slot completion**
+- audio_server stays parked in `BlockedOnNotif` indefinitely
+- `frames_consumed` stays at 0
+- audio-demo's `drain` request also gets a reply but with stale stats,
+  so AUDIO_DEMO never reaches `:PASS`
+
+So the open question is: **why doesn't the AC'97 controller raise an
+IOC interrupt after the BDL is programmed and LVI is advanced?**
+Candidates listed in "Concrete next-step plan" below.
 
 ## Reproduction
 
@@ -171,8 +194,8 @@ Why other ring-3 drivers are unaffected:
 
 ## Already done — current state of the branch
 
-Four commits on `feat/phase-63-audio-stack-implementation` close every
-layer above the kernel race:
+Five commits on `feat/phase-63-audio-stack-implementation` close every
+known layer above the AC'97 IRQ-delivery question:
 
 | Commit | What it fixed | File(s) |
 |---|---|---|
@@ -180,10 +203,12 @@ layer above the kernel race:
 | `3164cdf` | `audio_server` was always falling into stub mode because the kernel's `is_authorized_driver_process` gate (`kernel/src/syscall/device_host.rs:126`) requires the caller's `exec_path` to start with `/drivers/`, but audio_server lived at `/bin/audio_server`. | `kernel/src/fs/ramdisk.rs` (move ELF entry from BIN_ENTRIES to DRIVERS_ENTRIES); `kernel/initrd/etc/services.d/audio_server.conf` + `xtask/src/main.rs` audio_server.conf (`command=/drivers/audio_server`); `userspace/audio_server/src/lib.rs` test assertion. |
 | `51002f8` | `SyscallBackend::recv` allocated a 1522 B bulk buffer (sized for net frames). audio's `SubmitFrames` carries up to 64 KiB of PCM; the kernel was silently truncating to 1522 B. | `userspace/lib/driver_runtime/src/ipc/mod.rs` — added `recv_with_capacity`; `userspace/audio_server/src/irq.rs` — calls it with `MAX_SUBMIT_BYTES + 256`. |
 | `ada4f6a` | An earlier "log + continue" branch on recv error (in 51002f8) turned the kernel race into a tight hot loop that allocated 64 KiB / iter and starved stdin_feeder. Reverted to the original "exit 8 → init restart" behavior. | `userspace/audio_server/src/irq.rs` — reverted continue branch. |
+| `f1573bd` | Stale ISR wake tokens left in `isr_wake_queue` after `recv_msg_with_notif`'s fast-path bit-drain were converted into wakes on tasks with no message and no bits, returning `u64::MAX`. Drop those tokens in the per-core drain loop. **Codex-authored** via codex-rescue. | `kernel/src/task/scheduler.rs` (drain-loop guard); `kernel/src/ipc/notification.rs` (new `bound_pending_bits_for_task` helper). |
 
-After these four commits, the **only remaining failure** is the kernel
-scheduler-v2 + bound-notification race that returns `u64::MAX` from
-`ipc_recv_msg`.
+**After f1573bd, audio_server is no longer crashing.** It correctly
+parks in `BlockedOnNotif` waiting for an AC'97 IRQ. The remaining
+failure is that **the AC'97 IRQ never fires**, so the wake never
+arrives and `frames_consumed` stays at 0.
 
 ## What I tried that didn't work
 
@@ -192,30 +217,122 @@ Logging the failures here so the next session doesn't repeat them:
 1. **"Tolerate transient recv errors with `continue`".** Created the
    tight hot loop described above. Reverted in `ada4f6a`. Lesson: the
    recv error is not transient — it fires on every call, so you can't
-   simply ignore it.
+   simply ignore it. (Also obsoleted by `f1573bd` — the recv error no
+   longer fires at all.)
 
-2. **Increasing the recv buffer to 64 KiB.** This is correct (audio
-   needs it) but does not fix the wake race — recv still returns
-   `u64::MAX` immediately.
+2. **Increasing the recv buffer to 64 KiB.** Correct and shipped in
+   `51002f8` — but the spurious-wake bug fired before any submit ever
+   reached audio_server, so this fix alone wasn't observable until
+   `f1573bd` landed.
 
-3. **Investigating whether `MAX_BULK_LEN` (kernel side, 65536) caps the
-   buf_len.** The kernel does NOT validate buf_len in
-   `ipc_recv_msg`; the only cap is on the send path. So buffer size is
-   not the source of the immediate `u64::MAX`.
+3. **Investigating whether `MAX_BULK_LEN` (kernel side, 65536) caps
+   the buf_len.** The kernel does NOT validate buf_len in
+   `ipc_recv_msg`; the only cap is on the send path.
 
-4. **Asking whether the AC'97 IRQ ever fires.** I never got past the
-   recv-error to verify — but the symptom is the same in both
-   `audio-smoke` (where audio-demo runs and submits frames) and
-   `run-gui` (where no client ever runs), so the wake bug is
-   independent of any actual IRQ activity. It's likely triggered by
-   the very *act* of binding the notification.
+4. **Hypotheses A and B from the original analysis** (IRQ shim drains
+   bits during wake / stale `woken` flag). Codex confirmed both
+   wrong — the IRQ shim does not drain bits, and
+   `block_current_on_notif_v2` constructs a fresh `AtomicBool` per
+   call. The actual race (hypothesis C) was a stale ISR wake token in
+   `isr_wake_queue` that survived the fast-path drain.
 
-## Concrete next-step plan
+## Concrete next-step plan (AC'97 IRQ pipeline)
+
+The spurious-wake bug is closed. The new question is: **why doesn't
+the AC'97 controller raise an IOC interrupt after the BDL is
+programmed and `LVI` is advanced?** Candidates in priority order:
+
+### Hypothesis I — `CR.RPBM` is being cleared / never set on the right register
+
+`Ac97Backend::init` (`userspace/audio_server/src/device.rs:721-767`)
+calls `init_controller(&bus)` then `open_pcm_out_stream(&bus,
+bdl_iova)`. The latter writes `CR.RPBM | LVBIE | FEIE | IOCE` to
+`nabm::PCM_OUT_BASE + nabm::CR`. Verify by:
+
+1. Add a debug write that reads back `CR` after the write completes
+   and logs the value to STDOUT_FILENO. If `RPBM` is not set, the
+   write never landed (PIO routing bug? wrong BAR? wrong base?).
+2. Read `GLOB_STA` (NABM offset 0x30) after init and check the
+   PCM-OUT half-empty / interrupt status bits — they should clear
+   immediately after a successful start.
+
+### Hypothesis II — BDL `IOC` flag isn't reaching the controller
+
+`submit_buffer` in `Ac97Logic` (`device.rs:615-640`) writes
+`flags: 0x8000` (IOC bit) into the per-slot BDL entry. Then
+`submit_frames_inner` mirrors that descriptor into the DMA-backed
+`bdl_dma[head]` (`device.rs:528`). Verify by:
+
+1. After `submit_frames_inner` writes a slot, read back `bdl_dma[head]`
+   and log `flags`. Should be `0x8000`.
+2. Read `nabm::PCM_OUT_BASE + nabm::CIV` (current index value) from
+   the controller — does it advance past the slot you posted? If yes,
+   the controller IS consuming buffers but not raising IRQs (suggests
+   IOC flag is being lost between userspace and the device — DMA-
+   coherency or IOMMU translation bug). If no, the controller never
+   sees the BDL update at all.
+
+### Hypothesis III — IRQ delivered but bound notification not signalled
+
+The kernel routes legacy INTx line 10 to vector 0x62 (visible in
+m3os.log: `[apic] I/O APIC: PCI IRQ 10 → GSI 10 (pin 10) → vector
+98 (level, active-low)`). The ISR shim for vector 0x62 should call
+`signal_irq_bit` for the bound notification. Verify by:
+
+1. Check kernel logs for any line mentioning vector 0x62 firing. With
+   QEMU's `wav` audio backend, the controller should consume a slot
+   every ~22 ms (one BDL slot at 48 kHz stereo S16Le).
+2. Add a per-vector IRQ counter that gets dumped on serial
+   periodically. If vector 0x62's count is 0 after audio-demo runs,
+   the IRQ never fires (Hypothesis I or II). If non-zero but
+   audio_server doesn't wake, the bound-notification signal path is
+   dropping it (Hypothesis III).
+
+### Hypothesis IV — QEMU's AC'97 device under `-audiodev wav` doesn't generate IRQs
+
+QEMU's `none` audio backend famously does not pull samples from the
+controller, so no IRQs fire. The `wav` backend writes samples to a
+file but it's worth verifying that QEMU's `intel-hda` / `AC97`
+emulation actually raises interrupts under `wav`. A quick experiment:
+
+1. Run audio-smoke under `-audiodev wav,id=snd0,...` (current default).
+2. Compare against a brief test under `-audiodev pa,id=snd0` (if a
+   PulseAudio host is available).
+3. If `pa` works and `wav` doesn't, switch the audio-smoke harness to
+   `pa` (or add a `null,timer-period=...` fallback) and document.
+
+### Step-by-step plan
+
+1. Run `M3OS_SMOKE_SERIAL_DUMP=/tmp/serial.log cargo xtask audio-smoke`
+   and grep the dump for any `[apic]` or `irq.subscribe` messages
+   timed *after* `AUDIO_DEMO:opened`. If none, IRQ never fires →
+   Hypothesis I / II / IV.
+2. Add the per-vector IRQ counter dump (kernel/src/arch/x86_64/interrupts.rs).
+3. Pick the matching hypothesis and patch.
+
+### Backstop in audio_server (still open)
+
+Even after the IRQ pipeline is fixed, `audio_server` should not crash
+on the first recv error if a future regression brings the spurious-
+wake class back. Consider adding a small consecutive-error counter
+that tolerates up to N (~3) errors before exiting. Avoid the tight-
+loop pitfall (no allocation in the error branch; yield between
+retries). See the discussion in `ada4f6a`'s commit message.
+
+## Original plan — kept for historical context
+
+The plan below was written for the spurious-wake bug, **which is now
+fixed by `f1573bd`**. Preserved here in case the symptom resurfaces
+under a different repro (e.g. a new ring-3 driver class with long
+idle periods).
+
+<details>
+<summary>Original five-step plan (obsolete — keep collapsed)</summary>
 
 The right starting point is **kernel-side instrumentation**, not more
 userspace adjustments.
 
-### Step 1 — capture full serial output, not just the trace ring
+#### Step 1 — capture full serial output, not just the trace ring
 
 Add `M3OS_SMOKE_SERIAL_DUMP=/tmp/serial.log` to your audio-smoke
 invocation. The default smoke harness only prints the trace ring on
@@ -223,80 +340,56 @@ failure (last 256 events per core); the actual kernel serial output
 (audio_server's "recv failed", per-IRQ logs, scheduler diagnostics) is
 discarded. The wired-up env var lives in `xtask/src/main.rs:3680`.
 
-### Step 2 — instrument the spurious-wake path
+#### Step 2 — instrument the spurious-wake path
 
 Add a temporary log line at
-[`kernel/src/ipc/endpoint.rs:695`](../../kernel/src/ipc/endpoint.rs)
-just before the `debug_assert!(false, "[ipc] recv_msg_with_notif:
-spurious wake")`. Capture: receiver TaskId, ep_id, notif_id, the value
-returned by `block_current_on_notif_v2`, what the woken flag was at
-entry vs. exit, whether `unregister_recv_waiter` returned anything
-useful.
+`kernel/src/ipc/endpoint.rs:695` just before the
+`debug_assert!(false, "[ipc] recv_msg_with_notif: spurious wake")`.
+Capture: receiver TaskId, ep_id, notif_id, the value returned by
+`block_current_on_notif_v2`, what the woken flag was at entry vs.
+exit, whether `unregister_recv_waiter` returned anything useful.
 
-```rust
-log::warn!(
-    "[ipc] recv_msg_with_notif: spurious wake — task={:?} ep={:?} notif={:?} \
-     post-block bits={} pending_msg={}",
-    receiver, ep_id, notif_id, bits,
-    scheduler::has_pending_message(receiver),
-);
-```
-
-This will tell you whether the wake is coming from:
-- A real IRQ that drained too eagerly (bits would be 0 only after a
-  successful drain elsewhere)
-- A scheduler-side spurious wake (no IRQ fired but `woken` was true at
-  block entry)
-
-### Step 3 — verify with a unit test on `kernel-core`
+#### Step 3 — verify with a unit test on `kernel-core`
 
 `kernel-core/src/sched_model.rs` has the host-testable scheduler state
 machine. Add a test that drives `BlockedOnNotif × wake` with the
 condition (message + bits) both empty at the moment `block_current` is
-called. Should reproduce the symptom on the host without QEMU.
+called.
 
-### Step 4 — fix the race
+#### Step 4 — fix the race
 
-Two candidate strategies (the
-[2026-04-25 scheduler-design-comparison handoff](2026-04-25-scheduler-design-comparison.md)
-discusses both at length):
+Either a per-task spinlock around block/wake (Linux `pi_lock` model)
+or a single state-word + condition recheck (Linux `try_to_wake_up`).
+The 2026-04-25 doc recommends the second.
 
-- **Per-task spinlock around block/wake** (Linux `pi_lock` model). Smallest
-  fix; makes the block + condition-check + wake transition atomic.
-- **Single state-word + condition recheck after state write**
-  (Linux `try_to_wake_up`). Larger rewrite; closes the entire
-  lost-wake / spurious-wake bug class.
+#### Step 5 — backstop in audio_server
 
-The 2026-04-25 doc strongly recommends the second; the 2026-04-28
-handoff provides additional context on why intermediate fixes don't
-hold.
+See the "Backstop" item in the new plan above.
 
-### Step 5 — backstop in audio_server
+</details>
 
-Even after the kernel race is fixed, `audio_server` should not crash
-on the first recv error. The current bounded "exit 8 → init restart 3x"
-behavior is fine as a backstop, but consider adding a counter:
-tolerate up to N consecutive errors before exiting. Avoid the tight-
-loop pitfall (no allocation in the error branch; yield between
-retries). See the discussion in the body of `ada4f6a`'s commit message.
-
-## Files to read first (in this order)
+## Files to read first (in this order — for the AC'97 IRQ pipeline bug)
 
 1. **This document.**
-2. `kernel/src/ipc/endpoint.rs:560-700` — the `recv_msg_with_notif`
-   function that returns `u64::MAX` on the spurious-wake path.
-3. `kernel/src/task/scheduler.rs:3395-3414` — `block_current_on_notif_v2`,
-   the v2 blocking primitive recv_msg_with_notif depends on.
-4. `kernel/src/ipc/notification.rs` — `drain_bits`,
-   `register_recv_waiter`, `unregister_recv_waiter`, `signal_irq_bit`.
-5. `userspace/audio_server/src/irq.rs:191-260` — audio_server's
-   `run_io_loop`, the consumer that hits the race.
-6. `userspace/lib/driver_runtime/src/ipc/mod.rs:195-300` — the
-   `SyscallBackend::recv` / `recv_with_capacity` path; trace through
-   how `u64::MAX` from the syscall becomes a `DriverRuntimeError`.
-7. `docs/handoffs/2026-04-25-scheduler-design-comparison.md` —
-   discusses the same lost-wake bug class for the v1 scheduler;
-   recommendations apply directly.
+2. `userspace/audio_server/src/device.rs:120-260, 366-410, 700-870` —
+   AC'97 register definitions (`nabm` module), `init_controller`,
+   `open_pcm_out_stream`, `Ac97Backend::init`, and the trait impls
+   for `submit_frames` / `handle_irq` / `close_stream`.
+3. `userspace/audio_server/src/device.rs:474-534` —
+   `submit_frames_inner`: the hot path that copies PCM into the
+   DMA ring and mirrors BDL descriptors with `IOC=0x8000`.
+4. `userspace/audio_server/src/irq.rs:174-260` — `subscribe_and_bind`
+   and `run_io_loop` — what audio_server actually does on a wake.
+5. `kernel/src/syscall/device_host.rs:1468-1815` —
+   `sys_device_irq_subscribe`, vector allocation, `bind_irq_vector`,
+   `release_irq_bindings_for_pid`. This is where the legacy INTx
+   line gets wired into vector 0x62.
+6. `kernel/src/arch/x86_64/apic.rs` (`route_pci_irq`) and
+   `kernel/src/arch/x86_64/interrupts.rs` (the ISR shim that
+   calls `signal_irq_bit`).
+7. `kernel/src/ipc/notification.rs` (now updated by `f1573bd`) —
+   `signal_irq_bit`, the per-core `isr_wake_queue`, and the new
+   `bound_pending_bits_for_task` helper used by the f1573bd guard.
 
 ## Key constants and IDs (for triage)
 
@@ -329,10 +422,12 @@ retries). See the discussion in the body of `ada4f6a`'s commit message.
 
 - `cargo xtask audio-smoke` passes — `AUDIO_DEMO:PASS` sentinel is
   observed within the 30s timeout.
-- `cargo xtask run-gui` boots cleanly with no `audio_server: recv
-  failed` lines on serial; `audio_server` stays alive past 30s of idle.
+- `cargo xtask run-gui` boots cleanly; `audio_server` stays alive past
+  30s of idle (already true post-`f1573bd`).
 - `frames_consumed > 0` is observable via `audio-stats` from the
-  shell.
+  shell. **(Currently 0 — this is the open work.)**
 - The recorded WAV file (`target/audio-smoke/audio.wav`) has at least
   5% of samples with `|sample| > 100` (the existing audio-smoke
   acceptance criterion).
+- AC'97 IRQ vector 0x62 fires at least once per second of playback
+  (verifiable via the per-vector counter from "Step 2" of the new plan).
