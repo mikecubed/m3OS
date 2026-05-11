@@ -5138,18 +5138,27 @@ pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
 ///     idempotently; or (b) the waker already ran (Task::state == Ready)
 ///     and we skip.
 ///   - Spurious wakes (collecting a task whose deadline was just cleared) are
-///     harmless: `wake_task_v2`'s pi_lock CAS only succeeds for Blocked*; if
-///     the task already woke, we get `AlreadyAwake` (no-op).
-fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
+///     handled at the wake site by re-checking the deadline under
+///     `scheduler_lock` before invoking `wake_task_v2`. The previous comment
+///     here claimed `wake_task_v2`'s state CAS made spurious collections
+///     harmless — that was wrong when the task wakes naturally between
+///     collection and the wake call, then RE-blocks (e.g. `call_msg` enters
+///     `BlockedOnReply` with no deadline). The collect-then-wake race surfaced
+///     as the Phase 63 audio handoff's `reply_v2:deadline_expired_no_deadline`
+///     spurious-wake diagnostic (all 32 hits traced to `drive_expired_wake_deadlines`).
+fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([(TaskId, u64); 8], usize) {
     if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
-        return ([TaskId(0); 8], 0);
+        return ([(TaskId(0), 0); 8], 0);
     }
     let now = crate::arch::x86_64::interrupts::tick_count();
-    let mut expired: [TaskId; 8] = [TaskId(0); 8];
+    let mut expired: [(TaskId, u64); 8] = [(TaskId(0), 0); 8];
     let mut n = 0usize;
 
     for task in sched.tasks.iter() {
-        if task.wake_deadline.is_none_or(|d| d > now) {
+        let Some(deadline) = task.wake_deadline else {
+            continue;
+        };
+        if deadline > now {
             continue;
         }
         if !matches!(
@@ -5169,7 +5178,7 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
             continue;
         }
         if n < expired.len() {
-            expired[n] = task.id;
+            expired[n] = (task.id, deadline);
             n += 1;
         }
     }
@@ -5179,20 +5188,36 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
 
 /// Drive deadline expiry for all tasks whose `wake_deadline` has passed.
 ///
-/// Phase 1: collect candidate TaskIds under SCHEDULER.lock (no pi_lock touch).
-/// Phase 2: drop SCHEDULER.lock, then call `wake_task_v2` for each candidate —
-/// the canonical pi_lock-outer / scheduler_lock-inner wake path.
-///
-/// This replaces the previous `scan_expired_wake_deadlines` which violated
-/// the lock-ordering invariant by acquiring pi_lock while holding
-/// SCHEDULER.lock.
+/// Phase 1: collect candidate (TaskId, deadline) tuples under SCHEDULER.lock
+/// (no pi_lock touch).
+/// Phase 2: drop SCHEDULER.lock; for each candidate, RE-VALIDATE that the
+/// task's current `wake_deadline` still matches the collected value before
+/// invoking `wake_task_v2`. Closes the Phase 63 collect-then-wake race where
+/// a task could wake naturally between collection and our wake, re-block
+/// (e.g. as `BlockedOnReply` via `call_msg` with no deadline), and then be
+/// transitioned to Ready by our stale wake — the dominant
+/// `reply_v2:deadline_expired_no_deadline` shape in the spurious-wake
+/// diagnostic. A small remaining race exists between the re-validation
+/// `scheduler_lock` release and `wake_task_v2`'s `pi_lock` acquire, but the
+/// window is microseconds versus the milliseconds-scale window before this
+/// fix.
 fn drive_expired_wake_deadlines() {
     let (expired, n) = {
         let sched = scheduler_lock();
         collect_expired_wake_deadlines(&sched)
         // SCHEDULER.lock dropped here.
     };
-    for id in &expired[..n] {
+    for (id, expected_deadline) in &expired[..n] {
+        let still_valid = {
+            let sched = scheduler_lock();
+            sched
+                .find(*id)
+                .is_some_and(|idx| sched.tasks[idx].wake_deadline == Some(*expected_deadline))
+            // SCHEDULER.lock dropped here.
+        };
+        if !still_valid {
+            continue;
+        }
         // wake_task_v2 acquires pi_lock OUTER, then scheduler_lock INNER.
         // CAS only succeeds for Blocked*; spurious calls (state already
         // Ready) return AlreadyAwake and are no-ops.
