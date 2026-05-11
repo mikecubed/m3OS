@@ -246,17 +246,54 @@ pub fn run_io_loop(
                 // identifies clients by the message label (kernel-
                 // staged sender id); the rate-limited rejection log
                 // lives in `ClientRegistry::reject`.
+                //
+                // 2026-05-11 takeover fix: if an `Open` arrives from a
+                // client that isn't the current owner, treat it as
+                // the previous client having gone away (single-client
+                // server — a new IPC sender id means a fresh process,
+                // and the audio_server has no other way to learn of
+                // a crashed/aborted client). Close the lingering
+                // stream on the backend, force-release the slot, and
+                // admit the new client. Without this, an
+                // `audio-demo` invocation that died mid-`SubmitFrames`
+                // (e.g., the documented `Io(-32)` intermittency)
+                // leaves the registry pinned to the dead pid, and
+                // every subsequent run reports `Server:Busy` at the
+                // `Open` stage.
                 let client_id = frame.label as u32;
-                if !clients.try_admit(client_id) {
-                    let mut buf = [0u8; 16];
-                    let reply = ServerMessage::OpenError(AudioError::Busy);
-                    if let Ok(n) = reply.encode(&mut buf) {
-                        let _ = transport.store_reply_bulk(&buf[..n]);
-                    }
-                    let _ = transport.reply(frame.label, 0);
-                    continue;
-                }
                 let action = decode_message(&frame.bulk);
+                let is_open = matches!(
+                    action,
+                    IoAction::HandleMessage {
+                        msg: ClientMessage::Open { .. },
+                        ..
+                    }
+                );
+                if !clients.try_admit(client_id) {
+                    if is_open {
+                        if let Some(prev_owner) = clients.force_release() {
+                            // Best-effort cleanup of the previous
+                            // client's stream so the new opener gets a
+                            // fresh backend state. The close itself
+                            // may fail (e.g., stream already torn
+                            // down) — that's fine, the registry
+                            // release is what unblocks the admit.
+                            if let Some(s) = streams.open.as_ref() {
+                                let _ = streams.close(backend, s.stream_id);
+                            }
+                            let _ = prev_owner;
+                        }
+                        let _ = clients.try_admit(client_id);
+                    } else {
+                        let mut buf = [0u8; 16];
+                        let reply = ServerMessage::OpenError(AudioError::Busy);
+                        if let Ok(n) = reply.encode(&mut buf) {
+                            let _ = transport.store_reply_bulk(&buf[..n]);
+                        }
+                        let _ = transport.reply(frame.label, 0);
+                        continue;
+                    }
+                }
                 let outcome = match action {
                     IoAction::HandleMessage { msg, consumed } => match &msg {
                         // SubmitFrames carries its PCM payload as the

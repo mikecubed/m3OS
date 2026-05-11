@@ -84,6 +84,28 @@ impl ClientRegistry {
         }
     }
 
+    /// Force-release the slot regardless of current owner.
+    ///
+    /// Used by the io loop's `Open`-from-new-client takeover path: if
+    /// an `Open` arrives from a `client_id` that is not the current
+    /// owner, the previous owner is presumed gone (single-client
+    /// server semantics — only one audio-demo style client exists at
+    /// a time, and a fresh process has a new IPC sender id). The
+    /// caller is expected to also tear down the active stream on the
+    /// backend before admitting the new client.
+    ///
+    /// Returns the previous owner's id if the slot was occupied, so
+    /// the caller can attribute log lines and stream-close calls.
+    pub fn force_release(&mut self) -> Option<u32> {
+        match self.state {
+            ClientState::Idle => None,
+            ClientState::Owned { client_id } => {
+                self.state = ClientState::Idle;
+                Some(client_id)
+            }
+        }
+    }
+
     /// Release the slot.  Idempotent — calling `release` on an
     /// already-idle registry is a no-op so socket-disconnect paths
     /// can call it without first probing the state.  Releases by a
@@ -285,6 +307,28 @@ mod tests {
             reg.try_admit(i);
             reg.release(i);
         }
+        assert_eq!(reg.state(), ClientState::Idle);
+    }
+
+    #[test]
+    fn force_release_returns_previous_owner_and_idles_slot() {
+        // Takeover path: io loop calls force_release() when an `Open`
+        // arrives from a client that isn't the current owner (the
+        // previous client is presumed gone). The returned owner id is
+        // used for log attribution; the new admit must then succeed.
+        let mut reg = ClientRegistry::new();
+        reg.try_admit(42);
+        let prev = reg.force_release();
+        assert_eq!(prev, Some(42));
+        assert_eq!(reg.state(), ClientState::Idle);
+        assert!(reg.try_admit(99));
+        assert_eq!(reg.state(), ClientState::Owned { client_id: 99 });
+    }
+
+    #[test]
+    fn force_release_on_idle_returns_none() {
+        let mut reg = ClientRegistry::new();
+        assert_eq!(reg.force_release(), None);
         assert_eq!(reg.state(), ClientState::Idle);
     }
 
