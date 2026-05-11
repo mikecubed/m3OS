@@ -3370,6 +3370,38 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
 static SPURIOUS_BLOCK_WAKE_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(32);
 
+/// Phase 63 audio handoff follow-up — separate 32-hit boot budget for
+/// `wake_task_v2` callers waking `BlockedOnReply` tasks. Logs the file:line
+/// the wake originated from so the spurious-wake source the
+/// `reply_v2:deadline_expired_no_deadline` site flagged can be traced
+/// back to a specific kernel callsite.
+static WAKE_REPLY_DIAG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(32);
+
+fn log_wake_blocked_on_reply(
+    id: TaskId,
+    caller: &'static core::panic::Location<'static>,
+    has_pending: bool,
+) {
+    if WAKE_REPLY_DIAG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[sched] wake_task_v2 on BlockedOnReply: task={} caller={}:{} has_pending_msg={}",
+        id.0,
+        caller.file(),
+        caller.line(),
+        has_pending,
+    );
+}
+
 fn log_spurious_block_wake(
     caller: TaskId,
     site: &'static str,
@@ -3793,7 +3825,13 @@ pub enum WakeOutcome {
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
+#[track_caller]
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
+    // Phase 63 audio handoff follow-up — capture the caller location so we
+    // can log it when the CAS transitions BlockedOnReply → Ready. That
+    // identifies which kernel site is spuriously waking call_msg-blocked
+    // tasks (the dominant shape in `reply_v2:deadline_expired_no_deadline`).
+    let caller_loc = core::panic::Location::caller();
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
     // The Vec never shrinks; slots are Dead-recycled but the memory at
@@ -3909,6 +3947,23 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
             state_before: prev_state_u8,
             core: sched.tasks[idx].assigned_core,
         });
+
+        // Phase 63 audio handoff follow-up — log unpaired wakes of
+        // BlockedOnReply tasks. Almost every legitimate wake on a
+        // BlockedOnReply task is paired with `deliver_message` (which
+        // sets `pending_msg` and the `reply_waker` AtomicBool). If
+        // we wake a BlockedOnReply task without that pairing, the
+        // caller's `block_current_on_reply_v2` returns DeadlineExpired
+        // and `call_msg` sees `take_message → None` (the
+        // `call_msg:no_reply_message` IPC diag site). Logging the
+        // caller location of THIS function identifies which wake
+        // path is the culprit. The check runs after the CAS but
+        // still under both locks, so the prev_state observation is
+        // consistent with the transition we just performed.
+        if prev_state_u8 == TaskState::BlockedOnReply as u8 {
+            let has_pending = sched.tasks[idx].pending_msg.is_some();
+            log_wake_blocked_on_reply(id, caller_loc, has_pending);
+        }
 
         // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
         // for use after both locks drop.
