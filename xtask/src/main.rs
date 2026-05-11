@@ -246,7 +246,12 @@ fn main() {
                 std::process::exit(1);
             });
             let fresh = remaining.iter().any(|a| a == "--fresh");
-            cmd_run(fresh, devices);
+            // Phase 63 audio-fix: headless `run` mirrors `run-gui` —
+            // audio is on by default and `--no-audio` opts out. Without
+            // this, `audio_server` discovers no AC'97 device and falls
+            // back to silent stub mode (`consumed=0`).
+            let no_audio = remaining.iter().any(|a| a == "--no-audio");
+            cmd_run(fresh, devices, !no_audio);
         }
         Some("run-gui") => {
             let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
@@ -395,7 +400,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -2625,6 +2630,25 @@ fn qemu_run_gui_args_for_test(
     with_audio: bool,
 ) -> Vec<String> {
     let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Gui, devices);
+    if with_audio {
+        append_ac97_audio_flags_gui(&mut args);
+    }
+    args
+}
+
+/// Phase 63 audio-fix unit-test helper: mirror of
+/// [`qemu_run_gui_args_for_test`] for the headless `cmd_run` launcher
+/// so we can assert that `cargo xtask run` (default-on audio) emits
+/// the AC'97 device pair. Same audiodev probe path as `run-gui`; the
+/// `_gui` suffix on the helper is historical.
+#[cfg(test)]
+fn qemu_run_headless_args_for_test(
+    uefi_image: &Path,
+    ovmf: &Path,
+    devices: DeviceSet,
+    with_audio: bool,
+) -> Vec<String> {
+    let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
     if with_audio {
         append_ac97_audio_flags_gui(&mut args);
     }
@@ -8976,7 +9000,7 @@ fn cmd_clean() {
     }
 }
 
-fn cmd_run(fresh: bool, devices: DeviceSet) {
+fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -8995,7 +9019,7 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
         false,
         false,
     );
-    launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
+    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Headless, devices, with_audio);
 }
 
 fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
@@ -14590,6 +14614,50 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["-audiodev", "none,id=noaudio"]),
             "with-audio run-gui must keep `-audiodev none,id=noaudio` for the PC speaker"
+        );
+    }
+
+    #[test]
+    fn run_headless_with_audio_emits_ac97_device_flags() {
+        // Phase 63 audio-fix acceptance: headless `cargo xtask run` (default
+        // audio-on) emits an `-audiodev <driver>,id=snd0` pair followed by
+        // the shared AC97 device line, matching `run-gui`. Without this,
+        // `audio_server` parks in stub mode and `audio-demo` reports
+        // `consumed=0`.
+        let args = qemu_run_headless_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ true,
+        );
+        let audiodev_idx = args
+            .windows(2)
+            .position(|w| w[0] == "-audiodev" && w[1].ends_with(",id=snd0"))
+            .expect("run must emit `-audiodev <driver>,id=snd0` when audio is on");
+        let device_window = args[audiodev_idx + 2..].windows(2).position(|w| {
+            w[0] == AC97_QEMU_AUDIO_DEVICE_FLAGS[0] && w[1] == AC97_QEMU_AUDIO_DEVICE_FLAGS[1]
+        });
+        assert!(
+            device_window.is_some(),
+            "run must emit `{} {}` after the audiodev pair",
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[0],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[1],
+        );
+    }
+
+    #[test]
+    fn run_headless_without_audio_skips_ac97_flags() {
+        // `--no-audio` on headless `run` must skip the AC97 pair so the
+        // historical silent-headless behavior remains available.
+        let args = qemu_run_headless_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ false,
+        );
+        assert!(
+            !args.iter().any(|a| a == "AC97,audiodev=snd0,addr=0x5"),
+            "--no-audio run must NOT emit `AC97,audiodev=snd0,addr=0x5`"
         );
     }
 
