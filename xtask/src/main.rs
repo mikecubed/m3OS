@@ -2533,10 +2533,32 @@ fn gui_audiodev_flag() -> Vec<String> {
 }
 
 fn detect_gui_audio_driver() -> &'static str {
+    // Explicit operator override wins over auto-probe so a developer
+    // can bypass a misbehaving detector (e.g., a distro that puts the
+    // PulseAudio socket somewhere the default candidate list doesn't
+    // know about). Accepted values: any driver name QEMU reports under
+    // `-audiodev help` — typically `pipewire`, `pa`, `alsa`, `sdl`,
+    // `oss`, `coreaudio`, `dsound`, or `none`. We trust the override
+    // verbatim — if QEMU doesn't support the driver the launch will
+    // fail with a QEMU-side error, which is more diagnostic than a
+    // silent `none` fallback.
+    if let Some(driver) = std::env::var("M3OS_AUDIODEV")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        println!(
+            "audio: M3OS_AUDIODEV={driver} — bypassing auto-probe and emitting `-audiodev {driver},id=snd0`"
+        );
+        // Leak to satisfy the &'static str signature; this function is
+        // called once per launch so the leak is bounded.
+        return Box::leak(driver.into_boxed_str());
+    }
+
     if !cfg!(target_os = "linux") {
         println!(
             "audio: PipeWire/PulseAudio probing is only supported on Linux hosts; \
-             falling back to `-audiodev none,id=snd0` (no audible output)"
+             falling back to `-audiodev none,id=snd0` (no audible output). \
+             Set M3OS_AUDIODEV=<driver> to override."
         );
         return "none";
     }
@@ -2546,7 +2568,8 @@ fn detect_gui_audio_driver() -> &'static str {
         _ => {
             println!(
                 "audio: $XDG_RUNTIME_DIR is unset, cannot probe for PipeWire/PulseAudio sockets; \
-                 falling back to `-audiodev none,id=snd0` (no audible output)"
+                 falling back to `-audiodev none,id=snd0` (no audible output). \
+                 Set M3OS_AUDIODEV=<driver> to override."
             );
             return "none";
         }
@@ -2556,20 +2579,72 @@ fn detect_gui_audio_driver() -> &'static str {
 
     // Order matters: prefer PipeWire's native QEMU backend (no pulse shim
     // required), then fall back to PulseAudio, finally to silent `none`.
-    let candidates: &[(&str, &str)] = &[("pipewire", "pipewire-0"), ("pa", "pulse/native")];
+    //
+    // Multiple candidate socket paths per driver because distros vary:
+    // - Stock PipeWire creates `$XDG_RUNTIME_DIR/pipewire-0`, but session
+    //   managers can produce `pipewire-1` / `pipewire-2` when several
+    //   instances coexist.
+    // - PulseAudio's native socket is `pulse/native` on most distros;
+    //   pipewire-pulse drops it at the same path.
+    let candidates: &[(&str, &[&str])] = &[
+        ("pipewire", &["pipewire-0", "pipewire-1", "pipewire-2"]),
+        ("pa", &["pulse/native", "pulse/cli"]),
+    ];
 
-    for (driver, socket_rel) in candidates {
-        let socket_path = runtime_dir.join(socket_rel);
-        if supported.iter().any(|s| s == driver) && socket_path.exists() {
-            return driver;
+    let mut driver_unsupported: Vec<&str> = Vec::new();
+    for (driver, socket_rels) in candidates {
+        if !supported.iter().any(|s| s == driver) {
+            driver_unsupported.push(driver);
+            continue;
+        }
+        for rel in *socket_rels {
+            let socket_path = runtime_dir.join(rel);
+            if socket_path.exists() {
+                return driver;
+            }
         }
     }
 
+    // Diagnostic: nothing matched. Print what we know so the developer
+    // can decide whether to start a daemon, install a shim, or set
+    // M3OS_AUDIODEV explicitly.
+    let supported_summary = if supported.is_empty() {
+        String::from("(none — `qemu-system-x86_64 -audiodev help` returned no drivers)")
+    } else {
+        supported.join(", ")
+    };
+    let unsupported_summary = if driver_unsupported.is_empty() {
+        String::from("(QEMU has both pipewire and pa backends compiled in)")
+    } else {
+        format!(
+            "QEMU lacks: {} — rebuild QEMU with --enable-{}",
+            driver_unsupported.join(", "),
+            driver_unsupported.join(",--enable-"),
+        )
+    };
+    let runtime_entries = match std::fs::read_dir(&runtime_dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                String::from("(empty)")
+            } else {
+                names.join(", ")
+            }
+        }
+        Err(err) => format!("(cannot read directory: {err})"),
+    };
     println!(
-        "audio: no reachable PipeWire or PulseAudio socket found in {runtime}; \
-         falling back to `-audiodev none,id=snd0`. AC'97 frames will be discarded \
-         (not audible). Install `pipewire-pulse` or start `pulseaudio` for audible output, \
-         or pass `--no-audio` to silence this probe.",
+        "audio: no reachable PipeWire or PulseAudio socket found in {runtime}.\n\
+         audio:   QEMU drivers supported: {supported_summary}\n\
+         audio:   {unsupported_summary}\n\
+         audio:   {runtime} contents: {runtime_entries}\n\
+         audio: falling back to `-audiodev none,id=snd0` (AC'97 frames will be \
+         discarded; no audible output). Pass `--no-audio` to silence this probe, \
+         or set `M3OS_AUDIODEV=<driver>` (e.g. `M3OS_AUDIODEV=pa`) to override.",
         runtime = runtime_dir.display(),
     );
     "none"
