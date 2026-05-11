@@ -3948,31 +3948,32 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
             core: sched.tasks[idx].assigned_core,
         });
 
-        // Phase 63 audio handoff follow-up — log unpaired wakes of
-        // BlockedOnReply tasks. Almost every legitimate wake on a
-        // BlockedOnReply task is paired with `deliver_message` (which
-        // sets `pending_msg` and the `reply_waker` AtomicBool). If
-        // we wake a BlockedOnReply task without that pairing, the
-        // caller's `block_current_on_reply_v2` returns DeadlineExpired
-        // and `call_msg` sees `take_message → None` (the
-        // `call_msg:no_reply_message` IPC diag site). Logging the
-        // caller location of THIS function identifies which wake
-        // path is the culprit. The check runs after the CAS but
-        // still under both locks, so the prev_state observation is
-        // consistent with the transition we just performed.
-        if prev_state_u8 == TaskState::BlockedOnReply as u8 {
-            let has_pending = sched.tasks[idx].pending_msg.is_some();
-            log_wake_blocked_on_reply(id, caller_loc, has_pending);
-        }
+        // Phase 63 audio handoff follow-up — CAPTURE diagnostic state
+        // here (cheap reads) but DEFER the log call until after both
+        // locks drop. `log::warn!` invoked while holding `pi_lock` +
+        // `scheduler_lock` deadlocks against logger / serial paths
+        // that may also want one of those locks.
+        let log_blocked_on_reply = prev_state_u8 == TaskState::BlockedOnReply as u8;
+        let had_pending = if log_blocked_on_reply {
+            sched.tasks[idx].pending_msg.is_some()
+        } else {
+            false
+        };
 
         // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
         // for use after both locks drop.
         let assigned: u8 = sched.tasks[idx].assigned_core;
         let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        (assigned, on_cpu_ptr)
+        (assigned, on_cpu_ptr, log_blocked_on_reply, had_pending)
         // SCHEDULER.lock released, then pi_lock released.
     };
-    let (assigned_core, on_cpu_ptr) = post_lock;
+    let (assigned_core, on_cpu_ptr, log_blocked_on_reply, had_pending) = post_lock;
+
+    // Phase 63 audio handoff follow-up — emit the deferred BlockedOnReply
+    // wake diag now that both `pi_lock` and `scheduler_lock` are released.
+    if log_blocked_on_reply {
+        log_wake_blocked_on_reply(id, caller_loc, had_pending);
+    }
 
     // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
     //
