@@ -659,6 +659,20 @@ pub(super) fn lookup_bound_notif(task_sched_idx: usize) -> Option<NotifId> {
     }
 }
 
+/// Return the pending bits for the notification bound to a scheduler task slot.
+///
+/// This is used by the scheduler's ISR-wake drain to distinguish a real
+/// bound-notification wake from a stale queued wake token whose bits were
+/// already consumed by `recv_msg_with_notif`'s fast path.
+pub(crate) fn bound_pending_bits_for_task(task_sched_idx: usize) -> Option<u64> {
+    let notif_id = lookup_bound_notif(task_sched_idx)?;
+    let idx = notif_id.0 as usize;
+    if idx >= MAX_NOTIFS {
+        return Some(0);
+    }
+    Some(PENDING[idx].load(Ordering::Acquire))
+}
+
 /// Atomically drain pending bits from a notification.
 ///
 /// Returns the bits that were pending (0 if none). ISR-safe.

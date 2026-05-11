@@ -4253,10 +4253,25 @@ pub fn run() -> ! {
         if let Some(data) = crate::smp::get_core_data(core_id) {
             for task_idx in data.isr_wake_queue.drain() {
                 // Look up the TaskId for this idx (briefly under scheduler_lock).
+                // Bound notifications may leave a stale ISR wake token behind
+                // after recv_msg_with_notif's fast path has already consumed
+                // the pending bits. Do not turn that stale token into a wake.
                 let task_id = {
                     let sched = scheduler_lock();
                     if task_idx < sched.tasks.len() {
-                        Some(sched.tasks[task_idx].id)
+                        let task = &sched.tasks[task_idx];
+                        let stale_bound_notif_wake =
+                            matches!(task.state, TaskState::BlockedOnNotif)
+                                && task.pending_msg.is_none()
+                                && matches!(
+                                    crate::ipc::notification::bound_pending_bits_for_task(task_idx),
+                                    Some(0)
+                                );
+                        if stale_bound_notif_wake {
+                            None
+                        } else {
+                            Some(task.id)
+                        }
                     } else {
                         None
                     }
