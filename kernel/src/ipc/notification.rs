@@ -659,6 +659,17 @@ pub(super) fn lookup_bound_notif(task_sched_idx: usize) -> Option<NotifId> {
     }
 }
 
+/// Whether the scheduler task slot has a notification bound to it.
+///
+/// Lock-free read of `TCB_BOUND_NOTIF` — the same source `recv_msg_with_notif`
+/// consults to opt into the message-or-notification fast path. The stuck-task
+/// watchdog uses this to suppress its "no waker registered" verdict for tasks
+/// parked in `BlockedOnNotif` via `recv_msg_with_notif`, whose wake source is
+/// the bound notification rather than a `wake_deadline`.
+pub(crate) fn task_has_bound_notif(task_sched_idx: usize) -> bool {
+    lookup_bound_notif(task_sched_idx).is_some()
+}
+
 /// Return the pending bits for the notification bound to a scheduler task slot.
 ///
 /// This is used by the scheduler's ISR-wake drain to distinguish a real

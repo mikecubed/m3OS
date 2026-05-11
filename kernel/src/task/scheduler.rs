@@ -5538,6 +5538,23 @@ pub fn watchdog_scan() {
             if task.state == super::TaskState::BlockedOnRecv && task.wake_deadline.is_none() {
                 continue;
             }
+            // Phase 63 audio handoff follow-up — `recv_msg_with_notif`'s
+            // `BlockedOnNotif` is a legitimate "wake from endpoint OR bound
+            // notification" wait whose wake source is the bound-notification
+            // table, not a deadline. Skip the stuck-no-waker verdict when the
+            // task holds a live `BoundNotification` subscription. Without
+            // this, an idle `audio_server` (or any IRQ-bound ring-3 driver
+            // parked in its serve loop) trips the watchdog at 30 s and dumps
+            // a misleading trace ring. Warnings still fire for tasks parked
+            // in `BlockedOnNotif` *without* a bound notification (e.g. a
+            // `notify_wait` whose signaler was lost) or with an expired
+            // `wake_deadline`.
+            if task.state == super::TaskState::BlockedOnNotif
+                && task.wake_deadline.is_none()
+                && crate::ipc::notification::task_has_bound_notif(idx)
+            {
+                continue;
+            }
             let verdict = watchdog_verdict(now, task.blocked_since_tick, task.wake_deadline);
             if verdict != WatchdogVerdict::Ok && n_warn < warnings.len() {
                 warnings[n_warn] = (
