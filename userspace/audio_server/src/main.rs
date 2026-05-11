@@ -162,7 +162,7 @@ fn run_stub_loop(endpoint: EndpointCap) -> i32 {
     use driver_runtime::ipc::{IpcBackend, RecvResult};
     use kernel_core::audio::{AudioError, ClientMessage, ServerMessage};
 
-    let mut transport = driver_runtime::ipc::SyscallBackend;
+    let mut transport = driver_runtime::ipc::SyscallBackend::new();
     loop {
         let result = match transport.recv(endpoint) {
             Ok(r) => r,

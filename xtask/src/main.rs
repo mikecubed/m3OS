@@ -6098,7 +6098,7 @@ fn parse_smoke_boot_args(name: &str, args: &[String]) -> Result<SmokeBootArgs, S
 /// bind, IPC service registration) which is observable but adds boot
 /// time and noise; the conf-loaded check is fast and deterministic.
 fn audio_smoke_steps() -> Vec<SmokeStep> {
-    vec![
+    let mut steps = vec![
         SmokeStep::Wait {
             pattern: "[m3os] Hello from kernel",
             timeout_secs: 30,
@@ -6109,33 +6109,44 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 90,
             label: "guest/audio: init loaded audio_server.conf",
         },
-        // D.1: invoke the audio-demo reference client via init's shell.
-        SmokeStep::Send {
-            input: "audio-demo\n",
-            label: "guest/audio: launch audio-demo",
-        },
-        // D.1: wait for the PASS sentinel, but also intercept FAIL immediately.
-        // 30 s covers the 1-second tone plus codec initialisation latency
-        // inside QEMU TCG. On `AUDIO_DEMO:FAIL stage=...` the harness exits
-        // with SMOKE_EXIT_AUDIO_DEMO_FAILED and surfaces the failing stage.
-        SmokeStep::WaitPassOrFail {
-            pass_pattern: "AUDIO_DEMO:PASS",
-            fail_prefix: "AUDIO_DEMO:FAIL stage=",
-            timeout_secs: 30,
-            label: "guest/audio: audio-demo PASS sentinel",
-            exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
-        },
-        // D.2: wait for the stats line and assert frames_consumed > 0.
-        // `bad_substring` catches `consumed=0 ` (trailing space before
-        // `underruns=`) — a zero-consumed count proves the DMA engine
-        // never advanced the BDL, which is the regression Track A.2 guards.
-        SmokeStep::WaitLineNotMatching {
-            pattern: "AUDIO_DEMO:stats consumed=",
-            bad_substring: "consumed=0 ",
-            timeout_secs: 5,
-            label: "guest/audio: frames_consumed non-zero",
-        },
-    ]
+    ];
+    // 2026-05-11 follow-up: the previous step list sent `audio-demo\n`
+    // immediately after the audio_server-loaded marker — well before the
+    // serial console reached a logged-in shell. The keystrokes hit
+    // `m3OS login:` and were rejected ("Login incorrect"), so audio-demo
+    // never ran and `audio_server` parked in `BlockedOnNotif` waiting for
+    // an IPC client that never connected. Use the shared boot+login
+    // prefix so the command lands at the post-login `sh0` prompt the way
+    // every other regression smoke does.
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // D.1: invoke the audio-demo reference client from the logged-in shell.
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/audio: launch audio-demo",
+    });
+    // D.1: wait for the PASS sentinel, but also intercept FAIL immediately.
+    // 30 s covers the 1-second tone plus codec initialisation latency
+    // inside QEMU TCG. On `AUDIO_DEMO:FAIL stage=...` the harness exits
+    // with SMOKE_EXIT_AUDIO_DEMO_FAILED and surfaces the failing stage.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/audio: audio-demo PASS sentinel",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    // D.2: wait for the stats line and assert frames_consumed > 0.
+    // `bad_substring` catches `consumed=0 ` (trailing space before
+    // `underruns=`) — a zero-consumed count proves the DMA engine
+    // never advanced the BDL, which is the regression Track A.2 guards.
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/audio: frames_consumed non-zero",
+    });
+    steps
 }
 
 /// Build the QEMU arg vector for the audio smoke.

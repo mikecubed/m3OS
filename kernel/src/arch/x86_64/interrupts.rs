@@ -2084,6 +2084,26 @@ pub enum DeviceIrqKind {
 static DEVICE_IRQ_TABLE: Mutex<[Option<DeviceIrqEntry>; DEVICE_IRQ_VECTOR_COUNT as usize]> =
     Mutex::new([const { None }; DEVICE_IRQ_VECTOR_COUNT as usize]);
 
+/// Per-vector hit counter for the device-IRQ bank. Incremented on every
+/// dispatch (whether a handler is registered or not) so external observers
+/// can confirm the kernel is receiving an IRQ for a given vector.
+///
+/// Read-only via [`device_irq_hits`]; resets only on boot. Lock-free
+/// `AtomicU64` so the ISR shim never contends with read paths.
+static DEVICE_IRQ_HITS: [core::sync::atomic::AtomicU64; DEVICE_IRQ_VECTOR_COUNT as usize] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DEVICE_IRQ_VECTOR_COUNT as usize];
+
+/// Read the hit count for `vector` (offset from [`DEVICE_IRQ_VECTOR_BASE`]).
+/// Returns `0` for vectors outside the bank.
+pub fn device_irq_hits(vector: u8) -> u64 {
+    if !(DEVICE_IRQ_VECTOR_BASE..DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT).contains(&vector)
+    {
+        return 0;
+    }
+    let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    DEVICE_IRQ_HITS[idx].load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Install `entry` at `vector`. Returns `Err` if the vector is outside the
 /// device-IRQ bank or already occupied.
 ///
@@ -2154,6 +2174,7 @@ pub fn unregister_device_irq(vector: u8) {
 #[inline(always)]
 fn dispatch_device_irq(vector: u8, stack_frame: &InterruptStackFrame) {
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    DEVICE_IRQ_HITS[idx].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let snapshot: Option<(fn(), DeviceIrqKind)> = {
         let tbl = DEVICE_IRQ_TABLE.lock();
         tbl[idx].as_ref().map(|e| (e.handler, e.kind))

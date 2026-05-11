@@ -141,7 +141,6 @@ fn program_main(_args: &[&str]) -> i32 {
             return 6;
         }
     };
-    log_stats(stats);
 
     if let Err(err) = client.close() {
         log_error("close", err);
@@ -149,6 +148,11 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:closed\n");
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:PASS\n");
+    // Emit the stats sentinel AFTER PASS so the smoke harness's
+    // post-PASS `WaitLineNotMatching` step still finds it in the
+    // serial buffer — the PASS-step drain otherwise consumes
+    // everything up to and including PASS.
+    log_stats(stats);
     0
 }
 
@@ -168,14 +172,22 @@ fn submit_tone(
     let mut phase: u32 = 0;
 
     let total_frames = (SAMPLE_RATE_HZ * DURATION_S) as usize;
-    // Round chunk size down to a stereo-frame boundary so we never
-    // split a frame across submits.
-    let max_chunk_frames = MAX_SUBMIT_BYTES / STEREO_FRAME_BYTES;
+    // Cap the per-call chunk size to roughly half the AC'97 backend's
+    // BDL ring (16 KiB / 2 = 8 KiB) so a fresh submit always fits even
+    // when the controller is mid-playing a previous chunk. A full
+    // 16 KiB submit would require all 32 ring slots to be free, but
+    // `observe_irq` leaves the slot at the current CIV in-flight,
+    // which produces a permanent 1-slot deficit and a `WouldBlock`
+    // loop for the smoke harness's second submit. Round down to a
+    // stereo-frame boundary so we never split a frame across submits.
+    const SUBMIT_CHUNK_BYTES: usize = 8 * 1024;
+    let max_chunk_frames = SUBMIT_CHUNK_BYTES / STEREO_FRAME_BYTES;
     let mut frames_remaining = total_frames;
 
     // One stack-allocated scratch buffer, reused across chunks. Sized
-    // to MAX_SUBMIT_BYTES so the largest chunk fits.
-    let mut chunk = [0u8; MAX_SUBMIT_BYTES];
+    // to the per-call cap so the largest chunk fits without overflowing
+    // the user stack.
+    let mut chunk = [0u8; SUBMIT_CHUNK_BYTES];
 
     while frames_remaining > 0 {
         let frames_this_chunk = core::cmp::min(frames_remaining, max_chunk_frames);
@@ -193,7 +205,32 @@ fn submit_tone(
             chunk[off + 3] = bytes[1];
         }
 
-        let written = client.submit_frames(&chunk[..chunk_bytes])?;
+        // Retry on `WouldBlock` (server-side AC'97 BDL ring full). The
+        // ring drains as the controller consumes buffers; sleeping ~5 ms
+        // between attempts gives QEMU's bus-master timer time to make
+        // progress without burning a tight CPU loop. Cap retries so a
+        // genuinely stalled controller surfaces as an error instead of
+        // wedging the demo.
+        let mut written = 0usize;
+        let mut retries = 0usize;
+        loop {
+            match client.submit_frames(&chunk[..chunk_bytes]) {
+                Ok(n) => {
+                    written = n;
+                    break;
+                }
+                Err(AudioClientError::Server(kernel_core::audio::AudioError::WouldBlock)) => {
+                    if retries >= 200 {
+                        return Err(AudioClientError::Server(
+                            kernel_core::audio::AudioError::WouldBlock,
+                        ));
+                    }
+                    retries += 1;
+                    syscall_lib::nanosleep_for(0, 5_000_000);
+                }
+                Err(other) => return Err(other),
+            }
+        }
         if written != chunk_bytes {
             // Partial accept is not part of the Phase 57 contract;
             // surface as a `Protocol(Truncated)` so the operator
@@ -339,11 +376,27 @@ fn write_u32(n: u32) {
 // ---------------------------------------------------------------------------
 
 fn log_error(stage: &str, err: AudioClientError) {
-    syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:FAIL stage=");
-    syscall_lib::write_str(STDOUT_FILENO, stage);
-    syscall_lib::write_str(STDOUT_FILENO, " variant=");
-    syscall_lib::write_str(STDOUT_FILENO, error_label(err));
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
+    // Assemble the FAIL line in a stack buffer and emit it in one write
+    // so the smoke harness — which fires on the `AUDIO_DEMO:FAIL stage=`
+    // prefix — captures the variant suffix instead of a torn line.
+    let mut buf = [0u8; 128];
+    let mut len = 0;
+    let parts: [&[u8]; 5] = [
+        b"AUDIO_DEMO:FAIL stage=",
+        stage.as_bytes(),
+        b" variant=",
+        error_label(err).as_bytes(),
+        b"\n",
+    ];
+    for part in parts {
+        let take = part.len().min(buf.len() - len);
+        buf[len..len + take].copy_from_slice(&part[..take]);
+        len += take;
+        if len == buf.len() {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(STDOUT_FILENO, &buf[..len]);
 }
 
 fn error_label(err: AudioClientError) -> &'static str {

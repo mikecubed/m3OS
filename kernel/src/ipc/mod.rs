@@ -641,19 +641,21 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
 
 /// Maximum bulk-data payload accepted by `ipc_send_buf` / `ipc_call_buf`.
 ///
-/// Sized at 16 4 KiB pages so high-bandwidth pixel-upload paths
+/// Sized at 20 4 KiB pages so high-bandwidth pixel-upload paths
 /// (`term` → `display_server` chunked surface buffers) hit the kernel
-/// IPC primitive in ~16 roundtrips per 1 MiB frame instead of ~252.
+/// IPC primitive in ~16 roundtrips per 1 MiB frame instead of ~252,
+/// and the audio path can ship a full `MAX_SUBMIT_BYTES` (64 KiB)
+/// PCM payload alongside its 16 B request frame in one `ipc_call_buf`.
 /// The kernel allocates `len` bytes on demand per `ipc_send_with_bulk`,
 /// not `MAX_BULK_LEN`, so small protocol verbs still cost ~tens of bytes
 /// each — this bump only changes the ceiling, not the per-call alloc.
 /// Raising it further is safe in principle but consumers'
 /// `bulk_buf: Vec<u8>` reservations need to track in lockstep
 /// (`display_server::client::MAX_BULK_BYTES`,
-/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`). 65536 picks
-/// a comfortable round-binary headroom over the 1 MiB / 16 = 64 KiB
-/// per-chunk upper bound a Phase 56 surface ever wants to send.
-const MAX_BULK_LEN: usize = 65536;
+/// `kernel_core::display::protocol::MAX_FRAME_BODY_LEN`). 81920 leaves
+/// 16 KiB headroom over the 64 KiB PCM submit payload so future
+/// driver protocols can grow without re-bumping this constant.
+const MAX_BULK_LEN: usize = 81920;
 
 /// Send (or call) with an attached bulk-data buffer.
 ///

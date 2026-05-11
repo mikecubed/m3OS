@@ -33,17 +33,24 @@ use driver_runtime::{
 pub enum IoAction {
     /// Notification wake — call `backend.handle_irq()` and ack the bits.
     HandleIrq { bits: u64 },
-    /// Decoded protocol message — dispatch via the codec.
-    HandleMessage { msg: ClientMessage },
+    /// Decoded protocol message. `consumed` is the number of bytes the
+    /// decoder used; trailing bytes in the same bulk buffer carry any
+    /// out-of-band payload (e.g. PCM data for `SubmitFrames`).
+    HandleMessage { msg: ClientMessage, consumed: usize },
     /// Decode error — log and reply with `OpenError`/`SubmitError`.
     DecodeError { err: ProtocolError },
 }
 
 /// Translate a raw `bulk` payload into an [`IoAction::HandleMessage`]
 /// or `IoAction::DecodeError`. Pure logic, exercised on the host.
+///
+/// The decoded `consumed` byte count is carried on the
+/// `HandleMessage` variant so the io loop can locate the trailing
+/// payload that rides the same bulk buffer (currently used by
+/// `SubmitFrames` to find its PCM bytes).
 pub fn decode_message(bulk: &[u8]) -> IoAction {
     match ClientMessage::decode(bulk) {
-        Ok((msg, _consumed)) => IoAction::HandleMessage { msg },
+        Ok((msg, consumed)) => IoAction::HandleMessage { msg, consumed },
         Err(err) => IoAction::DecodeError { err },
     }
 }
@@ -210,7 +217,7 @@ pub fn run_io_loop(
     // with comfortable margin for ABI evolution.
     const AUDIO_RECV_CAP: usize = MAX_SUBMIT_BYTES + 256;
 
-    let mut transport = driver_runtime::ipc::SyscallBackend;
+    let mut transport = driver_runtime::ipc::SyscallBackend::new();
     loop {
         let result = match transport.recv_with_capacity(endpoint, AUDIO_RECV_CAP) {
             Ok(r) => r,
@@ -251,7 +258,37 @@ pub fn run_io_loop(
                 }
                 let action = decode_message(&frame.bulk);
                 let outcome = match action {
-                    IoAction::HandleMessage { msg } => dispatch_message(&msg, streams, backend),
+                    IoAction::HandleMessage { msg, consumed } => match &msg {
+                        // SubmitFrames carries its PCM payload as the
+                        // bytes immediately after the encoded frame
+                        // header in the same bulk buffer. Extract that
+                        // slice and run it through `streams.submit` so
+                        // the backend actually programs the BDL —
+                        // `dispatch_message` cannot see `frame.bulk` and
+                        // would otherwise return `SubmitAck` without
+                        // touching the hardware (the original Phase 57
+                        // D.1 stub that left `frames_consumed` pinned
+                        // at `0` and the AC'97 IRQ silent).
+                        ClientMessage::SubmitFrames { len } => {
+                            let pcm_len = *len as usize;
+                            if streams.open.is_none() {
+                                DispatchOutcome::SubmitError(AudioError::InvalidArgument)
+                            } else if consumed.saturating_add(pcm_len) > frame.bulk.len() {
+                                DispatchOutcome::SubmitError(AudioError::Internal)
+                            } else {
+                                let stream_id =
+                                    streams.open.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                                let pcm = &frame.bulk[consumed..consumed + pcm_len];
+                                match streams.submit(backend, stream_id, pcm) {
+                                    Ok(_) => DispatchOutcome::SubmitAck {
+                                        frames_consumed: streams.stats().frames_consumed,
+                                    },
+                                    Err(e) => DispatchOutcome::SubmitError(e),
+                                }
+                            }
+                        }
+                        _ => dispatch_message(&msg, streams, backend),
+                    },
                     IoAction::DecodeError { .. } => {
                         DispatchOutcome::OpenError(AudioError::InvalidArgument)
                     }
@@ -260,6 +297,19 @@ pub fn run_io_loop(
                         continue;
                     }
                 };
+                // Sync the StreamRegistry's `frames_consumed` from the
+                // backend before any reply that includes stats. The
+                // backend's IRQ-side state (or, under `-audiodev wav`,
+                // its CIV-poll fallback inside `submit_frames`) is
+                // authoritative; the StreamRegistry only mirrors the
+                // count for the reply path. Without this sync the
+                // `GetStats` reply would forever report `0` because
+                // `record_consumed` is never called from this loop.
+                let device_consumed = backend.poll_frames_consumed();
+                let mirrored = streams.stats().frames_consumed;
+                if device_consumed > mirrored {
+                    streams.record_consumed(device_consumed - mirrored);
+                }
                 let server_msg = encode_outcome(&outcome, streams);
                 let mut buf = [0u8; 64];
                 if let Ok(n) = server_msg.encode(&mut buf) {
@@ -472,8 +522,12 @@ mod tests {
         let n = msg.encode(&mut buf).expect("encode");
         let action = decode_message(&buf[..n]);
         match action {
-            IoAction::HandleMessage { msg: decoded } => {
+            IoAction::HandleMessage {
+                msg: decoded,
+                consumed,
+            } => {
                 assert_eq!(decoded, ClientMessage::Drain);
+                assert_eq!(consumed, n);
             }
             other => panic!("unexpected action: {:?}", other),
         }

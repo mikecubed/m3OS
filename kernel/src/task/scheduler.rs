@@ -4333,6 +4333,16 @@ pub fn run() -> ! {
             crate::trace::dump_trace_rings_recent(256);
             #[cfg(feature = "sched-trace")]
             crate::task::sched_trace::dump_sched_trace_rings();
+            // Per-vector device IRQ counters — non-zero entries point to a
+            // wake-side or notification-routing bug; all-zero entries point
+            // to a device-programming or QEMU-emulation issue.
+            for v in 0..crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT {
+                let vector = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + v;
+                let hits = crate::arch::x86_64::interrupts::device_irq_hits(vector);
+                if hits != 0 {
+                    log::warn!("[sched] device IRQ vector {:#x} hits={}", vector, hits);
+                }
+            }
         }
 
         // Before picking next, wake any tasks whose `wake_deadline` has

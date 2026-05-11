@@ -90,6 +90,19 @@ pub trait AudioBackend {
     /// once per `RecvResult::Notification`; the io loop uses the
     /// result to fan out to the stream registry and the stats verb.
     fn handle_irq(&mut self) -> Result<IrqEvent, AudioError>;
+
+    /// Snapshot the device-side `frames_consumed` counter.
+    ///
+    /// Polls the controller for any newly-completed buffers (bringing
+    /// the internal `tail` cursor up to the hardware's `CIV`) and
+    /// returns the resulting `frames_consumed` value. Acts as the
+    /// non-IRQ stats path for backends like QEMU's `-audiodev wav`,
+    /// which advances the bus-master timer but never raises IOC.
+    /// Default implementation returns `0` so test doubles compile
+    /// unchanged.
+    fn poll_frames_consumed(&mut self) -> u64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +793,29 @@ impl Ac97Backend {
             underrun_count: self.logic.underrun_count(),
         }
     }
+
+    /// Poll the controller's `CIV` register and advance internal
+    /// completion state to match. Acts as the non-IRQ fallback for
+    /// QEMU's `-audiodev wav` backend, which does not deliver IOC
+    /// IRQs even though the bus master continues to fetch buffers
+    /// (CIV / PICB advance on a timer). Without this, `tail` and
+    /// `frames_consumed` stay pinned at the IRQ-side baseline and
+    /// `submit_frames` deadlocks on `WouldBlock` after the first
+    /// 16 KiB chunk fills the BDL ring.
+    ///
+    /// Returns the number of completed buffers folded in; `0` means
+    /// nothing changed since the last poll. Idempotent.
+    pub fn poll_completed_buffers(&mut self) -> usize {
+        let civ = self.bus.read_u8(BAR_NABM, nabm::PCM_OUT_BASE + nabm::CIV);
+        let tail_before = self.logic.tail;
+        // `observe_irq` advances `tail` from its current value up to
+        // `civ`, accumulating each retired buffer's `samples` into
+        // `frames_consumed`. Pass `sr=0` so no spurious IRQ event is
+        // synthesised; the function is pure state-machine logic and
+        // doesn't itself touch hardware.
+        self.logic.observe_irq(0, civ);
+        self.logic.tail.wrapping_sub(tail_before) as usize
+    }
 }
 
 #[cfg(not(test))]
@@ -814,6 +850,12 @@ impl AudioBackend for Ac97Backend {
         if stream_id != Self::PCM_OUT_STREAM_ID || !self.stream_open {
             return Err(AudioError::InvalidArgument);
         }
+        // Free any buffers the hardware has already consumed but not
+        // yet acknowledged via IRQ (QEMU's `-audiodev wav` advances CIV
+        // on a timer without firing IOC). Without this, `tail` stays
+        // pinned and `submit_frames_inner` returns `WouldBlock` after
+        // the first ring-full chunk.
+        self.poll_completed_buffers();
         // Delegate to the pure helper so the ring-copy logic is host-testable.
         // Capture IOVAs before the mutable borrows to satisfy the borrow checker.
         // `pcm_ring`, `bdl`, and `logic` are disjoint fields, so three simultaneous
@@ -849,6 +891,11 @@ impl AudioBackend for Ac97Backend {
         close_pcm_out_stream(&self.bus)?;
         self.stream_open = false;
         Ok(())
+    }
+
+    fn poll_frames_consumed(&mut self) -> u64 {
+        self.poll_completed_buffers();
+        self.logic.frames_consumed()
     }
 
     fn handle_irq(&mut self) -> Result<IrqEvent, AudioError> {

@@ -120,6 +120,18 @@ pub struct RecvFrame {
     /// protocols (all state rides in the bulk buffer), but surfaced
     /// anyway so future protocols can piggyback on the same backend.
     pub data0: u64,
+    /// Reply-capability handle the kernel staged in `msg.data[3]` for
+    /// `call`-shaped messages. `0` means the sender used `send` rather
+    /// than `call`, so no reply is expected.
+    ///
+    /// The kernel's `call_msg` (`kernel/src/ipc/endpoint.rs`) inserts
+    /// the receiver's `Capability::Reply(caller)` into the first free
+    /// cap slot — which depends on how many caps the receiver already
+    /// holds. Drivers with several pre-existing caps (device handle,
+    /// DMA buffers, IRQ notification) get a reply-cap handle well
+    /// above `1`, so a hardcoded slot constant is unsafe; use this
+    /// dynamic handle in [`SyscallBackend::reply`] instead.
+    pub reply_cap_handle: u32,
     /// Bulk-data payload the kernel reported via `msg.data[1]`.
     /// Matches the layout in [`kernel_core::driver_ipc::block`] or
     /// [`kernel_core::driver_ipc::net`] depending on the peer.
@@ -181,8 +193,15 @@ pub trait IpcBackend {
 // ---------------------------------------------------------------------------
 
 /// Production [`IpcBackend`] that forwards to the Phase 50 userspace
-/// IPC wrappers in `syscall_lib`. The unit struct carries no state —
-/// every call maps 1:1 to a syscall.
+/// IPC wrappers in `syscall_lib`.
+///
+/// The backend stashes the most recent reply-cap handle returned by
+/// `recv` so that [`Self::reply`] can use whatever slot the kernel
+/// chose for the caller's `Capability::Reply` — drivers with several
+/// other caps (device handle, DMA buffers, IRQ notification) get
+/// reply-cap slots well above `1`, and the previous hardcoded
+/// `REPLY_CAP_HANDLE = 1` constant ate the endpoint cap on the next
+/// reply for those servers.
 ///
 /// Every `Err(DriverRuntimeError::Device(DeviceHostError::Internal))`
 /// returned here corresponds to a `u64::MAX` sentinel out of the
@@ -190,19 +209,32 @@ pub trait IpcBackend {
 /// handle was bad or the kernel refused the operation"; drivers
 /// treating this as a fatal error is acceptable per the task's
 /// error-discipline bullet.
-pub struct SyscallBackend;
+pub struct SyscallBackend {
+    /// Reply-cap handle staged by the kernel for the in-flight call,
+    /// captured from `msg.data[3]` on the most recent `recv`. `0`
+    /// means the last message was a `send` (no reply expected).
+    last_reply_cap_handle: u32,
+}
+
+impl Default for SyscallBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyscallBackend {
+    pub const fn new() -> Self {
+        Self {
+            last_reply_cap_handle: 0,
+        }
+    }
+}
 
 impl SyscallBackend {
     /// The single bulk-recv buffer size for driver servers. Matches
     /// the block / net schemas: the biggest driver-side message is a
     /// frame-sized net payload, bounded by `MAX_FRAME_BYTES`.
     pub const MAX_BULK_RECV: usize = kernel_core::driver_ipc::net::MAX_FRAME_BYTES as usize;
-
-    /// The one-shot reply-cap handle convention — Phase 50 stages
-    /// the peer's reply capability at this fixed slot when the
-    /// server returns from `ipc_recv_msg`. Matches the `vfs_server`
-    /// / `net_server` convention documented in Phase 54.
-    const REPLY_CAP_HANDLE: u32 = 1;
 
     fn decode_recv_result(
         rc: u64,
@@ -224,9 +256,15 @@ impl SyscallBackend {
 
         let real_len = (msg.data[1] as usize).min(buf.len());
         buf.truncate(real_len);
+        // The kernel's `call_msg` populates `msg.data[3]` with the
+        // reply-cap handle it inserted into this task's cap table
+        // (`with_reply_cap_handle`). Truncate to `u32`: cap handles are
+        // u32 in `syscall_lib`.
+        let reply_cap_handle = msg.data[3] as u32;
         RecvResult::Message(RecvFrame {
             label: msg.label,
             data0: msg.data[0],
+            reply_cap_handle,
             bulk: buf,
         })
     }
@@ -259,7 +297,14 @@ impl SyscallBackend {
                 kernel_core::device_host::DeviceHostError::Internal,
             ));
         }
-        Ok(Self::decode_recv_result(rc, msg, buf))
+        let result = Self::decode_recv_result(rc, msg, buf);
+        // Stash the reply-cap handle (if any) so the next `reply`
+        // call uses the slot the kernel actually allocated rather
+        // than guessing a fixed convention.
+        if let RecvResult::Message(frame) = &result {
+            self.last_reply_cap_handle = frame.reply_cap_handle;
+        }
+        Ok(result)
     }
 }
 
@@ -269,7 +314,7 @@ impl IpcBackend for SyscallBackend {
     }
 
     fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {
-        let rc = syscall_lib::ipc_reply(Self::REPLY_CAP_HANDLE, label, data0);
+        let rc = syscall_lib::ipc_reply(self.last_reply_cap_handle, label, data0);
         if rc == u64::MAX {
             return Err(crate::DriverRuntimeError::Device(
                 kernel_core::device_host::DeviceHostError::Internal,
@@ -460,6 +505,7 @@ pub(crate) mod mock {
         mock.push_request(RecvFrame {
             label: 42,
             data0: 7,
+            reply_cap_handle: 5,
             bulk: vec![1, 2, 3],
         });
         mock.push_notification(0b1010_0101);
@@ -471,6 +517,7 @@ pub(crate) mod mock {
             RecvResult::Message(f) => {
                 assert_eq!(f.label, 42);
                 assert_eq!(f.data0, 7);
+                assert_eq!(f.reply_cap_handle, 5);
                 assert_eq!(f.bulk, vec![1, 2, 3]);
             }
             other => panic!("expected Message, got {:?}", other),
@@ -496,12 +543,14 @@ mod tests {
         let mut msg = syscall_lib::IpcMessage::new(1);
         msg.data[0] = 0x55;
         msg.data[1] = 3;
+        msg.data[3] = 7;
         let decoded = SyscallBackend::decode_recv_result(1, msg, alloc::vec![1, 2, 3, 4]);
         assert_eq!(
             decoded,
             RecvResult::Message(RecvFrame {
                 label: 1,
                 data0: 0x55,
+                reply_cap_handle: 7,
                 bulk: alloc::vec![1, 2, 3],
             })
         );
