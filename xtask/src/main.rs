@@ -2613,13 +2613,21 @@ fn detect_gui_audio_driver() -> &'static str {
     } else {
         supported.join(", ")
     };
+    // Surface the most common cause of `Available audio drivers: none wav`
+    // (a stripped QEMU build) with a per-distro install hint. Falling back
+    // to `none` is correct, but the developer wants to know *why* and what
+    // to do about it.
     let unsupported_summary = if driver_unsupported.is_empty() {
         String::from("(QEMU has both pipewire and pa backends compiled in)")
     } else {
         format!(
-            "QEMU lacks: {} — rebuild QEMU with --enable-{}",
-            driver_unsupported.join(", "),
-            driver_unsupported.join(",--enable-"),
+            "QEMU lacks: {missing}. On Arch: \
+             `sudo pacman -S qemu-audio-pa qemu-audio-pipewire`. \
+             On Debian/Ubuntu the default `qemu-system-x86` already \
+             includes both; on Fedora install `qemu-audio`. \
+             A self-built QEMU needs `--enable-pipewire` and/or \
+             `--enable-pa` (configure flags) before `make`.",
+            missing = driver_unsupported.join(", "),
         )
     };
     let runtime_entries = match std::fs::read_dir(&runtime_dir) {
