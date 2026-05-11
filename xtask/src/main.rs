@@ -4236,6 +4236,14 @@ fn run_smoke_script(
     // All steps passed — kill QEMU.
     let _ = child.kill();
     let _ = child.wait();
+    // Phase 63 audio handoff follow-up — when `M3OS_SMOKE_SERIAL_DUMP` is
+    // set, also dump the full history on the success path. The kernel
+    // gained rate-limited `u64::MAX diag:` lines for the `Io(-32)` IPC
+    // race, and `audio-demo` retries successfully on those — so the
+    // diagnostic only ever shows up in the transcript of a *passing*
+    // run. Without this, the dump path was failure-only and the diag
+    // was invisible.
+    dump_serial(&serial_history);
     Ok(())
 }
 
