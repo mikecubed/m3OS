@@ -3301,22 +3301,37 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     let outcome = block_current_until(TaskState::BlockedOnReply, &woken, None);
     // Phase 63 audio handoff follow-up — capture wake state BEFORE clearing
     // the reply waker so a racing producer cannot mutate the flag between
-    // our observation and the log line. If the block returned Woken /
-    // AlreadyTrue but pending_msg is still None, we are looking at the
-    // spurious-wake bug — log enough state to distinguish "wake flag set
-    // without delivery" (deliver_message bypassed) from "wake flag unset
-    // but task resumed anyway" (wake_task_v2 without setting the flag).
+    // our observation and the log line. Three spurious-wake shapes:
+    //
+    //   1. `Woken` / `AlreadyTrue` with `pending_at_clear=false` — wake
+    //      side set the `reply_waker` flag without storing `pending_msg`.
+    //   2. `DeadlineExpired` with `deadline_ticks=None` — `block_current_until`
+    //      reports this when the task resumed but `woken.load()` was false
+    //      at the post-resume recheck (block_current_until.rs:3249-3253).
+    //      Without a deadline this means `wake_task_v2` fired and put the
+    //      task back on Ready WITHOUT anyone setting the flag — the
+    //      "wake_task_v2 without setting reply_waker" lost-wake shape.
+    //   3. Any return value with `pending_at_clear=false` — covered by 1
+    //      and 2; the `take_message → None` in `call_msg` follows.
     let pending_at_clear = has_pending_message(caller);
     let woken_flag = woken.load(core::sync::atomic::Ordering::Acquire);
     clear_reply_waker(caller);
-    if matches!(outcome, BlockOutcome::Woken | BlockOutcome::AlreadyTrue) && !pending_at_clear {
-        log_spurious_block_wake(
-            caller,
-            "reply_v2:no_pending_at_clear",
-            Some(outcome),
-            woken_flag,
-            pending_at_clear,
-        );
+    let site_opt = match (outcome, pending_at_clear) {
+        (BlockOutcome::Woken | BlockOutcome::AlreadyTrue, false) => {
+            Some("reply_v2:no_pending_at_clear")
+        }
+        (BlockOutcome::DeadlineExpired, _) => {
+            // No deadline was passed (we called block_current_until with
+            // `None`), so DeadlineExpired here is itself a spurious-wake
+            // signal — log regardless of pending_at_clear so we capture
+            // the wake-without-flag-set path that the previous diagnostic
+            // missed.
+            Some("reply_v2:deadline_expired_no_deadline")
+        }
+        _ => None,
+    };
+    if let Some(site) = site_opt {
+        log_spurious_block_wake(caller, site, Some(outcome), woken_flag, pending_at_clear);
     }
 
     // Regardless of the outcome, the caller (call_msg) will call take_message()
