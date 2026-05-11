@@ -215,21 +215,17 @@ pub fn run_io_loop(
         let result = match transport.recv_with_capacity(endpoint, AUDIO_RECV_CAP) {
             Ok(r) => r,
             Err(_) => {
-                // Phase 63 driver-host fix: a transient `recv` error here is
-                // most often a scheduler-v2 spurious wake (notification bits
-                // race-drained between the wake and the post-block `drain_bits`
-                // check in `recv_msg_with_notif`). e1000 / nvme do not crash
-                // on this because their IRQs fire frequently enough to mask
-                // the race; audio_server has long idle periods and was
-                // exiting on the first occurrence. Log and loop instead so
-                // a well-formed client message later in the boot wakes the
-                // server normally. The underlying race is tracked as a
-                // Phase 63 follow-up (kernel scheduler-v2 wake protocol).
-                syscall_lib::write_str(
-                    STDOUT_FILENO,
-                    "audio_server: recv transient error — looping\n",
-                );
-                continue;
+                // Phase 63 driver-host fix: a recv error here is currently
+                // bound to a deeper Phase 63 IRQ-pipeline issue (the AC'97
+                // notification bits race-drain in `recv_msg_with_notif`,
+                // returning `u64::MAX` repeatedly without blocking). An
+                // earlier "log + continue" branch turned this into a tight
+                // hot loop that starved other userspace services; restore
+                // the original bounded behavior — exit + let init's
+                // `restart=on-failure max_restart=3` policy contain the
+                // chaos until the underlying race lands as a kernel fix.
+                syscall_lib::write_str(STDOUT_FILENO, "audio_server: recv failed\n");
+                return 8;
             }
         };
         match result {
