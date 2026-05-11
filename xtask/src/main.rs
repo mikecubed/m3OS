@@ -7350,7 +7350,12 @@ fn populate_ext2_files(
     // the `on-restart=audio_server.restart` line is consumed by F.4's
     // recovery state machine; init's parser logs an unknown-key
     // warning for it but loads the service unchanged.
-    let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
+    // Phase 63 driver-host fix: `command=/drivers/audio_server` (not
+    // `/bin/`) so the kernel's `is_authorized_driver_process` gate
+    // accepts audio_server's `sys_device_claim(0,0,5,0)` for the AC'97
+    // controller — without the `/drivers/` prefix audio_server falls
+    // back to stub mode and `frames_consumed` never advances.
+    let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
     // Phase 57 Track G: term — graphical terminal emulator. Per the G.1
     // acceptance bullet, the policy is on-failure with a budget of three;

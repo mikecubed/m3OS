@@ -120,8 +120,11 @@ mod tests {
             "conf must declare name=audio_server"
         );
         assert!(
-            conf.contains("command=/bin/audio_server"),
-            "conf must declare command=/bin/audio_server"
+            conf.contains("command=/drivers/audio_server"),
+            "conf must declare command=/drivers/audio_server (Phase 63 \
+             driver-host fix: kernel `is_authorized_driver_process` keys \
+             on the `/drivers/` exec-path prefix to authorize \
+             `sys_device_claim` for the AC'97 controller)"
         );
         assert!(
             conf.contains("type=daemon"),

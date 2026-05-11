@@ -200,7 +200,7 @@ fn is_interactive_debug_exec_path(path: &str) -> bool {
             | "/bin/kbd_server"
             | "/bin/mouse_server"
             | "/bin/display_server"
-            | "/bin/audio_server"
+            | "/drivers/audio_server"
             | "/bin/term"
             | "/bin/ion"
             | "/bin/exit0"

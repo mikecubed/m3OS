@@ -232,9 +232,13 @@ static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
 // kernel_core::session::StartupSequence.
 static SESSION_MANAGER_ELF: &[u8] = generated_initrd_asset!("session_manager");
 
-// Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
-// Exposed under /bin so `init` can launch it via the standard
-// service-config path (`command=/bin/audio_server`).
+// Phase 57 Track D.1 / Phase 63 driver-host correctness fix: audio_server
+// daemon — ring-3 AC'97 driver. Exposed under `/drivers/<name>` (not
+// `/bin/`) because the kernel's `is_authorized_driver_process` gate keys
+// on the `/drivers/` exec-path prefix to authorize `sys_device_claim`.
+// Without this prefix, audio_server falls back to stub mode and never
+// claims the AC'97 PCI device — leaving `frames_consumed` at zero and
+// breaking the Phase 63 audio-smoke gate.
 static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 
 // Phase 57 Track E.2: audio-demo one-shot — generates a 440 Hz sine
@@ -429,13 +433,6 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "session_manager",
         RamdiskNode::File {
             content: SESSION_MANAGER_ELF,
-        },
-    ),
-    // Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
-    (
-        "audio_server",
-        RamdiskNode::File {
-            content: AUDIO_SERVER_ELF,
         },
     ),
     // Phase 57 Track E.2: audio-demo one-shot reference client.
@@ -752,6 +749,15 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "e1000",
         RamdiskNode::File {
             content: E1000_DRIVER_ELF,
+        },
+    ),
+    // Phase 63 driver-host fix: audio_server is a ring-3 driver and must
+    // live under `/drivers/` so `is_authorized_driver_process` accepts its
+    // `sys_device_claim(0,0,5,0)` call for the AC'97 controller.
+    (
+        "audio_server",
+        RamdiskNode::File {
+            content: AUDIO_SERVER_ELF,
         },
     ),
 ];

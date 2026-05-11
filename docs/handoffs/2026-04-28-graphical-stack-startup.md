@@ -157,7 +157,7 @@ Service layout that init creates (boot order, all forked from PID 1):
 | 13  | nvme_driver       | /drivers/nvme           | NVMe (no HW → exits)      |
 | 14  | e1000_driver      | /drivers/e1000          | e1000 (no HW → exits)     |
 | 15  | session_manager   | /bin/session_manager    | boot ordering for GUI     |
-| 16  | audio_server      | /bin/audio_server       | AC'97 (no HW → exits)     |
+| 16  | audio_server      | /drivers/audio_server   | AC'97 (no HW → exits)     |
 | 17  | term              | /bin/term               | graphical terminal        |
 | 18  | (login or sup.)   | /bin/login              | serial login              |
 | 19  | ion (term child)  | /bin/ion                | shell inside term         |
