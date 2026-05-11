@@ -1,7 +1,7 @@
 ---
-status: resolved-with-followups
+status: resolved
 branch: feat/phase-63-audio-stack-implementation
-last-known-good-commit: 374ffe7
+last-known-good-commit: c51ada1
 date: 2026-05-11
 component: end-to-end audio path — driver_runtime IPC ↔ audio_server ↔ AC'97 BDL ↔ QEMU wav backend
 related:
@@ -16,9 +16,13 @@ related:
 > the first issue this thread tracked. The wake-race is fixed
 > (`f1573bd`), the AC'97 IRQ pipeline is fixed (`58bbbc8`), the
 > WAV-silent / second-open / Open-while-open / Io(-32) issues all
-> closed across the 2026-05-11 sessions. The file is kept under the
-> same name so existing references don't break. Two non-blocking
-> follow-ups remain — see [Known follow-ups](#known-follow-ups).
+> closed across the 2026-05-11 sessions, and the two non-blocking
+> follow-ups originally noted (kernel `ipc_call_buf == u64::MAX`
+> race and scheduler watchdog false-positive) are now also resolved
+> in `c51ada1` and `f2040a8` respectively. The file is kept under
+> the same name so existing references don't break. See
+> [Resolved follow-ups](#resolved-follow-ups) for the diagnostic
+> process and fix details.
 
 ## ⚠ Status update (2026-05-11 — final, end-to-end working)
 
@@ -71,10 +75,15 @@ and [Bugs closed in this 2026-05-11 session](#bugs-closed-in-this-2026-05-11-ses
   stream is already open; `audio-demo` retries `Io(-32)` like a
   `WouldBlock`. Audio path is end-to-end working — 5/5
   audio-smoke runs PASS.
-- Two non-blocking follow-ups: the underlying kernel
-  `ipc_call_buf == u64::MAX` race is masked but not fixed, and the
-  scheduler's stuck-no-waker watchdog dumps a misleading trace
-  ring after 30 s of audio_server idle. See [Known follow-ups](#known-follow-ups).
+- Post-final sessions: both originally-listed follow-ups closed.
+  `drive_expired_wake_deadlines` was unpaired-waking `BlockedOnReply`
+  tasks (the kernel-side source of the `Io(-32)` cascade) — fixed in
+  `c51ada1` by re-validating the deadline between collection and
+  wake. The watchdog false-positive on idle `audio_server` is fixed
+  in `f2040a8` by skipping `BlockedOnNotif` with a live bound
+  notification. The 200×5 ms `Io(-32)` retry in `audio-demo` stays
+  as defence-in-depth against the residual ~1% race window. See
+  [Resolved follow-ups](#resolved-follow-ups).
 
 ## Reproduction
 
@@ -158,15 +167,16 @@ Validation tools added (kept in tree):
 | 17 | `audio_server::irq::dispatch_message` `Open` arm | When `audio-demo` died after `Open` but before `Close` (the `Io(-32)` intermittency aborting mid-`SubmitFrames`), the `Ac97Backend.stream_open` flag stayed `true`. Subsequent demo invocations got `OpenError(Busy)` indefinitely; the server never recovered without a restart. The earlier `ClientRegistry::force_release` takeover never fired because every audio_client user sends the same constant `LABEL_AUDIO_CMD = 0x000A_0D10_C0DE` — `frame.label`-derived `client_id` is identical across consecutive demo processes | `dispatch_message`'s `Open` arm now treats an arriving Open while the stream is already open as a takeover: close the lingering stream on the backend, then proceed with the open. The existing client_id eviction stays as a future-proofing layer for when clients diversify their IPC labels. Host test `dispatch_open_when_already_open_takes_over_and_returns_opened` pins the new semantic (audio_server/src/irq.rs) |
 | 18 | `audio-demo::submit_tone` | `AudioClientError::Io(-32)` (the `audio_client` mapping for `ipc_call_buf` returning `u64::MAX` — see [Known follow-ups](#known-follow-ups)) was treated as a hard failure. Even with the server-side Open-takeover fix the next demo had to be manually re-invoked to recover from a single missed call | Retry `Io(-32)` on the same schedule as `Server:WouldBlock` (200 attempts × 5 ms backoff). The retry absorbs the documented IPC race so a single missed `ipc_call_buf` no longer aborts the run (audio-demo/src/main.rs) |
 
-## Known follow-ups
+## Resolved follow-ups
 
-These are non-blocking — `audio-demo` works end-to-end and
-`audio-smoke` is deterministic — but worth tracking because both
-sit at boundaries that other phases will touch.
+Both originally-listed follow-ups closed across the 2026-05-11
+diagnostic / fix sessions following the main audio-path work. The
+diagnostic instrumentation that pinned each cause is left in tree
+for the next regression of the same shape.
 
-### 1. Underlying `ipc_call_buf == u64::MAX` race (masked, not fixed)
+### 1. Kernel `ipc_call_buf == u64::MAX` race — fixed in `c51ada1`
 
-`Io(-32)` is the `audio_client::SyscallSocket::call` branch:
+**Original symptom.** `audio_client::SyscallSocket::call`:
 
 ```rust
 let reply_label = syscall_lib::ipc_call_buf(
@@ -177,53 +187,98 @@ if reply_label == u64::MAX {
 }
 ```
 
-The kernel returns `u64::MAX` from `ipc_call_buf` on ~10–20% of
-sends in this codebase under TCG; the user-visible failure is
-absorbed by the new client-side retry, but the underlying race
-still exists. Plausible causes, in rough order:
+returned `u64::MAX` on roughly 10–20 % of `SubmitFrames` sends
+under TCG. The audio path masked it with a 200×5 ms retry, but the
+same race fired across **every** ring-3 IPC client that uses
+`call_msg` — term ↔ display_server (`LABEL_CLIENT_EVENT_PULL`),
+display_server ↔ kbd_server / mouse_server (`KBD_EVENT_PULL` /
+`MOUSE_EVENT_PULL`), and audio-demo ↔ audio_server
+(`LABEL_AUDIO_CMD`). Each fired the same kernel diagnostic
+once enabled.
 
-A) **audio_server still parked in `recv` from the previous `Open`
-   reply** when audio-demo's first `SubmitFrames` syscall reaches
-   the kernel, but in a state where the send path treats the
-   endpoint as "no receiver" rather than queuing. The
-   bound-notification fix in `f1573bd` covers stale wake tokens but
-   not necessarily `u64::MAX` returns from `ipc_call_buf`.
+**Diagnostic process.** Three commits layered on instrumentation
+that narrowed the cause from "somewhere in the IPC stack" to a
+single line in the scheduler:
 
-B) **Bulk payload size + queue depth interaction.** Submit ships a
-   `frame_header (16 B) + 8 KiB PCM = 8208 B` bulk payload. Even
-   though `MAX_BULK_LEN = 80 KiB`, the kernel may reject under some
-   transient send-queue / receiver-not-ready combination.
+1. **`a571115`** — rate-limited `[ipc] u64::MAX diag` logs at every
+   kernel site that returns the sentinel from `ipc_call_buf` /
+   `ipc_send_with_bulk` / `endpoint::call_msg` /
+   `endpoint::recv_msg_with_notif`. First pass showed 32/32 hits at
+   `call_msg:no_reply_message` — the post-`block_current_until`
+   path where `take_message` returned `None`.
+2. **`13ed58a` + `e816b87`** — `[sched] spurious block wake` logs
+   inside `block_current_on_reply_v2`, capturing the
+   `BlockOutcome`, the local `woken` flag, and `pending_at_clear`.
+   Result: 31/32 spurious cases were
+   `outcome=DeadlineExpired, woken_flag=false, pending_at_clear=false`
+   — meaning `wake_task_v2` had fired without `deliver_message`
+   having been called first.
+3. **`6d0f18a` + `297aff1` + `82226cb`** — `#[track_caller]` on
+   `wake_task_v2`, filtered to log only when prev_state was
+   `BlockedOnReply` AND `pending_msg` was `None` at the CAS (the
+   unpaired-wake shape). 32/32 hits resolved to a single line:
+   `kernel/src/task/scheduler.rs` `drive_expired_wake_deadlines`'s
+   `wake_task_v2(*id)` call.
 
-C) **driver_runtime reply-cap reuse.** Bug #2's fix in `58bbbc8`
-   moved audio_server to dynamic `reply_cap_handle` from
-   `msg.data[3]`. If a prior verb leaks the reply cap slot, the
-   next `recv` could land the new reply cap somewhere unexpected —
-   but that should surface on the server, not the client.
+**Root cause.** `drive_expired_wake_deadlines` (scheduler.rs, ~5189
+in the pre-fix tree) collected `TaskId`s with expired
+`wake_deadline` under `scheduler_lock`, dropped the lock, then
+iterated calling `wake_task_v2(id)` for each. Between collection
+and the wake, a task could:
 
-**Recommendation.** This work should land alongside any other
-ring-3-driver client that ships through `audio_client`-shaped
-syscalls (mouse/keyboard/audio/display all share the same
-`SyscallBackend`):
+1. Wake naturally (its `wake_deadline` cleared, state → `Ready`).
+2. Resume, process whatever woke it.
+3. Re-block on a different state (e.g. `BlockedOnReply` via
+   `call_msg` with no deadline).
 
-1. **Move the `Io(-32)` retry from `audio-demo` into
-   `audio_client::SyscallSocket::call`** so every client benefits
-   without each binary repeating the loop. The retry budget is the
-   same kind of "transient back-pressure" the `Server:WouldBlock`
-   branch already encodes; cap the audio-demo loop at a smaller
-   number once the client-level retry exists.
-2. **Add a kernel-side reason byte to `ipc_call_buf`** instead of
-   the binary `u64::MAX` sentinel. A typed errno (`-EPIPE` vs
-   `-EAGAIN` vs `-ENOENT`) would narrow A vs B vs C in one log run
-   and let `audio_client` retry only on truly-transient cases.
-3. **Audit `audio_server`'s recv-loop transition** between `Open`'s
-   `reply()` and the next `recv()`. The window where a new `call`
-   from the demo could see "no receiver" is the most likely
-   integration seam.
+The stale wake then fired against the **new** block state,
+transitioning `BlockedOnReply → Ready` with no `pending_msg` set —
+the caller's `block_current_on_reply_v2` returned
+`DeadlineExpired`, `call_msg`'s `take_message` returned `None`, and
+the syscall produced `u64::MAX` to userspace.
 
-### 2. Scheduler watchdog false-positive on idle `audio_server`
+The old comment in `collect_expired_wake_deadlines` had asserted
+spurious collections were harmless because `wake_task_v2` returns
+`AlreadyAwake` for non-`Blocked*` states. That reasoning missed
+the case where the task had **re-entered** a `Blocked*` state for
+an unrelated reason between collection and the wake.
 
-When `audio_server` sits with no client connected, the scheduler's
-30 s stuck-no-waker watchdog fires:
+**Fix (`c51ada1`).** `collect_expired_wake_deadlines` now returns
+`(TaskId, u64)` tuples carrying the deadline observed at
+collection time. `drive_expired_wake_deadlines` re-acquires
+`scheduler_lock` briefly before each wake and verifies the task's
+current `wake_deadline` still matches the collected value. Skip if
+not — the task has either woken naturally and re-blocked with a
+different deadline, or has no deadline at all (the bug case).
+
+**Residual.** A small race window remains between the re-validation
+`scheduler_lock` release and `wake_task_v2`'s `pi_lock` acquire.
+Empirically: pre-fix runs saw 32 `Io(-32)` events / ~50 s boot;
+post-fix runs see 1. The `audio-demo` / `audio_client` retry stays
+as defence in depth and now almost never fires. If the residual
+becomes load-bearing, the next step is to refactor `wake_task_v2`
+to accept a precondition closure evaluated under `pi_lock` so the
+deadline check happens atomically with the state CAS.
+
+**Diagnostic infrastructure kept in tree.**
+
+- `kernel/src/ipc/mod.rs::log_ipc_umax` (32-hit boot budget,
+  `IPC_UMAX_DIAG_BUDGET`) — discriminator strings cover every
+  `u64::MAX` return site in IPC.
+- `kernel/src/task/scheduler.rs::log_spurious_block_wake` and
+  `log_wake_blocked_on_reply` (32-hit boot budgets,
+  `SPURIOUS_BLOCK_WAKE_BUDGET` / `WAKE_REPLY_DIAG_BUDGET`) —
+  catch any future regression of the unpaired-wake shape.
+
+Future kernel-side IPC bugs of the same family should start by
+grepping `/tmp/serial.log` for `[sched] wake_task_v2 on
+BlockedOnReply` and `[ipc] u64::MAX diag:` — either is silent on a
+healthy boot.
+
+### 2. Scheduler watchdog false-positive on idle `audio_server` — fixed in `f2040a8`
+
+**Original symptom.** With no client connected, `audio_server`'s
+30 s stuck-no-waker watchdog fired and dumped a 60-KB trace ring:
 
 ```
 [WARN] [sched] task pid=16 name=fork-child state=BlockedOnNotif stuck-since=30001ms (no waker registered)
@@ -232,62 +287,64 @@ When `audio_server` sits with no client connected, the scheduler's
 ... (thousands of lines)
 ```
 
-The server is actually fine — it's in `recv_with_capacity` waiting
-on either the IPC endpoint queue or its bound notification (vector
-0x62). Both wake sources are registered. The watchdog's
-"no waker registered" check reads `task.wake_deadline.is_none() &&
-task.state == BlockedOnNotif` and concludes the task is
-unwakeable, but `BlockedOnNotif` for `recv_msg_with_notif` is
-inherently a "wake from either side" state — the wake source is
-the notification subscription, not a deadline.
+The server was actually fine — parked in `recv_with_capacity`
+waiting on either the IPC endpoint queue or its bound notification
+(vector `0x62`). The watchdog's "no waker registered" verdict
+checked `task.wake_deadline.is_none() && task.state ==
+BlockedOnNotif` and concluded the task was unwakeable, but
+`BlockedOnNotif` for `recv_msg_with_notif` is inherently a "wake
+from either side" state — the wake source is the bound notification,
+not a deadline.
 
-The dump is also user-visible as a giant block of repeating
-scheduler trace lines that the user reasonably mistakes for a
-crash — the m3os-irq.log thread spent a session resolving this
-exact misread.
+**Fix (`f2040a8`).** `watchdog_scan()` now extends the existing
+`BlockedOnRecv && wake_deadline.is_none()` skip to also cover
+`BlockedOnNotif && wake_deadline.is_none() &&
+task_has_bound_notif(idx)`. The check uses a new lock-free
+`crate::ipc::notification::task_has_bound_notif` helper that reads
+`TCB_BOUND_NOTIF[task_sched_idx]` — the same source
+`recv_msg_with_notif` consults to opt into the message-or-
+notification fast path. The verdict still fires for tasks parked in
+`BlockedOnNotif` **without** a bound notification (e.g. a
+`notify_wait` whose signaler was lost) or with an expired
+`wake_deadline`, so real lost-wake bugs surface.
 
-**Recommendation.** Two complementary changes:
-
-1. **Suppress the stuck-no-waker verdict for tasks that hold a
-   live `BoundNotification` subscription.** The
-   `device_host.irq_subscribe` path already records the
-   subscription; the watchdog can check it and skip the warning.
-   Quick fix; closes the false-positive on `audio_server` and the
-   class of IRQ-bound drivers more generally.
-2. **Replace the trace-ring dump with a per-task one-liner.** Even
-   when the warning is correct (some other lost-wake), a 60-KB
-   serial dump is the wrong signal-to-noise; the relevant info is
-   the task's last scheduling event and the registered wake
-   sources. The full trace ring is still available via the
-   user-mode dump command.
+This closes the false-positive for the broader class of IRQ-bound
+ring-3 drivers (every driver that uses
+`device_host.irq_subscribe → IrqNotification::bind_to_endpoint`),
+not just `audio_server`.
 
 ## Files to read first
 
-In this order, for the kernel `Io(-32)` follow-up:
+For a future regression of the kernel IPC `u64::MAX` race
+(diagnostic infrastructure stays in tree — start here):
 
 1. **This document.**
-2. `userspace/lib/audio_client/src/lib.rs:380-423` —
+2. `kernel/src/ipc/mod.rs` — `log_ipc_umax` helper +
+   `IPC_UMAX_DIAG_BUDGET` (32 hits/boot). Tagged at every kernel
+   site that returns `u64::MAX` from `ipc_call_buf` /
+   `ipc_send_with_bulk` / `endpoint::call_msg` /
+   `endpoint::recv_msg_with_notif`.
+3. `kernel/src/task/scheduler.rs` — `log_spurious_block_wake`
+   (`SPURIOUS_BLOCK_WAKE_BUDGET`) and `log_wake_blocked_on_reply`
+   (`WAKE_REPLY_DIAG_BUDGET`), each capped at 32 hits/boot.
+4. `kernel/src/task/scheduler.rs::drive_expired_wake_deadlines` —
+   the re-validation pattern that closed the race in `c51ada1`.
+   Same pattern applies to any future collect-then-wake site.
+5. `userspace/lib/audio_client/src/lib.rs:380-423` —
    `SyscallSocket::call`, the only producer of
-   `AudioClientError::Io(-32)` and `Io(-5)`. Candidate site for
-   moving the retry from `audio-demo` into the shared client.
-3. `userspace/audio-demo/src/main.rs:205-240` — `submit_tone`'s
-   per-chunk loop with the temporary `Io(-32)` retry.
-4. `kernel/src/ipc/mod.rs` — `ipc_call_buf` and the conditions
-   under which it returns `u64::MAX`. Look for the "no receiver"
-   / "would block on send" branches and consider exposing a typed
-   reason byte.
-5. `userspace/audio_server/src/irq.rs` — `run_io_loop`, the
-   `recv → handle → reply → recv` cycle. The transition from
-   `Open`'s reply back to `recv` is the candidate race window.
+   `AudioClientError::Io(-32)`.
+6. `userspace/audio-demo/src/main.rs:205-240` — `submit_tone`'s
+   per-chunk loop with the `Io(-32)` retry (now defence in depth
+   rather than the primary mitigation).
 
-For the watchdog follow-up:
+For the watchdog suppression:
 
-1. `kernel/src/task/scheduler.rs:5495-5600` — `WatchdogVerdict`,
-   `dump_dispatch_state`, and the trace-ring dump trigger.
-2. `kernel/src/ipc/notification.rs:739+` — bound-notification
-   wake bookkeeping.
-3. `kernel/src/ipc/endpoint.rs:657-700` — `recv_msg_with_notif`'s
-   wake-source registration around the v2 block site.
+1. `kernel/src/task/scheduler.rs::watchdog_scan` — the
+   `BlockedOnNotif && task_has_bound_notif` skip introduced in
+   `f2040a8`.
+2. `kernel/src/ipc/notification.rs::task_has_bound_notif` —
+   lock-free read of `TCB_BOUND_NOTIF` (the same source
+   `recv_msg_with_notif` consults).
 
 For the now-resolved WAV-silent issue (kept for context):
 
@@ -351,10 +408,17 @@ For the post-session WAV-silent issue (now resolved):
 - `bell-smoke` (a sibling test) shares the same fix surface — it
   should now also work end-to-end given the IPC/IRQ changes, but
   hasn't been re-validated this session.
-- The Phase 63 audio-smoke gate is not yet in PR CI
-  (`cargo xtask check` only). With the closing-session reliability
-  (5/5 deterministic), wiring `audio-smoke` into the pre-push hook
-  is a one-line config change.
+- The `audio-smoke` pre-push gate is now wired (`41346ff`); CI gate
+  (PR-blocking) is still open. With the closing-session reliability
+  (5/5 deterministic), adding the gate to PR CI is a small
+  workflow-config change.
+- A fully-atomic version of the `drive_expired_wake_deadlines` fix
+  (precondition closure evaluated under `pi_lock` inside
+  `wake_task_v2`) would close the residual ~1% race window. The
+  current re-validate-then-wake pattern is empirically enough: 32
+  → 1 `Io(-32)` events per ~50 s run, and `audio-demo`'s retry
+  absorbs the residual. Defer until / unless the residual fires
+  in a load-bearing path.
 
 ## Done-when
 
@@ -371,8 +435,9 @@ For the post-session WAV-silent issue (now resolved):
 - (Done) `audio-demo` plays an audible 440 Hz tone from
   `cargo xtask run` / `cargo xtask run-gui` on a developer host
   with a PipeWire/PulseAudio-capable QEMU build.
-- **Now-actionable**: wire `cargo xtask audio-smoke` into the
-  pre-push hook now that pass-rate is 100%.
-- **Follow-ups (non-blocking)**: see [Known follow-ups](#known-follow-ups)
-  for the underlying `ipc_call_buf == u64::MAX` race and the
-  scheduler watchdog false-positive.
+- (Done) `cargo xtask audio-smoke` wired into the pre-push hook
+  (`41346ff`).
+- (Done) Kernel `ipc_call_buf == u64::MAX` race resolved (`c51ada1`)
+  — see [Resolved follow-ups §1](#1-kernel-ipc_call_buf--u64max-race--fixed-in-c51ada1).
+- (Done) Scheduler watchdog false-positive resolved (`f2040a8`)
+  — see [Resolved follow-ups §2](#2-scheduler-watchdog-false-positive-on-idle-audio_server--fixed-in-f2040a8).
