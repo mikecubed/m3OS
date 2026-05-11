@@ -96,6 +96,58 @@ fn nibble_to_hex(v: u8) -> u8 {
     }
 }
 
+/// Phase 63 audio handoff follow-up — bounded budget for kernel-side
+/// `u64::MAX` IPC return diagnostics. Caps spam at 32 occurrences per
+/// boot (across all sites) so a recurring race stays readable in the
+/// transcript without flooding when it fires inside a tight retry
+/// loop (e.g. `audio-demo`'s 200×5 ms `Io(-32)` backoff). The
+/// `site` discriminator pins which branch of `ipc_send_with_bulk` /
+/// `endpoint::call_msg` / `endpoint::recv_msg_with_notif` produced
+/// the sentinel — needed to distinguish:
+///
+/// - `send_with_bulk:bad_len` / `send_with_bulk:copy_failed` —
+///   pre-flight failures (caller-side bug)
+/// - `call_msg:endpoint_closed` — endpoint dropped between lookup
+///   and lock acquisition (rare; persistent if true)
+/// - `call_msg:cap_table_full` — server cap-table exhaustion (a
+///   reply-cap leak signature)
+/// - `call_msg:no_reply_message` — block primitive returned with
+///   no `pending_msg` set (the "spurious wake" IPC logic bug)
+/// - `recv_msg_with_notif:cap_full` /
+///   `recv_msg_with_notif:transfer_cap_failed` — server-side
+///   delivery failures that send a sentinel reply back to the caller
+///
+/// Pair this with the audio-demo retry budget to identify which
+/// branch fires under the `Io(-32)` intermittency — see
+/// `docs/handoffs/2026-05-11-phase-63-audio-irq-wake-race.md`
+/// §"Known follow-ups".
+static IPC_UMAX_DIAG_BUDGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(32);
+
+pub(super) fn log_ipc_umax(
+    task_id: crate::task::TaskId,
+    site: &'static str,
+    label: u64,
+    detail: u64,
+) {
+    if IPC_UMAX_DIAG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[ipc] u64::MAX diag: task={} site={} label={:#x} detail={:#x}",
+        task_id.0,
+        site,
+        label,
+        detail,
+    );
+}
+
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
@@ -678,6 +730,7 @@ fn ipc_send_with_bulk(
 
     let len = buf_len as usize;
     if len == 0 || len > MAX_BULK_LEN {
+        log_ipc_umax(task_id, "send_with_bulk:bad_len", msg.label, buf_len);
         return u64::MAX;
     }
 
@@ -688,6 +741,7 @@ fn ipc_send_with_bulk(
         .and_then(|s| s.copy_to_kernel(&mut bulk))
         .is_err()
     {
+        log_ipc_umax(task_id, "send_with_bulk:copy_failed", msg.label, buf_ptr);
         return u64::MAX;
     }
 
@@ -721,6 +775,11 @@ fn ipc_send_with_bulk(
     if is_call {
         let reply = endpoint::call(task_id, ep_id, msg);
         if reply == u64::MAX {
+            // Diagnostic is emitted by `endpoint::call_msg` at the
+            // specific u64::MAX-producing branch (endpoint_closed /
+            // cap_table_full / no_reply_message). Re-logging here
+            // would lose the per-branch discriminator that motivates
+            // the helper, so just drain the staged bulk and propagate.
             let _ = scheduler::take_bulk_data(task_id);
         }
         reply
@@ -728,6 +787,7 @@ fn ipc_send_with_bulk(
         0
     } else {
         // Send failed — clean up the bulk data.
+        log_ipc_umax(task_id, "send_with_bulk:send_failed", msg.label, buf_len);
         let _ = scheduler::take_bulk_data(task_id);
         u64::MAX
     }
