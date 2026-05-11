@@ -839,9 +839,28 @@ impl AudioBackend for Ac97Backend {
         if self.stream_open {
             return Err(AudioError::Busy);
         }
-        // `Ac97Logic`'s BDL state is the single source of truth for
-        // stream-open tracking; `stream_open` is retained here only to
-        // satisfy the trait contract's "second open returns Busy" guard.
+        // Phase 63 second-open fix: `close_stream` halts the bus master
+        // (CR=0) and issues CR.RR, which clears the AC'97 hardware's
+        // CIV/LVI/SR/BDBAR. The mirror in `Ac97Logic` (head, tail, lvi,
+        // BDL entries) is untouched, so a second `open_stream` that
+        // only flipped `stream_open = true` would leave:
+        //
+        //  - The bus master halted (CR=0) — hardware can't consume
+        //    anything `submit_frames` posts, so CIV stays at 0 and
+        //    `tail` never advances.
+        //  - `Ac97Logic.head` pointing at the previous run's end —
+        //    submits append past stale positions and `frames_*`
+        //    counters carry over.
+        //
+        // The visible symptom is run #2 of `audio-demo` failing with
+        // `Server:WouldBlock` after ~1 s of 200×5 ms retries while
+        // submit_buffer rejects every chunk because `in_flight` reads
+        // as full from the carried-over head/tail.
+        //
+        // Re-program BDBAR → LVI=0 → CR.RPBM and reset the mirror so
+        // every Open IPC begins from a clean state.
+        self.logic = Ac97Logic::new();
+        open_pcm_out_stream(&self.bus, self.bdl.iova())?;
         self.stream_open = true;
         Ok(Self::PCM_OUT_STREAM_ID)
     }

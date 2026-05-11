@@ -6272,6 +6272,32 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "guest/audio: frames_consumed non-zero",
     });
+    // 2026-05-11 second-open regression: a second `audio-demo`
+    // invocation must also reach `AUDIO_DEMO:PASS`. The first version
+    // of `Ac97Backend::open_stream` only flipped `stream_open = true`
+    // and left both the AC'97 controller (CR=0, BDBAR cleared by close)
+    // and the `Ac97Logic` mirror carrying state from the previous run,
+    // so run #2's submits hit `Server:WouldBlock` after ~1 s of retries.
+    // The fix is in `device.rs::Ac97Backend::open_stream`; this second
+    // pass through audio-demo locks the regression out.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/audio: relaunch audio-demo (second-open regression)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/audio: audio-demo PASS sentinel (run #2)",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/audio: frames_consumed non-zero (run #2)",
+    });
     steps
 }
 
@@ -14165,6 +14191,46 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn audio_smoke_steps_run_audio_demo_twice_for_second_open_regression() {
+        // 2026-05-11 second-open regression: the step list must invoke
+        // audio-demo twice so the BDL/CR reset on `open_stream` is
+        // exercised. Without this, a `Ac97Backend::open_stream` that
+        // only flips `stream_open = true` (the original Phase 57 D.1
+        // shape) passes the smoke but wedges every real second open.
+        let steps = audio_smoke_steps();
+        let demo_sends: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                SmokeStep::Send { input, label } if input.starts_with("audio-demo") => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            demo_sends.len() >= 2,
+            "audio-smoke must send `audio-demo` at least twice (got {demo_sends:?})"
+        );
+        // Each Send must be followed by a WaitPassOrFail on
+        // AUDIO_DEMO:PASS so a failure on either run aborts the smoke.
+        let pass_or_fail_count = steps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    SmokeStep::WaitPassOrFail {
+                        pass_pattern: "AUDIO_DEMO:PASS",
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            pass_or_fail_count >= 2,
+            "audio-smoke must have at least two WaitPassOrFail steps on AUDIO_DEMO:PASS \
+             (got {pass_or_fail_count})"
+        );
     }
 
     #[test]
