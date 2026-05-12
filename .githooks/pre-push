@@ -158,3 +158,15 @@ if [ "${M3OS_E1000_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask ssh-e1000-banner-check..."
     cargo xtask ssh-e1000-banner-check --timeout 30
 fi
+
+# Phase 63a doom-audio gate. Gated behind M3OS_DOOM_AUDIO_REGRESSION=1
+# because (a) DOOM rebuilds aren't free (16 MB+ of musl-static engine
+# + Rust staticlibs) and (b) the gate runs `/bin/doom` for 8.5 in-game
+# seconds inside QEMU which adds ~30s wall-clock. Set the env var on
+# branches that touch userspace/doom, userspace/lib/audio_mixer,
+# userspace/lib/audio_client_ffi, or audio_server's PCM path so the
+# regression catches DOOM-side audio drift before merge.
+if [ "${M3OS_DOOM_AUDIO_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask doom-audio-smoke..."
+    cargo xtask doom-audio-smoke --timeout 120
+fi

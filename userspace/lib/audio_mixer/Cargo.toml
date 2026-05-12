@@ -1,0 +1,16 @@
+[package]
+name = "audio_mixer"
+version = "0.63.1"
+edition = "2024"
+description = "Phase 63a Track A — pure-logic Rust mixer with a C-ABI surface, reused by DOOM (m3os_sound / m3os_music) and any future system-mixer service."
+build = "build.rs"
+
+[lib]
+name = "audio_mixer"
+path = "src/lib.rs"
+# `staticlib` is intentionally NOT in the default crate-type list — the
+# host test build target (`x86_64-unknown-linux-gnu`) cannot link a
+# `#![no_std]` staticlib without a panic-handler / global allocator.
+# `xtask::build_doom` builds the staticlib via
+# `cargo rustc --crate-type=staticlib --target <musl>` when wiring the
+# DOOM binary; the default `rlib` is what cargo test consumes.

@@ -111,12 +111,75 @@ pub struct AudioStats {
 /// `frame` is the encoded control frame. `bulk` is any payload bytes
 /// that ride the same call (currently only `SubmitFrames` uses this
 /// — the PCM bytes follow the frame on the wire).
+///
+/// The trait is `pub(crate)` in the default build so the production
+/// surface stays tight. Enabling the `test-support` feature promotes
+/// it (and [`ReplyBuf`] and the `*_with_socket` constructors) to
+/// `pub` via a re-export so `audio_client_ffi` host tests can inject
+/// a fake socket.
 pub(crate) trait AudioSocket {
     fn call(
         &mut self,
         frame: &[u8],
         bulk: &[u8],
     ) -> Result<heapless_buf::ReplyBuf, AudioClientError>;
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    //! Test-only seam exposing the private [`super::AudioSocket`]
+    //! trait, [`super::heapless_buf::ReplyBuf`], and the
+    //! `*_with_socket` constructors so `audio_client_ffi` can drive
+    //! the error-mapping path against a fake transport.
+    //!
+    //! Production code never reads from this module — the
+    //! `test-support` feature is dev-only.
+
+    pub use super::heapless_buf::ReplyBuf;
+
+    /// Public mirror of the crate-private `AudioSocket` trait. Test
+    /// callers implement this; the blanket impl below adapts back to
+    /// the private one for `AudioClient` construction.
+    pub trait FakeAudioSocket {
+        fn call(&mut self, frame: &[u8], bulk: &[u8]) -> Result<ReplyBuf, super::AudioClientError>;
+    }
+
+    /// Adapter that turns any [`FakeAudioSocket`] implementor into a
+    /// type that satisfies the crate-private [`super::AudioSocket`]
+    /// trait. Stores the user's fake by value — ownership transfers
+    /// into the adapter (and through it into the constructed
+    /// `AudioClient`).
+    pub struct FakeSocketAdapter<T: FakeAudioSocket>(pub T);
+
+    impl<T: FakeAudioSocket> super::AudioSocket for FakeSocketAdapter<T> {
+        fn call(&mut self, frame: &[u8], bulk: &[u8]) -> Result<ReplyBuf, super::AudioClientError> {
+            self.0.call(frame, bulk)
+        }
+    }
+
+    impl<T: FakeAudioSocket> super::AudioClient<FakeSocketAdapter<T>> {
+        /// Construct an `AudioClient` driving a fake socket without
+        /// issuing `Open`. Mirrors the crate-private
+        /// `new_with_socket`.
+        pub fn new_with_fake(socket: T) -> Self {
+            Self {
+                socket: FakeSocketAdapter(socket),
+                stream_id: None,
+            }
+        }
+
+        /// Construct an `AudioClient` and issue `Open` against the
+        /// fake socket. Returns the same error type the production
+        /// path returns.
+        pub fn open_with_fake(
+            socket: T,
+            format: super::PcmFormat,
+            layout: super::ChannelLayout,
+            rate: super::SampleRate,
+        ) -> Result<Self, super::AudioClientError> {
+            super::AudioClient::open_with_socket(FakeSocketAdapter(socket), format, layout, rate)
+        }
+    }
 }
 
 mod heapless_buf {

@@ -14,6 +14,10 @@ path = "src/lib.rs"
 # for callers that want to hand the client a `Vec`-shaped buffer.
 default = []
 alloc = ["syscall-lib/alloc"]
+# Phase 63a Track B — exposes the `AudioSocket` trait and the
+# `*_with_socket` constructors so `audio_client_ffi` can drive the
+# error-mapping path against a fake transport in host tests.
+test-support = []
 
 [dependencies]
 syscall-lib = { path = "../../syscall-lib" }

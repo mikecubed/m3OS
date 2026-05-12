@@ -1,0 +1,27 @@
+[package]
+name = "audio_client_ffi"
+version = "0.63.1"
+edition = "2024"
+description = "Phase 63a Track B — C-ABI veneer over audio_client. Hand-shipped audio_client.h plus build-script drift check."
+build = "build.rs"
+
+[lib]
+name = "audio_client_ffi"
+path = "src/lib.rs"
+# `staticlib` is built on demand by xtask::build_doom via
+# `cargo rustc --crate-type=staticlib --target <musl>`; the default
+# `rlib` is what cargo test consumes.
+
+[dependencies]
+audio_client = { path = "../audio_client" }
+kernel-core = { path = "../../../kernel-core", default-features = false }
+# audio_mixer is pulled in as an rlib dependency so the
+# `audio_mixer_*` C-ABI symbols are present in the audio_client_ffi
+# staticlib alongside the `audio_ffi_*` symbols. This means the
+# DOOM musl link only needs to consume one .a file and the panic
+# handler / global allocator live in exactly one place (in
+# `audio_client_ffi::staticlib_runtime` under `target_env = "musl"`).
+audio_mixer = { path = "../audio_mixer" }
+
+[dev-dependencies]
+audio_client = { path = "../audio_client", features = ["test-support"] }

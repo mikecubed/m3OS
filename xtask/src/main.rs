@@ -33,6 +33,10 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("surface_buffer", &[]),
     ("crypto-lib", &[]),
     ("term", &["--lib"]),
+    // Phase 63a Track A — pure-logic mixer with C-ABI surface
+    ("audio_mixer", &[]),
+    // Phase 63a Track B — C-ABI veneer over audio_client
+    ("audio_client_ffi", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -347,6 +351,20 @@ fn main() {
                 });
             cmd_bell_smoke(&smoke_args);
         }
+        // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
+        // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
+        // an auto-quit budget so the engine's Shutdown emits the
+        // `M3OS_DOOM:audio_summary` line, then asserts the recorded
+        // WAV is non-silent.
+        Some("doom-audio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("doom-audio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_doom_audio_smoke(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -400,7 +418,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -1150,16 +1168,63 @@ fn build_doom() {
     let commit_stamp = initrd.join("doom.commit");
     let cached_commit = fs::read_to_string(&commit_stamp).unwrap_or_default();
 
-    // Cache hit: non-empty binary AND it was built from the current pinned commit.
-    // When DOOMGENERIC_COMMIT changes the stamp mismatch forces a rebuild.
+    // Phase 63a Track G — extend the cache key to include the m3OS-
+    // side overlay sources so changes to dg_m3os.c, patches/*, or
+    // the new m3os_* platform files force a rebuild. Same shape as
+    // the commit stamp but a fingerprint of all overlay files.
+    let overlay_files = [
+        "userspace/doom/dg_m3os.c",
+        "userspace/doom/m3os_dmx.c",
+        "userspace/doom/m3os_dmx.h",
+        "userspace/doom/m3os_sound.c",
+        "userspace/doom/m3os_sound.h",
+        "userspace/doom/m3os_music.c",
+        "userspace/doom/m3os_music.h",
+        "userspace/doom/patches/i_sound.c",
+        "userspace/doom/patches/i_input.c",
+        "userspace/doom/patches/v_video.c",
+        "userspace/doom/patches/w_wad.c",
+        "userspace/doom/patches/st_lib.c",
+        "userspace/doom/patches/doomgeneric.h",
+    ];
+    let overlay_fingerprint = {
+        let mut combined: Vec<u8> = Vec::new();
+        for rel in &overlay_files {
+            let p = root.join(rel);
+            combined.extend_from_slice(rel.as_bytes());
+            combined.push(b'\n');
+            match fs::read(&p) {
+                Ok(bytes) => combined.extend_from_slice(&bytes),
+                // A missing or unreadable overlay file is a distinct
+                // input from an empty one — record it explicitly so the
+                // fingerprint can never collide with a successful read
+                // of a different file set (otherwise a transient I/O
+                // error could stamp a cache that later "matches" once
+                // the file is readable again).
+                Err(_) => combined.extend_from_slice(b"<MISSING>"),
+            }
+            combined.push(b'\n');
+        }
+        // Lightweight non-crypto hash — collisions for source-file
+        // content are not adversarial here, just unlikely.
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a basis
+        for b in &combined {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    };
+    let stamp_text = format!("{DOOMGENERIC_COMMIT}\noverlay={overlay_fingerprint}");
+
+    // Cache hit: non-empty binary AND the commit stamp matches AND
+    // the overlay fingerprint matches the committed sources.
     if doom_bin.exists()
         && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
-        && cached_commit.trim() == DOOMGENERIC_COMMIT
+        && cached_commit.trim() == stamp_text.trim()
     {
         println!(
-            "doom: using cached {} (commit {})",
-            doom_bin.display(),
-            DOOMGENERIC_COMMIT
+            "doom: using cached {} (commit {DOOMGENERIC_COMMIT}, overlay {overlay_fingerprint})",
+            doom_bin.display()
         );
         return;
     }
@@ -1316,6 +1381,22 @@ fn build_doom() {
         return;
     }
 
+    // Phase 63a Track G.2 — additional platform-layer files for the
+    // audio path. Adding them here means upstream's `i_sound.c`
+    // (replaced by our patches overlay) plus our DMX decoder + sound
+    // module + music synth + the audio_client_ffi staticlib all
+    // compile in together when `FEATURE_SOUND` is defined.
+    for file in [
+        "userspace/doom/m3os_dmx.c",
+        "userspace/doom/m3os_sound.c",
+        "userspace/doom/m3os_music.c",
+    ] {
+        let p = root.join(file);
+        if p.exists() {
+            c_files.push(p.to_str().unwrap().to_string());
+        }
+    }
+
     // Detect musl cross-compiler.
     let cc = match find_musl_cc() {
         Some(cc) => cc,
@@ -1328,16 +1409,84 @@ fn build_doom() {
         }
     };
 
+    // Phase 63a Track G.3 — build the Rust staticlibs the new C files
+    // depend on. Each is produced via `cargo rustc --crate-type=staticlib`
+    // so the host-test rlib path (`cargo xtask check`) stays unaffected.
+    // RUSTFLAGS mirror the `build_musl_rust_bins` path (static reloc +
+    // crt-static) so the resulting .a does not pull in libgcc_eh / glibc
+    // dynamic-loader hooks (`_dl_find_object`) that the musl-static
+    // link would otherwise fail to resolve.
+    let staticlibs_dir = root.join("target/x86_64-unknown-linux-musl/release");
+    // audio_client_ffi depends on audio_mixer as an rlib, so building
+    // it as a staticlib rolls in *both* sets of C-ABI symbols
+    // (`audio_ffi_*` and `audio_mixer_*`) plus exactly one copy of
+    // the Rust runtime / panic_handler (defined in
+    // `audio_client_ffi::staticlib_runtime`).
+    {
+        println!("doom: building audio_client_ffi staticlib for musl (rolls in audio_mixer)...");
+        let mut cargo = Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&root)
+            .args([
+                "rustc",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-p",
+                "audio_client_ffi",
+                "--crate-type=staticlib",
+            ])
+            .env(
+                "RUSTFLAGS",
+                "-C relocation-model=static -C target-feature=+crt-static",
+            );
+        apply_musl_cargo_env(&mut cargo);
+        let status = cargo.status();
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!(
+                    "warning: failed to build audio_client_ffi staticlib — skipping doom build"
+                );
+                if !doom_bin.exists() {
+                    fs::write(&doom_bin, b"").unwrap();
+                }
+                return;
+            }
+        }
+    }
+
     // Include path: point to the doomgeneric source so dg_m3os.c can
     // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
-    // Disable optional SDL audio (FEATURE_SOUND) — m3OS has no audio yet.
+    // Phase 63a Track G.1 / G.3: enable FEATURE_SOUND (our patches/
+    // i_sound.c overlay + m3os_sound/m3os_music/m3os_dmx provide the
+    // audio path) and add include paths for the new C headers.
     let mut args = vec![
         "-static".to_string(),
         "-O2".to_string(),
         format!("-I{}", dg_src.to_str().unwrap()),
-        "-UFEATURE_SOUND".to_string(),
+        format!(
+            "-I{}",
+            root.join("userspace/lib/audio_client_ffi/include")
+                .to_str()
+                .unwrap()
+        ),
+        format!(
+            "-I{}",
+            root.join("userspace/lib/audio_mixer/include")
+                .to_str()
+                .unwrap()
+        ),
+        "-DFEATURE_SOUND".to_string(),
     ];
     args.extend(c_files);
+    // Phase 63a Track G.3 — link order matters: audio_client_ffi
+    // depends on syscall-lib + audio_client + kernel-core, all
+    // bundled in libaudio_client_ffi.a. audio_mixer is standalone.
+    args.push(format!("-L{}", staticlibs_dir.to_str().unwrap()));
+    // Only audio_client_ffi.a is needed — audio_mixer's code is
+    // rolled in as a transitive rlib dependency (see Cargo.toml).
+    args.push("-l:libaudio_client_ffi.a".to_string());
     args.push("-o".to_string());
     args.push(doom_bin.to_str().unwrap().to_string());
     args.extend(musl_cc_extra_ldflags());
@@ -1362,8 +1511,9 @@ fn build_doom() {
     }
 
     println!("doom: built → target/generated-initrd/doom");
-    // Record the commit so future runs can validate the binary cache.
-    let _ = fs::write(initrd.join("doom.commit"), DOOMGENERIC_COMMIT);
+    // Record the cache key (commit + overlay fingerprint) so future
+    // runs can detect stale binaries built from a prior overlay revision.
+    let _ = fs::write(initrd.join("doom.commit"), &stamp_text);
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
@@ -2995,9 +3145,85 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 63a Track C.2 / D.6 / E.4 — host-side C unit tests for
+    // the DOOM platform-layer modules (m3os_dmx, m3os_sound, and
+    // m3os_music — `doom_c_test_step` runs all three). These compile
+    // with the host `cc` and run before QEMU so a regression fails
+    // CI without a full kernel boot.
+    doom_c_test_step(&root);
+
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, and term host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, and audio_client_ffi host tests pass; doom platform-layer C tests pass"
     );
+}
+
+/// Phase 63a Track C.2 / D.6 / E.4 — compile each DOOM platform-
+/// layer C module against its sibling test driver using the host
+/// `cc` (no musl required) and run the resulting binary. Each test
+/// driver returns non-zero exit on failure; we abort the check on
+/// any non-zero.
+///
+/// `MODULES` is a list of `(name, extra-cflags)` so per-module
+/// host-test seams (e.g. `-DM3OS_SOUND_HOST_TEST` to suppress the
+/// doomgeneric adapter block) can be encoded without each driver
+/// needing its own helper function.
+fn doom_c_test_step(root: &std::path::Path) {
+    const MODULES: &[(&str, &[&str])] = &[
+        ("m3os_dmx", &[]),
+        ("m3os_sound", &["-DM3OS_SOUND_HOST_TEST"]),
+        ("m3os_music", &["-DM3OS_SOUND_HOST_TEST"]),
+    ];
+    let doom_dir = root.join("userspace/doom");
+    let tests_dir = doom_dir.join("tests");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let scratch = root.join("target/doom-c-tests");
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        eprintln!("doom_c_test_step: create_dir_all {scratch:?}: {e}");
+        std::process::exit(1);
+    }
+    for (module, extra_cflags) in MODULES {
+        let c_src = doom_dir.join(format!("{module}.c"));
+        let test_src = tests_dir.join(format!("test_{module}.c"));
+        if !c_src.exists() || !test_src.exists() {
+            eprintln!(
+                "doom_c_test_step: missing {} or {}",
+                c_src.display(),
+                test_src.display()
+            );
+            std::process::exit(1);
+        }
+        let bin = scratch.join(format!("test_{module}"));
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-Wall")
+            .arg("-Wextra")
+            .arg("-pedantic")
+            .arg("-std=c11");
+        for flag in *extra_cflags {
+            cmd.arg(flag);
+        }
+        cmd.arg("-o").arg(&bin).arg(&c_src).arg(&test_src);
+        let status = cmd
+            .status()
+            .unwrap_or_else(|e| panic!("doom_c_test_step: spawn cc: {e}"));
+        if !status.success() {
+            eprintln!(
+                "doom_c_test_step: compile failed for {}",
+                test_src.display()
+            );
+            std::process::exit(1);
+        }
+        let status = Command::new(&bin)
+            .status()
+            .unwrap_or_else(|e| panic!("doom_c_test_step: spawn {}: {e}", bin.display()));
+        if !status.success() {
+            eprintln!(
+                "doom_c_test_step: tests failed in {} (rerun manually: {})",
+                test_src.display(),
+                bin.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7086,6 +7312,218 @@ fn cmd_bell_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_BELL_SMOKE_FAILED);
         }
     }
+}
+
+/// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
+const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 65;
+
+/// Phase 63a Track H — boots m3OS with the WAV AC'97 backend, runs
+/// `/bin/doom -warp 1 1`, waits for the `M3OS_DOOM:audio_summary`
+/// line emitted by `m3os_sound_shutdown_inner`, asserts
+/// `frames_consumed > 0`, then verifies the recorded WAV is
+/// non-silent.
+///
+/// Keystroke injection (the in-game pistol fire + quit sequence the
+/// design doc described) requires QEMU monitor / sendkey
+/// infrastructure that this xtask doesn't yet have — DOOM reads
+/// PS/2 scancodes via `sys_read_scancode`, not serial stdin, so the
+/// usual `SmokeStep::Send` path doesn't reach the engine. Instead
+/// the harness sets up an auto-quit budget via the
+/// `/tmp/doom-autoquit-tics` seam in `dg_m3os.c`: at the configured
+/// tic limit (a few seconds at 35 Hz) DOOM calls `I_Quit()`, which
+/// runs every Shutdown handler — including
+/// `m3os_sound_shutdown_inner` — exactly as a user-initiated quit
+/// would. The `DSPPISTOL` SFX submission noted in the design doc is
+/// replaced by Tier 2a title-music output as the audible signal;
+/// the WAV non-silent check covers both equally.
+fn cmd_doom_audio_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let wav_path = smoke_dir.join("doom-audio.wav");
+
+    let ovmf = find_ovmf();
+    let qemu_args = doom_audio_smoke_qemu_args(&wav_path, &uefi_image, &ovmf, args.display);
+    let steps = doom_audio_smoke_steps();
+
+    println!(
+        "doom-audio-smoke: launching QEMU with AC'97 WAV backend (timeout {}s)",
+        args.timeout_secs
+    );
+    println!("doom-audio-smoke: WAV output → {}", wav_path.display());
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "doom-audio-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("doom-audio-smoke: timeout waiting for audio_summary\n{msg}");
+            std::process::exit(SMOKE_EXIT_DOOM_AUDIO_FAILED);
+        }
+    }
+
+    // Post-QEMU WAV non-silent check — same shape as audio-smoke.
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => {
+            println!("doom-audio-smoke: WAV non-silent check PASSED");
+        }
+        Err(msg) => {
+            eprintln!("doom-audio-smoke: WAV is silent\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+/// Phase 63a Track H — QEMU args for the doom-audio-smoke gate.
+/// Mirrors `audio_smoke_qemu_args` but writes to `doom-audio.wav`.
+fn doom_audio_smoke_qemu_args(
+    wav_path: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Phase 63a Track H — serial step list for the doom-audio-smoke gate.
+fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/doom-audio: kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/doom-audio: init loaded audio_server.conf",
+        },
+    ];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Write the autoquit budget so DOOM exits cleanly after N tics
+    // (≈ N/35 seconds). 300 tics ≈ 8.5 s gives the synth time to
+    // produce audible Tier 2a music + any auto-played SFX, and well
+    // within the 90-second per-step budget.
+    steps.push(SmokeStep::Send {
+        input: "echo 300 > /tmp/doom-autoquit-tics\n",
+        label: "guest/doom-audio: install autoquit budget",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    // Phase 57d follow-up — `fb-takeover` yields the framebuffer
+    // from display_server, runs DOOM, then reclaims on exit. DOOM
+    // can't `sys_fb_acquire` directly while display_server holds
+    // the framebuffer (-EBUSY), so the wrapper is mandatory for
+    // any post-Phase-56 boot.
+    steps.push(SmokeStep::Send {
+        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        label: "guest/doom-audio: launch DOOM via fb-takeover into E1M1",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-audio: title_ready marker",
+    });
+    // Wait for the audio_summary line emitted by m3os_sound_shutdown.
+    // We use WaitLineNotMatching so a zero-consumed count fails
+    // immediately rather than wasting the timeout budget.
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "M3OS_DOOM:audio_summary frames_submitted=",
+        bad_substring: "frames_consumed=0 ",
+        timeout_secs: 60,
+        label: "guest/doom-audio: audio_summary frames_consumed > 0",
+    });
+    // Phase 63a Track I.1 — stream-leak resilience. The first DOOM
+    // has exited; relaunch it inside the same QEMU instance. The
+    // second run must also acquire the stream (no
+    // `doom.audio.unavailable code=ebusy` line on serial) and emit
+    // its own audio_summary. This proves audio_server's
+    // socket-disconnect → stream-close path runs correctly.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        label: "guest/doom-audio: relaunch DOOM (stream-leak resilience)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-audio: second-run title_ready marker",
+    });
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "M3OS_DOOM:audio_summary frames_submitted=",
+        bad_substring: "frames_consumed=0 ",
+        timeout_secs: 60,
+        label: "guest/doom-audio: second-run audio_summary frames_consumed > 0",
+    });
+    // Phase 63a Track I.2 — BEL re-arm. After the second DOOM exit,
+    // run `bell-test` (the Phase 63 Track E.1 binary) and verify
+    // it sees frames_consumed > 0. This proves the BEL re-acquires
+    // the audio stream once DOOM releases it.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/bell-test\n",
+        label: "guest/doom-audio: bell-test (BEL re-arm)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "BELL_TEST:PASS",
+        fail_prefix: "BELL_TEST:FAIL",
+        timeout_secs: 30,
+        label: "guest/doom-audio: BEL re-arm PASS",
+        exit_code_on_fail: SMOKE_EXIT_DOOM_AUDIO_FAILED,
+    });
+    steps
 }
 
 fn cmd_fmt(fix: bool) {
@@ -14186,6 +14624,7 @@ mod tests {
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
             SMOKE_EXIT_WAV_SILENT,
             SMOKE_EXIT_BELL_SMOKE_FAILED,
+            SMOKE_EXIT_DOOM_AUDIO_FAILED,
         ];
         for (i, &a) in codes.iter().enumerate() {
             for &b in &codes[i + 1..] {

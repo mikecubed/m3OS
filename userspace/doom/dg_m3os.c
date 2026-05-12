@@ -172,6 +172,47 @@ void DG_DrawFrame(void)
 {
     if (!g_fb_ptr) return;
 
+    /* Phase 63a Track G.4 — one-shot serial marker so the
+     * doom-audio-smoke gate has a deterministic "DOOM is past
+     * init" signal. Gated by a static flag flipped on the first
+     * invocation.
+     *
+     * Phase 63a Track H — `/tmp/doom-autoquit-tics` is a smoke-gate
+     * seam: the doom-audio-smoke harness writes the desired budget
+     * into that file before launching DOOM, and we read it once at
+     * title-ready time. The counter is incremented per
+     * `DG_DrawFrame` call (i.e. per rendered frame); in doomgeneric
+     * the engine drives one DG_DrawFrame per game tic, so a budget
+     * of N is consumed in ~N tics today. The file path keeps its
+     * historical `-tics` suffix for harness compatibility, but the
+     * accounting is in render frames. When the counter crosses the
+     * budget we call `I_Quit()` so the engine's normal Shutdown
+     * runs (which fires `m3os_sound_shutdown_inner` and emits the
+     * `M3OS_DOOM:audio_summary` line the gate parses). DOOM running
+     * under a user — `/tmp/doom-autoquit-tics` absent — sees no
+     * behavioural change. */
+    static int title_ready_printed = 0;
+    static int s_autoquit_frames = -1;
+    static int s_frame_counter = 0;
+    if (!title_ready_printed) {
+        title_ready_printed = 1;
+        printf("M3OS_DOOM:title_ready\n"); /* DevSkim: ignore DS154189 -- literal string, smoke-gate marker line */
+        fflush(stdout);
+        FILE *f = fopen("/tmp/doom-autoquit-tics", "r"); /* DevSkim: ignore DS154189 -- literal local path, read-only, smoke-gate seam */
+        if (f) {
+            int n;
+            if (fscanf(f, "%d", &n) == 1 && n > 0) { /* DevSkim: ignore DS154189 -- bounded %d conversion, no string buffers involved */
+                s_autoquit_frames = n;
+            }
+            fclose(f);
+        }
+    }
+    s_frame_counter++;
+    if (s_autoquit_frames > 0 && s_frame_counter >= s_autoquit_frames) {
+        extern void I_Quit(void);
+        I_Quit();
+    }
+
     const uint32_t fb_pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per FB row */
     const int      bgr      = (g_fb_info.pixel_format == 1);
     /* Clip to the smaller of the DOOM canvas and the physical framebuffer. */

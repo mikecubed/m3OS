@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.63.0"
+version = "0.63.1"
 edition = "2024"
 
 # Phase 61 Track 0a — kernel is built as both a library (so `kernel/tests/*.rs`

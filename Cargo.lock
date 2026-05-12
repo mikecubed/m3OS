@@ -119,6 +119,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_client_ffi"
+version = "0.63.1"
+dependencies = [
+ "audio_client",
+ "audio_mixer",
+ "kernel-core",
+]
+
+[[package]]
+name = "audio_mixer"
+version = "0.63.1"
+
+[[package]]
 name = "audio_server"
 version = "0.57.0"
 dependencies = [
@@ -975,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.63.0"
+version = "0.63.1"
 dependencies = [
  "bootloader_api",
  "kernel-core",
