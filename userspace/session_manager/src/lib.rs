@@ -19,4 +19,5 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod lifecycle;
 pub mod table;
