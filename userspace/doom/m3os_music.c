@@ -43,7 +43,12 @@ struct m3os_mus_state {
     size_t lump_len;
     size_t score_offset;
     size_t cursor;
-    uint8_t tick_remaining; /* delay ticks pending before next event */
+    /* Delay ticks pending before next event group. Width is
+     * `uint32_t` because real songs encode inter-phrase rests of
+     * hundreds-to-thousands of ticks; a `uint8_t` here clamped
+     * everything above 255 and made the music race through long
+     * pauses (perceived as the whole piece being "sped up"). */
+    uint32_t tick_remaining;
     int finished;           /* ScoreEnd reached */
     m3os_voice_t voices[M3OS_VOICES];
     /* Pre-computed per-voice waveform buffers — populated lazily on
@@ -334,6 +339,16 @@ static int dispatch_event(m3os_mus_state_t *state) {
     int event = (ctrl >> 4) & 0x07;
     int channel = ctrl & 0x0F;
 
+    /* MUS channel 15 (0-based) is the percussion / drum channel. In
+     * a SoundFont synth, each NoteOn on this channel triggers a
+     * different drum sample (e.g. note 49 = crash cymbal, 42 =
+     * closed hi-hat). Tier 2a has no drum-synth, so playing them
+     * as pitched tones at the note's frequency produces buzzy
+     * artefacts the listener hears as crackle on cymbal/hi-hat
+     * hits. We still consume the body bytes (otherwise the stream
+     * parser desynchronises) but skip the synth interaction. */
+#define M3OS_MUS_DRUM_CHANNEL 15
+
     switch (event) {
     case M3OS_MUS_EVT_RELEASE_NOTE: {
         if (state->cursor >= state->lump_len) {
@@ -341,7 +356,9 @@ static int dispatch_event(m3os_mus_state_t *state) {
             break;
         }
         uint8_t note = state->lump[state->cursor++] & 0x7F;
-        release_voice(state, channel, note);
+        if (channel != M3OS_MUS_DRUM_CHANNEL) {
+            release_voice(state, channel, note);
+        }
         break;
     }
     case M3OS_MUS_EVT_PLAY_NOTE: {
@@ -358,6 +375,10 @@ static int dispatch_event(m3os_mus_state_t *state) {
                 break;
             }
             velocity = state->lump[state->cursor++] & 0x7F;
+        }
+        if (channel == M3OS_MUS_DRUM_CHANNEL) {
+            /* Body bytes consumed above; no synth voice claimed. */
+            break;
         }
         if (velocity < 0) velocity = 127; /* sustain previous velocity */
         int v = claim_voice(state, channel, note, velocity);
@@ -410,8 +431,7 @@ int m3os_music_tick(m3os_mus_state_t *state) {
     while (state->cursor < state->lump_len && !state->finished) {
         int last = dispatch_event(state);
         if (last) {
-            uint32_t delay = read_varint(state);
-            state->tick_remaining = (uint8_t)(delay > 255 ? 255 : delay);
+            state->tick_remaining = read_varint(state);
             break;
         }
     }
