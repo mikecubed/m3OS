@@ -50,7 +50,22 @@ struct m3os_mus_state {
      * first NoteOn for that voice. */
     uint8_t voice_buf[M3OS_VOICES][VOICE_PERIOD_SAMPLES];
     int voice_buf_seeded[M3OS_VOICES];
+    /* Per-voice cooldown counter in DOOM-tic units. After NoteOff
+     * we mark the slot unclaimable for a few tics so the mixer's
+     * release-fade can run to completion before the slot is
+     * recycled. Otherwise a quickly-following NoteOn would replace
+     * the in-flight fade and the listener would hear a volume-step
+     * click on every voice-reclaim. */
+    uint8_t voice_lockout_tics[M3OS_VOICES];
 };
+
+/* Lockout duration in DOOM-tic units (1 tic ≈ 29 ms). 2 tics is
+ * comfortably longer than the mixer's 192-frame / 4 ms release
+ * fade so the channel is truly silent before another note seeds
+ * it. With 16 total voices and typical 4–8-voice polyphony, this
+ * leaves plenty of slot headroom; only pathological note-dense
+ * passages would saturate. */
+#define M3OS_VOICE_LOCKOUT_TICS 2
 
 static uint8_t g_master_volume = 100;
 /* Mixer accessor — wired by the production module init; tests
@@ -158,9 +173,30 @@ static m3os_waveform_t channel_waveform(int channel) {
 }
 
 /* Claim a voice for a NoteOn. Returns -1 if no voice is free.
- * Tier 2a: first inactive voice wins. */
+ * Tier 2a: first inactive AND not-locked-out voice wins. Voices
+ * that just released are temporarily skipped so their mixer fade
+ * can finish without being interrupted by a re-seed. */
 static int claim_voice(m3os_mus_state_t *state, int channel, int note,
                        int velocity) {
+    for (int i = 0; i < M3OS_VOICES; ++i) {
+        if (!state->voices[i].active && state->voice_lockout_tics[i] == 0) {
+            state->voices[i].active = 1;
+            state->voices[i].channel = channel;
+            state->voices[i].note = note;
+            state->voices[i].velocity = velocity;
+            state->voices[i].waveform = channel_waveform(channel);
+            if (!state->voice_buf_seeded[i]) {
+                seed_waveform(state->voice_buf[i], state->voices[i].waveform);
+                state->voice_buf_seeded[i] = 1;
+            }
+            return i;
+        }
+    }
+    /* Fall-back: nothing free outside lockout — accept a still-locked
+     * slot rather than drop the note entirely. The audible voice-reclaim
+     * click is a much smaller artefact than a missing note in dense
+     * music, and the cursor-preservation in `set_channel_with` keeps
+     * the seam continuous in buffer phase. */
     for (int i = 0; i < M3OS_VOICES; ++i) {
         if (!state->voices[i].active) {
             state->voices[i].active = 1;
@@ -172,6 +208,7 @@ static int claim_voice(m3os_mus_state_t *state, int channel, int note,
                 seed_waveform(state->voice_buf[i], state->voices[i].waveform);
                 state->voice_buf_seeded[i] = 1;
             }
+            state->voice_lockout_tics[i] = 0;
             return i;
         }
     }
@@ -191,6 +228,11 @@ static void release_voice(m3os_mus_state_t *state, int channel, int note) {
         if (state->voices[i].active && state->voices[i].channel == channel &&
             state->voices[i].note == note) {
             state->voices[i].active = 0;
+            /* Lock the slot so the mixer's release-fade can run to
+             * completion before another NoteOn re-seeds it (a
+             * re-seed during fade would produce an audible
+             * volume-step click). */
+            state->voice_lockout_tics[i] = M3OS_VOICE_LOCKOUT_TICS;
             audio_mixer_t *m = g_mixer_accessor ? g_mixer_accessor() : NULL;
             if (m != NULL) {
                 /* Linear fade-out instead of immediate clear so the
@@ -457,6 +499,15 @@ void m3os_music_advance_for_doom_tic(void) {
             g_current_song->tick_remaining = 0;
         }
         return;
+    }
+    /* Tick down per-voice slot lockouts so released voices become
+     * claimable again once their release-fade has had time to run
+     * to completion (M3OS_VOICE_LOCKOUT_TICS DOOM-tics ≈ 58 ms,
+     * comfortably longer than the 4 ms mixer fade). */
+    for (int i = 0; i < M3OS_VOICES; ++i) {
+        if (g_current_song->voice_lockout_tics[i] > 0) {
+            g_current_song->voice_lockout_tics[i] -= 1;
+        }
     }
     for (int i = 0; i < 4; ++i) {
         if (m3os_music_tick(g_current_song)) {
