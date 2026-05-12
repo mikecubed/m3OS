@@ -61,11 +61,17 @@ If any step is silent or produces the EBUSY fallback line, file an issue with th
 
 ## Deferred Until Later
 
-- Tier 2b SoundFont synth (proposed `63b-doom-music-soundfont`) — the memo's Tier 2b call-out remains valid.
-- Tier 4 system mixer service so BEL + DOOM can coexist concurrently — no roadmap entry yet; the `audio_mixer` crate is named generically so the future service can consume it without renaming.
-- Producer thread for the audio submit loop — defer until Phase 76 lands stable userspace threading.
-- QEMU-monitor `sendkey` infrastructure so the smoke gate can drive DOOM via real scancodes instead of the `/tmp/doom-autoquit-tics` seam — useful for testing DOOM input handling, not strictly necessary for the audio path.
-- MIDI fallthrough in `RegisterSong` — Tier 2a `RegisterSong` returns `NULL` for non-MUS data; a thin MIDI → MUS converter is the right level of work for Tier 2b.
+A detailed inventory of every deferred item — with concrete effort estimates and dependency notes for the next person picking one up — lives in **[`docs/appendix/doom-audio-deferred-work.md`](./appendix/doom-audio-deferred-work.md)**. Highlights:
+
+- **Tier 2b SoundFont synth** (proposed `63b-doom-music-soundfont`): the proper "DOOM-faithful music" path. ~8 h focused work, deserves a real phase.
+- **Tier 4 system mixer service** so BEL + DOOM can coexist concurrently: 1–2 days, its own phase, the `audio_mixer` crate is already named generically so the future service can consume it.
+- **Producer thread for the audio submit loop**: blocked on Phase 76 (dynamic linker / pthreads).
+- **MIDI fallthrough in `RegisterSong`** — landed correctly only after Tier 2b's preset state exists.
+- **Loose follow-ups** (cross-fade between voice-reclaim notes, MUS NoteOn velocity continuation, `UpdateSoundParams` mid-note volume changes, `audio_server` restart resync, distance-attenuation A/B match, crossfade on `S_ChangeMusic`, bandlimited synthesis, sub-tick audio sub-stepping, dynamic BDL sizing, per-client volume) — each sized at 15 min – 2 h.
+
+The Tier-2a-plus drum-synth (squarewave/triangle drums via channel 15 in MUS) is not in the deferred list because it landed alongside this doc.
+
+Out-of-band concerns (not audio-specific): QEMU-monitor `sendkey` infrastructure so the smoke gate can drive DOOM via real scancodes instead of the `/tmp/doom-autoquit-tics` seam — useful for testing DOOM input handling, not strictly necessary for the audio path.
 
 ## Cross-Links
 

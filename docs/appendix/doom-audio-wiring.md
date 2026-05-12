@@ -9,6 +9,7 @@
 - Phase 57 audio target choice — [`docs/appendix/phase-57-audio-target-choice.md`](./phase-57-audio-target-choice.md)
 - Phase 63 audio stack implementation — [`docs/roadmap/63-audio-stack-implementation.md`](../roadmap/63-audio-stack-implementation.md)
 - Phase 63a DOOM audio wiring (this memo's implementation phase) — [`docs/roadmap/63a-doom-audio-wiring.md`](../roadmap/63a-doom-audio-wiring.md), [`docs/roadmap/tasks/63a-doom-audio-wiring-tasks.md`](../roadmap/tasks/63a-doom-audio-wiring-tasks.md)
+- Post-63a deferred work inventory (scheduling-ready breakdown of every follow-up, with concrete effort estimates) — [`docs/appendix/doom-audio-deferred-work.md`](./doom-audio-deferred-work.md)
 
 ---
 
