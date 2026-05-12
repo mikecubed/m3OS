@@ -172,6 +172,17 @@ void DG_DrawFrame(void)
 {
     if (!g_fb_ptr) return;
 
+    /* Phase 63a Track G.4 — one-shot serial marker so the
+     * doom-audio-smoke gate has a deterministic "DOOM is past
+     * init" signal before it sends keystrokes. Gated by a static
+     * flag flipped on the first invocation. */
+    static int title_ready_printed = 0;
+    if (!title_ready_printed) {
+        title_ready_printed = 1;
+        printf("M3OS_DOOM:title_ready\n");
+        fflush(stdout);
+    }
+
     const uint32_t fb_pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per FB row */
     const int      bgr      = (g_fb_info.pixel_format == 1);
     /* Clip to the smaller of the DOOM canvas and the physical framebuffer. */

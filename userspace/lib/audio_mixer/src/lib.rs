@@ -29,6 +29,11 @@
 //! divides by `128` via an arithmetic right-shift of `7` (no division
 //! on the hot path).
 
+// Pure-logic mixer: `#![no_std]` outside of host tests. The
+// staticlib build of the DOOM audio path links this crate as an
+// rlib transitively from `audio_client_ffi`; the panic_handler /
+// global_allocator live there so they're defined exactly once at
+// the staticlib root.
 #![cfg_attr(not(test), no_std)]
 
 pub mod ffi;

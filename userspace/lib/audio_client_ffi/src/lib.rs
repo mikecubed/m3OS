@@ -13,7 +13,21 @@
 //! `audio_client_ffi/build.rs` enforces drift-free header / Rust
 //! constants at compile time.
 
+// `no_std` outside of host tests so the staticlib path links into
+// the DOOM musl-static binary without pulling in precompiled std
+// (panic=unwind metadata would trigger `_dl_find_object` link
+// errors against musl). The companion `staticlib_runtime` module
+// installs the `#[panic_handler]` + `#[global_allocator]` exactly
+// once at the staticlib root — `audio_mixer` is pulled in as a
+// transitive rlib dependency so its `audio_mixer_*` C-ABI symbols
+// are present in the same .a file.
 #![cfg_attr(not(test), no_std)]
+
+#[cfg(all(not(test), target_env = "musl"))]
+mod staticlib_runtime;
+
+#[cfg(all(not(test), target_env = "musl"))]
+mod mixer_reexport;
 
 extern crate alloc;
 

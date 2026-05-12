@@ -1154,16 +1154,56 @@ fn build_doom() {
     let commit_stamp = initrd.join("doom.commit");
     let cached_commit = fs::read_to_string(&commit_stamp).unwrap_or_default();
 
-    // Cache hit: non-empty binary AND it was built from the current pinned commit.
-    // When DOOMGENERIC_COMMIT changes the stamp mismatch forces a rebuild.
+    // Phase 63a Track G — extend the cache key to include the m3OS-
+    // side overlay sources so changes to dg_m3os.c, patches/*, or
+    // the new m3os_* platform files force a rebuild. Same shape as
+    // the commit stamp but a fingerprint of all overlay files.
+    let overlay_files = [
+        "userspace/doom/dg_m3os.c",
+        "userspace/doom/m3os_dmx.c",
+        "userspace/doom/m3os_dmx.h",
+        "userspace/doom/m3os_sound.c",
+        "userspace/doom/m3os_sound.h",
+        "userspace/doom/m3os_music.c",
+        "userspace/doom/m3os_music.h",
+        "userspace/doom/patches/i_sound.c",
+        "userspace/doom/patches/i_input.c",
+        "userspace/doom/patches/v_video.c",
+        "userspace/doom/patches/w_wad.c",
+        "userspace/doom/patches/st_lib.c",
+        "userspace/doom/patches/doomgeneric.h",
+    ];
+    let overlay_fingerprint = {
+        let mut combined: Vec<u8> = Vec::new();
+        for rel in &overlay_files {
+            let p = root.join(rel);
+            if let Ok(bytes) = fs::read(&p) {
+                combined.extend_from_slice(rel.as_bytes());
+                combined.push(b'\n');
+                combined.extend_from_slice(&bytes);
+                combined.push(b'\n');
+            }
+        }
+        // Lightweight non-crypto hash — collisions for source-file
+        // content are not adversarial here, just unlikely.
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a basis
+        for b in &combined {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    };
+    let stamp_text = format!("{DOOMGENERIC_COMMIT}\noverlay={overlay_fingerprint}");
+
+    // Cache hit: non-empty binary AND the commit stamp matches AND
+    // the overlay fingerprint matches the committed sources.
     if doom_bin.exists()
         && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
-        && cached_commit.trim() == DOOMGENERIC_COMMIT
+        && cached_commit.trim() == stamp_text.trim()
     {
         println!(
-            "doom: using cached {} (commit {})",
-            doom_bin.display(),
-            DOOMGENERIC_COMMIT
+            "doom: using cached {} (commit {DOOMGENERIC_COMMIT}, overlay {overlay_fingerprint})",
+            doom_bin.display()
         );
         return;
     }
@@ -1320,6 +1360,22 @@ fn build_doom() {
         return;
     }
 
+    // Phase 63a Track G.2 — additional platform-layer files for the
+    // audio path. Adding them here means upstream's `i_sound.c`
+    // (replaced by our patches overlay) plus our DMX decoder + sound
+    // module + music synth + the audio_client_ffi staticlib all
+    // compile in together when `FEATURE_SOUND` is defined.
+    for file in [
+        "userspace/doom/m3os_dmx.c",
+        "userspace/doom/m3os_sound.c",
+        "userspace/doom/m3os_music.c",
+    ] {
+        let p = root.join(file);
+        if p.exists() {
+            c_files.push(p.to_str().unwrap().to_string());
+        }
+    }
+
     // Detect musl cross-compiler.
     let cc = match find_musl_cc() {
         Some(cc) => cc,
@@ -1332,16 +1388,84 @@ fn build_doom() {
         }
     };
 
+    // Phase 63a Track G.3 — build the Rust staticlibs the new C files
+    // depend on. Each is produced via `cargo rustc --crate-type=staticlib`
+    // so the host-test rlib path (`cargo xtask check`) stays unaffected.
+    // RUSTFLAGS mirror the `build_musl_rust_bins` path (static reloc +
+    // crt-static) so the resulting .a does not pull in libgcc_eh / glibc
+    // dynamic-loader hooks (`_dl_find_object`) that the musl-static
+    // link would otherwise fail to resolve.
+    let staticlibs_dir = root.join("target/x86_64-unknown-linux-musl/release");
+    // audio_client_ffi depends on audio_mixer as an rlib, so building
+    // it as a staticlib rolls in *both* sets of C-ABI symbols
+    // (`audio_ffi_*` and `audio_mixer_*`) plus exactly one copy of
+    // the Rust runtime / panic_handler (defined in
+    // `audio_mixer::staticlib_runtime`).
+    {
+        println!("doom: building audio_client_ffi staticlib for musl (rolls in audio_mixer)...");
+        let mut cargo = Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&root)
+            .args([
+                "rustc",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-p",
+                "audio_client_ffi",
+                "--crate-type=staticlib",
+            ])
+            .env(
+                "RUSTFLAGS",
+                "-C relocation-model=static -C target-feature=+crt-static",
+            );
+        apply_musl_cargo_env(&mut cargo);
+        let status = cargo.status();
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!(
+                    "warning: failed to build audio_client_ffi staticlib — skipping doom build"
+                );
+                if !doom_bin.exists() {
+                    fs::write(&doom_bin, b"").unwrap();
+                }
+                return;
+            }
+        }
+    }
+
     // Include path: point to the doomgeneric source so dg_m3os.c can
     // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
-    // Disable optional SDL audio (FEATURE_SOUND) — m3OS has no audio yet.
+    // Phase 63a Track G.1 / G.3: enable FEATURE_SOUND (our patches/
+    // i_sound.c overlay + m3os_sound/m3os_music/m3os_dmx provide the
+    // audio path) and add include paths for the new C headers.
     let mut args = vec![
         "-static".to_string(),
         "-O2".to_string(),
         format!("-I{}", dg_src.to_str().unwrap()),
-        "-UFEATURE_SOUND".to_string(),
+        format!(
+            "-I{}",
+            root.join("userspace/lib/audio_client_ffi/include")
+                .to_str()
+                .unwrap()
+        ),
+        format!(
+            "-I{}",
+            root.join("userspace/lib/audio_mixer/include")
+                .to_str()
+                .unwrap()
+        ),
+        "-DFEATURE_SOUND".to_string(),
     ];
     args.extend(c_files);
+    // Phase 63a Track G.3 — link order matters: audio_client_ffi
+    // depends on syscall-lib + audio_client + kernel-core, all
+    // bundled in libaudio_client_ffi.a. audio_mixer is standalone.
+    args.push(format!("-L{}", staticlibs_dir.to_str().unwrap()));
+    // Only audio_client_ffi.a is needed — audio_mixer's code is
+    // rolled in as a transitive rlib dependency (see Cargo.toml).
+    args.push("-l:libaudio_client_ffi.a".to_string());
     args.push("-o".to_string());
     args.push(doom_bin.to_str().unwrap().to_string());
     args.extend(musl_cc_extra_ldflags());
@@ -1366,8 +1490,9 @@ fn build_doom() {
     }
 
     println!("doom: built → target/generated-initrd/doom");
-    // Record the commit so future runs can validate the binary cache.
-    let _ = fs::write(initrd.join("doom.commit"), DOOMGENERIC_COMMIT);
+    // Record the cache key (commit + overlay fingerprint) so future
+    // runs can detect stale binaries built from a prior overlay revision.
+    let _ = fs::write(initrd.join("doom.commit"), &stamp_text);
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).

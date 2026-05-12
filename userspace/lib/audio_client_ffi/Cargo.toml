@@ -15,6 +15,13 @@ path = "src/lib.rs"
 [dependencies]
 audio_client = { path = "../audio_client" }
 kernel-core = { path = "../../../kernel-core", default-features = false }
+# audio_mixer is pulled in as an rlib dependency so the
+# `audio_mixer_*` C-ABI symbols are present in the audio_client_ffi
+# staticlib alongside the `audio_ffi_*` symbols. This means the
+# DOOM musl link only needs to consume one .a file and the panic
+# handler / global allocator live in exactly one place (in
+# `audio_mixer::staticlib_runtime` under `target_env = "musl"`).
+audio_mixer = { path = "../audio_mixer" }
 
 [dev-dependencies]
 audio_client = { path = "../audio_client", features = ["test-support"] }

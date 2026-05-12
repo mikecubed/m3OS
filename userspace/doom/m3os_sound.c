@@ -291,6 +291,13 @@ void m3os_sound_update_inner(void) {
     if (g_state.audio_disabled || g_state.mixer == NULL) {
         return;
     }
+#ifndef M3OS_SOUND_HOST_TEST
+    /* Advance the music tick scheduler at MUS-native 140 Hz (4 ticks
+     * per DOOM tic). Done before audio_mixer_step so any voice
+     * claims / releases this tic are reflected in the mix. */
+    extern void m3os_music_advance_for_doom_tic(void);
+    m3os_music_advance_for_doom_tic();
+#endif
     /* Produce one tic's worth of stereo S16LE frames into the scratch
      * buffer, then submit. WouldBlock is silently dropped — Phase 63's
      * underrun-zero-fill recovers. */
@@ -385,6 +392,14 @@ static int m3os_sm_get_sfx_lump_num(sfxinfo_t *sfx) {
     return W_GetNumForName(name);
 }
 
+/* Accessor used by m3os_music.c to share the SFX mixer instance —
+ * see audio_mixer instance docs in m3os_sound.h. */
+static audio_mixer_t *m3os_sound_get_mixer_for_music(void) {
+    return g_state.mixer;
+}
+
+extern void m3os_music_set_mixer_accessor(audio_mixer_t *(*fn)(void));
+
 static boolean m3os_sm_init(boolean use_sfx_prefix) {
     (void)use_sfx_prefix;
     /* First-time init: wire the production submitter, then run the
@@ -393,6 +408,10 @@ static boolean m3os_sm_init(boolean use_sfx_prefix) {
         g_state.submitter = k_prod_submitter;
     }
     m3os_sound_init_inner();
+    /* Wire the shared mixer accessor for m3os_music so the synth's
+     * NoteOn / NoteOff routes through the same audio_mixer_t we just
+     * created. Done after _init_inner so the mixer pointer is set. */
+    m3os_music_set_mixer_accessor(m3os_sound_get_mixer_for_music);
     return true;
 }
 

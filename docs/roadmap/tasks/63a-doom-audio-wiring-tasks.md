@@ -43,8 +43,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | **Complete** |
 | D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | **Complete** |
 | E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | **Complete** |
-| F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | Planned |
-| G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | Planned |
+| F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | **Complete** |
+| G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | **Complete** |
 | H | `cargo xtask doom-audio-smoke` gate — scripted SFX trigger → non-silent WAV | G | Planned |
 | I | Stream-leak resilience verification | H | Planned |
 | J | Kernel patch bump, README/AGENTS update, memo retire, design-doc closure | I | Planned |
@@ -343,9 +343,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Phase 47's patch-overlay mechanism (`xtask/src/main.rs::build_doom:1255-1273`) copies any `.c` or `.h` file from `userspace/doom/patches/` over the upstream doomgeneric source after `git checkout`. Adding our modules to the registration list is the smallest possible engine-side change.
 
 **Acceptance:**
-- [ ] `userspace/doom/patches/i_sound.c` declares `extern sound_module_t m3os_sound_module;` and `extern music_module_t m3os_music_module;` and lists them in the `sound_modules` and `music_modules` arrays at file scope.
-- [ ] The file is a drop-in replacement for upstream `i_sound.c` — every other function in upstream is preserved verbatim (DRY: the patch only changes the registration list).
-- [ ] `build_doom` log output shows `doom: applied patch i_sound.c` after the patch is copied.
+- [x] `userspace/doom/patches/i_sound.c` declares `extern sound_module_t m3os_sound_module;` and `extern music_module_t m3os_music_module;` and lists them in `sound_modules[]` and assigns `&m3os_music_module` in `InitMusicModule()`. Upstream's musicmodule init was a function body (not an array literal), so the music registration is a one-line body change rather than an array element.
+- [x] The file is a drop-in replacement for upstream `i_sound.c` — every other function (`I_InitSound`, `I_ShutdownSound`, `I_StartSound`, etc.) is preserved verbatim; the patch only changes the registration sites.
+- [x] `build_doom` log output shows `doom: applied patch i_sound.c` after the patch is copied — confirmed by the `cargo xtask image` log line.
 
 ---
 
@@ -358,8 +358,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Without this flip the upstream `i_sound.c` dispatcher compiles to no-ops and our modules are never called.
 
 **Acceptance:**
-- [ ] `-UFEATURE_SOUND` is replaced by `-DFEATURE_SOUND`.
-- [ ] `cargo xtask image` succeeds (the upstream `i_sound.c` and `s_sound.c` compile under `-DFEATURE_SOUND`).
+- [x] `-UFEATURE_SOUND` is replaced by `-DFEATURE_SOUND` in `build_doom`'s args vec.
+- [x] `cargo xtask image` succeeds — the upstream `i_sound.c` (our patches overlay) and `s_sound.c` compile under `-DFEATURE_SOUND` and the DOOM binary links.
 
 ### G.2 — Add new C files to `build_doom`
 
@@ -368,8 +368,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Three new platform-layer files must be compiled into the DOOM binary alongside `dg_m3os.c`.
 
 **Acceptance:**
-- [ ] `userspace/doom/m3os_dmx.c`, `m3os_sound.c`, `m3os_music.c` are pushed onto `c_files` after the existing `dg_m3os.c` push.
-- [ ] Build log lists all four platform files at compile time.
+- [x] `userspace/doom/m3os_dmx.c`, `m3os_sound.c`, `m3os_music.c` are pushed onto `c_files` after the existing `dg_m3os.c` push.
+- [x] Build log compiles all four platform files; the resulting DOOM binary is ~616 KB (up from ~480 KB baseline — the audio path adds ~136 KB of Rust + C code).
 
 ### G.3 — Link `audio_client_ffi` + `audio_mixer` staticlibs
 
@@ -378,10 +378,11 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The musl-gcc invocation needs `-L<rust-target-dir>` and `-laudio_client_ffi -laudio_mixer` to resolve the C-ABI symbols the new modules call.
 
 **Acceptance:**
-- [ ] Before calling musl-gcc, `build_doom` runs `cargo build --release --target <musl-target> -p audio_mixer -p audio_client_ffi` and locates the produced `.a` files.
-- [ ] `-L<staticlib-dir>` and `-l:libaudio_mixer.a -l:libaudio_client_ffi.a` (linker static-archive syntax) are appended to the musl-gcc args.
-- [ ] `-I<workspace>/userspace/lib/audio_client_ffi/include -I<workspace>/userspace/lib/audio_mixer/include` is appended so the C `#include` directives resolve.
-- [ ] Build succeeds; `target/generated-initrd/doom` has size > 100 KiB above the pre-63a baseline (real linker output, not a stub).
+- [x] Before calling musl-gcc, `build_doom` runs `cargo rustc --release --target x86_64-unknown-linux-musl -p audio_client_ffi --crate-type=staticlib` (which rolls in `audio_mixer` as an rlib dependency via Cargo.toml). RUSTFLAGS include `-C relocation-model=static -C target-feature=+crt-static` so the staticlib does not pull in libgcc_eh / `_dl_find_object`.
+- [x] `-L<staticlib-dir>` and `-l:libaudio_client_ffi.a` (linker static-archive syntax) are appended to the musl-gcc args. Only one .a file is needed because `audio_mixer`'s code is rolled in transitively; the `mixer_reexport` module's `#[used]` keepalive static ensures Rust's dead-code analyzer preserves every `audio_mixer_*` C symbol.
+- [x] `-I<workspace>/userspace/lib/audio_client_ffi/include -I<workspace>/userspace/lib/audio_mixer/include` is appended so the C `#include` directives resolve.
+- [x] Build succeeds; `target/generated-initrd/doom` is 616 KB (up from ~480 KB baseline — > 100 KiB delta).
+- [x] The DOOM build cache key now includes a fingerprint of the overlay files (`dg_m3os.c`, `m3os_dmx.c`, `m3os_sound.c`, `m3os_music.c`, `patches/*`, `m3os_*.h`) so changes to any of them force a rebuild — `DOOMGENERIC_COMMIT` alone would miss our edits.
 
 ### G.4 — `DG_DrawFrame` emits a one-shot `title_ready` marker
 
@@ -390,10 +391,10 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Track H's smoke gate needs a deterministic post-boot signal before it sends keystrokes. A one-shot serial print on the first successful frame draw is the simplest reliable trigger. Note: engine-side sound-module init is *not* something `DG_Init` needs to call directly — upstream's `I_InitSound` iterates the `sound_modules` array Track F installs, so our `m3os_sound_module.Init` is invoked through the engine's normal startup flow.
 
 **Acceptance:**
-- [ ] `DG_DrawFrame` prints `M3OS_DOOM:title_ready` exactly once on its first invocation, gated by a `static int already_printed = 0;` flag flipped immediately before the print.
-- [ ] The print goes to stdout (which `term` and the serial console both receive).
-- [ ] Manual `cargo xtask run-gui` confirms the line appears in serial output shortly after DOOM's first frame renders.
-- [ ] `DG_Init` is *not* modified to call `m3os_sound_module.Init` directly — upstream `I_InitSound` handles that via the `sound_modules` array; modifying `DG_Init` would double-init.
+- [x] `DG_DrawFrame` prints `M3OS_DOOM:title_ready` exactly once on its first invocation, gated by a `static int title_ready_printed = 0;` flag flipped immediately before the `printf`.
+- [x] The print goes to stdout (which `term` and the serial console both receive); `fflush(stdout)` ensures it lands before any further frame work.
+- [ ] Manual `cargo xtask run-gui` confirms the line appears in serial output — deferred to manual smoke once Track H lands the automated harness.
+- [x] `DG_Init` is *not* modified to call `m3os_sound_module.Init` directly — upstream `I_InitSound` handles that via the `sound_modules` array our patches overlay installs.
 
 ---
 
