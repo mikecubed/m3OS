@@ -1,8 +1,8 @@
 ---
 status: resolved
 branch: feat/phase-63-audio-stack-implementation
-last-known-good-commit: c51ada1
-date: 2026-05-11
+last-known-good-commit: HEAD
+date: 2026-05-12
 component: end-to-end audio path — driver_runtime IPC ↔ audio_server ↔ AC'97 BDL ↔ QEMU wav backend
 related:
   - docs/handoffs/2026-04-25-scheduler-design-comparison.md
@@ -19,15 +19,16 @@ related:
 > closed across the 2026-05-11 sessions, and the two non-blocking
 > follow-ups originally noted (kernel `ipc_call_buf == u64::MAX`
 > race and scheduler watchdog false-positive) are now also resolved
-> in `c51ada1` and `f2040a8` respectively. One pre-existing harness
-> issue surfaced during PR #148 merge prep — `cargo xtask bell-smoke`
-> times out at step 3 `TERM_SMOKE:ready`. The bell wire-level path
-> works end-to-end manually; only the smoke gate is broken. Tracked
-> as [Open follow-ups §1](#1-bell-smoke-step-3-term_smokeready-timeout)
-> for the next session. The file is kept under the same name so
-> existing references don't break. See
-> [Resolved follow-ups](#resolved-follow-ups) for the diagnostic
-> process and fix details on closed items.
+> in `c51ada1` and `f2040a8` respectively. The remaining pre-existing
+> harness issue — `cargo xtask bell-smoke` timing out at step 3
+> `TERM_SMOKE:ready` — is now closed on 2026-05-12: the root cause
+> was a consuming-Wait matcher racing two cross-core markers, and
+> the bell-smoke step list itself gated on irrelevant TERM_SMOKE
+> markers. Both are fixed; see
+> [Resolved follow-ups §3](#3-bell-smoke-step-3-term_smokeready-timeout--fixed-2026-05-12).
+> The file is kept under the same name so existing references don't
+> break. See [Resolved follow-ups](#resolved-follow-ups) for the
+> diagnostic process and fix details on every closed item.
 
 ## ⚠ Status update (2026-05-11 — final, end-to-end working)
 
@@ -89,6 +90,15 @@ and [Bugs closed in this 2026-05-11 session](#bugs-closed-in-this-2026-05-11-ses
   notification. The 200×5 ms `Io(-32)` retry in `audio-demo` stays
   as defence-in-depth against the residual ~1% race window. See
   [Resolved follow-ups](#resolved-follow-ups).
+- 2026-05-12: `bell-smoke` step 3 timeout closed. The
+  consuming-`Wait` matcher in `run_smoke_script` /
+  `run_smoke_steps_with_capture` was draining past matches and
+  losing earlier-arrived markers (the harness layer); the
+  bell-smoke step list also gated on TERM_SMOKE markers that are
+  off-path for `bell-test` and skipped the login prefix (the test
+  layer). Both fixed; two consecutive `cargo xtask bell-smoke`
+  runs PASS in 32 s each. See
+  [Resolved follow-ups §3](#3-bell-smoke-step-3-term_smokeready-timeout--fixed-2026-05-12).
 
 ## Reproduction
 
@@ -318,111 +328,112 @@ ring-3 drivers (every driver that uses
 `device_host.irq_subscribe → IrqNotification::bind_to_endpoint`),
 not just `audio_server`.
 
-## Open follow-ups
+### 3. `bell-smoke` step 3 `TERM_SMOKE:ready` timeout — fixed 2026-05-12
 
-### 1. `bell-smoke` step 3 `TERM_SMOKE:ready` timeout
-
-**Symptom.** `cargo xtask bell-smoke` reproducibly times out at
-step 3 after step 2 (`session_manager: session.boot: state=running`)
-passes:
+**Original symptom.** `cargo xtask bell-smoke` reproducibly timed
+out at step 3 after step 2 (`session_manager: session.boot:
+state=running`) passed:
 
 ```
 [step 1] wait: guest/bell-smoke: kernel first message (30s)
 [step 2] wait: guest/bell-smoke: session_manager reaches state=running (120s)
 [step 3] wait: guest/bell-smoke: term event loop started (60s)
-bell-smoke: FAILED
-step 3 timed out: guest/bell-smoke: term event loop started
+bell-smoke: FAILED / step 3 timed out
 ```
 
-**What the gate is supposed to verify.** Step 3 waits for
-`TERM_SMOKE:ready` — emitted by `userspace/term/src/main.rs:229` via
-`syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL)` immediately
-before the event-pull loop. The pattern is the same one the
-`audio-smoke` gate's later steps consume successfully. After step 3
-the harness goes on to: wait for `TERM_SMOKE:prompt-ready`, type
-`bell-test\n` at the prompt, and assert `BELL_TEST:PASS` (which
-proves `frames_consumed > 0` after `Bell::ring`).
+The bell wire-level path worked end-to-end (audible BEL beep on
+`run-gui`, host-test coverage on `Bell::ring` →
+`AudioClientBellSink`), and the timeout reproduced on `318b391`
+(the pre-PR commit), so the failure was pre-existing — not a
+regression from PR #148.
 
-**Not a regression introduced by PR #148.** Verified by checking out
-the parent commit (`318b391`, the pre-PR head) and running the same
-gate — fails identically at step 3. Reproduces both before and after
-the merge-prep fixes (`fec91ae` PIO/IPC, `b8ffc5c` bell diagnostics,
-`9245b71` bell tone pad, `375a589` `submit_frames_inner` tail-pad).
-The actual bell wire-level path is verified working end-to-end via
-the manual `run-gui` smoke (user confirmed audible 880 Hz BEL beep
-post-`9245b71`).
+**Diagnostic process.** One pass with
+`M3OS_SMOKE_SERIAL_DUMP=/tmp/bell-smoke-serial.log` was enough.
+`grep -n` against the captured transcript pinned the order:
 
-**Hypothesis space (not yet narrowed).**
-
-1. **Term genuinely does not start.** Session_manager reports
-   `state=running` before all services have produced their ready
-   markers, and term's startup in this particular QEMU config
-   (`-audiodev wav` headless) stalls somewhere between fork-exec and
-   the `write_str(READY_SENTINEL)` line. Strong candidate: term opens
-   the framebuffer + PTY + display_server connection at startup;
-   under headless `wav` the framebuffer surface negotiation may
-   diverge from the `-audiodev pulse` path that `run-gui` uses.
-2. **Term starts but the marker is intercepted.** Some other
-   userspace process is consuming term's stdout before the harness
-   matches the pattern. Less likely — `audio-smoke` uses the same
-   serial-stdin / display_server stack and successfully matches
-   `TERM_SMOKE:ready` in its later steps.
-3. **Smoke-harness drain bug.** The `WaitLineNotMatching` / drain
-   plumbing recently fixed in PR #148 (`94ae319` / `4ef2b74`) was
-   for a different code path; step 3 is a plain `Wait`. Worth ruling
-   out by adding a `dump_serial_on_success` env-flag pass through
-   the no-match exit and inspecting whether `TERM_SMOKE:ready` ever
-   appeared in the captured buffer.
-
-**Reproduction.**
-
-```sh
-git checkout feat/phase-63-audio-stack-implementation
-cargo xtask bell-smoke
-# → bell-smoke: FAILED / step 3 timed out
+```
+278:TERM_SMOKE:ready
+280:session_manager: session.boot: state=running
+287:TERM_SMOKE:prompt-ready
 ```
 
-To rule out a regression in the merge-prep work:
+`TERM_SMOKE:ready` was emitted **before** `state=running`, but the
+step list waited for `state=running` first. The handoff's
+"hypothesis #3" (harness drain bug) was closest — the actual shape
+was an order-race against the harness's consuming-Wait matcher.
 
-```sh
-git checkout 318b391  # pre-PR parent
-cargo xtask bell-smoke
-# → bell-smoke: FAILED / step 3 timed out (same shape)
-```
+**Root cause (two compounding layers).**
 
-**What to look at first.**
+1. **Harness layer.** `run_smoke_script` /
+   `run_smoke_steps_with_capture`'s `SmokeStep::Wait` arm called
+   `drain_serial_through_match` on success, cutting `serial_buf`
+   past the match offset. The next `Wait` then searched only the
+   *suffix* — so any marker that arrived before the previous
+   match was permanently invisible. `TERM_SMOKE:ready` (emitted by
+   `term` on a different core) and `state=running` (emitted by
+   `session_manager`) sit milliseconds apart on the wire; whichever
+   one arrived first relative to the step order would be silently
+   dropped.
 
-1. Re-run `bell-smoke` with `M3OS_SMOKE_DUMP_SERIAL_ON_SUCCESS=1`
-   (or a new on-failure equivalent — the env hook in
-   `41346ff` was scoped to success). If `TERM_SMOKE:ready` shows up
-   in the captured serial after step 3 timed out, the gate's
-   `Wait` window is too short or the marker is arriving via the
-   wrong stream. If it doesn't show up, term genuinely isn't
-   reaching `main.rs:229`.
-2. Diff the QEMU command lines `cargo xtask audio-smoke` and
-   `cargo xtask bell-smoke` produce. `audio-smoke` does see term's
-   later markers (`TERM_SMOKE:prompt-ready` is matched downstream
-   from the boot-settle sleep), so the difference is some subset of:
-   `-audiodev wav` placement, init args, or the headless vs
-   `gui=on` flag that flows through to display_server.
-3. If term is genuinely stuck, instrument
-   `userspace/term/src/main.rs` with a series of step markers
-   (`TERM_BOOT:1`, `TERM_BOOT:2`, …) ahead of line 229 so the next
-   run tells us *which* of: `init_input_handler`,
-   `display_server::connect`, `surface::map`, `pty_open`, the
-   initial `RenderCommand::Clear` compose, or the
-   `write_str(READY_SENTINEL)` itself is failing.
-4. Worth confirming `term`'s ramdisk + service-config wiring is
-   still correct after the recent kernel work. Run
-   `cargo xtask clean && cargo xtask bell-smoke` to force a disk
-   rebuild and rule out a stale `disk.img`.
+2. **bell-smoke step list layer.** The list gated on
+   `state=running`, `TERM_SMOKE:ready`, and `TERM_SMOKE:prompt-ready`
+   in sequence, then sent `bell-test\n`. None of those markers are
+   on the bell-test execution path — `bell-test` is a stand-alone
+   binary that runs from `sh0` (serial), constructs an
+   `AudioClientBellSink` directly, and never touches `term`'s ANSI
+   parser. Worse, the list skipped `boot_and_login_steps()`, so the
+   `Send "bell-test\n"` would have landed at `m3OS login:` and been
+   typed as a username even if step 3 had been reachable.
 
-**Scope.** The fix is **not** required for Phase 63 merge: the
-bell-smoke gate is not in pre-push (only `audio-smoke` is — wired
-in `41346ff`) and not on PR CI. The audible bell is verified
-manually, and the bell wire-level path has bell-test +
-`AudioClientBellSink` host-test coverage. Convert to a hosted
-follow-up issue / future handoff doc once Phase 63 is merged.
+**Fix.**
+
+- **Harness (`xtask/src/main.rs`).** `SmokeStep::Wait` is now
+  non-consuming: when `find_serial_match` succeeds, the runner
+  breaks out without calling `drain_serial_through_match`. The
+  reset boundary is `Send`, which already clears `serial_buf`
+  after writing input — so the "fresh output after Send"
+  semantics that `WaitLineNotMatching` / `WaitPassOrFail` rely on
+  are preserved. A new doc comment on the variant pins the rule
+  in source. The fix lands in both `run_smoke_script` and
+  `run_smoke_steps_with_capture` so soak/stress runners benefit
+  too.
+- **bell-smoke step list (`xtask/src/main.rs`).** Replaced with
+  the same shape `audio_smoke_steps` uses: kernel hello → wait
+  `init: loaded service 'audio_server'` → `boot_and_login_steps()`
+  → `Send "bell-test\n"` → `WaitPassOrFail` on
+  `BELL_TEST:PASS` / `BELL_TEST:FAIL`. The TERM_SMOKE markers and
+  the `state=running` gate are gone.
+
+**Test coverage added.**
+
+- `wait_steps_match_out_of_order_emissions_after_handoff_fix` —
+  the order-race property in unit-test form, replaying the
+  observed bell-smoke transcript.
+- `bell_smoke_steps_gate_on_audio_server_loaded_not_session_running`
+  — anti-regression on the racy `state=running` gate.
+- `bell_smoke_steps_do_not_gate_on_term_smoke_markers` —
+  anti-regression on the off-path TERM_SMOKE gates.
+- `bell_smoke_steps_log_in_before_sending_bell_test` — pins
+  ordering: username send → login-ready wait → bell-test send.
+- `bell_smoke_steps_use_wait_pass_or_fail_so_fail_lines_surface_immediately`
+  — pins WaitPassOrFail (not plain Wait) so FAIL variants exit
+  with `SMOKE_EXIT_BELL_SMOKE_FAILED` instead of timing out.
+
+**Verification.** Two consecutive `cargo xtask bell-smoke` runs
+PASS in 32 s each. `BELL_TEST:consumed=2816 underruns=0`
+confirms `frames_consumed > 0`. `cargo xtask check` (clippy +
+fmt + 110 xtask host tests + kernel-core / passwd / driver_runtime
+/ audio_client / audio_server / surface_buffer / crypto-lib /
+term host tests) is clean. `cargo xtask audio-smoke` continues to
+PASS the WAV non-silent check, so the harness change did not
+regress the consuming-vs-non-consuming behavior the other smoke
+step types still rely on.
+
+## Open follow-ups
+
+_None. The last open item — `bell-smoke` step 3 — closed on
+2026-05-12; see
+[Resolved follow-ups §3](#3-bell-smoke-step-3-term_smokeready-timeout--fixed-2026-05-12)._
 
 ## Files to read first
 
@@ -494,18 +505,25 @@ For the post-session WAV-silent issue (now resolved):
 
 ## What's covered by tests
 
-- 73 host-side tests pass (`cargo xtask check`)
-- 10 audio-smoke step-list / WAV / wait-pass-or-fail shape tests pass
-  (`cargo test -p xtask --target x86_64-unknown-linux-gnu`)
+- 110 `xtask` host tests pass (`cargo test -p xtask --target
+  x86_64-unknown-linux-gnu`), including the 5 new bell-smoke
+  shape tests and the harness-level
+  `wait_steps_match_out_of_order_emissions_after_handoff_fix`
+  regression test for the 2026-05-12 non-consuming Wait fix.
+- 73 host-side tests pass on the rest of the workspace
+  (`cargo xtask check`).
 - 4 `ClientRegistry` host tests cover admit / release /
-  `force_release` / rate-limited rejection
+  `force_release` / rate-limited rejection.
 - 1 `dispatch_message` host test pins the new Open-while-open
-  takeover semantic
-- Sample WAV at `target/audio-smoke/audio.wav` after a passing run:
-  4.85 MB, 44.1 kHz S16 stereo, ~158K total non-silent samples
-  (two audio-demo invocations back-to-back); loudest 1-second
-  window ~99% non-silent (~88K/88K), max abs amplitude ~8.9K of
-  32.7K matches the 0.3-of-full-scale tone the demo emits
+  takeover semantic.
+- `cargo xtask audio-smoke` and `cargo xtask bell-smoke` PASS
+  end-to-end. Sample WAV at `target/audio-smoke/audio.wav` after
+  a passing audio-smoke run: 4.85 MB, 44.1 kHz S16 stereo, ~158K
+  total non-silent samples (two audio-demo invocations
+  back-to-back); loudest 1-second window ~99% non-silent
+  (~88K/88K), max abs amplitude ~8.9K of 32.7K matches the
+  0.3-of-full-scale tone the demo emits. bell-smoke reports
+  `BELL_TEST:consumed=2816 underruns=0` on a passing run.
 
 ## Out of scope
 
@@ -516,16 +534,10 @@ For the post-session WAV-silent issue (now resolved):
   driver-host clients with multiple pre-existing caps were broken.
   Worth migrating those servers to read `msg.data[3]` too, but it's
   not blocking any current test.
-- `bell-smoke` (a sibling test) shares the same fix surface. The
-  underlying bell path now works end-to-end (manual BEL `printf '\x07'`
-  rings audibly on `run-gui` after `9245b71` / `375a589`), but the
-  `cargo xtask bell-smoke` gate itself reproducibly times out at
-  step 3 (`TERM_SMOKE:ready`). See
-  [Open follow-ups §1](#1-bell-smoke-step-3-term_smokeready-timeout)
-  for the failure mode, reproduction, and what to investigate. The
-  fix is *not* in the merge-prep path for PR #148 — the failure
-  reproduces on the pre-PR commit (`318b391`) too, so it is a
-  pre-existing harness issue rather than a regression.
+- (Closed 2026-05-12.) `bell-smoke` now PASSes end-to-end after
+  the harness-level non-consuming-Wait fix and the bell-smoke
+  step list realignment. See
+  [Resolved follow-ups §3](#3-bell-smoke-step-3-term_smokeready-timeout--fixed-2026-05-12).
 - The `audio-smoke` pre-push gate is now wired (`41346ff`); CI gate
   (PR-blocking) is still open. With the closing-session reliability
   (5/5 deterministic), adding the gate to PR CI is a small
@@ -559,3 +571,8 @@ For the post-session WAV-silent issue (now resolved):
   — see [Resolved follow-ups §1](#1-kernel-ipc_call_buf--u64max-race--fixed-in-c51ada1).
 - (Done) Scheduler watchdog false-positive resolved (`f2040a8`)
   — see [Resolved follow-ups §2](#2-scheduler-watchdog-false-positive-on-idle-audio_server--fixed-in-f2040a8).
+- (Done) `cargo xtask bell-smoke` exits 0 deterministically
+  (consuming-Wait race in `run_smoke_script` /
+  `run_smoke_steps_with_capture` removed; bell-smoke step list
+  realigned with `audio_smoke_steps`-shape) — see
+  [Resolved follow-ups §3](#3-bell-smoke-step-3-term_smokeready-timeout--fixed-2026-05-12).

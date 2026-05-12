@@ -3297,6 +3297,16 @@ fn cmd_test(test_args: &TestArgs) {
 #[allow(dead_code)]
 enum SmokeStep {
     /// Wait for `pattern` to appear in serial output within `timeout_secs`.
+    ///
+    /// Non-consuming: when `pattern` is found, the matched bytes stay in
+    /// `serial_buf` so a later `Wait` for a marker that arrived *before*
+    /// `pattern` still succeeds. The reset boundary is `Send`, which clears
+    /// `serial_buf` after writing input. Without this rule, two `Wait` steps
+    /// whose markers race (e.g. `TERM_SMOKE:ready` emitted by `term` vs.
+    /// `session_manager: session.boot: state=running` emitted by
+    /// `session_manager` on a different core, milliseconds apart) would
+    /// deadlock the harness whenever the wire order disagreed with the
+    /// step order — the bug closed by the bell-smoke handoff §1 fix.
     Wait {
         pattern: &'static str,
         timeout_secs: u64,
@@ -3851,9 +3861,10 @@ fn run_smoke_script(
                     // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
-                    if let Some((mode, match_end)) = find_serial_match(&stripped, &cleaned, pattern)
-                    {
-                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                    if find_serial_match(&stripped, &cleaned, pattern).is_some() {
+                        // Non-consuming: see `SmokeStep::Wait` doc. We deliberately
+                        // do NOT drain through the match, so a later `Wait` for an
+                        // earlier-arrived marker still observes its line.
                         break;
                     }
 
@@ -6893,19 +6904,37 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
 /// ## Steps
 ///
 /// 1. Wait for the kernel boot marker.
-/// 2. Wait for `session_manager: session.boot: state=running` — this confirms
-///    the full startup chain (display_server → kbd_server → mouse_server →
-///    audio_server → term) completed, meaning audio_server is running.
-/// 3. Wait for `TERM_SMOKE:ready` — term has entered its event loop.
-/// 4. Wait for `TERM_SMOKE:prompt-ready` — shell prompt is live, sh0 is
-///    ready to accept commands.
+/// 2. Wait for `init: loaded service 'audio_server'` — proves init has
+///    registered the audio_server manifest entry and will spawn it. Mirrors
+///    `audio_smoke_steps`'s gating: we do NOT gate on
+///    `session_manager: session.boot: state=running` because that line
+///    races with other markers across cores and is unrelated to whether
+///    bell-test can reach the audio path from sh0.
+/// 3. `boot_and_login_steps()` — wait for the post-boot `m3OS login:`
+///    prompt and log into `sh0` as root. Without this, the next `Send`
+///    would type `bell-test` at the login prompt instead of running it.
+/// 4. Sleep 500 ms so the post-login shell finishes painting its prompt.
 /// 5. `Send` `bell-test\n` to run the bell path exerciser from `sh0`.
 ///    `bell-test` calls `Bell::ring()` → `AudioClientBellSink::play` →
 ///    `audio_client::submit_frames`, sleeps 200 ms, then queries stats and
 ///    prints `BELL_TEST:consumed=<N> underruns=<M>` followed by
-///    `BELL_TEST:PASS` or `BELL_TEST:FAIL:consumed=0`.
-/// 6. Wait for `BELL_TEST:PASS` within 10 s.  On `BELL_TEST:FAIL` the
-///    smoke exits immediately with `SMOKE_EXIT_BELL_SMOKE_FAILED`.
+///    `BELL_TEST:PASS` or `BELL_TEST:FAIL:consumed=0` /
+///    `BELL_TEST:FAIL:audio_unavailable`.
+/// 6. `WaitPassOrFail` for `BELL_TEST:PASS` vs `BELL_TEST:FAIL` within
+///    15 s. On `BELL_TEST:FAIL` the harness exits immediately with
+///    `SMOKE_EXIT_BELL_SMOKE_FAILED` and surfaces the failing variant.
+///
+/// ## Why no TERM_SMOKE gating
+///
+/// Earlier versions of this list gated on `TERM_SMOKE:ready` and
+/// `TERM_SMOKE:prompt-ready`. Those markers describe the *graphical*
+/// terminal emulator and are off-path: `bell-test` runs from sh0
+/// (serial), not from term's ANSI parser. The TERM_SMOKE markers also
+/// race with `session_manager: state=running` on the wire (different
+/// cores, ms apart) and the consuming-Wait matcher used to deadlock when
+/// the wire order disagreed with the step order — see the bell-smoke
+/// handoff §1 fix. The harness is now non-consuming for `Wait`, but
+/// gating bell-smoke on irrelevant markers is still the wrong shape.
 ///
 /// ## Failure modes
 ///
@@ -6917,46 +6946,44 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
 /// - If `audio_server` is absent, `AudioClientBellSink::ensure_open` fails
 ///   and `bell-test` prints `BELL_TEST:FAIL:audio_unavailable`.
 fn bell_smoke_steps() -> Vec<SmokeStep> {
-    vec![
+    let mut steps = vec![
         SmokeStep::Wait {
             pattern: "[m3os] Hello from kernel",
             timeout_secs: 30,
             label: "guest/bell-smoke: kernel first message",
         },
         SmokeStep::Wait {
-            pattern: "session_manager: session.boot: state=running",
-            timeout_secs: 120,
-            label: "guest/bell-smoke: session_manager reaches state=running",
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/bell-smoke: init loaded audio_server.conf",
         },
-        SmokeStep::Wait {
-            pattern: "TERM_SMOKE:ready",
-            timeout_secs: 60,
-            label: "guest/bell-smoke: term event loop started",
-        },
-        SmokeStep::Wait {
-            pattern: "TERM_SMOKE:prompt-ready",
-            timeout_secs: 30,
-            label: "guest/bell-smoke: term prompt is ready",
-        },
-        // Run the bell path exerciser from sh0. bell-test directly constructs
-        // AudioClientBellSink, calls Bell::ring(), sleeps 200 ms for DMA, then
-        // queries stats and prints BELL_TEST:PASS or BELL_TEST:FAIL.
-        // This bypasses the kbd_server routing gap: serial stdin goes to sh0,
-        // not to term's ANSI parser; bell-test invokes the bell library directly.
-        SmokeStep::Send {
-            input: "bell-test\n",
-            label: "guest/bell-smoke: run bell-test binary",
-        },
-        // Wait for BELL_TEST:PASS — bell-test confirmed frames_consumed > 0.
-        // The 10 s budget covers: bell-test's own 200 ms sleep + DMA latency
-        // + sh0 prompt round-trip. bell-test exits immediately on FAIL, so
-        // BELL_TEST:FAIL lines arrive before the PASS timeout fires.
-        SmokeStep::Wait {
-            pattern: "BELL_TEST:PASS",
-            timeout_secs: 10,
-            label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
-        },
-    ]
+    ];
+    // Log into sh0 so the next Send lands at a shell prompt rather than
+    // `m3OS login:`. Mirrors `audio_smoke_steps`'s use of the same prefix.
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Run the bell path exerciser from sh0. bell-test directly constructs
+    // AudioClientBellSink, calls Bell::ring(), sleeps 200 ms for DMA, then
+    // queries stats and prints BELL_TEST:PASS or BELL_TEST:FAIL.
+    // This bypasses the kbd_server routing gap: serial stdin goes to sh0,
+    // not to term's ANSI parser; bell-test invokes the bell library directly.
+    steps.push(SmokeStep::Send {
+        input: "bell-test\n",
+        label: "guest/bell-smoke: run bell-test binary",
+    });
+    // WaitPassOrFail surfaces the failing variant from
+    // `BELL_TEST:FAIL:consumed=0` / `BELL_TEST:FAIL:audio_unavailable`
+    // immediately rather than letting the step time out generically.
+    // 15 s covers: bell-test's own 200 ms tone sleep + DMA latency + sh0
+    // prompt round-trip, plus headroom for slower CI.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "BELL_TEST:PASS",
+        fail_prefix: "BELL_TEST:FAIL",
+        timeout_secs: 15,
+        label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+        exit_code_on_fail: SMOKE_EXIT_BELL_SMOKE_FAILED,
+    });
+    steps
 }
 
 /// Build the QEMU arg vector for the bell-smoke.
@@ -11213,9 +11240,10 @@ fn run_smoke_steps_with_capture(
                         ));
                     }
 
-                    if let Some((mode, match_end)) = find_serial_match(&stripped, &cleaned, pattern)
-                    {
-                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                    if find_serial_match(&stripped, &cleaned, pattern).is_some() {
+                        // Non-consuming: see `SmokeStep::Wait` doc. Leaves the matched
+                        // bytes in `serial_buf` so a later `Wait` for an earlier-arrived
+                        // marker still observes its line.
                         break;
                     }
 
@@ -13478,6 +13506,42 @@ mod tests {
     }
 
     #[test]
+    fn wait_steps_match_out_of_order_emissions_after_handoff_fix() {
+        // Regression for the bell-smoke handoff §1 deadlock: `term` and
+        // `session_manager` emit ready markers on different cores ~ms
+        // apart and the wire order is non-deterministic. A step list
+        // that gates on the later-named marker first must still match
+        // the earlier-named marker afterward. The harness fix is "Wait
+        // does not drain on match" (`run_smoke_script` /
+        // `run_smoke_steps_with_capture`); the property we pin here is
+        // that `find_serial_match` itself is happy with both lookups
+        // against the same buffer regardless of the inspection order,
+        // and the buffer stays untouched between calls.
+        let serial = "TERM_SMOKE:ready\nsession_manager: session.boot: state=running\n";
+        let stripped = strip_ansi(serial);
+        let cleaned = strip_background_noise(&stripped);
+
+        // First lookup is for the marker that arrived SECOND on the wire.
+        assert!(
+            find_serial_match(
+                &stripped,
+                &cleaned,
+                "session_manager: session.boot: state=running",
+            )
+            .is_some(),
+            "second-arrived marker must match"
+        );
+        // The buggy runner used to drain past the match here. With the
+        // fix, the buffer is untouched, so a follow-up Wait for the
+        // marker that arrived FIRST still finds it.
+        assert!(
+            find_serial_match(&stripped, &cleaned, "TERM_SMOKE:ready").is_some(),
+            "first-arrived marker must still match after a successful Wait \
+             on a later marker — the consuming-Wait drain has been removed"
+        );
+    }
+
+    #[test]
     fn render_terminal_text_replaces_line_after_carriage_return() {
         let serial = "root@m3os:/# /usr/bin/tcc --version\rroot@m3os:/# ";
         assert_eq!(render_terminal_text(serial), "root@m3os:/# ");
@@ -14520,10 +14584,11 @@ mod tests {
         // the xtask logic: when `bell-test` prints FAIL, the bell-smoke
         // command must surface the right exit code.
         //
-        // The xtask's `run_smoke_script` waits for `BELL_TEST:PASS` with
-        // a 10 s timeout. If `bell-test` emits `BELL_TEST:FAIL:consumed=0`
-        // the wait for BELL_TEST:PASS times out (or we catch the FAIL
-        // sentinel explicitly). Either way the smoke exits with
+        // The xtask's `run_smoke_script` uses `WaitPassOrFail` to wait
+        // for `BELL_TEST:PASS` or any `BELL_TEST:FAIL` prefix within
+        // 15 s. On `BELL_TEST:FAIL:consumed=0` (or
+        // `BELL_TEST:FAIL:audio_unavailable`) the harness surfaces the
+        // captured suffix and exits immediately with
         // SMOKE_EXIT_BELL_SMOKE_FAILED (code 64; 63 is
         // SMOKE_EXIT_WAV_SILENT — the assertion below pins both).
         //
@@ -14612,35 +14677,151 @@ mod tests {
     }
 
     #[test]
-    fn bell_smoke_steps_wait_for_session_running_before_term() {
-        // bell-smoke requires the full session startup chain to complete
-        // before injecting the BEL — without audio_server running,
-        // AudioClientBellSink would fail to connect.
+    fn bell_smoke_steps_gate_on_audio_server_loaded_not_session_running() {
+        // bell-smoke previously gated on
+        // `session_manager: session.boot: state=running`. That marker
+        // races with `TERM_SMOKE:ready` on the wire (different cores,
+        // ~ms apart) and is unrelated to whether bell-test can reach
+        // the audio path. Bell-test runs from sh0 and only needs
+        // audio_server to be up; gate on init's audio_server-loaded
+        // marker the same way `audio_smoke_steps` does.
         let steps = bell_smoke_steps();
-        let session_pattern = wait_pattern_for_label(
-            &steps,
-            "guest/bell-smoke: session_manager reaches state=running",
-        )
-        .expect("bell-smoke must wait for session_manager: session.boot: state=running");
-        assert_eq!(
-            session_pattern, "session_manager: session.boot: state=running",
-            "bell-smoke must gate on the session running sentinel before any BEL injection"
+        let audio_loaded =
+            wait_pattern_for_label(&steps, "guest/bell-smoke: init loaded audio_server.conf")
+                .expect(
+                    "bell-smoke must wait for `init: loaded service 'audio_server'` \
+             before injecting the bell — proves init has the manifest \
+             entry and will spawn the server",
+                );
+        assert_eq!(audio_loaded, "init: loaded service 'audio_server'");
+
+        // Anti-regression: the racy state=running gate must be gone.
+        for step in &steps {
+            if let SmokeStep::Wait { pattern, .. } = step {
+                assert_ne!(
+                    *pattern, "session_manager: session.boot: state=running",
+                    "bell-smoke must NOT gate on state=running — it races \
+                     with TERM_SMOKE markers across cores and used to \
+                     deadlock the consuming-Wait matcher (handoff §1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bell_smoke_steps_do_not_gate_on_term_smoke_markers() {
+        // The TERM_SMOKE markers describe the graphical terminal emulator
+        // and are off-path for bell-smoke: `bell-test` runs from sh0
+        // (serial), not from term's ANSI parser. Gating on them adds a
+        // race surface for no benefit.
+        let steps = bell_smoke_steps();
+        for step in &steps {
+            if let SmokeStep::Wait { pattern, .. } = step {
+                assert!(
+                    !pattern.starts_with("TERM_SMOKE:"),
+                    "bell-smoke must NOT gate on TERM_SMOKE markers — \
+                     bell-test runs from sh0, not term; got {pattern:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bell_smoke_steps_log_in_before_sending_bell_test() {
+        // bell-test runs from `sh0` (serial). Without `boot_and_login_steps()`
+        // the `Send "bell-test\n"` would land at the `m3OS login:` prompt
+        // and be typed as a username rather than executed. Mirror the
+        // shape `audio_smoke_steps` already proven by running audio-demo
+        // from sh0.
+        let steps = bell_smoke_steps();
+
+        let bell_test_index = steps
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Send {
+                        label: "guest/bell-smoke: run bell-test binary",
+                        ..
+                    }
+                )
+            })
+            .expect("bell-smoke must Send `bell-test\\n`");
+
+        // boot_and_login_steps() ends with sending `/bin/echo __LOGIN_READY__\n`
+        // and waiting for `__LOGIN_READY__`. Confirm both the username send
+        // and the ready marker land BEFORE bell-test.
+        let username_idx = steps[..bell_test_index]
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Send {
+                        input: "root\n",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must include boot_and_login_steps() before \
+                 sending bell-test (Send `root\\n` for the username)",
+            );
+        let ready_idx = steps[..bell_test_index]
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Wait {
+                        pattern: "__LOGIN_READY__",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must wait for the login-ready marker (emitted \
+                 by `/bin/echo __LOGIN_READY__`) before sending bell-test",
+            );
+        assert!(
+            username_idx < ready_idx && ready_idx < bell_test_index,
+            "ordering must be: username send -> login-ready wait -> bell-test send"
         );
     }
 
     #[test]
-    fn bell_smoke_steps_wait_for_term_prompt_ready() {
-        // bell-smoke must wait for the term prompt-ready sentinel before
-        // injecting the BEL, because Bell::ring uses AudioClientBellSink
-        // which is only constructed after term's event loop opens the stream.
+    fn bell_smoke_steps_use_wait_pass_or_fail_so_fail_lines_surface_immediately() {
+        // The plain `Wait` for BELL_TEST:PASS would let
+        // `BELL_TEST:FAIL:consumed=0` time out generically (10–15 s)
+        // instead of surfacing the failing variant. WaitPassOrFail is
+        // the same shape audio-smoke uses for AUDIO_DEMO:FAIL.
         let steps = bell_smoke_steps();
-        let prompt_pattern =
-            wait_pattern_for_label(&steps, "guest/bell-smoke: term prompt is ready")
-                .expect("bell-smoke must wait for TERM_SMOKE:prompt-ready before BEL injection");
-        assert_eq!(
-            prompt_pattern, "TERM_SMOKE:prompt-ready",
-            "bell-smoke must gate on TERM_SMOKE:prompt-ready before injecting BEL"
-        );
+        let bell_step = steps
+            .iter()
+            .find(|s| {
+                matches!(
+                    s,
+                    SmokeStep::WaitPassOrFail {
+                        label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must use WaitPassOrFail (not Wait) so \
+                 BELL_TEST:FAIL lines exit with SMOKE_EXIT_BELL_SMOKE_FAILED \
+                 instead of timing out generically",
+            );
+        let SmokeStep::WaitPassOrFail {
+            pass_pattern,
+            fail_prefix,
+            exit_code_on_fail,
+            ..
+        } = bell_step
+        else {
+            unreachable!("guarded by .find(matches!) above")
+        };
+        assert_eq!(*pass_pattern, "BELL_TEST:PASS");
+        assert_eq!(*fail_prefix, "BELL_TEST:FAIL");
+        assert_eq!(*exit_code_on_fail, SMOKE_EXIT_BELL_SMOKE_FAILED);
     }
 
     // ----------------------------------------------------------------
