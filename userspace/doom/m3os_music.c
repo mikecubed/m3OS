@@ -32,11 +32,24 @@
 #define M3OS_MUS_MAGIC2 'S'
 #define M3OS_MUS_MAGIC3 0x1A
 
-#define M3OS_VOICES 16
-/* One period of the waveform at SOURCE_RATE_HZ. The mixer's
- * resampler walks through this buffer; setting source_rate_hz to
- * `frequency_hz * VOICE_PERIOD_SAMPLES` gives the desired pitch. */
+/* Tier 2a music budget: 12 melodic voices in mixer channels
+ * 16..27, plus 4 drum voices in channels 28..31. Total still fits
+ * the 16-channel music half of the 32-channel mixer (channels
+ * 0..15 remain reserved for SFX). */
+#define M3OS_VOICES 12
+#define M3OS_DRUM_VOICES 4
+#define M3OS_DRUM_CHANNEL_BASE (M3OS_MUSIC_CHANNEL_BASE + M3OS_VOICES)
+
+/* One period of the melodic waveform. The mixer's resampler walks
+ * through this buffer at `frequency_hz * VOICE_PERIOD_SAMPLES`
+ * to produce the desired pitch. */
 #define VOICE_PERIOD_SAMPLES 128
+
+/* Per-drum one-shot sample buffer length, in 48 kHz frames. ~170 ms
+ * each — long enough for the longest drum (crash cymbal decay) at
+ * Tier 2a fidelity; shorter drums simply have a trailing silence
+ * region after their decay completes. */
+#define M3OS_DRUM_BUF_SAMPLES 8192
 
 struct m3os_mus_state {
     const uint8_t *lump;
@@ -327,6 +340,193 @@ static uint32_t read_varint(m3os_mus_state_t *state) {
     return value;
 }
 
+/* -----------------------------------------------------------------
+ * Drum synth — Tier 2a-plus path for MUS channel 15 (percussion).
+ *
+ * The MUS drum channel uses GM percussion key-number → drum-sample
+ * routing (note 36 = kick, 38 = snare, 42 = closed hat, 49 = crash,
+ * etc.). Tier 2a has no SoundFont, so we generate each drum kind
+ * once into a static u8 buffer via either filtered noise (cymbals,
+ * snare, hats) or a pitched triangle (kick, toms), shaped by a
+ * linear amplitude decay. Each NoteOn looks up the kind by note,
+ * seeds the kind's buffer on first use, and seeds a free
+ * round-robin slot in the drum mixer pool (no loop — drums are
+ * one-shots).
+ *
+ * Buffers are 8192 frames (~170 ms at 48 kHz); longer drum hits
+ * (crash) are truncated. Unmapped percussion notes are silent
+ * (better than wrong-pitch tones).
+ * ---------------------------------------------------------------*/
+
+typedef enum {
+    M3OS_DRUM_KICK = 0,
+    M3OS_DRUM_SNARE,
+    M3OS_DRUM_HAT_CLOSED,
+    M3OS_DRUM_HAT_OPEN,
+    M3OS_DRUM_CRASH,
+    M3OS_DRUM_RIDE,
+    M3OS_DRUM_TOM_LOW,
+    M3OS_DRUM_TOM_MID,
+    M3OS_DRUM_TOM_HIGH,
+    M3OS_DRUM_KIND_COUNT,
+} m3os_drum_kind_t;
+
+static uint8_t g_drum_buf[M3OS_DRUM_KIND_COUNT][M3OS_DRUM_BUF_SAMPLES];
+static int g_drum_buf_seeded[M3OS_DRUM_KIND_COUNT];
+static int g_drum_voice_next = 0; /* round-robin into the drum pool */
+
+/* MIDI percussion key-number → drum kind. Returns -1 for unmapped
+ * notes (silent). Mapping follows the General MIDI Level 1
+ * percussion key map; only the subset actually used by DOOM music
+ * is mapped (per chocolate-doom's SF2 GM kit observations). */
+static int drum_kind_for_note(int note) {
+    switch (note) {
+    case 35: /* Acoustic Bass Drum */
+    case 36: /* Bass Drum 1 */
+        return M3OS_DRUM_KICK;
+    case 38: /* Acoustic Snare */
+    case 40: /* Electric Snare */
+        return M3OS_DRUM_SNARE;
+    case 42: /* Closed Hi-Hat */
+    case 44: /* Pedal Hi-Hat */
+        return M3OS_DRUM_HAT_CLOSED;
+    case 46: /* Open Hi-Hat */
+        return M3OS_DRUM_HAT_OPEN;
+    case 49: /* Crash Cymbal 1 */
+    case 52: /* Chinese Cymbal */
+    case 55: /* Splash Cymbal */
+    case 57: /* Crash Cymbal 2 */
+        return M3OS_DRUM_CRASH;
+    case 51: /* Ride Cymbal 1 */
+    case 53: /* Ride Bell */
+    case 59: /* Ride Cymbal 2 */
+        return M3OS_DRUM_RIDE;
+    case 41: /* Low Floor Tom */
+    case 43: /* High Floor Tom */
+        return M3OS_DRUM_TOM_LOW;
+    case 45: /* Low Tom */
+    case 47: /* Low-Mid Tom */
+        return M3OS_DRUM_TOM_MID;
+    case 48: /* Hi-Mid Tom */
+    case 50: /* High Tom */
+        return M3OS_DRUM_TOM_HIGH;
+    default:
+        return -1;
+    }
+}
+
+/* Deterministic xorshift32 PRNG state, re-seeded per drum kind so a
+ * given drum always sounds the same across runs. */
+static uint32_t g_drum_prng = 0xDEADBEEFu;
+static uint8_t drum_noise_byte(void) {
+    uint32_t x = g_drum_prng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_drum_prng = x;
+    return (uint8_t)(x & 0xFFu);
+}
+
+/* Seed `buf` with one full hit of the given drum kind. Linear
+ * amplitude decay from `amp_start` down to 0 over `decay_samples`;
+ * past that point the buffer is filled with silence (u8 = 128). */
+static void seed_drum_buffer(m3os_drum_kind_t kind, uint8_t *buf) {
+    g_drum_prng = 0xDEADBEEFu ^ (uint32_t)kind; /* deterministic */
+    int amp_start, decay_samples, pitch_freq_hz;
+    int is_noise;
+    switch (kind) {
+    case M3OS_DRUM_KICK:
+        amp_start = 60; decay_samples = 3000; is_noise = 0; pitch_freq_hz = 60;
+        break;
+    case M3OS_DRUM_SNARE:
+        amp_start = 50; decay_samples = 4000; is_noise = 1; pitch_freq_hz = 0;
+        break;
+    case M3OS_DRUM_HAT_CLOSED:
+        amp_start = 35; decay_samples = 1500; is_noise = 1; pitch_freq_hz = 0;
+        break;
+    case M3OS_DRUM_HAT_OPEN:
+        amp_start = 35; decay_samples = 5500; is_noise = 1; pitch_freq_hz = 0;
+        break;
+    case M3OS_DRUM_CRASH:
+        amp_start = 55; decay_samples = 8000; is_noise = 1; pitch_freq_hz = 0;
+        break;
+    case M3OS_DRUM_RIDE:
+        amp_start = 40; decay_samples = 6000; is_noise = 1; pitch_freq_hz = 0;
+        break;
+    case M3OS_DRUM_TOM_LOW:
+        amp_start = 50; decay_samples = 5000; is_noise = 0; pitch_freq_hz = 110;
+        break;
+    case M3OS_DRUM_TOM_MID:
+        amp_start = 50; decay_samples = 4500; is_noise = 0; pitch_freq_hz = 180;
+        break;
+    case M3OS_DRUM_TOM_HIGH:
+        amp_start = 50; decay_samples = 4000; is_noise = 0; pitch_freq_hz = 250;
+        break;
+    default:
+        memset(buf, 128, M3OS_DRUM_BUF_SAMPLES);
+        return;
+    }
+    for (int i = 0; i < M3OS_DRUM_BUF_SAMPLES; ++i) {
+        int amp = 0;
+        if (i < decay_samples) {
+            amp = (amp_start * (decay_samples - i)) / decay_samples;
+        }
+        int sample;
+        if (is_noise) {
+            /* White noise scaled by envelope. Center around 0 (signed). */
+            int noise_signed = (int)drum_noise_byte() - 128;
+            sample = (noise_signed * amp) / 128;
+        } else {
+            /* Pitched triangle at `pitch_freq_hz` (kick / toms). */
+            int period_samples = (pitch_freq_hz > 0) ? 48000 / pitch_freq_hz : 1;
+            if (period_samples < 2) period_samples = 2;
+            int pos = i % period_samples;
+            int half = period_samples / 2;
+            int triangle;
+            if (pos < half) {
+                triangle = -amp + (2 * amp * pos) / half;
+            } else {
+                triangle = amp - (2 * amp * (pos - half)) / half;
+            }
+            sample = triangle;
+        }
+        int u = 128 + sample;
+        if (u < 0) u = 0;
+        if (u > 255) u = 255;
+        buf[i] = (uint8_t)u;
+    }
+}
+
+/* Play one drum hit. Picks a round-robin mixer slot from the drum
+ * pool; seeds the drum's sample buffer on first use. Velocity
+ * scales the per-channel volume; the master_volume is applied on
+ * top. */
+static void play_drum(int note, int velocity) {
+    int kind_i = drum_kind_for_note(note);
+    if (kind_i < 0) {
+        return; /* unmapped MIDI percussion → silent */
+    }
+    m3os_drum_kind_t kind = (m3os_drum_kind_t)kind_i;
+    if (!g_drum_buf_seeded[kind]) {
+        seed_drum_buffer(kind, g_drum_buf[kind]);
+        g_drum_buf_seeded[kind] = 1;
+    }
+    audio_mixer_t *m = g_mixer_accessor ? g_mixer_accessor() : NULL;
+    if (m == NULL) {
+        return;
+    }
+    size_t ch_idx = (size_t)(M3OS_DRUM_CHANNEL_BASE +
+                              (g_drum_voice_next % M3OS_DRUM_VOICES));
+    g_drum_voice_next = (g_drum_voice_next + 1) % M3OS_DRUM_VOICES;
+    int vol = (g_master_volume * velocity) / 127;
+    if (vol > 127) vol = 127;
+    /* Drums are one-shots — non-looping; the channel naturally
+     * deactivates when the cursor walks past `M3OS_DRUM_BUF_SAMPLES`. */
+    audio_mixer_set_channel(m, ch_idx, g_drum_buf[kind],
+                            (size_t)M3OS_DRUM_BUF_SAMPLES, 48000,
+                            (uint8_t)vol, (uint8_t)vol);
+}
+
 /* Dispatch a single MUS event. Returns 1 if the event was the
  * last in its group (a delay varint follows), 0 otherwise. */
 static int dispatch_event(m3os_mus_state_t *state) {
@@ -377,7 +577,11 @@ static int dispatch_event(m3os_mus_state_t *state) {
             velocity = state->lump[state->cursor++] & 0x7F;
         }
         if (channel == M3OS_MUS_DRUM_CHANNEL) {
-            /* Body bytes consumed above; no synth voice claimed. */
+            /* Tier 2a-plus drum synth: route to a noise / triangle
+             * one-shot voice from the drum pool. Body bytes already
+             * consumed; ReleaseNote is a no-op for drums. */
+            if (velocity < 0) velocity = 127;
+            play_drum(note, velocity);
             break;
         }
         if (velocity < 0) velocity = 127; /* sustain previous velocity */

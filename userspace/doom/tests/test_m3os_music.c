@@ -231,6 +231,118 @@ static int test_music_volume_scales_voices(void) {
     return 0;
 }
 
+static int test_drum_channel_routes_to_drum_pool(void) {
+    reset_world();
+    /* Score: PlayNote on channel 15 (drum) note 36 (kick) velocity 100.
+     * ctrl byte = (event=1 << 4) | channel=15 | last=0x80 = 0x9F.
+     * note byte = 36 | 0x80 (velocity bit) = 0xA4. velocity = 100 = 0x64. */
+    uint8_t score[] = {
+        0x9F, 0xA4, 0x64,    /* PlayNote ch=15 note=36 vel=100 last=1 */
+        0x00,                /* delay */
+    };
+    uint8_t buf[64] = {0};
+    build_mus_lump(buf, 16, score, sizeof(score));
+    m3os_mus_state_t *state = m3os_mus_parse_header(buf, 16 + sizeof(score));
+    ASSERT(state != NULL, "lump should parse");
+
+    m3os_music_tick(state);
+
+    /* Drum routed to drum pool (channels 28..31 in our 12-melodic +
+     * 4-drum split). */
+    int drum_hit = 0;
+    for (int i = 28; i < 32; i++) {
+        if (g_channels[i].set_calls > 0) {
+            drum_hit = 1;
+            break;
+        }
+    }
+    ASSERT(drum_hit, "drum NoteOn should claim a drum-pool channel (28..31)");
+    /* No melodic voice should have been claimed. */
+    for (int i = 16; i < 28; i++) {
+        ASSERT(g_channels[i].set_calls == 0,
+               "melodic channels must be untouched by drum events");
+    }
+    /* Drum source rate is 48 kHz (1:1, no pitch shift). */
+    int drum_ch = -1;
+    for (int i = 28; i < 32; i++) {
+        if (g_channels[i].set_calls > 0) { drum_ch = i; break; }
+    }
+    ASSERT(drum_ch >= 0, "drum channel must be located");
+    ASSERT(g_channels[drum_ch].rate_hz == 48000,
+           "drum samples should play at 48000 Hz (no pitch shift)");
+
+    m3os_mus_state_free(state);
+    return 0;
+}
+
+static int test_unmapped_drum_note_is_silent(void) {
+    reset_world();
+    /* Score: PlayNote on channel 15 note 60 (not in drum map, e.g. tubular
+     * bell which we don't generate). Should be entirely silent — no
+     * mixer activity on any channel. */
+    uint8_t score[] = {
+        0x9F, 0xBC, 0x64,    /* PlayNote ch=15 note=60 vel=100 last=1 */
+        0x00,                /* delay */
+    };
+    uint8_t buf[64] = {0};
+    build_mus_lump(buf, 16, score, sizeof(score));
+    m3os_mus_state_t *state = m3os_mus_parse_header(buf, 16 + sizeof(score));
+    ASSERT(state != NULL, "lump should parse");
+
+    m3os_music_tick(state);
+
+    for (int i = 0; i < MIXER_CHANNELS; i++) {
+        ASSERT(g_channels[i].set_calls == 0,
+               "unmapped drum MIDI note must produce no mixer activity");
+    }
+
+    m3os_mus_state_free(state);
+    return 0;
+}
+
+static int test_drum_round_robin_uses_full_pool(void) {
+    reset_world();
+    /* Five drum hits in quick succession. With 4 drum-pool slots
+     * and round-robin allocation, all four slots should be touched
+     * (the 5th hit wraps back to the first slot). */
+    uint8_t score[] = {
+        0x1F, 0xA4, 0x64,    /* PlayNote ch=15 n=36 vel=100 last=0 (kick) */
+        0x1F, 0xA6, 0x64,    /* PlayNote ch=15 n=38 vel=100 last=0 (snare) */
+        0x1F, 0xAA, 0x64,    /* PlayNote ch=15 n=42 vel=100 last=0 (hat cl) */
+        0x1F, 0xB1, 0x64,    /* PlayNote ch=15 n=49 vel=100 last=0 (crash) */
+        0x9F, 0xA4, 0x64,    /* PlayNote ch=15 n=36 vel=100 last=1 (kick again) */
+        0x00,                /* delay */
+    };
+    uint8_t buf[64] = {0};
+    build_mus_lump(buf, 16, score, sizeof(score));
+    m3os_mus_state_t *state = m3os_mus_parse_header(buf, 16 + sizeof(score));
+    ASSERT(state != NULL, "lump should parse");
+
+    m3os_music_tick(state);
+
+    int touched = 0;
+    int hit_twice = 0;
+    int total_set_calls = 0;
+    for (int i = 28; i < 32; i++) {
+        if (g_channels[i].set_calls > 0) touched++;
+        if (g_channels[i].set_calls == 2) hit_twice++;
+        total_set_calls += (int)g_channels[i].set_calls;
+    }
+    ASSERT(touched == 4, "all 4 drum-pool slots should have been hit");
+    /* The 5th drum hit wraps around so exactly one slot in the pool
+     * ends up with set_calls == 2 and the other three are at 1. The
+     * specific slot depends on the pool's round-robin starting
+     * position, which is module-global and carries across tests
+     * (not reset by reset_world). Asserting on the wrap shape
+     * rather than the slot index keeps the test order-independent. */
+    ASSERT(hit_twice == 1,
+           "round-robin should wrap exactly once across 5 hits in a 4-slot pool");
+    ASSERT(total_set_calls == 5, "5 drum hits should produce 5 mixer set_calls");
+
+    m3os_mus_state_free(state);
+    return 0;
+}
+
 static int test_stop_all_clears_active_voices(void) {
     reset_world();
     /* Two PlayNote events on different channels then ScoreEnd. */
@@ -265,6 +377,9 @@ int main(void) {
         {"test_note_on_off_round_trip", test_note_on_off_round_trip},
         {"test_score_end_terminates", test_score_end_terminates},
         {"test_music_volume_scales_voices", test_music_volume_scales_voices},
+        {"test_drum_channel_routes_to_drum_pool", test_drum_channel_routes_to_drum_pool},
+        {"test_unmapped_drum_note_is_silent", test_unmapped_drum_note_is_silent},
+        {"test_drum_round_robin_uses_full_pool", test_drum_round_robin_uses_full_pool},
         {"test_stop_all_clears_active_voices", test_stop_all_clears_active_voices},
     };
     int failures = 0;
