@@ -174,3 +174,22 @@ The single concrete change in `kernel/` for Phase 57 audio is one line of wideni
 > pipeline via a new `bell-test` binary that bypasses the kbd_server input-injection
 > gap. See `docs/roadmap/63-audio-stack-implementation.md` and
 > `docs/63-audio-stack-implementation.md` for the full breakdown.
+
+> **Phase 64 closure note:** Phase 57's `session_manager` lifecycle methods were
+> stubs — `start()` / `stop()` / `restart()` returned `Ack` unconditionally,
+> `m3ctl session-state` reported a value derived from IPC round-trip latency
+> rather than from a per-service state machine, and the typed `text-fallback`
+> recovery contract was logging-only at the F.4 boundary. Phase 64 (kernel
+> v0.64.0) delivered real supervisory behavior: a per-service `ServiceTable`
+> tracking PID + per-child `ServiceState` (`Starting`, `Running`, `Stopping`,
+> `Restarting`, `Failed`), a two-phase `stop_service` (SIGTERM → 5s grace →
+> SIGKILL → `sys_waitpid` reap) driven as a state machine across event-loop
+> iterations so the daemon never suspends, `restart_service` with the
+> `MAX_RETRIES_PER_STEP` / `MAX_RESTART_COUNT` budgets enforced and a
+> `DISPLAY_CRITICAL_SERVICES` set that escalates budget exhaustion to the
+> text-fallback motion, an authentic `session-state` reply that carries
+> per-service `(name, ServiceState, restart_count)` triples sourced from the
+> table, and a `recover.rs` that actually drops display-server children in
+> reverse start order before emitting the fallback notification. See
+> `docs/roadmap/64-session-manager-lifecycle.md` and
+> `docs/64-session-manager-lifecycle.md` for the full breakdown.
