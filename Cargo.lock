@@ -119,6 +119,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_client_ffi"
+version = "0.63.1"
+dependencies = [
+ "audio_client",
+ "kernel-core",
+]
+
+[[package]]
 name = "audio_mixer"
 version = "0.63.1"
 

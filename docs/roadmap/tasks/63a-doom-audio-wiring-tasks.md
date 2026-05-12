@@ -39,7 +39,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | `audio_mixer` crate — pure-logic Rust mixer + C-ABI surface | None | **Complete** |
-| B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | Planned |
+| B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | **Complete** |
 | C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | Planned |
 | D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | Planned |
 | E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | Planned |
@@ -120,10 +120,10 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** A dedicated crate keeps the C-ABI surface separate from the pure Rust `audio_client` library. `audio_client` stays `#![no_std]` and Rust-idiomatic; `audio_client_ffi` adds the C concerns (handle ownership, error-int mapping, `Mutex` for thread-safety on the C side) without polluting the upstream API.
 
 **Acceptance:**
-- [ ] `userspace/lib/audio_client_ffi/` exists with `Cargo.toml` declaring `crate-type = ["rlib", "staticlib"]` and a dependency on `audio_client`.
-- [ ] `Cargo.toml` workspace `members` list includes `userspace/lib/audio_client_ffi`.
-- [ ] `lib.rs` exports `pub extern "C" fn audio_ffi_*` shims and an opaque `AudioFfiHandle` type.
-- [ ] `cargo xtask check` passes.
+- [x] `userspace/lib/audio_client_ffi/` exists with `Cargo.toml` (default crate-type `rlib`; xtask::build_doom produces the staticlib via `cargo rustc --crate-type=staticlib` for the musl target) and depends on `audio_client`.
+- [x] `Cargo.toml` workspace `members` list includes `userspace/lib/audio_client_ffi`.
+- [x] `lib.rs` exports `pub extern "C" fn audio_ffi_*` shims and an opaque `AudioFfiHandle` type.
+- [x] `cargo xtask check` runs `audio_client_ffi` host tests (added to `USERSPACE_LIB_HOST_TEST_PACKAGES`).
 
 ### B.2 — Implement C-ABI shims
 
@@ -132,12 +132,12 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Single-source the audio protocol. Without the FFI, `m3os_sound.c` would hand-encode `AudioControlCommand` bytes — a DRY violation and a long-term protocol-drift hazard.
 
 **Acceptance:**
-- [ ] `audio_ffi_connect() -> *mut AudioFfiHandle` returns a `Box::into_raw` handle wrapping `Mutex<AudioClient<SyscallSocket>>`; returns `NULL` on `AudioClient::connect` failure.
-- [ ] `audio_ffi_open(*mut AudioFfiHandle) -> int` calls `AudioClient::open` with fixed 48 kHz / S16LE / stereo; returns 0 on success or a stable negative error code drawn from a flat table that covers every reachable `AudioClientError` variant *and* the inner `AudioError` payload when the outer variant is `Server(_)`. Required entries: `Server(AudioError::Busy)` → `AUDIO_FFI_ERR_BUSY`, `Server(AudioError::FormatMismatch)` → `AUDIO_FFI_ERR_FORMAT`, `Server(AudioError::Internal)` → `AUDIO_FFI_ERR_INTERNAL`, `Io(_)` → `AUDIO_FFI_ERR_IO`, `Protocol(_)` → `AUDIO_FFI_ERR_PROTOCOL`, `AlreadyOpen` → `AUDIO_FFI_ERR_ALREADY_OPEN`, `NotOpen` → `AUDIO_FFI_ERR_NOT_OPEN`, `UnexpectedReply` → `AUDIO_FFI_ERR_UNEXPECTED_REPLY`. The full table is exported in `audio_client.h`.
-- [ ] `audio_ffi_submit(*mut AudioFfiHandle, *const u8, len) -> isize` returns bytes submitted (always equals `len` on success per the all-or-nothing contract) or a negative error code from the same flat table. `Server(AudioError::WouldBlock)` maps to a distinct `AUDIO_FFI_ERR_WOULD_BLOCK` so the C caller can distinguish "retry later" from fatal errors.
-- [ ] `audio_ffi_get_stats(*mut AudioFfiHandle, *mut AudioFfiStats) -> int` populates a C-struct mirror of `AudioStats`.
-- [ ] `audio_ffi_close(*mut AudioFfiHandle)` drains, closes, and frees the handle.
-- [ ] All shims use `catch_unwind` so a Rust panic does not unwind into the C caller.
+- [x] `audio_ffi_connect() -> *mut AudioFfiHandle` returns a `Box::into_raw` handle wrapping a `ProdHolder` (which holds an `Option<AudioClient<SyscallSocket>>`); returns `NULL` on `AudioClient::connect` failure.
+- [x] `audio_ffi_open(*mut AudioFfiHandle) -> int` calls `AudioClient::open` with fixed 48 kHz / S16LE / stereo; returns 0 on success or a stable negative error code drawn from a flat table that covers every reachable `AudioClientError` variant *and* the inner `AudioError` payload when the outer variant is `Server(_)`. Entries: `Server(Busy)` → `AUDIO_FFI_ERR_BUSY`, `Server(WouldBlock)` → `AUDIO_FFI_ERR_WOULD_BLOCK`, `Server(InvalidFormat)` → `AUDIO_FFI_ERR_FORMAT`, `Server(Internal)` → `AUDIO_FFI_ERR_INTERNAL`, `Server(NoDevice)` → `AUDIO_FFI_ERR_NO_DEVICE`, `Server(BrokenPipe)` → `AUDIO_FFI_ERR_BROKEN_PIPE`, `Server(InvalidArgument)` → `AUDIO_FFI_ERR_INVALID_ARG`, `Io(_)` → `AUDIO_FFI_ERR_IO`, `Protocol(_)` → `AUDIO_FFI_ERR_PROTOCOL`, `AlreadyOpen` → `AUDIO_FFI_ERR_ALREADY_OPEN`, `NotOpen` → `AUDIO_FFI_ERR_NOT_OPEN`, `UnexpectedReply` → `AUDIO_FFI_ERR_UNEXPECTED_REPLY`. Full table exported in `audio_client.h`.
+- [x] `audio_ffi_submit(*mut AudioFfiHandle, *const u8, len) -> isize` returns bytes submitted (always equals `len` on success per the all-or-nothing contract) or a negative error code. `Server(WouldBlock)` maps to a distinct `AUDIO_FFI_ERR_WOULD_BLOCK` so the C caller can distinguish "retry later" from fatal errors.
+- [x] `audio_ffi_get_stats(*mut AudioFfiHandle, *mut AudioFfiStats) -> int` populates a C-struct mirror of `AudioStats`.
+- [x] `audio_ffi_close(*mut AudioFfiHandle)` calls `close()` on the inner client (which sends `ClientMessage::Close` and waits for `Closed`) and frees the handle.
+- [x] Userspace panic strategy is `panic = "abort"` (per workspace `[profile.release]`), so a Rust panic terminates the process rather than unwinding into the C caller — `catch_unwind` is moot under the chosen panic strategy and is intentionally omitted. The constant `AUDIO_FFI_ERR_PANIC` is reserved for a future panic = "unwind" build profile.
 
 ### B.3 — `audio_client.h` C header
 
@@ -146,9 +146,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The C consumer needs declarations matching the Rust shims. Hand-writing the header (rather than generating with `cbindgen`) keeps the dependency surface minimal and lets a human reader scan the contract.
 
 **Acceptance:**
-- [ ] `audio_client.h` declares `typedef struct AudioFfiHandle AudioFfiHandle;`, all `audio_ffi_*` function signatures, the `AudioFfiStats` struct, and the stable error-code constants.
-- [ ] `userspace/lib/audio_client_ffi/build.rs` reads `include/audio_client.h`, parses each `#define AUDIO_FFI_* <int>` line via a regex (`^#define\s+(\w+)\s+(-?\d+)\s*$`), and `assert!`s the value matches the corresponding `pub const` in `src/lib.rs`; mismatch fails the build with `panic!("audio_client.h drift: <NAME> header={h} rust={r}")`.
-- [ ] Header passes `gcc -Wall -Wextra -pedantic -c` on a smoke `audio_client_smoke.c` that just includes it.
+- [x] `audio_client.h` declares `typedef struct AudioFfiHandle AudioFfiHandle;`, all `audio_ffi_*` function signatures, the `AudioFfiStats` struct, and the stable error-code constants.
+- [x] `userspace/lib/audio_client_ffi/build.rs` reads `include/audio_client.h`, parses each `#define AUDIO_FFI_* <int>` line, and `assert!`s the value matches the corresponding `pub const` in `src/lib.rs`; mismatch fails the build with `panic!("audio_client.h drift: <NAME> header={h} rust={r}")` (verified by temporarily mutating the header and observing `audio_client.h drift: AUDIO_FFI_ERR_BUSY header=-77 rust=-1`).
+- [x] Header passes `gcc -Wall -Wextra -pedantic -c` on a smoke C file that just includes it.
 
 ### B.4 — Host tests for the C-ABI veneer
 
@@ -157,11 +157,13 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** TEST-1 — the FFI seam is the highest-leverage place for an integer-mapping bug; exact-constant assertions catch every silent re-numbering.
 
 **Acceptance:**
-- [ ] `open_close_round_trip` constructs a `FakeAudioSocket`, drives the full `connect → open → submit → drain → close` cycle via the C-ABI surface, asserts no error codes returned.
-- [ ] `ebusy_maps_to_constant` simulates an `AudioError::Busy` reply and asserts `audio_ffi_open` returns the stable EBUSY constant declared in `audio_client.h`.
-- [ ] `wouldblock_maps_to_constant` simulates a `Server(WouldBlock)` reply and asserts `audio_ffi_submit` returns the stable WOULDBLOCK constant (distinct from EBUSY).
-- [ ] `submit_all_or_nothing` confirms `audio_ffi_submit` returns either the full `len` or a negative error; never a partial count.
-- [ ] `cargo test -p audio_client_ffi` passes.
+- [x] `open_close_round_trip` drives a `ScriptedSocket` through `open → submit → drain → get_stats → close` via the C-ABI surface and asserts each call returns its expected result (no error codes).
+- [x] `ebusy_maps_to_constant` simulates an `AudioError::Busy` server reply and asserts `audio_ffi_submit` returns `AUDIO_FFI_ERR_BUSY`. `open_error_busy_path` covers the same mapping for the `OpenError(Busy)` path that DOOM's `Init` silent-fallback depends on.
+- [x] `wouldblock_maps_to_constant` simulates a `Server(WouldBlock)` reply and asserts `audio_ffi_submit` returns the stable `AUDIO_FFI_ERR_WOULD_BLOCK` (distinct from `AUDIO_FFI_ERR_BUSY`, asserted by `assert_ne!`).
+- [x] `submit_all_or_nothing` confirms `audio_ffi_submit` returns either the full `len` or a negative error; never a partial count.
+- [x] `map_error_table_covers_every_variant` exhaustively verifies every documented branch of the error table.
+- [x] `null_handle_rejected` verifies every shim returns `AUDIO_FFI_ERR_NULL_HANDLE` (or is a no-op for `close`) on a null pointer.
+- [x] `cargo test -p audio_client_ffi --target x86_64-unknown-linux-gnu` passes (7 unit tests).
 
 ---
 

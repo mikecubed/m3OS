@@ -1,0 +1,20 @@
+[package]
+name = "audio_client_ffi"
+version = "0.63.1"
+edition = "2024"
+description = "Phase 63a Track B — C-ABI veneer over audio_client. Hand-shipped audio_client.h plus build-script drift check."
+build = "build.rs"
+
+[lib]
+name = "audio_client_ffi"
+path = "src/lib.rs"
+# `staticlib` is built on demand by xtask::build_doom via
+# `cargo rustc --crate-type=staticlib --target <musl>`; the default
+# `rlib` is what cargo test consumes.
+
+[dependencies]
+audio_client = { path = "../audio_client" }
+kernel-core = { path = "../../../kernel-core", default-features = false }
+
+[dev-dependencies]
+audio_client = { path = "../audio_client", features = ["test-support"] }

@@ -35,6 +35,8 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("term", &["--lib"]),
     // Phase 63a Track A — pure-logic mixer with C-ABI surface
     ("audio_mixer", &[]),
+    // Phase 63a Track B — C-ABI veneer over audio_client
+    ("audio_client_ffi", &[]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -2998,7 +3000,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, and audio_mixer host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, and audio_client_ffi host tests pass"
     );
 }
 
