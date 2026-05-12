@@ -150,6 +150,13 @@ These don't deserve a dedicated phase. Any of them can be landed as a small PR w
 - **Effort:** 2 h if pursued — pre-compute multiple lower-detail waveform buffers (mip-mapping) and have the synth pick one based on note frequency.
 - **Depends on:** nothing technical; skip if 63b is the next phase.
 
+### LF-9b. Smooth the drum-synth noise envelope
+
+- **What:** Tier 2a drums (cymbals, hats, snare) are filtered white noise × linear decay envelope. WAV analysis of `doom-audio-smoke` output shows the "clicks" the listener reports during music are mostly the noise-content sample-by-sample transitions (jump amplitudes of 4000–7000 i16 at sub-millisecond intervals — exactly the shape of white noise). Real DOOM percussion uses recorded drum kit samples; ours are synthesized.
+- **Why deferred:** the drum samples land naturally in Tier 2b's SoundFont path (`63b-E` maps MUS channel 15 to SF2 preset bank 128). A Tier 2a-only "make the drum noise less harsh" fix would be a 1-h band-pass filter + envelope tweak, but the gains are limited — Tier 2a-quality drums by definition won't sound like Bobby Prince's recordings.
+- **Effort:** 1 h if pursued (single-pole low-pass IIR on the noise samples, shaped attack envelope on cymbals). The `analyze_wav.rs` tool committed alongside this doc gives concrete before/after metrics if the experiment is run.
+- **Depends on:** nothing technical; skip if 63b is the next phase.
+
 ### LF-10. Sub-tick audio sub-stepping (event-accurate timing)
 
 - **What:** Phase 63a's `m3os_sound::Update` dispatches all 4 MUS ticks of a DOOM tic BEFORE running `audio_mixer_step` once. Events that should fire mid-tic (e.g. a 2-tick-long staccato note) get snapped to the tic boundary. Audible as slightly mistimed accents on rapid passages.

@@ -78,6 +78,17 @@ pub struct ChannelState {
     /// step-discontinuity click that bare-clear NoteOff would cause.
     fade_out_remaining: u16,
     fade_out_total: u16,
+    /// Voice-reclaim volume ramp. When `vol_ramp_total > 0`, the
+    /// per-frame `left_vol` / `right_vol` linearly interpolate from
+    /// `(prev_left_vol, prev_right_vol)` to the channel's nominal
+    /// `(left_vol, right_vol)` over `vol_ramp_total` frames. Used
+    /// when a new note reclaims an in-flight voice — without the
+    /// ramp the volume changes in one frame, producing an audible
+    /// step at the cursor's current waveform amplitude.
+    vol_ramp_remaining: u16,
+    vol_ramp_total: u16,
+    prev_left_vol: u8,
+    prev_right_vol: u8,
 }
 
 unsafe impl Send for ChannelState {}
@@ -96,6 +107,10 @@ impl Default for ChannelState {
             loop_enabled: false,
             fade_out_remaining: 0,
             fade_out_total: 0,
+            vol_ramp_remaining: 0,
+            vol_ramp_total: 0,
+            prev_left_vol: 0,
+            prev_right_vol: 0,
         }
     }
 }
@@ -233,10 +248,11 @@ impl Mixer {
         let lv = left_vol.min(127);
         let rv = right_vol.min(127);
         let inc = (((source_rate_hz as u64) << 16) / OUTPUT_RATE_HZ as u64) as u32;
+        let was_active = self.channels[idx].active;
         // Preserve cursor across re-seed when the channel is still
         // active (NoteOn on an in-flight voice). Modular-reduce so
         // the preserved value is in-range for the new buffer.
-        let preserved_cursor = if self.channels[idx].active {
+        let preserved_cursor = if was_active {
             let len_units = (samples.len() as u64) << 16;
             let mut c = self.channels[idx].cursor;
             if len_units > 0 {
@@ -250,6 +266,25 @@ impl Mixer {
         } else {
             0
         };
+        // Voice-reclaim volume ramp. When reclaiming an active voice
+        // (mid-note NoteOn), keep the old vol as the starting point
+        // and ramp to the new vol over 64 output frames (~1.3 ms at
+        // 48 kHz). This avoids the per-frame volume step that the
+        // waveform-at-cursor amplitude would otherwise materialise as
+        // an audible click at every legato note transition. For a
+        // freshly-active channel (default state) no ramp is needed —
+        // the cursor starts at 0 where the silence-bordered waveform
+        // is at amplitude 0 anyway.
+        const VOL_RAMP_FRAMES: u16 = 64;
+        let (prev_lv, prev_rv, ramp_frames) = if was_active {
+            (
+                self.channels[idx].left_vol,
+                self.channels[idx].right_vol,
+                VOL_RAMP_FRAMES,
+            )
+        } else {
+            (lv, rv, 0)
+        };
         self.channels[idx] = ChannelState {
             samples_ptr: samples.as_ptr(),
             samples_len: samples.len(),
@@ -261,6 +296,10 @@ impl Mixer {
             loop_enabled,
             fade_out_remaining: 0,
             fade_out_total: 0,
+            vol_ramp_remaining: ramp_frames,
+            vol_ramp_total: ramp_frames,
+            prev_left_vol: prev_lv,
+            prev_right_vol: prev_rv,
         };
     }
 
@@ -357,8 +396,25 @@ impl Mixer {
                 let s1_full = (s1 - 128) << 8;
                 let frac = (ch.cursor & 0xFFFF) as i32;
                 let interp = (s0_full * (0x10000 - frac) + s1_full * frac) >> 16;
-                let mut l = (interp * ch.left_vol as i32) >> 7;
-                let mut r = (interp * ch.right_vol as i32) >> 7;
+                // Effective per-frame volume. When a voice-reclaim
+                // ramp is in flight, linearly interpolate from
+                // `prev_*_vol` to `*_vol` over `vol_ramp_total`
+                // frames. Otherwise use the nominal vol verbatim.
+                let (effective_lv, effective_rv) = if ch.vol_ramp_total > 0 {
+                    let progress = (ch.vol_ramp_total - ch.vol_ramp_remaining) as i32;
+                    let total = ch.vol_ramp_total as i32;
+                    let elv = (ch.prev_left_vol as i32 * (total - progress)
+                        + ch.left_vol as i32 * progress)
+                        / total;
+                    let erv = (ch.prev_right_vol as i32 * (total - progress)
+                        + ch.right_vol as i32 * progress)
+                        / total;
+                    (elv, erv)
+                } else {
+                    (ch.left_vol as i32, ch.right_vol as i32)
+                };
+                let mut l = (interp * effective_lv) >> 7;
+                let mut r = (interp * effective_rv) >> 7;
                 // Apply linear fade-out if the channel is in release.
                 // `fade_out_remaining / fade_out_total` ramps from 1.0
                 // down to 0.0 over `fade_out_total` frames.
@@ -371,6 +427,15 @@ impl Mixer {
                 acc_l = acc_l.saturating_add(l);
                 acc_r = acc_r.saturating_add(r);
                 ch.cursor = ch.cursor.wrapping_add(ch.inc as u64);
+                // Advance volume-reclaim ramp.
+                if ch.vol_ramp_total > 0 {
+                    if ch.vol_ramp_remaining <= 1 {
+                        ch.vol_ramp_remaining = 0;
+                        ch.vol_ramp_total = 0;
+                    } else {
+                        ch.vol_ramp_remaining -= 1;
+                    }
+                }
                 // Advance release-envelope after the frame is written
                 // so the final scaled sample is `0/total = 0` exactly.
                 if ch.fade_out_total > 0 {
