@@ -37,6 +37,10 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_mixer", &[]),
     // Phase 63a Track B — C-ABI veneer over audio_client
     ("audio_client_ffi", &[]),
+    // Phase 64 — session_manager pure-logic `table` and `lifecycle`
+    // modules. Same lib + bin split as `audio_server`; host tests
+    // build the lib only and skip the `_start`-bearing binary.
+    ("session_manager", &["--lib"]),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -611,6 +615,12 @@ fn build_userspace_bins() {
             // `os-binary` gate as `m3ctl` so its `_start` entry point
             // is built only when the xtask asks for the OS binary.
             "fb-takeover" => &["--features", "os-binary"],
+            // Phase 64: `session_manager` adopts the lib + bin split
+            // so the new `table` / `lifecycle` modules host-test under
+            // `cargo test -p session_manager`. The xtask drops the
+            // gate to build the OS binary; host tests compile the
+            // lib only.
+            "session_manager" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -3153,7 +3163,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, and audio_client_ffi host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, and session_manager host tests pass; doom platform-layer C tests pass"
     );
 }
 

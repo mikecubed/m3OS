@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "session_manager"
-version = "0.57.0"
+version = "0.64.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",

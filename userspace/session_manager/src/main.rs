@@ -54,6 +54,13 @@ mod boot;
 mod control;
 mod recover;
 
+// Phase 64: pure-logic types (`Pid`, `ServiceState`, `ServiceTable`)
+// live in the `session_manager` library crate so they host-test under
+// `cargo test -p session_manager --target x86_64-unknown-linux-gnu`.
+// The binary picks them up through the crate name.
+#[allow(unused_imports)]
+use session_manager::table::{Pid, ServiceState, ServiceTable};
+
 use core::alloc::Layout;
 
 use kernel_core::session::{MAX_RETRIES_PER_STEP, SessionState, SessionStep, StartupSequence};
