@@ -95,11 +95,17 @@ static uint32_t midi_to_freq_hz(int note) {
     return k_freq_table[note];
 }
 
-/* Per-voice peak amplitude in DMX u8 space — chosen so a chord of
- * 4–8 simultaneous voices at the default master/velocity scaling
- * stays under the mixer's i16 clamp. AMP=32 puts each voice at
- * ±8192 in i16 space after the <<8 sign conversion. */
-#define M3OS_MUSIC_AMP 32
+/* Per-voice peak amplitude in DMX u8 space. AMP=20 puts each voice
+ * at ±5120 in i16 space after the <<8 sign conversion. At the
+ * default master/velocity vol of ~78, the per-voice clipping-domain
+ * peak is ~3120; 8 simultaneous voices summed at peak land around
+ * 24960 — comfortably below i16::MAX = 32767. AMP=32 (the prior
+ * value) clipped at 7+ simultaneous voices, producing the
+ * harmonic-distortion crackle the listener heard on dense
+ * chord-changes; the lower amplitude trades raw loudness for a
+ * clean composite signal. The DOOM engine's `S_AdjustSoundParams`
+ * + `snd_MusicVolume` give the player further control. */
+#define M3OS_MUSIC_AMP 20
 
 /* Seed `buf` with one period of `waveform` in DMX format. Both
  * shapes are constructed so the buffer starts AND ends at silence

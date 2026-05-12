@@ -199,6 +199,18 @@ impl Mixer {
     /// Internal helper that backs both [`Mixer::set_channel`] and
     /// [`Mixer::set_channel_loop`].
     ///
+    /// Cursor preservation policy: if the target channel is
+    /// currently `active` (either playing or in release-fade), the
+    /// 16.16 cursor is **preserved** across the re-seed, scaled
+    /// modulo the new buffer length. This makes voice-reclaim
+    /// (NoteOff + NoteOn for the same voice within one mixer tic)
+    /// smooth — the new note starts at the same buffer phase the
+    /// outgoing one ended on, so amplitude is continuous across the
+    /// tic boundary. For a freshly-inactive channel (default state
+    /// or post-fade) the cursor resets to 0 so the buffer's
+    /// silence-bordered start sample (128 in DMX space) leads the
+    /// note in cleanly.
+    ///
     /// # Safety
     ///
     /// Same slice-lifetime contract as [`Mixer::set_channel`].
@@ -221,10 +233,27 @@ impl Mixer {
         let lv = left_vol.min(127);
         let rv = right_vol.min(127);
         let inc = (((source_rate_hz as u64) << 16) / OUTPUT_RATE_HZ as u64) as u32;
+        // Preserve cursor across re-seed when the channel is still
+        // active (NoteOn on an in-flight voice). Modular-reduce so
+        // the preserved value is in-range for the new buffer.
+        let preserved_cursor = if self.channels[idx].active {
+            let len_units = (samples.len() as u64) << 16;
+            let mut c = self.channels[idx].cursor;
+            if len_units > 0 {
+                while c >= len_units {
+                    c = c.wrapping_sub(len_units);
+                }
+            } else {
+                c = 0;
+            }
+            c
+        } else {
+            0
+        };
         self.channels[idx] = ChannelState {
             samples_ptr: samples.as_ptr(),
             samples_len: samples.len(),
-            cursor: 0,
+            cursor: preserved_cursor,
             inc,
             left_vol: lv,
             right_vol: rv,
@@ -600,6 +629,55 @@ mod tests {
         assert!(
             !mixer.channel(0).unwrap().is_active(),
             "channel should be inactive after fade completes"
+        );
+    }
+
+    #[test]
+    fn set_channel_loop_preserves_cursor_when_active() {
+        // Seed a 4-sample loop, advance the cursor, then re-seed
+        // with the same buffer + same rate. The pre-existing cursor
+        // must be preserved (modular-reduced into the new buffer)
+        // so the channel's audio continues from the same phase.
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![128u8, 192, 192, 128];
+        unsafe {
+            mixer.set_channel_loop(0, &samples, 48_000, 127, 127);
+        }
+        // Advance ~2 frames so the cursor is at ~2 in 16.16.
+        let mut throwaway = [0u8; 2 * BYTES_PER_FRAME];
+        let _ = mixer.step(&mut throwaway, 2);
+        let cursor_before = mixer.channel(0).unwrap().cursor;
+        assert!(cursor_before > 0, "cursor should have advanced");
+        // Re-seed with the same buffer — cursor must be preserved.
+        unsafe {
+            mixer.set_channel_loop(0, &samples, 48_000, 127, 127);
+        }
+        let cursor_after = mixer.channel(0).unwrap().cursor;
+        assert_eq!(
+            cursor_after, cursor_before,
+            "re-seeding an active channel must preserve the cursor"
+        );
+    }
+
+    #[test]
+    fn set_channel_loop_resets_cursor_when_inactive() {
+        // Same setup as above, but mark the channel inactive
+        // (post-fade) before re-seeding. Cursor must reset to 0.
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![128u8, 192, 192, 128];
+        unsafe {
+            mixer.set_channel_loop(0, &samples, 48_000, 127, 127);
+        }
+        let mut throwaway = [0u8; 2 * BYTES_PER_FRAME];
+        let _ = mixer.step(&mut throwaway, 2);
+        mixer.clear_channel(0);
+        unsafe {
+            mixer.set_channel_loop(0, &samples, 48_000, 127, 127);
+        }
+        assert_eq!(
+            mixer.channel(0).unwrap().cursor,
+            0,
+            "re-seeding an inactive channel must reset the cursor"
         );
     }
 
