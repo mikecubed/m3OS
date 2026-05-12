@@ -1,12 +1,11 @@
 /*
  * m3os_dmx.h — Phase 63a Track C: WAD DMX SFX decoder.
  *
- * The DMX format ships in every DOOM SFX lump:
- *   bytes 0..1   : format tag (u16le, must equal 3)
- *   bytes 2..3   : sample rate (u16le, Hz)
- *   bytes 4..7   : sample count (u32le)
- *   bytes 8..11  : padding (u16le[2], ignored)
- *   bytes 12..   : unsigned 8-bit PCM (DMX-format, 128 = silence)
+ * The DMX format ships in every DOOM SFX lump (8-byte header):
+ *   bytes 0..1 : format tag (u16le, must equal 3)
+ *   bytes 2..3 : sample rate (u16le, Hz)
+ *   bytes 4..7 : sample count (u32le)
+ *   bytes 8..  : unsigned 8-bit PCM (DMX-format, 128 = silence)
  *
  * Decoder is zero-copy: `samples` points back into the caller's lump
  * buffer. The caller must keep the lump alive for as long as the

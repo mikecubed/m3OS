@@ -178,17 +178,22 @@ void DG_DrawFrame(void)
      * invocation.
      *
      * Phase 63a Track H — `/tmp/doom-autoquit-tics` is a smoke-gate
-     * seam: the doom-audio-smoke harness writes the desired tic
-     * budget into that file before launching DOOM, and we read it
-     * once at title-ready time. When the tic counter crosses the
+     * seam: the doom-audio-smoke harness writes the desired budget
+     * into that file before launching DOOM, and we read it once at
+     * title-ready time. The counter is incremented per
+     * `DG_DrawFrame` call (i.e. per rendered frame); in doomgeneric
+     * the engine drives one DG_DrawFrame per game tic, so a budget
+     * of N is consumed in ~N tics today. The file path keeps its
+     * historical `-tics` suffix for harness compatibility, but the
+     * accounting is in render frames. When the counter crosses the
      * budget we call `I_Quit()` so the engine's normal Shutdown
      * runs (which fires `m3os_sound_shutdown_inner` and emits the
      * `M3OS_DOOM:audio_summary` line the gate parses). DOOM running
      * under a user — `/tmp/doom-autoquit-tics` absent — sees no
      * behavioural change. */
     static int title_ready_printed = 0;
-    static int s_autoquit_tics = -1;
-    static int s_tic_counter = 0;
+    static int s_autoquit_frames = -1;
+    static int s_frame_counter = 0;
     if (!title_ready_printed) {
         title_ready_printed = 1;
         printf("M3OS_DOOM:title_ready\n");
@@ -197,13 +202,13 @@ void DG_DrawFrame(void)
         if (f) {
             int n;
             if (fscanf(f, "%d", &n) == 1 && n > 0) {
-                s_autoquit_tics = n;
+                s_autoquit_frames = n;
             }
             fclose(f);
         }
     }
-    s_tic_counter++;
-    if (s_autoquit_tics > 0 && s_tic_counter >= s_autoquit_tics) {
+    s_frame_counter++;
+    if (s_autoquit_frames > 0 && s_frame_counter >= s_autoquit_frames) {
         extern void I_Quit(void);
         I_Quit();
     }

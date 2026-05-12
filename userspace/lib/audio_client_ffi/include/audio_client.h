@@ -50,7 +50,10 @@ extern "C" {
 #define AUDIO_FFI_ERR_UNEXPECTED_REPLY -12
 /* Null handle passed to an FFI verb. */
 #define AUDIO_FFI_ERR_NULL_HANDLE -13
-/* Internal panic captured by `catch_unwind`. */
+/* Reserved for an internal-panic path. The current implementation
+ * aborts on panic via the static-lib runtime's `#[panic_handler]`
+ * rather than catching across the FFI boundary, so this code is not
+ * currently returned. Kept for ABI stability. */
 #define AUDIO_FFI_ERR_PANIC -14
 
 /* Opaque handle. */
@@ -82,8 +85,10 @@ int audio_ffi_drain(AudioFfiHandle *handle);
 /* Populate `*out` with the latest stats. Returns 0 on success. */
 int audio_ffi_get_stats(AudioFfiHandle *handle, AudioFfiStats *out);
 
-/* Close the stream and release the handle. Idempotent: a second call
- * on the same pointer is a no-op (the handle is consumed). */
+/* Close the stream and release the handle. After this returns, the
+ * handle pointer is freed and must not be reused — passing the same
+ * non-NULL pointer to any FFI verb (including a second `close`) is
+ * undefined behavior. Passing NULL is a safe no-op. */
 void audio_ffi_close(AudioFfiHandle *handle);
 
 #ifdef __cplusplus

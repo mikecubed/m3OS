@@ -1,7 +1,7 @@
 /*
  * m3os_dmx.c — Phase 63a Track C: WAD DMX SFX decoder.
  *
- * Pure C, no allocation, no I/O. Validates the 12-byte DMX header,
+ * Pure C, no allocation, no I/O. Validates the 8-byte DMX header,
  * bounds-checks the declared sample count against the lump length,
  * and returns a zero-copy view (`(rate_hz, samples, len)`) for the
  * mixer to consume.

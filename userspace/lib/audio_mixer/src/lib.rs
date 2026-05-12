@@ -347,11 +347,11 @@ impl Mixer {
         if out.len() < needed {
             return 0;
         }
-        // Zero the output region first so the per-channel loop can
-        // accumulate via `+=` without an explicit silence path.
-        for byte in &mut out[..needed] {
-            *byte = 0;
-        }
+        // Each iteration accumulates into local `acc_l`/`acc_r` and
+        // writes the saturated frame into `out` exactly once, so the
+        // output region is fully overwritten without a separate
+        // pre-zero pass. Inactive channels and the no-channel case
+        // both fall through with zero accumulators, producing silence.
         for frame_i in 0..frames {
             let mut acc_l: i32 = 0;
             let mut acc_r: i32 = 0;
