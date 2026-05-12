@@ -21,13 +21,15 @@
     } while (0)
 
 static int test_valid_lump(void) {
-    /* 12-byte header + 4-byte body. Format tag 3, rate 11025, count 4. */
-    uint8_t lump[16] = {0};
+    /* 8-byte header + 4-byte body. Format tag 3, rate 11025, count 4.
+     * Mirrors the real DMX layout: vanilla DOOM / chocolate-doom both
+     * use an 8-byte header (not 12 — earlier revisions of this
+     * decoder mistakenly assumed 12 and rejected every real-WAD SFX). */
+    uint8_t lump[12] = {0};
     lump[0] = 3;  lump[1] = 0;            /* format tag = 3 */
     lump[2] = 0x11; lump[3] = 0x2B;       /* rate = 0x2B11 = 11025 */
     lump[4] = 4;  lump[5] = 0; lump[6] = 0; lump[7] = 0; /* count = 4 */
-    /* padding bytes 8..11 ignored */
-    lump[12] = 128; lump[13] = 192; lump[14] = 64; lump[15] = 200;
+    lump[8] = 128; lump[9] = 192; lump[10] = 64; lump[11] = 200;
 
     m3os_dmx_decoded out;
     memset(&out, 0xCC, sizeof(out));
@@ -35,21 +37,22 @@ static int test_valid_lump(void) {
     ASSERT(rc == 0, "expected decode success");
     ASSERT(out.rate_hz == 11025, "rate mismatch");
     ASSERT(out.len == 4, "len mismatch");
-    ASSERT(out.samples == lump + 12, "samples pointer should alias lump+12");
+    ASSERT(out.samples == lump + 8, "samples pointer should alias lump+8");
     ASSERT(out.samples[0] == 128 && out.samples[3] == 200, "sample bytes mismatch");
     return 0;
 }
 
 static int test_short_lump(void) {
-    uint8_t lump[10] = {3, 0, 0x11, 0x2B, 4, 0, 0, 0, 0, 0};
+    /* Lump shorter than the 8-byte header. */
+    uint8_t lump[5] = {3, 0, 0x11, 0x2B, 4};
     m3os_dmx_decoded out;
     int rc = m3os_dmx_decode(lump, sizeof(lump), &out);
-    ASSERT(rc == -1, "lumps under 16 bytes must be rejected");
+    ASSERT(rc == -1, "lumps under the 9-byte minimum must be rejected");
     return 0;
 }
 
 static int test_bad_format_tag(void) {
-    uint8_t lump[16] = {0};
+    uint8_t lump[12] = {0};
     lump[0] = 7; lump[1] = 0;             /* format tag != 3 */
     lump[2] = 0x11; lump[3] = 0x2B;
     lump[4] = 4;
@@ -73,7 +76,7 @@ static int test_oversize_sample_count(void) {
 
 static int test_zero_rate(void) {
     /* rate_hz = 0 would divide by zero in the mixer's `inc` math. */
-    uint8_t lump[16] = {0};
+    uint8_t lump[12] = {0};
     lump[0] = 3; lump[1] = 0;
     /* rate = 0 */
     lump[4] = 4;
@@ -85,46 +88,29 @@ static int test_zero_rate(void) {
 
 static int test_null_pointers(void) {
     m3os_dmx_decoded out;
-    uint8_t lump[16] = {3, 0, 0x11, 0x2B, 4, 0, 0, 0};
+    uint8_t lump[12] = {3, 0, 0x11, 0x2B, 4, 0, 0, 0};
     ASSERT(m3os_dmx_decode(NULL, sizeof(lump), &out) == -1, "null lump rejected");
     ASSERT(m3os_dmx_decode(lump, sizeof(lump), NULL) == -1, "null out rejected");
     return 0;
 }
 
-static int test_strips_dmx_padding(void) {
-    /* A real-WAD-shaped lump: 12-byte header + 100-byte sample body.
-     * Pads of 16 bytes at each end should be stripped, leaving 68
-     * bytes of "real" sample content starting at lump+12+16. */
-    uint8_t lump[12 + 100] = {0};
+static int test_real_wad_dspistol_shape(void) {
+    /* Models the DOOM1.WAD DSPISTOL lump exactly: 8-byte header +
+     * 3200-byte sample body. The earlier (12-byte-header) decoder
+     * rejected this with `sample_count + 12 > lump_len` because
+     * 3200 + 12 = 3212 > 3208. The fix makes it pass. */
+    static uint8_t lump[3208];
+    memset(lump, 128, sizeof(lump));  /* fill body with silence */
     lump[0] = 3; lump[1] = 0;
-    lump[2] = 0x11; lump[3] = 0x2B;
-    lump[4] = 100; lump[5] = 0; lump[6] = 0; lump[7] = 0;
-    /* Sentinel byte at the first non-pad position. */
-    lump[12 + 16] = 0xA5;
+    lump[2] = 0x22; lump[3] = 0x56;   /* rate = 0x5622 = 22050 */
+    lump[4] = 0x80; lump[5] = 0x0C;   /* count = 0x0C80 = 3200 */
+    lump[6] = 0; lump[7] = 0;
     m3os_dmx_decoded out;
     int rc = m3os_dmx_decode(lump, sizeof(lump), &out);
-    ASSERT(rc == 0, "decode should succeed");
-    ASSERT(out.len == 68, "len should be sample_count - 32 after pad strip");
-    ASSERT(out.samples == lump + 12 + 16, "samples should point past leading pad");
-    ASSERT(out.samples[0] == 0xA5, "first non-pad sentinel should be exposed");
-    return 0;
-}
-
-static int test_small_lump_passes_through_without_strip(void) {
-    /* Synthetic 4-sample body — too small to contain 32 bytes of
-     * pad, so the decoder leaves the body verbatim. Preserves the
-     * Track C test fixture shape. */
-    uint8_t lump[16] = {0};
-    lump[0] = 3; lump[1] = 0;
-    lump[2] = 0x11; lump[3] = 0x2B;
-    lump[4] = 4; lump[5] = 0; lump[6] = 0; lump[7] = 0;
-    lump[12] = 0xC3;
-    m3os_dmx_decoded out;
-    int rc = m3os_dmx_decode(lump, sizeof(lump), &out);
-    ASSERT(rc == 0, "decode should succeed");
-    ASSERT(out.len == 4, "small lump should pass through unstripped");
-    ASSERT(out.samples == lump + 12, "small lump samples start at lump+12");
-    ASSERT(out.samples[0] == 0xC3, "first sample byte preserved");
+    ASSERT(rc == 0, "DSPISTOL-shape lump must decode (regression: 8-byte header)");
+    ASSERT(out.rate_hz == 22050, "rate should be 22050");
+    ASSERT(out.len == 3200, "len should equal sample_count");
+    ASSERT(out.samples == lump + 8, "samples must start at lump+8");
     return 0;
 }
 
@@ -141,9 +127,7 @@ int main(void) {
         {"test_oversize_sample_count", test_oversize_sample_count},
         {"test_zero_rate", test_zero_rate},
         {"test_null_pointers", test_null_pointers},
-        {"test_strips_dmx_padding", test_strips_dmx_padding},
-        {"test_small_lump_passes_through_without_strip",
-         test_small_lump_passes_through_without_strip},
+        {"test_real_wad_dspistol_shape", test_real_wad_dspistol_shape},
     };
     int failures = 0;
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

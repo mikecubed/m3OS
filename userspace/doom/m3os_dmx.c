@@ -8,9 +8,25 @@
  */
 #include "m3os_dmx.h"
 
-/* Smallest DMX lump we'll accept: 12-byte header + at least 4 bytes
+/* DMX SFX lumps in real DOOM WADs use an **8-byte** header:
+ *   bytes 0..1: format tag (u16le, must equal 3)
+ *   bytes 2..3: sample rate (u16le, Hz)
+ *   bytes 4..7: sample count (u32le)
+ *   bytes 8..: unsigned-8 PCM samples
+ *
+ * Earlier revisions of this decoder assumed a 12-byte header
+ * (treating the next 4 bytes as DMX-library padding). That made
+ * every real-WAD SFX fail the `sample_count + 12 > lump_len`
+ * bounds check — DOOM1.WAD's DSPISTOL has lump_len=3208 +
+ * sample_count=3200, which fits exactly with an 8-byte header but
+ * overflows a 12-byte one. The chocolate-doom and vanilla i_sound
+ * loaders both use 8 bytes; we now match them.
+ */
+#define M3OS_DMX_HEADER 8
+
+/* Smallest DMX lump we'll accept: 8-byte header + at least 1 byte
  * of body. Lumps shorter than this are malformed. */
-#define M3OS_DMX_MIN_LUMP 16
+#define M3OS_DMX_MIN_LUMP (M3OS_DMX_HEADER + 1)
 
 /* DMX format tag is 3 for the unsigned-8 PCM container used by every
  * shipping DOOM SFX. */
@@ -28,19 +44,6 @@ static uint32_t m3os_dmx_read_u32le(const uint8_t *p) {
            ((uint32_t)p[3] << 24);
 }
 
-/* DMX SFX lumps in real DOOM WADs reserve 16 sustain-pad bytes at
- * the start and 16 at the end of the sample body (chocolate-doom
- * precedent — the pads hold the sample's starting/ending volume to
- * prevent DMA double-buffer clicks on legacy SoundBlaster cards).
- * Our mixer interpolates so the pads serve no purpose here, but
- * playing them DOES introduce an audible click at the SFX boundary
- * because the silence-before-sample transition isn't smooth.
- *
- * Strip the pads when the lump is large enough to have them
- * (real WADs always are); smaller lumps — typically synthetic test
- * fixtures — pass through verbatim. */
-#define M3OS_DMX_PAD 16
-
 int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out) {
     if (lump == NULL || out == NULL) {
         return -1;
@@ -57,23 +60,23 @@ int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out)
         return -1;
     }
     uint32_t sample_count = m3os_dmx_read_u32le(lump + 4);
-    /* The 12-byte header lives in front of `sample_count` bytes of
-     * unsigned-8 PCM. Rejecting `sample_count + 12 > lump_len` keeps
-     * the per-sample reads in `audio_mixer_step` in-bounds. The cast
-     * to size_t avoids an integer overflow on 32-bit platforms. */
-    if ((size_t)sample_count + 12u > lump_len) {
+    /* Rejecting `sample_count + 8 > lump_len` keeps the per-sample
+     * reads in `audio_mixer_step` in-bounds. The cast to size_t
+     * avoids an integer overflow on 32-bit platforms. */
+    if ((size_t)sample_count + (size_t)M3OS_DMX_HEADER > lump_len) {
         return -1;
     }
     if (sample_count == 0) {
         return -1;
     }
     out->rate_hz = rate_hz;
-    if (sample_count > (uint32_t)(2 * M3OS_DMX_PAD)) {
-        out->samples = lump + 12 + M3OS_DMX_PAD;
-        out->len = sample_count - (uint32_t)(2 * M3OS_DMX_PAD);
-    } else {
-        out->samples = lump + 12;
-        out->len = sample_count;
-    }
+    out->samples = lump + M3OS_DMX_HEADER;
+    out->len = sample_count;
+    /* Pad-stripping is intentionally NOT performed here. The
+     * chocolate-doom and vanilla i_sound loaders both pass the
+     * full `sample_count` window unchanged; the leading/trailing
+     * sustain bytes (when present) hold the same value as the first
+     * / last "real" sample so they don't introduce audible clicks
+     * once the channel is seeded. */
     return 0;
 }

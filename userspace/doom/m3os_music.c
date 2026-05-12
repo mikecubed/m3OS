@@ -95,43 +95,50 @@ static uint32_t midi_to_freq_hz(int note) {
     return k_freq_table[note];
 }
 
-/* Per-voice peak amplitude in DMX u8 space — chosen so even an
- * 8-voice chord at master = 100 stays under the mixer's i16 clamp.
- * High = 128 + AMP, low = 128 - AMP. With AMP = 32 the per-voice
- * peak after the <<8 conversion is ±8192, so eight simultaneous
- * voices at vol 78 (the default master/velocity scaling) accumulate
- * to ~31000 — just below i16::MAX = 32767. SFX adds further headroom
- * through DOOM's `S_AdjustSoundParams` distance attenuation. */
+/* Per-voice peak amplitude in DMX u8 space — chosen so a chord of
+ * 4–8 simultaneous voices at the default master/velocity scaling
+ * stays under the mixer's i16 clamp. AMP=32 puts each voice at
+ * ±8192 in i16 space after the <<8 sign conversion. */
 #define M3OS_MUSIC_AMP 32
 
-/* Seed `buf` with one period of `waveform` in DMX format
- * (unsigned-8 PCM, 128 = silence). */
+/* Seed `buf` with one period of `waveform` in DMX format. Both
+ * shapes are constructed so the buffer starts AND ends at silence
+ * (sample value 128). This matters for two reasons:
+ *
+ *   1. NoteOn re-seeds the channel cursor to 0; if buf[0] != 128
+ *      the listener hears a click as the mixer transitions from
+ *      silence to peak amplitude in one output frame.
+ *   2. NoteOff clears the channel; whichever sample the cursor was
+ *      on becomes silence. If buf is silence-bordered, the cursor
+ *      is statistically more likely to be near silence at NoteOff
+ *      time and the resulting transition is softer.
+ *
+ * For Tier 2a both "square" and "triangle" use the same smooth
+ * triangular envelope — the named waveforms are forward-compatible
+ * placeholders for Tier 2b's SoundFont voices. */
 static void seed_waveform(uint8_t *buf, m3os_waveform_t waveform) {
-    const uint8_t high = (uint8_t)(128 + M3OS_MUSIC_AMP);
-    const uint8_t low = (uint8_t)(128 - M3OS_MUSIC_AMP);
-    switch (waveform) {
-    case M3OS_WAVEFORM_SQUARE:
-        for (size_t i = 0; i < VOICE_PERIOD_SAMPLES / 2; ++i) {
-            buf[i] = high;
+    (void)waveform; /* Tier 2a: single shape for both buckets */
+    const size_t W = VOICE_PERIOD_SAMPLES;
+    const size_t Q = W / 4;
+    const int amp = M3OS_MUSIC_AMP;
+    for (size_t i = 0; i < W; ++i) {
+        int v;
+        if (i < Q) {
+            /* Rising edge: silence → +amp over Q samples. */
+            v = 128 + (int)((i * (size_t)amp) / Q);
+        } else if (i < 2 * Q) {
+            /* Falling edge: +amp → silence over Q samples. */
+            v = 128 + amp - (int)(((i - Q) * (size_t)amp) / Q);
+        } else if (i < 3 * Q) {
+            /* Falling edge below silence: silence → -amp over Q samples. */
+            v = 128 - (int)(((i - 2 * Q) * (size_t)amp) / Q);
+        } else {
+            /* Rising edge back to silence: -amp → silence over Q samples. */
+            v = 128 - amp + (int)(((i - 3 * Q) * (size_t)amp) / Q);
         }
-        for (size_t i = VOICE_PERIOD_SAMPLES / 2; i < VOICE_PERIOD_SAMPLES; ++i) {
-            buf[i] = low;
-        }
-        break;
-    case M3OS_WAVEFORM_TRIANGLE:
-    default: {
-        /* Triangle: ramp up, ramp down. Linear over half-periods. */
-        for (size_t i = 0; i < VOICE_PERIOD_SAMPLES / 2; ++i) {
-            int v = low + (int)((i * (high - low)) / (VOICE_PERIOD_SAMPLES / 2));
-            buf[i] = (uint8_t)v;
-        }
-        for (size_t i = VOICE_PERIOD_SAMPLES / 2; i < VOICE_PERIOD_SAMPLES; ++i) {
-            int j = i - VOICE_PERIOD_SAMPLES / 2;
-            int v = high - (int)((j * (high - low)) / (VOICE_PERIOD_SAMPLES / 2));
-            buf[i] = (uint8_t)v;
-        }
-        break;
-    }
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        buf[i] = (uint8_t)v;
     }
 }
 
