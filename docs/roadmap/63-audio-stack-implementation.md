@@ -1,6 +1,6 @@
 # Phase 63 - Audio Stack Implementation
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-63
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
 **Builds on:** Replaces the Phase 57 `Ac97Backend` accounting-only stub with real PIO + DMA register writes that drive the existing Phase 57 D.2 helpers (`init_controller`, `open_pcm_out_stream`, `Ac97Logic`, `handle_pcm_out_irq`); adds a privileged PIO syscall family because Phase 55b's device-host surface is MMIO-only and AC'97's BARs are I/O-space; switches QEMU `-audiodev` from the stub `none` backend to PulseAudio under `run-gui` and to a WAV file under `audio-smoke`; extends the smoke gate from "conf loaded" to "frames consumed advanced AND the recorded WAV is non-silent".
