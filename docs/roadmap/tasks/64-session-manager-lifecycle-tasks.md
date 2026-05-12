@@ -13,9 +13,17 @@
 | B | `stop()` — SIGTERM + grace + SIGKILL + `sys_waitpid` | A | Planned |
 | C | `restart()` — chained stop+start with restart-budget enforcement | B | Planned |
 | D | Text-fallback motion: reverse-order stop of display-server children | C | Planned |
-| E | `m3ctl session-state` reports authentic `ServiceState` | A | Planned |
+| E | `m3ctl session-state` reports authentic `ServiceState` | A, C | Planned |
 | F | Phase 57 design doc + task doc closure note | D, E | Planned |
 | G | Documentation and Release | F | Planned |
+
+> **Naming note:** `ServiceState` introduced in Track A is a *per-child* state
+> (`Starting`, `Running`, `Stopping`, `Restarting`, `Failed`) and is orthogonal
+> to the existing session-wide `kernel_core::session::SessionState`
+> (`Booting`, `Running`, `Recovering`, `TextFallback`) defined in
+> `kernel-core/src/session/startup.rs`. Both types coexist: `SessionState`
+> describes the graphical session as a whole; `ServiceState` describes a
+> single supervised child.
 
 ---
 
@@ -30,7 +38,8 @@
 **Acceptance:**
 - [ ] `ServiceState` enum has variants: `Starting`, `Running`, `Stopping`, `Restarting`, `Failed`.
 - [ ] `ServiceEntry` holds `pid: Option<Pid>`, `state: ServiceState`, `restart_count: u32`, `step_failures: u32`.
-- [ ] `ServiceTable` provides `insert`, `update_state`, `get_pid`, and `iter` methods.
+- [ ] `ServiceTable` provides `insert`, `update_pid`, `update_state`, `get_pid`, and `iter` methods.
+- [ ] `ServiceState` is documented as per-child and **distinct** from `kernel_core::session::SessionState`; the doc comment on the enum cites both types.
 - [ ] At least five unit tests cover state transition paths.
 
 ### A.2 — Wire `ServiceTable` into the event loop
@@ -41,8 +50,22 @@
 
 **Acceptance:**
 - [ ] After each `sys_spawn` call the returned PID is stored via `ServiceTable::update_pid`.
-- [ ] On SIGCHLD receipt the event loop calls `sys_waitpid(WNOHANG)` and marks the matching `ServiceEntry` exited.
+- [ ] `session_manager` installs a SIGCHLD handler via `sys_sigaction` before the first `sys_spawn` call; the handler signals a `Notification` consumed by the event loop (no work is performed inside the handler).
+- [ ] On the SIGCHLD `Notification`, the event loop drains `sys_waitpid(-1, ..., WNOHANG)` in a loop and marks each matching `ServiceEntry` exited.
 - [ ] An integration test spawns a short-lived child and verifies the table transitions to `Failed` after exit.
+
+### A.3 — Add `crash_stub` test binary for lifecycle integration tests
+
+**Files:** `Cargo.toml`, `xtask/src/main.rs`, `kernel/src/fs/ramdisk.rs`, `userspace/crash_stub/src/main.rs` (new crate)
+**Symbol:** `userspace/crash_stub`
+**Why it matters:** B.1, C.1, and D.1 acceptance items require a deterministic short-lived child that ignores SIGTERM (for grace-period testing) and a variant that exits immediately (for crash-loop testing). Without this binary the integration tests cannot run inside QEMU.
+
+**Acceptance:**
+- [ ] `userspace/crash_stub` is added to the workspace `members` list in the top-level `Cargo.toml`.
+- [ ] `xtask/src/main.rs` `build_userspace` includes `crash_stub` in the `bins` array with `needs_alloc = false`.
+- [ ] `kernel/src/fs/ramdisk.rs` registers `crash_stub` in `BIN_ENTRIES` via `include_bytes!`.
+- [ ] The binary accepts a single argv mode: `exit-immediately`, `ignore-sigterm`, or `exit-on-sigterm` and behaves accordingly.
+- [ ] `cargo xtask check` passes after adding the crate.
 
 ---
 
@@ -55,11 +78,12 @@
 **Why it matters:** An unconditional Ack stop cannot guarantee the child is gone before a restart begins.
 
 **Acceptance:**
-- [ ] `stop_service` sends SIGTERM via `sys_kill(pid, SIGTERM)`, then polls `sys_waitpid(WNOHANG)` for up to 5 seconds.
-- [ ] If not exited after 5 seconds, sends SIGKILL and calls `sys_waitpid` with blocking semantics.
-- [ ] Returns `Ok(exit_code)` after confirmed exit; returns `Err(StopError::KillFailed)` only if SIGKILL itself fails.
-- [ ] `stop()` IPC handler does not reply `Ack` until `stop_service` returns.
-- [ ] At least three unit tests: normal SIGTERM exit, grace-period expiry + SIGKILL, nonexistent PID.
+- [ ] `stop_service` is driven as a state machine across event-loop iterations (states: `SentTerm { deadline_ms }`, `SentKill { deadline_ms }`, `Reaped { exit_code }`). The event loop is **not** suspended; other IPC continues to be serviced while a stop is in flight.
+- [ ] On entry, `stop_service` sends SIGTERM via `sys_kill(pid, SIGTERM)` and records `deadline_ms = now_ms() + SIGTERM_GRACE_MS`.
+- [ ] Each event-loop tick (including SIGCHLD `Notification` wake-ups) re-checks `sys_waitpid(pid, ..., WNOHANG)`; on `now_ms() >= deadline_ms` it transitions to `SentKill`, sends SIGKILL, and sets a second deadline (`SIGKILL_REAP_MS = 1000`).
+- [ ] In `SentKill` state, exhausting the second deadline without a reap returns `Err(StopError::KillFailed)`; otherwise the transition to `Reaped { exit_code }` resolves the in-flight `stop()` IPC reply.
+- [ ] `stop()` IPC handler defers its reply (does not return `Ack` synchronously) until the state machine reaches `Reaped`.
+- [ ] At least three host-side unit tests against a mock `KernelClock + SignalSink + Reaper`: normal SIGTERM exit, grace-period expiry → SIGKILL, nonexistent PID (immediate `Err`).
 
 ---
 
@@ -74,9 +98,11 @@
 **Acceptance:**
 - [ ] `restart_service` calls `stop_service` then `start_service`; each failure increments `ServiceEntry::step_failures`.
 - [ ] `ServiceEntry::restart_count` increments on each full restart attempt.
-- [ ] After 3 `step_failures` or 3 `restart_count` increments, service transitions to `Failed` and `restart_service` returns `Err(BudgetExhausted)`.
-- [ ] Budget exhaustion is logged at ERROR level with service name and counts.
-- [ ] An integration test triggers 4 restarts of a crash-looping stub and verifies `Failed` state.
+- [ ] After `MAX_RETRIES_PER_STEP` (3) `step_failures` or `MAX_RESTART_COUNT` (3) `restart_count` increments, service transitions to `Failed` and `restart_service` returns `Err(BudgetExhausted)`.
+- [ ] On `BudgetExhausted` for any display-critical service (`display_server`, `kbd_server`, or `mouse_server`), `restart_service` invokes `recover::run_text_fallback`; the display-critical set is a named constant `DISPLAY_CRITICAL_SERVICES` in `lifecycle.rs`.
+- [ ] Budget exhaustion is logged at ERROR level with service name, `restart_count`, and `step_failures`.
+- [ ] An integration test launches `crash_stub` (A.3, mode `exit-immediately`) under the supervisor, triggers 4 restart attempts, and verifies `ServiceState::Failed`.
+- [ ] An integration test launches `crash_stub` (A.3, mode `exit-immediately`) as `display_server`, exhausts the budget, and verifies `run_text_fallback` was invoked.
 
 ---
 
@@ -104,10 +130,13 @@
 **Symbol:** `handle_state_query`
 **Why it matters:** Before this phase `session-state` output was derived from IPC latency, not from the actual service state machine.
 
+**Notes for the implementer:** The `session-state`, `session-stop`, and `session-restart` verbs already exist as Phase 57 stubs in `userspace/session_manager/src/control.rs`; only the **payload** returned by `session-state` and the **dispatching backend** for `session-stop` / `session-restart` change in this phase. Do not re-register verbs.
+
 **Acceptance:**
-- [ ] A new control verb `QueryState { name: Option<String> }` returns a list of `(name, ServiceState)` pairs from `ServiceTable`.
+- [ ] The existing `session-state` verb (Phase 57) is extended so the reply carries a list of `(name, ServiceState, restart_count)` triples sourced from `ServiceTable`.
 - [ ] `m3ctl session-state` (with no argument) prints all services and states; `m3ctl session-state <name>` prints one.
-- [ ] Output includes the restart count for services in `Restarting` or `Failed` state.
+- [ ] Output includes the `restart_count` and `step_failures` for services in `Restarting` or `Failed` state.
+- [ ] The existing `session-stop` and `session-restart` verbs route to `lifecycle::stop_service` / `lifecycle::restart_service` (Track B/C) rather than the Phase 57 stub backend.
 
 ---
 
@@ -134,13 +163,11 @@
 
 ---
 
----
-
 ## Track G — Documentation and Release
 
 ### G.1 — Create the aligned legacy learning doc
 
-**File:** `docs/64-session-manager-lifecycle.md`
+**File:** `docs/64-session-manager-lifecycle.md` (legacy learning doc — **distinct from** `docs/roadmap/64-session-manager-lifecycle.md`, which is the Phase 64 roadmap design doc; do not overwrite the roadmap doc)
 **Symbol:** (new document)
 **Why it matters:** Learners need a concise reference explaining what real supervisor lifecycle management looks like — PID tracking, two-phase stop, restart budgets — without conflating it with Phase 57's stub behavior or future socket-activation work.
 
@@ -160,6 +187,8 @@
 - [ ] `kernel/Cargo.toml` `version = "0.64.0"`
 - [ ] `Cargo.lock` regenerated (run `cargo check` or `cargo xtask check` to trigger)
 - [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.64.0`
+- [ ] `AGENTS.md` project-overview paragraph appended with a one-line summary of Phase 64 (real `session_manager` lifecycle: PID tracking, two-phase stop, restart budgets, authentic `session-state`).
+- [ ] `AGENTS.md` `cargo xtask check` description updated to add `session_manager` to the host-test list (the new `table.rs` and `lifecycle.rs` modules are host-testable).
 - [ ] `cargo xtask check` passes after the bump
 - [ ] Git tag `v0.64.0` recommended at phase merge
 
@@ -168,5 +197,6 @@
 ## Documentation Notes
 
 - `table.rs` and `lifecycle.rs` are new files under `userspace/session_manager/src/`; they replace inline logic previously scattered in `main.rs` and `recover.rs`.
-- The 5-second SIGTERM grace period is a named constant (`SIGTERM_GRACE_MS = 5000`) defined once in `lifecycle.rs`.
-- The restart budget values (3 step failures, 3 steady-state restarts) are named constants from `kernel-core::session::policy` so they appear in one place and are testable on the host.
+- The 5-second SIGTERM grace period is a named constant (`SIGTERM_GRACE_MS = 5000`) defined once in `lifecycle.rs`. A complementary `SIGKILL_REAP_MS = 1000` bounds the post-SIGKILL reap window.
+- The restart budget values reuse the existing `kernel_core::session::MAX_RETRIES_PER_STEP` constant (`= 3`) and introduce a new `kernel_core::session::MAX_RESTART_COUNT` constant (`= 3`) in the same module. There is no `kernel_core::session::policy` submodule — both constants live at `kernel_core::session::` so they are host-testable from `kernel-core` unit tests.
+- `ServiceState` (per-child) and `kernel_core::session::SessionState` (session-wide) are distinct types. Implementers must not collapse them.
