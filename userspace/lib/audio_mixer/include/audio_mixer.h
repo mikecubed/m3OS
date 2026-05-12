@@ -60,6 +60,14 @@ int audio_mixer_set_channel_loop(audio_mixer_t *mixer,
 /* Zero a channel. */
 int audio_mixer_clear_channel(audio_mixer_t *mixer, size_t idx);
 
+/* Schedule a linear fade-out on a channel over `fade_frames` output
+ * frames, then deactivate. Suppresses the step-discontinuity click
+ * that audio_mixer_clear_channel produces; music callers use this
+ * for NoteOff. `fade_frames == 0` is equivalent to clear_channel. */
+int audio_mixer_release_channel(audio_mixer_t *mixer,
+                                size_t idx,
+                                uint16_t fade_frames);
+
 /* Mix `frames` stereo S16LE frames into `out` (capacity
  * `byte_capacity`). Returns the number of bytes written, or a
  * negative AUDIO_MIXER_ERR_* code on failure. */

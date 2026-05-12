@@ -76,6 +76,14 @@ int audio_mixer_clear_channel(audio_mixer_t *m, size_t idx) {
     g_channels[idx].clear_calls++;
     return 0;
 }
+int audio_mixer_release_channel(audio_mixer_t *m, size_t idx, uint16_t fade_frames) {
+    /* The release fade ramps the mixer channel to silence over
+     * `fade_frames` output frames before deactivating; for test
+     * accounting we treat it the same as a clear (the test fixtures
+     * inspect `clear_calls` to verify NoteOff routed to the mixer). */
+    (void)fade_frames;
+    return audio_mixer_clear_channel(m, idx);
+}
 ptrdiff_t audio_mixer_step(audio_mixer_t *m, uint8_t *out, size_t cap, size_t frames) {
     (void)m; (void)out; (void)cap;
     return (ptrdiff_t)(frames * 4);

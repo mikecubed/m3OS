@@ -71,6 +71,13 @@ pub struct ChannelState {
     /// of deactivating at end-of-buffer. Used by music voices that
     /// seed a one-period waveform and need it to sustain.
     loop_enabled: bool,
+    /// When > 0, the channel is in linear release: the per-frame
+    /// contribution is scaled by `fade_out_remaining / fade_out_total`,
+    /// and `fade_out_remaining` decrements one count per output frame.
+    /// On reaching 0 the channel deactivates. Used to suppress the
+    /// step-discontinuity click that bare-clear NoteOff would cause.
+    fade_out_remaining: u16,
+    fade_out_total: u16,
 }
 
 unsafe impl Send for ChannelState {}
@@ -87,6 +94,8 @@ impl Default for ChannelState {
             right_vol: 0,
             active: false,
             loop_enabled: false,
+            fade_out_remaining: 0,
+            fade_out_total: 0,
         }
     }
 }
@@ -221,16 +230,43 @@ impl Mixer {
             right_vol: rv,
             active: true,
             loop_enabled,
+            fade_out_remaining: 0,
+            fade_out_total: 0,
         };
     }
 
-    /// Zero channel `idx`. Used by `S_StopSound` and at music
-    /// note-off.
+    /// Zero channel `idx` immediately. Used by `S_StopSound`.
+    /// Causes a step-discontinuity (the channel's current sample
+    /// value drops to silence in one output frame); music callers
+    /// should prefer [`Mixer::release_channel`] for click-free
+    /// NoteOff.
     pub fn clear_channel(&mut self, idx: usize) {
         if idx >= self.channel_count {
             return;
         }
         self.channels[idx] = ChannelState::default();
+    }
+
+    /// Schedule a linear fade-out on channel `idx` over `fade_frames`
+    /// output frames, then deactivate. Used by music NoteOff so a
+    /// note doesn't end on a step-discontinuity (which would click
+    /// audibly). `fade_frames == 0` falls through to
+    /// [`Mixer::clear_channel`] for parity with the "stop now"
+    /// caller. No-op if the channel is already inactive.
+    pub fn release_channel(&mut self, idx: usize, fade_frames: u16) {
+        if idx >= self.channel_count {
+            return;
+        }
+        if fade_frames == 0 {
+            self.clear_channel(idx);
+            return;
+        }
+        let ch = &mut self.channels[idx];
+        if !ch.active {
+            return;
+        }
+        ch.fade_out_total = fade_frames;
+        ch.fade_out_remaining = fade_frames;
     }
 
     /// Mix `frames` stereo S16LE frames into `out`. Returns the
@@ -292,11 +328,30 @@ impl Mixer {
                 let s1_full = (s1 - 128) << 8;
                 let frac = (ch.cursor & 0xFFFF) as i32;
                 let interp = (s0_full * (0x10000 - frac) + s1_full * frac) >> 16;
-                let l = (interp * ch.left_vol as i32) >> 7;
-                let r = (interp * ch.right_vol as i32) >> 7;
+                let mut l = (interp * ch.left_vol as i32) >> 7;
+                let mut r = (interp * ch.right_vol as i32) >> 7;
+                // Apply linear fade-out if the channel is in release.
+                // `fade_out_remaining / fade_out_total` ramps from 1.0
+                // down to 0.0 over `fade_out_total` frames.
+                if ch.fade_out_total > 0 {
+                    let num = ch.fade_out_remaining as i32;
+                    let den = ch.fade_out_total as i32;
+                    l = (l * num) / den;
+                    r = (r * num) / den;
+                }
                 acc_l = acc_l.saturating_add(l);
                 acc_r = acc_r.saturating_add(r);
                 ch.cursor = ch.cursor.wrapping_add(ch.inc as u64);
+                // Advance release-envelope after the frame is written
+                // so the final scaled sample is `0/total = 0` exactly.
+                if ch.fade_out_total > 0 {
+                    if ch.fade_out_remaining == 0 {
+                        ch.active = false;
+                        ch.fade_out_total = 0;
+                    } else {
+                        ch.fade_out_remaining -= 1;
+                    }
+                }
             }
             let l = acc_l.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let r = acc_r.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -505,6 +560,58 @@ mod tests {
             saw_nonzero_past_end,
             "looping channel must continue producing samples past the buffer end"
         );
+    }
+
+    #[test]
+    fn release_channel_ramps_to_silence() {
+        // A constant-amplitude sample at full vol with a 4-frame
+        // release fade. Frames 0..3 should be scaled by 4/4, 3/4,
+        // 2/4, 1/4 of the full-vol value; frame 4 and onwards
+        // should be silent (channel deactivated).
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![192u8; 64]; // constant +16384 signed
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 127, 127);
+        }
+        mixer.release_channel(0, 4);
+        let mut out = [0u8; 8 * BYTES_PER_FRAME];
+        let n = mixer.step(&mut out, 8);
+        assert_eq!(n, 32);
+        // Read the left channel of each of the 8 frames.
+        let frame_l = |i: usize| -> i16 {
+            let off = i * BYTES_PER_FRAME;
+            i16::from_le_bytes([out[off], out[off + 1]])
+        };
+        // Full-vol contribution at vol 127 on constant 192 sample:
+        // (192-128)*256=16384, then * 127 >> 7 = 16256.
+        // With fade scale (remaining/total) at frames 0..3:
+        // 4/4 → 16256
+        // 3/4 → 12192
+        // 2/4 → 8128
+        // 1/4 → 4064
+        // Then 0 onward should be silence.
+        assert_eq!(frame_l(0), 16256, "frame 0 should be full amplitude");
+        assert_eq!(frame_l(1), 12192, "frame 1 should be 3/4 amplitude");
+        assert_eq!(frame_l(2), 8128, "frame 2 should be 2/4 amplitude");
+        assert_eq!(frame_l(3), 4064, "frame 3 should be 1/4 amplitude");
+        for i in 4..8 {
+            assert_eq!(frame_l(i), 0, "frame {} should be silent post-fade", i);
+        }
+        assert!(
+            !mixer.channel(0).unwrap().is_active(),
+            "channel should be inactive after fade completes"
+        );
+    }
+
+    #[test]
+    fn release_zero_frames_falls_through_to_clear() {
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![200u8; 16];
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 127, 127);
+        }
+        mixer.release_channel(0, 0);
+        assert!(!mixer.channel(0).unwrap().is_active());
     }
 
     #[test]

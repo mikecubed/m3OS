@@ -168,6 +168,33 @@ pub unsafe extern "C" fn audio_mixer_clear_channel(mixer: *mut Mixer, idx: usize
     AUDIO_MIXER_OK
 }
 
+/// Schedule a linear fade-out on channel `idx` over `fade_frames`
+/// output frames, then deactivate the channel. Used by music
+/// NoteOff to suppress the step-discontinuity click that
+/// [`audio_mixer_clear_channel`] would otherwise produce. A
+/// `fade_frames == 0` argument falls through to immediate clear.
+///
+/// # Safety
+///
+/// `mixer` must be a valid pointer from [`audio_mixer_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn audio_mixer_release_channel(
+    mixer: *mut Mixer,
+    idx: usize,
+    fade_frames: u16,
+) -> c_int {
+    if mixer.is_null() {
+        return AUDIO_MIXER_ERR_NULL_HANDLE;
+    }
+    // SAFETY: caller upholds validity.
+    let m = unsafe { &mut *mixer };
+    if idx >= m.channel_count() {
+        return AUDIO_MIXER_ERR_INVAL;
+    }
+    m.release_channel(idx, fade_frames);
+    AUDIO_MIXER_OK
+}
+
 /// Mix `frames` stereo S16LE frames into `out` (capacity
 /// `byte_capacity`). Returns the number of bytes written, or a
 /// negative error code.

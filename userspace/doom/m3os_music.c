@@ -172,6 +172,13 @@ static int claim_voice(m3os_mus_state_t *state, int channel, int note,
     return -1;
 }
 
+/* Fade length applied to music NoteOff. 4 ms at 48 kHz = 192 output
+ * frames is short enough to be perceived as "the note ended" rather
+ * than "the note decayed", yet long enough to suppress the
+ * step-discontinuity click that an immediate clear would produce
+ * when the cursor was mid-cycle. */
+#define M3OS_MUSIC_RELEASE_FRAMES 192
+
 /* Release any voice playing `note` on `channel`. */
 static void release_voice(m3os_mus_state_t *state, int channel, int note) {
     for (int i = 0; i < M3OS_VOICES; ++i) {
@@ -180,7 +187,13 @@ static void release_voice(m3os_mus_state_t *state, int channel, int note) {
             state->voices[i].active = 0;
             audio_mixer_t *m = g_mixer_accessor ? g_mixer_accessor() : NULL;
             if (m != NULL) {
-                audio_mixer_clear_channel(m, (size_t)(M3OS_MUSIC_CHANNEL_BASE + i));
+                /* Linear fade-out instead of immediate clear so the
+                 * mid-cycle waveform doesn't drop to silence in one
+                 * frame (audible click; cumulative over many notes
+                 * per second the listener hears as crackle). */
+                audio_mixer_release_channel(
+                    m, (size_t)(M3OS_MUSIC_CHANNEL_BASE + i),
+                    M3OS_MUSIC_RELEASE_FRAMES);
             }
             return;
         }
