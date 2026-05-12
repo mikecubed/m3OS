@@ -40,7 +40,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 |---|---|---|---|
 | A | `audio_mixer` crate — pure-logic Rust mixer + C-ABI surface | None | **Complete** |
 | B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | **Complete** |
-| C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | Planned |
+| C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | **Complete** |
 | D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | Planned |
 | E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | Planned |
 | F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | Planned |
@@ -176,12 +176,14 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** WAD SFX lumps are raw bytes with a 12-byte DMX header (`format_tag:u16le, rate:u16le, sample_count:u32le, padding:u16le[2]`, then unsigned 8-bit PCM). Without validation, a malformed WAD could trigger an out-of-bounds read in the mixer's per-sample lookup.
 
 **Acceptance:**
-- [ ] `int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out)` returns 0 on success or `-1` on malformed input.
-- [ ] Rejects lumps with `lump_len < 16` (header + minimum 4-sample body).
-- [ ] Rejects lumps where the format tag is not 3.
-- [ ] Rejects lumps where `sample_count + 12 > lump_len`.
-- [ ] Populates `out->rate_hz`, `out->samples` (pointer into the lump, zero-copy), `out->len`.
-- [ ] No allocation; no I/O; pure C.
+- [x] `int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out)` returns 0 on success or `-1` on malformed input.
+- [x] Rejects lumps with `lump_len < 16` (header + minimum 4-sample body).
+- [x] Rejects lumps where the format tag is not 3.
+- [x] Rejects lumps where `sample_count + 12 > lump_len`.
+- [x] Rejects `rate_hz == 0` (would divide by zero in the mixer's `inc` math).
+- [x] Rejects null `lump` and null `out`.
+- [x] Populates `out->rate_hz`, `out->samples` (pointer into the lump, zero-copy), `out->len`.
+- [x] No allocation; no I/O; pure C.
 
 ### C.2 — Host-side C unit tests for the decoder
 
@@ -190,9 +192,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** TEST-1 — the DMX decoder is the second-most-likely place for a WAD-data bug; host tests catch malformed-input rejection before the smoke gate ever sees a frame.
 
 **Acceptance:**
-- [ ] A host-side `cc -o doom_c_tests` step in xtask compiles `m3os_dmx.c` + `test_m3os_dmx.c` with the host's `cc` (no musl required) and runs the binary.
-- [ ] All four tests pass; failure prints an `assert`-style diagnostic and returns non-zero.
-- [ ] The new step is wired into `cargo xtask check` so a `m3os_dmx.c` regression fails CI without booting QEMU.
+- [x] A new `doom_c_test_step` xtask helper compiles each `userspace/doom/<module>.c` + `userspace/doom/tests/test_<module>.c` pair with the host's `cc` (`-Wall -Wextra -pedantic -std=c11`, no musl required) into `target/doom-c-tests/`, then runs each binary.
+- [x] All 6 DMX tests pass (`test_valid_lump`, `test_short_lump`, `test_bad_format_tag`, `test_oversize_sample_count`, `test_zero_rate`, `test_null_pointers`); failure prints `FILE:LINE: msg` and returns non-zero exit.
+- [x] The step is invoked at the end of `cmd_check` so a `m3os_dmx.c` regression fails `cargo xtask check` without booting QEMU. New module/test pairs are added to the `MODULES` constant — no further xtask wiring needed.
 
 ---
 

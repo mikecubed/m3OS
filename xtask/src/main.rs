@@ -2999,9 +2999,77 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 63a Track C.2 — host-side C unit tests for the DOOM
+    // platform-layer modules (m3os_dmx today; m3os_sound / m3os_music
+    // join later). These compile with the host `cc` and run before
+    // QEMU so a regression fails CI without a full kernel boot.
+    doom_c_test_step(&root);
+
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, and audio_client_ffi host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, and audio_client_ffi host tests pass; doom platform-layer C tests pass"
     );
+}
+
+/// Phase 63a Track C.2 — compile each DOOM platform-layer C module
+/// against its sibling test driver using the host `cc` (no musl
+/// required) and run the resulting binary. Each test driver returns
+/// non-zero exit on failure; we abort the check on any non-zero.
+///
+/// New `<module>.c` + `tests/test_<module>.c` pairs are added to
+/// `MODULES` and pick up the same compile / run flow with no further
+/// xtask changes.
+fn doom_c_test_step(root: &std::path::Path) {
+    const MODULES: &[&str] = &["m3os_dmx"];
+    let doom_dir = root.join("userspace/doom");
+    let tests_dir = doom_dir.join("tests");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let scratch = root.join("target/doom-c-tests");
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        eprintln!("doom_c_test_step: create_dir_all {scratch:?}: {e}");
+        std::process::exit(1);
+    }
+    for module in MODULES {
+        let c_src = doom_dir.join(format!("{module}.c"));
+        let test_src = tests_dir.join(format!("test_{module}.c"));
+        if !c_src.exists() || !test_src.exists() {
+            eprintln!(
+                "doom_c_test_step: missing {} or {}",
+                c_src.display(),
+                test_src.display()
+            );
+            std::process::exit(1);
+        }
+        let bin = scratch.join(format!("test_{module}"));
+        let status = Command::new(&cc)
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg("-pedantic")
+            .arg("-std=c11")
+            .arg("-o")
+            .arg(&bin)
+            .arg(&c_src)
+            .arg(&test_src)
+            .status()
+            .unwrap_or_else(|e| panic!("doom_c_test_step: spawn cc: {e}"));
+        if !status.success() {
+            eprintln!(
+                "doom_c_test_step: compile failed for {}",
+                test_src.display()
+            );
+            std::process::exit(1);
+        }
+        let status = Command::new(&bin)
+            .status()
+            .unwrap_or_else(|e| panic!("doom_c_test_step: spawn {}: {e}", bin.display()));
+        if !status.success() {
+            eprintln!(
+                "doom_c_test_step: tests failed in {} (rerun manually: {})",
+                test_src.display(),
+                bin.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
