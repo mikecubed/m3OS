@@ -220,10 +220,14 @@ impl AudioClientBellSink {
         }
     }
 
-    /// Lazily open the AudioClient if it is not already open.
-    /// Returns `Err(BellError::AudioUnavailable)` if `audio_server`
-    /// is not registered or refused the connection.
-    fn ensure_open(&mut self) -> Result<(), BellError> {
+    /// Lazily open the AudioClient if it is not already open. Surfaces
+    /// the typed [`audio_client::AudioClientError`] so the caller can
+    /// log a one-line diagnostic before mapping to
+    /// [`BellError::AudioUnavailable`]. Without that diagnostic the
+    /// fall-back path swallows the variant and we lose the failure
+    /// reason on a `run-gui` manual test (the only place this code
+    /// runs end-to-end against real hardware).
+    fn ensure_open(&mut self) -> Result<(), audio_client::AudioClientError> {
         if self.client.is_some() {
             return Ok(());
         }
@@ -231,8 +235,7 @@ impl AudioClientBellSink {
             kernel_core::audio::PcmFormat::S16Le,
             kernel_core::audio::ChannelLayout::Stereo,
             kernel_core::audio::SampleRate::Hz48000,
-        )
-        .map_err(|_| BellError::AudioUnavailable)?;
+        )?;
         self.client = Some(client);
         Ok(())
     }
@@ -245,14 +248,72 @@ impl Default for AudioClientBellSink {
     }
 }
 
+/// One-line marker for an [`audio_client::AudioClientError`] variant.
+///
+/// `run-gui` manual bell tests run with no kernel-side logging hook
+/// other than `STDOUT_FILENO`, so we surface failures as short stable
+/// tokens that grep cleanly out of `m3os.log`. The token covers the
+/// variant; for [`audio_client::AudioClientError::Io`] and the
+/// `Server` arm we collapse the inner errno / `AudioError` to a
+/// finite set of names (`io_enoent_lookup`, `server_busy`, …) so the
+/// helper stays alloc-free.
+#[cfg(all(not(test), feature = "os-binary"))]
+fn audio_client_error_marker(err: &audio_client::AudioClientError) -> &'static str {
+    use audio_client::AudioClientError;
+    use kernel_core::audio::AudioError;
+
+    match err {
+        // `SyscallSocket::connect` maps `ipc_lookup_service == u64::MAX`
+        // to `Io(-2)` (ENOENT-shaped) — the most likely first-call
+        // failure if `audio_server` raced behind term in init's start
+        // order. Distinct token so the manual-test diff can spot it.
+        AudioClientError::Io(-2) => "io_enoent_lookup_failed",
+        AudioClientError::Io(-22) => "io_einval",
+        AudioClientError::Io(-32) => "io_epipe",
+        AudioClientError::Io(_) => "io_other",
+        AudioClientError::Protocol(_) => "protocol_decode_error",
+        AudioClientError::Server(AudioError::Busy) => "server_busy",
+        AudioClientError::Server(AudioError::WouldBlock) => "server_would_block",
+        AudioClientError::Server(AudioError::NoDevice) => "server_no_device",
+        AudioClientError::Server(AudioError::BrokenPipe) => "server_broken_pipe",
+        AudioClientError::Server(AudioError::InvalidFormat) => "server_invalid_format",
+        AudioClientError::Server(AudioError::InvalidArgument) => "server_invalid_argument",
+        AudioClientError::Server(AudioError::Internal) => "server_internal",
+        AudioClientError::Server(_) => "server_other",
+        AudioClientError::AlreadyOpen => "client_already_open",
+        AudioClientError::NotOpen => "client_not_open",
+        AudioClientError::UnexpectedReply => "client_unexpected_reply",
+        // `AudioClientError` is `#[non_exhaustive]` — a future variant
+        // surfaces as a generic token rather than blocking the build.
+        _ => "unknown_variant",
+    }
+}
+
+/// Emit `term.bell.<kind>:<marker>\n` to stdout. Two `write_str` calls
+/// avoid a stack buffer / allocation; serial output is already line-
+/// based so partial-write interleaving is acceptable for a one-shot
+/// diagnostic on a failure path.
+#[cfg(all(not(test), feature = "os-binary"))]
+fn log_bell_error(kind: &'static str, marker: &'static str) {
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "term.bell.");
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, kind);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, ":");
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, marker);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+}
+
 #[cfg(all(not(test), feature = "os-binary"))]
 impl BellSink for AudioClientBellSink {
     fn play(&mut self) -> Result<(), BellError> {
-        self.ensure_open()?;
+        if let Err(e) = self.ensure_open() {
+            log_bell_error("open_failed", audio_client_error_marker(&e));
+            return Err(BellError::AudioUnavailable);
+        }
         let client = self.client.as_mut().expect("ensure_open populated client");
         match client.submit_frames(&self.tone_bytes) {
             Ok(_) => Ok(()),
-            Err(_) => {
+            Err(e) => {
+                log_bell_error("submit_failed", audio_client_error_marker(&e));
                 // Drop the cached client so the next ring re-opens.
                 // The server may have crashed; restart-aware behavior
                 // lives in audio_server's supervisor manifest, not
