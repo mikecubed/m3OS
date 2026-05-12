@@ -54,7 +54,7 @@
 extern crate alloc;
 
 pub use kernel_core::session::recover::{
-    FramebufferRestoreError, FramebufferRestorer, Recovery, RecoveryAction, TextFallbackOutcome,
+    FramebufferRestoreError, FramebufferRestorer, TextFallbackOutcome,
     execute_text_fallback_rollback,
 };
 
