@@ -157,3 +157,20 @@ The single concrete change in `kernel/` for Phase 57 audio is one line of wideni
 - Media playback, recording, and advanced codecs
 - Multiple graphical sessions or richer display-manager features
 - Full desktop shell, notifications, settings panels, and broader app ecosystems
+
+> **Phase 63 closure note:** Phase 57 shipped with the `cfg(not(test)) Ac97Backend` as
+> an accounting stub — register writes were stubbed, so `audio-demo` ran end-to-end
+> in the host-test layer but did not produce audible output, and the `audio-smoke`
+> harness verified only that `audio_server` loaded. Phase 63 (kernel v0.63.0) delivered
+> the real PCM emission path: a privileged `SYS_DEVICE_PIO_{READ,WRITE}` syscall family
+> with a userspace `Pio<T>` wrapper, an `Ac97PioBus` adapter implementing `MmioOps`
+> over the two AC'97 BARs, a real `Ac97Backend` that drives `init_controller` +
+> `open_pcm_out_stream` + DMA-allocated BDL/PCM ring + `submit_frames` copy +
+> LVI advance + IRQ-driven underrun zero-fill, QEMU `-audiodev` selection
+> (PulseAudio for `run-gui`, WAV file for `audio-smoke`), and an extended
+> `audio-smoke` gate that asserts `frames_consumed > 0` via `AudioControlCommand::GetStats`
+> plus a non-silent recorded WAV (≥5% samples with `|sample| > 100`). The `bell-smoke`
+> xtask step verifies the BEL → `term::bell::Bell::ring` → `AudioClientBellSink`
+> pipeline via a new `bell-test` binary that bypasses the kbd_server input-injection
+> gap. See `docs/roadmap/63-audio-stack-implementation.md` and
+> `docs/63-audio-stack-implementation.md` for the full breakdown.

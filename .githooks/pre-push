@@ -107,6 +107,15 @@ cargo xtask device-smoke --device nvme --iommu --timeout 90
 echo "pre-push: running cargo xtask device-smoke --device e1000 --iommu..."
 cargo xtask device-smoke --device e1000 --iommu --timeout 90
 
+# Phase 63 audio gate (2026-05-11): the audio path went deterministic
+# (5/5 in the closing session) and the smoke now exercises Open / submit
+# / drain / close twice, so a regression in the AC'97 BDL programming,
+# audio_server takeover, or audio-demo Io(-32) retry surfaces here.
+# Failure shape: missing AUDIO_DEMO:PASS sentinel, or the WAV non-silent
+# check reporting <5% non-silent samples in any 1-second window.
+echo "pre-push: running cargo xtask audio-smoke..."
+cargo xtask audio-smoke --timeout 90
+
 echo "pre-push: running cargo xtask regression..."
 # Suite-level QEMU contention occasionally causes spurious timeouts on
 # individual tests (see docs/post-mortems/2026-04-24-ingress-task-starvation.md

@@ -593,6 +593,12 @@ pub fn recv_msg_with_notif(
                     Ok(handle) => Some(handle),
                     Err(_) => {
                         log::warn!("[ipc] recv_msg_with_notif: cap table full");
+                        super::log_ipc_umax(
+                            pending.task,
+                            "recv_msg_with_notif:cap_full",
+                            pending.msg.label,
+                            receiver.0,
+                        );
                         // Phase 57e Bug #6 (F2): atomic deliver+wake.
                         let _ = scheduler::deliver_message_and_wake(
                             pending.task,
@@ -609,6 +615,12 @@ pub fn recv_msg_with_notif(
                 if let Some(handle) = reply_cap_handle {
                     let _ = scheduler::remove_task_cap(receiver, handle);
                 }
+                super::log_ipc_umax(
+                    pending.task,
+                    "recv_msg_with_notif:transfer_cap_failed",
+                    pending.msg.label,
+                    receiver.0,
+                );
                 // Phase 57e Bug #6 (F2): atomic deliver+wake.
                 let _ = scheduler::deliver_message_and_wake(pending.task, Message::new(u64::MAX));
                 return (RECV_KIND_MESSAGE, Message::new(u64::MAX));
@@ -851,7 +863,15 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) if !e.closed => e,
-            _ => return Message::new(u64::MAX),
+            _ => {
+                super::log_ipc_umax(
+                    caller,
+                    "call_msg:endpoint_closed",
+                    msg.label,
+                    ep_id.0 as u64,
+                );
+                return Message::new(u64::MAX);
+            }
         };
 
         if let Some(receiver) = ep.receivers.pop_front() {
@@ -883,6 +903,7 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                     log::warn!(
                         "[ipc] call_msg: server capability table full, reply cap not inserted"
                     );
+                    super::log_ipc_umax(caller, "call_msg:cap_table_full", msg.label, receiver.0);
                     // Put the receiver back at the front of the queue so it
                     // remains blocked on the endpoint as if this call never arrived.
                     let mut reg = ENDPOINTS.lock();
@@ -945,6 +966,17 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
             debug_assert!(
                 false,
                 "[ipc] call_msg: woke with no reply message — IPC logic bug"
+            );
+            // Phase 63 audio handoff follow-up — this is the "spurious
+            // wake" path the handoff lists as one candidate for the
+            // intermittent `Io(-32)`. If the diagnostic budget logs
+            // this site, the bug is in the block primitive (not in
+            // the call/recv structure).
+            super::log_ipc_umax(
+                caller,
+                "call_msg:no_reply_message",
+                msg.label,
+                ep_id.0 as u64,
             );
             Message::new(u64::MAX)
         }

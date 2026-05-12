@@ -109,7 +109,7 @@ impl BlockServer<SyscallBackend> {
     pub fn new(endpoint: EndpointCap) -> Self {
         Self {
             endpoint,
-            backend: Mutex::new(SyscallBackend),
+            backend: Mutex::new(SyscallBackend::new()),
         }
     }
 }
@@ -280,6 +280,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: 0xABCD,
             data0: 0,
+            reply_cap_handle: 0,
             bulk: read_request_bytes(0x42, 0x1000, 4, 0xdead_beef),
         });
 
@@ -340,6 +341,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: 0,
             data0: 0,
+            reply_cap_handle: 0,
             bulk: full,
         });
 
@@ -377,6 +379,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: 0x1234,
             data0: 0,
+            reply_cap_handle: 0,
             bulk: garbage,
         });
 

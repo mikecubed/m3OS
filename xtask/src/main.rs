@@ -16,6 +16,25 @@ const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`."
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
 const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04";
 
+/// Userspace `#![no_std]` crates whose `[cfg(test)]` modules can build and run
+/// on the host (`x86_64-unknown-linux-gnu`) target. `xtask check` runs each of
+/// them so a regression in any one blocks merges the same way kernel-core,
+/// passwd, and driver_runtime do today.
+///
+/// `term` builds via its `[lib]` target — the binary is `#![no_main]` and
+/// cannot link on the host, so `--lib` is required to skip the bin.
+///
+/// Each entry is `(package, extra cargo args)`. `passwd` is intentionally not
+/// listed here; it needs `--no-default-features --features host-tests --test
+/// passwd_host` and remains in its dedicated block above.
+const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
+    ("audio_client", &[]),
+    ("audio_server", &[]),
+    ("surface_buffer", &[]),
+    ("crypto-lib", &[]),
+    ("term", &["--lib"]),
+];
+
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
 ///
 /// Phase 55a Track F.1: the IOMMU-specific device arguments appended
@@ -27,16 +46,12 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 /// one and silently drop settings.
 pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
-/// Phase 57 H.5 — verbatim audio command-line surface from the A.1
-/// audio-target memo (`docs/appendix/phase-57-audio-target-choice.md`).
+/// Phase 57 H.5 / Phase 63 C.1 — headless audio flags (no host sink required).
 ///
-/// Headless safety: `-audiodev none,id=snd0` does not bind a host audio
-/// sink, so `cargo xtask run-gui` works in CI environments without
-/// PulseAudio. A developer who wants audible output can override the
-/// backend at runtime via `QEMU_AUDIO_DRV=pa cargo xtask run-gui`
-/// (QEMU env-var precedence rules apply). The `-device AC97,audiodev=snd0`
-/// pair is the chosen first audio target — Intel 82801AA AC'97
-/// (`0x8086:0x2415`).
+/// Used by `cargo xtask run` (headless) and `cargo xtask run-gui --no-audio`.
+/// `-audiodev none,id=snd0` discards every frame so the run never requires
+/// a host PulseAudio daemon — safe for CI environments and developer machines
+/// without audio hardware.
 ///
 /// `addr=0x5` pins the PCI slot to 0:5.0 so the matching `audio_server`
 /// `SENTINEL_BDF` (in `userspace/audio_server/src/lib.rs`) finds the
@@ -44,15 +59,25 @@ pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=o
 /// 5 is the first free slot and the `audio_server` claim path matches
 /// it exactly.
 ///
-/// The constant is referenced from `cmd_run_gui` (default: enabled) and
-/// pinned by xtask unit tests so any future deviation from the memo
-/// surfaces at `cargo test -p xtask` time, not at QEMU launch time.
-pub const AC97_QEMU_AUDIO_FLAGS: &[&str] = &[
+/// Pinned by `ac97_qemu_audio_flags_headless_pinned` xtask unit test.
+pub const AC97_QEMU_AUDIO_FLAGS_HEADLESS: &[&str] = &[
     "-audiodev",
     "none,id=snd0",
     "-device",
     "AC97,audiodev=snd0,addr=0x5",
 ];
+
+/// Phase 63 C.1 — GUI audio: shared `-device` line for the AC'97 controller.
+///
+/// The `-audiodev` half is computed at launch time by [`gui_audiodev_flag`]
+/// because the right host backend (`pipewire`, `pa`, or `none`) depends on
+/// which audio daemon is actually reachable on the host — modern Linux
+/// distros (Arch / Omarchy / Fedora) ship PipeWire without the
+/// `pipewire-pulse` shim, so a hard-coded `pa,id=snd0` causes QEMU to exit
+/// silently when the pulse socket isn't available.
+///
+/// Pinned by `ac97_qemu_audio_device_pinned` xtask unit test.
+pub const AC97_QEMU_AUDIO_DEVICE_FLAGS: &[&str] = &["-device", "AC97,audiodev=snd0,addr=0x5"];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -68,6 +93,13 @@ const QEMU_EXIT_FAILURE: i32 = 0x23;
 const SMOKE_EXIT_AUDIO_DEMO_FAILED: i32 = 60;
 const SMOKE_EXIT_SESSION_NOT_RUNNING: i32 = 61;
 const SMOKE_EXIT_SESSION_RECOVERY_FAILED: i32 = 62;
+/// Phase 63 D.3: the recorded WAV file exists but is silent (fewer than
+/// 5% of samples exceed the `|sample| > 100` threshold).
+const SMOKE_EXIT_WAV_SILENT: i32 = 63;
+/// Phase 63 Track E.1: bell-smoke failed to observe `frames_consumed > 0`
+/// after running `bell-test` from sh0. `bell-test` calls `Bell::ring` →
+/// `AudioClientBellSink::play` directly, bypassing the kbd_server routing gap.
+const SMOKE_EXIT_BELL_SMOKE_FAILED: i32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -214,7 +246,12 @@ fn main() {
                 std::process::exit(1);
             });
             let fresh = remaining.iter().any(|a| a == "--fresh");
-            cmd_run(fresh, devices);
+            // Phase 63 audio-fix: headless `run` mirrors `run-gui` —
+            // audio is on by default and `--no-audio` opts out. Without
+            // this, `audio_server` discovers no AC'97 device and falls
+            // back to silent stub mode (`consumed=0`).
+            let no_audio = remaining.iter().any(|a| a == "--no-audio");
+            cmd_run(fresh, devices, !no_audio);
         }
         Some("run-gui") => {
             let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
@@ -296,6 +333,20 @@ fn main() {
                 });
             cmd_session_recover_smoke(&smoke_args);
         }
+        // Phase 63 Track E.1 (resend): BEL → audio path end-to-end smoke.
+        // Boots with WAV AC'97 backend, waits for term + audio_server to be
+        // running, then runs `bell-test` from sh0. bell-test calls
+        // Bell::ring → AudioClientBellSink directly (bypassing kbd_server
+        // routing), then queries stats and prints BELL_TEST:PASS / FAIL.
+        Some("bell-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("bell-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_bell_smoke(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -349,7 +400,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -484,6 +535,21 @@ fn build_userspace_bins() {
         // pulls in `kernel-core` (audio protocol codec) at the alloc
         // feature level for shared types.
         ("audio-demo", "audio-demo", true),
+        // Phase 63 Track E.1 — one-shot audio stats CLI.  Used by the
+        // `bell-smoke` harness to verify `frames_consumed > 0` after a
+        // BEL byte is injected.  `needs_alloc = true` for the same
+        // reason as `audio-demo` (audio_client → kernel-core).
+        ("audio-stats", "audio-stats", true),
+        // Phase 63 Track E.1 — bell path exerciser.  Constructs an
+        // `AudioClientBellSink` from `term::bell`, calls `Bell::ring()`,
+        // sleeps 200 ms, then calls `AudioClient::connect().get_stats()`
+        // and prints `BELL_TEST:PASS` / `BELL_TEST:FAIL:consumed=0`.
+        // Fixes the kbd_server routing gap: serial injection goes to sh0,
+        // not term; this binary is run from sh0 and directly invokes the
+        // same bell library code path term uses. `needs_alloc = true`
+        // because the binary links `term` (which uses `alloc`) and
+        // `audio_client` (which links `kernel-core` at the alloc level).
+        ("bell-test", "bell-test", true),
         // Phase 57 Track G — graphical terminal emulator. `needs_alloc
         // = true` because the binary links `kernel-core` (font
         // provider, ANSI parser) and uses `alloc` types in the screen
@@ -2379,14 +2445,17 @@ fn launch_qemu_with_devices(uefi_image: &Path, display_mode: QemuDisplayMode, de
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
-/// Phase 57 H.5: GUI launcher that optionally appends [`AC97_QEMU_AUDIO_FLAGS`]
-/// for `cargo xtask run-gui` (default: audio enabled, `--no-audio` opts out).
+/// Phase 57 H.5 / Phase 63 C.1: GUI launcher that optionally appends the
+/// AC'97 audio flags via [`append_ac97_audio_flags_gui`] for
+/// `cargo xtask run-gui` (default: audio enabled, `--no-audio` opts out).
 ///
-/// The audio flags are appended to the arg list assembled by
-/// [`qemu_run_args_with_devices`]; the existing
-/// `pcspk-audiodev=noaudio` machine option and `-audiodev none,id=noaudio`
-/// PC-speaker binding are preserved verbatim so non-audio runs continue to
-/// match today's behavior byte-for-byte.
+/// With audio enabled the GUI launcher probes the host at startup for a
+/// reachable PipeWire / PulseAudio socket and falls back to silent
+/// `-audiodev none,id=snd0` if neither is available — never failing the
+/// launch on a missing audio daemon. The existing `pcspk-audiodev=noaudio`
+/// machine option and `-audiodev none,id=noaudio` PC-speaker binding are
+/// preserved verbatim so non-audio runs continue to match today's
+/// behavior byte-for-byte.
 fn launch_qemu_with_devices_audio(
     uefi_image: &Path,
     display_mode: QemuDisplayMode,
@@ -2396,7 +2465,7 @@ fn launch_qemu_with_devices_audio(
     let ovmf = find_ovmf();
     let mut args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
     if with_audio {
-        append_ac97_audio_flags(&mut args);
+        append_ac97_audio_flags_gui(&mut args);
     }
 
     if display_mode == QemuDisplayMode::Gui {
@@ -2413,13 +2482,202 @@ fn launch_qemu_with_devices_audio(
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
-/// Append the Phase 57 [`AC97_QEMU_AUDIO_FLAGS`] to a QEMU arg vector.
+/// Append [`AC97_QEMU_AUDIO_FLAGS_HEADLESS`] to a QEMU arg vector.
 ///
-/// Centralised so the production launcher and the xtask unit tests
-/// share one definition — see `run_gui_with_audio_emits_ac97_device_flags`
-/// for the contract assertion.
-fn append_ac97_audio_flags(args: &mut Vec<String>) {
-    args.extend(AC97_QEMU_AUDIO_FLAGS.iter().map(|s| (*s).to_string()));
+/// Used by `audio_smoke_qemu_args` and any headless launcher that needs
+/// the AC'97 device present but discards all audio output.
+fn append_ac97_audio_flags_headless(args: &mut Vec<String>) {
+    args.extend(
+        AC97_QEMU_AUDIO_FLAGS_HEADLESS
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+}
+
+/// Append the `-audiodev` + `-device AC97,…` pair for `cargo xtask run-gui`
+/// (audio enabled).
+///
+/// The `-audiodev` driver is chosen at launch time by [`gui_audiodev_flag`]:
+/// on Linux it prefers `pipewire` (QEMU 8.1+ native backend) when the
+/// PipeWire socket exists, then falls back to `pa` if the PulseAudio socket
+/// is reachable, and finally to `none` (with a printed warning) so the
+/// launch never fails just because no host audio daemon is available.
+/// On non-Linux hosts the driver is `none` and a warning is printed.
+///
+/// The `-device AC97,audiodev=snd0,addr=0x5` line comes from
+/// [`AC97_QEMU_AUDIO_DEVICE_FLAGS`] and is pinned by an xtask test so the
+/// `audio_server` `SENTINEL_BDF` PCI-slot match stays stable.
+fn append_ac97_audio_flags_gui(args: &mut Vec<String>) {
+    args.extend(gui_audiodev_flag());
+    args.extend(
+        AC97_QEMU_AUDIO_DEVICE_FLAGS
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+}
+
+/// Phase 63 hotfix: probe the host for a usable QEMU audio backend and
+/// return the matching `-audiodev <driver>,id=snd0` arg pair.
+///
+/// Probe order on Linux: `pipewire` (QEMU 8.1+ native) → `pa` (PulseAudio)
+/// → `none` (silent fallback). For each candidate the function checks both
+/// (a) that QEMU was built with the driver (parsed from
+/// `qemu-system-x86_64 -audiodev help`) and (b) that the corresponding
+/// daemon socket exists under `$XDG_RUNTIME_DIR`. If neither is reachable
+/// — common on PipeWire-only setups without the `pipewire-pulse` shim —
+/// the function emits `none,id=snd0` and prints a hint so the developer
+/// knows AC'97 frames will be discarded rather than audible.
+fn gui_audiodev_flag() -> Vec<String> {
+    let driver = detect_gui_audio_driver();
+    vec!["-audiodev".to_string(), format!("{driver},id=snd0")]
+}
+
+fn detect_gui_audio_driver() -> &'static str {
+    // Explicit operator override wins over auto-probe so a developer
+    // can bypass a misbehaving detector (e.g., a distro that puts the
+    // PulseAudio socket somewhere the default candidate list doesn't
+    // know about). Accepted values: any driver name QEMU reports under
+    // `-audiodev help` — typically `pipewire`, `pa`, `alsa`, `sdl`,
+    // `oss`, `coreaudio`, `dsound`, or `none`. We trust the override
+    // verbatim — if QEMU doesn't support the driver the launch will
+    // fail with a QEMU-side error, which is more diagnostic than a
+    // silent `none` fallback.
+    if let Some(driver) = std::env::var("M3OS_AUDIODEV")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        println!(
+            "audio: M3OS_AUDIODEV={driver} — bypassing auto-probe and emitting `-audiodev {driver},id=snd0`"
+        );
+        // Leak to satisfy the &'static str signature; this function is
+        // called once per launch so the leak is bounded.
+        return Box::leak(driver.into_boxed_str());
+    }
+
+    if !cfg!(target_os = "linux") {
+        println!(
+            "audio: PipeWire/PulseAudio probing is only supported on Linux hosts; \
+             falling back to `-audiodev none,id=snd0` (no audible output). \
+             Set M3OS_AUDIODEV=<driver> to override."
+        );
+        return "none";
+    }
+
+    let runtime_dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            println!(
+                "audio: $XDG_RUNTIME_DIR is unset, cannot probe for PipeWire/PulseAudio sockets; \
+                 falling back to `-audiodev none,id=snd0` (no audible output). \
+                 Set M3OS_AUDIODEV=<driver> to override."
+            );
+            return "none";
+        }
+    };
+
+    let supported = qemu_supported_audiodev_drivers();
+
+    // Order matters: prefer PipeWire's native QEMU backend (no pulse shim
+    // required), then fall back to PulseAudio, finally to silent `none`.
+    //
+    // Multiple candidate socket paths per driver because distros vary:
+    // - Stock PipeWire creates `$XDG_RUNTIME_DIR/pipewire-0`, but session
+    //   managers can produce `pipewire-1` / `pipewire-2` when several
+    //   instances coexist.
+    // - PulseAudio's native socket is `pulse/native` on most distros;
+    //   pipewire-pulse drops it at the same path.
+    let candidates: &[(&str, &[&str])] = &[
+        ("pipewire", &["pipewire-0", "pipewire-1", "pipewire-2"]),
+        ("pa", &["pulse/native", "pulse/cli"]),
+    ];
+
+    let mut driver_unsupported: Vec<&str> = Vec::new();
+    for (driver, socket_rels) in candidates {
+        if !supported.iter().any(|s| s == driver) {
+            driver_unsupported.push(driver);
+            continue;
+        }
+        for rel in *socket_rels {
+            let socket_path = runtime_dir.join(rel);
+            if socket_path.exists() {
+                return driver;
+            }
+        }
+    }
+
+    // Diagnostic: nothing matched. Print what we know so the developer
+    // can decide whether to start a daemon, install a shim, or set
+    // M3OS_AUDIODEV explicitly.
+    let supported_summary = if supported.is_empty() {
+        String::from("(none — `qemu-system-x86_64 -audiodev help` returned no drivers)")
+    } else {
+        supported.join(", ")
+    };
+    // Surface the most common cause of `Available audio drivers: none wav`
+    // (a stripped QEMU build) with a per-distro install hint. Falling back
+    // to `none` is correct, but the developer wants to know *why* and what
+    // to do about it.
+    let unsupported_summary = if driver_unsupported.is_empty() {
+        String::from("(QEMU has both pipewire and pa backends compiled in)")
+    } else {
+        format!(
+            "QEMU lacks: {missing}. On Arch: \
+             `sudo pacman -S qemu-audio-pa qemu-audio-pipewire`. \
+             On Debian/Ubuntu the default `qemu-system-x86` already \
+             includes both; on Fedora install `qemu-audio`. \
+             A self-built QEMU needs `--enable-pipewire` and/or \
+             `--enable-pa` (configure flags) before `make`.",
+            missing = driver_unsupported.join(", "),
+        )
+    };
+    let runtime_entries = match std::fs::read_dir(&runtime_dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                String::from("(empty)")
+            } else {
+                names.join(", ")
+            }
+        }
+        Err(err) => format!("(cannot read directory: {err})"),
+    };
+    println!(
+        "audio: no reachable PipeWire or PulseAudio socket found in {runtime}.\n\
+         audio:   QEMU drivers supported: {supported_summary}\n\
+         audio:   {unsupported_summary}\n\
+         audio:   {runtime} contents: {runtime_entries}\n\
+         audio: falling back to `-audiodev none,id=snd0` (AC'97 frames will be \
+         discarded; no audible output). Pass `--no-audio` to silence this probe, \
+         or set `M3OS_AUDIODEV=<driver>` (e.g. `M3OS_AUDIODEV=pa`) to override.",
+        runtime = runtime_dir.display(),
+    );
+    "none"
+}
+
+/// Parse `qemu-system-x86_64 -audiodev help` to learn which audio backends
+/// the host's QEMU was compiled with. Returns an empty list if QEMU is not
+/// on `$PATH`; callers then degrade to `none`.
+fn qemu_supported_audiodev_drivers() -> Vec<String> {
+    let output = match Command::new("qemu-system-x86_64")
+        .args(["-audiodev", "help"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // QEMU emits "Available audio drivers:" followed by one driver name
+    // per line. Tolerant parsing skips blank lines and any header line
+    // containing a colon so we work across QEMU versions.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(':'))
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2456,7 +2714,26 @@ fn qemu_run_gui_args_for_test(
 ) -> Vec<String> {
     let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Gui, devices);
     if with_audio {
-        append_ac97_audio_flags(&mut args);
+        append_ac97_audio_flags_gui(&mut args);
+    }
+    args
+}
+
+/// Phase 63 audio-fix unit-test helper: mirror of
+/// [`qemu_run_gui_args_for_test`] for the headless `cmd_run` launcher
+/// so we can assert that `cargo xtask run` (default-on audio) emits
+/// the AC'97 device pair. Same audiodev probe path as `run-gui`; the
+/// `_gui` suffix on the helper is historical.
+#[cfg(test)]
+fn qemu_run_headless_args_for_test(
+    uefi_image: &Path,
+    ovmf: &Path,
+    devices: DeviceSet,
+    with_audio: bool,
+) -> Vec<String> {
+    let mut args = qemu_run_args_with_devices(uefi_image, ovmf, QemuDisplayMode::Headless, devices);
+    if with_audio {
+        append_ac97_audio_flags_gui(&mut args);
     }
     args
 }
@@ -2673,6 +2950,39 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 63 review-resolution: userspace library host tests previously
+    // ran only on demand. They are now part of `xtask check` so that
+    // breakage in any one of them blocks merges the same way kernel-core
+    // and driver_runtime breakage does. Each entry uses the lib
+    // (`x86_64-unknown-linux-gnu`) target because the production crates
+    // are `#![no_std]` and only the `[cfg(test)]` modules pull in `std`.
+    for (pkg, extra_args) in USERSPACE_LIB_HOST_TEST_PACKAGES {
+        let mut args: Vec<&str> = vec![
+            "test",
+            "--package",
+            pkg,
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ];
+        args.extend_from_slice(extra_args);
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args(&args)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to spawn {pkg} host tests: {e}"));
+        if !status.success() {
+            eprintln!(
+                "{pkg} host tests failed — rerun `cargo test -p {pkg} --target {KERNEL_CORE_HOST_TARGET}{}`",
+                if extra_args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", extra_args.join(" "))
+                }
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -2686,7 +2996,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, and driver_runtime host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, and term host tests pass"
     );
 }
 
@@ -2987,6 +3297,16 @@ fn cmd_test(test_args: &TestArgs) {
 #[allow(dead_code)]
 enum SmokeStep {
     /// Wait for `pattern` to appear in serial output within `timeout_secs`.
+    ///
+    /// Non-consuming: when `pattern` is found, the matched bytes stay in
+    /// `serial_buf` so a later `Wait` for a marker that arrived *before*
+    /// `pattern` still succeeds. The reset boundary is `Send`, which clears
+    /// `serial_buf` after writing input. Without this rule, two `Wait` steps
+    /// whose markers race (e.g. `TERM_SMOKE:ready` emitted by `term` vs.
+    /// `session_manager: session.boot: state=running` emitted by
+    /// `session_manager` on a different core, milliseconds apart) would
+    /// deadlock the harness whenever the wire order disagreed with the
+    /// step order — the bug closed by the bell-smoke handoff §1 fix.
     Wait {
         pattern: &'static str,
         timeout_secs: u64,
@@ -3009,6 +3329,39 @@ enum SmokeStep {
         label: &'static str,
         extra_steps_a: &'static [SmokeStep],
         extra_steps_b: &'static [SmokeStep],
+    },
+    /// Wait for a line containing `pattern`, then assert the matched line
+    /// does NOT also contain `bad_substring`.
+    ///
+    /// Introduced for Phase 63 D.2: wait for
+    /// `AUDIO_DEMO:stats consumed=<N>` and fail if N is zero by checking
+    /// that the line does not contain `consumed=0 ` or `consumed=0\n`.
+    /// This avoids a full regex engine for a single tightly-scoped check.
+    WaitLineNotMatching {
+        pattern: &'static str,
+        bad_substring: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+    },
+    /// Wait for either a pass line or a fail line, whichever appears first.
+    ///
+    /// Introduced for Phase 63 D.1 fix: replaces the plain `Wait` for
+    /// `AUDIO_DEMO:PASS` so that `AUDIO_DEMO:FAIL stage=` is caught
+    /// immediately rather than letting the step time out generically.
+    ///
+    /// Behaviour:
+    /// - If a line containing `pass_pattern` is found → step passes.
+    /// - If a line starting with `fail_prefix` is found → the rest of
+    ///   the matched line (after `fail_prefix`) is captured and the
+    ///   step exits via `exit_code_on_fail` with the captured text in
+    ///   the error message.
+    /// - If neither is found within `timeout_secs` → generic timeout error.
+    WaitPassOrFail {
+        pass_pattern: &'static str,
+        fail_prefix: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+        exit_code_on_fail: i32,
     },
 }
 
@@ -3093,6 +3446,22 @@ fn starts_with_background_noise(input: &str) -> bool {
         .iter()
         .chain(BACKGROUND_INIT_PREFIXES.iter())
         .any(|pfx| input.starts_with(pfx))
+}
+
+/// Find a complete newline-terminated FAIL line in `serial` and return
+/// the text between `fail_prefix` and the terminating `\n`.
+///
+/// Returns `None` if `fail_prefix` is not present *or* if the prefix is
+/// present but the line has not yet been terminated. Without this, the
+/// `WaitPassOrFail` step fires the moment the prefix appears, kills
+/// QEMU mid-write, and the captured suffix is truncated — losing the
+/// `variant=<AudioClientError>` diagnostic that points at the
+/// underlying server-side failure.
+fn find_terminated_fail_line(serial: &str, fail_prefix: &str) -> Option<String> {
+    let start = serial.find(fail_prefix)?;
+    let after_prefix = start + fail_prefix.len();
+    let end = serial[after_prefix..].find('\n')?;
+    Some(serial[after_prefix..after_prefix + end].to_owned())
 }
 
 fn strip_background_noise(input: &str) -> String {
@@ -3492,9 +3861,10 @@ fn run_smoke_script(
                     // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
-                    if let Some((mode, match_end)) = find_serial_match(&stripped, &cleaned, pattern)
-                    {
-                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                    if find_serial_match(&stripped, &cleaned, pattern).is_some() {
+                        // Non-consuming: see `SmokeStep::Wait` doc. We deliberately
+                        // do NOT drain through the match, so a later `Wait` for an
+                        // earlier-arrived marker still observes its line.
                         break;
                     }
 
@@ -3657,12 +4027,234 @@ fn run_smoke_script(
                     queue.push_front(extra);
                 }
             }
+
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                label,
+            } => {
+                println!(
+                    "[step {}] wait-line-not-matching: {label} ({}s)",
+                    step_num, timeout_secs
+                );
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    // Find the first complete (newline-terminated) line that contains `pattern`.
+                    // Iterate with `split_inclusive('\n')` and a running byte cursor so the
+                    // drain offset is anchored to the line currently under inspection — using
+                    // `s.find(line)` would return the *first* occurrence of that text in the
+                    // buffer, which can sit inside a different earlier line.
+                    //
+                    // The returned offset is in *stripped* or *cleaned* coordinates depending
+                    // on which buffer matched; we hand it to `drain_serial_through_match`
+                    // along with the `SerialMatchMode` so it can translate back into the raw
+                    // `serial_buf` index space before draining. Draining `serial_buf` with a
+                    // stripped/cleaned offset directly skews the buffer because `strip_ansi`
+                    // and `strip_background_noise` change string length.
+                    let search = |s: &str| -> Option<(bool, usize)> {
+                        let mut cursor = 0usize;
+                        for segment in s.split_inclusive('\n') {
+                            // Only consider complete lines (ones terminated by '\n').
+                            let segment_end = cursor + segment.len();
+                            if segment.ends_with('\n') {
+                                let line = segment.trim_end_matches('\n');
+                                if line.contains(pattern) {
+                                    let failed = line.contains(bad_substring);
+                                    // segment_end already includes the trailing newline,
+                                    // so the drain consumes the full matched line.
+                                    return Some((!failed, segment_end));
+                                }
+                            }
+                            cursor = segment_end;
+                        }
+                        None
+                    };
+                    let result = search(&cleaned)
+                        .map(|(ok, end)| (ok, SerialMatchMode::Cleaned, end))
+                        .or_else(|| {
+                            search(&stripped).map(|(ok, end)| (ok, SerialMatchMode::Stripped, end))
+                        });
+
+                    if let Some((ok, mode, match_end)) = result {
+                        if ok {
+                            // Drain consumed output, translating stripped/cleaned offsets
+                            // back into raw-buffer indices before cutting.
+                            drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                            break;
+                        } else {
+                            // Pattern matched but line also contained bad_substring.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "step {} assertion failed: {label}\n\
+                                 pattern \"{pattern}\" matched a line containing \
+                                 bad_substring \"{bad_substring}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} timed out: {label}\n\
+                             expected pattern: \"{pattern}\"\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
+
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            // On final-step disconnect check for the pattern.
+                            if remaining == 0 {
+                                for line in stripped.lines() {
+                                    if line.contains(pattern) {
+                                        if !line.contains(bad_substring) {
+                                            serial_buf.clear();
+                                            // break out of outer loop
+                                            return Ok(());
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}: {label}\n\
+                                 expected pattern: \"{pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+                }
+            }
+
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                timeout_secs,
+                label,
+                exit_code_on_fail,
+            } => {
+                println!(
+                    "[step {}] wait-pass-or-fail: {label} ({}s)",
+                    step_num, timeout_secs
+                );
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    // Check pass first, then fail.
+                    if let Some((mode, match_end)) =
+                        find_serial_match(&stripped, &cleaned, pass_pattern)
+                    {
+                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                        break;
+                    }
+                    // Scan for a line starting with fail_prefix. Require a
+                    // newline after the prefix so we capture the complete
+                    // line (with the `variant=...` suffix) instead of a
+                    // partial buffer — killing QEMU mid-write of the FAIL
+                    // line truncates the variant tag and hides which
+                    // `AudioClientError` actually fired.
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
+                    if let Some(captured) = fail_capture {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let msg = format!(
+                            "audio-demo failed at stage: {captured}\n\
+                             (step {} — {label})",
+                            step_num
+                        );
+                        eprintln!("{msg}");
+                        std::process::exit(*exit_code_on_fail);
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        dump_serial(&serial_history);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                        return Err(format!(
+                            "step {} timed out: {label}\n\
+                             expected pass pattern: \"{pass_pattern}\"\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
+
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            if stripped.contains(pass_pattern) && remaining == 0 {
+                                serial_buf.clear();
+                                break;
+                            }
+                            dump_serial(&serial_history);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}: {label}\n\
+                                 expected pass pattern: \"{pass_pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 
     // All steps passed — kill QEMU.
     let _ = child.kill();
     let _ = child.wait();
+    // Phase 63 audio handoff follow-up — when `M3OS_SMOKE_SERIAL_DUMP` is
+    // set, also dump the full history on the success path. The kernel
+    // gained rate-limited `u64::MAX diag:` lines for the `Io(-32)` IPC
+    // race, and `audio-demo` retries successfully on those — so the
+    // diagnostic only ever shows up in the transcript of a *passing*
+    // run. Without this, the dump path was failure-only and the diag
+    // was invisible.
+    dump_serial(&serial_history);
     Ok(())
 }
 
@@ -5651,7 +6243,7 @@ fn parse_smoke_boot_args(name: &str, args: &[String]) -> Result<SmokeBootArgs, S
 /// bind, IPC service registration) which is observable but adds boot
 /// time and noise; the conf-loaded check is fast and deterministic.
 fn audio_smoke_steps() -> Vec<SmokeStep> {
-    vec![
+    let mut steps = vec![
         SmokeStep::Wait {
             pattern: "[m3os] Hello from kernel",
             timeout_secs: 30,
@@ -5662,15 +6254,88 @@ fn audio_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 90,
             label: "guest/audio: init loaded audio_server.conf",
         },
-    ]
+    ];
+    // 2026-05-11 follow-up: the previous step list sent `audio-demo\n`
+    // immediately after the audio_server-loaded marker — well before the
+    // serial console reached a logged-in shell. The keystrokes hit
+    // `m3OS login:` and were rejected ("Login incorrect"), so audio-demo
+    // never ran and `audio_server` parked in `BlockedOnNotif` waiting for
+    // an IPC client that never connected. Use the shared boot+login
+    // prefix so the command lands at the post-login `sh0` prompt the way
+    // every other regression smoke does.
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // D.1: invoke the audio-demo reference client from the logged-in shell.
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/audio: launch audio-demo",
+    });
+    // D.1: wait for the PASS sentinel, but also intercept FAIL immediately.
+    // 30 s covers the 1-second tone plus codec initialisation latency
+    // inside QEMU TCG. On `AUDIO_DEMO:FAIL stage=...` the harness exits
+    // with SMOKE_EXIT_AUDIO_DEMO_FAILED and surfaces the failing stage.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/audio: audio-demo PASS sentinel",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    // D.2: wait for the stats line and assert frames_consumed > 0.
+    // `bad_substring` catches `consumed=0 ` (trailing space before
+    // `underruns=`) — a zero-consumed count proves the DMA engine
+    // never advanced the BDL, which is the regression Track A.2 guards.
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/audio: frames_consumed non-zero",
+    });
+    // 2026-05-11 second-open regression: a second `audio-demo`
+    // invocation must also reach `AUDIO_DEMO:PASS`. The first version
+    // of `Ac97Backend::open_stream` only flipped `stream_open = true`
+    // and left both the AC'97 controller (CR=0, BDBAR cleared by close)
+    // and the `Ac97Logic` mirror carrying state from the previous run,
+    // so run #2's submits hit `Server:WouldBlock` after ~1 s of retries.
+    // The fix is in `device.rs::Ac97Backend::open_stream`; this second
+    // pass through audio-demo locks the regression out.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "audio-demo\n",
+        label: "guest/audio: relaunch audio-demo (second-open regression)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "AUDIO_DEMO:PASS",
+        fail_prefix: "AUDIO_DEMO:FAIL stage=",
+        timeout_secs: 30,
+        label: "guest/audio: audio-demo PASS sentinel (run #2)",
+        exit_code_on_fail: SMOKE_EXIT_AUDIO_DEMO_FAILED,
+    });
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "AUDIO_DEMO:stats consumed=",
+        bad_substring: "consumed=0 ",
+        timeout_secs: 5,
+        label: "guest/audio: frames_consumed non-zero (run #2)",
+    });
+    steps
 }
 
-/// Build the QEMU arg vector for the audio smoke. Hostfwd is stripped
-/// the same way `cmd_device_smoke` strips it so parallel CI lanes do
-/// not collide on host ports 2222/2323. The Phase 57 audio flags
-/// ([`AC97_QEMU_AUDIO_FLAGS`]) are appended so the AC'97 emulation is
-/// live for the duration of the boot.
-fn audio_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+/// Build the QEMU arg vector for the audio smoke.
+///
+/// Hostfwd is stripped the same way `cmd_device_smoke` strips it so parallel
+/// CI lanes do not collide on host ports 2222/2323.
+///
+/// Phase 63 C.2: instead of the headless `none` backend, the smoke emits
+/// `-audiodev wav,id=snd0,path=<smoke_dir>/audio.wav` so CI can verify
+/// audible output by inspecting the recorded WAV file after the run.
+/// The `id=snd0` value matches the `-device AC97,audiodev=snd0` flag
+/// appended below, so QEMU wires them together correctly.
+fn audio_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
     let display_mode = if display {
         QemuDisplayMode::Gui
     } else {
@@ -5683,7 +6348,38 @@ fn audio_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<S
             *arg = "user,id=net0".to_string();
         }
     }
-    append_ac97_audio_flags(&mut qemu_args);
+    // Phase 63 C.2: WAV backend so the smoke harness can verify non-silent
+    // output by reading the recorded file after QEMU exits.
+    let wav_path = smoke_dir.join("audio.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Build the QEMU arg vector for session-smoke and session-recover-smoke.
+///
+/// Shares the hostfwd-stripping logic with [`audio_smoke_qemu_args`] but
+/// uses the headless audio backend (`none,id=snd0`) because these smokes
+/// gate on session startup state, not audio frame emission — WAV output
+/// is unnecessary overhead for CI session checks.
+fn session_smoke_qemu_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    append_ac97_audio_flags_headless(&mut qemu_args);
     qemu_args
 }
 
@@ -5705,13 +6401,20 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
         false,
     );
 
+    // Phase 63 C.2: prepare the smoke output directory and WAV path.
+    let smoke_dir = prepare_audio_smoke_dir();
+
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = audio_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
     let steps = audio_smoke_steps();
 
     println!(
         "audio-smoke: launching QEMU with AC'97 audio device (timeout {}s)",
         args.timeout_secs
+    );
+    println!(
+        "audio-smoke: WAV output → {}",
+        smoke_dir.join("audio.wav").display()
     );
 
     let mut child = Command::new("qemu-system-x86_64")
@@ -5739,6 +6442,231 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_AUDIO_DEMO_FAILED);
         }
     }
+
+    // Phase 63 D.3: after QEMU exits, verify the recorded WAV is non-silent.
+    // This is the host-side proof that QEMU's audio backend received real PCM
+    // frames from the AC'97 engine (not just accounting counters).
+    let wav_path = smoke_dir.join("audio.wav");
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => {
+            println!("audio-smoke: WAV non-silent check PASSED");
+        }
+        Err(msg) => {
+            eprintln!("audio-smoke: WAV non-silent check FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+/// Phase 63 D.3: assert a WAV file at `path` is non-silent.
+///
+/// Parses the RIFF/WAVE header to locate the PCM data chunk, interprets
+/// the samples as little-endian `i16`, and asserts that at least 5% of
+/// samples have `|sample| > 100` (well above the WAV zero-silence noise
+/// floor). QEMU's `wav` audio backend emits PCM_S16LE at whatever rate
+/// the AC'97 engine requests; the threshold is format-independent.
+///
+/// Returns `Err` with a human-readable message if:
+/// - the file cannot be read,
+/// - the header is not valid RIFF/WAVE,
+/// - the data chunk has zero samples, or
+/// - fewer than 5% of samples are non-silent.
+fn assert_wav_non_silent(path: &Path) -> Result<(), String> {
+    let data =
+        fs::read(path).map_err(|e| format!("cannot read WAV file {}: {e}", path.display()))?;
+
+    // RIFF header: "RIFF" (4) + file_size (4) + "WAVE" (4) = 12 bytes.
+    if data.len() < 12 {
+        return Err(format!(
+            "WAV file {} is too short ({} bytes) to contain a RIFF header",
+            path.display(),
+            data.len()
+        ));
+    }
+    if &data[0..4] != b"RIFF" {
+        return Err(format!(
+            "WAV file {} does not start with RIFF magic",
+            path.display()
+        ));
+    }
+    if &data[8..12] != b"WAVE" {
+        return Err(format!(
+            "WAV file {} is missing WAVE format tag",
+            path.display()
+        ));
+    }
+
+    // Walk sub-chunks starting at offset 12. We need the fmt chunk
+    // (for the channel count / sample rate that gates the windowed
+    // non-silent threshold) and the data chunk (which we expect to
+    // hold S16LE samples).
+    //
+    // QEMU's `-audiodev wav` backend writes a streaming WAV: the RIFF
+    // and `data` chunk-size fields are left at zero because the final
+    // length isn't known when the file is opened. Tolerate that by
+    // treating a declared chunk that overruns the file as "extends to
+    // EOF" so the smoke harness can still inspect the trailing PCM.
+    let mut offset = 12usize;
+    let mut sample_rate: Option<u32> = None;
+    let mut channels: Option<u16> = None;
+    let mut data_offset: Option<usize> = None;
+    let mut data_size: Option<usize> = None;
+
+    while offset + 8 <= data.len() {
+        let id = &data[offset..offset + 4];
+        let declared_size =
+            u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk_start = offset + 8;
+        let remaining = data.len().saturating_sub(chunk_start);
+        // A streaming WAV records size=0; an oversize header (declared
+        // larger than the file) is the same shape under crash-truncation.
+        // In both cases the payload that *is* on disk runs from
+        // `chunk_start` to EOF, so use the smaller of the two.
+        let chunk_size = if declared_size == 0 || declared_size > remaining {
+            remaining
+        } else {
+            declared_size
+        };
+        let chunk_end = chunk_start + chunk_size;
+
+        if id == b"fmt " && chunk_size >= 16 {
+            channels = Some(u16::from_le_bytes(
+                data[chunk_start + 2..chunk_start + 4].try_into().unwrap(),
+            ));
+            sample_rate = Some(u32::from_le_bytes(
+                data[chunk_start + 4..chunk_start + 8].try_into().unwrap(),
+            ));
+        }
+        if id == b"data" {
+            data_offset = Some(chunk_start);
+            data_size = Some(chunk_size);
+            break;
+        }
+        // Align to even boundary per RIFF spec.
+        let aligned = chunk_end + (chunk_size & 1);
+        if aligned <= offset {
+            return Err(format!(
+                "WAV file {} contains a non-advancing chunk at offset {}",
+                path.display(),
+                offset
+            ));
+        }
+        offset = aligned;
+    }
+
+    let data_start =
+        data_offset.ok_or_else(|| format!("WAV file {} has no 'data' chunk", path.display()))?;
+    let data_len = data_size
+        .ok_or_else(|| format!("WAV file {} 'data' chunk size missing", path.display()))?;
+
+    // PCM_S16LE: 2 bytes per sample.
+    let n_samples = data_len / 2;
+    if n_samples == 0 {
+        return Err(format!(
+            "WAV file {} 'data' chunk is empty (0 samples)",
+            path.display()
+        ));
+    }
+
+    let pcm_bytes = &data[data_start..data_start + data_len];
+    let mut samples: Vec<bool> = Vec::with_capacity(n_samples);
+    for chunk in pcm_bytes.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        // `i16::MIN.abs()` would overflow; widen to i32 so full-scale negative
+        // samples are counted correctly rather than panicking on debug builds.
+        samples.push(i32::from(sample).abs() > 100);
+    }
+
+    // The recording covers the entire boot — mostly silence — so a
+    // whole-file percentage drowns the tone phase. Slide a one-second
+    // window across the samples and report the loudest window's
+    // non-silent fraction; the tone is present when that fraction
+    // crosses the threshold.
+    let rate = sample_rate.unwrap_or(44_100);
+    let ch = channels.unwrap_or(2).max(1) as usize;
+    let window_samples = (rate as usize).saturating_mul(ch).min(n_samples).max(1);
+    let threshold_pct = 5u64;
+
+    let total_non_silent: usize = samples.iter().filter(|&&b| b).count();
+    let mut window_non_silent: usize = samples[..window_samples].iter().filter(|&&b| b).count();
+    let mut best_window: usize = window_non_silent;
+    for i in window_samples..n_samples {
+        if samples[i] {
+            window_non_silent += 1;
+        }
+        if samples[i - window_samples] {
+            window_non_silent -= 1;
+        }
+        if window_non_silent > best_window {
+            best_window = window_non_silent;
+        }
+    }
+    let window_pct = (best_window as u64 * 100) / window_samples as u64;
+    if window_pct < threshold_pct {
+        return Err(format!(
+            "WAV file {} is effectively silent: loudest {ws}-sample window has \
+             only {window_pct}% non-silent samples (best={best_window} of {ws}, \
+             total non-silent={total_non_silent}/{n_samples}, threshold {threshold_pct}%)",
+            path.display(),
+            ws = window_samples,
+        ));
+    }
+
+    println!(
+        "audio-smoke: WAV check PASSED — loudest {window_samples}-sample window has \
+         {window_pct}% non-silent samples ({best_window}/{window_samples}), \
+         total non-silent {total_non_silent}/{n_samples}"
+    );
+    Ok(())
+}
+
+/// Phase 63 C.2: prepare the audio smoke output directory.
+///
+/// Creates `target/audio-smoke/` if it does not exist, removes any prior
+/// `audio.wav` from a previous run, and verifies the directory is writable
+/// by creating a probe file. Exits with an error message if the directory
+/// cannot be created or is not writable so the user gets a clear diagnosis
+/// rather than a cryptic QEMU failure.
+fn prepare_audio_smoke_dir() -> PathBuf {
+    let root = workspace_root();
+    let smoke_dir = root.join("target/audio-smoke");
+
+    if let Err(e) = fs::create_dir_all(&smoke_dir) {
+        eprintln!(
+            "audio-smoke: cannot create output directory {}: {e}",
+            smoke_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Remove any WAV from a prior run so the smoke gate always reads a fresh file.
+    let wav_path = smoke_dir.join("audio.wav");
+    if wav_path.exists() {
+        if let Err(e) = fs::remove_file(&wav_path) {
+            eprintln!(
+                "audio-smoke: cannot remove prior audio.wav {}: {e}",
+                wav_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Verify writability with a probe file before launching QEMU.
+    let probe = smoke_dir.join(".write_probe");
+    match fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+        }
+        Err(e) => {
+            eprintln!(
+                "audio-smoke: output directory {} is not writable: {e}",
+                smoke_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    smoke_dir
 }
 
 /// Phase 57 H.2 — smoke step list for `cargo xtask session-smoke`.
@@ -5811,7 +6739,7 @@ fn cmd_session_smoke(args: &SmokeBootArgs) {
     );
 
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
     let steps = session_smoke_steps();
 
     println!(
@@ -5911,7 +6839,7 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
     );
 
     let ovmf = find_ovmf();
-    let qemu_args = audio_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
     let steps = session_recover_smoke_steps();
 
     println!(
@@ -5945,6 +6873,217 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
             let _ = child.wait();
             eprintln!("session-recover-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_SESSION_RECOVERY_FAILED);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 63 Track E.1 — bell-smoke step list, QEMU arg builder, and command
+// ---------------------------------------------------------------------------
+
+/// Phase 63 Track E.1 (resend) — smoke step list for `cargo xtask bell-smoke`.
+///
+/// ## Routing fix
+///
+/// The original implementation injected `printf '\x07'\n` via QEMU serial
+/// stdin. Serial stdin goes to the kernel serial shell (`sh0`), **not** to
+/// `term`'s ANSI parser (which reads from `kbd_server`). The BEL byte never
+/// reached `Bell::ring` — the old approach was broken by design.
+///
+/// The fix: run the `bell-test` binary from `sh0`. `bell-test` directly
+/// constructs an `AudioClientBellSink` and calls `Bell::ring()`, exercising
+/// the exact same code path `term`'s ANSI parser takes. No kbd_server
+/// routing required.
+///
+/// ## Scope
+///
+/// Verifies that the `Bell::ring` → `AudioClientBellSink::play` →
+/// `audio_client::submit_frames` → `Ac97Backend` path actually advances
+/// `frames_consumed` once the real AC'97 backend (Phase 63 A/B) is live.
+///
+/// ## Steps
+///
+/// 1. Wait for the kernel boot marker.
+/// 2. Wait for `init: loaded service 'audio_server'` — proves init has
+///    registered the audio_server manifest entry and will spawn it. Mirrors
+///    `audio_smoke_steps`'s gating: we do NOT gate on
+///    `session_manager: session.boot: state=running` because that line
+///    races with other markers across cores and is unrelated to whether
+///    bell-test can reach the audio path from sh0.
+/// 3. `boot_and_login_steps()` — wait for the post-boot `m3OS login:`
+///    prompt and log into `sh0` as root. Without this, the next `Send`
+///    would type `bell-test` at the login prompt instead of running it.
+/// 4. Sleep 500 ms so the post-login shell finishes painting its prompt.
+/// 5. `Send` `bell-test\n` to run the bell path exerciser from `sh0`.
+///    `bell-test` calls `Bell::ring()` → `AudioClientBellSink::play` →
+///    `audio_client::submit_frames`, sleeps 200 ms, then queries stats and
+///    prints `BELL_TEST:consumed=<N> underruns=<M>` followed by
+///    `BELL_TEST:PASS` or `BELL_TEST:FAIL:consumed=0` /
+///    `BELL_TEST:FAIL:audio_unavailable`.
+/// 6. `WaitPassOrFail` for `BELL_TEST:PASS` vs `BELL_TEST:FAIL` within
+///    15 s. On `BELL_TEST:FAIL` the harness exits immediately with
+///    `SMOKE_EXIT_BELL_SMOKE_FAILED` and surfaces the failing variant.
+///
+/// ## Why no TERM_SMOKE gating
+///
+/// Earlier versions of this list gated on `TERM_SMOKE:ready` and
+/// `TERM_SMOKE:prompt-ready`. Those markers describe the *graphical*
+/// terminal emulator and are off-path: `bell-test` runs from sh0
+/// (serial), not from term's ANSI parser. The TERM_SMOKE markers also
+/// race with `session_manager: state=running` on the wire (different
+/// cores, ms apart) and the consuming-Wait matcher used to deadlock when
+/// the wire order disagreed with the step order — see the bell-smoke
+/// handoff §1 fix. The harness is now non-consuming for `Wait`, but
+/// gating bell-smoke on irrelevant markers is still the wrong shape.
+///
+/// ## Failure modes
+///
+/// - If `Bell::ring` → `submit_frames` does not reach the Ac97Backend,
+///   `frames_consumed` stays zero → `bell-test` prints `BELL_TEST:FAIL:consumed=0`
+///   and the smoke exits.
+/// - If `Ac97Backend` is absent (Phase 57 accounting stub), `frames_submitted`
+///   advances but `frames_consumed` does not. Same failure path.
+/// - If `audio_server` is absent, `AudioClientBellSink::ensure_open` fails
+///   and `bell-test` prints `BELL_TEST:FAIL:audio_unavailable`.
+fn bell_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/bell-smoke: kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/bell-smoke: init loaded audio_server.conf",
+        },
+    ];
+    // Log into sh0 so the next Send lands at a shell prompt rather than
+    // `m3OS login:`. Mirrors `audio_smoke_steps`'s use of the same prefix.
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Run the bell path exerciser from sh0. bell-test directly constructs
+    // AudioClientBellSink, calls Bell::ring(), sleeps 200 ms for DMA, then
+    // queries stats and prints BELL_TEST:PASS or BELL_TEST:FAIL.
+    // This bypasses the kbd_server routing gap: serial stdin goes to sh0,
+    // not to term's ANSI parser; bell-test invokes the bell library directly.
+    steps.push(SmokeStep::Send {
+        input: "bell-test\n",
+        label: "guest/bell-smoke: run bell-test binary",
+    });
+    // WaitPassOrFail surfaces the failing variant from
+    // `BELL_TEST:FAIL:consumed=0` / `BELL_TEST:FAIL:audio_unavailable`
+    // immediately rather than letting the step time out generically.
+    // 15 s covers: bell-test's own 200 ms tone sleep + DMA latency + sh0
+    // prompt round-trip, plus headroom for slower CI.
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "BELL_TEST:PASS",
+        fail_prefix: "BELL_TEST:FAIL",
+        timeout_secs: 15,
+        label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+        exit_code_on_fail: SMOKE_EXIT_BELL_SMOKE_FAILED,
+    });
+    steps
+}
+
+/// Build the QEMU arg vector for the bell-smoke.
+///
+/// Uses the same WAV audio backend as [`audio_smoke_qemu_args`] so
+/// the smoke is deterministic (no host PulseAudio required) and the
+/// recorded WAV can optionally be inspected for non-silence. The WAV
+/// file is written to `<smoke_dir>/bell-smoke.wav` to avoid colliding
+/// with the `audio-smoke` run's `audio.wav` when both smokes are run
+/// in the same CI job.
+///
+/// The session-smoke QEMU flags are included (full session startup:
+/// display_server + kbd + mouse + audio_server + term) because
+/// bell-smoke requires `term` to be running.
+fn bell_smoke_qemu_args(
+    smoke_dir: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // WAV backend for deterministic CI — same pattern as audio_smoke_qemu_args.
+    let wav_path = smoke_dir.join("bell-smoke.wav");
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+fn cmd_bell_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    // Prepare output directory for the WAV recording.
+    let smoke_dir = prepare_audio_smoke_dir();
+
+    let ovmf = find_ovmf();
+    let qemu_args = bell_smoke_qemu_args(&smoke_dir, &uefi_image, &ovmf, args.display);
+    let steps = bell_smoke_steps();
+
+    println!(
+        "bell-smoke: launching QEMU with AC'97 WAV backend (timeout {}s)",
+        args.timeout_secs
+    );
+    println!(
+        "bell-smoke: WAV output → {}",
+        smoke_dir.join("bell-smoke.wav").display()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("bell-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("bell-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_BELL_SMOKE_FAILED);
         }
     }
 }
@@ -6440,7 +7579,12 @@ fn populate_ext2_files(
     // the `on-restart=audio_server.restart` line is consumed by F.4's
     // recovery state machine; init's parser logs an unknown-key
     // warning for it but loads the service unchanged.
-    let audio_server_conf = "name=audio_server\ncommand=/bin/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
+    // Phase 63 driver-host fix: `command=/drivers/audio_server` (not
+    // `/bin/`) so the kernel's `is_authorized_driver_process` gate
+    // accepts audio_server's `sys_device_claim(0,0,5,0)` for the AC'97
+    // controller — without the `/drivers/` prefix audio_server falls
+    // back to stub mode and `frames_consumed` never advances.
+    let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
     // Phase 57 Track G: term — graphical terminal emulator. Per the G.1
     // acceptance bullet, the policy is on-failure with a budget of three;
@@ -8000,7 +9144,7 @@ fn cmd_clean() {
     }
 }
 
-fn cmd_run(fresh: bool, devices: DeviceSet) {
+fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -8019,7 +9163,7 @@ fn cmd_run(fresh: bool, devices: DeviceSet) {
         false,
         false,
     );
-    launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
+    launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Headless, devices, with_audio);
 }
 
 fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
@@ -10096,9 +11240,10 @@ fn run_smoke_steps_with_capture(
                         ));
                     }
 
-                    if let Some((mode, match_end)) = find_serial_match(&stripped, &cleaned, pattern)
-                    {
-                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                    if find_serial_match(&stripped, &cleaned, pattern).is_some() {
+                        // Non-consuming: see `SmokeStep::Wait` doc. Leaves the matched
+                        // bytes in `serial_buf` so a later `Wait` for an earlier-arrived
+                        // marker still observes its line.
                         break;
                     }
 
@@ -10210,6 +11355,155 @@ fn run_smoke_steps_with_capture(
                 };
                 for extra in inject.iter().rev() {
                     queue.push_front(extra);
+                }
+            }
+
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                label,
+            } => {
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    // Iterate with `split_inclusive('\n')` and a running byte cursor so the
+                    // drain offset is anchored to the line currently under inspection — using
+                    // `s.find(line)` would return the *first* occurrence of that text in the
+                    // buffer, which can sit inside a different earlier line.
+                    //
+                    // The returned offset is in *stripped* or *cleaned* coordinates depending
+                    // on which buffer matched; we hand it to `drain_serial_through_match`
+                    // along with the `SerialMatchMode` so it can translate back into the raw
+                    // `serial_buf` index space before draining. Draining `serial_buf` with a
+                    // stripped/cleaned offset directly skews the buffer because `strip_ansi`
+                    // and `strip_background_noise` change string length.
+                    let search = |s: &str| -> Option<(bool, usize)> {
+                        let mut cursor = 0usize;
+                        for segment in s.split_inclusive('\n') {
+                            let segment_end = cursor + segment.len();
+                            if segment.ends_with('\n') {
+                                let line = segment.trim_end_matches('\n');
+                                if line.contains(pattern) {
+                                    let failed = line.contains(bad_substring);
+                                    return Some((!failed, segment_end));
+                                }
+                            }
+                            cursor = segment_end;
+                        }
+                        None
+                    };
+                    let result = search(&cleaned)
+                        .map(|(ok, end)| (ok, SerialMatchMode::Cleaned, end))
+                        .or_else(|| {
+                            search(&stripped).map(|(ok, end)| (ok, SerialMatchMode::Stripped, end))
+                        });
+
+                    if let Some((ok, mode, match_end)) = result {
+                        if ok {
+                            // Translate stripped/cleaned offsets back into raw-buffer
+                            // indices before cutting.
+                            drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                            break;
+                        } else {
+                            let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                            return Err(format!(
+                                "step {} assertion failed: {label}\n\
+                                 pattern \"{pattern}\" matched a line containing \
+                                 bad_substring \"{bad_substring}\"\n\
+                                 last serial output:\n{last_lines}",
+                                step_num
+                            ));
+                        }
+                    }
+
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.try_recv() {
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                        return Err(format!(
+                            "timeout waiting for '{pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
+                            step_num
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                timeout_secs,
+                label,
+                exit_code_on_fail,
+            } => {
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    if let Some((mode, match_end)) =
+                        find_serial_match(&stripped, &cleaned, pass_pattern)
+                    {
+                        drain_serial_through_match(&mut serial_buf, &stripped, mode, match_end);
+                        break;
+                    }
+                    let fail_capture = find_terminated_fail_line(&cleaned, fail_prefix)
+                        .or_else(|| find_terminated_fail_line(&stripped, fail_prefix));
+                    if let Some(captured) = fail_capture {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let msg = format!(
+                            "audio-demo failed at stage: {captured}\n\
+                             (step {} — {label})",
+                            step_num
+                        );
+                        eprintln!("{msg}");
+                        std::process::exit(*exit_code_on_fail);
+                    }
+
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.try_recv() {
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
+                        return Err(format!(
+                            "timeout waiting for '{pass_pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
+                            step_num
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }
@@ -11205,7 +12499,10 @@ mod tests {
         let mut out = Vec::new();
         for step in steps {
             match step {
-                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => out.push(*label),
+                SmokeStep::Wait { label, .. }
+                | SmokeStep::Send { label, .. }
+                | SmokeStep::WaitLineNotMatching { label, .. }
+                | SmokeStep::WaitPassOrFail { label, .. } => out.push(*label),
                 SmokeStep::WaitEither {
                     label,
                     extra_steps_a,
@@ -11254,6 +12551,13 @@ mod tests {
                 SmokeStep::Wait { pattern, label, .. } if *label == target_label => {
                     return Some(*pattern);
                 }
+                SmokeStep::WaitPassOrFail {
+                    pass_pattern,
+                    label,
+                    ..
+                } if *label == target_label => {
+                    return Some(*pass_pattern);
+                }
                 SmokeStep::WaitEither {
                     pattern_a,
                     label,
@@ -11284,6 +12588,11 @@ mod tests {
         for step in steps {
             match step {
                 SmokeStep::Wait {
+                    timeout_secs,
+                    label,
+                    ..
+                } if *label == target_label => return Some(*timeout_secs),
+                SmokeStep::WaitPassOrFail {
                     timeout_secs,
                     label,
                     ..
@@ -12197,6 +13506,42 @@ mod tests {
     }
 
     #[test]
+    fn wait_steps_match_out_of_order_emissions_after_handoff_fix() {
+        // Regression for the bell-smoke handoff §1 deadlock: `term` and
+        // `session_manager` emit ready markers on different cores ~ms
+        // apart and the wire order is non-deterministic. A step list
+        // that gates on the later-named marker first must still match
+        // the earlier-named marker afterward. The harness fix is "Wait
+        // does not drain on match" (`run_smoke_script` /
+        // `run_smoke_steps_with_capture`); the property we pin here is
+        // that `find_serial_match` itself is happy with both lookups
+        // against the same buffer regardless of the inspection order,
+        // and the buffer stays untouched between calls.
+        let serial = "TERM_SMOKE:ready\nsession_manager: session.boot: state=running\n";
+        let stripped = strip_ansi(serial);
+        let cleaned = strip_background_noise(&stripped);
+
+        // First lookup is for the marker that arrived SECOND on the wire.
+        assert!(
+            find_serial_match(
+                &stripped,
+                &cleaned,
+                "session_manager: session.boot: state=running",
+            )
+            .is_some(),
+            "second-arrived marker must match"
+        );
+        // The buggy runner used to drain past the match here. With the
+        // fix, the buffer is untouched, so a follow-up Wait for the
+        // marker that arrived FIRST still finds it.
+        assert!(
+            find_serial_match(&stripped, &cleaned, "TERM_SMOKE:ready").is_some(),
+            "first-arrived marker must still match after a successful Wait \
+             on a later marker — the consuming-Wait drain has been removed"
+        );
+    }
+
+    #[test]
     fn render_terminal_text_replaces_line_after_carriage_return() {
         let serial = "root@m3os:/# /usr/bin/tcc --version\rroot@m3os:/# ";
         assert_eq!(render_terminal_text(serial), "root@m3os:/# ");
@@ -12786,33 +14131,61 @@ mod tests {
 
     #[test]
     fn audio_smoke_qemu_args_include_ac97_flags() {
-        // H.5 acceptance: the same AC97 audio device flags reused by
-        // the audio-smoke command via the centralised constant. This
-        // pins that audio-smoke does not silently drop the AC97 flags.
+        // Phase 63 C.2 acceptance: audio-smoke emits `-audiodev wav,id=snd0,path=...`
+        // and `-device AC97,audiodev=snd0,addr=0x5`. The WAV path must live inside
+        // the smoke directory and `id=snd0` must match between `-audiodev` and
+        // `-device AC97,audiodev=snd0` so QEMU wires them together.
+        let smoke_dir = Path::new("target/audio-smoke");
         let args = audio_smoke_qemu_args(
+            smoke_dir,
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             /* display */ false,
         );
         let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut i = 0;
-        for &want in AC97_QEMU_AUDIO_FLAGS {
-            let rel = strs[i..]
-                .iter()
-                .position(|a| *a == want)
-                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from audio-smoke argv"));
-            i += rel + 1;
-        }
+
+        // The `-audiodev` entry must be the WAV backend with `id=snd0`.
+        let audiodev_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-audiodev")
+            .expect("audio-smoke argv must contain `-audiodev`");
+        let audiodev_val = strs[audiodev_idx + 1];
+        assert!(
+            audiodev_val.starts_with("wav,id=snd0,path="),
+            "audio-smoke `-audiodev` must be `wav,id=snd0,path=...`, got {audiodev_val:?}"
+        );
+        assert!(
+            audiodev_val.contains("audio.wav"),
+            "audio-smoke WAV path must end with `audio.wav`, got {audiodev_val:?}"
+        );
+
+        // The `-device` entry must reference `audiodev=snd0` (same id).
+        let device_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-device" && w[1].starts_with("AC97,"))
+            .expect("audio-smoke argv must contain `-device AC97,...`");
+        let device_val = strs[device_idx + 1];
+        assert!(
+            device_val.contains("audiodev=snd0"),
+            "audio-smoke `-device AC97` must reference `audiodev=snd0`, got {device_val:?}"
+        );
+        assert!(
+            device_val.contains("addr=0x5"),
+            "audio-smoke `-device AC97` must pin PCI slot via `addr=0x5`, got {device_val:?}"
+        );
     }
 
     #[test]
     fn smoke_exit_codes_are_distinct() {
-        // H.1 / H.2 / H.3 acceptance: each smoke fails with a distinct
-        // exit code so CI can route a regression to the right tracker.
+        // H.1 / H.2 / H.3 / Phase 63 D.3 / E.1 acceptance: each smoke fails
+        // with a distinct exit code so CI can route a regression to the
+        // right tracker.
         let codes = [
             SMOKE_EXIT_AUDIO_DEMO_FAILED,
             SMOKE_EXIT_SESSION_NOT_RUNNING,
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
+            SMOKE_EXIT_WAV_SILENT,
+            SMOKE_EXIT_BELL_SMOKE_FAILED,
         ];
         for (i, &a) in codes.iter().enumerate() {
             for &b in &codes[i + 1..] {
@@ -12827,33 +14200,659 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 57 H.5: `cargo xtask run-gui` audio plumbing tests (RED).
+    // Phase 63 D.1 / D.2 / D.3 — audio-smoke step list + WAV assertions.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn audio_smoke_steps_run_audio_demo_and_wait_for_pass() {
+        // D.1 acceptance: after the `init: loaded service 'audio_server'`
+        // step, `audio_smoke_steps` must send `audio-demo\n` to the guest
+        // shell and then wait for the `AUDIO_DEMO:PASS` sentinel.
+        let steps = audio_smoke_steps();
+
+        // The Send step must inject `audio-demo\n`.
+        let send_input = send_input_for_label(&steps, "guest/audio: launch audio-demo")
+            .expect("audio-smoke must have a Send step labelled 'guest/audio: launch audio-demo'");
+        assert_eq!(send_input, "audio-demo\n");
+
+        // The Wait step must wait for the PASS sentinel.
+        let pattern = wait_pattern_for_label(&steps, "guest/audio: audio-demo PASS sentinel")
+            .expect("audio-smoke must wait for AUDIO_DEMO:PASS");
+        assert_eq!(pattern, "AUDIO_DEMO:PASS");
+    }
+
+    #[test]
+    fn audio_smoke_steps_wait_for_nonzero_consumed_stats() {
+        // D.2 acceptance: after AUDIO_DEMO:PASS the step list must
+        // contain a `WaitLineNotMatching` that waits for
+        // `AUDIO_DEMO:stats consumed=` and fails if the line contains
+        // `consumed=0 ` (zero frames consumed).
+        let steps = audio_smoke_steps();
+
+        // Find the WaitLineNotMatching step.
+        let step = steps.iter().find(|s| {
+            matches!(
+                s,
+                SmokeStep::WaitLineNotMatching {
+                    label,
+                    ..
+                } if *label == "guest/audio: frames_consumed non-zero"
+            )
+        });
+        let step = step.expect(
+            "audio-smoke must have a WaitLineNotMatching step labelled \
+             'guest/audio: frames_consumed non-zero'",
+        );
+
+        match step {
+            SmokeStep::WaitLineNotMatching {
+                pattern,
+                bad_substring,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(
+                    *pattern, "AUDIO_DEMO:stats consumed=",
+                    "stats step must wait for the consumed= sentinel"
+                );
+                assert_eq!(
+                    *bad_substring, "consumed=0 ",
+                    "stats step must reject lines with consumed=0 (zero frames)"
+                );
+                assert!(*timeout_secs >= 5, "stats step timeout must be at least 5s");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn audio_smoke_steps_run_audio_demo_twice_for_second_open_regression() {
+        // 2026-05-11 second-open regression: the step list must invoke
+        // audio-demo twice so the BDL/CR reset on `open_stream` is
+        // exercised. Without this, a `Ac97Backend::open_stream` that
+        // only flips `stream_open = true` (the original Phase 57 D.1
+        // shape) passes the smoke but wedges every real second open.
+        let steps = audio_smoke_steps();
+        let demo_sends: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                SmokeStep::Send { input, label } if input.starts_with("audio-demo") => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            demo_sends.len() >= 2,
+            "audio-smoke must send `audio-demo` at least twice (got {demo_sends:?})"
+        );
+        // Each Send must be followed by a WaitPassOrFail on
+        // AUDIO_DEMO:PASS so a failure on either run aborts the smoke.
+        let pass_or_fail_count = steps
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    SmokeStep::WaitPassOrFail {
+                        pass_pattern: "AUDIO_DEMO:PASS",
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            pass_or_fail_count >= 2,
+            "audio-smoke must have at least two WaitPassOrFail steps on AUDIO_DEMO:PASS \
+             (got {pass_or_fail_count})"
+        );
+    }
+
+    #[test]
+    fn audio_smoke_steps_wait_pass_or_fail_step_is_present() {
+        // D.1 fix acceptance: audio_smoke_steps must replace the plain Wait
+        // for AUDIO_DEMO:PASS with a WaitPassOrFail that catches FAIL lines.
+        let steps = audio_smoke_steps();
+        let step = steps.iter().find(|s| {
+            matches!(
+                s,
+                SmokeStep::WaitPassOrFail {
+                    label,
+                    ..
+                } if *label == "guest/audio: audio-demo PASS sentinel"
+            )
+        });
+        let step = step.expect(
+            "audio_smoke_steps must have a WaitPassOrFail step labelled \
+             'guest/audio: audio-demo PASS sentinel'",
+        );
+        match step {
+            SmokeStep::WaitPassOrFail {
+                pass_pattern,
+                fail_prefix,
+                exit_code_on_fail,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(*pass_pattern, "AUDIO_DEMO:PASS");
+                assert_eq!(*fail_prefix, "AUDIO_DEMO:FAIL stage=");
+                assert_eq!(
+                    *exit_code_on_fail, SMOKE_EXIT_AUDIO_DEMO_FAILED,
+                    "exit_code_on_fail must be SMOKE_EXIT_AUDIO_DEMO_FAILED"
+                );
+                assert!(*timeout_secs >= 30, "timeout must be at least 30s");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn wait_pass_or_fail_captures_stage_from_fail_line() {
+        // D.1 fix acceptance: when a serial buffer contains
+        // `AUDIO_DEMO:FAIL stage=drain` the captured stage text must be
+        // "drain variant=Server" (everything after the fail_prefix).
+        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=drain variant=Server\n";
+        let captured = find_terminated_fail_line(serial_output, fail_prefix);
+        assert_eq!(captured.as_deref(), Some("drain variant=Server"));
+    }
+
+    #[test]
+    fn wait_pass_or_fail_skips_unterminated_fail_line() {
+        // 2026-05-11 regression: the previous implementation matched
+        // partial FAIL lines via `str::lines()` and tore the suffix off
+        // when QEMU was killed mid-write, hiding the
+        // `variant=<AudioClientError>` diagnostic. With newline-gating,
+        // an unterminated FAIL line must not produce a match.
+        let fail_prefix = "AUDIO_DEMO:FAIL stage=";
+        let serial_output = "AUDIO_DEMO:BEGIN\nAUDIO_DEMO:FAIL stage=submit vari";
+        assert!(find_terminated_fail_line(serial_output, fail_prefix).is_none());
+    }
+
+    /// Build a minimal valid RIFF/WAVE file with S16LE PCM data.
+    ///
+    /// `samples` is the raw i16 sample data. Channel count / sample rate
+    /// are not encoded (the WAV checker only needs the data chunk).
+    fn build_test_wav(samples: &[i16]) -> Vec<u8> {
+        let num_bytes = samples.len() * 2;
+        // RIFF header (12) + fmt chunk (24) + data chunk header (8) + data.
+        let total_size = 12 + 24 + 8 + num_bytes;
+        let mut out = Vec::with_capacity(total_size);
+
+        // RIFF header.
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((total_size - 8) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+
+        // fmt chunk (PCM = audio format 1, stereo, 48000 Hz, S16LE).
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&2u16.to_le_bytes()); // channels
+        out.extend_from_slice(&48000u32.to_le_bytes()); // sample rate
+        out.extend_from_slice(&(48000u32 * 2 * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&4u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+        // data chunk.
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(num_bytes as u32).to_le_bytes());
+        for &s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+
+        out
+    }
+
+    #[test]
+    fn assert_wav_non_silent_passes_for_synthesized_sine() {
+        // D.3 acceptance: a 440 Hz sine at ~30% amplitude over 1024 samples
+        // must have well above 5% non-silent samples (|sample| > 100).
+        use std::f64::consts::PI;
+        let n = 1024usize;
+        let samples: Vec<i16> = (0..n)
+            .map(|i| {
+                let angle = 2.0 * PI * 440.0 * (i as f64) / 48000.0;
+                (angle.sin() * 10000.0) as i16
+            })
+            .collect();
+
+        let wav_bytes = build_test_wav(&samples);
+
+        // Write to a temp file.
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_sine_440hz.wav");
+        std::fs::write(&path, &wav_bytes).expect("write test wav");
+
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            result.is_ok(),
+            "assert_wav_non_silent must pass for a 440 Hz sine wave, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn assert_wav_non_silent_passes_for_streaming_wav_with_late_audio() {
+        // QEMU's `-audiodev wav` backend writes a streaming WAV: the
+        // RIFF and `data` chunk-size fields stay at zero because the
+        // final length isn't known when the file is opened. The actual
+        // audio appears at the *end* of the file (the boot phase is
+        // captured as silence). The checker must tolerate size=0 and
+        // window the non-silent measurement so the loud region drives
+        // the verdict.
+        use std::f64::consts::PI;
+        // 5 seconds of stereo silence followed by 1 second of sine.
+        let rate = 48_000usize;
+        let silent_secs = 5usize;
+        let tone_secs = 1usize;
+        let total_frames = (silent_secs + tone_secs) * rate;
+        let tone_start = silent_secs * rate;
+        let mut samples = vec![0i16; total_frames * 2];
+        for i in tone_start..total_frames {
+            let angle = 2.0 * PI * 440.0 * (i as f64) / rate as f64;
+            let s = (angle.sin() * 10_000.0) as i16;
+            samples[i * 2] = s;
+            samples[i * 2 + 1] = s;
+        }
+
+        // Build a streaming-style WAV: header with size=0 fields.
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        wav.extend_from_slice(&(rate as u32).to_le_bytes());
+        wav.extend_from_slice(&((rate as u32) * 2 * 2).to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        for &s in &samples {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_streaming_wav.wav");
+        std::fs::write(&path, &wav).expect("write streaming wav");
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "assert_wav_non_silent must pass when audio sits at file tail with size=0 \
+             headers, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn assert_wav_non_silent_fails_for_silent_wav() {
+        // D.3 acceptance: a WAV with all-zero samples must fail with a message
+        // containing the observed percentage of non-silent samples.
+        let samples = vec![0i16; 1024];
+        let wav_bytes = build_test_wav(&samples);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_silent.wav");
+        std::fs::write(&path, &wav_bytes).expect("write silent wav");
+
+        let result = assert_wav_non_silent(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match result {
+            Err(msg) => {
+                // Error message must include the percentage of non-silent samples.
+                assert!(
+                    msg.contains("0%") || msg.contains("silent"),
+                    "error message must report the observed percentage, got: {msg:?}"
+                );
+            }
+            Ok(()) => panic!("assert_wav_non_silent must fail for a silent WAV"),
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 63 Track E.1 — bell-smoke step list and QEMU arg assertions.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn bell_smoke_steps_run_bell_test_and_wait_for_pass() {
+        // E.1 resend acceptance: the smoke step list must:
+        // (a) send `bell-test\n` to sh0 (NOT `printf '\x07'` — that route
+        //     was broken; serial stdin goes to sh0, not term's ANSI parser).
+        // (b) wait for `BELL_TEST:PASS` — bell-test confirmed frames_consumed > 0.
+        let steps = bell_smoke_steps();
+
+        // (a) bell-test command send step must be present.
+        let bell_test_input =
+            send_input_for_label(&steps, "guest/bell-smoke: run bell-test binary")
+                .expect("bell-smoke steps must include a Send step to run bell-test");
+        assert!(
+            bell_test_input.contains("bell-test"),
+            "bell-test Send step must invoke the binary, got {bell_test_input:?}"
+        );
+        // Confirm the broken BEL-byte injection via printf is GONE.
+        assert!(
+            !bell_test_input.contains("\\x07"),
+            "bell-smoke must NOT inject raw BEL via printf — that path \
+             goes to sh0, not term's ANSI parser; got {bell_test_input:?}"
+        );
+
+        // (b) The BELL_TEST:PASS wait must follow.
+        let pass_pattern = wait_pattern_for_label(
+            &steps,
+            "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+        )
+        .expect(
+            "bell-smoke steps must wait for BELL_TEST:PASS \
+             (frames_consumed > 0 confirmed by bell-test binary)",
+        );
+        assert_eq!(
+            pass_pattern, "BELL_TEST:PASS",
+            "bell-smoke must wait for the BELL_TEST:PASS sentinel"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_steps_do_not_use_broken_printf_bel_injection() {
+        // Phase 63 E.1 routing fix: the old `printf '\x07'` approach sent the
+        // BEL byte to sh0 (serial stdin), not to term's kbd_server input path.
+        // Verify no step sends the printf BEL injection.
+        let steps = bell_smoke_steps();
+        for step in &steps {
+            if let SmokeStep::Send { input, .. } = step {
+                assert!(
+                    !input.contains("\\x07"),
+                    "bell-smoke must not inject BEL via printf; got Send input {input:?}"
+                );
+                assert!(
+                    !input.contains("printf"),
+                    "bell-smoke must not use printf for BEL injection; got Send input {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bell_smoke_negative_path_bell_test_fail_consumed_zero() {
+        // Phase 63 E.1 acceptance: a negative-path test that simulates
+        // `bell-test` emitting `BELL_TEST:FAIL:consumed=0` and verifies
+        // the smoke harness would exit with SMOKE_EXIT_BELL_SMOKE_FAILED.
+        //
+        // This is a host unit test that does not run QEMU. It validates
+        // the xtask logic: when `bell-test` prints FAIL, the bell-smoke
+        // command must surface the right exit code.
+        //
+        // The xtask's `run_smoke_script` uses `WaitPassOrFail` to wait
+        // for `BELL_TEST:PASS` or any `BELL_TEST:FAIL` prefix within
+        // 15 s. On `BELL_TEST:FAIL:consumed=0` (or
+        // `BELL_TEST:FAIL:audio_unavailable`) the harness surfaces the
+        // captured suffix and exits immediately with
+        // SMOKE_EXIT_BELL_SMOKE_FAILED (code 64; 63 is
+        // SMOKE_EXIT_WAV_SILENT — the assertion below pins both).
+        //
+        // We validate the constant and step structure here rather than
+        // simulating a full QEMU run, which would require a mock process.
+        assert_eq!(
+            SMOKE_EXIT_BELL_SMOKE_FAILED, 64,
+            "bell-smoke failed exit code must be 64 (Phase 63 Track E.1; \
+             63 is reserved for SMOKE_EXIT_WAV_SILENT)"
+        );
+
+        // The PASS sentinel the smoke harness waits for.
+        let steps = bell_smoke_steps();
+        let pass_pattern = wait_pattern_for_label(
+            &steps,
+            "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+        )
+        .expect("must have PASS wait step");
+        assert_eq!(pass_pattern, "BELL_TEST:PASS");
+
+        // The FAIL output that bell-test emits when consumed=0. It does NOT
+        // match BELL_TEST:PASS, so the smoke script keeps waiting until
+        // timeout, then returns Err() → cmd_bell_smoke calls
+        // std::process::exit(SMOKE_EXIT_BELL_SMOKE_FAILED).
+        let fail_line = "BELL_TEST:FAIL:consumed=0";
+        assert!(
+            !fail_line.contains(pass_pattern),
+            "BELL_TEST:FAIL output {fail_line:?} must not accidentally match \
+             the PASS sentinel {pass_pattern:?} — if it did, a failing run \
+             would be misreported as a pass"
+        );
+        // And the consumed=0 value is visible in the FAIL line.
+        assert!(
+            fail_line.contains("consumed=0"),
+            "FAIL line must name consumed=0 for CI diagnostics, got {fail_line:?}"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_uses_ac97_qemu_audio_flags() {
+        // E.1 acceptance: bell-smoke uses the WAV audio backend for
+        // deterministic CI (no host PulseAudio dependency). The `-device AC97`
+        // entry must pin the PCI slot with `addr=0x5` matching the sentinel
+        // BDF in `audio_server::SENTINEL_DEVICE`.
+        let smoke_dir = Path::new("target/audio-smoke");
+        let args = bell_smoke_qemu_args(
+            smoke_dir,
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            /* display */ false,
+        );
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        // Must use WAV backend with `id=snd0`.
+        let audiodev_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-audiodev")
+            .expect("bell-smoke argv must contain `-audiodev`");
+        let audiodev_val = strs[audiodev_idx + 1];
+        assert!(
+            audiodev_val.starts_with("wav,id=snd0,path="),
+            "bell-smoke `-audiodev` must be `wav,id=snd0,path=...` (WAV backend for CI), \
+             got {audiodev_val:?}"
+        );
+
+        // WAV file must be inside the smoke dir.
+        assert!(
+            audiodev_val.contains("bell-smoke.wav"),
+            "bell-smoke WAV path must contain `bell-smoke.wav`, got {audiodev_val:?}"
+        );
+
+        // Must attach the AC97 device with the sentinel PCI slot.
+        let device_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "-device" && w[1].starts_with("AC97,"))
+            .expect("bell-smoke argv must contain `-device AC97,...`");
+        let device_val = strs[device_idx + 1];
+        assert!(
+            device_val.contains("audiodev=snd0"),
+            "bell-smoke `-device AC97` must reference `audiodev=snd0`, got {device_val:?}"
+        );
+        assert!(
+            device_val.contains("addr=0x5"),
+            "bell-smoke `-device AC97` must pin PCI slot via `addr=0x5`, got {device_val:?}"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_steps_gate_on_audio_server_loaded_not_session_running() {
+        // bell-smoke previously gated on
+        // `session_manager: session.boot: state=running`. That marker
+        // races with `TERM_SMOKE:ready` on the wire (different cores,
+        // ~ms apart) and is unrelated to whether bell-test can reach
+        // the audio path. Bell-test runs from sh0 and only needs
+        // audio_server to be up; gate on init's audio_server-loaded
+        // marker the same way `audio_smoke_steps` does.
+        let steps = bell_smoke_steps();
+        let audio_loaded =
+            wait_pattern_for_label(&steps, "guest/bell-smoke: init loaded audio_server.conf")
+                .expect(
+                    "bell-smoke must wait for `init: loaded service 'audio_server'` \
+             before injecting the bell — proves init has the manifest \
+             entry and will spawn the server",
+                );
+        assert_eq!(audio_loaded, "init: loaded service 'audio_server'");
+
+        // Anti-regression: the racy state=running gate must be gone.
+        for step in &steps {
+            if let SmokeStep::Wait { pattern, .. } = step {
+                assert_ne!(
+                    *pattern, "session_manager: session.boot: state=running",
+                    "bell-smoke must NOT gate on state=running — it races \
+                     with TERM_SMOKE markers across cores and used to \
+                     deadlock the consuming-Wait matcher (handoff §1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bell_smoke_steps_do_not_gate_on_term_smoke_markers() {
+        // The TERM_SMOKE markers describe the graphical terminal emulator
+        // and are off-path for bell-smoke: `bell-test` runs from sh0
+        // (serial), not from term's ANSI parser. Gating on them adds a
+        // race surface for no benefit.
+        let steps = bell_smoke_steps();
+        for step in &steps {
+            if let SmokeStep::Wait { pattern, .. } = step {
+                assert!(
+                    !pattern.starts_with("TERM_SMOKE:"),
+                    "bell-smoke must NOT gate on TERM_SMOKE markers — \
+                     bell-test runs from sh0, not term; got {pattern:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bell_smoke_steps_log_in_before_sending_bell_test() {
+        // bell-test runs from `sh0` (serial). Without `boot_and_login_steps()`
+        // the `Send "bell-test\n"` would land at the `m3OS login:` prompt
+        // and be typed as a username rather than executed. Mirror the
+        // shape `audio_smoke_steps` already proven by running audio-demo
+        // from sh0.
+        let steps = bell_smoke_steps();
+
+        let bell_test_index = steps
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Send {
+                        label: "guest/bell-smoke: run bell-test binary",
+                        ..
+                    }
+                )
+            })
+            .expect("bell-smoke must Send `bell-test\\n`");
+
+        // boot_and_login_steps() ends with sending `/bin/echo __LOGIN_READY__\n`
+        // and waiting for `__LOGIN_READY__`. Confirm both the username send
+        // and the ready marker land BEFORE bell-test.
+        let username_idx = steps[..bell_test_index]
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Send {
+                        input: "root\n",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must include boot_and_login_steps() before \
+                 sending bell-test (Send `root\\n` for the username)",
+            );
+        let ready_idx = steps[..bell_test_index]
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    SmokeStep::Wait {
+                        pattern: "__LOGIN_READY__",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must wait for the login-ready marker (emitted \
+                 by `/bin/echo __LOGIN_READY__`) before sending bell-test",
+            );
+        assert!(
+            username_idx < ready_idx && ready_idx < bell_test_index,
+            "ordering must be: username send -> login-ready wait -> bell-test send"
+        );
+    }
+
+    #[test]
+    fn bell_smoke_steps_use_wait_pass_or_fail_so_fail_lines_surface_immediately() {
+        // The plain `Wait` for BELL_TEST:PASS would let
+        // `BELL_TEST:FAIL:consumed=0` time out generically (10–15 s)
+        // instead of surfacing the failing variant. WaitPassOrFail is
+        // the same shape audio-smoke uses for AUDIO_DEMO:FAIL.
+        let steps = bell_smoke_steps();
+        let bell_step = steps
+            .iter()
+            .find(|s| {
+                matches!(
+                    s,
+                    SmokeStep::WaitPassOrFail {
+                        label: "guest/bell-smoke: frames_consumed > 0 after Bell::ring",
+                        ..
+                    }
+                )
+            })
+            .expect(
+                "bell-smoke must use WaitPassOrFail (not Wait) so \
+                 BELL_TEST:FAIL lines exit with SMOKE_EXIT_BELL_SMOKE_FAILED \
+                 instead of timing out generically",
+            );
+        let SmokeStep::WaitPassOrFail {
+            pass_pattern,
+            fail_prefix,
+            exit_code_on_fail,
+            ..
+        } = bell_step
+        else {
+            unreachable!("guarded by .find(matches!) above")
+        };
+        assert_eq!(*pass_pattern, "BELL_TEST:PASS");
+        assert_eq!(*fail_prefix, "BELL_TEST:FAIL");
+        assert_eq!(*exit_code_on_fail, SMOKE_EXIT_BELL_SMOKE_FAILED);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 57 H.5 / Phase 63 C.1 / Phase 63 hotfix: `cargo xtask run-gui`
+    // audio plumbing.
     //
-    // The constant `AC97_QEMU_AUDIO_FLAGS` pins the Phase 57 audio
-    // command-line surface verbatim per the A.1 audio-target memo
-    // (`docs/appendix/phase-57-audio-target-choice.md`). A single
-    // named constant keeps the contract auditable: any deviation from
-    // the documented flags will surface here before reaching CI.
+    // - `AC97_QEMU_AUDIO_FLAGS_HEADLESS`: `none,id=snd0` — used by the
+    //   audio-smoke WAV args builder; safe headless fallback (no host sink).
+    // - `AC97_QEMU_AUDIO_DEVICE_FLAGS`: shared `-device AC97,…` line used by
+    //   both headless and GUI launch paths.
+    // - `gui_audiodev_flag()`: probes the host at launch time and emits
+    //   `-audiodev <pipewire|pa|none>,id=snd0`. The hard-coded `pa,id=snd0`
+    //   from the original Phase 63 C.1 commit broke `cargo xtask run-gui`
+    //   on PipeWire-only hosts (Arch / Omarchy / Fedora) without the
+    //   `pipewire-pulse` shim — QEMU exited silently when the pulse socket
+    //   wasn't reachable. The probe-then-fallback design keeps the launch
+    //   path unconditionally safe.
     //
-    // Headless smoke uses `none,id=snd0` so the smoke harness does not
-    // require a host audio sink. `run-gui` reuses the same flags so a
-    // developer who explicitly wants audible output can override via
-    // `QEMU_AUDIO_DRV=pa cargo xtask run-gui` (QEMU env-var override).
-    // The `--no-audio` opt-out skips the AC97 device entirely while
+    // The `--no-audio` opt-out still skips the AC97 device entirely while
     // preserving the legacy `pcspk-audiodev=noaudio` PC-speaker binding
     // so non-audio runs match today's behavior byte-for-byte.
     // ----------------------------------------------------------------
 
     #[test]
-    fn ac97_qemu_audio_flags_pinned_per_a1_memo() {
-        // A.1 memo: `-device AC97,audiodev=snd0` plus a paired
-        // `-audiodev` line. Headless safety pins the backend to
-        // `none,id=snd0` (no host audio sink required). `addr=0x5`
-        // pins the PCI slot to 0:5.0 so the matching `audio_server`
-        // `SENTINEL_BDF` finds the device deterministically (slot 3
-        // is e1000, slot 4 is nvme).
+    fn ac97_qemu_audio_flags_headless_pinned() {
+        // Phase 63 C.1: headless constant is still `none,id=snd0` — no host
+        // audio sink required. `addr=0x5` pins the PCI slot to 0:5.0 so the
+        // matching `audio_server` `SENTINEL_BDF` finds the device
+        // deterministically (slot 3 is e1000, slot 4 is nvme).
         assert_eq!(
-            AC97_QEMU_AUDIO_FLAGS,
+            AC97_QEMU_AUDIO_FLAGS_HEADLESS,
             &[
                 "-audiodev",
                 "none,id=snd0",
@@ -12864,25 +14863,65 @@ mod tests {
     }
 
     #[test]
+    fn ac97_qemu_audio_device_pinned() {
+        // The shared `-device AC97,…,addr=0x5` line stays stable so the
+        // audio_server sentinel-BDF path resolves regardless of which
+        // backend the GUI launcher selects at probe time.
+        assert_eq!(
+            AC97_QEMU_AUDIO_DEVICE_FLAGS,
+            &["-device", "AC97,audiodev=snd0,addr=0x5"]
+        );
+        // The headless flags must contain the device line verbatim so the
+        // two launch paths cannot drift on the PCI BDF.
+        assert_eq!(
+            &AC97_QEMU_AUDIO_FLAGS_HEADLESS[2..],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS,
+            "headless flags and shared device flags must agree on the AC97 line"
+        );
+    }
+
+    #[test]
+    fn gui_audiodev_flag_emits_recognized_driver() {
+        // Phase 63 hotfix: regardless of host, the probe must emit a
+        // syntactically valid `-audiodev <driver>,id=snd0` pair, with
+        // <driver> in the known-safe set.
+        let flag = gui_audiodev_flag();
+        assert_eq!(flag.len(), 2, "expected exactly `-audiodev <value>` pair");
+        assert_eq!(flag[0], "-audiodev");
+        let allowed = ["pipewire,id=snd0", "pa,id=snd0", "none,id=snd0"];
+        assert!(
+            allowed.contains(&flag[1].as_str()),
+            "driver value {value:?} must be one of {allowed:?}",
+            value = flag[1],
+        );
+    }
+
+    #[test]
     fn run_gui_with_audio_emits_ac97_device_flags() {
-        // Acceptance H.5: `run-gui` adds the chosen-target's QEMU
-        // `-audiodev` and `-device` flags by default.
+        // Phase 63 C.1 acceptance, hotfixed: `run-gui` emits some
+        // `-audiodev <driver>,id=snd0` pair followed by the AC97 device
+        // line, regardless of which backend the host probe picked.
         let args = qemu_run_gui_args_for_test(
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             DeviceSet::default(),
             /* with_audio */ true,
         );
-        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Every audio-flag entry must appear in argv, in order.
-        let mut i = 0;
-        for &want in AC97_QEMU_AUDIO_FLAGS {
-            let rel = strs[i..]
-                .iter()
-                .position(|a| *a == want)
-                .unwrap_or_else(|| panic!("AC97 flag {want:?} missing from run-gui argv"));
-            i += rel + 1;
-        }
+        // `-audiodev <something>,id=snd0` must appear.
+        let audiodev_idx = args
+            .windows(2)
+            .position(|w| w[0] == "-audiodev" && w[1].ends_with(",id=snd0"))
+            .expect("run-gui must emit `-audiodev <driver>,id=snd0`");
+        // The shared AC97 device line must follow it (in argv order).
+        let device_window = args[audiodev_idx + 2..].windows(2).position(|w| {
+            w[0] == AC97_QEMU_AUDIO_DEVICE_FLAGS[0] && w[1] == AC97_QEMU_AUDIO_DEVICE_FLAGS[1]
+        });
+        assert!(
+            device_window.is_some(),
+            "run-gui must emit `{} {}` after the audiodev pair",
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[0],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[1],
+        );
     }
 
     #[test]
@@ -12913,6 +14952,50 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["-audiodev", "none,id=noaudio"]),
             "with-audio run-gui must keep `-audiodev none,id=noaudio` for the PC speaker"
+        );
+    }
+
+    #[test]
+    fn run_headless_with_audio_emits_ac97_device_flags() {
+        // Phase 63 audio-fix acceptance: headless `cargo xtask run` (default
+        // audio-on) emits an `-audiodev <driver>,id=snd0` pair followed by
+        // the shared AC97 device line, matching `run-gui`. Without this,
+        // `audio_server` parks in stub mode and `audio-demo` reports
+        // `consumed=0`.
+        let args = qemu_run_headless_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ true,
+        );
+        let audiodev_idx = args
+            .windows(2)
+            .position(|w| w[0] == "-audiodev" && w[1].ends_with(",id=snd0"))
+            .expect("run must emit `-audiodev <driver>,id=snd0` when audio is on");
+        let device_window = args[audiodev_idx + 2..].windows(2).position(|w| {
+            w[0] == AC97_QEMU_AUDIO_DEVICE_FLAGS[0] && w[1] == AC97_QEMU_AUDIO_DEVICE_FLAGS[1]
+        });
+        assert!(
+            device_window.is_some(),
+            "run must emit `{} {}` after the audiodev pair",
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[0],
+            AC97_QEMU_AUDIO_DEVICE_FLAGS[1],
+        );
+    }
+
+    #[test]
+    fn run_headless_without_audio_skips_ac97_flags() {
+        // `--no-audio` on headless `run` must skip the AC97 pair so the
+        // historical silent-headless behavior remains available.
+        let args = qemu_run_headless_args_for_test(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            DeviceSet::default(),
+            /* with_audio */ false,
+        );
+        assert!(
+            !args.iter().any(|a| a == "AC97,audiodev=snd0,addr=0x5"),
+            "--no-audio run must NOT emit `AC97,audiodev=snd0,addr=0x5`"
         );
     }
 

@@ -53,7 +53,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use kernel_core::device_host::{
     DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, IrqBinding, IrqBindingRegistryCore,
-    IrqRegistryError, MmioBoundsError, RegistryError, build_mmio_window, classify_pci_id,
+    IrqRegistryError, MmioBoundsError, PioValidationError, RegistryError, build_mmio_window,
+    classify_pci_id, validate_pio_access,
 };
 use kernel_core::ipc::Capability;
 use kernel_core::ipc::capability::CapHandle;
@@ -91,6 +92,8 @@ const NEG_EPERM: isize = -1;
 /// catch-all when the kernel detects an invariant violation it cannot
 /// map onto a more specific errno.
 const NEG_EFAULT: isize = -14;
+/// Negative errno `-ERANGE` (34) — offset + width exceeds the BAR size.
+const NEG_ERANGE: isize = -34;
 
 /// Driver name recorded in the PCI registry for ring-3 claims.
 ///
@@ -3036,6 +3039,208 @@ fn bar_coverage_no_domain_with_active_iommu_returns_internal_and_neg_eio() {
         "identity-fallback must return Ok(None)"
     );
 }
+// ---------------------------------------------------------------------------
+// Phase 63 Track Z.2 — sys_device_pio_read / sys_device_pio_write
+// ---------------------------------------------------------------------------
+
+/// Z.2 — `sys_device_pio_read(dev_cap, bar_index, offset, width) -> isize`.
+///
+/// Reads `width` bytes (1, 2, or 4) from I/O port `port_base + offset`
+/// of the PIO BAR at `bar_index` for the claimed device identified by
+/// `dev_cap`. Returns the value zero-extended into the low bits on success,
+/// or a negative errno.
+///
+/// Error mapping:
+/// - `-EBADF` — `dev_cap` is not a `Capability::Device` owned by the caller.
+/// - `-EINVAL` — `width` is not 1/2/4, or the BAR is MMIO (not PIO).
+/// - `-ERANGE` — `offset + width` exceeds the BAR size.
+///
+/// No allocation is performed. No logging on the hot path.
+pub fn sys_device_pio_read(dev_cap: u32, bar_index: u8, offset: u32, width: u8) -> isize {
+    use crate::pci::bar::{BarError, BarMapping, map_bar};
+
+    // ---- Caller identity --------------------------------------------------
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+
+    // ---- Capability validation --------------------------------------------
+    let key = match scheduler::task_cap(task_id, dev_cap as CapHandle) {
+        Ok(Capability::Device { key }) => key,
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    // Cross-pid ownership check.
+    {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        match reg.core.owner_of(key) {
+            Some(owner) if owner == pid => {}
+            Some(_) => return NEG_EPERM,
+            None => return NEG_EBADF,
+        }
+    }
+
+    // ---- Resolve the BAR --------------------------------------------------
+    let region = {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        let slot = match reg.slot_for(pid, key) {
+            Some(slot) => slot,
+            None => return NEG_EPERM,
+        };
+        match map_bar(&slot.handle, bar_index) {
+            Ok(BarMapping::Pio { region }) => region,
+            Ok(BarMapping::Mmio { .. }) => return NEG_EINVAL,
+            Err(BarError::IndexOutOfRange) | Err(BarError::InvalidPair) => return NEG_EINVAL,
+            Err(_) => return NEG_EINVAL,
+        }
+    };
+
+    // ---- Pure-logic validation (width + range) ----------------------------
+    match validate_pio_access(width, true, offset, region.size()) {
+        Ok(()) => {}
+        Err(PioValidationError::InvalidWidth) => return NEG_EINVAL,
+        Err(PioValidationError::NotPioBar) => return NEG_EINVAL,
+        Err(PioValidationError::OffsetOutOfRange) => return NEG_ERANGE,
+    }
+
+    // ---- Port I/O (privileged; userspace cannot execute in/out) -----------
+    // Defense-in-depth: `validate_pio_access` only checks `offset + width <=
+    // bar_size`; it does not bound the resulting absolute port in the 16-bit
+    // I/O address space. A malformed PIO BAR with `port_base + size > 65536`
+    // could still produce a u16 wrap when added to `offset`, hitting the wrong
+    // I/O ports. Reject both `offset > u16::MAX` and any `port_base + offset
+    // + (width - 1) > u16::MAX` with `-ERANGE`.
+    let offset_u16: u16 = match u16::try_from(offset) {
+        Ok(v) => v,
+        Err(_) => return NEG_ERANGE,
+    };
+    let port = match region.port_base().checked_add(offset_u16) {
+        Some(p) => p,
+        None => return NEG_ERANGE,
+    };
+    if port.checked_add((width - 1) as u16).is_none() {
+        return NEG_ERANGE;
+    }
+    // SAFETY: We validated capability ownership, BAR type, offset range, and
+    // absolute port range above. Only the owning driver process (ring-3, not
+    // ring-0) can reach this path; the kernel performs the I/O on the
+    // driver's behalf.
+    let value: u32 = unsafe {
+        match width {
+            1 => u32::from(x86_64::instructions::port::PortReadOnly::<u8>::new(port).read()),
+            2 => u32::from(x86_64::instructions::port::PortReadOnly::<u16>::new(port).read()),
+            _ => x86_64::instructions::port::PortReadOnly::<u32>::new(port).read(),
+        }
+    };
+    value as isize
+}
+
+/// Z.2 — `sys_device_pio_write(dev_cap, bar_index, offset, value, width) -> isize`.
+///
+/// Writes `width` bytes (1, 2, or 4) to I/O port `port_base + offset`
+/// of the PIO BAR at `bar_index` for the claimed device identified by
+/// `dev_cap`. Returns 0 on success, or a negative errno.
+///
+/// Error mapping:
+/// - `-EBADF` — `dev_cap` is not a `Capability::Device` owned by the caller.
+/// - `-EINVAL` — `width` is not 1/2/4, or the BAR is MMIO (not PIO).
+/// - `-ERANGE` — `offset + width` exceeds the BAR size.
+///
+/// No allocation is performed. No logging on the hot path.
+pub fn sys_device_pio_write(
+    dev_cap: u32,
+    bar_index: u8,
+    offset: u32,
+    value: u32,
+    width: u8,
+) -> isize {
+    use crate::pci::bar::{BarError, BarMapping, map_bar};
+
+    // ---- Caller identity --------------------------------------------------
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+
+    // ---- Capability validation --------------------------------------------
+    let key = match scheduler::task_cap(task_id, dev_cap as CapHandle) {
+        Ok(Capability::Device { key }) => key,
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    // Cross-pid ownership check.
+    {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        match reg.core.owner_of(key) {
+            Some(owner) if owner == pid => {}
+            Some(_) => return NEG_EPERM,
+            None => return NEG_EBADF,
+        }
+    }
+
+    // ---- Resolve the BAR --------------------------------------------------
+    let region = {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        let slot = match reg.slot_for(pid, key) {
+            Some(slot) => slot,
+            None => return NEG_EPERM,
+        };
+        match map_bar(&slot.handle, bar_index) {
+            Ok(BarMapping::Pio { region }) => region,
+            Ok(BarMapping::Mmio { .. }) => return NEG_EINVAL,
+            Err(BarError::IndexOutOfRange) | Err(BarError::InvalidPair) => return NEG_EINVAL,
+            Err(_) => return NEG_EINVAL,
+        }
+    };
+
+    // ---- Pure-logic validation (width + range) ----------------------------
+    match validate_pio_access(width, true, offset, region.size()) {
+        Ok(()) => {}
+        Err(PioValidationError::InvalidWidth) => return NEG_EINVAL,
+        Err(PioValidationError::NotPioBar) => return NEG_EINVAL,
+        Err(PioValidationError::OffsetOutOfRange) => return NEG_ERANGE,
+    }
+
+    // ---- Port I/O (privileged; userspace cannot execute in/out) -----------
+    // Defense-in-depth: see `sys_device_pio_read` for the rationale. Reject
+    // offsets that don't fit in u16 and absolute ports that wrap the 16-bit
+    // I/O address space with `-ERANGE` before issuing the `out` instruction.
+    let offset_u16: u16 = match u16::try_from(offset) {
+        Ok(v) => v,
+        Err(_) => return NEG_ERANGE,
+    };
+    let port = match region.port_base().checked_add(offset_u16) {
+        Some(p) => p,
+        None => return NEG_ERANGE,
+    };
+    if port.checked_add((width - 1) as u16).is_none() {
+        return NEG_ERANGE;
+    }
+    // SAFETY: We validated capability ownership, BAR type, offset range, and
+    // absolute port range above. Only the owning driver process (ring-3, not
+    // ring-0) can reach this path; the kernel performs the I/O on the
+    // driver's behalf.
+    unsafe {
+        match width {
+            1 => x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(value as u8),
+            2 => x86_64::instructions::port::PortWriteOnly::<u16>::new(port).write(value as u16),
+            _ => x86_64::instructions::port::PortWriteOnly::<u32>::new(port).write(value),
+        }
+    }
+    0
+}
+
 fn device_claim_error_to_errno(
     error: DeviceHostError,
     segment: u16,

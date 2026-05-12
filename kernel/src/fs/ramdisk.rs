@@ -232,9 +232,13 @@ static GRAB_HOOK_SMOKE_ELF: &[u8] = generated_initrd_asset!("grab-hook-smoke");
 // kernel_core::session::StartupSequence.
 static SESSION_MANAGER_ELF: &[u8] = generated_initrd_asset!("session_manager");
 
-// Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
-// Exposed under /bin so `init` can launch it via the standard
-// service-config path (`command=/bin/audio_server`).
+// Phase 57 Track D.1 / Phase 63 driver-host correctness fix: audio_server
+// daemon — ring-3 AC'97 driver. Exposed under `/drivers/<name>` (not
+// `/bin/`) because the kernel's `is_authorized_driver_process` gate keys
+// on the `/drivers/` exec-path prefix to authorize `sys_device_claim`.
+// Without this prefix, audio_server falls back to stub mode and never
+// claims the AC'97 PCI device — leaving `frames_consumed` at zero and
+// breaking the Phase 63 audio-smoke gate.
 static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 
 // Phase 57 Track E.2: audio-demo one-shot — generates a 440 Hz sine
@@ -242,6 +246,20 @@ static AUDIO_SERVER_ELF: &[u8] = generated_initrd_asset!("audio_server");
 // it is reachable via the shell and via the H.1 smoke harness.
 // Intentionally not registered as a service (one-shot, not daemon).
 static AUDIO_DEMO_ELF: &[u8] = generated_initrd_asset!("audio-demo");
+
+// Phase 63 Track E.1: audio-stats one-shot — queries audio_server via
+// ControlCommand(GetStats) and prints AUDIO_STATS:consumed=<N> underruns=<M>
+// followed by AUDIO_STATS:PASS or AUDIO_STATS:FAIL:consumed=0.  General-purpose
+// stats query tool. Not a daemon — no .conf entry.
+static AUDIO_STATS_ELF: &[u8] = generated_initrd_asset!("audio-stats");
+
+// Phase 63 Track E.1: bell-test one-shot — exercises the Bell::ring →
+// AudioClientBellSink → audio_client::submit_frames path directly from sh0,
+// bypassing the kbd_server routing gap. Prints BELL_TEST:consumed=<N>
+// underruns=<M> followed by BELL_TEST:PASS (frames_consumed > 0) or
+// BELL_TEST:FAIL:consumed=0.  Used by the bell-smoke harness.
+// Not a daemon — no .conf entry.
+static BELL_TEST_ELF: &[u8] = generated_initrd_asset!("bell-test");
 
 // Phase 57 Track G: term — graphical terminal emulator. Exposed under
 // /bin so `session_manager` (and `init` via `term.conf`) can launch it
@@ -417,18 +435,25 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: SESSION_MANAGER_ELF,
         },
     ),
-    // Phase 57 Track D.1: audio_server daemon — ring-3 AC'97 driver.
-    (
-        "audio_server",
-        RamdiskNode::File {
-            content: AUDIO_SERVER_ELF,
-        },
-    ),
     // Phase 57 Track E.2: audio-demo one-shot reference client.
     (
         "audio-demo",
         RamdiskNode::File {
             content: AUDIO_DEMO_ELF,
+        },
+    ),
+    // Phase 63 Track E.1: audio-stats one-shot stats CLI.
+    (
+        "audio-stats",
+        RamdiskNode::File {
+            content: AUDIO_STATS_ELF,
+        },
+    ),
+    // Phase 63 Track E.1: bell-test — bell path exerciser for the bell-smoke harness.
+    (
+        "bell-test",
+        RamdiskNode::File {
+            content: BELL_TEST_ELF,
         },
     ),
     // Phase 57 Track G: term — graphical terminal emulator (the first
@@ -724,6 +749,15 @@ static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
         "e1000",
         RamdiskNode::File {
             content: E1000_DRIVER_ELF,
+        },
+    ),
+    // Phase 63 driver-host fix: audio_server is a ring-3 driver and must
+    // live under `/drivers/` so `is_authorized_driver_process` accepts its
+    // `sys_device_claim(0,0,5,0)` call for the AC'97 controller.
+    (
+        "audio_server",
+        RamdiskNode::File {
+            content: AUDIO_SERVER_ELF,
         },
     ),
 ];

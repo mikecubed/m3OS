@@ -116,7 +116,7 @@ instead of fixing them.
 ## Deferred or Later-Phase Topics
 
 - Routed mouse/input architecture and multi-client display ownership (Phase 56)
-- Audio output and local graphical session work, including DOOM sound/music support if desired (Phase 57)
+- Audio output and local graphical session work, including DOOM sound/music support if desired (Phase 57). Wiring shape and recommended feature set for the future DOOM-audio track are sketched in [`docs/appendix/doom-audio-wiring.md`](./appendix/doom-audio-wiring.md)
 - Frame/tic/blit instrumentation for performance tuning
 - Write-combining framebuffer mappings or smaller dirty-rectangle blits
 - User-supplied IWAD workflow and broader WAD compatibility

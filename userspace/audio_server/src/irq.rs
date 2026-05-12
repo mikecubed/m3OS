@@ -33,17 +33,24 @@ use driver_runtime::{
 pub enum IoAction {
     /// Notification wake — call `backend.handle_irq()` and ack the bits.
     HandleIrq { bits: u64 },
-    /// Decoded protocol message — dispatch via the codec.
-    HandleMessage { msg: ClientMessage },
+    /// Decoded protocol message. `consumed` is the number of bytes the
+    /// decoder used; trailing bytes in the same bulk buffer carry any
+    /// out-of-band payload (e.g. PCM data for `SubmitFrames`).
+    HandleMessage { msg: ClientMessage, consumed: usize },
     /// Decode error — log and reply with `OpenError`/`SubmitError`.
     DecodeError { err: ProtocolError },
 }
 
 /// Translate a raw `bulk` payload into an [`IoAction::HandleMessage`]
 /// or `IoAction::DecodeError`. Pure logic, exercised on the host.
+///
+/// The decoded `consumed` byte count is carried on the
+/// `HandleMessage` variant so the io loop can locate the trailing
+/// payload that rides the same bulk buffer (currently used by
+/// `SubmitFrames` to find its PCM bytes).
 pub fn decode_message(bulk: &[u8]) -> IoAction {
     match ClientMessage::decode(bulk) {
-        Ok((msg, _consumed)) => IoAction::HandleMessage { msg },
+        Ok((msg, consumed)) => IoAction::HandleMessage { msg, consumed },
         Err(err) => IoAction::DecodeError { err },
     }
 }
@@ -88,10 +95,30 @@ pub fn dispatch_message(
             format,
             layout,
             rate,
-        } => match streams.try_open(backend, *format, *layout, *rate) {
-            Ok(id) => DispatchOutcome::Opened { stream_id: id },
-            Err(e) => DispatchOutcome::OpenError(e),
-        },
+        } => {
+            // 2026-05-11 stale-stream fix: if a stream is already open
+            // (the previous client died without sending `Close` — e.g.,
+            // the documented `Io(-32)` intermittency aborts
+            // `audio-demo` mid-`SubmitFrames`), close it first so the
+            // new `Open` lands on a clean backend. This is the
+            // protocol-level companion to the io loop's `force_release`
+            // takeover: both paths exist because the audio_server has
+            // no cap-revocation hook and uses a fixed
+            // `LABEL_AUDIO_CMD` for every audio-demo invocation, so
+            // `client_id` (`frame.label`) can't distinguish two
+            // consecutive demo processes. Without this branch,
+            // `try_open` hits `Ac97Backend.stream_open == true` and
+            // returns `Busy` indefinitely until audio_server is
+            // restarted.
+            if let Some(s) = streams.open.as_ref() {
+                let stale_id = s.stream_id;
+                let _ = streams.close(backend, stale_id);
+            }
+            match streams.try_open(backend, *format, *layout, *rate) {
+                Ok(id) => DispatchOutcome::Opened { stream_id: id },
+                Err(e) => DispatchOutcome::OpenError(e),
+            }
+        }
         ClientMessage::SubmitFrames { len } => {
             // The bulk payload (the actual PCM bytes) rides the same
             // socket immediately after the encoded frame — the io
@@ -196,14 +223,34 @@ pub fn run_io_loop(
     irq: IrqNotification<SyscallBackend>,
 ) -> i32 {
     use driver_runtime::ipc::{IpcBackend, RecvResult};
-    use kernel_core::audio::ServerMessage;
+    use kernel_core::audio::{MAX_SUBMIT_BYTES, ServerMessage};
     use syscall_lib::STDOUT_FILENO;
 
-    let mut transport = driver_runtime::ipc::SyscallBackend;
+    // Phase 63 driver-host fix: size the recv bulk buffer for the largest
+    // audio request (a `SubmitFrames` PCM payload — up to MAX_SUBMIT_BYTES,
+    // 64 KiB — preceded by the small ClientMessage frame header). The
+    // default `SyscallBackend::recv` bulk cap is 1522 B (sized for net
+    // frames) and would silently truncate the PCM payload, so audio_server
+    // must opt into a larger buffer via `recv_with_capacity`.
+    //
+    // The +256 slack covers the request frame header (currently 16 B)
+    // with comfortable margin for ABI evolution.
+    const AUDIO_RECV_CAP: usize = MAX_SUBMIT_BYTES + 256;
+
+    let mut transport = driver_runtime::ipc::SyscallBackend::new();
     loop {
-        let result = match transport.recv(endpoint) {
+        let result = match transport.recv_with_capacity(endpoint, AUDIO_RECV_CAP) {
             Ok(r) => r,
             Err(_) => {
+                // Phase 63 driver-host fix: a recv error here is currently
+                // bound to a deeper Phase 63 IRQ-pipeline issue (the AC'97
+                // notification bits race-drain in `recv_msg_with_notif`,
+                // returning `u64::MAX` repeatedly without blocking). An
+                // earlier "log + continue" branch turned this into a tight
+                // hot loop that starved other userspace services; restore
+                // the original bounded behavior — exit + let init's
+                // `restart=on-failure max_restart=3` policy contain the
+                // chaos until the underlying race lands as a kernel fix.
                 syscall_lib::write_str(STDOUT_FILENO, "audio_server: recv failed\n");
                 return 8;
             }
@@ -219,19 +266,86 @@ pub fn run_io_loop(
                 // identifies clients by the message label (kernel-
                 // staged sender id); the rate-limited rejection log
                 // lives in `ClientRegistry::reject`.
+                //
+                // 2026-05-11 takeover fix: if an `Open` arrives from a
+                // client that isn't the current owner, treat it as
+                // the previous client having gone away (single-client
+                // server — a new IPC sender id means a fresh process,
+                // and the audio_server has no other way to learn of
+                // a crashed/aborted client). Close the lingering
+                // stream on the backend, force-release the slot, and
+                // admit the new client. Without this, an
+                // `audio-demo` invocation that died mid-`SubmitFrames`
+                // (e.g., the documented `Io(-32)` intermittency)
+                // leaves the registry pinned to the dead pid, and
+                // every subsequent run reports `Server:Busy` at the
+                // `Open` stage.
                 let client_id = frame.label as u32;
-                if !clients.try_admit(client_id) {
-                    let mut buf = [0u8; 16];
-                    let reply = ServerMessage::OpenError(AudioError::Busy);
-                    if let Ok(n) = reply.encode(&mut buf) {
-                        let _ = transport.store_reply_bulk(&buf[..n]);
-                    }
-                    let _ = transport.reply(frame.label, 0);
-                    continue;
-                }
                 let action = decode_message(&frame.bulk);
+                let is_open = matches!(
+                    action,
+                    IoAction::HandleMessage {
+                        msg: ClientMessage::Open { .. },
+                        ..
+                    }
+                );
+                if !clients.try_admit(client_id) {
+                    if is_open {
+                        if let Some(prev_owner) = clients.force_release() {
+                            // Best-effort cleanup of the previous
+                            // client's stream so the new opener gets a
+                            // fresh backend state. The close itself
+                            // may fail (e.g., stream already torn
+                            // down) — that's fine, the registry
+                            // release is what unblocks the admit.
+                            if let Some(s) = streams.open.as_ref() {
+                                let _ = streams.close(backend, s.stream_id);
+                            }
+                            let _ = prev_owner;
+                        }
+                        let _ = clients.try_admit(client_id);
+                    } else {
+                        let mut buf = [0u8; 16];
+                        let reply = ServerMessage::OpenError(AudioError::Busy);
+                        if let Ok(n) = reply.encode(&mut buf) {
+                            let _ = transport.store_reply_bulk(&buf[..n]);
+                        }
+                        let _ = transport.reply(frame.label, 0);
+                        continue;
+                    }
+                }
                 let outcome = match action {
-                    IoAction::HandleMessage { msg } => dispatch_message(&msg, streams, backend),
+                    IoAction::HandleMessage { msg, consumed } => match &msg {
+                        // SubmitFrames carries its PCM payload as the
+                        // bytes immediately after the encoded frame
+                        // header in the same bulk buffer. Extract that
+                        // slice and run it through `streams.submit` so
+                        // the backend actually programs the BDL —
+                        // `dispatch_message` cannot see `frame.bulk` and
+                        // would otherwise return `SubmitAck` without
+                        // touching the hardware (the original Phase 57
+                        // D.1 stub that left `frames_consumed` pinned
+                        // at `0` and the AC'97 IRQ silent).
+                        ClientMessage::SubmitFrames { len } => {
+                            let pcm_len = *len as usize;
+                            if streams.open.is_none() {
+                                DispatchOutcome::SubmitError(AudioError::InvalidArgument)
+                            } else if consumed.saturating_add(pcm_len) > frame.bulk.len() {
+                                DispatchOutcome::SubmitError(AudioError::Internal)
+                            } else {
+                                let stream_id =
+                                    streams.open.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                                let pcm = &frame.bulk[consumed..consumed + pcm_len];
+                                match streams.submit(backend, stream_id, pcm) {
+                                    Ok(_) => DispatchOutcome::SubmitAck {
+                                        frames_consumed: streams.stats().frames_consumed,
+                                    },
+                                    Err(e) => DispatchOutcome::SubmitError(e),
+                                }
+                            }
+                        }
+                        _ => dispatch_message(&msg, streams, backend),
+                    },
                     IoAction::DecodeError { .. } => {
                         DispatchOutcome::OpenError(AudioError::InvalidArgument)
                     }
@@ -240,6 +354,19 @@ pub fn run_io_loop(
                         continue;
                     }
                 };
+                // Sync the StreamRegistry's `frames_consumed` from the
+                // backend before any reply that includes stats. The
+                // backend's IRQ-side state (or, under `-audiodev wav`,
+                // its CIV-poll fallback inside `submit_frames`) is
+                // authoritative; the StreamRegistry only mirrors the
+                // count for the reply path. Without this sync the
+                // `GetStats` reply would forever report `0` because
+                // `record_consumed` is never called from this loop.
+                let device_consumed = backend.poll_frames_consumed();
+                let mirrored = streams.stats().frames_consumed;
+                if device_consumed > mirrored {
+                    streams.record_consumed(device_consumed - mirrored);
+                }
                 let server_msg = encode_outcome(&outcome, streams);
                 let mut buf = [0u8; 64];
                 if let Ok(n) = server_msg.encode(&mut buf) {
@@ -321,6 +448,10 @@ pub fn apply_irq_event(event: crate::device::IrqEvent, streams: &mut StreamRegis
             // stats update at this layer.
         }
         IrqEvent::Underrun => {
+            // Bump the underrun counter exactly once per event.  The
+            // io loop must then call `repost_silence_after_underrun` to
+            // re-arm the BDL; those two steps are separate so the
+            // underrun_count is never double-counted.
             streams.record_underrun();
         }
         IrqEvent::FifoError => {
@@ -329,6 +460,36 @@ pub fn apply_irq_event(event: crate::device::IrqEvent, streams: &mut StreamRegis
         }
         IrqEvent::None => {}
     }
+}
+
+/// Re-arm the BDL after an underrun by submitting one silence slot.
+///
+/// Called by the io loop immediately after [`apply_irq_event`] returns
+/// `IrqEvent::Underrun`.  Because [`crate::device::IrqEvent::Underrun`]
+/// is only produced when `Ac97Logic` observed FIFOE on an *empty* ring
+/// (`head == tail`), posting one silence slot is always safe — the ring
+/// has room and the device will start consuming from the new entry.
+///
+/// The call goes through `StreamRegistry::submit` so
+/// `stream.stats.frames_submitted` advances — the underrun-recovery
+/// slot counts as a submitted frame from the caller's perspective.
+///
+/// # No double-count
+///
+/// `apply_irq_event` already incremented `underrun_count` for this
+/// event; this function must *not* bump it again.  It only posts audio
+/// data; the stats counter update is the caller's responsibility before
+/// this call.
+pub fn repost_silence_after_underrun(
+    backend: &mut dyn AudioBackend,
+    stream_id: u32,
+    streams: &mut StreamRegistry,
+) {
+    use crate::device::SILENCE_FRAME;
+    // `submit` may return `WouldBlock` if — against the invariant — the
+    // BDL somehow has no room; ignore that gracefully rather than
+    // panicking in the IRQ handler path.
+    let _ = streams.submit(backend, stream_id, &SILENCE_FRAME);
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +579,12 @@ mod tests {
         let n = msg.encode(&mut buf).expect("encode");
         let action = decode_message(&buf[..n]);
         match action {
-            IoAction::HandleMessage { msg: decoded } => {
+            IoAction::HandleMessage {
+                msg: decoded,
+                consumed,
+            } => {
                 assert_eq!(decoded, ClientMessage::Drain);
+                assert_eq!(consumed, n);
             }
             other => panic!("unexpected action: {:?}", other),
         }
@@ -457,20 +622,36 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_open_when_already_open_returns_open_error_busy() {
-        // Second `Open` while the registry holds a stream returns
-        // `OpenError(Busy)` — the protocol surface for the
-        // single-stream constraint.
+    fn dispatch_open_when_already_open_takes_over_and_returns_opened() {
+        // 2026-05-11 stale-stream fix: an `Open` arriving while a
+        // stream is already open is treated as a takeover — the
+        // previous session is closed and a fresh stream id is
+        // allocated. This replaces the old `Busy` semantics so that
+        // a client that died mid-protocol (e.g., the documented
+        // `Io(-32)` aborting `audio-demo` between `Open` and
+        // `Close`) doesn't permanently wedge the server. The fixed
+        // `LABEL_AUDIO_CMD` means the io loop's client_id-based
+        // `force_release` takeover can't distinguish two
+        // consecutive demo processes — this protocol-level path is
+        // what actually unblocks them.
         let mut reg = StreamRegistry::new();
         let mut b = FakeBackend::new();
-        let _ = open_stereo(&mut reg, &mut b);
+        let first_id = open_stereo(&mut reg, &mut b);
         let msg = ClientMessage::Open {
             format: PcmFormat::S16Le,
             layout: ChannelLayout::Stereo,
             rate: SampleRate::Hz48000,
         };
         let outcome = dispatch_message(&msg, &mut reg, &mut b);
-        assert_eq!(outcome, DispatchOutcome::OpenError(AudioError::Busy));
+        match outcome {
+            DispatchOutcome::Opened { stream_id } => {
+                assert_ne!(
+                    stream_id, first_id,
+                    "takeover must allocate a fresh stream id so backend state is reset"
+                );
+            }
+            other => panic!("expected Opened, got {other:?}"),
+        }
     }
 
     #[test]
@@ -623,6 +804,43 @@ mod tests {
         apply_irq_event(IrqEvent::None, &mut reg);
         let s = reg.stats();
         assert_eq!(s.underrun_count, 0);
+    }
+
+    // -- B.2: repost_silence_after_underrun ----------------------------------
+
+    /// B.2: open → simulate `IrqEvent::Underrun` → assert `frames_submitted`
+    /// advances by exactly one slot's worth of zero bytes.
+    #[test]
+    fn repost_silence_after_underrun_advances_frames_submitted_by_one_slot() {
+        use super::repost_silence_after_underrun;
+        use crate::device::PCM_SLOT_STRIDE;
+
+        let mut reg = StreamRegistry::new();
+        let mut b = FakeBackend::new();
+        let stream_id = open_stereo(&mut reg, &mut b);
+
+        // Precondition: no frames submitted yet.
+        assert_eq!(reg.stats().frames_submitted, 0);
+
+        // Simulate an underrun event: apply_irq_event bumps underrun_count.
+        apply_irq_event(IrqEvent::Underrun, &mut reg);
+        assert_eq!(reg.stats().underrun_count, 1, "underrun_count must be 1");
+
+        // Repost one silence slot.
+        repost_silence_after_underrun(&mut b, stream_id, &mut reg);
+
+        // frames_submitted must advance by exactly PCM_SLOT_STRIDE bytes.
+        assert_eq!(
+            reg.stats().frames_submitted,
+            PCM_SLOT_STRIDE as u64,
+            "frames_submitted must advance by one slot stride of silence"
+        );
+        // underrun_count must remain at 1 — no double-count.
+        assert_eq!(
+            reg.stats().underrun_count,
+            1,
+            "underrun_count must not be double-incremented by repost"
+        );
     }
 
     // -- io-loop discipline check -----------------------------------------

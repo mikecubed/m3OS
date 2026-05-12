@@ -87,7 +87,7 @@ impl NetServer<SyscallBackend> {
         Self {
             endpoint,
             ingress_endpoint: None,
-            backend: Mutex::new(SyscallBackend),
+            backend: Mutex::new(SyscallBackend::new()),
         }
     }
 }
@@ -348,6 +348,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: NET_SEND_FRAME as u64,
             data0: 0,
+            reply_cap_handle: 0,
             bulk: send_frame_bytes(frame.len() as u16, &frame),
         });
 
@@ -384,6 +385,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: NET_SEND_FRAME as u64,
             data0: 0,
+            reply_cap_handle: 0,
             // Empty bulk — decode_net_send rejects as InvalidFrame.
             bulk: Vec::new(),
         });
@@ -549,6 +551,7 @@ mod tests {
         mock.push_request(RecvFrame {
             label: NET_SEND_FRAME as u64,
             data0: 0,
+            reply_cap_handle: 0,
             bulk: send_frame_bytes(frame.len() as u16, &frame),
         });
 

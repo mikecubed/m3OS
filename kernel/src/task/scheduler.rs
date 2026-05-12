@@ -3285,6 +3285,7 @@ pub fn block_current_until(
 pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     let woken = Arc::new(AtomicBool::new(false));
     if !register_reply_waker(caller, woken.clone()) {
+        log_spurious_block_wake(caller, "reply_v2:register_failed", None, false, false);
         return false;
     }
 
@@ -3298,7 +3299,40 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
     }
 
     let outcome = block_current_until(TaskState::BlockedOnReply, &woken, None);
+    // Phase 63 audio handoff follow-up — capture wake state BEFORE clearing
+    // the reply waker so a racing producer cannot mutate the flag between
+    // our observation and the log line. Three spurious-wake shapes:
+    //
+    //   1. `Woken` / `AlreadyTrue` with `pending_at_clear=false` — wake
+    //      side set the `reply_waker` flag without storing `pending_msg`.
+    //   2. `DeadlineExpired` with `deadline_ticks=None` — `block_current_until`
+    //      reports this when the task resumed but `woken.load()` was false
+    //      at the post-resume recheck (block_current_until.rs:3249-3253).
+    //      Without a deadline this means `wake_task_v2` fired and put the
+    //      task back on Ready WITHOUT anyone setting the flag — the
+    //      "wake_task_v2 without setting reply_waker" lost-wake shape.
+    //   3. Any return value with `pending_at_clear=false` — covered by 1
+    //      and 2; the `take_message → None` in `call_msg` follows.
+    let pending_at_clear = has_pending_message(caller);
+    let woken_flag = woken.load(core::sync::atomic::Ordering::Acquire);
     clear_reply_waker(caller);
+    let site_opt = match (outcome, pending_at_clear) {
+        (BlockOutcome::Woken | BlockOutcome::AlreadyTrue, false) => {
+            Some("reply_v2:no_pending_at_clear")
+        }
+        (BlockOutcome::DeadlineExpired, _) => {
+            // No deadline was passed (we called block_current_until with
+            // `None`), so DeadlineExpired here is itself a spurious-wake
+            // signal — log regardless of pending_at_clear so we capture
+            // the wake-without-flag-set path that the previous diagnostic
+            // missed.
+            Some("reply_v2:deadline_expired_no_deadline")
+        }
+        _ => None,
+    };
+    if let Some(site) = site_opt {
+        log_spurious_block_wake(caller, site, Some(outcome), woken_flag, pending_at_clear);
+    }
 
     // Regardless of the outcome, the caller (call_msg) will call take_message()
     // to confirm message delivery. We report true for Woken/AlreadyTrue, false
@@ -3307,6 +3341,92 @@ pub fn block_current_on_reply_v2(caller: TaskId) -> bool {
         BlockOutcome::Woken | BlockOutcome::AlreadyTrue => true,
         BlockOutcome::DeadlineExpired => false,
     }
+}
+
+/// Phase 63 audio handoff follow-up — rate-limited diagnostic for the
+/// spurious-wake race the IPC `call_msg:no_reply_message` log site
+/// (`kernel/src/ipc/mod.rs::log_ipc_umax`) flagged across audio, term,
+/// kbd, and mouse protocols. Separate budget from `IPC_UMAX_DIAG_BUDGET`
+/// so the two sites don't compete for the same cap.
+///
+/// Discriminator semantics:
+///
+/// - `reply_v2:register_failed` — `register_reply_waker` couldn't find
+///   the caller in the scheduler. Should be rare; means
+///   `block_current_on_reply_v2` returned `false` without ever blocking
+///   and the caller saw `take_message → None`.
+/// - `reply_v2:no_pending_at_clear` — block returned `Woken` or
+///   `AlreadyTrue` but `has_pending_message` is `false` at clear time.
+///   Combined with `woken_flag`:
+///     * `woken_flag = true` and `pending = false` → some path set the
+///       `reply_waker` flag without storing a `pending_msg` (e.g.
+///       `complete_send`'s shared flag, or a stale waker from a prior
+///       block primitive).
+///     * `woken_flag = false` (outcome must be `Woken` since
+///       `AlreadyTrue` requires the flag) → impossible by construction
+///       in the current primitive; would indicate a memory-ordering
+///       bug between `block_current_until`'s post-resume load and the
+///       wake-side store.
+static SPURIOUS_BLOCK_WAKE_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(32);
+
+/// Phase 63 audio handoff follow-up — separate 32-hit boot budget for
+/// `wake_task_v2` callers waking `BlockedOnReply` tasks. Logs the file:line
+/// the wake originated from so the spurious-wake source the
+/// `reply_v2:deadline_expired_no_deadline` site flagged can be traced
+/// back to a specific kernel callsite.
+static WAKE_REPLY_DIAG_BUDGET: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(32);
+
+fn log_wake_blocked_on_reply(
+    id: TaskId,
+    caller: &'static core::panic::Location<'static>,
+    has_pending: bool,
+) {
+    if WAKE_REPLY_DIAG_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[sched] wake_task_v2 on BlockedOnReply: task={} caller={}:{} has_pending_msg={}",
+        id.0,
+        caller.file(),
+        caller.line(),
+        has_pending,
+    );
+}
+
+fn log_spurious_block_wake(
+    caller: TaskId,
+    site: &'static str,
+    outcome: Option<BlockOutcome>,
+    woken_flag: bool,
+    pending_at_clear: bool,
+) {
+    if SPURIOUS_BLOCK_WAKE_BUDGET
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_err()
+    {
+        return;
+    }
+    log::warn!(
+        "[sched] spurious block wake: task={} site={} outcome={:?} woken_flag={} pending_at_clear={}",
+        caller.0,
+        site,
+        outcome,
+        woken_flag,
+        pending_at_clear,
+    );
 }
 
 fn register_reply_waker(id: TaskId, waker: Arc<AtomicBool>) -> bool {
@@ -3705,7 +3825,13 @@ pub enum WakeOutcome {
 /// - m3OS handoff 2026-04-25:
 ///   `docs/handoffs/57a-scheduler-rewrite-v2-transitions.md` (wake side
 ///   steps 1–5).
+#[track_caller]
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
+    // Phase 63 audio handoff follow-up — capture the caller location so we
+    // can log it when the CAS transitions BlockedOnReply → Ready. That
+    // identifies which kernel site is spuriously waking call_msg-blocked
+    // tasks (the dominant shape in `reply_v2:deadline_expired_no_deadline`).
+    let caller_loc = core::panic::Location::caller();
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
     // The Vec never shrinks; slots are Dead-recycled but the memory at
@@ -3822,14 +3948,39 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
             core: sched.tasks[idx].assigned_core,
         });
 
+        // Phase 63 audio handoff follow-up — CAPTURE diagnostic state
+        // here (cheap reads) but DEFER the log call until after both
+        // locks drop. `log::warn!` invoked while holding `pi_lock` +
+        // `scheduler_lock` deadlocks against logger / serial paths
+        // that may also want one of those locks.
+        //
+        // Filter at the capture site: only the UNPAIRED wakes
+        // (`prev_state == BlockedOnReply && pending_msg.is_none()`)
+        // are the actual spurious-wake bug we're hunting. A legit
+        // `endpoint::reply` always calls `deliver_message` BEFORE
+        // `wake_task_v2`, so `pending_msg.is_some()` at the CAS — and
+        // we want those out of the budget so the rare unpaired wakes
+        // are not crowded out by routine reply traffic.
+        let log_unpaired_reply_wake = prev_state_u8 == TaskState::BlockedOnReply as u8
+            && sched.tasks[idx].pending_msg.is_none();
+
         // Re-read `assigned_core` and `on_cpu_ptr` from the VALIDATED slot,
         // for use after both locks drop.
         let assigned: u8 = sched.tasks[idx].assigned_core;
         let on_cpu_ptr: *const core::sync::atomic::AtomicBool = &raw const sched.tasks[idx].on_cpu;
-        (assigned, on_cpu_ptr)
+        (assigned, on_cpu_ptr, log_unpaired_reply_wake)
         // SCHEDULER.lock released, then pi_lock released.
     };
-    let (assigned_core, on_cpu_ptr) = post_lock;
+    let (assigned_core, on_cpu_ptr, log_unpaired_reply_wake) = post_lock;
+
+    // Phase 63 audio handoff follow-up — emit the deferred BlockedOnReply
+    // wake diag now that both `pi_lock` and `scheduler_lock` are released.
+    // `has_pending=false` is implicit in the filter: the diag only fires
+    // when prev_state was BlockedOnReply AND pending_msg was None at the
+    // CAS — the actually-spurious shape.
+    if log_unpaired_reply_wake {
+        log_wake_blocked_on_reply(id, caller_loc, false);
+    }
 
     // ── Step 4: Spin-wait on Task::on_cpu == false (cross-core only) ─────────
     //
@@ -4253,10 +4404,25 @@ pub fn run() -> ! {
         if let Some(data) = crate::smp::get_core_data(core_id) {
             for task_idx in data.isr_wake_queue.drain() {
                 // Look up the TaskId for this idx (briefly under scheduler_lock).
+                // Bound notifications may leave a stale ISR wake token behind
+                // after recv_msg_with_notif's fast path has already consumed
+                // the pending bits. Do not turn that stale token into a wake.
                 let task_id = {
                     let sched = scheduler_lock();
                     if task_idx < sched.tasks.len() {
-                        Some(sched.tasks[task_idx].id)
+                        let task = &sched.tasks[task_idx];
+                        let stale_bound_notif_wake =
+                            matches!(task.state, TaskState::BlockedOnNotif)
+                                && task.pending_msg.is_none()
+                                && matches!(
+                                    crate::ipc::notification::bound_pending_bits_for_task(task_idx),
+                                    Some(0)
+                                );
+                        if stale_bound_notif_wake {
+                            None
+                        } else {
+                            Some(task.id)
+                        }
                     } else {
                         None
                     }
@@ -4318,6 +4484,16 @@ pub fn run() -> ! {
             crate::trace::dump_trace_rings_recent(256);
             #[cfg(feature = "sched-trace")]
             crate::task::sched_trace::dump_sched_trace_rings();
+            // Per-vector device IRQ counters — non-zero entries point to a
+            // wake-side or notification-routing bug; all-zero entries point
+            // to a device-programming or QEMU-emulation issue.
+            for v in 0..crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT {
+                let vector = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + v;
+                let hits = crate::arch::x86_64::interrupts::device_irq_hits(vector);
+                if hits != 0 {
+                    log::warn!("[sched] device IRQ vector {:#x} hits={}", vector, hits);
+                }
+            }
         }
 
         // Before picking next, wake any tasks whose `wake_deadline` has
@@ -4962,18 +5138,27 @@ pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
 ///     idempotently; or (b) the waker already ran (Task::state == Ready)
 ///     and we skip.
 ///   - Spurious wakes (collecting a task whose deadline was just cleared) are
-///     harmless: `wake_task_v2`'s pi_lock CAS only succeeds for Blocked*; if
-///     the task already woke, we get `AlreadyAwake` (no-op).
-fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
+///     handled at the wake site by re-checking the deadline under
+///     `scheduler_lock` before invoking `wake_task_v2`. The previous comment
+///     here claimed `wake_task_v2`'s state CAS made spurious collections
+///     harmless — that was wrong when the task wakes naturally between
+///     collection and the wake call, then RE-blocks (e.g. `call_msg` enters
+///     `BlockedOnReply` with no deadline). The collect-then-wake race surfaced
+///     as the Phase 63 audio handoff's `reply_v2:deadline_expired_no_deadline`
+///     spurious-wake diagnostic (all 32 hits traced to `drive_expired_wake_deadlines`).
+fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([(TaskId, u64); 8], usize) {
     if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
-        return ([TaskId(0); 8], 0);
+        return ([(TaskId(0), 0); 8], 0);
     }
     let now = crate::arch::x86_64::interrupts::tick_count();
-    let mut expired: [TaskId; 8] = [TaskId(0); 8];
+    let mut expired: [(TaskId, u64); 8] = [(TaskId(0), 0); 8];
     let mut n = 0usize;
 
     for task in sched.tasks.iter() {
-        if task.wake_deadline.is_none_or(|d| d > now) {
+        let Some(deadline) = task.wake_deadline else {
+            continue;
+        };
+        if deadline > now {
             continue;
         }
         if !matches!(
@@ -4993,7 +5178,7 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
             continue;
         }
         if n < expired.len() {
-            expired[n] = task.id;
+            expired[n] = (task.id, deadline);
             n += 1;
         }
     }
@@ -5003,20 +5188,36 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([TaskId; 8], usize) {
 
 /// Drive deadline expiry for all tasks whose `wake_deadline` has passed.
 ///
-/// Phase 1: collect candidate TaskIds under SCHEDULER.lock (no pi_lock touch).
-/// Phase 2: drop SCHEDULER.lock, then call `wake_task_v2` for each candidate —
-/// the canonical pi_lock-outer / scheduler_lock-inner wake path.
-///
-/// This replaces the previous `scan_expired_wake_deadlines` which violated
-/// the lock-ordering invariant by acquiring pi_lock while holding
-/// SCHEDULER.lock.
+/// Phase 1: collect candidate (TaskId, deadline) tuples under SCHEDULER.lock
+/// (no pi_lock touch).
+/// Phase 2: drop SCHEDULER.lock; for each candidate, RE-VALIDATE that the
+/// task's current `wake_deadline` still matches the collected value before
+/// invoking `wake_task_v2`. Closes the Phase 63 collect-then-wake race where
+/// a task could wake naturally between collection and our wake, re-block
+/// (e.g. as `BlockedOnReply` via `call_msg` with no deadline), and then be
+/// transitioned to Ready by our stale wake — the dominant
+/// `reply_v2:deadline_expired_no_deadline` shape in the spurious-wake
+/// diagnostic. A small remaining race exists between the re-validation
+/// `scheduler_lock` release and `wake_task_v2`'s `pi_lock` acquire, but the
+/// window is microseconds versus the milliseconds-scale window before this
+/// fix.
 fn drive_expired_wake_deadlines() {
     let (expired, n) = {
         let sched = scheduler_lock();
         collect_expired_wake_deadlines(&sched)
         // SCHEDULER.lock dropped here.
     };
-    for id in &expired[..n] {
+    for (id, expected_deadline) in &expired[..n] {
+        let still_valid = {
+            let sched = scheduler_lock();
+            sched
+                .find(*id)
+                .is_some_and(|idx| sched.tasks[idx].wake_deadline == Some(*expected_deadline))
+            // SCHEDULER.lock dropped here.
+        };
+        if !still_valid {
+            continue;
+        }
         // wake_task_v2 acquires pi_lock OUTER, then scheduler_lock INNER.
         // CAS only succeeds for Blocked*; spurious calls (state already
         // Ready) return AlreadyAwake and are no-ops.
@@ -5511,6 +5712,23 @@ pub fn watchdog_scan() {
             // A server sitting in a plain receive loop has no timeout/deadline
             // by design; warn on receive blocks only when a deadline exists.
             if task.state == super::TaskState::BlockedOnRecv && task.wake_deadline.is_none() {
+                continue;
+            }
+            // Phase 63 audio handoff follow-up — `recv_msg_with_notif`'s
+            // `BlockedOnNotif` is a legitimate "wake from endpoint OR bound
+            // notification" wait whose wake source is the bound-notification
+            // table, not a deadline. Skip the stuck-no-waker verdict when the
+            // task holds a live `BoundNotification` subscription. Without
+            // this, an idle `audio_server` (or any IRQ-bound ring-3 driver
+            // parked in its serve loop) trips the watchdog at 30 s and dumps
+            // a misleading trace ring. Warnings still fire for tasks parked
+            // in `BlockedOnNotif` *without* a bound notification (e.g. a
+            // `notify_wait` whose signaler was lost) or with an expired
+            // `wake_deadline`.
+            if task.state == super::TaskState::BlockedOnNotif
+                && task.wake_deadline.is_none()
+                && crate::ipc::notification::task_has_bound_notif(idx)
+            {
                 continue;
             }
             let verdict = watchdog_verdict(now, task.blocked_since_tick, task.wake_deadline);

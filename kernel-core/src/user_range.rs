@@ -4,7 +4,17 @@
 //! so boundary conditions can be tested on the host without QEMU.
 
 /// Maximum bytes accepted in a single user-copy operation.
-pub const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
+///
+/// Sized to comfortably hold the largest bulk-IPC payload we accept
+/// (see `MAX_BULK_LEN` in `kernel/src/ipc/mod.rs`, currently 80 KiB)
+/// plus headroom for the IPC frame header and minor wire overhead.
+/// The previous 64 KiB cap matched the old `MAX_BULK_LEN` exactly,
+/// which broke the audio path: `audio_client::SyscallSocket::call`
+/// concatenates a 16 B request frame and a 64 KiB PCM payload into
+/// one `ipc_call_buf`, hitting 65552 B > 65536 B and surfacing as a
+/// silent `copy_to_kernel` failure (the Phase 63 audio-smoke `submit`
+/// stage).
+pub const MAX_COPY_LEN: usize = 96 * 1024; // 96 KiB
 
 /// Lowest valid user address (below this is the null-guard region).
 pub const USER_ADDR_MIN: u64 = 0x1000;

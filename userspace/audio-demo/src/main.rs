@@ -59,8 +59,8 @@ extern crate alloc;
 
 use core::alloc::Layout;
 
-use audio_client::{AudioClient, AudioClientError};
-use kernel_core::audio::{ChannelLayout, MAX_SUBMIT_BYTES, PcmFormat, ProtocolError, SampleRate};
+use audio_client::{AudioClient, AudioClientError, AudioStats};
+use kernel_core::audio::{AudioError, ChannelLayout, PcmFormat, ProtocolError, SampleRate};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -131,12 +131,28 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:drained\n");
 
+    // D.2: query the server for consumption stats before closing the stream.
+    // The sentinel line `AUDIO_DEMO:stats consumed=<N> underruns=<M>` is
+    // parsed by the audio-smoke harness to assert frames_consumed > 0.
+    let stats = match client.get_stats() {
+        Ok(s) => s,
+        Err(err) => {
+            log_error("get_stats", err);
+            return 6;
+        }
+    };
+
     if let Err(err) = client.close() {
         log_error("close", err);
         return 5;
     }
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:closed\n");
     syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:PASS\n");
+    // Emit the stats sentinel AFTER PASS so the smoke harness's
+    // post-PASS `WaitLineNotMatching` step still finds it in the
+    // serial buffer — the PASS-step drain otherwise consumes
+    // everything up to and including PASS.
+    log_stats(stats);
     0
 }
 
@@ -156,14 +172,22 @@ fn submit_tone(
     let mut phase: u32 = 0;
 
     let total_frames = (SAMPLE_RATE_HZ * DURATION_S) as usize;
-    // Round chunk size down to a stereo-frame boundary so we never
-    // split a frame across submits.
-    let max_chunk_frames = MAX_SUBMIT_BYTES / STEREO_FRAME_BYTES;
+    // Cap the per-call chunk size to roughly half the AC'97 backend's
+    // BDL ring (16 KiB / 2 = 8 KiB) so a fresh submit always fits even
+    // when the controller is mid-playing a previous chunk. A full
+    // 16 KiB submit would require all 32 ring slots to be free, but
+    // `observe_irq` leaves the slot at the current CIV in-flight,
+    // which produces a permanent 1-slot deficit and a `WouldBlock`
+    // loop for the smoke harness's second submit. Round down to a
+    // stereo-frame boundary so we never split a frame across submits.
+    const SUBMIT_CHUNK_BYTES: usize = 8 * 1024;
+    let max_chunk_frames = SUBMIT_CHUNK_BYTES / STEREO_FRAME_BYTES;
     let mut frames_remaining = total_frames;
 
     // One stack-allocated scratch buffer, reused across chunks. Sized
-    // to MAX_SUBMIT_BYTES so the largest chunk fits.
-    let mut chunk = [0u8; MAX_SUBMIT_BYTES];
+    // to the per-call cap so the largest chunk fits without overflowing
+    // the user stack.
+    let mut chunk = [0u8; SUBMIT_CHUNK_BYTES];
 
     while frames_remaining > 0 {
         let frames_this_chunk = core::cmp::min(frames_remaining, max_chunk_frames);
@@ -181,7 +205,46 @@ fn submit_tone(
             chunk[off + 3] = bytes[1];
         }
 
-        let written = client.submit_frames(&chunk[..chunk_bytes])?;
+        // Retry on `WouldBlock` (server-side AC'97 BDL ring full). The
+        // ring drains as the controller consumes buffers; sleeping ~5 ms
+        // between attempts gives QEMU's bus-master timer time to make
+        // progress without burning a tight CPU loop. Cap retries so a
+        // genuinely stalled controller surfaces as an error instead of
+        // wedging the demo.
+        let written;
+        let mut retries = 0usize;
+        loop {
+            match client.submit_frames(&chunk[..chunk_bytes]) {
+                Ok(n) => {
+                    written = n;
+                    break;
+                }
+                Err(AudioClientError::Server(AudioError::WouldBlock)) => {
+                    if retries >= 200 {
+                        return Err(AudioClientError::Server(AudioError::WouldBlock));
+                    }
+                    retries += 1;
+                    syscall_lib::nanosleep_for(0, 5_000_000);
+                }
+                // 2026-05-11 IPC-intermittency retry: `Io(-32)` is the
+                // audio_client mapping for `ipc_call_buf` returning
+                // `u64::MAX` on the send path — a documented transient
+                // race in the kernel IPC layer (see handoff). Without
+                // this retry the demo aborts on ~10–20% of submits, and
+                // even with the server-side takeover the next demo run
+                // is the only way to recover. Treat it like a transient
+                // would-block: short backoff, bounded retries, then
+                // surface the error.
+                Err(AudioClientError::Io(-32)) => {
+                    if retries >= 200 {
+                        return Err(AudioClientError::Io(-32));
+                    }
+                    retries += 1;
+                    syscall_lib::nanosleep_for(0, 5_000_000);
+                }
+                Err(other) => return Err(other),
+            }
+        }
         if written != chunk_bytes {
             // Partial accept is not part of the Phase 57 contract;
             // surface as a `Protocol(Truncated)` so the operator
@@ -277,22 +340,133 @@ fn build_quarter_sine_lut() -> [i16; LUT_LEN] {
 }
 
 // ---------------------------------------------------------------------------
+// Stats logging — D.2 sentinel parsed by the audio-smoke harness
+// ---------------------------------------------------------------------------
+
+/// Print the `AUDIO_DEMO:stats consumed=<N> underruns=<M>` sentinel.
+///
+/// The line shape is locked for Track E / WaitLineNotMatching compatibility:
+/// `consumed=` reads `AudioStats::frames_consumed`; `underruns=` reads
+/// `AudioStats::underrun_count`. The sentinel label words are intentionally
+/// shorter than the wire field names so the output stays human-readable.
+///
+/// Uses a minimal integer-to-string helper to stay `no_std` / alloc-free.
+fn log_stats(stats: AudioStats) {
+    syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:stats consumed=");
+    write_u64(stats.frames_consumed);
+    syscall_lib::write_str(STDOUT_FILENO, " underruns=");
+    write_u32(stats.underrun_count);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+}
+
+/// Write a `u64` decimal integer to stdout without heap allocation.
+fn write_u64(mut n: u64) {
+    // Build digits in reverse, then write forward.
+    let mut buf = [0u8; 20]; // 2^64 fits in 20 decimal digits
+    let mut len = 0;
+    if n == 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "0");
+        return;
+    }
+    while n > 0 {
+        buf[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    buf[..len].reverse();
+    // Safety: all bytes are ASCII digits.
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        syscall_lib::write_str(STDOUT_FILENO, s);
+    }
+}
+
+/// Write a `u32` decimal integer to stdout without heap allocation.
+fn write_u32(n: u32) {
+    write_u64(n as u64);
+}
+
+// ---------------------------------------------------------------------------
 // Error logging — structured single-line for the E.2 acceptance bullet
 // ---------------------------------------------------------------------------
 
 fn log_error(stage: &str, err: AudioClientError) {
-    syscall_lib::write_str(STDOUT_FILENO, "AUDIO_DEMO:FAIL stage=");
-    syscall_lib::write_str(STDOUT_FILENO, stage);
-    syscall_lib::write_str(STDOUT_FILENO, " variant=");
-    syscall_lib::write_str(STDOUT_FILENO, error_label(err));
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
+    // Assemble the FAIL line in a stack buffer and emit it in one write
+    // so the smoke harness — which fires on the `AUDIO_DEMO:FAIL stage=`
+    // prefix — captures the variant suffix instead of a torn line.
+    let mut buf = [0u8; 192];
+    let mut len = 0;
+    let mut errno_buf = [0u8; 16];
+    let errno_slice = format_errno(&err, &mut errno_buf);
+    let parts: [&[u8]; 7] = [
+        b"AUDIO_DEMO:FAIL stage=",
+        stage.as_bytes(),
+        b" variant=",
+        error_label(err).as_bytes(),
+        b" errno=",
+        errno_slice,
+        b"\n",
+    ];
+    for part in parts {
+        let take = part.len().min(buf.len() - len);
+        buf[len..len + take].copy_from_slice(&part[..take]);
+        len += take;
+        if len == buf.len() {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(STDOUT_FILENO, &buf[..len]);
+}
+
+/// Format the errno tag for the FAIL line. Only `Io(i32)` carries an
+/// errno today; every other variant emits `-` so the smoke harness
+/// always sees a stable `errno=<value>` field.
+fn format_errno<'a>(err: &AudioClientError, buf: &'a mut [u8; 16]) -> &'a [u8] {
+    let value = match err {
+        AudioClientError::Io(code) => *code,
+        _ => return &b"-"[..],
+    };
+    let mut n = value.unsigned_abs() as u64;
+    let mut tmp = [0u8; 16];
+    let mut idx = tmp.len();
+    if n == 0 {
+        idx -= 1;
+        tmp[idx] = b'0';
+    } else {
+        while n > 0 {
+            idx -= 1;
+            tmp[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    let digits = &tmp[idx..];
+    let mut out_len = 0;
+    if value < 0 {
+        buf[out_len] = b'-';
+        out_len += 1;
+    }
+    let take = digits.len().min(buf.len() - out_len);
+    buf[out_len..out_len + take].copy_from_slice(&digits[..take]);
+    out_len += take;
+    &buf[..out_len]
 }
 
 fn error_label(err: AudioClientError) -> &'static str {
     match err {
         AudioClientError::Io(_) => "Io",
         AudioClientError::Protocol(_) => "Protocol",
-        AudioClientError::Server(_) => "Server",
+        // Inline the AudioError discriminant so the smoke harness can
+        // distinguish `WouldBlock` (ring-pressure retry exhaustion)
+        // from `Internal` (DMA fault) etc. without a separate field.
+        AudioClientError::Server(inner) => match inner {
+            AudioError::Busy => "Server:Busy",
+            AudioError::WouldBlock => "Server:WouldBlock",
+            AudioError::NoDevice => "Server:NoDevice",
+            AudioError::BrokenPipe => "Server:BrokenPipe",
+            AudioError::InvalidFormat => "Server:InvalidFormat",
+            AudioError::InvalidArgument => "Server:InvalidArgument",
+            AudioError::Internal => "Server:Internal",
+            _ => "Server:Unknown",
+        },
         AudioClientError::AlreadyOpen => "AlreadyOpen",
         AudioClientError::NotOpen => "NotOpen",
         AudioClientError::UnexpectedReply => "UnexpectedReply",
