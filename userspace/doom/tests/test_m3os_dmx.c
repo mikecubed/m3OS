@@ -91,6 +91,43 @@ static int test_null_pointers(void) {
     return 0;
 }
 
+static int test_strips_dmx_padding(void) {
+    /* A real-WAD-shaped lump: 12-byte header + 100-byte sample body.
+     * Pads of 16 bytes at each end should be stripped, leaving 68
+     * bytes of "real" sample content starting at lump+12+16. */
+    uint8_t lump[12 + 100] = {0};
+    lump[0] = 3; lump[1] = 0;
+    lump[2] = 0x11; lump[3] = 0x2B;
+    lump[4] = 100; lump[5] = 0; lump[6] = 0; lump[7] = 0;
+    /* Sentinel byte at the first non-pad position. */
+    lump[12 + 16] = 0xA5;
+    m3os_dmx_decoded out;
+    int rc = m3os_dmx_decode(lump, sizeof(lump), &out);
+    ASSERT(rc == 0, "decode should succeed");
+    ASSERT(out.len == 68, "len should be sample_count - 32 after pad strip");
+    ASSERT(out.samples == lump + 12 + 16, "samples should point past leading pad");
+    ASSERT(out.samples[0] == 0xA5, "first non-pad sentinel should be exposed");
+    return 0;
+}
+
+static int test_small_lump_passes_through_without_strip(void) {
+    /* Synthetic 4-sample body — too small to contain 32 bytes of
+     * pad, so the decoder leaves the body verbatim. Preserves the
+     * Track C test fixture shape. */
+    uint8_t lump[16] = {0};
+    lump[0] = 3; lump[1] = 0;
+    lump[2] = 0x11; lump[3] = 0x2B;
+    lump[4] = 4; lump[5] = 0; lump[6] = 0; lump[7] = 0;
+    lump[12] = 0xC3;
+    m3os_dmx_decoded out;
+    int rc = m3os_dmx_decode(lump, sizeof(lump), &out);
+    ASSERT(rc == 0, "decode should succeed");
+    ASSERT(out.len == 4, "small lump should pass through unstripped");
+    ASSERT(out.samples == lump + 12, "small lump samples start at lump+12");
+    ASSERT(out.samples[0] == 0xC3, "first sample byte preserved");
+    return 0;
+}
+
 typedef struct {
     const char *name;
     int (*fn)(void);
@@ -104,6 +141,9 @@ int main(void) {
         {"test_oversize_sample_count", test_oversize_sample_count},
         {"test_zero_rate", test_zero_rate},
         {"test_null_pointers", test_null_pointers},
+        {"test_strips_dmx_padding", test_strips_dmx_padding},
+        {"test_small_lump_passes_through_without_strip",
+         test_small_lump_passes_through_without_strip},
     };
     int failures = 0;
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

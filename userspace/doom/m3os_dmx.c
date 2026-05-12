@@ -28,6 +28,19 @@ static uint32_t m3os_dmx_read_u32le(const uint8_t *p) {
            ((uint32_t)p[3] << 24);
 }
 
+/* DMX SFX lumps in real DOOM WADs reserve 16 sustain-pad bytes at
+ * the start and 16 at the end of the sample body (chocolate-doom
+ * precedent — the pads hold the sample's starting/ending volume to
+ * prevent DMA double-buffer clicks on legacy SoundBlaster cards).
+ * Our mixer interpolates so the pads serve no purpose here, but
+ * playing them DOES introduce an audible click at the SFX boundary
+ * because the silence-before-sample transition isn't smooth.
+ *
+ * Strip the pads when the lump is large enough to have them
+ * (real WADs always are); smaller lumps — typically synthetic test
+ * fixtures — pass through verbatim. */
+#define M3OS_DMX_PAD 16
+
 int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out) {
     if (lump == NULL || out == NULL) {
         return -1;
@@ -55,7 +68,12 @@ int m3os_dmx_decode(const uint8_t *lump, size_t lump_len, m3os_dmx_decoded *out)
         return -1;
     }
     out->rate_hz = rate_hz;
-    out->samples = lump + 12;
-    out->len = sample_count;
+    if (sample_count > (uint32_t)(2 * M3OS_DMX_PAD)) {
+        out->samples = lump + 12 + M3OS_DMX_PAD;
+        out->len = sample_count - (uint32_t)(2 * M3OS_DMX_PAD);
+    } else {
+        out->samples = lump + 12;
+        out->len = sample_count;
+    }
     return 0;
 }

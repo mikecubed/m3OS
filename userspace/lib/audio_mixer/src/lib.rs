@@ -67,6 +67,10 @@ pub struct ChannelState {
     left_vol: u8,
     right_vol: u8,
     active: bool,
+    /// When true, the cursor wraps modulo `samples_len << 16` instead
+    /// of deactivating at end-of-buffer. Used by music voices that
+    /// seed a one-period waveform and need it to sustain.
+    loop_enabled: bool,
 }
 
 unsafe impl Send for ChannelState {}
@@ -82,6 +86,7 @@ impl Default for ChannelState {
             left_vol: 0,
             right_vol: 0,
             active: false,
+            loop_enabled: false,
         }
     }
 }
@@ -153,6 +158,50 @@ impl Mixer {
         left_vol: u8,
         right_vol: u8,
     ) {
+        // SAFETY: callers of this safe wrapper inherit the same
+        // contract documented above; the inner call delegates.
+        unsafe {
+            self.set_channel_with(idx, samples, source_rate_hz, left_vol, right_vol, false);
+        }
+    }
+
+    /// Like [`Mixer::set_channel`] but the cursor wraps modulo
+    /// `samples_len` instead of deactivating at end-of-buffer.
+    /// Music voices use this so a one-period waveform sustains until
+    /// `clear_channel` (i.e. NoteOff) explicitly silences it.
+    ///
+    /// # Safety
+    ///
+    /// Same slice-lifetime contract as [`Mixer::set_channel`].
+    pub unsafe fn set_channel_loop(
+        &mut self,
+        idx: usize,
+        samples: &[u8],
+        source_rate_hz: u32,
+        left_vol: u8,
+        right_vol: u8,
+    ) {
+        // SAFETY: same contract as set_channel.
+        unsafe {
+            self.set_channel_with(idx, samples, source_rate_hz, left_vol, right_vol, true);
+        }
+    }
+
+    /// Internal helper that backs both [`Mixer::set_channel`] and
+    /// [`Mixer::set_channel_loop`].
+    ///
+    /// # Safety
+    ///
+    /// Same slice-lifetime contract as [`Mixer::set_channel`].
+    unsafe fn set_channel_with(
+        &mut self,
+        idx: usize,
+        samples: &[u8],
+        source_rate_hz: u32,
+        left_vol: u8,
+        right_vol: u8,
+        loop_enabled: bool,
+    ) {
         if idx >= self.channel_count {
             return;
         }
@@ -171,6 +220,7 @@ impl Mixer {
             left_vol: lv,
             right_vol: rv,
             active: true,
+            loop_enabled,
         };
     }
 
@@ -205,6 +255,18 @@ impl Mixer {
                 if !ch.active {
                     continue;
                 }
+                // For looping channels, normalize the cursor modulo
+                // `samples_len << 16` before each frame so a long-running
+                // tone wraps cleanly. The single-iteration `while` is
+                // sufficient for any realistic source rate (one mixer
+                // step never advances the cursor by more than a few
+                // buffer widths at audible pitches).
+                if ch.loop_enabled {
+                    let len_units = (ch.samples_len as u64) << 16;
+                    while ch.cursor >= len_units {
+                        ch.cursor = ch.cursor.wrapping_sub(len_units);
+                    }
+                }
                 let cursor_int = (ch.cursor >> 16) as usize;
                 if cursor_int >= ch.samples_len {
                     ch.active = false;
@@ -216,6 +278,12 @@ impl Mixer {
                 let s0 = (unsafe { *ch.samples_ptr.add(cursor_int) }) as i32;
                 let s1 = if cursor_int + 1 < ch.samples_len {
                     (unsafe { *ch.samples_ptr.add(cursor_int + 1) }) as i32
+                } else if ch.loop_enabled {
+                    // Wrap the interpolation neighbour back to sample 0
+                    // so the join between cycles is smooth (otherwise
+                    // the last sample interpolates against silence,
+                    // injecting a click per loop period).
+                    (unsafe { *ch.samples_ptr.add(0) }) as i32
                 } else {
                     128
                 };
@@ -402,5 +470,60 @@ mod tests {
         let mut out = [0u8; 4];
         let n = mixer.step(&mut out, 32);
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn looping_channel_sustains_past_buffer_end() {
+        // A 4-sample looping channel at 48 kHz advances the cursor by
+        // exactly one sample per output frame. After 8 output frames
+        // the cursor has wrapped twice; the channel must still be
+        // active and producing samples (not silenced like the
+        // non-looping variant).
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![128u8, 192, 192, 128];
+        unsafe {
+            mixer.set_channel_loop(0, &samples, 48_000, 127, 127);
+        }
+        let mut out = [0u8; 16 * BYTES_PER_FRAME];
+        let n = mixer.step(&mut out, 16);
+        assert_eq!(n, 64);
+        // Channel should still be active after 4× the buffer length.
+        assert!(mixer.channel(0).unwrap().is_active());
+        // At least one frame past the original 4-sample buffer must
+        // produce non-zero output (proving the loop is feeding fresh
+        // samples).
+        let mut saw_nonzero_past_end = false;
+        for i in 4..16 {
+            let off = i * BYTES_PER_FRAME;
+            let l = i16::from_le_bytes([out[off], out[off + 1]]);
+            if l != 0 {
+                saw_nonzero_past_end = true;
+                break;
+            }
+        }
+        assert!(
+            saw_nonzero_past_end,
+            "looping channel must continue producing samples past the buffer end"
+        );
+    }
+
+    #[test]
+    fn nonlooping_channel_silences_past_buffer_end() {
+        // The non-looping default: after the 4-sample buffer is
+        // exhausted, the channel deactivates and produces silence.
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![128u8, 192, 192, 128];
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 127, 127);
+        }
+        let mut out = [0u8; 16 * BYTES_PER_FRAME];
+        let n = mixer.step(&mut out, 16);
+        assert_eq!(n, 64);
+        assert!(!mixer.channel(0).unwrap().is_active());
+        for i in 4..16 {
+            let off = i * BYTES_PER_FRAME;
+            let l = i16::from_le_bytes([out[off], out[off + 1]]);
+            assert_eq!(l, 0, "frame {} after buffer end must be silent", i);
+        }
     }
 }

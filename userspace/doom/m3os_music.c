@@ -95,28 +95,39 @@ static uint32_t midi_to_freq_hz(int note) {
     return k_freq_table[note];
 }
 
+/* Per-voice peak amplitude in DMX u8 space — chosen so even an
+ * 8-voice chord at master = 100 stays under the mixer's i16 clamp.
+ * High = 128 + AMP, low = 128 - AMP. With AMP = 32 the per-voice
+ * peak after the <<8 conversion is ±8192, so eight simultaneous
+ * voices at vol 78 (the default master/velocity scaling) accumulate
+ * to ~31000 — just below i16::MAX = 32767. SFX adds further headroom
+ * through DOOM's `S_AdjustSoundParams` distance attenuation. */
+#define M3OS_MUSIC_AMP 32
+
 /* Seed `buf` with one period of `waveform` in DMX format
  * (unsigned-8 PCM, 128 = silence). */
 static void seed_waveform(uint8_t *buf, m3os_waveform_t waveform) {
+    const uint8_t high = (uint8_t)(128 + M3OS_MUSIC_AMP);
+    const uint8_t low = (uint8_t)(128 - M3OS_MUSIC_AMP);
     switch (waveform) {
     case M3OS_WAVEFORM_SQUARE:
         for (size_t i = 0; i < VOICE_PERIOD_SAMPLES / 2; ++i) {
-            buf[i] = 200; /* high */
+            buf[i] = high;
         }
         for (size_t i = VOICE_PERIOD_SAMPLES / 2; i < VOICE_PERIOD_SAMPLES; ++i) {
-            buf[i] = 56; /* low */
+            buf[i] = low;
         }
         break;
     case M3OS_WAVEFORM_TRIANGLE:
     default: {
         /* Triangle: ramp up, ramp down. Linear over half-periods. */
         for (size_t i = 0; i < VOICE_PERIOD_SAMPLES / 2; ++i) {
-            int v = 56 + (int)((i * (200 - 56)) / (VOICE_PERIOD_SAMPLES / 2));
+            int v = low + (int)((i * (high - low)) / (VOICE_PERIOD_SAMPLES / 2));
             buf[i] = (uint8_t)v;
         }
         for (size_t i = VOICE_PERIOD_SAMPLES / 2; i < VOICE_PERIOD_SAMPLES; ++i) {
             int j = i - VOICE_PERIOD_SAMPLES / 2;
-            int v = 200 - (int)((j * (200 - 56)) / (VOICE_PERIOD_SAMPLES / 2));
+            int v = high - (int)((j * (high - low)) / (VOICE_PERIOD_SAMPLES / 2));
             buf[i] = (uint8_t)v;
         }
         break;
@@ -180,10 +191,14 @@ static void seed_voice_in_mixer(m3os_mus_state_t *state, int voice_idx) {
      * 0..127. Triangle pan is unused at Tier 2a (mono music). */
     uint8_t vol = (uint8_t)((g_master_volume * state->voices[voice_idx].velocity) / 127);
     if (vol > 127) vol = 127;
-    audio_mixer_set_channel(m, (size_t)(M3OS_MUSIC_CHANNEL_BASE + voice_idx),
-                            state->voice_buf[voice_idx],
-                            (size_t)VOICE_PERIOD_SAMPLES, source_rate, vol,
-                            vol);
+    /* Loop the one-period waveform so the note sustains until
+     * NoteOff. Without looping, the mixer plays exactly one period
+     * (~2 ms at 440 Hz) and goes silent — each note becomes an
+     * audible click instead of a held tone. */
+    audio_mixer_set_channel_loop(m, (size_t)(M3OS_MUSIC_CHANNEL_BASE + voice_idx),
+                                 state->voice_buf[voice_idx],
+                                 (size_t)VOICE_PERIOD_SAMPLES, source_rate, vol,
+                                 vol);
 }
 
 /* -----------------------------------------------------------------

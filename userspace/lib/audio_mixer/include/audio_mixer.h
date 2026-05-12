@@ -35,7 +35,8 @@ void audio_mixer_drop(audio_mixer_t *mixer);
 
 /* Seed a channel. `samples` must remain valid for `len` bytes for as
  * long as the channel is active. Volumes are 0..=127. Returns 0 on
- * success or a negative AUDIO_MIXER_ERR_* code. */
+ * success or a negative AUDIO_MIXER_ERR_* code. The channel
+ * deactivates when the cursor walks past the end of `samples`. */
 int audio_mixer_set_channel(audio_mixer_t *mixer,
                             size_t idx,
                             const uint8_t *samples,
@@ -43,6 +44,18 @@ int audio_mixer_set_channel(audio_mixer_t *mixer,
                             uint32_t source_rate_hz,
                             uint8_t left_vol,
                             uint8_t right_vol);
+
+/* Like audio_mixer_set_channel but the cursor wraps modulo `len`
+ * instead of deactivating at end-of-buffer. Used by music voices
+ * so a one-period waveform sustains until audio_mixer_clear_channel
+ * (i.e. NoteOff) silences it. */
+int audio_mixer_set_channel_loop(audio_mixer_t *mixer,
+                                 size_t idx,
+                                 const uint8_t *samples,
+                                 size_t len,
+                                 uint32_t source_rate_hz,
+                                 uint8_t left_vol,
+                                 uint8_t right_vol);
 
 /* Zero a channel. */
 int audio_mixer_clear_channel(audio_mixer_t *mixer, size_t idx);

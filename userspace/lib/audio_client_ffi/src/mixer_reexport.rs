@@ -22,6 +22,7 @@ static AUDIO_MIXER_KEEPALIVE: AudioMixerSymbols = AudioMixerSymbols {
     new: audio_mixer::ffi::audio_mixer_new,
     drop: audio_mixer::ffi::audio_mixer_drop,
     set_channel: audio_mixer::ffi::audio_mixer_set_channel,
+    set_channel_loop: audio_mixer::ffi::audio_mixer_set_channel_loop,
     clear_channel: audio_mixer::ffi::audio_mixer_clear_channel,
     step: audio_mixer::ffi::audio_mixer_step,
 };
@@ -31,6 +32,15 @@ struct AudioMixerSymbols {
     new: extern "C" fn(usize) -> *mut audio_mixer::Mixer,
     drop: unsafe extern "C" fn(*mut audio_mixer::Mixer),
     set_channel: unsafe extern "C" fn(
+        *mut audio_mixer::Mixer,
+        usize,
+        *const u8,
+        usize,
+        u32,
+        u8,
+        u8,
+    ) -> c_int,
+    set_channel_loop: unsafe extern "C" fn(
         *mut audio_mixer::Mixer,
         usize,
         *const u8,

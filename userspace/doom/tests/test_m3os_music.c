@@ -61,6 +61,14 @@ int audio_mixer_set_channel(audio_mixer_t *m, size_t idx, const uint8_t *s,
     g_channels[idx].set_calls++;
     return 0;
 }
+int audio_mixer_set_channel_loop(audio_mixer_t *m, size_t idx, const uint8_t *s,
+                                 size_t len, uint32_t rate, uint8_t lv,
+                                 uint8_t rv) {
+    /* Music voices reach the mixer via the looping variant; for
+     * test-recording purposes we treat it identically to the
+     * non-looping path. */
+    return audio_mixer_set_channel(m, idx, s, len, rate, lv, rv);
+}
 int audio_mixer_clear_channel(audio_mixer_t *m, size_t idx) {
     (void)m;
     if (idx >= MIXER_CHANNELS) return -1;

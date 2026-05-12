@@ -107,6 +107,48 @@ pub unsafe extern "C" fn audio_mixer_set_channel(
     AUDIO_MIXER_OK
 }
 
+/// Seed channel `idx` with a sample buffer that loops indefinitely
+/// (the cursor wraps modulo `len`). Used by music voices so a
+/// one-period waveform sustains until `audio_mixer_clear_channel`
+/// silences it. Returns `0` on success or a negative error code.
+///
+/// # Safety
+///
+/// Same contract as [`audio_mixer_set_channel`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn audio_mixer_set_channel_loop(
+    mixer: *mut Mixer,
+    idx: usize,
+    samples: *const u8,
+    len: usize,
+    source_rate_hz: u32,
+    left_vol: u8,
+    right_vol: u8,
+) -> c_int {
+    if mixer.is_null() {
+        return AUDIO_MIXER_ERR_NULL_HANDLE;
+    }
+    if samples.is_null() || len == 0 {
+        return AUDIO_MIXER_ERR_EMPTY;
+    }
+    if source_rate_hz == 0 {
+        return AUDIO_MIXER_ERR_INVAL;
+    }
+    // SAFETY: caller upholds that `mixer` is valid.
+    let m = unsafe { &mut *mixer };
+    if idx >= m.channel_count() {
+        return AUDIO_MIXER_ERR_INVAL;
+    }
+    // SAFETY: caller upholds the slice contract.
+    let slice = unsafe { core::slice::from_raw_parts(samples, len) };
+    // SAFETY: re-entering the safe API; the slice contract was just
+    // documented for the caller.
+    unsafe {
+        m.set_channel_loop(idx, slice, source_rate_hz, left_vol, right_vol);
+    }
+    AUDIO_MIXER_OK
+}
+
 /// Zero channel `idx`.
 ///
 /// # Safety
