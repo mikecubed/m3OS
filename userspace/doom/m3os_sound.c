@@ -320,52 +320,39 @@ void m3os_sound_update_inner(void) {
     }
     g_state.doom_tics_processed++;
 #ifndef M3OS_SOUND_HOST_TEST
-    /* Pace music advance against the device's *actual*
-     * consumption rate, not wall-clock. The audio_server's
-     * `frames_consumed` counter tracks samples consumed by DMA.
-     * Query it per Update; advance music only when the device has
-     * consumed at least one tic's worth (1408 frames = 2816
-     * samples) since the last advance. This guarantees music
-     * clock matches audio playback rate regardless of loop
-     * iteration rate or QEMU emulation slowdown.
+    /* Pace music advance via a submit-success interlock. Each
+     * successful submit "earns" one music advance for the next
+     * Update. Because the audio_server's BDL queue is finite and
+     * the device drains it at 48 kHz, successful submits are
+     * naturally throttled to the device's real consumption rate
+     * (~34 Hz given our 1408-frame tic size). Music advance
+     * inherits the same rate, which is what we want — at 34 Hz
+     * advance × 4 MUS ticks per advance = 136 MUS ticks/sec, vs
+     * the 140 Hz native rate (3% slow, below human tempo-perception
+     * threshold).
      *
-     * We must keep submitting on EVERY Update (after the gate) to
-     * keep the BDL queue non-empty — otherwise the device runs out
-     * and `frames_consumed` stops growing (no IRQ during silence),
-     * which would lock the pacer in a permanent skip state.
-     * Submits that happen without a music advance just play
-     * forward the existing mixer state: the mixer cursor keeps
-     * walking the (looping for music, one-shot for SFX) sample
-     * buffers, so the audio is continuous; only the high-level
-     * music-clock events (NoteOn/NoteOff) are throttled to
-     * audio-time. Excess submits while the BDL is full return
-     * WouldBlock and are silently dropped — no harm done. */
+     * This replaced an earlier approach that queried
+     * `audio_ffi_get_stats` every Update. That doubled IPC traffic
+     * to audio_server, which surfaces a pre-existing notification-
+     * bit race in `audio_server::irq::run_io_loop`'s recv path
+     * (see `irq.rs:244-256` — "the AC'97 notification bits
+     * race-drain in `recv_msg_with_notif`, returning `u64::MAX`
+     * repeatedly without blocking"). The race kills audio_server
+     * within seconds; the new interlock avoids it entirely by
+     * pacing purely off submit success, which the SubmitAck reply
+     * already carries.
+     *
+     * Submits that happen without a music advance still produce
+     * continuous audio because the mixer's cursor keeps walking
+     * the looping music-voice buffers — only the high-level
+     * NoteOn/NoteOff timing is throttled. Excess submits while
+     * the BDL is full return WouldBlock and are silently dropped;
+     * music advance is gated to the NEXT successful submit. */
     extern void m3os_music_advance_for_doom_tic(void);
-    static uint64_t s_last_advance_consumed = 0;
-    static int s_started = 0;
-    /* `frames_consumed` from the audio_server is in INDIVIDUAL u16
-     * samples, not stereo frames — for stereo S16LE each frame is 2
-     * samples (L + R). So one tic of audio (1408 frames) consumes
-     * 2816 samples in the audio_server's accounting. */
-    const uint64_t SAMPLES_PER_TIC = (uint64_t)M3OS_PCM_TIC_FRAMES * 2;
-    int should_advance = 0;
-    if (!s_started) {
-        /* First call — always advance to seed the music state.
-         * The first submit fills the BDL so subsequent get_stats
-         * calls can observe real consumption. */
-        should_advance = 1;
-        s_started = 1;
-    } else {
-        m3os_audio_stats_t stats = {0, 0, 0};
-        if (g_state.submitter.get_stats(g_state.handle, &stats) == 0) {
-            if (stats.frames_consumed >= s_last_advance_consumed + SAMPLES_PER_TIC) {
-                should_advance = 1;
-                s_last_advance_consumed += SAMPLES_PER_TIC;
-            }
-        }
-    }
-    if (should_advance) {
+    static int s_pending_advances = 1;
+    if (s_pending_advances > 0) {
         m3os_music_advance_for_doom_tic();
+        s_pending_advances--;
     }
 #endif
     /* Produce one tic's worth of stereo S16LE frames into the scratch
@@ -380,6 +367,14 @@ void m3os_sound_update_inner(void) {
     intptr_t rc = g_state.submitter.submit(g_state.handle, g_state.scratch,
                                             (size_t)produced);
     g_state.submit_call_count++;
+#ifndef M3OS_SOUND_HOST_TEST
+    if (rc >= 0) {
+        /* Pacer interlock: each successful submit earns one music
+         * advance for the next Update. See the long comment in the
+         * pre-mix gate above for the rationale. */
+        s_pending_advances++;
+    }
+#endif
     if (rc < 0) {
         g_state.submit_last_error = (int)rc;
         /* WouldBlock is the only non-fatal submit error. Anything
