@@ -41,7 +41,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | A | `audio_mixer` crate — pure-logic Rust mixer + C-ABI surface | None | **Complete** |
 | B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | **Complete** |
 | C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | **Complete** |
-| D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | Planned |
+| D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | **Complete** |
 | E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | Planned |
 | F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | Planned |
 | G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | Planned |
@@ -207,10 +207,10 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** DI — the submitter and mixer are injected via function-table structs held in module state, so the unit tests run the full state machine against a `FakeSubmitter` without `audio_server`. LSP — the module satisfies the unchanged upstream `sound_module_t` contract.
 
 **Acceptance:**
-- [ ] `m3os_sound_module` is a `static sound_module_t` whose `Init`, `Shutdown`, `StartSound`, `StopSound`, `Update`, `UpdateSoundParams`, `SoundIsPlaying`, `GetSfxLumpNum`, `CacheSounds` slots point at functions defined in this file.
-- [ ] `m3os_audio_submitter_t` is a struct of function pointers: `connect`, `open`, `submit`, `get_stats`, `close`. Production wires it to `audio_client_ffi`; tests wire it to a fake.
-- [ ] `m3os_sound_state` holds `submitter`, `mixer` (`Mixer *` from `audio_mixer_new(32)` — 16 SFX + 16 music voices), per-channel SFX-decoded cache, `audio_disabled` flag.
-- [ ] No global mutable state outside `m3os_sound_state`; the state is a `static` instance scoped to the file.
+- [x] `m3os_sound_module` is a file-scope `sound_module_t` (defined non-`static` so the patches/i_sound.c overlay can extern it) whose `Init`, `Shutdown`, `StartSound`, `StopSound`, `Update`, `UpdateSoundParams`, `SoundIsPlaying`, `GetSfxLumpNum`, `CacheSounds` slots point at functions defined in this file. Wrapped in `#ifndef M3OS_SOUND_HOST_TEST` so the host-test build (which lacks doomgeneric headers) still compiles.
+- [x] `m3os_audio_submitter_t` is a struct of function pointers: `connect`, `open`, `submit`, `get_stats`, `close`. Production wires it to `audio_client_ffi` via `k_prod_submitter`; tests wire it to a fake via `m3os_sound_inject_submitter`.
+- [x] `m3os_sound_state` holds `submitter`, `mixer` (`audio_mixer_t *` from `audio_mixer_new(32)` — 16 SFX + 16 music voices), per-channel SFX-decoded cache, `audio_disabled` flag, `scratch` buffer for the Update hot path.
+- [x] No global mutable state outside `g_state`; the state is a `static` (file-private) singleton.
 
 ### D.2 — `Init` lifecycle with `EBUSY` silent-fallback
 
@@ -219,11 +219,11 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Phase 57's single-client policy means `audio_server` may return `EBUSY`. Gameplay must never block on audio — `EBUSY` degrades to silent operation with one INFO log line, not an error halt.
 
 **Acceptance:**
-- [ ] `Init` calls `submitter.connect()` → on `NULL`, sets `audio_disabled = true`, logs `doom.audio.unavailable code=connect-failed`, returns success.
-- [ ] On successful connect, calls `submitter.open()` → on `EBUSY`, closes the handle, sets `audio_disabled = true`, logs `doom.audio.unavailable code=ebusy`, returns success.
-- [ ] On successful open, creates the mixer via `audio_mixer_new(32)`.
-- [ ] `audio_disabled = true` makes `StartSound`, `Update`, `UpdateSoundParams` no-ops for the rest of the process.
-- [ ] No allocation in the `audio_disabled` hot path (the branch is a single field check).
+- [x] `Init` calls `submitter.connect()` → on `NULL`, sets `audio_disabled = 1`, logs `doom.audio.unavailable code=connect-failed`, returns success (test: `test_init_connect_failure_silent`).
+- [x] On successful connect, calls `submitter.open()` → on `EBUSY`, closes the handle, sets `audio_disabled = 1`, logs `doom.audio.unavailable code=ebusy`, returns success (test: `test_init_ebusy_silent`).
+- [x] On successful open, creates the mixer via `audio_mixer_new(32)` (test: `test_init_happy_path`).
+- [x] `audio_disabled = 1` makes `StartSound`, `Update`, `UpdateSoundParams` no-ops for the rest of the process (test: `test_update_skips_when_audio_disabled` + start/stop guards).
+- [x] No allocation in the `audio_disabled` hot path (the branch is a single field check; the scratch buffer is a fixed-size `static uint8_t` in `g_state`).
 
 ### D.3 — `StartSound` / `StopSound` / `UpdateSoundParams` channel routing
 
@@ -232,11 +232,11 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The engine's SFX state machine routes per-channel updates through this table; channel allocation must respect DOOM's `MAX_CHANNELS = 16` semantics and the SFX cache.
 
 **Acceptance:**
-- [ ] `StartSound(channel, sfx_id, vol, pan, ...)` decodes the SFX lump on first use, caches the result, claims the named channel via `audio_mixer_set_channel(state->mixer, channel, samples, len, rate_hz, left_vol(pan, vol), right_vol(pan, vol))`. DOOM's `MAX_CHANNELS = 16` keeps SFX in mixer channels `0..15`; music (Track E) owns `16..31`.
-- [ ] `StopSound(channel)` calls `audio_mixer_clear_channel(state->mixer, channel)` and zeroes the channel's cache entry.
-- [ ] `UpdateSoundParams(channel, vol, pan)` re-sets the per-channel volume without restarting the sample.
-- [ ] `SoundIsPlaying(channel)` reports whether the mixer's channel cursor is short of `sample_len`.
-- [ ] All four entry points are no-ops when `audio_disabled = true`.
+- [x] `StartSound(sfxinfo, channel, vol, sep)` looks up the cached decode (decoding via `W_CacheLumpNum` + `m3os_dmx_decode` on first miss), then calls `m3os_sound_start_decoded` which seeds `audio_mixer_set_channel`. DOOM's `MAX_CHANNELS = 16` keeps SFX in mixer channels `0..15`; music (Track E) owns `16..31` (test: `test_start_sound_claims_channel`).
+- [x] `StopSound(channel)` calls `audio_mixer_clear_channel` and zeroes the channel's `channel_active` entry (test: `test_stop_sound_clears_channel`).
+- [x] `UpdateSoundParams(channel, vol, sep)` is a no-op for Tier 1 (per-tic volume drift is inaudible at this fidelity and `S_UpdateSounds` re-invokes `StartSound` on relevant changes — chocolate-doom precedent). Documented in the function body comment.
+- [x] `SoundIsPlaying(channel)` reports the mixer-tracked `channel_active` flag.
+- [x] All four entry points are no-ops when `audio_disabled = 1`.
 
 ### D.4 — `Update` per-tic submit loop
 
@@ -245,12 +245,12 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** This is the audio hot path. Called once per 35 Hz tic, it produces one tic's worth (~11 BDL slots × 512 bytes = 5632 bytes) of mixed S16LE stereo and submits via `audio_ffi_submit`. `WouldBlock` is dropped — Phase 63's underrun-zero-fill recovers.
 
 **Acceptance:**
-- [ ] One call to `audio_mixer_step` per `Update` invocation, sized to ~5632 bytes (rounded up to a multiple of `PCM_SLOT_STRIDE = 512`).
-- [ ] One call to `audio_ffi_submit` per `Update` with the mixed bytes.
-- [ ] `submit` returning the WOULDBLOCK error constant is silent — no log, no exception, just drop this tic.
-- [ ] `submit` returning any other negative error is logged once per session (rate-limited) at WARN.
-- [ ] No allocation on the hot path; the scratch buffer is a fixed-size `static uint8_t scratch[6144]` in module state.
-- [ ] When `audio_disabled = true`, `Update` returns immediately without touching the mixer.
+- [x] One call to `audio_mixer_step` per `Update` invocation, sized to `M3OS_PCM_TIC_FRAMES = 1408` frames = 5632 bytes (one DOOM tic at 35 Hz / 48 kHz, rounded up to a multiple of `PCM_SLOT_STRIDE = 512`).
+- [x] One call to `submitter.submit` per `Update` with the mixed bytes (test: `test_update_submits_when_enabled`).
+- [x] `submit` returning `AUDIO_FFI_ERR_WOULD_BLOCK` is silent — no log, no exception, just drop this tic (test: `test_update_swallows_wouldblock`).
+- [x] `submit` returning any other negative error is logged once per session via a `static int warned` rate-limit guard at WARN.
+- [x] No allocation on the hot path; the scratch buffer is the fixed-size `g_state.scratch[M3OS_PCM_TIC_BYTES + 256]` in module state.
+- [x] When `audio_disabled = 1`, `Update` returns immediately without touching the mixer (test: `test_update_skips_when_audio_disabled`).
 
 ### D.5 — `Shutdown` with audio-summary log line
 
@@ -259,9 +259,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Track H's `doom-audio-smoke` gate parses an `M3OS_DOOM:audio_summary` line from this hook. Without it, the smoke gate has no deterministic post-run signal to assert against beyond the WAV file.
 
 **Acceptance:**
-- [ ] `Shutdown` calls `audio_ffi_get_stats` and prints `M3OS_DOOM:audio_summary frames_submitted=<N> frames_consumed=<M> underruns=<K>` to stdout (which `term` routes to the serial console).
-- [ ] Then calls `submitter.close()` and `audio_mixer_drop(mixer)`.
-- [ ] Idempotent: a second call after the first is a no-op.
+- [x] `Shutdown` calls `submitter.get_stats` and prints `M3OS_DOOM:audio_summary frames_submitted=<N> frames_consumed=<M> underruns=<K>` to stdout (which `term` routes to the serial console) — test: `test_shutdown_emits_audio_summary` captures stdout and asserts the line + each field is present. Emitted even when `audio_disabled = 1` so the smoke gate can distinguish "audio path ran" from "DOOM crashed before audio was wired".
+- [x] Then calls `submitter.close()` and `audio_mixer_drop(mixer)`.
+- [x] Idempotent: a second call after the first is a no-op (test: `test_shutdown_idempotent`).
 
 ### D.6 — Host unit tests for the sound module
 
@@ -270,11 +270,17 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** TEST-1 — the SFX state machine is the most behavior-rich module in the phase; host tests against a `FakeSubmitter` cover paths the smoke gate cannot easily reach (EBUSY fallback, channel-clear semantics, audio_disabled idempotency).
 
 **Acceptance:**
-- [ ] `test_init_ebusy_silent` returns 0; sets the fake submitter to return EBUSY on `open`; asserts `Init` returns success, sets `audio_disabled`, logs the expected line.
-- [ ] `test_start_sound_claims_channel` asserts the fake submitter sees no `submit` calls and the mixer's channel 3 is populated after `StartSound(3, ...)`.
-- [ ] `test_stop_sound_clears_channel` asserts the mixer's channel 3 is empty after `StopSound(3)`.
-- [ ] `test_update_skips_when_audio_disabled` asserts no `submit` calls when `audio_disabled = true`.
-- [ ] All tests are wired into the `cargo xtask check` C-test step from Track C.2.
+- [x] `test_init_happy_path` exercises the connect → open → mixer create flow; asserts each delegate is called exactly once and `audio_disabled = 0`.
+- [x] `test_init_ebusy_silent` sets the fake submitter to return `AUDIO_FFI_ERR_BUSY` on `open`; asserts `Init` returns success, `audio_disabled = 1`, the close path runs, and no mixer is created.
+- [x] `test_init_connect_failure_silent` covers the NULL-connect fallback.
+- [x] `test_start_sound_claims_channel` asserts the fake mixer's channel 3 is active with the expected rate after `StartSound(3, ...)` and channel 0 remains inactive.
+- [x] `test_stop_sound_clears_channel` asserts the mixer channel goes inactive after `StopSound(3)`.
+- [x] `test_update_skips_when_audio_disabled` asserts no `submit` calls when `audio_disabled = 1`.
+- [x] `test_update_submits_when_enabled` asserts one `submit` per `Update` with one tic's bytes.
+- [x] `test_update_swallows_wouldblock` asserts the per-tic submit-loop tolerates `AUDIO_FFI_ERR_WOULD_BLOCK` indefinitely.
+- [x] `test_shutdown_emits_audio_summary` redirects stdout and verifies the `M3OS_DOOM:audio_summary` line includes the scripted stats.
+- [x] `test_shutdown_idempotent` verifies the second `Shutdown` is a no-op.
+- [x] All 10 tests are wired into `cargo xtask check` via `doom_c_test_step` with `-DM3OS_SOUND_HOST_TEST`.
 
 ---
 

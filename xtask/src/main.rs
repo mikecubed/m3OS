@@ -3010,16 +3010,21 @@ fn cmd_check() {
     );
 }
 
-/// Phase 63a Track C.2 — compile each DOOM platform-layer C module
-/// against its sibling test driver using the host `cc` (no musl
-/// required) and run the resulting binary. Each test driver returns
-/// non-zero exit on failure; we abort the check on any non-zero.
+/// Phase 63a Track C.2 / D.6 / E.4 — compile each DOOM platform-
+/// layer C module against its sibling test driver using the host
+/// `cc` (no musl required) and run the resulting binary. Each test
+/// driver returns non-zero exit on failure; we abort the check on
+/// any non-zero.
 ///
-/// New `<module>.c` + `tests/test_<module>.c` pairs are added to
-/// `MODULES` and pick up the same compile / run flow with no further
-/// xtask changes.
+/// `MODULES` is a list of `(name, extra-cflags)` so per-module
+/// host-test seams (e.g. `-DM3OS_SOUND_HOST_TEST` to suppress the
+/// doomgeneric adapter block) can be encoded without each driver
+/// needing its own helper function.
 fn doom_c_test_step(root: &std::path::Path) {
-    const MODULES: &[&str] = &["m3os_dmx"];
+    const MODULES: &[(&str, &[&str])] = &[
+        ("m3os_dmx", &[]),
+        ("m3os_sound", &["-DM3OS_SOUND_HOST_TEST"]),
+    ];
     let doom_dir = root.join("userspace/doom");
     let tests_dir = doom_dir.join("tests");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
@@ -3028,7 +3033,7 @@ fn doom_c_test_step(root: &std::path::Path) {
         eprintln!("doom_c_test_step: create_dir_all {scratch:?}: {e}");
         std::process::exit(1);
     }
-    for module in MODULES {
+    for (module, extra_cflags) in MODULES {
         let c_src = doom_dir.join(format!("{module}.c"));
         let test_src = tests_dir.join(format!("test_{module}.c"));
         if !c_src.exists() || !test_src.exists() {
@@ -3040,15 +3045,16 @@ fn doom_c_test_step(root: &std::path::Path) {
             std::process::exit(1);
         }
         let bin = scratch.join(format!("test_{module}"));
-        let status = Command::new(&cc)
-            .arg("-Wall")
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-Wall")
             .arg("-Wextra")
             .arg("-pedantic")
-            .arg("-std=c11")
-            .arg("-o")
-            .arg(&bin)
-            .arg(&c_src)
-            .arg(&test_src)
+            .arg("-std=c11");
+        for flag in *extra_cflags {
+            cmd.arg(flag);
+        }
+        cmd.arg("-o").arg(&bin).arg(&c_src).arg(&test_src);
+        let status = cmd
             .status()
             .unwrap_or_else(|e| panic!("doom_c_test_step: spawn cc: {e}"));
         if !status.success() {
