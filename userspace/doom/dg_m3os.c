@@ -174,13 +174,38 @@ void DG_DrawFrame(void)
 
     /* Phase 63a Track G.4 — one-shot serial marker so the
      * doom-audio-smoke gate has a deterministic "DOOM is past
-     * init" signal before it sends keystrokes. Gated by a static
-     * flag flipped on the first invocation. */
+     * init" signal. Gated by a static flag flipped on the first
+     * invocation.
+     *
+     * Phase 63a Track H — `/tmp/doom-autoquit-tics` is a smoke-gate
+     * seam: the doom-audio-smoke harness writes the desired tic
+     * budget into that file before launching DOOM, and we read it
+     * once at title-ready time. When the tic counter crosses the
+     * budget we call `I_Quit()` so the engine's normal Shutdown
+     * runs (which fires `m3os_sound_shutdown_inner` and emits the
+     * `M3OS_DOOM:audio_summary` line the gate parses). DOOM running
+     * under a user — `/tmp/doom-autoquit-tics` absent — sees no
+     * behavioural change. */
     static int title_ready_printed = 0;
+    static int s_autoquit_tics = -1;
+    static int s_tic_counter = 0;
     if (!title_ready_printed) {
         title_ready_printed = 1;
         printf("M3OS_DOOM:title_ready\n");
         fflush(stdout);
+        FILE *f = fopen("/tmp/doom-autoquit-tics", "r");
+        if (f) {
+            int n;
+            if (fscanf(f, "%d", &n) == 1 && n > 0) {
+                s_autoquit_tics = n;
+            }
+            fclose(f);
+        }
+    }
+    s_tic_counter++;
+    if (s_autoquit_tics > 0 && s_tic_counter >= s_autoquit_tics) {
+        extern void I_Quit(void);
+        I_Quit();
     }
 
     const uint32_t fb_pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per FB row */

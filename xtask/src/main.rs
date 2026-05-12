@@ -351,6 +351,20 @@ fn main() {
                 });
             cmd_bell_smoke(&smoke_args);
         }
+        // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
+        // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
+        // an auto-quit budget so the engine's Shutdown emits the
+        // `M3OS_DOOM:audio_summary` line, then asserts the recorded
+        // WAV is non-silent.
+        Some("doom-audio-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("doom-audio-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_doom_audio_smoke(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -404,7 +418,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -7290,6 +7304,180 @@ fn cmd_bell_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_BELL_SMOKE_FAILED);
         }
     }
+}
+
+/// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
+const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 65;
+
+/// Phase 63a Track H — boots m3OS with the WAV AC'97 backend, runs
+/// `/bin/doom -warp 1 1`, waits for the `M3OS_DOOM:audio_summary`
+/// line emitted by `m3os_sound_shutdown_inner`, asserts
+/// `frames_consumed > 0`, then verifies the recorded WAV is
+/// non-silent.
+///
+/// Keystroke injection (the in-game pistol fire + quit sequence the
+/// design doc described) requires QEMU monitor / sendkey
+/// infrastructure that this xtask doesn't yet have — DOOM reads
+/// PS/2 scancodes via `sys_read_scancode`, not serial stdin, so the
+/// usual `SmokeStep::Send` path doesn't reach the engine. Instead
+/// the harness sets up an auto-quit budget via the
+/// `/tmp/doom-autoquit-tics` seam in `dg_m3os.c`: at the configured
+/// tic limit (a few seconds at 35 Hz) DOOM calls `I_Quit()`, which
+/// runs every Shutdown handler — including
+/// `m3os_sound_shutdown_inner` — exactly as a user-initiated quit
+/// would. The `DSPPISTOL` SFX submission noted in the design doc is
+/// replaced by Tier 2a title-music output as the audible signal;
+/// the WAV non-silent check covers both equally.
+fn cmd_doom_audio_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let smoke_dir = prepare_audio_smoke_dir();
+    let wav_path = smoke_dir.join("doom-audio.wav");
+
+    let ovmf = find_ovmf();
+    let qemu_args = doom_audio_smoke_qemu_args(&wav_path, &uefi_image, &ovmf, args.display);
+    let steps = doom_audio_smoke_steps();
+
+    println!(
+        "doom-audio-smoke: launching QEMU with AC'97 WAV backend (timeout {}s)",
+        args.timeout_secs
+    );
+    println!("doom-audio-smoke: WAV output → {}", wav_path.display());
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "doom-audio-smoke: serial script PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("doom-audio-smoke: timeout waiting for audio_summary\n{msg}");
+            std::process::exit(SMOKE_EXIT_DOOM_AUDIO_FAILED);
+        }
+    }
+
+    // Post-QEMU WAV non-silent check — same shape as audio-smoke.
+    match assert_wav_non_silent(&wav_path) {
+        Ok(()) => {
+            println!("doom-audio-smoke: WAV non-silent check PASSED");
+        }
+        Err(msg) => {
+            eprintln!("doom-audio-smoke: WAV is silent\n{msg}");
+            std::process::exit(SMOKE_EXIT_WAV_SILENT);
+        }
+    }
+}
+
+/// Phase 63a Track H — QEMU args for the doom-audio-smoke gate.
+/// Mirrors `audio_smoke_qemu_args` but writes to `doom-audio.wav`.
+fn doom_audio_smoke_qemu_args(
+    wav_path: &Path,
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        format!("wav,id=snd0,path={}", wav_path.display()),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+    qemu_args
+}
+
+/// Phase 63a Track H — serial step list for the doom-audio-smoke gate.
+fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/doom-audio: kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "init: loaded service 'audio_server'",
+            timeout_secs: 90,
+            label: "guest/doom-audio: init loaded audio_server.conf",
+        },
+    ];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // Write the autoquit budget so DOOM exits cleanly after N tics
+    // (≈ N/35 seconds). 300 tics ≈ 8.5 s gives the synth time to
+    // produce audible Tier 2a music + any auto-played SFX, and well
+    // within the 90-second per-step budget.
+    steps.push(SmokeStep::Send {
+        input: "echo 300 > /tmp/doom-autoquit-tics\n",
+        label: "guest/doom-audio: install autoquit budget",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    // Phase 57d follow-up — `fb-takeover` yields the framebuffer
+    // from display_server, runs DOOM, then reclaims on exit. DOOM
+    // can't `sys_fb_acquire` directly while display_server holds
+    // the framebuffer (-EBUSY), so the wrapper is mandatory for
+    // any post-Phase-56 boot.
+    steps.push(SmokeStep::Send {
+        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        label: "guest/doom-audio: launch DOOM via fb-takeover into E1M1",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-audio: title_ready marker",
+    });
+    // Wait for the audio_summary line emitted by m3os_sound_shutdown.
+    // We use WaitLineNotMatching so a zero-consumed count fails
+    // immediately rather than wasting the timeout budget.
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "M3OS_DOOM:audio_summary frames_submitted=",
+        bad_substring: "frames_consumed=0 ",
+        timeout_secs: 60,
+        label: "guest/doom-audio: audio_summary frames_consumed > 0",
+    });
+    steps
 }
 
 fn cmd_fmt(fix: bool) {

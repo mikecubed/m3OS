@@ -45,7 +45,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | **Complete** |
 | F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | **Complete** |
 | G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | **Complete** |
-| H | `cargo xtask doom-audio-smoke` gate — scripted SFX trigger → non-silent WAV | G | Planned |
+| H | `cargo xtask doom-audio-smoke` gate — scripted SFX trigger → non-silent WAV | G | **Complete** |
 | I | Stream-leak resilience verification | H | Planned |
 | J | Kernel patch bump, README/AGENTS update, memo retire, design-doc closure | I | Planned |
 
@@ -407,16 +407,15 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** A deterministic CI gate that asserts DOOM produces audible output. Mirrors Phase 63's `cmd_audio_smoke` shape; reuses the WAV `audiodev` backend.
 
 **Acceptance:**
-- [ ] New subcommand `doom-audio-smoke` parses CLI args; defaults to a 90-second timeout.
-- [ ] Boots QEMU with `-audiodev wav,id=snd0,path=<smoke_dir>/doom_audio.wav` and the existing `-device AC97,audiodev=snd0,addr=0x5`.
-- [ ] Waits for `term` to register on the serial console.
-- [ ] Sends `/bin/doom -warp 1 1\n` to the serial console. The `-warp 1 1` flag skips the title-screen menu and enters Episode 1 Map 1 directly, eliminating menu-navigation timing fragility.
-- [ ] Waits for the `M3OS_DOOM:title_ready` marker emitted by `dg_m3os.c::DG_DrawFrame` (see Track G.4).
-- [ ] Sends one `Ctrl` keystroke (DOOM's default "fire" key). The player spawns holding a pistol in E1M1, so a single `Ctrl` discharges it and produces one `DSPPISTOL` SFX submission through the mixer.
-- [ ] Sends the DOOM exit sequence: `Esc` (open in-game menu) → `Q` (Quit Game) → `Y` (confirm). DOOM's quit path calls `m3os_sound_module.Shutdown` (Track D.5) which prints `M3OS_DOOM:audio_summary frames_submitted=<N> frames_consumed=<M> underruns=<K>`.
-- [ ] Waits up to 5 s for `M3OS_DOOM:audio_summary frames_consumed=[1-9]\d*` on the serial console; timeout or `frames_consumed=0` is a failure.
-- [ ] Post-QEMU step: opens `<smoke_dir>/doom_audio.wav`, asserts ≥ 5 % of S16LE samples have absolute value > 256.
-- [ ] Three distinct failure modes produce three distinct error messages: `doom-audio-smoke: timeout waiting for audio_summary`, `doom-audio-smoke: frames_consumed=0`, `doom-audio-smoke: WAV is silent`.
+- [x] New subcommand `doom-audio-smoke` parses CLI args via the shared `parse_smoke_boot_args` helper (defaults to the same per-step timeouts the other smoke gates use; the overall budget is 120 s in the pre-push wiring).
+- [x] Boots QEMU with `-audiodev wav,id=snd0,path=<smoke_dir>/doom-audio.wav` and the existing `-device AC97,audiodev=snd0,addr=0x5`.
+- [x] Waits for kernel boot + `init: loaded service 'audio_server'` + login (`boot_and_login_steps`).
+- [x] Writes `300` to `/tmp/doom-autoquit-tics` so the in-engine autoquit seam in `dg_m3os.c::DG_DrawFrame` fires `I_Quit()` after ~8.5 seconds of gameplay. The keystroke-injection path the design doc described (Ctrl → Esc → Q → Y) requires QEMU monitor / `sendkey` infrastructure that this xtask doesn't yet have because DOOM reads PS/2 scancodes via `sys_read_scancode`, not serial stdin. The autoquit seam replaces it: same end-state (engine Shutdown runs, `m3os_sound_shutdown_inner` prints `M3OS_DOOM:audio_summary`), simpler harness.
+- [x] Sends `/bin/doom -warp 1 1\n` to the serial console. The `-warp 1 1` flag skips the title-screen menu and enters Episode 1 Map 1 directly, eliminating menu-navigation timing fragility.
+- [x] Waits for the `M3OS_DOOM:title_ready` marker emitted by `dg_m3os.c::DG_DrawFrame` (see Track G.4).
+- [x] Waits for `M3OS_DOOM:audio_summary frames_submitted=...` and asserts the line does *not* contain `frames_consumed=0 ` via `SmokeStep::WaitLineNotMatching`. A zero count proves the DMA engine never advanced the BDL — the audio-server-side regression Phase 63 Track A.2 already guards.
+- [x] Post-QEMU step: opens `<smoke_dir>/doom-audio.wav`, asserts non-silence via the existing `assert_wav_non_silent` helper (same threshold the audio-smoke gate uses).
+- [x] Three distinct failure modes produce three distinct error messages: `doom-audio-smoke: timeout waiting for audio_summary` (script timeout, exit code `SMOKE_EXIT_DOOM_AUDIO_FAILED`), `frames_consumed=0 ` substring inside the audio_summary line (same exit code), and `doom-audio-smoke: WAV is silent` (exit code `SMOKE_EXIT_WAV_SILENT`).
 
 ### H.2 — Wire `doom-audio-smoke` into the pre-push gate set
 
@@ -425,9 +424,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Phase 63's `audio-smoke` is *not* in `cmd_check` (which stays QEMU-free); it runs as a pre-push gate. 63a follows the same placement: `cmd_check` stays fast and headless-host-only, while QEMU-driven gates (`audio-smoke`, `bell-smoke`, `doom-audio-smoke`) run in the pre-push hook alongside `smoke-test` and `regression`.
 
 **Acceptance:**
-- [ ] `.githooks/pre-push` invokes `cargo xtask doom-audio-smoke` after the existing `cargo xtask audio-smoke` / `bell-smoke` calls (or via the `M3OS_*_REGRESSION=1` env-var gating pattern those gates already use).
-- [ ] `AGENTS.md` First-Time Setup section lists `doom-audio-smoke` in the same paragraph that already names `smoke-test`, `regression`, and `ssh-e1000-banner-check` as pre-push gates.
-- [ ] `cmd_check` is *not* modified — keeping it QEMU-free is a deliberate parallel to Phase 63's gate placement.
+- [x] `.githooks/pre-push` invokes `cargo xtask doom-audio-smoke --timeout 120` gated by `M3OS_DOOM_AUDIO_REGRESSION=1`, mirroring the `M3OS_E1000_REGRESSION=1` pattern. The gate is off-by-default because the gate adds ~30 s of wall-clock + a DOOM rebuild (~5 s if cached, 30+ s if not); branches that touch DOOM / audio code should set the env var.
+- [x] `AGENTS.md` First-Time Setup section lists `doom-audio-smoke` alongside `ssh-e1000-banner-check` as an env-gated pre-push regression.
+- [x] `cmd_check` is *not* modified — keeping it QEMU-free is a deliberate parallel to Phase 63's gate placement.
 
 ---
 
