@@ -3145,10 +3145,11 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Phase 63a Track C.2 — host-side C unit tests for the DOOM
-    // platform-layer modules (m3os_dmx today; m3os_sound / m3os_music
-    // join later). These compile with the host `cc` and run before
-    // QEMU so a regression fails CI without a full kernel boot.
+    // Phase 63a Track C.2 / D.6 / E.4 — host-side C unit tests for
+    // the DOOM platform-layer modules (m3os_dmx, m3os_sound, and
+    // m3os_music — `doom_c_test_step` runs all three). These compile
+    // with the host `cc` and run before QEMU so a regression fails
+    // CI without a full kernel boot.
     doom_c_test_step(&root);
 
     println!(

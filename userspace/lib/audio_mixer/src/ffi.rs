@@ -216,13 +216,21 @@ pub unsafe extern "C" fn audio_mixer_step(
     if out.is_null() {
         return AUDIO_MIXER_ERR_EMPTY as isize;
     }
-    let needed = frames.saturating_mul(crate::BYTES_PER_FRAME);
+    // Mirror `Mixer::step`'s overflow path: `checked_mul` rather than
+    // `saturating_mul` so a wraparound surfaces as a distinct error
+    // code instead of silently widening into the buffer-too-small
+    // branch.
+    let Some(needed) = frames.checked_mul(crate::BYTES_PER_FRAME) else {
+        return AUDIO_MIXER_ERR_INVAL as isize;
+    };
     if byte_capacity < needed {
         return AUDIO_MIXER_ERR_OUTPUT_TOO_SMALL as isize;
     }
     // SAFETY: caller upholds validity / writability.
     let m = unsafe { &mut *mixer };
-    let slice = unsafe { core::slice::from_raw_parts_mut(out, byte_capacity) };
+    // Hand `Mixer::step` only the region it will actually write
+    // (`needed` bytes), not the full caller-declared capacity.
+    let slice = unsafe { core::slice::from_raw_parts_mut(out, needed) };
     let written = m.step(slice, frames);
     written as isize
 }

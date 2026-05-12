@@ -146,7 +146,9 @@ pub mod test_support {
 
     /// Adapter that turns any [`FakeAudioSocket`] implementor into a
     /// type that satisfies the crate-private [`super::AudioSocket`]
-    /// trait. Wraps the user's fake by reference.
+    /// trait. Stores the user's fake by value — ownership transfers
+    /// into the adapter (and through it into the constructed
+    /// `AudioClient`).
     pub struct FakeSocketAdapter<T: FakeAudioSocket>(pub T);
 
     impl<T: FakeAudioSocket> super::AudioSocket for FakeSocketAdapter<T> {
