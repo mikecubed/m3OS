@@ -62,6 +62,13 @@ struct m3os_sound_state {
     /* Scratch buffer the Update hot path mixes into. Sized for one
      * tic; `static` storage keeps the hot path allocation-free. */
     uint8_t scratch[M3OS_PCM_TIC_BYTES + 256];
+    /* Diagnostic counters reported in the audio_summary line.
+     * `doom_tics_processed` increments per `Update` call (each tic
+     * mixes one tic of audio); a healthy session shows this matching
+     * the configured `/tmp/doom-autoquit-tics` budget. Divergence
+     * means I_UpdateSound is being called more or less often than
+     * once per game tic, which would explain music tempo issues. */
+    uint32_t doom_tics_processed;
     /* Diagnostics — only inspected by tests. */
     size_t submit_call_count;
     int submit_last_error;
@@ -199,12 +206,32 @@ void m3os_sound_shutdown_inner(void) {
     if (!g_state.audio_disabled && g_state.handle != NULL) {
         (void)g_state.submitter.get_stats(g_state.handle, &stats);
     }
+    /* Diagnostic counters from the music engine; declared extern to
+     * avoid a header round-trip. Compiled out of the host-test build
+     * because the test driver doesn't link m3os_music. */
+#ifndef M3OS_SOUND_HOST_TEST
+    extern uint32_t m3os_music_diag_mus_ticks(void);
+    extern uint32_t m3os_music_diag_note_ons(void);
+    extern uint32_t m3os_music_diag_drum_hits(void);
+    uint32_t mus_ticks = m3os_music_diag_mus_ticks();
+    uint32_t note_ons = m3os_music_diag_note_ons();
+    uint32_t drum_hits = m3os_music_diag_drum_hits();
+#else
+    uint32_t mus_ticks = 0;
+    uint32_t note_ons = 0;
+    uint32_t drum_hits = 0;
+#endif
     fprintf(stdout,
             "M3OS_DOOM:audio_summary frames_submitted=%llu "
-            "frames_consumed=%llu underruns=%u\n",
+            "frames_consumed=%llu underruns=%u doom_tics=%u "
+            "mus_ticks=%u note_ons=%u drum_hits=%u\n",
             (unsigned long long)stats.frames_submitted,
             (unsigned long long)stats.frames_consumed,
-            stats.underrun_count);
+            stats.underrun_count,
+            g_state.doom_tics_processed,
+            mus_ticks,
+            note_ons,
+            drum_hits);
     fflush(stdout);
 
     if (g_state.handle != NULL) {
@@ -291,12 +318,55 @@ void m3os_sound_update_inner(void) {
     if (g_state.audio_disabled || g_state.mixer == NULL) {
         return;
     }
+    g_state.doom_tics_processed++;
 #ifndef M3OS_SOUND_HOST_TEST
-    /* Advance the music tick scheduler at MUS-native 140 Hz (4 ticks
-     * per DOOM tic). Done before audio_mixer_step so any voice
-     * claims / releases this tic are reflected in the mix. */
+    /* Pace music advance against the device's *actual*
+     * consumption rate, not wall-clock. The audio_server's
+     * `frames_consumed` counter tracks samples consumed by DMA.
+     * Query it per Update; advance music only when the device has
+     * consumed at least one tic's worth (1408 frames = 2816
+     * samples) since the last advance. This guarantees music
+     * clock matches audio playback rate regardless of loop
+     * iteration rate or QEMU emulation slowdown.
+     *
+     * We must keep submitting on EVERY Update (after the gate) to
+     * keep the BDL queue non-empty — otherwise the device runs out
+     * and `frames_consumed` stops growing (no IRQ during silence),
+     * which would lock the pacer in a permanent skip state.
+     * Submits that happen without a music advance just play
+     * forward the existing mixer state: the mixer cursor keeps
+     * walking the (looping for music, one-shot for SFX) sample
+     * buffers, so the audio is continuous; only the high-level
+     * music-clock events (NoteOn/NoteOff) are throttled to
+     * audio-time. Excess submits while the BDL is full return
+     * WouldBlock and are silently dropped — no harm done. */
     extern void m3os_music_advance_for_doom_tic(void);
-    m3os_music_advance_for_doom_tic();
+    static uint64_t s_last_advance_consumed = 0;
+    static int s_started = 0;
+    /* `frames_consumed` from the audio_server is in INDIVIDUAL u16
+     * samples, not stereo frames — for stereo S16LE each frame is 2
+     * samples (L + R). So one tic of audio (1408 frames) consumes
+     * 2816 samples in the audio_server's accounting. */
+    const uint64_t SAMPLES_PER_TIC = (uint64_t)M3OS_PCM_TIC_FRAMES * 2;
+    int should_advance = 0;
+    if (!s_started) {
+        /* First call — always advance to seed the music state.
+         * The first submit fills the BDL so subsequent get_stats
+         * calls can observe real consumption. */
+        should_advance = 1;
+        s_started = 1;
+    } else {
+        m3os_audio_stats_t stats = {0, 0, 0};
+        if (g_state.submitter.get_stats(g_state.handle, &stats) == 0) {
+            if (stats.frames_consumed >= s_last_advance_consumed + SAMPLES_PER_TIC) {
+                should_advance = 1;
+                s_last_advance_consumed += SAMPLES_PER_TIC;
+            }
+        }
+    }
+    if (should_advance) {
+        m3os_music_advance_for_doom_tic();
+    }
 #endif
     /* Produce one tic's worth of stereo S16LE frames into the scratch
      * buffer, then submit. WouldBlock is silently dropped — Phase 63's

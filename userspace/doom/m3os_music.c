@@ -103,6 +103,18 @@ void m3os_music_set_mixer_accessor(audio_mixer_t *(*fn)(void)) {
     g_mixer_accessor = fn;
 }
 
+/* Diagnostic counters surfaced through the audio_summary line in
+ * m3os_sound_shutdown_inner. See the field comment in
+ * m3os_sound.c::m3os_sound_state.doom_tics_processed for what each
+ * means and what the expected ratios are. */
+static uint32_t g_mus_ticks_dispatched = 0;
+static uint32_t g_note_ons_dispatched = 0;
+static uint32_t g_drum_hits_dispatched = 0;
+
+uint32_t m3os_music_diag_mus_ticks(void) { return g_mus_ticks_dispatched; }
+uint32_t m3os_music_diag_note_ons(void) { return g_note_ons_dispatched; }
+uint32_t m3os_music_diag_drum_hits(void) { return g_drum_hits_dispatched; }
+
 /* MIDI note → frequency (Hz). A4 = 69 = 440 Hz. Returns integer Hz
  * (Tier 2a precision is fine; the resampler interpolates). */
 static uint32_t midi_to_freq_hz(int note) {
@@ -581,10 +593,12 @@ static int dispatch_event(m3os_mus_state_t *state) {
              * one-shot voice from the drum pool. Body bytes already
              * consumed; ReleaseNote is a no-op for drums. */
             if (velocity < 0) velocity = 127;
+            g_drum_hits_dispatched++;
             play_drum(note, velocity);
             break;
         }
         if (velocity < 0) velocity = 127; /* sustain previous velocity */
+        g_note_ons_dispatched++;
         int v = claim_voice(state, channel, note, velocity);
         if (v >= 0) {
             seed_voice_in_mixer(state, v);
@@ -626,6 +640,7 @@ int m3os_music_tick(m3os_mus_state_t *state) {
     if (state == NULL || state->finished) {
         return state ? (state->finished ? 1 : 0) : 0;
     }
+    g_mus_ticks_dispatched++;
     if (state->tick_remaining > 0) {
         state->tick_remaining--;
         return 0;
