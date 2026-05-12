@@ -3024,6 +3024,7 @@ fn doom_c_test_step(root: &std::path::Path) {
     const MODULES: &[(&str, &[&str])] = &[
         ("m3os_dmx", &[]),
         ("m3os_sound", &["-DM3OS_SOUND_HOST_TEST"]),
+        ("m3os_music", &["-DM3OS_SOUND_HOST_TEST"]),
     ];
     let doom_dir = root.join("userspace/doom");
     let tests_dir = doom_dir.join("tests");

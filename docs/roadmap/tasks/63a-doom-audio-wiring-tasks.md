@@ -42,7 +42,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | **Complete** |
 | C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | **Complete** |
 | D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | **Complete** |
-| E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | Planned |
+| E | `m3os_music.c` — `music_module_t` Tier 2a MUS synth feeding the mixer | A, D | **Complete** |
 | F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | Planned |
 | G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | Planned |
 | H | `cargo xtask doom-audio-smoke` gate — scripted SFX trigger → non-silent WAV | G | Planned |
@@ -293,10 +293,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** MUS is a compact MIDI-like format. The parser walks the event stream at the song's native 140 Hz tickrate, dispatching NoteOn / NoteOff / Controller / PitchBend / SystemEvent events.
 
 **Acceptance:**
-- [ ] `m3os_mus_parse_header(lump, lump_len)` validates the MUS magic (`MUS\x1a`), reads the score-start offset, returns a `m3os_mus_state` or `NULL` on malformed input.
-- [ ] `m3os_mus_dispatch_next_event(state)` advances the event cursor and dispatches one event to the synth.
-- [ ] `m3os_music_tick(state)` is invoked from `m3os_sound::Update` (single-submit-path invariant); processes one MUS tick worth of events.
-- [ ] Host C unit test covers: valid header parse, magic rejection, NoteOn → NoteOff flow, ScoreEnd handling.
+- [x] `m3os_mus_parse_header(lump, lump_len)` validates the MUS magic (`MUS\x1a`), reads the score-start offset, range-checks `score_offset + score_len <= lump_len`, returns a heap `m3os_mus_state_t *` or `NULL` on malformed input.
+- [x] `m3os_music_tick(state)` is invoked from `m3os_sound::Update` (via `m3os_music_advance_for_doom_tic` running 4 ticks per DOOM tic, so MUS clocks at its native 140 Hz). Processes events until the next "last in group" flag fires, reads the trailing varint delay, and pauses for that many ticks. Returns 1 on ScoreEnd, 0 otherwise.
+- [x] Host C unit tests (7 total in `tests/test_m3os_music.c`) cover: valid header parse, bad-magic rejection, score-range overflow, NoteOn → NoteOff round-trip, ScoreEnd termination, master-volume scaling, stop-all clear.
 
 ### E.2 — Square + triangle voice synth feeding the shared mixer
 
@@ -305,10 +304,10 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Voices feed the same `Mixer` instance as SFX (channels 16..32 in a 32-channel mixer) so there's exactly one mix path and one submit path — no parallel music submit loop to keep in sync.
 
 **Acceptance:**
-- [ ] `m3os_synth_voice_t` holds `phase` (16.16 fixed-point), `phase_inc` (derived from MIDI note number), `waveform` (square or triangle), `note_active`.
-- [ ] `m3os_synth_note_on(voice_idx, note_number, velocity)` claims voice and seeds the mixer channel via `audio_mixer_set_channel(16 + voice_idx, generated_wave_buffer, ...)`.
-- [ ] `m3os_synth_note_off(voice_idx)` clears the mixer channel via `audio_mixer_clear_channel`.
-- [ ] Waveform selection is per-MUS-instrument-number: instruments 1..63 use square, 64..127 use triangle (Tier 2a is intentionally crude).
+- [x] `m3os_voice_t` holds `channel`, `note`, `velocity`, `waveform`, `active` — the resampler's cursor is owned by the mixer, so the synth voice does not duplicate it. (Per design-doc Tier 2a clarification, the mixer's 16.16 cursor is the source of truth.)
+- [x] On PlayNote: `claim_voice` seeds the per-voice waveform buffer on first use and `seed_voice_in_mixer` calls `audio_mixer_set_channel(M3OS_MUSIC_CHANNEL_BASE + voice_idx, voice_buf, ...)`.
+- [x] On ReleaseNote: `release_voice` clears the matching voice and calls `audio_mixer_clear_channel`.
+- [x] Tier 2a waveform selection: even MUS channels use square, odd channels use triangle — Tier 2a doesn't track Controller(0)=patch events so we use channel-id parity as the cheapest proxy. Documented inline as a deliberate Tier 2a simplification.
 
 ### E.3 — `music_module_t` table + MIDI fallthrough
 
@@ -317,12 +316,12 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** LSP — the table satisfies the unchanged upstream `music_module_t` contract; the engine treats `m3os_music_module` interchangeably with any other music back-end.
 
 **Acceptance:**
-- [ ] `RegisterSong(lump, lump_len)` detects MIDI vs MUS via magic-byte check; for MIDI, calls a thin MIDI → MUS conversion routine; returns an opaque handle.
-- [ ] `PlaySong(handle, looping)` starts the synth's MUS tick scheduler on the next `Poll`.
-- [ ] `StopSong()` clears all 16 voice channels via `audio_mixer_clear_channel(16..32)`.
-- [ ] `SetMusicVolume(vol)` scales the per-voice volume passed to `audio_mixer_set_channel`.
-- [ ] `Poll()` is a no-op — music ticks are driven from `m3os_sound::Update` to keep one submit cadence.
-- [ ] `MusicIsPlaying()` reports whether any voice is `note_active`.
+- [x] `RegisterSong(data, len)` detects MUS via magic-byte check (`MUS\x1a`). MIDI fallthrough is **deferred**: the function returns `NULL` for non-MUS data and the engine silently skips music. Tier 2b SoundFont synth (or a MIDI converter) is the right phase for that work — pinned in the "Deferred Until Later" section of the design doc.
+- [x] `PlaySong(handle, looping)` stores the song + loop flag for `m3os_music_advance_for_doom_tic` to drive.
+- [x] `StopSong()` calls `m3os_music_stop_all_inner` which iterates all active voices and clears each via `audio_mixer_clear_channel`.
+- [x] `SetMusicVolume(vol)` clamps to 0..127 and stores as `g_master_volume`; the next NoteOn's seeded volume scales by `(master * velocity) / 127`.
+- [x] `Poll()` is a no-op — music ticks are driven from `m3os_sound::Update` via `m3os_music_advance_for_doom_tic` to keep one submit cadence.
+- [x] `MusicIsPlaying()` returns true while the current song is non-null and not finished.
 
 ### E.4 — Host unit tests for the music module
 
@@ -331,7 +330,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** TEST-1 — the MUS state machine is the second-most behavior-rich module; host tests cover paths the smoke gate cannot reach (malformed-MUS rejection, voice-volume scaling, looping).
 
 **Acceptance:**
-- [ ] All four tests pass under the Track C.2 C-test step.
+- [x] 7 tests pass under the Track C.2 C-test step (`m3os_music` added to xtask's `MODULES` list with `-DM3OS_SOUND_HOST_TEST`).
 
 ---
 
