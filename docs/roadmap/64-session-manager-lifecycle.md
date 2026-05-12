@@ -31,11 +31,11 @@ This phase exists to make `session_manager`'s supervisory behavior real, not sim
 
 ### `stop()` — SIGTERM with grace period then SIGKILL
 
-`stop()` sends SIGTERM to the child PID, sets a 5-second timer, and then calls `sys_waitpid` in a loop. If the child has not exited by the timer expiry, `stop()` sends SIGKILL and waits again. The call does not reply `Ack` until `sys_waitpid` confirms the exit.
+`stop()` sends SIGTERM to the child PID, sets a 5-second timer (`SIGTERM_GRACE_MS = 5000`), and then polls `sys_waitpid(pid, ..., WNOHANG)` on each event-loop tick (driven by the SIGCHLD `Notification` and a periodic wake-up). The lifecycle method is implemented as a state machine across event-loop iterations — `session_manager` continues to service other IPC during the grace window. If the child has not exited by deadline, `stop()` transitions to `SentKill`, sends SIGKILL, and reaps within a 1-second bound (`SIGKILL_REAP_MS = 1000`). The IPC reply is deferred until the state machine reaches `Reaped`.
 
 ### `restart()` — chained stop + start with restart-budget enforcement
 
-`restart()` calls `stop()`, then `start()`. Each service has a restart budget of 3 retries per step (stop failure, start failure) and 3 steady-state restarts. Exceeding either budget transitions the service to `Failed` state and triggers the `text-fallback` recovery path if the failed service is display-critical.
+`restart()` calls `stop()`, then `start()`. Each service has a restart budget of `MAX_RETRIES_PER_STEP` (3) per step (stop failure, start failure) and `MAX_RESTART_COUNT` (3) steady-state restarts. Both constants live in `kernel_core::session::` (the existing `MAX_RETRIES_PER_STEP` is reused; `MAX_RESTART_COUNT` is added in the same module). Exceeding either budget transitions the service to `Failed` state and, if the failed service is in `DISPLAY_CRITICAL_SERVICES` (`display_server`, `kbd_server`, `mouse_server`), invokes `recover::run_text_fallback`.
 
 ### Text-fallback motion actually drops display-server children
 
@@ -49,7 +49,9 @@ The `session-state` subcommand queries `session_manager` for the per-service `Se
 
 ### `userspace/session_manager/src/table.rs` (new)
 
-A `ServiceTable` mapping service names to `ServiceEntry { pid: Option<Pid>, state: ServiceState, restart_count: u32 }`. Updated atomically within the single-threaded `session_manager` event loop. The table is the single source of truth for `m3ctl session-state`.
+A `ServiceTable` mapping service names to `ServiceEntry { pid: Option<Pid>, state: ServiceState, restart_count: u32, step_failures: u32 }`. Updated atomically within the single-threaded `session_manager` event loop. The table is the single source of truth for `m3ctl session-state`.
+
+`ServiceState` is **per-child** (`Starting`, `Running`, `Stopping`, `Restarting`, `Failed`) and is orthogonal to the pre-existing `kernel_core::session::SessionState` (`Booting`, `Running`, `Recovering`, `TextFallback`), which describes the graphical session as a whole. Both types coexist; implementers must not collapse them.
 
 ### `userspace/session_manager/src/lifecycle.rs` (new)
 
@@ -72,7 +74,7 @@ Queries the `session_manager` control socket and prints the `ServiceState` for e
 
 ## Implementation Outline
 
-Apply TDD: write host-side unit tests for `ServiceTable` state transitions, the SIGTERM grace-period state machine, and budget-exhaustion paths in `kernel-core::session::policy` before implementing any of the lifecycle machinery. This catches edge cases (nonexistent PID, budget-zero corner, double-stop) without requiring QEMU.
+Apply TDD: write host-side unit tests for `ServiceTable` state transitions, the SIGTERM grace-period state machine, and budget-exhaustion paths against the `kernel_core::session::` constants (`MAX_RETRIES_PER_STEP`, `MAX_RESTART_COUNT`) before implementing any of the lifecycle machinery. This catches edge cases (nonexistent PID, budget-zero corner, double-stop) without requiring QEMU.
 
 Respect YAGNI strictly: this phase delivers real start, stop, restart, and text-fallback — nothing more. Per-user unit files, socket activation, cgroup isolation, and time-windowed budgets are listed as deferred and must not be added here even if they seem low-cost.
 
@@ -88,8 +90,8 @@ Respect YAGNI strictly: this phase delivers real start, stop, restart, and text-
 ## Acceptance Criteria
 
 - `cargo xtask session-smoke` terminates a supervised child externally (SIGKILL) and observes `session_manager` restart it within the retry budget.
-- Stopping a service via `m3ctl session-stop <name>` causes the child to receive SIGTERM and exit within 6 seconds; `sys_waitpid` is called before the Ack is returned.
-- Exceeding the restart budget transitions the service to `Failed` state visible in `m3ctl session-state`.
+- Stopping a service via `m3ctl session-stop <name>` causes the child to receive SIGTERM and be reaped within `SIGTERM_GRACE_MS + SIGKILL_REAP_MS` (5000 + 1000 ms); `sys_waitpid` is called before the Ack is returned.
+- Exceeding the restart budget transitions the service to `Failed` state visible in `m3ctl session-state`. If the failed service is in `DISPLAY_CRITICAL_SERVICES` (`display_server`, `kbd_server`, `mouse_server`), `recover::run_text_fallback` is invoked.
 - The `text-fallback` path stops all display-server children before emitting the fallback notification; confirmed by watching child PID list in the `session-smoke` integration test.
 - Phase 57 design doc carries a closure note referencing Phase 64 for real lifecycle implementation.
 
