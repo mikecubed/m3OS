@@ -142,28 +142,13 @@ pub const BELL_DURATION_MS: u32 = 30;
 /// and 30 ms duration: `48000 * 30 / 1000 = 1440` samples per channel.
 const BELL_SAMPLES_PER_CHANNEL: usize = (48_000 * BELL_DURATION_MS as usize) / 1_000;
 
-/// Square-wave region of the bell buffer in bytes. Stereo (2 channels)
-/// × 16-bit (2 bytes/sample) × [`BELL_SAMPLES_PER_CHANNEL`]. The actual
-/// submission [`BELL_TONE_BYTES`] is padded up to the audio_server's
-/// internal slot stride; the trailing pad bytes stay zero-initialized
-/// so the device DMAs silence at the tone's tail.
-const BELL_TONE_BYTES_RAW: usize = BELL_SAMPLES_PER_CHANNEL * 2 * 2;
-
-/// AC'97 BDL slot stride used by `audio_server::device::submit_frames_inner`
-/// (`DEFAULT_PCM_RING_BYTES / BDL_ENTRIES` = 16 KiB / 32 = 512). The server
-/// returns `AudioError::InvalidArgument` for any submission whose length
-/// is not a non-zero multiple of this stride, so the bell tone must be
-/// padded to a multiple before submit. This is a contract leak from
-/// audio_server — `audio_client::submit_frames` documents no alignment
-/// requirement on the wire — and is tracked as a Phase 63 follow-up
-/// (server-side tail-pad in `submit_frames_inner`). Once that lands, the
-/// hardcoded constant here can come out.
-const PCM_SLOT_STRIDE_BYTES: usize = 512;
-
-/// Bell tone buffer size in bytes. The first [`BELL_TONE_BYTES_RAW`]
-/// bytes carry the 880 Hz square wave; the remainder is silence used
-/// only as backend-alignment pad.
-pub const BELL_TONE_BYTES: usize = BELL_TONE_BYTES_RAW.next_multiple_of(PCM_SLOT_STRIDE_BYTES);
+/// Bell tone buffer size in bytes. Stereo (2 channels) × 16-bit
+/// (2 bytes per sample) × [`BELL_SAMPLES_PER_CHANNEL`] — exactly the
+/// caller-visible tone payload. `audio_server::device::submit_frames_inner`
+/// handles slot-stride alignment internally by zero-padding the
+/// trailing partial BDL slot, so the bell can submit the natural
+/// 30 ms tone size without caller-side rounding.
+pub const BELL_TONE_BYTES: usize = BELL_SAMPLES_PER_CHANNEL * 2 * 2;
 
 /// Bell tone amplitude as a fraction of `i16::MAX`. 0.4 keeps the
 /// tone audible without clipping when mixed with other audio.
@@ -522,28 +507,11 @@ mod tests {
         // 30 ms at 48 kHz stereo 16-bit:
         //   48000 * 30 / 1000 = 1440 samples per channel
         //   * 2 channels = 2880 samples total
-        //   * 2 bytes / sample = 5760 bytes (the raw square-wave region)
+        //   * 2 bytes / sample = 5760 bytes
+        // No caller-side pad: `audio_server::submit_frames_inner` pads
+        // the trailing partial BDL slot itself.
         assert_eq!(BELL_SAMPLES_PER_CHANNEL, 1440);
-        assert_eq!(BELL_TONE_BYTES_RAW, 5760);
-        // 5760 is not a multiple of 512; rounded up to the next BDL
-        // slot boundary the submitted buffer is 6144 bytes (12 × 512).
-        // The trailing 384 bytes carry silence so the device DMAs a
-        // brief tail of zero PCM after the square wave.
-        assert_eq!(BELL_TONE_BYTES, 6144);
-        assert_eq!(BELL_TONE_BYTES % PCM_SLOT_STRIDE_BYTES, 0);
-        assert!(BELL_TONE_BYTES >= BELL_TONE_BYTES_RAW);
-    }
-
-    #[test]
-    fn bell_tone_pad_region_is_silence() {
-        // The square-wave region [0..BELL_TONE_BYTES_RAW) carries the
-        // 880 Hz tone; everything from `BELL_TONE_BYTES_RAW` to
-        // `BELL_TONE_BYTES` must be zero so the AC'97 controller plays
-        // silence at the tail rather than residual stack data.
-        let buf = build_bell_tone_bytes();
-        for (i, &b) in buf.iter().enumerate().skip(BELL_TONE_BYTES_RAW) {
-            assert_eq!(b, 0, "pad byte {i} must be silence");
-        }
+        assert_eq!(BELL_TONE_BYTES, 5760);
     }
 
     #[test]

@@ -454,17 +454,29 @@ pub const SILENCE_FRAME: [u8; PCM_SLOT_STRIDE] = [0u8; PCM_SLOT_STRIDE];
 ///
 /// # Rules
 ///
-/// - `bytes.len()` must be a non-zero multiple of [`PCM_SLOT_STRIDE`].
-///   A submission smaller than one slot returns
-///   [`AudioError::InvalidArgument`]; a submission that is not a
-///   multiple of the stride also returns `InvalidArgument`.
+/// - `bytes.len()` must be non-zero; zero-length submissions return
+///   [`AudioError::InvalidArgument`].
+/// - Any non-zero length is accepted. The submission occupies
+///   `ceil(bytes.len() / PCM_SLOT_STRIDE)` BDL slots. If the request
+///   does not divide evenly into [`PCM_SLOT_STRIDE`]-sized slots, the
+///   trailing partial slot is zero-padded out to a full slot so the
+///   AC'97 controller always DMAs whole 512-byte buffers (the BDL
+///   `samples` field is fixed per slot). The pad bytes carry silence
+///   at the tail of the tone — at 48 kHz stereo 16-bit, a 511-byte pad
+///   is ≤ 128 samples = ~2.66 ms of silence, well inside the bell's
+///   50 ms render-loop budget. This keeps `audio_client::submit_frames`
+///   honest: callers see no slot-stride alignment requirement on the
+///   wire, matching the documented contract.
 /// - BDL capacity is checked for the **entire** submission before any
 ///   copy. If the BDL cannot hold every requested slot the function
 ///   returns [`AudioError::WouldBlock`] without copying any bytes or
 ///   posting any descriptors. This matches `audio_client`'s
 ///   all-or-nothing submit contract — partial accepts are surfaced as
 ///   `WouldBlock`, never as a short `Ok(n < bytes.len())`.
-/// - Returns `Ok(bytes.len())` on success.
+/// - Returns `Ok(bytes.len())` on success — the caller-visible byte
+///   count, not the slot-rounded `num_slots * PCM_SLOT_STRIDE`. This
+///   keeps `streams.submit` → `frames_submitted` accounting tied to
+///   the caller's payload rather than the internal pad.
 ///
 /// # Arguments
 ///
@@ -492,12 +504,16 @@ pub fn submit_frames_inner(
     bdl_iova: u64,
     logic: &mut Ac97Logic,
 ) -> Result<usize, AudioError> {
-    // Partial-slot submissions are not supported in Phase 63.
-    if bytes.len() < PCM_SLOT_STRIDE || bytes.len() % PCM_SLOT_STRIDE != 0 {
+    // Zero-length submissions have nothing to do; reject so the caller
+    // notices a logic error rather than silently advancing.
+    if bytes.is_empty() {
         return Err(AudioError::InvalidArgument);
     }
 
-    let num_slots = bytes.len() / PCM_SLOT_STRIDE;
+    // Round up: a partial trailing slot is zero-padded in-place below
+    // so the AC'97 controller still sees full PCM_SLOT_STRIDE-sized
+    // buffers when it walks the BDL.
+    let num_slots = bytes.len().div_ceil(PCM_SLOT_STRIDE);
 
     // All-or-nothing: require enough BDL room for the *whole* submission
     // before touching the ring. `audio_client::submit_frames` documents
@@ -511,16 +527,22 @@ pub fn submit_frames_inner(
         return Err(AudioError::WouldBlock);
     }
 
-    let mut total_copied = 0usize;
-
     for i in 0..num_slots {
         let head = logic.head % BDL_ENTRIES;
         let slot_byte_offset = head * PCM_SLOT_STRIDE;
         let src_offset = i * PCM_SLOT_STRIDE;
+        // Copy whatever `bytes` actually carries for this slot. The
+        // last iteration may have `copy_len < PCM_SLOT_STRIDE`; the
+        // remainder of the slot is zero-filled below so the device
+        // DMAs silence at the tail rather than residual ring data
+        // from a prior submit.
+        let copy_len = (bytes.len() - src_offset).min(PCM_SLOT_STRIDE);
 
-        // Copy into the PCM ring DMA region at the correct slot.
-        pcm_ring[slot_byte_offset..slot_byte_offset + PCM_SLOT_STRIDE]
-            .copy_from_slice(&bytes[src_offset..src_offset + PCM_SLOT_STRIDE]);
+        let dst = &mut pcm_ring[slot_byte_offset..slot_byte_offset + PCM_SLOT_STRIDE];
+        dst[..copy_len].copy_from_slice(&bytes[src_offset..src_offset + copy_len]);
+        if copy_len < PCM_SLOT_STRIDE {
+            dst[copy_len..].fill(0);
+        }
 
         // Compute addresses for `submit_buffer`.
         let bdl_iova_offset = bdl_iova + (head * core::mem::size_of::<BufferDescriptor>()) as u64;
@@ -539,11 +561,16 @@ pub fn submit_frames_inner(
         // mirror — without this write the controller would replay
         // zeroed/stale entries.
         bdl_dma[head] = logic.bdl[head];
-
-        total_copied += PCM_SLOT_STRIDE;
     }
 
-    Ok(total_copied)
+    // Return the caller-visible byte count, not `num_slots * PCM_SLOT_STRIDE`.
+    // The `frames_submitted` accounting in `StreamRegistry::submit` tracks
+    // PCM bytes the caller actually handed us; the internal silence pad on
+    // the tail of the last slot is invisible to the caller and must not
+    // appear in stats. (The pad bytes still get DMA'd, so they affect
+    // `frames_consumed` on the IRQ side — that's correct: the device played
+    // them — but the producer side stays anchored to the request size.)
+    Ok(bytes.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,27 +1954,48 @@ mod tests {
         assert_eq!(logic.lvi(), 1, "LVI=1 after slot 1");
     }
 
-    /// B.1(d): partial-slot submission (bytes.len() < PCM_SLOT_STRIDE)
-    /// must return `InvalidArgument`.
+    /// B.1(d): a sub-slot submission is accepted; the trailing pad
+    /// inside the single allocated slot is zero-filled so the AC'97
+    /// controller DMAs silence rather than residual ring bytes.
     #[test]
-    fn submit_frames_inner_partial_slot_returns_invalid_argument() {
-        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+    fn submit_frames_inner_partial_slot_is_padded_and_accepted() {
+        let mut pcm_ring = [0xAAu8; DEFAULT_PCM_RING_BYTES];
         let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
-        let partial = [0u8; PCM_SLOT_STRIDE - 1];
-        let err = submit_frames_inner(
-            &partial,
+        // 256 < PCM_SLOT_STRIDE = 512 — caller-visible payload only
+        // covers the first half of the slot.
+        let payload = [0x5Au8; PCM_SLOT_STRIDE / 2];
+        let n = submit_frames_inner(
+            &payload,
             &mut pcm_ring,
             0x1000,
             &mut bdl_dma,
             0x2000,
             &mut logic,
         )
-        .expect_err("partial slot must be rejected");
-        assert_eq!(err, AudioError::InvalidArgument);
+        .expect("partial slot must be padded and accepted");
+        // The accepted byte count is the caller's payload, not the
+        // slot-rounded size.
+        assert_eq!(n, payload.len());
+        // Slot 0 carries the payload …
+        assert_eq!(&pcm_ring[..payload.len()], &payload[..]);
+        // … and the rest of the slot is silence (not the 0xAA sentinel).
+        for (i, &b) in pcm_ring
+            .iter()
+            .enumerate()
+            .skip(payload.len())
+            .take(PCM_SLOT_STRIDE - payload.len())
+        {
+            assert_eq!(b, 0, "pad byte {i} must be silence (got {b:#x})");
+        }
+        // Exactly one BDL slot was posted.
+        assert_eq!(logic.lvi(), 0, "LVI = 0 after one BDL entry");
+        assert_eq!(logic.head, 1, "head advanced past slot 0");
     }
 
-    /// B.1(d): zero-length submission must also return `InvalidArgument`.
+    /// B.1(d): zero-length submission must return `InvalidArgument`.
+    /// (Empty payloads are still rejected; only non-empty submissions
+    /// benefit from the tail-pad.)
     #[test]
     fn submit_frames_inner_zero_len_returns_invalid_argument() {
         let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
@@ -1958,25 +2006,88 @@ mod tests {
         assert_eq!(err, AudioError::InvalidArgument);
     }
 
-    /// B.1(d): non-multiple-of-stride submission must return
-    /// `InvalidArgument` even when larger than one slot.
+    /// B.1(d): a submission that spans multiple slots with a partial
+    /// trailing slot is accepted and pads only the trailing slot's
+    /// tail (the leading full slots are copied verbatim).
     #[test]
-    fn submit_frames_inner_non_stride_multiple_returns_invalid_argument() {
-        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+    fn submit_frames_inner_partial_trailing_slot_pads_only_the_tail() {
+        let mut pcm_ring = [0xAAu8; DEFAULT_PCM_RING_BYTES];
         let mut bdl_dma = fresh_bdl_dma();
         let mut logic = Ac97Logic::new();
-        // PCM_SLOT_STRIDE + 1 is not a multiple of PCM_SLOT_STRIDE.
-        let odd = alloc::vec![0u8; PCM_SLOT_STRIDE + 1];
-        let err = submit_frames_inner(
-            &odd,
+        // 1 full slot (0x11 fill) + half a slot (0x22 fill).
+        let mut data = alloc::vec![0x11u8; PCM_SLOT_STRIDE];
+        data.extend(core::iter::repeat_n(0x22u8, PCM_SLOT_STRIDE / 2));
+        assert_eq!(data.len(), PCM_SLOT_STRIDE + PCM_SLOT_STRIDE / 2);
+
+        let n = submit_frames_inner(
+            &data,
             &mut pcm_ring,
             0x1000,
             &mut bdl_dma,
             0x2000,
             &mut logic,
         )
-        .expect_err("non-multiple stride must be rejected");
-        assert_eq!(err, AudioError::InvalidArgument);
+        .expect("partial trailing slot must be padded and accepted");
+
+        assert_eq!(n, data.len(), "must return caller-visible byte count");
+        // Slot 0 is a verbatim copy of the leading 0x11 region.
+        assert!(
+            pcm_ring[..PCM_SLOT_STRIDE].iter().all(|&b| b == 0x11),
+            "leading slot must carry the full 0x11 payload"
+        );
+        // Slot 1 has the 0x22 prefix + zero tail (no 0xAA sentinel left).
+        let slot1 = &pcm_ring[PCM_SLOT_STRIDE..2 * PCM_SLOT_STRIDE];
+        assert!(
+            slot1[..PCM_SLOT_STRIDE / 2].iter().all(|&b| b == 0x22),
+            "trailing slot must carry the 0x22 prefix"
+        );
+        assert!(
+            slot1[PCM_SLOT_STRIDE / 2..].iter().all(|&b| b == 0),
+            "trailing slot tail must be silence"
+        );
+        // Two BDL slots were posted, both with the full slot-stride
+        // sample count — the controller has no notion of "partial".
+        assert_eq!(logic.lvi(), 1, "LVI = 1 after two BDL entries");
+        // BDL `samples` is always the full slot stride in S16 samples
+        // (256 = PCM_SLOT_STRIDE / 2); pad bytes are part of the slot
+        // and the controller has no visibility into the partial-payload
+        // boundary. Read through a local to satisfy packed-struct
+        // alignment rules.
+        let entry0 = logic.bdl()[0];
+        let entry1 = logic.bdl()[1];
+        assert_eq!({ entry0.samples }, (PCM_SLOT_STRIDE / 2) as u16);
+        assert_eq!({ entry1.samples }, (PCM_SLOT_STRIDE / 2) as u16);
+    }
+
+    /// B.1(d): the bell-tone shape (a non-stride-multiple length below
+    /// 16 KiB) is now accepted end-to-end. Pins the contract that
+    /// `term::bell::BELL_TONE_BYTES = 5760` (= 30 ms × 48 kHz stereo
+    /// 16-bit) can be submitted without caller-side padding.
+    #[test]
+    fn submit_frames_inner_accepts_bell_tone_shape_unpadded() {
+        let mut pcm_ring = [0u8; DEFAULT_PCM_RING_BYTES];
+        let mut bdl_dma = fresh_bdl_dma();
+        let mut logic = Ac97Logic::new();
+        // The exact 30 ms bell tone size — 11 full slots + 128 bytes.
+        let bell_tone = alloc::vec![0x33u8; 5760];
+        assert_ne!(
+            bell_tone.len() % PCM_SLOT_STRIDE,
+            0,
+            "this test only covers the partial-slot case"
+        );
+        let n = submit_frames_inner(
+            &bell_tone,
+            &mut pcm_ring,
+            0x1000,
+            &mut bdl_dma,
+            0x2000,
+            &mut logic,
+        )
+        .expect("bell tone (5760 B) must be accepted");
+        assert_eq!(n, bell_tone.len());
+        // 12 slots posted (ceil(5760 / 512) = 12).
+        assert_eq!(logic.lvi(), 11);
+        assert_eq!(logic.head, 12);
     }
 
     /// B.1(e): when the BDL is full, submit must return `WouldBlock`
