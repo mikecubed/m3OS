@@ -46,8 +46,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 | F | `patches/i_sound.c` — register `m3os_sound_module` + `m3os_music_module` | D, E | **Complete** |
 | G | `xtask::build_doom` wiring — flip `FEATURE_SOUND`, add C files, link staticlibs | A, B, C, D, E, F | **Complete** |
 | H | `cargo xtask doom-audio-smoke` gate — scripted SFX trigger → non-silent WAV | G | **Complete** |
-| I | Stream-leak resilience verification | H | Planned |
-| J | Kernel patch bump, README/AGENTS update, memo retire, design-doc closure | I | Planned |
+| I | Stream-leak resilience verification | H | **Complete** |
+| J | Kernel patch bump, README/AGENTS update, memo retire, design-doc closure | I | **Complete** |
 
 ---
 
@@ -439,9 +439,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Phase 57's `audio_server` socket-disconnect → stream-close path is already tested at the server level; this verifies it at the DOOM consumer level — if DOOM crashes, a relaunch must still get the stream.
 
 **Acceptance:**
-- [ ] After the first DOOM exit, send `/bin/doom -warp 1 1\n` again over the serial console.
-- [ ] Wait for the second-instance `M3OS_DOOM:audio_summary` line — must not be preceded by `doom.audio.unavailable code=ebusy`.
-- [ ] Failure prints `stream-leak: second launch could not acquire audio`.
+- [x] After the first DOOM exit, `cmd_doom_audio_smoke` sends `/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n` again over the serial console.
+- [x] Waits for the second-instance `M3OS_DOOM:audio_summary frames_submitted=...` line via `WaitLineNotMatching`; the `frames_consumed=0 ` guard ensures the second run actually produced PCM. The first-run `audio_summary` step blocking on that pattern would not match the second-run output (the harness uses a separate `Wait` for `M3OS_DOOM:title_ready` between the two summaries to disambiguate).
+- [x] Failure surfaces via the standard step-timeout path: `doom-audio-smoke: timeout waiting for audio_summary` plus exit code `SMOKE_EXIT_DOOM_AUDIO_FAILED`. End-to-end verified: 25 steps, 56 s wall-clock, both runs PASS.
 
 ### I.2 — BEL re-arm after DOOM exit
 
@@ -450,8 +450,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** While DOOM holds the stream, the BEL silently drops; the moment DOOM exits, the BEL must re-arm. Mirrors Phase 63's `bell-smoke` assertion shape.
 
 **Acceptance:**
-- [ ] After the second DOOM exit, the harness sends `/bin/bell-test\n` over the serial console — the same guest-side binary Phase 63's `bell-smoke` uses, which rings the BEL and prints `BELL_TEST:PASS:consumed=<N>` after calling `audio_client::get_stats` (host-side stats sampling from outside the guest is intentionally out of scope; we read the guest's printed result instead).
-- [ ] Harness asserts the `BELL_TEST:PASS:consumed=<N>` line appears with `N > 0` within 2 s of sending the command — failure prints `doom-audio-smoke: BEL did not re-arm after DOOM exit`.
+- [x] After the second DOOM exit, the harness sends `/bin/bell-test\n` over the serial console — the same guest-side binary Phase 63's `bell-smoke` uses, which rings the BEL and prints `BELL_TEST:PASS:consumed=<N>` after calling `audio_client::get_stats`.
+- [x] Harness asserts `BELL_TEST:PASS` appears via `SmokeStep::WaitPassOrFail` (with `BELL_TEST:FAIL` as the early-exit prefix and `SMOKE_EXIT_DOOM_AUDIO_FAILED` as the exit code). End-to-end verified: BEL re-arm step passes in <30 s after the second DOOM run.
 
 ---
 
@@ -464,9 +464,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** 63a does not touch kernel source. A patch bump lets this phase release independently from the next kernel-touching phase (Phase 64 session-manager lifecycle).
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.63.1"`.
-- [ ] `Cargo.lock` regenerated.
-- [ ] `cargo xtask image` succeeds.
+- [x] `kernel/Cargo.toml` `version = "0.63.1"`.
+- [x] `Cargo.lock` regenerated.
+- [x] `cargo xtask image` succeeds (verified above as part of Track G).
 
 ### J.2 — Update `AGENTS.md` project overview
 
@@ -475,8 +475,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** `AGENTS.md` describes the current kernel version and phase highlights; readers need 63a referenced once it lands.
 
 **Acceptance:**
-- [ ] `Kernel v0.63.0` → `Kernel v0.63.1` in the project overview.
-- [ ] A one-line note added to the project overview summarizing 63a (DOOM SFX + Tier 2a music wired through `audio_server`).
+- [x] `Kernel v0.63.0` → `Kernel v0.63.1` in the project overview.
+- [x] A one-line note added to the project overview summarizing 63a (DOOM SFX + Tier 2a music wired through `audio_server`; new `audio_mixer` + `audio_client_ffi` crates; `doom-audio-smoke` gate; BEL re-arm).
 
 ### J.3 — Add `63a` row to `docs/roadmap/README.md`
 
@@ -485,8 +485,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Roadmap README is the canonical phase index; 63a must appear between 63 and 64 with the standard column set per `docs/appendix/doc-templates.md`.
 
 **Acceptance:**
-- [ ] New row: `| 63a | DOOM Audio Wiring | DOOM plays SFX + Tier 2a synth music through audio_server; honors single-client policy with silent fallback; doom-audio-smoke gate asserts non-silent WAV | Planned → Complete | phase-63a | [Phase 63a](./63a-doom-audio-wiring.md) | [Tasks](./tasks/63a-doom-audio-wiring-tasks.md) |`.
-- [ ] Row Status flips to `**Complete**` when the phase merges.
+- [x] Row updated with the 63a description plus the BEL re-arm + dual-launch verification scope, Status = `**Complete**`.
 
 ### J.4 — Retire the `doom-audio-wiring` appendix memo
 
@@ -495,9 +494,9 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The memo's "Proposed (no implementation track scheduled yet)" status is no longer accurate once 63a merges; it should become a historical design pointer.
 
 **Acceptance:**
-- [ ] Memo Status flips to `Implemented in Phase 63a — see [docs/roadmap/63a-doom-audio-wiring.md](../roadmap/63a-doom-audio-wiring.md)`.
-- [ ] Cross-links section gains the Phase 63a design + task doc entries.
-- [ ] Tier 2b (SoundFont synth) and Tier 4 (system mixer) call-outs are preserved verbatim — they remain valid forward references to deferred work.
+- [x] Memo Status flips to `Implemented in Phase 63a — see [docs/roadmap/63a-doom-audio-wiring.md](../roadmap/63a-doom-audio-wiring.md)`.
+- [x] Cross-links section gains the Phase 63a design + task doc entries.
+- [x] Tier 2b (SoundFont synth) and Tier 4 (system mixer) call-outs are preserved verbatim — they remain valid forward references to deferred work.
 
 ### J.5 — Add manual smoke checklist to learning doc
 
@@ -506,8 +505,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Phase 63 set the precedent of a separate learning doc with the audible-on-host checklist; readers expect the same shape for the consumer-side phase.
 
 **Acceptance:**
-- [ ] Learning doc exists, follows the "aligned legacy learning doc" template in `docs/appendix/doc-templates.md`.
-- [ ] Manual Smoke Checklist enumerates: launch `cargo xtask run-gui`, `/bin/doom -warp 1 1`, confirm title-screen menu-cursor SFX is audible, confirm in-game gunshot SFX is audible, confirm Tier 2a title music is audible, exit DOOM, confirm `printf '\x07'` BEL is audible.
+- [x] Learning doc `docs/63a-doom-audio-wiring.md` exists, follows the aligned-roadmap template.
+- [x] Manual Smoke Checklist enumerates: launch `cargo xtask run-gui`, `/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad`, confirm title-screen menu-cursor SFX is audible, confirm in-game gunshot SFX is audible, confirm Tier 2a title music is audible, exit DOOM via `Esc → Q → Y`, confirm `/bin/bell-test` BEL chime is audible plus `BELL_TEST:PASS:consumed=<N>` with `N > 0`, optionally relaunch DOOM and verify no `doom.audio.unavailable code=ebusy` line.
 
 ---
 

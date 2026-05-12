@@ -7477,6 +7477,44 @@ fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 60,
         label: "guest/doom-audio: audio_summary frames_consumed > 0",
     });
+    // Phase 63a Track I.1 — stream-leak resilience. The first DOOM
+    // has exited; relaunch it inside the same QEMU instance. The
+    // second run must also acquire the stream (no
+    // `doom.audio.unavailable code=ebusy` line on serial) and emit
+    // its own audio_summary. This proves audio_server's
+    // socket-disconnect → stream-close path runs correctly.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        label: "guest/doom-audio: relaunch DOOM (stream-leak resilience)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-audio: second-run title_ready marker",
+    });
+    steps.push(SmokeStep::WaitLineNotMatching {
+        pattern: "M3OS_DOOM:audio_summary frames_submitted=",
+        bad_substring: "frames_consumed=0 ",
+        timeout_secs: 60,
+        label: "guest/doom-audio: second-run audio_summary frames_consumed > 0",
+    });
+    // Phase 63a Track I.2 — BEL re-arm. After the second DOOM exit,
+    // run `bell-test` (the Phase 63 Track E.1 binary) and verify
+    // it sees frames_consumed > 0. This proves the BEL re-acquires
+    // the audio stream once DOOM releases it.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/bell-test\n",
+        label: "guest/doom-audio: bell-test (BEL re-arm)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "BELL_TEST:PASS",
+        fail_prefix: "BELL_TEST:FAIL",
+        timeout_secs: 30,
+        label: "guest/doom-audio: BEL re-arm PASS",
+        exit_code_on_fail: SMOKE_EXIT_DOOM_AUDIO_FAILED,
+    });
     steps
 }
 

@@ -1,6 +1,6 @@
 # DOOM Audio Wiring — Design Notes for a Future Track
 
-**Status:** Proposed (no implementation track scheduled yet)
+**Status:** Implemented in Phase 63a — see [`docs/roadmap/63a-doom-audio-wiring.md`](../roadmap/63a-doom-audio-wiring.md)
 **Source Ref:** post-phase-63
 **Cross-links:**
 - Phase 47 DOOM port — [`docs/47-doom.md`](../47-doom.md)
@@ -8,6 +8,7 @@
 - Phase 57 audio ABI — [`docs/appendix/phase-57-audio-abi.md`](./phase-57-audio-abi.md)
 - Phase 57 audio target choice — [`docs/appendix/phase-57-audio-target-choice.md`](./phase-57-audio-target-choice.md)
 - Phase 63 audio stack implementation — [`docs/roadmap/63-audio-stack-implementation.md`](../roadmap/63-audio-stack-implementation.md)
+- Phase 63a DOOM audio wiring (this memo's implementation phase) — [`docs/roadmap/63a-doom-audio-wiring.md`](../roadmap/63a-doom-audio-wiring.md), [`docs/roadmap/tasks/63a-doom-audio-wiring-tasks.md`](../roadmap/tasks/63a-doom-audio-wiring-tasks.md)
 
 ---
 
