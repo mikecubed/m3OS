@@ -119,6 +119,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_mixer"
+version = "0.63.1"
+
+[[package]]
 name = "audio_server"
 version = "0.57.0"
 dependencies = [

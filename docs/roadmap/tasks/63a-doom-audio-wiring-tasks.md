@@ -38,7 +38,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `audio_mixer` crate — pure-logic Rust mixer + C-ABI surface | None | Planned |
+| A | `audio_mixer` crate — pure-logic Rust mixer + C-ABI surface | None | **Complete** |
 | B | `audio_client_ffi` crate — C-ABI veneer over `audio_client` | None | Planned |
 | C | `m3os_dmx.c` — WAD DMX header parse + bounds check | None | Planned |
 | D | `m3os_sound.c` — `sound_module_t` body with DI seam, `EBUSY` silent-fallback | A, B, C | Planned |
@@ -60,10 +60,10 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** A new workspace crate is the cleanest seam for "pure mix engine reusable across DOOM and any future system-mixer service" (memo's Tier 4 path). Centralizing it here means Phase 63a's mixer is the same mixer a future service will consume.
 
 **Acceptance:**
-- [ ] `userspace/lib/audio_mixer/` exists with `Cargo.toml` declaring `crate-type = ["rlib", "staticlib"]` and `name = "audio_mixer"`.
-- [ ] `Cargo.toml` workspace `members` list includes `userspace/lib/audio_mixer`.
-- [ ] `lib.rs` is `#![no_std]` and exports `pub struct Mixer`, `pub struct ChannelState`, `pub fn step`.
-- [ ] `cargo xtask check` passes (clippy + rustfmt + host tests).
+- [x] `userspace/lib/audio_mixer/` exists with `Cargo.toml`; default crate-type is `rlib`; `xtask::build_doom` produces the `staticlib` via `cargo rustc --crate-type=staticlib` for the musl target (host tests cannot link a `#![no_std]` staticlib without a panic-handler / global allocator, so `staticlib` is not in the default list).
+- [x] `Cargo.toml` workspace `members` list includes `userspace/lib/audio_mixer`.
+- [x] `lib.rs` is `#![cfg_attr(not(test), no_std)]` and exports `pub struct Mixer`, `pub struct ChannelState`, `pub fn step`.
+- [x] `cargo xtask check` runs `audio_mixer` host tests (added to `USERSPACE_LIB_HOST_TEST_PACKAGES`).
 
 ### A.2 — Implement `Mixer` and `ChannelState` (Rust API)
 
@@ -72,13 +72,13 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** Pure-logic mix engine: no I/O, no allocation in `step`, all hot-path math is deterministic. SRP — this module knows nothing about IPC, WAD files, or DOOM. Testable in isolation.
 
 **Acceptance:**
-- [ ] `Mixer::new(channel_count: usize) -> Self` constructs a fixed-channel mixer; `channel_count <= 32`.
-- [ ] `Mixer::set_channel(idx, sample_slice, source_rate_hz, left_vol, right_vol)` seeds a channel; `left_vol` / `right_vol` are `0..=127`.
-- [ ] `Mixer::clear_channel(idx)` zeroes the channel state (used by `S_StopSound`).
-- [ ] `Mixer::step(out: &mut [u8], frames: usize)` writes `frames * 4` bytes of stereo S16LE; returns the count of bytes written.
-- [ ] `step` uses 16.16-fixed-point linear interpolation: `inc = (source_rate << 16) / 48000`; per output frame, lookup two adjacent samples and interpolate.
-- [ ] Per-frame accumulator is `i32`; final clamp to `i16::MIN..=i16::MAX` before store.
-- [ ] No heap allocation in `step` (verified by a host test that installs a `#[global_allocator]` shim that aborts on any allocation, then runs `step` for 10 000 iterations against a pre-seeded mixer).
+- [x] `Mixer::new(channel_count: usize) -> Self` constructs a fixed-channel mixer; `channel_count <= 32`.
+- [x] `Mixer::set_channel(idx, sample_slice, source_rate_hz, left_vol, right_vol)` (`unsafe fn` — slice contract) seeds a channel; `left_vol` / `right_vol` are clamped to `0..=127`.
+- [x] `Mixer::clear_channel(idx)` zeroes the channel state (used by `S_StopSound`).
+- [x] `Mixer::step(out: &mut [u8], frames: usize)` writes `frames * 4` bytes of stereo S16LE; returns the count of bytes written (or `0` on undersized `out`).
+- [x] `step` uses 16.16-fixed-point linear interpolation: `inc = (source_rate << 16) / 48000`; per output frame, lookup two adjacent samples and interpolate.
+- [x] Per-frame accumulator is `i32`; final clamp to `i16::MIN..=i16::MAX` before store.
+- [x] No heap allocation in `step` (verified by `tests/no_alloc.rs`: a `#[global_allocator]` tripwire that panics on any allocation while armed, then runs `step` for 10 000 iterations against a pre-seeded mixer).
 
 ### A.3 — Host unit tests for `Mixer`
 
@@ -87,12 +87,12 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** TDD gate per CCC TEST-1 / TEST-6. The mixer is the only place where audio quality bugs can hide; exact-output assertions catch off-by-one, clamp inversion, and pan mis-assignment.
 
 **Acceptance:**
-- [ ] `single_channel_mute` asserts `step` output is all-zero when `left_vol = right_vol = 0`.
-- [ ] `single_channel_full_volume` asserts `step` output matches an exact expected byte sequence for a 4-sample synthetic input at 48 kHz, vol 127.
-- [ ] `two_channel_pan` asserts the left output equals channel 0's contribution and the right output equals channel 1's contribution when channel 0 is pan-hard-left and channel 1 is pan-hard-right.
-- [ ] `clamp_at_bounds` asserts an overdriven mix (8 channels at full volume of `i16::MAX`-valued samples) clamps to `i16::MAX` rather than wrapping.
-- [ ] `resampler_11025_to_48000` asserts that a synthetic ramp input at 11025 Hz produces a monotonically-non-decreasing output across resampled frames.
-- [ ] `cargo test -p audio_mixer` passes.
+- [x] `single_channel_mute` asserts `step` output is all-zero when `left_vol = right_vol = 0`.
+- [x] `single_channel_full_volume` asserts `step` output matches an exact expected byte sequence (signed `[0, 16256, 16256, 0]` per stereo frame) for a 4-sample synthetic input at 48 kHz, vol 127.
+- [x] `two_channel_pan` asserts the left output equals channel 0's contribution and the right output equals channel 1's contribution when channel 0 is pan-hard-left and channel 1 is pan-hard-right.
+- [x] `clamp_at_bounds` asserts an overdriven mix (8 channels at full volume of `255`-valued samples → ~`i16::MAX`-magnitude) clamps to `i16::MAX` rather than wrapping.
+- [x] `resampler_11025_to_48000` asserts that a synthetic ramp input at 11025 Hz produces a monotonically-non-decreasing output across resampled frames.
+- [x] `cargo test -p audio_mixer --target x86_64-unknown-linux-gnu` passes (12 unit tests + 1 no-alloc integration test).
 
 ### A.4 — C-ABI surface and header
 
@@ -101,13 +101,13 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** DRY — the C-side mixer is the same code as the Rust-side mixer. Without the C ABI, `m3os_sound.c` would have to re-implement the resampler in C, duplicating the algorithm and the bugs.
 
 **Acceptance:**
-- [ ] `#[no_mangle] pub extern "C" fn audio_mixer_new(channel_count: usize) -> *mut Mixer` returns a heap-allocated `Box::into_raw(Box::new(Mixer::new(...)))`.
-- [ ] `audio_mixer_drop(*mut Mixer)` reclaims via `Box::from_raw`.
-- [ ] `audio_mixer_set_channel(*mut Mixer, idx, *const u8, len, source_rate_hz, left_vol, right_vol) -> int` returns 0 on success or a stable error code.
-- [ ] `audio_mixer_step(*mut Mixer, *mut u8, byte_capacity, frames) -> isize` returns bytes written, or negative error.
-- [ ] `audio_mixer.h` declares matching `extern "C"` signatures and the `AUDIO_MIXER_ERR_*` constants.
-- [ ] `userspace/lib/audio_mixer/build.rs` reads `include/audio_mixer.h`, parses each `#define AUDIO_MIXER_* <int>` line via a regex (`^#define\s+(\w+)\s+(-?\d+)\s*$`), and `assert!`s the value matches the corresponding `pub const` in `src/ffi.rs`; mismatch fails the build with `panic!("audio_mixer.h drift: <NAME> header={h} rust={r}")`.
-- [ ] At least one host test in `ffi.rs` calls the C-ABI surface through `unsafe { extern "C" }` and asserts equivalence with the Rust API.
+- [x] `#[unsafe(no_mangle)] pub extern "C" fn audio_mixer_new(channel_count: usize) -> *mut Mixer` returns `Box::into_raw(Box::new(Mixer::new(...)))` (NULL on `channel_count > MAX_CHANNELS`).
+- [x] `audio_mixer_drop(*mut Mixer)` reclaims via `Box::from_raw`.
+- [x] `audio_mixer_set_channel(*mut Mixer, idx, *const u8, len, source_rate_hz, left_vol, right_vol) -> int` returns 0 on success or a stable `AUDIO_MIXER_ERR_*` code.
+- [x] `audio_mixer_step(*mut Mixer, *mut u8, byte_capacity, frames) -> isize` returns bytes written, or negative error.
+- [x] `audio_mixer.h` declares matching `extern "C"` signatures and the `AUDIO_MIXER_*` constants.
+- [x] `userspace/lib/audio_mixer/build.rs` reads `include/audio_mixer.h`, parses each `#define AUDIO_MIXER_* <int>` line, and `assert!`s the value matches the corresponding `pub const` in `src/ffi.rs`; mismatch fails the build with `panic!("audio_mixer.h drift: <NAME> header={h} rust={r}")` (verified by temporarily mutating the header and observing `audio_mixer.h drift: AUDIO_MIXER_ERR_INVAL header=-99 rust=-1`).
+- [x] Five host tests in `ffi.rs` call the C-ABI surface through `unsafe { extern "C" }`: `ffi_round_trip_matches_rust_api`, `ffi_rejects_oversized_channel_count`, `ffi_rejects_null_handle`, `ffi_rejects_undersized_output`, `ffi_rejects_empty_sample_buffer`.
 
 ---
 

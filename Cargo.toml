@@ -89,6 +89,8 @@ members = [
     "userspace/audio_server",
     # Phase 57 Track E.1 — userspace audio client library
     "userspace/lib/audio_client",
+    # Phase 63a Track A — pure-logic mixer with C-ABI surface
+    "userspace/lib/audio_mixer",
     # Phase 57 Track E.2 — userspace audio reference demo
     "userspace/audio-demo",
     # Phase 63 Track E.1 — one-shot audio stats CLI for the bell-smoke harness
