@@ -78,7 +78,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - [ ] `Mixer::step(out: &mut [u8], frames: usize)` writes `frames * 4` bytes of stereo S16LE; returns the count of bytes written.
 - [ ] `step` uses 16.16-fixed-point linear interpolation: `inc = (source_rate << 16) / 48000`; per output frame, lookup two adjacent samples and interpolate.
 - [ ] Per-frame accumulator is `i32`; final clamp to `i16::MIN..=i16::MAX` before store.
-- [ ] No heap allocation in `step` (verified by `#[deny(unsafe_code)]` plus a host test that runs `step` 10 000 times without growing RSS).
+- [ ] No heap allocation in `step` (verified by a host test that installs a `#[global_allocator]` shim that aborts on any allocation, then runs `step` for 10 000 iterations against a pre-seeded mixer).
 
 ### A.3 — Host unit tests for `Mixer`
 
@@ -92,7 +92,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - [ ] `two_channel_pan` asserts the left output equals channel 0's contribution and the right output equals channel 1's contribution when channel 0 is pan-hard-left and channel 1 is pan-hard-right.
 - [ ] `clamp_at_bounds` asserts an overdriven mix (8 channels at full volume of `i16::MAX`-valued samples) clamps to `i16::MAX` rather than wrapping.
 - [ ] `resampler_11025_to_48000` asserts that a synthetic ramp input at 11025 Hz produces a monotonically-non-decreasing output across resampled frames.
-- [ ] `cargo test -p audio-mixer` passes.
+- [ ] `cargo test -p audio_mixer` passes.
 
 ### A.4 — C-ABI surface and header
 
@@ -105,7 +105,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - [ ] `audio_mixer_drop(*mut Mixer)` reclaims via `Box::from_raw`.
 - [ ] `audio_mixer_set_channel(*mut Mixer, idx, *const u8, len, source_rate_hz, left_vol, right_vol) -> int` returns 0 on success or a stable error code.
 - [ ] `audio_mixer_step(*mut Mixer, *mut u8, byte_capacity, frames) -> isize` returns bytes written, or negative error.
-- [ ] `audio_mixer.h` declares matching `extern "C"` signatures and the error constants; the build script verifies the constants match the Rust impl.
+- [ ] `audio_mixer.h` declares matching `extern "C"` signatures and the `AUDIO_MIXER_ERR_*` constants.
+- [ ] `userspace/lib/audio_mixer/build.rs` reads `include/audio_mixer.h`, parses each `#define AUDIO_MIXER_* <int>` line via a regex (`^#define\s+(\w+)\s+(-?\d+)\s*$`), and `assert!`s the value matches the corresponding `pub const` in `src/ffi.rs`; mismatch fails the build with `panic!("audio_mixer.h drift: <NAME> header={h} rust={r}")`.
 - [ ] At least one host test in `ffi.rs` calls the C-ABI surface through `unsafe { extern "C" }` and asserts equivalence with the Rust API.
 
 ---
@@ -132,8 +133,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 
 **Acceptance:**
 - [ ] `audio_ffi_connect() -> *mut AudioFfiHandle` returns a `Box::into_raw` handle wrapping `Mutex<AudioClient<SyscallSocket>>`; returns `NULL` on `AudioClient::connect` failure.
-- [ ] `audio_ffi_open(*mut AudioFfiHandle) -> int` calls `AudioClient::open` with fixed 48 kHz / S16LE / stereo; returns 0 on success or a stable error code matching `AudioClientError` discriminants.
-- [ ] `audio_ffi_submit(*mut AudioFfiHandle, *const u8, len) -> isize` returns bytes submitted (always equals `len` on success per the all-or-nothing contract) or a negative error code. `WouldBlock` is mapped to a distinct constant so the C caller can distinguish "retry later" from fatal errors.
+- [ ] `audio_ffi_open(*mut AudioFfiHandle) -> int` calls `AudioClient::open` with fixed 48 kHz / S16LE / stereo; returns 0 on success or a stable negative error code drawn from a flat table that covers every reachable `AudioClientError` variant *and* the inner `AudioError` payload when the outer variant is `Server(_)`. Required entries: `Server(AudioError::Busy)` → `AUDIO_FFI_ERR_BUSY`, `Server(AudioError::FormatMismatch)` → `AUDIO_FFI_ERR_FORMAT`, `Server(AudioError::Internal)` → `AUDIO_FFI_ERR_INTERNAL`, `Io(_)` → `AUDIO_FFI_ERR_IO`, `Protocol(_)` → `AUDIO_FFI_ERR_PROTOCOL`, `AlreadyOpen` → `AUDIO_FFI_ERR_ALREADY_OPEN`, `NotOpen` → `AUDIO_FFI_ERR_NOT_OPEN`, `UnexpectedReply` → `AUDIO_FFI_ERR_UNEXPECTED_REPLY`. The full table is exported in `audio_client.h`.
+- [ ] `audio_ffi_submit(*mut AudioFfiHandle, *const u8, len) -> isize` returns bytes submitted (always equals `len` on success per the all-or-nothing contract) or a negative error code from the same flat table. `Server(AudioError::WouldBlock)` maps to a distinct `AUDIO_FFI_ERR_WOULD_BLOCK` so the C caller can distinguish "retry later" from fatal errors.
 - [ ] `audio_ffi_get_stats(*mut AudioFfiHandle, *mut AudioFfiStats) -> int` populates a C-struct mirror of `AudioStats`.
 - [ ] `audio_ffi_close(*mut AudioFfiHandle)` drains, closes, and frees the handle.
 - [ ] All shims use `catch_unwind` so a Rust panic does not unwind into the C caller.
@@ -146,7 +147,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 
 **Acceptance:**
 - [ ] `audio_client.h` declares `typedef struct AudioFfiHandle AudioFfiHandle;`, all `audio_ffi_*` function signatures, the `AudioFfiStats` struct, and the stable error-code constants.
-- [ ] A build script in `audio_client_ffi` at `build.rs` parses the header and `assert!`s the constant values match the Rust impl at compile time; build fails if they drift.
+- [ ] `userspace/lib/audio_client_ffi/build.rs` reads `include/audio_client.h`, parses each `#define AUDIO_FFI_* <int>` line via a regex (`^#define\s+(\w+)\s+(-?\d+)\s*$`), and `assert!`s the value matches the corresponding `pub const` in `src/lib.rs`; mismatch fails the build with `panic!("audio_client.h drift: <NAME> header={h} rust={r}")`.
 - [ ] Header passes `gcc -Wall -Wextra -pedantic -c` on a smoke `audio_client_smoke.c` that just includes it.
 
 ### B.4 — Host tests for the C-ABI veneer
@@ -160,7 +161,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - [ ] `ebusy_maps_to_constant` simulates an `AudioError::Busy` reply and asserts `audio_ffi_open` returns the stable EBUSY constant declared in `audio_client.h`.
 - [ ] `wouldblock_maps_to_constant` simulates a `Server(WouldBlock)` reply and asserts `audio_ffi_submit` returns the stable WOULDBLOCK constant (distinct from EBUSY).
 - [ ] `submit_all_or_nothing` confirms `audio_ffi_submit` returns either the full `len` or a negative error; never a partial count.
-- [ ] `cargo test -p audio-client-ffi` passes.
+- [ ] `cargo test -p audio_client_ffi` passes.
 
 ---
 
@@ -227,8 +228,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The engine's SFX state machine routes per-channel updates through this table; channel allocation must respect DOOM's `MAX_CHANNELS = 16` semantics and the SFX cache.
 
 **Acceptance:**
-- [ ] `StartSound(channel, sfx_id, vol, pan, ...)` decodes the SFX lump on first use, caches the result, claims the named channel via `audio_mixer_set_channel(channel, samples, len, rate_hz, left_vol(pan, vol), right_vol(pan, vol))`.
-- [ ] `StopSound(channel)` calls `audio_mixer_clear_channel(channel)` and zeroes the channel's cache entry.
+- [ ] `StartSound(channel, sfx_id, vol, pan, ...)` decodes the SFX lump on first use, caches the result, claims the named channel via `audio_mixer_set_channel(state->mixer, channel, samples, len, rate_hz, left_vol(pan, vol), right_vol(pan, vol))`. DOOM's `MAX_CHANNELS = 16` keeps SFX in mixer channels `0..15`; music (Track E) owns `16..31`.
+- [ ] `StopSound(channel)` calls `audio_mixer_clear_channel(state->mixer, channel)` and zeroes the channel's cache entry.
 - [ ] `UpdateSoundParams(channel, vol, pan)` re-sets the per-channel volume without restarting the sample.
 - [ ] `SoundIsPlaying(channel)` reports whether the mixer's channel cursor is short of `sample_len`.
 - [ ] All four entry points are no-ops when `audio_disabled = true`.
@@ -344,7 +345,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 ### G.1 — Flip `-UFEATURE_SOUND` to `-DFEATURE_SOUND`
 
 **File:** `xtask/src/main.rs::build_doom`
-**Symbol:** `args` vec near line 1335
+**Symbol:** `args` vec in `build_doom`, the entry currently containing `"-UFEATURE_SOUND".to_string()`
 **Why it matters:** Without this flip the upstream `i_sound.c` dispatcher compiles to no-ops and our modules are never called.
 
 **Acceptance:**
@@ -354,7 +355,7 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 ### G.2 — Add new C files to `build_doom`
 
 **File:** `xtask/src/main.rs::build_doom`
-**Symbol:** `c_files` push block near line 1308
+**Symbol:** `c_files` push block in `build_doom`, immediately after the existing `c_files.push(platform.to_str()...)` line that adds `dg_m3os.c`
 **Why it matters:** Three new platform-layer files must be compiled into the DOOM binary alongside `dg_m3os.c`.
 
 **Acceptance:**
@@ -368,20 +369,22 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** The musl-gcc invocation needs `-L<rust-target-dir>` and `-laudio_client_ffi -laudio_mixer` to resolve the C-ABI symbols the new modules call.
 
 **Acceptance:**
-- [ ] Before calling musl-gcc, `build_doom` runs `cargo build --release --target <musl-target> -p audio-mixer -p audio-client-ffi` and locates the produced `.a` files.
+- [ ] Before calling musl-gcc, `build_doom` runs `cargo build --release --target <musl-target> -p audio_mixer -p audio_client_ffi` and locates the produced `.a` files.
 - [ ] `-L<staticlib-dir>` and `-l:libaudio_mixer.a -l:libaudio_client_ffi.a` (linker static-archive syntax) are appended to the musl-gcc args.
 - [ ] `-I<workspace>/userspace/lib/audio_client_ffi/include -I<workspace>/userspace/lib/audio_mixer/include` is appended so the C `#include` directives resolve.
 - [ ] Build succeeds; `target/generated-initrd/doom` has size > 100 KiB above the pre-63a baseline (real linker output, not a stub).
 
-### G.4 — `dg_m3os.c::DG_Init` calls `m3os_sound_module.Init`
+### G.4 — `DG_DrawFrame` emits a one-shot `title_ready` marker
 
 **File:** `userspace/doom/dg_m3os.c`
-**Symbol:** `DG_Init`
-**Why it matters:** doomgeneric does not auto-call sound-module init; the platform layer's `DG_Init` must invoke it. Without this, all upstream-bound `sound_modules[0]->Init()` calls would still execute, but Track F's overlay swaps the registration list and ensures our module is `sound_modules[0]`.
+**Symbol:** `DG_DrawFrame`, new `M3OS_DOOM:title_ready` print
+**Why it matters:** Track H's smoke gate needs a deterministic post-boot signal before it sends keystrokes. A one-shot serial print on the first successful frame draw is the simplest reliable trigger. Note: engine-side sound-module init is *not* something `DG_Init` needs to call directly — upstream's `I_InitSound` iterates the `sound_modules` array Track F installs, so our `m3os_sound_module.Init` is invoked through the engine's normal startup flow.
 
 **Acceptance:**
-- [ ] `DG_Init` calls `m3os_sound_module.Init(...)` and `m3os_music_module.Init(...)` after the framebuffer + keyboard hooks are set up.
-- [ ] On failure of either Init, the call returns success (DI: audio is non-fatal).
+- [ ] `DG_DrawFrame` prints `M3OS_DOOM:title_ready` exactly once on its first invocation, gated by a `static int already_printed = 0;` flag flipped immediately before the print.
+- [ ] The print goes to stdout (which `term` and the serial console both receive).
+- [ ] Manual `cargo xtask run-gui` confirms the line appears in serial output shortly after DOOM's first frame renders.
+- [ ] `DG_Init` is *not* modified to call `m3os_sound_module.Init` directly — upstream `I_InitSound` handles that via the `sound_modules` array; modifying `DG_Init` would double-init.
 
 ---
 
@@ -397,23 +400,24 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - [ ] New subcommand `doom-audio-smoke` parses CLI args; defaults to a 90-second timeout.
 - [ ] Boots QEMU with `-audiodev wav,id=snd0,path=<smoke_dir>/doom_audio.wav` and the existing `-device AC97,audiodev=snd0,addr=0x5`.
 - [ ] Waits for `term` to register on the serial console.
-- [ ] Sends `/bin/doom -warp 1 1\n` to the serial console.
-- [ ] Waits for the title-screen-loaded marker (a one-shot serial print from `dg_m3os.c::DG_DrawFrame` after the first frame).
-- [ ] Sends a menu-confirm keystroke (which triggers `DSPISTOL` per shareware DOOM1.WAD).
-- [ ] Waits up to 5 s for `M3OS_DOOM:audio_summary frames_consumed=[1-9]\d*` on the serial console.
-- [ ] Sends `quit\n` to clean-shutdown DOOM.
+- [ ] Sends `/bin/doom -warp 1 1\n` to the serial console. The `-warp 1 1` flag skips the title-screen menu and enters Episode 1 Map 1 directly, eliminating menu-navigation timing fragility.
+- [ ] Waits for the `M3OS_DOOM:title_ready` marker emitted by `dg_m3os.c::DG_DrawFrame` (see Track G.4).
+- [ ] Sends one `Ctrl` keystroke (DOOM's default "fire" key). The player spawns holding a pistol in E1M1, so a single `Ctrl` discharges it and produces one `DSPPISTOL` SFX submission through the mixer.
+- [ ] Sends the DOOM exit sequence: `Esc` (open in-game menu) → `Q` (Quit Game) → `Y` (confirm). DOOM's quit path calls `m3os_sound_module.Shutdown` (Track D.5) which prints `M3OS_DOOM:audio_summary frames_submitted=<N> frames_consumed=<M> underruns=<K>`.
+- [ ] Waits up to 5 s for `M3OS_DOOM:audio_summary frames_consumed=[1-9]\d*` on the serial console; timeout or `frames_consumed=0` is a failure.
 - [ ] Post-QEMU step: opens `<smoke_dir>/doom_audio.wav`, asserts ≥ 5 % of S16LE samples have absolute value > 256.
-- [ ] Three distinct failure modes produce three distinct error messages: timeout-waiting-for-summary, summary-line-says-zero, WAV-is-silent.
+- [ ] Three distinct failure modes produce three distinct error messages: `doom-audio-smoke: timeout waiting for audio_summary`, `doom-audio-smoke: frames_consumed=0`, `doom-audio-smoke: WAV is silent`.
 
-### H.2 — Wire `doom-audio-smoke` into `cargo xtask check`
+### H.2 — Wire `doom-audio-smoke` into the pre-push gate set
 
-**File:** `xtask/src/main.rs`, `.githooks/pre-push`
-**Symbol:** `cmd_check` or equivalent gate aggregation
-**Why it matters:** Without CI wiring a future regression goes unnoticed until a manual run-gui.
+**File:** `.githooks/pre-push`, `AGENTS.md`
+**Symbol:** pre-push hook script body; AGENTS.md First-Time Setup section
+**Why it matters:** Phase 63's `audio-smoke` is *not* in `cmd_check` (which stays QEMU-free); it runs as a pre-push gate. 63a follows the same placement: `cmd_check` stays fast and headless-host-only, while QEMU-driven gates (`audio-smoke`, `bell-smoke`, `doom-audio-smoke`) run in the pre-push hook alongside `smoke-test` and `regression`.
 
 **Acceptance:**
-- [ ] `cargo xtask check` invokes `cargo xtask doom-audio-smoke` (or is skipped behind an env var if QEMU is unavailable, matching Phase 63's `audio-smoke` pattern).
-- [ ] Pre-push hook documentation in `AGENTS.md` mentions `doom-audio-smoke` as an additional headless gate.
+- [ ] `.githooks/pre-push` invokes `cargo xtask doom-audio-smoke` after the existing `cargo xtask audio-smoke` / `bell-smoke` calls (or via the `M3OS_*_REGRESSION=1` env-var gating pattern those gates already use).
+- [ ] `AGENTS.md` First-Time Setup section lists `doom-audio-smoke` in the same paragraph that already names `smoke-test`, `regression`, and `ssh-e1000-banner-check` as pre-push gates.
+- [ ] `cmd_check` is *not* modified — keeping it QEMU-free is a deliberate parallel to Phase 63's gate placement.
 
 ---
 
@@ -437,8 +441,8 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 **Why it matters:** While DOOM holds the stream, the BEL silently drops; the moment DOOM exits, the BEL must re-arm. Mirrors Phase 63's `bell-smoke` assertion shape.
 
 **Acceptance:**
-- [ ] After the second DOOM exit, send a BEL byte (`printf '\x07'\n`) over the serial console.
-- [ ] Sample `AudioControlCommand::GetStats` via the existing audio-server stats path and assert `frames_consumed` increments within 200 ms.
+- [ ] After the second DOOM exit, the harness sends `/bin/bell-test\n` over the serial console — the same guest-side binary Phase 63's `bell-smoke` uses, which rings the BEL and prints `BELL_TEST:PASS:consumed=<N>` after calling `audio_client::get_stats` (host-side stats sampling from outside the guest is intentionally out of scope; we read the guest's printed result instead).
+- [ ] Harness asserts the `BELL_TEST:PASS:consumed=<N>` line appears with `N > 0` within 2 s of sending the command — failure prints `doom-audio-smoke: BEL did not re-arm after DOOM exit`.
 
 ---
 
@@ -508,4 +512,4 @@ Tracks that earlier drafts proposed are **not Phase 63a work** — they already 
 - Producer thread is **out of scope** for 63a — in-loop submit is the chosen pattern. The `Submitter` interface is shaped so a future thread swap is one-line; see "Deferred Until Later" in the design doc.
 - The `i_sound.c` patches overlay is the smallest possible engine-side change: it replaces only the registration arrays, preserving every other upstream function verbatim.
 - All host tests run under `cargo xtask check`; the new C-test step in xtask compiles `m3os_dmx.c` / `m3os_sound.c` / `m3os_music.c` with the host `cc` against test drivers under `userspace/doom/tests/`, no QEMU required.
-- The `doom-audio-smoke` gate uses shareware `DOOM1.WAD` (already shipped per Phase 47); the scripted trigger is the title-screen menu-confirm which deterministically plays `DSPISTOL`. A WAD swap that changes this behavior must update the gate.
+- The `doom-audio-smoke` gate uses shareware `DOOM1.WAD` (already shipped per Phase 47); the scripted trigger is `-warp 1 1` followed by a `Ctrl` keystroke (DOOM's default fire key), which discharges the spawn-loadout pistol and plays `DSPPISTOL`. A WAD swap that changes the E1M1 player loadout (no pistol, or a different starting weapon) must update the gate.

@@ -8,11 +8,11 @@
 
 ## Milestone Goal
 
-A user running `cargo xtask run-gui` can launch `/bin/doom` from the `term` prompt and hear DOOM's SFX (menu cursor, gunshots, doors, monster sounds) and a Tier 2a square/triangle synth rendition of the title music play through the host audio device. `cargo xtask doom-audio-smoke` boots headless, scripts DOOM to a title-screen menu-confirm that triggers `DSPISTOL`, asserts `frames_consumed` advances via `AudioControlCommand::GetStats`, and verifies the QEMU-recorded WAV is non-silent. The Phase 63 single-client `EBUSY` policy is preserved: if `audio_server` is busy when DOOM starts, DOOM logs `doom.audio.unavailable` once at INFO and runs silently; the BEL is silently dropped while DOOM holds the stream and re-arms on DOOM exit. The kernel patch-bumps to `0.63.1`.
+A user running `cargo xtask run-gui` can launch `/bin/doom` from the `term` prompt and hear DOOM's SFX (menu cursor, gunshots, doors, monster sounds) and a Tier 2a square/triangle synth rendition of the title music play through the host audio device. `cargo xtask doom-audio-smoke` boots headless, scripts DOOM into Episode 1 Map 1 via `-warp 1 1`, fires the player's pistol with one `Ctrl` keystroke to produce a `DSPPISTOL` SFX submission, asserts `frames_consumed > 0` via the shutdown-time `M3OS_DOOM:audio_summary` line, and verifies the QEMU-recorded WAV is non-silent. The Phase 63 single-client `EBUSY` policy is preserved: if `audio_server` is busy when DOOM starts, DOOM logs `doom.audio.unavailable` once at INFO and runs silently; the BEL is silently dropped while DOOM holds the stream and re-arms on DOOM exit. The kernel patch-bumps to `0.63.1`.
 
 ## Why This Phase Exists
 
-Phase 47 landed DOOM as a framebuffer + keyboard application and explicitly deferred sound to Phase 57. Phase 57 landed `audio_server` and `audio_client` with full host-test coverage but a stub `Ac97Backend`. Phase 63 replaced that stub with real PCM emission, closing the kernel/driver/server stack — but the DOOM platform layer (`userspace/doom/dg_m3os.c`) still has zero audio wiring (`grep -E 'audio|sound|sfx|i_sound' dg_m3os.c` returns nothing), and `xtask/src/main.rs:1336` still passes `-UFEATURE_SOUND` so the upstream `i_sound.c` dispatcher compiles to no-ops.
+Phase 47 landed DOOM as a framebuffer + keyboard application and explicitly deferred sound to Phase 57. Phase 57 landed `audio_server` and `audio_client` with full host-test coverage but a stub `Ac97Backend`. Phase 63 replaced that stub with real PCM emission, closing the kernel/driver/server stack — but the DOOM platform layer (`userspace/doom/dg_m3os.c`) still has zero audio wiring (`grep -E 'audio|sound|sfx|i_sound' dg_m3os.c` returns nothing), and `build_doom` in `xtask/src/main.rs` still passes `-UFEATURE_SOUND` so the upstream `i_sound.c` dispatcher compiles to no-ops.
 
 63a is the last consumer-side gap. Without it, the BEL is the only audible payload on the system and the audio path has only one consumer archetype (single-tone `audio-demo`). DOOM is a materially different consumer — game-loop cadence, 16-channel mix, real WAD-embedded sample data at native rates — and exercises ABI assumptions that a single sine wave never touches. 63a also makes the mix-engine surface a reusable crate (`audio_mixer`), which prepares the ground for the future system mixer service the Phase 63 doom-audio-wiring memo names as Tier 4.
 
@@ -30,7 +30,7 @@ The phase deliberately stays in userspace + xtask. The kernel ABI does not chang
 
 ### Reusable mix engine — `audio_mixer` crate (Track A)
 
-A new `userspace/lib/audio_mixer/` crate exposes a pure-logic, `#![no_std]` mixer that any audio consumer can drive. Public Rust surface: a `Mixer` struct with a parameterized channel count, a `ChannelState` describing one active sound, and a `step` method that consumes a slice of mix-frames-to-produce and emits stereo S16LE bytes. Resampling is 16.16-fixed-point linear interpolation. Volume is a `u8` 0..=127 scale matching DOOM's per-channel left/right pan. The crate also exposes a C-ABI surface (`audio_mixer_*` functions over an opaque `Mixer*` handle) for the doomgeneric C consumer. Pure-Rust host tests live in the crate alongside the implementation; `cargo test -p audio-mixer` covers exact-output assertions, channel-isolation, clamp-at-bounds, and resampler precision.
+A new `userspace/lib/audio_mixer/` crate exposes a pure-logic, `#![no_std]` mixer that any audio consumer can drive. Public Rust surface: a `Mixer` struct with a parameterized channel count, a `ChannelState` describing one active sound, and a `step` method that consumes a slice of mix-frames-to-produce and emits stereo S16LE bytes. Resampling is 16.16-fixed-point linear interpolation. Volume is a `u8` 0..=127 scale matching DOOM's per-channel left/right pan. The crate also exposes a C-ABI surface (`audio_mixer_*` functions over an opaque `Mixer*` handle) for the doomgeneric C consumer. Pure-Rust host tests live in the crate alongside the implementation; `cargo test -p audio_mixer` covers exact-output assertions, channel-isolation, clamp-at-bounds, and resampler precision.
 
 ### C-ABI veneer — `audio_client_ffi` crate (Track B)
 
@@ -44,7 +44,7 @@ A pure C module parses the WAD-embedded DMX header (12-byte header: 16-bit forma
 
 Implements the `sound_module_t` function table:
 
-- `Init`: connects to `audio_server` via `audio_ffi_connect`, calls `audio_ffi_open` with the fixed 48 kHz / S16LE / stereo format. On `EBUSY`, logs `doom.audio.unavailable` once at INFO, sets a module-level `audio_disabled` flag, and binds `StartSound` / `UpdateSoundParams` to no-op stubs for the rest of the process. On success, creates a `Mixer` via `audio_mixer_new(16)`.
+- `Init`: connects to `audio_server` via `audio_ffi_connect`, calls `audio_ffi_open` with the fixed 48 kHz / S16LE / stereo format. On `EBUSY`, logs `doom.audio.unavailable` once at INFO, sets a module-level `audio_disabled` flag, and binds `StartSound` / `UpdateSoundParams` to no-op stubs for the rest of the process. On success, creates a `Mixer` via `audio_mixer_new(32)` — SFX claims channels `0..15` (DOOM's `MAX_CHANNELS = 16`), the Tier 2a music synth claims `16..31`.
 - `Shutdown`: drains and closes the stream, frees the mixer.
 - `StartSound`: looks up the cached decode, claims a free mixer channel, seeds it with the sample pointer, source rate, volume, and pan.
 - `UpdateSoundParams` / `StopSound` / `SoundIsPlaying`: thin wrappers over `Mixer` channel operations.
@@ -65,31 +65,36 @@ A patches-overlay file (same mechanism Phase 47 uses for `i_input.c`) replaces u
 
 ### xtask build wiring (Track G)
 
-Three changes to `build_doom`:
+Four changes to `build_doom` plus one new platform-layer marker:
 
 1. Flip `-UFEATURE_SOUND` to `-DFEATURE_SOUND` so upstream `i_sound.c` and `s_sound.c` compile in.
 2. Add `m3os_sound.c`, `m3os_dmx.c`, `m3os_music.c` to the source list.
 3. Link the `audio_client_ffi` and `audio_mixer` Rust staticlibs into the final musl-gcc invocation, with `-I` pointing at the committed C headers.
+4. In `dg_m3os.c`, add a one-shot `M3OS_DOOM:title_ready` serial print on the first `DG_DrawFrame` invocation so the smoke harness has a deterministic "DOOM is past init" signal. Engine-side audio module init flow stays unchanged — upstream's `I_InitSound` iterates the registered `sound_modules` array Track F installs.
 
-A new `cmd_doom_audio_smoke` function adds a `cargo xtask doom-audio-smoke` subcommand that mirrors `cmd_audio_smoke`'s WAV-backed shape: boot headless, drive DOOM via stdin keyboard injection to a title-screen menu-confirm (which triggers `DSPISTOL`), wait for an `M3OS_DOOM:audio_summary frames_consumed=<N>` line printed by `m3os_sound::Shutdown`, sample the WAV file, and assert ≥ 5 % of samples are above the silence threshold.
+### Audio smoke gate (Track H)
 
-### Stream-leak resilience (Track H)
+A new `cmd_doom_audio_smoke` function adds a `cargo xtask doom-audio-smoke` subcommand mirroring `cmd_audio_smoke`'s WAV-backed shape: boot headless with the WAV-recording AC'97 audiodev, wait for `term`, send `/bin/doom -warp 1 1\n` (the `-warp` flag skips the title-screen menu entirely and drops the player into Episode 1 Map 1 with a pistol in hand), wait for the `M3OS_DOOM:title_ready` marker, send a single `Ctrl` keystroke to fire the pistol (producing one `DSPPISTOL` SFX submission), then issue the DOOM in-game quit sequence (`Esc` → `Q` → `Y`) which triggers `m3os_sound_module.Shutdown`. Shutdown prints `M3OS_DOOM:audio_summary frames_submitted=<N> frames_consumed=<M> underruns=<K>`; the harness asserts `frames_consumed > 0` from that line and ≥ 5 % non-silent samples from the recorded WAV.
 
-If DOOM crashes or is SIGKILLed mid-frame, a relaunch within one second must still acquire the stream. The behavior is mostly governed by `audio_server`'s socket-disconnect → stream-close path, which Phase 57's tests already cover — Track H is verification only, not new code: a host-side test in `audio_client_ffi` exercises the connect/open/abort/reconnect/open cycle, and a `doom-audio-smoke` post-step launches DOOM twice back-to-back.
+The gate is *not* wired into `cmd_check` (which stays QEMU-free) — instead it joins `audio-smoke`, `bell-smoke`, `smoke-test`, and `regression` as a pre-push hook gate. This mirrors Phase 63's `audio-smoke` placement.
 
-### Kernel patch bump (Track I)
+### Stream-leak resilience (Track I)
 
-`kernel/Cargo.toml` moves from `0.63.0` to `0.63.1`. No kernel source changes. The bump lets 63a release independently from the next kernel-touching phase.
+If DOOM crashes or is SIGKILLed mid-frame, a relaunch within one second must still acquire the stream. The behavior is mostly governed by `audio_server`'s socket-disconnect → stream-close path, which Phase 57's tests already cover — Track I is verification only, not new code: a host-side test in `audio_client_ffi` exercises the connect/open/abort/reconnect/open cycle, and a `doom-audio-smoke` post-step launches DOOM twice back-to-back and asserts the second launch never logs `doom.audio.unavailable code=ebusy`.
+
+### Kernel patch bump + doc wiring (Track J)
+
+`kernel/Cargo.toml` moves from `0.63.0` to `0.63.1`. No kernel source changes. The bump lets 63a release independently from the next kernel-touching phase. The roadmap README and `AGENTS.md` project overview are updated, the `docs/appendix/doom-audio-wiring.md` memo is flipped to "Implemented in Phase 63a", and a new learning doc captures the manual audible-on-host smoke checklist.
 
 ## Important Components and How They Work
 
 ### `userspace/lib/audio_mixer/src/lib.rs`
 
-Owns `Mixer`, `ChannelState`, and the pure mix loop. `Mixer::step(out: &mut [u8], frames: usize)` walks the 16 channels, for each active channel computes `(source_rate << 16) / 48000` per output frame, advances a 16.16 cursor into the sample slice, looks up two adjacent samples and linearly interpolates, multiplies by per-channel left/right volume into a 32-bit accumulator, then clamps the accumulator to `i16::MIN..=i16::MAX` on store. No allocation in `step`. The C-ABI surface (`audio_mixer_new`, `audio_mixer_set_channel`, `audio_mixer_clear_channel`, `audio_mixer_step`, `audio_mixer_drop`) takes an opaque `*mut Mixer` and returns stable `int` codes.
+Owns `Mixer`, `ChannelState`, and the pure mix loop. `Mixer::step(out: &mut [u8], frames: usize)` walks the (up to 32) channels — SFX in `0..15`, music voices in `16..31` — for each active channel computes `(source_rate << 16) / 48000` per output frame, advances a 16.16 cursor into the sample slice, looks up two adjacent samples and linearly interpolates, multiplies by per-channel left/right volume into a 32-bit accumulator, then clamps the accumulator to `i16::MIN..=i16::MAX` on store. No allocation in `step`. The C-ABI surface (`audio_mixer_new`, `audio_mixer_set_channel`, `audio_mixer_clear_channel`, `audio_mixer_step`, `audio_mixer_drop`) takes an opaque `*mut Mixer` and returns stable `int` codes.
 
 ### `userspace/lib/audio_client_ffi/src/lib.rs`
 
-Wraps `audio_client::AudioClient` in `#[no_mangle] pub extern "C"` shims. Owns a `Mutex<Option<AudioClient<SyscallSocket>>>` behind an opaque handle to keep the C side from having to think about thread safety. Error mapping is exhaustive: every `AudioClientError` variant maps to a stable `int` constant declared in `audio_client.h`. The build script verifies, at compile time, that the `int` constants in the header match the discriminant values used by the Rust impl.
+Wraps `audio_client::AudioClient` in `#[no_mangle] pub extern "C"` shims. Owns a `Mutex<Option<AudioClient<SyscallSocket>>>` behind an opaque handle to keep the C side from having to think about thread safety. Error mapping is a flat table over the cartesian product of `AudioClientError` × the inner `AudioError` payload of `Server(_)`: `Server(AudioError::Busy)` → `AUDIO_FFI_ERR_BUSY`, `Server(AudioError::WouldBlock)` → `AUDIO_FFI_ERR_WOULD_BLOCK`, `Server(AudioError::FormatMismatch)` → `AUDIO_FFI_ERR_FORMAT`, `Io(_)` → `AUDIO_FFI_ERR_IO`, `Protocol(_)` → `AUDIO_FFI_ERR_PROTOCOL`, `AlreadyOpen` / `NotOpen` / `UnexpectedReply` → their own constants. The full table is published in `audio_client.h`. The build script reads the header, regex-matches every `#define AUDIO_FFI_* <int>` line, and `assert!`s the value matches the corresponding `pub const` in `src/lib.rs` — mismatch is a hard build error so the C and Rust tables cannot silently drift.
 
 ### `userspace/doom/m3os_dmx.c`
 
@@ -119,7 +124,7 @@ Three small additions: drop `-UFEATURE_SOUND`, add the three new `.c` files to `
 
 ### `xtask/src/main.rs::cmd_doom_audio_smoke`
 
-New top-level command. Boots QEMU with the existing `wav,id=snd0,path=…` audiodev (same shape `audio-smoke` uses), waits for `term` to register, sends `/bin/doom` over the serial console, waits for the title screen, sends the menu-confirm keystroke, waits for `M3OS_DOOM:audio_summary` on the serial console, terminates DOOM cleanly, parses the WAV file, and asserts both `frames_consumed > 0` (from the summary line) and ≥ 5 % non-silent samples (from the WAV). Three distinct failure modes per Phase 63's pattern.
+New top-level command. Boots QEMU with the existing `wav,id=snd0,path=…` audiodev (same shape `audio-smoke` uses), waits for `term` to register, sends `/bin/doom -warp 1 1\n` (the `-warp` flag drops the player directly into Episode 1 Map 1 with a pistol in hand — no title-screen menu navigation), waits for the `M3OS_DOOM:title_ready` marker (Track G.4), sends one `Ctrl` keystroke to fire the pistol (a single `DSPPISTOL` SFX submission), sends the DOOM in-game quit sequence (`Esc` → `Q` → `Y`) so `m3os_sound_module.Shutdown` prints the `M3OS_DOOM:audio_summary` line, parses the WAV file, and asserts both `frames_consumed > 0` (from the summary line) and ≥ 5 % non-silent samples (from the WAV). Three distinct failure modes per Phase 63's pattern.
 
 ## How This Builds on Earlier Phases
 
@@ -152,7 +157,7 @@ TDD-first across the board — the mixer math, the DMX decoder, and the FFI vene
 - A second consecutive `/bin/doom` launch within one second of the first crash/exit acquires the stream cleanly (no `EBUSY` from a leaked socket).
 - When `term`'s BEL fires while DOOM is holding the stream, the BEL is silently dropped — no crash, no log spam, and the BEL re-arms audibly on DOOM exit (verified by a follow-up BEL test post-DOOM in `doom-audio-smoke`).
 - `audio_disabled` fallback verified: a second instance of `/bin/doom` started while the first is running prints `doom.audio.unavailable` once at INFO, runs without crashing, and exits cleanly.
-- `cargo test -p audio-mixer` and `cargo test -p audio-client-ffi` pass; the mixer host tests assert exact output samples for at least: single-channel mute, single-channel full-volume, two-channel left-pan + right-pan, clamp-at-bounds for an overdriven mix, and resampler precision at 11025 → 48000.
+- `cargo test -p audio_mixer` and `cargo test -p audio_client_ffi` pass; the mixer host tests assert exact output samples for at least: single-channel mute, single-channel full-volume, two-channel left-pan + right-pan, clamp-at-bounds for an overdriven mix, and resampler precision at 11025 → 48000.
 - `kernel/Cargo.toml` is at `0.63.1`; `AGENTS.md` and `docs/roadmap/README.md` reflect the bump; `docs/appendix/doom-audio-wiring.md` carries the Phase 63a closure note.
 
 ## Companion Task List
