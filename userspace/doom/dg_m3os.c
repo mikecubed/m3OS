@@ -196,12 +196,12 @@ void DG_DrawFrame(void)
     static int s_frame_counter = 0;
     if (!title_ready_printed) {
         title_ready_printed = 1;
-        printf("M3OS_DOOM:title_ready\n");
+        printf("M3OS_DOOM:title_ready\n"); /* DevSkim: ignore DS154189 -- literal string, smoke-gate marker line */
         fflush(stdout);
-        FILE *f = fopen("/tmp/doom-autoquit-tics", "r");
+        FILE *f = fopen("/tmp/doom-autoquit-tics", "r"); /* DevSkim: ignore DS154189 -- literal local path, read-only, smoke-gate seam */
         if (f) {
             int n;
-            if (fscanf(f, "%d", &n) == 1 && n > 0) {
+            if (fscanf(f, "%d", &n) == 1 && n > 0) { /* DevSkim: ignore DS154189 -- bounded %d conversion, no string buffers involved */
                 s_autoquit_frames = n;
             }
             fclose(f);

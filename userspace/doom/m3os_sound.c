@@ -155,7 +155,7 @@ int m3os_sound_init_inner(void) {
     void *handle = g_state.submitter.connect();
     if (handle == NULL) {
         g_state.audio_disabled = 1;
-        fprintf(stdout, "doom.audio.unavailable code=connect-failed\n");
+        fprintf(stdout, "doom.audio.unavailable code=connect-failed\n"); /* DevSkim: ignore DS154189 -- literal-format diagnostic, no user input */
         fflush(stdout);
         g_state.initialized = 1;
         return 1;
@@ -168,7 +168,7 @@ int m3os_sound_init_inner(void) {
         if (rc == AUDIO_FFI_ERR_BUSY) {
             code = "ebusy";
         }
-        fprintf(stdout, "doom.audio.unavailable code=%s\n", code);
+        fprintf(stdout, "doom.audio.unavailable code=%s\n", code); /* DevSkim: ignore DS154189 -- literal format, `code` is a compile-time string constant */
         fflush(stdout);
         g_state.submitter.close(handle);
         g_state.handle = NULL;
@@ -179,7 +179,7 @@ int m3os_sound_init_inner(void) {
 
     g_state.mixer = audio_mixer_new(M3OS_TOTAL_CHANNELS);
     if (g_state.mixer == NULL) {
-        fprintf(stdout, "doom.audio.unavailable code=mixer-failed\n");
+        fprintf(stdout, "doom.audio.unavailable code=mixer-failed\n"); /* DevSkim: ignore DS154189 -- literal-format diagnostic, no user input */
         fflush(stdout);
         g_state.submitter.close(handle);
         g_state.handle = NULL;
@@ -221,7 +221,7 @@ void m3os_sound_shutdown_inner(void) {
     uint32_t note_ons = 0;
     uint32_t drum_hits = 0;
 #endif
-    fprintf(stdout,
+    fprintf(stdout, /* DevSkim: ignore DS154189 -- literal format, integer args, smoke-gate marker line */
             "M3OS_DOOM:audio_summary frames_submitted=%llu "
             "frames_consumed=%llu underruns=%u doom_tics=%u "
             "mus_ticks=%u note_ons=%u drum_hits=%u\n",
@@ -383,7 +383,7 @@ void m3os_sound_update_inner(void) {
         if ((int)rc != AUDIO_FFI_ERR_WOULD_BLOCK) {
             static int warned = 0;
             if (!warned) {
-                fprintf(stderr, "doom.audio.submit_error code=%ld\n", (long)rc);
+                fprintf(stderr, "doom.audio.submit_error code=%ld\n", (long)rc); /* DevSkim: ignore DS154189 -- literal format, integer arg, one-shot warn */
                 fflush(stderr);
                 warned = 1;
             }

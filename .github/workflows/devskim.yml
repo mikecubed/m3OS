@@ -30,7 +30,14 @@ jobs:
         with:
           directory-to-scan: .
           should-scan-archives: false
-          ignore-globs: "sunset-local/docs/**,sunset-local/testing/**,userspace/doom/**"
+          # Keep our m3OS-specific platform code (m3os_sound.c,
+          # m3os_music.c, m3os_dmx.c, dg_m3os.c) under scan — dmx in
+          # particular parses untrusted WAD lump bytes and should be
+          # exercised by DevSkim. Only exclude the vendored doomgeneric
+          # tree, the upstream-derived patches/ overlay, and the host
+          # ASSERT-macro test files (where the only DS154189 hits are
+          # literal-string fprintf calls in test plumbing).
+          ignore-globs: "sunset-local/docs/**,sunset-local/testing/**,userspace/doom/doomgeneric/**,userspace/doom/patches/**,userspace/doom/tests/**"
 
       - name: Upload DevSkim scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4

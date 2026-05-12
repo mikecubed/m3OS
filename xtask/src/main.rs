@@ -1191,12 +1191,19 @@ fn build_doom() {
         let mut combined: Vec<u8> = Vec::new();
         for rel in &overlay_files {
             let p = root.join(rel);
-            if let Ok(bytes) = fs::read(&p) {
-                combined.extend_from_slice(rel.as_bytes());
-                combined.push(b'\n');
-                combined.extend_from_slice(&bytes);
-                combined.push(b'\n');
+            combined.extend_from_slice(rel.as_bytes());
+            combined.push(b'\n');
+            match fs::read(&p) {
+                Ok(bytes) => combined.extend_from_slice(&bytes),
+                // A missing or unreadable overlay file is a distinct
+                // input from an empty one — record it explicitly so the
+                // fingerprint can never collide with a successful read
+                // of a different file set (otherwise a transient I/O
+                // error could stamp a cache that later "matches" once
+                // the file is readable again).
+                Err(_) => combined.extend_from_slice(b"<MISSING>"),
             }
+            combined.push(b'\n');
         }
         // Lightweight non-crypto hash — collisions for source-file
         // content are not adversarial here, just unlikely.
@@ -1414,7 +1421,7 @@ fn build_doom() {
     // it as a staticlib rolls in *both* sets of C-ABI symbols
     // (`audio_ffi_*` and `audio_mixer_*`) plus exactly one copy of
     // the Rust runtime / panic_handler (defined in
-    // `audio_mixer::staticlib_runtime`).
+    // `audio_client_ffi::staticlib_runtime`).
     {
         println!("doom: building audio_client_ffi staticlib for musl (rolls in audio_mixer)...");
         let mut cargo = Command::new(env!("CARGO"));
@@ -14616,6 +14623,7 @@ mod tests {
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
             SMOKE_EXIT_WAV_SILENT,
             SMOKE_EXIT_BELL_SMOKE_FAILED,
+            SMOKE_EXIT_DOOM_AUDIO_FAILED,
         ];
         for (i, &a) in codes.iter().enumerate() {
             for &b in &codes[i + 1..] {

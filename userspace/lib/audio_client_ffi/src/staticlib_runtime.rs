@@ -1,10 +1,14 @@
-//! Minimal runtime for the musl-static staticlib build of
-//! `audio_mixer`. Provides a `#[panic_handler]` that aborts and a
-//! `#[global_allocator]` that calls into musl's libc malloc/free.
+//! Minimal runtime for the combined `audio_client_ffi` staticlib
+//! (which transitively rolls in `audio_mixer`). Provides a
+//! `#[panic_handler]` that aborts and a `#[global_allocator]` that
+//! calls into musl's libc malloc/free.
 //!
 //! Only compiled for the `target_env = "musl"` staticlib build —
 //! host tests and rlib consumers stay on the regular Rust std /
-//! testing alloc / panic infrastructure.
+//! testing alloc / panic infrastructure. Debugging duplicate-symbol
+//! / runtime-collision errors at link time? Start here — this module
+//! is the single owner of the panic_handler / global_allocator in
+//! the produced `.a`.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;

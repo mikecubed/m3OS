@@ -176,6 +176,12 @@ These don't deserve a dedicated phase. Any of them can be landed as a small PR w
 - **Effort:** 1 h.
 - **Depends on:** Tier-4 mixer service (only meaningful with concurrent clients).
 
+### LF-13. Sync `channel_active[]` with mixer auto-deactivation
+
+- **What:** `m3os_sound_is_playing_inner` returns the C-side `g_state.channel_active[channel]` flag, which is only cleared on explicit `StopSound`. The mixer, however, auto-deactivates a non-looping channel when its cursor crosses `samples_len` (see `Mixer::step`'s "cursor_int >= samples_len" branch). The two states drift: `I_SoundIsPlaying` keeps returning `true` after a sample finishes naturally, so DOOM's `S_GetChannel` reuse logic believes channels are perpetually busy and falls back to aggressive voice-steal more often than necessary. Audible as slightly punchier reuse on rapid SFX bursts; the smoke gate still passes because the steal path is well-exercised.
+- **Effort:** 1–2 h. Either add an `audio_mixer_channel_is_active(mixer, idx) -> bool` FFI query and have `m3os_sound_is_playing_inner` read it, or have `audio_mixer_step` return a "channels-that-became-inactive" bitset that `m3os_sound_update_inner` folds into `channel_active[]`. New host tests cover both directions of the sync.
+- **Depends on:** nothing in 63a.
+
 ---
 
 ## Quick-pick ordering (engineer's-choice)

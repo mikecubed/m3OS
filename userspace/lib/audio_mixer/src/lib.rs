@@ -343,7 +343,13 @@ impl Mixer {
     /// No allocation: the mix loop walks the fixed channel array and
     /// writes interleaved little-endian samples in place.
     pub fn step(&mut self, out: &mut [u8], frames: usize) -> usize {
-        let needed = frames * BYTES_PER_FRAME;
+        // `frames * BYTES_PER_FRAME` could overflow `usize` for huge
+        // frame counts (theoretical at this FFI boundary, since
+        // `frames` originates from C). Treat overflow as "buffer too
+        // small" and return 0, matching the under-sized-buffer path.
+        let Some(needed) = frames.checked_mul(BYTES_PER_FRAME) else {
+            return 0;
+        };
         if out.len() < needed {
             return 0;
         }
@@ -401,7 +407,14 @@ impl Mixer {
                 // `prev_*_vol` to `*_vol` over `vol_ramp_total`
                 // frames. Otherwise use the nominal vol verbatim.
                 let (effective_lv, effective_rv) = if ch.vol_ramp_total > 0 {
-                    let progress = (ch.vol_ramp_total - ch.vol_ramp_remaining) as i32;
+                    // Progress walks 1..=total over `total` frames so
+                    // the final ramped frame reaches the target volume
+                    // exactly (otherwise it would land at
+                    // `(prev + new*(total-1))/total` and step the
+                    // remaining 1/total on the next frame when the
+                    // ramp disables — an audible click for large
+                    // prev/new deltas).
+                    let progress = (ch.vol_ramp_total - ch.vol_ramp_remaining + 1) as i32;
                     let total = ch.vol_ramp_total as i32;
                     let elv = (ch.prev_left_vol as i32 * (total - progress)
                         + ch.left_vol as i32 * progress)
@@ -755,6 +768,43 @@ mod tests {
         }
         mixer.release_channel(0, 0);
         assert!(!mixer.channel(0).unwrap().is_active());
+    }
+
+    #[test]
+    fn vol_ramp_reaches_target_on_final_ramped_frame() {
+        // Reclaim ramp: re-seed an active channel with a new vol and
+        // confirm the FINAL ramped frame uses the new vol exactly
+        // (rather than landing short and stepping the last 1/total on
+        // the next frame, which would click for large prev/new
+        // deltas). Phase 63a CoP review LF: progress walks 1..=total.
+        let mut mixer = Mixer::new(1);
+        let samples = alloc::vec![192u8; 256]; // constant +16384 signed
+        // Initial seed at low vol.
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 8, 8);
+        }
+        // Pull one frame so the channel is "was_active" on next seed.
+        let mut throwaway = [0u8; BYTES_PER_FRAME];
+        let _ = mixer.step(&mut throwaway, 1);
+        // Re-seed at full vol → triggers the 64-frame voice-reclaim
+        // vol_ramp from prev (8/8) to new (127/127).
+        unsafe {
+            mixer.set_channel(0, &samples, 48_000, 127, 127);
+        }
+        // Render exactly the ramp window — 64 frames.
+        let mut out = [0u8; 64 * BYTES_PER_FRAME];
+        let n = mixer.step(&mut out, 64);
+        assert_eq!(n, 64 * BYTES_PER_FRAME);
+        // Final ramped frame (index 63) must equal full-vol amplitude
+        // (vol 127 on constant 192 sample: (192-128)*256=16384,
+        // then *127>>7 = 16256). Off-by-one would land it at
+        // (8*1 + 127*63)/128 * 128 → ~16128, a 128-unit step short.
+        let off = 63 * BYTES_PER_FRAME;
+        let final_ramped_l = i16::from_le_bytes([out[off], out[off + 1]]);
+        assert_eq!(
+            final_ramped_l, 16256,
+            "final ramped frame must reach the target volume exactly"
+        );
     }
 
     #[test]
