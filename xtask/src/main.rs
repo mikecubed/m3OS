@@ -482,7 +482,13 @@ fn build_userspace_bins() {
         ("ping", "ping", false),
         ("udp-smoke", "udp-smoke", false),
         ("smoke-runner", "smoke-runner", false),
-        ("init", "init", false),
+        // Phase 64b: init depends on kernel-core for the
+        // `session_events` codec (push notifications to
+        // session_manager on each reap). `needs_alloc = true` so
+        // build-std links the `alloc` crate — kernel-core's `lib.rs`
+        // has `extern crate alloc` at the root even though init's own
+        // code uses only stack buffers.
+        ("init", "init", true),
         ("shell", "sh0", false),
         ("edit", "edit", true),
         ("login", "login", false),
@@ -7162,6 +7168,15 @@ fn session_restart_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 30,
             label: "guest/session-restart: kernel first message",
         },
+        // Phase 64b — assert session_manager binds the push-event
+        // endpoint at startup. Checked here (before any `Send` resets
+        // the serial buffer) because the bind log fires once during
+        // daemon boot.
+        SmokeStep::Wait {
+            pattern: "session_manager: session.events: registered as 'session-events'",
+            timeout_secs: 90,
+            label: "guest/session-events: session_manager bound the events endpoint",
+        },
         SmokeStep::Wait {
             pattern: "session_manager: session.boot: state=running",
             timeout_secs: 90,
@@ -7179,7 +7194,7 @@ fn session_restart_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/session-restart: invoke m3ctl session-restart kbd_server",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "lifecycle.restart: 'kbd_server': delegating to init (Phase 64a)",
+        pattern: "lifecycle.restart: 'kbd_server': delegating to init (Phase 64b)",
         timeout_secs: 10,
         label: "guest/session-restart: daemon routed to new init-delegation path",
     });
@@ -7198,9 +7213,18 @@ fn session_restart_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/session-restart: init dispatched the restart",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "lifecycle.restart: 'kbd_server': converged (Phase 64a)",
+        pattern: "lifecycle.restart: 'kbd_server': converged (Phase 64b)",
         timeout_secs: 30,
         label: "guest/session-restart: daemon logged convergence after init restart",
+    });
+    // Phase 64b Item B — init's reap of kbd during the restart must
+    // produce a push notification that session_manager logs as
+    // `session.events: kbd exited`. Verifies the producer→consumer
+    // pipe is live (registration was already proven at startup).
+    steps.push(SmokeStep::Wait {
+        pattern: "session_manager: session.events: kbd exited",
+        timeout_secs: 10,
+        label: "guest/session-events: init pushed kbd's exit event to session_manager",
     });
     steps
 }

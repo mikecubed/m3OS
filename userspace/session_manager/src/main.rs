@@ -129,6 +129,13 @@ fn program_main(_args: &[&str]) -> i32 {
     let control_socket = control::bind_control_socket();
     let mut control_ctx = control::ControlContext::new();
 
+    // Phase 64b: bind the `"session-events"` push endpoint. Init
+    // lazily looks this up on its first reap and pushes
+    // `ServiceExitEvent`s to it. The boot sequence proceeds whether
+    // or not this binds — the existing `/run/services.status` poll
+    // path is the fallback observer.
+    let events_socket = control::bind_events_socket();
+
     // Drive the declared boot sequence.
     let mut backend = init_backend::InitSupervisorBackend::new();
     let final_state = run_boot_sequence(&mut backend);
@@ -150,6 +157,18 @@ fn program_main(_args: &[&str]) -> i32 {
         "session_manager: entering steady-state loop\n",
     );
     loop {
+        // Phase 64b — drain any pushed exit events from init first so
+        // the structured log surface records each reap. Bounded loop
+        // (≤8 events/tick) keeps the work cheap.
+        let _events = control::drain_exit_events(&events_socket, &mut backend);
+
+        // Phase 64b — drive any in-flight async-restart toward
+        // convergence before accepting a new request. Cheap when
+        // nothing is parked (single `is_none()` check). Placed
+        // before `poll_control_once` so a request that arrives the
+        // same tick as convergence still observes the freed slot.
+        control::tick_pending(&mut control_ctx, &mut backend);
+
         // Poll the control socket non-blocking. F.5 dispatches the
         // session-state / session-stop / session-restart verbs.
         let _serviced = control::poll_control_once(&control_socket, &mut control_ctx, &mut backend);
@@ -443,16 +462,41 @@ mod init_backend {
         }
 
         fn restart(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // Phase 64a — per-service restart via init delegation.
-            // Writes `restart <init_name>` to /run/init.cmd; init's
-            // handler stops the service, resets restart_count to 0,
-            // and re-starts it through the normal manifest-driven
-            // path. We observe completion by polling
-            // /run/services.status until the service is `running`
-            // again with a non-zero PID (and ideally a different PID
-            // than before, to confirm a genuine restart rather than a
-            // stale snapshot). The whole motion can take 1–6 s
-            // depending on init's restart_delay backoff.
+            // Phase 64b — synchronous wrapper around the same begin /
+            // observe / finish primitives the event-loop async path
+            // uses. Kept for callers (e.g. the boot-sequence rollback)
+            // that prefer a single blocking call. The async control
+            // path in `control::poll_control_once` skips this method
+            // and drives the primitives across event-loop ticks.
+            let prior_pid = self.begin_async_restart(service)?;
+            let init_name = init_service_name(service);
+            const STATUS_POLL_ITERS: u32 = 30;
+            const STATUS_POLL_NS: u32 = 500_000_000;
+            for _ in 0..STATUS_POLL_ITERS {
+                if let Some(new_pid) = observe_async_restart(init_name, prior_pid) {
+                    self.finish_async_restart(service, new_pid)?;
+                    return Ok(SupervisorReply::Ack);
+                }
+                let _ = syscall_lib::nanosleep_for(0, STATUS_POLL_NS);
+            }
+            let _ = self.fail_async_restart(service);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "session_manager: lifecycle.restart: '",
+            );
+            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "': timed out waiting for init restart to converge\n",
+            );
+            Err(SupervisorError::NotRunning)
+        }
+
+        fn begin_async_restart(&mut self, service: &str) -> Result<i32, SupervisorError> {
+            // Phase 64b — initiate but do not poll. The caller (either
+            // the synchronous `restart()` wrapper above or the
+            // event-loop tick path in `control::tick_pending`) is
+            // responsible for observing convergence.
             let init_name = init_service_name(service);
             if init_name.is_empty() {
                 return Err(SupervisorError::UnknownService);
@@ -466,54 +510,34 @@ mod init_backend {
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                "': delegating to init (Phase 64a)\n",
+                "': delegating to init (Phase 64b)\n",
             );
             if init_proxy::cmd_restart(init_name).is_err() {
                 self.table.update_state(service, ServiceState::Failed);
                 return Err(SupervisorError::NotRunning);
             }
-            // Wait for init to converge. Worst case: 5 s SIGTERM grace
-            // + 1 s SIGKILL reap + restart_delay (up to 60 s for high
-            // restart_count, but normally 1 s). Cap the wait at ~15 s
-            // total — beyond that the operator should investigate via
-            // `m3ctl session-state --detailed`.
-            const STATUS_POLL_ITERS: u32 = 30;
-            const STATUS_POLL_NS: u32 = 500_000_000;
-            let mut observed_new_pid = false;
-            for _ in 0..STATUS_POLL_ITERS {
-                if let Some(status) = init_proxy::read_service_status(init_name) {
-                    if matches!(status.state, InitServiceState::Running)
-                        && status.pid > 0
-                        && (prior_pid == 0 || status.pid != prior_pid)
-                    {
-                        self.table.update_pid(service, Some(Pid(status.pid)));
-                        self.table.update_state(service, ServiceState::Running);
-                        observed_new_pid = true;
-                        break;
-                    }
-                }
-                let _ = syscall_lib::nanosleep_for(0, STATUS_POLL_NS);
-            }
-            if !observed_new_pid {
-                syscall_lib::write_str(
-                    syscall_lib::STDOUT_FILENO,
-                    "session_manager: lifecycle.restart: '",
-                );
-                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
-                syscall_lib::write_str(
-                    syscall_lib::STDOUT_FILENO,
-                    "': timed out waiting for init restart to converge\n",
-                );
-                self.table.update_state(service, ServiceState::Failed);
-                return Err(SupervisorError::NotRunning);
-            }
+            Ok(prior_pid)
+        }
+
+        fn finish_async_restart(
+            &mut self,
+            service: &str,
+            new_pid: i32,
+        ) -> Result<(), SupervisorError> {
+            self.table.update_pid(service, Some(Pid(new_pid)));
+            self.table.update_state(service, ServiceState::Running);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
                 "session_manager: lifecycle.restart: '",
             );
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
-            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "': converged (Phase 64a)\n");
-            Ok(SupervisorReply::Ack)
+            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "': converged (Phase 64b)\n");
+            Ok(())
+        }
+
+        fn fail_async_restart(&mut self, service: &str) -> Result<(), SupervisorError> {
+            self.table.update_state(service, ServiceState::Failed);
+            Ok(())
         }
 
         fn await_ready(
@@ -624,6 +648,25 @@ mod init_backend {
                 count += 1;
             }
             (count as u8, entries)
+        }
+    }
+
+    /// Phase 64b — one-shot non-blocking observation: does
+    /// `/run/services.status` show the service `Running` with a PID
+    /// different from `prior_pid`? Returns `Some(new_pid)` on
+    /// convergence, `None` if not yet observed (or the status file is
+    /// still showing the stale snapshot). Shared by the synchronous
+    /// `restart()` wrapper above and by `control::tick_pending`.
+    pub(crate) fn observe_async_restart(init_name: &str, prior_pid: i32) -> Option<i32> {
+        use session_manager::init_status::InitServiceState;
+        let status = crate::init_proxy::read_service_status(init_name)?;
+        if matches!(status.state, InitServiceState::Running)
+            && status.pid > 0
+            && (prior_pid == 0 || status.pid != prior_pid)
+        {
+            Some(status.pid)
+        } else {
+            None
         }
     }
 }
