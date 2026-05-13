@@ -64,7 +64,7 @@ const TAG_VERB_SESSION_STATE: u8 = 0x01;
 const TAG_VERB_SESSION_STOP: u8 = 0x02;
 const TAG_VERB_SESSION_RESTART: u8 = 0x03;
 /// Phase 64 — return per-service `(name, ServiceState, restart_count,
-/// step_failures)` triples instead of a single session-wide state.
+/// step_failures)` quads instead of a single session-wide state.
 const TAG_VERB_SESSION_STATE_DETAILED: u8 = 0x04;
 /// Phase 64a — restart a single declared session service by name.
 /// Distinct from `SESSION_RESTART` which restarts the whole graphical
