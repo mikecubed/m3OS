@@ -215,6 +215,27 @@ pub trait SupervisorBackend {
         timeout_ms: u64,
     ) -> Result<SupervisorReply, SupervisorError>;
     fn on_exit_observed(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError>;
+
+    /// Phase 64 — return a per-service snapshot suitable for serializing
+    /// into a [`crate::session_control::ControlReply::ServiceStates`]
+    /// reply. The default implementation returns an empty snapshot so
+    /// pre-Phase-64 backends (and the F.3 dispatch tests) continue to
+    /// work without modification; the production `session_manager`
+    /// override walks its `ServiceTable` and populates one entry per
+    /// supervised service.
+    fn services_snapshot(
+        &mut self,
+    ) -> (
+        u8,
+        [crate::session_control::ServiceStateEntry;
+            crate::session_control::MAX_SERVICE_STATE_ENTRIES],
+    ) {
+        (
+            0,
+            [crate::session_control::ServiceStateEntry::empty();
+                crate::session_control::MAX_SERVICE_STATE_ENTRIES],
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

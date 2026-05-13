@@ -211,6 +211,19 @@ impl<'c, 'b, B: SupervisorBackend> SessionControlBackend for DaemonBackend<'c, '
         self.ctx.restart_requested = true;
         Ok(())
     }
+
+    fn services_snapshot(
+        &mut self,
+    ) -> (
+        u8,
+        [kernel_core::session_control::ServiceStateEntry;
+            kernel_core::session_control::MAX_SERVICE_STATE_ENTRIES],
+    ) {
+        // Phase 64 — forward to the supervisor's own snapshot. The
+        // production `InitSupervisorBackend` reads its `ServiceTable`;
+        // pre-Phase-64 backends use the default (empty) implementation.
+        self.supervisor.services_snapshot()
+    }
 }
 
 /// Non-blocking poll of the control socket. Returns `true` if a

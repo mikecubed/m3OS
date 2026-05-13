@@ -63,17 +63,39 @@ use crate::session::SessionState;
 const TAG_VERB_SESSION_STATE: u8 = 0x01;
 const TAG_VERB_SESSION_STOP: u8 = 0x02;
 const TAG_VERB_SESSION_RESTART: u8 = 0x03;
+/// Phase 64 — return per-service `(name, ServiceState, restart_count,
+/// step_failures)` triples instead of a single session-wide state.
+const TAG_VERB_SESSION_STATE_DETAILED: u8 = 0x04;
 
 /// Reply tags.
 const TAG_REPLY_STATE: u8 = 0x01;
 const TAG_REPLY_ACK: u8 = 0x02;
 const TAG_REPLY_ERROR: u8 = 0x03;
+/// Phase 64 — `ServiceStates` reply carrying per-service triples.
+const TAG_REPLY_SERVICE_STATES: u8 = 0x04;
 
 /// Session-state discriminants used in the `State` reply payload.
 const STATE_TAG_BOOTING: u8 = 0x01;
 const STATE_TAG_RUNNING: u8 = 0x02;
 const STATE_TAG_RECOVERING: u8 = 0x03;
 const STATE_TAG_TEXT_FALLBACK: u8 = 0x04;
+
+/// Per-child service-state discriminants for the Phase 64
+/// `ServiceStates` reply. Distinct value space from the session-wide
+/// `STATE_TAG_*` above because the two types are orthogonal (see
+/// `userspace/session_manager/src/table.rs`'s module doc).
+pub const PER_SVC_STARTING: u8 = 0x01;
+pub const PER_SVC_RUNNING: u8 = 0x02;
+pub const PER_SVC_STOPPING: u8 = 0x03;
+pub const PER_SVC_RESTARTING: u8 = 0x04;
+pub const PER_SVC_FAILED: u8 = 0x05;
+
+/// Maximum number of per-service entries the [`ControlReply::ServiceStates`]
+/// reply carries. Sized to the declared session-step count
+/// ([`crate::session_supervisor::DECLARED_SESSION_STEP_NAMES`] = 5)
+/// plus a 3-slot buffer for future steps without a wire-incompatible
+/// change. Allocation-free.
+pub const MAX_SERVICE_STATE_ENTRIES: usize = 8;
 
 /// Error codes carried inside a [`ControlReply::Error`].
 const ERR_CAPABILITY_MISSING: u8 = 0x01;
@@ -105,10 +127,75 @@ pub enum ControlVerb {
     /// the recovery counters (so the new attempt sees a fresh retry
     /// budget per step), and re-drive the F.1 boot sequence.
     SessionRestart,
+    /// Phase 64 — return per-service `(name, ServiceState,
+    /// restart_count, step_failures)` triples from the supervisor's
+    /// `ServiceTable`. Distinct from the [`Self::SessionState`] verb
+    /// (which still returns the session-wide [`SessionState`])
+    /// because the two questions — "what is the graphical session
+    /// doing?" and "what is each supervised child doing?" — have
+    /// distinct, orthogonal answer types.
+    SessionStateDetailed,
+}
+
+/// One per-service entry in a [`ControlReply::ServiceStates`] reply.
+///
+/// Allocation-free: the service name is held in a fixed 32-byte buffer
+/// indexed by `name_len`. `state_tag` is one of the `PER_SVC_*`
+/// constants — keeping the encoded discriminant alongside the entry
+/// means a future kernel-core enum change does not break the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceStateEntry {
+    /// Bytes 0..name_len are the service name (UTF-8). Remaining bytes
+    /// are zero-padded so `PartialEq` does not look at uninitialized
+    /// memory.
+    pub name: [u8; MAX_STEP_NAME_BYTES],
+    /// Number of valid bytes in [`Self::name`]. Bounded by
+    /// `MAX_STEP_NAME_BYTES`.
+    pub name_len: u8,
+    /// One of the `PER_SVC_*` constants
+    /// ([`PER_SVC_STARTING`] ... [`PER_SVC_FAILED`]).
+    pub state_tag: u8,
+    /// Number of full restart attempts since boot — sourced from
+    /// `ServiceTable::ServiceEntry::restart_count`.
+    pub restart_count: u32,
+    /// Number of step failures within the current restart attempt —
+    /// sourced from `ServiceTable::ServiceEntry::step_failures`.
+    pub step_failures: u32,
+}
+
+impl ServiceStateEntry {
+    /// Empty placeholder — `name_len == 0` and every field zeroed.
+    /// Used to pad the [`ControlReply::ServiceStates`] fixed-size
+    /// buffer when fewer than [`MAX_SERVICE_STATE_ENTRIES`] entries
+    /// are populated.
+    pub const fn empty() -> Self {
+        Self {
+            name: [0u8; MAX_STEP_NAME_BYTES],
+            name_len: 0,
+            state_tag: 0,
+            restart_count: 0,
+            step_failures: 0,
+        }
+    }
+
+    /// Borrow the service name as a `&str`, or `None` if the bytes are
+    /// not valid UTF-8 (the encoder rejects non-UTF-8 names; the
+    /// decoder calls this to surface a typed view).
+    pub fn name_as_str(&self) -> Option<&str> {
+        let len = (self.name_len as usize).min(MAX_STEP_NAME_BYTES);
+        core::str::from_utf8(&self.name[..len]).ok()
+    }
 }
 
 /// Replies from `session_manager` back to `m3ctl`.
+///
+/// The `ServiceStates` variant intentionally holds the entry array
+/// inline (≈ 336 bytes on 64-bit hosts) rather than behind a `Box`:
+/// the codec is `no_std` and the enum value lives on the stack of one
+/// dispatch call, so the size cost is bounded and the avoidance of
+/// `alloc` outside the variant's lifetime is the right trade-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ControlReply {
     /// `SessionState` query reply.
     State { state: SessionState },
@@ -116,6 +203,14 @@ pub enum ControlReply {
     Ack,
     /// Verb rejected. The variant carries the typed error.
     Error(SessionControlError),
+    /// Phase 64 — per-service `ServiceTable` snapshot returned by the
+    /// [`ControlVerb::SessionStateDetailed`] verb. `entry_count` valid
+    /// entries occupy slots `0..entry_count` of `entries`; remaining
+    /// slots are [`ServiceStateEntry::empty`].
+    ServiceStates {
+        entry_count: u8,
+        entries: [ServiceStateEntry; MAX_SERVICE_STATE_ENTRIES],
+    },
 }
 
 /// Typed error surface returned by the F.5 control-socket dispatcher.
@@ -182,6 +277,16 @@ pub trait SessionControlBackend {
     /// Initiate a graceful restart. Returns `Ok(())` on success or a
     /// typed error.
     fn session_restart(&mut self) -> Result<(), SessionControlError>;
+
+    /// Phase 64 — return per-service `ServiceTable` snapshot for the
+    /// [`ControlVerb::SessionStateDetailed`] verb. The default
+    /// implementation returns an empty snapshot so existing Phase 57
+    /// backends (and tests) continue to work without modification.
+    /// Production `session_manager` overrides this to walk its
+    /// `ServiceTable` and populate the entries.
+    fn services_snapshot(&mut self) -> (u8, [ServiceStateEntry; MAX_SERVICE_STATE_ENTRIES]) {
+        (0, [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +306,7 @@ pub fn encode_verb(verb: &ControlVerb, dst: &mut [u8]) -> Result<usize, SessionC
         ControlVerb::SessionState => TAG_VERB_SESSION_STATE,
         ControlVerb::SessionStop => TAG_VERB_SESSION_STOP,
         ControlVerb::SessionRestart => TAG_VERB_SESSION_RESTART,
+        ControlVerb::SessionStateDetailed => TAG_VERB_SESSION_STATE_DETAILED,
     };
     dst[0] = tag;
     Ok(1)
@@ -215,6 +321,7 @@ pub fn decode_verb(src: &[u8]) -> Result<ControlVerb, SessionControlError> {
         TAG_VERB_SESSION_STATE => Ok(ControlVerb::SessionState),
         TAG_VERB_SESSION_STOP => Ok(ControlVerb::SessionStop),
         TAG_VERB_SESSION_RESTART => Ok(ControlVerb::SessionRestart),
+        TAG_VERB_SESSION_STATE_DETAILED => Ok(ControlVerb::SessionStateDetailed),
         _ => Err(SessionControlError::MalformedRequest),
     }
 }
@@ -282,6 +389,51 @@ pub fn encode_reply(reply: &ControlReply, dst: &mut [u8]) -> Result<usize, Sessi
             dst[0] = TAG_REPLY_ERROR;
             dst[1] = session_control_error_to_byte(*err);
             Ok(2)
+        }
+        ControlReply::ServiceStates {
+            entry_count,
+            entries,
+        } => {
+            // Layout:
+            //   [0] TAG_REPLY_SERVICE_STATES
+            //   [1] entry_count (u8, ≤ MAX_SERVICE_STATE_ENTRIES)
+            //   For each valid entry, in order:
+            //     [..1] name_len (u8, ≤ MAX_STEP_NAME_BYTES)
+            //     [..name_len] name bytes (UTF-8)
+            //     [..1] state_tag (PER_SVC_*)
+            //     [..4] restart_count (LE u32)
+            //     [..4] step_failures (LE u32)
+            let count = (*entry_count as usize).min(MAX_SERVICE_STATE_ENTRIES);
+            // Pre-compute total length to bound-check `dst` once.
+            let mut total = 2; // tag + count
+            for entry in entries.iter().take(count) {
+                let name_len = (entry.name_len as usize).min(MAX_STEP_NAME_BYTES);
+                total += 1 + name_len + 1 + 4 + 4;
+            }
+            if dst.len() < total {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            dst[0] = TAG_REPLY_SERVICE_STATES;
+            // Cast safe: count ≤ MAX_SERVICE_STATE_ENTRIES = 8 < u8::MAX.
+            dst[1] = count as u8;
+            let mut off = 2;
+            for entry in entries.iter().take(count) {
+                let name_len = (entry.name_len as usize).min(MAX_STEP_NAME_BYTES);
+                if name_len > MAX_STEP_NAME_BYTES {
+                    return Err(SessionControlError::MalformedRequest);
+                }
+                dst[off] = name_len as u8;
+                off += 1;
+                dst[off..off + name_len].copy_from_slice(&entry.name[..name_len]);
+                off += name_len;
+                dst[off] = entry.state_tag;
+                off += 1;
+                dst[off..off + 4].copy_from_slice(&entry.restart_count.to_le_bytes());
+                off += 4;
+                dst[off..off + 4].copy_from_slice(&entry.step_failures.to_le_bytes());
+                off += 4;
+            }
+            Ok(total)
         }
     }
 }
@@ -353,6 +505,50 @@ pub fn decode_reply(src: &[u8]) -> Result<ControlReply, SessionControlError> {
             let err = byte_to_session_control_error(src[1])?;
             Ok(ControlReply::Error(err))
         }
+        TAG_REPLY_SERVICE_STATES => {
+            // Mirror of the encoder. See `encode_reply` for the layout
+            // contract. Decode fails on any malformed length so a
+            // truncated transport cannot produce a partially-valid
+            // `ControlReply::ServiceStates`.
+            if src.len() < 2 {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            let count = src[1] as usize;
+            if count > MAX_SERVICE_STATE_ENTRIES {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            let mut entries = [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES];
+            let mut off = 2;
+            for entry in entries.iter_mut().take(count) {
+                if src.len() < off + 1 {
+                    return Err(SessionControlError::MalformedRequest);
+                }
+                let name_len = src[off] as usize;
+                off += 1;
+                if name_len > MAX_STEP_NAME_BYTES {
+                    return Err(SessionControlError::MalformedRequest);
+                }
+                if src.len() < off + name_len + 1 + 4 + 4 {
+                    return Err(SessionControlError::MalformedRequest);
+                }
+                entry.name_len = name_len as u8;
+                entry.name[..name_len].copy_from_slice(&src[off..off + name_len]);
+                off += name_len;
+                entry.state_tag = src[off];
+                off += 1;
+                let mut buf4 = [0u8; 4];
+                buf4.copy_from_slice(&src[off..off + 4]);
+                entry.restart_count = u32::from_le_bytes(buf4);
+                off += 4;
+                buf4.copy_from_slice(&src[off..off + 4]);
+                entry.step_failures = u32::from_le_bytes(buf4);
+                off += 4;
+            }
+            Ok(ControlReply::ServiceStates {
+                entry_count: count as u8,
+                entries,
+            })
+        }
         _ => Err(SessionControlError::MalformedRequest),
     }
 }
@@ -416,6 +612,13 @@ pub fn dispatch_authenticated<B: SessionControlBackend>(
             Ok(()) => Ok(ControlReply::Ack),
             Err(e) => Ok(ControlReply::Error(e)),
         },
+        ControlVerb::SessionStateDetailed => {
+            let (entry_count, entries) = backend.services_snapshot();
+            Ok(ControlReply::ServiceStates {
+                entry_count,
+                entries,
+            })
+        }
     }
 }
 
@@ -517,5 +720,133 @@ mod tests {
         let bad = [TAG_REPLY_STATE, STATE_TAG_RECOVERING, 0xFF, 0, 0, 0, 0];
         let result = decode_reply(&bad);
         assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 64 — `SessionStateDetailed` verb + `ServiceStates` reply
+    // -----------------------------------------------------------------
+
+    /// Helper: build a `ServiceStateEntry` from a Rust `&str` for tests.
+    fn entry(
+        name: &str,
+        state_tag: u8,
+        restart_count: u32,
+        step_failures: u32,
+    ) -> ServiceStateEntry {
+        let mut e = ServiceStateEntry::empty();
+        let bytes = name.as_bytes();
+        e.name_len = bytes.len() as u8;
+        e.name[..bytes.len()].copy_from_slice(bytes);
+        e.state_tag = state_tag;
+        e.restart_count = restart_count;
+        e.step_failures = step_failures;
+        e
+    }
+
+    #[test]
+    fn session_state_detailed_verb_round_trips() {
+        let mut buf = [0u8; 8];
+        let len = encode_verb(&ControlVerb::SessionStateDetailed, &mut buf).expect("encode");
+        assert_eq!(&buf[..len], &[TAG_VERB_SESSION_STATE_DETAILED]);
+        let v = decode_verb(&buf[..len]).expect("decode");
+        assert_eq!(v, ControlVerb::SessionStateDetailed);
+    }
+
+    #[test]
+    fn service_states_reply_round_trips() {
+        let mut entries = [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES];
+        entries[0] = entry("display_server", PER_SVC_RUNNING, 0, 0);
+        entries[1] = entry("kbd_server", PER_SVC_RUNNING, 0, 0);
+        entries[2] = entry("audio_server", PER_SVC_FAILED, 3, 0);
+        entries[3] = entry("term", PER_SVC_RESTARTING, 1, 2);
+        let reply = ControlReply::ServiceStates {
+            entry_count: 4,
+            entries,
+        };
+        let mut buf = [0u8; 256];
+        let len = encode_reply(&reply, &mut buf).expect("encode");
+        let decoded = decode_reply(&buf[..len]).expect("decode");
+        assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn service_states_empty_reply_round_trips() {
+        let reply = ControlReply::ServiceStates {
+            entry_count: 0,
+            entries: [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES],
+        };
+        let mut buf = [0u8; 64];
+        let len = encode_reply(&reply, &mut buf).expect("encode");
+        assert_eq!(len, 2);
+        assert_eq!(buf[0], TAG_REPLY_SERVICE_STATES);
+        assert_eq!(buf[1], 0);
+        let decoded = decode_reply(&buf[..len]).expect("decode");
+        assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn service_states_reply_rejects_oversized_name_in_encode() {
+        let mut e = ServiceStateEntry::empty();
+        e.name_len = 0xFF; // larger than MAX_STEP_NAME_BYTES
+        e.state_tag = PER_SVC_RUNNING;
+        let mut entries = [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES];
+        entries[0] = e;
+        let reply = ControlReply::ServiceStates {
+            entry_count: 1,
+            entries,
+        };
+        let mut buf = [0u8; 256];
+        // The encoder bounds the per-entry name_len to MAX_STEP_NAME_BYTES
+        // before writing; the resulting wire bytes are valid but use the
+        // truncated length. The encoder MUST NOT silently produce a
+        // wire that re-claims `name_len = 0xFF`.
+        let len = encode_reply(&reply, &mut buf).expect("encode bounds to MAX_STEP_NAME_BYTES");
+        // 2 bytes header + 1 byte name_len + 32 bytes name + 1 byte
+        // state_tag + 4 bytes restart_count + 4 bytes step_failures.
+        assert_eq!(len, 2 + 1 + MAX_STEP_NAME_BYTES + 1 + 4 + 4);
+        // The decoded reply's name_len matches the truncated value.
+        let decoded = decode_reply(&buf[..len]).expect("decode");
+        if let ControlReply::ServiceStates { entries, .. } = decoded {
+            assert_eq!(entries[0].name_len as usize, MAX_STEP_NAME_BYTES);
+        } else {
+            panic!("expected ServiceStates");
+        }
+    }
+
+    #[test]
+    fn service_states_reply_rejects_too_many_entries_on_decode() {
+        // [TAG_REPLY_SERVICE_STATES, count=0xFF, ...] — count > MAX.
+        let bad = [TAG_REPLY_SERVICE_STATES, 0xFF];
+        let result = decode_reply(&bad);
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    #[test]
+    fn service_states_reply_rejects_truncated_buffer_on_decode() {
+        // Header says 1 entry but only the header is present.
+        let bad = [TAG_REPLY_SERVICE_STATES, 1];
+        let result = decode_reply(&bad);
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    /// Default `services_snapshot` returns 0 entries — Phase 57
+    /// backends and existing tests are unaffected.
+    #[test]
+    fn default_services_snapshot_is_empty() {
+        struct DummyBackend;
+        impl SessionControlBackend for DummyBackend {
+            fn current_state(&mut self) -> SessionState {
+                SessionState::Running
+            }
+            fn session_stop(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+            fn session_restart(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+        }
+        let mut b = DummyBackend;
+        let (count, _entries) = b.services_snapshot();
+        assert_eq!(count, 0);
     }
 }

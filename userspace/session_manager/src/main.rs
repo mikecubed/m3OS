@@ -341,22 +341,9 @@ mod init_backend {
             Self { table }
         }
 
-        /// Borrow the per-service table — used by the control dispatcher
-        /// to serve `session-state` queries from authentic data and by
-        /// `recover::run_text_fallback` to iterate children in reverse.
-        #[allow(dead_code)] // consumed once E.1 codec extension lands
-        pub fn table(&self) -> &ServiceTable {
-            &self.table
-        }
-
-        /// Mutate the per-service table. The control dispatcher writes
-        /// `ServiceState::Stopping` here before issuing the real stop
-        /// motion so a concurrent `session-state` query sees the
-        /// transition.
-        #[allow(dead_code)] // consumed once E.1 codec extension lands
-        pub fn table_mut(&mut self) -> &mut ServiceTable {
-            &mut self.table
-        }
+        // The per-service table is read via the `services_snapshot`
+        // override on the `SupervisorBackend` trait below; no
+        // out-of-band accessor is required.
     }
 
     /// Polling interval for [`InitSupervisorBackend::await_ready`].
@@ -492,6 +479,45 @@ mod init_backend {
                 exit_code: 0,
                 signaled: false,
             })
+        }
+
+        /// Phase 64 — populate one `ServiceStateEntry` per `ServiceTable`
+        /// entry for the `SessionStateDetailed` control verb. Stops at
+        /// `MAX_SERVICE_STATE_ENTRIES` to keep the reply allocation-free.
+        fn services_snapshot(
+            &mut self,
+        ) -> (
+            u8,
+            [kernel_core::session_control::ServiceStateEntry;
+                kernel_core::session_control::MAX_SERVICE_STATE_ENTRIES],
+        ) {
+            use kernel_core::session_control::{
+                MAX_SERVICE_STATE_ENTRIES, MAX_STEP_NAME_BYTES, PER_SVC_FAILED, PER_SVC_RESTARTING,
+                PER_SVC_RUNNING, PER_SVC_STARTING, PER_SVC_STOPPING, ServiceStateEntry,
+            };
+
+            let mut entries = [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES];
+            let mut count: usize = 0;
+            for entry in self.table.iter() {
+                if count >= MAX_SERVICE_STATE_ENTRIES {
+                    break;
+                }
+                let bytes = entry.name.as_bytes();
+                let name_len = bytes.len().min(MAX_STEP_NAME_BYTES);
+                entries[count].name_len = name_len as u8;
+                entries[count].name[..name_len].copy_from_slice(&bytes[..name_len]);
+                entries[count].state_tag = match entry.state {
+                    ServiceState::Starting => PER_SVC_STARTING,
+                    ServiceState::Running => PER_SVC_RUNNING,
+                    ServiceState::Stopping => PER_SVC_STOPPING,
+                    ServiceState::Restarting => PER_SVC_RESTARTING,
+                    ServiceState::Failed => PER_SVC_FAILED,
+                };
+                entries[count].restart_count = entry.restart_count;
+                entries[count].step_failures = entry.step_failures;
+                count += 1;
+            }
+            (count as u8, entries)
         }
     }
 }
