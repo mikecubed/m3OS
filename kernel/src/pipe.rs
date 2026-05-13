@@ -31,6 +31,39 @@ static PIPE_TABLE: IrqSafeMutex<Vec<Option<Pipe>>> = IrqSafeMutex::new(Vec::new(
 /// Phase 57b G.7 — IrqSafeMutex (task-context only).
 pub static PIPE_WAITQUEUES: IrqSafeMutex<Vec<Option<WaitQueue>>> = IrqSafeMutex::new(Vec::new());
 
+/// Sane upper bound for either `PIPE_TABLE.capacity()` or
+/// `PIPE_WAITQUEUES.capacity()`. Pipe IDs are allocated lazily; with
+/// `MAX_TASKS = 256` and a handful of pipes per task the realistic
+/// concurrent-open count is below 4 KiB. 64 KiB leaves enough headroom for
+/// long-running shell pipelines and the geometric `Vec` growth schedule
+/// while still catching obvious metadata corruption (wild `cap` values
+/// from a stomp generally land in the GiB+ range — see
+/// `docs/handoffs/2026-05-13-kernel-pipe-table-corruption.md`, where the
+/// corrupted `RBP` decoded to `0x1_0032_955_930`).
+const SANE_PIPE_VEC_CAP: usize = 65_536;
+
+/// Assert the `Vec<T>` invariants we expect of `PIPE_TABLE` /
+/// `PIPE_WAITQUEUES` before mutating it. A failure means the backing
+/// metadata (`ptr` / `cap` / `len`) was corrupted by an external stomp —
+/// the next `push` / `iter` would either dereference garbage or grow
+/// against a wild capacity. Panicking here captures the corruption at the
+/// observation site while the surrounding operation is still in the trace
+/// ring.
+#[inline]
+#[track_caller]
+fn assert_pipe_vec_sane<T>(name: &'static str, table: &Vec<Option<T>>) {
+    let cap = table.capacity();
+    let len = table.len();
+    assert!(
+        cap <= SANE_PIPE_VEC_CAP,
+        "{name} corruption: capacity={cap:#x} exceeds sane bound {SANE_PIPE_VEC_CAP:#x}"
+    );
+    assert!(
+        len <= cap,
+        "{name} corruption: len={len:#x} > capacity={cap:#x}"
+    );
+}
+
 /// Wake all tasks waiting on the given pipe.
 pub fn wake_pipe(pipe_id: usize) {
     let wqs = PIPE_WAITQUEUES.lock();
@@ -77,6 +110,10 @@ pub fn pipe_deregister_waiter(pipe_id: usize, task_id: kernel_core::types::TaskI
 pub fn create_pipe() -> usize {
     let mut table = PIPE_TABLE.lock();
     let mut wqs = PIPE_WAITQUEUES.lock();
+    // Trip on corrupted Vec metadata *before* the `push` below would
+    // dereference it. See `assert_pipe_vec_sane`.
+    assert_pipe_vec_sane("PIPE_TABLE", &table);
+    assert_pipe_vec_sane("PIPE_WAITQUEUES", &wqs);
     // Reuse a freed slot if available.
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
@@ -97,11 +134,13 @@ pub fn create_pipe() -> usize {
 /// Used when pipe creation fails before any FDs reference it.
 pub fn free_pipe(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
+    assert_pipe_vec_sane("PIPE_TABLE", &table);
     if pipe_id < table.len() {
         table[pipe_id] = None;
     }
     drop(table);
     let mut wqs = PIPE_WAITQUEUES.lock();
+    assert_pipe_vec_sane("PIPE_WAITQUEUES", &wqs);
     if pipe_id < wqs.len() {
         wqs[pipe_id] = None;
     }

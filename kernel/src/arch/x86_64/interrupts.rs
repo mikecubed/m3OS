@@ -124,6 +124,42 @@ fn assert_preempt_count_zero_on_return_to_user(stack_frame: &InterruptStackFrame
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
+// Page-fault re-entrance guard
+// ---------------------------------------------------------------------------
+//
+// Per-core latch raised on entry to the ring-0 arm of `page_fault_handler`.
+// If the crash-dump path itself faults (e.g. a corrupted formatter pointer
+// or stale vtable inside `panic_diag::dump_crash_context`,
+// `trace::dump_trace_rings`, or `dump_pte_walk_diagnostics`), the CPU
+// re-enters this handler with a fresh frame. Without the guard each
+// re-entry runs the full dump again and pushes another ~752-byte stack
+// frame, which both obliterates the original crash signature on serial and
+// quickly overflows the kernel stack — producing the 5-deep "cascade"
+// documented in
+// `docs/handoffs/2026-05-13-kernel-pipe-table-corruption.md`.
+//
+// The ring-0 arm is one-way (always ends in `hlt_loop`), so the latch is
+// never cleared. The flag is per-core so an unrelated kernel page fault on
+// another core still gets its full dump.
+static IN_KERNEL_PAGE_FAULT: [AtomicBool; crate::smp::MAX_CORES] =
+    [const { AtomicBool::new(false) }; crate::smp::MAX_CORES];
+
+/// Index into [`IN_KERNEL_PAGE_FAULT`] for the calling core.
+///
+/// Reads the LAPIC ID directly (no dependency on per-core data, which may
+/// itself be corrupted at the moment of the original fault). Falls back to
+/// 0 when the LAPIC mapping is not yet established (very early boot), which
+/// is also the BSP's index and serialises any concurrent early-boot faults
+/// onto the same latch — acceptable because early boot is single-core.
+fn page_fault_core_index() -> usize {
+    if crate::smp::is_per_core_ready() {
+        crate::smp::current_core_id() as usize
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CoW fault resolution (P17-T031, T032, T033)
 // ---------------------------------------------------------------------------
 
@@ -1093,6 +1129,42 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     // Ring-0 page fault: unrecoverable kernel bug.
+    //
+    // Re-entrance guard: if the crash-dump path below faulted, we'll be
+    // re-entered with the latch already set. Print a one-line marker with
+    // CR2 and RIP straight from the trap frame (no formatter machinery
+    // beyond `_panic_print` itself, which is already non-allocating) and
+    // halt this core so the first dump's output is preserved on serial.
+    let core_idx = page_fault_core_index();
+    if core_idx < IN_KERNEL_PAGE_FAULT.len()
+        && IN_KERNEL_PAGE_FAULT[core_idx]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        _panic_print(format_args!(
+            "[int] RECURSIVE KERNEL PAGE FAULT on core {} — cascade halted (cr2={:?} rip={:#x} err={:?})\n",
+            core_idx,
+            addr,
+            stack_frame.instruction_pointer.as_u64(),
+            err,
+        ));
+        crate::hlt_loop();
+    }
+
+    // Kernel-stack overflow detection: if the fault address lands inside a
+    // kstack guard page, name the slot before the regular dump path so the
+    // crash is recognised at the source rather than as a wild dereference.
+    if let Ok(fault_va) = addr
+        && let Some(slot) = crate::task::kstack::classify_guard_page_fault(fault_va.as_u64())
+    {
+        _panic_print(format_args!(
+            "[int] KERNEL STACK OVERFLOW: kstack slot {} guard page hit at {:#x} (rip={:#x})\n",
+            slot,
+            fault_va.as_u64(),
+            stack_frame.instruction_pointer.as_u64(),
+        ));
+    }
+
     _panic_print(format_args!(
         "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
         addr, err, stack_frame

@@ -93,6 +93,12 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
 
     mm::init(boot_info);
 
+    // Map the kernel-stack pool with guard pages. Must precede any code
+    // that claims a slot — Task::new, AP boot, per-process syscall-stack
+    // setup, and the test harness's task spawns all go through
+    // `kstack::alloc` / `alloc_leaked_top`.
+    task::kstack::init();
+
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
     // `tmpfs::init()` is deferred to after this block so its heap / frame
