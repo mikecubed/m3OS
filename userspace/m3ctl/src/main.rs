@@ -209,7 +209,10 @@ mod os_binary {
             }
         };
 
-        let mut req_buf = [0u8; 8];
+        // Phase 64a: `SessionRestartService` encodes as
+        // `[tag][name_len][name…]`, up to 2 + `MAX_STEP_NAME_BYTES` = 34
+        // bytes. 48 leaves headroom for future single-payload verbs.
+        let mut req_buf = [0u8; 48];
         let req_len = match encode_verb(&verb, &mut req_buf) {
             Ok(n) => n,
             Err(_) => {

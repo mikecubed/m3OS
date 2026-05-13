@@ -507,6 +507,12 @@ mod init_backend {
                 self.table.update_state(service, ServiceState::Failed);
                 return Err(SupervisorError::NotRunning);
             }
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "session_manager: lifecycle.restart: '",
+            );
+            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "': converged (Phase 64a)\n");
             Ok(SupervisorReply::Ack)
         }
 
