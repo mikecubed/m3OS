@@ -108,12 +108,29 @@ pub enum ParseError {
 /// encodes via [`kernel_core::session_control::encode_verb`].
 pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
     match verb {
-        // Phase 57 I.2 — session control verbs. The three verbs carry
-        // no arguments; extra args are tolerated (the parser is
-        // permissive — argument parsing is per-verb).
-        "session-state" => Ok(ParsedVerb::Session(ControlVerb::SessionState)),
+        // Phase 57 I.2 — session control verbs. Phase 64a adds the
+        // `--detailed` flag to `session-state` to opt into the
+        // per-service `ServiceStates` reply; the bare form continues
+        // to return the session-wide `SessionState` for back-compat.
+        "session-state" => {
+            if args.iter().any(|a| *a == "--detailed") {
+                Ok(ParsedVerb::Session(ControlVerb::SessionStateDetailed))
+            } else {
+                Ok(ParsedVerb::Session(ControlVerb::SessionState))
+            }
+        }
         "session-stop" => Ok(ParsedVerb::Session(ControlVerb::SessionStop)),
-        "session-restart" => Ok(ParsedVerb::Session(ControlVerb::SessionRestart)),
+        // Phase 64a: `session-restart <name>` restarts a single
+        // declared service via init delegation. `session-restart` with
+        // no arg keeps the Phase 57 whole-session semantics.
+        "session-restart" => match args.iter().find(|a| !a.starts_with("--")) {
+            None => Ok(ParsedVerb::Session(ControlVerb::SessionRestart)),
+            Some(name) => ControlVerb::new_session_restart_service(name)
+                .map(ParsedVerb::Session)
+                .map_err(|_| {
+                    ParseError::BadArgument("session-restart: service name must be 1..=32 bytes")
+                }),
+        },
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),

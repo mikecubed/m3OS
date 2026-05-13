@@ -73,6 +73,85 @@ fn session_verbs_take_no_arguments() {
     assert_eq!(parsed, ParsedVerb::Session(ControlVerb::SessionState));
 }
 
+#[test]
+fn session_state_detailed_flag_selects_detailed_verb() {
+    // Phase 64a: `session-state --detailed` opts into the per-service
+    // `ServiceStates` reply by dispatching the `SessionStateDetailed`
+    // verb. The bare `session-state` form continues to return the
+    // session-wide `SessionState` for back-compat.
+    let parsed = parse_verb("session-state", &["--detailed"])
+        .expect("session-state --detailed should parse");
+    assert_eq!(
+        parsed,
+        ParsedVerb::Session(ControlVerb::SessionStateDetailed)
+    );
+}
+
+#[test]
+fn session_state_detailed_flag_tolerates_position() {
+    // The flag is recognized anywhere in the trailing argv, not just
+    // as the first arg, so extra unrelated tokens before or after do
+    // not block detection.
+    let before = parse_verb("session-state", &["--detailed", "extra"])
+        .expect("session-state --detailed extra should parse");
+    let after = parse_verb("session-state", &["extra", "--detailed"])
+        .expect("session-state extra --detailed should parse");
+    assert_eq!(
+        before,
+        ParsedVerb::Session(ControlVerb::SessionStateDetailed)
+    );
+    assert_eq!(
+        after,
+        ParsedVerb::Session(ControlVerb::SessionStateDetailed)
+    );
+}
+
+#[test]
+fn session_restart_with_no_arg_keeps_whole_session_semantic() {
+    // Phase 64a: `session-restart` with no arg preserves the Phase 57
+    // whole-session restart contract for back-compat.
+    let parsed =
+        parse_verb("session-restart", &[]).expect("session-restart with no arg should parse");
+    assert_eq!(parsed, ParsedVerb::Session(ControlVerb::SessionRestart));
+}
+
+#[test]
+fn session_restart_with_name_dispatches_per_service_verb() {
+    // Phase 64a: `session-restart <name>` switches to the per-service
+    // verb. The codec-level `restart_service_name` accessor lets us
+    // assert on the embedded name without exposing the raw buffer.
+    let parsed = parse_verb("session-restart", &["display_server"])
+        .expect("session-restart display_server should parse");
+    match parsed {
+        ParsedVerb::Session(verb) => {
+            assert_eq!(verb.restart_service_name(), Some("display_server"));
+        }
+        other => panic!("expected Session, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_restart_oversized_name_returns_bad_argument() {
+    let big = "x".repeat(64);
+    let err =
+        parse_verb("session-restart", &[big.as_str()]).expect_err("oversized name should fail");
+    assert!(matches!(err, ParseError::BadArgument(_)));
+}
+
+#[test]
+fn session_restart_per_service_round_trips_through_codec() {
+    let parsed = parse_verb("session-restart", &["audio_server"])
+        .expect("session-restart audio_server should parse");
+    let verb = match parsed {
+        ParsedVerb::Session(v) => v,
+        other => panic!("expected Session, got {:?}", other),
+    };
+    let mut buf = [0u8; 64];
+    let n = encode_verb(&verb, &mut buf).expect("encode_verb");
+    let decoded = decode_verb(&buf[..n]).expect("decode_verb");
+    assert_eq!(decoded.restart_service_name(), Some("audio_server"));
+}
+
 // ---------------------------------------------------------------------------
 // DRY — the session-control codec lives once in kernel_core. We verify
 // every parsed session verb round-trips through encode_verb /

@@ -230,6 +230,21 @@ impl<'c, 'b, B: SupervisorBackend> SessionControlBackend for DaemonBackend<'c, '
         // pre-Phase-64 backends use the default (empty) implementation.
         self.supervisor.services_snapshot()
     }
+
+    fn session_restart_service(&mut self, service: &str) -> Result<(), SessionControlError> {
+        // Phase 64a — delegate to the supervisor's per-service restart
+        // motion. `InitSupervisorBackend::restart` writes
+        // `restart <name>` to /run/init.cmd and polls
+        // /run/services.status until the service comes back. Map the
+        // supervisor's typed errors onto the codec's typed surface so
+        // m3ctl operators see a stable wire result.
+        use kernel_core::session_supervisor::SupervisorError;
+        match self.supervisor.restart(service) {
+            Ok(_) => Ok(()),
+            Err(SupervisorError::UnknownService) => Err(SessionControlError::MalformedRequest),
+            Err(_) => Err(SessionControlError::Internal),
+        }
+    }
 }
 
 /// Non-blocking poll of the control socket. Returns `true` if a

@@ -52,6 +52,7 @@ extern crate alloc;
 
 mod boot;
 mod control;
+mod init_proxy;
 mod recover;
 mod runtime;
 
@@ -261,9 +262,10 @@ mod init_backend {
     //! is missing.
 
     use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
+    use session_manager::init_status::{InitServiceState, init_service_name};
     use session_manager::table::{Pid, ServiceState, ServiceTable};
 
-    use crate::runtime::stop_service_blocking;
+    use crate::init_proxy;
 
     /// Names that `init`'s service manifest registers under different
     /// IPC service names than the F.1 step name. The kbd_server, for
@@ -362,24 +364,24 @@ mod init_backend {
         }
 
         fn stop(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
-            let pid = match self.table.get_pid(service) {
-                Some(p) => p,
-                None => {
-                    // No live PID — either the service never started,
-                    // or it already exited. Idempotent no-op for
-                    // the rollback motion's best-effort teardown.
-                    syscall_lib::write_str(
-                        syscall_lib::STDOUT_FILENO,
-                        "session_manager: lifecycle.stop: no PID for '",
-                    );
-                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
-                    syscall_lib::write_str(
-                        syscall_lib::STDOUT_FILENO,
-                        "'; skipping (already exited or never started)\n",
-                    );
-                    return Ok(SupervisorReply::Ack);
-                }
-            };
+            // Phase 64a — durable stop via init delegation. The Phase 64
+            // shipped path signalled the child directly (SIGTERM via
+            // `runtime::stop_service_blocking`), but init would respawn
+            // the SIGTERM-signaled child within `restart_delay_secs` per
+            // its `restart=on-failure` policy. The fix is to delegate
+            // to init's `/run/init.cmd` `stop <name>` verb, which sets
+            // `restart_policy = Never` before signalling so the stop
+            // is durable.
+            let init_name = init_service_name(service);
+            if init_name.is_empty() {
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "session_manager: lifecycle.stop: unknown service '",
+                );
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "'\n");
+                return Err(SupervisorError::UnknownService);
+            }
             self.table.update_state(service, ServiceState::Stopping);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
@@ -388,49 +390,123 @@ mod init_backend {
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                "': delivering SIGTERM (Phase 64)\n",
+                "': delegating to init (Phase 64a)\n",
             );
-            match stop_service_blocking(pid) {
-                Ok(()) => {
-                    self.table.update_pid(service, None);
-                    // After reap the child is gone but the entry remains
-                    // eligible to start again. `Starting` with `pid=None`
-                    // is the codec's representation of "not running but
-                    // not failed" — reserve `Failed` for budget-exhausted
-                    // or non-recoverable errors. A future codec
-                    // extension can introduce a dedicated `Stopped` tag
-                    // if operator UX needs to distinguish the two.
-                    self.table.update_state(service, ServiceState::Starting);
-                    Ok(SupervisorReply::Ack)
-                }
-                Err(_) => {
-                    // The state machine surfaced a non-recoverable
-                    // error (TermFailed, KillFailed, or ReapFailed).
-                    // Log and continue — the rollback motion calling
-                    // us swallows individual stop errors per the F.4
-                    // contract, and the table is in `Failed` so the
-                    // operator sees the visible damage.
-                    syscall_lib::write_str(
-                        syscall_lib::STDOUT_FILENO,
-                        "session_manager: lifecycle.stop: '",
-                    );
-                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
-                    syscall_lib::write_str(
-                        syscall_lib::STDOUT_FILENO,
-                        "': stop failed (signal transport error)\n",
-                    );
-                    self.table.update_state(service, ServiceState::Failed);
-                    Err(SupervisorError::NotRunning)
-                }
+            if init_proxy::cmd_stop(init_name).is_err() {
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "session_manager: lifecycle.stop: '",
+                );
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "': init.cmd write failed\n");
+                self.table.update_state(service, ServiceState::Failed);
+                return Err(SupervisorError::NotRunning);
             }
+            // Wait up to ~6 s for init's stop motion (5 s SIGTERM grace
+            // + 1 s SIGKILL reap) to land in /run/services.status. Init
+            // writes the status file every ~1 s, so 12 × 500 ms covers
+            // the worst case.
+            const STATUS_POLL_ITERS: u32 = 12;
+            const STATUS_POLL_NS: u32 = 500_000_000;
+            let mut observed_terminal = false;
+            for _ in 0..STATUS_POLL_ITERS {
+                if let Some(status) = init_proxy::read_service_status(init_name) {
+                    if status.state.is_terminal() {
+                        observed_terminal = true;
+                        break;
+                    }
+                }
+                let _ = syscall_lib::nanosleep_for(0, STATUS_POLL_NS);
+            }
+            if !observed_terminal {
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "session_manager: lifecycle.stop: '",
+                );
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "': timed out waiting for init to reap\n",
+                );
+                self.table.update_state(service, ServiceState::Failed);
+                return Err(SupervisorError::NotRunning);
+            }
+            self.table.update_pid(service, None);
+            // Init's `stop` sets restart_policy=Never, so the service
+            // will not respawn until an operator issues a `restart` or
+            // re-enables the manifest entry. Mark `Starting` with
+            // `pid=None` — the table semantics for "not running but
+            // not failed". A future codec extension can introduce a
+            // dedicated `Stopped` tag if operator UX needs it.
+            self.table.update_state(service, ServiceState::Starting);
+            Ok(SupervisorReply::Ack)
         }
 
-        fn restart(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // Per-service restart verb is deferred (the F.5
-            // `session-restart` verb triggers a whole-session
-            // rollback + re-drive). This adapter returns `Ack` so the
-            // F.1 sequencer's rollback path that internally calls
-            // restart for cleanup continues to behave like Phase 57.
+        fn restart(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Phase 64a — per-service restart via init delegation.
+            // Writes `restart <init_name>` to /run/init.cmd; init's
+            // handler stops the service, resets restart_count to 0,
+            // and re-starts it through the normal manifest-driven
+            // path. We observe completion by polling
+            // /run/services.status until the service is `running`
+            // again with a non-zero PID (and ideally a different PID
+            // than before, to confirm a genuine restart rather than a
+            // stale snapshot). The whole motion can take 1–6 s
+            // depending on init's restart_delay backoff.
+            let init_name = init_service_name(service);
+            if init_name.is_empty() {
+                return Err(SupervisorError::UnknownService);
+            }
+            let prior_pid = self.table.get_pid(service).map(|p| p.0).unwrap_or(0);
+            self.table.update_state(service, ServiceState::Restarting);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "session_manager: lifecycle.restart: '",
+            );
+            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+            syscall_lib::write_str(
+                syscall_lib::STDOUT_FILENO,
+                "': delegating to init (Phase 64a)\n",
+            );
+            if init_proxy::cmd_restart(init_name).is_err() {
+                self.table.update_state(service, ServiceState::Failed);
+                return Err(SupervisorError::NotRunning);
+            }
+            // Wait for init to converge. Worst case: 5 s SIGTERM grace
+            // + 1 s SIGKILL reap + restart_delay (up to 60 s for high
+            // restart_count, but normally 1 s). Cap the wait at ~15 s
+            // total — beyond that the operator should investigate via
+            // `m3ctl session-state --detailed`.
+            const STATUS_POLL_ITERS: u32 = 30;
+            const STATUS_POLL_NS: u32 = 500_000_000;
+            let mut observed_new_pid = false;
+            for _ in 0..STATUS_POLL_ITERS {
+                if let Some(status) = init_proxy::read_service_status(init_name) {
+                    if matches!(status.state, InitServiceState::Running)
+                        && status.pid > 0
+                        && (prior_pid == 0 || status.pid != prior_pid)
+                    {
+                        self.table.update_pid(service, Some(Pid(status.pid)));
+                        self.table.update_state(service, ServiceState::Running);
+                        observed_new_pid = true;
+                        break;
+                    }
+                }
+                let _ = syscall_lib::nanosleep_for(0, STATUS_POLL_NS);
+            }
+            if !observed_new_pid {
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "session_manager: lifecycle.restart: '",
+                );
+                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "': timed out waiting for init restart to converge\n",
+                );
+                self.table.update_state(service, ServiceState::Failed);
+                return Err(SupervisorError::NotRunning);
+            }
             Ok(SupervisorReply::Ack)
         }
 

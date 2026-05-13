@@ -510,10 +510,12 @@ mod os_binary {
                unregister-bind <mask> <keycode> Unregister a keybind\n  \
                subscribe <kind>                Subscribe to event-stream of <kind>\n\
              \n\
-             Session verbs (Phase 57 I.2):\n  \
-               session-state                   Print session_manager's current state\n  \
+             Session verbs (Phase 57 I.2 + Phase 64a):\n  \
+               session-state [--detailed]      Print session_manager's current state\n                                   \
+                                              (with --detailed: per-service PID/state/restart_count/step_failures)\n  \
                session-stop                    Graceful shutdown (falls through to text-fallback)\n  \
-               session-restart                 Graceful stop + start\n",
+               session-restart [<name>]        With no arg: graceful whole-session stop + start\n                                   \
+                                              With <name>: restart a single declared service via init\n",
         );
     }
 
