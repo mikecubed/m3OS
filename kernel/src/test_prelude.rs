@@ -89,6 +89,11 @@ pub fn init_minimal_smp(boot_info: &'static mut BootInfo) {
     let rsdp_addr = boot_info.rsdp_addr.into_option();
     crate::mm::init(boot_info);
 
+    // Map the kernel-stack pool with guard pages. Required before any AP
+    // boot or task spawn since both go through `kstack::alloc_leaked_top` /
+    // `KernelStack::alloc`.
+    crate::task::kstack::init();
+
     crate::pci::init();
 
     crate::acpi::init(rsdp_addr);

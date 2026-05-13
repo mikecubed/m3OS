@@ -1151,6 +1151,20 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::hlt_loop();
     }
 
+    // Kernel-stack overflow detection: if the fault address lands inside a
+    // kstack guard page, name the slot before the regular dump path so the
+    // crash is recognised at the source rather than as a wild dereference.
+    if let Ok(fault_va) = addr
+        && let Some(slot) = crate::task::kstack::classify_guard_page_fault(fault_va.as_u64())
+    {
+        _panic_print(format_args!(
+            "[int] KERNEL STACK OVERFLOW: kstack slot {} guard page hit at {:#x} (rip={:#x})\n",
+            slot,
+            fault_va.as_u64(),
+            stack_frame.instruction_pointer.as_u64(),
+        ));
+    }
+
     _panic_print(format_args!(
         "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
         addr, err, stack_frame
