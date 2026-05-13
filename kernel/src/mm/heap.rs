@@ -873,6 +873,21 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
 
     let bytes_mapped = pages_mapped * 4096;
     let mapped_end = current_mapped + bytes_mapped;
+
+    // Cross-CPU TLB shootdown for the freshly-mapped range. The bootstrap
+    // heap lives in PML4[256] which is shallow-copied into every process's
+    // PML4 by `new_process_page_table`, so other cores may have cached
+    // page-walk state (paging-structure caches) for these addresses from
+    // before the mapping. `flush.flush()` above invalidates only the
+    // current core. The IPI infrastructure (`smp::tlb`) already runs in
+    // the page-fault demand-paging path; reusing the range API keeps the
+    // shootdown to a single IPI handshake instead of one per page.
+    let flush_start = (HEAP_START + current_mapped) as u64;
+    let flush_end = flush_start + bytes_mapped as u64;
+    if crate::smp::is_per_core_ready() {
+        crate::smp::tlb::tlb_shootdown_range_kernel(flush_start, flush_end);
+    }
+
     ALLOCATOR.bootstrap.extend(bytes_mapped);
     HEAP_MAPPED.store(mapped_end, Ordering::Release);
 
