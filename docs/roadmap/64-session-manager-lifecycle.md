@@ -3,8 +3,39 @@
 **Status:** Complete
 **Source Ref:** phase-64
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 19 (Signal Handling) ✅, Phase 52 (First Service Extractions) ✅
-**Builds on:** Replaces the Phase 57 `session_manager` stub lifecycle methods (unconditional `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, SIGCHLD observation via `sys_waitpid`, and restart-budget enforcement
-**Primary Components:** userspace/session_manager, kernel signal path, sys_waitpid, m3ctl
+**Builds on:** Replaces the Phase 57 `session_manager` stub lifecycle methods (unconditional `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, a non-blocking `kill(pid, 0)` liveness-probe reaper (the design-intent text below uses the original `sys_waitpid` wording; see the Closure Note for the shipped mechanism), and restart-budget enforcement
+**Primary Components:** userspace/session_manager, kernel signal path, `kill(pid, 0)` liveness probe (the original task-list shape was `sys_waitpid`; see the Closure Note), m3ctl
+
+> **Closure Note (Phase 64 shipped):** This doc captures the original Phase 64
+> *design intent*. Two intent-vs-implementation deviations are documented at
+> the source and called out here so the doc remains useful as a historical
+> map:
+>
+> 1. **Reap mechanism.** The design intent below describes `sys_waitpid`
+>    observation; the shipped reaper is a non-blocking `kill(pid, 0)` liveness
+>    probe in `userspace/session_manager/src/runtime.rs`. `session_manager` is
+>    not the parent of its supervised children (init is, via its existing
+>    manifest-driven boot), so `waitpid` is not available to this daemon;
+>    the kill-probe is functionally equivalent for Phase 64's stop and
+>    restart-budget contracts. The only piece of information it cannot
+>    recover is the child's exit code, which neither acceptance item nor
+>    production user surfaces consume.
+> 2. **Stop driver.** The design intent describes the stop motion as "a
+>    state machine across event-loop iterations" so the daemon never
+>    suspends. The shipped binary keeps the pure-logic state machine
+>    (`StopMachine` + `begin_stop` + `tick` in `lifecycle.rs`) but drives
+>    it via the synchronous wrapper `runtime::stop_service_blocking`,
+>    which polls in a `nanosleep` loop until the machine reaches
+>    `Reaped`. The pure-logic shape is already structured for a deferred-
+>    reply event-loop hoist; the hoist itself is a documented follow-up.
+> 3. **`m3ctl session-state` CLI surface.** The "authentic state" text
+>    below describes the per-service reply; the new typed
+>    `SessionStateDetailed` verb + `ServiceStates` reply variant
+>    carrying per-service `(name, ServiceState, restart_count,
+>    step_failures)` quads is implemented and host-tested, but the
+>    legacy `m3ctl session-state` CLI continues to issue the session-wide
+>    `ControlVerb::SessionState`. Adding a CLI flag to request the
+>    detailed reply is a documented follow-up.
 
 ## Milestone Goal
 
@@ -31,7 +62,7 @@ This phase exists to make `session_manager`'s supervisory behavior real, not sim
 
 ### `stop()` — SIGTERM with grace period then SIGKILL
 
-`stop()` sends SIGTERM to the child PID, sets a 5-second timer (`SIGTERM_GRACE_MS = 5000`), and then polls `sys_waitpid(pid, ..., WNOHANG)` on each event-loop tick (driven by the SIGCHLD `Notification` and a periodic wake-up). The lifecycle method is implemented as a state machine across event-loop iterations — `session_manager` continues to service other IPC during the grace window. If the child has not exited by deadline, `stop()` transitions to `SentKill`, sends SIGKILL, and reaps within a 1-second bound (`SIGKILL_REAP_MS = 1000`). The IPC reply is deferred until the state machine reaches `Reaped`.
+`stop()` sends SIGTERM to the child PID, sets a 5-second timer (`SIGTERM_GRACE_MS = 5000`), and then issues a non-blocking `kill(pid, 0)` liveness probe on each tick (`-ESRCH` means the PID is gone). The stop motion is a pure-logic state machine in `lifecycle.rs` (`StopMachine` + `begin_stop` + `tick`); the binary drives it through the synchronous wrapper `runtime::stop_service_blocking`, which polls in a `nanosleep` loop until the machine reaches `Reaped`. The pure-logic shape is already structured for a future deferred-reply event-loop hoist, but the synchronous driver is what ships in Phase 64 — one in-flight stop briefly stalls other IPC for its grace + reap windows; the hoist is a documented follow-up below. The original "polls `sys_waitpid(pid, ..., WNOHANG)` on each event-loop tick" wording reflects the task-list shape that assumed `session_manager` was the parent of its supervised children; in this codebase init is the parent, so `waitpid` is not available to `session_manager` and the `kill(0)` probe is functionally equivalent for the stop and restart-budget contracts (the only piece of information it cannot recover is the child's exit code, which neither acceptance item nor production user surfaces consume). If the child has not exited by the SIGTERM deadline, `stop()` transitions to `SentKill`, sends SIGKILL, and confirms the PID's disappearance within a 1-second bound (`SIGKILL_REAP_MS = 1000`).
 
 ### `restart()` — chained stop + start with restart-budget enforcement
 
