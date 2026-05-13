@@ -53,6 +53,14 @@ extern crate alloc;
 mod boot;
 mod control;
 mod recover;
+mod runtime;
+
+// Phase 64: pure-logic types (`Pid`, `ServiceState`, `ServiceTable`)
+// live in the `session_manager` library crate so they host-test under
+// `cargo test -p session_manager --target x86_64-unknown-linux-gnu`.
+// The binary picks them up through the crate name.
+#[allow(unused_imports)]
+use session_manager::table::{Pid, ServiceState, ServiceTable};
 
 use core::alloc::Layout;
 
@@ -253,6 +261,9 @@ mod init_backend {
     //! is missing.
 
     use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
+    use session_manager::table::{Pid, ServiceState, ServiceTable};
+
+    use crate::runtime::stop_service_blocking;
 
     /// Names that `init`'s service manifest registers under different
     /// IPC service names than the F.1 step name. The kbd_server, for
@@ -290,15 +301,49 @@ mod init_backend {
         handle != u64::MAX
     }
 
+    /// Phase 64 Track A.2: production adapter that satisfies the F.3
+    /// `SupervisorBackend` trait by talking to init through its
+    /// existing IPC registry **and** owning the per-service
+    /// [`ServiceTable`] introduced in Phase 64.
+    ///
+    /// - `start(name)` is a no-op (init does the actual spawn).
+    /// - `await_ready(name, timeout_ms)` polls the IPC registry until
+    ///   the service registers, then queries
+    ///   [`syscall_lib::ipc_lookup_service_owner_pid`] to record the
+    ///   child's PID in the table — this is the moment a per-child
+    ///   `ServiceState::Starting` transitions to `Running`.
+    /// - `stop(name)` reads the recorded PID and drives the host-
+    ///   tested `lifecycle::stop_service` via [`stop_service_blocking`],
+    ///   delivering SIGTERM, the 5 s grace, SIGKILL, and the `kill(0)`
+    ///   probe. Phase 57's logging-only `stop` is gone.
+    /// - `restart(name)` is currently a no-op at this layer — the
+    ///   Phase 57 control dispatcher's `session_restart` triggers a
+    ///   whole-session rollback + re-drive rather than a per-service
+    ///   restart. A typed per-service-restart verb is a future
+    ///   extension (see the Phase 64 design doc "Remaining" list).
     pub struct InitSupervisorBackend {
-        // No mutable state in F.2; F.4 will hold the
-        // `/run/init.cmd` fd and a small write buffer.
+        table: ServiceTable,
     }
 
     impl InitSupervisorBackend {
-        pub const fn new() -> Self {
-            Self {}
+        pub fn new() -> Self {
+            let mut table = ServiceTable::new();
+            // Pre-populate one entry per declared step so the table
+            // shape is stable from the first event-loop iteration
+            // onward; `m3ctl session-state` then sees every service
+            // (in `Starting` until ready).
+            for name in kernel_core::session_supervisor::declared_session_step_names()
+                .iter()
+                .copied()
+            {
+                table.insert(name);
+            }
+            Self { table }
         }
+
+        // The per-service table is read via the `services_snapshot`
+        // override on the `SupervisorBackend` trait below; no
+        // out-of-band accessor is required.
     }
 
     /// Polling interval for [`InitSupervisorBackend::await_ready`].
@@ -307,42 +352,85 @@ mod init_backend {
     const AWAIT_POLL_MS: u32 = 200;
 
     impl SupervisorBackend for InitSupervisorBackend {
-        fn start(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // Phase 57 F.2 transitional: init drives the actual
-            // service spawn through its `KNOWN_CONFIGS` manifest
-            // walker; `session_manager` is a passive observer that
-            // reports the step as Ack here and waits for the service
-            // to register in [`Self::await_ready`]. Returning Ack
-            // unconditionally means the F.1 sequencer's per-step
-            // attempt becomes "wait for ready" rather than "wait for
-            // already-registered" — which is the correct semantic
-            // for an observer that doesn't itself spawn the
-            // processes.
-            //
-            // F.4 replaces this with a `/run/init.cmd` start verb so
-            // session_manager can drive the lifecycle directly.
+        fn start(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Init drives the actual spawn via its manifest walker.
+            // The table entry was pre-populated by `new`; mark it
+            // explicitly as `Starting` in case a prior failed attempt
+            // left it in another state.
+            self.table.update_state(service, ServiceState::Starting);
             Ok(SupervisorReply::Ack)
         }
 
         fn stop(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // F.2: the rollback-on-text-fallback path stops services in
-            // reverse order via init's existing supervisor. F.2's
-            // adapter logs the intent so the boot transcript names
-            // the rollback; F.4 replaces this with a `/run/init.cmd`
-            // write.
+            let pid = match self.table.get_pid(service) {
+                Some(p) => p,
+                None => {
+                    // No live PID — either the service never started,
+                    // or it already exited. Idempotent no-op for
+                    // the rollback motion's best-effort teardown.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "session_manager: lifecycle.stop: no PID for '",
+                    );
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "'; skipping (already exited or never started)\n",
+                    );
+                    return Ok(SupervisorReply::Ack);
+                }
+            };
+            self.table.update_state(service, ServiceState::Stopping);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                "session_manager: session.recover: stop(",
+                "session_manager: lifecycle.stop: '",
             );
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                ") — F.4 will issue init.cmd write\n",
+                "': delivering SIGTERM (Phase 64)\n",
             );
-            Ok(SupervisorReply::Ack)
+            match stop_service_blocking(pid) {
+                Ok(()) => {
+                    self.table.update_pid(service, None);
+                    // After reap the child is gone but the entry remains
+                    // eligible to start again. `Starting` with `pid=None`
+                    // is the codec's representation of "not running but
+                    // not failed" — reserve `Failed` for budget-exhausted
+                    // or non-recoverable errors. A future codec
+                    // extension can introduce a dedicated `Stopped` tag
+                    // if operator UX needs to distinguish the two.
+                    self.table.update_state(service, ServiceState::Starting);
+                    Ok(SupervisorReply::Ack)
+                }
+                Err(_) => {
+                    // The state machine surfaced a non-recoverable
+                    // error (TermFailed, KillFailed, or ReapFailed).
+                    // Log and continue — the rollback motion calling
+                    // us swallows individual stop errors per the F.4
+                    // contract, and the table is in `Failed` so the
+                    // operator sees the visible damage.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "session_manager: lifecycle.stop: '",
+                    );
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "': stop failed (signal transport error)\n",
+                    );
+                    self.table.update_state(service, ServiceState::Failed);
+                    Err(SupervisorError::NotRunning)
+                }
+            }
         }
 
         fn restart(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Per-service restart verb is deferred (the F.5
+            // `session-restart` verb triggers a whole-session
+            // rollback + re-drive). This adapter returns `Ack` so the
+            // F.1 sequencer's rollback path that internally calls
+            // restart for cleanup continues to behave like Phase 57.
             Ok(SupervisorReply::Ack)
         }
 
@@ -365,7 +453,42 @@ mod init_backend {
             let deadline_polls = (timeout_ms / (AWAIT_POLL_MS as u64)).saturating_add(1);
             for _ in 0..deadline_polls {
                 if is_service_registered(service) {
-                    return Ok(SupervisorReply::ReadyState { ready: true });
+                    // Phase 64: only declare the service `Running` if
+                    // we can also pin down its owner PID. A registered
+                    // service whose PID lookup fails (kernel-owned,
+                    // private name gated, or registry corruption) would
+                    // otherwise leave the table in a self-inconsistent
+                    // state — `Running` with `pid=None` makes a later
+                    // `stop()` an idempotent no-op while operators see
+                    // a healthy service. Treat the missing PID as
+                    // not-ready so the sequencer keeps polling until
+                    // either the PID surfaces or the budget escalates
+                    // to text-fallback.
+                    let registry_name = ipc_service_name(service);
+                    let pid = if registry_name.is_empty() {
+                        None
+                    } else {
+                        syscall_lib::ipc_lookup_service_owner_pid(registry_name)
+                    };
+                    match pid {
+                        Some(pid) => {
+                            self.table.update_pid(service, Some(Pid(pid)));
+                            self.table.update_state(service, ServiceState::Running);
+                            return Ok(SupervisorReply::ReadyState { ready: true });
+                        }
+                        None => {
+                            syscall_lib::write_str(
+                                syscall_lib::STDOUT_FILENO,
+                                "session_manager: await_ready: '",
+                            );
+                            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                            syscall_lib::write_str(
+                                syscall_lib::STDOUT_FILENO,
+                                "': registered but owner PID lookup failed; keeping Starting\n",
+                            );
+                            // Fall through to the poll-and-retry path.
+                        }
+                    }
                 }
                 if timeout_ms == 0 {
                     break;
@@ -380,6 +503,45 @@ mod init_backend {
                 exit_code: 0,
                 signaled: false,
             })
+        }
+
+        /// Phase 64 — populate one `ServiceStateEntry` per `ServiceTable`
+        /// entry for the `SessionStateDetailed` control verb. Stops at
+        /// `MAX_SERVICE_STATE_ENTRIES` to keep the reply allocation-free.
+        fn services_snapshot(
+            &mut self,
+        ) -> (
+            u8,
+            [kernel_core::session_control::ServiceStateEntry;
+                kernel_core::session_control::MAX_SERVICE_STATE_ENTRIES],
+        ) {
+            use kernel_core::session_control::{
+                MAX_SERVICE_STATE_ENTRIES, MAX_STEP_NAME_BYTES, PER_SVC_FAILED, PER_SVC_RESTARTING,
+                PER_SVC_RUNNING, PER_SVC_STARTING, PER_SVC_STOPPING, ServiceStateEntry,
+            };
+
+            let mut entries = [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES];
+            let mut count: usize = 0;
+            for entry in self.table.iter() {
+                if count >= MAX_SERVICE_STATE_ENTRIES {
+                    break;
+                }
+                let bytes = entry.name.as_bytes();
+                let name_len = bytes.len().min(MAX_STEP_NAME_BYTES);
+                entries[count].name_len = name_len as u8;
+                entries[count].name[..name_len].copy_from_slice(&bytes[..name_len]);
+                entries[count].state_tag = match entry.state {
+                    ServiceState::Starting => PER_SVC_STARTING,
+                    ServiceState::Running => PER_SVC_RUNNING,
+                    ServiceState::Stopping => PER_SVC_STOPPING,
+                    ServiceState::Restarting => PER_SVC_RESTARTING,
+                    ServiceState::Failed => PER_SVC_FAILED,
+                };
+                entries[count].restart_count = entry.restart_count;
+                entries[count].step_failures = entry.step_failures;
+                count += 1;
+            }
+            (count as u8, entries)
         }
     }
 }

@@ -69,10 +69,16 @@ pub const LABEL_CTL_REPLY: u64 = 2;
 const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Maximum bulk size accepted on the control endpoint. The verb is a
-/// single byte; the buffer fits a 1-byte verb + the longest reply
-/// (a `Recovering` state with a 32-byte step name + 4-byte retry count
-/// + 3 bytes header = 40 bytes). 64 leaves headroom.
-const MAX_CONTROL_BUF: usize = 64;
+/// single byte; the buffer must fit the worst-case Phase 64
+/// `ServiceStates` reply, which packs up to `MAX_SERVICE_STATE_ENTRIES`
+/// (8) per-service quads — `(name, state, restart_count, step_failures)`.
+/// On the wire each quad is 42 bytes: 1 byte name_len + ≤32 bytes name +
+/// 1 byte state tag + 4 bytes restart_count + 4 bytes step_failures.
+/// Worst case: 2-byte header + 8·42 = 338 bytes. We round to 384 so the
+/// buffer stays one allocation page-fragment in size and tolerates
+/// future codec additions without revisiting the constant. Must stay
+/// in sync with `m3ctl`'s `SESSION_REPLY_MAX`.
+const MAX_CONTROL_BUF: usize = 384;
 
 /// Holder for the control-socket endpoint's cap-handle. Constructed
 /// once at startup; passed to [`poll_control_once`] each event-loop
@@ -210,6 +216,19 @@ impl<'c, 'b, B: SupervisorBackend> SessionControlBackend for DaemonBackend<'c, '
         self.rollback_to_text_fallback();
         self.ctx.restart_requested = true;
         Ok(())
+    }
+
+    fn services_snapshot(
+        &mut self,
+    ) -> (
+        u8,
+        [kernel_core::session_control::ServiceStateEntry;
+            kernel_core::session_control::MAX_SERVICE_STATE_ENTRIES],
+    ) {
+        // Phase 64 — forward to the supervisor's own snapshot. The
+        // production `InitSupervisorBackend` reads its `ServiceTable`;
+        // pre-Phase-64 backends use the default (empty) implementation.
+        self.supervisor.services_snapshot()
     }
 }
 

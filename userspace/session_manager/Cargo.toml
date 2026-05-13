@@ -1,11 +1,23 @@
 [package]
 name = "session_manager"
-version = "0.57.0"
+version = "0.64.0"
 edition = "2024"
+
+# Phase 64: pure-logic modules (`table.rs`, `lifecycle.rs`) host-test
+# under `cargo test -p session_manager --target x86_64-unknown-linux-gnu`.
+# The OS binary keeps `entry_point!` behind the `os-binary` feature so the
+# host-test build skips the `_start` symbol — same shape as `audio_server`.
+[lib]
+name = "session_manager"
+path = "src/lib.rs"
+
+[features]
+os-binary = []
 
 [[bin]]
 name = "session_manager"
 path = "src/main.rs"
+required-features = ["os-binary"]
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib", features = ["alloc"] }

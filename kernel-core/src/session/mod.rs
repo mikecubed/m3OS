@@ -41,3 +41,19 @@ pub const MAX_RETRIES_PER_STEP: u32 = 3;
 /// between retries. Named here so the resource-bound is a single fact
 /// in the codebase rather than a sprinkled magic number.
 pub const RETRY_BACKOFF_MS: u64 = 200;
+
+/// Phase 64: steady-state full-restart budget. After this many full
+/// `restart()` attempts on the same service (each attempt is a
+/// `stop()` + `start()` pair), the supervisor escalates the service to
+/// `ServiceState::Failed`. Named here alongside [`MAX_RETRIES_PER_STEP`]
+/// so both Phase 64 budget constants live at one stable path and are
+/// host-testable directly from `kernel-core` unit tests.
+///
+/// `MAX_RETRIES_PER_STEP` bounds the per-attempt step failures (one
+/// stop call can fail up to N times within one restart); this constant
+/// bounds the number of full restart attempts that have ever happened
+/// for a given service since boot. Both gates fire independently — a
+/// service that flaps three full restarts hits this gate; a service
+/// whose individual `stop()` keeps failing within one restart hits
+/// `MAX_RETRIES_PER_STEP`.
+pub const MAX_RESTART_COUNT: u32 = 3;

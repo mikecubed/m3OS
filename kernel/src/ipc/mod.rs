@@ -189,6 +189,7 @@ pub use registry::RegistryError;
 /// | 20 | 0x1113 | `ipc_try_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, or u64::MAX if no pending message |
 /// | 21 | 0x1114 | `ipc_service_exists(name_ptr, name_len)` | `arg0, arg1` → 1 if registered, 0 otherwise |
 /// | 22 | 0x1115 | `ipc_wait_service(name_ptr, name_len, timeout_ms)` | `arg0..2` → 1 ready, 0 timeout |
+/// | 23 | 0x1116 | `ipc_lookup_service_owner_pid(name_ptr, name_len)` | `arg0, arg1` → owner PID or `u64::MAX` |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -227,8 +228,8 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, 12, 17, 18, 19, 21, and 22 do not use arg0 as a pre-looked-up cap
-    // handle — process them before the cap-lookup preamble.
+    // Syscalls 10, 11, 12, 17, 18, 19, 21, 22, and 23 do not use arg0 as a
+    // pre-looked-up cap handle — process them before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
     }
@@ -252,6 +253,16 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 22 {
         return ipc_wait_service(task_id, arg0, arg1, arg2);
+    }
+    // Phase 64 Track A.2: query the owner PID of a registered service.
+    // `session_manager` consumes this after `await_ready` succeeds to
+    // populate `ServiceTable::update_pid`, which is the foundation for
+    // the new SIGTERM/SIGKILL lifecycle methods. The kernel already
+    // tracks owners via `registry::lookup_endpoint_with_owner`; this
+    // syscall is a thin wrapper that maps the owner `TaskId` to a
+    // userspace-visible `pid`.
+    if number == 23 {
+        return ipc_lookup_service_owner_pid(arg0, arg1);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -625,6 +636,60 @@ fn ipc_wait_service(
         task_id,
         deadline_ticks,
     ))
+}
+
+/// Phase 64 Track A.2 — Syscall 23 (0x1116): return the userspace PID of the
+/// process owning the registered service `name`.
+///
+/// Used by `session_manager` after `await_ready` succeeds: the
+/// `ServiceTable` records this PID so the new `stop_service` /
+/// `restart_service` lifecycle methods can target the child by PID
+/// rather than guessing.
+///
+/// Returns the PID as `u64` on success, or `u64::MAX` on any error
+/// (name too long, copy fault, service not registered, kernel-owned
+/// service with no PID). Kernel-registered services (e.g. blk facades)
+/// report owner-task-id `0`; this syscall surfaces that as `u64::MAX`
+/// because they cannot be targeted with `kill`.
+fn ipc_lookup_service_owner_pid(name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
+    if name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
+    let mut name_buf = [0u8; 32];
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+    let name = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    // Hide private kernel-facing services (vfs, net_udp): exposing their
+    // owner PID would let unprivileged userspace target them with kill()
+    // even though `ipc_lookup_service` intentionally refuses to hand out
+    // their endpoint caps. Mirrors the gate in `ipc_lookup_service`.
+    if is_private_service_name(name) {
+        return u64::MAX;
+    }
+    let (_, owner_task_id) = match registry::lookup_endpoint_with_owner(name) {
+        Some(pair) => pair,
+        None => return u64::MAX,
+    };
+    if owner_task_id == 0 {
+        // Kernel-owned service — no userspace PID to target.
+        return u64::MAX;
+    }
+    let task_id = crate::task::TaskId(owner_task_id);
+    match crate::task::scheduler::pid_for_task_id(task_id) {
+        Some(pid) => u64::from(pid),
+        None => u64::MAX,
+    }
 }
 
 /// Syscall 12 (0x110B): allocate a new IPC endpoint and insert an Endpoint

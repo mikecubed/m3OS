@@ -372,6 +372,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crash_stub"
+version = "0.64.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.63.1"
+version = "0.64.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1645,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "session_manager"
-version = "0.57.0"
+version = "0.64.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",

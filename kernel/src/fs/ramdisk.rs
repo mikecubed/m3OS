@@ -271,6 +271,12 @@ static TERM_ELF: &[u8] = generated_initrd_asset!("term");
 // `fb-takeover /bin/doom`. Not a daemon: no `.conf`.
 static FB_TAKEOVER_ELF: &[u8] = generated_initrd_asset!("fb-takeover");
 
+// Phase 64 Track A.3 — deterministic test child for the
+// session_manager lifecycle integration tests (B.1 grace-period and
+// C.1 crash-loop / display-critical text-fallback paths). Not a
+// daemon: no `.conf`.
+static CRASH_STUB_ELF: &[u8] = generated_initrd_asset!("crash_stub");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -693,6 +699,16 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "fb-takeover",
         RamdiskNode::File {
             content: FB_TAKEOVER_ELF,
+        },
+    ),
+    // Phase 64 Track A.3 — deterministic test child for the
+    // session_manager lifecycle integration tests. Not a daemon;
+    // launched from the test harness with one of three modes
+    // (exit-immediately, ignore-sigterm, exit-on-sigterm).
+    (
+        "crash_stub",
+        RamdiskNode::File {
+            content: CRASH_STUB_ELF,
         },
     ),
     // Phase 56 Track F.2: display-service crash-and-restart smoke

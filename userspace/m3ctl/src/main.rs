@@ -83,9 +83,14 @@ mod os_binary {
     const MAX_BULK_BYTES: usize = 4096;
 
     /// Maximum size of an encoded session reply. The largest variant
-    /// is a `Recovering` state with a 32-byte step name + 4-byte retry
-    /// count + small header. 64 leaves headroom.
-    const SESSION_REPLY_MAX: usize = 64;
+    /// is the Phase 64 `ServiceStates` reply: up to 8 per-service
+    /// quads — `(name, state, restart_count, step_failures)`. Each
+    /// quad is 42 bytes on the wire: 1 byte name_len + ≤32 bytes
+    /// name + 1 byte state tag + 4 bytes restart_count + 4 bytes
+    /// step_failures. Plus a 2-byte header → 338 bytes. We round to
+    /// 384 to leave headroom and to stay in lock-step with
+    /// `session_manager::control::MAX_CONTROL_BUF`.
+    const SESSION_REPLY_MAX: usize = 384;
 
     /// Service-lookup retry attempts before giving up. Same shape as
     /// `display_server::input::lookup_with_backoff`.
@@ -264,6 +269,50 @@ mod os_binary {
                 print_str(session_error_label(*err));
                 print_str("\n");
             }
+            // Phase 64 — `SessionStateDetailed` reply path. The legacy
+            // `session-state` verb doesn't request this variant; a
+            // future client adds the request and reuses this printer,
+            // which exposes the full per-service quad so operators can
+            // see when the restart-budget counters are getting close
+            // to their limits.
+            ControlReply::ServiceStates {
+                entry_count,
+                entries,
+            } => {
+                let count = (*entry_count as usize).min(entries.len());
+                for entry in entries.iter().take(count) {
+                    let name = entry.name_as_str().unwrap_or("?");
+                    print_str("service ");
+                    print_str(name);
+                    print_str(" state=");
+                    print_str(per_svc_state_label(entry.state_tag));
+                    print_str(" restart_count=");
+                    print_u32(entry.restart_count);
+                    print_str(" step_failures=");
+                    print_u32(entry.step_failures);
+                    print_str("\n");
+                }
+                if count == 0 {
+                    print_str("services: (empty)\n");
+                }
+            }
+        }
+    }
+
+    /// Map a Phase 64 per-service state tag to a stable string label
+    /// suitable for the `m3ctl session-state` output. Mirrors the
+    /// `PER_SVC_*` constants in `kernel_core::session_control`.
+    fn per_svc_state_label(tag: u8) -> &'static str {
+        use kernel_core::session_control::{
+            PER_SVC_FAILED, PER_SVC_RESTARTING, PER_SVC_RUNNING, PER_SVC_STARTING, PER_SVC_STOPPING,
+        };
+        match tag {
+            x if x == PER_SVC_STARTING => "starting",
+            x if x == PER_SVC_RUNNING => "running",
+            x if x == PER_SVC_STOPPING => "stopping",
+            x if x == PER_SVC_RESTARTING => "restarting",
+            x if x == PER_SVC_FAILED => "failed",
+            _ => "unknown",
         }
     }
 
