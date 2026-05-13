@@ -69,10 +69,15 @@ pub const LABEL_CTL_REPLY: u64 = 2;
 const REPLY_CAP_HANDLE: u32 = 1;
 
 /// Maximum bulk size accepted on the control endpoint. The verb is a
-/// single byte; the buffer fits a 1-byte verb + the longest reply
-/// (a `Recovering` state with a 32-byte step name + 4-byte retry count
-/// + 3 bytes header = 40 bytes). 64 leaves headroom.
-const MAX_CONTROL_BUF: usize = 64;
+/// single byte; the buffer must fit the worst-case Phase 64
+/// `ServiceStates` reply, which packs up to `MAX_SERVICE_STATE_ENTRIES`
+/// (8) per-service triples (1 byte name_len + ≤32 bytes name + 1 byte
+/// state tag + 4 bytes restart_count + 4 bytes step_failures = 42 bytes
+/// each) plus a 2-byte header. Worst case: 2 + 8·42 = 338 bytes. We
+/// round to 384 so the buffer stays one allocation page-fragment in
+/// size and tolerates future codec additions without revisiting the
+/// constant. Must stay in sync with `m3ctl`'s `SESSION_REPLY_MAX`.
+const MAX_CONTROL_BUF: usize = 384;
 
 /// Holder for the control-socket endpoint's cap-handle. Constructed
 /// once at startup; passed to [`poll_control_once`] each event-loop

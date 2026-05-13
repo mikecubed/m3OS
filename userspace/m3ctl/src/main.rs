@@ -83,9 +83,13 @@ mod os_binary {
     const MAX_BULK_BYTES: usize = 4096;
 
     /// Maximum size of an encoded session reply. The largest variant
-    /// is a `Recovering` state with a 32-byte step name + 4-byte retry
-    /// count + small header. 64 leaves headroom.
-    const SESSION_REPLY_MAX: usize = 64;
+    /// is the Phase 64 `ServiceStates` reply: up to 8 per-service
+    /// triples (≤42 bytes each: 1 byte name_len + ≤32 bytes name +
+    /// 1 byte state tag + 4 bytes restart_count + 4 bytes
+    /// step_failures) plus a 2-byte header → 338 bytes. We round to
+    /// 384 to leave headroom and to stay in lock-step with
+    /// `session_manager::control::MAX_CONTROL_BUF`.
+    const SESSION_REPLY_MAX: usize = 384;
 
     /// Service-lookup retry attempts before giving up. Same shape as
     /// `display_server::input::lookup_with_backoff`.

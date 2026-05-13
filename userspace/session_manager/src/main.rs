@@ -393,14 +393,14 @@ mod init_backend {
             match stop_service_blocking(pid) {
                 Ok(()) => {
                     self.table.update_pid(service, None);
-                    // After reap the service is functionally gone;
-                    // mark Failed (the operator can re-enter `Starting`
-                    // explicitly via `session-restart`). A clean
-                    // operator-initiated stop and a budget-exhausted
-                    // stop reach this state for now; per-cause
-                    // disambiguation is deferred to a future codec
-                    // extension.
-                    self.table.update_state(service, ServiceState::Failed);
+                    // After reap the child is gone but the entry remains
+                    // eligible to start again. `Starting` with `pid=None`
+                    // is the codec's representation of "not running but
+                    // not failed" — reserve `Failed` for budget-exhausted
+                    // or non-recoverable errors. A future codec
+                    // extension can introduce a dedicated `Stopped` tag
+                    // if operator UX needs to distinguish the two.
+                    self.table.update_state(service, ServiceState::Starting);
                     Ok(SupervisorReply::Ack)
                 }
                 Err(_) => {

@@ -1,12 +1,17 @@
 //! Phase 64 Tracks B + C — `stop_service` and `restart_service`.
 //!
 //! Real lifecycle methods that replace the Phase 57 stubs (which
-//! returned `Ack` unconditionally). `stop_service` is driven as a
-//! state machine across event-loop iterations so the daemon never
-//! suspends — other IPC continues to be serviced while a stop is in
-//! flight. `restart_service` chains `stop` + `start` and enforces the
-//! [`kernel_core::session::MAX_RETRIES_PER_STEP`] and
-//! [`kernel_core::session::MAX_RESTART_COUNT`] budgets; budget
+//! returned `Ack` unconditionally). The stop motion is expressed as a
+//! pure-logic state machine ([`StopMachine`]) that this module exposes
+//! via [`begin_stop`] + [`tick`]; the binary drives it through the
+//! synchronous wrapper [`crate::runtime::stop_service_blocking`], which
+//! polls in a `nanosleep` loop until the machine reaches `Reaped`. The
+//! pure-logic shape is already structured for a future deferred-reply
+//! hoist into the daemon's event loop, but the synchronous driver is
+//! what ships today and one in-flight stop briefly stalls other IPC
+//! for its grace + reap windows. `restart_service` chains `stop` +
+//! `start` and enforces the [`kernel_core::session::MAX_RETRIES_PER_STEP`]
+//! and [`kernel_core::session::MAX_RESTART_COUNT`] budgets; budget
 //! exhaustion on a [`DISPLAY_CRITICAL_SERVICES`] entry triggers the
 //! text-fallback recovery motion.
 //!
@@ -16,19 +21,26 @@
 //! host-testable without QEMU:
 //!
 //! - [`KernelClock::now_ms`] reads the supervisor's monotonic time
-//!   source. Production: `syscall_lib::clock_gettime`. Test: a fake
-//!   that returns whatever the test advances.
+//!   source. Production: `syscall_lib::clock_gettime` (see
+//!   `crate::runtime::SyscallClock`). Test: a fake that returns
+//!   whatever the test advances.
 //! - [`SignalSink::send_signal`] delivers `sys_kill`. Production:
-//!   `syscall_lib::kill`. Test: a fake that records calls and lets
-//!   the test verify the issued signal.
-//! - [`Reaper::try_reap`] non-blockingly polls `sys_waitpid(pid, ..,
-//!   WNOHANG)`. Production: `syscall_lib::waitpid`. Test: a fake that
-//!   returns `NotYet` until the test marks the child as exited.
+//!   `syscall_lib::kill` (see `crate::runtime::SyscallSignalSink`).
+//!   Test: a fake that records calls and lets the test verify the
+//!   issued signal.
+//! - [`Reaper::try_reap`] non-blockingly determines whether `pid` is
+//!   still alive. Production: a `kill(pid, 0)` liveness probe (see
+//!   `crate::runtime::KillProbeReaper`) — `session_manager` is not the
+//!   parent of the supervised children (init is, via its
+//!   manifest-driven boot), so `waitpid` is not available to this
+//!   daemon. The `kill(0)` probe returns `0` for "alive" and `-ESRCH`
+//!   for "gone", which is functionally equivalent for Phase 64's stop
+//!   and restart-budget contracts. Test: a fake that returns `NotYet`
+//!   until the test marks the child as exited.
 //!
-//! The state machine itself ([`StopMachine::tick`]) consumes all three
-//! traits and is the only thing the lifecycle methods need to be
-//! correct — the syscall wiring is in `main.rs` and is intentionally
-//! thin.
+//! The state machine itself ([`tick`]) consumes all three traits and
+//! is the only thing the lifecycle methods need to be correct — the
+//! syscall wiring lives in `runtime.rs` and is intentionally thin.
 
 use crate::table::{Pid, ServiceState, ServiceTable};
 use kernel_core::session::{MAX_RESTART_COUNT, MAX_RETRIES_PER_STEP};
@@ -38,10 +50,12 @@ use kernel_core::session::{MAX_RESTART_COUNT, MAX_RETRIES_PER_STEP};
 /// exit within this window receives SIGKILL.
 pub const SIGTERM_GRACE_MS: u64 = 5_000;
 
-/// Maximum time to wait for `sys_waitpid` to observe a reap after
-/// SIGKILL has been delivered. A SIGKILL that does not produce a reap
-/// within this window is treated as a kernel-side failure and the
-/// stop request returns [`StopError::KillFailed`].
+/// Maximum time to wait for the production [`Reaper`] (a `kill(pid, 0)`
+/// liveness probe — see the module docs for the parent/child rationale)
+/// to observe the PID disappear after SIGKILL has been delivered. A
+/// SIGKILL that does not produce a reap within this window is treated
+/// as a kernel-side failure and the stop request returns
+/// [`StopError::ReapFailed`].
 pub const SIGKILL_REAP_MS: u64 = 1_000;
 
 /// Services whose budget exhaustion triggers
@@ -80,13 +94,18 @@ pub trait SignalSink {
     fn send_signal(&mut self, pid: Pid, sig: i32) -> Result<(), ()>;
 }
 
-/// Non-blocking reap seam. Production: `syscall_lib::waitpid(pid, &,
-/// WNOHANG)`. Test: a fake that returns `NotYet` until the test marks
-/// the child as exited.
+/// Non-blocking reap seam. Production: a `kill(pid, 0)` liveness probe
+/// (see `crate::runtime::KillProbeReaper` and the module-level
+/// rationale for why `session_manager` cannot use `waitpid`). Test: a
+/// fake that returns `NotYet` until the test marks the child as
+/// exited.
 pub trait Reaper {
-    /// Try to reap `pid`. `NotYet` means the child has not exited;
-    /// `Reaped(code)` means it did and the wait status is `code`;
-    /// `Error` means the kernel returned an unexpected status.
+    /// Try to observe `pid`'s exit. `NotYet` means the child is still
+    /// alive; `Reaped(code)` means it has gone away (production fills
+    /// `exit_code = 0` because the `kill(0)` probe cannot recover the
+    /// wait status — none of Phase 64's acceptance items consume the
+    /// exit code); `Error` means the kernel returned an unexpected
+    /// status.
     fn try_reap(&mut self, pid: Pid) -> ReapOutcome;
 }
 
@@ -96,10 +115,14 @@ pub enum ReapOutcome {
     /// Child has not yet exited; the stop state machine should keep
     /// ticking on the next event-loop iteration.
     NotYet,
-    /// Child has exited; `exit_code` is the wait status word.
+    /// Child has exited; `exit_code` is the wait status word when the
+    /// `Reaper` implementation can recover it. The production
+    /// `kill(0)` probe cannot, and fills `0`.
     Reaped { exit_code: i32 },
-    /// `sys_waitpid` returned an unexpected error code. The state
-    /// machine surfaces this as [`StopError::ReapFailed`].
+    /// The `Reaper` returned an unexpected status (e.g. `-EPERM` from
+    /// the production `kill(0)` probe, which should not occur under
+    /// the same-uid local-session boot world). The state machine
+    /// surfaces this as [`StopError::ReapFailed`].
     Error,
 }
 
@@ -249,19 +272,33 @@ pub enum RestartError {
 
 /// Outcome of one step inside a restart attempt — used by the daemon
 /// to feed the budget counters in [`record_restart_attempt`].
+///
+/// `Success` represents only one specific success: the **completion of
+/// the `start` step of a full restart**. The daemon must not call
+/// [`record_restart_attempt`] with `Success` after a successful `stop`
+/// step on its own — doing so would treat the stop as a completed
+/// restart attempt and bump `restart_count`. Each `restart_service`
+/// invocation reports at most one `Success` (after the start step),
+/// plus zero or more `Failure`s for each failed sub-step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartStep {
-    /// The stop or start call succeeded this attempt.
+    /// The full restart attempt has completed: the start step
+    /// succeeded. The daemon reports this **once** per restart, at the
+    /// end of a successful `stop` + `start` chain.
     Success,
-    /// The stop or start call failed this attempt.
+    /// The stop or start call failed this attempt. May be reported
+    /// multiple times in one restart (e.g. a failed stop followed by a
+    /// retry).
     Failure,
 }
 
 /// Budget-aware bookkeeping for one restart attempt.
 ///
 /// Called by the daemon's restart loop after each `stop` / `start`
-/// step. Increments `step_failures` on `Failure`; on a successful full
-/// restart (the start step succeeded) increments `restart_count` and
+/// **failure**, and exactly once at the end of a successful **full
+/// restart** with [`RestartStep::Success`] (see the `RestartStep` doc).
+/// Increments `step_failures` on `Failure`; on a `Success` (the start
+/// step of a full restart completed) increments `restart_count` and
 /// clears `step_failures`. Returns `Err(BudgetExhausted)` once either
 /// counter reaches its budget.
 ///

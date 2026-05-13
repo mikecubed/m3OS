@@ -670,6 +670,13 @@ fn ipc_lookup_service_owner_pid(name_ptr: u64, name_len: u64) -> u64 {
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
+    // Hide private kernel-facing services (vfs, net_udp): exposing their
+    // owner PID would let unprivileged userspace target them with kill()
+    // even though `ipc_lookup_service` intentionally refuses to hand out
+    // their endpoint caps. Mirrors the gate in `ipc_lookup_service`.
+    if is_private_service_name(name) {
+        return u64::MAX;
+    }
     let (_, owner_task_id) = match registry::lookup_endpoint_with_owner(name) {
         Some(pair) => pair,
         None => return u64::MAX,

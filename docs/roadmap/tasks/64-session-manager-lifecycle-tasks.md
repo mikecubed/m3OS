@@ -3,7 +3,7 @@
 **Status:** Complete
 **Source Ref:** phase-64
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 19 (Signal Handling) ✅, Phase 52 (First Service Extractions) ✅
-**Goal:** Replace the Phase 57 `session_manager` lifecycle stubs (`stop/restart` unconditionally return `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, `sys_waitpid` observation, restart-budget enforcement, and authentic `m3ctl session-state` reporting; make the typed `text-fallback` recovery contract actually drop display-server children.
+**Goal:** Replace the Phase 57 `session_manager` lifecycle stubs (`stop/restart` unconditionally return `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, a non-blocking `kill(pid, 0)` liveness-probe reaper (the task-list shape originally described `sys_waitpid`; that requires `session_manager` to be the parent of its supervised children, but in this codebase init is the parent — rationale in `userspace/session_manager/src/runtime.rs`), restart-budget enforcement, and a new typed `SessionStateDetailed` verb + `ServiceStates` reply variant carrying per-service `(name, ServiceState, restart_count, step_failures)` quads (the legacy `m3ctl session-state` CLI still issues the session-wide `ControlVerb::SessionState`; a per-service CLI flag is a documented follow-up); make the typed `text-fallback` recovery contract actually drop display-server children.
 
 ## Track Layout
 

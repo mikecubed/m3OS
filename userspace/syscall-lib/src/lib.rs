@@ -581,12 +581,19 @@ pub fn ipc_lookup_service_owner_pid(name: &str) -> Option<i32> {
         )
     };
     if rc == u64::MAX {
-        None
-    } else {
-        // Kernel returns the PID as `u64`; truncate to `i32` since the
-        // process table holds `i32`s (matching `fork()` / `kill()`).
-        Some(rc as i32)
+        return None;
     }
+    // Kernel returns the PID as `u64`; we hold it as `i32` to match
+    // `fork()` / `kill()`. Range-check so a kernel that ever produces a
+    // PID > `i32::MAX` cannot wrap into a negative value the supervisor
+    // would then feed to `kill(pid, sig)`. A PID of 0 is invalid here:
+    // task id 0 is the kernel/idle task and is filtered out kernel-side,
+    // so observing it on the userspace surface indicates a corruption
+    // we treat as "no usable PID".
+    if rc == 0 || rc > i32::MAX as u64 {
+        return None;
+    }
+    Some(rc as i32)
 }
 
 /// Wait on a notification capability. Blocks until at least one bit is set.

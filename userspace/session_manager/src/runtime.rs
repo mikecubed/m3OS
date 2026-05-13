@@ -38,29 +38,63 @@
 //! interior-mutability dance. Each implements one trait; SRP is
 //! observed at the struct level.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use session_manager::lifecycle::{KernelClock, ReapOutcome, Reaper, SignalSink};
 use session_manager::table::Pid;
 
 /// Production [`KernelClock`] implementation. Reads the monotonic
 /// kernel clock via `clock_gettime` and converts to milliseconds.
+///
+/// On a transient `clock_gettime` failure (`tv_sec < 0`) the
+/// implementation falls back to a monotonically-increasing internal
+/// counter so the stop state machine's `deadline_ms` comparisons keep
+/// making forward progress. Returning a constant `0` would freeze the
+/// grace and reap windows in [`crate::stop_service_blocking`] and hang
+/// the supervisor indefinitely — that's worse than a clock that ticks
+/// at the poll cadence.
 pub struct SyscallClock;
+
+/// Fallback monotonic counter (milliseconds) used when `clock_gettime`
+/// reports a transport-level failure. Increments by the stop-machine
+/// poll interval (25 ms) on each fallback observation; the resulting
+/// virtual clock advances strictly forward so [`lifecycle::tick`]'s
+/// `now >= deadline_ms` checks still resolve.
+static FALLBACK_NOW_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Step size used by the fallback clock. Matches
+/// [`STOP_POLL_INTERVAL_NS`] so the virtual clock advances by roughly
+/// one poll interval per failed `clock_gettime` call.
+const FALLBACK_STEP_MS: u64 = 25;
 
 impl KernelClock for SyscallClock {
     fn now_ms(&self) -> u64 {
         let (tv_sec, tv_nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
-        // The clock surface returns `(-1, 0)` on transport failure; the
-        // deadline arithmetic in `lifecycle::tick` treats `now_ms == 0`
-        // as "the deadline has not yet elapsed," so the grace window
-        // simply needs an extra event-loop iteration to expire if the
-        // clock is broken. That fail-safe matches the broader Phase 64
-        // shape: never panic out of the supervisor on a transient
-        // kernel surface failure.
         if tv_sec < 0 {
-            return 0;
+            // Transport-level failure: advance the fallback counter so
+            // the stop machine's deadlines still elapse deterministically.
+            return FALLBACK_NOW_MS.fetch_add(FALLBACK_STEP_MS, Ordering::Relaxed)
+                + FALLBACK_STEP_MS;
         }
         let s = tv_sec as u64;
         let ns = tv_nsec.max(0) as u64;
-        s.saturating_mul(1_000).saturating_add(ns / 1_000_000)
+        let real_ms = s.saturating_mul(1_000).saturating_add(ns / 1_000_000);
+        // Keep the fallback counter pinned at-or-above the real clock so
+        // a subsequent failure cannot regress time below the value the
+        // state machine already observed.
+        let mut cur = FALLBACK_NOW_MS.load(Ordering::Relaxed);
+        while real_ms > cur {
+            match FALLBACK_NOW_MS.compare_exchange_weak(
+                cur,
+                real_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        real_ms
     }
 }
 
