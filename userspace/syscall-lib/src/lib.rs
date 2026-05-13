@@ -387,6 +387,12 @@ pub const SYS_IPC_SERVICE_EXISTS: u64 = 0x1114;
 /// Block until a named service is registered without allocating a cap handle.
 pub const SYS_IPC_WAIT_SERVICE: u64 = 0x1115;
 
+/// Phase 64 Track A.2: query the owner PID of a registered service.
+/// `session_manager` consumes this after `await_ready` succeeds to
+/// populate its per-service `ServiceTable` so the SIGTERM/SIGKILL
+/// lifecycle methods can target the child by PID.
+pub const SYS_IPC_LOOKUP_SERVICE_OWNER_PID: u64 = 0x1116;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -558,6 +564,28 @@ pub fn ipc_wait_service(name: &str, timeout_ms: u64) -> bool {
             name.len() as u64,
             timeout_ms,
         ) == 1
+    }
+}
+
+/// Phase 64 Track A.2: return the userspace PID of the process owning
+/// the registered service `name`, or `None` if the service is not
+/// registered, is kernel-owned (no userspace PID), or the lookup
+/// otherwise fails. `session_manager` consumes this after
+/// `await_ready` succeeds to populate `ServiceTable::update_pid`.
+pub fn ipc_lookup_service_owner_pid(name: &str) -> Option<i32> {
+    let rc = unsafe {
+        syscall2(
+            SYS_IPC_LOOKUP_SERVICE_OWNER_PID,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    };
+    if rc == u64::MAX {
+        None
+    } else {
+        // Kernel returns the PID as `u64`; truncate to `i32` since the
+        // process table holds `i32`s (matching `fork()` / `kill()`).
+        Some(rc as i32)
     }
 }
 

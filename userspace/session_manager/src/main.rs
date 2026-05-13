@@ -53,6 +53,7 @@ extern crate alloc;
 mod boot;
 mod control;
 mod recover;
+mod runtime;
 
 // Phase 64: pure-logic types (`Pid`, `ServiceState`, `ServiceTable`)
 // live in the `session_manager` library crate so they host-test under
@@ -260,6 +261,9 @@ mod init_backend {
     //! is missing.
 
     use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, SupervisorReply};
+    use session_manager::table::{Pid, ServiceState, ServiceTable};
+
+    use crate::runtime::stop_service_blocking;
 
     /// Names that `init`'s service manifest registers under different
     /// IPC service names than the F.1 step name. The kbd_server, for
@@ -297,14 +301,61 @@ mod init_backend {
         handle != u64::MAX
     }
 
+    /// Phase 64 Track A.2: production adapter that satisfies the F.3
+    /// `SupervisorBackend` trait by talking to init through its
+    /// existing IPC registry **and** owning the per-service
+    /// [`ServiceTable`] introduced in Phase 64.
+    ///
+    /// - `start(name)` is a no-op (init does the actual spawn).
+    /// - `await_ready(name, timeout_ms)` polls the IPC registry until
+    ///   the service registers, then queries
+    ///   [`syscall_lib::ipc_lookup_service_owner_pid`] to record the
+    ///   child's PID in the table — this is the moment a per-child
+    ///   `ServiceState::Starting` transitions to `Running`.
+    /// - `stop(name)` reads the recorded PID and drives the host-
+    ///   tested `lifecycle::stop_service` via [`stop_service_blocking`],
+    ///   delivering SIGTERM, the 5 s grace, SIGKILL, and the `kill(0)`
+    ///   probe. Phase 57's logging-only `stop` is gone.
+    /// - `restart(name)` is currently a no-op at this layer — the
+    ///   Phase 57 control dispatcher's `session_restart` triggers a
+    ///   whole-session rollback + re-drive rather than a per-service
+    ///   restart. A typed per-service-restart verb is a future
+    ///   extension (see the Phase 64 design doc "Remaining" list).
     pub struct InitSupervisorBackend {
-        // No mutable state in F.2; F.4 will hold the
-        // `/run/init.cmd` fd and a small write buffer.
+        table: ServiceTable,
     }
 
     impl InitSupervisorBackend {
-        pub const fn new() -> Self {
-            Self {}
+        pub fn new() -> Self {
+            let mut table = ServiceTable::new();
+            // Pre-populate one entry per declared step so the table
+            // shape is stable from the first event-loop iteration
+            // onward; `m3ctl session-state` then sees every service
+            // (in `Starting` until ready).
+            for name in kernel_core::session_supervisor::declared_session_step_names()
+                .iter()
+                .copied()
+            {
+                table.insert(name);
+            }
+            Self { table }
+        }
+
+        /// Borrow the per-service table — used by the control dispatcher
+        /// to serve `session-state` queries from authentic data and by
+        /// `recover::run_text_fallback` to iterate children in reverse.
+        #[allow(dead_code)] // consumed once E.1 codec extension lands
+        pub fn table(&self) -> &ServiceTable {
+            &self.table
+        }
+
+        /// Mutate the per-service table. The control dispatcher writes
+        /// `ServiceState::Stopping` here before issuing the real stop
+        /// motion so a concurrent `session-state` query sees the
+        /// transition.
+        #[allow(dead_code)] // consumed once E.1 codec extension lands
+        pub fn table_mut(&mut self) -> &mut ServiceTable {
+            &mut self.table
         }
     }
 
@@ -314,42 +365,85 @@ mod init_backend {
     const AWAIT_POLL_MS: u32 = 200;
 
     impl SupervisorBackend for InitSupervisorBackend {
-        fn start(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // Phase 57 F.2 transitional: init drives the actual
-            // service spawn through its `KNOWN_CONFIGS` manifest
-            // walker; `session_manager` is a passive observer that
-            // reports the step as Ack here and waits for the service
-            // to register in [`Self::await_ready`]. Returning Ack
-            // unconditionally means the F.1 sequencer's per-step
-            // attempt becomes "wait for ready" rather than "wait for
-            // already-registered" — which is the correct semantic
-            // for an observer that doesn't itself spawn the
-            // processes.
-            //
-            // F.4 replaces this with a `/run/init.cmd` start verb so
-            // session_manager can drive the lifecycle directly.
+        fn start(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Init drives the actual spawn via its manifest walker.
+            // The table entry was pre-populated by `new`; mark it
+            // explicitly as `Starting` in case a prior failed attempt
+            // left it in another state.
+            self.table.update_state(service, ServiceState::Starting);
             Ok(SupervisorReply::Ack)
         }
 
         fn stop(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
-            // F.2: the rollback-on-text-fallback path stops services in
-            // reverse order via init's existing supervisor. F.2's
-            // adapter logs the intent so the boot transcript names
-            // the rollback; F.4 replaces this with a `/run/init.cmd`
-            // write.
+            let pid = match self.table.get_pid(service) {
+                Some(p) => p,
+                None => {
+                    // No live PID — either the service never started,
+                    // or it already exited. Idempotent no-op for
+                    // the rollback motion's best-effort teardown.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "session_manager: lifecycle.stop: no PID for '",
+                    );
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "'; skipping (already exited or never started)\n",
+                    );
+                    return Ok(SupervisorReply::Ack);
+                }
+            };
+            self.table.update_state(service, ServiceState::Stopping);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                "session_manager: session.recover: stop(",
+                "session_manager: lifecycle.stop: '",
             );
             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
             syscall_lib::write_str(
                 syscall_lib::STDOUT_FILENO,
-                ") — F.4 will issue init.cmd write\n",
+                "': delivering SIGTERM (Phase 64)\n",
             );
-            Ok(SupervisorReply::Ack)
+            match stop_service_blocking(pid) {
+                Ok(()) => {
+                    self.table.update_pid(service, None);
+                    // After reap the service is functionally gone;
+                    // mark Failed (the operator can re-enter `Starting`
+                    // explicitly via `session-restart`). A clean
+                    // operator-initiated stop and a budget-exhausted
+                    // stop reach this state for now; per-cause
+                    // disambiguation is deferred to a future codec
+                    // extension.
+                    self.table.update_state(service, ServiceState::Failed);
+                    Ok(SupervisorReply::Ack)
+                }
+                Err(_) => {
+                    // The state machine surfaced a non-recoverable
+                    // error (TermFailed, KillFailed, or ReapFailed).
+                    // Log and continue — the rollback motion calling
+                    // us swallows individual stop errors per the F.4
+                    // contract, and the table is in `Failed` so the
+                    // operator sees the visible damage.
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "session_manager: lifecycle.stop: '",
+                    );
+                    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                    syscall_lib::write_str(
+                        syscall_lib::STDOUT_FILENO,
+                        "': stop failed (signal transport error)\n",
+                    );
+                    self.table.update_state(service, ServiceState::Failed);
+                    Err(SupervisorError::NotRunning)
+                }
+            }
         }
 
         fn restart(&mut self, _service: &str) -> Result<SupervisorReply, SupervisorError> {
+            // Per-service restart verb is deferred (the F.5
+            // `session-restart` verb triggers a whole-session
+            // rollback + re-drive). This adapter returns `Ack` so the
+            // F.1 sequencer's rollback path that internally calls
+            // restart for cleanup continues to behave like Phase 57.
             Ok(SupervisorReply::Ack)
         }
 
@@ -372,6 +466,17 @@ mod init_backend {
             let deadline_polls = (timeout_ms / (AWAIT_POLL_MS as u64)).saturating_add(1);
             for _ in 0..deadline_polls {
                 if is_service_registered(service) {
+                    // Phase 64: query the owner PID once and record
+                    // it in the per-service table so the `stop`
+                    // method below has a target.
+                    let registry_name = ipc_service_name(service);
+                    if !registry_name.is_empty() {
+                        if let Some(pid) = syscall_lib::ipc_lookup_service_owner_pid(registry_name)
+                        {
+                            self.table.update_pid(service, Some(Pid(pid)));
+                        }
+                    }
+                    self.table.update_state(service, ServiceState::Running);
                     return Ok(SupervisorReply::ReadyState { ready: true });
                 }
                 if timeout_ms == 0 {
