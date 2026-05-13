@@ -102,6 +102,10 @@ members = [
     "userspace/bell-test",
     # Phase 57 Track G — graphical terminal emulator
     "userspace/term",
+    # Phase 64 Track A.3 — deterministic test child used by the
+    # session_manager lifecycle integration tests (B.1 grace-period,
+    # C.1 crash-loop and display-critical text-fallback).
+    "userspace/crash_stub",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

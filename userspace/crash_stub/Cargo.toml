@@ -1,0 +1,12 @@
+[package]
+name = "crash_stub"
+version = "0.64.0"
+edition = "2024"
+description = "Phase 64 Track A.3 — deterministic test child for session_manager lifecycle integration tests."
+
+[[bin]]
+name = "crash_stub"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

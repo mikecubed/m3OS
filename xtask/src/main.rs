@@ -582,6 +582,11 @@ fn build_userspace_bins() {
         // (control codec) and uses `Vec` for the per-arg
         // null-terminated argv copy buffer in the child path.
         ("fb-takeover", "fb-takeover", true),
+        // Phase 64 Track A.3 — deterministic test child for the
+        // session_manager lifecycle integration tests. `needs_alloc =
+        // false` because the binary uses only `syscall_lib` primitives
+        // (no kernel-core link, no allocator).
+        ("crash_stub", "crash_stub", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {

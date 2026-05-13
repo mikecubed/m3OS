@@ -372,6 +372,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crash_stub"
+version = "0.64.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
