@@ -71,7 +71,8 @@ const TAG_VERB_SESSION_STATE_DETAILED: u8 = 0x04;
 const TAG_REPLY_STATE: u8 = 0x01;
 const TAG_REPLY_ACK: u8 = 0x02;
 const TAG_REPLY_ERROR: u8 = 0x03;
-/// Phase 64 — `ServiceStates` reply carrying per-service triples.
+/// Phase 64 — `ServiceStates` reply carrying per-service quads
+/// (`name`, `state`, `restart_count`, `step_failures`).
 const TAG_REPLY_SERVICE_STATES: u8 = 0x04;
 
 /// Session-state discriminants used in the `State` reply payload.
@@ -128,7 +129,7 @@ pub enum ControlVerb {
     /// budget per step), and re-drive the F.1 boot sequence.
     SessionRestart,
     /// Phase 64 — return per-service `(name, ServiceState,
-    /// restart_count, step_failures)` triples from the supervisor's
+    /// restart_count, step_failures)` quads from the supervisor's
     /// `ServiceTable`. Distinct from the [`Self::SessionState`] verb
     /// (which still returns the session-wide [`SessionState`])
     /// because the two questions — "what is the graphical session

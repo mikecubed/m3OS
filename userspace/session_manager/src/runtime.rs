@@ -57,15 +57,20 @@ pub struct SyscallClock;
 
 /// Fallback monotonic counter (milliseconds) used when `clock_gettime`
 /// reports a transport-level failure. Increments by the stop-machine
-/// poll interval (25 ms) on each fallback observation; the resulting
-/// virtual clock advances strictly forward so [`lifecycle::tick`]'s
+/// poll interval on each fallback observation; the resulting virtual
+/// clock advances strictly forward so [`lifecycle::tick`]'s
 /// `now >= deadline_ms` checks still resolve.
 static FALLBACK_NOW_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Step size used by the fallback clock. Matches
-/// [`STOP_POLL_INTERVAL_NS`] so the virtual clock advances by roughly
-/// one poll interval per failed `clock_gettime` call.
-const FALLBACK_STEP_MS: u64 = 25;
+/// Step size used by the fallback clock. Derived from
+/// [`STOP_POLL_INTERVAL_NS`] so the two cadences cannot drift apart if
+/// the poll interval is retuned later. Floor-1 ms so the fallback
+/// always makes forward progress even if the poll interval were ever
+/// reduced below one millisecond.
+const FALLBACK_STEP_MS: u64 = {
+    let ms = (STOP_POLL_INTERVAL_NS as u64) / 1_000_000;
+    if ms == 0 { 1 } else { ms }
+};
 
 impl KernelClock for SyscallClock {
     fn now_ms(&self) -> u64 {

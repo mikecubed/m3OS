@@ -84,9 +84,10 @@ mod os_binary {
 
     /// Maximum size of an encoded session reply. The largest variant
     /// is the Phase 64 `ServiceStates` reply: up to 8 per-service
-    /// triples (≤42 bytes each: 1 byte name_len + ≤32 bytes name +
-    /// 1 byte state tag + 4 bytes restart_count + 4 bytes
-    /// step_failures) plus a 2-byte header → 338 bytes. We round to
+    /// quads — `(name, state, restart_count, step_failures)`. Each
+    /// quad is 42 bytes on the wire: 1 byte name_len + ≤32 bytes
+    /// name + 1 byte state tag + 4 bytes restart_count + 4 bytes
+    /// step_failures. Plus a 2-byte header → 338 bytes. We round to
     /// 384 to leave headroom and to stay in lock-step with
     /// `session_manager::control::MAX_CONTROL_BUF`.
     const SESSION_REPLY_MAX: usize = 384;
