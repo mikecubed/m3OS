@@ -1,7 +1,7 @@
 # Session Manager Lifecycle (Phase 64)
 
 **Aligned Roadmap Phase:** Phase 64
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-64
 **Supersedes Legacy Doc:** new
 

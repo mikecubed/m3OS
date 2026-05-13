@@ -1,6 +1,6 @@
 # Phase 64 - Session Manager Lifecycle
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-64
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 19 (Signal Handling) ✅, Phase 52 (First Service Extractions) ✅
 **Builds on:** Replaces the Phase 57 `session_manager` stub lifecycle methods (unconditional `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, SIGCHLD observation via `sys_waitpid`, and restart-budget enforcement

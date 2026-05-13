@@ -1,6 +1,6 @@
 # Phase 64 — Session Manager Lifecycle: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-64
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 19 (Signal Handling) ✅, Phase 52 (First Service Extractions) ✅
 **Goal:** Replace the Phase 57 `session_manager` lifecycle stubs (`stop/restart` unconditionally return `Ack`) with real child-PID tracking, SIGTERM/SIGKILL delivery, `sys_waitpid` observation, restart-budget enforcement, and authentic `m3ctl session-state` reporting; make the typed `text-fallback` recovery contract actually drop display-server children.
