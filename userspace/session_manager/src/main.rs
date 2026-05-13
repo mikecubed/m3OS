@@ -453,18 +453,42 @@ mod init_backend {
             let deadline_polls = (timeout_ms / (AWAIT_POLL_MS as u64)).saturating_add(1);
             for _ in 0..deadline_polls {
                 if is_service_registered(service) {
-                    // Phase 64: query the owner PID once and record
-                    // it in the per-service table so the `stop`
-                    // method below has a target.
+                    // Phase 64: only declare the service `Running` if
+                    // we can also pin down its owner PID. A registered
+                    // service whose PID lookup fails (kernel-owned,
+                    // private name gated, or registry corruption) would
+                    // otherwise leave the table in a self-inconsistent
+                    // state — `Running` with `pid=None` makes a later
+                    // `stop()` an idempotent no-op while operators see
+                    // a healthy service. Treat the missing PID as
+                    // not-ready so the sequencer keeps polling until
+                    // either the PID surfaces or the budget escalates
+                    // to text-fallback.
                     let registry_name = ipc_service_name(service);
-                    if !registry_name.is_empty() {
-                        if let Some(pid) = syscall_lib::ipc_lookup_service_owner_pid(registry_name)
-                        {
+                    let pid = if registry_name.is_empty() {
+                        None
+                    } else {
+                        syscall_lib::ipc_lookup_service_owner_pid(registry_name)
+                    };
+                    match pid {
+                        Some(pid) => {
                             self.table.update_pid(service, Some(Pid(pid)));
+                            self.table.update_state(service, ServiceState::Running);
+                            return Ok(SupervisorReply::ReadyState { ready: true });
+                        }
+                        None => {
+                            syscall_lib::write_str(
+                                syscall_lib::STDOUT_FILENO,
+                                "session_manager: await_ready: '",
+                            );
+                            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, service);
+                            syscall_lib::write_str(
+                                syscall_lib::STDOUT_FILENO,
+                                "': registered but owner PID lookup failed; keeping Starting\n",
+                            );
+                            // Fall through to the poll-and-retry path.
                         }
                     }
-                    self.table.update_state(service, ServiceState::Running);
-                    return Ok(SupervisorReply::ReadyState { ready: true });
                 }
                 if timeout_ms == 0 {
                     break;

@@ -71,12 +71,13 @@ const REPLY_CAP_HANDLE: u32 = 1;
 /// Maximum bulk size accepted on the control endpoint. The verb is a
 /// single byte; the buffer must fit the worst-case Phase 64
 /// `ServiceStates` reply, which packs up to `MAX_SERVICE_STATE_ENTRIES`
-/// (8) per-service triples (1 byte name_len + ≤32 bytes name + 1 byte
-/// state tag + 4 bytes restart_count + 4 bytes step_failures = 42 bytes
-/// each) plus a 2-byte header. Worst case: 2 + 8·42 = 338 bytes. We
-/// round to 384 so the buffer stays one allocation page-fragment in
-/// size and tolerates future codec additions without revisiting the
-/// constant. Must stay in sync with `m3ctl`'s `SESSION_REPLY_MAX`.
+/// (8) per-service quads — `(name, state, restart_count, step_failures)`.
+/// On the wire each quad is 42 bytes: 1 byte name_len + ≤32 bytes name +
+/// 1 byte state tag + 4 bytes restart_count + 4 bytes step_failures.
+/// Worst case: 2-byte header + 8·42 = 338 bytes. We round to 384 so the
+/// buffer stays one allocation page-fragment in size and tolerates
+/// future codec additions without revisiting the constant. Must stay
+/// in sync with `m3ctl`'s `SESSION_REPLY_MAX`.
 const MAX_CONTROL_BUF: usize = 384;
 
 /// Holder for the control-socket endpoint's cap-handle. Constructed

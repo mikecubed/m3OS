@@ -269,10 +269,11 @@ mod os_binary {
                 print_str("\n");
             }
             // Phase 64 — `SessionStateDetailed` reply path. The legacy
-            // `session-state` verb doesn't request this variant; if a
-            // future client adds a `session-state-detailed` flag it
-            // walks the table itself rather than reusing this
-            // single-line printer.
+            // `session-state` verb doesn't request this variant; a
+            // future client adds the request and reuses this printer,
+            // which exposes the full per-service quad so operators can
+            // see when the restart-budget counters are getting close
+            // to their limits.
             ControlReply::ServiceStates {
                 entry_count,
                 entries,
@@ -284,6 +285,10 @@ mod os_binary {
                     print_str(name);
                     print_str(" state=");
                     print_str(per_svc_state_label(entry.state_tag));
+                    print_str(" restart_count=");
+                    print_u32(entry.restart_count);
+                    print_str(" step_failures=");
+                    print_u32(entry.step_failures);
                     print_str("\n");
                 }
                 if count == 0 {

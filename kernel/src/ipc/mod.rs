@@ -228,8 +228,8 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, 12, 17, 18, 19, 21, and 22 do not use arg0 as a pre-looked-up cap
-    // handle — process them before the cap-lookup preamble.
+    // Syscalls 10, 11, 12, 17, 18, 19, 21, 22, and 23 do not use arg0 as a
+    // pre-looked-up cap handle — process them before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
     }

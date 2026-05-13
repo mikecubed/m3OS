@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn sigkill_reap_window_exhaustion_returns_kill_failed() {
+    fn sigkill_reap_window_exhaustion_returns_reap_failed() {
         let clock = FakeClock::new();
         let mut sink = FakeSink::default();
         let mut reaper = FakeReaper::default();
