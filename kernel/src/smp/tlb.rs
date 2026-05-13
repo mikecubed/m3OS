@@ -231,6 +231,84 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
     crate::task::scheduler::preempt_enable();
 }
 
+/// Invalidate a range of kernel-shared page mappings on every online core.
+///
+/// Same handshake structure as [`tlb_shootdown_range`] but skips the
+/// per-address-space `active_cores` filter — used when the affected
+/// mapping lives in the upper half of every process's PML4 (heap grow,
+/// future kernel-VMA mutations), where every online core is potentially
+/// holding a stale TLB or paging-structure-cache entry regardless of
+/// which userspace process is currently active on it.
+///
+/// `start` and `end` are inclusive/exclusive virtual-address bounds; both
+/// are page-aligned internally. Falls back to a local-only flush on a
+/// uniprocessor system.
+pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
+    // Phase 57b — preempt-only migration shape; same rationale as
+    // [`tlb_shootdown`]. IF must stay enabled across the lock-held region
+    // so contending cores can service this core's IPIs.
+    crate::task::scheduler::preempt_disable();
+    'critical: {
+        let _lock = SHOOTDOWN_LOCK.lock();
+
+        // Align the range to page boundaries so every page intersecting
+        // [start, end) is invalidated, even when start or end are not aligned.
+        let aligned_start = start & !(4096 - 1);
+        let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
+
+        let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
+        let use_cr3_reload = page_count > INVLPG_THRESHOLD;
+
+        // Local flush first.
+        if use_cr3_reload {
+            let (frame, flags) = x86_64::registers::control::Cr3::read();
+            unsafe {
+                x86_64::registers::control::Cr3::write(frame, flags);
+            }
+        } else {
+            let mut addr = aligned_start;
+            while addr < aligned_end {
+                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
+                addr += 4096;
+            }
+        }
+
+        // Count remote online cores so the pending count is fixed before any
+        // IPI is sent (same underflow rationale as `tlb_shootdown_range`).
+        let my_core = super::per_core().core_id;
+        let mut targets = 0u8;
+        for core_id in 0..64u8 {
+            if core_id == my_core {
+                continue;
+            }
+            if let Some(data) = super::get_core_data(core_id)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                targets = targets.saturating_add(1);
+            }
+        }
+
+        if targets == 0 {
+            // Uniprocessor or every other core is offline — local flush is
+            // sufficient.
+            break 'critical;
+        }
+
+        SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
+        SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
+        SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
+        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+
+        ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
+
+        // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
+        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+            core::hint::spin_loop();
+        }
+    }
+    crate::task::scheduler::preempt_enable();
+}
+
 /// Handle a TLB shootdown IPI on the receiving core.
 ///
 /// Called from the IDT handler. Reads the target address or range, executes
