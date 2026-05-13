@@ -13,13 +13,32 @@
 //! - Never exit (kernel panics if PID 1 dies)
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use core::alloc::Layout;
+
+use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SockaddrUn, WNOHANG,
     clock_gettime, close, execve, exit, fork, getdents64, kill, mount, nanosleep, nanosleep_for,
     open, read, rt_sigaction_simple, sendto_unix, set_nonblocking, setuid, socket, waitpid, write,
     write_str, write_u64,
 };
+
+// Phase 64b — kernel-core dep brings in `extern crate alloc`, so init
+// needs a real allocator even though its own code stays alloc-free.
+// `BrkAllocator` is the same allocator every other userspace daemon
+// uses for its kernel-core link.
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    write_str(STDOUT_FILENO, "init: alloc error\n");
+    exit(99)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -573,6 +592,28 @@ impl DepGraph {
 // ---------------------------------------------------------------------------
 
 /// Parse a service definition from a buffer of `key=value` lines.
+/// Decode a POSIX-style wstatus into `(signaled, exit_code, signal_num)`.
+///
+/// `exit_code` is the non-negative byte the operator would see: the
+/// exit status for `WIFEXITED` paths, or the signal number for
+/// `WIFSIGNALED` paths. `signal_num` is the signal number when
+/// `signaled` is true, else zero.
+///
+/// The previous decoding `signaled = (status & 0x80) != 0` was wrong —
+/// bit 0x80 is the POSIX `WCOREDUMP` flag, which m3OS's kernel never
+/// sets. The fix relies on `WIFEXITED` ↔ `(s & 0x7f) == 0` and treats
+/// `(s & 0xff) == 0x7f` as `WIFSTOPPED` (filtered out defensively even
+/// though `WUNTRACED` is not requested).
+fn decode_wstatus(status: i32) -> (bool, i32, i32) {
+    let low = status & 0x7f;
+    let stopped = (status & 0xff) == 0x7f;
+    if low != 0 && !stopped {
+        (true, low, low)
+    } else {
+        (false, (status >> 8) & 0xff, 0)
+    }
+}
+
 fn parse_service_def(buf: &[u8], len: usize) -> Option<ServiceDef> {
     let mut svc = ServiceDef::empty();
     let mut pos = 0;
@@ -789,6 +830,14 @@ struct ServiceManager {
     /// `InjectKey` verb gated by
     /// `M3OS_DISPLAY_SERVER_INJECT_KEY=1`.
     display_server_inject_key: bool,
+    /// Phase 64b — cached `session-events` IPC endpoint cap for the
+    /// push-notification path. Looked up lazily on each
+    /// `handle_child_exit` until the lookup succeeds; the first
+    /// success is cached forever so each subsequent reap pays only a
+    /// branch and an `ipc_send_buf`. `0` means "not yet looked up
+    /// successfully" — we retry on every call until `session_manager`
+    /// registers its endpoint.
+    session_events_cap: u32,
 }
 
 /// Syslog severity levels.
@@ -822,6 +871,9 @@ impl ServiceManager {
             display_server_debug_crash: false,
             display_server_readback: false,
             display_server_inject_key: false,
+            // 0 = not yet looked up; `u32::MAX` = lookup failed (don't
+            // retry); any other value is a live `session-events` cap.
+            session_events_cap: 0,
         }
     }
 
@@ -1349,20 +1401,30 @@ impl ServiceManager {
 
     /// Handle a reaped child PID with its exit status.
     ///
-    /// Wait status encoding:
-    /// - If bit 7 set: process was killed by signal, bits 0-6 = signal number
-    /// - Otherwise: bits 8-15 = exit code
+    /// Wait status encoding (POSIX wstatus as produced by m3OS's
+    /// `sys_waitpid` — see `kernel/src/arch/x86_64/syscall/mod.rs`):
+    /// - Normal exit: `(exit_code & 0xff) << 8` — low byte is 0;
+    ///   `WIFEXITED(s)` ⇔ `(s & 0x7f) == 0`.
+    /// - Signal death: signal number in `s & 0x7f`; bit 0x80 (POSIX
+    ///   `WCOREDUMP`) is unused by m3OS, so detecting signal death via
+    ///   `(s & 0x80)` is wrong — it always reads false and
+    ///   misclassifies every signal-killed child as a normal exit
+    ///   with code 0.
+    /// - Stopped: `(s & 0xff) == 0x7f`. We do not request `WUNTRACED`,
+    ///   but defensively exclude this encoding from "signaled".
     fn handle_child_exit(&mut self, pid: i32, status: i32) {
         match self.pid_table.lookup(pid) {
             Some(idx) => {
                 self.pid_table.remove(pid);
 
-                let signaled = (status & 0x80) != 0;
-                let (exit_code, signal_num) = if signaled {
-                    (status & 0x7f, status & 0x7f) // signal number in lower 7 bits
-                } else {
-                    (((status >> 8) & 0xff), 0)
-                };
+                let (signaled, exit_code, signal_num) = decode_wstatus(status);
+
+                // Phase 64b — push exit event to session_manager BEFORE
+                // mutating service state so the cached PID is still
+                // current at notification time. Best-effort: a missing
+                // session-events endpoint (session_manager not yet
+                // registered or never came up) is silently skipped.
+                self.push_exit_event(idx, pid, exit_code, signaled);
 
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
@@ -1416,6 +1478,62 @@ impl ServiceManager {
                 }
             }
         }
+    }
+
+    /// Phase 64b — send a `ServiceExitEvent` push notification to
+    /// `session_manager` via the `"session-events"` IPC endpoint.
+    /// Best-effort: a missing or dormant endpoint is silently skipped
+    /// (the consumer's `/run/services.status` polling path is the
+    /// fallback observer). The cap handle is looked up lazily on the
+    /// first call and cached; a failed lookup is sticky so we do not
+    /// retry every reap.
+    fn push_exit_event(&mut self, idx: usize, pid: i32, exit_code: i32, signaled: bool) {
+        use kernel_core::session_events::{
+            LABEL_SESSION_EVENT_EXIT, MAX_EXIT_EVENT_BYTES, SESSION_EVENTS_SERVICE_NAME,
+            ServiceExitEvent, encode_exit_event,
+        };
+
+        // Lazy lookup with retry on miss. session_manager may not have
+        // registered yet when init's first reap fires (e.g. an early
+        // boot-time service exits before the graphical session
+        // sequencer reaches session_manager). Re-attempt the lookup
+        // until it succeeds, then cache forever.
+        if self.session_events_cap == 0 {
+            let raw = syscall_lib::ipc_lookup_service(SESSION_EVENTS_SERVICE_NAME);
+            if raw != u64::MAX && raw <= u32::MAX as u64 && raw != 0 {
+                self.session_events_cap = raw as u32;
+            }
+        }
+        if self.session_events_cap == 0 {
+            return;
+        }
+
+        // The service name lives in `self.services[idx].name`. Encode
+        // into a small stack buffer; the encoder rejects names > 32
+        // bytes, which matches init's own MAX_NAME.
+        let name_bytes = self.services[idx].name.as_bytes();
+        let name_str = match core::str::from_utf8(name_bytes) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return,
+        };
+        let wire_exit_code = if signaled { -exit_code } else { exit_code };
+        let event = match ServiceExitEvent::new(pid, wire_exit_code, signaled, name_str) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut buf = [0u8; MAX_EXIT_EVENT_BYTES];
+        let n = match encode_exit_event(&event, &mut buf) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        // `ipc_send_buf` is fire-and-forget; the reap path must not
+        // block waiting for session_manager to consume the event.
+        let _ = syscall_lib::ipc_send_buf(
+            self.session_events_cap,
+            LABEL_SESSION_EVENT_EXIT,
+            0,
+            &buf[..n],
+        );
     }
 
     /// Restart a service if its restart policy allows it.
@@ -1670,7 +1788,10 @@ impl ServiceManager {
             let ret = waitpid(pid, &mut st, WNOHANG);
             if ret > 0 {
                 self.pid_table.remove(pid);
-                let exit_code = (st >> 8) & 0xff;
+                let (signaled, exit_code, _signal_num) = decode_wstatus(st);
+                // Phase 64b — push exit event before mutating state so
+                // the cached PID is still current at notification time.
+                self.push_exit_event(idx, pid, exit_code, signaled);
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
                 self.services[idx].last_change_time = now_epoch_secs();
@@ -1691,6 +1812,13 @@ impl ServiceManager {
         let mut st: i32 = 0;
         waitpid(pid, &mut st, 0);
         self.pid_table.remove(pid);
+        // Phase 64b — decode the actual wstatus rather than hard-coding
+        // SIGKILL: a child that exited cleanly between SIGTERM-grace
+        // expiry and our SIGKILL delivery still needs an accurate
+        // event payload. The common case is `signaled=true,
+        // exit_code=9` (SIGKILL).
+        let (kill_signaled, kill_exit_code, _kill_signum) = decode_wstatus(st);
+        self.push_exit_event(idx, pid, kill_exit_code, kill_signaled);
         self.services[idx].status = ServiceStatus::Stopped(-1);
         self.services[idx].pid = 0;
         self.services[idx].last_change_time = now_epoch_secs();

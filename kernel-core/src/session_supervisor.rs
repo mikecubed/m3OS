@@ -236,6 +236,44 @@ pub trait SupervisorBackend {
                 crate::session_control::MAX_SERVICE_STATE_ENTRIES],
         )
     }
+
+    /// Phase 64b — initiate a non-blocking restart of one service.
+    /// Returns the **prior** PID on success so the caller can detect
+    /// "PID changed" later. The implementation must initiate the
+    /// restart (e.g. write `/run/init.cmd`) and set the per-service
+    /// state to `Restarting`, but must not block waiting for
+    /// convergence; that observation belongs to the event loop.
+    ///
+    /// The default implementation rejects so backends that have not
+    /// adopted the async restart contract fail closed.
+    fn begin_async_restart(&mut self, _service: &str) -> Result<i32, SupervisorError> {
+        Err(SupervisorError::UnknownService)
+    }
+
+    /// Phase 64b — commit a successful async-restart observation. The
+    /// caller has confirmed via `/run/services.status` (or an
+    /// equivalent push notification) that the service is `Running`
+    /// again with `new_pid`. The implementation updates its per-service
+    /// table to `Running` and records `new_pid`.
+    ///
+    /// Default no-op so the contract is opt-in.
+    fn finish_async_restart(
+        &mut self,
+        _service: &str,
+        _new_pid: i32,
+    ) -> Result<(), SupervisorError> {
+        Err(SupervisorError::UnknownService)
+    }
+
+    /// Phase 64b — record an async-restart failure (deadline elapsed
+    /// without observing a new PID, or init transitioned the service
+    /// to `PermanentlyStopped`). The implementation transitions the
+    /// per-service state to `Failed`.
+    ///
+    /// Default no-op so the contract is opt-in.
+    fn fail_async_restart(&mut self, _service: &str) -> Result<(), SupervisorError> {
+        Err(SupervisorError::UnknownService)
+    }
 }
 
 // ---------------------------------------------------------------------------

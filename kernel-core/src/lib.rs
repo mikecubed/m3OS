@@ -32,6 +32,7 @@ pub mod sched_model;
 pub mod service;
 pub mod session;
 pub mod session_control;
+pub mod session_events;
 pub mod session_supervisor;
 pub mod size_class;
 pub mod slab;

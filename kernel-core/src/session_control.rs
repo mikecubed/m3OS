@@ -64,8 +64,19 @@ const TAG_VERB_SESSION_STATE: u8 = 0x01;
 const TAG_VERB_SESSION_STOP: u8 = 0x02;
 const TAG_VERB_SESSION_RESTART: u8 = 0x03;
 /// Phase 64 — return per-service `(name, ServiceState, restart_count,
-/// step_failures)` triples instead of a single session-wide state.
+/// step_failures)` quads instead of a single session-wide state.
 const TAG_VERB_SESSION_STATE_DETAILED: u8 = 0x04;
+/// Phase 64a — restart a single declared session service by name.
+/// Distinct from `SESSION_RESTART` which restarts the whole graphical
+/// session. The wire payload is `[tag][name_len: u8][name: name_len bytes]`.
+///
+/// **Public** so consumers that need to peek at the leading verb byte
+/// before paying for a full `decode_verb` call (e.g.
+/// `session_manager`'s deferred-reply dispatcher in `control.rs`,
+/// which routes this verb through an async path) can reference one
+/// canonical constant. Duplicating the value would silently break
+/// routing on a future tag renumber.
+pub const TAG_VERB_SESSION_RESTART_SERVICE: u8 = 0x05;
 
 /// Reply tags.
 const TAG_REPLY_STATE: u8 = 0x01;
@@ -136,6 +147,53 @@ pub enum ControlVerb {
     /// doing?" and "what is each supervised child doing?" — have
     /// distinct, orthogonal answer types.
     SessionStateDetailed,
+    /// Phase 64a — restart one declared session service by name. The
+    /// supervisor delegates to init's `/run/init.cmd` `restart <name>`
+    /// verb, which performs a clean stop + start through the manifest.
+    /// Distinct from [`Self::SessionRestart`], which restarts the
+    /// entire graphical session.
+    ///
+    /// `name` is a fixed 32-byte buffer; `name_len` bounds the valid
+    /// bytes. Empty names (`name_len == 0`) are rejected by the
+    /// dispatcher.
+    SessionRestartService {
+        name: [u8; MAX_STEP_NAME_BYTES],
+        name_len: u8,
+    },
+}
+
+impl ControlVerb {
+    /// Construct a [`Self::SessionRestartService`] from a `&str`,
+    /// returning `MalformedRequest` if the name exceeds
+    /// [`MAX_STEP_NAME_BYTES`] or is empty. The helper centralizes the
+    /// length-check so callers (codec encoders, m3ctl arg parser,
+    /// tests) cannot diverge.
+    pub fn new_session_restart_service(service: &str) -> Result<Self, SessionControlError> {
+        let bytes = service.as_bytes();
+        if bytes.is_empty() || bytes.len() > MAX_STEP_NAME_BYTES {
+            return Err(SessionControlError::MalformedRequest);
+        }
+        let mut name = [0u8; MAX_STEP_NAME_BYTES];
+        name[..bytes.len()].copy_from_slice(bytes);
+        Ok(ControlVerb::SessionRestartService {
+            name,
+            name_len: bytes.len() as u8,
+        })
+    }
+
+    /// Borrow the service-name slice from a
+    /// [`Self::SessionRestartService`] verb, or `None` for other verbs
+    /// or when the stored `name_len` is corrupt. Centralizes the
+    /// length-clamp so consumers cannot read past `name_len`.
+    pub fn restart_service_name(&self) -> Option<&str> {
+        match self {
+            ControlVerb::SessionRestartService { name, name_len } => {
+                let len = (*name_len as usize).min(MAX_STEP_NAME_BYTES);
+                core::str::from_utf8(&name[..len]).ok()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One per-service entry in a [`ControlReply::ServiceStates`] reply.
@@ -288,6 +346,17 @@ pub trait SessionControlBackend {
     fn services_snapshot(&mut self) -> (u8, [ServiceStateEntry; MAX_SERVICE_STATE_ENTRIES]) {
         (0, [ServiceStateEntry::empty(); MAX_SERVICE_STATE_ENTRIES])
     }
+
+    /// Phase 64a — restart one supervised service by name. The default
+    /// implementation returns
+    /// [`SessionControlError::Internal`] so backends that do not
+    /// implement per-service restart (Phase 57 tests, the empty-default
+    /// host-test stubs) reject the verb cleanly. Production
+    /// `session_manager` overrides this to delegate to init via
+    /// `/run/init.cmd`.
+    fn session_restart_service(&mut self, _service: &str) -> Result<(), SessionControlError> {
+        Err(SessionControlError::Internal)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +372,39 @@ pub fn encode_verb(verb: &ControlVerb, dst: &mut [u8]) -> Result<usize, SessionC
     if dst.is_empty() {
         return Err(SessionControlError::MalformedRequest);
     }
-    let tag = match verb {
-        ControlVerb::SessionState => TAG_VERB_SESSION_STATE,
-        ControlVerb::SessionStop => TAG_VERB_SESSION_STOP,
-        ControlVerb::SessionRestart => TAG_VERB_SESSION_RESTART,
-        ControlVerb::SessionStateDetailed => TAG_VERB_SESSION_STATE_DETAILED,
-    };
-    dst[0] = tag;
-    Ok(1)
+    match verb {
+        ControlVerb::SessionState => {
+            dst[0] = TAG_VERB_SESSION_STATE;
+            Ok(1)
+        }
+        ControlVerb::SessionStop => {
+            dst[0] = TAG_VERB_SESSION_STOP;
+            Ok(1)
+        }
+        ControlVerb::SessionRestart => {
+            dst[0] = TAG_VERB_SESSION_RESTART;
+            Ok(1)
+        }
+        ControlVerb::SessionStateDetailed => {
+            dst[0] = TAG_VERB_SESSION_STATE_DETAILED;
+            Ok(1)
+        }
+        ControlVerb::SessionRestartService { name, name_len } => {
+            let len = *name_len as usize;
+            if len == 0 || len > MAX_STEP_NAME_BYTES {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            // Layout: [tag][name_len: u8][name: name_len bytes]
+            let total = 2 + len;
+            if dst.len() < total {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            dst[0] = TAG_VERB_SESSION_RESTART_SERVICE;
+            dst[1] = *name_len;
+            dst[2..2 + len].copy_from_slice(&name[..len]);
+            Ok(total)
+        }
+    }
 }
 
 /// Decode a verb from `src`.
@@ -323,6 +417,24 @@ pub fn decode_verb(src: &[u8]) -> Result<ControlVerb, SessionControlError> {
         TAG_VERB_SESSION_STOP => Ok(ControlVerb::SessionStop),
         TAG_VERB_SESSION_RESTART => Ok(ControlVerb::SessionRestart),
         TAG_VERB_SESSION_STATE_DETAILED => Ok(ControlVerb::SessionStateDetailed),
+        TAG_VERB_SESSION_RESTART_SERVICE => {
+            if src.len() < 2 {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            let name_len = src[1] as usize;
+            if name_len == 0 || name_len > MAX_STEP_NAME_BYTES {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            if src.len() < 2 + name_len {
+                return Err(SessionControlError::MalformedRequest);
+            }
+            let mut name = [0u8; MAX_STEP_NAME_BYTES];
+            name[..name_len].copy_from_slice(&src[2..2 + name_len]);
+            Ok(ControlVerb::SessionRestartService {
+                name,
+                name_len: name_len as u8,
+            })
+        }
         _ => Err(SessionControlError::MalformedRequest),
     }
 }
@@ -620,6 +732,16 @@ pub fn dispatch_authenticated<B: SessionControlBackend>(
                 entries,
             })
         }
+        ControlVerb::SessionRestartService { .. } => {
+            let service = match verb.restart_service_name() {
+                Some(s) => s,
+                None => return Err(SessionControlError::MalformedRequest),
+            };
+            match backend.session_restart_service(service) {
+                Ok(()) => Ok(ControlReply::Ack),
+                Err(e) => Ok(ControlReply::Error(e)),
+            }
+        }
     }
 }
 
@@ -849,5 +971,118 @@ mod tests {
         let mut b = DummyBackend;
         let (count, _entries) = b.services_snapshot();
         assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 64a — SessionRestartService codec + dispatcher
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_restart_service_verb_round_trips() {
+        let verb = ControlVerb::new_session_restart_service("display_server").expect("ctor");
+        let mut buf = [0u8; 64];
+        let n = encode_verb(&verb, &mut buf).expect("encode");
+        // Layout: tag + name_len + name. "display_server" is 14 bytes.
+        assert_eq!(n, 2 + 14);
+        assert_eq!(buf[0], TAG_VERB_SESSION_RESTART_SERVICE);
+        assert_eq!(buf[1], 14);
+        assert_eq!(&buf[2..2 + 14], b"display_server");
+        let decoded = decode_verb(&buf[..n]).expect("decode");
+        assert_eq!(decoded.restart_service_name(), Some("display_server"));
+    }
+
+    #[test]
+    fn session_restart_service_ctor_rejects_empty_name() {
+        let result = ControlVerb::new_session_restart_service("");
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    #[test]
+    fn session_restart_service_ctor_rejects_oversized_name() {
+        let big = "x".repeat(MAX_STEP_NAME_BYTES + 1);
+        let result = ControlVerb::new_session_restart_service(&big);
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    #[test]
+    fn session_restart_service_decode_rejects_zero_name_len() {
+        let bad = [TAG_VERB_SESSION_RESTART_SERVICE, 0];
+        let result = decode_verb(&bad);
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    #[test]
+    fn session_restart_service_decode_rejects_truncated_payload() {
+        // Header claims 8 bytes of name but only 3 follow.
+        let bad = [TAG_VERB_SESSION_RESTART_SERVICE, 8, b'a', b'b', b'c'];
+        let result = decode_verb(&bad);
+        assert!(matches!(result, Err(SessionControlError::MalformedRequest)));
+    }
+
+    #[test]
+    fn dispatch_authenticated_forwards_session_restart_service_to_backend() {
+        use core::cell::RefCell;
+        struct RecBackend {
+            calls: RefCell<alloc::vec::Vec<alloc::string::String>>,
+        }
+        impl SessionControlBackend for RecBackend {
+            fn current_state(&mut self) -> SessionState {
+                SessionState::Running
+            }
+            fn session_stop(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+            fn session_restart(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+            fn session_restart_service(
+                &mut self,
+                service: &str,
+            ) -> Result<(), SessionControlError> {
+                self.calls
+                    .borrow_mut()
+                    .push(alloc::string::String::from(service));
+                Ok(())
+            }
+        }
+        let cap = ControlSocketCap::granted_for_m3ctl_only();
+        let mut backend = RecBackend {
+            calls: RefCell::new(alloc::vec::Vec::new()),
+        };
+        let verb = ControlVerb::new_session_restart_service("term").unwrap();
+        let mut buf = [0u8; 64];
+        let n = encode_verb(&verb, &mut buf).unwrap();
+        let reply = dispatch_authenticated(&buf[..n], Some(&cap), &mut backend).expect("ok");
+        assert_eq!(reply, ControlReply::Ack);
+        assert_eq!(backend.calls.borrow().as_slice(), &["term".to_string()]);
+    }
+
+    #[test]
+    fn dispatch_authenticated_session_restart_service_surfaces_backend_error() {
+        struct FailBackend;
+        impl SessionControlBackend for FailBackend {
+            fn current_state(&mut self) -> SessionState {
+                SessionState::Running
+            }
+            fn session_stop(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+            fn session_restart(&mut self) -> Result<(), SessionControlError> {
+                Ok(())
+            }
+            fn session_restart_service(
+                &mut self,
+                _service: &str,
+            ) -> Result<(), SessionControlError> {
+                Err(SessionControlError::Internal)
+            }
+        }
+        let cap = ControlSocketCap::granted_for_m3ctl_only();
+        let mut backend = FailBackend;
+        let verb = ControlVerb::new_session_restart_service("display_server").unwrap();
+        let mut buf = [0u8; 64];
+        let n = encode_verb(&verb, &mut buf).unwrap();
+        let reply = dispatch_authenticated(&buf[..n], Some(&cap), &mut backend).expect("ok");
+        assert_eq!(reply, ControlReply::Error(SessionControlError::Internal));
     }
 }

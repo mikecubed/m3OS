@@ -41,20 +41,38 @@
 //! Per the F.5 acceptance this matches the Phase 56 m3ctl precedent
 //! and **introduces no UID-based access control**.
 
+use alloc::string::{String, ToString};
+
 use kernel_core::session::SessionState;
 use kernel_core::session_control::{
     ControlReply, ControlSocketCap, SessionControlBackend, SessionControlError,
-    dispatch_authenticated, encode_reply,
+    TAG_VERB_SESSION_RESTART_SERVICE, dispatch_authenticated, encode_reply,
 };
 use kernel_core::session_supervisor::SupervisorBackend;
+use session_manager::init_status::init_service_name;
 use syscall_lib::{IpcMessage, STDOUT_FILENO};
 
+use crate::init_proxy;
 use crate::recover;
+
+/// Phase 64b — maximum wall-clock time we will wait for an
+/// async-restart to converge before reporting failure to the caller
+/// via the deferred IPC reply. Bounded by init's worst-case restart
+/// timing: 5 s SIGTERM grace + 1 s SIGKILL reap + restart_delay
+/// (up to 60 s under heavy back-off, normally 1 s). 30 s covers the
+/// common case with headroom; permanently-stalled cases escalate via
+/// `m3ctl session-state --detailed`.
+const ASYNC_RESTART_DEADLINE_MS: u64 = 30_000;
 
 /// Service-registry name of the control endpoint. Stable across F.2
 /// (the prior stub) and F.5 (this dispatcher) so a future `m3ctl
 /// session-state` can look up the same name.
 pub const CONTROL_SERVICE_NAME: &str = "session-control";
+
+/// Maximum bytes we read from the `"session-events"` push endpoint on
+/// each tick. Sized to fit one `ServiceExitEvent`'s wire layout with
+/// headroom for future codec growth.
+const MAX_EVENT_BUF: usize = 64;
 
 /// IPC label `session_manager` accepts on the `"session-control"`
 /// endpoint when the bulk carries an encoded [`ControlVerb`]. Mirrors
@@ -102,6 +120,122 @@ impl ControlSocket {
     pub fn is_bound(&self) -> bool {
         self.ep_handle.is_some()
     }
+}
+
+/// Phase 64b — holder for the `"session-events"` push endpoint
+/// `session_manager` exposes for init to deliver exit notifications.
+/// Symmetrical with [`ControlSocket`]; both expose `ep_handle:
+/// Option<u32>` so a bind failure at startup is non-fatal.
+pub struct EventsSocket {
+    ep_handle: Option<u32>,
+}
+
+impl EventsSocket {
+    pub const fn dormant() -> Self {
+        Self { ep_handle: None }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_bound(&self) -> bool {
+        self.ep_handle.is_some()
+    }
+}
+
+/// Bind the `"session-events"` push endpoint. On failure the daemon
+/// continues with a dormant socket; init's lookups will simply find no
+/// endpoint and skip notification, and the existing
+/// `/run/services.status` polling path still observes exits (with
+/// higher latency).
+pub fn bind_events_socket() -> EventsSocket {
+    use kernel_core::session_events::SESSION_EVENTS_SERVICE_NAME;
+    let raw = syscall_lib::create_endpoint();
+    if raw == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "session_manager: session.events: create_endpoint failed; events dormant\n",
+        );
+        return EventsSocket::dormant();
+    }
+    let ep = raw as u32;
+    let reg = syscall_lib::ipc_register_service(ep, SESSION_EVENTS_SERVICE_NAME);
+    if reg == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "session_manager: session.events: register failed; events dormant\n",
+        );
+        return EventsSocket::dormant();
+    }
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "session_manager: session.events: registered as 'session-events' (Phase 64b)\n",
+    );
+    EventsSocket {
+        ep_handle: Some(ep),
+    }
+}
+
+/// Phase 64b — drain any pending exit-event push notifications from
+/// init. Bounded loop (up to 8 events per tick) so a flood cannot
+/// monopolize the event loop. Each event is logged at INFO level so
+/// the boot transcript captures init reaps; future tracks may also
+/// dispatch them to the supervisor's state machine.
+pub fn drain_exit_events<B: SupervisorBackend>(events: &EventsSocket, _supervisor: &mut B) -> u32 {
+    use kernel_core::session_events::{LABEL_SESSION_EVENT_EXIT, decode_exit_event};
+    let Some(ep) = events.ep_handle else {
+        return 0;
+    };
+    let mut handled: u32 = 0;
+    // Bounded drain — 8 events per tick is plenty for the five session
+    // services; preventing the loop from sticking on a noisy producer.
+    for _ in 0..8 {
+        let mut msg = IpcMessage::new(0);
+        let mut buf = [0u8; MAX_EVENT_BUF];
+        let label = syscall_lib::ipc_try_recv_msg(ep, &mut msg, &mut buf);
+        if label == u64::MAX {
+            break;
+        }
+        if label != LABEL_SESSION_EVENT_EXIT {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "session_manager: session.events: unknown label; dropping\n",
+            );
+            continue;
+        }
+        let bulk_len = (msg.data[1] as usize).min(buf.len());
+        match decode_exit_event(&buf[..bulk_len]) {
+            Ok(event) => {
+                syscall_lib::write_str(STDOUT_FILENO, "session_manager: session.events: ");
+                if let Some(name) = event.name_as_str() {
+                    syscall_lib::write_str(STDOUT_FILENO, name);
+                } else {
+                    syscall_lib::write_str(STDOUT_FILENO, "<?>");
+                }
+                syscall_lib::write_str(STDOUT_FILENO, " exited pid=");
+                syscall_lib::write_u64(STDOUT_FILENO, event.pid as u64);
+                if event.signaled {
+                    syscall_lib::write_str(STDOUT_FILENO, " signal=");
+                } else {
+                    syscall_lib::write_str(STDOUT_FILENO, " code=");
+                }
+                // exit_code is i32; write as u64 with a leading '-' on negative.
+                if event.exit_code < 0 {
+                    syscall_lib::write_str(STDOUT_FILENO, "-");
+                    syscall_lib::write_u64(STDOUT_FILENO, (-(event.exit_code as i64)) as u64);
+                } else {
+                    syscall_lib::write_u64(STDOUT_FILENO, event.exit_code as u64);
+                }
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                handled += 1;
+            }
+            Err(_) => {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "session_manager: session.events: decode error; dropping\n",
+                );
+            }
+        }
+    }
+    handled
 }
 
 /// Bind the control endpoint and register it under
@@ -157,6 +291,38 @@ pub struct ControlContext {
     /// the main event-loop reads this on the next iteration to re-run
     /// the boot sequence. Cleared by the loop after restart.
     pub restart_requested: bool,
+    /// Phase 64b — one in-flight `SessionRestartService` operation.
+    /// The dispatcher writes `restart <name>` to init.cmd, parks the
+    /// caller's reply cap + the prior PID here, and returns without
+    /// replying. The main loop calls [`tick_pending`] each iteration
+    /// to observe convergence via `/run/services.status`; when the
+    /// service is `Running` with a new PID, the reply cap is consumed
+    /// and the caller sees `Ack`. Only one async restart in flight at
+    /// a time — a second request reflects back `Internal` until the
+    /// first completes.
+    pub pending_restart: Option<PendingRestart>,
+}
+
+/// Phase 64b — one in-flight async restart operation.
+pub struct PendingRestart {
+    /// Per-recv reply cap, captured from `msg.reply_cap_handle()` at
+    /// dispatch time. Held until convergence or deadline, then
+    /// consumed by exactly one `ipc_reply`.
+    pub reply_cap_handle: u32,
+    /// Step name (e.g. `"kbd_server"`) as it appears in the supervisor
+    /// table; used to call `finish_async_restart` / `fail_async_restart`.
+    pub step_name: String,
+    /// Init manifest name (e.g. `"kbd"`) — what `/run/services.status`
+    /// indexes by. Cached so each tick avoids re-running
+    /// `init_service_name`.
+    pub init_name: String,
+    /// PID observed at request time. Convergence is "running with PID
+    /// != prior_pid"; `0` means "no prior PID known", in which case
+    /// any non-zero `Running` PID counts as convergence.
+    pub prior_pid: i32,
+    /// Monotonic deadline (ms) at which this request reports failure
+    /// to the caller via the deferred reply.
+    pub deadline_ms: u64,
 }
 
 impl ControlContext {
@@ -166,6 +332,7 @@ impl ControlContext {
         Self {
             state: SessionState::Booting,
             restart_requested: false,
+            pending_restart: None,
         }
     }
 }
@@ -230,6 +397,21 @@ impl<'c, 'b, B: SupervisorBackend> SessionControlBackend for DaemonBackend<'c, '
         // pre-Phase-64 backends use the default (empty) implementation.
         self.supervisor.services_snapshot()
     }
+
+    fn session_restart_service(&mut self, service: &str) -> Result<(), SessionControlError> {
+        // Phase 64a — delegate to the supervisor's per-service restart
+        // motion. `InitSupervisorBackend::restart` writes
+        // `restart <name>` to /run/init.cmd and polls
+        // /run/services.status until the service comes back. Map the
+        // supervisor's typed errors onto the codec's typed surface so
+        // m3ctl operators see a stable wire result.
+        use kernel_core::session_supervisor::SupervisorError;
+        match self.supervisor.restart(service) {
+            Ok(_) => Ok(()),
+            Err(SupervisorError::UnknownService) => Err(SessionControlError::MalformedRequest),
+            Err(_) => Err(SessionControlError::Internal),
+        }
+    }
 }
 
 /// Non-blocking poll of the control socket. Returns `true` if a
@@ -261,10 +443,15 @@ pub fn poll_control_once<B: SupervisorBackend>(
         // distinguish without an extra syscall; idle is the default.
         return false;
     }
+    // Phase 64b — use the per-recv reply cap the kernel staged into
+    // `msg.data[3]` rather than the hardcoded slot-1 fallback. The
+    // deferred-reply path relies on this so a parked async-restart's
+    // reply cap survives subsequent recvs.
+    let reply_cap = msg.reply_cap_handle().unwrap_or(REPLY_CAP_HANDLE);
     if label != LABEL_CTL_CMD {
         // Unknown label — F.2 stub used `u64::MAX` as the catch-all
         // sentinel; F.5 keeps that signal so the prior contract holds.
-        reply_with_sentinel("unknown label");
+        reply_with_sentinel(reply_cap, "unknown label");
         return true;
     }
 
@@ -282,6 +469,15 @@ pub fn poll_control_once<B: SupervisorBackend>(
     };
     let request_bytes = &buf[..bulk_len];
 
+    // Phase 64b — peek at the verb byte. `SessionRestartService` is
+    // long-running (1–30 s, dominated by init's stop-grace + restart
+    // back-off) and would block other IPC if handled synchronously.
+    // Route it to the async path; everything else still goes through
+    // `dispatch_authenticated` synchronously.
+    if request_bytes.first().copied() == Some(TAG_VERB_SESSION_RESTART_SERVICE) {
+        return handle_async_restart(request_bytes, reply_cap, ctx, supervisor);
+    }
+
     // Always-granted cap in the local daemon. Future cap-transferring
     // transport will replace this with a per-connection cap retrieved
     // from the IPC framing.
@@ -292,23 +488,141 @@ pub fn poll_control_once<B: SupervisorBackend>(
         Err(err) => ControlReply::Error(err),
     };
 
-    // Encode the reply into a fresh buffer so we don't aliasing the
-    // request buffer (which the kernel may still hold a reference to
-    // through the recv path).
-    let mut out_buf = [0u8; MAX_CONTROL_BUF];
-    let len = match encode_reply(&reply, &mut out_buf) {
-        Ok(n) => n,
-        Err(_) => {
-            reply_with_sentinel("reply encode failed");
+    send_reply(reply_cap, &reply);
+    true
+}
+
+/// Phase 64b — async dispatch for `SessionRestartService`. Writes
+/// `restart <name>` to `/run/init.cmd`, parks the caller's reply cap +
+/// the prior PID in `ctx.pending_restart`, and returns without
+/// replying. [`tick_pending`] consumes the parked record on each
+/// event-loop iteration.
+fn handle_async_restart<B: SupervisorBackend>(
+    request_bytes: &[u8],
+    reply_cap: u32,
+    ctx: &mut ControlContext,
+    supervisor: &mut B,
+) -> bool {
+    use kernel_core::session_control::decode_verb;
+
+    // One in-flight request at a time. A second request while one is
+    // parked reflects back `Internal` so m3ctl operators see a typed
+    // "busy" rather than a stale `Ack`.
+    if ctx.pending_restart.is_some() {
+        send_reply(
+            reply_cap,
+            &ControlReply::Error(SessionControlError::Internal),
+        );
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "session_manager: session.control: async restart already in flight; replying Internal\n",
+        );
+        return true;
+    }
+
+    let verb = match decode_verb(request_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            send_reply(reply_cap, &ControlReply::Error(e));
             return true;
         }
     };
-    if syscall_lib::ipc_store_reply_bulk(&out_buf[..len]) == u64::MAX {
-        reply_with_sentinel("store_reply_bulk failed");
+    let service = match verb.restart_service_name() {
+        Some(s) => s,
+        None => {
+            send_reply(
+                reply_cap,
+                &ControlReply::Error(SessionControlError::MalformedRequest),
+            );
+            return true;
+        }
+    };
+
+    let init_name = init_service_name(service);
+    if init_name.is_empty() {
+        send_reply(
+            reply_cap,
+            &ControlReply::Error(SessionControlError::MalformedRequest),
+        );
         return true;
     }
-    let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, LABEL_CTL_REPLY, len as u64);
-    true
+
+    match supervisor.begin_async_restart(service) {
+        Ok(prior_pid) => {
+            ctx.pending_restart = Some(PendingRestart {
+                reply_cap_handle: reply_cap,
+                step_name: service.to_string(),
+                init_name: init_name.to_string(),
+                prior_pid,
+                deadline_ms: init_proxy::now_ms() + ASYNC_RESTART_DEADLINE_MS,
+            });
+            true
+        }
+        Err(_) => {
+            send_reply(
+                reply_cap,
+                &ControlReply::Error(SessionControlError::Internal),
+            );
+            true
+        }
+    }
+}
+
+/// Phase 64b — drive any in-flight async restart toward convergence.
+/// Called from the daemon's main event loop on each iteration; cheap
+/// when nothing is parked (one `is_none()` check). When the parked
+/// service is `Running` in `/run/services.status` with a PID != the
+/// recorded prior PID, the deferred reply fires and the slot frees.
+/// On deadline elapse the caller sees `Error(Internal)`.
+pub fn tick_pending<B: SupervisorBackend>(ctx: &mut ControlContext, supervisor: &mut B) {
+    let Some(pending) = ctx.pending_restart.as_ref() else {
+        return;
+    };
+    let now = init_proxy::now_ms();
+    // Observe convergence first — even past the deadline we prefer to
+    // surface a successful restart if it landed at the same instant.
+    if let Some(new_pid) =
+        crate::init_backend::observe_async_restart(&pending.init_name, pending.prior_pid)
+    {
+        let step = pending.step_name.clone();
+        let cap = pending.reply_cap_handle;
+        ctx.pending_restart = None;
+        let _ = supervisor.finish_async_restart(&step, new_pid);
+        send_reply(cap, &ControlReply::Ack);
+        return;
+    }
+    if now >= pending.deadline_ms {
+        let step = pending.step_name.clone();
+        let cap = pending.reply_cap_handle;
+        ctx.pending_restart = None;
+        let _ = supervisor.fail_async_restart(&step);
+        syscall_lib::write_str(STDOUT_FILENO, "session_manager: lifecycle.restart: '");
+        syscall_lib::write_str(STDOUT_FILENO, &step);
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "': deferred reply deadline elapsed; reporting Internal\n",
+        );
+        send_reply(cap, &ControlReply::Error(SessionControlError::Internal));
+    }
+}
+
+/// Encode `reply` into the IPC reply bulk and call `ipc_reply` against
+/// `reply_cap`. On encode or store-bulk failure, falls back to the
+/// `u64::MAX` sentinel via [`reply_with_sentinel`].
+fn send_reply(reply_cap: u32, reply: &ControlReply) {
+    let mut out_buf = [0u8; MAX_CONTROL_BUF];
+    let len = match encode_reply(reply, &mut out_buf) {
+        Ok(n) => n,
+        Err(_) => {
+            reply_with_sentinel(reply_cap, "reply encode failed");
+            return;
+        }
+    };
+    if syscall_lib::ipc_store_reply_bulk(&out_buf[..len]) == u64::MAX {
+        reply_with_sentinel(reply_cap, "store_reply_bulk failed");
+        return;
+    }
+    let _ = syscall_lib::ipc_reply(reply_cap, LABEL_CTL_REPLY, len as u64);
 }
 
 /// Reply to the connected client with the `u64::MAX` sentinel label
@@ -317,9 +631,9 @@ pub fn poll_control_once<B: SupervisorBackend>(
 /// the cause. Centralized so all four error branches (unknown label,
 /// reply-encode failure, store-reply-bulk failure, and any future
 /// branches) emit a consistent log shape and reply atomically.
-fn reply_with_sentinel(cause: &'static str) {
+fn reply_with_sentinel(reply_cap: u32, cause: &'static str) {
     syscall_lib::write_str(STDOUT_FILENO, "session_manager: session.control: ");
     syscall_lib::write_str(STDOUT_FILENO, cause);
     syscall_lib::write_str(STDOUT_FILENO, "; replying with sentinel\n");
-    let _ = syscall_lib::ipc_reply(REPLY_CAP_HANDLE, u64::MAX, 0);
+    let _ = syscall_lib::ipc_reply(reply_cap, u64::MAX, 0);
 }

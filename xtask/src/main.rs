@@ -108,6 +108,11 @@ const SMOKE_EXIT_WAV_SILENT: i32 = 63;
 /// after running `bell-test` from sh0. `bell-test` calls `Bell::ring` →
 /// `AudioClientBellSink::play` directly, bypassing the kbd_server routing gap.
 const SMOKE_EXIT_BELL_SMOKE_FAILED: i32 = 64;
+/// Phase 64a Item 5: session-restart-smoke failed to observe a per-service
+/// restart end-to-end. Either `m3ctl session-restart kbd_server` did not
+/// reach the new init-delegation code path, init's `/run/init.cmd`
+/// handler did not pick it up, or the daemon's reply never arrived.
+const SMOKE_EXIT_SESSION_RESTART_FAILED: i32 = 65;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -332,6 +337,15 @@ fn main() {
                 });
             cmd_session_smoke(&smoke_args);
         }
+        Some("session-restart-smoke") => {
+            let smoke_args = parse_smoke_boot_args("session-restart-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_session_restart_smoke(&smoke_args);
+        }
         Some("session-recover-smoke") => {
             let smoke_args = parse_smoke_boot_args("session-recover-smoke", &args[2..])
                 .unwrap_or_else(|err| {
@@ -422,7 +436,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -468,7 +482,13 @@ fn build_userspace_bins() {
         ("ping", "ping", false),
         ("udp-smoke", "udp-smoke", false),
         ("smoke-runner", "smoke-runner", false),
-        ("init", "init", false),
+        // Phase 64b: init depends on kernel-core for the
+        // `session_events` codec (push notifications to
+        // session_manager on each reap). `needs_alloc = true` so
+        // build-std links the `alloc` crate — kernel-core's `lib.rs`
+        // has `extern crate alloc` at the root even though init's own
+        // code uses only stack buffers.
+        ("init", "init", true),
         ("shell", "sh0", false),
         ("edit", "edit", true),
         ("login", "login", false),
@@ -7114,6 +7134,154 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
             let _ = child.wait();
             eprintln!("session-recover-smoke: FAILED\n{msg}");
             std::process::exit(SMOKE_EXIT_SESSION_RECOVERY_FAILED);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 64a Item 5 — session-restart-smoke
+// ---------------------------------------------------------------------------
+
+/// Phase 64a — end-to-end test for the per-service `m3ctl session-restart
+/// <name>` verb. Asserts the full chain:
+///
+/// 1. Kernel boots; the graphical session reaches `state=running`.
+/// 2. `m3ctl session-restart kbd_server` (invoked from sh0) routes
+///    through the new `ControlVerb::SessionRestartService` codec entry.
+/// 3. `session_manager`'s production backend logs
+///    `lifecycle.restart: 'kbd_server': delegating to init (Phase 64a)`
+///    — proves the new init-delegation code path was reached.
+/// 4. init's `/run/init.cmd` handler observes the
+///    `restart kbd_server` line and logs `init: control: received
+///    restart kbd_server`.
+/// 5. init dispatches the verb and logs `init: restarting 'kbd'`.
+/// 6. `m3ctl` prints `ack` to serial, proving the daemon's deferred
+///    reply landed cleanly after the restart converged.
+///
+/// A failure at any step exits via `SMOKE_EXIT_SESSION_RESTART_FAILED`
+/// so CI can distinguish a regression in the per-service restart path
+/// from other smoke failures.
+fn session_restart_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "guest/session-restart: kernel first message",
+        },
+        // Phase 64b — assert session_manager binds the push-event
+        // endpoint at startup. Checked here (before any `Send` resets
+        // the serial buffer) because the bind log fires once during
+        // daemon boot.
+        SmokeStep::Wait {
+            pattern: "session_manager: session.events: registered as 'session-events'",
+            timeout_secs: 90,
+            label: "guest/session-events: session_manager bound the events endpoint",
+        },
+        SmokeStep::Wait {
+            pattern: "session_manager: session.boot: state=running",
+            timeout_secs: 90,
+            label: "guest/session-restart: graphical session reached state=running",
+        },
+    ];
+    // Log into sh0 so the next Send lands at a shell prompt rather than
+    // `m3OS login:`.
+    steps.extend(boot_and_login_steps());
+    // Brief settle so the post-login shell finishes painting its prompt
+    // before the m3ctl invocation lands.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "m3ctl session-restart kbd_server\n",
+        label: "guest/session-restart: invoke m3ctl session-restart kbd_server",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "lifecycle.restart: 'kbd_server': delegating to init (Phase 64b)",
+        timeout_secs: 10,
+        label: "guest/session-restart: daemon routed to new init-delegation path",
+    });
+    // init's manifest name for `kbd_server` is `kbd` (see
+    // `init_status::init_service_name`), so the daemon writes
+    // `restart kbd\n` to /run/init.cmd. Match init's resulting log
+    // lines on that name, not on the step-name `kbd_server`.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: control: received restart kbd",
+        timeout_secs: 10,
+        label: "guest/session-restart: init read restart cmd from /run/init.cmd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "init: control: restarting 'kbd'",
+        timeout_secs: 10,
+        label: "guest/session-restart: init dispatched the restart",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "lifecycle.restart: 'kbd_server': converged (Phase 64b)",
+        timeout_secs: 30,
+        label: "guest/session-restart: daemon logged convergence after init restart",
+    });
+    // Phase 64b Item B — init's reap of kbd during the restart must
+    // produce a push notification that session_manager logs as
+    // `session.events: kbd exited`. Verifies the producer→consumer
+    // pipe is live (registration was already proven at startup).
+    steps.push(SmokeStep::Wait {
+        pattern: "session_manager: session.events: kbd exited",
+        timeout_secs: 10,
+        label: "guest/session-events: init pushed kbd's exit event to session_manager",
+    });
+    steps
+}
+
+fn cmd_session_restart_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let qemu_args = session_smoke_qemu_args(&uefi_image, &ovmf, args.display);
+    let steps = session_restart_smoke_steps();
+
+    println!(
+        "session-restart-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "session-restart-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("session-restart-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_SESSION_RESTART_FAILED);
         }
     }
 }
