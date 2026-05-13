@@ -46,7 +46,7 @@ use alloc::string::{String, ToString};
 use kernel_core::session::SessionState;
 use kernel_core::session_control::{
     ControlReply, ControlSocketCap, SessionControlBackend, SessionControlError,
-    dispatch_authenticated, encode_reply,
+    TAG_VERB_SESSION_RESTART_SERVICE, dispatch_authenticated, encode_reply,
 };
 use kernel_core::session_supervisor::SupervisorBackend;
 use session_manager::init_status::init_service_name;
@@ -54,12 +54,6 @@ use syscall_lib::{IpcMessage, STDOUT_FILENO};
 
 use crate::init_proxy;
 use crate::recover;
-
-/// Wire tag for `ControlVerb::SessionRestartService`. Mirrored from
-/// `kernel_core::session_control` (which keeps the constant private)
-/// so this module can peek at the leading verb byte without paying a
-/// full `decode_verb` call before deciding sync-vs-async dispatch.
-const TAG_VERB_SESSION_RESTART_SERVICE: u8 = 0x05;
 
 /// Phase 64b — maximum wall-clock time we will wait for an
 /// async-restart to converge before reporting failure to the caller

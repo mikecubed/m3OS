@@ -69,7 +69,14 @@ const TAG_VERB_SESSION_STATE_DETAILED: u8 = 0x04;
 /// Phase 64a — restart a single declared session service by name.
 /// Distinct from `SESSION_RESTART` which restarts the whole graphical
 /// session. The wire payload is `[tag][name_len: u8][name: name_len bytes]`.
-const TAG_VERB_SESSION_RESTART_SERVICE: u8 = 0x05;
+///
+/// **Public** so consumers that need to peek at the leading verb byte
+/// before paying for a full `decode_verb` call (e.g.
+/// `session_manager`'s deferred-reply dispatcher in `control.rs`,
+/// which routes this verb through an async path) can reference one
+/// canonical constant. Duplicating the value would silently break
+/// routing on a future tag renumber.
+pub const TAG_VERB_SESSION_RESTART_SERVICE: u8 = 0x05;
 
 /// Reply tags.
 const TAG_REPLY_STATE: u8 = 0x01;

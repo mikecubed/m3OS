@@ -592,6 +592,28 @@ impl DepGraph {
 // ---------------------------------------------------------------------------
 
 /// Parse a service definition from a buffer of `key=value` lines.
+/// Decode a POSIX-style wstatus into `(signaled, exit_code, signal_num)`.
+///
+/// `exit_code` is the non-negative byte the operator would see: the
+/// exit status for `WIFEXITED` paths, or the signal number for
+/// `WIFSIGNALED` paths. `signal_num` is the signal number when
+/// `signaled` is true, else zero.
+///
+/// The previous decoding `signaled = (status & 0x80) != 0` was wrong —
+/// bit 0x80 is the POSIX `WCOREDUMP` flag, which m3OS's kernel never
+/// sets. The fix relies on `WIFEXITED` ↔ `(s & 0x7f) == 0` and treats
+/// `(s & 0xff) == 0x7f` as `WIFSTOPPED` (filtered out defensively even
+/// though `WUNTRACED` is not requested).
+fn decode_wstatus(status: i32) -> (bool, i32, i32) {
+    let low = status & 0x7f;
+    let stopped = (status & 0xff) == 0x7f;
+    if low != 0 && !stopped {
+        (true, low, low)
+    } else {
+        (false, (status >> 8) & 0xff, 0)
+    }
+}
+
 fn parse_service_def(buf: &[u8], len: usize) -> Option<ServiceDef> {
     let mut svc = ServiceDef::empty();
     let mut pos = 0;
@@ -1379,20 +1401,23 @@ impl ServiceManager {
 
     /// Handle a reaped child PID with its exit status.
     ///
-    /// Wait status encoding:
-    /// - If bit 7 set: process was killed by signal, bits 0-6 = signal number
-    /// - Otherwise: bits 8-15 = exit code
+    /// Wait status encoding (POSIX wstatus as produced by m3OS's
+    /// `sys_waitpid` — see `kernel/src/arch/x86_64/syscall/mod.rs`):
+    /// - Normal exit: `(exit_code & 0xff) << 8` — low byte is 0;
+    ///   `WIFEXITED(s)` ⇔ `(s & 0x7f) == 0`.
+    /// - Signal death: signal number in `s & 0x7f`; bit 0x80 (POSIX
+    ///   `WCOREDUMP`) is unused by m3OS, so detecting signal death via
+    ///   `(s & 0x80)` is wrong — it always reads false and
+    ///   misclassifies every signal-killed child as a normal exit
+    ///   with code 0.
+    /// - Stopped: `(s & 0xff) == 0x7f`. We do not request `WUNTRACED`,
+    ///   but defensively exclude this encoding from "signaled".
     fn handle_child_exit(&mut self, pid: i32, status: i32) {
         match self.pid_table.lookup(pid) {
             Some(idx) => {
                 self.pid_table.remove(pid);
 
-                let signaled = (status & 0x80) != 0;
-                let (exit_code, signal_num) = if signaled {
-                    (status & 0x7f, status & 0x7f) // signal number in lower 7 bits
-                } else {
-                    (((status >> 8) & 0xff), 0)
-                };
+                let (signaled, exit_code, signal_num) = decode_wstatus(status);
 
                 // Phase 64b — push exit event to session_manager BEFORE
                 // mutating service state so the cached PID is still
@@ -1763,15 +1788,10 @@ impl ServiceManager {
             let ret = waitpid(pid, &mut st, WNOHANG);
             if ret > 0 {
                 self.pid_table.remove(pid);
-                let signaled_clean = (st & 0x80) != 0;
-                let exit_code = if signaled_clean {
-                    st & 0x7f
-                } else {
-                    (st >> 8) & 0xff
-                };
+                let (signaled, exit_code, _signal_num) = decode_wstatus(st);
                 // Phase 64b — push exit event before mutating state so
                 // the cached PID is still current at notification time.
-                self.push_exit_event(idx, pid, exit_code, signaled_clean);
+                self.push_exit_event(idx, pid, exit_code, signaled);
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
                 self.services[idx].last_change_time = now_epoch_secs();
@@ -1792,10 +1812,13 @@ impl ServiceManager {
         let mut st: i32 = 0;
         waitpid(pid, &mut st, 0);
         self.pid_table.remove(pid);
-        // Phase 64b — push exit event for the SIGKILL path too.
-        // `exit_code = SIGKILL` (9) and `signaled = true` so the
-        // operator can distinguish a forced kill from a clean exit.
-        self.push_exit_event(idx, pid, 9, true);
+        // Phase 64b — decode the actual wstatus rather than hard-coding
+        // SIGKILL: a child that exited cleanly between SIGTERM-grace
+        // expiry and our SIGKILL delivery still needs an accurate
+        // event payload. The common case is `signaled=true,
+        // exit_code=9` (SIGKILL).
+        let (kill_signaled, kill_exit_code, _kill_signum) = decode_wstatus(st);
+        self.push_exit_event(idx, pid, kill_exit_code, kill_signaled);
         self.services[idx].status = ServiceStatus::Stopped(-1);
         self.services[idx].pid = 0;
         self.services[idx].last_change_time = now_epoch_secs();
