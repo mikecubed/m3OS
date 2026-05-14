@@ -3393,9 +3393,23 @@ fn log_wake_blocked_on_reply(
     {
         return;
     }
+    // 2026-05-14: also resolve task → pid+name so the reply_v2 tracker can
+    // identify which userspace daemon owns the affected reply path without a
+    // separate ~5 LoC patch each repro. Reads the scheduler-visible mirror
+    // under `scheduler_lock`; both locks the wake path held are already
+    // released by the time this log call runs.
+    let (pid, name) = {
+        let sched = scheduler_lock();
+        match sched.find(id) {
+            Some(idx) => (sched.tasks[idx].pid, sched.tasks[idx].name),
+            None => (0, ""),
+        }
+    };
     log::warn!(
-        "[sched] wake_task_v2 on BlockedOnReply: task={} caller={}:{} has_pending_msg={}",
+        "[sched] wake_task_v2 on BlockedOnReply: task={} pid={} name={} caller={}:{} has_pending_msg={}",
         id.0,
+        pid,
+        name,
         caller.file(),
         caller.line(),
         has_pending,
@@ -3827,11 +3841,49 @@ pub enum WakeOutcome {
 ///   steps 1–5).
 #[track_caller]
 pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
-    // Phase 63 audio handoff follow-up — capture the caller location so we
-    // can log it when the CAS transitions BlockedOnReply → Ready. That
-    // identifies which kernel site is spuriously waking call_msg-blocked
-    // tasks (the dominant shape in `reply_v2:deadline_expired_no_deadline`).
     let caller_loc = core::panic::Location::caller();
+    wake_task_v2_with(id, caller_loc, |_| true)
+}
+
+/// Same as [`wake_task_v2`] but evaluates `precondition` under the
+/// `pi_lock`+`scheduler_lock` critical section that wraps the state CAS.
+/// If `precondition` returns `false`, the wake is skipped and the function
+/// returns [`WakeOutcome::AlreadyAwake`] — no state mutation occurs.
+///
+/// **Why this exists.** `drive_expired_wake_deadlines` previously released
+/// `scheduler_lock` after re-validating `wake_deadline`, then called
+/// `wake_task_v2` which re-acquired `pi_lock`. A microseconds-wide TOCTTOU
+/// window between those two locks allowed a victim task to wake naturally,
+/// resume, finish work, and re-block on `BlockedOnReply`/`BlockedOnNotif`
+/// with no deadline — then a stale wake from this site fired against the
+/// new block, producing `wake_task_v2 on BlockedOnReply: has_pending_msg=false`
+/// and a downstream `recv_msg_with_notif` spurious-wake fallback that
+/// returned `u64::MAX` to userspace. The `audio_server` crash during
+/// DOOM playback (`docs/handoffs/2026-05-14-audio-intermittent-stutter-distortion.md`)
+/// was the load-bearing manifestation.
+///
+/// Passing the deadline-equality check as a closure that runs under the
+/// same `pi_lock` the CAS takes collapses the TOCTTOU window to zero —
+/// the deadline observation and the state transition are atomic relative
+/// to `block_current_until`'s self-revert path.
+#[track_caller]
+pub fn wake_task_v2_if(id: TaskId, precondition: impl FnOnce(&Task) -> bool) -> WakeOutcome {
+    let caller_loc = core::panic::Location::caller();
+    wake_task_v2_with(id, caller_loc, precondition)
+}
+
+fn wake_task_v2_with(
+    id: TaskId,
+    caller_loc: &'static core::panic::Location<'static>,
+    precondition: impl FnOnce(&Task) -> bool,
+) -> WakeOutcome {
+    // Phase 63 audio handoff follow-up — `caller_loc` lets the diag log
+    // identify which kernel site is spuriously waking call_msg-blocked
+    // tasks (the dominant shape in `reply_v2:deadline_expired_no_deadline`).
+    //
+    // `precondition` (added 2026-05-14) is evaluated atomically under
+    // `pi_lock`+`scheduler_lock` — see `wake_task_v2_if` doc for the
+    // residual-race fix it closes.
     // ── Step 1: Find the task index + capture pi_lock pointer ────────────────
     //
     // The Vec never shrinks; slots are Dead-recycled but the memory at
@@ -3906,6 +3958,18 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
 
         // Identity revalidation — slot may have been recycled.
         if idx >= sched.tasks.len() || sched.tasks[idx].id != id {
+            return WakeOutcome::AlreadyAwake;
+        }
+
+        // Precondition check (Phase 63 audio handoff residual-race fix).
+        // Evaluated under both `pi_lock` (held via `guard`) and
+        // `scheduler_lock` (held via `sched`) — atomic with respect to
+        // `block_current_until`'s self-revert path. If the precondition
+        // rejects, treat as a no-op wake: no state mutation, no deadline
+        // clear, no enqueue. The default precondition (`|_| true` passed
+        // from `wake_task_v2`) compiles to a no-op, preserving the
+        // unconditional-wake fast path.
+        if !precondition(&sched.tasks[idx]) {
             return WakeOutcome::AlreadyAwake;
         }
 
@@ -5138,14 +5202,12 @@ pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
 ///     idempotently; or (b) the waker already ran (Task::state == Ready)
 ///     and we skip.
 ///   - Spurious wakes (collecting a task whose deadline was just cleared) are
-///     handled at the wake site by re-checking the deadline under
-///     `scheduler_lock` before invoking `wake_task_v2`. The previous comment
-///     here claimed `wake_task_v2`'s state CAS made spurious collections
-///     harmless — that was wrong when the task wakes naturally between
-///     collection and the wake call, then RE-blocks (e.g. `call_msg` enters
-///     `BlockedOnReply` with no deadline). The collect-then-wake race surfaced
-///     as the Phase 63 audio handoff's `reply_v2:deadline_expired_no_deadline`
-///     spurious-wake diagnostic (all 32 hits traced to `drive_expired_wake_deadlines`).
+///     handled at the wake site by the precondition closure passed to
+///     [`wake_task_v2_if`]: the deadline equality check runs under the same
+///     `pi_lock` the state CAS takes, so the collect-then-wake race the
+///     Phase 63 audio handoff documented as `reply_v2:deadline_expired_no_deadline`
+///     is closed at the source rather than papered over with a re-validation
+///     pass outside the lock.
 fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([(TaskId, u64); 8], usize) {
     if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
         return ([(TaskId(0), 0); 8], 0);
@@ -5190,17 +5252,17 @@ fn collect_expired_wake_deadlines(sched: &Scheduler) -> ([(TaskId, u64); 8], usi
 ///
 /// Phase 1: collect candidate (TaskId, deadline) tuples under SCHEDULER.lock
 /// (no pi_lock touch).
-/// Phase 2: drop SCHEDULER.lock; for each candidate, RE-VALIDATE that the
-/// task's current `wake_deadline` still matches the collected value before
-/// invoking `wake_task_v2`. Closes the Phase 63 collect-then-wake race where
-/// a task could wake naturally between collection and our wake, re-block
-/// (e.g. as `BlockedOnReply` via `call_msg` with no deadline), and then be
-/// transitioned to Ready by our stale wake — the dominant
-/// `reply_v2:deadline_expired_no_deadline` shape in the spurious-wake
-/// diagnostic. A small remaining race exists between the re-validation
-/// `scheduler_lock` release and `wake_task_v2`'s `pi_lock` acquire, but the
-/// window is microseconds versus the milliseconds-scale window before this
-/// fix.
+/// Phase 2: drop SCHEDULER.lock; for each candidate, invoke
+/// [`wake_task_v2_if`] with a precondition closure that re-checks
+/// `wake_deadline == Some(expected_deadline)` under the same `pi_lock` the
+/// state CAS takes. This closes the Phase 63 collect-then-wake race: a
+/// task that wakes naturally between collection and our wake, then re-blocks
+/// (e.g. as `BlockedOnReply` via `call_msg` with no deadline), is rejected
+/// by the precondition because its new `wake_deadline` is `None` — the
+/// stale wake never fires. Prior to 2026-05-14 the re-validation lived
+/// outside `pi_lock`, leaving a microseconds-wide TOCTTOU residual that
+/// surfaced as the `audio_server: recv failed` DOOM-playback crash in
+/// `docs/handoffs/2026-05-14-audio-intermittent-stutter-distortion.md`.
 fn drive_expired_wake_deadlines() {
     let (expired, n) = {
         let sched = scheduler_lock();
@@ -5208,20 +5270,11 @@ fn drive_expired_wake_deadlines() {
         // SCHEDULER.lock dropped here.
     };
     for (id, expected_deadline) in &expired[..n] {
-        let still_valid = {
-            let sched = scheduler_lock();
-            sched
-                .find(*id)
-                .is_some_and(|idx| sched.tasks[idx].wake_deadline == Some(*expected_deadline))
-            // SCHEDULER.lock dropped here.
-        };
-        if !still_valid {
-            continue;
-        }
-        // wake_task_v2 acquires pi_lock OUTER, then scheduler_lock INNER.
-        // CAS only succeeds for Blocked*; spurious calls (state already
-        // Ready) return AlreadyAwake and are no-ops.
-        let _ = wake_task_v2(*id);
+        // wake_task_v2_if acquires pi_lock OUTER, then scheduler_lock INNER,
+        // and evaluates the closure with both locks held — atomic with
+        // respect to `block_current_until`'s self-revert path.
+        let expected = *expected_deadline;
+        let _ = wake_task_v2_if(*id, move |task| task.wake_deadline == Some(expected));
     }
 }
 
