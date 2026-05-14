@@ -41,6 +41,14 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // modules. Same lib + bin split as `audio_server`; host tests
     // build the lib only and skip the `_start`-bearing binary.
     ("session_manager", &["--lib"]),
+    // Phase 66 Track B — atomic shadow-file writes shared by passwd
+    // and adduser. Needs `--no-default-features --features host-tests`
+    // because the default feature pulls in the syscall_lib production
+    // backend.
+    (
+        "shadow",
+        &["--no-default-features", "--features", "host-tests"],
+    ),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -3188,7 +3196,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, and session_manager host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, and shadow host tests pass; doom platform-layer C tests pass"
     );
 }
 
@@ -8115,6 +8123,46 @@ fn create_data_disk(
 
 /// Populate the ext2 partition image with initial directories and files
 /// using `debugfs -w`. Creates temp host files for the `write` command.
+/// Phase 66 Track E.1 — bootstrap a single `/etc/shadow` password
+/// field using the same canonical format the in-guest `passwd` helper
+/// writes (`$sha256i$10000$<hex_salt>$<hex_hash>`).
+///
+/// Mirrors `syscall_lib::sha256::hash_password_iterated` byte-for-byte:
+/// round 1 hashes `salt || password`; subsequent rounds hash
+/// `prev_hash || salt || password`. Iteration count is pinned to
+/// [`passwd::HASH_ROUNDS`] (= 10000) so the boot image, runtime
+/// `passwd`, and `verify_password` cannot drift.
+fn generate_seeded_shadow_line(password: &[u8], salt: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(salt);
+        hasher.update(password);
+        hasher.finalize().to_vec()
+    };
+    for _ in 1..passwd::HASH_ROUNDS {
+        let mut hasher = Sha256::new();
+        hasher.update(&hash);
+        hasher.update(salt);
+        hasher.update(password);
+        hash = hasher.finalize().to_vec();
+    }
+
+    let prefix =
+        std::str::from_utf8(passwd::HASH_FORMAT_PREFIX).expect("HASH_FORMAT_PREFIX is ASCII");
+    let mut out = String::with_capacity(prefix.len() + salt.len() * 2 + 1 + 64);
+    out.push_str(prefix);
+    for &b in salt {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out.push('$');
+    for &b in &hash {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
 fn populate_ext2_files(
     part_path: &Path,
     output_dir: &Path,
@@ -8127,9 +8175,18 @@ fn populate_ext2_files(
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
-    // Pre-provisioned password hashes for CI/testing.  Format: $sha256$hex_salt$hex_hash
-    // where hash = SHA-256(salt_bytes || password_bytes).  Passwords: root="root", user="user".
-    let shadow_content = "root:$sha256$63695f726f6f745f73616c7431323334$5c8e5a851fee488aae9fc5890dd433f8a391fba2860899c271a6e6f5d3e4c439::::::\nuser:$sha256$63695f757365725f73616c7435363738$64fb26f3575e26ed5fc3b07e6c4ca2b6af8bf1f17267c34babb76448301a16ca::::::\n";
+    // Phase 66 Track E.1 — pre-provisioned `/etc/shadow` hashes are now
+    // generated through the same canonical helper the in-guest passwd
+    // binary uses (`$sha256i$10000$<hex_salt>$<hex_hash>`), so the
+    // bootstrap format cannot drift from runtime updates. Salts are
+    // fixed-bytes so the rebuilt disk image is byte-identical run to
+    // run — the salt is not a secret, only the password is.
+    let shadow_content = format!(
+        "root:{}::::::\nuser:{}::::::\n",
+        generate_seeded_shadow_line(b"root", b"ci_root_salt1234"),
+        generate_seeded_shadow_line(b"user", b"ci_user_salt5678"),
+    );
+    let shadow_content = shadow_content.as_str();
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
     // Phase 46: service definition files.

@@ -5,14 +5,16 @@
 #![no_main]
 
 use passwd::{
-    ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
+    HASH_ROUNDS, ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
     rewrite_shadow_file, user_exists,
 };
+use shadow::{ShadowError, shadow_write_atomic};
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, fsync, geteuid, getrandom, getuid, open, read, write, write_str,
+    O_RDONLY, STDOUT_FILENO, close, geteuid, getrandom, getuid, open, read, write, write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
+const SHADOW_PATH_STR: &str = "/etc/shadow";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 
 syscall_lib::entry_point!(passwd_main);
@@ -82,7 +84,8 @@ fn passwd_main(args: &[&str]) -> i32 {
         write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
         return 1;
     }
-    let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
+    let hash =
+        syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, HASH_ROUNDS);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
@@ -130,25 +133,37 @@ fn passwd_main(args: &[&str]) -> i32 {
         }
     };
 
-    // Write new shadow file.
-    let fd = open(SHADOW_PATH, syscall_lib::O_WRONLY | syscall_lib::O_TRUNC, 0);
-    if fd < 0 {
-        write_str(STDOUT_FILENO, "passwd: cannot write shadow file\n");
-        return 1;
+    // Atomic write: open /etc/shadow.new, fsync, rename over /etc/shadow.
+    // Phase 66 Track B — a crash mid-write leaves the live shadow intact.
+    match shadow_write_atomic(SHADOW_PATH_STR, &new_shadow[..out_pos]) {
+        Ok(()) => {}
+        Err(ShadowError::OpenFailed(_)) => {
+            write_str(STDOUT_FILENO, "passwd: cannot create /etc/shadow.new\n");
+            return 1;
+        }
+        Err(ShadowError::WriteFailed(_) | ShadowError::ShortWrite { .. }) => {
+            write_str(STDOUT_FILENO, "passwd: failed to write /etc/shadow.new\n");
+            return 1;
+        }
+        Err(ShadowError::FsyncFailed(_)) => {
+            write_str(
+                STDOUT_FILENO,
+                "passwd: fsync failed on /etc/shadow.new — not committing\n",
+            );
+            return 1;
+        }
+        Err(ShadowError::RenameFailed(_)) => {
+            write_str(
+                STDOUT_FILENO,
+                "passwd: failed to rename /etc/shadow.new over /etc/shadow\n",
+            );
+            return 1;
+        }
+        Err(ShadowError::PathTooLong) => {
+            write_str(STDOUT_FILENO, "passwd: shadow path too long\n");
+            return 1;
+        }
     }
-    let written = write(fd as i32, &new_shadow[..out_pos]);
-    if written < 0 || written as usize != out_pos {
-        write_str(STDOUT_FILENO, "passwd: failed to fully write shadow file\n");
-        close(fd as i32);
-        return 1;
-    }
-    if fsync(fd as i32) < 0 {
-        write_str(
-            STDOUT_FILENO,
-            "passwd: warning: fsync failed on shadow file\n",
-        );
-    }
-    close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");
     write_str(

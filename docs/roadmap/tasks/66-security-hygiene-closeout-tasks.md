@@ -1,21 +1,21 @@
 # Phase 66 — Security and Hygiene Closeout: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-66
-**Depends on:** Phase 48 (Security Foundation) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅. Phase 54a (Post-Serverization Kernel Hygiene) is Planned and completed-by-this-phase via Track F.2.
+**Depends on:** Phase 48 (Security Foundation) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅. Phase 54a (Post-Serverization Kernel Hygiene) is completed-by-this-phase via Track F.2.
 **Goal:** Close the five deferred security and hygiene items from Phase 48 and Phase 54a: sticky-bit enforcement in VFS unlink/rename; atomic shadow-file writes in passwd/adduser; O_CLOEXEC and O_NONBLOCK honored at descriptor construction; four layer-crossing wrapper bodies relocated from `kernel/src/arch/x86_64/syscall/mod.rs` into their owning modules; pre-seeded image password hash format upgraded. Flip Phase 54a status to Complete.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `/tmp` sticky-bit S_ISVTX enforcement in `unlink` and `rename` | None | Planned |
-| B | Atomic shadow file writes in `passwd` and `adduser` | None | Planned |
-| C | `O_CLOEXEC` / `O_NONBLOCK` plumbing at descriptor construction | None | Planned |
-| D | Relocate four layer-crossing wrapper bodies out of `arch/x86_64/syscall/mod.rs` into their owning modules | None | Planned |
-| E | Pre-seeded image password hash format upgrade | B | Planned |
-| F | Phase 48 + Phase 54a design docs + task docs updated; Phase 54a flipped Complete | A, B, C, D, E | Planned |
-| G | Documentation and Release | F | Planned |
+| A | `/tmp` sticky-bit S_ISVTX enforcement in `unlink` and `rename` | None | **Complete** |
+| B | Atomic shadow file writes in `passwd` and `adduser` | None | **Complete** |
+| C | `O_CLOEXEC` / `O_NONBLOCK` plumbing at descriptor construction | None | **Complete** |
+| D | Relocate four layer-crossing wrapper bodies out of `arch/x86_64/syscall/mod.rs` into their owning modules | None | **Complete** |
+| E | Pre-seeded image password hash format upgrade | B | **Complete** |
+| F | Phase 48 + Phase 54a design docs + task docs updated; Phase 54a flipped Complete | A, B, C, D, E | **Complete** |
+| G | Documentation and Release | F | **Complete** |
 
 ---
 

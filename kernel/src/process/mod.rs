@@ -331,19 +331,19 @@ pub fn close_cloexec_fds(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::arch::x86_64::syscall::release_socket_pub(h);
+        crate::net::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
     }
     for id in epolls {
-        crate::arch::x86_64::syscall::epoll_free_pub(id);
+        crate::epoll::epoll_free_pub(id);
     }
     for inode_num in ext2_last_alias {
-        crate::arch::x86_64::syscall::reap_unused_ext2_inode(inode_num);
+        crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
     for handle in vfs_last_alias {
-        crate::arch::x86_64::syscall::vfs_service_close_pub(handle);
+        crate::fs::vfs_service::vfs_service_close_pub(handle);
     }
 }
 
@@ -423,19 +423,19 @@ pub fn close_all_fds_for(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::arch::x86_64::syscall::release_socket_pub(h);
+        crate::net::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
     }
     for id in epolls {
-        crate::arch::x86_64::syscall::epoll_free_pub(id);
+        crate::epoll::epoll_free_pub(id);
     }
     for inode_num in ext2_last_alias {
-        crate::arch::x86_64::syscall::reap_unused_ext2_inode(inode_num);
+        crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
     for handle in vfs_last_alias {
-        crate::arch::x86_64::syscall::vfs_service_close_pub(handle);
+        crate::fs::vfs_service::vfs_service_close_pub(handle);
     }
 }
 

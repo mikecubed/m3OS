@@ -2,6 +2,7 @@
 #![no_std]
 #![no_main]
 
+use shadow::{ShadowError, shadow_write_atomic};
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, getrandom, open, read, write,
     write_str, write_u64,
@@ -9,6 +10,7 @@ use syscall_lib::{
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
+const SHADOW_PATH_STR: &str = "/etc/shadow";
 const GROUP_PATH: &[u8] = b"/etc/group\0";
 
 #[unsafe(no_mangle)]
@@ -84,7 +86,8 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "adduser: failed to generate random salt\n");
         exit(1);
     }
-    let hash = syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, 10000);
+    let hash =
+        syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, passwd::HASH_ROUNDS);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
@@ -128,38 +131,65 @@ pub extern "C" fn _start() -> ! {
         close(fd as i32);
     }
 
-    // Append to /etc/shadow (single write).
+    // Atomically rewrite /etc/shadow with the new entry appended.
+    // Phase 66 Track B — read current contents, build {existing} + new
+    // line in memory, then commit via shadow_write_atomic so a crash
+    // mid-write never leaves /etc/shadow torn.
+    //
+    // Hardening (PR 161 review): refuse to commit a rewritten shadow if
+    // the existing file can't be read fully. A silent open-failure or
+    // truncation here would drop existing entries.
     {
-        let fd = open(
-            SHADOW_PATH,
-            syscall_lib::O_WRONLY | syscall_lib::O_APPEND,
-            0,
-        );
-        if fd < 0 {
-            write_str(STDOUT_FILENO, "adduser: cannot open /etc/shadow\n");
-            exit(1);
-        }
-        let mut buf = [0u8; 512];
+        let mut shadow_buf = [0u8; 4096];
+        let shadow_len = match read_file_full(SHADOW_PATH, &mut shadow_buf) {
+            Ok(n) => n,
+            Err(ReadFileError::OpenFailed) => {
+                write_str(STDOUT_FILENO, "adduser: cannot read /etc/shadow\n");
+                exit(1);
+            }
+            Err(ReadFileError::Truncated) => {
+                write_str(
+                    STDOUT_FILENO,
+                    "adduser: /etc/shadow exceeds 4096-byte read buffer\n",
+                );
+                exit(1);
+            }
+        };
+        let mut new_shadow = [0u8; 4608];
         let mut pos = 0;
-        pos += copy_to_buf(&mut buf[pos..], username);
-        pos += copy_to_buf(&mut buf[pos..], b":$sha256i$10000$");
-        pos += copy_to_buf(&mut buf[pos..], &salt_hex[..salt_hex_len]);
-        pos += copy_to_buf(&mut buf[pos..], b"$");
-        pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
-        pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
-        let written = write(fd as i32, &buf[..pos]);
-        if written < 0 || written as usize != pos {
-            write_str(STDOUT_FILENO, "adduser: failed to write /etc/shadow\n");
-            close(fd as i32);
-            exit(1);
-        }
-        if fsync(fd as i32) < 0 {
+        if !append_checked(&mut new_shadow, &mut pos, &shadow_buf[..shadow_len])
+            || (pos > 0
+                && new_shadow[pos - 1] != b'\n'
+                && !append_checked(&mut new_shadow, &mut pos, b"\n"))
+            || !append_checked(&mut new_shadow, &mut pos, username)
+            || !append_checked(&mut new_shadow, &mut pos, b":")
+            || !append_checked(&mut new_shadow, &mut pos, passwd::HASH_FORMAT_PREFIX)
+            || !append_checked(&mut new_shadow, &mut pos, &salt_hex[..salt_hex_len])
+            || !append_checked(&mut new_shadow, &mut pos, b"$")
+            || !append_checked(&mut new_shadow, &mut pos, &hash_hex[..hash_hex_len])
+            || !append_checked(&mut new_shadow, &mut pos, b"::::::\n")
+        {
             write_str(
                 STDOUT_FILENO,
-                "adduser: warning: fsync failed on /etc/shadow\n",
+                "adduser: rewritten /etc/shadow exceeds buffer\n",
             );
+            exit(1);
         }
-        close(fd as i32);
+        if let Err(err) = shadow_write_atomic(SHADOW_PATH_STR, &new_shadow[..pos]) {
+            let msg: &str = match err {
+                ShadowError::OpenFailed(_) => "adduser: cannot create /etc/shadow.new\n",
+                ShadowError::WriteFailed(_) | ShadowError::ShortWrite { .. } => {
+                    "adduser: failed to write /etc/shadow.new\n"
+                }
+                ShadowError::FsyncFailed(_) => "adduser: fsync failed on /etc/shadow.new\n",
+                ShadowError::RenameFailed(_) => {
+                    "adduser: failed to rename /etc/shadow.new over /etc/shadow\n"
+                }
+                ShadowError::PathTooLong => "adduser: shadow path too long\n",
+            };
+            write_str(STDOUT_FILENO, msg);
+            exit(1);
+        }
     }
 
     // Append to /etc/group (single write).
@@ -281,6 +311,57 @@ fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     }
     close(fd as i32);
     total
+}
+
+enum ReadFileError {
+    OpenFailed,
+    Truncated,
+}
+
+// Strict variant of read_file used on /etc/shadow rewrites: distinguishes
+// open/read failure from a file that exceeds the provided buffer, so the
+// caller can refuse to commit a rewritten shadow with dropped entries.
+fn read_file_full(path: &[u8], buf: &mut [u8]) -> Result<usize, ReadFileError> {
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 {
+        return Err(ReadFileError::OpenFailed);
+    }
+    let mut total = 0;
+    let result = loop {
+        if total == buf.len() {
+            let mut probe = [0u8; 1];
+            let n = read(fd as i32, &mut probe);
+            break if n > 0 {
+                Err(ReadFileError::Truncated)
+            } else if n < 0 {
+                Err(ReadFileError::OpenFailed)
+            } else {
+                Ok(total)
+            };
+        }
+        let n = read(fd as i32, &mut buf[total..]);
+        if n < 0 {
+            break Err(ReadFileError::OpenFailed);
+        }
+        if n == 0 {
+            break Ok(total);
+        }
+        total += n as usize;
+    };
+    close(fd as i32);
+    result
+}
+
+fn append_checked(dst: &mut [u8], pos: &mut usize, src: &[u8]) -> bool {
+    let Some(end) = pos.checked_add(src.len()) else {
+        return false;
+    };
+    if end > dst.len() {
+        return false;
+    }
+    dst[*pos..end].copy_from_slice(src);
+    *pos = end;
+    true
 }
 
 fn read_line(buf: &mut [u8]) -> usize {

@@ -1543,6 +1543,31 @@ pub fn get_ext2_meta(path: &str) -> Option<(u32, u32, u16)> {
     }
 }
 
+/// Truncate and free the ext2 inode when its on-disk `links_count` has
+/// reached zero. The caller MUST have verified (under `PROCESS_TABLE`)
+/// that no open fd aliases this inode — this function intentionally
+/// skips a recount so two cores concurrently closing siblings of the
+/// same inode cannot both observe count==0 after each drops its own
+/// lock.
+///
+/// Phase 66 Track D.3 — body relocated from
+/// `kernel/src/arch/x86_64/syscall/mod.rs` so the reclamation logic
+/// lives next to the volume table it mutates.
+pub fn reap_unused_ext2_inode(inode_num: u32) {
+    let mut vol = EXT2_VOLUME.lock();
+    let Some(vol) = vol.as_mut() else {
+        return;
+    };
+    let Ok(mut inode) = vol.read_inode(inode_num) else {
+        return;
+    };
+    if inode.links_count != 0 {
+        return;
+    }
+    let _ = vol.truncate_file(inode_num, &mut inode);
+    let _ = vol.free_inode(inode_num);
+}
+
 /// Check if a root-relative ext2 path is a regular file (not directory/symlink).
 /// Returns `false` if the volume is not mounted or the path does not exist.
 pub fn is_ext2_regular_file(path: &str) -> bool {

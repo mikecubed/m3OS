@@ -22,3 +22,4 @@ pub mod protocol;
 pub mod ramdisk;
 pub mod tmpfs;
 pub mod vfs;
+pub mod vfs_service;

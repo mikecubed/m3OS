@@ -1,0 +1,27 @@
+[package]
+name = "shadow"
+version = "0.1.0"
+edition = "2024"
+description = "Phase 66 Track B — atomic shadow-file writes (temp + fsync + rename) shared by passwd and adduser."
+
+[features]
+default = ["guest-bin"]
+# The default build is no_std and links against syscall-lib for the
+# concrete production filesystem backend.
+guest-bin = ["dep:syscall-lib"]
+# Enabled by `cargo test -p shadow --no-default-features --features
+# host-tests`. Drops the syscall-lib dependency entirely so the
+# pure-logic core and the mock filesystem can run on the host.
+host-tests = []
+
+[lib]
+name = "shadow"
+path = "src/lib.rs"
+
+[[test]]
+name = "shadow_host"
+path = "host-tests/shadow_host.rs"
+required-features = ["host-tests"]
+
+[dependencies]
+syscall-lib = { path = "../../syscall-lib", optional = true }

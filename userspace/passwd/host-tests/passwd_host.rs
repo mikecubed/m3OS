@@ -1,4 +1,35 @@
-use passwd::{ShadowRewriteError, find_username_by_uid, requested_username, rewrite_shadow_file};
+use passwd::{
+    HASH_FORMAT_PREFIX, HASH_ROUNDS, ShadowRewriteError, find_username_by_uid, requested_username,
+    rewrite_shadow_file,
+};
+
+#[test]
+fn hash_format_prefix_embeds_hash_rounds() {
+    // HASH_FORMAT_PREFIX is `$sha256i$<rounds>$`. Parse the middle field
+    // and assert it matches HASH_ROUNDS, so the prefix and the in-code
+    // iteration count can never drift apart silently.
+    let prefix = core::str::from_utf8(HASH_FORMAT_PREFIX).expect("prefix is ASCII");
+    let mut parts = prefix.split('$');
+    assert_eq!(parts.next(), Some(""), "prefix should start with `$`");
+    assert_eq!(
+        parts.next(),
+        Some("sha256i"),
+        "algorithm tag must be sha256i"
+    );
+    let rounds_str = parts.next().expect("rounds field present");
+    assert_eq!(
+        parts.next(),
+        Some(""),
+        "prefix should end with trailing `$`"
+    );
+    let embedded: u32 = rounds_str
+        .parse()
+        .expect("rounds field is a decimal integer");
+    assert_eq!(
+        embedded, HASH_ROUNDS,
+        "HASH_FORMAT_PREFIX rounds field ({embedded}) must match HASH_ROUNDS ({HASH_ROUNDS})"
+    );
+}
 
 #[test]
 fn requested_username_uses_cli_target_when_present() {

@@ -6632,6 +6632,12 @@ const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
 #[allow(dead_code)]
 const O_NOFOLLOW: u64 = 0o400000;
+/// `O_NONBLOCK` (0x800). When set on the FD via `open()` the kernel must
+/// translate would-block conditions into `-EAGAIN` rather than parking.
+const O_NONBLOCK: u64 = 0o4000;
+/// `O_CLOEXEC` (0x80000). Atomically marks the new FD as close-on-exec,
+/// closing the open/fcntl race window.
+const O_CLOEXEC: u64 = 0o2000000;
 
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
 pub(super) const AT_FDCWD: u64 = (-100_i64) as u64;
@@ -6965,7 +6971,7 @@ fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
     })
 }
 
-fn vfs_service_open(path: &str, _flags: u64) -> u64 {
+fn vfs_service_open(path: &str, flags: u64) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
     use kernel_core::fs::vfs_protocol::VFS_OPEN;
@@ -6979,8 +6985,11 @@ fn vfs_service_open(path: &str, _flags: u64) -> u64 {
         None => return NEG_EINVAL,
     };
 
+    // Forward the caller's flags so `vfs_server::handle_open` can enforce
+    // its defensive flag-validation contract (reject anything other than
+    // read-only, non-creating, non-truncating opens).
     let mut msg = Message::new(VFS_OPEN);
-    msg.data[0] = 0;
+    msg.data[0] = flags;
     msg.data[1] = path.len() as u64;
     scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
 
@@ -7000,8 +7009,8 @@ fn vfs_service_open(path: &str, _flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
-        cloexec: false,
-        nonblock: false,
+        cloexec: flags & O_CLOEXEC != 0,
+        nonblock: flags & O_NONBLOCK != 0,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -7206,6 +7215,13 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         2 => (true, true),      // O_RDWR
         _ => return NEG_EINVAL, // invalid combination
     };
+    // Phase 66 Track C.2: honor `O_CLOEXEC` and `O_NONBLOCK` at FD
+    // construction. POSIX requires CLOEXEC to be applied atomically at
+    // `open()` to close the open/fcntl race window; NONBLOCK must take
+    // effect on the very FD `open()` returns, not only after a follow-up
+    // `fcntl(F_SETFL)`.
+    let cloexec = flags & O_CLOEXEC != 0;
+    let nonblock = flags & O_NONBLOCK != 0;
 
     // Phase 27: Permission check for existing files.
     let create = (flags & 0x40) != 0; // O_CREAT
@@ -7247,8 +7263,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7268,8 +7284,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: true,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7301,8 +7317,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                 offset: 0,
                 readable: true,
                 writable: true,
-                cloexec: false,
-                nonblock: false,
+                cloexec,
+                nonblock,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -7343,8 +7359,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7393,8 +7409,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -7423,8 +7439,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7476,8 +7492,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -7495,7 +7511,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     if let Some(rel) = fat32_relative_path(name) {
         if crate::fs::ext2::is_mounted() {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
         if data_is_mounted() {
@@ -7517,8 +7534,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                                 offset: 0,
                                 readable: true,
                                 writable: false,
-                                cloexec: false,
-                                nonblock: false,
+                                cloexec,
+                                nonblock,
                             };
 
                             return match alloc_fd(3, fd_entry) {
@@ -7556,8 +7573,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                             offset: initial_offset,
                             readable,
                             writable,
-                            cloexec: false,
-                            nonblock: false,
+                            cloexec,
+                            nonblock,
                         };
 
                         // Phase 31: support O_TRUNC on FAT32 — free the old
@@ -7619,8 +7636,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                                     offset: 0,
                                     readable,
                                     writable,
-                                    cloexec: false,
-                                    nonblock: false,
+                                    cloexec,
+                                    nonblock,
                                 };
 
                                 // Set ownership and permissions on the newly created file.
@@ -7660,7 +7677,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         // Check if ramdisk has this path (e.g. /bin/cat) — ramdisk takes priority.
         if crate::fs::ramdisk::ramdisk_lookup(name).is_none() {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
     }
@@ -7672,7 +7690,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             && let Some(rel) = ext2_root_path(name)
         {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
         return NEG_EROFS;
@@ -7686,7 +7705,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                 && let Some(rel) = ext2_root_path(name)
             {
                 return open_ext2_file(
-                    name, rel, readable, writable, create, append, truncate, mode_arg,
+                    name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                    nonblock,
                 );
             }
             // Legacy: /etc/* fallback — try /data/etc/* on FAT32 only.
@@ -7710,8 +7730,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                         offset: 0,
                         readable: true,
                         writable: false,
-                        cloexec: false,
-                        nonblock: false,
+                        cloexec,
+                        nonblock,
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -7735,8 +7755,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
-        cloexec: false,
-        nonblock: false,
+        cloexec,
+        nonblock,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -7776,30 +7796,19 @@ pub(super) fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
-/// Truncate and free the ext2 inode when its on-disk links_count has reached
-/// zero. The caller MUST have verified (under `PROCESS_TABLE`) that no open
-/// fd aliases this inode — this function intentionally skips a recount so
-/// two cores concurrently closing siblings of the same inode cannot both
-/// observe count==0 after each drops its own lock.
-pub(crate) fn reap_unused_ext2_inode(inode_num: u32) {
-    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-    let Some(vol) = vol.as_mut() else {
-        return;
-    };
-    let Ok(mut inode) = vol.read_inode(inode_num) else {
-        return;
-    };
-    if inode.links_count != 0 {
-        return;
-    }
-    let _ = vol.truncate_file(inode_num, &mut inode);
-    let _ = vol.free_inode(inode_num);
-}
+// Phase 66 Track D.3 — `reap_unused_ext2_inode` body has moved to
+// `kernel/src/fs/ext2.rs`. The call site at the bottom of
+// `sys_linux_close` now goes through `crate::fs::ext2::*` directly.
 
-/// Public wrapper so `kernel/src/process` can issue `VFS_CLOSE` directly
-/// after it has decided under `PROCESS_TABLE` that the handle being closed
-/// was the last alias.
-pub(crate) fn vfs_service_close_pub(service_handle: u64) {
+// Phase 66 Track D.4 — `vfs_service_close_pub` body has moved to
+// `kernel/src/fs/vfs_service.rs`. The IPC primitive is re-exposed as
+// `vfs_service_close_internal` so the new module can forward without
+// duplicating the message construction.
+
+/// Internal: tell the ring-3 VFS service a handle was closed.
+/// Re-exposed at `pub(crate)` so `kernel/src/fs/vfs_service.rs` can
+/// forward without duplicating the message construction below.
+pub(crate) fn vfs_service_close_internal(service_handle: u64) {
     vfs_service_close(service_handle);
 }
 
@@ -7837,7 +7846,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-            FdBackend::Socket { handle } => release_socket_handle(*handle),
+            FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
@@ -7891,7 +7900,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         return NEG_EBADF;
     }
     if let Some(inode_num) = ext2_reap {
-        reap_unused_ext2_inode(inode_num);
+        crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
     if let Some(handle) = vfs_last_close {
         vfs_service_close(handle);
@@ -8017,6 +8026,8 @@ fn open_ext2_file(
     append: bool,
     truncate: bool,
     mode_arg: u64,
+    cloexec: bool,
+    nonblock: bool,
 ) -> u64 {
     const NEG_EISDIR: u64 = (-21_i64) as u64;
     const NEG_ENOENT: u64 = (-2_i64) as u64;
@@ -8051,8 +8062,8 @@ fn open_ext2_file(
                     offset: 0,
                     readable: true,
                     writable: false,
-                    cloexec: false,
-                    nonblock: false,
+                    cloexec,
+                    nonblock,
                 };
                 return match alloc_fd(3, fd_entry) {
                     Some(i) => i as u64,
@@ -8093,8 +8104,8 @@ fn open_ext2_file(
                 offset: initial_offset,
                 readable,
                 writable,
-                cloexec: false,
-                nonblock: false,
+                cloexec,
+                nonblock,
             };
 
             match alloc_fd(3, fd_entry) {
@@ -8134,8 +8145,8 @@ fn open_ext2_file(
                         offset: 0,
                         readable,
                         writable,
-                        cloexec: false,
-                        nonblock: false,
+                        cloexec,
+                        nonblock,
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -12238,9 +12249,18 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
+    // Phase 66: Sticky-bit (S_ISVTX) enforcement before any inode mutation.
+    // If the target entry's metadata cannot be obtained (missing path),
+    // skip the sticky check entirely and let the unlink path below return
+    // -ENOENT rather than masking it as -EACCES.
+    let (_, _, euid, egid) = current_process_ids();
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
-        let (_, _, euid, egid) = current_process_ids();
         if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+        if let Some((file_uid, _, _)) = path_metadata(name)
+            && kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err()
+        {
             return NEG_EACCES;
         }
     }
@@ -12398,17 +12418,39 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     };
 
     // Phase 27: Write+execute permission on both parent directories.
+    // Phase 66: Sticky-bit (S_ISVTX) enforcement on the source parent
+    // directory before any rename mutation. POSIX semantics: a sticky
+    // source parent gates the rename even if the destination parent is
+    // unrelated. If the source path's metadata cannot be obtained the
+    // sticky check is skipped so the rename path can return -ENOENT
+    // rather than masking it as -EACCES.
     {
         let (_, _, euid, egid) = current_process_ids();
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved)
-            && !check_permission(pu, pg, pm, euid, egid, 3)
-        {
-            return NEG_EACCES;
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+            if let Some((file_uid, _, _)) = path_metadata(&old_resolved)
+                && kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err()
+            {
+                return NEG_EACCES;
+            }
         }
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved)
-            && !check_permission(pu, pg, pm, euid, egid, 3)
-        {
-            return NEG_EACCES;
+        // Destination parent: write+execute. Additionally, if the
+        // destination entry already exists, rename-over is effectively an
+        // unlink of the destination — POSIX requires the same sticky-bit
+        // semantics there. Only enforce when path_metadata(&new_resolved)
+        // succeeds so a missing destination still gets the natural
+        // rename-creates-new-entry path.
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+            if let Some((dest_uid, _, _)) = path_metadata(&new_resolved)
+                && kernel_core::fs::mode::check_sticky(pm, dest_uid, pu, euid, euid == 0).is_err()
+            {
+                return NEG_EACCES;
+            }
         }
     }
 
@@ -14686,7 +14728,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if proto == SocketProtocol::Udp && net_udp_service_available() {
         let err = net_udp_service_create(handle);
         if err != 0 {
-            release_socket_handle(handle);
+            crate::net::release_socket_pub(handle);
             return err;
         }
     }
@@ -14701,7 +14743,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
         None => {
-            release_socket_handle(handle);
+            crate::net::release_socket_pub(handle);
             NEG_EMFILE
         }
     }
@@ -14996,7 +15038,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
@@ -15004,15 +15046,15 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_to_kernel(&mut len_buf))
                         .is_err()
                     {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EFAULT;
                     }
                     if u32::from_ne_bytes(len_buf) < 16 {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return e;
                     }
                 }
@@ -15023,7 +15065,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
                     {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EFAULT;
                     }
                 }
@@ -15040,7 +15082,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
                     None => {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EMFILE;
                     }
                 }
@@ -16570,14 +16612,21 @@ static EPOLL_TABLE: crate::task::scheduler::IrqSafeMutex<
     crate::task::scheduler::IrqSafeMutex::new([NONE; MAX_EPOLL_INSTANCES])
 };
 
-/// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).
-pub fn epoll_free_pub(instance_id: usize) {
-    epoll_free(instance_id);
-}
+// Phase 66 Track D.2 — `epoll_free_pub` body has moved to
+// `kernel/src/epoll.rs`. The decrement helper is exposed as
+// `epoll_free_internal` so the new module can forward to it without
+// duplicating the table-locking dance below.
 
 /// Public entry point for epoll_add_ref (called from add_fd_refs on fork/dup).
 pub fn epoll_add_ref_pub(instance_id: usize) {
     epoll_add_ref(instance_id);
+}
+
+/// Internal: decrement epoll instance refcount; free when it reaches
+/// zero. Re-exposed at `pub(crate)` so `kernel/src/epoll.rs` can call it
+/// without duplicating the lock dance.
+pub(crate) fn epoll_free_internal(instance_id: usize) {
+    epoll_free(instance_id);
 }
 
 /// Decrement epoll instance refcount; free when it reaches zero.
@@ -16972,7 +17021,7 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 
 /// Returns `true` when the ring-3 `net_udp` service is registered and the
 /// current caller is *not* the service itself (prevents recursion).
-fn net_udp_service_available() -> bool {
+pub(crate) fn net_udp_service_available() -> bool {
     !is_current_exec_path("/bin/net_server") && crate::ipc::registry::is_registered("net_udp")
 }
 
@@ -17095,7 +17144,7 @@ fn net_udp_service_recvfrom_port(kernel_handle: u32) -> (u64, u16) {
 }
 
 /// Tell the service a socket was closed. Returns the port that was unbound.
-fn net_udp_service_close(kernel_handle: u32) -> u16 {
+pub(crate) fn net_udp_service_close(kernel_handle: u32) -> u16 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
     use kernel_core::net::udp_protocol::NET_UDP_CLOSE;
@@ -17115,15 +17164,6 @@ fn net_udp_service_close(kernel_handle: u32) -> u16 {
     reply.data[0] as u16
 }
 
-fn release_socket_handle(handle: u32) {
-    let hold_udp_last_ref = net_udp_service_available();
-    let result = crate::net::free_socket_with_result(handle, hold_udp_last_ref);
-    if result.needs_finalization {
-        net_udp_service_close(handle);
-        crate::net::finalize_socket_close(handle);
-    }
-}
-
-pub fn release_socket_pub(handle: u32) {
-    release_socket_handle(handle);
-}
+// Phase 66 Track D.1 — `release_socket_pub` body has moved to
+// `kernel/src/net/mod.rs`. The internal call sites here now go through
+// `crate::net::release_socket_pub` directly.
