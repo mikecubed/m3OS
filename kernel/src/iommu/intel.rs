@@ -570,6 +570,19 @@ impl VtdUnit {
     /// Pre-condition: [`bring_up_invalidation_queue`] succeeded —
     /// callers that hit this with `iq_ring_phys == None` get a
     /// `NotAvailable` error rather than a panic.
+    ///
+    /// Pre-condition (queue capacity): callers must drive the queue to
+    /// completion (via [`Self::submit_iwait_and_poll`]) before
+    /// submitting more than `IQ_DESC_COUNT - 1` descriptors. This
+    /// helper does *not* check that the slot at `iq_tail` has been
+    /// observed by hardware; on overflow it would write a fresh
+    /// descriptor over a still-pending one and the wrap-around would
+    /// leave `IQT == IQH`, which the IOMMU treats as "queue empty".
+    /// Phase 67's only caller (`flush_*` → submit two descriptors +
+    /// `submit_iwait_and_poll`) honours this trivially under the
+    /// `&mut self` borrow boundary; future bulk invalidators must
+    /// either call back into the IWAIT poll between batches or learn
+    /// to read `IQH` and reserve a sentinel slot.
     fn submit_qi_descriptor(&mut self, desc: QiDescriptor) -> Result<u64, IommuError> {
         let ring = self.iq_ring_phys.ok_or(IommuError::NotAvailable)?;
         let slot = self.iq_tail;
@@ -594,9 +607,19 @@ impl VtdUnit {
     /// would each see their own value (Phase 67 has at most one
     /// in-flight flush per unit because `&mut self` is the lock
     /// boundary, but the marker advance is cheap insurance).
+    ///
+    /// Marker `0` is reserved as a sentinel: the routine zeroes the
+    /// status word before submitting and polls for an observed match
+    /// against the fresh marker. If the marker were allowed to be
+    /// `0`, the poll would observe a match against the freshly-zeroed
+    /// status word *before* hardware wrote the IWAIT completion and
+    /// return prematurely. We therefore skip `0` on wrap-around.
     fn submit_iwait_and_poll(&mut self) -> Result<(), IommuError> {
         let status_phys = self.iq_status_phys.ok_or(IommuError::NotAvailable)?;
         self.iq_status_marker = self.iq_status_marker.wrapping_add(1);
+        if self.iq_status_marker == 0 {
+            self.iq_status_marker = 1;
+        }
         let marker = self.iq_status_marker;
         // Zero the status word before submitting so we observe the new
         // marker arriving.

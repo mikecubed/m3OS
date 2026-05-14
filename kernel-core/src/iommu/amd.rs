@@ -34,7 +34,9 @@
 //! - bits 15:0  — Requestor BDF (the DeviceID field).
 //! - bits 31:16 — PASID (Phase 67 ignores PASID — Phase 55a does not
 //!   enable PASID translation).
-//! - bits 47:32 — Domain ID for events that have one.
+//! - bits 47:32 — Domain ID for events that have one. Preserved by the
+//!   typed decoder so the AMD-Vi `amdvi-detail` log line keeps parity
+//!   with the pre-Phase-67 output.
 //! - bits 59:52 — Flags byte. The exact flag layout is event-specific;
 //!   Phase 67 preserves the raw bits so callers can dump them.
 //! - bits 63:60 — Event code (4-bit).
@@ -56,6 +58,11 @@ pub struct AmdViFaultEvent {
     /// PCI BDF that issued the faulting transaction.
     /// Layout: `(bus << 8) | (device << 3) | function`.
     pub requestor_bdf: u16,
+    /// Domain id from header bits 47:32. Zero on events that do not
+    /// carry one. Surfaced so the AMD-Vi `amdvi-detail` log line
+    /// retains the `domain={:#x}` field the legacy `EventEntry::decode`
+    /// path printed pre-Phase-67.
+    pub domain_id: u16,
     /// Event class. See [`AmdViFaultCode`].
     pub fault_code: AmdViFaultCode,
     /// Faulting IOVA for events that carry one (`IoPageFault`); zero
@@ -169,7 +176,7 @@ pub enum DecodeError {
 /// word0 = bytes[0..8]  (little-endian)
 ///   bits 15:0   = device_id  (requestor BDF)
 ///   bits 31:16  = pasid       (Phase 67 ignores)
-///   bits 47:32  = domain_id   (Phase 67 ignores)
+///   bits 47:32  = domain_id   (preserved verbatim)
 ///   bits 59:52  = flags       (preserved verbatim)
 ///   bits 63:60  = event_code  (mapped to AmdViFaultCode)
 /// word1 = bytes[8..16] (little-endian)
@@ -185,11 +192,13 @@ pub fn decode_event_log_entry(raw: &[u8; 16]) -> Result<AmdViFaultEvent, DecodeE
     ]);
     let code_raw = ((word0 >> 60) & 0xF) as u8;
     let requestor_bdf = (word0 & 0xFFFF) as u16;
+    let domain_id = ((word0 >> 32) & 0xFFFF) as u16;
     let flags = ((word0 >> 52) & 0xFF) as u8;
     let fault_code = AmdViFaultCode::from_raw(code_raw);
     let iova = word1;
     Ok(AmdViFaultEvent {
         requestor_bdf,
+        domain_id,
         fault_code,
         iova,
         flags,
@@ -199,14 +208,15 @@ pub fn decode_event_log_entry(raw: &[u8; 16]) -> Result<AmdViFaultEvent, DecodeE
 /// Encode an [`AmdViFaultEvent`] back into its 16-byte raw record.
 ///
 /// The inverse of [`decode_event_log_entry`] for the fields the
-/// decoder extracts. Bits the decoder does not extract (PASID,
-/// domain-id) are encoded as zero. Useful for test fixtures that need
-/// to construct synthetic event records without hand-rolling the bit
-/// math.
+/// decoder extracts. Bits the decoder does not extract (PASID) are
+/// encoded as zero. Useful for test fixtures that need to construct
+/// synthetic event records without hand-rolling the bit math.
 pub fn encode_event_log_entry(event: &AmdViFaultEvent) -> [u8; 16] {
     let code = event.fault_code.to_raw() as u64;
-    let word0: u64 =
-        (event.requestor_bdf as u64) | ((event.flags as u64) << 52) | ((code & 0xF) << 60);
+    let word0: u64 = (event.requestor_bdf as u64)
+        | (((event.domain_id as u64) & 0xFFFF) << 32)
+        | ((event.flags as u64) << 52)
+        | ((code & 0xF) << 60);
     let word1: u64 = event.iova;
     let mut out = [0u8; 16];
     out[0..8].copy_from_slice(&word0.to_le_bytes());
@@ -223,8 +233,19 @@ mod tests {
     use super::*;
 
     fn round_trip(code: AmdViFaultCode, bdf: u16, iova: u64, flags: u8) {
+        round_trip_with_domain(code, bdf, 0, iova, flags);
+    }
+
+    fn round_trip_with_domain(
+        code: AmdViFaultCode,
+        bdf: u16,
+        domain_id: u16,
+        iova: u64,
+        flags: u8,
+    ) {
         let event = AmdViFaultEvent {
             requestor_bdf: bdf,
+            domain_id,
             fault_code: code,
             iova,
             flags,
@@ -270,6 +291,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_preserves_domain_id_for_io_page_fault() {
+        round_trip_with_domain(
+            AmdViFaultCode::IoPageFault,
+            0x0820,
+            0x1234,
+            0xDEAD_BEEF_0000,
+            0x12,
+        );
+    }
+
+    #[test]
+    fn decode_preserves_domain_id_at_field_max() {
+        round_trip_with_domain(
+            AmdViFaultCode::IllegalDevTableEntry,
+            0x0001,
+            0xFFFF,
+            0,
+            0x00,
+        );
+    }
+
+    #[test]
     fn unknown_event_code_preserved_via_unknown_variant() {
         // Hand-build a raw record with event-code 0xF.
         let mut raw = [0u8; 16];
@@ -278,6 +321,7 @@ mod tests {
         raw[0..8].copy_from_slice(&word0.to_le_bytes());
         let event = decode_event_log_entry(&raw).expect("decoder accepts any 16-byte input");
         assert_eq!(event.requestor_bdf, 0x0042);
+        assert_eq!(event.domain_id, 0);
         match event.fault_code {
             AmdViFaultCode::Unknown(raw) => assert_eq!(raw, 0xF),
             other => panic!("expected Unknown(0xF), got {:?}", other),
@@ -312,6 +356,7 @@ mod tests {
         // (IoPageFault), BDF=0x0820, IOVA=0x0000_BEEF_C000, flags=0x10.
         let event = AmdViFaultEvent {
             requestor_bdf: 0x0820,
+            domain_id: 0x00AB,
             fault_code: AmdViFaultCode::IoPageFault,
             iova: 0x0000_BEEF_C000,
             flags: 0x10,
@@ -324,6 +369,8 @@ mod tests {
         assert_eq!(((word0 >> 60) & 0xF) as u8, 0x2);
         // BDF at bits 15:0.
         assert_eq!((word0 & 0xFFFF) as u16, 0x0820);
+        // Domain id at bits 47:32.
+        assert_eq!(((word0 >> 32) & 0xFFFF) as u16, 0x00AB);
         // Flags at bits 59:52.
         assert_eq!(((word0 >> 52) & 0xFF) as u8, 0x10);
         // IOVA at word1.

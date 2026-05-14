@@ -46,10 +46,13 @@ pub struct SupervisedPid(u64);
 /// `SupervisedSpawn::start("nvme_driver")` forks the named driver
 /// binary under the test supervisor and returns a handle the test
 /// keeps until it is done. `stop` sends SIGTERM and waits for exit;
-/// the harness asserts the child reached a clean exit before
-/// returning, so a test that lets the handle drop without calling
-/// stop sees a panic on the destructor (helpful for catching missed
-/// cleanups in negative-path tests).
+/// the host stub flips a flag so subsequent `is_alive()` queries
+/// observe the lifecycle transition. The destructor flips the same
+/// flag silently — leaked handles do **not** panic in the host stub
+/// because a panic-on-drop here would cascade into a double-panic on
+/// any test that also asserts. The asserting destructor is a
+/// candidate to add when the in-kernel test supervisor (Phase 55b
+/// Track F.2) is wired into the run.
 ///
 /// # Layering
 ///
@@ -303,40 +306,36 @@ fn driver_restart_resets_domain() {
 // ---------------------------------------------------------------------------
 //
 // These functions document the kernel-side contract each test depends
-// on. When the in-kernel test supervisor is wired in (Phase 55b F.2),
-// they get replaced by real syscall stubs that route to the supervised
-// driver's process control block. The host-side stubs return the
-// errno the kernel-registry tests in `kernel/src/lib.rs` already
-// assert, so the documentation stays internally consistent.
+// on. They intentionally panic when invoked: every caller is gated
+// behind `#[ignore]` waiting for the in-kernel test supervisor (Phase
+// 55b F.2) to be wired into `cargo xtask test`. Returning hardcoded
+// errno values would cause an accidentally un-ignored test to pass
+// silently against an unrelated kernel regression — the `todo!()`
+// scaffolds the Phase 67 PR replaced at least failed loudly. These
+// stubs preserve that "fails loudly" property: removing an
+// `#[ignore]` here without first wiring the supervisor produces an
+// immediate test panic with the kernel-side contract spelled out in
+// the message.
 
 fn simulate_mmio_with_handle(_pid: SupervisedPid, _handle: CapHandle) -> i32 {
-    // The kernel's MMIO syscall path returns -EBADF for any handle
-    // that does not match the calling PID's claim table — proven by
-    // `kernel::cross_device_mmio_denied` and
-    // `kernel::capability_forge_denied`.
-    E_BADF
+    panic!(
+        "simulate_mmio_with_handle: requires the in-kernel test supervisor \
+         (Phase 55b F.2). Re-enable the calling test only after the supervisor \
+         is wired into cargo xtask test. Kernel contract: -EBADF for any handle \
+         that does not match the calling PID's claim table — see \
+         `kernel::cross_device_mmio_denied` and `kernel::capability_forge_denied`."
+    );
 }
 
-fn simulate_dma_alloc_with_handle(pid: SupervisedPid, handle: CapHandle) -> i32 {
-    // `sys_device_dma_alloc` enforces two checks in sequence:
-    //   1. CapHandle must belong to the calling PID's claim table —
-    //      a mismatch returns -EBADF.
-    //   2. The DMA IOVA must lie inside the claimed device's domain
-    //      — a mismatch returns -EFAULT.
-    //
-    // The host stub picks the errno based on which path the test
-    // intends to exercise: a foreign-domain injection presents a
-    // domain mismatch (-EFAULT); a forged or stale handle presents a
-    // claim mismatch (-EBADF). Encoded in the sentinel-handle layout
-    // so the stub does not depend on a private kernel data structure.
-    if (handle.0 & 0xFFFF_0000_0000_0000) == 0xFADE_0000_0000_0000 {
-        E_FAULT
-    } else {
-        // Forged / stale / restart-recycled handles fall through to
-        // the cap-validate rejection path.
-        let _ = pid;
-        E_BADF
-    }
+fn simulate_dma_alloc_with_handle(_pid: SupervisedPid, _handle: CapHandle) -> i32 {
+    panic!(
+        "simulate_dma_alloc_with_handle: requires the in-kernel test supervisor \
+         (Phase 55b F.2). Re-enable the calling test only after the supervisor \
+         is wired into cargo xtask test. Kernel contract: \
+         (1) -EBADF when the CapHandle does not belong to the calling PID's claim \
+         table, (2) -EFAULT when the DMA IOVA lies outside the claimed device's \
+         domain — see `kernel::cross_device_dma_denied`."
+    );
 }
 
 // ---------------------------------------------------------------------------

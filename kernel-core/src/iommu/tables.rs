@@ -936,16 +936,20 @@ impl BdfGroups {
 /// claim per group, so this layer stays pure-logic and host-testable.
 ///
 /// BDFs that the IVRS tables never mentioned still claim cleanly — the
-/// helper allocates an ad-hoc singleton group on demand so a kernel
-/// driver claiming a BDF that fell outside the parsed alias set still
-/// gets a stable domain.
+/// helper records the per-BDF assignment in a separate map keyed
+/// directly by BDF so it never reuses the dense [`GroupId`] number
+/// space the IVRS-derived [`BdfGroups`] owns. Callers that hand a
+/// [`GroupId`] pulled from `groups()` to [`BdfGroups::members`] therefore
+/// always see only IVRS-mentioned BDFs and never an extra-singleton.
 #[derive(Debug, Default)]
 pub struct BdfDomainAssignment {
     groups: BdfGroups,
     /// Indexed by GroupId. `None` until the group's first claim.
     assigned: Vec<Option<crate::iommu::contract::DomainId>>,
-    /// On-demand singleton groups for BDFs not seen by the IVRS parser.
-    extra: BTreeMap<u16, (GroupId, Option<crate::iommu::contract::DomainId>)>,
+    /// On-demand singleton claims for BDFs not seen by the IVRS parser.
+    /// Keyed directly by BDF — these entries do not participate in the
+    /// [`GroupId`] space at all.
+    extra: BTreeMap<u16, crate::iommu::contract::DomainId>,
 }
 
 impl BdfDomainAssignment {
@@ -986,14 +990,15 @@ impl BdfDomainAssignment {
             *slot = Some(id);
             return Ok(id);
         }
-        // BDF outside the IVRS-mentioned set — fall back to a singleton
-        // group keyed by the BDF itself. Stable across calls.
-        if let Some((_, Some(id))) = self.extra.get(&bdf) {
+        // BDF outside the IVRS-mentioned set — fall back to a per-BDF
+        // singleton record. The extras map is keyed by BDF and is
+        // intentionally not part of the dense GroupId space owned by
+        // `groups`, so no GroupId collision is possible.
+        if let Some(id) = self.extra.get(&bdf) {
             return Ok(*id);
         }
         let id = alloc()?;
-        let next_gid = GroupId((self.assigned.len() + self.extra.len()) as u32);
-        self.extra.insert(bdf, (next_gid, Some(id)));
+        self.extra.insert(bdf, id);
         Ok(id)
     }
 
@@ -1002,7 +1007,7 @@ impl BdfDomainAssignment {
         if let Some(gid) = self.groups.group_of(bdf) {
             return self.assigned[gid.0 as usize];
         }
-        self.extra.get(&bdf).and_then(|(_, id)| *id)
+        self.extra.get(&bdf).copied()
     }
 
     /// Read-only view of the underlying grouping table.
@@ -2280,6 +2285,42 @@ mod tests {
         let b = assign.claim(0x5678, alloc_seq(&counter)).unwrap();
         assert_eq!(a, a_again, "repeated claim of same BDF returns cached id");
         assert_ne!(a, b, "distinct BDFs get distinct domains");
+    }
+
+    #[test]
+    fn bdf_domain_assignment_extras_do_not_leak_into_group_id_space() {
+        // IVRS declares one group (alias pair); a later claim of an
+        // unrelated BDF must not appear under any GroupId in
+        // `groups()`, so external code that iterates IVRS groups never
+        // observes the extras.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        let counter = core::cell::Cell::new(1);
+        let _ivrs_id = assign.claim(0x0200, alloc_seq(&counter)).unwrap();
+        let _extra_id = assign.claim(0xFFFE, alloc_seq(&counter)).unwrap();
+        let g = assign.groups();
+        // The IVRS-derived group still lists exactly the original BDFs,
+        // and there is no second group for the extra-singleton claim.
+        assert_eq!(g.group_count(), 1);
+        let members = g.members(GroupId(0)).unwrap();
+        assert!(members.contains(&0x0200));
+        assert!(members.contains(&0x0210));
+        assert!(!members.contains(&0xFFFE));
+        // `groups.group_of` for the extra BDF stays None so callers
+        // that route via `groups()` never accidentally pick it up.
+        assert!(g.group_of(0xFFFE).is_none());
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! helper (and not a trait method) so vendor code does not grow a hard
 //! dependency on the kernel-side `reserved_regions()` accessor.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use kernel_core::iommu::contract::{
@@ -48,12 +49,21 @@ use super::intel::VtdUnit;
 /// documented one-time allocation — the alternative (`Box<dyn IommuUnit>`)
 /// would add a heap allocation per unit and a vtable dispatch on every
 /// method call. The vendor set is small and fixed.
+///
+/// `AmdViUnit` is wrapped in [`Box`] so its address stays stable across
+/// the move into this enum, the move into the registry's [`Vec`], and
+/// any subsequent `Vec` reallocation. The AMD-Vi fault-IRQ trampoline
+/// holds raw pointers into the live unit (see
+/// [`crate::iommu::amd::register_unit_slot`]); without the indirection
+/// those pointers would be left dangling at the original stack slot the
+/// constructor used.
 #[allow(clippy::large_enum_variant, dead_code)]
 pub enum RegisteredUnit {
     /// Real Intel VT-d hardware unit.
     Vtd(VtdUnit),
-    /// Real AMD-Vi hardware unit.
-    AmdVi(AmdViUnit),
+    /// Real AMD-Vi hardware unit. Heap-allocated so the fault-IRQ
+    /// trampoline can hold a stable raw pointer to it.
+    AmdVi(Box<AmdViUnit>),
     /// Pure-logic identity-mapping fallback (no hardware effect).
     Identity(IdentityUnit),
 }

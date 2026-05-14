@@ -587,10 +587,10 @@ This track records the four IOMMU isolation test scaffolds that landed in `users
 **Why it matters:** These are the QEMU-level isolation acceptance tests for the Phase 55c R2 IOMMU BAR identity coverage work. Without them the kernel's cross-device denial path is unverified end-to-end.
 
 **Acceptance:**
-- [x] `cross_device_mmio_denied_end_to_end` exercises cross-device MMIO denial via the IOMMU. *(implemented in Phase 67 — see [Phase 67 tasks Track F](./67-iommu-substrate-completion-tasks.md))*
-- [x] `cross_device_dma_denied_end_to_end` exercises cross-device DMA denial via the IOMMU. *(implemented in Phase 67)*
-- [x] `capability_forge_denied_end_to_end` rejects forged capability handles. *(implemented in Phase 67)*
-- [x] `post_crash_handles_invalid_end_to_end` invalidates capabilities a supervisor still holds after the issuing driver crashes. *(implemented in Phase 67)*
+- [x] `cross_device_mmio_denied_end_to_end` body replaces the original `todo!()` scaffold with a real `SupervisedSpawn` + `CapHandle::inject_foreign_dma` shape. *(harness shape only in Phase 67 — see [Phase 67 tasks Track F](./67-iommu-substrate-completion-tasks.md); the test stays `#[ignore]`d pending the in-kernel test supervisor (Phase 55b F.2). The host-side `simulate_*` helpers panic on invocation so accidentally un-ignoring without the supervisor fails loudly rather than passing silently.)*
+- [x] `cross_device_dma_denied_end_to_end` body replaces `todo!()` with the same harness shape. *(harness shape only in Phase 67 — kernel exercise gated on the in-kernel test supervisor)*
+- [x] `capability_forge_denied_end_to_end` body replaces `todo!()` with the forged-handle harness shape. *(harness shape only in Phase 67 — kernel exercise gated on the in-kernel test supervisor)*
+- [x] `post_crash_handles_invalid_end_to_end` body replaces `todo!()` with the post-restart-handle harness shape. *(harness shape only in Phase 67 — kernel exercise gated on the in-kernel test supervisor)*
 
 ### K.2 — Supervised-spawn + capability-injection harness
 
@@ -599,8 +599,8 @@ This track records the four IOMMU isolation test scaffolds that landed in `users
 **Why it matters:** K.1's four scaffolds all depend on the same supervisor harness for spawning the NVMe driver under test and injecting a foreign-domain `CapHandle`. Phase 55c declared this out of scope and deferred.
 
 **Acceptance:**
-- [x] `SupervisedSpawn::start(binary)` forks the named binary under the test supervisor. *(implemented in Phase 67 — see [Phase 67 tasks Track F.1](./67-iommu-substrate-completion-tasks.md))*
-- [x] `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to a domain-B driver instance. *(implemented in Phase 67 — see [Phase 67 tasks Track F.2](./67-iommu-substrate-completion-tasks.md))*
+- [x] `SupervisedSpawn::start(binary)` allocates a synthetic `SupervisedPid`, records the requested binary name, and tracks lifecycle through `stop`. *(harness shape implemented in Phase 67 — see [Phase 67 tasks Track F.1](./67-iommu-substrate-completion-tasks.md). The host-side stub does not actually fork; the `kernel-supervisor → fork → SIGTERM` path is reserved for the Phase 55b F.2 supervisor wiring.)*
+- [x] `CapHandle::inject_foreign_dma` constructs a sentinel `CapHandle` value distinguishing source vs. target PIDs so tests can assert injection direction. *(harness shape implemented in Phase 67 — see [Phase 67 tasks Track F.2](./67-iommu-substrate-completion-tasks.md). The actual cross-domain `DmaBuffer` mint + foreign-process delivery is reserved for the Phase 55b F.2 supervisor wiring.)*
 
 ---
 

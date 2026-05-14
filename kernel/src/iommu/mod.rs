@@ -300,7 +300,13 @@ fn build_and_bring_up_vtd(slot: usize, register_base: u64) -> Result<RegisteredU
 /// cached IVRS tables so subsequent `claim_device(bdf)` calls return
 /// a shared `DomainId` for BDFs in the same equivalence class.
 fn build_and_bring_up_amdvi(slot: usize, register_base: u64) -> Result<RegisteredUnit, IommuError> {
-    let mut unit = amd::AmdViUnit::new(register_base, slot)?;
+    // Box the unit before `install_fault_handler` runs so the
+    // `register_unit_slot(self as *mut AmdViUnit)` call captures the
+    // stable heap address. A stack-local `AmdViUnit` would be moved
+    // into the enum, into the registry `Vec`, and possibly relocated
+    // again on `Vec` growth, leaving the trampoline's raw pointer
+    // dangling — see Phase 67 review thread on `kernel/src/iommu/amd.rs`.
+    let mut unit = alloc::boxed::Box::new(amd::AmdViUnit::new(register_base, slot)?);
     unit.bring_up()?;
     unit.install_fault_handler(fault::default_handler)?;
     unit.group_bdf_domains(amd::build_bdf_groups_from_ivrs());
