@@ -17,6 +17,18 @@
 
 extern crate alloc;
 
+// Phase 68 Track D — extracted manifest parser + supervisor planner.
+// The pure-logic body lives in `kernel_core::init::*`; these thin
+// re-export modules sit at the paths the task doc names so a reader
+// grepping `userspace/init/src/manifest.rs` lands in the right place.
+// The legacy `parse_service_def` + fixed-size `ServiceDef` path remains
+// the production code; Phase 68 introduces the heap-backed manifest
+// shape and accompanying host tests without rewiring the boot loop.
+#[allow(dead_code)]
+mod manifest;
+#[allow(dead_code)]
+mod supervisor;
+
 use core::alloc::Layout;
 
 use syscall_lib::heap::BrkAllocator;

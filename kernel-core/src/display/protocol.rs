@@ -39,9 +39,16 @@ use crate::input::events::{
 // ---------------------------------------------------------------------------
 
 /// Current protocol version negotiated in [`ClientMessage::Hello`] and
-/// echoed back in [`ServerMessage::Welcome`]. Any other value closes the
-/// connection with [`DisconnectReason::VersionMismatch`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// echoed back in [`ServerMessage::Welcome`].
+///
+/// Phase 68 Track C bumped this from `1` to `2` when `KeyEvent` gained
+/// a `modifier_side` field. Clients that announce `1` are downgraded
+/// via [`crate::input::events::downgrade_for_v1_client`] (every
+/// `KeyEvent` is emitted with [`crate::input::events::ModifierSide::Either`]
+/// over the legacy 19-byte wire layout). All in-tree clients
+/// (`kbd_server`, `display_server`, `m3ctl`, host fixtures) handshake
+/// at version `2`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Fixed frame-header size: `body_len (u16) + opcode (u16)`.
 pub const FRAME_HEADER_SIZE: usize = 4;
@@ -129,6 +136,15 @@ const OP_CTL_EVT_FOCUS_CHANGED: u16 = 0x0312;
 const OP_CTL_EVT_BIND_TRIGGERED: u16 = 0x0313;
 // Phase 56 close-out (G.1 regression) — test-only pixel-readback reply.
 const OP_CTL_EVT_PIXEL_REPLY: u16 = 0x0314;
+// Phase 68 Track A.3 — Layer-shell-equivalent role state-change event.
+// Fires when a `Layer`-role surface is (re)configured with new anchor /
+// exclusive-zone / keyboard-interactivity bits so subscribed clients can
+// re-layout around it.
+const OP_CTL_EVT_LAYER_EVENT: u16 = 0x0315;
+// Phase 68 Track A.3 — Cursor visibility / position transition event.
+// Fires when the compositor's pointer cursor changes visibility or
+// hotspot so subscribed clients can mirror or annotate cursor state.
+const OP_CTL_EVT_CURSOR_EVENT: u16 = 0x0316;
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -264,6 +280,11 @@ pub enum DisconnectReason {
 }
 
 /// Control-socket subscribable event kinds (A.8).
+///
+/// Phase 68 Track A.3 added `LayerEvent` and `CursorEvent` — the two new
+/// kinds extend the original 0..=3 mapping, keeping wire compatibility
+/// with subscribers that only know the four legacy kinds (the decoder
+/// rejects unknown discriminants with `ProtocolError::InvalidEnum`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -272,6 +293,12 @@ pub enum EventKind {
     SurfaceDestroyed = 1,
     FocusChanged = 2,
     BindTriggered = 3,
+    /// Phase 68 — a `Layer`-role surface was (re)configured. Subscribed
+    /// clients re-layout around the new anchor / exclusive-zone bits.
+    LayerEvent = 4,
+    /// Phase 68 — the compositor's pointer cursor changed visibility or
+    /// hotspot. Subscribed clients update cursor mirrors.
+    CursorEvent = 5,
 }
 
 /// Control-socket error codes (A.8 / E.4).
@@ -514,6 +541,30 @@ pub enum ControlEvent {
     PixelReply {
         color: u32,
     },
+    /// Phase 68 Track A.3 — `Layer`-role surface configuration update.
+    ///
+    /// Body layout (14 bytes LE): `surface_id (u32) | anchor_mask (u8) |
+    /// exclusive_zone (u32) | keyboard_interactivity (u8) | _pad (u32)`.
+    /// Carries the anchor / exclusive-zone / keyboard-interactivity bits
+    /// from the surface's [`LayerConfig`] so subscribers can re-layout
+    /// around the surface without re-querying via `ListSurfaces`.
+    LayerEvent {
+        surface_id: SurfaceId,
+        anchor_mask: u8,
+        exclusive_zone: u32,
+        keyboard_interactivity: KeyboardInteractivity,
+    },
+    /// Phase 68 Track A.3 — pointer cursor state transition.
+    ///
+    /// Body layout (10 bytes LE): `visible (u8) | hot_x (i32) | hot_y (i32) |
+    /// _pad (u8)`. `hot_x` / `hot_y` echo the cursor's hotspot in
+    /// surface-local coordinates so subscribers can mirror or annotate
+    /// cursor state.
+    CursorEvent {
+        visible: bool,
+        hot_x: i32,
+        hot_y: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +717,8 @@ fn event_kind_from_u8(v: u8) -> Result<EventKind, ProtocolError> {
         1 => Ok(EventKind::SurfaceDestroyed),
         2 => Ok(EventKind::FocusChanged),
         3 => Ok(EventKind::BindTriggered),
+        4 => Ok(EventKind::LayerEvent),
+        5 => Ok(EventKind::CursorEvent),
         _ => Err(ProtocolError::InvalidEnum),
     }
 }
@@ -1318,6 +1371,31 @@ impl ControlEvent {
                     body[0..4].copy_from_slice(&color.to_le_bytes());
                 })
             }
+            // Phase 68 Track A.3 — `LayerEvent` body: surface_id (u32) |
+            // anchor_mask (u8) | exclusive_zone (u32) |
+            // keyboard_interactivity (u8) = 10 bytes.
+            Self::LayerEvent {
+                surface_id,
+                anchor_mask,
+                exclusive_zone,
+                keyboard_interactivity,
+            } => encode_fixed_body(buf, OP_CTL_EVT_LAYER_EVENT, 10, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4] = *anchor_mask;
+                body[5..9].copy_from_slice(&exclusive_zone.to_le_bytes());
+                body[9] = *keyboard_interactivity as u8;
+            }),
+            // Phase 68 Track A.3 — `CursorEvent` body: visible (u8) |
+            // hot_x (i32) | hot_y (i32) = 9 bytes.
+            Self::CursorEvent {
+                visible,
+                hot_x,
+                hot_y,
+            } => encode_fixed_body(buf, OP_CTL_EVT_CURSOR_EVENT, 9, |body| {
+                body[0] = u8::from(*visible);
+                body[1..5].copy_from_slice(&hot_x.to_le_bytes());
+                body[5..9].copy_from_slice(&hot_y.to_le_bytes());
+            }),
         }
     }
 
@@ -1417,6 +1495,30 @@ impl ControlEvent {
                 expect_body_len(body_len, 4)?;
                 Self::PixelReply {
                     color: read_u32(body, 0)?,
+                }
+            }
+            // Phase 68 Track A.3 — see `OP_CTL_EVT_LAYER_EVENT`.
+            OP_CTL_EVT_LAYER_EVENT => {
+                expect_body_len(body_len, 10)?;
+                Self::LayerEvent {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    anchor_mask: body[4],
+                    exclusive_zone: read_u32(body, 5)?,
+                    keyboard_interactivity: keyboard_interactivity_from_u8(body[9])?,
+                }
+            }
+            // Phase 68 Track A.3 — see `OP_CTL_EVT_CURSOR_EVENT`.
+            OP_CTL_EVT_CURSOR_EVENT => {
+                expect_body_len(body_len, 9)?;
+                let visible = match body[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ProtocolError::InvalidEnum),
+                };
+                Self::CursorEvent {
+                    visible,
+                    hot_x: read_i32(body, 1)?,
+                    hot_y: read_i32(body, 5)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -1737,6 +1839,7 @@ mod tests {
             symbol: b'a' as u32,
             modifiers: ModifierState(MOD_SUPER | MOD_ALT),
             kind: KeyEventKind::Down,
+            modifier_side: crate::input::events::ModifierSide::Either,
         };
         encode_decode_round_trip_server(ServerMessage::Key(ev));
     }
@@ -1964,6 +2067,52 @@ mod tests {
         }
     }
 
+    // Phase 68 Track A.3 — `LayerEvent` round-trip across the legal
+    // anchor / keyboard-interactivity space.
+    #[test]
+    fn ctl_evt_layer_event_round_trips() {
+        for ki in [
+            KeyboardInteractivity::None,
+            KeyboardInteractivity::OnDemand,
+            KeyboardInteractivity::Exclusive,
+        ] {
+            for &anchor in &[0u8, ANCHOR_TOP | ANCHOR_LEFT, ANCHOR_CENTER, ANCHOR_EDGES] {
+                encode_decode_round_trip_ctl_evt(ControlEvent::LayerEvent {
+                    surface_id: SurfaceId(0x1234_5678),
+                    anchor_mask: anchor,
+                    exclusive_zone: 0xCAFE_BABE,
+                    keyboard_interactivity: ki,
+                });
+            }
+        }
+    }
+
+    // Phase 68 Track A.3 — `CursorEvent` round-trip for both visibility
+    // states and signed-extreme hotspot coordinates.
+    #[test]
+    fn ctl_evt_cursor_event_round_trips() {
+        for visible in [false, true] {
+            for &(hx, hy) in &[(0i32, 0i32), (i32::MIN, i32::MAX), (-128, 128), (1024, 768)] {
+                encode_decode_round_trip_ctl_evt(ControlEvent::CursorEvent {
+                    visible,
+                    hot_x: hx,
+                    hot_y: hy,
+                });
+            }
+        }
+    }
+
+    // Phase 68 Track A.3 — invalid visibility tag rejected.
+    #[test]
+    fn ctl_evt_cursor_event_rejects_invalid_visibility() {
+        let mut buf = [0u8; FRAME_HEADER_SIZE + 9];
+        buf[0..2].copy_from_slice(&9u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&OP_CTL_EVT_CURSOR_EVENT.to_le_bytes());
+        buf[4] = 5;
+        let err = ControlEvent::decode(&buf).unwrap_err();
+        assert_eq!(err, ProtocolError::InvalidEnum);
+    }
+
     #[test]
     fn ctl_evt_surface_list_reply_caps_entry_count() {
         let mut buf = [0u8; FRAME_HEADER_SIZE + 4];
@@ -2082,6 +2231,8 @@ mod tests {
             Just(EventKind::SurfaceDestroyed),
             Just(EventKind::FocusChanged),
             Just(EventKind::BindTriggered),
+            Just(EventKind::LayerEvent),
+            Just(EventKind::CursorEvent),
         ]
     }
 
@@ -2141,14 +2292,22 @@ mod tests {
                 Just(KeyEventKind::Up),
                 Just(KeyEventKind::Repeat),
             ],
+            prop_oneof![
+                Just(crate::input::events::ModifierSide::Left),
+                Just(crate::input::events::ModifierSide::Right),
+                Just(crate::input::events::ModifierSide::Either),
+            ],
         )
-            .prop_map(|(timestamp_ms, keycode, symbol, mods, kind)| KeyEvent {
-                timestamp_ms,
-                keycode,
-                symbol,
-                modifiers: ModifierState(mods),
-                kind,
-            })
+            .prop_map(
+                |(timestamp_ms, keycode, symbol, mods, kind, modifier_side)| KeyEvent {
+                    timestamp_ms,
+                    keycode,
+                    symbol,
+                    modifiers: ModifierState(mods),
+                    kind,
+                    modifier_side,
+                },
+            )
     }
 
     fn arb_pointer_event_proto() -> impl Strategy<Value = PointerEvent> {
@@ -2273,6 +2432,29 @@ mod tests {
                 }
             }),
             any::<u32>().prop_map(|color| ControlEvent::PixelReply { color }),
+            (
+                arb_surface_id(),
+                arb_anchor_mask(),
+                any::<u32>(),
+                arb_keyboard_interactivity(),
+            )
+                .prop_map(
+                    |(surface_id, anchor_mask, exclusive_zone, keyboard_interactivity)| {
+                        ControlEvent::LayerEvent {
+                            surface_id,
+                            anchor_mask,
+                            exclusive_zone,
+                            keyboard_interactivity,
+                        }
+                    },
+                ),
+            (any::<bool>(), any::<i32>(), any::<i32>()).prop_map(|(visible, hot_x, hot_y)| {
+                ControlEvent::CursorEvent {
+                    visible,
+                    hot_x,
+                    hot_y,
+                }
+            }),
         ]
     }
 

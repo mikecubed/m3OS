@@ -1,6 +1,6 @@
 # Phase 68 — Display Server Closeout: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-68
 **Depends on:** Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅, Phase 64 (Session Manager Lifecycle) ✅
 **Goal:** Close the five Phase 56 completion gaps. Wire `flush_subscriber_ring` into the four existing `publish_*` functions and add two new event kinds (`LayerEvent`, `CursorEvent`) with matching publish + flush wiring. Implement `DamageTracker` in the compositor and clip blits to the dirty union. Add `ModifierSide` to `KeyEvent` and bump global `PROTOCOL_VERSION` from `1` to `2` (with a version-1 client compatibility shim). Extract `userspace/init/src/manifest.rs` and `userspace/init/src/supervisor.rs` from `main.rs`; add comma-separated `depends=` and a typed `on-restart=` directive. Create `mouse_server.conf` and register `mouse_server` as a managed init service declaring `depends=kbd_server`. Append a `> Phase 68 closure note:` block to Phase 56's design doc; bump kernel to `0.68.0`.

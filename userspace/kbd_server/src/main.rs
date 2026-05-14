@@ -195,6 +195,12 @@ impl KeyboardPipeline {
             symbol,
             modifiers: mods,
             kind,
+            // Phase 68 Track C — derive the side designation from the
+            // hardware-neutral keycode. The `ScancodeDecoder` already
+            // mapped `0xE0`-prefixed extended scancodes to the
+            // right-side keycodes (KEY_RCTRL / KEY_RALT etc.); for
+            // non-modifier keys this returns `Either`.
+            modifier_side: kernel_core::input::events::ModifierSide::for_keycode(keycode.0),
         })
     }
 
@@ -213,6 +219,9 @@ impl KeyboardPipeline {
         {
             ev.symbol = sym.0;
         }
+        // Phase 68 Track C — repeats inherit the side designation of
+        // their originating keycode. Non-modifier keys remain `Either`.
+        ev.modifier_side = kernel_core::input::events::ModifierSide::for_keycode(ev.keycode);
         Some(ev)
     }
 }

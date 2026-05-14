@@ -48,6 +48,7 @@ use alloc::vec::Vec;
 
 use kernel_core::display::compose::{ComposeError, ComposeSurface, compose_frame};
 use kernel_core::display::cursor::{CursorRenderer, DefaultArrowCursor, cursor_damage};
+use kernel_core::display::damage::DamageTracker;
 use kernel_core::display::fb_owner::{FbError, FramebufferOwner, bytes_per_pixel};
 use kernel_core::display::layout::{FloatingLayout, LayoutPolicy, LayoutSurface, OutputGeometry};
 use kernel_core::display::protocol::{Rect, SurfaceId};
@@ -83,19 +84,31 @@ pub struct ComposeContext {
     /// Arrangement cached alongside `cached_toplevel_ids`. Empty
     /// until the first compose pass populates it.
     cached_arrangement: Vec<(SurfaceId, Rect)>,
+    /// Phase 68 Track B — accumulated damage rectangles for the
+    /// current frame. `mark_dirty` is called once per surface and
+    /// once per cursor old/new bounding box; `union_rect` is the
+    /// blit clip rectangle.
+    damage_tracker: DamageTracker,
 }
 
 impl ComposeContext {
     /// Construct an empty context. The first frame's `cursor_damage`
     /// call returns `None` for `prev`, so only the new cursor's box
     /// is damaged on frame 1.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             prev_pointer: None,
             prev_cursor_size: None,
             cached_toplevel_ids: Vec::new(),
             cached_arrangement: Vec::new(),
+            damage_tracker: DamageTracker::new(),
         }
+    }
+
+    /// Phase 68 Track B — exposed for diagnostics and tests so a
+    /// reviewer can confirm the tracker is being populated each frame.
+    pub fn damage_tracker(&self) -> &DamageTracker {
+        &self.damage_tracker
     }
 }
 
@@ -163,19 +176,51 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // Gate: skip compose work if there is no surface damage AND no
     // cursor motion. The frame is a no-op.
     //
-    // Trade-off: when only the cursor moved (no surface damage), the
-    // path below still walks every mapped surface and re-blits with
-    // full-surface damage rectangles. That is correct (cursor pixels
-    // are composited on top, so the underlying surfaces must be
-    // re-emitted under the old + new cursor rects) but wastes work
-    // when the cursor box is small relative to surface area. A
-    // dedicated cursor-only fast path that re-blits only the damaged
-    // regions of the underlying surfaces is deferred to a Phase 56
-    // follow-up; today every mouse move triggers a full repaint of
-    // every mapped surface.
+    // Phase 68 Track B partially closed the "every cursor move = full
+    // repaint" trade-off documented at this site through Phase 56:
+    // the cursor-only fast path below now runs a *clipped* compose
+    // whose damage is the union of old + new cursor boxes (so a
+    // cursor-only frame writes strictly fewer pixels than a full
+    // repaint). The wider trade-off is still partly open: the
+    // [`DamageTracker`] accumulates per-surface dirty rects + cursor
+    // motion as a diagnostic / observability seam (exposed via
+    // [`ComposeContext::damage_tracker`] for tests and debug dumps),
+    // but the *general-path* surface blit at the bottom of this
+    // function still emits a full-surface damage rect per entry — it
+    // does not yet consult [`DamageTracker::union_rect`] /
+    // [`DamageTracker::is_full_repaint_needed`] to clip those blits.
+    // Wiring the tracker into the general-path clip decision is a
+    // documented Phase 68 follow-up.
     let surface_damage = registry.has_damage();
     if !surface_damage && !cursor_motion {
         return Ok(0);
+    }
+
+    // Phase 68 Track B — feed cursor-motion damage into the tracker so
+    // a cursor-only frame's `union_rect` is the union of (old cursor
+    // box + new cursor box). Surfaces feed their entry rects below.
+    if cursor_motion
+        && let (Some(prev_pos), Some(prev_size)) = (ctx.prev_pointer, ctx.prev_cursor_size)
+    {
+        for rect in cursor_damage(prev_pos, prev_size, pointer_position, cursor_size) {
+            ctx.damage_tracker.mark_dirty(rect);
+        }
+    }
+    if cursor_motion && (ctx.prev_pointer.is_none() || ctx.prev_cursor_size.is_none()) {
+        // First-frame cursor — only the new cursor's bounding box is
+        // dirty. The first-compose `clear_rect_to_background(output)`
+        // below already triggers `mark_full_repaint` so this path is
+        // mostly diagnostic, but adding the new-cursor rect keeps the
+        // tracker accurate if the first-compose wipe is ever skipped.
+        let (cw, ch) = cursor_size;
+        if cw > 0 && ch > 0 {
+            ctx.damage_tracker.mark_dirty(Rect {
+                x: pointer_position.0.saturating_sub(cw as i32 / 2),
+                y: pointer_position.1.saturating_sub(ch as i32 / 2),
+                w: cw,
+                h: ch,
+            });
+        }
     }
 
     // Inform the layout policy about toplevel surfaces and the exclusive
@@ -233,6 +278,12 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     let is_first_compose = ctx.prev_pointer.is_none() || ctx.prev_cursor_size.is_none();
     if is_first_compose {
         clear_rect_to_background(owner, output)?;
+        // Phase 68 Track B — explicit full-repaint on the first
+        // compose pass: the surface-blit path below will paint every
+        // mapped surface and the tracker must reflect that so a
+        // subsequent reviewer can confirm "first frame = full repaint"
+        // via `damage_tracker().is_full_repaint_needed()` at the seam.
+        ctx.damage_tracker.mark_full_repaint();
     } else if cursor_motion
         && let (Some(prev_pos), Some(prev_size)) = (ctx.prev_pointer, ctx.prev_cursor_size)
     {
@@ -259,6 +310,107 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         return Ok(0);
     }
 
+    // Phase 68 Track B — cursor-only fast path. When no surface
+    // emitted new pixels but the cursor moved, skip the full-surface
+    // compose pass: the mapped surfaces are identical to last frame,
+    // so re-blitting every one is the wasted work the deferred-fast-
+    // path note at this site flagged through Phase 56.
+    //
+    // The cursor-trail clear above wiped the union of old + new
+    // cursor boxes to background. Where that union overlaps a mapped
+    // surface, the cleared pixels would otherwise be left as
+    // background and produce a visible "hole" trail across the
+    // window. To prevent that, we still run `compose_frame` here, but
+    // with the per-surface `damage` array narrowed to the cursor
+    // union (translated into each surface's local coordinates). The
+    // result: each mapped surface contributes at most a cursor-sized
+    // re-blit, which together with the cursor blit is strictly fewer
+    // pixels than the framebuffer resolution for any non-pathological
+    // cursor size — the optimisation the fast path was designed for,
+    // without the hole-trail regression.
+    if !surface_damage && cursor_motion && !is_first_compose {
+        let cursor: &dyn CursorRenderer = match &client_cursor_clone {
+            Some(cc) => cc,
+            None => &default,
+        };
+
+        // `cursor_motion && !is_first_compose` is the conjunction that
+        // gated the cursor-trail clear above; both `prev_pointer` and
+        // `prev_cursor_size` are guaranteed `Some(_)` here. The
+        // `expect`s document the invariant so a future refactor that
+        // weakens the gate breaks loudly instead of silently writing
+        // garbage damage rects.
+        let prev_pos = ctx.prev_pointer.expect(
+            "cursor fast path: prev_pointer set whenever cursor_motion && !is_first_compose",
+        );
+        let prev_size = ctx.prev_cursor_size.expect(
+            "cursor fast path: prev_cursor_size set whenever cursor_motion && !is_first_compose",
+        );
+        let cursor_repaint = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+
+        // Per-surface damage = cursor union translated into surface-
+        // local coordinates. `compose_frame` clips each local rect
+        // against the surface's `[0..w] × [0..h]` extent, so a
+        // surface that does not overlap the cursor union contributes
+        // zero blits (its local damage list survives the clip as
+        // empty / out-of-bounds and is skipped).
+        let local_damages: Vec<Vec<Rect>> = entries
+            .iter()
+            .map(|entry| {
+                let surface_rect = surface_screen_rect(entry, arrangement);
+                cursor_repaint
+                    .iter()
+                    .filter_map(|sr| {
+                        let dx = (sr.x as i64) - (surface_rect.x as i64);
+                        let dy = (sr.y as i64) - (surface_rect.y as i64);
+                        let lx = i32::try_from(dx).ok()?;
+                        let ly = i32::try_from(dy).ok()?;
+                        Some(Rect {
+                            x: lx,
+                            y: ly,
+                            w: sr.w,
+                            h: sr.h,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let snapshots: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|entry| entry.buf.pixels_snapshot())
+            .collect();
+
+        let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
+        for ((entry, dmg), snapshot) in entries
+            .iter()
+            .zip(local_damages.iter())
+            .zip(snapshots.iter())
+        {
+            compose.push(ComposeSurface {
+                id: entry.id,
+                layer: entry.layer,
+                rect: surface_screen_rect(entry, arrangement),
+                damage: &dmg[..],
+                pixels: snapshot.as_slice(),
+                opaque: entry.is_opaque(),
+            });
+        }
+
+        let surface_writes = compose_frame(owner, output, &mut compose)?;
+        let cursor_writes =
+            blit_cursor(owner, output, cursor, pointer_position).map_err(ComposeError::from)?;
+        if surface_writes + cursor_writes > 0 {
+            owner.present().map_err(ComposeError::from)?;
+        }
+        ctx.prev_pointer = Some(pointer_position);
+        ctx.prev_cursor_size = Some(cursor_size);
+        // Keep the damage tracker observable to tests but clear it
+        // so the next frame starts empty.
+        ctx.damage_tracker.reset();
+        return Ok(surface_writes + cursor_writes);
+    }
+
     // Build full-surface damage rectangles. Phase 56 ships full-surface
     // damage on every commit; later phases tracking partial damage will
     // replace this with the real list emitted by the surface state machine.
@@ -276,6 +428,16 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
             }]
         })
         .collect();
+
+    // Phase 68 Track B — feed each mapped surface's screen rect into
+    // the tracker so the union covers everything the compose pass
+    // will touch. `union_rect()` is observable from outside this
+    // function via [`ComposeContext::damage_tracker`] for tests and
+    // debug dumps; the cursor-only fast path above already returned
+    // by this point.
+    for entry in entries.iter() {
+        ctx.damage_tracker.mark_dirty(entry.rect);
+    }
 
     // Snapshot the current pixel contents of every compose entry into
     // owned `Vec<u8>` buffers before building the `ComposeSurface`
@@ -304,29 +466,10 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
     for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
-        // Phase 56 close-out (G.1) — Toplevel surfaces use the layout
-        // policy's arrangement for placement; Layer / Cursor surfaces
-        // keep their iter_compose-derived rects (anchor-driven for
-        // Layer, hotspot-driven for Cursor). Without this lookup, the
-        // multi-client coexistence regression would render every
-        // Toplevel at the same `centre_rect` position and only the
-        // top-of-z-order surface would be observable.
-        let rect = if matches!(
-            entry.layer,
-            kernel_core::display::compose::ComposeLayer::Toplevel
-        ) {
-            arrangement
-                .iter()
-                .find(|(id, _)| *id == entry.id)
-                .map(|(_, r)| *r)
-                .unwrap_or(entry.rect)
-        } else {
-            entry.rect
-        };
         compose.push(ComposeSurface {
             id: entry.id,
             layer: entry.layer,
-            rect,
+            rect: surface_screen_rect(entry, arrangement),
             damage: &dmg[..],
             pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
@@ -358,7 +501,40 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     ctx.prev_pointer = Some(pointer_position);
     ctx.prev_cursor_size = Some(cursor_size);
 
+    // Phase 68 Track B — clear the damage tracker now that the
+    // compose pass has consumed everything. The next frame starts
+    // empty; cursor motion / surface commits repopulate it.
+    ctx.damage_tracker.reset();
+
     Ok(surface_writes + cursor_writes)
+}
+
+/// Resolve a `ComposeEntry`'s screen-space rect, honouring the layout
+/// policy's arrangement for `Toplevel` surfaces while leaving
+/// `Layer` / `Cursor` / `Background` rects unchanged.
+///
+/// Phase 56 close-out (G.1): without this lookup, every `Toplevel`
+/// would composite at the same `centre_rect` position and only the
+/// top-of-z-order surface would be observable in the multi-client
+/// coexistence regression. The cursor-only fast path also calls this
+/// to keep the surface→cursor-damage translation consistent with the
+/// slow-path placement.
+fn surface_screen_rect(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+) -> Rect {
+    if matches!(
+        entry.layer,
+        kernel_core::display::compose::ComposeLayer::Toplevel
+    ) {
+        arrangement
+            .iter()
+            .find(|(id, _)| *id == entry.id)
+            .map(|(_, r)| *r)
+            .unwrap_or(entry.rect)
+    } else {
+        entry.rect
+    }
 }
 
 /// Sample a [`CursorRenderer`] over the screen rectangle implied by

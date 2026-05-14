@@ -71,6 +71,66 @@ pub enum KeyEventKind {
     Repeat = 2,
 }
 
+/// Phase 68 Track C — left/right discrimination for modifier keys.
+///
+/// PS/2 sends right-side modifier scancodes prefixed with `0xE0`;
+/// `kbd_server` (Phase 68 C.3) decodes the prefix and emits the
+/// appropriate side. Non-modifier keys emit
+/// [`ModifierSide::Either`] — the side designation only carries
+/// meaning for the `Shift` / `Ctrl` / `Alt` / `Super` key edges
+/// themselves.
+///
+/// A version-1 client (announcing `PROTOCOL_VERSION = 1` in its
+/// `ClientMessage::Hello`) sees every `KeyEvent` with
+/// [`ModifierSide::Either`] via a compatibility shim implemented in
+/// `kernel_core::input::events::downgrade_for_v1_client`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum ModifierSide {
+    /// Left-side modifier (bare scancode on PS/2: `0x2A` / `0x1D` /
+    /// `0x38` for Shift / Ctrl / Alt).
+    Left = 0,
+    /// Right-side modifier (`0xE0`-prefixed PS/2 scancode: `0xE0 0x36`
+    /// / `0xE0 0x1D` / `0xE0 0x38`). Note: right-Shift's bare
+    /// scancode is `0x36` rather than the `0xE0 0x2A` form used by
+    /// some sources — see the PS/2 scan-set 1 reference for the
+    /// canonical mapping.
+    Right = 1,
+    /// No side designation. Emitted for non-modifier keys, by the
+    /// version-1 compatibility shim for all keys, and by the
+    /// `InjectKey` test-only verb (which does not synthesize a
+    /// side-aware scancode).
+    #[default]
+    Either = 2,
+}
+
+impl ModifierSide {
+    /// Phase 68 Track C — map a hardware-neutral keycode to its side
+    /// designation. Left modifier keycodes return [`Self::Left`];
+    /// right modifier keycodes return [`Self::Right`]; everything
+    /// else returns [`Self::Either`]. `kbd_server::feed_byte` calls
+    /// this helper after `ScancodeDecoder` decodes the
+    /// `0xE0`-prefixed extended scancode into the appropriate
+    /// `KEY_RCTRL` / `KEY_RALT` / `KEY_RSHIFT` keycode.
+    pub fn for_keycode(keycode: u32) -> Self {
+        // The keycode constants are defined in `crate::input::keymap`;
+        // mirror their numeric values here so this helper does not
+        // pull in the keymap module (the keymap module imports
+        // `KeyEvent` from this file).
+        const KEY_LSHIFT: u32 = 0x0080;
+        const KEY_RSHIFT: u32 = 0x0081;
+        const KEY_LCTRL: u32 = 0x0082;
+        const KEY_RCTRL: u32 = 0x0083;
+        const KEY_LALT: u32 = 0x0084;
+        const KEY_RALT: u32 = 0x0085;
+        match keycode {
+            KEY_LSHIFT | KEY_LCTRL | KEY_LALT => Self::Left,
+            KEY_RSHIFT | KEY_RCTRL | KEY_RALT => Self::Right,
+            _ => Self::Either,
+        }
+    }
+}
+
 /// Hardware-neutral key event after scancode translation and keymap lookup.
 ///
 /// `keycode` is the `kbd_server`-internal hardware-neutral keycode (stable
@@ -78,6 +138,10 @@ pub enum KeyEventKind {
 /// code point (Unicode scalar for printable symbols; a `kernel-core`-defined
 /// constant in the private-use area for function/arrow/modifier keys).
 /// `modifiers` is the latched/held modifier snapshot at event time.
+///
+/// Phase 68 Track C added `modifier_side`. Non-modifier keys emit
+/// [`ModifierSide::Either`]; version-1 clients see every
+/// `KeyEvent` with `Either` via the downgrade shim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyEvent {
     pub timestamp_ms: u64,
@@ -85,10 +149,33 @@ pub struct KeyEvent {
     pub symbol: u32,
     pub modifiers: ModifierState,
     pub kind: KeyEventKind,
+    /// Phase 68 — left vs. right side of the originating physical
+    /// key. See [`ModifierSide`].
+    pub modifier_side: ModifierSide,
 }
 
 /// Exact serialized byte count of a [`KeyEvent`].
-pub const KEY_EVENT_WIRE_SIZE: usize = 8 + 4 + 4 + 2 + 1;
+///
+/// Phase 68 grew the wire size from 19 to 20 bytes when the
+/// `modifier_side` field was added.
+pub const KEY_EVENT_WIRE_SIZE: usize = 8 + 4 + 4 + 2 + 1 + 1;
+
+/// Pre-Phase-68 (`PROTOCOL_VERSION = 1`) wire size of a
+/// [`KeyEvent`]. The version-1 compatibility shim decodes the
+/// legacy layout and synthesizes [`ModifierSide::Either`].
+pub const KEY_EVENT_WIRE_SIZE_V1: usize = 8 + 4 + 4 + 2 + 1;
+
+/// Phase 68 Track C — produce a copy of `ev` suitable for sending to
+/// a client that handshook at `PROTOCOL_VERSION = 1`. The shim
+/// replaces `modifier_side` with [`ModifierSide::Either`] so the
+/// caller can encode using the legacy 19-byte layout without losing
+/// information the v1 client could not decode anyway.
+pub fn downgrade_for_v1_client(ev: KeyEvent) -> KeyEvent {
+    KeyEvent {
+        modifier_side: ModifierSide::Either,
+        ..ev
+    }
+}
 
 /// Pointer button transition attached to a [`PointerEvent`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -146,11 +233,19 @@ pub enum EventCodecError {
     InvalidButtonTag,
     /// Absolute-position flag was neither 0 nor 1.
     InvalidAbsFlag,
+    /// Phase 68 Track C — `ModifierSide` tag was not one of the
+    /// defined variants (`Left=0`, `Right=1`, `Either=2`).
+    InvalidModifierSide,
 }
 
 impl KeyEvent {
     /// Encode into a caller-supplied buffer. Returns the number of bytes
     /// written on success. Never allocates.
+    ///
+    /// Phase 68 wire format (20 bytes): `timestamp_ms (u64) | keycode
+    /// (u32) | symbol (u32) | modifiers (u16) | kind (u8) |
+    /// modifier_side (u8)`. The v1 layout (19 bytes) is accessible via
+    /// [`Self::encode_v1`] for the version-1 compatibility shim.
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, EventCodecError> {
         if buf.len() < KEY_EVENT_WIRE_SIZE {
             return Err(EventCodecError::Truncated);
@@ -163,6 +258,7 @@ impl KeyEvent {
         buf[12..16].copy_from_slice(&self.symbol.to_le_bytes());
         buf[16..18].copy_from_slice(&self.modifiers.0.to_le_bytes());
         buf[18] = self.kind as u8;
+        buf[19] = self.modifier_side as u8;
         Ok(KEY_EVENT_WIRE_SIZE)
     }
 
@@ -185,6 +281,12 @@ impl KeyEvent {
             2 => KeyEventKind::Repeat,
             _ => return Err(EventCodecError::InvalidKeyKind),
         };
+        let modifier_side = match buf[19] {
+            0 => ModifierSide::Left,
+            1 => ModifierSide::Right,
+            2 => ModifierSide::Either,
+            _ => return Err(EventCodecError::InvalidModifierSide),
+        };
         Ok((
             Self {
                 timestamp_ms,
@@ -192,8 +294,61 @@ impl KeyEvent {
                 symbol,
                 modifiers: ModifierState(mod_bits),
                 kind,
+                modifier_side,
             },
             KEY_EVENT_WIRE_SIZE,
+        ))
+    }
+
+    /// Encode using the pre-Phase-68 19-byte layout for a version-1
+    /// client. `modifier_side` is implicitly [`ModifierSide::Either`]
+    /// on the wire — the v1 layout never carried the field.
+    pub fn encode_v1(&self, buf: &mut [u8]) -> Result<usize, EventCodecError> {
+        if buf.len() < KEY_EVENT_WIRE_SIZE_V1 {
+            return Err(EventCodecError::Truncated);
+        }
+        if (self.modifiers.0 & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        buf[0..8].copy_from_slice(&self.timestamp_ms.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.keycode.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.symbol.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.modifiers.0.to_le_bytes());
+        buf[18] = self.kind as u8;
+        Ok(KEY_EVENT_WIRE_SIZE_V1)
+    }
+
+    /// Decode using the pre-Phase-68 19-byte layout. Sets
+    /// `modifier_side` to [`ModifierSide::Either`] — the shim
+    /// contract that lets a Phase 56 capture stream feed a Phase 68
+    /// consumer.
+    pub fn decode_v1(buf: &[u8]) -> Result<(Self, usize), EventCodecError> {
+        if buf.len() < KEY_EVENT_WIRE_SIZE_V1 {
+            return Err(EventCodecError::Truncated);
+        }
+        let timestamp_ms = u64::from_le_bytes(array8(&buf[0..8]));
+        let keycode = u32::from_le_bytes(array4(&buf[8..12]));
+        let symbol = u32::from_le_bytes(array4(&buf[12..16]));
+        let mod_bits = u16::from_le_bytes(array2(&buf[16..18]));
+        if (mod_bits & !MOD_ALL) != 0 {
+            return Err(EventCodecError::InvalidModifier);
+        }
+        let kind = match buf[18] {
+            0 => KeyEventKind::Down,
+            1 => KeyEventKind::Up,
+            2 => KeyEventKind::Repeat,
+            _ => return Err(EventCodecError::InvalidKeyKind),
+        };
+        Ok((
+            Self {
+                timestamp_ms,
+                keycode,
+                symbol,
+                modifiers: ModifierState(mod_bits),
+                kind,
+                modifier_side: ModifierSide::Either,
+            },
+            KEY_EVENT_WIRE_SIZE_V1,
         ))
     }
 }
@@ -305,6 +460,7 @@ mod tests {
             symbol: b'a' as u32,
             modifiers: ModifierState(MOD_SHIFT | MOD_CTRL),
             kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Left,
         };
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         let n = ev.encode(&mut buf).expect("encode");
@@ -322,6 +478,7 @@ mod tests {
             symbol: 0,
             modifiers: ModifierState(MOD_ALL),
             kind: KeyEventKind::Up,
+            modifier_side: ModifierSide::Right,
         };
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         ev.encode(&mut buf).expect("encode");
@@ -337,6 +494,7 @@ mod tests {
             symbol: 0x0a,
             modifiers: ModifierState::empty(),
             kind: KeyEventKind::Repeat,
+            modifier_side: ModifierSide::Either,
         };
         let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
         ev.encode(&mut buf).unwrap();
@@ -351,6 +509,7 @@ mod tests {
             symbol: 0,
             modifiers: ModifierState::empty(),
             kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Either,
         };
         let mut tiny = [0u8; KEY_EVENT_WIRE_SIZE - 1];
         assert_eq!(ev.encode(&mut tiny), Err(EventCodecError::Truncated));
@@ -366,6 +525,115 @@ mod tests {
             KeyEvent::decode(&buf).unwrap_err(),
             EventCodecError::InvalidKeyKind
         );
+    }
+
+    // Phase 68 Track C — `ModifierSide` round-trips left/right via the
+    // 20-byte layout, and an invalid tag is rejected with a typed
+    // error (the version-1 shim never produces this byte).
+    #[test]
+    fn key_event_modifier_side_left_round_trips() {
+        let ev = KeyEvent {
+            timestamp_ms: 1,
+            keycode: 0x2A,
+            symbol: 0,
+            modifiers: ModifierState(MOD_SHIFT),
+            kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Left,
+        };
+        let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
+        ev.encode(&mut buf).unwrap();
+        let (back, _) = KeyEvent::decode(&buf).unwrap();
+        assert_eq!(back.modifier_side, ModifierSide::Left);
+    }
+
+    #[test]
+    fn key_event_modifier_side_right_round_trips() {
+        let ev = KeyEvent {
+            timestamp_ms: 1,
+            keycode: 0x36,
+            symbol: 0,
+            modifiers: ModifierState(MOD_SHIFT),
+            kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Right,
+        };
+        let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
+        ev.encode(&mut buf).unwrap();
+        let (back, _) = KeyEvent::decode(&buf).unwrap();
+        assert_eq!(back.modifier_side, ModifierSide::Right);
+    }
+
+    #[test]
+    fn key_event_rejects_unknown_modifier_side_tag() {
+        let mut buf = [0u8; KEY_EVENT_WIRE_SIZE];
+        buf[19] = 9;
+        assert_eq!(
+            KeyEvent::decode(&buf).unwrap_err(),
+            EventCodecError::InvalidModifierSide
+        );
+    }
+
+    // Phase 68 Track C — version-1 compatibility shim: a v1 client
+    // captures the 19-byte legacy layout; the shim decode produces a
+    // `KeyEvent` with `modifier_side: Either` so downstream consumers
+    // see a Phase 68-shaped record.
+    #[test]
+    fn key_event_v1_decode_yields_either_side() {
+        let original = KeyEvent {
+            timestamp_ms: 7,
+            keycode: 0x1D,
+            symbol: 0,
+            modifiers: ModifierState(MOD_CTRL),
+            kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Right,
+        };
+        let mut buf = [0u8; KEY_EVENT_WIRE_SIZE_V1];
+        original.encode_v1(&mut buf).unwrap();
+        let (back, consumed) = KeyEvent::decode_v1(&buf).unwrap();
+        assert_eq!(consumed, KEY_EVENT_WIRE_SIZE_V1);
+        assert_eq!(back.modifier_side, ModifierSide::Either);
+        assert_eq!(back.keycode, original.keycode);
+        assert_eq!(back.kind, original.kind);
+    }
+
+    #[test]
+    fn downgrade_for_v1_client_strips_side() {
+        let original = KeyEvent {
+            timestamp_ms: 0,
+            keycode: 0,
+            symbol: 0,
+            modifiers: ModifierState::empty(),
+            kind: KeyEventKind::Down,
+            modifier_side: ModifierSide::Left,
+        };
+        let downgraded = downgrade_for_v1_client(original);
+        assert_eq!(downgraded.modifier_side, ModifierSide::Either);
+        assert_eq!(downgraded.keycode, original.keycode);
+        assert_eq!(downgraded.kind, original.kind);
+    }
+
+    // Phase 68 Track C — `ModifierSide::for_keycode` maps the keymap's
+    // left/right modifier keycodes to the correct side; non-modifier
+    // keys default to `Either`. The constants mirror the values in
+    // `crate::input::keymap` so this test pins the contract.
+    #[test]
+    fn modifier_side_for_left_keycodes() {
+        assert_eq!(ModifierSide::for_keycode(0x0080), ModifierSide::Left); // KEY_LSHIFT
+        assert_eq!(ModifierSide::for_keycode(0x0082), ModifierSide::Left); // KEY_LCTRL
+        assert_eq!(ModifierSide::for_keycode(0x0084), ModifierSide::Left); // KEY_LALT
+    }
+
+    #[test]
+    fn modifier_side_for_right_keycodes() {
+        assert_eq!(ModifierSide::for_keycode(0x0081), ModifierSide::Right); // KEY_RSHIFT
+        assert_eq!(ModifierSide::for_keycode(0x0083), ModifierSide::Right); // KEY_RCTRL
+        assert_eq!(ModifierSide::for_keycode(0x0085), ModifierSide::Right); // KEY_RALT
+    }
+
+    #[test]
+    fn modifier_side_for_non_modifier_is_either() {
+        assert_eq!(ModifierSide::for_keycode(0x001E), ModifierSide::Either); // KEY_A
+        assert_eq!(ModifierSide::for_keycode(0x0039), ModifierSide::Either); // KEY_SPACE
+        assert_eq!(ModifierSide::for_keycode(0), ModifierSide::Either);
     }
 
     #[test]
@@ -511,6 +779,14 @@ mod tests {
         (0u16..=MOD_ALL).prop_map(|bits| ModifierState(bits & MOD_ALL))
     }
 
+    fn arb_modifier_side() -> impl Strategy<Value = ModifierSide> {
+        prop_oneof![
+            Just(ModifierSide::Left),
+            Just(ModifierSide::Right),
+            Just(ModifierSide::Either),
+        ]
+    }
+
     fn arb_key_event() -> impl Strategy<Value = KeyEvent> {
         (
             any::<u64>(),
@@ -518,14 +794,16 @@ mod tests {
             any::<u32>(),
             arb_modifier_state(),
             arb_key_kind(),
+            arb_modifier_side(),
         )
             .prop_map(
-                |(timestamp_ms, keycode, symbol, modifiers, kind)| KeyEvent {
+                |(timestamp_ms, keycode, symbol, modifiers, kind, modifier_side)| KeyEvent {
                     timestamp_ms,
                     keycode,
                     symbol,
                     modifiers,
                     kind,
+                    modifier_side,
                 },
             )
     }

@@ -54,8 +54,8 @@ static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 static DIAG_PROTOCOL_VIOLATION_LOG_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(16);
 use crate::control::{
-    ControlSubscriptions, DebugCrashPolicy, publish_bind_triggered, publish_focus_changed,
-    publish_surface_created, publish_surface_destroyed, record_frame_sample,
+    ControlSubscriptions, DebugCrashPolicy, null_subscriber_sender, publish_bind_triggered,
+    publish_focus_changed, publish_surface_created, publish_surface_destroyed, record_frame_sample,
 };
 use crate::fb::KernelFramebufferOwner;
 use crate::input::{InputEffect, InputWiring};
@@ -504,7 +504,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             && outcome.destroyed.iter().any(|id| *id == focused_id)
         {
             focused = None;
-            publish_focus_changed(&mut control_subs, focused);
+            publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
         }
         if focused.is_none()
             && let Some((surface_id, _)) = outcome
@@ -513,7 +513,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
         {
             focused = Some(*surface_id);
-            publish_focus_changed(&mut control_subs, focused);
+            publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
         }
 
         // First-Toplevel-map gate for the input-owner service. Any
@@ -570,7 +570,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // the same SurfaceCreated event for any (id, role) pair.
         for msg in outcome.outbound.iter() {
             if let ServerMessage::SurfaceDestroyed { surface_id } = msg {
-                publish_surface_destroyed(&mut control_subs, *surface_id);
+                publish_surface_destroyed(&mut control_subs, *surface_id, null_subscriber_sender);
             }
         }
         prev_surface_ids = cur_surface_ids;
@@ -830,13 +830,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // id round-trips end-to-end. Richer payloads land
                     // alongside the bind-table API extension noted
                     // in the H.1 hand-off.
-                    publish_bind_triggered(&mut control_subs, 0, id);
+                    publish_bind_triggered(&mut control_subs, 0, id, null_subscriber_sender);
                 }
                 InputEffect::FocusChanged(id) => {
                     let prev = focused;
                     focused = Some(id);
                     if prev != focused {
-                        publish_focus_changed(&mut control_subs, focused);
+                        publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
                     }
                 }
                 InputEffect::PointerEnter(_id) | InputEffect::PointerLeave(_id) => {
@@ -1495,20 +1495,20 @@ fn publish_surface_lifecycle_deltas(
             j += 1;
         } else if p.0 < c.0 {
             // `p` was destroyed.
-            publish_surface_destroyed(subs, p);
+            publish_surface_destroyed(subs, p, null_subscriber_sender);
             i += 1;
         } else {
             // `c` is new.
-            publish_surface_created(subs, registry, c);
+            publish_surface_created(subs, registry, c, null_subscriber_sender);
             j += 1;
         }
     }
     while i < prev.len() {
-        publish_surface_destroyed(subs, prev[i]);
+        publish_surface_destroyed(subs, prev[i], null_subscriber_sender);
         i += 1;
     }
     while j < cur.len() {
-        publish_surface_created(subs, registry, cur[j]);
+        publish_surface_created(subs, registry, cur[j], null_subscriber_sender);
         j += 1;
     }
 }

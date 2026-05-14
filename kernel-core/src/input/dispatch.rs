@@ -545,6 +545,7 @@ mod tests {
             symbol: 0,
             modifiers: ModifierState(modifiers),
             kind: KeyEventKind::Down,
+            modifier_side: crate::input::events::ModifierSide::Either,
         }
     }
 
@@ -555,6 +556,7 @@ mod tests {
             symbol: 0,
             modifiers: ModifierState(modifiers),
             kind: KeyEventKind::Repeat,
+            modifier_side: crate::input::events::ModifierSide::Either,
         }
     }
 
@@ -565,6 +567,7 @@ mod tests {
             symbol: 0,
             modifiers: ModifierState(modifiers),
             kind: KeyEventKind::Up,
+            modifier_side: crate::input::events::ModifierSide::Either,
         }
     }
 

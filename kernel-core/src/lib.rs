@@ -14,6 +14,7 @@ pub mod driver_runtime;
 pub mod e1000;
 pub mod fb;
 pub mod fs;
+pub mod init;
 pub mod input;
 pub mod iommu;
 pub mod ipc;
