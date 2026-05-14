@@ -6985,8 +6985,11 @@ fn vfs_service_open(path: &str, flags: u64) -> u64 {
         None => return NEG_EINVAL,
     };
 
+    // Forward the caller's flags so `vfs_server::handle_open` can enforce
+    // its defensive flag-validation contract (reject anything other than
+    // read-only, non-creating, non-truncating opens).
     let mut msg = Message::new(VFS_OPEN);
-    msg.data[0] = 0;
+    msg.data[0] = flags;
     msg.data[1] = path.len() as u64;
     scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
 

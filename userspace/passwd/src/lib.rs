@@ -20,7 +20,11 @@
 //! - **Hash:** the final 32 SHA-256 bytes encoded as 64 hex characters.
 //!
 //! `userspace/syscall-lib/src/sha256.rs::verify_password` accepts this
-//! shape on `login` / `su` paths and refuses any other prefix.
+//! `$sha256i$` shape on `login` / `su` paths. It also still accepts the
+//! legacy `$sha256$<hex_salt>$<hex_hash>` (single-round) prefix so seeded
+//! images and existing shadow entries written before Phase 66 keep
+//! working; new writes from `passwd` / `adduser` use the iterated format
+//! exclusively.
 #![no_std]
 
 /// Canonical `/etc/shadow` field prefix for new password hashes

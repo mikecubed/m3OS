@@ -5,7 +5,7 @@
 #![no_main]
 
 use passwd::{
-    ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
+    HASH_ROUNDS, ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
     rewrite_shadow_file, user_exists,
 };
 use shadow::{ShadowError, shadow_write_atomic};
@@ -84,7 +84,8 @@ fn passwd_main(args: &[&str]) -> i32 {
         write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
         return 1;
     }
-    let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
+    let hash =
+        syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, HASH_ROUNDS);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
