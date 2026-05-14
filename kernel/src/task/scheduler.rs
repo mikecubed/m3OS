@@ -3398,22 +3398,35 @@ fn log_wake_blocked_on_reply(
     // separate ~5 LoC patch each repro. Reads the scheduler-visible mirror
     // under `scheduler_lock`; both locks the wake path held are already
     // released by the time this log call runs.
-    let (pid, name) = {
+    //
+    // The "not found" branch deliberately renders as `pid=? name=<gone>`
+    // rather than `pid=0 name=""` — `pid=0` is a real, meaningful value
+    // (the kernel BSP / idle task), so the zero-default would silently
+    // misattribute a slot-recycled task to the kernel.
+    let resolved = {
         let sched = scheduler_lock();
-        match sched.find(id) {
-            Some(idx) => (sched.tasks[idx].pid, sched.tasks[idx].name),
-            None => (0, ""),
-        }
+        sched
+            .find(id)
+            .map(|idx| (sched.tasks[idx].pid, sched.tasks[idx].name))
     };
-    log::warn!(
-        "[sched] wake_task_v2 on BlockedOnReply: task={} pid={} name={} caller={}:{} has_pending_msg={}",
-        id.0,
-        pid,
-        name,
-        caller.file(),
-        caller.line(),
-        has_pending,
-    );
+    match resolved {
+        Some((pid, name)) => log::warn!(
+            "[sched] wake_task_v2 on BlockedOnReply: task={} pid={} name={} caller={}:{} has_pending_msg={}",
+            id.0,
+            pid,
+            name,
+            caller.file(),
+            caller.line(),
+            has_pending,
+        ),
+        None => log::warn!(
+            "[sched] wake_task_v2 on BlockedOnReply: task={} pid=? name=<gone> caller={}:{} has_pending_msg={}",
+            id.0,
+            caller.file(),
+            caller.line(),
+            has_pending,
+        ),
+    }
 }
 
 fn log_spurious_block_wake(
@@ -3866,8 +3879,16 @@ pub fn wake_task_v2(id: TaskId) -> WakeOutcome {
 /// same `pi_lock` the CAS takes collapses the TOCTTOU window to zero —
 /// the deadline observation and the state transition are atomic relative
 /// to `block_current_until`'s self-revert path.
+///
+/// **Visibility note.** `pub(crate)` rather than `pub`: the precondition
+/// closure runs under both `pi_lock` and `scheduler_lock`, so any
+/// allocation, blocking call, or re-entry into the scheduler from inside
+/// the closure will deadlock. Keeping the helper scoped to the kernel
+/// crate avoids advertising that foot-gun to downstream callers without
+/// a documented use case. Promote to `pub` if and when an out-of-crate
+/// caller justifies the broader surface.
 #[track_caller]
-pub fn wake_task_v2_if(id: TaskId, precondition: impl FnOnce(&Task) -> bool) -> WakeOutcome {
+pub(crate) fn wake_task_v2_if(id: TaskId, precondition: impl FnOnce(&Task) -> bool) -> WakeOutcome {
     let caller_loc = core::panic::Location::caller();
     wake_task_v2_with(id, caller_loc, precondition)
 }
