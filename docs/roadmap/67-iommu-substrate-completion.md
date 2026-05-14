@@ -3,6 +3,7 @@
 **Status:** Planned
 **Source Ref:** phase-67
 **Depends on:** Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
+**Co-existing tip:** Phase 66 (Security and Hygiene Closeout) — Phase 67 lands on top of the 56/57/63/63a/64/66 tip; no surface contested by those phases is touched here
 **Builds on:** Closes the AMD-Vi and VT-d items that Phase 55a deferred or left as TODOs; replaces the four `todo!()` isolation-test scaffolds from Phase 55c with a real supervised-spawn + CapHandle injection harness
 **Primary Components:** kernel/src/iommu/amd.rs, kernel/src/iommu/intel.rs, userspace/drivers/nvme/tests/isolation.rs, kernel-core/iommu
 
@@ -12,7 +13,7 @@ The IOMMU substrate is complete: AMD-Vi installs a fault ISR and decodes fault e
 
 ## Why This Phase Exists
 
-Phase 55a declared its AMD-Vi fault ISR installation as Track E work that would be done, but `kernel/src/iommu/amd.rs:938` retains a `// Track E TODO` comment. VT-d scalable mode is hardcoded `false` at `intel.rs:178`, and VT-d queued invalidation is bypassed in favor of a slower register-based path at `intel.rs:722`. These are not cosmetic deferrals: without fault dispatch the IOMMU cannot report DMA violations; without queued invalidation the VT-d implementation is incompatible with scalable mode on modern hardware.
+Phase 55a declared its AMD-Vi fault ISR installation as Track E work that would be done, but `kernel/src/iommu/amd.rs:938` retains a `// Track E TODO` comment. VT-d scalable mode is hardcoded `false` at `intel.rs:178`, and VT-d has no per-domain queued-invalidation API at all — `VtdUnit::bring_up` (around `intel.rs:715`) fires a single global context-cache + IOTLB invalidation through register writes and that is the only flush path. These are not cosmetic deferrals: without fault dispatch the IOMMU cannot report DMA violations; without queued invalidation the VT-d implementation has no per-domain flush primitive and is incompatible with scalable mode on modern hardware.
 
 The isolation tests in `userspace/drivers/nvme/tests/isolation.rs` contain four `todo!()` bodies that were Phase 55c scaffolding, never replaced with real test logic.
 
@@ -35,7 +36,7 @@ A `decode_event_log_entry` function in `kernel-core::iommu::amd` parses the raw 
 
 ### VT-d queued invalidation engine
 
-Replace the register-based invalidation path (`intel.rs:722`) with a queued invalidation descriptor submission. The invalidation queue descriptor ring is allocated at IOMMU bring-up; `flush_domain`, `flush_iotlb`, and `flush_context` submit typed descriptors and poll the tail counter. No behavioral change to callers; the `IommuUnit` trait surface is unchanged.
+Today `VtdUnit::bring_up` (around `intel.rs:715`) issues a one-shot global context-cache + IOTLB invalidation through `invalidate_context_cache_global` / `invalidate_iotlb_global` and no per-domain flush API exists. Add new `flush_domain`, `flush_iotlb`, and `flush_context` methods that submit typed descriptors to a queued-invalidation ring allocated at bring-up and poll the tail counter. The existing global-invalidation calls at bring-up stay — they fire before the queue is up, and queued invalidation is not yet available at that point. The `IommuUnit` trait surface is unchanged.
 
 ### VT-d scalable mode bring-up
 
@@ -43,11 +44,11 @@ When the DMAR capability register reports scalable mode support and CR4.LA57 is 
 
 ### AMD-Vi multi-BDF domain grouping
 
-Parse IVRS Device Entry records for `IVHD_DEV_ALL` and alias entries; group BDFs that the IVRS lists as sharing a domain into a single IOMMU domain at bring-up time. Before this phase each claimed BDF received an independent domain regardless of IVRS grouping.
+The IVRS parser in `kernel-core::iommu::tables` already exposes `IvhdDeviceEntry::AliasSelect` and `IvhdDeviceEntry::AliasStartRange`. This phase adds a BDF-grouping helper (union-find over those alias entries) and threads it through `AmdVi::group_bdf_domains` so claimed BDFs that share an IVRS alias share a single `DomainId`. Before this phase each claimed BDF received an independent domain regardless of IVRS grouping.
 
 ### IOMMU isolation tests
 
-Replace the four `todo!()` bodies in `userspace/drivers/nvme/tests/isolation.rs` with real tests using a supervised-spawn harness: spawn the NVMe userspace driver, inject a `CapHandle` for a DMA buffer that belongs to a different domain, and verify that the kernel rejects the I/O at the IOMMU check point rather than allowing the cross-domain access.
+Replace the four `todo!()` bodies in `userspace/drivers/nvme/tests/isolation.rs` (`cross_device_mmio_denied_end_to_end`, `cross_device_dma_denied_end_to_end`, `capability_forge_denied_end_to_end`, `post_crash_handles_invalid_end_to_end`) with real tests using a supervised-spawn harness, and add one new test `driver_restart_resets_domain` covering the cross-restart domain-recycle path. Each test spawns one or more NVMe userspace driver instances, injects a `CapHandle` for a DMA buffer that belongs to a different domain (or a forged / stale handle), and verifies the kernel rejects the operation at the IOMMU or capability check point rather than allowing it through.
 
 ## Important Components and How They Work
 
@@ -65,28 +66,30 @@ Pure-logic decoder, host-testable. Input: 128-bit raw entry bytes. Output: `AmdV
 
 ### `userspace/drivers/nvme/tests/isolation.rs` — real isolation test harness
 
-A `SupervisedSpawn` helper starts the NVMe driver binary under the test supervisor. `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to domain B's driver instance. The test asserts that the subsequent I/O syscall returns `-EFAULT` or similar rather than succeeding.
+A `SupervisedSpawn` helper starts the NVMe driver binary under the test supervisor. `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to domain B's driver instance. The four existing scaffolds (`cross_device_mmio_denied_end_to_end`, `cross_device_dma_denied_end_to_end`, `capability_forge_denied_end_to_end`, `post_crash_handles_invalid_end_to_end`) exercise cross-device denial, capability-forge denial, and post-crash handle invalidation; the new `driver_restart_resets_domain` covers domain recycling across a supervised restart. Each test asserts the failing syscall returns the expected negative errno (`-EFAULT` / `-EBADF`) rather than succeeding.
 
 ## How This Builds on Earlier Phases
 
 - Extends Phase 55a's AMD-Vi and VT-d implementations in-place without changing the `IommuUnit` trait surface.
+- Reuses the existing IVHD parser in `kernel-core::iommu::tables` (alias variants already decoded and round-trip tested); this phase adds a grouping helper rather than a parallel parser.
 - Uses the Phase 55b supervised driver spawn infrastructure for the isolation test harness.
 - Uses Phase 55c's `CapHandle` and domain lifetime mechanics to construct the cross-domain injection scenario.
 - Updates Phase 55a and 55c design docs to mark the closed items.
+- Lands on top of the 56/57/63/63a/64/66 tip without touching any surface those phases introduced (no compositor, audio, session-manager, or DOOM-stack churn).
 
 ## Implementation Outline
 
 The AMD-Vi and VT-d branches share structural symmetry: both expose a fault-reporting path, both require a flush-invalidation pipeline, and both need a domain-grouping table. Abstract where natural — `kernel-core::iommu` should contain the pure-logic decoder and IVRS parser shared by both branches, while `kernel/src/iommu/amd.rs` and `kernel/src/iommu/intel.rs` retain the hardware-specific ISR and ring management. Avoid duplicating the event-log drain loop shape across the two files.
 
-Follow TDD for the pure-logic components: write host-side tests for `decode_event_log_entry` (covering all seven `AmdViFaultCode` variants) and `parse_ivhd_entries` (alias entries, device-all) before integrating them into the kernel ISR. The isolation tests in Track F are the QEMU top of this test pyramid — they cannot replace the host-side decoder tests.
+Follow TDD for the pure-logic components: write host-side tests for `decode_event_log_entry` (covering all seven `AmdViFaultCode` variants) and the new BDF-grouping helper (union-find over the existing `IvhdDeviceEntry::AliasSelect` / `AliasStartRange` records) before integrating them into the kernel ISR. The isolation tests in Track F are the QEMU top of this test pyramid — they cannot replace the host-side decoder tests.
 
-1. Write host-side tests for `AmdViFaultEvent` decoder and IVRS alias parser in `kernel-core`; then implement `install_fault_handler` and `drain_event_log` in `amd.rs`.
-2. Implement VT-d queued invalidation ring; wire `flush_domain`/`flush_iotlb`/`flush_context` to submit descriptors.
+1. Write host-side tests for `AmdViFaultEvent` decoder in new `kernel-core/src/iommu/amd.rs`; then implement `install_fault_handler` and `drain_event_log` in `kernel/src/iommu/amd.rs`.
+2. Implement VT-d queued invalidation ring at bring-up; add new `flush_domain`/`flush_iotlb`/`flush_context` methods that submit descriptors and poll IQH; leave the global bring-up invalidation untouched.
 3. Add scalable-mode page-table construction behind runtime capability check.
-4. Parse IVRS alias and grouping entries; implement `group_bdf_domains`.
+4. Add a BDF-grouping helper that consumes the existing `IvhdDeviceEntry` alias variants in `kernel-core/src/iommu/tables.rs`; implement `AmdVi::group_bdf_domains`.
 5. Implement `SupervisedSpawn` and `CapHandle::inject_foreign_dma` in the NVMe test harness.
-6. Replace four `todo!()` bodies with real isolation test logic.
-7. Update Phase 55a design doc (remove "Known Open Bug" section per 55c R2 closure; add Phase 67 completion note); update Phase 55c doc.
+6. Replace four `todo!()` bodies and add a fifth `driver_restart_resets_domain` test.
+7. Update Phase 55a design doc (retitle "Known Open Bug" section to record 55c R2 closure; add Phase 67 completion note); back-fill an Isolation Tests track in the Phase 55c task doc and annotate it as implemented in Phase 67.
 
 ## Acceptance Criteria
 
