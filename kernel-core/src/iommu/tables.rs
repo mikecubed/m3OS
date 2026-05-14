@@ -1101,10 +1101,25 @@ pub fn group_bdfs_by_alias(tables: &IvrsTables) -> BdfGroups {
     uf.finalize()
 }
 
+/// Walk forward from `start_idx` looking for the [`IvhdDeviceEntry::EndRange`]
+/// that terminates the range whose `StartRange` / `AliasStartRange` sits at
+/// `start_idx - 1`. The search aborts at the first nested `StartRange` or
+/// `AliasStartRange` so malformed (interleaved or nested) IVHD blocks cannot
+/// cause one range to swallow the terminator of a later range.
+///
+/// Returning `None` causes callers to collapse the outer range to its start
+/// BDF only — see the "missing terminator" rule on [`group_bdfs_by_alias`].
 fn find_range_end(entries: &[IvhdDeviceEntry], start_idx: usize) -> Option<u16> {
     for entry in &entries[start_idx..] {
-        if let IvhdDeviceEntry::EndRange { device_id, .. } = *entry {
-            return Some(device_id);
+        match *entry {
+            IvhdDeviceEntry::EndRange { device_id, .. } => return Some(device_id),
+            IvhdDeviceEntry::StartRange { .. } | IvhdDeviceEntry::AliasStartRange { .. } => {
+                // Nested or interleaved range — abort the search so the
+                // outer range collapses to its start BDF rather than
+                // hijacking the inner range's terminator.
+                return None;
+            }
+            _ => {}
         }
     }
     None
@@ -2179,6 +2194,71 @@ mod tests {
         let g = groups.group_of(0x0500).expect("singleton");
         let members = groups.members(g).expect("group exists");
         assert_eq!(members, &[0x0500]);
+    }
+
+    #[test]
+    fn group_bdfs_interleaved_alias_start_range_pairs_with_nearest_end() {
+        // Malformed but possible firmware: an AliasStartRange followed by
+        // a nested StartRange before the matching EndRange. The first
+        // range's `find_range_end` must NOT cross the inner StartRange
+        // and pick up the later EndRange — it must stop at the inner
+        // StartRange and treat its own range as a single-device alias
+        // (start BDF only) per the documented "missing terminator"
+        // collapse rule.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                // First AliasStartRange — terminator is missing (the
+                // next StartRange interrupts the search).
+                IvhdDeviceEntry::AliasStartRange {
+                    device_id: 0x0300,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                // Inner StartRange (no alias) that must abort the
+                // outer range's terminator search.
+                IvhdDeviceEntry::StartRange {
+                    device_id: 0x0400,
+                    data_setting: 0,
+                },
+                // EndRange terminates the inner StartRange only.
+                IvhdDeviceEntry::EndRange {
+                    device_id: 0x0403,
+                    data_setting: 0,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        // Outer AliasStartRange collapses to {0x0200, 0x0300}.
+        let g_outer = groups.group_of(0x0200).expect("alias source");
+        assert_eq!(
+            groups.group_of(0x0300).expect("alias target"),
+            g_outer,
+            "outer pair must share a group"
+        );
+        // The inner StartRange members [0x0400..=0x0403] must NOT join
+        // the outer pair — they are singletons in their own right.
+        for bdf in 0x0400u16..=0x0403 {
+            let g_inner = groups.group_of(bdf).expect("inner range member");
+            assert_ne!(
+                g_inner, g_outer,
+                "BDF {:#x} must not be unioned with the outer alias pair",
+                bdf
+            );
+        }
+        // BDFs strictly between the inner StartRange and the swallowed
+        // EndRange of the outer search (e.g. 0x0301..=0x0303) must not
+        // be members of any group, since the outer range collapsed to
+        // its start BDF only.
+        for bdf in 0x0301u16..=0x0303 {
+            assert!(
+                groups.group_of(bdf).is_none(),
+                "BDF {:#x} should not be grouped — outer range collapsed",
+                bdf
+            );
+        }
     }
 
     #[test]

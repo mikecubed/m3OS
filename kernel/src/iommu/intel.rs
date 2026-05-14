@@ -614,6 +614,14 @@ impl VtdUnit {
     /// `0`, the poll would observe a match against the freshly-zeroed
     /// status word *before* hardware wrote the IWAIT completion and
     /// return prematurely. We therefore skip `0` on wrap-around.
+    ///
+    /// **Preempt-off worst case**: the poll runs with
+    /// `preempt_disable()` held for up to [`IQ_POLL_LIMIT`] iterations
+    /// (matching the legacy GSTS poll discipline). On a wedged unit
+    /// that hits the timeout, preemption stays disabled for the full
+    /// duration before `FlushTimeout` is surfaced. Do not call from
+    /// latency-sensitive contexts. The `FlushTimeout` path is meant as
+    /// a "queue is wedged" signal, not a routinely-tolerable wait.
     fn submit_iwait_and_poll(&mut self) -> Result<(), IommuError> {
         let status_phys = self.iq_status_phys.ok_or(IommuError::NotAvailable)?;
         self.iq_status_marker = self.iq_status_marker.wrapping_add(1);
@@ -1273,6 +1281,13 @@ impl IommuUnit for VtdUnit {
         // per-domain path. On any QI-side failure (timeout, queue not
         // up, domain not registered yet) fall back to the global
         // register-path invalidation that Phase 55a shipped.
+        //
+        // The queued `flush_domain` performs BOTH a context-cache
+        // (CC_INV) and an IOTLB invalidation under one IWAIT. The
+        // register-path fallback must invalidate both caches as well or
+        // a wedged QI engine would silently leave stale context-cache
+        // entries behind. This mirrors `flush_context_or_global` /
+        // `flush_iotlb_or_global` used by `bind_device`.
         if self.iq_ring_phys.is_some() {
             match self.flush_domain(domain) {
                 Ok(()) => return Ok(()),
@@ -1285,6 +1300,7 @@ impl IommuUnit for VtdUnit {
                 Err(_) => {}
             }
         }
+        self.invalidate_context_cache_global();
         self.invalidate_iotlb_global();
         Ok(())
     }
