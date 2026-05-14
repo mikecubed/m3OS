@@ -12238,9 +12238,14 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
+    // Phase 66: Sticky-bit (S_ISVTX) enforcement before any inode mutation.
+    let (_, _, euid, egid) = current_process_ids();
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
-        let (_, _, euid, egid) = current_process_ids();
         if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+        let file_uid = path_metadata(name).map(|(u, _, _)| u).unwrap_or(pu);
+        if kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err() {
             return NEG_EACCES;
         }
     }
@@ -12398,12 +12403,22 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     };
 
     // Phase 27: Write+execute permission on both parent directories.
+    // Phase 66: Sticky-bit (S_ISVTX) enforcement on the source parent
+    // directory before any rename mutation. POSIX semantics: a sticky
+    // source parent gates the rename even if the destination parent is
+    // unrelated.
     {
         let (_, _, euid, egid) = current_process_ids();
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved)
-            && !check_permission(pu, pg, pm, euid, egid, 3)
-        {
-            return NEG_EACCES;
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+            let file_uid = path_metadata(&old_resolved)
+                .map(|(u, _, _)| u)
+                .unwrap_or(pu);
+            if kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err() {
+                return NEG_EACCES;
+            }
         }
         if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved)
             && !check_permission(pu, pg, pm, euid, egid, 3)

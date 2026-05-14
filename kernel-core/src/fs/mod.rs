@@ -1,5 +1,6 @@
 pub mod ext2;
 pub mod fat32;
 pub mod mbr;
+pub mod mode;
 pub mod tmpfs;
 pub mod vfs_protocol;
