@@ -1,5 +1,5 @@
 ---
-status: open
+status: resolved (2026-05-14 — `fix/wake-task-v2-precondition-race`)
 priority: medium (user-visible UX regression, intermittent, reboot-recoverable)
 date: 2026-05-14
 component: AC'97 audio pipeline — audio_server BDL refill loop ↔ IRQ-driven wake ↔ `block_current_on_reply_v2` IPC reply path
@@ -11,8 +11,38 @@ related:
   - userspace/audio_server/src/irq.rs
   - userspace/audio_server/src/stream.rs
   - userspace/audio-demo/src/main.rs
-log: not captured yet — see [Reproduction](#reproduction) for what to collect on the next occurrence
+log: m3os-audio-crash.log, m3os-audio-crash-2.log (DOOM-playback reproductions captured 2026-05-14)
 ---
+
+> **Resolved 2026-05-14.** Two user-captured DOOM-playback crash logs
+> (`m3os-audio-crash.log`, `m3os-audio-crash-2.log`) confirmed
+> Hypothesis A — the reply_v2 residual race firing under audio load.
+> Log 2 line 835 caught the exact diagnostic signature
+> (`wake_task_v2 on BlockedOnReply: task=25 caller=…:5224 has_pending_msg=false`)
+> immediately before `audio_server: recv failed`. The race fired on a
+> DOOM `audio_client` task blocked in `BlockedOnReply`; the audio_server
+> itself crashed via the `recv_msg_with_notif` spurious-wake fallback
+> returning `u64::MAX`, which `audio_server::run_io_loop`
+> (`userspace/audio_server/src/irq.rs:244-256`) treats as fatal by
+> design.
+>
+> Fix: precondition-closure refactor of `wake_task_v2` per the
+> reply_v2 tracker's design sketch — `wake_task_v2_if(id, |t| t.wake_deadline == Some(expected))`
+> runs the deadline check inside the same `pi_lock`+`scheduler_lock`
+> critical section as the state CAS, collapsing the TOCTTOU window
+> to zero. `drive_expired_wake_deadlines` switched to the new helper;
+> the redundant re-validation pass outside the lock is removed.
+> `log_wake_blocked_on_reply` also gained a one-shot pid+name capture
+> so the next reproduction (if any) names the affected task directly
+> instead of leaving "task=25" anonymous.
+>
+> Verification: two consecutive `cargo xtask doom-audio-smoke` PASS;
+> `audio-smoke`, `smoke-test`, `regression`, `cargo xtask test` (all
+> 12 kernel tests) all green.
+>
+> Original report follows for context.
+>
+> ---
 
 # Handoff — intermittent audio stutter + distortion ("morse code" pattern)
 

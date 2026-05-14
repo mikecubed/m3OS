@@ -1,16 +1,34 @@
 ---
-status: open
+status: resolved (2026-05-14 — `fix/wake-task-v2-precondition-race`)
 priority: low (tracking)
 date: 2026-05-13
 component: kernel scheduler — `drive_expired_wake_deadlines` ↔ `block_current_on_reply_v2` residual race
 related:
   - docs/handoffs/2026-05-11-phase-63-audio-irq-wake-race.md
-  - kernel/src/task/scheduler.rs (drive_expired_wake_deadlines, block_current_on_reply_v2, wake_task_v2)
+  - docs/handoffs/2026-05-14-audio-intermittent-stutter-distortion.md
+  - kernel/src/task/scheduler.rs (drive_expired_wake_deadlines, block_current_on_reply_v2, wake_task_v2, wake_task_v2_if)
 log: m3os-1h.log (1-hour idle KVM run on `fix/page-fault-reentry-guard`, 2026-05-13)
 ---
 
 # Handoff — residual `reply_v2:deadline_expired_no_deadline` spurious wakes
 
+> **Resolved 2026-05-14.** The audio_server DOOM-playback crash
+> (`docs/handoffs/2026-05-14-audio-intermittent-stutter-distortion.md`)
+> tripped this tracker's elevation criterion #2 ("a userspace caller
+> starts surfacing the retry as an observable failure"). The fix
+> sketch this doc left behind — refactor `wake_task_v2` to accept a
+> precondition closure evaluated atomically under `pi_lock` — landed
+> on `fix/wake-task-v2-precondition-race` as `wake_task_v2_if`.
+> `drive_expired_wake_deadlines` now passes
+> `|t| t.wake_deadline == Some(expected_deadline)` as the precondition;
+> the re-validation pass outside the lock is removed. Two consecutive
+> `cargo xtask doom-audio-smoke` runs PASS; `audio-smoke`, `smoke-test`,
+> `regression`, and the full 12-test `cargo xtask test` suite are all
+> green. Kept open as a record of the elevation criteria pattern —
+> for future "accepted residual" tracker work.
+>
+> Original (pre-fix) status note follows for historical context.
+>
 > **Status note.** This is a **known, already-characterized residual
 > race** documented in the Phase 63 audio handoff
 > (`docs/handoffs/2026-05-11-phase-63-audio-irq-wake-race.md`), kept
