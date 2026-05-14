@@ -6632,6 +6632,12 @@ const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
 #[allow(dead_code)]
 const O_NOFOLLOW: u64 = 0o400000;
+/// `O_NONBLOCK` (0x800). When set on the FD via `open()` the kernel must
+/// translate would-block conditions into `-EAGAIN` rather than parking.
+const O_NONBLOCK: u64 = 0o4000;
+/// `O_CLOEXEC` (0x80000). Atomically marks the new FD as close-on-exec,
+/// closing the open/fcntl race window.
+const O_CLOEXEC: u64 = 0o2000000;
 
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
 pub(super) const AT_FDCWD: u64 = (-100_i64) as u64;
@@ -6965,7 +6971,7 @@ fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
     })
 }
 
-fn vfs_service_open(path: &str, _flags: u64) -> u64 {
+fn vfs_service_open(path: &str, flags: u64) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
     use kernel_core::fs::vfs_protocol::VFS_OPEN;
@@ -7000,8 +7006,8 @@ fn vfs_service_open(path: &str, _flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
-        cloexec: false,
-        nonblock: false,
+        cloexec: flags & O_CLOEXEC != 0,
+        nonblock: flags & O_NONBLOCK != 0,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -7206,6 +7212,13 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         2 => (true, true),      // O_RDWR
         _ => return NEG_EINVAL, // invalid combination
     };
+    // Phase 66 Track C.2: honor `O_CLOEXEC` and `O_NONBLOCK` at FD
+    // construction. POSIX requires CLOEXEC to be applied atomically at
+    // `open()` to close the open/fcntl race window; NONBLOCK must take
+    // effect on the very FD `open()` returns, not only after a follow-up
+    // `fcntl(F_SETFL)`.
+    let cloexec = flags & O_CLOEXEC != 0;
+    let nonblock = flags & O_NONBLOCK != 0;
 
     // Phase 27: Permission check for existing files.
     let create = (flags & 0x40) != 0; // O_CREAT
@@ -7247,8 +7260,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7268,8 +7281,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: true,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7301,8 +7314,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                 offset: 0,
                 readable: true,
                 writable: true,
-                cloexec: false,
-                nonblock: false,
+                cloexec,
+                nonblock,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -7343,8 +7356,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7393,8 +7406,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -7423,8 +7436,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -7476,8 +7489,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
-            cloexec: false,
-            nonblock: false,
+            cloexec,
+            nonblock,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -7495,7 +7508,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     if let Some(rel) = fat32_relative_path(name) {
         if crate::fs::ext2::is_mounted() {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
         if data_is_mounted() {
@@ -7517,8 +7531,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                                 offset: 0,
                                 readable: true,
                                 writable: false,
-                                cloexec: false,
-                                nonblock: false,
+                                cloexec,
+                                nonblock,
                             };
 
                             return match alloc_fd(3, fd_entry) {
@@ -7556,8 +7570,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                             offset: initial_offset,
                             readable,
                             writable,
-                            cloexec: false,
-                            nonblock: false,
+                            cloexec,
+                            nonblock,
                         };
 
                         // Phase 31: support O_TRUNC on FAT32 — free the old
@@ -7619,8 +7633,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                                     offset: 0,
                                     readable,
                                     writable,
-                                    cloexec: false,
-                                    nonblock: false,
+                                    cloexec,
+                                    nonblock,
                                 };
 
                                 // Set ownership and permissions on the newly created file.
@@ -7660,7 +7674,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         // Check if ramdisk has this path (e.g. /bin/cat) — ramdisk takes priority.
         if crate::fs::ramdisk::ramdisk_lookup(name).is_none() {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
     }
@@ -7672,7 +7687,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             && let Some(rel) = ext2_root_path(name)
         {
             return open_ext2_file(
-                name, rel, readable, writable, create, append, truncate, mode_arg,
+                name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                nonblock,
             );
         }
         return NEG_EROFS;
@@ -7686,7 +7702,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                 && let Some(rel) = ext2_root_path(name)
             {
                 return open_ext2_file(
-                    name, rel, readable, writable, create, append, truncate, mode_arg,
+                    name, rel, readable, writable, create, append, truncate, mode_arg, cloexec,
+                    nonblock,
                 );
             }
             // Legacy: /etc/* fallback — try /data/etc/* on FAT32 only.
@@ -7710,8 +7727,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                         offset: 0,
                         readable: true,
                         writable: false,
-                        cloexec: false,
-                        nonblock: false,
+                        cloexec,
+                        nonblock,
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -7735,8 +7752,8 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
-        cloexec: false,
-        nonblock: false,
+        cloexec,
+        nonblock,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -8017,6 +8034,8 @@ fn open_ext2_file(
     append: bool,
     truncate: bool,
     mode_arg: u64,
+    cloexec: bool,
+    nonblock: bool,
 ) -> u64 {
     const NEG_EISDIR: u64 = (-21_i64) as u64;
     const NEG_ENOENT: u64 = (-2_i64) as u64;
@@ -8051,8 +8070,8 @@ fn open_ext2_file(
                     offset: 0,
                     readable: true,
                     writable: false,
-                    cloexec: false,
-                    nonblock: false,
+                    cloexec,
+                    nonblock,
                 };
                 return match alloc_fd(3, fd_entry) {
                     Some(i) => i as u64,
@@ -8093,8 +8112,8 @@ fn open_ext2_file(
                 offset: initial_offset,
                 readable,
                 writable,
-                cloexec: false,
-                nonblock: false,
+                cloexec,
+                nonblock,
             };
 
             match alloc_fd(3, fd_entry) {
@@ -8134,8 +8153,8 @@ fn open_ext2_file(
                         offset: 0,
                         readable,
                         writable,
-                        cloexec: false,
-                        nonblock: false,
+                        cloexec,
+                        nonblock,
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
