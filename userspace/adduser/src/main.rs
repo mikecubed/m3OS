@@ -149,7 +149,8 @@ pub extern "C" fn _start() -> ! {
             pos += 1;
         }
         pos += copy_to_buf(&mut new_shadow[pos..], username);
-        pos += copy_to_buf(&mut new_shadow[pos..], b":$sha256i$10000$");
+        pos += copy_to_buf(&mut new_shadow[pos..], b":");
+        pos += copy_to_buf(&mut new_shadow[pos..], passwd::HASH_FORMAT_PREFIX);
         pos += copy_to_buf(&mut new_shadow[pos..], &salt_hex[..salt_hex_len]);
         pos += copy_to_buf(&mut new_shadow[pos..], b"$");
         pos += copy_to_buf(&mut new_shadow[pos..], &hash_hex[..hash_hex_len]);

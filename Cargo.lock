@@ -15,6 +15,7 @@ dependencies = [
 name = "adduser"
 version = "0.1.0"
 dependencies = [
+ "passwd",
  "shadow",
  "syscall-lib",
 ]
@@ -2507,7 +2508,9 @@ dependencies = [
  "bootloader",
  "fatfs",
  "gpt",
+ "passwd",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

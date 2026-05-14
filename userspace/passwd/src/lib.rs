@@ -1,5 +1,36 @@
 //! Shared passwd helpers that stay usable from both the no_std binary and host-side tests.
+//!
+//! ## Password hash format (Phase 66 Track E.1)
+//!
+//! Both `/etc/shadow` writers — `passwd` (rewrite) and `adduser`
+//! (append) — store password hashes in this single canonical format:
+//!
+//! ```text
+//! $sha256i$<rounds>$<hex_salt>$<hex_hash>
+//! ```
+//!
+//! - **Algorithm:** SHA-256 iterative. The first round is
+//!   `SHA-256(salt || password)`; rounds 2..N are `SHA-256(prev_hash
+//!   || salt || password)`. Implementation: `syscall_lib::sha256::
+//!   hash_password_iterated` in-guest, mirrored byte-for-byte by the
+//!   host-side regenerator in `xtask` (`generate_seeded_shadow_line`).
+//! - **Iteration count:** [`HASH_ROUNDS`] (10000) — fixed by [`HASH_FORMAT_PREFIX`].
+//! - **Salt:** 16 random bytes from `getrandom`, encoded as 32 hex
+//!   characters.
+//! - **Hash:** the final 32 SHA-256 bytes encoded as 64 hex characters.
+//!
+//! `userspace/syscall-lib/src/sha256.rs::verify_password` accepts this
+//! shape on `login` / `su` paths and refuses any other prefix.
 #![no_std]
+
+/// Canonical `/etc/shadow` field prefix for new password hashes
+/// (Phase 66 Track E.1). The trailing `$` separates the prefix from the
+/// hex salt that follows.
+pub const HASH_FORMAT_PREFIX: &[u8] = b"$sha256i$10000$";
+
+/// SHA-256 iteration count baked into [`HASH_FORMAT_PREFIX`]. Kept as a
+/// separate named constant so xtask, passwd, and adduser cannot drift.
+pub const HASH_ROUNDS: u32 = 10000;
 
 pub fn requested_username<'a>(args: &'a [&'a str]) -> Option<&'a [u8]> {
     args.get(1).map(|name| name.as_bytes())
@@ -26,7 +57,7 @@ fn find_username<'a>(passwd: &'a [u8], username: &[u8]) -> Option<&'a [u8]> {
 
 pub fn build_hash_field(salt_hex: &[u8], hash_hex: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut pos = 0usize;
-    append_bytes(out, &mut pos, b"$sha256i$10000$").ok()?;
+    append_bytes(out, &mut pos, HASH_FORMAT_PREFIX).ok()?;
     append_bytes(out, &mut pos, salt_hex).ok()?;
     append_bytes(out, &mut pos, b"$").ok()?;
     append_bytes(out, &mut pos, hash_hex).ok()?;
