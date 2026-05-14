@@ -2,9 +2,9 @@
 
 **Status:** Planned
 **Source Ref:** phase-66
-**Depends on:** Phase 48 (Security Foundation) ✅, Phase 54a (Post-Serverization Kernel Hygiene) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅
+**Depends on:** Phase 48 (Security Foundation) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅. Phase 54a (Post-Serverization Kernel Hygiene) is Planned and completed-by-this-phase (see Track F.2 in the task list).
 **Builds on:** Closes the Phase 48 and Phase 54a trust-floor gaps that were identified but not implemented; closes supplemental-pass items F4 and F5 from the pre-1.0 blocker list; flips Phase 54a from Planned to Complete
-**Primary Components:** kernel VFS unlink/rename, userspace/passwd, userspace/adduser, kernel syscall open/openat/openat2, kernel/src/process/mod.rs, kernel/src/arch/x86_64/syscall/
+**Primary Components:** kernel VFS unlink/rename, userspace/passwd, userspace/adduser, kernel open-family syscalls (`sys_linux_open`, `sys_linux_openat`), `kernel/src/process/mod.rs` (`FdEntry`), `kernel/src/arch/x86_64/syscall/mod.rs`
 
 ## Milestone Goal
 
@@ -35,11 +35,11 @@ The kernel VFS `unlink` and `rename` handlers check S_ISVTX on the parent direct
 
 ### CLOEXEC and NONBLOCK flag plumbing
 
-`open`, `openat`, `openat2`, and `vfs_service_open` honor `O_CLOEXEC` and `O_NONBLOCK` at descriptor-creation time. FD flags are stored in the `FileDescription` struct and checked at `execve` (CLOEXEC) and at read/write (NONBLOCK). Before this phase the flags were accepted but silently discarded.
+`sys_linux_open` and `sys_linux_openat` honor `O_CLOEXEC` and `O_NONBLOCK` at descriptor-creation time by writing them into the per-FD `FdEntry` struct. CLOEXEC was already enforced for `pipe2`-created and dup-created FDs and is already honored by `execve` via `close_cloexec_fds`; the gap closed here is the `open` path, which previously accepted the flag and discarded it. `O_NONBLOCK` storage is genuinely new: `FdEntry` gains a `nonblock: bool` field and the blocking-capable `read`/`write` paths return `-EAGAIN` instead of parking when it is set.
 
 ### Layer-crossing wrapper relocation
 
-The four functions `release_socket_pub`, `epoll_free_pub`, `reap_unused_ext2_inode`, and `vfs_service_close_pub` are moved from `kernel/src/process/mod.rs` to their owning modules (`net`, `epoll`, `ext2`, `vfs`). The wrappers in `process/mod.rs` become `pub(crate)` re-exports until callers are updated.
+The four functions `release_socket_pub`, `epoll_free_pub`, `reap_unused_ext2_inode`, and `vfs_service_close_pub` currently live as wrapper bodies inside `kernel/src/arch/x86_64/syscall/mod.rs`, each reaching across into a subsystem that owns its real data (net socket table, epoll instance table, ext2 inode table, vfs-service handle table). Phase 66 moves each body into the module that owns its data: `kernel/src/net/mod.rs`, a new `kernel/src/epoll.rs`, `kernel/src/fs/ext2.rs`, and a new `kernel/src/fs/vfs_service.rs`. The two FD-teardown call sites inside `kernel/src/process/mod.rs` switch to the new paths in lock-step; no re-export shim is introduced.
 
 ### Pre-seeded image password hash format upgrade
 
@@ -47,21 +47,21 @@ The image bootstrap script and `passwd`/`adduser` are updated to use a documente
 
 ## Important Components and How They Work
 
-### `kernel/src/fs/vfs.rs` — sticky-bit checks in `unlink` and `rename`
+### `kernel/src/fs/vfs.rs` and `kernel-core/src/fs/mode.rs` — sticky-bit checks in `unlink` and `rename`
 
-A new `check_sticky` helper reads the parent directory's mode, tests S_ISVTX, and compares file owner UID to the calling process UID. Called at the top of both `sys_unlink` and `sys_rename` before any inode mutation.
+A new `kernel-core::fs::mode` module defines `S_ISVTX = 0o1000` and a host-testable `check_sticky(parent_mode, file_uid, dir_uid, caller_uid, caller_is_root)` helper. The kernel calls `check_sticky` at the top of both `sys_linux_unlink` and `sys_linux_rename` (in `kernel/src/arch/x86_64/syscall/mod.rs`) before any inode mutation, across the tmpfs, ext2, and fat32-fallback backends. The `/tmp` directory is already created in tmpfs with mode `0o1777` by `populate_mountpoints` in `kernel/src/fs/tmpfs.rs`, so no disk-image change is required — only the VFS-side enforcement.
 
-### `userspace/passwd/src/shadow.rs` and `userspace/adduser/src/shadow.rs`
+### `userspace/lib/shadow/src/lib.rs` — atomic write helper
 
-Both binaries share a `shadow_write_atomic(path, content)` helper in a new `userspace/lib/shadow` crate. The helper: opens `{path}.new` with `O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC`, writes all content, calls `fsync`, then calls `rename`. Failure at any step returns an error without touching the original file.
+A new `userspace/lib/shadow` crate exposes `shadow_write_atomic(path, content)`. The helper opens `{path}.new` with `O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC`, writes all content, calls `fsync`, then `rename`s `{path}.new` over `{path}`. Failure at any step returns an error without touching the original file. Both `userspace/passwd` and `userspace/adduser` import the crate and remove their direct `/etc/shadow` write paths.
 
-### `kernel/src/fs/file.rs` — `FileDescription` flags
+### `kernel/src/process/mod.rs` — `FdEntry` flags
 
-`O_CLOEXEC` is stored as `FdFlags::CLOEXEC` on the `FileDescription`. `execve` iterates all FDs and closes those with `CLOEXEC`. `O_NONBLOCK` is stored as `FileStatusFlags::NONBLOCK` and checked in `read` / `write` before blocking.
+`FdEntry` already carries `cloexec: bool`, and `execve` already closes CLOEXEC FDs via `close_cloexec_fds`. Phase 66 (a) makes `sys_linux_open` and `sys_linux_openat` actually propagate `O_CLOEXEC` into `FdEntry.cloexec` (today the bit is silently discarded by the open path), and (b) adds a parallel `nonblock: bool` field so `O_NONBLOCK` can finally take effect. The blocking-capable `read`/`write` paths consult `FdEntry.nonblock` and return `-EAGAIN` instead of parking when set.
 
-### `kernel/src/net/mod.rs`, `kernel/src/epoll.rs`, `kernel/src/fs/ext2/mod.rs`, `kernel/src/vfs_service.rs`
+### `kernel/src/net/mod.rs`, `kernel/src/epoll.rs` (new), `kernel/src/fs/ext2.rs`, `kernel/src/fs/vfs_service.rs` (new)
 
-Receive the four relocated functions. `process/mod.rs` retains `pub(crate)` re-exports for one release cycle to avoid breaking all call sites in a single commit.
+Receive the four relocated wrapper bodies that previously lived in `kernel/src/arch/x86_64/syscall/mod.rs`. The two FD-teardown call sites inside `kernel/src/process/mod.rs` switch to the new paths in lock-step; no re-export shim is introduced.
 
 ## How This Builds on Earlier Phases
 
@@ -72,26 +72,25 @@ Receive the four relocated functions. `process/mod.rs` retains `pub(crate)` re-e
 
 ## Implementation Outline
 
-Each item in this phase is deliberately narrow in scope (SRP): `check_sticky` touches only the VFS unlink/rename path; `shadow_write_atomic` touches only credential write paths; `FdFlags` touches only descriptor construction; the four wrapper relocations touch only module boundaries. Keep each change isolated — resist combining them into omnibus commits, as mixed diffs obscure both review and bisection.
+Each item in this phase is deliberately narrow in scope (SRP): `check_sticky` touches only the VFS unlink/rename path; `shadow_write_atomic` touches only credential write paths; the `FdEntry.cloexec`/`FdEntry.nonblock` plumbing touches only descriptor construction and the blocking-capable read/write paths; the four wrapper relocations touch only module boundaries. Keep each change isolated — resist combining them into omnibus commits, as mixed diffs obscure both review and bisection.
 
 The `shadow_write_atomic` temp-file-rename pattern is the canonical DRY target for this phase: both `passwd` and `adduser` previously duplicated the direct write path independently. The shared `userspace/lib/shadow` crate eliminates that duplication once and ensures any future credential-writing binary inherits the atomic behavior automatically.
 
-Follow TDD for the sticky-bit check: write the four unit tests (`check_sticky` with bit clear, bit set + owner match, bit set + dir owner match, bit set + neither) in `kernel-core::fs::mode` before implementing the kernel VFS hook. The QEMU integration test is the top of the pyramid, not a substitute for the host-side cases.
+Follow TDD for the sticky-bit check: write the four unit tests (`check_sticky` with bit clear, bit set + owner match, bit set + dir owner match, bit set + neither) in the new `kernel-core::fs::mode` module before wiring the kernel VFS hook. The QEMU integration test is the top of the pyramid, not a substitute for the host-side cases.
 
-1. Write host-side `check_sticky` unit tests in `kernel-core::fs::mode`; then add S_ISVTX constant and implement `check_sticky` in `kernel/src/fs/vfs.rs`.
-2. Set S_ISVTX on `/tmp` in the disk image builder.
-3. Create `userspace/lib/shadow` crate with `shadow_write_atomic`; update `passwd` and `adduser` to import from the shared crate.
-4. Add `FdFlags::CLOEXEC` and `FileStatusFlags::NONBLOCK` to `FileDescription`; wire into `open`, `openat`, `openat2`, `vfs_service_open`, `execve`, `read`, `write`.
-5. Move the four layer-crossing wrappers to their owning modules.
-6. Upgrade the pre-seeded image password hash format.
-7. Update Phase 48 and Phase 54a docs; flip Phase 54a status to Complete.
+1. Write host-side `check_sticky` unit tests in a new `kernel-core/src/fs/mode.rs`; then implement `check_sticky` and call it from `sys_linux_unlink` and `sys_linux_rename` in `kernel/src/arch/x86_64/syscall/mod.rs` for all three filesystem backends (tmpfs, ext2, fat32 fallback). The `/tmp` directory already has `0o1777` via tmpfs's `populate_mountpoints`, so no disk-image change is required.
+2. Create `userspace/lib/shadow` crate with `shadow_write_atomic`; update `passwd` and `adduser` to import from the shared crate.
+3. Add a `nonblock: bool` field to `FdEntry` in `kernel/src/process/mod.rs`; teach `sys_linux_open` / `sys_linux_openat` (via `open_user_path`) to propagate `O_CLOEXEC` and `O_NONBLOCK` into the new FD; teach the blocking-capable `read`/`write` paths to return `-EAGAIN` when `nonblock` is set.
+4. Relocate the four wrapper bodies out of `kernel/src/arch/x86_64/syscall/mod.rs` into `kernel/src/net/mod.rs`, a new `kernel/src/epoll.rs`, `kernel/src/fs/ext2.rs`, and a new `kernel/src/fs/vfs_service.rs`; update the two FD-teardown call sites in `kernel/src/process/mod.rs`.
+5. Upgrade the pre-seeded image password hash format and consolidate the hashing helper.
+6. Update Phase 48 and Phase 54a docs; flip Phase 54a status to Complete.
 
 ## Acceptance Criteria
 
 - `cargo xtask test --test sticky_bit` passes: a non-owner non-root process cannot unlink another user's file in a sticky-bit directory; the owner can.
 - `cargo xtask test --test shadow_atomic` passes: a crash injected mid-write (via `kill -9` to `passwd`) leaves `/etc/shadow` untouched and `/etc/shadow.new` containing partial content.
 - `cargo xtask test --test cloexec_fd` passes: an FD opened with `O_CLOEXEC` is not present in the child after `execve`.
-- `grep -rn 'release_socket_pub\|epoll_free_pub\|reap_unused_ext2_inode\|vfs_service_close_pub' kernel/src/process/mod.rs` returns only `pub(crate) use` lines (no function bodies).
+- `grep -n 'fn release_socket_pub\|fn epoll_free_pub\|fn reap_unused_ext2_inode\|fn vfs_service_close_pub' kernel/src/arch/x86_64/syscall/mod.rs` returns zero lines (the bodies have moved to their owning modules); `kernel/src/process/mod.rs` calls them through the new paths (`crate::net::*`, `crate::epoll::*`, `crate::fs::ext2::*`, `crate::fs::vfs_service::*`).
 - Phase 54a status field reads "Complete" in `docs/roadmap/54a-post-serverization-kernel-hygiene.md`.
 
 ## Companion Task List
