@@ -18,4 +18,5 @@ pub mod layout;
 pub mod pixel_chunk;
 pub mod protocol;
 pub mod stats;
+pub mod subscription;
 pub mod surface;
