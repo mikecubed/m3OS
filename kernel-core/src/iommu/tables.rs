@@ -862,6 +862,349 @@ fn parse_ivmd(bytes: &[u8]) -> Result<IvrsMemDefinition, IvrsParseError> {
 }
 
 // ---------------------------------------------------------------------------
+// BDF grouping over IVHD alias entries — Phase 67 Track E.1
+// ---------------------------------------------------------------------------
+
+use alloc::collections::BTreeMap;
+
+/// Group identifier handed back by [`group_bdfs_by_alias`].
+///
+/// Group IDs are dense, zero-based, and assigned in the order each
+/// group is discovered. Callers use [`BdfGroups::group_of`] to map a
+/// BDF to its [`GroupId`] in O(log n) time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupId(pub u32);
+
+/// Result of walking an [`IvrsTables`] and grouping every BDF that
+/// shares an IVRS alias chain into an equivalence class.
+///
+/// `groups[i]` is the sorted list of BDFs in group `GroupId(i as u32)`.
+/// `by_bdf` lets callers look up a BDF's group in O(log n).
+///
+/// Two BDFs end up in the same group iff:
+///
+/// - they are linked by an `IvhdDeviceEntry::AliasSelect` (single
+///   device aliased to a source), or
+/// - they fall inside an `IvhdDeviceEntry::AliasStartRange` plus its
+///   matching `IvhdDeviceEntry::EndRange` pair (every BDF in the range
+///   is aliased to the same source), or
+/// - they participate transitively in the union-find closure of those
+///   alias pairs.
+///
+/// BDFs that appear only as the source of an alias (and never as a
+/// member of any range or AliasSelect target) are still recorded as a
+/// singleton group, so callers can use `group_of` for every BDF the
+/// IVRS mentions.
+///
+/// Phase 67 Track E.2 consumes this map at AMD-Vi bring-up so the
+/// per-BDF domain map respects IVRS grouping rather than allocating an
+/// independent domain per BDF.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BdfGroups {
+    /// Per-group sorted BDF list. `groups[i.0 as usize]` is the
+    /// equivalence class for `GroupId(i)`.
+    pub groups: Vec<Vec<u16>>,
+    /// O(log n) BDF → GroupId index.
+    pub by_bdf: BTreeMap<u16, GroupId>,
+}
+
+impl BdfGroups {
+    /// Lookup the [`GroupId`] for `bdf`. Returns `None` for BDFs the
+    /// IVRS tables did not mention.
+    pub fn group_of(&self, bdf: u16) -> Option<GroupId> {
+        self.by_bdf.get(&bdf).copied()
+    }
+
+    /// Returns the BDF list for `group`, or `None` if the id is out of
+    /// range.
+    pub fn members(&self, group: GroupId) -> Option<&[u16]> {
+        self.groups.get(group.0 as usize).map(|v| v.as_slice())
+    }
+
+    /// Number of distinct groups discovered.
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+}
+
+/// Live BDF → domain assignment built on top of a static [`BdfGroups`].
+///
+/// AMD-Vi (Phase 67 Track E.2) wraps this helper so that calling
+/// `claim_device(bdf)` for two BDFs in the same IVRS alias group returns
+/// the same [`DomainId`]. The helper is allocator-agnostic: the caller
+/// supplies a closure that produces a fresh `DomainId` on the first
+/// claim per group, so this layer stays pure-logic and host-testable.
+///
+/// BDFs that the IVRS tables never mentioned still claim cleanly — the
+/// helper records the per-BDF assignment in a separate map keyed
+/// directly by BDF so it never reuses the dense [`GroupId`] number
+/// space the IVRS-derived [`BdfGroups`] owns. Callers that hand a
+/// [`GroupId`] pulled from `groups()` to [`BdfGroups::members`] therefore
+/// always see only IVRS-mentioned BDFs and never an extra-singleton.
+#[derive(Debug, Default)]
+pub struct BdfDomainAssignment {
+    groups: BdfGroups,
+    /// Indexed by GroupId. `None` until the group's first claim.
+    assigned: Vec<Option<crate::iommu::contract::DomainId>>,
+    /// On-demand singleton claims for BDFs not seen by the IVRS parser.
+    /// Keyed directly by BDF — these entries do not participate in the
+    /// [`GroupId`] space at all.
+    extra: BTreeMap<u16, crate::iommu::contract::DomainId>,
+}
+
+impl BdfDomainAssignment {
+    /// Build a new assignment table backed by `groups`.
+    pub fn new(groups: BdfGroups) -> Self {
+        let count = groups.group_count();
+        let mut assigned = Vec::with_capacity(count);
+        for _ in 0..count {
+            assigned.push(None);
+        }
+        Self {
+            groups,
+            assigned,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Claim (or look up the existing) [`DomainId`] for `bdf`. The
+    /// `alloc` closure is invoked only when the group has no domain
+    /// yet; subsequent claims in the same group return the cached id.
+    ///
+    /// The closure returns `Result<DomainId, IommuError>` so the caller
+    /// can propagate allocator failures cleanly.
+    pub fn claim<F>(
+        &mut self,
+        bdf: u16,
+        mut alloc: F,
+    ) -> Result<crate::iommu::contract::DomainId, crate::iommu::contract::IommuError>
+    where
+        F: FnMut() -> Result<crate::iommu::contract::DomainId, crate::iommu::contract::IommuError>,
+    {
+        if let Some(gid) = self.groups.group_of(bdf) {
+            let slot = &mut self.assigned[gid.0 as usize];
+            if let Some(id) = *slot {
+                return Ok(id);
+            }
+            let id = alloc()?;
+            *slot = Some(id);
+            return Ok(id);
+        }
+        // BDF outside the IVRS-mentioned set — fall back to a per-BDF
+        // singleton record. The extras map is keyed by BDF and is
+        // intentionally not part of the dense GroupId space owned by
+        // `groups`, so no GroupId collision is possible.
+        if let Some(id) = self.extra.get(&bdf) {
+            return Ok(*id);
+        }
+        let id = alloc()?;
+        self.extra.insert(bdf, id);
+        Ok(id)
+    }
+
+    /// Returns the assigned [`DomainId`] for `bdf` without allocating.
+    pub fn domain_for(&self, bdf: u16) -> Option<crate::iommu::contract::DomainId> {
+        if let Some(gid) = self.groups.group_of(bdf) {
+            return self.assigned[gid.0 as usize];
+        }
+        self.extra.get(&bdf).copied()
+    }
+
+    /// Read-only view of the underlying grouping table.
+    pub fn groups(&self) -> &BdfGroups {
+        &self.groups
+    }
+}
+
+/// Walk every IVHD block in `tables` and build a BDF equivalence-class
+/// map keyed by the alias entries the IVRS parser already decoded.
+///
+/// The algorithm is union-find over `(device_id, alias_device_id)`
+/// pairs, expanding `AliasStartRange`/`EndRange` pairs into one alias
+/// per BDF in the inclusive range before unioning. Group ids are
+/// re-numbered to be dense after the union pass so callers never see a
+/// gap.
+///
+/// `AliasStartRange` without a matching `EndRange` is treated as a
+/// single-device alias on the start BDF — this matches the AMD IVRS
+/// parsing convention that a missing terminator implies the range is a
+/// single device. The acceptance criterion requires no parser changes;
+/// this helper handles malformed inputs by collapsing them rather than
+/// returning an error.
+pub fn group_bdfs_by_alias(tables: &IvrsTables) -> BdfGroups {
+    let mut uf = UnionFind::default();
+
+    for block in &tables.ivhd_blocks {
+        let entries = &block.device_entries;
+        let mut i = 0;
+        while i < entries.len() {
+            match entries[i] {
+                IvhdDeviceEntry::AliasSelect {
+                    device_id,
+                    alias_device_id,
+                    ..
+                } => {
+                    uf.union(device_id, alias_device_id);
+                }
+                IvhdDeviceEntry::AliasStartRange {
+                    device_id,
+                    alias_device_id,
+                    ..
+                } => {
+                    // Find the matching EndRange that terminates the
+                    // range. The AMD IVRS spec pairs an AliasStartRange
+                    // with the next EndRange in the same block.
+                    let end_bdf = match find_range_end(entries, i + 1) {
+                        Some(end) => end,
+                        None => device_id,
+                    };
+                    let (lo, hi) = if device_id <= end_bdf {
+                        (device_id, end_bdf)
+                    } else {
+                        (end_bdf, device_id)
+                    };
+                    for bdf in lo..=hi {
+                        uf.union(bdf, alias_device_id);
+                    }
+                }
+                IvhdDeviceEntry::Select { device_id, .. } => {
+                    // Single-device declaration without alias — record
+                    // it as a singleton so downstream lookups see it.
+                    uf.touch(device_id);
+                }
+                IvhdDeviceEntry::StartRange { device_id, .. } => {
+                    // Range without alias — find matching EndRange,
+                    // record every BDF as its own singleton so the
+                    // map remains total over IVRS-mentioned devices.
+                    let end_bdf = match find_range_end(entries, i + 1) {
+                        Some(end) => end,
+                        None => device_id,
+                    };
+                    let (lo, hi) = if device_id <= end_bdf {
+                        (device_id, end_bdf)
+                    } else {
+                        (end_bdf, device_id)
+                    };
+                    for bdf in lo..=hi {
+                        uf.touch(bdf);
+                    }
+                }
+                IvhdDeviceEntry::EndRange { .. } => {
+                    // End-of-range; consumed by the StartRange /
+                    // AliasStartRange handler. No-op here.
+                }
+            }
+            i += 1;
+        }
+    }
+
+    uf.finalize()
+}
+
+/// Walk forward from `start_idx` looking for the [`IvhdDeviceEntry::EndRange`]
+/// that terminates the range whose `StartRange` / `AliasStartRange` sits at
+/// `start_idx - 1`. The search aborts at the first nested `StartRange` or
+/// `AliasStartRange` so malformed (interleaved or nested) IVHD blocks cannot
+/// cause one range to swallow the terminator of a later range.
+///
+/// Returning `None` causes callers to collapse the outer range to its start
+/// BDF only — see the "missing terminator" rule on [`group_bdfs_by_alias`].
+fn find_range_end(entries: &[IvhdDeviceEntry], start_idx: usize) -> Option<u16> {
+    for entry in &entries[start_idx..] {
+        match *entry {
+            IvhdDeviceEntry::EndRange { device_id, .. } => return Some(device_id),
+            IvhdDeviceEntry::StartRange { .. } | IvhdDeviceEntry::AliasStartRange { .. } => {
+                // Nested or interleaved range — abort the search so the
+                // outer range collapses to its start BDF rather than
+                // hijacking the inner range's terminator.
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Union-find specialised for the IVHD grouping problem.
+///
+/// Entries are keyed by BDF (u16). The structure is a forest stored as
+/// a `BTreeMap<u16, u16>` where each value is the parent BDF; a BDF is
+/// a root iff `parents[bdf] == bdf`.
+#[derive(Debug, Default)]
+struct UnionFind {
+    parents: BTreeMap<u16, u16>,
+}
+
+impl UnionFind {
+    fn touch(&mut self, bdf: u16) {
+        self.parents.entry(bdf).or_insert(bdf);
+    }
+
+    fn find(&mut self, bdf: u16) -> u16 {
+        self.touch(bdf);
+        let mut current = bdf;
+        loop {
+            let parent = *self.parents.get(&current).expect("touched");
+            if parent == current {
+                break;
+            }
+            current = parent;
+        }
+        // Path compression — flatten the chain from `bdf` to `current`.
+        let root = current;
+        let mut node = bdf;
+        loop {
+            let parent = *self.parents.get(&node).expect("touched");
+            if parent == node {
+                break;
+            }
+            self.parents.insert(node, root);
+            node = parent;
+        }
+        root
+    }
+
+    fn union(&mut self, a: u16, b: u16) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        // Deterministic merge: lower BDF becomes the root so the
+        // generated GroupId numbering is stable across runs.
+        let (root, child) = if ra < rb { (ra, rb) } else { (rb, ra) };
+        self.parents.insert(child, root);
+    }
+
+    fn finalize(mut self) -> BdfGroups {
+        let bdfs: Vec<u16> = self.parents.keys().copied().collect();
+        // First pass: assign a dense GroupId per root, in order of
+        // ascending root BDF.
+        let mut root_to_group: BTreeMap<u16, GroupId> = BTreeMap::new();
+        let mut groups: Vec<Vec<u16>> = Vec::new();
+        for bdf in &bdfs {
+            let root = self.find(*bdf);
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = root_to_group.entry(root) {
+                let gid = GroupId(groups.len() as u32);
+                slot.insert(gid);
+                groups.push(Vec::new());
+            }
+        }
+        // Second pass: place every BDF into its group's member list.
+        let mut by_bdf: BTreeMap<u16, GroupId> = BTreeMap::new();
+        for bdf in &bdfs {
+            let root = self.find(*bdf);
+            let gid = *root_to_group.get(&root).expect("assigned in first pass");
+            groups[gid.0 as usize].push(*bdf);
+            by_bdf.insert(*bdf, gid);
+        }
+        // Member lists are inserted in BTreeMap iteration order
+        // (ascending BDF), so they are already sorted.
+        BdfGroups { groups, by_bdf }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1699,5 +2042,391 @@ mod tests {
             garbage.extend_from_slice(&bytes);
             let _ = decode_ivrs(&garbage);
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 67 Track E.1 — BDF grouping over IVHD alias entries
+    // ----------------------------------------------------------------------
+
+    fn ivhd_block_with_entries(entries: Vec<IvhdDeviceEntry>) -> IvhdBlock {
+        IvhdBlock {
+            block_type: IVHD_TYPE_40H,
+            flags: 0,
+            length: 0,
+            device_id: 0,
+            capability_offset: 0,
+            iommu_base_address: 0,
+            pci_segment: 0,
+            iommu_info: 0,
+            iommu_feature_info: 0,
+            device_entries: entries,
+        }
+    }
+
+    #[test]
+    fn group_bdfs_single_alias_select_unions_pair() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        // Both BDFs should land in the same group.
+        let g_target = groups.group_of(0x0210).expect("device_id present");
+        let g_source = groups.group_of(0x0200).expect("alias_device_id present");
+        assert_eq!(g_target, g_source);
+        let members = groups.members(g_target).expect("group exists");
+        assert_eq!(members, &[0x0200, 0x0210]);
+    }
+
+    #[test]
+    fn group_bdfs_alias_start_range_with_end_unions_full_range() {
+        // Range [0x0300..=0x0303] all alias to 0x0200.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasStartRange {
+                    device_id: 0x0300,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                IvhdDeviceEntry::EndRange {
+                    device_id: 0x0303,
+                    data_setting: 0,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let g = groups.group_of(0x0200).expect("source");
+        for bdf in 0x0300u16..=0x0303 {
+            let g_member = groups.group_of(bdf).expect("range member");
+            assert_eq!(
+                g, g_member,
+                "BDF {:#x} should share the source's group",
+                bdf
+            );
+        }
+        let members = groups.members(g).expect("group exists");
+        assert_eq!(members.len(), 5, "0x0200 + 4 range members = 5");
+    }
+
+    #[test]
+    fn group_bdfs_union_find_merges_transitive_alias_pairs() {
+        // Two alias pairs that transitively merge:
+        //   (0x0210 -> 0x0200) and (0x0220 -> 0x0210)
+        // After union, all three BDFs share a single group.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0220,
+                    data_setting: 0,
+                    alias_device_id: 0x0210,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let g = groups.group_of(0x0200).expect("first BDF in chain");
+        assert_eq!(groups.group_of(0x0210).unwrap(), g);
+        assert_eq!(groups.group_of(0x0220).unwrap(), g);
+        let members = groups.members(g).expect("group exists");
+        assert_eq!(members, &[0x0200, 0x0210, 0x0220]);
+    }
+
+    #[test]
+    fn group_bdfs_independent_alias_pairs_get_separate_group_ids() {
+        // Two unrelated alias pairs — they must end up in different
+        // groups, and the GroupId values must be dense (0 and 1).
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0410,
+                    data_setting: 0,
+                    alias_device_id: 0x0400,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        assert_eq!(groups.groups.len(), 2);
+        let g1 = groups.group_of(0x0200).unwrap();
+        let g2 = groups.group_of(0x0400).unwrap();
+        assert_ne!(g1, g2);
+        // Dense, zero-based ids.
+        assert!(g1.0 < 2 && g2.0 < 2);
+    }
+
+    #[test]
+    fn group_bdfs_select_entries_become_singletons() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![IvhdDeviceEntry::Select {
+                device_id: 0x0500,
+                data_setting: 0,
+            }])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let g = groups.group_of(0x0500).expect("singleton");
+        let members = groups.members(g).expect("group exists");
+        assert_eq!(members, &[0x0500]);
+    }
+
+    #[test]
+    fn group_bdfs_interleaved_alias_start_range_pairs_with_nearest_end() {
+        // Malformed but possible firmware: an AliasStartRange followed by
+        // a nested StartRange before the matching EndRange. The first
+        // range's `find_range_end` must NOT cross the inner StartRange
+        // and pick up the later EndRange — it must stop at the inner
+        // StartRange and treat its own range as a single-device alias
+        // (start BDF only) per the documented "missing terminator"
+        // collapse rule.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                // First AliasStartRange — terminator is missing (the
+                // next StartRange interrupts the search).
+                IvhdDeviceEntry::AliasStartRange {
+                    device_id: 0x0300,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                // Inner StartRange (no alias) that must abort the
+                // outer range's terminator search.
+                IvhdDeviceEntry::StartRange {
+                    device_id: 0x0400,
+                    data_setting: 0,
+                },
+                // EndRange terminates the inner StartRange only.
+                IvhdDeviceEntry::EndRange {
+                    device_id: 0x0403,
+                    data_setting: 0,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        // Outer AliasStartRange collapses to {0x0200, 0x0300}.
+        let g_outer = groups.group_of(0x0200).expect("alias source");
+        assert_eq!(
+            groups.group_of(0x0300).expect("alias target"),
+            g_outer,
+            "outer pair must share a group"
+        );
+        // The inner StartRange members [0x0400..=0x0403] must NOT join
+        // the outer pair — they are singletons in their own right.
+        for bdf in 0x0400u16..=0x0403 {
+            let g_inner = groups.group_of(bdf).expect("inner range member");
+            assert_ne!(
+                g_inner, g_outer,
+                "BDF {:#x} must not be unioned with the outer alias pair",
+                bdf
+            );
+        }
+        // BDFs strictly between the inner StartRange and the swallowed
+        // EndRange of the outer search (e.g. 0x0301..=0x0303) must not
+        // be members of any group, since the outer range collapsed to
+        // its start BDF only.
+        for bdf in 0x0301u16..=0x0303 {
+            assert!(
+                groups.group_of(bdf).is_none(),
+                "BDF {:#x} should not be grouped — outer range collapsed",
+                bdf
+            );
+        }
+    }
+
+    #[test]
+    fn group_bdfs_empty_tables_produces_empty_groups() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: Vec::new(),
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        assert!(groups.groups.is_empty());
+        assert!(groups.by_bdf.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase 67 Track E.2 — BdfDomainAssignment integration
+    // ----------------------------------------------------------------------
+
+    use crate::iommu::contract::{DomainId, IommuError};
+
+    fn alloc_seq(
+        next: &core::cell::Cell<u32>,
+    ) -> impl FnMut() -> Result<DomainId, IommuError> + '_ {
+        move || {
+            let id = next.get();
+            next.set(id + 1);
+            Ok(DomainId(id))
+        }
+    }
+
+    #[test]
+    fn bdf_domain_assignment_grouped_bdfs_share_domain() {
+        // Build a group: 0x0210 -> 0x0200 via AliasSelect.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        let counter = core::cell::Cell::new(1);
+        let id_a = assign.claim(0x0200, alloc_seq(&counter)).unwrap();
+        let id_b = assign.claim(0x0210, alloc_seq(&counter)).unwrap();
+        assert_eq!(
+            id_a, id_b,
+            "grouped BDFs must share a DomainId per acceptance"
+        );
+        // Counter advanced exactly once.
+        assert_eq!(counter.get(), 2, "single allocation across the pair");
+    }
+
+    #[test]
+    fn bdf_domain_assignment_independent_groups_get_separate_ids() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0410,
+                    data_setting: 0,
+                    alias_device_id: 0x0400,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        let counter = core::cell::Cell::new(1);
+        let g1_a = assign.claim(0x0200, alloc_seq(&counter)).unwrap();
+        let g1_b = assign.claim(0x0210, alloc_seq(&counter)).unwrap();
+        let g2_a = assign.claim(0x0400, alloc_seq(&counter)).unwrap();
+        let g2_b = assign.claim(0x0410, alloc_seq(&counter)).unwrap();
+        assert_eq!(g1_a, g1_b);
+        assert_eq!(g2_a, g2_b);
+        assert_ne!(g1_a, g2_a);
+    }
+
+    #[test]
+    fn bdf_domain_assignment_unknown_bdf_gets_singleton_domain() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: Vec::new(),
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        let counter = core::cell::Cell::new(1);
+        let a = assign.claim(0x1234, alloc_seq(&counter)).unwrap();
+        let a_again = assign.claim(0x1234, alloc_seq(&counter)).unwrap();
+        let b = assign.claim(0x5678, alloc_seq(&counter)).unwrap();
+        assert_eq!(a, a_again, "repeated claim of same BDF returns cached id");
+        assert_ne!(a, b, "distinct BDFs get distinct domains");
+    }
+
+    #[test]
+    fn bdf_domain_assignment_extras_do_not_leak_into_group_id_space() {
+        // IVRS declares one group (alias pair); a later claim of an
+        // unrelated BDF must not appear under any GroupId in
+        // `groups()`, so external code that iterates IVRS groups never
+        // observes the extras.
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0210,
+                    data_setting: 0,
+                    alias_device_id: 0x0200,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        let counter = core::cell::Cell::new(1);
+        let _ivrs_id = assign.claim(0x0200, alloc_seq(&counter)).unwrap();
+        let _extra_id = assign.claim(0xFFFE, alloc_seq(&counter)).unwrap();
+        let g = assign.groups();
+        // The IVRS-derived group still lists exactly the original BDFs,
+        // and there is no second group for the extra-singleton claim.
+        assert_eq!(g.group_count(), 1);
+        let members = g.members(GroupId(0)).unwrap();
+        assert!(members.contains(&0x0200));
+        assert!(members.contains(&0x0210));
+        assert!(!members.contains(&0xFFFE));
+        // `groups.group_of` for the extra BDF stays None so callers
+        // that route via `groups()` never accidentally pick it up.
+        assert!(g.group_of(0xFFFE).is_none());
+    }
+
+    #[test]
+    fn bdf_domain_assignment_domain_for_returns_cached_value() {
+        let tables = IvrsTables {
+            header: None,
+            ivhd_blocks: vec![ivhd_block_with_entries(vec![
+                IvhdDeviceEntry::AliasSelect {
+                    device_id: 0x0810,
+                    data_setting: 0,
+                    alias_device_id: 0x0800,
+                },
+            ])],
+            ivmds: Vec::new(),
+            unknown_blocks: 0,
+        };
+        let groups = group_bdfs_by_alias(&tables);
+        let mut assign = BdfDomainAssignment::new(groups);
+        // Before claim, neither BDF has a domain.
+        assert!(assign.domain_for(0x0800).is_none());
+        assert!(assign.domain_for(0x0810).is_none());
+        let counter = core::cell::Cell::new(7);
+        let id = assign.claim(0x0800, alloc_seq(&counter)).unwrap();
+        // After claim, both BDFs see the same cached id without
+        // invoking the allocator again.
+        assert_eq!(assign.domain_for(0x0800), Some(id));
+        assert_eq!(assign.domain_for(0x0810), Some(id));
     }
 }

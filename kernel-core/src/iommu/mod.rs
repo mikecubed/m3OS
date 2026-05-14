@@ -19,6 +19,7 @@
 //!   descriptors, reserved-region sets).
 
 pub mod acpi_integration;
+pub mod amd;
 pub mod amdvi_page_table;
 pub mod amdvi_regs;
 pub mod bar_coverage;

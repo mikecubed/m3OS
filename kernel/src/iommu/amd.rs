@@ -42,22 +42,23 @@
 
 #![allow(dead_code)] // Phase 55a wiring lands in Track E; symbols used by tests only until then.
 
-use crate::task::scheduler::IrqSafeMutex;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use kernel_core::iommu::amd::{AmdViFaultEvent, decode_event_log_entry};
 use kernel_core::iommu::amdvi_page_table::{AmdViPageTableEntry, AmdViPteFlags};
 use kernel_core::iommu::amdvi_regs::{
-    CommandEntry, ControlBits, DeviceTableEntry, EventCode, EventEntry, PFN_MASK_40,
-    REG_CMD_BUF_BAR, REG_CMD_BUF_HEAD, REG_CMD_BUF_TAIL, REG_CONTROL, REG_DEV_TAB_BAR,
-    REG_EVENT_LOG_BAR, REG_EVENT_LOG_HEAD, REG_EVENT_LOG_TAIL, REG_EXT_FEATURE, REG_MSI_ADDR_HI,
-    REG_MSI_ADDR_LO, REG_MSI_CTRL, REG_MSI_DATA,
+    CommandEntry, ControlBits, DeviceTableEntry, PFN_MASK_40, REG_CMD_BUF_BAR, REG_CMD_BUF_HEAD,
+    REG_CMD_BUF_TAIL, REG_CONTROL, REG_DEV_TAB_BAR, REG_EVENT_LOG_BAR, REG_EVENT_LOG_HEAD,
+    REG_EVENT_LOG_TAIL, REG_EXT_FEATURE, REG_MSI_ADDR_HI, REG_MSI_ADDR_LO, REG_MSI_CTRL,
+    REG_MSI_DATA,
 };
 use kernel_core::iommu::contract::{
     DmaDomain, DomainError, DomainId, FaultHandlerFn, FaultRecord, IommuCapabilities, IommuError,
     IommuUnit, Iova, MapFlags, PhysAddr,
 };
+use kernel_core::iommu::tables::{BdfDomainAssignment, BdfGroups, group_bdfs_by_alias};
 
 // ---------------------------------------------------------------------------
 // Sizing constants
@@ -88,6 +89,27 @@ const DOMAIN_IOVA_TOP: u64 = 1u64 << 48;
 const CMD_BUF_LEN_ENCODING: u64 = 8;
 /// EventLog length encoding — same shape as CMD_BUF_BAR.
 const EVENT_LOG_LEN_ENCODING: u64 = 8;
+
+/// Phase 67 Track A.2 — maximum events drained per ISR invocation.
+///
+/// AMD-Vi's event-log ring is 256 entries (`EVENT_LOG_BYTES / 16`). The
+/// drain loop must be bounded to avoid the ISR spinning indefinitely if
+/// firmware floods the ring; we cap at one ring's worth so a single
+/// invocation can recover a full backlog without revisiting it. Entries
+/// beyond the bound advance a named overflow counter
+/// ([`EVENT_LOG_OVERFLOW`]) and are left for the next invocation.
+pub const EVENT_LOG_RING_DEPTH: usize = (EVENT_LOG_BYTES / 16) as usize;
+
+/// Monotonic count of event-log entries the ISR observed but could not
+/// drain within the per-invocation bound. Read by diagnostic tooling and
+/// the Track A.2 QEMU smoke test.
+pub static EVENT_LOG_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+/// Monotonic count of events drained by the AMD-Vi event-log ISR since
+/// boot. Mirrors the VT-d fault-counter pattern in
+/// [`crate::iommu::fault::fault_count`] so diagnostic tools can confirm
+/// the IRQ is actually firing without parsing serial output.
+pub static EVENT_LOG_DRAINS: AtomicU32 = AtomicU32::new(0);
 
 /// Monotonic allocator for [`DomainId`] values within a unit.
 static NEXT_DOMAIN_ID: AtomicU32 = AtomicU32::new(1);
@@ -144,6 +166,12 @@ pub struct AmdViUnit {
     domains: Vec<DomainState>,
     /// Installed fault handler, invoked on every event-log record.
     fault_handler: Option<FaultHandlerFn>,
+    /// Per-Phase 67 Track E: BDF → group → DomainId map populated from
+    /// the IVRS alias entries at bring-up. When a claim arrives for a
+    /// BDF that shares an IVRS alias group with another BDF, the same
+    /// `DomainId` is returned so the requester pair points at a single
+    /// domain rather than two split ones.
+    bdf_domains: Option<BdfDomainAssignment>,
 }
 
 /// Per-domain bookkeeping. Keeps enough state to tear down cleanly when
@@ -158,8 +186,10 @@ struct DomainState {
     bdf: Option<u16>,
 }
 
-// SAFETY: AmdViUnit is only accessed through `UNITS` behind an [`IrqSafeMutex`];
-// the MMIO virtual address remains valid for the lifetime of the kernel
+// SAFETY: AmdViUnit is only accessed either through the kernel-side IOMMU
+// registry (`Box<AmdViUnit>` behind `crate::iommu::registry::REGISTRY`'s
+// `IrqSafeMutex`) or via the fault-IRQ trampoline, which runs with IF=0.
+// The MMIO virtual address remains valid for the lifetime of the kernel
 // because the phys-offset map is installed before any IOMMU init runs.
 unsafe impl Send for AmdViUnit {}
 
@@ -220,6 +250,7 @@ impl AmdViUnit {
             caps: None,
             domains: Vec::new(),
             fault_handler: None,
+            bdf_domains: None,
         })
     }
 
@@ -386,71 +417,110 @@ impl AmdViUnit {
 // ---------------------------------------------------------------------------
 
 impl AmdViUnit {
-    /// Drain the event-log ring, decoding each entry and invoking the
-    /// installed fault handler. Safe to call from IRQ or polled context.
+    /// Phase 67 Track A.2 — drain the event-log ring.
     ///
-    /// Returns the number of events drained.
-    pub fn process_events(&mut self) -> usize {
+    /// Reads EVTLOG_HEAD and EVTLOG_TAIL, iterates each pending entry
+    /// up to [`EVENT_LOG_RING_DEPTH`], decodes the raw 16-byte record
+    /// through [`decode_event_log_entry`], dispatches the resulting
+    /// [`AmdViFaultEvent`] to the shared fault logger and the
+    /// installed user handler, and finally advances HEAD so hardware
+    /// observes the drain.
+    ///
+    /// Bounded loop semantics: the drain stops at
+    /// `EVENT_LOG_RING_DEPTH` entries even if more are visible.
+    /// Entries that would have been processed past that bound advance
+    /// the named [`EVENT_LOG_OVERFLOW`] counter; the next ISR
+    /// invocation (or the next polled call) picks them up. This keeps
+    /// the ISR latency bounded regardless of firmware behaviour.
+    ///
+    /// Safe to call from IRQ or polled context — performs no
+    /// allocation and no blocking.
+    ///
+    /// Returns the number of events actually drained on this
+    /// invocation.
+    pub fn drain_event_log(&mut self) -> usize {
         let ring_entries = EVENT_LOG_BYTES / 16;
         let hw_tail = self.read_reg(REG_EVENT_LOG_TAIL) / 16;
-        let mut count = 0usize;
-        while self.event_head != hw_tail {
+        let mut count: usize = 0;
+        while self.event_head != hw_tail && count < EVENT_LOG_RING_DEPTH {
             let slot_phys = self.event_log_phys + self.event_head * 16;
             // SAFETY: event_log_phys is a 4 KiB ring; slot < ring_entries.
-            let (w0, w1) = unsafe {
-                let ptr = phys_to_virt(slot_phys) as *const u64;
-                (read_volatile(ptr), read_volatile(ptr.add(1)))
+            let raw: [u8; 16] = unsafe {
+                let ptr = phys_to_virt(slot_phys);
+                let mut buf = [0u8; 16];
+                core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16);
+                buf
             };
-            let event = EventEntry::new(w0, w1);
-            let decoded = event.decode();
+            // Phase 67 Track A.2 uses the typed kernel-core decoder so
+            // every event funnels through the same code path host
+            // tests cover.
+            let event: AmdViFaultEvent = decode_event_log_entry(&raw)
+                .expect("decode_event_log_entry is total over [u8; 16]");
             let record = FaultRecord {
-                requester_bdf: decoded.device_id,
-                fault_reason: decoded.code as u16,
-                iova: Iova(decoded.address),
+                requester_bdf: event.requestor_bdf,
+                fault_reason: event.fault_code.to_raw() as u16,
+                iova: Iova(event.iova),
             };
-            // Use the shared fault-event logger (Track C's fault.rs) so the
-            // log format is identical across VT-d and AMD-Vi — required by
-            // the task list's DRY rule for fault logging.
+            // Shared fault-event logger so the log format is identical
+            // across VT-d and AMD-Vi (Phase 55a DRY rule).
             crate::iommu::fault::log_fault_event(
                 "amdvi",
                 record.requester_bdf,
                 record.iova.0,
                 record.fault_reason,
             );
-            // Additional AMD-Vi-specific context useful for debugging but
-            // not part of the shared format.
+            // Additional AMD-Vi-specific context useful for debugging
+            // but not part of the shared format. `domain` is restored
+            // from header bits 47:32 to retain parity with the
+            // pre-Phase-67 `EventEntry::decode` log line.
             log::warn!(
-                "[iommu] amdvi-detail: unit={} domain={:#x} event_code={}",
+                "[iommu] amdvi-detail: unit={} domain={:#x} event_code={} flags={:#x}",
                 self.unit_index,
-                decoded.domain_id,
-                event_code_name(decoded.code),
+                event.domain_id,
+                event.fault_code,
+                event.flags,
             );
             if let Some(handler) = self.fault_handler {
                 handler(&record);
             }
             self.event_head = (self.event_head + 1) % ring_entries;
             count += 1;
+            EVENT_LOG_DRAINS.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.event_head != hw_tail {
+            // Hit the per-invocation bound with more entries pending.
+            // Account every remaining entry against the overflow counter
+            // so external observers can see the pressure.
+            let pending = if hw_tail >= self.event_head {
+                hw_tail - self.event_head
+            } else {
+                (ring_entries - self.event_head) + hw_tail
+            };
+            EVENT_LOG_OVERFLOW.fetch_add(pending as u32, Ordering::Relaxed);
+            log::warn!(
+                "[amdvi] event-log drain hit bound: drained={} pending={}",
+                count,
+                pending
+            );
         }
         if count > 0 {
-            // Update the head register so hardware sees the drain.
+            // Update HEAD so hardware sees the drain.
             self.write_reg(REG_EVENT_LOG_HEAD, self.event_head * 16);
         }
         count
     }
-}
 
-/// Human-readable name for an AMD-Vi event-log code, used in the
-/// `amdvi-detail` log line emitted alongside the shared structured fault
-/// event.
-fn event_code_name(code: u8) -> &'static str {
-    match code {
-        EventCode::ILLEGAL_DEV_TABLE_ENTRY => "illegal_dev_table_entry",
-        EventCode::IO_PAGE_FAULT => "io_page_fault",
-        EventCode::DEV_TAB_HW_ERROR => "dev_tab_hw_error",
-        EventCode::PAGE_TAB_HW_ERROR => "page_tab_hw_error",
-        _ => "unknown",
+    /// Legacy alias retained for callers that pre-date Track A. Phase
+    /// 67 Track A renamed the entry point to `drain_event_log`; this
+    /// shim keeps existing callers working without churn.
+    #[allow(dead_code)]
+    pub fn process_events(&mut self) -> usize {
+        self.drain_event_log()
     }
 }
+
+// Phase 67 Track A — event_code_name was replaced by
+// AmdViFaultCode::name() / Display from kernel-core.
 
 // ---------------------------------------------------------------------------
 // MSI programming for the IOMMU interrupt
@@ -706,16 +776,34 @@ impl IommuUnit for AmdViUnit {
 
     fn install_fault_handler(&mut self, handler: FaultHandlerFn) -> Result<(), IommuError> {
         self.fault_handler = Some(handler);
-        // Vector allocation for Phase 55a: reserve one from the pool.
-        // The IRQ dispatcher wiring (`install_msi_irq`-style) is Track E's
-        // job; we program the AMD-Vi MSI registers against the vector now
-        // so the unit knows where to send event-log interrupts.
-        if let Some(vector) = crate::pci::reserve_msi_vectors(1) {
-            self.install_msi(vector);
-            Ok(())
-        } else {
-            Err(IommuError::HardwareFault)
-        }
+        // Phase 67 Track A.1 — register the per-unit IRQ trampoline in
+        // the device-IRQ bank before programming MSI so the vector is
+        // immediately routable when the AMD-Vi hardware delivers an
+        // event-log interrupt. The trampoline calls
+        // [`AmdViUnit::drain_event_log`] on each registered unit; the
+        // unit registers itself into [`UNIT_SLOTS`] right after the
+        // vector reservation succeeds. Idempotent: a re-install on the
+        // same unit replaces the handler in place without claiming a
+        // second vector or growing the slot array.
+        register_unit_slot(self as *mut AmdViUnit)?;
+        let vector = match reserve_fault_vector() {
+            Ok(v) => v,
+            Err(msg) => {
+                log::warn!(
+                    "[amdvi] unit[{}] fault IRQ reservation failed: {}",
+                    self.unit_index,
+                    msg
+                );
+                return Err(IommuError::HardwareFault);
+            }
+        };
+        self.install_msi(vector);
+        log::info!(
+            "[iommu] iommu.amd.fault_isr=installed unit={} vector={:#x}",
+            self.unit_index,
+            vector,
+        );
+        Ok(())
     }
 
     fn capabilities(&self) -> IommuCapabilities {
@@ -925,20 +1013,251 @@ impl AmdViUnit {
 }
 
 // ---------------------------------------------------------------------------
-// Unit registry
+// Phase 67 Track E — multi-BDF domain grouping
 // ---------------------------------------------------------------------------
 
-/// Registry of AMD-Vi units discovered during ACPI init. Populated by
-/// Track E's wiring; the registry type and mutex shape are defined here
-/// so the `IommuUnit` dispatch surface is local to this module.
+impl AmdViUnit {
+    /// Install (or replace) the BDF → alias-group map for this unit.
+    ///
+    /// Typically called from `iommu::init` after the IVRS tables have
+    /// been parsed: walk every IVHD block, run
+    /// [`kernel_core::iommu::tables::group_bdfs_by_alias`] over the
+    /// decoded entries, and hand the result to this method so that
+    /// subsequent [`AmdViUnit::claim_device`] calls return a shared
+    /// `DomainId` for BDFs in the same equivalence class.
+    ///
+    /// Idempotent: passing the same groups again resets any per-group
+    /// claims to "unclaimed". Phase 55a kept one domain per claimed
+    /// BDF; Phase 67 makes that the default per IVRS group.
+    pub fn group_bdf_domains(&mut self, groups: BdfGroups) {
+        self.bdf_domains = Some(BdfDomainAssignment::new(groups));
+    }
+
+    /// Allocate (or look up) the translation [`DomainId`] for the PCI
+    /// requester identified by `bdf`.
+    ///
+    /// First call for any BDF in an IVRS alias group allocates a fresh
+    /// `DomainId` via [`AmdViUnit::create_domain`]. Subsequent calls
+    /// for *any* BDF in the same group return the cached `DomainId`
+    /// without allocating a new domain.
+    ///
+    /// **Domain-id allocator only.** This method does not program the
+    /// AMD-Vi device-table to route the BDF's DMA traffic at the
+    /// returned domain — Phase 55a left that wiring out of the AMD-Vi
+    /// path entirely (the registry's `bind_pci_device` returns
+    /// `IommuError::NotAvailable` for AMD-Vi units). Until per-BDF
+    /// device-table programming lands as a follow-up, the BDF
+    /// continues to hit whatever device-table entry the unit started
+    /// with. Callers that rely on translated DMA on AMD-Vi platforms
+    /// are responsible for that gap; the grouping layer here only
+    /// guarantees that two grouped BDFs see the same `DomainId`.
+    ///
+    /// Phase 67 Track E.2 acceptance: two grouped BDFs share a domain
+    /// id. When `bdf_domains` has not been populated (no IVRS or pre-
+    /// Phase-67 boot), each call still produces an independent domain
+    /// via `create_domain` — the grouping layer is opt-in.
+    pub fn claim_device(&mut self, bdf: u16) -> Result<DomainId, IommuError> {
+        if !self.brought_up {
+            return Err(IommuError::NotAvailable);
+        }
+        // Pre-Phase-67 fallback: no grouping installed, return a fresh
+        // domain on every call (matching Phase 55a behavior).
+        if self.bdf_domains.is_none() {
+            let domain = self.create_domain()?;
+            return Ok(domain.id());
+        }
+        // Phase 67 path: consult the grouping table. The
+        // `BdfDomainAssignment::claim` closure must produce a fresh
+        // `DomainId` on first-claim-per-group. We delegate to
+        // `create_domain` which already allocates a page-table root,
+        // pre-maps reserved regions, and pushes a `DomainState`.
+        //
+        // We need to move the assignment out of `self` while we hold
+        // `&mut self` for `create_domain` (the closure may call
+        // `create_domain` on `self`). Use `Option::take` + restore on
+        // the way out so the borrow checker is satisfied.
+        let mut assign = self.bdf_domains.take().expect("checked is_some above");
+        let result = assign.claim(bdf, || {
+            let domain = self.create_domain()?;
+            Ok(domain.id())
+        });
+        self.bdf_domains = Some(assign);
+        result
+    }
+
+    /// Return the cached domain assignment, if any. Diagnostic + test
+    /// observer; the kernel uses [`claim_device`] for the production
+    /// path.
+    #[allow(dead_code)]
+    pub fn bdf_domain_for(&self, bdf: u16) -> Option<DomainId> {
+        self.bdf_domains.as_ref().and_then(|a| a.domain_for(bdf))
+    }
+}
+
+/// Build a [`BdfGroups`] table from every IVHD block in the cached
+/// IVRS tables. Returns an empty map when no IVRS table is present —
+/// the AMD-Vi unit then falls through to the Phase-55a "one BDF, one
+/// domain" path with no behavior change.
 ///
-/// Phase 57b G.5 — converted from `spin::Mutex` to [`IrqSafeMutex`] per the
-/// Track A.1 audit (`docs/handoffs/57b-spinlock-callsite-audit.md` row
-/// `kernel/src/iommu/amd.rs:919`). Classification is task-only (the
-/// AMD-Vi fault-dispatch ISR path is currently a Track E TODO; no ISR
-/// handler is installed today). Inherits Track F's preempt-discipline
-/// automatically.
-pub static UNITS: IrqSafeMutex<Vec<AmdViUnit>> = IrqSafeMutex::new(Vec::new());
+/// Centralises the call into `kernel-core::iommu::tables::group_bdfs_by_alias`
+/// so any caller (boot init, unit tests, diagnostic tools) sees the
+/// same grouping pass.
+pub fn build_bdf_groups_from_ivrs() -> BdfGroups {
+    match crate::acpi::ivrs_tables() {
+        Some(ivrs) => group_bdfs_by_alias(ivrs),
+        None => BdfGroups::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 67 Track A — fault IRQ trampoline + unit slot array
+// ---------------------------------------------------------------------------
+//
+// AMD-Vi units are owned by the kernel-side IOMMU registry
+// (`crate::iommu::registry::REGISTRY`). The registry stores each unit
+// behind a `Box<AmdViUnit>` so the fault-IRQ trampoline can hold a
+// stable raw pointer to the heap allocation (see
+// [`register_unit_slot`] for the safety contract). A second module-
+// local `Vec<AmdViUnit>` was once kept here as a rendezvous point
+// between bring-up and dispatch, but the registry has been the sole
+// authoritative storage since Phase 67 wired the trampoline.
+
+/// Maximum AMD-Vi units the per-vector trampoline can dispatch to.
+/// Mirrors the VT-d MAX_FAULT_UNITS sizing in `intel.rs`; one is
+/// enough for QEMU, a handful covers bare metal.
+const MAX_AMDVI_UNITS: usize = 8;
+
+/// Global registry of live [`AmdViUnit`] pointers that have called
+/// [`AmdViUnit::install_fault_handler`]. The IRQ trampoline walks this
+/// list and invokes `drain_event_log` on each unit whose hardware may
+/// have raised the interrupt — AMD-Vi events route by-MSI rather than
+/// by-unit, so we drain everyone on every fire.
+///
+/// `usize` storage so the entries can live in a `Mutex` without
+/// pointer aliasing fights at static-init time. See
+/// [`register_unit_slot`] for the safety contract.
+static UNIT_SLOTS: spin::Mutex<[Option<usize>; MAX_AMDVI_UNITS]> =
+    spin::Mutex::new([None; MAX_AMDVI_UNITS]);
+
+/// Shared atomic holding the device-IRQ vector reserved for the
+/// AMD-Vi event-log interrupt. Zero (which is a reserved CPU vector
+/// anyway) means "not yet reserved".
+static AMDVI_FAULT_VECTOR: AtomicU8 = AtomicU8::new(0);
+
+/// Add `unit` to the trampoline dispatch list. The pointer must remain
+/// valid for the rest of the kernel's lifetime — callers are responsible
+/// for arranging stable storage before invoking this. The kernel-side
+/// caller is `AmdViUnit::install_fault_handler`, which is in turn called
+/// from `build_and_bring_up_amdvi` on a `Box<AmdViUnit>` so the captured
+/// `self` pointer is the heap address of the boxed unit. The box is
+/// then moved into [`registry::RegisteredUnit::AmdVi`] and into the
+/// registry `Vec`; both moves only relocate the box pointer, not the
+/// heap allocation it owns, so the address recorded here remains valid
+/// for the rest of the kernel's lifetime.
+///
+/// Idempotent: if the same pointer is already registered the call is a
+/// no-op. Returns `Err(IommuError::HardwareFault)` only when the slot
+/// array is full, which Phase 67 treats as a non-recoverable hardware
+/// configuration error.
+fn register_unit_slot(unit: *mut AmdViUnit) -> Result<(), IommuError> {
+    let mut slots = UNIT_SLOTS.lock();
+    let p = unit as usize;
+    if slots.contains(&Some(p)) {
+        return Ok(());
+    }
+    if let Some(slot) = slots.iter_mut().find(|s| s.is_none()) {
+        *slot = Some(p);
+        Ok(())
+    } else {
+        Err(IommuError::HardwareFault)
+    }
+}
+
+/// Reserve (or look up) the device-IRQ vector that carries AMD-Vi
+/// event-log interrupts. Top-of-bank allocation mirrors the VT-d
+/// reserve_iommu_irq strategy in `intel.rs` so MSI vector allocations
+/// (which go bottom-up) do not collide.
+///
+/// Concurrency: IOMMU bring-up is sequential under `iommu::init`, so in
+/// practice the call sites never race. The implementation still
+/// publishes the reservation via `compare_exchange` so a future caller
+/// that runs unit bring-ups in parallel cannot race two `register_device_irq`
+/// calls into reserving (and leaking) two distinct vectors. The first
+/// thread to publish wins; later threads observe the published vector
+/// on a re-load and return it without touching the device-IRQ pool.
+fn reserve_fault_vector() -> Result<u8, &'static str> {
+    let existing = AMDVI_FAULT_VECTOR.load(Ordering::Acquire);
+    if existing != 0 {
+        return Ok(existing);
+    }
+    use crate::arch::x86_64::interrupts::{
+        DEVICE_IRQ_VECTOR_BASE, DEVICE_IRQ_VECTOR_COUNT, DeviceIrqEntry, DeviceIrqKind,
+        register_device_irq,
+    };
+    let top = DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT;
+    let mut candidate = top - 1;
+    loop {
+        match register_device_irq(
+            candidate,
+            DeviceIrqEntry {
+                handler: amdvi_fault_irq_trampoline,
+                kind: DeviceIrqKind::Msi,
+            },
+        ) {
+            Ok(()) => {
+                // Publish the reservation atomically. If a racing
+                // thread already published a different vector, drop
+                // ours and return the published one — the device-IRQ
+                // pool pays for one extra registration but the caller
+                // sees a single canonical vector.
+                match AMDVI_FAULT_VECTOR.compare_exchange(
+                    0,
+                    candidate,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(candidate),
+                    Err(published) => return Ok(published),
+                }
+            }
+            Err("device IRQ vector already registered") => {
+                if candidate == DEVICE_IRQ_VECTOR_BASE {
+                    return Err("no device-IRQ slot available for AMD-Vi fault handler");
+                }
+                candidate -= 1;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+/// IRQ trampoline — invoked from the device-IRQ stub when the AMD-Vi
+/// MSI fires. Snapshots the slot array under the lock, releases it,
+/// then drains each registered unit's event log.
+///
+/// Runs in ISR context. Performs no allocation. Each
+/// `drain_event_log` call is bounded by
+/// [`EVENT_LOG_RING_DEPTH`] so the worst-case ISR latency is bounded
+/// independently of firmware behaviour.
+fn amdvi_fault_irq_trampoline() {
+    let snapshot: [Option<usize>; MAX_AMDVI_UNITS] = {
+        let guard = UNIT_SLOTS.lock();
+        *guard
+    };
+    for slot in snapshot.into_iter().flatten() {
+        // SAFETY: UNIT_SLOTS only stores `*mut AmdViUnit` produced by
+        // `install_fault_handler` running on a `Box<AmdViUnit>` whose
+        // heap allocation is owned by the kernel-side IOMMU registry
+        // for the rest of the kernel's lifetime — see
+        // [`register_unit_slot`] for the full chain. No two units alias
+        // each other (the registry holds each one exactly once). The
+        // ISR runs with IF=0 so no concurrent task can be modifying the
+        // unit at the same instant, and `drain_event_log` takes
+        // `&mut self` but the borrow is purely scoped to this call.
+        let unit: &mut AmdViUnit = unsafe { &mut *(slot as *mut AmdViUnit) };
+        let _ = unit.drain_event_log();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests — limited to host-compilable assertions on constant math. The

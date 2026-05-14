@@ -194,9 +194,22 @@ pub trait PhysMemAccess {
 /// translation.
 pub const LEVEL_SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
+/// Phase 67 Track D.2 — shift table for 5-level (LA57) IOMMU paging.
+/// Adds PML5 at shift 48, matching how the CPU's 5-level paging
+/// hierarchy extends the canonical 4-level shifts.
+pub const LEVEL_SHIFTS_5: [u32; 5] = [48, 39, 30, 21, 12];
+
 /// Extract the 9-bit index into the table at `level` (0 = PML4, 3 = PT).
 pub const fn level_index(iova: u64, level: usize) -> usize {
     ((iova >> LEVEL_SHIFTS[level]) & 0x1FF) as usize
+}
+
+/// Phase 67 Track D.2 — index extractor parameterised over the
+/// page-table depth (4 = legacy SL tables, 5 = scalable-mode LA57).
+/// For `total_levels == 4`, behaviour is identical to [`level_index`].
+pub const fn level_index_n(iova: u64, level: usize, total_levels: usize) -> usize {
+    let shift = 12 + 9 * (total_levels - 1 - level);
+    ((iova >> shift as u32) & 0x1FF) as usize
 }
 
 /// Walk a VT-d second-level page table rooted at `root_phys` resolving
@@ -374,6 +387,30 @@ mod tests {
         assert_eq!(level_index(iova, 1), 0x055);
         assert_eq!(level_index(iova, 2), 0x0F2);
         assert_eq!(level_index(iova, 3), 0x011);
+    }
+
+    #[test]
+    fn level_index_n_matches_legacy_at_total_levels_4() {
+        let iova =
+            (0x1A3u64 << 39) | (0x055u64 << 30) | (0x0F2u64 << 21) | (0x011u64 << 12) | 0x123u64;
+        for level in 0..4 {
+            assert_eq!(level_index(iova, level), level_index_n(iova, level, 4));
+        }
+    }
+
+    #[test]
+    fn level_index_n_extracts_five_level_indices() {
+        // IOVA: PML5=0x011, PML4=0x055, PDPT=0x0F2, PD=0x011, PT=0x001
+        let iova = (0x011u64 << 48)
+            | (0x055u64 << 39)
+            | (0x0F2u64 << 30)
+            | (0x011u64 << 21)
+            | (0x001u64 << 12);
+        assert_eq!(level_index_n(iova, 0, 5), 0x011);
+        assert_eq!(level_index_n(iova, 1, 5), 0x055);
+        assert_eq!(level_index_n(iova, 2, 5), 0x0F2);
+        assert_eq!(level_index_n(iova, 3, 5), 0x011);
+        assert_eq!(level_index_n(iova, 4, 5), 0x001);
     }
 
     /// Build a 4-level SL page table in `mem` with a single 4 KiB leaf

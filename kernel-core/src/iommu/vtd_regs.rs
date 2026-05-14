@@ -280,6 +280,143 @@ pub const IOTLB_IIRG_SHIFT: u64 = 60;
 pub const IOTLB_IIRG_GLOBAL: u64 = 0b01u64 << IOTLB_IIRG_SHIFT;
 
 // ---------------------------------------------------------------------------
+// Phase 67 Track C.2 — queued-invalidation descriptors
+// ---------------------------------------------------------------------------
+//
+// VT-d 3.3 §6.5.2 defines a 128-bit descriptor format submitted to the
+// invalidation queue ring at IQA. Phase 67 implements three descriptor
+// kinds covering the trait surface:
+//
+// * Context-cache invalidate (type 1)
+// * IOTLB invalidate          (type 2)
+// * Invalidation Wait         (type 5) — used to bound the IQT advance
+//
+// Every descriptor occupies a contiguous 16-byte slot in the ring.
+
+/// VT-d queued-invalidation descriptor — two 64-bit halves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QiDescriptor {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl QiDescriptor {
+    /// Empty (all-zero) descriptor. Useful for ring initialisation.
+    pub const fn empty() -> Self {
+        Self { low: 0, high: 0 }
+    }
+
+    /// Build a Context-Cache Invalidate descriptor (`cc_inv`, type
+    /// 0x1). `granularity` is the CIRG field — see [`CCMD_CIRG_GLOBAL`]
+    /// constants. `did` is the 16-bit domain id; bits ignored when
+    /// `granularity` == global.
+    pub const fn cc_inv(granularity_cirg: u8, did: u16) -> Self {
+        // Type field at bits 3:0 = 0x1.
+        // Granularity (G) bits 5:4 = granularity_cirg & 0x3.
+        // Domain-id at bits 31:16.
+        let g = (granularity_cirg as u64) & 0x3;
+        let low = 0x1u64 | (g << 4) | ((did as u64) << 16);
+        Self { low, high: 0 }
+    }
+
+    /// Build an IOTLB Invalidate descriptor (`iotlb_inv`, type 0x2).
+    /// `granularity` is the IIRG field. Domain-id at bits 31:16.
+    pub const fn iotlb_inv(granularity_iirg: u8, did: u16) -> Self {
+        let g = (granularity_iirg as u64) & 0x3;
+        let low = 0x2u64 | (g << 4) | ((did as u64) << 16);
+        Self { low, high: 0 }
+    }
+
+    /// Build an Invalidation-Wait descriptor (`iwait`, type 0x5) that
+    /// stores `data` to `addr_phys` when the queue drains. The poller
+    /// watches `addr_phys` for the marker, matching the AMD-Vi
+    /// completion-wait pattern.
+    pub const fn iwait(addr_phys: u64, data: u32) -> Self {
+        // Type at bits 3:0 = 0x5.
+        // Status-Write (SW) bit 5 set so the descriptor writes `data`
+        // to `addr_phys` on completion.
+        // Status-Data field at bits 63:32 of the low qword.
+        let low = 0x5u64 | (1u64 << 5) | ((data as u64) << 32);
+        // Status address goes in the high qword, low bits zero.
+        let high = addr_phys & !0x3u64;
+        Self { low, high }
+    }
+
+    /// Descriptor type at bits 3:0.
+    pub const fn ty(self) -> u8 {
+        (self.low & 0xF) as u8
+    }
+}
+
+/// GCMD.QIE — Queued Invalidation Enable bit. Phase 67 Track C.2.
+/// VT-d 3.3 §10.4.4 places QIE at bit 26.
+pub const GCMD_QIE_BIT: u32 = 1 << 26;
+/// GSTS.QIES is at the same bit position as GCMD_QIE_BIT — Phase 67
+/// alias to avoid relying on the legacy `GSTS_QIES` named constant.
+pub const GSTS_QIES_BIT: u32 = GSTS_QIES;
+
+/// IQA register encoding helper. `addr` is the 4 KiB-page-aligned base
+/// of the queue ring; `qs` is the queue-size encoding (0 = 256
+/// descriptors, 1 = 512, …). VT-d 3.3 §10.4.21: IQA[2:0] = QS, bits
+/// 63:12 = ring base PFN.
+pub const fn encode_iqa(addr: u64, qs: u8) -> u64 {
+    (addr & !0xFFFu64) | ((qs as u64) & 0x7)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — descriptor encode round-trip
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod qi_tests {
+    use super::*;
+
+    #[test]
+    fn cc_inv_descriptor_carries_type_and_domain_id() {
+        let d = QiDescriptor::cc_inv(0b01, 0x0042);
+        assert_eq!(d.ty(), 0x1);
+        assert_eq!((d.low >> 4) & 0x3, 0b01);
+        assert_eq!((d.low >> 16) & 0xFFFF, 0x0042);
+        assert_eq!(d.high, 0);
+    }
+
+    #[test]
+    fn iotlb_inv_descriptor_carries_type_and_domain_id() {
+        let d = QiDescriptor::iotlb_inv(0b10, 0x00AA);
+        assert_eq!(d.ty(), 0x2);
+        assert_eq!((d.low >> 4) & 0x3, 0b10);
+        assert_eq!((d.low >> 16) & 0xFFFF, 0x00AA);
+    }
+
+    #[test]
+    fn iwait_descriptor_packs_addr_and_data() {
+        let d = QiDescriptor::iwait(0xDEAD_B000, 0xCAFE_BABE);
+        assert_eq!(d.ty(), 0x5);
+        // SW bit set.
+        assert!(d.low & (1 << 5) != 0);
+        // Data in high 32 bits of low qword.
+        assert_eq!((d.low >> 32) as u32, 0xCAFE_BABE);
+        // Address bottom-aligned.
+        assert_eq!(d.high & !0x3, 0xDEAD_B000);
+    }
+
+    #[test]
+    fn encode_iqa_aligns_address_and_packs_qs() {
+        let raw = encode_iqa(0x1234_5000, 0);
+        assert_eq!(raw & !0xFFF, 0x1234_5000);
+        assert_eq!(raw & 0x7, 0);
+        let raw2 = encode_iqa(0x1234_5000, 3);
+        assert_eq!(raw2 & 0x7, 3);
+    }
+
+    #[test]
+    fn gcmd_qie_bit_matches_spec_position() {
+        assert_eq!(GCMD_QIE_BIT, 1 << 26);
+        assert_eq!(GSTS_QIES_BIT, 1 << 26);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

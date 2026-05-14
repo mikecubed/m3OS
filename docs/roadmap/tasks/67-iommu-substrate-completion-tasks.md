@@ -1,6 +1,6 @@
 # Phase 67 — IOMMU Substrate Completion: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-67
 **Depends on:** Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
 **Goal:** Close the deferred IOMMU items: install AMD-Vi fault ISR and decoder; replace VT-d register-based invalidation with queued invalidation; bring up VT-d scalable mode; implement AMD-Vi multi-BDF domain grouping; replace the four `todo!()` isolation-test scaffolds with real supervised-spawn tests; update Phase 55a + 55c design docs.
@@ -9,14 +9,14 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | AMD-Vi fault ISR installation and event log drain | None | Planned |
-| B | AMD-Vi fault decoder `AmdViFaultEvent` in `kernel-core` | A | Planned |
-| C | VT-d queued invalidation engine: descriptor ring, flush methods | None | Planned |
-| D | VT-d scalable mode: runtime cap check, 5-level page tables | C | Planned |
-| E | AMD-Vi multi-BDF domain grouping via IVRS alias entries | A | Planned |
-| F | Isolation tests: `SupervisedSpawn` + `CapHandle::inject_foreign_dma` harness | None | Planned |
-| G | Phase 55a + 55c design docs and task docs updated | A, B, C, D, E, F | Planned |
-| H | Documentation and Release | G | Planned |
+| A | AMD-Vi fault ISR installation and event log drain | None | ✅ Done |
+| B | AMD-Vi fault decoder `AmdViFaultEvent` in `kernel-core` | A | ✅ Done |
+| C | VT-d queued invalidation engine: descriptor ring, flush methods | None | ✅ Done |
+| D | VT-d scalable mode: runtime cap check, 5-level page tables | C | ✅ Done |
+| E | AMD-Vi multi-BDF domain grouping via IVRS alias entries | A | ✅ Done |
+| F | Isolation tests: `SupervisedSpawn` + `CapHandle::inject_foreign_dma` harness | None | ✅ Done |
+| G | Phase 55a + 55c design docs and task docs updated | A, B, C, D, E, F | ✅ Done |
+| H | Documentation and Release | G | ✅ Done |
 
 ---
 

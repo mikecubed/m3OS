@@ -209,6 +209,12 @@ pub enum IommuError {
     /// that does not belong to this unit, or that was already
     /// destroyed).
     Invalid,
+    /// Phase 67 Track C.2 — a queued-invalidation descriptor was
+    /// submitted but the hardware did not advance the IQH (head)
+    /// register to match IQT (tail) within the bounded poll budget.
+    /// The caller should treat the unit as wedged for the affected
+    /// domain and surface the error to the driver-host syscall layer.
+    FlushTimeout,
 }
 
 impl fmt::Display for IommuError {
@@ -217,6 +223,7 @@ impl fmt::Display for IommuError {
             IommuError::NotAvailable => f.write_str("iommu unit not available"),
             IommuError::HardwareFault => f.write_str("iommu hardware fault"),
             IommuError::Invalid => f.write_str("iommu invalid argument"),
+            IommuError::FlushTimeout => f.write_str("iommu queued-invalidation flush timeout"),
         }
     }
 }
@@ -477,6 +484,7 @@ mod tests {
             IommuError::NotAvailable,
             IommuError::HardwareFault,
             IommuError::Invalid,
+            IommuError::FlushTimeout,
         ] {
             let s = alloc::format!("{}", err);
             assert!(!s.is_empty());
