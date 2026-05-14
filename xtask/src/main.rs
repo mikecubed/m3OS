@@ -41,6 +41,14 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     // modules. Same lib + bin split as `audio_server`; host tests
     // build the lib only and skip the `_start`-bearing binary.
     ("session_manager", &["--lib"]),
+    // Phase 66 Track B — atomic shadow-file writes shared by passwd
+    // and adduser. Needs `--no-default-features --features host-tests`
+    // because the default feature pulls in the syscall_lib production
+    // backend.
+    (
+        "shadow",
+        &["--no-default-features", "--features", "host-tests"],
+    ),
 ];
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
@@ -3188,7 +3196,7 @@ fn cmd_check() {
     doom_c_test_step(&root);
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, and session_manager host tests pass; doom platform-layer C tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, driver_runtime, audio_client, audio_server, surface_buffer, crypto-lib, term, audio_mixer, audio_client_ffi, session_manager, and shadow host tests pass; doom platform-layer C tests pass"
     );
 }
 

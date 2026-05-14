@@ -15,6 +15,7 @@ dependencies = [
 name = "adduser"
 version = "0.1.0"
 dependencies = [
+ "shadow",
  "syscall-lib",
 ]
 
@@ -1271,6 +1272,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "passwd"
 version = "0.1.0"
 dependencies = [
+ "shadow",
  "syscall-lib",
 ]
 
@@ -1678,6 +1680,13 @@ checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shadow"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

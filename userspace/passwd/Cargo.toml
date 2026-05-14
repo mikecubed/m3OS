@@ -26,3 +26,4 @@ required-features = ["host-tests"]
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib" }
+shadow = { path = "../lib/shadow" }

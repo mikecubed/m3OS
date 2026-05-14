@@ -2,6 +2,7 @@
 #![no_std]
 #![no_main]
 
+use shadow::{ShadowError, shadow_write_atomic};
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, getrandom, open, read, write,
     write_str, write_u64,
@@ -9,6 +10,7 @@ use syscall_lib::{
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
+const SHADOW_PATH_STR: &str = "/etc/shadow";
 const GROUP_PATH: &[u8] = b"/etc/group\0";
 
 #[unsafe(no_mangle)]
@@ -128,38 +130,45 @@ pub extern "C" fn _start() -> ! {
         close(fd as i32);
     }
 
-    // Append to /etc/shadow (single write).
+    // Atomically rewrite /etc/shadow with the new entry appended.
+    // Phase 66 Track B — read current contents, build {existing} + new
+    // line in memory, then commit via shadow_write_atomic so a crash
+    // mid-write never leaves /etc/shadow torn.
     {
-        let fd = open(
-            SHADOW_PATH,
-            syscall_lib::O_WRONLY | syscall_lib::O_APPEND,
-            0,
-        );
-        if fd < 0 {
-            write_str(STDOUT_FILENO, "adduser: cannot open /etc/shadow\n");
+        let mut shadow_buf = [0u8; 4096];
+        let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
+        let mut new_shadow = [0u8; 4608];
+        if shadow_len > new_shadow.len() {
+            write_str(STDOUT_FILENO, "adduser: /etc/shadow too large to rewrite\n");
             exit(1);
         }
-        let mut buf = [0u8; 512];
         let mut pos = 0;
-        pos += copy_to_buf(&mut buf[pos..], username);
-        pos += copy_to_buf(&mut buf[pos..], b":$sha256i$10000$");
-        pos += copy_to_buf(&mut buf[pos..], &salt_hex[..salt_hex_len]);
-        pos += copy_to_buf(&mut buf[pos..], b"$");
-        pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
-        pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
-        let written = write(fd as i32, &buf[..pos]);
-        if written < 0 || written as usize != pos {
-            write_str(STDOUT_FILENO, "adduser: failed to write /etc/shadow\n");
-            close(fd as i32);
+        pos += copy_to_buf(&mut new_shadow[pos..], &shadow_buf[..shadow_len]);
+        if pos > 0 && new_shadow[pos - 1] != b'\n' {
+            new_shadow[pos] = b'\n';
+            pos += 1;
+        }
+        pos += copy_to_buf(&mut new_shadow[pos..], username);
+        pos += copy_to_buf(&mut new_shadow[pos..], b":$sha256i$10000$");
+        pos += copy_to_buf(&mut new_shadow[pos..], &salt_hex[..salt_hex_len]);
+        pos += copy_to_buf(&mut new_shadow[pos..], b"$");
+        pos += copy_to_buf(&mut new_shadow[pos..], &hash_hex[..hash_hex_len]);
+        pos += copy_to_buf(&mut new_shadow[pos..], b"::::::\n");
+        if let Err(err) = shadow_write_atomic(SHADOW_PATH_STR, &new_shadow[..pos]) {
+            let msg: &str = match err {
+                ShadowError::OpenFailed(_) => "adduser: cannot create /etc/shadow.new\n",
+                ShadowError::WriteFailed(_) | ShadowError::ShortWrite { .. } => {
+                    "adduser: failed to write /etc/shadow.new\n"
+                }
+                ShadowError::FsyncFailed(_) => "adduser: fsync failed on /etc/shadow.new\n",
+                ShadowError::RenameFailed(_) => {
+                    "adduser: failed to rename /etc/shadow.new over /etc/shadow\n"
+                }
+                ShadowError::PathTooLong => "adduser: shadow path too long\n",
+            };
+            write_str(STDOUT_FILENO, msg);
             exit(1);
         }
-        if fsync(fd as i32) < 0 {
-            write_str(
-                STDOUT_FILENO,
-                "adduser: warning: fsync failed on /etc/shadow\n",
-            );
-        }
-        close(fd as i32);
     }
 
     // Append to /etc/group (single write).
