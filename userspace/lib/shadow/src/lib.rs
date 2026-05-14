@@ -123,11 +123,10 @@ pub fn shadow_write_atomic_with<F: ShadowFs>(
 mod syscall_backend {
     use super::{ShadowError, ShadowFs, shadow_write_atomic_with};
 
-    const O_WRONLY_FLAGS: u64 =
-        syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC | O_CLOEXEC;
-    /// `O_CLOEXEC` value (0x80000). Not yet exposed by syscall_lib;
-    /// inlined here so passwd/adduser get the bit on every open.
-    const O_CLOEXEC: u64 = 0o2000000;
+    const O_WRONLY_FLAGS: u64 = syscall_lib::O_WRONLY
+        | syscall_lib::O_CREAT
+        | syscall_lib::O_TRUNC
+        | syscall_lib::O_CLOEXEC;
 
     /// Production [`ShadowFs`] backend that calls into syscall_lib.
     pub struct SyscallShadowFs;

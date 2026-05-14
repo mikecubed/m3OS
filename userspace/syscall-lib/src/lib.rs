@@ -1145,6 +1145,11 @@ pub const SYS_NICE: u64 = 34;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
 pub const O_NONBLOCK: u64 = 0x800;
+/// `O_CLOEXEC` (0o2000000 = 0x80000). Atomically marks the new FD as
+/// close-on-exec at `open()` time, eliminating the open/fcntl race window.
+/// Must match the kernel-side definition in
+/// `kernel/src/arch/x86_64/syscall/mod.rs`.
+pub const O_CLOEXEC: u64 = 0o2000000;
 
 /// Wrapper for the `fcntl()` syscall.
 pub fn fcntl(fd: i32, cmd: u64, arg: u64) -> isize {

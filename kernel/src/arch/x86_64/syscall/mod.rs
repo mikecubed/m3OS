@@ -12436,10 +12436,21 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
                 return NEG_EACCES;
             }
         }
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved)
-            && !check_permission(pu, pg, pm, euid, egid, 3)
-        {
-            return NEG_EACCES;
+        // Destination parent: write+execute. Additionally, if the
+        // destination entry already exists, rename-over is effectively an
+        // unlink of the destination — POSIX requires the same sticky-bit
+        // semantics there. Only enforce when path_metadata(&new_resolved)
+        // succeeds so a missing destination still gets the natural
+        // rename-creates-new-entry path.
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+            if let Some((dest_uid, _, _)) = path_metadata(&new_resolved)
+                && kernel_core::fs::mode::check_sticky(pm, dest_uid, pu, euid, euid == 0).is_err()
+            {
+                return NEG_EACCES;
+            }
         }
     }
 
