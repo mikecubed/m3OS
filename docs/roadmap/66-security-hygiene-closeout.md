@@ -1,8 +1,8 @@
 # Phase 66 - Security and Hygiene Closeout
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-66
-**Depends on:** Phase 48 (Security Foundation) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅. Phase 54a (Post-Serverization Kernel Hygiene) is Planned and completed-by-this-phase (see Track F.2 in the task list).
+**Depends on:** Phase 48 (Security Foundation) ✅, Phase 27 (User Accounts) ✅, Phase 28 (Extended Filesystem) ✅. Phase 54a (Post-Serverization Kernel Hygiene) is completed-by-this-phase (see Track F.2 in the task list).
 **Builds on:** Closes the Phase 48 and Phase 54a trust-floor gaps that were identified but not implemented; closes supplemental-pass items F4 and F5 from the pre-1.0 blocker list; flips Phase 54a from Planned to Complete
 **Primary Components:** kernel VFS unlink/rename, userspace/passwd, userspace/adduser, kernel open-family syscalls (`sys_linux_open`, `sys_linux_openat`), `kernel/src/process/mod.rs` (`FdEntry`), `kernel/src/arch/x86_64/syscall/mod.rs`
 

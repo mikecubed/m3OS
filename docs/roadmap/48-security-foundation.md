@@ -129,3 +129,13 @@ The combination of init defaults, account provisioning, and remote-access config
 - Advanced key-management, rotation, and audit infrastructure
 - Rich multi-factor or hardware-backed authentication flows
 - General sandboxing beyond the repaired trust floor
+
+## Phase 66 Closure Note
+
+The two trust-floor items this phase explicitly deferred — `/tmp`
+sticky-bit (`S_ISVTX`) enforcement in VFS unlink/rename, and atomic
+`/etc/shadow` writes (temp + fsync + rename) in `passwd` and `adduser`
+— were delivered in [Phase 66 — Security and Hygiene
+Closeout](./66-security-hygiene-closeout.md). The pre-seeded image
+password hash format was likewise upgraded to the canonical
+`$sha256i$10000$` form documented inline in `passwd_lib`.

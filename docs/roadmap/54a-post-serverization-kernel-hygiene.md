@@ -1,6 +1,6 @@
 # Phase 54a - Post-Serverization Kernel Hygiene
 
-**Status:** Planned
+**Status:** Complete (delivered by [Phase 66](./66-security-hygiene-closeout.md))
 **Source Ref:** phase-54a
 **Depends on:** Phase 54 (Deep Serverization) ✅
 **Builds on:** Closes the two cross-cutting kernel-hygiene items surfaced during Phase 54's closure review that were intentionally scoped out of PR #108 because they pre-date the serverization work and touch code beyond that PR's surface.
@@ -97,3 +97,20 @@ Each subsystem that owns an fd backend exposes its own free / release function. 
 - MOUNT_OP_LOCK yielding primitive — tracked as long-term scheduling work in `docs/debug/54-followups.md`.
 - Scheduler diagnostic threshold tuning — no action unless the current thresholds become noisy; tracked in `docs/debug/54-followups.md`.
 - Full epoll extraction out of `kernel/src/arch/x86_64/syscall/mod.rs` — Phase 54a hoists only the cleanup helper; a full module split remains a later refactor if it becomes blocking.
+
+## Phase 66 Closure Note
+
+This phase's entire scope was implemented by [Phase 66 — Security and
+Hygiene Closeout](./66-security-hygiene-closeout.md):
+
+- `O_CLOEXEC` and `O_NONBLOCK` plumbing through every `FdEntry`
+  construction site in `open_resolved_path` (and the
+  `vfs_service_open` route) — Phase 66 Track C.
+- The four `arch::x86_64::syscall::*_pub` wrappers
+  (`release_socket_pub`, `epoll_free_pub`, `reap_unused_ext2_inode`,
+  `vfs_service_close_pub`) moved into `kernel/src/net/mod.rs`, new
+  `kernel/src/epoll.rs`, `kernel/src/fs/ext2.rs`, and new
+  `kernel/src/fs/vfs_service.rs` respectively — Phase 66 Track D.
+- The two FD-teardown call sites inside `kernel/src/process/mod.rs`
+  switched to the new paths in lock-step. No `pub(crate) use` shim
+  layer was introduced.

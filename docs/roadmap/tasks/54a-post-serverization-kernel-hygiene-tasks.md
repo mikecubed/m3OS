@@ -1,6 +1,6 @@
 # Phase 54a — Post-Serverization Kernel Hygiene: Task List
 
-**Status:** Planned
+**Status:** Complete (delivered by [Phase 66](../66-security-hygiene-closeout.md))
 **Source Ref:** phase-54a
 **Depends on:** Phase 54 (Deep Serverization) ✅
 **Goal:** Close the two cross-cutting kernel-hygiene items carried forward from Phase 54's closure review — missing CLOEXEC / NONBLOCK plumbing at non-pipe / non-socket fd construction sites, and the four `arch::x86_64::syscall::*_pub` wrappers that keep `kernel/src/process/mod.rs` on an arch-specific dependency — without changing process-cleanup or VFS-refcounting behavior.
