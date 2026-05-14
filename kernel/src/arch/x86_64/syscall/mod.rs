@@ -7793,30 +7793,19 @@ pub(super) fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
-/// Truncate and free the ext2 inode when its on-disk links_count has reached
-/// zero. The caller MUST have verified (under `PROCESS_TABLE`) that no open
-/// fd aliases this inode — this function intentionally skips a recount so
-/// two cores concurrently closing siblings of the same inode cannot both
-/// observe count==0 after each drops its own lock.
-pub(crate) fn reap_unused_ext2_inode(inode_num: u32) {
-    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-    let Some(vol) = vol.as_mut() else {
-        return;
-    };
-    let Ok(mut inode) = vol.read_inode(inode_num) else {
-        return;
-    };
-    if inode.links_count != 0 {
-        return;
-    }
-    let _ = vol.truncate_file(inode_num, &mut inode);
-    let _ = vol.free_inode(inode_num);
-}
+// Phase 66 Track D.3 — `reap_unused_ext2_inode` body has moved to
+// `kernel/src/fs/ext2.rs`. The call site at the bottom of
+// `sys_linux_close` now goes through `crate::fs::ext2::*` directly.
 
-/// Public wrapper so `kernel/src/process` can issue `VFS_CLOSE` directly
-/// after it has decided under `PROCESS_TABLE` that the handle being closed
-/// was the last alias.
-pub(crate) fn vfs_service_close_pub(service_handle: u64) {
+// Phase 66 Track D.4 — `vfs_service_close_pub` body has moved to
+// `kernel/src/fs/vfs_service.rs`. The IPC primitive is re-exposed as
+// `vfs_service_close_internal` so the new module can forward without
+// duplicating the message construction.
+
+/// Internal: tell the ring-3 VFS service a handle was closed.
+/// Re-exposed at `pub(crate)` so `kernel/src/fs/vfs_service.rs` can
+/// forward without duplicating the message construction below.
+pub(crate) fn vfs_service_close_internal(service_handle: u64) {
     vfs_service_close(service_handle);
 }
 
@@ -7854,7 +7843,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-            FdBackend::Socket { handle } => release_socket_handle(*handle),
+            FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
@@ -7908,7 +7897,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         return NEG_EBADF;
     }
     if let Some(inode_num) = ext2_reap {
-        reap_unused_ext2_inode(inode_num);
+        crate::fs::ext2::reap_unused_ext2_inode(inode_num);
     }
     if let Some(handle) = vfs_last_close {
         vfs_service_close(handle);
@@ -14720,7 +14709,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if proto == SocketProtocol::Udp && net_udp_service_available() {
         let err = net_udp_service_create(handle);
         if err != 0 {
-            release_socket_handle(handle);
+            crate::net::release_socket_pub(handle);
             return err;
         }
     }
@@ -14735,7 +14724,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
         None => {
-            release_socket_handle(handle);
+            crate::net::release_socket_pub(handle);
             NEG_EMFILE
         }
     }
@@ -15030,7 +15019,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
@@ -15038,15 +15027,15 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_to_kernel(&mut len_buf))
                         .is_err()
                     {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EFAULT;
                     }
                     if u32::from_ne_bytes(len_buf) < 16 {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return e;
                     }
                 }
@@ -15057,7 +15046,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
                     {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EFAULT;
                     }
                 }
@@ -15074,7 +15063,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
                     None => {
-                        release_socket_handle(new_handle);
+                        crate::net::release_socket_pub(new_handle);
                         return NEG_EMFILE;
                     }
                 }
@@ -16604,14 +16593,21 @@ static EPOLL_TABLE: crate::task::scheduler::IrqSafeMutex<
     crate::task::scheduler::IrqSafeMutex::new([NONE; MAX_EPOLL_INSTANCES])
 };
 
-/// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).
-pub fn epoll_free_pub(instance_id: usize) {
-    epoll_free(instance_id);
-}
+// Phase 66 Track D.2 — `epoll_free_pub` body has moved to
+// `kernel/src/epoll.rs`. The decrement helper is exposed as
+// `epoll_free_internal` so the new module can forward to it without
+// duplicating the table-locking dance below.
 
 /// Public entry point for epoll_add_ref (called from add_fd_refs on fork/dup).
 pub fn epoll_add_ref_pub(instance_id: usize) {
     epoll_add_ref(instance_id);
+}
+
+/// Internal: decrement epoll instance refcount; free when it reaches
+/// zero. Re-exposed at `pub(crate)` so `kernel/src/epoll.rs` can call it
+/// without duplicating the lock dance.
+pub(crate) fn epoll_free_internal(instance_id: usize) {
+    epoll_free(instance_id);
 }
 
 /// Decrement epoll instance refcount; free when it reaches zero.
@@ -17006,7 +17002,7 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 
 /// Returns `true` when the ring-3 `net_udp` service is registered and the
 /// current caller is *not* the service itself (prevents recursion).
-fn net_udp_service_available() -> bool {
+pub(crate) fn net_udp_service_available() -> bool {
     !is_current_exec_path("/bin/net_server") && crate::ipc::registry::is_registered("net_udp")
 }
 
@@ -17129,7 +17125,7 @@ fn net_udp_service_recvfrom_port(kernel_handle: u32) -> (u64, u16) {
 }
 
 /// Tell the service a socket was closed. Returns the port that was unbound.
-fn net_udp_service_close(kernel_handle: u32) -> u16 {
+pub(crate) fn net_udp_service_close(kernel_handle: u32) -> u16 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
     use kernel_core::net::udp_protocol::NET_UDP_CLOSE;
@@ -17149,15 +17145,6 @@ fn net_udp_service_close(kernel_handle: u32) -> u16 {
     reply.data[0] as u16
 }
 
-fn release_socket_handle(handle: u32) {
-    let hold_udp_last_ref = net_udp_service_available();
-    let result = crate::net::free_socket_with_result(handle, hold_udp_last_ref);
-    if result.needs_finalization {
-        net_udp_service_close(handle);
-        crate::net::finalize_socket_close(handle);
-    }
-}
-
-pub fn release_socket_pub(handle: u32) {
-    release_socket_handle(handle);
-}
+// Phase 66 Track D.1 — `release_socket_pub` body has moved to
+// `kernel/src/net/mod.rs`. The internal call sites here now go through
+// `crate::net::release_socket_pub` directly.

@@ -32,6 +32,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod arch;
 pub mod blk;
+pub mod epoll;
 pub mod fb;
 pub mod fs;
 pub mod iommu;

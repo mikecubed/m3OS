@@ -385,6 +385,26 @@ pub fn wake_sockets_for_tcp_slot(tcp_idx: usize) {
     }
 }
 
+/// Release a socket handle, handling the optional `net_udp` service
+/// last-reference handshake.
+///
+/// Phase 66 Track D.1 — the orchestration formerly lived as
+/// `release_socket_handle` / `release_socket_pub` inside
+/// `kernel/src/arch/x86_64/syscall/mod.rs`. The socket table is owned by
+/// this module, so the teardown belongs next to it. The two UDP-service
+/// hooks (`net_udp_service_available` / `net_udp_service_close`) still
+/// reside in the syscall layer because they are net-protocol IPC glue
+/// shared with the socket()/recvfrom() paths; carving the rest of the
+/// `net_udp` plumbing out is a follow-up.
+pub fn release_socket_pub(handle: SocketHandle) {
+    let hold_udp_last_ref = crate::arch::x86_64::syscall::net_udp_service_available();
+    let result = free_socket_with_result(handle, hold_udp_last_ref);
+    if result.needs_finalization {
+        crate::arch::x86_64::syscall::net_udp_service_close(handle);
+        finalize_socket_close(handle);
+    }
+}
+
 /// Wake all sockets bound to a given UDP port.
 /// Called from the UDP handler after receiving a datagram.
 pub fn wake_sockets_for_udp_port(port: u16) {
