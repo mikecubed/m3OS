@@ -154,6 +154,7 @@ mod tests {
             symbol,
             modifiers: ModifierState(modifiers),
             kind: KeyEventKind::Down,
+            modifier_side: kernel_core::input::events::ModifierSide::Either,
         }
     }
 
@@ -164,6 +165,7 @@ mod tests {
             symbol,
             modifiers: ModifierState(0),
             kind: KeyEventKind::Up,
+            modifier_side: kernel_core::input::events::ModifierSide::Either,
         }
     }
 

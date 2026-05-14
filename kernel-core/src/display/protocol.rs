@@ -39,9 +39,16 @@ use crate::input::events::{
 // ---------------------------------------------------------------------------
 
 /// Current protocol version negotiated in [`ClientMessage::Hello`] and
-/// echoed back in [`ServerMessage::Welcome`]. Any other value closes the
-/// connection with [`DisconnectReason::VersionMismatch`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// echoed back in [`ServerMessage::Welcome`].
+///
+/// Phase 68 Track C bumped this from `1` to `2` when `KeyEvent` gained
+/// a `modifier_side` field. Clients that announce `1` are downgraded
+/// via [`crate::input::events::downgrade_for_v1_client`] (every
+/// `KeyEvent` is emitted with [`crate::input::events::ModifierSide::Either`]
+/// over the legacy 19-byte wire layout). All in-tree clients
+/// (`kbd_server`, `display_server`, `m3ctl`, host fixtures) handshake
+/// at version `2`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Fixed frame-header size: `body_len (u16) + opcode (u16)`.
 pub const FRAME_HEADER_SIZE: usize = 4;
@@ -1832,6 +1839,7 @@ mod tests {
             symbol: b'a' as u32,
             modifiers: ModifierState(MOD_SUPER | MOD_ALT),
             kind: KeyEventKind::Down,
+            modifier_side: crate::input::events::ModifierSide::Either,
         };
         encode_decode_round_trip_server(ServerMessage::Key(ev));
     }
@@ -2284,14 +2292,22 @@ mod tests {
                 Just(KeyEventKind::Up),
                 Just(KeyEventKind::Repeat),
             ],
+            prop_oneof![
+                Just(crate::input::events::ModifierSide::Left),
+                Just(crate::input::events::ModifierSide::Right),
+                Just(crate::input::events::ModifierSide::Either),
+            ],
         )
-            .prop_map(|(timestamp_ms, keycode, symbol, mods, kind)| KeyEvent {
-                timestamp_ms,
-                keycode,
-                symbol,
-                modifiers: ModifierState(mods),
-                kind,
-            })
+            .prop_map(
+                |(timestamp_ms, keycode, symbol, mods, kind, modifier_side)| KeyEvent {
+                    timestamp_ms,
+                    keycode,
+                    symbol,
+                    modifiers: ModifierState(mods),
+                    kind,
+                    modifier_side,
+                },
+            )
     }
 
     fn arb_pointer_event_proto() -> impl Strategy<Value = PointerEvent> {

@@ -396,7 +396,9 @@ where
             kind,
         } => {
             if inject_key_policy.is_enabled() {
-                use kernel_core::input::events::{KeyEvent, KeyEventKind, ModifierState};
+                use kernel_core::input::events::{
+                    KeyEvent, KeyEventKind, ModifierSide, ModifierState,
+                };
                 match *kind {
                     0 | 1 | 2 => {
                         let kind_enum = match *kind {
@@ -410,6 +412,12 @@ where
                             symbol: *keycode,
                             modifiers: ModifierState(*modifier_mask),
                             kind: kind_enum,
+                            // Phase 68 Track C — `InjectKey` does not
+                            // carry side information; the helper derives
+                            // it from the injected keycode (left vs.
+                            // right modifier or `Either` for everything
+                            // else).
+                            modifier_side: ModifierSide::for_keycode(*keycode),
                         });
                         ControlEvent::Ack
                     }

@@ -1046,6 +1046,10 @@ impl KeyRepeatScheduler {
             symbol: 0,
             modifiers: self.last_mods,
             kind: KeyEventKind::Repeat,
+            // Phase 68: scheduler-driven repeats inherit the side the
+            // original Down emitted. The scheduler does not store the
+            // side today, so `Either` is the conservative default.
+            modifier_side: crate::input::events::ModifierSide::Either,
         })
     }
 
