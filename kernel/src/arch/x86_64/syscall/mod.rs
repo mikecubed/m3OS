@@ -12247,13 +12247,17 @@ pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
 
     // Phase 27: Write+execute permission on parent directory.
     // Phase 66: Sticky-bit (S_ISVTX) enforcement before any inode mutation.
+    // If the target entry's metadata cannot be obtained (missing path),
+    // skip the sticky check entirely and let the unlink path below return
+    // -ENOENT rather than masking it as -EACCES.
     let (_, _, euid, egid) = current_process_ids();
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
         if !check_permission(pu, pg, pm, euid, egid, 3) {
             return NEG_EACCES;
         }
-        let file_uid = path_metadata(name).map(|(u, _, _)| u).unwrap_or(pu);
-        if kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err() {
+        if let Some((file_uid, _, _)) = path_metadata(name)
+            && kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err()
+        {
             return NEG_EACCES;
         }
     }
@@ -12414,17 +12418,18 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     // Phase 66: Sticky-bit (S_ISVTX) enforcement on the source parent
     // directory before any rename mutation. POSIX semantics: a sticky
     // source parent gates the rename even if the destination parent is
-    // unrelated.
+    // unrelated. If the source path's metadata cannot be obtained the
+    // sticky check is skipped so the rename path can return -ENOENT
+    // rather than masking it as -EACCES.
     {
         let (_, _, euid, egid) = current_process_ids();
         if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
             if !check_permission(pu, pg, pm, euid, egid, 3) {
                 return NEG_EACCES;
             }
-            let file_uid = path_metadata(&old_resolved)
-                .map(|(u, _, _)| u)
-                .unwrap_or(pu);
-            if kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err() {
+            if let Some((file_uid, _, _)) = path_metadata(&old_resolved)
+                && kernel_core::fs::mode::check_sticky(pm, file_uid, pu, euid, euid == 0).is_err()
+            {
                 return NEG_EACCES;
             }
         }
