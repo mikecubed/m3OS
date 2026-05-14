@@ -74,36 +74,43 @@ pub fn tlb_shootdown(addr: u64) {
     // holder mid-handshake.  It is lock-free (Phase 57b D.2) so it cannot
     // recurse through this caller.
     crate::task::scheduler::preempt_disable();
-    {
+    'critical: {
         let _lock = SHOOTDOWN_LOCK.lock();
 
         // Always invalidate locally.
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
 
-        // Count remote online cores under the same `get_core_data + is_online`
-        // predicate we'll iterate again to send the IPIs. Counting and sending
-        // MUST walk identical predicates so `SHOOTDOWN_PENDING` and the
-        // recipient set are by construction equal — see the matching comment
-        // in `tlb_shootdown_range_kernel` for the underflow rationale a
-        // mismatched LAPIC-shorthand broadcast would produce.
+        // Snapshot recipients in a single predicate walk. The count stored
+        // in SHOOTDOWN_PENDING and the IPIs we actually send below MUST be
+        // by construction equal — there is no second walk of get_core_data /
+        // is_online, so an AP that flips online or offline after this point
+        // cannot cause an underflow or hang. We capture apic_id directly so
+        // the send loop calls send_ipi() unconditionally rather than
+        // round-tripping through send_ipi_to_core's is_online re-check
+        // (which would re-introduce the same TOCTTOU).
         let my_core = super::per_core().core_id;
-        let mut targets = 0u8;
-        for core_id in 0..64u8 {
+        let mut recipients = [0u8; crate::smp::MAX_CORES];
+        let mut targets: usize = 0;
+        for core_id in 0..crate::smp::MAX_CORES as u8 {
             if core_id == my_core {
                 continue;
             }
             if let Some(data) = super::get_core_data(core_id)
                 && data.is_online.load(Ordering::Acquire)
+                && targets < recipients.len()
             {
-                targets = targets.saturating_add(1);
+                recipients[targets] = data.apic_id;
+                targets += 1;
             }
         }
 
         if targets == 0 {
             // Uniprocessor or every other core offline — local flush is
-            // sufficient.
-            crate::task::scheduler::preempt_enable();
-            return;
+            // sufficient. Exit the critical block so _lock drops BEFORE the
+            // post-block preempt_enable runs — re-enabling preemption while
+            // the mutex is still held risks a same-core deadlock if a
+            // preempted task tries another TLB shootdown.
+            break 'critical;
         }
 
         // Clear range state so the IPI handler uses the legacy single-address path.
@@ -112,20 +119,11 @@ pub fn tlb_shootdown(addr: u64) {
 
         // Set up the request before publishing IPIs.
         SHOOTDOWN_ADDR.store(addr, Ordering::Release);
-        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+        SHOOTDOWN_PENDING.store(targets as u8, Ordering::Release);
 
-        // Send to exactly the cores we counted. Matches `tlb_shootdown_range`
-        // and `tlb_shootdown_range_kernel`: walk the same predicate so the
-        // IPI recipient set and the pending count are by construction equal.
-        for core_id in 0..64u8 {
-            if core_id == my_core {
-                continue;
-            }
-            if let Some(data) = super::get_core_data(core_id)
-                && data.is_online.load(Ordering::Acquire)
-            {
-                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
-            }
+        // Send to exactly the snapshot we counted — same set, by construction.
+        for &apic_id in &recipients[..targets] {
+            ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
         }
 
         // Spin-wait for all remote cores to acknowledge.  IF stays
@@ -289,30 +287,30 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
             }
         }
 
-        // Count remote online cores so the pending count is fixed before any
-        // IPI is sent (same underflow rationale as `tlb_shootdown_range`).
+        // Snapshot recipients in a single predicate walk. Capturing the
+        // recipient `apic_id`s up front (rather than walking the predicate
+        // again to send) closes the count-vs-send TOCTTOU: an AP that flips
+        // `is_online` between two walks would otherwise receive an IPI but
+        // not be reflected in `SHOOTDOWN_PENDING`, underflowing the u8.
         //
-        // Copilot review #156: the pending count and the IPI recipients
-        // MUST match. `send_ipi_all_excluding_self` is a LAPIC shorthand
-        // that delivers to every physically present LAPIC regardless of
-        // OS-level `is_online` state — APs mid-boot, CPUs beyond
-        // `MAX_CORES`, or any LAPIC the kernel hasn't yet enumerated
-        // would all receive the IPI, run the handler, and `fetch_sub` on
-        // `SHOOTDOWN_PENDING`. With a pre-counted target smaller than the
-        // actual recipient set, the `u8` decrement underflows and the
-        // sender's spin-wait sees `> 0` forever. Mirror
-        // `tlb_shootdown_range`'s explicit per-core send loop so
-        // recipients and counted cores are by construction identical.
+        // The send loop calls `send_ipi(apic_id, ...)` directly rather than
+        // round-tripping through `send_ipi_to_core`, whose `is_online`
+        // re-check would reintroduce the same race in a different
+        // direction (a recipient that went *offline* between count and send
+        // would silently skip its decrement).
         let my_core = super::per_core().core_id;
-        let mut targets = 0u8;
-        for core_id in 0..64u8 {
+        let mut recipients = [0u8; crate::smp::MAX_CORES];
+        let mut targets: usize = 0;
+        for core_id in 0..crate::smp::MAX_CORES as u8 {
             if core_id == my_core {
                 continue;
             }
             if let Some(data) = super::get_core_data(core_id)
                 && data.is_online.load(Ordering::Acquire)
+                && targets < recipients.len()
             {
-                targets = targets.saturating_add(1);
+                recipients[targets] = data.apic_id;
+                targets += 1;
             }
         }
 
@@ -325,21 +323,13 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
         SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
         SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
         SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
-        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+        SHOOTDOWN_PENDING.store(targets as u8, Ordering::Release);
 
-        // Send to exactly the cores we counted. `send_ipi_to_core` re-checks
-        // `is_online` and is a no-op for offline cores — but the count and
-        // the recipients are by construction identical because we walk the
-        // same `get_core_data + is_online` predicate on both paths.
-        for core_id in 0..64u8 {
-            if core_id == my_core {
-                continue;
-            }
-            if let Some(data) = super::get_core_data(core_id)
-                && data.is_online.load(Ordering::Acquire)
-            {
-                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
-            }
+        // Send to exactly the snapshot. Recipients and pending count are
+        // by construction equal — there is no second predicate walk that
+        // could disagree with the snapshot.
+        for &apic_id in &recipients[..targets] {
+            ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
         }
 
         // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
