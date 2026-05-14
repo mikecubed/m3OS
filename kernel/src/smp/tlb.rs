@@ -48,23 +48,6 @@ static SHOOTDOWN_USE_CR3_RELOAD: AtomicBool = AtomicBool::new(false);
 const INVLPG_THRESHOLD: u64 = 32;
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Count the number of cores that are actually online.
-fn online_core_count() -> u8 {
-    let mut count = 0u8;
-    for i in 0..super::core_count() {
-        if let Some(data) = super::get_core_data(i)
-            && data.is_online.load(core::sync::atomic::Ordering::Acquire)
-        {
-            count += 1;
-        }
-    }
-    count
-}
-
-// ---------------------------------------------------------------------------
 // Public API (T031, T034)
 // ---------------------------------------------------------------------------
 
@@ -94,35 +77,68 @@ pub fn tlb_shootdown(addr: u64) {
     {
         let _lock = SHOOTDOWN_LOCK.lock();
 
-        let online = online_core_count();
-
         // Always invalidate locally.
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
 
-        if online > 1 {
-            // Clear range state so the IPI handler uses the legacy single-address path.
-            SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
-            SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
-
-            // Set up the request.
-            SHOOTDOWN_ADDR.store(addr, Ordering::Release);
-            SHOOTDOWN_PENDING.store(online - 1, Ordering::Release);
-
-            // Send TLB shootdown IPI to all other cores.
-            ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
-
-            // Spin-wait for all remote cores to acknowledge.  IF stays
-            // enabled here; a self-targeted IRQ (timer, etc.) is allowed
-            // to fire and return.  Remote cores' IPI handlers run with
-            // their own IF state, never contend for `SHOOTDOWN_LOCK`,
-            // and only touch the `SHOOTDOWN_*` atomics.
-            // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
-            // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-            // this core can service its own IRQs.  Cannot yield here: we are still inside
-            // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
-            while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-                core::hint::spin_loop();
+        // Count remote online cores under the same `get_core_data + is_online`
+        // predicate we'll iterate again to send the IPIs. Counting and sending
+        // MUST walk identical predicates so `SHOOTDOWN_PENDING` and the
+        // recipient set are by construction equal — see the matching comment
+        // in `tlb_shootdown_range_kernel` for the underflow rationale a
+        // mismatched LAPIC-shorthand broadcast would produce.
+        let my_core = super::per_core().core_id;
+        let mut targets = 0u8;
+        for core_id in 0..64u8 {
+            if core_id == my_core {
+                continue;
             }
+            if let Some(data) = super::get_core_data(core_id)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                targets = targets.saturating_add(1);
+            }
+        }
+
+        if targets == 0 {
+            // Uniprocessor or every other core offline — local flush is
+            // sufficient.
+            crate::task::scheduler::preempt_enable();
+            return;
+        }
+
+        // Clear range state so the IPI handler uses the legacy single-address path.
+        SHOOTDOWN_RANGE_START.store(0, Ordering::Release);
+        SHOOTDOWN_RANGE_END.store(0, Ordering::Release);
+
+        // Set up the request before publishing IPIs.
+        SHOOTDOWN_ADDR.store(addr, Ordering::Release);
+        SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+
+        // Send to exactly the cores we counted. Matches `tlb_shootdown_range`
+        // and `tlb_shootdown_range_kernel`: walk the same predicate so the
+        // IPI recipient set and the pending count are by construction equal.
+        for core_id in 0..64u8 {
+            if core_id == my_core {
+                continue;
+            }
+            if let Some(data) = super::get_core_data(core_id)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+            }
+        }
+
+        // Spin-wait for all remote cores to acknowledge.  IF stays
+        // enabled here; a self-targeted IRQ (timer, etc.) is allowed
+        // to fire and return.  Remote cores' IPI handlers run with
+        // their own IF state, never contend for `SHOOTDOWN_LOCK`,
+        // and only touch the `SHOOTDOWN_*` atomics.
+        // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
+        // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
+        // this core can service its own IRQs.  Cannot yield here: we are still inside
+        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
+        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+            core::hint::spin_loop();
         }
     }
     crate::task::scheduler::preempt_enable();
