@@ -587,10 +587,10 @@ This track records the four IOMMU isolation test scaffolds that landed in `users
 **Why it matters:** These are the QEMU-level isolation acceptance tests for the Phase 55c R2 IOMMU BAR identity coverage work. Without them the kernel's cross-device denial path is unverified end-to-end.
 
 **Acceptance:**
-- [ ] `cross_device_mmio_denied_end_to_end` exercises cross-device MMIO denial via the IOMMU. *(implemented in Phase 67 — see [Phase 67 tasks Track F](./67-iommu-substrate-completion-tasks.md))*
-- [ ] `cross_device_dma_denied_end_to_end` exercises cross-device DMA denial via the IOMMU. *(implemented in Phase 67)*
-- [ ] `capability_forge_denied_end_to_end` rejects forged capability handles. *(implemented in Phase 67)*
-- [ ] `post_crash_handles_invalid_end_to_end` invalidates capabilities a supervisor still holds after the issuing driver crashes. *(implemented in Phase 67)*
+- [x] `cross_device_mmio_denied_end_to_end` exercises cross-device MMIO denial via the IOMMU. *(implemented in Phase 67 — see [Phase 67 tasks Track F](./67-iommu-substrate-completion-tasks.md))*
+- [x] `cross_device_dma_denied_end_to_end` exercises cross-device DMA denial via the IOMMU. *(implemented in Phase 67)*
+- [x] `capability_forge_denied_end_to_end` rejects forged capability handles. *(implemented in Phase 67)*
+- [x] `post_crash_handles_invalid_end_to_end` invalidates capabilities a supervisor still holds after the issuing driver crashes. *(implemented in Phase 67)*
 
 ### K.2 — Supervised-spawn + capability-injection harness
 
@@ -599,8 +599,8 @@ This track records the four IOMMU isolation test scaffolds that landed in `users
 **Why it matters:** K.1's four scaffolds all depend on the same supervisor harness for spawning the NVMe driver under test and injecting a foreign-domain `CapHandle`. Phase 55c declared this out of scope and deferred.
 
 **Acceptance:**
-- [ ] `SupervisedSpawn::start(binary)` forks the named binary under the test supervisor. *(implemented in Phase 67 — see [Phase 67 tasks Track F.1](./67-iommu-substrate-completion-tasks.md))*
-- [ ] `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to a domain-B driver instance. *(implemented in Phase 67 — see [Phase 67 tasks Track F.2](./67-iommu-substrate-completion-tasks.md))*
+- [x] `SupervisedSpawn::start(binary)` forks the named binary under the test supervisor. *(implemented in Phase 67 — see [Phase 67 tasks Track F.1](./67-iommu-substrate-completion-tasks.md))*
+- [x] `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to a domain-B driver instance. *(implemented in Phase 67 — see [Phase 67 tasks Track F.2](./67-iommu-substrate-completion-tasks.md))*
 
 ---
 

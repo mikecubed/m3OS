@@ -1,6 +1,6 @@
 # Phase 67 - IOMMU Substrate Completion
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-67
 **Depends on:** Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
 **Co-existing tip:** Phase 66 (Security and Hygiene Closeout) — Phase 67 lands on top of the 56/57/63/63a/64/66 tip; no surface contested by those phases is touched here

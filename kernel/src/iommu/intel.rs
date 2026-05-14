@@ -48,10 +48,13 @@ use kernel_core::iommu::contract::{
     IommuUnit, Iova, MapFlags, PhysAddr,
 };
 use kernel_core::iommu::iova::IovaAllocator;
-use kernel_core::iommu::vtd_page_table::{PAGE_SIZE, VtdPageTableEntry, VtdPteFlags, level_index};
+use kernel_core::iommu::vtd_page_table::{
+    PAGE_SIZE, VtdPageTableEntry, VtdPteFlags, level_index_n,
+};
 use kernel_core::iommu::vtd_regs::{
-    CCMD_CIRG_GLOBAL, CCMD_ICC, GCMD_SRTP, GCMD_TE, GSTS_RTPS, GSTS_TES, IOTLB_IIRG_GLOBAL,
-    IOTLB_IVT, IOTLB_REG, VtdCap, VtdEcap, VtdRegs, VtdVersion, encode_rtaddr_legacy,
+    CCMD_CIRG_GLOBAL, CCMD_ICC, GCMD_QIE_BIT, GCMD_SRTP, GCMD_TE, GSTS_QIES_BIT, GSTS_RTPS,
+    GSTS_TES, IOTLB_IIRG_GLOBAL, IOTLB_IVT, IOTLB_REG, QiDescriptor, VtdCap, VtdEcap, VtdRegs,
+    VtdVersion, encode_iqa, encode_rtaddr_legacy,
 };
 
 use crate::arch::x86_64::apic;
@@ -63,6 +66,21 @@ use crate::mm::frame_allocator;
 use crate::mm::phys_offset;
 
 use super::fault as iommu_fault;
+
+/// Phase 67 Track D.2 — `true` when the CPU's `CR4.LA57` bit is set.
+///
+/// When LA57 is enabled the host paging hierarchy uses 5 levels (the
+/// extra PML5 sits above the legacy PML4). VT-d scalable-mode IOMMU
+/// page tables must match — running the IOMMU in 4-level mode against
+/// a 5-level CPU produces an address-width mismatch faulting on every
+/// translation. Phase 67 reads the bit live so a kernel that enables
+/// LA57 after `iommu::init` (none today, but a future power-state
+/// change might) still routes through the right page-table depth on
+/// the next `create_domain`.
+fn cr4_la57_enabled() -> bool {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    Cr4::read().contains(Cr4Flags::L5_PAGING)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -106,7 +124,10 @@ struct VtdDomainState {
     id: DomainId,
     /// The 16-bit domain-id field embedded in the context-table entry.
     vtd_domain_id: u16,
-    /// Physical address of the PML4 (level-0) page. Page-aligned.
+    /// Physical address of the root page-table page (the top-level
+    /// page; either PML4 for 4-level or PML5 for 5-level scalable
+    /// mode). The legacy field name is kept for source-compat with
+    /// pre-Phase-67 callers — semantically this is "the table root".
     pml4_phys: u64,
     /// IOVA allocator for this domain. Window is [0, 2^48).
     iova: IovaAllocator,
@@ -115,6 +136,11 @@ struct VtdDomainState {
     /// PCI BDF this domain is bound to. Phase 55a: one BDF per domain.
     /// Stored as `bus << 8 | device << 3 | function`.
     bound_bdf: u16,
+    /// Phase 67 Track D.2 — number of page-table levels in this
+    /// domain's SL hierarchy: 4 for legacy 4-level (`scalable_mode ==
+    /// false` or `CR4.LA57 == 0`) or 5 for scalable-mode + LA57. Set
+    /// at `create_domain` time from [`VtdUnit::init_page_tables`].
+    levels: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +174,22 @@ pub struct VtdUnit {
     next_vtd_domain_id: u16,
     /// `true` after `bring_up` succeeded.
     up: bool,
+    /// Phase 67 Track C.1 — physical address of the 4 KiB invalidation
+    /// queue ring. `None` until `bring_up` allocates it. When `Some`,
+    /// the unit submits queued-invalidation descriptors instead of the
+    /// register-path CCMD/IOTLB sequence.
+    iq_ring_phys: Option<u64>,
+    /// Software-managed producer cursor (in descriptors). Advanced
+    /// after every queued descriptor write.
+    iq_tail: u64,
+    /// Phase 67 Track C.2 — physical address of the invalidation-wait
+    /// status word. Aligned so the IWAIT descriptor's status-address
+    /// field can encode it directly.
+    iq_status_phys: Option<u64>,
+    /// Monotonically advancing marker stamped into each IWAIT
+    /// descriptor. The poller watches the status word for this marker
+    /// to know the queue has drained past the wait descriptor.
+    iq_status_marker: u32,
 }
 
 // SAFETY: VtdUnit is single-owner; the trait takes `&mut self` so the
@@ -175,7 +217,12 @@ impl VtdUnit {
             address_width_bits: cap.address_width_bits(),
             interrupt_remapping: ecap.interrupt_remapping(),
             queued_invalidation: ecap.queued_invalidation(),
-            scalable_mode: false, // Phase 55a — deferred.
+            // Phase 67 Track D.1 — surface the runtime ECAP.SMTS bit
+            // instead of the previously hardcoded `false`. Callers
+            // querying `IommuCapabilities::scalable_mode` now observe
+            // whether the underlying hardware really advertises
+            // scalable-mode translation support.
+            scalable_mode: ecap.scalable_mode(),
         };
         Self {
             unit_index,
@@ -189,6 +236,10 @@ impl VtdUnit {
             next_domain_id: 1,
             next_vtd_domain_id: 1,
             up: false,
+            iq_ring_phys: None,
+            iq_tail: 0,
+            iq_status_phys: None,
+            iq_status_marker: 0,
         }
     }
 
@@ -209,6 +260,32 @@ impl VtdUnit {
     #[allow(dead_code)]
     pub fn ecap(&self) -> VtdEcap {
         self.ecap
+    }
+
+    /// Phase 67 Track D.1 — runtime scalable-mode capability check.
+    ///
+    /// Reads the live `ECAP.SMTS` bit through the cached snapshot
+    /// captured at `new`. Callers that previously consulted the
+    /// hardcoded `false` constant should switch to this accessor so
+    /// scalable mode actually engages on capable hardware.
+    pub fn supports_scalable_mode(&self) -> bool {
+        self.ecap.scalable_mode()
+    }
+
+    /// Phase 67 Track D.2 — bring up page tables for a fresh domain.
+    /// Returns the chosen level count (4 or 5) given the unit's
+    /// scalable-mode capability and the CPU's `CR4.LA57` state.
+    ///
+    /// A scalable-mode-capable unit on a CPU that has LA57 enabled
+    /// uses 5-level tables (`PML5 → PML4 → PDPT → PD → PT`); every
+    /// other configuration stays on the legacy 4-level tree
+    /// (`PML4 → PDPT → PD → PT`) Phase 55a shipped.
+    pub fn init_page_tables(&self) -> u8 {
+        if self.supports_scalable_mode() && cr4_la57_enabled() {
+            5
+        } else {
+            4
+        }
     }
 
     // ---- MMIO primitives ------------------------------------------------
@@ -419,6 +496,183 @@ impl VtdUnit {
         crate::task::scheduler::preempt_enable();
     }
 
+    // ---- Phase 67 Track C — queued invalidation engine ----------------
+
+    /// Bound on a poll for IQH (head register) to reach IQT (tail).
+    /// Same shape as `GSTS_POLL_LIMIT`; sized to bound wall time even
+    /// on a wedged unit.
+    const IQ_POLL_LIMIT: u32 = 2_000_000;
+
+    /// Number of 16-byte descriptors in the QS=0 ring. VT-d 3.3
+    /// §10.4.21: QS=0 maps to 256 entries (4 KiB total).
+    const IQ_DESC_COUNT: u64 = 256;
+
+    /// Allocate the invalidation-queue ring + status word and program
+    /// the IQA / IQH / IQT registers so subsequent flush calls can
+    /// submit descriptors. Idempotent: returns immediately if the
+    /// queue was already set up.
+    ///
+    /// Phase 67 Track C.1 acceptance:
+    /// - Allocates a 4 KiB ring page via the frame allocator.
+    /// - Writes IQA with QS=0 (256 descriptors).
+    /// - Verifies the IQA write by reading it back.
+    fn bring_up_invalidation_queue(&mut self) -> Result<(), IommuError> {
+        if self.iq_ring_phys.is_some() {
+            return Ok(());
+        }
+        // Caller must have set up the root table before enabling QI —
+        // the queue handler refuses to write descriptors until the
+        // unit reports translation is configured. Phase 67 lifts the
+        // queue right after `ensure_root_table` so the order is
+        // satisfied at the call site.
+        let ring_phys = Self::alloc_table_page().ok_or(IommuError::HardwareFault)?;
+        let status_phys = Self::alloc_table_page().ok_or(IommuError::HardwareFault)?;
+
+        // Zero IQH / IQT before pointing IQA at the new ring so
+        // hardware does not race against stale head/tail values.
+        self.write_u64(VtdRegs::IQH, 0);
+        self.write_u64(VtdRegs::IQT, 0);
+        let iqa = encode_iqa(ring_phys, 0);
+        self.write_u64(VtdRegs::IQA, iqa);
+        // Read-back verification per acceptance.
+        let observed = self.read_u64(VtdRegs::IQA);
+        if (observed & !0xFFFu64) != (ring_phys & !0xFFFu64) {
+            log::warn!(
+                "[vtd] unit[{}] IQA read-back mismatch: wrote={:#x} read={:#x}",
+                self.unit_index,
+                iqa,
+                observed,
+            );
+            return Err(IommuError::HardwareFault);
+        }
+
+        // Enable queued-invalidation in GCMD; wait for GSTS.QIES.
+        self.write_u32(VtdRegs::GCMD, GCMD_QIE_BIT);
+        self.wait_gsts_bit(GSTS_QIES_BIT)?;
+
+        self.iq_ring_phys = Some(ring_phys);
+        self.iq_status_phys = Some(status_phys);
+        self.iq_tail = 0;
+        self.iq_status_marker = 0;
+        log::info!(
+            "[iommu] vtd unit[{}] queued invalidation enabled: ring={:#x} status={:#x}",
+            self.unit_index,
+            ring_phys,
+            status_phys,
+        );
+        Ok(())
+    }
+
+    /// Submit `desc` to the queue ring at the current tail and advance
+    /// IQT. Returns the descriptor slot the entry was written at so
+    /// callers can correlate completions if needed.
+    ///
+    /// Pre-condition: [`bring_up_invalidation_queue`] succeeded —
+    /// callers that hit this with `iq_ring_phys == None` get a
+    /// `NotAvailable` error rather than a panic.
+    fn submit_qi_descriptor(&mut self, desc: QiDescriptor) -> Result<u64, IommuError> {
+        let ring = self.iq_ring_phys.ok_or(IommuError::NotAvailable)?;
+        let slot = self.iq_tail;
+        let slot_phys = ring + slot * 16;
+        // SAFETY: ring is a 4 KiB frame; slot < IQ_DESC_COUNT.
+        let virt = (phys_offset() + slot_phys) as *mut u64;
+        unsafe {
+            write_volatile(virt, desc.low);
+            write_volatile(virt.add(1), desc.high);
+        }
+        // Advance tail with wrap-around.
+        self.iq_tail = (self.iq_tail + 1) % Self::IQ_DESC_COUNT;
+        self.write_u64(VtdRegs::IQT, self.iq_tail * 16);
+        Ok(slot)
+    }
+
+    /// Submit an IWAIT descriptor and poll the status word until the
+    /// fresh marker shows up. Bounded by [`IQ_POLL_LIMIT`]; on timeout
+    /// returns [`IommuError::FlushTimeout`].
+    ///
+    /// Each call advances the per-unit marker so concurrent flushes
+    /// would each see their own value (Phase 67 has at most one
+    /// in-flight flush per unit because `&mut self` is the lock
+    /// boundary, but the marker advance is cheap insurance).
+    fn submit_iwait_and_poll(&mut self) -> Result<(), IommuError> {
+        let status_phys = self.iq_status_phys.ok_or(IommuError::NotAvailable)?;
+        self.iq_status_marker = self.iq_status_marker.wrapping_add(1);
+        let marker = self.iq_status_marker;
+        // Zero the status word before submitting so we observe the new
+        // marker arriving.
+        let status_virt = (phys_offset() + status_phys) as *mut u32;
+        // SAFETY: status_phys was allocated via the frame allocator
+        // and is owned solely by this unit.
+        unsafe {
+            write_volatile(status_virt, 0);
+        }
+        let desc = QiDescriptor::iwait(status_phys, marker);
+        self.submit_qi_descriptor(desc)?;
+        // Poll the status word for the marker. Same preempt-discipline
+        // as the legacy GSTS poll.
+        crate::task::scheduler::preempt_disable();
+        let result = (|| {
+            for _ in 0..Self::IQ_POLL_LIMIT {
+                let observed = unsafe { read_volatile(status_virt as *const u32) };
+                if observed == marker {
+                    return Ok(());
+                }
+                core::hint::spin_loop();
+            }
+            Err(IommuError::FlushTimeout)
+        })();
+        crate::task::scheduler::preempt_enable();
+        result
+    }
+
+    /// Look up the 16-bit VT-d domain id for a kernel-side
+    /// [`DomainId`]. Returns `IommuError::Invalid` for unknown ids.
+    fn vtd_did_for(&self, domain: DomainId) -> Result<u16, IommuError> {
+        self.domains
+            .iter()
+            .find(|d| d.id == domain)
+            .map(|d| d.vtd_domain_id)
+            .ok_or(IommuError::Invalid)
+    }
+
+    /// Phase 67 Track C.2 — queued context-cache + IOTLB flush for a
+    /// single domain. Submits one CC_INV (domain-granularity), one
+    /// IOTLB_INV (domain-granularity), then an IWAIT and polls.
+    pub fn flush_domain(&mut self, domain: DomainId) -> Result<(), IommuError> {
+        let did = self.vtd_did_for(domain)?;
+        if self.iq_ring_phys.is_none() {
+            // Queue not up — caller is responsible for register-path
+            // fallback. Returning Ok here would silently drop the
+            // flush.
+            return Err(IommuError::NotAvailable);
+        }
+        // Domain-granular CIRG = 0b10 / IIRG = 0b10 per VT-d 3.3
+        // §10.4.27 (CCMD) and §10.4.31 (IOTLB).
+        self.submit_qi_descriptor(QiDescriptor::cc_inv(0b10, did))?;
+        self.submit_qi_descriptor(QiDescriptor::iotlb_inv(0b10, did))?;
+        self.submit_iwait_and_poll()
+    }
+
+    /// Phase 67 Track C.2 — queued IOTLB-only flush for a domain.
+    pub fn flush_iotlb(&mut self, domain: DomainId) -> Result<(), IommuError> {
+        let did = self.vtd_did_for(domain)?;
+        if self.iq_ring_phys.is_none() {
+            return Err(IommuError::NotAvailable);
+        }
+        self.submit_qi_descriptor(QiDescriptor::iotlb_inv(0b10, did))?;
+        self.submit_iwait_and_poll()
+    }
+
+    /// Phase 67 Track C.2 — queued context-cache flush for a domain.
+    pub fn flush_context(&mut self, domain: DomainId) -> Result<(), IommuError> {
+        let did = self.vtd_did_for(domain)?;
+        if self.iq_ring_phys.is_none() {
+            return Err(IommuError::NotAvailable);
+        }
+        self.submit_qi_descriptor(QiDescriptor::cc_inv(0b10, did))?;
+        self.submit_iwait_and_poll()
+    }
+
     // ---- Page-table walk/install ---------------------------------------
 
     /// Translate [`MapFlags`] into SL-PTE bits.
@@ -438,15 +692,21 @@ impl VtdUnit {
     /// leaf-entry byte offset (`table_phys`, `entry_offset_bytes`) and
     /// a count of newly-allocated intermediate pages (added to the
     /// caller's pt_pages counter).
+    ///
+    /// Phase 67 Track D.2: `levels` selects between the legacy 4-level
+    /// hierarchy (`PML4 → PDPT → PD → PT`) and the scalable-mode
+    /// 5-level hierarchy (`PML5 → PML4 → PDPT → PD → PT`). Domains
+    /// stamp their chosen depth at create-time and pass it through on
+    /// every walk.
     fn walk_and_install_intermediates(
         root_phys: u64,
         iova: u64,
+        levels: usize,
     ) -> Result<(u64, usize, u32), IommuError> {
         let mut table_phys = root_phys;
         let mut allocated = 0u32;
-        for level in 0..3 {
-            // 0 = PML4, 1 = PDPT, 2 = PD; leaf is 3 (PT).
-            let idx = level_index(iova, level);
+        for level in 0..(levels - 1) {
+            let idx = level_index_n(iova, level, levels);
             let entry_offset = idx * 8;
             let raw = Self::read_table_entry(table_phys, entry_offset);
             let entry = VtdPageTableEntry::decode(raw);
@@ -464,17 +724,18 @@ impl VtdUnit {
             table_phys = next_phys;
         }
         // Leaf table.
-        let idx = level_index(iova, 3);
+        let idx = level_index_n(iova, levels - 1, levels);
         let entry_offset = idx * 8;
         Ok((table_phys, entry_offset, allocated))
     }
 
     /// Walk the SL table looking up the leaf entry for `iova` *without*
-    /// allocating intermediates. Used by unmap.
-    fn walk_read_only(root_phys: u64, iova: u64) -> Option<(u64, usize)> {
+    /// allocating intermediates. Used by unmap. See
+    /// [`walk_and_install_intermediates`] for the `levels` contract.
+    fn walk_read_only(root_phys: u64, iova: u64, levels: usize) -> Option<(u64, usize)> {
         let mut table_phys = root_phys;
-        for level in 0..3 {
-            let idx = level_index(iova, level);
+        for level in 0..(levels - 1) {
+            let idx = level_index_n(iova, level, levels);
             let entry_offset = idx * 8;
             let raw = Self::read_table_entry(table_phys, entry_offset);
             let entry = VtdPageTableEntry::decode(raw);
@@ -483,20 +744,25 @@ impl VtdUnit {
             }
             table_phys = entry.phys();
         }
-        let idx = level_index(iova, 3);
+        let idx = level_index_n(iova, levels - 1, levels);
         Some((table_phys, idx * 8))
     }
 
     /// Recursively free every page-table page reachable from `table_phys`
     /// at `level`. Leaf-level (PT) pages free their own frame; inner
     /// levels recurse into every present non-super-page entry first.
-    fn free_subtree(table_phys: u64, level: usize) {
-        if level < 3 {
+    ///
+    /// Phase 67 Track D.2: `total_levels` is 4 for the legacy 4-level
+    /// tree or 5 for scalable-mode 5-level (LA57) trees; leaf level
+    /// equals `total_levels - 1`.
+    fn free_subtree(table_phys: u64, level: usize, total_levels: usize) {
+        let leaf_level = total_levels - 1;
+        if level < leaf_level {
             for i in 0..512 {
                 let raw = Self::read_table_entry(table_phys, i * 8);
                 let entry = VtdPageTableEntry::decode(raw);
                 if entry.is_present() && !entry.is_super_page() {
-                    Self::free_subtree(entry.phys(), level + 1);
+                    Self::free_subtree(entry.phys(), level + 1, total_levels);
                 }
             }
         }
@@ -738,6 +1004,23 @@ impl IommuUnit for VtdUnit {
         self.write_u32(VtdRegs::GCMD, GCMD_TE);
         self.wait_gsts_bit(GSTS_TES)?;
 
+        // 5. Phase 67 Track C.1 — bring up queued invalidation if the
+        //    hardware advertises it. Failure is non-fatal: log + leave
+        //    the ring un-installed so subsequent `flush_*` calls return
+        //    `NotAvailable` and the existing register-path stays
+        //    operational. This deliberate degradation matches Phase
+        //    55a's "IOMMU regressions degrade, do not brick" policy.
+        if self.capabilities.queued_invalidation
+            && let Err(e) = self.bring_up_invalidation_queue()
+        {
+            log::warn!(
+                "[iommu] vtd unit[{}] queued-invalidation bring-up failed: {} \
+                 — register-path flushes still available",
+                self.unit_index,
+                e
+            );
+        }
+
         self.up = true;
         log::info!(
             "[iommu] iommu.unit.brought_up vendor=vtd unit={} register_base={:#x} \
@@ -776,6 +1059,11 @@ impl IommuUnit for VtdUnit {
         let vtd_domain_id = self.next_vtd_domain_id;
         self.next_vtd_domain_id = self.next_vtd_domain_id.saturating_add(1);
 
+        // Phase 67 Track D.2 — stamp the chosen page-table depth per
+        // domain. `init_page_tables` returns 5 only when both the
+        // hardware advertises scalable mode and the CPU has LA57
+        // enabled; otherwise it returns the legacy 4.
+        let levels = self.init_page_tables();
         self.domains.push(VtdDomainState {
             id,
             vtd_domain_id,
@@ -783,6 +1071,7 @@ impl IommuUnit for VtdUnit {
             iova,
             pt_pages: 0,
             bound_bdf: 0,
+            levels,
         });
 
         // Flush the context cache so a subsequent map is observed by
@@ -790,10 +1079,11 @@ impl IommuUnit for VtdUnit {
         self.invalidate_context_cache_global();
 
         log::info!(
-            "[iommu] iommu.domain.created vendor=vtd unit={} domain_id={:#x} root_phys={:#x}",
+            "[iommu] iommu.domain.created vendor=vtd unit={} domain_id={:#x} root_phys={:#x} levels={}",
             self.unit_index,
             id.0,
             pml4_phys,
+            levels,
         );
 
         Ok(DmaDomain::new(id, self.unit_index))
@@ -822,8 +1112,10 @@ impl IommuUnit for VtdUnit {
             }
         }
 
-        // Walk the SL table freeing every page-table page.
-        Self::free_subtree(state.pml4_phys, 0);
+        // Walk the SL table freeing every page-table page. Phase 67
+        // Track D.2: pass the per-domain `levels` so 5-level trees are
+        // freed correctly when scalable mode is active.
+        Self::free_subtree(state.pml4_phys, 0, state.levels as usize);
 
         // Global flush so stale translations from the torn-down domain
         // cannot leak through.
@@ -852,15 +1144,16 @@ impl IommuUnit for VtdUnit {
             return Err(DomainError::InvalidRange);
         }
         let pte_flags = Self::encode_pte_flags(flags);
-        // Snapshot the pml4 and cap under the domain lookup, then drop
-        // the borrow before walking so we can mutate pt_pages after.
-        let (pml4_phys, mut pt_pages) = {
+        // Snapshot the pml4, cap, and level count under the domain
+        // lookup, then drop the borrow before walking so we can mutate
+        // pt_pages after.
+        let (pml4_phys, mut pt_pages, levels) = {
             let state = self
                 .domains
                 .iter()
                 .find(|d| d.id == domain)
                 .ok_or(DomainError::InvalidRange)?;
-            (state.pml4_phys, state.pt_pages)
+            (state.pml4_phys, state.pt_pages, state.levels as usize)
         };
 
         let npages = (len / PAGE_SIZE as usize) as u64;
@@ -869,7 +1162,7 @@ impl IommuUnit for VtdUnit {
             let page_phys = phys.0 + i * PAGE_SIZE;
 
             let (leaf_phys, entry_offset, new_pages) =
-                Self::walk_and_install_intermediates(pml4_phys, page_iova)
+                Self::walk_and_install_intermediates(pml4_phys, page_iova, levels)
                     .map_err(|_| DomainError::HardwareFault)?;
             pt_pages = pt_pages.saturating_add(new_pages);
             if pt_pages > DOMAIN_PT_PAGE_CAP {
@@ -901,7 +1194,12 @@ impl IommuUnit for VtdUnit {
         // Fresh translations are not guaranteed to become visible until the
         // IOTLB is invalidated; otherwise devices can keep faulting on a
         // just-mapped IOVA range.
-        self.invalidate_iotlb_global();
+        //
+        // Phase 67 Track C.2: prefer the queued-invalidation domain
+        // flush when the queue is up so only the affected domain pays
+        // the invalidation cost. Falls back to the global register
+        // path on any QI-side failure.
+        self.flush_iotlb_or_global(domain);
         Ok(())
     }
 
@@ -913,19 +1211,21 @@ impl IommuUnit for VtdUnit {
             return Err(DomainError::InvalidRange);
         }
 
-        let pml4_phys = {
+        let (pml4_phys, levels) = {
             let state = self
                 .domains
                 .iter()
                 .find(|d| d.id == domain)
                 .ok_or(DomainError::InvalidRange)?;
-            state.pml4_phys
+            (state.pml4_phys, state.levels as usize)
         };
 
         let npages = (len / PAGE_SIZE as usize) as u64;
         for i in 0..npages {
             let page_iova = iova.0 + i * PAGE_SIZE;
-            let Some((leaf_phys, entry_offset)) = Self::walk_read_only(pml4_phys, page_iova) else {
+            let Some((leaf_phys, entry_offset)) =
+                Self::walk_read_only(pml4_phys, page_iova, levels)
+            else {
                 return Err(DomainError::NotMapped);
             };
             let raw = Self::read_table_entry(leaf_phys, entry_offset);
@@ -937,11 +1237,31 @@ impl IommuUnit for VtdUnit {
 
         // Required by the trait: IOTLB invalidation before returning
         // success.
-        self.invalidate_iotlb_global();
+        //
+        // Phase 67 Track C.2: per-domain queued flush; fall back to
+        // global on QI-side failure.
+        self.flush_iotlb_or_global(domain);
         Ok(())
     }
 
-    fn flush(&mut self, _domain: DomainId) -> Result<(), IommuError> {
+    fn flush(&mut self, domain: DomainId) -> Result<(), IommuError> {
+        // Phase 67 Track C.2 — prefer the queued-invalidation engine
+        // when available so the trait-level flush exercises the new
+        // per-domain path. On any QI-side failure (timeout, queue not
+        // up, domain not registered yet) fall back to the global
+        // register-path invalidation that Phase 55a shipped.
+        if self.iq_ring_phys.is_some() {
+            match self.flush_domain(domain) {
+                Ok(()) => return Ok(()),
+                Err(IommuError::FlushTimeout) | Err(IommuError::Invalid) => {
+                    log::warn!(
+                        "[iommu] vtd unit[{}] queued flush_domain failed; falling back to global invalidation",
+                        self.unit_index
+                    );
+                }
+                Err(_) => {}
+            }
+        }
         self.invalidate_iotlb_global();
         Ok(())
     }
@@ -1051,9 +1371,52 @@ impl VtdUnit {
             state.bound_bdf = ((bus as u16) << 8) | (dev_fn as u16);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.invalidate_context_cache_global();
-        self.invalidate_iotlb_global();
+        // Phase 67 Track C.2: prefer queued context-cache + IOTLB
+        // flush for the bound domain. The global path stays as the
+        // fall-back when the queue is not up or the descriptor flush
+        // timed out.
+        self.flush_context_or_global(domain_id);
+        self.flush_iotlb_or_global(domain_id);
         Ok(())
+    }
+
+    /// Phase 67 Track C.2 helper — flush the domain's IOTLB through
+    /// queued invalidation when the ring is up, otherwise fall back
+    /// to the global register-path invalidation. Swallows
+    /// non-recoverable QI errors with a `warn!` so callers see the
+    /// best-effort "translations are coherent again" guarantee.
+    fn flush_iotlb_or_global(&mut self, domain: DomainId) {
+        if self.iq_ring_phys.is_some() {
+            match self.flush_iotlb(domain) {
+                Ok(()) => return,
+                Err(IommuError::FlushTimeout) | Err(IommuError::Invalid) => {
+                    log::warn!(
+                        "[iommu] vtd unit[{}] queued flush_iotlb fell back to global",
+                        self.unit_index
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        self.invalidate_iotlb_global();
+    }
+
+    /// Phase 67 Track C.2 helper — same pattern as
+    /// [`flush_iotlb_or_global`] for the context-cache.
+    fn flush_context_or_global(&mut self, domain: DomainId) {
+        if self.iq_ring_phys.is_some() {
+            match self.flush_context(domain) {
+                Ok(()) => return,
+                Err(IommuError::FlushTimeout) | Err(IommuError::Invalid) => {
+                    log::warn!(
+                        "[iommu] vtd unit[{}] queued flush_context fell back to global",
+                        self.unit_index
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        self.invalidate_context_cache_global();
     }
 }
 

@@ -94,10 +94,12 @@ DMAR / IVRS tables describe reserved memory regions (typically firmware GPU fram
 - Mature kernels expose per-process IOMMU groups for VFIO device passthrough to guests; m3OS does not need that until it hosts VMs.
 - Production systems carry significant quirk tables for vendor-specific DMAR bugs; Phase 55a ships the straight-path implementation and records quirks only as they are observed on the reference matrix.
 
-## Known Open Bug — must close before Phase 58
+## Bug Closure Record
 
-- **VT-d MMIO translation drops driver `CTRL.RST` writes under `--iommu`.** Surfaced by Phase 55b's tighter `cargo xtask device-smoke --device {nvme,e1000} --iommu` assertions. The per-device domain setup does not install identity-mapped MMIO windows for each claimed device's BAR regions, so ring-3 drivers' MMIO resets are silently lost under active VT-d translation. Full diagnosis, reproduction, and acceptance criteria in [`docs/appendix/phase-55b-residuals.md`](../appendix/phase-55b-residuals.md) (item R2). **This must close before the Phase 58 1.0 gate ships its "IOMMU-isolated ring-3 drivers" claim.**
+- **VT-d MMIO translation drops driver `CTRL.RST` writes under `--iommu`.** Surfaced by Phase 55b's tighter `cargo xtask device-smoke --device {nvme,e1000} --iommu` assertions. The per-device domain setup did not install identity-mapped MMIO windows for each claimed device's BAR regions, so ring-3 drivers' MMIO resets were silently lost under active VT-d translation. Full diagnosis, reproduction, and acceptance criteria in [`docs/appendix/phase-55b-residuals.md`](../appendix/phase-55b-residuals.md) (item R2).
   - **Status (2026-05-08):** Closed by [Phase 55c R2 — IOMMU MMIO Identity Coverage](./55c-ring-3-driver-correctness-closure.md). Every claimed-device BAR is now identity-mapped in the device's IOMMU domain; `cargo xtask device-smoke --device {nvme,e1000} --iommu` pass end-to-end. Retained here for historical traceability — see Phase 55c § R2 for the resolution.
+
+> **Phase 67 completion note:** The remaining IOMMU substrate items that Phase 55a deferred or tracked as TODOs — AMD-Vi fault ISR + decoder (`kernel/src/iommu/amd.rs::install_fault_handler` + `kernel-core/src/iommu/amd.rs::decode_event_log_entry`), VT-d queued invalidation (`kernel/src/iommu/intel.rs::flush_domain` / `flush_iotlb` / `flush_context`), VT-d scalable mode bring-up (`VtdUnit::supports_scalable_mode` + `init_page_tables`), AMD-Vi multi-BDF domain grouping (`AmdVi::group_bdf_domains` + `kernel-core/src/iommu/tables.rs::group_bdfs_by_alias`), and the four isolation-test `todo!()` scaffolds in `userspace/drivers/nvme/tests/isolation.rs` — are closed by [Phase 67 — IOMMU Substrate Completion](./67-iommu-substrate-completion.md). See [`docs/roadmap/tasks/67-iommu-substrate-completion-tasks.md`](./tasks/67-iommu-substrate-completion-tasks.md) for the per-track acceptance trace.
 
 ## Deferred Until Later
 

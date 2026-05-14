@@ -62,6 +62,16 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
 /// one and silently drop settings.
 pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off,aw-bits=48"];
 
+/// Phase 67 Track D.2 — scalable-mode VT-d args.
+///
+/// Mirrors [`IOMMU_QEMU_ARGS`] but flips `x-scalable-mode` from `off`
+/// to `modern` so the guest can exercise the queued-invalidation +
+/// 5-level page-table bring-up paths added in Phase 67. Test harnesses
+/// opt in by passing `--iommu-scalable` (and dropping the regular
+/// `--iommu` flag) so the two flag sets do not collide.
+pub const IOMMU_SCALABLE_QEMU_ARGS: &[&str] =
+    &["-device", "intel-iommu,x-scalable-mode=modern,aw-bits=48"];
+
 /// Phase 57 H.5 / Phase 63 C.1 — headless audio flags (no host sink required).
 ///
 /// Used by `cargo xtask run` (headless) and `cargo xtask run-gui --no-audio`.
