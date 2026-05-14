@@ -275,6 +275,18 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
 
         // Count remote online cores so the pending count is fixed before any
         // IPI is sent (same underflow rationale as `tlb_shootdown_range`).
+        //
+        // Copilot review #156: the pending count and the IPI recipients
+        // MUST match. `send_ipi_all_excluding_self` is a LAPIC shorthand
+        // that delivers to every physically present LAPIC regardless of
+        // OS-level `is_online` state — APs mid-boot, CPUs beyond
+        // `MAX_CORES`, or any LAPIC the kernel hasn't yet enumerated
+        // would all receive the IPI, run the handler, and `fetch_sub` on
+        // `SHOOTDOWN_PENDING`. With a pre-counted target smaller than the
+        // actual recipient set, the `u8` decrement underflows and the
+        // sender's spin-wait sees `> 0` forever. Mirror
+        // `tlb_shootdown_range`'s explicit per-core send loop so
+        // recipients and counted cores are by construction identical.
         let my_core = super::per_core().core_id;
         let mut targets = 0u8;
         for core_id in 0..64u8 {
@@ -299,7 +311,20 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
         SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
         SHOOTDOWN_PENDING.store(targets, Ordering::Release);
 
-        ipi::send_ipi_all_excluding_self(ipi::IPI_TLB_SHOOTDOWN);
+        // Send to exactly the cores we counted. `send_ipi_to_core` re-checks
+        // `is_online` and is a no-op for offline cores — but the count and
+        // the recipients are by construction identical because we walk the
+        // same `get_core_data + is_online` predicate on both paths.
+        for core_id in 0..64u8 {
+            if core_id == my_core {
+                continue;
+            }
+            if let Some(data) = super::get_core_data(core_id)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+            }
+        }
 
         // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
         while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
