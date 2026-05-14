@@ -75,16 +75,17 @@
 - [ ] Writes the physical address to the IQA register with `QS=0` (256 descriptors).
 - [ ] Asserts IQA write succeeded by reading back and comparing.
 
-### C.2 — Implement descriptor submission for `flush_domain`, `flush_iotlb`, `flush_context`
+### C.2 — Add `flush_domain`, `flush_iotlb`, `flush_context` over queued invalidation
 
 **File:** `kernel/src/iommu/intel.rs`
 **Symbol:** `VtdUnit::flush_domain`, `VtdUnit::flush_iotlb`, `VtdUnit::flush_context`
-**Why it matters:** Replacing the register-based path removes the incompatibility with scalable mode.
+**Why it matters:** Per-domain queued invalidation is required for scalable mode and gives the kernel a finer-grained flush API than the current global-only path.
 
 **Acceptance:**
-- [ ] Each flush method writes the appropriate invalidation descriptor to the ring and advances IQT.
-- [ ] Each method polls IQH until it equals IQT (synchronous wait).
-- [ ] Register-based path at `intel.rs:722` is removed; no call site still uses it.
+- [ ] Each new flush method writes the appropriate invalidation descriptor to the ring and advances IQT.
+- [ ] Each method polls IQH until it equals IQT (synchronous wait); a bounded timeout produces `IommuError::FlushTimeout`.
+- [ ] The pre-existing global invalidation calls in `bring_up` (`invalidate_context_cache_global`, `invalidate_iotlb_global`) stay — they fire before the queue is up. No callers currently use a per-domain register-based path, so nothing register-based is removed by this task.
+- [ ] At least one callsite in `kernel/src/iommu/` invokes each new flush method (e.g., on domain mutation) so the path is not dead code.
 - [ ] `cargo xtask test --test iommu_vtd_qi` passes.
 
 ---
@@ -109,22 +110,24 @@
 
 **Acceptance:**
 - [ ] `init_page_tables` checks `supports_scalable_mode() && cr4_la57_enabled()` and sets the page-table level count accordingly (5 or 4).
-- [ ] `cargo xtask test --test iommu_vtd_scalable` passes on a QEMU target with `-device intel-iommu,eim=on,device-iotlb=on`.
+- [ ] `cargo xtask test --test iommu_vtd_scalable` passes on a QEMU target with `-device intel-iommu,x-scalable-mode=modern,aw-bits=48` (matches the project's existing `IOMMU_QEMU_ARGS` pattern in `xtask/src/main.rs:63`, with `x-scalable-mode=off` flipped to `modern`).
+- [ ] `xtask/src/main.rs` `IOMMU_QEMU_ARGS` gains a sibling constant (or a flag) for the scalable-mode variant so the test harness can opt in without forking the default IOMMU args.
 
 ---
 
 ## Track E — AMD-Vi Multi-BDF Domain Grouping
 
-### E.1 — Parse IVRS alias and device-all entries
+### E.1 — Add a BDF-grouping helper over existing IVHD alias entries
 
-**File:** `kernel-core/src/iommu/ivrs.rs`
-**Symbol:** `parse_ivhd_entries`, `IvhdEntry`
-**Why it matters:** Without alias parsing, devices that share a DMA domain get independent domains, breaking IOMMU correctness for multi-function devices.
+**File:** `kernel-core/src/iommu/tables.rs` (extend existing module)
+**Symbol:** `group_bdfs_by_alias` (or similar), consuming the existing `IvhdDeviceEntry::AliasSelect` and `IvhdDeviceEntry::AliasStartRange` variants
+**Why it matters:** The IVRS parser already decodes alias entries and has round-trip tests (`ivrs_decode_ivhd_40h_with_alias` at `tables.rs:1343`). The missing piece is a typed helper that walks an `IvrsTables` and groups BDFs into equivalence classes (union-find over alias pairs) for downstream consumption by `AmdVi::group_bdf_domains`.
 
 **Acceptance:**
-- [ ] `IvhdEntry` has a `DevAlias { source_bdf, target_bdf }` variant.
-- [ ] `parse_ivhd_entries` returns a `Vec<IvhdEntry>` including alias entries.
-- [ ] At least two unit tests cover alias record parsing.
+- [ ] No new parser is introduced; the helper consumes the existing `IvhdDeviceEntry` variants.
+- [ ] The helper returns BDF equivalence classes (e.g., `Vec<Vec<u16>>` or a `BTreeMap<u16, GroupId>`) so a caller can look up a BDF's group in O(log n).
+- [ ] `AliasStartRange` records expand into the implied per-device aliases over the (start, end) range before unioning.
+- [ ] At least three unit tests: single `AliasSelect`, single `AliasStartRange`, and a graph that needs union-find (two alias pairs that transitively merge).
 
 ### E.2 — Group BDFs into shared domains at bring-up
 
@@ -152,18 +155,19 @@
 - [ ] `SupervisedSpawn::stop()` sends SIGTERM and waits for exit.
 - [ ] At least one test uses the harness end-to-end.
 
-### F.2 — Implement `CapHandle::inject_foreign_dma` and replace all four `todo!()` bodies
+### F.2 — Implement `CapHandle::inject_foreign_dma`, fill the four scaffolds, and add a fifth restart test
 
 **File:** `userspace/drivers/nvme/tests/isolation.rs`
-**Symbol:** `CapHandle::inject_foreign_dma`, `test_cross_domain_dma_rejected`, `test_driver_restart_resets_domain`, `test_overmapped_bar_rejected`, `test_stale_cap_rejected`
-**Why it matters:** These were the Phase 55c acceptance tests that were scaffolded but never implemented.
+**Symbol:** `CapHandle::inject_foreign_dma`, `cross_device_mmio_denied_end_to_end`, `cross_device_dma_denied_end_to_end`, `capability_forge_denied_end_to_end`, `post_crash_handles_invalid_end_to_end`, new `driver_restart_resets_domain`
+**Why it matters:** Four existing `todo!()` scaffolds (at lines 85 / 112 / 139 / 171) were Phase 55c acceptance items that were never implemented. The fifth test covers the cross-restart domain-recycle path that none of the four scaffolds scopes.
 
 **Acceptance:**
 - [ ] `inject_foreign_dma` creates a `DmaBuffer` in one supervised driver's domain and passes its bus address to a second driver instance.
-- [ ] `test_cross_domain_dma_rejected`: cross-domain DMA I/O returns `-EFAULT`; no kernel panic.
-- [ ] `test_driver_restart_resets_domain`: after driver restart, the old domain is destroyed and a new one is created.
-- [ ] `test_overmapped_bar_rejected`: a BAR MMIO map beyond the registered coverage range is rejected.
-- [ ] `test_stale_cap_rejected`: using a capability handle after the driver that created it has exited returns `-EBADF`.
+- [ ] `cross_device_mmio_denied_end_to_end`: an NVMe driver instance attempting an MMIO operation on a foreign device's BAR is rejected at the IOMMU check point with a typed negative errno.
+- [ ] `cross_device_dma_denied_end_to_end`: cross-device DMA I/O returns `-EFAULT`; no kernel panic.
+- [ ] `capability_forge_denied_end_to_end`: an attempt to call a device-host syscall with a forged `CapHandle` returns `-EBADF`.
+- [ ] `post_crash_handles_invalid_end_to_end`: a `CapHandle` held by a supervisor after the issuing driver crashes is rejected on subsequent use with `-EBADF`.
+- [ ] New `driver_restart_resets_domain`: after a supervised driver restart the old `DomainId` is destroyed, a new domain is created at re-claim, and a `CapHandle` minted in the pre-restart domain fails to translate post-restart.
 - [ ] `grep -n 'todo!' userspace/drivers/nvme/tests/isolation.rs` returns zero lines.
 
 ---
@@ -174,20 +178,22 @@
 
 **File:** `docs/roadmap/55a-iommu-substrate.md`
 **Symbol:** (document section `## Known Open Bug`)
-**Why it matters:** The "Known Open Bug — must close before Phase 58" section was already closed by 55c R2; that fact must be recorded and the Phase 67 completion added.
+**Why it matters:** The section already carries an inline `Status (2026-05-08): Closed by Phase 55c R2` note; this task formalizes the closure header and appends the Phase 67 completion record.
 
 **Acceptance:**
-- [ ] The `## Known Open Bug` section is retitled `## Bug Closure Record` and notes that the VT-d MMIO CTRL.RST issue was closed in Phase 55c R2.
-- [ ] A `> **Phase 67 completion note:**` block is appended listing the items closed by this phase.
+- [ ] The `## Known Open Bug — must close before Phase 58` heading is retitled `## Bug Closure Record` (the existing 55c R2 closure note stays as the record body — do not remove it).
+- [ ] A `> **Phase 67 completion note:**` blockquote is appended listing the items closed by this phase (AMD-Vi fault ISR + decoder, VT-d queued invalidation, VT-d scalable mode, AMD-Vi multi-BDF grouping, isolation tests).
 
-### G.2 — Update Phase 55c task doc to reference isolation test closure
+### G.2 — Annotate the new 55c Isolation Tests track as implemented in Phase 67
 
 **File:** `docs/roadmap/tasks/55c-ring-3-driver-correctness-closure-tasks.md`
-**Symbol:** (isolation test track)
-**Why it matters:** The four `todo!()` scaffolds were Phase 55c acceptance items; their closure reference must be recorded.
+**Symbol:** Track K (added by this phase — see Documentation Notes below)
+**Why it matters:** The 55c task doc currently has no track that records the four `todo!()` scaffolds as deferred acceptance items. Without that record, Phase 67's closure has nothing concrete to point back at. G.2 first back-fills the missing track in 55c, then marks it as closed.
 
 **Acceptance:**
-- [ ] Isolation test track acceptance items note "(implemented in Phase 67)".
+- [ ] A new `## Track K — Isolation Tests (deferred → Phase 67)` section exists in `55c-ring-3-driver-correctness-closure-tasks.md` listing the four scaffold tests and `CapHandle::inject_foreign_dma`.
+- [ ] The Track Layout table at the top of 55c-tasks gains a row for Track K with Status `✅ Closed by Phase 67`.
+- [ ] Each acceptance bullet in Track K is annotated `(implemented in Phase 67)` and cross-links to `docs/roadmap/tasks/67-iommu-substrate-completion-tasks.md` Track F.
 
 ---
 
@@ -204,7 +210,7 @@
 **Acceptance:**
 - [ ] `docs/67-iommu-substrate-completion.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 67`, `**Status:** Planned`, `**Source Ref:** phase-67`, `**Supersedes Legacy Doc:** new`).
 - [ ] Overview is one learner-friendly paragraph explaining what Phase 55a left incomplete and what this phase closes.
-- [ ] Key Files table cites `kernel/src/iommu/amd.rs`, `kernel/src/iommu/intel.rs`, `kernel-core/src/iommu/amd.rs`, `kernel-core/src/iommu/ivrs.rs`, and `userspace/drivers/nvme/tests/isolation.rs`.
+- [ ] Key Files table cites `kernel/src/iommu/amd.rs`, `kernel/src/iommu/intel.rs`, `kernel-core/src/iommu/amd.rs` (new — fault decoder), `kernel-core/src/iommu/tables.rs` (extended — BDF-grouping helper), and `userspace/drivers/nvme/tests/isolation.rs`.
 - [ ] Related Roadmap Docs links `docs/roadmap/67-iommu-substrate-completion.md` and `docs/roadmap/tasks/67-iommu-substrate-completion-tasks.md`.
 
 ### H.2 — Bump kernel version to 0.67.0
@@ -224,6 +230,9 @@
 
 ## Documentation Notes
 
-- `kernel-core/src/iommu/amd.rs` for the fault decoder is a new file alongside the existing IVRS parser; it must be `no_std` compatible.
-- The queued invalidation ring in Track C must be pinned (physically contiguous, non-pageable); use the existing `DmaBuffer<u8>` allocation path.
+- `kernel-core/src/iommu/amd.rs` for the fault decoder is a new file alongside the existing IVRS parser in `kernel-core/src/iommu/tables.rs`; it must be `no_std` compatible.
+- Track E extends the existing IVHD parser in `kernel-core/src/iommu/tables.rs` rather than creating a parallel `ivrs.rs` module. The existing `IvhdDeviceEntry` enum (with `AliasSelect` and `AliasStartRange` variants) and its round-trip tests stay authoritative; this phase adds a grouping helper that consumes those types.
+- The queued invalidation ring in Track C must be pinned (physically contiguous, non-pageable); use the existing `DmaBuffer<u8>` allocation path. The pre-existing global invalidation calls in `VtdUnit::bring_up` stay in place — they fire before the queue is up.
 - VT-d scalable-mode 5-level page tables change the IOMMU page-table depth only — the kernel's own paging level (`cr4.la57`) is not changed by this phase.
+- D.2's QEMU flag set (`x-scalable-mode=modern,aw-bits=48`) mirrors the project's existing `IOMMU_QEMU_ARGS` constant in `xtask/src/main.rs:63`, with only `x-scalable-mode` flipped. The current `eim` / `device-iotlb` flags are unrelated to scalable-mode bring-up and are not required here.
+- Track F preserves the existing scaffold function names (`cross_device_mmio_denied_end_to_end`, `cross_device_dma_denied_end_to_end`, `capability_forge_denied_end_to_end`, `post_crash_handles_invalid_end_to_end`) and adds one new test (`driver_restart_resets_domain`). The acceptance bullets match what each scaffold scopes; do not rename the existing functions.

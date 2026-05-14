@@ -19,6 +19,7 @@
 | H | **R1 userspace:** `e1000-crash-smoke` EAGAIN assertion; unignore `qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds` | G | Planned |
 | I | **Regressions:** `scripts/ssh_e1000_banner_check.sh` (R3), `cargo xtask device-smoke --device {nvme,e1000} --iommu` (R2) wired into the same CI lane, EAGAIN smoke (R1) | D, F, H | Planned |
 | J | **Documentation + version:** 55b residuals strike-throughs; Phase 56 bound-notification precondition note; `v0.55.3` bump | I | ✅ Done |
+| K | **Isolation tests (scaffolded, deferred):** four `todo!()` bodies in `userspace/drivers/nvme/tests/isolation.rs` plus `CapHandle::inject_foreign_dma` and the supervised-spawn harness | D, E, F | ✅ Closed by Phase 67 |
 
 ---
 
@@ -572,6 +573,34 @@ Pure logic belongs in `kernel-core`. Syscall wiring and MMIO-adjacent work belon
 - [x] `README.md` version line updated.
 - [x] Both roadmap READMEs reflect Phase 55c as Complete.
 - [x] `cargo xtask check` passes.
+
+---
+
+## Track K — Isolation Tests (deferred → Phase 67)
+
+This track records the four IOMMU isolation test scaffolds that landed in `userspace/drivers/nvme/tests/isolation.rs` during Phase 55c as Track D / R2 follow-ups. The bodies were left as `todo!()` calls pending a supervised-spawn + capability-injection harness, which Phase 55c did not build. The track is recorded here so the deferral is auditable and so Phase 67 has a concrete prior commitment to close.
+
+### K.1 — Four `todo!()` scaffolds in `isolation.rs`
+
+**File:** `userspace/drivers/nvme/tests/isolation.rs`
+**Symbol:** `cross_device_mmio_denied_end_to_end` (line 79), `cross_device_dma_denied_end_to_end` (line 106), `capability_forge_denied_end_to_end` (line 132), `post_crash_handles_invalid_end_to_end` (line 162)
+**Why it matters:** These are the QEMU-level isolation acceptance tests for the Phase 55c R2 IOMMU BAR identity coverage work. Without them the kernel's cross-device denial path is unverified end-to-end.
+
+**Acceptance:**
+- [ ] `cross_device_mmio_denied_end_to_end` exercises cross-device MMIO denial via the IOMMU. *(implemented in Phase 67 — see [Phase 67 tasks Track F](./67-iommu-substrate-completion-tasks.md))*
+- [ ] `cross_device_dma_denied_end_to_end` exercises cross-device DMA denial via the IOMMU. *(implemented in Phase 67)*
+- [ ] `capability_forge_denied_end_to_end` rejects forged capability handles. *(implemented in Phase 67)*
+- [ ] `post_crash_handles_invalid_end_to_end` invalidates capabilities a supervisor still holds after the issuing driver crashes. *(implemented in Phase 67)*
+
+### K.2 — Supervised-spawn + capability-injection harness
+
+**File:** `userspace/drivers/nvme/tests/isolation.rs`
+**Symbol:** `SupervisedSpawn`, `CapHandle::inject_foreign_dma`
+**Why it matters:** K.1's four scaffolds all depend on the same supervisor harness for spawning the NVMe driver under test and injecting a foreign-domain `CapHandle`. Phase 55c declared this out of scope and deferred.
+
+**Acceptance:**
+- [ ] `SupervisedSpawn::start(binary)` forks the named binary under the test supervisor. *(implemented in Phase 67 — see [Phase 67 tasks Track F.1](./67-iommu-substrate-completion-tasks.md))*
+- [ ] `CapHandle::inject_foreign_dma` creates a `DmaBuffer` in domain A and hands its bus address to a domain-B driver instance. *(implemented in Phase 67 — see [Phase 67 tasks Track F.2](./67-iommu-substrate-completion-tasks.md))*
 
 ---
 
