@@ -301,12 +301,35 @@ where
 }
 
 /// Enqueue `event` for every subscriber of its kind, then immediately
-/// flush each subscriber's ring through `send_fn`.
+/// flush each affected subscriber's ring through `send_fn`.
 ///
 /// The publish path is "queue, then drain" rather than "send directly"
 /// so the bounded-queue drop-oldest behaviour applies even when the
 /// transport accepts every event — a slow consumer cannot wedge a
 /// fast publisher.
+///
+/// ## Whole-ring drain semantics
+///
+/// The flush step calls [`flush_subscriber_ring`] per subscriber,
+/// which drains that client's *entire* pending queue — including
+/// events of other kinds that the same client subscribed to and that
+/// have not yet been transmitted. Two observable consequences:
+///
+/// 1. **`events_dropped` is per-event, not per-publish.** A single
+///    publish that returns [`FlushError::WouldBlock`] from the
+///    transport bumps the counter by one for *every* event the loop
+///    pulls off the ring before the transport eventually succeeds,
+///    including previously-queued backlog from earlier publishes.
+/// 2. **Multi-kind subscribers see cross-kind drain.** A client
+///    subscribed to both `LayerEvent` and `CursorEvent` will have
+///    *both* kinds' queued events drained when this function is
+///    called for *either* kind. This is intentional: it keeps each
+///    client's queue eventually drained even when one kind goes
+///    quiet, instead of pinning backlog behind a starved publisher.
+///
+/// Callers that need strict per-kind isolation should drain through
+/// [`ControlSubscriptions::drain_one`] from the IPC pull verb path
+/// rather than relying on the publish-side flush.
 pub fn publish_to_subscribers<F>(
     subs: &mut ControlSubscriptions,
     event: ControlEvent,
