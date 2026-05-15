@@ -8752,11 +8752,49 @@ fn populate_ext2_files(
     // into `xtask/assets/fonts/term.ttf`; a missing file means the
     // developer forgot to fetch — treat as a hard, actionable error
     // so a silently-fallback build doesn't ship without the icons.
+    //
+    // Re-verify the SHA-256 here (not just file presence) against the
+    // committed `term.ttf.sha256` digest so a stale, partially-copied,
+    // or manually-replaced asset can't slip into the disk image. The
+    // checksum read mirrors `cmd_fetch_fonts`.
     let font_src = workspace_root().join("xtask/assets/fonts/term.ttf");
+    let font_sha = workspace_root().join("xtask/assets/fonts/term.ttf.sha256");
     if !font_src.is_file() {
         eprintln!(
             "Error: Nerd Font asset missing at {}\n\
              Run `cargo xtask fetch-fonts` first.",
+            font_src.display()
+        );
+        std::process::exit(1);
+    }
+    let expected_font_sha = match fs::read_to_string(&font_sha) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
+            eprintln!(
+                "Error: failed to read font checksum file {}: {e}\n\
+                 Run `cargo xtask fetch-fonts` to restore it.",
+                font_sha.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    if expected_font_sha.len() != 64 || !expected_font_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!(
+            "Error: font checksum file does not contain a 64-char hex digest: {}",
+            font_sha.display()
+        );
+        std::process::exit(1);
+    }
+    if !verify_sha256_strict(&font_src, &expected_font_sha) {
+        eprintln!(
+            "Error: SHA-256 mismatch on staged Nerd Font asset.\n\
+             Expected: {expected_font_sha}\n\
+             Path:     {}\n\
+             Run `cargo xtask fetch-fonts` to re-stage a verified copy.",
             font_src.display()
         );
         std::process::exit(1);

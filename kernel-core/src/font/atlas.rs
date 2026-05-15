@@ -18,8 +18,13 @@ use alloc::vec::Vec;
 use super::parser::Font;
 use super::raster::{CellMetrics, RasterBitmap, Rasterizer};
 
-/// Default per-`term` atlas capacity. 1024 entries × ~16 bytes
-/// bitmap = ~16 KiB worst case for an 8 × 16 cell.
+/// Default per-`term` atlas capacity (cached glyph count, not a
+/// memory ceiling). The packed 8 × 16 bitmap is 16 bytes per glyph,
+/// so the rasterized pixel data alone is ~16 KiB at 1024 entries.
+/// Real per-`term` heap footprint is several times higher: each
+/// cached entry also carries a `Slot` (codepoint + prev/next link
+/// fields + the `RasterBitmap`'s `Vec<u8>` header) plus a separately
+/// allocated bitmap heap block.
 pub const DEFAULT_ATLAS_CAPACITY: usize = 1024;
 
 /// Errors observable from the atlas API.
@@ -33,6 +38,14 @@ pub enum AtlasError {
     /// whose top-left coordinate is `(cell/2) - 1`; that underflows
     /// for `cell_w < 2` or `cell_h < 2`.
     CellTooSmall,
+    /// The font byte buffer handed to [`Atlas::new`] could not be
+    /// parsed (`Font::open` failed because the bytes are malformed,
+    /// truncated, or missing required tables). Distinct from
+    /// [`OutlineUnavailable`] so callers can separate "bad font
+    /// file" from "covered glyph could not be outlined".
+    ///
+    /// [`OutlineUnavailable`]: AtlasError::OutlineUnavailable
+    Malformed,
     /// Outline rasterization failed for a codepoint the font claims
     /// to cover. Surfaced from [`Atlas::resolve`] as the
     /// fallback-dot path so the caller does not have to branch.
@@ -93,7 +106,7 @@ impl Atlas {
         // and we don't want to thread a self-referential struct
         // through `Atlas`.
         let metrics = {
-            let font = Font::open(&bytes).map_err(|_| AtlasError::OutlineUnavailable)?;
+            let font = Font::open(&bytes).map_err(|_| AtlasError::Malformed)?;
             CellMetrics {
                 cell_w,
                 cell_h,
@@ -353,46 +366,7 @@ fn build_fallback(width: u8, height: u8) -> RasterBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test fixture font candidates, in priority order:
-    ///
-    /// 1. The repository's staged Nerd Font, materialized by
-    ///    `cargo xtask fetch-fonts`. This is the deterministic
-    ///    fixture — every developer who builds the disk image
-    ///    has this asset locally, and CI fetches it before running
-    ///    `cargo xtask check`.
-    /// 2. System-installed DejaVu Sans Mono at the canonical
-    ///    Debian / Fedora / Arch paths. Kept as a fallback so a
-    ///    fresh checkout that hasn't run `fetch-fonts` still has
-    ///    a path that works on most Linux dev machines.
-    ///
-    /// If none of these resolve, the test still short-circuits so
-    /// `cargo test -p kernel-core` does not hard-fail on a minimal
-    /// dev box — but loud `eprintln!` lines (see `load_bytes`) make
-    /// it visible that coverage was skipped instead of silently
-    /// passing.
-    const TEST_FONT_PATHS: &[&str] = &[
-        // Workspace-staged Nerd Font (run `cargo xtask fetch-fonts`).
-        "xtask/assets/fonts/term.ttf",
-        "../xtask/assets/fonts/term.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    ];
-
-    fn load_bytes() -> Option<Vec<u8>> {
-        for candidate in TEST_FONT_PATHS {
-            if let Ok(bytes) = std::fs::read(candidate) {
-                return Some(bytes);
-            }
-        }
-        eprintln!(
-            "kernel-core font tests: no fixture font found; ran with reduced \
-             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
-             fixture at xtask/assets/fonts/term.ttf."
-        );
-        None
-    }
+    use crate::font::test_fixtures::load_test_font_bytes as load_bytes;
 
     #[test]
     fn capacity_zero_rejected() {
@@ -418,7 +392,7 @@ mod tests {
     fn malformed_bytes_rejected() {
         let bytes = vec![0u8; 4];
         let err = Atlas::new(bytes, 8, 16, 16).err().expect("expected error");
-        assert_eq!(err, AtlasError::OutlineUnavailable);
+        assert_eq!(err, AtlasError::Malformed);
     }
 
     #[test]

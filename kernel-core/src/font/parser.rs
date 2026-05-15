@@ -237,38 +237,7 @@ impl ttf_parser::OutlineBuilder for OutlineCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Load a TTF for these tests. The workspace-staged Nerd Font
-    /// (`xtask/assets/fonts/term.ttf`, materialized by
-    /// `cargo xtask fetch-fonts`) is the deterministic fixture; the
-    /// system DejaVu Sans Mono paths and Arial are fallbacks for
-    /// minimal dev boxes. DejaVu is distributed under the Bitstream
-    /// Vera / DejaVu license; no font binary is bundled in-tree.
-    /// Tests that find no font on disk short-circuit so
-    /// `cargo test -p kernel-core` still works from any directory,
-    /// but the `eprintln!` makes the skip loud rather than silent.
-    fn load_test_font_bytes() -> Option<Vec<u8>> {
-        for candidate in TEST_FONT_PATHS {
-            if let Ok(bytes) = std::fs::read(candidate) {
-                return Some(bytes);
-            }
-        }
-        eprintln!(
-            "kernel-core font tests: no fixture font found; ran with reduced \
-             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
-             fixture at xtask/assets/fonts/term.ttf."
-        );
-        None
-    }
-
-    const TEST_FONT_PATHS: &[&str] = &[
-        "xtask/assets/fonts/term.ttf",
-        "../xtask/assets/fonts/term.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/Library/Fonts/Arial.ttf",
-    ];
+    use crate::font::test_fixtures::load_test_font_bytes;
 
     #[test]
     fn malformed_bytes_rejected() {

@@ -123,8 +123,13 @@ fn compose_fonts_name<'a>(buf: &'a mut [u8; 64], leaf: &str) -> &'a str {
             i += 1;
         }
     }
-    // SAFETY: bytes copied are ASCII subset of the leaf identifier
-    // plus the fixed prefix, both UTF-8 by construction.
+    // The fixed `fonts-` prefix is ASCII, and `leaf.as_bytes()`
+    // preserves whatever UTF-8 the caller already had (argv is
+    // UTF-8, not necessarily ASCII). Concatenating valid UTF-8
+    // with a leading ASCII run is still valid UTF-8, so the
+    // `from_utf8` conversion below is safe by construction —
+    // the fallback `"fonts"` only triggers if a future caller
+    // hands us malformed UTF-8.
     core::str::from_utf8(&buf[..i]).unwrap_or("fonts")
 }
 
@@ -586,10 +591,11 @@ fn run_fonts_branch_icon() -> Result<(), &'static str> {
     if bm.is_blank() {
         return Err("branch-icon-rendered-blank");
     }
-    // 4 px is the fallback-dot ink count; a real branch icon's
-    // glyph paints substantially more than that. Use 8 to leave
-    // slack for a sparsely-rendered glyph at 8 × 16 cell size while
-    // still rejecting the fallback shape.
+    // The fallback dot paints exactly 4 px (a 2 × 2 stamp), so an
+    // `ink_count() <= 4` rejection catches the fallback path
+    // without rejecting a sparsely-rasterized real glyph at 8 × 16
+    // cell size. Tightening the threshold higher would risk
+    // flagging legitimate glyphs whose 8 × 16 bitmap is sparse.
     if bm.ink_count() <= 4 {
         return Err("branch-icon-rendered-as-fallback-dot");
     }

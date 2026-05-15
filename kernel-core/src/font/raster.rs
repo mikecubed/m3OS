@@ -381,31 +381,7 @@ fn split_contours(segments: &[OutlineSegment], mapped: &[(f32, f32)]) -> Vec<Vec
 mod tests {
     use super::*;
     use crate::font::parser::Font;
-
-    /// See `kernel_core::font::atlas::tests::TEST_FONT_PATHS` for the
-    /// rationale — the workspace-staged Nerd Font is the
-    /// deterministic fixture, with system DejaVu as a fallback.
-    const TEST_FONT_PATHS: &[&str] = &[
-        "xtask/assets/fonts/term.ttf",
-        "../xtask/assets/fonts/term.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    ];
-
-    fn load_test_font_bytes() -> Option<Vec<u8>> {
-        for candidate in TEST_FONT_PATHS {
-            if let Ok(bytes) = std::fs::read(candidate) {
-                return Some(bytes);
-            }
-        }
-        eprintln!(
-            "kernel-core font tests: no fixture font found; ran with reduced \
-             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
-             fixture at xtask/assets/fonts/term.ttf."
-        );
-        None
-    }
+    use crate::font::test_fixtures::load_test_font_bytes;
 
     fn cell_metrics_for(font: &Font<'_>) -> CellMetrics {
         CellMetrics {
