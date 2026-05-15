@@ -28,9 +28,11 @@
 **Why it matters:** The TTF spec is large; deciding upfront whether to pull `ttf-parser` (no_std-friendly, MIT) vs writing a subset shapes the rest of Track A.
 
 **Acceptance:**
-- [ ] A 1-paragraph decision recorded in the design doc or an ADR file.
-- [ ] If vendoring `ttf-parser`: the crate is added to `kernel-core`'s dependency list with `default-features = false` and the version pinned.
+- [x] A 1-paragraph decision recorded in the design doc or an ADR file.
+- [x] If vendoring `ttf-parser`: the crate is added to `kernel-core`'s dependency list with `default-features = false` and the version pinned.
 - [ ] If hand-rolling: scope is `cmap` format 4 + 12, `glyf`, `loca`, `head`, `maxp` — explicitly documented as the subset.
+
+**Decision:** vendor `ttf-parser` v0.25 with `default-features = false` + `no-std-float` feature (no_std, zero-allocation, MIT OR Apache-2.0). Recorded in [docs/roadmap/69c-terminal-font-infrastructure.md](../69c-terminal-font-infrastructure.md#decision-track-a1-vendor-ttf-parser).
 
 ### A.2 — Font parser implementation
 
@@ -39,10 +41,10 @@
 **Why it matters:** Without parsing, no rasterizer.
 
 **Acceptance:**
-- [ ] `Font::open(bytes: &[u8]) -> Result<Font, FontError>` validates the magic + required tables.
-- [ ] `glyph_index(codepoint: u32) -> Option<GlyphId>` returns the glyph for the codepoint (or None if absent).
-- [ ] `glyph_outline(glyph: GlyphId) -> Outline` returns the Bezier curve set in em-units.
-- [ ] Host tests use a public-domain TTF (committed to `kernel-core/tests/fonts/` or fetched on demand): assert known codepoint → glyph mappings; assert outline contour count for a representative glyph.
+- [x] `Font::open(bytes: &[u8]) -> Result<Font, FontError>` validates the magic + required tables.
+- [x] `glyph_index(codepoint: u32) -> Option<GlyphId>` returns the glyph for the codepoint (or None if absent).
+- [x] `glyph_outline(glyph: GlyphId) -> Outline` returns the Bezier curve set in em-units.
+- [x] Host tests use a public-domain TTF (committed to `kernel-core/tests/fonts/` or fetched on demand): assert known codepoint → glyph mappings; assert outline contour count for a representative glyph.
 
 ---
 
@@ -55,11 +57,11 @@
 **Why it matters:** Outlines are useless without pixels.
 
 **Acceptance:**
-- [ ] `rasterize_glyph(outline: &Outline, cell_w: u16, cell_h: u16, em_size: u16) -> RasterBitmap` produces a coverage bitmap matching the Phase 69b shape.
-- [ ] Rasterizer uses scanline + edge-table fill (no SSE / AVX; m3OS disables SIMD).
-- [ ] Glyphs are centred horizontally and baseline-aligned in the cell.
-- [ ] Coverage is 1-bit (no AA in v1) — pixel is set if its centre is inside the outline.
-- [ ] Host tests: rasterize the letter `H` from the test font, assert the bitmap has exactly two vertical bars + one horizontal crossbar; rasterize `o`, assert a closed loop.
+- [x] `rasterize_glyph(outline: &Outline, cell_w: u16, cell_h: u16, em_size: u16) -> RasterBitmap` produces a coverage bitmap matching the Phase 69b shape. (Signature lands as `rasterize_glyph(outline, CellMetrics { cell_w, cell_h, units_per_em, ascender, descender })` so the rasterizer reads metrics off the font.)
+- [x] Rasterizer uses scanline + edge-table fill (no SSE / AVX; m3OS disables SIMD).
+- [x] Glyphs are centred horizontally and baseline-aligned in the cell.
+- [x] Coverage is 1-bit (no AA in v1) — pixel is set if its centre is inside the outline.
+- [x] Host tests: rasterize the letter `H` from the test font, assert the bitmap has exactly two vertical bars + one horizontal crossbar; rasterize `o`, assert a closed loop.
 
 ---
 
@@ -72,11 +74,11 @@
 **Why it matters:** Without bounded eviction, an adversarial codepoint stream OOMs `term`.
 
 **Acceptance:**
-- [ ] `Atlas::new(font: Font, capacity: usize)` constructs with default capacity 1024.
-- [ ] `resolve(codepoint: u32) -> &RasterBitmap` hits the cache or rasterizes + inserts.
-- [ ] Cache uses LRU eviction (host test: fill to capacity + 1, oldest entry is evicted).
-- [ ] `Atlas` is `!Send` and lives inside `term`'s process; no cross-process atlas sharing in 69c.
-- [ ] Host tests cover: cache miss → hit transition; LRU eviction order; codepoint with no glyph in the font → fallback dot.
+- [x] `Atlas::new(font: Font, capacity: usize)` constructs with default capacity 1024. (Lands as `Atlas::new(bytes, cell_w, cell_h, capacity)` so the atlas owns the font bytes and the parser is re-opened internally — avoids a self-referential `Atlas<'a>`.)
+- [x] `resolve(codepoint: u32) -> &RasterBitmap` hits the cache or rasterizes + inserts.
+- [x] Cache uses LRU eviction (host test: fill to capacity + 1, oldest entry is evicted).
+- [x] `Atlas` is `!Send` and lives inside `term`'s process; no cross-process atlas sharing in 69c.
+- [x] Host tests cover: cache miss → hit transition; LRU eviction order; codepoint with no glyph in the font → fallback dot.
 
 ---
 

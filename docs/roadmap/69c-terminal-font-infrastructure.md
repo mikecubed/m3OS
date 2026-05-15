@@ -100,7 +100,11 @@ After `Renderer::new(display)`, but before the first compose, `term` reads `/usr
 
 ## Implementation Outline
 
-1. Decide between vendoring `ttf-parser` + `ab_glyph` vs hand-rolling the subset; document the call.
+### Decision (Track A.1): vendor `ttf-parser`
+
+Vendoring `ttf-parser` v0.25 with `default-features = false` (no_std, zero-allocation, MIT OR Apache-2.0) is the chosen path. `ttf-parser` covers the full set of `cmap` formats m3OS could encounter from a Nerd Font asset (formats 0 / 4 / 12 / 13 / 14), handles compound `glyf` glyphs, and exposes the outline-builder trait the rasterizer needs. Hand-rolling a subset would deliver less coverage at higher maintenance cost, while still requiring the same outline-walker machinery. The rasterizer (`kernel-core/src/font/raster.rs`) and the LRU atlas (`kernel-core/src/font/atlas.rs`) are hand-rolled because their behaviour is small and m3OS-specific (1-bit coverage, centred-in-cell baseline alignment, capacity-bounded eviction).
+
+1. Decide between vendoring `ttf-parser` + `ab_glyph` vs hand-rolling the subset; document the call. **Decided: vendor `ttf-parser`. See "Decision (Track A.1)" above.**
 2. Build `kernel-core/src/font/parser.rs` (host tests on a public-domain TTF).
 3. Build `kernel-core/src/font/raster.rs` (host tests: rasterize known glyphs, assert bitmap).
 4. Build `kernel-core/src/font/atlas.rs` (host tests: cache hit, miss → rasterize, LRU eviction).
