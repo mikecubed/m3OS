@@ -129,7 +129,7 @@ fn login_once() {
     let user_env_len = build_env(b"USER=", username, &mut user_env);
 
     let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-    let env_term: &[u8] = b"TERM=m3os\0";
+    let env_term: &[u8] = b"TERM=m3os-term\0";
     let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
 
     let envp: [*const u8; 6] = [

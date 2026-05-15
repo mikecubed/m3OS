@@ -120,7 +120,7 @@ This is sufficient for remote access and terminal multiplexing.
 ## Deferred Until Later
 
 - Packet mode (for flow control signaling)
-- Window size change propagation (`SIGWINCH` through PTY)
+- Window size change propagation (`SIGWINCH` through PTY) — *closed in Phase 69 (`term` issues `ioctl(TIOCSWINSZ)` on `ServerMessage::SurfaceResized`; the kernel TIOCSWINSZ branch sends SIGWINCH to the foreground process group)*
 - Terminal multiplexer (screen/tmux-style)
 - Dynamic PTY allocation beyond the fixed pool
 - `/dev/tty` (controlling terminal device node)

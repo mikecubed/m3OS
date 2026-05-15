@@ -277,6 +277,11 @@ static FB_TAKEOVER_ELF: &[u8] = generated_initrd_asset!("fb-takeover");
 // daemon: no `.conf`.
 static CRASH_STUB_ELF: &[u8] = generated_initrd_asset!("crash_stub");
 
+// Phase 69 Track H — `tui-smoke` byte-level validator. Run from the
+// post-login shell by `cargo xtask tui-smoke`. Not a daemon: no
+// `.conf`.
+static TUI_SMOKE_ELF: &[u8] = generated_initrd_asset!("tui-smoke");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -465,6 +470,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     // Phase 57 Track G: term — graphical terminal emulator (the first
     // non-demo display_server client).
     ("term", RamdiskNode::File { content: TERM_ELF }),
+    // Phase 69 Track H: tui-smoke — byte-level validator for the
+    // m3os-term terminal contract.
+    (
+        "tui-smoke",
+        RamdiskNode::File {
+            content: TUI_SMOKE_ELF,
+        },
+    ),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),

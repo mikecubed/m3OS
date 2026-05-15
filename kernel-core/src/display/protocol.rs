@@ -94,6 +94,10 @@ const OP_SERVER_FOCUS_OUT: u16 = 0x0121;
 const OP_SERVER_KEY_EVENT: u16 = 0x0130;
 const OP_SERVER_POINTER_EVENT: u16 = 0x0131;
 const OP_SERVER_BUFFER_RELEASED: u16 = 0x0140;
+/// Phase 69 Track D — `SurfaceResized` server→client notification.
+/// Body layout (12 bytes LE): `surface_id (u32) | width (u32) |
+/// height (u32)`.
+const OP_SERVER_SURFACE_RESIZED: u16 = 0x0141;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_VERSION: u16 = 0x0201;
@@ -406,6 +410,15 @@ pub enum ServerMessage {
     BufferReleased {
         surface_id: SurfaceId,
         buffer_id: BufferId,
+    },
+    /// Phase 69 Track D — surface geometry change. Carries the new
+    /// pixel dimensions of the surface so the client can recompute
+    /// its cell grid and propagate a SIGWINCH-equivalent ioctl down
+    /// the PTY chain.
+    SurfaceResized {
+        surface_id: SurfaceId,
+        width: u32,
+        height: u32,
     },
 }
 
@@ -1091,6 +1104,15 @@ impl ServerMessage {
                 body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
                 body[4..8].copy_from_slice(&buffer_id.0.to_le_bytes());
             }),
+            Self::SurfaceResized {
+                surface_id,
+                width,
+                height,
+            } => encode_fixed_body(buf, OP_SERVER_SURFACE_RESIZED, 12, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&width.to_le_bytes());
+                body[8..12].copy_from_slice(&height.to_le_bytes());
+            }),
         }
     }
 
@@ -1152,6 +1174,14 @@ impl ServerMessage {
                 Self::BufferReleased {
                     surface_id: SurfaceId(read_u32(body, 0)?),
                     buffer_id: BufferId(read_u32(body, 4)?),
+                }
+            }
+            OP_SERVER_SURFACE_RESIZED => {
+                expect_body_len(body_len, 12)?;
+                Self::SurfaceResized {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                    width: read_u32(body, 4)?,
+                    height: read_u32(body, 8)?,
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),

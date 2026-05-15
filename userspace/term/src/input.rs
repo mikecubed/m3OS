@@ -124,6 +124,30 @@ impl Default for InputHandler {
     }
 }
 
+/// Phase 69 Track G — wrap a paste payload in bracketed-paste
+/// markers when the mode is enabled.
+///
+/// Bracketed-paste protocol:
+///   start: `ESC [ 200 ~` (6 bytes)
+///   end:   `ESC [ 201 ~` (6 bytes)
+///
+/// Editors that opt in (`vim`, `nvim`, `emacs`) use the brackets to
+/// distinguish typed input from pasted input — pasted text bypasses
+/// per-line autoindent and history events.
+///
+/// When `enabled == false`, returns `payload` verbatim with no
+/// brackets.
+pub fn wrap_paste(payload: &[u8], enabled: bool) -> alloc::vec::Vec<u8> {
+    if !enabled {
+        return payload.to_vec();
+    }
+    let mut out = alloc::vec::Vec::with_capacity(payload.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +322,37 @@ mod tests {
         event.kind = KeyEventKind::Repeat;
         h.translate(&event, &mut w);
         assert_eq!(w.bytes, b"a");
+    }
+
+    /// Phase 69 Track G.1 — `wrap_paste(payload, true)` wraps the
+    /// payload in `\x1b[200~ … \x1b[201~`. Empty payload still emits
+    /// the brackets so the receiver can distinguish "paste of empty
+    /// string" from "no paste".
+    #[test]
+    fn wrap_paste_wraps_when_enabled() {
+        let wrapped = wrap_paste(b"hello", true);
+        assert_eq!(wrapped, b"\x1b[200~hello\x1b[201~");
+
+        let empty = wrap_paste(b"", true);
+        assert_eq!(empty, b"\x1b[200~\x1b[201~");
+    }
+
+    /// Phase 69 Track G.1 — when disabled, `wrap_paste` returns the
+    /// payload verbatim.
+    #[test]
+    fn wrap_paste_passthrough_when_disabled() {
+        let raw = wrap_paste(b"hello\nworld", false);
+        assert_eq!(raw, b"hello\nworld");
+    }
+
+    /// Phase 69 Track G.1 — payload containing the close sequence as
+    /// data passes through verbatim; the protocol does not require
+    /// in-band escaping. Receivers terminate on the first `\x1b[201~`
+    /// they see; the start/end framing is the only guarantee the
+    /// helper provides.
+    #[test]
+    fn wrap_paste_does_not_escape_close_sequence_in_payload() {
+        let wrapped = wrap_paste(b"a\x1b[201~b", true);
+        assert_eq!(wrapped, b"\x1b[200~a\x1b[201~b\x1b[201~");
     }
 }

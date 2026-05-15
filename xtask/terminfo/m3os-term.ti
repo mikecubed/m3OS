@@ -1,0 +1,75 @@
+# m3OS Phase 69 — m3os-term terminfo entry.
+#
+# Compiled to a binary entry via `tic -o <staging>/usr/share/terminfo` in
+# xtask `populate_ext2_files`. Installed to
+# `/usr/share/terminfo/m/m3os-term` inside the ext2 data disk so any
+# program calling `setupterm()` or `tigetstr()` against
+# `TERM=m3os-term` finds the right escape sequences.
+#
+# Capability set covers what `term` actually implements after Phase 69:
+#   - 256-color SGR (Track C) + RGB truecolor extension
+#   - Alternate-screen buffer ?1049 (Track B)
+#   - DECSCUSR cursor shapes 0..=6 (Track F)
+#   - Bracketed paste ?2004 (Track G)
+#   - SGR mouse 1006 (Track E)
+#   - Cursor movement / ED / EL / SGR (Phase 22b baseline)
+#
+# Capabilities that rely on non-CSI escape sequences (e.g. `ESC 7`,
+# `ESC 8`, `ESC M`, `ESC c`, `ESC =`, `ESC >`, `ESC (` charset selects)
+# are intentionally omitted because `kernel_core::fb::AnsiParser` only
+# recognises `ESC [` (CSI) and silently discards everything else. The
+# parser will be extended in a later phase; until then advertising
+# those capabilities would mislead `setupterm()` callers.
+#
+# A small number of CSI capabilities (`csr`, `dch`, `dl`, `ech`, `ich`,
+# `il`, `rin`, `indn`, `tbc`, `vpa`, `cbt`) remain in the entry: they
+# parse cleanly today but route to a no-op in `dispatch_csi`. They are
+# kept here so the published terminfo stays stable across the planned
+# Phase 69+ work that wires the missing dispatch arms; a follow-up
+# audit will either implement or remove each one as the parser grows.
+#
+# Input-side `k*` capabilities are pinned to what
+# `userspace/term/src/input.rs::InputHandler` actually emits today, not
+# what the named keys conventionally produce on xterm. Concretely:
+#   - `kbs=\177`              — backspace lands as DEL (0x7f), since
+#                               `InputHandler` translates 0x08→0x7F.
+#   - `kcuu1=\E[A` / `kcud1=\E[B` / `kcuf1=\E[C` / `kcub1=\E[D`
+#                             — CSI form (`\E[…`), not SS3 (`\EO…`),
+#                               since `special_key_sequence` returns the
+#                               CSI bytes for the four arrow keysyms.
+# Capabilities for keys the handler does not yet generate (`khome`,
+# `kend`, `kpp`, `knp`, `kich1`, `kdch1`, `kcbt`, function keys) are
+# intentionally omitted; advertising them would mislead curses input
+# parsers into expecting bytes that never arrive. The companion
+# follow-up that extends `InputHandler` to emit Home/End/PageUp/PageDown
+# can re-add the matching capabilities at that time.
+
+m3os-term|m3OS Phase 69 terminal,
+	am, bce, msgr, npc, xenl,
+	colors#256, cols#80, it#8, lines#25, pairs#32767,
+	bel=^G, blink=\E[5m, bold=\E[1m,
+	cbt=\E[Z, civis=\E[?25l, clear=\E[H\E[2J, cnorm=\E[?25h,
+	cr=\r, csr=\E[%i%p1%d;%p2%dr, cub=\E[%p1%dD, cub1=\b,
+	cud=\E[%p1%dB, cud1=\n, cuf=\E[%p1%dC, cuf1=\E[C,
+	cup=\E[%i%p1%d;%p2%dH, cuu=\E[%p1%dA, cuu1=\E[A,
+	dch=\E[%p1%dP, dch1=\E[P, dl=\E[%p1%dM, dl1=\E[M,
+	ech=\E[%p1%dX, ed=\E[J, el=\E[K, el1=\E[1K,
+	enacs=, home=\E[H, hpa=\E[%i%p1%dG, ht=^I,
+	ich=\E[%p1%d@, il=\E[%p1%dL, il1=\E[L,
+	ind=\n, indn=\E[%p1%dS,
+	invis=\E[8m,
+	kbs=\177, kcub1=\E[D, kcud1=\E[B, kcuf1=\E[C, kcuu1=\E[A,
+	kmous=\E[<,
+	op=\E[39;49m, rev=\E[7m,
+	rin=\E[%p1%dT, rmcup=\E[?1049l,
+	rmso=\E[27m, rmul=\E[24m,
+	setab=\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m,
+	setaf=\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m,
+	sgr=\E[0%?%p6%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;m,
+	sgr0=\E[0m, smcup=\E[?1049h,
+	smso=\E[7m, smul=\E[4m, tbc=\E[3g,
+	u6=\E[%i%d;%dR, u7=\E[6n, u8=\E[?%[;0123456789]c, u9=\E[c,
+	vpa=\E[%i%p1%dd,
+	BE=\E[?2004h, BD=\E[?2004l,
+	XM=\E[?1006;1000%?%p1%{1}%=%th%el%;,
+	Ss=\E[%p1%d\sq, Se=\E[2\sq,

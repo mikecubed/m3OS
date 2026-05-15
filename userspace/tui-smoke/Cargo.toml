@@ -1,0 +1,21 @@
+[package]
+name = "tui-smoke"
+version = "0.69.0"
+edition = "2024"
+description = "Phase 69 Track H — byte-level validator for the m3os-term terminal contract. Runs from the post-login shell; each subcommand exercises one Phase 69 capability against the term lib and prints TUI_SMOKE:<name>:ok or TUI_SMOKE:<name>:fail <reason>."
+
+[[bin]]
+name = "tui-smoke"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+# `default-features = false` disables the `std` feature that
+# `kernel-core` enables by default for host-test consumers; the
+# x86_64-unknown-none target build must use the `no_std` shape.
+kernel-core = { path = "../../kernel-core", default-features = false }
+# `term` is required for direct access to the Phase 69 Screen, mouse
+# reporter, bracketed-paste helper, and palette tables. The lib target
+# compiles without `os-binary`; only its OS-binary surface (DisplayClient)
+# depends on the feature.
+term = { path = "../term" }

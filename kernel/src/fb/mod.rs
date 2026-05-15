@@ -725,15 +725,30 @@ impl FbConsole {
                     _ => {}
                 }
             }
-            ConsoleCmd::SetCursorVisible(visible) => {
-                if visible {
-                    self.cursor_visible = true;
-                    self.show_cursor();
-                } else {
-                    self.hide_cursor();
-                    self.cursor_visible = false;
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                // Phase 69 Track B — the kernel FB console is a single
+                // text-mode surface; only DECTCEM (?25) is meaningful
+                // here. We iterate each parsed code so multi-param
+                // sequences like `\E[?25;1006h` still toggle the
+                // cursor when terminfo batches `?25` with a
+                // `term`-only code. Other codes (alt-screen, mouse,
+                // bracketed paste) are owned by userspace `term` and
+                // drop silently to keep the kernel console undisturbed.
+                for &code in &codes[..count.min(codes.len())] {
+                    if code == 25 {
+                        if set {
+                            self.cursor_visible = true;
+                            self.show_cursor();
+                        } else {
+                            self.hide_cursor();
+                            self.cursor_visible = false;
+                        }
+                    }
                 }
             }
+            // Phase 69 Track F — DECSCUSR cursor shape is purely
+            // cosmetic for the kernel FB console; accept and ignore.
+            ConsoleCmd::CursorShape { .. } => {}
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }

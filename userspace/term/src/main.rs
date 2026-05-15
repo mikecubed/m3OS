@@ -47,6 +47,8 @@ use term::display::DisplayClient;
 #[cfg(not(test))]
 use term::input::{InputHandler, PtyWriter};
 #[cfg(not(test))]
+use term::mouse::{EncodingMode, MouseReporter, TrackingMode};
+#[cfg(not(test))]
 use term::pty::PtyHost;
 #[cfg(not(test))]
 use term::render::Renderer;
@@ -112,6 +114,11 @@ const PTY_READ_CHUNK: usize = 256;
 /// cost in series.
 #[cfg(not(test))]
 const COMPOSE_INTERVAL_MS: u64 = 16;
+
+/// Phase 69 Track F.2 — blinking-cursor tick interval in milliseconds.
+/// Matches xterm's default cursor blink rate.
+#[cfg(not(test))]
+const BLINK_INTERVAL_MS: u64 = 500;
 
 #[cfg(not(test))]
 const SHELL_DEPENDENCY_SERVICE: &str = "vfs";
@@ -198,6 +205,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     let mut input_handler = InputHandler::new();
+    let mut mouse_reporter = MouseReporter::new();
 
     // Paint an initial cleared frame so the surface gets a buffer
     // attached *before* any PTY traffic arrives. Without this, the
@@ -225,6 +233,10 @@ fn program_main(_args: &[&str]) -> i32 {
     // before the first `AttachSharedBuffer`, leaving the terminal invisible.
     renderer.compose();
     let mut last_compose_ms = clock.now_ms();
+    // Phase 69 Track F.2 — drives the 500 ms blink tick for the
+    // DECSCUSR blinking cursor shapes. Always initialised; the tick
+    // only marks damage when `Screen::cursor_shape().is_blinking()`.
+    let mut last_blink_ms = last_compose_ms;
 
     syscall_lib::write_str(STDOUT_FILENO, READY_SENTINEL);
 
@@ -272,10 +284,14 @@ fn program_main(_args: &[&str]) -> i32 {
                 screen.feed(byte, &mut render_cmds);
             }
             for cmd in render_cmds.drain(..) {
-                if matches!(cmd, RenderCommand::Bell) {
-                    ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
-                } else {
-                    renderer.apply(cmd);
+                match cmd {
+                    RenderCommand::Bell => {
+                        ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
+                    }
+                    RenderCommand::SetMouseMode { code, set } => {
+                        update_mouse_mode(&mut mouse_reporter, code, set);
+                    }
+                    other => renderer.apply(other),
                 }
             }
         } else if n == 0 {
@@ -306,6 +322,16 @@ fn program_main(_args: &[&str]) -> i32 {
                     did_work = true;
                     input_handler.translate(&ev, &mut writer);
                 }
+                PulledEvent::Pointer(ev) => {
+                    did_work = true;
+                    if let Some(bytes) = mouse_reporter.encode(&ev, screen.cols(), screen.rows()) {
+                        let _ = syscall_lib::write(primary_fd, bytes.as_slice());
+                    }
+                }
+                PulledEvent::SurfaceResized { width, height } => {
+                    did_work = true;
+                    handle_surface_resize(primary_fd, &mut screen, &mut renderer, width, height);
+                }
                 PulledEvent::Disconnect => {
                     syscall_lib::write_str(STDOUT_FILENO, "term: display_server disconnect\n");
                     disconnect = true;
@@ -329,6 +355,20 @@ fn program_main(_args: &[&str]) -> i32 {
             Err(_) => {
                 syscall_lib::write_str(STDOUT_FILENO, "term: poll_shell_exit error\n");
                 break;
+            }
+        }
+
+        // 5c2. Phase 69 Track F.2 — blink tick. When the current
+        //      DECSCUSR cursor shape is a blinking variant, force a
+        //      compose every 500 ms even if the PTY and event queue
+        //      were idle so the cursor visibly blinks. The compose
+        //      throttle still caps actual frame submission at
+        //      `COMPOSE_INTERVAL_MS`.
+        if screen.cursor_shape().is_blinking() {
+            let now_ms = clock.now_ms();
+            if now_ms.saturating_sub(last_blink_ms) >= BLINK_INTERVAL_MS {
+                renderer.mark_damaged();
+                last_blink_ms = now_ms;
             }
         }
 
@@ -461,14 +501,20 @@ fn ring_bell(
 enum PulledEvent {
     /// A `KeyEvent` for the input handler to translate.
     Key(kernel_core::input::events::KeyEvent),
+    /// Phase 69 Track E — a `PointerEvent` for the mouse reporter
+    /// to encode into PTY bytes.
+    Pointer(kernel_core::input::events::PointerEvent),
+    /// Phase 69 Track D — surface geometry changed; the loop must
+    /// reshape the cell grid and propagate SIGWINCH via TIOCSWINSZ.
+    SurfaceResized { width: u32, height: u32 },
     /// `display_server` told us the connection is closing — exit
     /// cleanly so the supervisor can restart per `term.conf`.
     Disconnect,
     /// No event this tick (`LABEL_CLIENT_EVENT_NONE`, transport
     /// error, decode failure, or a `ServerMessage` term doesn't
-    /// consume — `Pointer`, `Welcome`, `SurfaceConfigured`,
-    /// `FocusIn` / `FocusOut`, `BufferReleased`, `SurfaceDestroyed`).
-    /// All of these are non-fatal and the next iteration retries.
+    /// consume — `Welcome`, `SurfaceConfigured`, `FocusIn` /
+    /// `FocusOut`, `BufferReleased`, `SurfaceDestroyed`). All of
+    /// these are non-fatal and the next iteration retries.
     None,
 }
 
@@ -503,8 +549,12 @@ fn pull_one_event(display_handle: u32, buf: &mut [u8]) -> PulledEvent {
     }
     match ServerMessage::decode(&buf[..len]) {
         Ok((ServerMessage::Key(ev), _)) => PulledEvent::Key(ev),
+        Ok((ServerMessage::Pointer(ev), _)) => PulledEvent::Pointer(ev),
+        Ok((ServerMessage::SurfaceResized { width, height, .. }, _)) => {
+            PulledEvent::SurfaceResized { width, height }
+        }
         Ok((ServerMessage::Disconnect { .. }, _)) => PulledEvent::Disconnect,
-        // Pointer / Welcome / FocusIn / FocusOut / SurfaceConfigured /
+        // Welcome / FocusIn / FocusOut / SurfaceConfigured /
         // SurfaceDestroyed / BufferReleased: not load-bearing for
         // term's contract — drop silently.
         Ok(_) => PulledEvent::None,
@@ -523,4 +573,114 @@ fn lookup_display_for_input() -> Option<u32> {
         return None;
     }
     Some(raw as u32)
+}
+
+/// Phase 69 Track E — translate a DEC private mode code into a
+/// `MouseReporter` state update. Driven by
+/// `RenderCommand::SetMouseMode` emitted by `Screen::feed`.
+///
+/// Tracking-mode (`?9` / `?1000` / `?1002` / `?1003`) and
+/// encoding-mode (`?1006`) are stored independently so xterm-style
+/// idioms like `?1000h ?1006h` (enable normal tracking, then SGR
+/// encoding) followed by `?1006l` revert the encoding back to the
+/// legacy form without disabling tracking.
+#[cfg(not(test))]
+fn update_mouse_mode(reporter: &mut MouseReporter, code: u16, set: bool) {
+    match code {
+        9 => reporter.set_tracking(if set {
+            TrackingMode::X10
+        } else {
+            TrackingMode::Disabled
+        }),
+        1000 => reporter.set_tracking(if set {
+            TrackingMode::Normal
+        } else {
+            TrackingMode::Disabled
+        }),
+        // ?1002 / ?1003 are tracked as their own variants so the
+        // deferred motion-tracking work has a name to switch on,
+        // even though `encode` currently treats them like Normal.
+        1002 => reporter.set_tracking(if set {
+            TrackingMode::ButtonMotion
+        } else {
+            TrackingMode::Disabled
+        }),
+        1003 => reporter.set_tracking(if set {
+            TrackingMode::AnyEvent
+        } else {
+            TrackingMode::Disabled
+        }),
+        1006 => reporter.set_encoding(if set {
+            EncodingMode::Sgr
+        } else {
+            EncodingMode::Legacy
+        }),
+        _ => {}
+    }
+}
+
+/// Phase 69 Track D — react to a `SurfaceResized` notification by
+/// recomputing the cell grid and issuing `ioctl(TIOCSWINSZ)` on the
+/// PTY primary fd. The kernel `TIOCSWINSZ` handler updates the PTY's
+/// `winsize` and sends SIGWINCH to the foreground process group.
+#[cfg(not(test))]
+fn handle_surface_resize<F: term::render::FramebufferOwner>(
+    primary_fd: i32,
+    screen: &mut Screen,
+    renderer: &mut Renderer<F>,
+    width: u32,
+    height: u32,
+) {
+    // The Phase 56 renderer ships an 8×16 glyph grid (the kernel-core
+    // fallback font); replace the constants here when the font_atlas
+    // exposes runtime metrics.
+    const GLYPH_W: u32 = 8;
+    const GLYPH_H: u32 = 16;
+    // Phase 69 PR 168 round-3 fix — a malformed `SurfaceResized` could
+    // request 65535×65535 cells (~4.3B cells × `Cell` size = multi-GB)
+    // and crash `term`. Cap each dimension at 1024 cells (8192×16384
+    // logical pixels — well above any realistic display) and the total
+    // cell budget at ~1M, which keeps `Screen::resize` allocations in
+    // single-digit MB regardless of the message contents.
+    const MAX_CELLS_PER_AXIS: u32 = 1024;
+    const MAX_TOTAL_CELLS: u32 = 1_000_000;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut cols = (width / GLYPH_W).max(1).min(MAX_CELLS_PER_AXIS) as u16;
+    let mut rows = (height / GLYPH_H).max(1).min(MAX_CELLS_PER_AXIS) as u16;
+    // Per-axis cap above bounds the product at `MAX_CELLS_PER_AXIS^2 =
+    // ~1M`, which already satisfies the total-cell budget — but if the
+    // axis cap is later relaxed, halve the larger axis until the total
+    // budget is honoured. Pure-integer loop avoids `libm`.
+    while (cols as u32) * (rows as u32) > MAX_TOTAL_CELLS {
+        if cols >= rows {
+            cols = (cols / 2).max(1);
+        } else {
+            rows = (rows / 2).max(1);
+        }
+    }
+
+    let mut local_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
+    screen.resize(cols, rows, &mut local_cmds);
+    for cmd in local_cmds {
+        renderer.apply(cmd);
+    }
+
+    // Phase 69 PR 168 fix — `Winsize::ws_xpixel`/`ws_ypixel` are 16-bit but
+    // the display server hands us `u32`. A pathological surface > 65535 px
+    // would wrap to a bogus small value (e.g. 70000 → 4464); saturate to
+    // `u16::MAX` so the TTY layer sees an honest "very large" sentinel
+    // instead of misreporting the size after the truncation.
+    let ws = syscall_lib::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: width.min(u16::MAX as u32) as u16,
+        ws_ypixel: height.min(u16::MAX as u32) as u16,
+    };
+    let _ = syscall_lib::ioctl(
+        primary_fd,
+        syscall_lib::TIOCSWINSZ,
+        &ws as *const syscall_lib::Winsize as usize,
+    );
 }
