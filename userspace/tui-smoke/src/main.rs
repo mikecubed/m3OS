@@ -540,14 +540,16 @@ fn run_fonts_startup() -> Result<(), &'static str> {
         Ok(a) => a,
         Err(_) => return Err("atlas-construct-failed"),
     };
-    // Pre-warm printable ASCII (95 codepoints inc. space) and
-    // require at least 64 to render non-blank. We deliberately
-    // pick 64 — not 95 — because some printable codepoints
-    // (space, certain Nerd-Font-patched positions) may legitimately
-    // map to a glyph the rasterizer renders as blank at 8 × 16,
-    // and the gate must be robust to that without losing teeth.
+    // Pre-warm printable ASCII (`U+0020..=U+007E`, 95 codepoints
+    // inc. space). We exclude `U+007F` (DEL) because the atlas
+    // classifies it as a blank control codepoint, so it can never
+    // contribute to the non-blank count below. The threshold is 64
+    // — not 95 — because some printable codepoints (space, certain
+    // Nerd-Font-patched positions) may legitimately map to a glyph
+    // the rasterizer renders as blank at 8 × 16, and the gate must
+    // be robust to that without losing teeth.
     let mut count = 0usize;
-    for cp in 0x20u32..0x80 {
+    for cp in 0x20u32..0x7F {
         let bm = atlas.resolve(cp);
         if !bm.is_blank() {
             count += 1;

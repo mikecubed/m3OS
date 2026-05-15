@@ -156,9 +156,14 @@ impl Rasterizer {
         let bx_max = (outline.bbox.x_max as f32) * scale_x;
         let glyph_w_px = bx_max - bx_min;
         let dx = (cell_w as f32 - glyph_w_px) * 0.5 - bx_min;
-        // Baseline: descender at `cell_h - 1 - 1` (one px bottom
-        // padding); ascender lands `ascender * scale_y` above it.
-        let baseline_y = (cell_h - 1) as f32 - 1.0;
+        // Baseline: place so a point at em-y = `descender` (which is
+        // negative) lands at row `cell_h - 2`, leaving one row of
+        // bottom padding. With `usable_h = cell_h - 2`, a point at
+        // em-y = `ascender` then lands at row 0 (touching the top
+        // edge). Without subtracting the descender contribution here,
+        // descender pixels for glyphs like `g`, `p`, `y` map past
+        // `cell_h - 1` and get silently clipped by `set_pixel`.
+        let baseline_y = (cell_h as f32 - 2.0) + (metrics.descender as f32) * scale_y;
 
         let mapped: Vec<(f32, f32)> =
             flatten_outline(&outline.segments, scale_x, scale_y, dx, baseline_y);
@@ -571,6 +576,77 @@ mod tests {
         assert!(
             (5..120).contains(&ink),
             "rasterized 'o' ink count out of expected ring range: {ink}"
+        );
+    }
+
+    /// Regression: descender glyphs (`g`, `p`, `y`, etc.) must not
+    /// have their lower strokes silently clipped below the cell.
+    /// Uses a synthetic outline that lives entirely in the descender
+    /// band (em-y < 0) so the test does not depend on a specific
+    /// font's `g` shape.
+    #[test]
+    fn descender_outline_lands_inside_cell() {
+        use crate::font::parser::BoundingBox;
+        use OutlineSegment::*;
+        // A filled rectangle in the descender band: em-y from -300 to
+        // -100. Pre-fix this rendered as a blank cell because the
+        // baseline was pinned at `cell_h - 2` and `baseline - y*scale`
+        // for negative `y` exceeded `cell_h - 1`.
+        let outline = Outline {
+            segments: alloc::vec![
+                MoveTo {
+                    x: 100.0,
+                    y: -300.0
+                },
+                LineTo {
+                    x: 500.0,
+                    y: -300.0
+                },
+                LineTo {
+                    x: 500.0,
+                    y: -100.0
+                },
+                LineTo {
+                    x: 100.0,
+                    y: -100.0
+                },
+                Close,
+            ],
+            bbox: BoundingBox {
+                x_min: 100,
+                y_min: -300,
+                x_max: 500,
+                y_max: -100,
+            },
+        };
+        let metrics = CellMetrics {
+            cell_w: 16,
+            cell_h: 16,
+            units_per_em: 1000,
+            ascender: 1020,
+            descender: -300,
+        };
+        let bm = Rasterizer.rasterize_glyph(&outline, metrics);
+        assert!(
+            !bm.is_blank(),
+            "descender band must produce visible pixels, not be clipped"
+        );
+        // The lowest inked row must land in the descender band — at
+        // or below row 12 (well into the lower half of the 16-row
+        // cell) — proving the baseline reserved space below it.
+        let lowest_inked = (0..bm.height as usize)
+            .rev()
+            .find(|&y| (0..bm.width as usize).any(|x| bm.pixel(x, y)));
+        assert!(
+            matches!(lowest_inked, Some(y) if y >= 12),
+            "descender pixels did not reach the lower band: lowest_inked = {lowest_inked:?}"
+        );
+        // And no inked row should land at `cell_h - 1` (the reserved
+        // bottom-padding row) — the baseline contract preserves a
+        // 1 px gap so descenders don't kiss the grid line.
+        assert!(
+            !(0..bm.width as usize).any(|x| bm.pixel(x, (bm.height - 1) as usize)),
+            "descender band must not overwrite bottom padding row"
         );
     }
 

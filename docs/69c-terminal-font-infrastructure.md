@@ -86,9 +86,17 @@ The public surface is intentionally small:
 - `Font::glyph_outline(glyph) -> Result<Outline, FontError>` —
   drives `ttf-parser`'s `OutlineBuilder` callbacks and collects the
   segments into an owned `Outline` (segments + bounding box in
-  em-units). Empty glyphs (`.notdef`, space, control characters)
-  return an empty outline rather than an error so the caller does
-  not need to branch.
+  em-units). When `ttf-parser`'s `outline_glyph` returns `None` —
+  composite cycles, missing `glyf` data, glyph ids past
+  `num_glyphs`, and bitmap-only / colour-only glyphs that have no
+  contour data (JetBrainsMono Nerd Font's space is one example) —
+  the parser surfaces `Err(FontError::OutlineUnavailable)`. Glyphs
+  that report `Some(bbox)` with no builder callbacks (some fonts'
+  space and `.notdef`) land in the `Ok(empty segments)` branch.
+  The blank-vs-visible-fallback decision lives in `Atlas::resolve`,
+  which maps both the `Err` and the empty-`Ok` cases to the right
+  output via `is_blank_codepoint` and
+  `renders_blank_when_unrasterizable`.
 
 The `OutlineSegment` enum mirrors `ttf-parser`'s callback shape:
 `MoveTo`, `LineTo`, `QuadTo` (quadratic Bezier), `CurveTo` (cubic
@@ -211,11 +219,13 @@ blits the pre-resolved bitmap.
 `build_atlas` reads `/usr/share/fonts/m3os/term.ttf` via
 `syscall_lib::open` + `read` (chunked in 4 KiB blocks) into an
 `alloc::Vec<u8>`, constructs an `Atlas` with the default 1024
-capacity, pre-warms the printable-ASCII range so the boot log can
-report a glyph count, and calls `Renderer::set_atlas`. On any
-failure (file missing, parse error, atlas construction error) the
-function logs `term: font load failed; using static fallback` and
-returns without changing the renderer's `GlyphSource`.
+capacity, pre-warms printable ASCII (`U+0020..=U+007E`, 95 cps)
+plus the Latin-1 supplement (`U+00A1..=U+00FF`, 95 cps) — together
+~190 codepoints — so the boot log's glyph count comfortably clears
+the documented `N > 100` gate, and calls `Renderer::set_atlas`. On
+any failure (file missing, parse error, atlas construction error)
+the function logs `term: font load failed; using static fallback`
+and returns without changing the renderer's `GlyphSource`.
 
 ### Track F — `tui-smoke fonts` (`userspace/tui-smoke`)
 
@@ -223,8 +233,10 @@ Five subcommand leaves, each emitting
 `TUI_SMOKE:fonts-<leaf>:ok` on success:
 
 - **`startup`** — opens the staged font, builds a fresh atlas,
-  pre-warms `U+0020..=U+007F`, asserts ≥ 64 of those produce
-  non-blank pixels and the atlas length is ≥ 64.
+  pre-warms printable ASCII (`U+0020..=U+007E`, 95 cps; DEL is
+  excluded because the atlas classifies it as a blank control
+  codepoint), asserts ≥ 64 of those produce non-blank pixels and
+  the atlas length is ≥ 64.
 - **`branch-icon`** — confirms the font's cmap covers `U+E0A0`
   (`Font::glyph_index` is `Some`), resolves the codepoint, and
   asserts the bitmap is non-blank *and* has more ink than the

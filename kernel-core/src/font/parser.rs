@@ -171,11 +171,16 @@ impl<'a> Font<'a> {
     /// visible centred-dot fallback rather than caching a blank
     /// bitmap for a font-covered codepoint.
     ///
-    /// Note that legitimately blank glyphs (space, NBSP, control
-    /// codepoints) report `Some(bbox)` from `outline_glyph` with no
-    /// builder callbacks, so they land in the `Ok(empty segments)`
-    /// branch below and the atlas caches a blank bitmap as
-    /// expected.
+    /// Note that some fonts (DejaVu Sans Mono among them) record
+    /// legitimately blank glyphs (space, NBSP, control codepoints)
+    /// as `Some(bbox)` from `outline_glyph` with no builder
+    /// callbacks; those land in the `Ok(empty segments)` branch
+    /// below. Other fonts (JetBrainsMono Nerd Font Mono is one)
+    /// record space as a cmap entry with no `glyf` data so
+    /// `outline_glyph` returns `None`, which surfaces here as
+    /// `Err(OutlineUnavailable)`. The blank-vs-visible-fallback
+    /// decision happens in [`crate::font::atlas::Atlas::resolve`] —
+    /// the parser only reports what `ttf-parser` actually found.
     pub fn glyph_outline(&self, glyph: GlyphId) -> Result<Outline, FontError> {
         let id = ttf_parser::GlyphId(glyph.0);
         let mut builder = OutlineCollector::default();
