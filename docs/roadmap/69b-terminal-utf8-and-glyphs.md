@@ -1,6 +1,6 @@
 # Phase 69b - UTF-8 Wire Decoding and Bitmap Glyph Expansion
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69b
 **Depends on:** Phase 22b (ANSI Escape) ✅, Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode)
 **Builds on:** Extends Phase 57 `term`'s byte-level `Screen::feed` to a UTF-8 codepoint feed; extends the bitmap font in `kernel-core::fb` (or `userspace/term`'s glyph module — implementer's call) from 7-bit ASCII to cover the Latin-1 supplement (U+0080–U+00FF) and Unicode box-drawing block (U+2500–U+257F). Phase 69a's `IUTF8` termios flag gains its first behavioural effect: when set, the ldisc's VERASE accounting recognises continuation bytes.
@@ -32,7 +32,7 @@ The post-Phase-57 evaluation lists "UTF-8 decoding and font coverage" as gap #5;
 
 ### UTF-8 byte-stream decoder (Track A)
 
-A new `Utf8Decoder` state machine in `kernel-core/src/utf8.rs` consumes one byte per call and returns either `DecoderOutput::Pending`, `DecoderOutput::Codepoint(u32)`, or `DecoderOutput::Invalid` (caller emits U+FFFD). The decoder is pure-logic, host-testable, and `no_std`.
+A new `Utf8Decoder` state machine in `kernel-core/src/utf8.rs` consumes one byte per call and returns one of five `DecoderOutput` variants: `Pending`, `Codepoint(u32)`, `Invalid` (caller emits U+FFFD), `InvalidThenCodepoint(u32)` (caller emits U+FFFD followed by the preserved codepoint — used when an in-flight sequence is broken by a valid ASCII byte), and `InvalidThenPending` (caller emits U+FFFD; the decoder has begun a fresh multi-byte sequence on the offending byte). The decoder is pure-logic, host-testable, and `no_std`.
 
 ### `Screen::feed` codepoint feed (Track B)
 
@@ -78,11 +78,13 @@ A new `tui-smoke utf8` subcommand (extending the Phase 69 binary):
 
 ### `kernel-core/src/utf8.rs` (new) — UTF-8 decoder
 
-Pure-logic state machine. `Utf8Decoder::new()` starts in the `Initial` state. `decode_byte(b)` returns one of:
+Pure-logic state machine. `Utf8Decoder::new()` starts in the `Initial` state. `decode_byte(b)` returns one of five outputs:
 
 - `Pending` — partial sequence, more bytes needed.
 - `Codepoint(u32)` — full codepoint decoded; decoder reset to `Initial`.
 - `Invalid` — malformed sequence; caller emits U+FFFD; decoder resets.
+- `InvalidThenCodepoint(u32)` — in-flight sequence broke AND the offending byte was a complete ASCII codepoint; caller emits U+FFFD followed by the codepoint so valid trailing data is preserved.
+- `InvalidThenPending` — in-flight sequence broke AND the offending byte started a fresh multi-byte sequence; caller emits U+FFFD and the next byte continues the new sequence.
 
 ### `userspace/term/src/screen.rs` — codepoint feed
 

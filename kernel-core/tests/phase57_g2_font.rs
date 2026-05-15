@@ -37,18 +37,72 @@ fn glyph_tilde_present() {
     assert!(font.glyph(0x7E).is_some(), "0x7E must be present");
 }
 
-/// Phase 57 G.2 acceptance: codepoints outside the ASCII printable +
-/// DEL range return `None` rather than panicking or returning a
-/// placeholder.
+/// Phase 57 G.2 acceptance (Phase 69b updated): C1 control codepoints
+/// (U+0080..=U+009F), codepoints above the Latin-1 supplement but
+/// outside the box-drawing block, and out-of-range codepoints still
+/// return `None` from the bundled font's `glyph` method. Phase 69b
+/// promotes Latin-1 + box-drawing to `Some`; everything else stays
+/// `None` and renders against the fallback dot only through the
+/// [`BasicBitmapFont::glyph_or_fallback`] accessor.
 #[test]
 fn glyph_non_ascii_returns_none() {
     let font = BasicBitmapFont::new();
-    assert!(font.glyph(0x80).is_none(), "0x80 must not be present");
-    assert!(font.glyph(0x100).is_none(), "0x100 must not be present");
+    assert!(
+        font.glyph(0x80).is_none(),
+        "0x80 (C1 control) must not be present"
+    );
+    assert!(
+        font.glyph(0x100).is_none(),
+        "0x100 (outside Latin-1) must not be present"
+    );
     assert!(
         font.glyph(0x10FFFF).is_none(),
         "U+10FFFF must not be present"
     );
+}
+
+/// Phase 69b Track E — Latin-1 supplement (U+0080..=U+00FF) is now
+/// covered by the bundled font for visible codepoints. C1 control
+/// chars + NBSP remain `None`, the rest must return `Some`.
+#[test]
+fn glyph_latin1_visible_range_present_after_phase_69b() {
+    let font = BasicBitmapFont::new();
+    for cp in 0xA1u32..=0xFF {
+        assert!(
+            font.glyph(cp).is_some(),
+            "codepoint {:#06x} must be present in Phase 69b",
+            cp
+        );
+    }
+}
+
+/// Phase 69b Track E — the Unicode box-drawing block
+/// (U+2500..=U+257F) is now covered by the bundled font.
+#[test]
+fn glyph_box_drawing_block_present_after_phase_69b() {
+    let font = BasicBitmapFont::new();
+    for cp in 0x2500u32..=0x257F {
+        assert!(
+            font.glyph(cp).is_some(),
+            "codepoint {:#06x} must be present in Phase 69b",
+            cp
+        );
+    }
+}
+
+/// Phase 69b Track E — `glyph_or_fallback` returns a non-None glyph
+/// for every codepoint, with the fallback dot used for any codepoint
+/// outside the covered ranges.
+#[test]
+fn glyph_or_fallback_always_returns_a_glyph() {
+    let font = BasicBitmapFont::new();
+    // CJK codepoint (no glyph table in Phase 69b) routes to the
+    // fallback dot — the returned glyph has a 2×2 inked block at the
+    // cell centre.
+    let g = font.glyph_or_fallback(0x4E2D);
+    assert_eq!(g.width, 8);
+    assert_eq!(g.height, 16);
+    assert!(g.bitmap.iter().any(|&b| b != 0));
 }
 
 /// Phase 57 G.2 acceptance: codepoints below the printable range

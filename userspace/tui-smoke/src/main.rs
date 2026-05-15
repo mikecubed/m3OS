@@ -39,9 +39,14 @@ use alloc::vec::Vec;
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{STDIN_FILENO, STDOUT_FILENO};
 
+use kernel_core::session::{FALLBACK_DOT_GLYPH, GLYPH_TABLE_BOX_DRAWING, resolve_glyph};
+use kernel_core::tty::{EditBuffer, IUTF8};
+
 use term::input::wrap_paste;
 use term::mouse::{Mode as MouseMode, MouseReporter};
-use term::screen::{CursorShape, RenderCommand, Screen, ScreenSelect, XTERM_256_PALETTE};
+use term::screen::{
+    CursorShape, REPLACEMENT_CHARACTER, RenderCommand, Screen, ScreenSelect, XTERM_256_PALETTE,
+};
 
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
@@ -71,11 +76,12 @@ fn program_main(args: &[&str], env: &[&str]) -> i32 {
         "resize" => run_resize(),
         "paste" => run_paste(),
         "term-env" => run_term_env(env),
+        "utf8" => run_utf8(),
         "" => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
                 "tui-smoke: missing subcommand. Use one of: alt-screen, \
-                 colors, mouse, cursor, resize, paste, term-env\n",
+                 colors, mouse, cursor, resize, paste, term-env, utf8\n",
             );
             return 2;
         }
@@ -304,6 +310,109 @@ fn run_paste() -> Result<(), &'static str> {
     if empty.as_slice() != b"\x1b[200~\x1b[201~" {
         return Err("wrap-empty-payload-mismatch");
     }
+    Ok(())
+}
+
+/// Phase 69b Track H — `tui-smoke utf8`.
+///
+/// Drives the UTF-8 decode + glyph resolver + wide-cell accounting +
+/// IUTF8 erase paths end-to-end on a host-mode `Screen` instance plus
+/// a host-mode `EditBuffer`. The subcommand does not touch the kernel
+/// TTY or PTY (the termios-smoke gate covers those paths) — its job is
+/// to assert the byte-stream → cell-state → glyph-bitmap chain that
+/// Phase 69b lands.
+fn run_utf8() -> Result<(), &'static str> {
+    // 1. A 3-byte UTF-8 sequence for U+2500 lands a single cell with
+    //    codepoint 0x2500; the resolved glyph matches the
+    //    box-drawing horizontal-line bitmap.
+    let mut s = Screen::with_geometry(10, 2);
+    let mut out: Vec<RenderCommand> = Vec::new();
+    for &b in &[0xE2u8, 0x94, 0x80] {
+        s.feed(b, &mut out);
+    }
+    let cell = match s.cell(0, 0) {
+        Ok(c) => c,
+        Err(_) => return Err("box-drawing-cell-out-of-bounds"),
+    };
+    if cell.codepoint != 0x2500 {
+        return Err("box-drawing-cell-codepoint-mismatch");
+    }
+    if cell.wide_continuation {
+        return Err("box-drawing-cell-flagged-wide");
+    }
+    let g = resolve_glyph(0x2500);
+    let expected = &GLYPH_TABLE_BOX_DRAWING[0];
+    if !core::ptr::eq(g.bitmap.as_ptr(), expected.bitmap.as_ptr()) {
+        return Err("box-drawing-glyph-not-from-table");
+    }
+    // Inked-pixel sanity check: row 7 or row 8 must carry pixels.
+    if g.bitmap[7] == 0 && g.bitmap[8] == 0 {
+        return Err("box-drawing-glyph-empty-center");
+    }
+
+    // 2. A lone continuation byte yields U+FFFD; the rendered glyph
+    //    is the fallback dot.
+    let mut s2 = Screen::with_geometry(10, 2);
+    let mut out2: Vec<RenderCommand> = Vec::new();
+    s2.feed(0x80, &mut out2);
+    let cell = match s2.cell(0, 0) {
+        Ok(c) => c,
+        Err(_) => return Err("invalid-cell-out-of-bounds"),
+    };
+    if cell.codepoint != REPLACEMENT_CHARACTER {
+        return Err("invalid-cell-codepoint-not-replacement");
+    }
+    let g = resolve_glyph(REPLACEMENT_CHARACTER);
+    if !core::ptr::eq(g.bitmap.as_ptr(), FALLBACK_DOT_GLYPH.bitmap.as_ptr()) {
+        return Err("replacement-glyph-not-fallback");
+    }
+
+    // 3. A 3-byte CJK codepoint U+4E2D (UTF-8 bytes E4 B8 AD)
+    //    occupies (0, 0) + (0, 1) as a wide cell pair; the renderer
+    //    paints the fallback dot because CJK glyph tables are
+    //    deferred to a later phase.
+    let mut s3 = Screen::with_geometry(10, 2);
+    let mut out3: Vec<RenderCommand> = Vec::new();
+    for &b in &[0xE4u8, 0xB8, 0xAD] {
+        s3.feed(b, &mut out3);
+    }
+    let lead = match s3.cell(0, 0) {
+        Ok(c) => c,
+        Err(_) => return Err("wide-lead-out-of-bounds"),
+    };
+    if lead.codepoint != 0x4E2D {
+        return Err("wide-lead-codepoint-mismatch");
+    }
+    let trail = match s3.cell(0, 1) {
+        Ok(c) => c,
+        Err(_) => return Err("wide-trail-out-of-bounds"),
+    };
+    if !trail.wide_continuation {
+        return Err("wide-trail-not-flagged");
+    }
+    let g = resolve_glyph(0x4E2D);
+    if !core::ptr::eq(g.bitmap.as_ptr(), FALLBACK_DOT_GLYPH.bitmap.as_ptr()) {
+        return Err("cjk-glyph-not-fallback");
+    }
+
+    // 4. With IUTF8 set, pushing a 2-byte Latin-1 sequence into a
+    //    canonical-mode edit buffer and erasing once removes the
+    //    whole codepoint.
+    let mut buf = EditBuffer::new();
+    for &b in &[0xC3u8, 0xA9] {
+        if !buf.push(b) {
+            return Err("edit-buf-push-failed");
+        }
+    }
+    let _ = IUTF8; // touch the imported flag so its presence is part of the gate
+    let removed = buf.erase_one_codepoint(true);
+    if removed != 2 {
+        return Err("iutf8-erase-did-not-remove-two-bytes");
+    }
+    if !buf.is_empty() {
+        return Err("iutf8-erase-left-residue");
+    }
+
     Ok(())
 }
 

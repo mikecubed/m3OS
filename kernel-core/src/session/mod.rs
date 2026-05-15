@@ -22,10 +22,15 @@
 
 pub mod font;
 pub mod font_data;
+pub mod glyph_tables;
 pub mod recover;
 pub mod startup;
 
 pub use font::{BasicBitmapFont, FontError, FontProvider, Glyph};
+pub use glyph_tables::{
+    BLANK_GLYPH, BOX_DRAWING_FIRST, BOX_DRAWING_LAST, FALLBACK_DOT_GLYPH, GLYPH_TABLE_BOX_DRAWING,
+    GLYPH_TABLE_LATIN1, LATIN1_FIRST, LATIN1_LAST, resolve_glyph, width_of,
+};
 pub use recover::{Recovery, RecoveryAction};
 pub use startup::{SessionError, SessionState, SessionStep, StartupSequence};
 

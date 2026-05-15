@@ -28,7 +28,8 @@
 //!   exercise it on `cargo test -p kernel-core --target
 //!   x86_64-unknown-linux-gnu`.
 
-use super::font_data::{ASCII_FIRST, ASCII_LAST, CELL_HEIGHT, CELL_WIDTH, GLYPH_BITMAPS};
+use super::font_data::{CELL_HEIGHT, CELL_WIDTH};
+use super::glyph_tables::{BLANK_GLYPH, FALLBACK_DOT_GLYPH, resolve_glyph};
 
 /// Errors observable on the font public surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,16 +158,41 @@ impl BasicBitmapFont {
 }
 
 impl FontProvider for BasicBitmapFont {
+    /// Phase 69b Track E — the font dispatches through the unified
+    /// [`resolve_glyph`] resolver so the bundled font now covers
+    /// ASCII (`U+0020..=U+007F`), Latin-1 supplement
+    /// (`U+0080..=U+00FF`), and the Unicode box-drawing block
+    /// (`U+2500..=U+257F`). Codepoints outside those ranges return
+    /// `None` so the renderer can paint its missing-glyph cell — the
+    /// resolver's centred-dot fallback is opt-in via the new
+    /// [`BasicBitmapFont::glyph_or_fallback`] accessor for renderers
+    /// that prefer a visible replacement.
     fn glyph(&self, codepoint: u32) -> Option<&Glyph> {
-        if !(ASCII_FIRST..=ASCII_LAST).contains(&codepoint) {
+        let g = resolve_glyph(codepoint);
+        // The resolver always returns a `'static` reference; we treat
+        // the fallback dot and the blank cell as "no glyph" so existing
+        // callers (which expect `None` for "we don't have a bitmap for
+        // this codepoint") still see the same shape.
+        if core::ptr::eq(g, &FALLBACK_DOT_GLYPH) || core::ptr::eq(g, &BLANK_GLYPH) {
             return None;
         }
-        let idx = (codepoint - ASCII_FIRST) as usize;
-        Some(&GLYPH_BITMAPS[idx])
+        Some(g)
     }
 
     fn cell_size(&self) -> (u8, u8) {
         (CELL_WIDTH, CELL_HEIGHT)
+    }
+}
+
+impl BasicBitmapFont {
+    /// Phase 69b Track E — variant of [`FontProvider::glyph`] that
+    /// returns the centred-dot fallback (rather than `None`) for any
+    /// codepoint outside the covered ranges. Renderers that want a
+    /// visible placeholder for un-supported codepoints (e.g. CJK
+    /// before Phase 69c ships the tables) call this method and forward
+    /// the returned `&Glyph` directly.
+    pub fn glyph_or_fallback(&self, codepoint: u32) -> &'static Glyph {
+        resolve_glyph(codepoint)
     }
 }
 

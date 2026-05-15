@@ -29,7 +29,8 @@ use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
 };
-use kernel_core::session::font::{BasicBitmapFont, FontProvider};
+use kernel_core::session::BLANK_GLYPH;
+use kernel_core::session::font::BasicBitmapFont;
 use syscall_lib::STDOUT_FILENO;
 
 use crate::render::FramebufferOwner;
@@ -375,21 +376,24 @@ impl FramebufferOwner for DisplayClient {
         };
         let cell_view = &mut pixels_u32[cell_offset..];
 
-        // Look up the glyph; if missing, paint the cell with bg only.
+        // Phase 69b Track E — resolve through `glyph_or_fallback` so
+        // U+FFFD and uncovered codepoints (e.g. CJK before the Phase
+        // 69c tables ship) paint the centred-dot fallback glyph
+        // rather than rendering as a blank background cell. Control
+        // characters route to `BLANK_GLYPH`, which we explicitly map
+        // to a bg-only fill so they stay invisible.
         let font = BasicBitmapFont::new();
-        match font.glyph(codepoint) {
-            Some(glyph) => {
-                let _ = glyph.render_into(cell_view, stride_pixels, fg, bg);
-            }
-            None => {
-                fill_cell_bg(
-                    cell_view,
-                    stride_pixels,
-                    CELL_WIDTH as usize,
-                    CELL_HEIGHT as usize,
-                    bg,
-                );
-            }
+        let glyph = font.glyph_or_fallback(codepoint);
+        if core::ptr::eq(glyph, &BLANK_GLYPH) {
+            fill_cell_bg(
+                cell_view,
+                stride_pixels,
+                CELL_WIDTH as usize,
+                CELL_HEIGHT as usize,
+                bg,
+            );
+        } else {
+            let _ = glyph.render_into(cell_view, stride_pixels, fg, bg);
         }
     }
 

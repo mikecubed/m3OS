@@ -42,5 +42,6 @@ pub mod trace_ring;
 pub mod tty;
 pub mod types;
 pub mod user_range;
+pub mod utf8;
 pub mod watchdog_policy;
 pub mod xsave_model;
