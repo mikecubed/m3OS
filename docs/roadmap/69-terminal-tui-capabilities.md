@@ -170,7 +170,7 @@ Source: `xtask/terminfo/m3os-term.ti`. Compiled by host-side `tic` during `xtask
 ## Deferred Until Later
 
 - **Termios raw/cbreak mode + line-discipline plumbing** → Phase 69a.
-- **UTF-8 wire decoding + Latin-1 supplement + Unicode box-drawing glyphs** → Phase 69b.
+- **UTF-8 wire decoding + Latin-1 supplement + Unicode box-drawing glyphs** *(closed in Phase 69b — `kernel-core::utf8::Utf8Decoder` decodes bytes before the parser, `kernel-core::session::resolve_glyph` dispatches Latin-1 + box-drawing tables + a centred-dot fallback, and `kernel-core::session::width_of` powers wide-cell accounting in `Screen::put_char`. The `Screen::feed` extension point introduced in Phase 69 for the alternate-screen path now also hosts the UTF-8 decoder.)*
 - **TTF/OTF font loader + glyph atlas + Nerd Font asset embedding** → Phase 69c.
 - **`ncurses` port + first quality TUI app validators (`less`, `htop`, `tmux`)** → Phase 69d.
 - **Neovim port** (libuv + Lua/LuaJIT-equivalent + tree-sitter) → dedicated phase after 69d.

@@ -121,4 +121,5 @@ The legacy aligned learning doc [`docs/22b-ansi-escape.md`](../22b-ansi-escape.m
 - Cursor position report (`ESC [ 6 n`) and other terminal-response sequences — Ion does not query the terminal so no input path exists for sending the response back.
 - Customizable tab stops (`ESC H` set, `CSI g` clear) — tab stops are fixed at every 8 columns.
 - OSC and DCS sequences (window titles, hyperlinks, sixel) — out of scope for a bitmap kernel console.
-- Unicode beyond ASCII printable range — characters outside `0x20`–`0x7E` render as a filled-block placeholder because the IBM CP437 font is shipped as ASCII only.
+- Unicode beyond ASCII printable range — *closed in Phase 69b for `term` (Latin-1 supplement U+0080–U+00FF + Unicode box-drawing U+2500–U+257F covered by `kernel-core::session::resolve_glyph`; everything else outside those ranges renders the centred-dot fallback through `BasicBitmapFont::glyph_or_fallback`). The kernel framebuffer console still ships ASCII-only and falls through to its existing `PLACEHOLDER` glyph for non-ASCII codepoints.*
+- `ConsoleCmd::PutChar` payload widened from `char` to `u32` in Phase 69b so the parser can carry any Unicode scalar through to the renderer without a lossy `char` round-trip.

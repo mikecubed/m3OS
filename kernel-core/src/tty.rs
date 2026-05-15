@@ -274,7 +274,8 @@ impl EditBuffer {
         }
     }
 
-    /// Erase the last character. Returns the erased byte or None.
+    /// Erase the last byte from the buffer. Returns the erased byte
+    /// or None when the buffer is empty.
     pub fn erase_char(&mut self) -> Option<u8> {
         if self.len > 0 {
             self.len -= 1;
@@ -282,6 +283,54 @@ impl EditBuffer {
         } else {
             None
         }
+    }
+
+    /// Phase 69b Track G — IUTF8-aware erase. When `iutf8` is set, the
+    /// erase walks back across all UTF-8 continuation bytes
+    /// (`10xxxxxx`) up to and including the leading byte of the most
+    /// recent codepoint, so VERASE removes a whole codepoint rather
+    /// than a single byte. With `iutf8` cleared, the behaviour matches
+    /// the legacy [`EditBuffer::erase_char`] — one byte per call.
+    ///
+    /// Returns the number of bytes removed (0 when the buffer is
+    /// empty). The kernel-core ldisc only echoes a single `\x08 \x08`
+    /// sequence per VERASE today; the wider semantics here let the
+    /// caller decide whether to echo more (e.g. a future double-width
+    /// codepoint deserving two erase echoes).
+    ///
+    /// Resilience: if the buffer tail is malformed UTF-8 (a stray
+    /// leading byte with no following continuation, or only
+    /// continuations with no leading), exactly one byte is removed so
+    /// successive `erase_one_codepoint` calls drain the malformed
+    /// region byte by byte. This matches the Linux ldisc behaviour for
+    /// the same edge case.
+    pub fn erase_one_codepoint(&mut self, iutf8: bool) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        if !iutf8 {
+            self.len -= 1;
+            return 1;
+        }
+        // Scan back from the end while bytes are UTF-8 continuations
+        // (`10xxxxxx`). Cap the walk at four bytes (the maximum
+        // legal UTF-8 sequence length) so a malformed stream cannot
+        // chew through the whole buffer.
+        let mut removed: usize = 0;
+        const MAX_UTF8_LEN: usize = 4;
+        while self.len > 0 && removed < MAX_UTF8_LEN {
+            let b = self.buf[self.len - 1];
+            self.len -= 1;
+            removed += 1;
+            // Stop after consuming a non-continuation byte (which is
+            // the leading byte of the codepoint, or — if the stream is
+            // malformed — a stray byte we treat as one codepoint of
+            // its own).
+            if b & 0xC0 != 0x80 {
+                break;
+            }
+        }
+        removed
     }
 
     /// Kill (erase) the entire line. Returns the number of characters erased.
@@ -663,8 +712,18 @@ impl LineDiscipline {
         if canonical {
             // VERASE (backspace/DEL/0x08)
             if byte == c_cc[VERASE] || byte == 0x7F || byte == 0x08 {
-                let erased = self.edit_buf.erase_char();
-                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
+                // Phase 69b Track G — IUTF8-aware erase. When the
+                // termios `IUTF8` bit is set, VERASE removes the
+                // continuation bytes for the most recent codepoint
+                // plus its leading byte (one whole codepoint per
+                // press); when cleared, behaviour matches Phase 57
+                // (one byte per press). A single backspace echo is
+                // emitted per call: codepoint width on the visible
+                // grid is a Phase 69b Track F concern handled by the
+                // screen state machine, not the line discipline.
+                let iutf8 = self.termios.c_iflag & IUTF8 != 0;
+                let erased = self.edit_buf.erase_one_codepoint(iutf8);
+                if erased > 0 && echo_on && (c_lflag & ECHOE != 0) {
                     let mut echo = SmallVec::new();
                     echo.push(0x08); // BS
                     echo.push(b' ');
@@ -1039,6 +1098,126 @@ mod tests {
             // Should be BS SP BS.
             assert_eq!(echo.as_slice(), &[0x08, b' ', 0x08]);
         }
+    }
+
+    /// Phase 69b Track G — `EditBuffer::erase_one_codepoint` with
+    /// IUTF8 cleared removes exactly one byte (legacy behaviour).
+    #[test]
+    fn edit_buffer_erase_one_codepoint_legacy_byte_only() {
+        let mut buf = EditBuffer::new();
+        for &b in &[0xC3u8, 0xA9] {
+            buf.push(b);
+        }
+        // Without IUTF8, one byte per call.
+        assert_eq!(buf.erase_one_codepoint(false), 1);
+        assert_eq!(buf.as_slice(), &[0xC3]);
+        assert_eq!(buf.erase_one_codepoint(false), 1);
+        assert!(buf.is_empty());
+        // Empty buffer reports 0.
+        assert_eq!(buf.erase_one_codepoint(false), 0);
+    }
+
+    /// Phase 69b Track G — IUTF8 set: a 2-byte Latin-1 codepoint
+    /// (e.g. é = C3 A9) is erased as one codepoint.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_two_byte_codepoint() {
+        let mut buf = EditBuffer::new();
+        for &b in &[0xC3u8, 0xA9] {
+            buf.push(b);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 2);
+        assert!(buf.is_empty());
+    }
+
+    /// Phase 69b Track G — IUTF8 set: a 3-byte box-drawing codepoint
+    /// (e.g. ─ = E2 94 80) is erased as one codepoint.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_three_byte_codepoint() {
+        let mut buf = EditBuffer::new();
+        for &b in &[0xE2u8, 0x94, 0x80] {
+            buf.push(b);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 3);
+        assert!(buf.is_empty());
+    }
+
+    /// Phase 69b Track G — IUTF8 set: a 4-byte emoji-class codepoint
+    /// (e.g. U+1F600 = F0 9F 98 80) is erased as one codepoint.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_four_byte_codepoint() {
+        let mut buf = EditBuffer::new();
+        for &b in &[0xF0u8, 0x9F, 0x98, 0x80] {
+            buf.push(b);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 4);
+        assert!(buf.is_empty());
+    }
+
+    /// Phase 69b Track G — IUTF8 set + ASCII: a 1-byte codepoint is
+    /// erased exactly like the legacy path.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_ascii_one_byte() {
+        let mut buf = EditBuffer::new();
+        buf.push(b'a');
+        buf.push(b'b');
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), b"a");
+    }
+
+    /// Phase 69b Track G — IUTF8 set: an all-continuation tail (no
+    /// leading byte) gets bounded by the 4-byte UTF-8 max so the
+    /// erase cannot run away across the whole buffer.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_caps_runaway() {
+        let mut buf = EditBuffer::new();
+        // Eight continuation bytes with no leading byte — malformed
+        // sequence. The erase walks at most 4 (UTF-8 max length).
+        for _ in 0..8 {
+            buf.push(0x80);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 4);
+        assert_eq!(buf.as_slice().len(), 4);
+    }
+
+    /// Phase 69b Track G — IUTF8 set + VERASE on the canonical ldisc:
+    /// the buffer's two Latin-1 bytes are removed together. The echo
+    /// remains one BS/SP/BS triplet — codepoint-width-on-grid is a
+    /// Phase 69b Track F concern handled by the screen state machine.
+    #[test]
+    fn ldisc_canonical_verase_iutf8_removes_whole_codepoint() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_iflag |= IUTF8;
+        // Push C3 A9 (é) — two raw bytes pretending they were typed
+        // by a UTF-8 input method. The ldisc would accept these one
+        // at a time; we mirror that here via process_byte.
+        for byte in [0xC3u8, 0xA9] {
+            collect_pushed(&mut ld, byte);
+        }
+        assert_eq!(ld.edit_buf.as_slice(), &[0xC3, 0xA9]);
+        // VERASE — the IUTF8-aware erase clears both bytes in one
+        // press.
+        let (result, _) = collect_pushed(&mut ld, 0x7F);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    /// Phase 69b Track G — IUTF8 cleared: the same byte stream still
+    /// removes one byte per VERASE (legacy behaviour preserved).
+    #[test]
+    fn ldisc_canonical_verase_iutf8_off_removes_single_byte() {
+        let mut ld = LineDiscipline::new();
+        assert_eq!(ld.termios.c_iflag & IUTF8, 0);
+        for byte in [0xC3u8, 0xA9] {
+            collect_pushed(&mut ld, byte);
+        }
+        let (_, _) = collect_pushed(&mut ld, 0x7F);
+        // One byte remains: the leading 0xC3.
+        assert_eq!(ld.edit_buf.as_slice(), &[0xC3]);
     }
 
     #[test]

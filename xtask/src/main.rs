@@ -7680,6 +7680,13 @@ const TUI_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
         "TUI_SMOKE:paste:ok",
         "TUI_SMOKE:paste:fail",
     ),
+    (
+        "utf8",
+        "/bin/tui-smoke utf8\n",
+        "guest/tui-smoke: UTF-8 decode + glyph resolver",
+        "TUI_SMOKE:utf8:ok",
+        "TUI_SMOKE:utf8:fail",
+    ),
 ];
 
 /// Phase 69 Track H.2 — step list for the tui-smoke gate. Each

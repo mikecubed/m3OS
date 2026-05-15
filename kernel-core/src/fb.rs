@@ -13,7 +13,15 @@ const MAX_PARAMS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleCmd {
     /// Print a visible character at the current cursor position.
-    PutChar(char),
+    ///
+    /// Phase 69b Track B.1 — payload widened from `char` to `u32` so
+    /// callers feeding decoded UTF-8 codepoints (via
+    /// [`crate::utf8::Utf8Decoder`]) can route any Unicode scalar
+    /// straight into the parser without a lossy `char` round-trip.
+    /// ASCII / Latin-1 call sites continue to compile by casting
+    /// `byte as u32` or `c as u32`; existing renderers index their
+    /// glyph tables on the same `u32` the cell buffer already stores.
+    PutChar(u32),
     /// Carriage return — move cursor to column 0.
     CarriageReturn,
     /// Newline — advance to next line.
@@ -322,7 +330,7 @@ impl AnsiParser {
             '\n' => ConsoleCmd::Newline,
             '\x08' => ConsoleCmd::Backspace,
             '\t' => ConsoleCmd::Tab,
-            _ => ConsoleCmd::PutChar(c),
+            _ => ConsoleCmd::PutChar(c as u32),
         }
     }
 
@@ -548,7 +556,13 @@ mod tests {
     #[test]
     fn test_printable_chars() {
         let cmds = parse_str("AB");
-        assert_eq!(cmds, &[ConsoleCmd::PutChar('A'), ConsoleCmd::PutChar('B')]);
+        assert_eq!(
+            cmds,
+            &[
+                ConsoleCmd::PutChar(b'A' as u32),
+                ConsoleCmd::PutChar(b'B' as u32),
+            ]
+        );
     }
 
     #[test]
@@ -632,7 +646,7 @@ mod tests {
             &[
                 ConsoleCmd::Nop, // ESC
                 ConsoleCmd::Nop, // 'X' — discarded, back to Normal
-                ConsoleCmd::PutChar('A'),
+                ConsoleCmd::PutChar(b'A' as u32),
             ]
         );
     }
@@ -670,12 +684,12 @@ mod tests {
         assert_eq!(
             cmds,
             &[
-                ConsoleCmd::PutChar('A'),
+                ConsoleCmd::PutChar(b'A' as u32),
                 ConsoleCmd::Nop,             // ESC
                 ConsoleCmd::Nop,             // [
                 ConsoleCmd::Nop,             // 2
                 ConsoleCmd::EraseDisplay(2), // J
-                ConsoleCmd::PutChar('B'),
+                ConsoleCmd::PutChar(b'B' as u32),
             ]
         );
     }
@@ -776,7 +790,7 @@ mod tests {
         assert_eq!(cmd, ConsoleCmd::Nop); // malformed, discarded
         assert_eq!(parser.state, EscState::Normal);
         // Normal text works again
-        assert_eq!(parser.process_char('X'), ConsoleCmd::PutChar('X'));
+        assert_eq!(parser.process_char('X'), ConsoleCmd::PutChar(b'X' as u32));
     }
 
     #[test]

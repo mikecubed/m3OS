@@ -1,6 +1,6 @@
 # Phase 69b - UTF-8 Wire Decoding and Bitmap Glyph Expansion
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69b
 **Depends on:** Phase 22b (ANSI Escape) ✅, Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode)
 **Builds on:** Extends Phase 57 `term`'s byte-level `Screen::feed` to a UTF-8 codepoint feed; extends the bitmap font in `kernel-core::fb` (or `userspace/term`'s glyph module — implementer's call) from 7-bit ASCII to cover the Latin-1 supplement (U+0080–U+00FF) and Unicode box-drawing block (U+2500–U+257F). Phase 69a's `IUTF8` termios flag gains its first behavioural effect: when set, the ldisc's VERASE accounting recognises continuation bytes.

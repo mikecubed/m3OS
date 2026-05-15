@@ -459,14 +459,22 @@ impl FbConsole {
     }
 
     /// Render a single character cell at grid position `(col, row)`.
-    fn render_char_at(&mut self, col: usize, row: usize, c: char) {
+    ///
+    /// Phase 69b Track B.1 — accepts a `u32` codepoint to match the
+    /// widened [`ConsoleCmd::PutChar`] payload. The kernel framebuffer
+    /// console still only ships the 7-bit ASCII bitmap font; anything
+    /// outside `FONT_FIRST..=FONT_LAST` falls through to `PLACEHOLDER`.
+    /// The richer Latin-1 / box-drawing tables live in the userspace
+    /// `term` renderer (kernel-core::session::font), so applications
+    /// running under `term` see the full Phase 69b coverage while the
+    /// kernel console keeps its minimal footprint.
+    fn render_char_at(&mut self, col: usize, row: usize, codepoint: u32) {
         let px_x = col * CHAR_W;
         let px_y = row * CHAR_H;
 
         let glyph: &[u8; CHAR_H] = {
-            let code = c as u32;
-            if code >= FONT_FIRST as u32 && code <= FONT_LAST as u32 {
-                &FONT[(code - FONT_FIRST as u32) as usize]
+            if codepoint >= FONT_FIRST as u32 && codepoint <= FONT_LAST as u32 {
+                &FONT[(codepoint - FONT_FIRST as u32) as usize]
             } else {
                 &PLACEHOLDER
             }
@@ -555,7 +563,9 @@ impl FbConsole {
     }
 
     /// Render one visible character, advancing the cursor with line wrapping.
-    fn put_visible_char(&mut self, c: char) {
+    ///
+    /// Phase 69b Track B.1 — codepoint payload widened to `u32`.
+    fn put_visible_char(&mut self, codepoint: u32) {
         let rows = self.rows();
         let cols = self.cols();
         if rows == 0 || cols == 0 {
@@ -570,7 +580,7 @@ impl FbConsole {
                 self.cursor_row = rows - 1;
             }
         }
-        self.render_char_at(self.cursor_col, self.cursor_row, c);
+        self.render_char_at(self.cursor_col, self.cursor_row, codepoint);
         self.cursor_col += 1;
     }
 
@@ -622,7 +632,7 @@ impl FbConsole {
                 } else {
                     return;
                 }
-                self.render_char_at(self.cursor_col, self.cursor_row, ' ');
+                self.render_char_at(self.cursor_col, self.cursor_row, b' ' as u32);
             }
             ConsoleCmd::Tab => {
                 let next_tab = (self.cursor_col + 8) & !7;

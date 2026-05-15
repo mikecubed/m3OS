@@ -45,7 +45,7 @@ The kernel TTY ioctl path gains `TCGETS` (0x5401), `TCSETS` (0x5402), `TCSETSW` 
 
 ### `c_iflag` plumbing (Track C)
 
-Implement `IGNCR` (ignore CR on input), `INLCR` (map NL → CR on input), `ICRNL` (map CR → NL on input), `IUTF8` (input is UTF-8; affects ERASE behaviour with multibyte sequences — full effect lands in 69b), `IXON` / `IXOFF` (software flow control; honoured by the ldisc).
+Implement `IGNCR` (ignore CR on input), `INLCR` (map NL → CR on input), `ICRNL` (map CR → NL on input), `IUTF8` (input is UTF-8; affects ERASE behaviour with multibyte sequences — *closed in Phase 69b: when `IUTF8` is set, `EditBuffer::erase_one_codepoint` walks back across UTF-8 continuation bytes plus the leading byte so VERASE removes one whole codepoint per press; when cleared, the legacy one-byte-per-erase behaviour is preserved*), `IXON` / `IXOFF` (software flow control; honoured by the ldisc).
 
 ### `c_oflag` plumbing (Track D)
 

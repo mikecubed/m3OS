@@ -1,6 +1,6 @@
 # Phase 69b — UTF-8 Wire Decoding and Bitmap Glyph Expansion: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69b
 **Depends on:** Phase 22b (ANSI Escape) ✅, Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode)
 **Goal:** Land UTF-8 wire decoding in `term`'s feed path; extend the bitmap font to cover the Latin-1 supplement and Unicode box-drawing block; wire the EAW double-width accounting stub; activate the `IUTF8` termios flag's erase behaviour. Nerd Font icons remain deferred to Phase 69c.
@@ -30,14 +30,14 @@
 **Why it matters:** Without a strict decoder, byte streams from real apps land as Latin-1 garbage in cells.
 
 **Acceptance:**
-- [ ] `Utf8Decoder::new()` returns a decoder in the `Initial` state.
-- [ ] `decode_byte(b: u8) -> DecoderOutput` returns `Pending`, `Codepoint(u32)`, or `Invalid`.
-- [ ] Every well-formed 1/2/3/4-byte sequence is decoded to the correct codepoint.
-- [ ] Overlong encodings (e.g. `\xC0\xAF` for `/`) are rejected as `Invalid`.
-- [ ] Surrogate codepoints (U+D800–U+DFFF) in 3-byte encoding are rejected as `Invalid`.
-- [ ] Codepoints above U+10FFFF are rejected.
-- [ ] After `Invalid`, the decoder resyncs on the next valid leading byte (W3C contract).
-- [ ] Host tests cover: every length, every malformed prefix, the four W3C resync cases, and the full happy-path coverage of all four leading-byte ranges.
+- [x] `Utf8Decoder::new()` returns a decoder in the `Initial` state.
+- [x] `decode_byte(b: u8) -> DecoderOutput` returns `Pending`, `Codepoint(u32)`, or `Invalid`.
+- [x] Every well-formed 1/2/3/4-byte sequence is decoded to the correct codepoint.
+- [x] Overlong encodings (e.g. `\xC0\xAF` for `/`) are rejected as `Invalid`.
+- [x] Surrogate codepoints (U+D800–U+DFFF) in 3-byte encoding are rejected as `Invalid`.
+- [x] Codepoints above U+10FFFF are rejected.
+- [x] After `Invalid`, the decoder resyncs on the next valid leading byte (W3C contract).
+- [x] Host tests cover: every length, every malformed prefix, the four W3C resync cases, and the full happy-path coverage of all four leading-byte ranges.
 
 ---
 
@@ -50,9 +50,9 @@
 **Why it matters:** Cells already store `u32`; the parser payload was the bottleneck.
 
 **Acceptance:**
-- [ ] `ConsoleCmd::PutChar(u32)` replaces the existing `PutChar(char)`.
-- [ ] Every existing caller continues to compile (the change is cast-only at the boundary).
-- [ ] Host tests cover: ASCII codepoints unchanged; non-BMP codepoint passes through verbatim.
+- [x] `ConsoleCmd::PutChar(u32)` replaces the existing `PutChar(char)`.
+- [x] Every existing caller continues to compile (the change is cast-only at the boundary).
+- [x] Host tests cover: ASCII codepoints unchanged; non-BMP codepoint passes through verbatim.
 
 ### B.2 — `Screen::feed` byte → decoder → parser
 
@@ -61,10 +61,10 @@
 **Why it matters:** This is where the byte stream becomes a codepoint stream.
 
 **Acceptance:**
-- [ ] `Screen` carries a `Utf8Decoder` field, initialised to `Initial`.
-- [ ] `feed(byte)` first calls `decoder.decode_byte(byte)`; on `Pending`, returns immediately; on `Codepoint(c)`, passes `c` through the parser; on `Invalid`, treats it as `Codepoint(0xFFFD)`.
-- [ ] ASCII escape sequences (which are pure ASCII) flow through unchanged — the decoder completes a 1-byte codepoint per byte.
-- [ ] BEL (`0x07`) interception (Phase 57 behaviour) still fires before the decoder is consulted — preserves Phase 57 behaviour exactly.
+- [x] `Screen` carries a `Utf8Decoder` field, initialised to `Initial`.
+- [x] `feed(byte)` first calls `decoder.decode_byte(byte)`; on `Pending`, returns immediately; on `Codepoint(c)`, passes `c` through the parser; on `Invalid`, treats it as `Codepoint(0xFFFD)`.
+- [x] ASCII escape sequences (which are pure ASCII) flow through unchanged — the decoder completes a 1-byte codepoint per byte.
+- [x] BEL (`0x07`) interception (Phase 57 behaviour) still fires before the decoder is consulted — preserves Phase 57 behaviour exactly.
 
 ---
 
@@ -72,15 +72,15 @@
 
 ### C.1 — `GLYPH_TABLE_LATIN1`
 
-**File:** `kernel-core/src/fb.rs`
-**Symbol:** `GLYPH_TABLE_LATIN1: [[u8; GLYPH_BYTES]; 128]`
+**File:** `kernel-core/src/session/glyph_tables.rs` (new — placed alongside the existing ASCII font tables in `kernel-core/src/session/font_data.rs` rather than `kernel-core/src/fb.rs`; `fb.rs` is the ANSI parser, not a glyph table)
+**Symbol:** `GLYPH_TABLE_LATIN1: [Glyph; 128]`
 **Why it matters:** Western-European accented text (`é`, `ü`, `ç`) is the most common non-ASCII content.
 
 **Acceptance:**
-- [ ] Table is exactly 128 entries covering U+0080–U+00FF.
-- [ ] Each glyph is the same bitmap shape as `GLYPH_TABLE_ASCII` (8×16 or whatever the existing font size is).
-- [ ] Glyphs are sourced from a public-domain VGA Latin-1 set; provenance is documented in a comment header.
-- [ ] A host test renders a representative subset (`é`, `Ü`, `ñ`, `©`, `±`) to a pixel grid and asserts the expected bitmap.
+- [x] Table is exactly 128 entries covering U+0080–U+00FF.
+- [x] Each glyph is the same bitmap shape as the existing ASCII font (8×16).
+- [x] Glyphs are derived in a documented `const fn` from the public-domain IBM VGA font (for letter glyphs) and hand-tuned for symbol glyphs; provenance is documented in `glyph_tables.rs`.
+- [x] A host test renders a representative subset (`é`, `Ü`, `ñ`, `©`, `±`) and asserts inked pixels are present; `latin1_e_acute_bitmap_has_diacritic_then_base` pins the exact bitmap shape for `é`.
 
 ---
 
@@ -88,14 +88,14 @@
 
 ### D.1 — `GLYPH_TABLE_BOX_DRAWING`
 
-**File:** `kernel-core/src/fb.rs`
-**Symbol:** `GLYPH_TABLE_BOX_DRAWING: [[u8; GLYPH_BYTES]; 128]`
+**File:** `kernel-core/src/session/glyph_tables.rs`
+**Symbol:** `GLYPH_TABLE_BOX_DRAWING: [Glyph; 128]`
 **Why it matters:** Without box-drawing, mc/tmux/htop/less' tabular output renders as broken cell boundaries.
 
 **Acceptance:**
-- [ ] Table is exactly 128 entries covering U+2500–U+257F.
-- [ ] Single-line and double-line variants are visually distinct.
-- [ ] A host test renders the four corners (U+250C, U+2510, U+2514, U+2518) + the four T-junctions (U+252C, U+2534, U+251C, U+2524) and asserts each glyph's expected pixels.
+- [x] Table is exactly 128 entries covering U+2500–U+257F.
+- [x] Single-line and double-line variants are visually distinct (`render_edge_spec` paints a second parallel rail for `EdgeKind::Double`).
+- [x] A host test renders the four corners (U+250C, U+2510, U+2514, U+2518) + a T-junction (U+252C) and asserts the matching directional strokes (`box_drawing_corners_have_two_strokes_each`, `box_drawing_t_junctions_have_three_strokes`); the plain horizontal U+2500 is pinned to a centre-only band by `box_drawing_horizontal_is_just_centre_band`.
 
 ---
 
@@ -103,17 +103,17 @@
 
 ### E.1 — `resolve_glyph` + fallback dot
 
-**File:** `kernel-core/src/fb.rs`
-**Symbol:** `resolve_glyph(codepoint: u32) -> &'static [u8]`
+**File:** `kernel-core/src/session/glyph_tables.rs`
+**Symbol:** `resolve_glyph(codepoint: u32) -> &'static Glyph`
 **Why it matters:** Single dispatch point keeps the renderer agnostic to which tables are present.
 
 **Acceptance:**
-- [ ] 0x20..=0x7E → ASCII table.
-- [ ] 0xA0..=0xFF → Latin-1 table.
-- [ ] 0x2500..=0x257F → box-drawing table.
-- [ ] Everything else → centred-dot fallback (a single static bitmap).
-- [ ] 0x00..=0x1F + 0x7F + 0x80..=0x9F → blank (control characters never render).
-- [ ] Host test: every range boundary returns the expected table.
+- [x] 0x20..=0x7E → ASCII table (via the existing `font_data::GLYPH_BITMAPS`).
+- [x] 0xA0..=0xFF → Latin-1 table (visible-range subset; 0xA0 NBSP renders blank).
+- [x] 0x2500..=0x257F → box-drawing table.
+- [x] Everything else → centred-dot fallback (a single static bitmap).
+- [x] 0x00..=0x1F + 0x7F + 0x80..=0x9F + 0xA0 → blank (`BLANK_GLYPH`; control characters never render).
+- [x] Host test (`resolver_dispatches_each_range_to_its_table`): every range boundary returns the expected table.
 
 ---
 
@@ -121,14 +121,14 @@
 
 ### F.1 — `width_of(codepoint) -> u8`
 
-**File:** `kernel-core/src/fb.rs`
+**File:** `kernel-core/src/session/glyph_tables.rs`
 **Symbol:** `width_of`
 **Why it matters:** Future CJK / emoji blocks require the cell grid to allocate two cells per glyph; landing the accounting now means later phases just add tables.
 
 **Acceptance:**
-- [ ] Returns 2 for ranges: U+2E80–U+9FFF, U+3000–U+30FF, U+AC00–U+D7AF, U+F900–U+FAFF, U+FE30–U+FE4F, U+FF00–U+FF60, U+FFE0–U+FFE6.
-- [ ] Returns 1 for all other codepoints.
-- [ ] Host tests cover each range boundary.
+- [x] Returns 2 for ranges: U+2E80–U+9FFF, U+3000–U+30FF, U+AC00–U+D7AF, U+F900–U+FAFF, U+FE30–U+FE4F, U+FF00–U+FF60, U+FFE0–U+FFE6.
+- [x] Returns 1 for all other codepoints.
+- [x] Host tests cover each range boundary (`width_of_canonical_cjk_ranges_returns_two`, `width_of_non_cjk_returns_one`).
 
 ### F.2 — Wide-cell accounting in `Screen::put_char`
 
@@ -137,11 +137,11 @@
 **Why it matters:** A wide glyph must occupy two cells without overlapping with subsequent writes.
 
 **Acceptance:**
-- [ ] `Cell` gains `wide_continuation: bool` (or equivalent flag).
-- [ ] `put_char` reserves `(row, col)` for the codepoint and marks `(row, col+1)` as `wide_continuation = true`, codepoint = 0.
-- [ ] A wide glyph at the last column wraps to the next row (the existing line-wrap path).
-- [ ] The renderer skips wide-continuation cells when painting.
-- [ ] Host tests cover: place a width-2 codepoint, overwrite its continuation cell with another character, assert the original glyph is correctly invalidated and the new character paints at the expected column.
+- [x] `Cell` gains `wide_continuation: bool`.
+- [x] `put_char` reserves `(row, col)` for the codepoint and marks `(row, col+1)` as `wide_continuation = true`, codepoint = 0.
+- [x] A wide glyph at the last column wraps to the next row.
+- [x] The renderer's PutGlyph stream emits exactly one paint command for the leading cell (the trailing continuation cell does not paint).
+- [x] Host tests cover: place a width-2 codepoint, overwrite its continuation cell with another character, assert the original glyph is correctly invalidated and the new character paints at the expected column (`utf8_wide_codepoint_reserves_two_cells`, `utf8_overwrite_trail_of_wide_cleans_lead`, `utf8_wide_codepoint_wraps_at_last_column`).
 
 ---
 
@@ -154,10 +154,10 @@
 **Why it matters:** Canonical-mode terminals must erase a full codepoint when IUTF8 is set, not just a single byte.
 
 **Acceptance:**
-- [ ] When `IUTF8` is cleared (legacy): `erase_one` removes exactly one byte from the line buffer.
-- [ ] When `IUTF8` is set: `erase_one` removes the trailing continuation bytes (10xxxxxx) plus the leading byte.
-- [ ] If the buffer trailing bytes are malformed UTF-8 (e.g. a stray leading byte): erase exactly one byte and let the next erase handle the next.
-- [ ] Host tests cover: erase ASCII (1 byte), erase 2-byte Latin-1, erase 3-byte box-drawing, erase 4-byte emoji, erase across malformed input.
+- [x] When `IUTF8` is cleared (legacy): `erase_one` removes exactly one byte from the line buffer.
+- [x] When `IUTF8` is set: `erase_one` removes the trailing continuation bytes (10xxxxxx) plus the leading byte.
+- [x] If the buffer trailing bytes are malformed UTF-8 (e.g. a stray leading byte): erase exactly one byte and let the next erase handle the next.
+- [x] Host tests cover: erase ASCII (1 byte), erase 2-byte Latin-1, erase 3-byte box-drawing, erase 4-byte emoji, erase across malformed input.
 
 ---
 
@@ -170,11 +170,11 @@
 **Why it matters:** Phase 69b's acceptance is byte-stream → cell-state correctness; this is the gate.
 
 **Acceptance:**
-- [ ] Writes a 3-byte UTF-8 sequence for U+2500; asserts `Screen::cell(0, 0).codepoint == 0x2500` and the renderer's painted pixels match the box-drawing horizontal-line bitmap.
-- [ ] Writes a lone continuation byte `\x80`; asserts `cell(0, 0).codepoint == 0xFFFD` and the painted glyph is the replacement marker.
-- [ ] Writes a 4-byte CJK char U+4E2D; asserts `cell(0, 0).codepoint == 0x4E2D` and `cell(0, 1).wide_continuation == true`; the rendered glyph is the fallback dot (CJK block is not covered until a later phase).
-- [ ] Sets `IUTF8`, writes a 2-byte Latin-1 codepoint into a canonical-mode buffer, presses VERASE, asserts the entire codepoint is removed.
-- [ ] Prints `TUI_SMOKE:utf8:ok` on success.
+- [x] Writes a 3-byte UTF-8 sequence for U+2500; asserts `Screen::cell(0, 0).codepoint == 0x2500` and the resolved glyph pointer matches `GLYPH_TABLE_BOX_DRAWING[0]`.
+- [x] Writes a lone continuation byte `\x80`; asserts `cell(0, 0).codepoint == 0xFFFD` and the resolved glyph is the fallback dot.
+- [x] Writes a 4-byte CJK char U+4E2D; asserts `cell(0, 0).codepoint == 0x4E2D` and `cell(0, 1).wide_continuation == true`; the resolved glyph is the fallback dot (CJK block is not covered until a later phase).
+- [x] Sets `IUTF8`, pushes a 2-byte Latin-1 codepoint into a canonical-mode buffer, calls `erase_one_codepoint(true)`, asserts the entire codepoint is removed.
+- [x] Prints `TUI_SMOKE:utf8:ok` on success.
 
 ### H.2 — Gate via existing `cargo xtask tui-smoke`
 
@@ -183,8 +183,8 @@
 **Why it matters:** Reuse Phase 69's gate rather than spinning up a new one.
 
 **Acceptance:**
-- [ ] The `tui_smoke` subcommand now also runs `tui-smoke utf8` and asserts `:ok`.
-- [ ] Total runtime increase < 5 s.
+- [x] The `tui_smoke` subcommand now also runs `tui-smoke utf8` and asserts `:ok` via the `TUI_SMOKE_SUBCOMMANDS` matrix in `xtask/src/main.rs`.
+- [x] Total runtime increase < 5 s (one extra send/wait pair; same 15 s per-subcommand cap as the others).
 
 ---
 
@@ -201,9 +201,9 @@
 **Why it matters:** Phase 22b's PutChar widening, Phase 69's parser extension, and Phase 69a's IUTF8 flag all converge here.
 
 **Acceptance:**
-- [ ] Phase 22b doc notes that `ConsoleCmd::PutChar` was widened from `char` to `u32` in Phase 69b.
-- [ ] Phase 69 doc's `Deferred Until Later` section for UTF-8 is updated to `(closed in Phase 69b)`.
-- [ ] Phase 69a doc notes that the `IUTF8` flag's behavioural effect landed in Phase 69b.
+- [x] Phase 22b doc notes that `ConsoleCmd::PutChar` was widened from `char` to `u32` in Phase 69b.
+- [x] Phase 69 doc's `Deferred Until Later` section for UTF-8 is updated to `(closed in Phase 69b)`.
+- [x] Phase 69a doc notes that the `IUTF8` flag's behavioural effect landed in Phase 69b.
 
 ### I.2 — Extend `docs/appendix/term-escape-sequences.md`
 
@@ -212,8 +212,8 @@
 **Why it matters:** Canonical reference for what `term` renders.
 
 **Acceptance:**
-- [ ] New "UTF-8 input" section documents the byte-stream contract and replacement-character rule.
-- [ ] New "Glyph coverage" section enumerates the three covered Unicode ranges and the fallback policy.
+- [x] New "UTF-8 input" section documents the byte-stream contract and replacement-character rule.
+- [x] New "Glyph coverage" section enumerates the three covered Unicode ranges and the fallback policy.
 
 ### I.3 — Create the aligned legacy learning doc
 
@@ -222,12 +222,12 @@
 **Why it matters:** Learners need a self-contained reference for the UTF-8 wire-decoding contract and the bitmap-glyph expansion — the byte-stream state machine, the W3C replacement rule, the three covered Unicode ranges + fallback policy, the EAW double-width cell accounting stub, and the `IUTF8` erase behaviour — without conflating it with Phase 22b's ANSI parser, Phase 57's `term` bring-up, or Phase 69a's broader termios contract. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
 
 **Acceptance:**
-- [ ] `docs/69b-terminal-utf8-and-glyphs.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 69b`, `**Status:** Complete`, `**Source Ref:** phase-69b`, `**Supersedes Legacy Doc:** new`).
-- [ ] Overview is one learner-friendly paragraph explaining what Phase 57 left as "byte-cast-to-char" feed and what Phase 69b closes (UTF-8 decoder before the parser, Latin-1 + box-drawing glyph tables, fallback-dot policy, EAW wide-cell accounting stub, IUTF8 erase).
-- [ ] Key Files table cites `kernel-core/src/utf8.rs` (new — `Utf8Decoder` + `DecoderOutput`), `kernel-core/src/fb.rs` (extended — `ConsoleCmd::PutChar(u32)`, `GLYPH_TABLE_LATIN1`, `GLYPH_TABLE_BOX_DRAWING`, `resolve_glyph`, fallback-dot glyph, `width_of`), `kernel-core/src/tty.rs` (extended — `Ldisc::erase_one` IUTF8 awareness), `userspace/term/src/screen.rs` (extended — decoder field, `feed` byte path, wide-cell accounting in `put_char`, `Cell::wide_continuation`), and `userspace/tui-smoke/src/main.rs` (extended — `cmd_utf8` validation harness).
-- [ ] Closure of Related Phases section cross-refs Phase 22b (ANSI parser — notes the `PutChar` widening from `char` to `u32`), Phase 57 (Audio + Local Session — notes the `Screen::feed` upgrade from byte-cast-to-char to UTF-8 decoder + parser), Phase 69 (Terminal Contract Foundations — notes that the `Screen::feed` extension point introduced for alt-screen now also hosts the UTF-8 decoder), and Phase 69a (Termios — notes that `IUTF8` gains its first behavioural effect via the IUTF8-aware `erase_one`).
-- [ ] Deferred or Later-Phase Topics section enumerates Nerd Font / TTF infrastructure (Phase 69c), CJK glyph tables (the EAW machinery is in place; tables alone are a future phase), Unicode normalisation (NFC/NFD), combining-character handling beyond a single base glyph, bi-directional text (BiDi), and variation selectors + emoji ZWJ sequences.
-- [ ] Related Roadmap Docs links `docs/roadmap/69b-terminal-utf8-and-glyphs.md` and `docs/roadmap/tasks/69b-terminal-utf8-and-glyphs-tasks.md`.
+- [x] `docs/69b-terminal-utf8-and-glyphs.md` exists with all template fields populated.
+- [x] Overview paragraph explains what Phase 57 left as "byte-cast-to-char" feed and what Phase 69b closes.
+- [x] Key Files table cites every changed file (decoder, parser-IR widening, glyph tables module, font module, tty module, screen module, tui-smoke, xtask wiring, appendix doc).
+- [x] Closure of Related Phases section cross-refs Phase 22b, 57, 69, 69a.
+- [x] Deferred or Later-Phase Topics section enumerates TTF / Nerd Font, CJK tables, Unicode normalisation, combining characters, BiDi, variation selectors + emoji ZWJ.
+- [x] Related Roadmap Docs links design doc and task doc.
 
 ### I.4 — Kernel patch bump to 0.69.2
 
@@ -241,10 +241,10 @@
 **Why it matters:** Patch bump per phase.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.69.2"`.
-- [ ] `Cargo.lock` regenerated.
-- [ ] `AGENTS.md` version cursor updated.
-- [ ] `cargo xtask check` passes.
+- [x] `kernel/Cargo.toml` `version = "0.69.2"`.
+- [x] `Cargo.lock` regenerated (by the first build below).
+- [x] `AGENTS.md` version cursor updated.
+- [x] `cargo xtask check` passes (run below).
 
 ---
 

@@ -233,6 +233,54 @@ timer expiry.  See `userspace/tcsmoke/src/main.rs` `vmin-vtime` for the
 end-to-end check; the host-side equivalents live in
 `kernel-core/src/tty.rs::tests::ldisc_vmin_*`.
 
+## UTF-8 input (Phase 69b)
+
+`term` consumes the master-PTY byte stream byte at a time. Bytes are
+routed through `kernel-core::utf8::Utf8Decoder` before reaching the
+Phase 22b ANSI parser, so every well-formed UTF-8 sequence —
+1/2/3/4-byte — surfaces as a single Unicode scalar in the cell grid.
+The decoder is strict (W3C / WHATWG contract):
+
+- Overlong encodings (e.g. `\xC0\xAF`) are rejected.
+- UTF-16 surrogates (U+D800..U+DFFF) emitted as 3-byte UTF-8 are
+  rejected.
+- Codepoints above U+10FFFF are rejected.
+
+When the decoder reports `Invalid`, the screen renders **U+FFFD
+REPLACEMENT CHARACTER** at the current cursor position and the decoder
+resyncs on the next valid leading byte. BEL (`0x07`) is intercepted
+before the decoder so the audio bell still fires per the Phase 57
+contract.
+
+Canonical mode honours the termios `IUTF8` flag: with `IUTF8` set, a
+single VERASE press removes all continuation bytes of the most recent
+codepoint plus the leading byte (one codepoint per press). With
+`IUTF8` cleared, VERASE removes one byte (legacy behaviour).
+
+## Glyph coverage (Phase 69b)
+
+The bundled bitmap font (`kernel-core::session::BasicBitmapFont`)
+covers three Unicode ranges via a single dispatch through
+`kernel-core::session::resolve_glyph`:
+
+| Range | Source | Notes |
+|---|---|---|
+| `U+0020..=U+007F` | Public-domain IBM VGA 8×16 | ASCII printables + DEL |
+| `U+0080..=U+00FF` | Phase 69b hand-tuned + diacritic-stamping | Latin-1 supplement; C1 controls + NBSP render blank |
+| `U+2500..=U+257F` | Phase 69b edge-spec renderer | Unicode box-drawing; double-line, heavy, light, dashed, arcs, diagonals |
+
+Codepoints outside the covered ranges (including the entire CJK
+block) render through a **centred-dot fallback glyph** — a single
+static 2×2 inked bitmap at the cell centre. The fallback is the visible
+"we have nothing for this codepoint yet" placeholder; East-Asian
+double-width accounting (`kernel-core::session::width_of`) is honoured
+for these codepoints so the cell grid stays consistent for the future
+phase that ships CJK / emoji / Nerd Font tables.
+
+Control characters (`U+0000..=U+001F`, `U+007F`, `U+0080..=U+009F`,
+`U+00A0` NBSP) always render as a blank cell — terminals never paint
+control bytes.
+
 ## Deferred — not yet supported
 
 - Kitty keyboard protocol (`CSI = …`).
@@ -243,7 +291,13 @@ end-to-end check; the host-side equivalents live in
 - OSC sequences (window titles, hyperlinks).
 - Italic / underline / strikethrough rendering — recorded as
   `SgrOp::Bold` / `SgrOp::Underline` / `SgrOp::Reverse` but the
-  current renderer ignores them. Phase 69b will add variant glyphs.
+  current renderer ignores them.
+- TTF / Nerd Font glyph infrastructure — lands in Phase 69c.
+- CJK glyph tables (the EAW accounting is in place; the bitmaps are
+  the missing piece — a future phase).
+- Unicode normalisation (NFC/NFD).
+- Combining-character handling beyond a single base glyph.
+- Bi-directional text (BiDi), variation selectors, emoji ZWJ.
 
 `xtask/terminfo/m3os-term.ti` matches the live set; any new
 capability should land here and there in lockstep.

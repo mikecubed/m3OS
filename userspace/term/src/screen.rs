@@ -19,8 +19,15 @@
 use alloc::vec::Vec;
 
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrOp};
+use kernel_core::session::width_of;
+use kernel_core::utf8::{DecoderOutput, Utf8Decoder};
 
 use crate::{DEFAULT_COLS, DEFAULT_ROWS, SCROLLBACK_LINES};
+
+/// Phase 69b Track B.2 — Unicode replacement character emitted by
+/// [`Screen::feed`] whenever the UTF-8 decoder reports `Invalid`.
+/// Matches the W3C / WHATWG replacement-character contract.
+pub const REPLACEMENT_CHARACTER: u32 = 0xFFFD;
 
 /// Errors observable on the screen public surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,11 +194,22 @@ pub enum RenderCommand {
 
 /// One cell in the screen buffer.  `codepoint` is the glyph; `fg`/`bg`
 /// are the BGRA8888 packed colours at the time the cell was written.
+///
+/// Phase 69b Track F — wide-cell accounting. A double-width codepoint
+/// (per the EAW table in `kernel-core::session::width_of`) occupies
+/// two adjacent cells: the leading cell carries the codepoint, and the
+/// trailing cell carries `codepoint = 0`, `wide_continuation = true`.
+/// The renderer skips wide-continuation cells when painting so the
+/// leading glyph's pixels are not stomped by a half-width repaint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub codepoint: u32,
     pub fg: u32,
     pub bg: u32,
+    /// Phase 69b Track F — true when this cell is the trailing
+    /// half of a wide (double-width) glyph; the leading cell at
+    /// `(row, col - 1)` carries the codepoint.
+    pub wide_continuation: bool,
 }
 
 impl Cell {
@@ -201,6 +219,7 @@ impl Cell {
             codepoint: 0x20,
             fg,
             bg,
+            wide_continuation: false,
         }
     }
 }
@@ -305,6 +324,12 @@ pub struct Screen {
     bracketed_paste_enabled: bool,
     /// ANSI parser state.
     parser: AnsiParser,
+    /// Phase 69b Track B.2 — UTF-8 byte-stream decoder. Bytes are
+    /// pushed through this decoder before reaching the ANSI parser;
+    /// `Pending` short-circuits the feed (waiting for more bytes),
+    /// `Codepoint(c)` is routed through the parser, and `Invalid` is
+    /// remapped to U+FFFD per the W3C replacement-character rule.
+    decoder: Utf8Decoder,
 }
 
 impl Screen {
@@ -335,6 +360,7 @@ impl Screen {
             cursor_shape: CursorShape::BlinkingBlock,
             bracketed_paste_enabled: false,
             parser: AnsiParser::new(),
+            decoder: Utf8Decoder::new(),
         }
     }
 
@@ -532,22 +558,54 @@ impl Screen {
         Ok(self.buf[row as usize * self.cols as usize + col as usize])
     }
 
-    /// Feed one byte through the ANSI parser and update the screen
-    /// state.  Push the typed render commands produced into `out`.
-    /// The function allocates only when scrollback grows, never per
-    /// character.
+    /// Feed one byte through the UTF-8 decoder, then the ANSI parser,
+    /// and update the screen state. Push the typed render commands
+    /// produced into `out`. The function allocates only when scrollback
+    /// grows, never per character.
+    ///
+    /// Phase 69b Track B.2 — bytes are first routed through the
+    /// [`Utf8Decoder`]. `Pending` short-circuits the feed (waiting for
+    /// the next continuation byte). `Codepoint(c)` is processed by the
+    /// parser as if it were a single character — pure-ASCII codepoints
+    /// (which is what all escape-sequence bytes are) decode in one
+    /// step, so Phase 22b sequence handling is unaffected. `Invalid`
+    /// is replaced with U+FFFD per the W3C replacement-character rule
+    /// and forwarded to [`Screen::put_char`] directly (escape-sequence
+    /// state is preserved across malformed payload bytes — a malformed
+    /// byte inside an escape sequence is unusual but should not break
+    /// out of the in-flight sequence). BEL (`0x07`) is intercepted
+    /// before the decoder is consulted to preserve the Phase 57
+    /// `Bell` mapping exactly.
     pub fn feed(&mut self, byte: u8, out: &mut Vec<RenderCommand>) {
         // BEL is intercepted before the parser so it does not become a
-        // `PutChar('\x07')`.  The G.4 acceptance pins this mapping.
+        // `PutChar('\x07')`. The G.4 acceptance pins this mapping.
         if byte == 0x07 {
             out.push(RenderCommand::Bell);
             return;
         }
-        let ch = byte as char;
-        let cmd = self.parser.process_char(ch);
+        let codepoint = match self.decoder.decode_byte(byte) {
+            DecoderOutput::Pending => return,
+            DecoderOutput::Codepoint(c) => c,
+            DecoderOutput::Invalid => REPLACEMENT_CHARACTER,
+        };
+        // ASCII codepoints (< 0x80) flow through the existing Phase
+        // 22b parser unchanged — every escape sequence byte is ASCII.
+        // Codepoints >= 0x80 cannot occur inside an ANSI escape so we
+        // route them directly to `put_char`; this also handles the
+        // U+FFFD replacement case from a malformed sequence.
+        if codepoint <= 0x7F {
+            let ch = (codepoint as u8) as char;
+            let cmd = self.parser.process_char(ch);
+            self.dispatch_console_cmd(cmd, out);
+        } else {
+            self.put_char(codepoint, out);
+        }
+    }
+
+    fn dispatch_console_cmd(&mut self, cmd: ConsoleCmd, out: &mut Vec<RenderCommand>) {
         match cmd {
             ConsoleCmd::Nop => {}
-            ConsoleCmd::PutChar(c) => self.put_char(c as u32, out),
+            ConsoleCmd::PutChar(codepoint) => self.put_char(codepoint, out),
             ConsoleCmd::CarriageReturn => {
                 self.cursor_col = 0;
                 out.push(RenderCommand::MoveCursor {
@@ -703,16 +761,61 @@ impl Screen {
     }
 
     fn put_char(&mut self, codepoint: u32, out: &mut Vec<RenderCommand>) {
+        // Phase 69b Track F — wide-glyph accounting. A double-width
+        // codepoint occupies `(row, col)` *and* `(row, col + 1)`. If
+        // only one column remains on the current row, wrap to the next
+        // row before placing the glyph (matches xterm's wrap policy).
+        let width = width_of(codepoint).max(1);
         if self.cursor_col >= self.cols {
+            self.line_feed(out);
+            self.cursor_col = 0;
+        }
+        if width == 2 && self.cursor_col + 1 >= self.cols {
+            // Not enough room on this row — leave the trailing cell
+            // blank and wrap so the glyph lands intact on the next row.
+            // The blank cell at `(row, cols-1)` keeps the cell grid
+            // consistent for the renderer; we paint it explicitly so
+            // the framebuffer drops any prior content there.
+            let row = self.cursor_row;
+            let col = self.cursor_col;
+            self.blank_cell(row, col, out);
             self.line_feed(out);
             self.cursor_col = 0;
         }
         let row = self.cursor_row;
         let col = self.cursor_col;
-        let idx = row as usize * self.cols as usize + col as usize;
+        let cols = self.cols;
+        let idx = row as usize * cols as usize + col as usize;
         let fg = self.fg;
         let bg = self.bg;
-        self.active_buf_mut()[idx] = Cell { codepoint, fg, bg };
+        // Phase 69b Track F — if this cell is currently the trailing
+        // half of a wide glyph (`wide_continuation == true`), the
+        // leader at `(row, col - 1)` is the surviving pixel source.
+        // Blank the leader so the renderer drops its stale pixels
+        // before we paint the new glyph here. The continuation flag
+        // on this cell is cleared a few lines below when we write
+        // the new `Cell` value.
+        let target_is_wide_trail = self.active_buf()[idx].wide_continuation;
+        if target_is_wide_trail && col > 0 {
+            self.blank_cell(row, col - 1, out);
+        }
+        // Phase 69b Track F — if the cell currently at `(row, col+1)`
+        // is the trailing half of an existing wide glyph at
+        // `(row, col)`, the renderer's pixels there are stale once we
+        // overwrite the leader. Blank the trail and clear its
+        // continuation flag so the new glyph paints cleanly.
+        let trailing_is_continuation = (col + 1) < cols
+            && self.active_buf()[row as usize * cols as usize + (col + 1) as usize]
+                .wide_continuation;
+        if trailing_is_continuation {
+            self.blank_cell(row, col + 1, out);
+        }
+        self.active_buf_mut()[idx] = Cell {
+            codepoint,
+            fg,
+            bg,
+            wide_continuation: false,
+        };
         out.push(RenderCommand::PutGlyph {
             row,
             col,
@@ -721,6 +824,24 @@ impl Screen {
             bg,
         });
         self.cursor_col += 1;
+        if width == 2 {
+            // Reserve the trailing cell as a continuation. No
+            // `PutGlyph` is emitted because the leading cell's draw
+            // already covers both columns — but the cell-state must
+            // reflect the wide accounting so subsequent overwrites
+            // know to blank the leader.
+            let trail_col = self.cursor_col;
+            if trail_col < self.cols {
+                let trail_idx = row as usize * self.cols as usize + trail_col as usize;
+                self.active_buf_mut()[trail_idx] = Cell {
+                    codepoint: 0,
+                    fg,
+                    bg,
+                    wide_continuation: true,
+                };
+            }
+            self.cursor_col = self.cursor_col.saturating_add(1).min(self.cols);
+        }
     }
 
     fn line_feed(&mut self, out: &mut Vec<RenderCommand>) {
@@ -1325,6 +1446,157 @@ mod tests {
         let (r, c) = s.cursor();
         assert!(r < 2);
         assert!(c <= 4);
+    }
+
+    /// Phase 69b Track B.2 — a 3-byte UTF-8 sequence for U+2500
+    /// lands as a single cell carrying the decoded codepoint.
+    #[test]
+    fn utf8_three_byte_box_drawing_decodes_to_single_cell() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // U+2500 ─ is E2 94 80.
+        s.feed(0xE2, &mut out);
+        // After the leading byte the decoder is `Pending` — no cell
+        // has been written yet, cursor still at (0, 0).
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, b' ' as u32);
+        assert_eq!(s.cursor(), (0, 0));
+        s.feed(0x94, &mut out);
+        s.feed(0x80, &mut out);
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, 0x2500);
+        assert_eq!(s.cursor().1, 1);
+    }
+
+    /// Phase 69b Track B.2 — a 2-byte UTF-8 sequence for U+00E9 (é)
+    /// decodes into a single cell.
+    #[test]
+    fn utf8_two_byte_latin1_decodes_to_single_cell() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // U+00E9 é is C3 A9.
+        s.feed(0xC3, &mut out);
+        s.feed(0xA9, &mut out);
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, 0x00E9);
+    }
+
+    /// Phase 69b Track B.2 — a lone continuation byte yields exactly
+    /// one U+FFFD cell.
+    #[test]
+    fn utf8_lone_continuation_yields_replacement_character() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // 0x80 is a continuation byte at the start of a sequence —
+        // strictly invalid. The decoder emits Invalid, screen routes
+        // it to U+FFFD.
+        s.feed(0x80, &mut out);
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, REPLACEMENT_CHARACTER);
+    }
+
+    /// Phase 69b Track B.2 — BEL (0x07) is intercepted before the
+    /// decoder, exactly as in Phase 57. A BEL byte must not advance
+    /// any decoder state nor produce a cell update.
+    #[test]
+    fn utf8_bel_byte_still_maps_to_bell_command() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        s.feed(0x07, &mut out);
+        assert_eq!(out.as_slice(), &[RenderCommand::Bell]);
+        // Cursor unchanged, no cell touched.
+        assert_eq!(s.cursor(), (0, 0));
+        assert_eq!(s.cell(0, 0).unwrap().codepoint, b' ' as u32);
+    }
+
+    /// Phase 69b Track F — a width-2 codepoint (CJK U+4E2D = 中)
+    /// occupies the leading cell plus the trailing cell as a
+    /// wide-continuation. The renderer sees exactly one `PutGlyph`
+    /// for the leading cell.
+    #[test]
+    fn utf8_wide_codepoint_reserves_two_cells() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // U+4E2D = E4 B8 AD.
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        // Leading cell.
+        let lead = s.cell(0, 0).unwrap();
+        assert_eq!(lead.codepoint, 0x4E2D);
+        assert!(!lead.wide_continuation);
+        // Trailing cell.
+        let trail = s.cell(0, 1).unwrap();
+        assert!(
+            trail.wide_continuation,
+            "trailing cell must be wide_continuation"
+        );
+        assert_eq!(trail.codepoint, 0);
+        // Cursor advanced by 2.
+        assert_eq!(s.cursor(), (0, 2));
+        // Exactly one PutGlyph for the leading cell.
+        let put_glyphs = out
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::PutGlyph { .. }))
+            .count();
+        assert_eq!(put_glyphs, 1);
+    }
+
+    /// Phase 69b Track F — overwriting the trailing cell of a wide
+    /// glyph also blanks the leading half so the renderer drops the
+    /// stale leading pixels.
+    #[test]
+    fn utf8_overwrite_trail_of_wide_cleans_lead() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // Place 中 at (0, 0)/(0, 1).
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        // Move cursor back to (0, 1) — the trailing cell.
+        let _ = feed_str(&mut s, "\x1b[1;2H");
+        // Drain any out-of-band cursor moves.
+        out.clear();
+        // Now write 'X' at the trailing cell.
+        s.feed(b'X', &mut out);
+        // The leading cell (0, 0) must have been blanked.
+        let lead = s.cell(0, 0).unwrap();
+        assert_eq!(lead.codepoint, b' ' as u32);
+        // The trailing cell now carries 'X'.
+        let trail = s.cell(0, 1).unwrap();
+        assert_eq!(trail.codepoint, b'X' as u32);
+        assert!(!trail.wide_continuation);
+    }
+
+    /// Phase 69b Track F — a width-2 glyph at the last column wraps
+    /// to the next row so the wide cell pair stays adjacent.
+    #[test]
+    fn utf8_wide_codepoint_wraps_at_last_column() {
+        let mut s = Screen::with_geometry(3, 2);
+        let mut out = Vec::new();
+        // Fill columns 0 and 1 with ASCII so the wide glyph cannot
+        // fit at columns 1..=2 on row 0 — it must wrap.
+        s.feed(b'a', &mut out);
+        s.feed(b'b', &mut out);
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        // After the wide glyph: the glyph must land on row 1, cols
+        // 0/1.
+        let lead = s.cell(1, 0).unwrap();
+        assert_eq!(lead.codepoint, 0x4E2D);
+        let trail = s.cell(1, 1).unwrap();
+        assert!(trail.wide_continuation);
+    }
+
+    /// Phase 69b Track B.2 — pure-ASCII escape sequences (every byte
+    /// is < 0x80) still flow through the Phase 22b parser. Each byte
+    /// completes a 1-byte UTF-8 codepoint and then routes to the
+    /// parser, so the existing CSI vocabulary keeps working.
+    #[test]
+    fn utf8_ascii_escape_sequences_unaffected() {
+        let mut s = Screen::with_geometry(10, 2);
+        let _ = feed_str(&mut s, "\x1b[2J");
+        // Cursor moved to origin by ED 2.
+        assert_eq!(s.cursor(), (0, 0));
+        // Colours stay at defaults.
+        assert_eq!(s.colors(), (DEFAULT_FG, DEFAULT_BG));
     }
 
     /// Phase 57 G.4 property test: arbitrary ANSI byte sequences must
