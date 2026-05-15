@@ -59,8 +59,12 @@ greyscale ramp).
 ## DEC private modes
 
 `CSI ? <code> h` (set) / `CSI ? <code> l` (reset). Phase 69 introduced
-the typed `ConsoleCmd::DecPrivateMode { code, set }` arm; consumers
-that do not recognise a code drop it silently.
+the typed `ConsoleCmd::DecPrivateMode { codes: [u16; MAX_PARAMS], count, set }`
+arm — a single CSI may carry multiple semicolon-separated codes
+(e.g. `CSI ? 1006 ; 1000 h` from the terminfo `XM` capability) and
+consumers iterate `codes[..count]`. Single-code payloads can be
+constructed via the `ConsoleCmd::dec_private_single` helper.
+Consumers that do not recognise a code drop it silently.
 
 | Code | Name | Effect in `term` |
 |---|---|---|
@@ -123,7 +127,10 @@ produce 1-based cell coordinates, clamped into `1..=cols` / `1..=rows`.
 - the payload verbatim when `enabled` is `false`.
 
 The mode bit is owned by `Screen::bracketed_paste_enabled` and toggled
-via `DecPrivateMode { code: 2004, .. }`.
+via a `DecPrivateMode { codes, count, set }` payload whose
+`codes[..count]` slice contains `2004`. (Constructed by the parser when
+it sees `CSI ? 2004 h/l`, or by callers via
+`ConsoleCmd::dec_private_single(2004, …)`.)
 
 ## Surface resize → SIGWINCH
 

@@ -91,10 +91,10 @@
 **Why it matters:** The Phase 22b parser handles standard CSI sequences but discards `?`-prefixed DEC private modes. Every Phase 69 mode (alt-screen, mouse, bracketed paste) is a `?` mode.
 
 **Acceptance:**
-- [x] `ConsoleCmd` gains `DecPrivateMode { code: u16, set: bool }`.
-- [x] `AnsiParser` recognizes `\x1b[?<n>h` and `\x1b[?<n>l` (single-parameter form) and emits `DecPrivateMode { code: n, set: true|false }`.
-- [x] Unrecognized codes produce `DecPrivateMode { code: n, set: … }` and are dropped silently by callers (no parser crash).
-- [x] Host tests in `kernel-core` cover: `?1049h`, `?1049l`, `?47h`, `?47l`, `?9h`, `?1000h`, `?1006h`, `?2004h`, `?2004l`, and one bogus code.
+- [x] `ConsoleCmd` gains `DecPrivateMode { codes: [u16; MAX_PARAMS], count: usize, set: bool }` (multi-code form widened in PR 168 round-2 to support terminfo patterns like `?1006;1000h`); a `ConsoleCmd::dec_private_single` helper wraps the single-code construction path used by tests and synthesizers.
+- [x] `AnsiParser` recognizes `\x1b[?<n>h` / `\x1b[?<n>l` *and* the multi-parameter form `\x1b[?<n1>;<n2>;...h/l`, and emits a single `DecPrivateMode` whose `codes[..count]` carries every parsed parameter.
+- [x] Unrecognized codes are preserved in `codes[..count]` and dropped silently by callers (no parser crash).
+- [x] Host tests in `kernel-core` cover: `?1049h`, `?1049l`, `?47h`, `?47l`, `?9h`, `?1000h`, `?1006h`, `?2004h`, `?2004l`, one bogus code, plus `test_dec_private_multi_param` for `?1006;1000h` and `?1000;1006;2004h`.
 
 ### B.2 — Dual cell-grid in `Screen`
 

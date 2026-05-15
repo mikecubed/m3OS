@@ -636,11 +636,30 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
     // exposes runtime metrics.
     const GLYPH_W: u32 = 8;
     const GLYPH_H: u32 = 16;
+    // Phase 69 PR 168 round-3 fix — a malformed `SurfaceResized` could
+    // request 65535×65535 cells (~4.3B cells × `Cell` size = multi-GB)
+    // and crash `term`. Cap each dimension at 1024 cells (8192×16384
+    // logical pixels — well above any realistic display) and the total
+    // cell budget at ~1M, which keeps `Screen::resize` allocations in
+    // single-digit MB regardless of the message contents.
+    const MAX_CELLS_PER_AXIS: u32 = 1024;
+    const MAX_TOTAL_CELLS: u32 = 1_000_000;
     if width == 0 || height == 0 {
         return;
     }
-    let cols = (width / GLYPH_W).max(1).min(u16::MAX as u32) as u16;
-    let rows = (height / GLYPH_H).max(1).min(u16::MAX as u32) as u16;
+    let mut cols = (width / GLYPH_W).max(1).min(MAX_CELLS_PER_AXIS) as u16;
+    let mut rows = (height / GLYPH_H).max(1).min(MAX_CELLS_PER_AXIS) as u16;
+    // Per-axis cap above bounds the product at `MAX_CELLS_PER_AXIS^2 =
+    // ~1M`, which already satisfies the total-cell budget — but if the
+    // axis cap is later relaxed, halve the larger axis until the total
+    // budget is honoured. Pure-integer loop avoids `libm`.
+    while (cols as u32) * (rows as u32) > MAX_TOTAL_CELLS {
+        if cols >= rows {
+            cols = (cols / 2).max(1);
+        } else {
+            rows = (rows / 2).max(1);
+        }
+    }
 
     let mut local_cmds: alloc::vec::Vec<RenderCommand> = alloc::vec::Vec::new();
     screen.resize(cols, rows, &mut local_cmds);

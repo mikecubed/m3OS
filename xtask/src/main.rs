@@ -7576,7 +7576,8 @@ fn cmd_tui_smoke(args: &SmokeBootArgs) {
 
     println!(
         "tui-smoke: launching QEMU (timeout {}s, {} subcommands)",
-        args.timeout_secs, 7
+        args.timeout_secs,
+        TUI_SMOKE_SUBCOMMANDS.len()
     );
 
     let mut child = Command::new("qemu-system-x86_64")
@@ -7606,6 +7607,62 @@ fn cmd_tui_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 69 Track H.2 — single source of truth for the tui-smoke
+/// subcommand matrix. The launcher log derives its subcommand count
+/// from `TUI_SMOKE_SUBCOMMANDS.len()` so adding a row here cannot
+/// drift from the user-facing message.
+const TUI_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "term-env",
+        "/bin/tui-smoke term-env\n",
+        "guest/tui-smoke: TERM=m3os-term",
+        "TUI_SMOKE:term-env:ok",
+        "TUI_SMOKE:term-env:fail",
+    ),
+    (
+        "alt-screen",
+        "/bin/tui-smoke alt-screen\n",
+        "guest/tui-smoke: alternate-screen buffer",
+        "TUI_SMOKE:alt-screen:ok",
+        "TUI_SMOKE:alt-screen:fail",
+    ),
+    (
+        "colors",
+        "/bin/tui-smoke colors\n",
+        "guest/tui-smoke: 256-color + truecolor SGR",
+        "TUI_SMOKE:colors:ok",
+        "TUI_SMOKE:colors:fail",
+    ),
+    (
+        "mouse",
+        "/bin/tui-smoke mouse\n",
+        "guest/tui-smoke: SGR mouse encoding",
+        "TUI_SMOKE:mouse:ok",
+        "TUI_SMOKE:mouse:fail",
+    ),
+    (
+        "cursor",
+        "/bin/tui-smoke cursor\n",
+        "guest/tui-smoke: DECSCUSR cursor shape",
+        "TUI_SMOKE:cursor:ok",
+        "TUI_SMOKE:cursor:fail",
+    ),
+    (
+        "resize",
+        "/bin/tui-smoke resize\n",
+        "guest/tui-smoke: Screen::resize + TIOCSWINSZ",
+        "TUI_SMOKE:resize:ok",
+        "TUI_SMOKE:resize:fail",
+    ),
+    (
+        "paste",
+        "/bin/tui-smoke paste\n",
+        "guest/tui-smoke: bracketed-paste wrap",
+        "TUI_SMOKE:paste:ok",
+        "TUI_SMOKE:paste:fail",
+    ),
+];
+
 /// Phase 69 Track H.2 — step list for the tui-smoke gate. Each
 /// subcommand is `/bin/tui-smoke <subcmd>` and the harness waits for
 /// the matching `TUI_SMOKE:<name>:ok` sentinel.
@@ -7618,58 +7675,7 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
     steps.extend(boot_and_login_steps());
     steps.push(SmokeStep::Sleep { millis: 500 });
 
-    let subcmds: &[(&str, &str, &str, &str, &str)] = &[
-        (
-            "term-env",
-            "/bin/tui-smoke term-env\n",
-            "guest/tui-smoke: TERM=m3os-term",
-            "TUI_SMOKE:term-env:ok",
-            "TUI_SMOKE:term-env:fail",
-        ),
-        (
-            "alt-screen",
-            "/bin/tui-smoke alt-screen\n",
-            "guest/tui-smoke: alternate-screen buffer",
-            "TUI_SMOKE:alt-screen:ok",
-            "TUI_SMOKE:alt-screen:fail",
-        ),
-        (
-            "colors",
-            "/bin/tui-smoke colors\n",
-            "guest/tui-smoke: 256-color + truecolor SGR",
-            "TUI_SMOKE:colors:ok",
-            "TUI_SMOKE:colors:fail",
-        ),
-        (
-            "mouse",
-            "/bin/tui-smoke mouse\n",
-            "guest/tui-smoke: SGR mouse encoding",
-            "TUI_SMOKE:mouse:ok",
-            "TUI_SMOKE:mouse:fail",
-        ),
-        (
-            "cursor",
-            "/bin/tui-smoke cursor\n",
-            "guest/tui-smoke: DECSCUSR cursor shape",
-            "TUI_SMOKE:cursor:ok",
-            "TUI_SMOKE:cursor:fail",
-        ),
-        (
-            "resize",
-            "/bin/tui-smoke resize\n",
-            "guest/tui-smoke: Screen::resize + TIOCSWINSZ",
-            "TUI_SMOKE:resize:ok",
-            "TUI_SMOKE:resize:fail",
-        ),
-        (
-            "paste",
-            "/bin/tui-smoke paste\n",
-            "guest/tui-smoke: bracketed-paste wrap",
-            "TUI_SMOKE:paste:ok",
-            "TUI_SMOKE:paste:fail",
-        ),
-    ];
-    for (_, input, label, pass, fail) in subcmds {
+    for (_, input, label, pass, fail) in TUI_SMOKE_SUBCOMMANDS {
         steps.push(SmokeStep::Send {
             input,
             label: "guest/tui-smoke: send subcommand",
@@ -7686,7 +7692,10 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
 }
 
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
-const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 65;
+/// Originally 65 (collided with `SMOKE_EXIT_SESSION_RESTART_FAILED`); bumped
+/// to 67 in PR 168 round-3 review so each smoke-mode failure exits with a
+/// distinct status for CI failure routing.
+const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 67;
 
 /// Phase 63a Track H — boots m3OS with the WAV AC'97 backend, runs
 /// `/bin/doom -warp 1 1`, waits for the `M3OS_DOOM:audio_summary`
@@ -9659,11 +9668,11 @@ fn populate_doom_files(part_path: &Path) {
 
     let mut cmds = String::new();
 
-    // Create /usr/share/doom/ directory tree.
-    // debugfs mkdir does not create parent directories, so each level must be
-    // created explicitly starting from the top-level `usr` directory.
-    cmds.push_str("mkdir usr\n");
-    cmds.push_str("mkdir usr/share\n");
+    // Create the `/usr/share/doom/` leaf only. `populate_ext2_files` already
+    // created `/usr` and `/usr/share` (Phase 69 added the terminfo tree at
+    // `/usr/share/terminfo`), and debugfs `mkdir` errors with EEXIST on a
+    // duplicate which would print spurious warnings — and, depending on the
+    // debugfs build, can abort the script and skip the WAD `write`.
     cmds.push_str("mkdir usr/share/doom\n");
 
     // Write the WAD file.
@@ -9672,9 +9681,8 @@ fn populate_doom_files(part_path: &Path) {
         wad_src.display()
     ));
 
-    // Set permissions.
-    cmds.push_str("sif usr mode 0x41ED\n");
-    cmds.push_str("sif usr/share mode 0x41ED\n");
+    // Set permissions on the doom leaf only — `/usr` and `/usr/share` modes
+    // are owned by `populate_ext2_files`.
     cmds.push_str("sif usr/share/doom mode 0x41ED\n");
     cmds.push_str("sif usr/share/doom/doom1.wad mode 0x81A4\n");
     cmds.push_str("q\n");
@@ -15132,6 +15140,12 @@ mod tests {
             SMOKE_EXIT_SESSION_RECOVERY_FAILED,
             SMOKE_EXIT_WAV_SILENT,
             SMOKE_EXIT_BELL_SMOKE_FAILED,
+            // Phase 64 + Phase 69: include every smoke exit code in the
+            // distinctness check so a future addition cannot silently
+            // collide the way `DOOM_AUDIO_FAILED` did with
+            // `SESSION_RESTART_FAILED` before PR 168 round-3.
+            SMOKE_EXIT_SESSION_RESTART_FAILED,
+            SMOKE_EXIT_TUI_SMOKE_FAILED,
             SMOKE_EXIT_DOOM_AUDIO_FAILED,
         ];
         for (i, &a) in codes.iter().enumerate() {

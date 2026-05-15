@@ -47,9 +47,10 @@ pub enum ConsoleCmd {
     /// A single CSI may carry multiple semicolon-separated codes
     /// (e.g. `CSI ? 1006 ; 1000 h` from the terminfo `XM` capability);
     /// every parsed code is preserved in `codes[..count]` and consumers
-    /// must iterate via [`DecPrivateMode::codes_slice`] so multi-mode
-    /// toggles like the xterm `?1000 + ?1006` mouse-tracking idiom land
-    /// as a single batched apply.
+    /// must iterate that slice so multi-mode toggles like the xterm
+    /// `?1000 + ?1006` mouse-tracking idiom land as a single batched
+    /// apply. Single-code call sites can construct payloads tersely via
+    /// [`ConsoleCmd::dec_private_single`].
     DecPrivateMode {
         codes: [u16; MAX_PARAMS],
         count: usize,
@@ -91,7 +92,7 @@ pub struct SgrParams {
 }
 
 /// Phase 69 Track C — typed SGR operation produced by
-/// [`SgrParams::iter_ops`]. Lets consumers walk a CSI `m` sequence
+/// [`SgrParams::ops`]. Lets consumers walk a CSI `m` sequence
 /// without re-implementing the 38/48 extended-color sub-grammar in
 /// every renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
