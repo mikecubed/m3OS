@@ -1,6 +1,6 @@
 # Phase 69a - Termios Raw Mode and Line Discipline
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69a
 **Depends on:** Phase 22 (TTY/PTY) ✅, Phase 29 (PTY Subsystem) ✅, Phase 69 (Terminal Contract Foundations)
 **Builds on:** Extends the Phase 22 kernel TTY line discipline (`kernel/src/tty.rs`) with the full POSIX termios surface — input/local mode flag plumbing, VMIN/VTIME, IUTF8, OPOST controls — so editors and pagers can take byte-accurate, unbuffered input. The Phase 22 console line discipline already owns canonical-mode line editing; this phase makes the cooked/raw distinction first-class and routes all of it through both kernel TTY0 and the PTY pair from Phase 29.

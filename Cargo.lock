@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.69.0"
+version = "0.69.1"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1939,6 +1939,13 @@ version = "0.2.0"
 [[package]]
 name = "syslogd"
 version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
+name = "tcsmoke"
+version = "0.69.1"
 dependencies = [
  "syscall-lib",
 ]

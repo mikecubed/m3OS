@@ -221,3 +221,14 @@ task breakdown.
 - Packet mode (`TIOCPKT`) for terminal multiplexers
 - Multiple simultaneous TTY instances beyond the single console TTY
 - `openpty` libc helper (depends on full PTY data path)
+
+## Subsequent Phase Closeout
+
+The "minimal termios" caveat in this phase — only `c_lflag::ICANON|ECHO|ISIG`
+were honoured at the ldisc level; `c_iflag::IXON`/`IXOFF`, `c_cc::VMIN`/`VTIME`,
+`IEXTEN`/`VLNEXT`, and the `OPOST`/`ONLCR` symmetry on the kernel TTY write
+path were stubs — was closed in **Phase 69a** (Termios Raw Mode and Line
+Discipline).  See [Phase 69a](./69a-terminal-termios.md) for the full POSIX
+flag plumbing, the four-quadrant VMIN/VTIME timer, the
+`tcgetattr`/`tcsetattr`/`cfmakeraw` userspace surface, and the
+`cargo xtask termios-smoke` validation gate.

@@ -84,15 +84,29 @@ pub const ECHO: u32 = 0o000010;
 pub const ECHOE: u32 = 0o000020;
 pub const ECHOK: u32 = 0o000040;
 pub const ECHONL: u32 = 0o000100;
+pub const NOFLSH: u32 = 0o000200;
+pub const TOSTOP: u32 = 0o000400;
 pub const IEXTEN: u32 = 0o100000;
 
 // ---------------------------------------------------------------------------
-// c_iflag constants
+// c_iflag constants (Linux numeric values — match musl shims)
 // ---------------------------------------------------------------------------
 
-pub const ICRNL: u32 = 0o000400;
+pub const IGNBRK: u32 = 0o000001;
+pub const BRKINT: u32 = 0o000002;
+pub const IGNPAR: u32 = 0o000004;
+pub const PARMRK: u32 = 0o000010;
+pub const INPCK: u32 = 0o000020;
+pub const ISTRIP: u32 = 0o000040;
 pub const INLCR: u32 = 0o000100;
 pub const IGNCR: u32 = 0o000200;
+pub const ICRNL: u32 = 0o000400;
+pub const IUCLC: u32 = 0o001000;
+pub const IXON: u32 = 0o002000;
+pub const IXANY: u32 = 0o004000;
+pub const IXOFF: u32 = 0o010000;
+pub const IMAXBEL: u32 = 0o020000;
+pub const IUTF8: u32 = 0o040000;
 
 // ---------------------------------------------------------------------------
 // c_oflag constants
@@ -126,12 +140,16 @@ pub const VKILL: usize = 3;
 pub const VEOF: usize = 4;
 pub const VTIME: usize = 5;
 pub const VMIN: usize = 6;
+pub const VSWTC: usize = 7;
 pub const VSTART: usize = 8;
 pub const VSTOP: usize = 9;
 pub const VSUSP: usize = 10;
 pub const VEOL: usize = 11;
+pub const VREPRINT: usize = 12;
+pub const VDISCARD: usize = 13;
 pub const VWERASE: usize = 14;
 pub const VLNEXT: usize = 15;
+pub const VEOL2: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Default termios constructor
@@ -139,7 +157,10 @@ pub const VLNEXT: usize = 15;
 
 impl Termios {
     /// Create a termios with sensible cooked-mode defaults matching Linux.
-    pub const fn default_cooked() -> Self {
+    ///
+    /// Baseline: `ICRNL|IXON | OPOST|ONLCR | ICANON|ECHO|ECHOE|ECHOK|ISIG|IEXTEN`
+    /// with the standard control characters.
+    pub const fn cooked_default() -> Self {
         let mut c_cc = [0u8; NCCS];
         c_cc[VINTR] = 0x03; // ^C
         c_cc[VQUIT] = 0x1C; // ^\
@@ -152,17 +173,42 @@ impl Termios {
         c_cc[VSTOP] = 0x13; // ^S (XOFF)
         c_cc[VSUSP] = 0x1A; // ^Z
         c_cc[VEOL] = 0;
+        c_cc[VREPRINT] = 0x12; // ^R
+        c_cc[VDISCARD] = 0x0F; // ^O
         c_cc[VWERASE] = 0x17; // ^W
         c_cc[VLNEXT] = 0x16; // ^V
+        c_cc[VEOL2] = 0;
 
         Termios {
-            c_iflag: ICRNL,
+            c_iflag: ICRNL | IXON,
             c_oflag: OPOST | ONLCR,
             c_cflag: B38400 | CS8 | CREAD | HUPCL,
-            c_lflag: ICANON | ECHO | ECHOE | ISIG | IEXTEN,
+            c_lflag: ICANON | ECHO | ECHOE | ECHOK | ISIG | IEXTEN,
             c_line: 0,
             c_cc,
         }
+    }
+
+    /// Backwards-compatible alias for [`cooked_default`].
+    pub const fn default_cooked() -> Self {
+        Self::cooked_default()
+    }
+
+    /// Create a termios in raw mode, matching the POSIX `cfmakeraw` clearset.
+    ///
+    /// Clears the four `c_iflag` mapping bits + BRKINT/PARMRK/IGNBRK/ISTRIP,
+    /// clears `OPOST`, clears the local-mode line editor / signal / extended
+    /// processing bits, sets character size to `CS8`, and sets `VMIN = 1` /
+    /// `VTIME = 0` for blocking byte-by-byte reads.
+    pub const fn raw_default() -> Self {
+        let mut t = Self::cooked_default();
+        t.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+        t.c_oflag &= !OPOST;
+        t.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+        t.c_cflag = (t.c_cflag & !0o000060) | CS8;
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+        t
     }
 
     /// Returns true if ICANON is set (cooked / canonical mode).
@@ -383,6 +429,17 @@ pub struct LineDiscipline {
     pub edit_buf: EditBuffer,
     /// Escape sequence parser state for canonical-mode filtering.
     esc_state: EscState,
+    /// IXON: output is suspended after a VSTOP byte until VSTART arrives.
+    /// Pure flag; the kernel side decides what "output suspended" means.
+    pub output_suspended: bool,
+    /// IEXTEN/VLNEXT: the next byte is delivered literally.
+    lnext_pending: bool,
+    /// VMIN/VTIME tracking — number of raw-mode bytes buffered since the
+    /// reader last drained, plus the absolute deadline tick (1 ms / tick)
+    /// at which a VTIME timer expires.  `deadline_ticks == None` means the
+    /// timer is not armed.
+    pub raw_buffered: usize,
+    pub deadline_ticks: Option<u64>,
 }
 
 impl Default for LineDiscipline {
@@ -395,9 +452,74 @@ impl LineDiscipline {
     /// Create a new LineDiscipline with default cooked-mode termios.
     pub const fn new() -> Self {
         LineDiscipline {
-            termios: Termios::default_cooked(),
+            termios: Termios::cooked_default(),
             edit_buf: EditBuffer::new(),
             esc_state: EscState::Normal,
+            output_suspended: false,
+            lnext_pending: false,
+            raw_buffered: 0,
+            deadline_ticks: None,
+        }
+    }
+
+    /// Tell the discipline how many raw-mode bytes are currently buffered.
+    /// Call from the kernel side after a successful read drains the ring.
+    pub fn set_raw_buffered(&mut self, n: usize) {
+        self.raw_buffered = n;
+        if n == 0 {
+            self.deadline_ticks = None;
+        }
+    }
+
+    /// Arm the VTIME timer using `now_ticks` as the current monotonic tick.
+    /// Used by the read path when it parks for VMIN/VTIME timing.
+    pub fn arm_vtime_timer(&mut self, now_ticks: u64) {
+        let vtime = self.termios.c_cc[VTIME] as u64;
+        if vtime > 0 && self.deadline_ticks.is_none() {
+            // VTIME unit is 0.1 s; ticks are 1 ms apart (TICKS_PER_SEC=1000).
+            self.deadline_ticks = Some(now_ticks.saturating_add(vtime * 100));
+        }
+    }
+
+    /// Returns true when a non-canonical read should complete *now*.
+    ///
+    /// The four POSIX cases:
+    /// * `VMIN > 0, VTIME == 0` — block until ≥ VMIN bytes buffered.
+    /// * `VMIN == 0, VTIME > 0` — return immediately if any data buffered;
+    ///   otherwise wait until the deadline.
+    /// * `VMIN > 0, VTIME > 0` — inter-byte timer; once any byte arrives,
+    ///   the timer arms and the read completes when VMIN reached or the
+    ///   deadline elapses.
+    /// * `VMIN == 0, VTIME == 0` — poll: always ready (read returns whatever
+    ///   is available, including zero bytes).
+    pub fn poll_read_ready(&self, now_ticks: u64) -> bool {
+        if self.termios.is_canonical() {
+            // Canonical mode: ready when a complete line is buffered. The
+            // caller already checks the edit buffer for `\n`; this branch
+            // just provides a sane default.
+            return self.edit_buf.as_slice().contains(&b'\n');
+        }
+        let vmin = self.termios.c_cc[VMIN] as usize;
+        let vtime = self.termios.c_cc[VTIME] as usize;
+        match (vmin, vtime) {
+            (0, 0) => true,
+            (0, _) => {
+                if self.raw_buffered > 0 {
+                    return true;
+                }
+                self.deadline_ticks.map(|d| now_ticks >= d).unwrap_or(false)
+            }
+            (n, 0) => self.raw_buffered >= n,
+            (n, _) => {
+                if self.raw_buffered >= n {
+                    return true;
+                }
+                if self.raw_buffered == 0 {
+                    // Inter-byte timer not armed yet.
+                    return false;
+                }
+                self.deadline_ticks.map(|d| now_ticks >= d).unwrap_or(false)
+            }
         }
     }
 
@@ -417,6 +539,21 @@ impl LineDiscipline {
         let canonical = c_lflag & ICANON != 0;
         let echo_on = c_lflag & ECHO != 0;
         let isig = c_lflag & ISIG != 0;
+        let iexten = c_lflag & IEXTEN != 0;
+        let ixon = c_iflag & IXON != 0;
+
+        // VLNEXT (literal next): when IEXTEN is on and the previous byte
+        // was VLNEXT, deliver this byte verbatim — no signal, no editing,
+        // no IXON suspension.
+        if self.lnext_pending {
+            self.lnext_pending = false;
+            push_fn(&[byte]);
+            let mut echo = SmallVec::new();
+            if echo_on {
+                echo.push(byte);
+            }
+            return LdiscResult::Pushed { echo };
+        }
 
         // 1. Apply iflag transforms (ICRNL, INLCR, IGNCR).
         let byte = if (c_iflag & INLCR != 0) && byte == b'\n' {
@@ -431,6 +568,32 @@ impl LineDiscipline {
         } else {
             byte
         };
+
+        // 1a. IXON: VSTOP suspends output, VSTART resumes it.  In both cases
+        // the byte is consumed (never delivered to the reader).
+        if ixon {
+            if byte == c_cc[VSTOP] {
+                self.output_suspended = true;
+                return LdiscResult::Consumed;
+            }
+            if byte == c_cc[VSTART] {
+                self.output_suspended = false;
+                return LdiscResult::Consumed;
+            }
+        }
+
+        // 1b. IEXTEN: VLNEXT arms literal-next; VDISCARD toggles output
+        //     discard.  Both bytes are consumed.
+        if iexten && c_cc[VLNEXT] != 0 && byte == c_cc[VLNEXT] {
+            self.lnext_pending = true;
+            return LdiscResult::Consumed;
+        }
+        if iexten && c_cc[VDISCARD] != 0 && byte == c_cc[VDISCARD] {
+            // Toggle output-discard; semantics are intentionally minimal —
+            // the kernel side may inspect `output_suspended` if it wants
+            // to honour VDISCARD as well.
+            return LdiscResult::Consumed;
+        }
 
         // 2. Check ISIG (signal generation from c_cc).
         if isig {
@@ -1207,5 +1370,246 @@ mod tests {
             assert!(pushed.is_empty());
         }
         assert!(ld.edit_buf.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 69a — Termios round-trip + cooked/raw defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn termios_cooked_default_baseline() {
+        let t = Termios::cooked_default();
+        assert!(t.c_iflag & ICRNL != 0);
+        assert!(t.c_iflag & IXON != 0);
+        assert!(t.c_oflag & OPOST != 0);
+        assert!(t.c_oflag & ONLCR != 0);
+        assert!(t.c_lflag & ICANON != 0);
+        assert!(t.c_lflag & ECHO != 0);
+        assert!(t.c_lflag & ECHOE != 0);
+        assert!(t.c_lflag & ECHOK != 0);
+        assert!(t.c_lflag & ISIG != 0);
+        assert!(t.c_lflag & IEXTEN != 0);
+        assert_eq!(t.c_cc[VEOF], 0x04);
+        assert_eq!(t.c_cc[VINTR], 0x03);
+        assert_eq!(t.c_cc[VQUIT], 0x1C);
+        assert_eq!(t.c_cc[VERASE], 0x7F);
+        assert_eq!(t.c_cc[VKILL], 0x15);
+        assert_eq!(t.c_cc[VEOL], 0);
+        assert_eq!(t.c_cc[VSUSP], 0x1A);
+        assert_eq!(t.c_cc[VMIN], 1);
+        assert_eq!(t.c_cc[VTIME], 0);
+    }
+
+    #[test]
+    fn termios_raw_default_clears_cfmakeraw_bits() {
+        let t = Termios::raw_default();
+        // Local-mode editing / signals / extended processing all off.
+        assert_eq!(t.c_lflag & (ICANON | ECHO | ISIG | IEXTEN), 0);
+        // Output post-processing off.
+        assert_eq!(t.c_oflag & OPOST, 0);
+        // Four input-mapping bits cleared.
+        assert_eq!(t.c_iflag & (INLCR | IGNCR | ICRNL | IXON), 0);
+        // Other cfmakeraw clears.
+        assert_eq!(t.c_iflag & (IGNBRK | BRKINT | PARMRK | ISTRIP), 0);
+        // VMIN=1 / VTIME=0 by definition.
+        assert_eq!(t.c_cc[VMIN], 1);
+        assert_eq!(t.c_cc[VTIME], 0);
+    }
+
+    #[test]
+    fn termios_round_trip_through_ioctl_layout() {
+        // Round-trip every distinct flag bit.  The C-ABI struct stores
+        // each mode word as a u32, so no bits are lost across copy.
+        let mut t = Termios::cooked_default();
+        t.c_iflag = 0xFFFF_FFFF;
+        t.c_oflag = 0xDEAD_BEEF;
+        t.c_cflag = 0x0123_4567;
+        t.c_lflag = 0x89AB_CDEF;
+        for (i, slot) in t.c_cc.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        let bytes: [u8; TERMIOS_SIZE] = unsafe { core::mem::transmute(t) };
+        let restored: Termios = unsafe { core::mem::transmute(bytes) };
+        assert_eq!(restored.c_iflag, 0xFFFF_FFFF);
+        assert_eq!(restored.c_oflag, 0xDEAD_BEEF);
+        assert_eq!(restored.c_cflag, 0x0123_4567);
+        assert_eq!(restored.c_lflag, 0x89AB_CDEF);
+        for i in 0..NCCS {
+            assert_eq!(restored.c_cc[i], i as u8);
+        }
+    }
+
+    #[test]
+    fn termios_iflag_constants_no_collisions() {
+        let bits = [
+            IGNBRK, BRKINT, IGNPAR, PARMRK, INPCK, ISTRIP, INLCR, IGNCR, ICRNL, IUCLC, IXON, IXANY,
+            IXOFF, IMAXBEL, IUTF8,
+        ];
+        let mut all = 0u32;
+        for b in bits {
+            assert_eq!(all & b, 0, "iflag bit collision: {:#o}", b);
+            all |= b;
+        }
+    }
+
+    #[test]
+    fn termios_lflag_constants_no_collisions() {
+        let bits = [
+            ISIG, ICANON, ECHO, ECHOE, ECHOK, ECHONL, NOFLSH, TOSTOP, IEXTEN,
+        ];
+        let mut all = 0u32;
+        for b in bits {
+            assert_eq!(all & b, 0, "lflag bit collision: {:#o}", b);
+            all |= b;
+        }
+    }
+
+    #[test]
+    fn termios_cc_indices_unique() {
+        let idx = [
+            VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, VSWTC, VSTART, VSTOP, VSUSP, VEOL,
+            VREPRINT, VDISCARD, VWERASE, VLNEXT, VEOL2,
+        ];
+        let mut seen = [false; NCCS];
+        for i in idx {
+            assert!(i < NCCS);
+            assert!(!seen[i], "duplicate c_cc index {}", i);
+            seen[i] = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // IXON / IXOFF flow control
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ldisc_ixon_vstop_suspends_output() {
+        let mut ld = LineDiscipline::new();
+        // Default cooked includes IXON.  Send VSTOP (^S, 0x13).
+        let (result, pushed) = collect_pushed(&mut ld, 0x13);
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+        assert!(ld.output_suspended);
+        // VSTART (^Q, 0x11) resumes.
+        let (result, pushed) = collect_pushed(&mut ld, 0x11);
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+        assert!(!ld.output_suspended);
+    }
+
+    #[test]
+    fn ldisc_ixon_disabled_passes_xon_xoff_through() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_iflag &= !IXON;
+        ld.termios.c_lflag &= !ICANON;
+        let (result, pushed) = collect_pushed(&mut ld, 0x13);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![0x13]);
+        assert!(!ld.output_suspended);
+    }
+
+    // -----------------------------------------------------------------------
+    // IEXTEN / VLNEXT — literal-next byte
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ldisc_iexten_vlnext_makes_next_byte_literal() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON; // raw-style for clarity
+        // VLNEXT (^V, 0x16) is consumed; the next byte is delivered verbatim.
+        let (result, pushed) = collect_pushed(&mut ld, 0x16);
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+        // The next byte — even ^C — is delivered as a literal byte.
+        let (result, pushed) = collect_pushed(&mut ld, 0x03);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![0x03]);
+    }
+
+    #[test]
+    fn ldisc_iexten_disabled_drops_vlnext() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag &= !IEXTEN;
+        ld.termios.c_lflag &= !ISIG;
+        // VLNEXT (^V, 0x16) becomes an ordinary byte.
+        let (result, pushed) = collect_pushed(&mut ld, 0x16);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![0x16]);
+    }
+
+    // -----------------------------------------------------------------------
+    // VMIN / VTIME poll_read_ready quadrant coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ldisc_vmin_zero_vtime_zero_polls() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_cc[VMIN] = 0;
+        ld.termios.c_cc[VTIME] = 0;
+        ld.set_raw_buffered(0);
+        assert!(ld.poll_read_ready(0));
+    }
+
+    #[test]
+    fn ldisc_vmin_positive_vtime_zero_blocks() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_cc[VMIN] = 2;
+        ld.termios.c_cc[VTIME] = 0;
+        ld.set_raw_buffered(1);
+        assert!(!ld.poll_read_ready(0));
+        ld.set_raw_buffered(2);
+        assert!(ld.poll_read_ready(0));
+    }
+
+    #[test]
+    fn ldisc_vmin_zero_vtime_positive_returns_on_deadline() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_cc[VMIN] = 0;
+        ld.termios.c_cc[VTIME] = 5; // 500 ms
+        ld.set_raw_buffered(0);
+        assert!(!ld.poll_read_ready(0));
+        ld.arm_vtime_timer(100);
+        assert_eq!(ld.deadline_ticks, Some(100 + 500));
+        assert!(!ld.poll_read_ready(599));
+        assert!(ld.poll_read_ready(600));
+        // Any data short-circuits the deadline.
+        ld.set_raw_buffered(1);
+        assert!(ld.poll_read_ready(0));
+    }
+
+    #[test]
+    fn ldisc_vmin_positive_vtime_positive_inter_byte_timer() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_cc[VMIN] = 4;
+        ld.termios.c_cc[VTIME] = 1; // 100 ms inter-byte
+        ld.set_raw_buffered(0);
+        // No bytes yet — timer not armed.
+        assert!(!ld.poll_read_ready(1_000));
+        ld.set_raw_buffered(1);
+        ld.arm_vtime_timer(2_000);
+        assert_eq!(ld.deadline_ticks, Some(2_100));
+        assert!(!ld.poll_read_ready(2_099));
+        assert!(ld.poll_read_ready(2_100));
+        // Reaching VMIN short-circuits the deadline.
+        ld.set_raw_buffered(4);
+        assert!(ld.poll_read_ready(0));
+    }
+
+    #[test]
+    fn ldisc_set_raw_buffered_zero_clears_timer() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_cc[VMIN] = 1;
+        ld.termios.c_cc[VTIME] = 1;
+        ld.set_raw_buffered(1);
+        ld.arm_vtime_timer(0);
+        assert!(ld.deadline_ticks.is_some());
+        ld.set_raw_buffered(0);
+        assert!(ld.deadline_ticks.is_none());
     }
 }

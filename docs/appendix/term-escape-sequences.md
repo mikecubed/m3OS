@@ -141,6 +141,98 @@ and issues `ioctl(TIOCSWINSZ)` on the PTY primary fd. The kernel
 TIOCSWINSZ branch (`kernel/src/arch/x86_64/syscall/mod.rs:11398`) then
 sends `SIGWINCH` to the foreground process group.
 
+## Termios contract (Phase 69a)
+
+The full POSIX termios surface lives in `kernel-core/src/tty.rs` and is
+consumed via the userspace `tcgetattr` / `tcsetattr` / `cfmakeraw`
+helpers in `userspace/syscall-lib/src/lib.rs`.  Each flag is honoured
+on both the kernel TTY0 ldisc and the per-PTY-pair ldisc; numeric
+values match Linux/musl bit positions so future C ports compile
+unchanged.
+
+### `c_iflag` — input mode
+
+| Bit | Behaviour |
+|---|---|
+| `IGNBRK = 0o000001` | Ignore BREAK condition (no serial driver yet). |
+| `BRKINT = 0o000002` | BREAK → SIGINT (no serial driver yet). |
+| `PARMRK = 0o000010` | Mark parity errors (no serial driver yet). |
+| `INPCK  = 0o000020` | Enable parity checking (no serial driver yet). |
+| `ISTRIP = 0o000040` | Strip 8th bit (no serial driver yet). |
+| `INLCR  = 0o000100` | Map incoming `\n` → `\r`. |
+| `IGNCR  = 0o000200` | Drop incoming `\r`. |
+| `ICRNL  = 0o000400` | Map incoming `\r` → `\n`. |
+| `IXON   = 0o002000` | VSTOP suspends output; VSTART resumes. |
+| `IXOFF  = 0o010000` | Emit XOFF when input buffer ≥ 80 % full. |
+| `IUTF8  = 0o040000` | Round-trips today; full effect lands in Phase 69b. |
+
+### `c_oflag` — output mode
+
+| Bit | Behaviour |
+|---|---|
+| `OPOST = 0o000001` | Enable output post-processing.  When cleared, write bytes pass through verbatim on both the kernel TTY0 path and the PTY slave→master path. |
+| `ONLCR = 0o000004` | When `OPOST` is set, expand outgoing `\n` to `\r\n`. |
+
+### `c_lflag` — local mode
+
+| Bit | Behaviour |
+|---|---|
+| `ISIG    = 0o000001` | VINTR/VQUIT/VSUSP raise SIGINT/SIGQUIT/SIGTSTP via `send_signal_to_group`. |
+| `ICANON  = 0o000002` | Cooked-mode line editor; clearing switches the PTY slave read path to byte-by-byte raw delivery. |
+| `ECHO    = 0o000010` | Local echo of input bytes. |
+| `ECHOE   = 0o000020` | VERASE prints `^H \b`. |
+| `ECHOK   = 0o000040` | VKILL prints a `\n` after killing the line. |
+| `ECHONL  = 0o000100` | Echo `\n` even when ECHO is off (canonical mode only). |
+| `IEXTEN  = 0o100000` | Enables VLNEXT (literal-next) and VDISCARD. |
+
+### `c_cc` — control characters
+
+| Index | Symbol | Default | Role |
+|---|---|---|---|
+| 0  | `VINTR`    | `^C` (0x03) | Generates SIGINT when ISIG is on. |
+| 1  | `VQUIT`    | `^\` (0x1C) | Generates SIGQUIT when ISIG is on. |
+| 2  | `VERASE`   | `^?` (0x7F) | Erase one character (canonical). |
+| 3  | `VKILL`    | `^U` (0x15) | Erase the whole line (canonical). |
+| 4  | `VEOF`     | `^D` (0x04) | End-of-file on empty line; flush partial line otherwise. |
+| 5  | `VTIME`    | 0           | Tenths of a second for raw-mode read timeout. |
+| 6  | `VMIN`     | 1           | Minimum bytes for a raw-mode read. |
+| 8  | `VSTART`   | `^Q` (0x11) | XON — resumes output when IXON is on. |
+| 9  | `VSTOP`    | `^S` (0x13) | XOFF — suspends output when IXON is on. |
+| 10 | `VSUSP`    | `^Z` (0x1A) | Generates SIGTSTP when ISIG is on. |
+| 13 | `VDISCARD` | `^O` (0x0F) | Toggle output discard when IEXTEN is on. |
+| 14 | `VWERASE`  | `^W` (0x17) | Word erase (canonical). |
+| 15 | `VLNEXT`   | `^V` (0x16) | Deliver next byte literally when IEXTEN is on. |
+
+### `tcgetattr` / `tcsetattr` semantics
+
+| Ioctl | Userspace verb | Behaviour |
+|---|---|---|
+| `TCGETS  = 0x5401` | `tcgetattr(fd)` | Copy current termios to user. |
+| `TCSETS  = 0x5402` | `tcsetattr_when(fd, TCSANOW, &t)` | Apply immediately. |
+| `TCSETSW = 0x5403` | `tcsetattr_when(fd, TCSADRAIN, &t)` | Drain output, then apply. |
+| `TCSETSF = 0x5404` | `tcsetattr_when(fd, TCSAFLUSH, &t)` | Drain output and flush input edit buffer, then apply. |
+
+The PTY *master* fd is not a terminal device for the slave's termios; all
+four ioctls return `-ENOTTY` against a master fd, matching Linux
+`drivers/tty/n_tty.c`.
+
+### VMIN / VTIME read semantics (raw mode only)
+
+Computed inside `kernel-core::LineDiscipline::poll_read_ready`:
+
+| `VMIN` | `VTIME` | Behaviour |
+|---|---|---|
+| `> 0` | `0`  | Block until ≥ `VMIN` bytes are available. |
+| `0`   | `> 0`| Return immediately if any data; otherwise wait `VTIME × 100 ms`. |
+| `> 0` | `> 0`| Inter-byte timer: arms on first byte, fires when `VMIN` reached or timer expires. |
+| `0`   | `0`  | Polling: read returns whatever is buffered, including 0 bytes. |
+
+The kernel slave-read path threads the deadline through `WaitQueue` via
+`block_current_until` so the wait wakes on either a byte arrival or
+timer expiry.  See `userspace/tcsmoke/src/main.rs` `vmin-vtime` for the
+end-to-end check; the host-side equivalents live in
+`kernel-core/src/tty.rs::tests::ldisc_vmin_*`.
+
 ## Deferred — not yet supported
 
 - Kitty keyboard protocol (`CSI = …`).

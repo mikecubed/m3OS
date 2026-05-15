@@ -135,6 +135,9 @@ const SMOKE_EXIT_SESSION_RESTART_FAILED: i32 = 65;
 /// subcommand emitted `TUI_SMOKE:<name>:fail …`. The harness surfaces the
 /// failing variant immediately rather than letting the step time out.
 const SMOKE_EXIT_TUI_SMOKE_FAILED: i32 = 66;
+/// Phase 69a Track I: termios-smoke failed — at least one tcsmoke
+/// subcommand emitted `TC_SMOKE:<name>:fail …`.
+const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -403,6 +406,18 @@ fn main() {
             });
             cmd_tui_smoke(&smoke_args);
         }
+        // Phase 69a Track I — `cargo xtask termios-smoke` boots, logs in,
+        // and drives every `tcsmoke <subcmd>`.  Asserts each subcommand
+        // prints `TC_SMOKE:<name>:ok`.
+        Some("termios-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("termios-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_termios_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -470,7 +485,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -646,6 +661,10 @@ fn build_userspace_bins() {
         // in the per-subcommand render-command buffers, so
         // `needs_alloc = true`.
         ("tui-smoke", "tui-smoke", true),
+        // Phase 69a Track I — `tcsmoke` byte-level validator for the
+        // POSIX termios contract.  Links `syscall_lib` only, but uses
+        // `BrkAllocator`, so `needs_alloc = true`.
+        ("tcsmoke", "tcsmoke", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -7686,6 +7705,150 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 15,
             label,
             exit_code_on_fail: SMOKE_EXIT_TUI_SMOKE_FAILED,
+        });
+    }
+    steps
+}
+
+/// Phase 69a Track I — single source of truth for the tcsmoke
+/// subcommand matrix.
+const TC_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "round-trip",
+        "/bin/tcsmoke round-trip\n",
+        "guest/tcsmoke: termios get/set round-trip",
+        "TC_SMOKE:round-trip:ok",
+        "TC_SMOKE:round-trip:fail",
+    ),
+    (
+        "icanon-off",
+        "/bin/tcsmoke icanon-off\n",
+        "guest/tcsmoke: ICANON off — single-byte read",
+        "TC_SMOKE:icanon-off:ok",
+        "TC_SMOKE:icanon-off:fail",
+    ),
+    (
+        "echo-off",
+        "/bin/tcsmoke echo-off\n",
+        "guest/tcsmoke: ECHO off — slave reads, no master echo",
+        "TC_SMOKE:echo-off:ok",
+        "TC_SMOKE:echo-off:fail",
+    ),
+    (
+        "vmin-vtime",
+        "/bin/tcsmoke vmin-vtime\n",
+        "guest/tcsmoke: VMIN / VTIME quadrant coverage",
+        "TC_SMOKE:vmin-vtime:ok",
+        "TC_SMOKE:vmin-vtime:fail",
+    ),
+    (
+        "isig",
+        "/bin/tcsmoke isig\n",
+        "guest/tcsmoke: ISIG → SIGINT handler runs",
+        "TC_SMOKE:isig:ok",
+        "TC_SMOKE:isig:fail",
+    ),
+    (
+        "opost-off",
+        "/bin/tcsmoke opost-off\n",
+        "guest/tcsmoke: OPOST off — verbatim slave→master byte stream",
+        "TC_SMOKE:opost-off:ok",
+        "TC_SMOKE:opost-off:fail",
+    ),
+];
+
+/// Phase 69a Track I.2 — `cargo xtask termios-smoke` boots, runs each
+/// `tcsmoke <subcmd>` from the post-login shell, and asserts every
+/// subcommand prints `TC_SMOKE:<name>:ok`.
+fn cmd_termios_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = termios_smoke_steps();
+
+    println!(
+        "termios-smoke: launching QEMU (timeout {}s, {} subcommands)",
+        args.timeout_secs,
+        TC_SMOKE_SUBCOMMANDS.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "termios-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("termios-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_TERMIOS_SMOKE_FAILED);
+        }
+    }
+}
+
+fn termios_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/tcsmoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    for (_, input, label, pass, fail) in TC_SMOKE_SUBCOMMANDS {
+        steps.push(SmokeStep::Send {
+            input,
+            label: "guest/tcsmoke: send subcommand",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: pass,
+            fail_prefix: fail,
+            timeout_secs: 15,
+            label,
+            exit_code_on_fail: SMOKE_EXIT_TERMIOS_SMOKE_FAILED,
         });
     }
     steps

@@ -282,6 +282,11 @@ static CRASH_STUB_ELF: &[u8] = generated_initrd_asset!("crash_stub");
 // `.conf`.
 static TUI_SMOKE_ELF: &[u8] = generated_initrd_asset!("tui-smoke");
 
+// Phase 69a Track I — `tcsmoke` byte-level validator for the POSIX
+// termios contract.  Run from the post-login shell by
+// `cargo xtask termios-smoke`.  Not a daemon: no `.conf`.
+static TCSMOKE_ELF: &[u8] = generated_initrd_asset!("tcsmoke");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -476,6 +481,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "tui-smoke",
         RamdiskNode::File {
             content: TUI_SMOKE_ELF,
+        },
+    ),
+    // Phase 69a Track I: tcsmoke — byte-level validator for the POSIX
+    // termios contract.
+    (
+        "tcsmoke",
+        RamdiskNode::File {
+            content: TCSMOKE_ELF,
         },
     ),
     // Phase 32: build tools and utilities

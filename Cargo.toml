@@ -112,6 +112,10 @@ members = [
     # terminal contract. Run from the post-login shell by the
     # `cargo xtask tui-smoke` gate.
     "userspace/tui-smoke",
+    # Phase 69a Track I — byte-level validator for the POSIX termios
+    # contract. Run from the post-login shell by the
+    # `cargo xtask termios-smoke` gate.
+    "userspace/tcsmoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
