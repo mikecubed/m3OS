@@ -286,11 +286,12 @@ impl EditBuffer {
     }
 
     /// Phase 69b Track G — IUTF8-aware erase. When `iutf8` is set, the
-    /// erase walks back across all UTF-8 continuation bytes
-    /// (`10xxxxxx`) up to and including the leading byte of the most
-    /// recent codepoint, so VERASE removes a whole codepoint rather
-    /// than a single byte. With `iutf8` cleared, the behaviour matches
-    /// the legacy [`EditBuffer::erase_char`] — one byte per call.
+    /// erase removes the whole most-recent codepoint *iff* the buffer
+    /// tail is well-formed UTF-8 — that is, the byte preceding the
+    /// trailing continuations is a valid leading byte whose shape
+    /// matches the observed continuation count. With `iutf8` cleared,
+    /// the behaviour matches the legacy [`EditBuffer::erase_char`] —
+    /// one byte per call.
     ///
     /// Returns the number of bytes removed (0 when the buffer is
     /// empty). The kernel-core ldisc only echoes a single `\x08 \x08`
@@ -299,11 +300,13 @@ impl EditBuffer {
     /// codepoint deserving two erase echoes).
     ///
     /// Resilience: if the buffer tail is malformed UTF-8 (a stray
-    /// leading byte with no following continuation, or only
-    /// continuations with no leading), exactly one byte is removed so
+    /// leading byte with no following continuation, only continuations
+    /// with no preceding leader, or a leading-byte shape that does not
+    /// match the continuation count), exactly one byte is removed so
     /// successive `erase_one_codepoint` calls drain the malformed
     /// region byte by byte. This matches the Linux ldisc behaviour for
-    /// the same edge case.
+    /// the same edge case and prevents the erase from consuming a
+    /// preceding valid codepoint when its successor is malformed.
     pub fn erase_one_codepoint(&mut self, iutf8: bool) -> usize {
         if self.len == 0 {
             return 0;
@@ -312,25 +315,54 @@ impl EditBuffer {
             self.len -= 1;
             return 1;
         }
-        // Scan back from the end while bytes are UTF-8 continuations
-        // (`10xxxxxx`). Cap the walk at four bytes (the maximum
-        // legal UTF-8 sequence length) so a malformed stream cannot
-        // chew through the whole buffer.
-        let mut removed: usize = 0;
+        // Count trailing continuation bytes (`10xxxxxx`) up to the
+        // legal UTF-8 maximum so a long malformed run cannot trick the
+        // scan into walking arbitrarily far.
         const MAX_UTF8_LEN: usize = 4;
-        while self.len > 0 && removed < MAX_UTF8_LEN {
-            let b = self.buf[self.len - 1];
+        let mut cont_count: usize = 0;
+        while cont_count < self.len
+            && cont_count < MAX_UTF8_LEN
+            && self.buf[self.len - 1 - cont_count] & 0xC0 == 0x80
+        {
+            cont_count += 1;
+        }
+        // If the buffer is shorter than (cont_count + 1) bytes, the
+        // continuations have no preceding leader — malformed. Same
+        // handling as a mismatched leader: remove exactly one byte.
+        if cont_count >= self.len {
             self.len -= 1;
-            removed += 1;
-            // Stop after consuming a non-continuation byte (which is
-            // the leading byte of the codepoint, or — if the stream is
-            // malformed — a stray byte we treat as one codepoint of
-            // its own).
-            if b & 0xC0 != 0x80 {
-                break;
+            return 1;
+        }
+        // Compute the continuation count the byte preceding the
+        // continuations expects. Anything other than a valid 1/2/3/4-
+        // byte UTF-8 leading byte signals malformed input.
+        let leading = self.buf[self.len - 1 - cont_count];
+        let expected_cont: Option<usize> = if leading & 0x80 == 0 {
+            Some(0) // ASCII (0xxxxxxx)
+        } else if leading & 0xE0 == 0xC0 {
+            Some(1) // 110xxxxx — 2-byte leader
+        } else if leading & 0xF0 == 0xE0 {
+            Some(2) // 1110xxxx — 3-byte leader
+        } else if leading & 0xF8 == 0xF0 {
+            Some(3) // 11110xxx — 4-byte leader
+        } else {
+            None // continuation byte (already covered above) or invalid
+        };
+        match expected_cont {
+            Some(n) if n == cont_count => {
+                // Well-formed sequence — remove leader + continuations.
+                let removed = cont_count + 1;
+                self.len -= removed;
+                removed
+            }
+            _ => {
+                // Shape mismatch or invalid leader — remove only the
+                // trailing byte so a preceding valid codepoint is not
+                // consumed by the malformed tail.
+                self.len -= 1;
+                1
             }
         }
-        removed
     }
 
     /// Kill (erase) the entire line. Returns the number of characters erased.
@@ -1168,20 +1200,98 @@ mod tests {
         assert_eq!(buf.as_slice(), b"a");
     }
 
-    /// Phase 69b Track G — IUTF8 set: an all-continuation tail (no
-    /// leading byte) gets bounded by the 4-byte UTF-8 max so the
-    /// erase cannot run away across the whole buffer.
+    /// Phase 69b Track G — IUTF8 set: a malformed tail (the byte
+    /// preceding the trailing continuations is itself a continuation
+    /// rather than a leading byte, or its shape does not match the
+    /// observed continuation count) is removed byte-by-byte. The
+    /// scan is still bounded to the 4-byte UTF-8 maximum so it
+    /// cannot run away across a long all-continuation buffer.
     #[test]
-    fn edit_buffer_erase_one_codepoint_iutf8_caps_runaway() {
+    fn edit_buffer_erase_one_codepoint_iutf8_malformed_tail_one_byte() {
         let mut buf = EditBuffer::new();
-        // Eight continuation bytes with no leading byte — malformed
-        // sequence. The erase walks at most 4 (UTF-8 max length).
+        // Eight continuation bytes with no leading byte — malformed.
+        // Each erase removes exactly one continuation byte.
         for _ in 0..8 {
             buf.push(0x80);
         }
+        assert_eq!(buf.erase_one_codepoint(true), 1);
+        assert_eq!(buf.as_slice().len(), 7);
+        assert_eq!(buf.erase_one_codepoint(true), 1);
+        assert_eq!(buf.as_slice().len(), 6);
+    }
+
+    /// Phase 69b Track G — IUTF8 set: even when the malformed
+    /// continuation run is much longer than the legal UTF-8 maximum
+    /// (4 bytes), the scan in [`EditBuffer::erase_one_codepoint`] is
+    /// bounded by `MAX_UTF8_LEN` so a `b"\xC3" + 16 * 0x80` style
+    /// buffer cannot cause a runaway look-back across the whole
+    /// buffer. The cap forces the scan to inspect at most four
+    /// trailing continuations; everything beyond stays in the buffer
+    /// and is drained one byte per call.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_long_continuation_run_bounded() {
+        let mut buf = EditBuffer::new();
+        // Start with a valid 2-byte leader so the leading-byte shape
+        // check has something to fail against.
+        buf.push(0xC3);
+        // 16 bogus continuation bytes — well over the 4-byte legal
+        // UTF-8 maximum.
+        for _ in 0..16 {
+            buf.push(0x80);
+        }
+        // The cap forces the scan to look at no more than the last
+        // four bytes; the byte before them (still a continuation) is
+        // not a valid leader, so the erase falls back to one byte.
         let removed = buf.erase_one_codepoint(true);
-        assert_eq!(removed, 4);
-        assert_eq!(buf.as_slice().len(), 4);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice().len(), 16);
+    }
+
+    /// Phase 69b Track G — IUTF8 set: when the buffer ends with a
+    /// stray continuation byte preceded by a valid leading byte that
+    /// does NOT match the continuation count (e.g. `b"A\x80"` where
+    /// 'A' is ASCII and expects zero continuations), the erase must
+    /// remove only the trailing byte and preserve the preceding
+    /// valid codepoint. The previous implementation erroneously
+    /// erased the leading byte along with the malformed tail.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_preserves_preceding_ascii() {
+        let mut buf = EditBuffer::new();
+        buf.push(b'A');
+        buf.push(0x80);
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), b"A");
+    }
+
+    /// Phase 69b Track G — IUTF8 set: when the buffer ends with a
+    /// stray leading byte that has no following continuations
+    /// (e.g. `b"A\xC3"` where 0xC3 expects one continuation), the
+    /// stray leader is removed alone — the preceding ASCII byte
+    /// stays.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_preserves_preceding_when_leader_is_stray() {
+        let mut buf = EditBuffer::new();
+        buf.push(b'A');
+        buf.push(0xC3);
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), b"A");
+    }
+
+    /// Phase 69b Track G — IUTF8 set: when the buffer ends with a
+    /// well-formed multi-byte sequence preceded by another valid
+    /// codepoint, the whole trailing codepoint is removed while the
+    /// preceding codepoint is preserved.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_well_formed_after_ascii() {
+        let mut buf = EditBuffer::new();
+        buf.push(b'A');
+        buf.push(0xC3);
+        buf.push(0xA9);
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 2);
+        assert_eq!(buf.as_slice(), b"A");
     }
 
     /// Phase 69b Track G — IUTF8 set + VERASE on the canonical ldisc:

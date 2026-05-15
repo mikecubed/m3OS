@@ -39,10 +39,23 @@ pub enum DecoderOutput {
     /// Complete codepoint decoded.
     Codepoint(u32),
     /// Malformed input — caller should emit U+FFFD. The decoder is
-    /// already reset; the next byte (or this byte's redelivery, if
-    /// the caller wants to honour the W3C resync rule for leading
-    /// bytes) starts a fresh sequence.
+    /// already reset; the next byte starts a fresh sequence. This
+    /// variant is returned when the offending byte cannot itself
+    /// start a fresh sequence (a stray continuation, an invalid
+    /// leading byte, or when an in-flight sequence broke on an
+    /// equally-invalid leading byte).
     Invalid,
+    /// Two-output resync: the in-flight sequence is replaced (caller
+    /// emits U+FFFD) AND the offending byte was a complete ASCII
+    /// codepoint. Caller emits both: replacement first, then the
+    /// codepoint. Preserves valid trailing ASCII data that a strict
+    /// resync would otherwise drop.
+    InvalidThenCodepoint(u32),
+    /// Two-output resync: the in-flight sequence is replaced (caller
+    /// emits U+FFFD) AND the offending byte started a fresh multi-byte
+    /// sequence. The decoder is now Pending on that new sequence; the
+    /// next byte continues it.
+    InvalidThenPending,
 }
 
 /// Internal state of the decoder. The number embedded in each multi-
@@ -223,34 +236,31 @@ impl Utf8Decoder {
         DecoderOutput::Pending
     }
 
-    /// The W3C "Best Practices for U+FFFD Substitution" rule says that
-    /// when a continuation byte is missing, the decoder emits one
-    /// replacement for the in-flight sequence and re-examines the
-    /// offending byte as the start of a fresh sequence. We approximate
-    /// this by reporting `Invalid` for the in-flight sequence and, if
-    /// the offending byte is itself a valid leading byte (or ASCII),
-    /// folding it into the decoder so the caller sees the freshly
-    /// decoded codepoint on the next call — but the public contract
-    /// is one byte one call, so we cannot emit two outputs at once.
-    /// Instead we return `Invalid` here and leave the decoder in
-    /// `Initial` (already done by the caller); if the offending byte
-    /// was ASCII, we synthesise a 1-byte completion immediately by
-    /// re-entering `decode_leading`. That collapses one of the W3C's
-    /// two outputs (the replacement) into the trailing valid output
-    /// when possible, which is the only way a one-byte-one-call API
-    /// can honour the resync intent without buffering.
+    /// W3C "Best Practices for U+FFFD Substitution" — when a
+    /// continuation byte is missing, emit one U+FFFD for the in-flight
+    /// sequence and re-process the offending byte as a fresh leading
+    /// byte. The decoder has already been reset to [`State::Initial`]
+    /// by the caller. We re-feed the byte through [`decode_leading`]
+    /// and fold its result into a combined two-output variant so the
+    /// caller never loses valid trailing data:
+    ///
+    /// - ASCII byte → [`DecoderOutput::InvalidThenCodepoint`] carrying
+    ///   the ASCII codepoint.
+    /// - Valid 2/3/4-byte leading byte → [`DecoderOutput::InvalidThenPending`];
+    ///   the decoder is now Pending on the new sequence.
+    /// - Invalid byte (stray continuation excluded by the caller, plus
+    ///   0xC0/0xC1/0xF5..=0xFF) → [`DecoderOutput::Invalid`] (single
+    ///   replacement). No valid data is lost.
     fn resync_after_invalid(&mut self, byte: u8) -> DecoderOutput {
-        // ASCII: no in-flight bytes to combine with; treat the byte as
-        // a fresh 1-byte sequence. We owe the caller exactly one
-        // `Invalid` (for the abandoned in-flight sequence), so the
-        // ASCII byte's value is lost. The W3C contract is "emit one
-        // U+FFFD per ill-formed sequence then resync"; the caller's
-        // contract is "one byte one output". Returning `Invalid`
-        // here, leaving state at `Initial`, satisfies both: the
-        // caller resyncs on the next byte (which may be the same
-        // ASCII byte re-fed, or whatever else arrives).
-        let _ = byte;
-        DecoderOutput::Invalid
+        match self.decode_leading(byte) {
+            DecoderOutput::Codepoint(c) => DecoderOutput::InvalidThenCodepoint(c),
+            DecoderOutput::Pending => DecoderOutput::InvalidThenPending,
+            DecoderOutput::Invalid => DecoderOutput::Invalid,
+            // decode_leading never produces the combined variants.
+            DecoderOutput::InvalidThenCodepoint(_) | DecoderOutput::InvalidThenPending => {
+                DecoderOutput::Invalid
+            }
+        }
     }
 }
 
@@ -442,51 +452,83 @@ mod tests {
         assert_eq!(outs.last().copied(), Some(DecoderOutput::Invalid));
     }
 
-    /// W3C resync case 1: a leading byte interrupted by another
-    /// leading byte. After `Invalid`, the decoder is back in the
-    /// initial state and decodes the next sequence cleanly.
+    /// W3C resync case 1: a leading byte interrupted by an ASCII byte.
+    /// The offending ASCII byte is preserved by the combined
+    /// [`DecoderOutput::InvalidThenCodepoint`] variant so its value is
+    /// not lost.
     #[test]
-    fn resync_leading_after_truncated_two_byte() {
+    fn resync_two_byte_truncated_by_ascii_preserves_ascii() {
         let mut d = Utf8Decoder::new();
-        // Start a 2-byte sequence then break it with another leading
-        // byte (ASCII 'A').
         assert_eq!(d.decode_byte(0xC2), DecoderOutput::Pending);
-        // Per the public contract, the offending non-continuation byte
-        // produces `Invalid`; the decoder resets so the next byte
-        // starts fresh.
-        assert_eq!(d.decode_byte(b'A'), DecoderOutput::Invalid);
+        assert_eq!(
+            d.decode_byte(b'A'),
+            DecoderOutput::InvalidThenCodepoint(b'A' as u32)
+        );
         assert!(matches!(d.state, State::Initial));
-        // Next byte parses normally.
+        // Next byte parses normally as a fresh sequence.
         assert_eq!(d.decode_byte(b'B'), DecoderOutput::Codepoint(b'B' as u32));
     }
 
-    /// W3C resync case 2: a 3-byte sequence interrupted mid-stream.
+    /// W3C resync case 2: a 3-byte sequence interrupted by an invalid
+    /// leading byte (0xFF) — neither a continuation nor a valid
+    /// leading byte. The output is the single-replacement [`Invalid`].
     #[test]
-    fn resync_after_truncated_three_byte() {
+    fn resync_after_truncated_three_byte_invalid_leader() {
         let mut d = Utf8Decoder::new();
-        // 0xE2 0x94 starts U+2500, but instead of 0x80 we feed 0xFF
-        // (an invalid byte).
         assert_eq!(d.decode_byte(0xE2), DecoderOutput::Pending);
         assert_eq!(d.decode_byte(0x94), DecoderOutput::Pending);
         assert_eq!(d.decode_byte(0xFF), DecoderOutput::Invalid);
         assert!(matches!(d.state, State::Initial));
-        // Decoder accepts a fresh ASCII byte.
         assert_eq!(d.decode_byte(b'X'), DecoderOutput::Codepoint(b'X' as u32));
     }
 
-    /// W3C resync case 3: a 4-byte sequence interrupted before the
-    /// final byte.
+    /// W3C resync case 3: a 3-byte sequence interrupted by an ASCII
+    /// byte. The ASCII byte is preserved via
+    /// [`DecoderOutput::InvalidThenCodepoint`].
     #[test]
-    fn resync_after_truncated_four_byte() {
+    fn resync_three_byte_truncated_by_ascii_preserves_ascii() {
         let mut d = Utf8Decoder::new();
-        // Start the 4-byte form for U+10000 then drop the last
-        // continuation in favour of a fresh ASCII byte.
+        assert_eq!(d.decode_byte(0xE2), DecoderOutput::Pending);
+        assert_eq!(d.decode_byte(0x94), DecoderOutput::Pending);
+        assert_eq!(
+            d.decode_byte(b'X'),
+            DecoderOutput::InvalidThenCodepoint(b'X' as u32)
+        );
+        assert!(matches!(d.state, State::Initial));
+    }
+
+    /// W3C resync case 4: a 4-byte sequence interrupted by an ASCII
+    /// byte. The ASCII byte is preserved.
+    #[test]
+    fn resync_four_byte_truncated_by_ascii_preserves_ascii() {
+        let mut d = Utf8Decoder::new();
         assert_eq!(d.decode_byte(0xF0), DecoderOutput::Pending);
         assert_eq!(d.decode_byte(0x90), DecoderOutput::Pending);
         assert_eq!(d.decode_byte(0x80), DecoderOutput::Pending);
-        assert_eq!(d.decode_byte(b'Q'), DecoderOutput::Invalid);
+        assert_eq!(
+            d.decode_byte(b'Q'),
+            DecoderOutput::InvalidThenCodepoint(b'Q' as u32)
+        );
         assert!(matches!(d.state, State::Initial));
         assert_eq!(d.decode_byte(b'q'), DecoderOutput::Codepoint(b'q' as u32));
+    }
+
+    /// W3C resync case 5: a truncated multi-byte sequence followed by
+    /// a fresh valid multi-byte leading byte. The decoder emits
+    /// [`InvalidThenPending`] and the next byte continues the new
+    /// sequence — no valid data lost.
+    #[test]
+    fn resync_truncated_by_multibyte_leader_preserves_sequence() {
+        let mut d = Utf8Decoder::new();
+        assert_eq!(d.decode_byte(0xC2), DecoderOutput::Pending);
+        // Start a fresh 2-byte sequence (U+00E9 → C3 A9). The first
+        // byte yields InvalidThenPending to signal both replacements
+        // for the in-flight sequence AND that a new sequence has
+        // begun.
+        assert_eq!(d.decode_byte(0xC3), DecoderOutput::InvalidThenPending);
+        // Now in Awaiting2 state; the next continuation byte completes
+        // the new codepoint.
+        assert_eq!(d.decode_byte(0xA9), DecoderOutput::Codepoint(0x00E9));
     }
 
     /// W3C resync case 4: two back-to-back malformed sequences each
@@ -504,14 +546,21 @@ mod tests {
     }
 
     /// A two-byte sequence with a non-continuation second byte is
-    /// rejected at the would-be continuation position. The decoder
-    /// resyncs immediately.
+    /// rejected at the would-be continuation position. When the
+    /// offending byte is itself a valid ASCII byte, the combined
+    /// [`DecoderOutput::InvalidThenCodepoint`] preserves it so no
+    /// valid data is lost.
     #[test]
     fn two_byte_missing_continuation_rejected() {
         let mut d = Utf8Decoder::new();
         assert_eq!(d.decode_byte(0xC2), DecoderOutput::Pending);
-        // 0x40 is in the ASCII range — not a continuation byte.
-        assert_eq!(d.decode_byte(0x40), DecoderOutput::Invalid);
+        // 0x40 is in the ASCII range — not a continuation byte. The
+        // truncated in-flight sequence yields a U+FFFD AND the 0x40
+        // codepoint is preserved by the combined variant.
+        assert_eq!(
+            d.decode_byte(0x40),
+            DecoderOutput::InvalidThenCodepoint(0x40)
+        );
         assert!(matches!(d.state, State::Initial));
     }
 

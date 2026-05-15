@@ -583,16 +583,46 @@ impl Screen {
             out.push(RenderCommand::Bell);
             return;
         }
-        let codepoint = match self.decoder.decode_byte(byte) {
-            DecoderOutput::Pending => return,
-            DecoderOutput::Codepoint(c) => c,
-            DecoderOutput::Invalid => REPLACEMENT_CHARACTER,
-        };
-        // ASCII codepoints (< 0x80) flow through the existing Phase
-        // 22b parser unchanged — every escape sequence byte is ASCII.
-        // Codepoints >= 0x80 cannot occur inside an ANSI escape so we
-        // route them directly to `put_char`; this also handles the
-        // U+FFFD replacement case from a malformed sequence.
+        match self.decoder.decode_byte(byte) {
+            DecoderOutput::Pending => {}
+            DecoderOutput::Codepoint(c) => self.emit_codepoint(c, out),
+            DecoderOutput::Invalid => self.emit_codepoint(REPLACEMENT_CHARACTER, out),
+            DecoderOutput::InvalidThenCodepoint(c) => {
+                // The truncated in-flight sequence yields one U+FFFD,
+                // and the offending byte was itself a complete ASCII
+                // codepoint — emit both, preserving valid trailing
+                // data the strict resync would otherwise drop.
+                self.emit_codepoint(REPLACEMENT_CHARACTER, out);
+                self.emit_codepoint(c, out);
+            }
+            DecoderOutput::InvalidThenPending => {
+                // The truncated in-flight sequence yields one U+FFFD;
+                // the offending byte has already begun a fresh
+                // multi-byte sequence in the decoder.
+                self.emit_codepoint(REPLACEMENT_CHARACTER, out);
+            }
+        }
+    }
+
+    /// Route a decoded codepoint either through the Phase 22b ANSI
+    /// parser (when ASCII — every escape-sequence byte is ASCII) or
+    /// directly into [`Screen::put_char`]. Codepoints >= 0x80 cannot
+    /// occur inside an ANSI escape, so they bypass the parser; this
+    /// also handles the U+FFFD replacement-character path from
+    /// malformed UTF-8.
+    ///
+    /// BEL (U+0007) is mapped to a [`RenderCommand::Bell`] here too —
+    /// the outer [`Screen::feed`] intercepts raw 0x07 bytes before the
+    /// decoder, but a malformed UTF-8 sequence whose resync re-feed
+    /// happens to land on 0x07 would otherwise route through the
+    /// parser and emit a `PutGlyph` for the control codepoint. The
+    /// guard keeps the Phase 57 BEL mapping intact regardless of how
+    /// the codepoint was produced.
+    fn emit_codepoint(&mut self, codepoint: u32, out: &mut Vec<RenderCommand>) {
+        if codepoint == 0x07 {
+            out.push(RenderCommand::Bell);
+            return;
+        }
         if codepoint <= 0x7F {
             let ch = (codepoint as u8) as char;
             let cmd = self.parser.process_char(ch);
@@ -833,6 +863,19 @@ impl Screen {
             let trail_col = self.cursor_col;
             if trail_col < self.cols {
                 let trail_idx = row as usize * self.cols as usize + trail_col as usize;
+                // If the cell about to be overwritten by this trail is
+                // itself a wide *leader* (a real glyph with width 2
+                // and no continuation flag), its own trailing cell at
+                // `trail_col + 1` would otherwise remain as an orphan
+                // `wide_continuation`. Blank that orphan first so the
+                // grid stays consistent.
+                let displaced = self.active_buf()[trail_idx];
+                let displaced_is_wide_leader = !displaced.wide_continuation
+                    && displaced.codepoint != 0
+                    && width_of(displaced.codepoint) == 2;
+                if displaced_is_wide_leader && (trail_col + 1) < self.cols {
+                    self.blank_cell(row, trail_col + 1, out);
+                }
                 self.active_buf_mut()[trail_idx] = Cell {
                     codepoint: 0,
                     fg,
@@ -1562,6 +1605,47 @@ mod tests {
         let trail = s.cell(0, 1).unwrap();
         assert_eq!(trail.codepoint, b'X' as u32);
         assert!(!trail.wide_continuation);
+    }
+
+    /// Phase 69b Track F — when a new wide glyph's trailing cell falls
+    /// on a column that currently holds a *leader* of another wide
+    /// glyph, the displaced leader's own trail (one column further
+    /// right) must be blanked so it does not remain as an orphan
+    /// `wide_continuation`. Without that step, a subsequent overwrite
+    /// at the orphan column would incorrectly blank an unrelated cell
+    /// to its left.
+    #[test]
+    fn utf8_wide_glyph_displaces_existing_wide_leader_cleanly() {
+        let mut s = Screen::with_geometry(6, 1);
+        let mut out: Vec<RenderCommand> = Vec::new();
+        // Place 'A' at (0, 0), then 中 at (0, 1)..=(0, 2).
+        s.feed(b'A', &mut out);
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        // Move cursor back to (0, 0) via CR and overwrite columns
+        // 0..=1 with a new wide 中.
+        s.feed(b'\r', &mut out);
+        out.clear();
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        // Column 0 — new leader.
+        let new_lead = s.cell(0, 0).unwrap();
+        assert_eq!(new_lead.codepoint, 0x4E2D);
+        assert!(!new_lead.wide_continuation);
+        // Column 1 — new trailing cell.
+        let new_trail = s.cell(0, 1).unwrap();
+        assert!(new_trail.wide_continuation);
+        assert_eq!(new_trail.codepoint, 0);
+        // Column 2 — the old wide glyph's trail. The leader it pointed
+        // to (col 1) is now the new pair's trail, so column 2 must NOT
+        // remain an orphan continuation.
+        let displaced_trail = s.cell(0, 2).unwrap();
+        assert!(
+            !displaced_trail.wide_continuation,
+            "column 2 must not be an orphan wide_continuation after a new wide leader is written at column 0"
+        );
     }
 
     /// Phase 69b Track F — a width-2 glyph at the last column wraps

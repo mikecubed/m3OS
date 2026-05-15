@@ -367,9 +367,10 @@ fn run_utf8() -> Result<(), &'static str> {
         return Err("replacement-glyph-not-fallback");
     }
 
-    // 3. A 4-byte CJK codepoint U+4E2D occupies (0, 0) + (0, 1) as a
-    //    wide cell pair; the renderer paints the fallback dot
-    //    because CJK glyph tables are deferred.
+    // 3. A 3-byte CJK codepoint U+4E2D (UTF-8 bytes E4 B8 AD)
+    //    occupies (0, 0) + (0, 1) as a wide cell pair; the renderer
+    //    paints the fallback dot because CJK glyph tables are
+    //    deferred to a later phase.
     let mut s3 = Screen::with_geometry(10, 2);
     let mut out3: Vec<RenderCommand> = Vec::new();
     for &b in &[0xE4u8, 0xB8, 0xAD] {
