@@ -8384,8 +8384,8 @@ fn compile_m3os_terminfo(output_dir: &Path) -> PathBuf {
         Err(e) => {
             eprintln!("Error: failed to invoke `tic`: {e}");
             eprintln!(
-                "       Phase 69 requires `tic` (from ncurses / e2fsprogs's terminfo \
-                 toolchain) on PATH so the m3os-term entry can be staged on the data \
+                "       Phase 69 requires `tic` (the terminfo compiler shipped with \
+                 ncurses) on PATH so the m3os-term entry can be staged on the data \
                  disk. Install with `apt install ncurses-bin` on Debian/Ubuntu or \
                  `dnf install ncurses` on Fedora."
             );

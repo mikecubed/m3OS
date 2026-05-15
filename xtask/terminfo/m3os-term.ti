@@ -14,11 +14,22 @@
 #   - SGR mouse 1006 (Track E)
 #   - Cursor movement / ED / EL / SGR (Phase 22b baseline)
 #
-# Sequences that `term` does NOT implement after Phase 69 are omitted.
-# Future phases extend this file in lockstep with the parser.
+# Capabilities that rely on non-CSI escape sequences (e.g. `ESC 7`,
+# `ESC 8`, `ESC M`, `ESC c`, `ESC =`, `ESC >`, `ESC (` charset selects)
+# are intentionally omitted because `kernel_core::fb::AnsiParser` only
+# recognises `ESC [` (CSI) and silently discards everything else. The
+# parser will be extended in a later phase; until then advertising
+# those capabilities would mislead `setupterm()` callers.
+#
+# A small number of CSI capabilities (`csr`, `dch`, `dl`, `ech`, `ich`,
+# `il`, `rin`, `indn`, `tbc`, `vpa`, `cbt`) remain in the entry: they
+# parse cleanly today but route to a no-op in `dispatch_csi`. They are
+# kept here so the published terminfo stays stable across the planned
+# Phase 69+ work that wires the missing dispatch arms; a follow-up
+# audit will either implement or remove each one as the parser grows.
 
 m3os-term|m3OS Phase 69 terminal,
-	am, bce, mir, msgr, npc, xenl,
+	am, bce, msgr, npc, xenl,
 	colors#256, cols#80, it#8, lines#25, pairs#32767,
 	bel=^G, blink=\E[5m, bold=\E[1m,
 	cbt=\E[Z, civis=\E[?25l, clear=\E[H\E[2J, cnorm=\E[?25h,
@@ -28,20 +39,19 @@ m3os-term|m3OS Phase 69 terminal,
 	dch=\E[%p1%dP, dch1=\E[P, dl=\E[%p1%dM, dl1=\E[M,
 	ech=\E[%p1%dX, ed=\E[J, el=\E[K, el1=\E[1K,
 	enacs=, home=\E[H, hpa=\E[%i%p1%dG, ht=^I,
-	hts=\EH, ich=\E[%p1%d@, il=\E[%p1%dL, il1=\E[L,
+	ich=\E[%p1%d@, il=\E[%p1%dL, il1=\E[L,
 	ind=\n, indn=\E[%p1%dS,
 	invis=\E[8m, kbs=\b, kcbt=\E[Z, kcub1=\EOD, kcud1=\EOB,
 	kcuf1=\EOC, kcuu1=\EOA, kdch1=\E[3~, kend=\EOF, khome=\EOH,
 	kich1=\E[2~, kmous=\E[<, knp=\E[6~, kpp=\E[5~,
-	op=\E[39;49m, rc=\E8, rev=\E[7m,
-	ri=\EM, rin=\E[%p1%dT, rmacs=\E(B, rmcup=\E[?1049l, rmir=\E[4l,
-	rmkx=\E[?1l\E>, rmso=\E[27m, rmul=\E[24m, rs1=\Ec,
-	rs2=\E[!p\E[?3;4l\E[4l\E>, sc=\E7,
+	op=\E[39;49m, rev=\E[7m,
+	rin=\E[%p1%dT, rmcup=\E[?1049l,
+	rmso=\E[27m, rmul=\E[24m,
 	setab=\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m,
 	setaf=\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m,
 	sgr=\E[0%?%p6%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;m,
-	sgr0=\E[0m, smacs=\E(0, smcup=\E[?1049h, smir=\E[4h,
-	smkx=\E[?1h\E=, smso=\E[7m, smul=\E[4m, tbc=\E[3g,
+	sgr0=\E[0m, smcup=\E[?1049h,
+	smso=\E[7m, smul=\E[4m, tbc=\E[3g,
 	u6=\E[%i%d;%dR, u7=\E[6n, u8=\E[?%[;0123456789]c, u9=\E[c,
 	vpa=\E[%i%p1%dd,
 	BE=\E[?2004h, BD=\E[?2004l,

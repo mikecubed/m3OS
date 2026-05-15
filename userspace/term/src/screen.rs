@@ -660,25 +660,17 @@ impl Screen {
             // gets a no-op here so a script that hides the cursor
             // does not crash.
             25 => {}
-            // Alternate-screen buffer. `?1049` saves cursor + colours;
-            // `?47` aliases without the save/restore. The Phase 69
-            // task explicitly differentiates the two — `?47` is
-            // implemented as the alias path.
-            1049 => {
+            // Alternate-screen buffer. Both `?1049` and the legacy
+            // `?47` route through the same `switch_to_alt` /
+            // `switch_to_primary` path: cursor + colours are saved
+            // on enter and restored on exit. xterm historically
+            // exposed `?47` as the unbuffered switch (no save), but
+            // m3os-term ships a single buffered path so that
+            // applications mixing the two codes see consistent
+            // round-trip behaviour. A true `?47` (no save/restore)
+            // path is deferred — see Phase 69 deferrals.
+            1049 | 47 => {
                 if set {
-                    self.switch_to_alt(out);
-                } else {
-                    self.switch_to_primary(out);
-                }
-            }
-            47 => {
-                if set {
-                    // Alias: switch without saving cursor — but to
-                    // keep the test surface symmetric we still call
-                    // switch_to_alt; the saved_cursor field is
-                    // overwritten unconditionally there, so callers
-                    // that pair `?47h` with `?47l` see the same
-                    // restore-on-exit behaviour as `?1049`.
                     self.switch_to_alt(out);
                 } else {
                     self.switch_to_primary(out);

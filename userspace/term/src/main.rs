@@ -47,7 +47,7 @@ use term::display::DisplayClient;
 #[cfg(not(test))]
 use term::input::{InputHandler, PtyWriter};
 #[cfg(not(test))]
-use term::mouse::{Mode as MouseMode, MouseReporter};
+use term::mouse::{EncodingMode, MouseReporter, TrackingMode};
 #[cfg(not(test))]
 use term::pty::PtyHost;
 #[cfg(not(test))]
@@ -576,25 +576,46 @@ fn lookup_display_for_input() -> Option<u32> {
 }
 
 /// Phase 69 Track E — translate a DEC private mode code into a
-/// `MouseReporter` mode update. Driven by
+/// `MouseReporter` state update. Driven by
 /// `RenderCommand::SetMouseMode` emitted by `Screen::feed`.
+///
+/// Tracking-mode (`?9` / `?1000` / `?1002` / `?1003`) and
+/// encoding-mode (`?1006`) are stored independently so xterm-style
+/// idioms like `?1000h ?1006h` (enable normal tracking, then SGR
+/// encoding) followed by `?1006l` revert the encoding back to the
+/// legacy form without disabling tracking.
 #[cfg(not(test))]
 fn update_mouse_mode(reporter: &mut MouseReporter, code: u16, set: bool) {
-    let mode = match (code, set) {
-        (_, false) => MouseMode::Disabled,
-        (9, true) => MouseMode::X10,
-        (1000, true) => MouseMode::ButtonEvent,
-        // 1002 (button-event with motion) and 1003 (any-event with
-        // motion) are mapped onto ButtonEvent — motion tracking is
-        // deferred but enabling either still emits press/release.
-        (1002 | 1003, true) => MouseMode::ButtonEvent,
-        (1006, true) => MouseMode::Sgr,
-        _ => MouseMode::Disabled,
-    };
-    if matches!(mode, MouseMode::Disabled) && !set {
-        reporter.disable();
-    } else {
-        reporter.enable(mode);
+    match code {
+        9 => reporter.set_tracking(if set {
+            TrackingMode::X10
+        } else {
+            TrackingMode::Disabled
+        }),
+        1000 => reporter.set_tracking(if set {
+            TrackingMode::Normal
+        } else {
+            TrackingMode::Disabled
+        }),
+        // ?1002 / ?1003 are tracked as their own variants so the
+        // deferred motion-tracking work has a name to switch on,
+        // even though `encode` currently treats them like Normal.
+        1002 => reporter.set_tracking(if set {
+            TrackingMode::ButtonMotion
+        } else {
+            TrackingMode::Disabled
+        }),
+        1003 => reporter.set_tracking(if set {
+            TrackingMode::AnyEvent
+        } else {
+            TrackingMode::Disabled
+        }),
+        1006 => reporter.set_encoding(if set {
+            EncodingMode::Sgr
+        } else {
+            EncodingMode::Legacy
+        }),
+        _ => {}
     }
 }
 

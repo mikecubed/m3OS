@@ -1,11 +1,15 @@
 //! Phase 69 Track E — `PointerEvent`-to-PTY mouse reporting encoder.
 //!
-//! `MouseReporter` owns the X10 / button-event / SGR mouse modes set
-//! by the DEC private mode codes `?9` / `?1000` / `?1006`. The
+//! `MouseReporter` owns the X10 / button-event / motion / SGR mouse
+//! state set by the DEC private mode codes `?9` / `?1000` / `?1002`
+//! / `?1003` / `?1006`. Tracking-mode (which events get reported)
+//! and encoding-mode (the wire format) are stored separately, the
+//! way xterm models them: `?1006l` only reverts the encoding back
+//! to the legacy form and `?1000l` only disables tracking. The
 //! reporter does not move pixels — it converts pointer events into
 //! the byte sequences ncurses-class TUI apps expect on stdin.
 //!
-//! `encode(event, cols, rows)` returns `Some(bytes)` when reporting
+//! `encode(event, cols, rows)` returns `Some(bytes)` when tracking
 //! is active. The returned buffer is stack-bounded (heapless::Vec
 //! is not a workspace dep, so we use a small inline array wrapped
 //! in a fixed-length slice via `MouseBytes`).
@@ -88,29 +92,75 @@ impl MouseBytes {
     }
 }
 
-/// Phase 69 Track E — active mouse reporting mode.
+/// Phase 69 Track E — tracking-mode state (which pointer-event
+/// transitions get reported). xterm models this as orthogonal to
+/// encoding-mode: `?9` / `?1000` / `?1002` / `?1003` flip tracking,
+/// `?1006` flips encoding. We keep the two pieces of state separate
+/// so `?1006l` only changes the wire format and `?1000l` only
+/// disables tracking — earlier revisions stored a single `Mode` and
+/// `?1006l` therefore disabled the whole mouse stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// No reporting; `encode` always returns `None`.
+pub enum TrackingMode {
+    /// No reporting; `encode` returns `None` regardless of encoding.
     #[default]
     Disabled,
-    /// `?9` — X10 mouse mode. Press-only, legacy 6-byte sequence.
+    /// `?9` — X10 mouse mode. Press only.
     X10,
-    /// `?1000` — normal tracking. Press and release, button == 3 on
-    /// release per the xterm wire layout.
+    /// `?1000` — normal tracking. Press + release.
+    Normal,
+    /// `?1002` — button-event tracking (motion while a button is
+    /// held). Phase 69 treats motion as deferred, so this currently
+    /// behaves like [`TrackingMode::Normal`]: press + release are
+    /// reported, intra-button motion is dropped. Kept as its own
+    /// variant so the deferred motion work has a name to switch on.
+    ButtonMotion,
+    /// `?1003` — any-event tracking. Same caveat as
+    /// [`TrackingMode::ButtonMotion`].
+    AnyEvent,
+}
+
+/// Phase 69 Track E — encoding-mode state (the wire format used for
+/// each reported transition). Independent of [`TrackingMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EncodingMode {
+    /// xterm legacy form: `\x1b[M Cb Cx Cy` with the `+32` offset.
+    /// Press events emit the button index; release events emit `3`
+    /// (Normal / ButtonMotion / AnyEvent), or are dropped entirely
+    /// (X10).
+    #[default]
+    Legacy,
+    /// `?1006` SGR-encoded form: `\x1b[<Pb;Px;Py M` (press) /
+    /// `\x1b[<Pb;Px;Py m` (release). Decimal coordinates, no offset.
+    Sgr,
+}
+
+/// Legacy single-axis mode kept for callers that drive the reporter
+/// with a single `enable(Mode)` call (tests and the `tui-smoke`
+/// binary). Each variant maps to a concrete `(tracking, encoding)`
+/// pair via [`MouseReporter::enable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// No reporting.
+    #[default]
+    Disabled,
+    /// X10 tracking + Legacy encoding.
+    X10,
+    /// Normal tracking + Legacy encoding.
     ButtonEvent,
-    /// `?1006` — SGR-encoded press/release.
+    /// Normal tracking + SGR encoding (the typical xterm-style combo).
     Sgr,
 }
 
 /// Phase 69 Track E — pointer-event-to-PTY-bytes encoder.
 ///
-/// `MouseReporter::new()` starts in `Mode::Disabled`. The Phase 56
-/// `Pointer` event variant is the only input; the typed `Mode` is
-/// driven by `Screen::feed`'s `DecPrivateMode` arms via [`enable`]
-/// / [`disable`].
+/// `MouseReporter::new()` starts with both tracking and encoding
+/// disabled / default. The Phase 56 `Pointer` event variant is the
+/// only input. `Screen::feed`'s `DecPrivateMode` arms route mode
+/// changes through [`set_tracking`] / [`set_encoding`] (or, for the
+/// single-axis legacy callers, [`enable`] / [`disable`]).
 pub struct MouseReporter {
-    mode: Mode,
+    tracking: TrackingMode,
+    encoding: EncodingMode,
 }
 
 impl Default for MouseReporter {
@@ -122,38 +172,83 @@ impl Default for MouseReporter {
 impl MouseReporter {
     pub const fn new() -> Self {
         Self {
-            mode: Mode::Disabled,
+            tracking: TrackingMode::Disabled,
+            encoding: EncodingMode::Legacy,
         }
     }
 
-    /// Current active mode.
+    /// Current tracking mode (which events get reported).
+    pub fn tracking(&self) -> TrackingMode {
+        self.tracking
+    }
+
+    /// Current encoding mode (the wire format for reports).
+    pub fn encoding(&self) -> EncodingMode {
+        self.encoding
+    }
+
+    /// Derive the legacy [`Mode`] view from the current
+    /// `(tracking, encoding)` pair. Surface area kept for callers
+    /// that still think in terms of the pre-split single mode.
     pub fn mode(&self) -> Mode {
-        self.mode
+        match (self.tracking, self.encoding) {
+            (TrackingMode::Disabled, _) => Mode::Disabled,
+            (TrackingMode::X10, _) => Mode::X10,
+            (_, EncodingMode::Sgr) => Mode::Sgr,
+            (_, EncodingMode::Legacy) => Mode::ButtonEvent,
+        }
     }
 
-    /// Enable the requested reporting mode. Calling with the same
-    /// mode is idempotent. SGR (`?1006`) and ButtonEvent (`?1000`)
-    /// can coexist; the most-recently-enabled mode wins for encoding.
+    /// Flip the tracking-mode independently of the encoding. The
+    /// encoding stays whatever was last set, so the common xterm
+    /// pattern `?1000h ?1006h` (enable button-event tracking, then
+    /// enable SGR encoding) lands on `(Normal, Sgr)` and a later
+    /// `?1006l` reverts to `(Normal, Legacy)` without disabling
+    /// tracking.
+    pub fn set_tracking(&mut self, tracking: TrackingMode) {
+        self.tracking = tracking;
+    }
+
+    /// Flip the encoding-mode independently of the tracking.
+    /// `?1006l` reverts to [`EncodingMode::Legacy`] but leaves
+    /// tracking enabled if it was; this is the bug the Phase 69
+    /// review surfaced.
+    pub fn set_encoding(&mut self, encoding: EncodingMode) {
+        self.encoding = encoding;
+    }
+
+    /// Legacy single-axis API kept for callers that still think in
+    /// terms of one mode. Maps the requested [`Mode`] onto a
+    /// concrete `(tracking, encoding)` pair and writes both fields.
     pub fn enable(&mut self, mode: Mode) {
-        self.mode = mode;
+        let (t, e) = match mode {
+            Mode::Disabled => (TrackingMode::Disabled, EncodingMode::Legacy),
+            Mode::X10 => (TrackingMode::X10, EncodingMode::Legacy),
+            Mode::ButtonEvent => (TrackingMode::Normal, EncodingMode::Legacy),
+            Mode::Sgr => (TrackingMode::Normal, EncodingMode::Sgr),
+        };
+        self.tracking = t;
+        self.encoding = e;
     }
 
-    /// Disable reporting. `encode` returns `None` after this.
+    /// Disable reporting. Resets tracking to [`TrackingMode::Disabled`]
+    /// and encoding to its default ([`EncodingMode::Legacy`]).
     pub fn disable(&mut self) {
-        self.mode = Mode::Disabled;
+        self.tracking = TrackingMode::Disabled;
+        self.encoding = EncodingMode::Legacy;
     }
 
     /// Encode `event` to a stack-bounded byte buffer suitable for
-    /// writing to the PTY primary fd. Returns `None` when reporting
+    /// writing to the PTY primary fd. Returns `None` when tracking
     /// is disabled or when the event is a motion-only sample (no
     /// button edge) — Phase 69 ships mouse tracking that responds
-    /// to button press / release only. Motion-mouse tracking
+    /// to button press / release only. True motion-mouse tracking
     /// (`?1002` / `?1003`) is deferred.
     ///
     /// `cols` and `rows` are the cell-grid dimensions; coordinates
     /// are clamped into `1..=cols` / `1..=rows`.
     pub fn encode(&self, event: &PointerEvent, cols: u16, rows: u16) -> Option<MouseBytes> {
-        if matches!(self.mode, Mode::Disabled) {
+        if matches!(self.tracking, TrackingMode::Disabled) {
             return None;
         }
         let (button_index, is_release) = match event.button {
@@ -161,16 +256,16 @@ impl MouseReporter {
             PointerButton::Up(i) => (i, true),
             PointerButton::None => return None,
         };
+        // X10 ships press events only; release is dropped regardless
+        // of the encoding-mode the caller picked.
+        if matches!(self.tracking, TrackingMode::X10) && is_release {
+            return None;
+        }
         let (px, py) = compute_cell_position(event, cols, rows);
         let mut out = MouseBytes::new();
-        match self.mode {
-            Mode::Disabled => return None,
-            Mode::X10 | Mode::ButtonEvent => {
+        match self.encoding {
+            EncodingMode::Legacy => {
                 // X10 form: \x1b[M  Cb Cx Cy   (1-based + 32 offset)
-                if matches!(self.mode, Mode::X10) && is_release {
-                    // X10 ships press events only.
-                    return None;
-                }
                 let cb_value = if is_release { 3u8 } else { button_index.min(2) };
                 out.push(0x1b);
                 out.push(b'[');
@@ -179,7 +274,7 @@ impl MouseReporter {
                 out.push((px.min(223) as u8).wrapping_add(32));
                 out.push((py.min(223) as u8).wrapping_add(32));
             }
-            Mode::Sgr => {
+            EncodingMode::Sgr => {
                 // SGR form: \x1b[<Pb;Px;Py M  (press) or m (release).
                 out.push(0x1b);
                 out.push(b'[');
@@ -346,5 +441,48 @@ mod tests {
             .expect("sgr enabled");
         // Expect cell (80, 25): \x1b[<0;80;25M
         assert_eq!(bytes.as_slice(), b"\x1b[<0;80;25M");
+    }
+
+    /// Phase 69 review-resolution — disabling SGR encoding via
+    /// `?1006l` must not turn off tracking. The common xterm idiom
+    /// `?1000h ?1006h` then `?1006l` should leave normal tracking
+    /// active and revert to legacy encoding.
+    #[test]
+    fn sgr_encoding_reset_keeps_tracking() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        r.set_encoding(EncodingMode::Sgr);
+        // ?1006l flips encoding back to Legacy but keeps tracking.
+        r.set_encoding(EncodingMode::Legacy);
+        assert_eq!(r.tracking(), TrackingMode::Normal);
+        assert_eq!(r.encoding(), EncodingMode::Legacy);
+        let bytes = r
+            .encode(&press(0, 10 * 8, 5 * 16), 80, 25)
+            .expect("tracking still active");
+        // Expect legacy wire form: ESC '[' 'M' Cb Cx Cy.
+        assert_eq!(bytes.as_slice(), b"\x1b[M +&");
+    }
+
+    /// Phase 69 review-resolution — disabling tracking via `?1000l`
+    /// stops all reports, even when SGR encoding is still set.
+    #[test]
+    fn tracking_disabled_stops_reports() {
+        let mut r = MouseReporter::new();
+        r.set_tracking(TrackingMode::Normal);
+        r.set_encoding(EncodingMode::Sgr);
+        r.set_tracking(TrackingMode::Disabled);
+        assert!(r.encode(&press(0, 10 * 8, 5 * 16), 80, 25).is_none());
+    }
+
+    /// Phase 69 review-resolution — the legacy `enable(Mode::Sgr)`
+    /// shim sets tracking to Normal (the xterm-canonical pairing)
+    /// so a single-axis caller still gets the expected wire form.
+    #[test]
+    fn legacy_enable_sgr_pairs_with_normal_tracking() {
+        let mut r = MouseReporter::new();
+        r.enable(Mode::Sgr);
+        assert_eq!(r.tracking(), TrackingMode::Normal);
+        assert_eq!(r.encoding(), EncodingMode::Sgr);
+        assert_eq!(r.mode(), Mode::Sgr);
     }
 }
