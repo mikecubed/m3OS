@@ -202,3 +202,27 @@ The single concrete change in `kernel/` for Phase 57 audio is one line of wideni
 > children in reverse start order before emitting the fallback notification.
 > See `docs/roadmap/64-session-manager-lifecycle.md` and
 > `docs/64-session-manager-lifecycle.md` for the full breakdown.
+
+> **Phase 69 closure note:** Phase 57 shipped `term` with a Phase 22b-era
+> terminal contract (8-color SGR, basic cursor movement, BEL → audio).
+> Phase 69 (kernel v0.69.0) extends `term` with the Phase-69 wire-protocol
+> capability set so it is ready for full-screen ncurses-class applications:
+> a published `m3os-term` terminfo entry installed at
+> `/usr/share/terminfo/m/m3os-term`; alternate-screen buffer via
+> `ConsoleCmd::DecPrivateMode` (`?1049` and `?47`) with a saved-cursor
+> snapshot; 256-color indexed + 24-bit RGB SGR (`SgrParams::ops()` →
+> `SgrOp::Fg/Bg{Indexed,Rgb}` with an `XTERM_256_PALETTE`-backed resolver);
+> X10 / button-event / SGR mouse reporting via a new `term::mouse`
+> module and a `Pointer` variant on the binary's `PulledEvent` channel;
+> DECSCUSR cursor shapes (`CSI <n> SP q`) plus a 500 ms blink tick;
+> bracketed paste (`?2004`) with a `wrap_paste` helper; SIGWINCH
+> propagation via a new `ServerMessage::SurfaceResized` ↔ `Screen::resize`
+> ↔ `ioctl(TIOCSWINSZ)` chain (the kernel TIOCSWINSZ branch then sends
+> SIGWINCH to the foreground process group); and a `userspace/tui-smoke`
+> byte-level validator with a `cargo xtask tui-smoke` QEMU gate. Termios
+> rewiring, UTF-8 + glyph rendering, font infrastructure, and
+> application-level validation against real ports (nvim, tmux, htop, mc,
+> less) move to the dedicated follow-ups 69a, 69b, 69c, and 69d. See
+> `docs/roadmap/tasks/69-terminal-tui-capabilities-tasks.md` for the
+> per-track breakdown.
+

@@ -131,6 +131,10 @@ const SMOKE_EXIT_BELL_SMOKE_FAILED: i32 = 64;
 /// reach the new init-delegation code path, init's `/run/init.cmd`
 /// handler did not pick it up, or the daemon's reply never arrived.
 const SMOKE_EXIT_SESSION_RESTART_FAILED: i32 = 65;
+/// Phase 69 Track H: tui-smoke failed — at least one terminal-contract
+/// subcommand emitted `TUI_SMOKE:<name>:fail …`. The harness surfaces the
+/// failing variant immediately rather than letting the step time out.
+const SMOKE_EXIT_TUI_SMOKE_FAILED: i32 = 66;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -387,6 +391,18 @@ fn main() {
                 });
             cmd_bell_smoke(&smoke_args);
         }
+        // Phase 69 Track H — `cargo xtask tui-smoke` boots the kernel,
+        // logs into sh0, and drives every `tui-smoke <subcmd>` against
+        // the post-login shell. Asserts each subcommand prints
+        // `TUI_SMOKE:<name>:ok`.
+        Some("tui-smoke") => {
+            let smoke_args = parse_smoke_boot_args("tui-smoke", &args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_tui_smoke(&smoke_args);
+        }
         // Phase 63a Track H — DOOM SFX + music end-to-end smoke. Boots
         // with WAV AC'97 backend, launches `/bin/doom -warp 1 1` with
         // an auto-quit budget so the engine's Shutdown emits the
@@ -454,7 +470,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -625,6 +641,11 @@ fn build_userspace_bins() {
         // false` because the binary uses only `syscall_lib` primitives
         // (no kernel-core link, no allocator).
         ("crash_stub", "crash_stub", false),
+        // Phase 69 Track H — `tui-smoke` byte-level validator. Links
+        // `term` (which links `kernel-core`) and uses `alloc::vec::Vec`
+        // in the per-subcommand render-command buffers, so
+        // `needs_alloc = true`.
+        ("tui-smoke", "tui-smoke", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -7515,6 +7536,155 @@ fn cmd_bell_smoke(args: &SmokeBootArgs) {
     }
 }
 
+/// Phase 69 Track H — boots m3OS, logs into sh0, and drives each
+/// `tui-smoke <subcmd>` against the post-login shell. Asserts every
+/// subcommand prints `TUI_SMOKE:<name>:ok`; the failing variant from
+/// any `TUI_SMOKE:<name>:fail` is surfaced immediately with exit code
+/// [`SMOKE_EXIT_TUI_SMOKE_FAILED`].
+fn cmd_tui_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = tui_smoke_steps();
+
+    println!(
+        "tui-smoke: launching QEMU (timeout {}s, {} subcommands)",
+        args.timeout_secs, 7
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("tui-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("tui-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_TUI_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 69 Track H.2 — step list for the tui-smoke gate. Each
+/// subcommand is `/bin/tui-smoke <subcmd>` and the harness waits for
+/// the matching `TUI_SMOKE:<name>:ok` sentinel.
+fn tui_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/tui-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    let subcmds: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "term-env",
+            "/bin/tui-smoke term-env\n",
+            "guest/tui-smoke: TERM=m3os-term",
+            "TUI_SMOKE:term-env:ok",
+            "TUI_SMOKE:term-env:fail",
+        ),
+        (
+            "alt-screen",
+            "/bin/tui-smoke alt-screen\n",
+            "guest/tui-smoke: alternate-screen buffer",
+            "TUI_SMOKE:alt-screen:ok",
+            "TUI_SMOKE:alt-screen:fail",
+        ),
+        (
+            "colors",
+            "/bin/tui-smoke colors\n",
+            "guest/tui-smoke: 256-color + truecolor SGR",
+            "TUI_SMOKE:colors:ok",
+            "TUI_SMOKE:colors:fail",
+        ),
+        (
+            "mouse",
+            "/bin/tui-smoke mouse\n",
+            "guest/tui-smoke: SGR mouse encoding",
+            "TUI_SMOKE:mouse:ok",
+            "TUI_SMOKE:mouse:fail",
+        ),
+        (
+            "cursor",
+            "/bin/tui-smoke cursor\n",
+            "guest/tui-smoke: DECSCUSR cursor shape",
+            "TUI_SMOKE:cursor:ok",
+            "TUI_SMOKE:cursor:fail",
+        ),
+        (
+            "resize",
+            "/bin/tui-smoke resize\n",
+            "guest/tui-smoke: Screen::resize + TIOCSWINSZ",
+            "TUI_SMOKE:resize:ok",
+            "TUI_SMOKE:resize:fail",
+        ),
+        (
+            "paste",
+            "/bin/tui-smoke paste\n",
+            "guest/tui-smoke: bracketed-paste wrap",
+            "TUI_SMOKE:paste:ok",
+            "TUI_SMOKE:paste:fail",
+        ),
+    ];
+    for (_, input, label, pass, fail) in subcmds {
+        steps.push(SmokeStep::Send {
+            input,
+            label: "guest/tui-smoke: send subcommand",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: pass,
+            fail_prefix: fail,
+            timeout_secs: 15,
+            label,
+            exit_code_on_fail: SMOKE_EXIT_TUI_SMOKE_FAILED,
+        });
+    }
+    steps
+}
+
 /// Phase 63a Track H — `cargo xtask doom-audio-smoke` exit codes.
 const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 65;
 
@@ -8173,6 +8343,67 @@ fn generate_seeded_shadow_line(password: &[u8], salt: &[u8]) -> String {
     out
 }
 
+/// Phase 69 Track A.2 — compile `xtask/terminfo/m3os-term.ti` into a
+/// staging directory via `tic` and return the path of the compiled
+/// `m3os-term` binary entry. Treats a missing `tic` (or a `tic` that
+/// fails on the input source) as a hard, actionable error: terminfo
+/// is a hard dependency of Phase 69 and any program calling
+/// `setupterm("m3os-term", …)` would silently fall back to `xterm`
+/// assumptions if we let the build proceed without it.
+fn compile_m3os_terminfo(output_dir: &Path) -> PathBuf {
+    let source = workspace_root().join("xtask/terminfo/m3os-term.ti");
+    if !source.is_file() {
+        eprintln!("Error: terminfo source not found at {}", source.display());
+        eprintln!("       (Phase 69 Track A.1 expects this file to be present.)");
+        std::process::exit(1);
+    }
+    let stage = output_dir.join("terminfo-staging");
+    if stage.exists() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    fs::create_dir_all(&stage).expect("create terminfo staging dir");
+
+    let tic_result = Command::new("tic")
+        .arg("-x")
+        .arg("-o")
+        .arg(&stage)
+        .arg(&source)
+        .output();
+    match tic_result {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!(
+                "Error: tic failed to compile {} (exit {}): {}",
+                source.display(),
+                out.status,
+                stderr.trim()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: failed to invoke `tic`: {e}");
+            eprintln!(
+                "       Phase 69 requires `tic` (from ncurses / e2fsprogs's terminfo \
+                 toolchain) on PATH so the m3os-term entry can be staged on the data \
+                 disk. Install with `apt install ncurses-bin` on Debian/Ubuntu or \
+                 `dnf install ncurses` on Fedora."
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let compiled = stage.join("m").join("m3os-term");
+    if !compiled.is_file() {
+        eprintln!(
+            "Error: tic succeeded but expected output {} was not produced.",
+            compiled.display()
+        );
+        std::process::exit(1);
+    }
+    compiled
+}
+
 fn populate_ext2_files(
     part_path: &Path,
     output_dir: &Path,
@@ -8287,6 +8518,12 @@ fn populate_ext2_files(
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
+
+    // Phase 69 Track A — compile the `m3os-term` terminfo entry so a binary
+    // copy can be staged at `/usr/share/terminfo/m/m3os-term` inside the
+    // data disk. Returns the path to the compiled `m3os-term` file. Treats
+    // missing `tic` as a hard error per A.2 acceptance.
+    let terminfo_bin = compile_m3os_terminfo(output_dir);
 
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");
@@ -8582,6 +8819,26 @@ fn populate_ext2_files(
          sif etc/services.d mode 0x41ED\n\
          sif etc/services.d uid 0\n\
          sif etc/services.d gid 0\n\
+         mkdir usr\n\
+         sif usr mode 0x41ED\n\
+         sif usr uid 0\n\
+         sif usr gid 0\n\
+         mkdir usr/share\n\
+         sif usr/share mode 0x41ED\n\
+         sif usr/share uid 0\n\
+         sif usr/share gid 0\n\
+         mkdir usr/share/terminfo\n\
+         sif usr/share/terminfo mode 0x41ED\n\
+         sif usr/share/terminfo uid 0\n\
+         sif usr/share/terminfo gid 0\n\
+         mkdir usr/share/terminfo/m\n\
+         sif usr/share/terminfo/m mode 0x41ED\n\
+         sif usr/share/terminfo/m uid 0\n\
+         sif usr/share/terminfo/m gid 0\n\
+         write \"{terminfo_bin}\" usr/share/terminfo/m/m3os-term\n\
+         sif usr/share/terminfo/m/m3os-term mode 0x81A4\n\
+         sif usr/share/terminfo/m/m3os-term uid 0\n\
+         sif usr/share/terminfo/m/m3os-term gid 0\n\
          sif dev mode 0x41ED\n\
          sif dev uid 0\n\
          sif dev gid 0\n\
@@ -8699,6 +8956,7 @@ fn populate_ext2_files(
         readback_cmds = readback_cmds,
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
+        terminfo_bin = terminfo_bin.display(),
     );
 
     let mut debugfs = Command::new("debugfs")

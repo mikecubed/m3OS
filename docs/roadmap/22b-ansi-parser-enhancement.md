@@ -111,7 +111,9 @@ The legacy aligned learning doc [`docs/22b-ansi-escape.md`](../22b-ansi-escape.m
 
 ## Deferred Until Later
 
-- 24-bit and 256-colour SGR (`38 ; 2 ; r ; g ; b` and `38 ; 5 ; n`) — see [Phase 59 Validation Backlog](./59-validation-backlog.md) for related visual smoke tests.
+- 24-bit and 256-colour SGR (`38 ; 2 ; r ; g ; b` and `38 ; 5 ; n`) — *closed in Phase 69 (`SgrParams::ops` yields `FgIndexed` / `BgIndexed` / `FgRgb` / `BgRgb` variants; the kernel framebuffer console still ignores them while `userspace/term/src/screen.rs` resolves them via `XTERM_256_PALETTE` + `color_to_bgra`).*
+- DEC private mode set/reset for any code other than `?25` (DECTCEM) — *closed in Phase 69 (`ConsoleCmd::DecPrivateMode { code, set }` covers `?1049`, `?47`, `?9`, `?1000`, `?1006`, `?2004`; consumers that do not recognise a code drop it silently).*
+- DECSCUSR cursor shape (`CSI <n> SP q`) — *closed in Phase 69 (`ConsoleCmd::CursorShape { shape }` for `n` ∈ 0..=6; the parser exits the new `CsiIntermediate` state on the final byte).*
 - SGR underline (4), italic (3), inverse (7), strikethrough (9), and their reset variants 21–29. The 8x16 bitmap font has no variant glyphs.
 - Visible cursor block rendering. `cursor_visible` is stored but `execute_cmd` does not yet draw a block at the current position; Ion hides the cursor during redraws so the missing render is invisible in normal use.
 - Scroll regions (`ESC [ r ; s r`, DECSTBM) — the scroll region is always the full screen.

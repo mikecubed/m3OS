@@ -817,8 +817,8 @@ impl FbRenderer {
                 }
                 _ => {}
             },
-            ConsoleCmd::SetCursorVisible(visible) => {
-                if visible {
+            ConsoleCmd::DecPrivateMode { code: 25, set } => {
+                if set {
                     self.cursor_visible = true;
                     self.show_cursor();
                 } else {
@@ -826,6 +826,16 @@ impl FbRenderer {
                     self.cursor_visible = false;
                 }
             }
+            // Phase 69 — alternate-screen, mouse, bracketed-paste, and
+            // any other DEC private modes are owned by `term` (the
+            // graphical terminal emulator). The kernel framebuffer
+            // console drops them silently so legacy text-mode sessions
+            // do not get confused.
+            ConsoleCmd::DecPrivateMode { .. } => {}
+            // Phase 69 Track F — DECSCUSR cursor shape. The text-mode
+            // FB console only paints a single-cell block today, so we
+            // accept and ignore the shape selection.
+            ConsoleCmd::CursorShape { .. } => {}
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }

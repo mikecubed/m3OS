@@ -47,6 +47,7 @@ extern crate std;
 
 pub mod bell;
 pub mod input;
+pub mod mouse;
 pub mod pty;
 pub mod render;
 pub mod screen;

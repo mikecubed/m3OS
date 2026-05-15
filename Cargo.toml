@@ -108,6 +108,10 @@ members = [
     # session_manager lifecycle integration tests (B.1 grace-period,
     # C.1 crash-loop and display-critical text-fallback).
     "userspace/crash_stub",
+    # Phase 69 Track H — byte-level validator for the m3os-term
+    # terminal contract. Run from the post-login shell by the
+    # `cargo xtask tui-smoke` gate.
+    "userspace/tui-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

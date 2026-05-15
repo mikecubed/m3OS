@@ -38,8 +38,18 @@ pub enum ConsoleCmd {
     EraseLine(u16),
     /// Erase in Display: 0 = cursor to end, 1 = start to cursor, 2 = entire screen.
     EraseDisplay(u16),
-    /// Show/hide cursor (DECTCEM).
-    SetCursorVisible(bool),
+    /// Phase 69 Track B — DEC private mode set/reset (`CSI ? <code> h`
+    /// or `CSI ? <code> l`). Covers `?25` (DECTCEM cursor visibility),
+    /// `?1049` / `?47` (alternate-screen buffer), `?9` / `?1000` /
+    /// `?1006` (mouse reporting), and `?2004` (bracketed paste). Codes
+    /// the consumer does not recognise are dropped silently.
+    DecPrivateMode { code: u16, set: bool },
+    /// Phase 69 Track F — DECSCUSR cursor shape (`CSI <n> SP q`). `shape`
+    /// is `0..=6` per the DEC vocabulary: 0/1 blinking block, 2 steady
+    /// block, 3 blinking underline, 4 steady underline, 5 blinking bar,
+    /// 6 steady bar. Out-of-range codes are filtered by the parser and
+    /// do not produce this variant.
+    CursorShape { shape: u16 },
     /// SGR — Set Graphic Rendition. Parameters stored as a slice reference
     /// isn't possible in a Copy enum, so we use a small inline array.
     Sgr(SgrParams),
@@ -54,6 +64,146 @@ pub struct SgrParams {
     pub count: usize,
 }
 
+/// Phase 69 Track C — typed SGR operation produced by
+/// [`SgrParams::iter_ops`]. Lets consumers walk a CSI `m` sequence
+/// without re-implementing the 38/48 extended-color sub-grammar in
+/// every renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SgrOp {
+    /// `SGR 0` — reset all attributes to default.
+    Reset,
+    /// `SGR 1` — bold.
+    Bold,
+    /// `SGR 4` — underline.
+    Underline,
+    /// `SGR 7` — reverse video.
+    Reverse,
+    /// `SGR 22` — clear bold.
+    NoBold,
+    /// `SGR 24` — clear underline.
+    NoUnderline,
+    /// `SGR 27` — clear reverse.
+    NoReverse,
+    /// `SGR 30..=37` — standard 8-color foreground (index 0..=7).
+    Fg8(u8),
+    /// `SGR 40..=47` — standard 8-color background (index 0..=7).
+    Bg8(u8),
+    /// `SGR 39` — restore default foreground.
+    FgDefault,
+    /// `SGR 49` — restore default background.
+    BgDefault,
+    /// `SGR 90..=97` — bright 8-color foreground (index 0..=7, palette
+    /// indices 8..=15).
+    FgBright8(u8),
+    /// `SGR 100..=107` — bright 8-color background (index 0..=7,
+    /// palette indices 8..=15).
+    BgBright8(u8),
+    /// `SGR 38;5;<n>` — 256-color indexed foreground.
+    FgIndexed(u8),
+    /// `SGR 48;5;<n>` — 256-color indexed background.
+    BgIndexed(u8),
+    /// `SGR 38;2;<r>;<g>;<b>` — 24-bit RGB foreground.
+    FgRgb(u8, u8, u8),
+    /// `SGR 48;2;<r>;<g>;<b>` — 24-bit RGB background.
+    BgRgb(u8, u8, u8),
+}
+
+impl SgrParams {
+    /// Phase 69 Track C — walk the raw SGR params and yield typed
+    /// [`SgrOp`] values. Unrecognised codes are skipped silently.
+    /// Truncated extended-color sequences (e.g. `38;5` with no
+    /// trailing index) are also dropped silently so a malformed SGR
+    /// cannot derail the rest of the sequence.
+    pub fn ops(&self) -> SgrOpIter<'_> {
+        SgrOpIter {
+            params: &self.params[..self.count.min(self.params.len())],
+            idx: 0,
+        }
+    }
+}
+
+/// Iterator returned by [`SgrParams::ops`].
+#[derive(Debug, Clone)]
+pub struct SgrOpIter<'a> {
+    params: &'a [u16],
+    idx: usize,
+}
+
+impl<'a> Iterator for SgrOpIter<'a> {
+    type Item = SgrOp;
+
+    fn next(&mut self) -> Option<SgrOp> {
+        while self.idx < self.params.len() {
+            let code = self.params[self.idx];
+            self.idx += 1;
+            match code {
+                0 => return Some(SgrOp::Reset),
+                1 => return Some(SgrOp::Bold),
+                4 => return Some(SgrOp::Underline),
+                7 => return Some(SgrOp::Reverse),
+                22 => return Some(SgrOp::NoBold),
+                24 => return Some(SgrOp::NoUnderline),
+                27 => return Some(SgrOp::NoReverse),
+                30..=37 => return Some(SgrOp::Fg8((code - 30) as u8)),
+                39 => return Some(SgrOp::FgDefault),
+                40..=47 => return Some(SgrOp::Bg8((code - 40) as u8)),
+                49 => return Some(SgrOp::BgDefault),
+                90..=97 => return Some(SgrOp::FgBright8((code - 90) as u8)),
+                100..=107 => return Some(SgrOp::BgBright8((code - 100) as u8)),
+                38 | 48 => {
+                    let is_fg = code == 38;
+                    let sub = match self.params.get(self.idx) {
+                        Some(&s) => s,
+                        None => return None,
+                    };
+                    self.idx += 1;
+                    match sub {
+                        5 => {
+                            let n = match self.params.get(self.idx) {
+                                Some(&v) => v,
+                                None => return None,
+                            };
+                            self.idx += 1;
+                            let n = (n & 0xff) as u8;
+                            return Some(if is_fg {
+                                SgrOp::FgIndexed(n)
+                            } else {
+                                SgrOp::BgIndexed(n)
+                            });
+                        }
+                        2 => {
+                            let r = self.params.get(self.idx).copied();
+                            let g = self.params.get(self.idx + 1).copied();
+                            let b = self.params.get(self.idx + 2).copied();
+                            match (r, g, b) {
+                                (Some(r), Some(g), Some(b)) => {
+                                    self.idx += 3;
+                                    let r = (r & 0xff) as u8;
+                                    let g = (g & 0xff) as u8;
+                                    let b = (b & 0xff) as u8;
+                                    return Some(if is_fg {
+                                        SgrOp::FgRgb(r, g, b)
+                                    } else {
+                                        SgrOp::BgRgb(r, g, b)
+                                    });
+                                }
+                                _ => return None,
+                            }
+                        }
+                        // Unknown sub-spec (e.g. 38;3 for CMY or 38;4 for
+                        // CMYK) — skip silently and keep walking.
+                        _ => continue,
+                    }
+                }
+                // Codes we don't model yet (italic, blink, faint, …)
+                // are skipped. They are not part of Phase 69's scope.
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
 /// Parser state for the escape sequence state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscState {
@@ -65,6 +215,12 @@ pub enum EscState {
     Csi,
     /// Inside a CSI private sequence (ESC [ ?) — accumulating parameters.
     CsiPrivate,
+    /// Phase 69 Track F — saw an intermediate space byte inside a CSI
+    /// sequence (`ESC [ <n> SP ...`). DEC's DECSCUSR uses this form:
+    /// `ESC [ <n> SP q`. We track the intermediate so the final byte
+    /// `q` dispatches to a cursor-shape command rather than the
+    /// existing repertoire.
+    CsiIntermediate,
 }
 
 /// ANSI escape sequence parser.
@@ -125,6 +281,7 @@ impl AnsiParser {
             EscState::Escape => self.process_escape(c),
             EscState::Csi => self.process_csi(c),
             EscState::CsiPrivate => self.process_csi_private(c),
+            EscState::CsiIntermediate => self.process_csi_intermediate(c),
         }
     }
 
@@ -186,6 +343,14 @@ impl AnsiParser {
                 self.state = EscState::CsiPrivate;
                 ConsoleCmd::Nop
             }
+            // Phase 69 Track F — intermediate space byte: `ESC [ <n> SP <final>`.
+            // DEC's DECSCUSR `ESC [ <n> SP q` cursor-shape sequence is the
+            // only consumer today; future DEC private intermediates can
+            // dispatch from `process_csi_intermediate`.
+            ' ' => {
+                self.state = EscState::CsiIntermediate;
+                ConsoleCmd::Nop
+            }
             // Final byte (0x40–0x7E) — dispatch the CSI sequence.
             c if (c as u32) >= 0x40 && (c as u32) <= 0x7E => {
                 let cmd = self.dispatch_csi(c);
@@ -198,6 +363,28 @@ impl AnsiParser {
                 ConsoleCmd::Nop
             }
         }
+    }
+
+    fn process_csi_intermediate(&mut self, c: char) -> ConsoleCmd {
+        // We've already seen `ESC [ <params> SP`. The only final byte
+        // we recognise is 'q' for DECSCUSR; everything else is dropped.
+        let cmd = match c {
+            'q' => {
+                let shape = self.param(0, 0);
+                if shape <= 6 {
+                    ConsoleCmd::CursorShape { shape }
+                } else {
+                    ConsoleCmd::Nop
+                }
+            }
+            _ => ConsoleCmd::Nop,
+        };
+        // Whether final byte was 'q' or something we don't recognise,
+        // exit back to Normal — a malformed sequence still terminates
+        // on the final byte. Only digits could extend the params, but
+        // intermediates separate params from final bytes per ECMA-48.
+        self.state = EscState::Normal;
+        cmd
     }
 
     fn process_csi_private(&mut self, c: char) -> ConsoleCmd {
@@ -278,22 +465,22 @@ impl AnsiParser {
     }
 
     fn dispatch_csi_private(&self, final_byte: char) -> ConsoleCmd {
+        // Phase 69 Track B — every single-parameter `ESC [ ? <n> h/l`
+        // dispatches to `DecPrivateMode`. Code 25 (DECTCEM) used to map
+        // to a dedicated `SetCursorVisible`; that case is now folded
+        // into `DecPrivateMode { code: 25, .. }` so the alternate-screen
+        // / mouse / bracketed-paste codes share a single uniform arm.
+        // Consumers that do not recognise a code drop the command
+        // silently.
         match final_byte {
-            // DECTCEM — cursor visibility
-            'h' => {
-                if self.param(0, 0) == 25 {
-                    ConsoleCmd::SetCursorVisible(true)
-                } else {
-                    ConsoleCmd::Nop
-                }
-            }
-            'l' => {
-                if self.param(0, 0) == 25 {
-                    ConsoleCmd::SetCursorVisible(false)
-                } else {
-                    ConsoleCmd::Nop
-                }
-            }
+            'h' => ConsoleCmd::DecPrivateMode {
+                code: self.param(0, 0),
+                set: true,
+            },
+            'l' => ConsoleCmd::DecPrivateMode {
+                code: self.param(0, 0),
+                set: false,
+            },
             _ => ConsoleCmd::Nop,
         }
     }
@@ -352,13 +539,25 @@ mod tests {
     #[test]
     fn test_dectcem_hide() {
         let cmd = parse_str_last("\x1b[?25l");
-        assert_eq!(cmd, ConsoleCmd::SetCursorVisible(false));
+        assert_eq!(
+            cmd,
+            ConsoleCmd::DecPrivateMode {
+                code: 25,
+                set: false
+            }
+        );
     }
 
     #[test]
     fn test_dectcem_show() {
         let cmd = parse_str_last("\x1b[?25h");
-        assert_eq!(cmd, ConsoleCmd::SetCursorVisible(true));
+        assert_eq!(
+            cmd,
+            ConsoleCmd::DecPrivateMode {
+                code: 25,
+                set: true
+            }
+        );
     }
 
     #[test]
@@ -563,8 +762,142 @@ mod tests {
 
     #[test]
     fn test_csi_private_unknown_param() {
-        // CSI ? with an unknown param (not 25) + 'h' should produce Nop.
-        assert_eq!(parse_str_last("\x1b[?1h"), ConsoleCmd::Nop);
+        // Phase 69 Track B — non-25 codes still produce DecPrivateMode;
+        // unrecognised codes are dropped at the consumer level.
+        assert_eq!(
+            parse_str_last("\x1b[?1h"),
+            ConsoleCmd::DecPrivateMode { code: 1, set: true }
+        );
+    }
+
+    /// Phase 69 Track B — DECSET / DECRST for alternate-screen
+    /// (`?1049`, `?47`), mouse reporting (`?9`, `?1000`, `?1006`),
+    /// and bracketed paste (`?2004`).
+    #[test]
+    fn test_dec_private_mode_codes() {
+        let cases: [(&str, u16, bool); 10] = [
+            ("\x1b[?1049h", 1049, true),
+            ("\x1b[?1049l", 1049, false),
+            ("\x1b[?47h", 47, true),
+            ("\x1b[?47l", 47, false),
+            ("\x1b[?9h", 9, true),
+            ("\x1b[?1000h", 1000, true),
+            ("\x1b[?1006h", 1006, true),
+            ("\x1b[?2004h", 2004, true),
+            ("\x1b[?2004l", 2004, false),
+            // Bogus / unrecognised code still parses successfully; the
+            // consumer drops it silently.
+            ("\x1b[?9999h", 9999, true),
+        ];
+        for (input, code, set) in cases {
+            assert_eq!(
+                parse_str_last(input),
+                ConsoleCmd::DecPrivateMode { code, set },
+                "unexpected parse for {:?}",
+                input.as_bytes()
+            );
+        }
+    }
+
+    /// Phase 69 Track C — 256-color indexed SGR.
+    #[test]
+    fn test_sgr_256_indexed_fg_and_bg() {
+        let cmd = parse_str_last("\x1b[38;5;208m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr, got {:?}", cmd)
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::FgIndexed(208)]);
+
+        let cmd = parse_str_last("\x1b[48;5;0m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::BgIndexed(0)]);
+
+        let cmd = parse_str_last("\x1b[38;5;255m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::FgIndexed(255)]);
+    }
+
+    /// Phase 69 Track C — 24-bit RGB SGR.
+    #[test]
+    fn test_sgr_truecolor_rgb() {
+        let cmd = parse_str_last("\x1b[38;2;1;2;3m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::FgRgb(1, 2, 3)]);
+
+        let cmd = parse_str_last("\x1b[48;2;0;0;255m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::BgRgb(0, 0, 255)]);
+    }
+
+    /// Phase 69 Track C — mixed SGR sequence combines bold + indexed-fg.
+    #[test]
+    fn test_sgr_mixed_bold_and_indexed_fg() {
+        let cmd = parse_str_last("\x1b[1;38;5;208m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::Bold, SgrOp::FgIndexed(208)]);
+    }
+
+    /// Phase 69 Track C — bright 8-color foreground / background.
+    #[test]
+    fn test_sgr_bright_8color() {
+        let cmd = parse_str_last("\x1b[93m");
+        let sgr = if let ConsoleCmd::Sgr(s) = cmd {
+            s
+        } else {
+            panic!("expected Sgr")
+        };
+        let ops: alloc::vec::Vec<_> = sgr.ops().collect();
+        assert_eq!(ops, &[SgrOp::FgBright8(3)]);
+    }
+
+    /// Phase 69 Track F — DECSCUSR cursor-shape sequences.
+    #[test]
+    fn test_decscusr_cursor_shapes() {
+        for shape in 0..=6u16 {
+            let seq = alloc::format!("\x1b[{} q", shape);
+            assert_eq!(
+                parse_str_last(&seq),
+                ConsoleCmd::CursorShape { shape },
+                "DECSCUSR {} did not parse",
+                shape
+            );
+        }
+        // Out-of-range shape is dropped to Nop without changing parser
+        // state.
+        assert_eq!(parse_str_last("\x1b[7 q"), ConsoleCmd::Nop);
+        // Default shape (no param) parses as shape 0.
+        assert_eq!(
+            parse_str_last("\x1b[ q"),
+            ConsoleCmd::CursorShape { shape: 0 }
+        );
     }
 
     #[test]

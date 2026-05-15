@@ -1,0 +1,49 @@
+# m3OS Phase 69 — m3os-term terminfo entry.
+#
+# Compiled to a binary entry via `tic -o <staging>/usr/share/terminfo` in
+# xtask `populate_ext2_files`. Installed to
+# `/usr/share/terminfo/m/m3os-term` inside the ext2 data disk so any
+# program calling `setupterm()` or `tigetstr()` against
+# `TERM=m3os-term` finds the right escape sequences.
+#
+# Capability set covers what `term` actually implements after Phase 69:
+#   - 256-color SGR (Track C) + RGB truecolor extension
+#   - Alternate-screen buffer ?1049 (Track B)
+#   - DECSCUSR cursor shapes 0..=6 (Track F)
+#   - Bracketed paste ?2004 (Track G)
+#   - SGR mouse 1006 (Track E)
+#   - Cursor movement / ED / EL / SGR (Phase 22b baseline)
+#
+# Sequences that `term` does NOT implement after Phase 69 are omitted.
+# Future phases extend this file in lockstep with the parser.
+
+m3os-term|m3OS Phase 69 terminal,
+	am, bce, mir, msgr, npc, xenl,
+	colors#256, cols#80, it#8, lines#25, pairs#32767,
+	bel=^G, blink=\E[5m, bold=\E[1m,
+	cbt=\E[Z, civis=\E[?25l, clear=\E[H\E[2J, cnorm=\E[?25h,
+	cr=\r, csr=\E[%i%p1%d;%p2%dr, cub=\E[%p1%dD, cub1=\b,
+	cud=\E[%p1%dB, cud1=\n, cuf=\E[%p1%dC, cuf1=\E[C,
+	cup=\E[%i%p1%d;%p2%dH, cuu=\E[%p1%dA, cuu1=\E[A,
+	dch=\E[%p1%dP, dch1=\E[P, dl=\E[%p1%dM, dl1=\E[M,
+	ech=\E[%p1%dX, ed=\E[J, el=\E[K, el1=\E[1K,
+	enacs=, home=\E[H, hpa=\E[%i%p1%dG, ht=^I,
+	hts=\EH, ich=\E[%p1%d@, il=\E[%p1%dL, il1=\E[L,
+	ind=\n, indn=\E[%p1%dS,
+	invis=\E[8m, kbs=\b, kcbt=\E[Z, kcub1=\EOD, kcud1=\EOB,
+	kcuf1=\EOC, kcuu1=\EOA, kdch1=\E[3~, kend=\EOF, khome=\EOH,
+	kich1=\E[2~, kmous=\E[<, knp=\E[6~, kpp=\E[5~,
+	op=\E[39;49m, rc=\E8, rev=\E[7m,
+	ri=\EM, rin=\E[%p1%dT, rmacs=\E(B, rmcup=\E[?1049l, rmir=\E[4l,
+	rmkx=\E[?1l\E>, rmso=\E[27m, rmul=\E[24m, rs1=\Ec,
+	rs2=\E[!p\E[?3;4l\E[4l\E>, sc=\E7,
+	setab=\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m,
+	setaf=\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m,
+	sgr=\E[0%?%p6%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;m,
+	sgr0=\E[0m, smacs=\E(0, smcup=\E[?1049h, smir=\E[4h,
+	smkx=\E[?1h\E=, smso=\E[7m, smul=\E[4m, tbc=\E[3g,
+	u6=\E[%i%d;%dR, u7=\E[6n, u8=\E[?%[;0123456789]c, u9=\E[c,
+	vpa=\E[%i%p1%dd,
+	BE=\E[?2004h, BD=\E[?2004l,
+	XM=\E[?1006;1000%?%p1%{1}%=%th%el%;,
+	Ss=\E[%p1%d\sq, Se=\E[2\sq,

@@ -725,8 +725,8 @@ impl FbConsole {
                     _ => {}
                 }
             }
-            ConsoleCmd::SetCursorVisible(visible) => {
-                if visible {
+            ConsoleCmd::DecPrivateMode { code: 25, set } => {
+                if set {
                     self.cursor_visible = true;
                     self.show_cursor();
                 } else {
@@ -734,6 +734,14 @@ impl FbConsole {
                     self.cursor_visible = false;
                 }
             }
+            // Phase 69 — all other DEC private modes (alt-screen,
+            // mouse, bracketed paste) are owned by userspace `term`.
+            // The kernel framebuffer console is a single-buffer
+            // text-mode surface and silently ignores them.
+            ConsoleCmd::DecPrivateMode { .. } => {}
+            // Phase 69 Track F — DECSCUSR cursor shape is purely
+            // cosmetic for the kernel FB console; accept and ignore.
+            ConsoleCmd::CursorShape { .. } => {}
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }

@@ -122,7 +122,20 @@ impl<F: FramebufferOwner> Renderer<F> {
             }
             RenderCommand::Bell => { /* audio path; no pixels */ }
             RenderCommand::MoveCursor { .. } => { /* cursor sprite is deferred to a later track */ }
+            // Phase 69 Track E — mouse-mode changes are routed to
+            // `MouseReporter` by the main loop; the renderer is a
+            // pure pixel sink and never sees this command.
+            RenderCommand::SetMouseMode { .. } => {}
         }
+    }
+
+    /// Phase 69 Track F.2 — force the next [`Renderer::compose`] call
+    /// to push a frame even if no `PutGlyph` / `Clear` / `Scroll`
+    /// arrived this tick. Used by the blink-tick path in
+    /// `main.rs` so a blinking cursor still drives display updates
+    /// while the PTY is idle.
+    pub fn mark_damaged(&mut self) {
+        self.pending_submit = true;
     }
 
     /// True when there is buffered damage waiting to be submitted.
