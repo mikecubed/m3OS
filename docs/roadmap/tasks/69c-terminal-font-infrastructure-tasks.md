@@ -1,6 +1,6 @@
 # Phase 69c — TTF Font Loader and Nerd Font Asset Embedding: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69c
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs)
 **Goal:** Land TTF font parsing, glyph rasterization, a bounded LRU atlas, and a Nerd Font asset on the data disk so `term` resolves arbitrary Unicode codepoints — including Nerd Font private-use-area icons — at full fidelity. Phase 69b's static bitmap tables remain as the startup-fallback path.
@@ -9,13 +9,13 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | TTF/OTF parser in `kernel-core/src/font/parser.rs` (vendor vs hand-roll decision documented) | None | Planned |
-| B | Glyph rasterizer in `kernel-core/src/font/raster.rs` | A | Planned |
-| C | Bounded LRU atlas in `kernel-core/src/font/atlas.rs` | A, B | Planned |
-| D | Font asset staging: `cargo xtask fetch-fonts`, ext2 copy in `populate_ext2_files` | None | Planned |
-| E | `term` boot wiring + atlas-backed `Renderer::glyph_pixels`; static-table fallback preserved | C, D | Planned |
-| F | Validation: `tui-smoke fonts` subcommand | E | Planned |
-| G | Documentation: Phase 69b cross-ref; appendix update; aligned legacy learning doc; kernel patch bump to 0.69.3 | F | Planned |
+| A | TTF/OTF parser in `kernel-core/src/font/parser.rs` (vendor vs hand-roll decision documented) | None | Complete |
+| B | Glyph rasterizer in `kernel-core/src/font/raster.rs` | A | Complete |
+| C | Bounded LRU atlas in `kernel-core/src/font/atlas.rs` | A, B | Complete |
+| D | Font asset staging: `cargo xtask fetch-fonts`, ext2 copy in `populate_ext2_files` | None | Complete |
+| E | `term` boot wiring + atlas-backed `Renderer::glyph_pixels`; static-table fallback preserved | C, D | Complete |
+| F | Validation: `tui-smoke fonts` subcommand | E | Complete |
+| G | Documentation: Phase 69b cross-ref; appendix update; aligned legacy learning doc; kernel patch bump to 0.69.3 | F | Complete |
 
 ---
 
@@ -30,7 +30,7 @@
 **Acceptance:**
 - [x] A 1-paragraph decision recorded in the design doc or an ADR file.
 - [x] If vendoring `ttf-parser`: the crate is added to `kernel-core`'s dependency list with `default-features = false` and the version pinned.
-- [ ] If hand-rolling: scope is `cmap` format 4 + 12, `glyf`, `loca`, `head`, `maxp` — explicitly documented as the subset.
+- [x] If hand-rolling: scope is `cmap` format 4 + 12, `glyf`, `loca`, `head`, `maxp` — explicitly documented as the subset.
 
 **Decision:** vendor `ttf-parser` v0.25 with `default-features = false` + `no-std-float` feature (no_std, zero-allocation, MIT OR Apache-2.0). Recorded in [docs/roadmap/69c-terminal-font-infrastructure.md](../69c-terminal-font-infrastructure.md#decision-track-a1-vendor-ttf-parser).
 
@@ -91,10 +91,10 @@
 **Why it matters:** TTF files are binary blobs; committing them inflates the repo, but they need to be reproducible.
 
 **Acceptance:**
-- [ ] `cargo xtask fetch-fonts` downloads `JetBrainsMono Nerd Font Mono Regular.ttf` from a pinned URL (Nerd Fonts GitHub release) into `xtask/assets/fonts/term.ttf`.
-- [ ] SHA-256 is verified against a checksum committed in `xtask/assets/fonts/term.ttf.sha256`.
-- [ ] Mismatch aborts with a clear error.
-- [ ] Subsequent runs skip the download if the file matches the checksum.
+- [x] `cargo xtask fetch-fonts` downloads `JetBrainsMono Nerd Font Mono Regular.ttf` from a pinned URL (Nerd Fonts GitHub release) into `xtask/assets/fonts/term.ttf`.
+- [x] SHA-256 is verified against a checksum committed in `xtask/assets/fonts/term.ttf.sha256`.
+- [x] Mismatch aborts with a clear error.
+- [x] Subsequent runs skip the download if the file matches the checksum.
 
 ### D.2 — Stage the font on the ext2 data disk
 
@@ -103,9 +103,9 @@
 **Why it matters:** The font must be readable from `term`'s userspace path at runtime.
 
 **Acceptance:**
-- [ ] `populate_ext2_files` creates `/usr/share/fonts/m3os/` and copies `xtask/assets/fonts/term.ttf` to `/usr/share/fonts/m3os/term.ttf`.
-- [ ] If the source file is missing, `xtask image` aborts with `error: run "cargo xtask fetch-fonts" first`.
-- [ ] `cargo xtask check` continues to pass.
+- [x] `populate_ext2_files` creates `/usr/share/fonts/m3os/` and copies `xtask/assets/fonts/term.ttf` to `/usr/share/fonts/m3os/term.ttf`.
+- [x] If the source file is missing, `xtask image` aborts with `error: run "cargo xtask fetch-fonts" first`.
+- [x] `cargo xtask check` continues to pass.
 
 ---
 
@@ -118,10 +118,10 @@
 **Why it matters:** This is where the static-table → atlas switch flips for the runtime path.
 
 **Acceptance:**
-- [ ] After `Renderer::new(display)`, `term` opens `/usr/share/fonts/m3os/term.ttf` via `syscall_lib::open` + `read`.
-- [ ] On success: constructs an `Atlas` with capacity 1024 and stashes it on the renderer.
-- [ ] On any failure (file missing, parse error, OOM): logs `term: font load failed; using static fallback` and proceeds with Phase 69b's static-table path.
-- [ ] Boot log includes `term: atlas loaded N glyphs` on success.
+- [x] After `Renderer::new(display)`, `term` opens `/usr/share/fonts/m3os/term.ttf` via `syscall_lib::open` + `read`.
+- [x] On success: constructs an `Atlas` with capacity 1024 and stashes it on the renderer.
+- [x] On any failure (file missing, parse error, OOM): logs `term: font load failed; using static fallback` and proceeds with Phase 69b's static-table path.
+- [x] Boot log includes `term: atlas loaded N glyphs` on success.
 
 ### E.2 — Renderer atlas-backed glyph path
 
@@ -130,10 +130,10 @@
 **Why it matters:** This is the seam Phase 69b's `resolve_glyph` accessor was built for.
 
 **Acceptance:**
-- [ ] `Renderer` carries a `GlyphSource` enum: `Static` (Phase 69b tables) or `Atlas(Atlas)`.
-- [ ] `glyph_pixels(codepoint)` dispatches: `Atlas` → `atlas.resolve(codepoint)`; `Static` → `kernel_core::fb::resolve_glyph(codepoint)`.
-- [ ] No allocation per glyph blit (both paths return `&RasterBitmap`).
-- [ ] When the atlas misses (codepoint not in the font), the resolver falls back to the static centred-dot glyph — same behaviour Phase 69b promised.
+- [x] `Renderer` carries a `GlyphSource` enum: `Static` (Phase 69b tables) or `Atlas(Atlas)`.
+- [x] `glyph_pixels(codepoint)` dispatches: `Atlas` → `atlas.resolve(codepoint)`; `Static` → `kernel_core::fb::resolve_glyph(codepoint)`.
+- [x] No allocation per glyph blit (both paths return `&RasterBitmap`).
+- [x] When the atlas misses (codepoint not in the font), the resolver falls back to the static centred-dot glyph — same behaviour Phase 69b promised.
 
 ---
 
@@ -146,11 +146,11 @@
 **Why it matters:** Phase 69c's acceptance is "the atlas works for real glyphs"; this is the gate.
 
 **Acceptance:**
-- [ ] `tui-smoke fonts startup` asserts the boot log contains `term: atlas loaded N glyphs` with N > 100.
-- [ ] `tui-smoke fonts branch-icon` writes U+E0A0 to the screen, asserts `Screen::cell(0, 0).codepoint == 0xE0A0` and the renderer's painted pixels are not all blank (atlas rasterizer produced output).
-- [ ] `tui-smoke fonts emoji` writes U+1F600; passes whether the font covers it (assert non-blank pixels) or not (assert centred-dot fallback) — both are acceptable, neither must crash.
-- [ ] `tui-smoke fonts adversarial` writes 2048 distinct codepoints in sequence; asserts no OOM, atlas size stays at 1024, eviction order is LRU.
-- [ ] `tui-smoke fonts missing-font` (driven by an xtask harness that omits the font from the data disk) asserts `term: font load failed; using static fallback` and asserts ASCII / Latin-1 / box-drawing still render.
+- [x] `tui-smoke fonts startup` asserts the boot log contains `term: atlas loaded N glyphs` with N > 100.
+- [x] `tui-smoke fonts branch-icon` writes U+E0A0 to the screen, asserts `Screen::cell(0, 0).codepoint == 0xE0A0` and the renderer's painted pixels are not all blank (atlas rasterizer produced output).
+- [x] `tui-smoke fonts emoji` writes U+1F600; passes whether the font covers it (assert non-blank pixels) or not (assert centred-dot fallback) — both are acceptable, neither must crash.
+- [x] `tui-smoke fonts adversarial` writes 2048 distinct codepoints in sequence; asserts no OOM, atlas size stays at 1024, eviction order is LRU.
+- [x] `tui-smoke fonts missing-font` (driven by an xtask harness that omits the font from the data disk) asserts `term: font load failed; using static fallback` and asserts ASCII / Latin-1 / box-drawing still render.
 
 ### F.2 — Wire into `cargo xtask tui-smoke`
 
@@ -159,8 +159,8 @@
 **Why it matters:** One gate covers all of 69 / 69a / 69b / 69c.
 
 **Acceptance:**
-- [ ] `cargo xtask tui-smoke` invokes the five new `fonts` checks.
-- [ ] Total runtime under 120 s.
+- [x] `cargo xtask tui-smoke` invokes the five new `fonts` checks.
+- [x] Total runtime under 120 s.
 
 ---
 
@@ -173,7 +173,7 @@
 **Why it matters:** Phase 69b's `Deferred Until Later` line for TTF/Nerd Font is closed by 69c.
 
 **Acceptance:**
-- [ ] Phase 69b doc updated to mark TTF/Nerd Font as `(closed in Phase 69c)`.
+- [x] Phase 69b doc updated to mark TTF/Nerd Font as `(closed in Phase 69c)`.
 
 ### G.2 — Extend `docs/appendix/term-escape-sequences.md`
 
@@ -182,8 +182,8 @@
 **Why it matters:** Document the runtime font resolver and the static fallback.
 
 **Acceptance:**
-- [ ] New "Font infrastructure" section explains the atlas → static-fallback dispatch.
-- [ ] Documents the font path `/usr/share/fonts/m3os/term.ttf` and the asset's provenance.
+- [x] New "Font infrastructure" section explains the atlas → static-fallback dispatch.
+- [x] Documents the font path `/usr/share/fonts/m3os/term.ttf` and the asset's provenance.
 
 ### G.3 — Create the aligned legacy learning doc
 
@@ -192,12 +192,12 @@
 **Why it matters:** Learners need a self-contained reference for the TTF font infrastructure — the parser/rasterizer/atlas pipeline, the Nerd Font asset path, the static-table fallback contract, and what Phase 69c deliberately defers (multi-font, sizing, OpenType shaping) — without conflating it with Phase 69b's bitmap-glyph expansion or Phase 69's broader terminal contract. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
 
 **Acceptance:**
-- [ ] `docs/69c-terminal-font-infrastructure.md` exists with all template fields populated (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc).
-- [ ] Overview paragraph explains what Phase 69b left as a static-table glyph path and what Phase 69c replaces it with.
-- [ ] Key Files table cites every changed file (parser, rasterizer, atlas, font module entry, term boot wiring, renderer dispatch, xtask fetch + staging, tui-smoke fonts subcommand, appendix doc).
-- [ ] Closure of Related Phases section cross-refs Phase 57, 69, 69a, 69b.
-- [ ] How This Phase Differs From Later Font Work section calls out the deferred items (multi-size, per-region fallback, OpenType features, AA, variable fonts, hot-reload, configurable path).
-- [ ] Related Roadmap Docs links design doc and task doc.
+- [x] `docs/69c-terminal-font-infrastructure.md` exists with all template fields populated (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc).
+- [x] Overview paragraph explains what Phase 69b left as a static-table glyph path and what Phase 69c replaces it with.
+- [x] Key Files table cites every changed file (parser, rasterizer, atlas, font module entry, term boot wiring, renderer dispatch, xtask fetch + staging, tui-smoke fonts subcommand, appendix doc).
+- [x] Closure of Related Phases section cross-refs Phase 57, 69, 69a, 69b.
+- [x] How This Phase Differs From Later Font Work section calls out the deferred items (multi-size, per-region fallback, OpenType features, AA, variable fonts, hot-reload, configurable path).
+- [x] Related Roadmap Docs links design doc and task doc.
 
 ### G.4 — Kernel patch bump to 0.69.3
 
@@ -211,10 +211,10 @@
 **Why it matters:** Patch bump per phase.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.69.3"`.
-- [ ] `Cargo.lock` regenerated.
-- [ ] `AGENTS.md` version cursor updated.
-- [ ] `cargo xtask check` passes.
+- [x] `kernel/Cargo.toml` `version = "0.69.3"`.
+- [x] `Cargo.lock` regenerated.
+- [x] `AGENTS.md` version cursor updated.
+- [x] `cargo xtask check` passes.
 
 ---
 

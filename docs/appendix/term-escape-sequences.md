@@ -292,6 +292,55 @@ Control characters (`U+0000..=U+001F`, `U+007F`, `U+0080..=U+009F`,
 `U+00A0` NBSP) always render as a blank cell — terminals never paint
 control bytes.
 
+## Font infrastructure (Phase 69c)
+
+Phase 69c lands `kernel-core::font` — a TTF/OTF parser, a 1-bit
+scanline rasterizer, and a bounded LRU atlas — so the runtime
+glyph resolver can cover any Unicode codepoint that lives in a
+loaded font, including Nerd Font private-use-area icons
+(`U+E000..=U+F8FF`, `U+F0000..=U+FFFFD`).
+
+### Asset path
+
+The font file is staged on the ext2 data disk at
+`/usr/share/fonts/m3os/term.ttf`. The asset itself is
+**JetBrainsMono Nerd Font Mono Regular** (Apache 2.0, ~2 MB) from
+the upstream `ryanoasis/nerd-fonts` release v3.2.1. It is **not
+committed** to the repository — `cargo xtask fetch-fonts` downloads
+the file into `xtask/assets/fonts/term.ttf` and verifies the
+SHA-256 against `xtask/assets/fonts/term.ttf.sha256` (committed)
+before subsequent `cargo xtask image` runs stage it on the disk.
+
+### Runtime dispatch
+
+`term`'s `Renderer` carries a `GlyphSource` enum:
+
+- `GlyphSource::Atlas(Atlas)` — Phase 69c TTF-backed path. The
+  atlas resolves a codepoint to a rasterized bitmap on first
+  access, hits the cache afterward, and evicts the least-recently
+  used entry once it reaches its 1024-glyph capacity. Codepoints
+  the font does not cover fall back to the centred-dot fallback
+  bitmap so the user still sees an inked cell.
+- `GlyphSource::Static` — Phase 69b static-table path. Covers
+  ASCII (`U+0020..=U+007F`), Latin-1 supplement
+  (`U+0080..=U+00FF`), Unicode box-drawing (`U+2500..=U+257F`),
+  and the centred-dot fallback. This is the path `term` uses
+  before atlas construction completes and the permanent fallback
+  if the font file is missing, corrupt, or refuses to parse.
+
+`term` boots on `Static` and upgrades to `Atlas` when
+`/usr/share/fonts/m3os/term.ttf` opens and parses cleanly. The
+boot log records `term: atlas loaded N glyphs` on success and
+`term: font load failed; using static fallback` on any failure —
+the second message is the load-bearing signal for the
+`tui-smoke fonts missing-font` gate.
+
+The renderer's `compose()` resolves the codepoint through
+`GlyphSource` and hands a `&GlyphView` to `FramebufferOwner::put_glyph`,
+so the framebuffer owner does not branch on resolution policy:
+both static and atlas paths flatten to the same packed-bits
+bitmap shape.
+
 ## Deferred — not yet supported
 
 - Kitty keyboard protocol (`CSI = …`).

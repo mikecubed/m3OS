@@ -7692,6 +7692,43 @@ const TUI_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
         "TUI_SMOKE:utf8:ok",
         "TUI_SMOKE:utf8:fail",
     ),
+    // Phase 69c Track F.1 — each `fonts <leaf>` leaf exercises one
+    // acceptance bullet from the TTF infrastructure gate.
+    (
+        "fonts-startup",
+        "/bin/tui-smoke fonts startup\n",
+        "guest/tui-smoke: fonts startup — staged font parses + atlas warms",
+        "TUI_SMOKE:fonts-startup:ok",
+        "TUI_SMOKE:fonts-startup:fail",
+    ),
+    (
+        "fonts-branch-icon",
+        "/bin/tui-smoke fonts branch-icon\n",
+        "guest/tui-smoke: fonts branch-icon — U+E0A0 rasterizes to non-blank pixels",
+        "TUI_SMOKE:fonts-branch-icon:ok",
+        "TUI_SMOKE:fonts-branch-icon:fail",
+    ),
+    (
+        "fonts-emoji",
+        "/bin/tui-smoke fonts emoji\n",
+        "guest/tui-smoke: fonts emoji — U+1F600 resolves (covered or fallback)",
+        "TUI_SMOKE:fonts-emoji:ok",
+        "TUI_SMOKE:fonts-emoji:fail",
+    ),
+    (
+        "fonts-adversarial",
+        "/bin/tui-smoke fonts adversarial\n",
+        "guest/tui-smoke: fonts adversarial — atlas stays capacity-bounded",
+        "TUI_SMOKE:fonts-adversarial:ok",
+        "TUI_SMOKE:fonts-adversarial:fail",
+    ),
+    (
+        "fonts-missing-font",
+        "/bin/tui-smoke fonts missing-font\n",
+        "guest/tui-smoke: fonts missing-font — static fallback resolves ASCII/Latin-1/box-drawing",
+        "TUI_SMOKE:fonts-missing-font:ok",
+        "TUI_SMOKE:fonts-missing-font:fail",
+    ),
 ];
 
 /// Phase 69 Track H.2 — step list for the tui-smoke gate. Each

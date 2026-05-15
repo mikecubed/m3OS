@@ -1,6 +1,6 @@
 # Phase 69c - TTF Font Loader and Nerd Font Asset Embedding
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69c
 **Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs)
 **Builds on:** Replaces the static bitmap glyph tables in `kernel-core::fb` with a TTF/OTF rasterizer + glyph atlas cache, and embeds a Nerd Font asset on the ext2 data disk so modern developer TUIs (lazygit, lf, fzf, starship glyphs, btop's gauges) render at full fidelity. Phase 69b's `resolve_glyph` accessor is the seam — its body changes from a static-table dispatch to an atlas lookup with a TTF-rasterized fallback.

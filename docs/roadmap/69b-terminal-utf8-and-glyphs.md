@@ -140,7 +140,7 @@ Pure-logic state machine. `Utf8Decoder::new()` starts in the `Initial` state. `d
 
 ## Deferred Until Later
 
-- TTF/OTF font loader + Nerd Font asset embedding → Phase 69c.
+- TTF/OTF font loader + Nerd Font asset embedding → Phase 69c. *(closed in Phase 69c — `kernel-core::font` ships a `ttf-parser`-backed parser, scanline rasterizer, and bounded LRU atlas; `term` opens `/usr/share/fonts/m3os/term.ttf` at boot and upgrades the renderer to the atlas path. Phase 69b's static-table resolver remains as the load-failure fallback.)*
 - CJK glyph tables (the EAW machinery is in place; tables alone are a future phase).
 - Unicode normalisation (NFC/NFD) — `term` does not currently transform input.
 - Combining-character handling beyond a single base glyph.
