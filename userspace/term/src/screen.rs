@@ -573,16 +573,13 @@ impl Screen {
     /// and forwarded to [`Screen::put_char`] directly (escape-sequence
     /// state is preserved across malformed payload bytes — a malformed
     /// byte inside an escape sequence is unusual but should not break
-    /// out of the in-flight sequence). BEL (`0x07`) is intercepted
-    /// before the decoder is consulted to preserve the Phase 57
-    /// `Bell` mapping exactly.
+    /// out of the in-flight sequence). BEL (`0x07`) is recognised
+    /// inside [`Screen::emit_codepoint`]; routing it through the
+    /// decoder first means a BEL that arrives mid-sequence cancels
+    /// the in-flight UTF-8 codepoint (emitting U+FFFD) before the
+    /// bell rings — otherwise the next continuation byte would
+    /// silently complete the broken sequence.
     pub fn feed(&mut self, byte: u8, out: &mut Vec<RenderCommand>) {
-        // BEL is intercepted before the parser so it does not become a
-        // `PutChar('\x07')`. The G.4 acceptance pins this mapping.
-        if byte == 0x07 {
-            out.push(RenderCommand::Bell);
-            return;
-        }
         match self.decoder.decode_byte(byte) {
             DecoderOutput::Pending => {}
             DecoderOutput::Codepoint(c) => self.emit_codepoint(c, out),
@@ -611,13 +608,17 @@ impl Screen {
     /// also handles the U+FFFD replacement-character path from
     /// malformed UTF-8.
     ///
-    /// BEL (U+0007) is mapped to a [`RenderCommand::Bell`] here too —
-    /// the outer [`Screen::feed`] intercepts raw 0x07 bytes before the
-    /// decoder, but a malformed UTF-8 sequence whose resync re-feed
-    /// happens to land on 0x07 would otherwise route through the
-    /// parser and emit a `PutGlyph` for the control codepoint. The
-    /// guard keeps the Phase 57 BEL mapping intact regardless of how
-    /// the codepoint was produced.
+    /// BEL (U+0007) is mapped to a [`RenderCommand::Bell`] here.
+    /// [`Screen::feed`] routes every byte (including 0x07) through
+    /// the decoder first, so the BEL guard is the single mapping
+    /// site: an isolated `0x07` byte decodes to `Codepoint(0x07)`
+    /// and lands here; a `0x07` byte arriving mid-multi-byte
+    /// sequence decodes to `InvalidThenCodepoint(0x07)`, in which
+    /// case `feed` emits U+FFFD for the cancelled in-flight
+    /// sequence before re-entering `emit_codepoint` with `0x07` and
+    /// ringing the bell. Without this guard the ASCII path below
+    /// would route 0x07 through the parser, which has no BEL
+    /// handler and would emit a `PutGlyph` for the control byte.
     fn emit_codepoint(&mut self, codepoint: u32, out: &mut Vec<RenderCommand>) {
         if codepoint == 0x07 {
             out.push(RenderCommand::Bell);
@@ -855,11 +856,15 @@ impl Screen {
         });
         self.cursor_col += 1;
         if width == 2 {
-            // Reserve the trailing cell as a continuation. No
-            // `PutGlyph` is emitted because the leading cell's draw
-            // already covers both columns — but the cell-state must
-            // reflect the wide accounting so subsequent overwrites
-            // know to blank the leader.
+            // Reserve the trailing cell as a continuation, AND emit a
+            // blank `PutGlyph` for it. The leading `PutGlyph` only
+            // paints a single 8×16 cell (the renderer has no
+            // wide-glyph protocol), so the trail column's previous
+            // pixels would otherwise stay visible underneath the
+            // wide-cell pair. The blank render command paints the
+            // background colour across the trail cell; the buffer
+            // entry retains `wide_continuation: true` so wide-cell
+            // accounting remains correct.
             let trail_col = self.cursor_col;
             if trail_col < self.cols {
                 let trail_idx = row as usize * self.cols as usize + trail_col as usize;
@@ -876,6 +881,15 @@ impl Screen {
                 if displaced_is_wide_leader && (trail_col + 1) < self.cols {
                     self.blank_cell(row, trail_col + 1, out);
                 }
+                // Paint the trail cell as a blank space so previous
+                // pixels are overwritten with bg.
+                out.push(RenderCommand::PutGlyph {
+                    row,
+                    col: trail_col,
+                    codepoint: b' ' as u32,
+                    fg,
+                    bg,
+                });
                 self.active_buf_mut()[trail_idx] = Cell {
                     codepoint: 0,
                     fg,
@@ -1534,9 +1548,11 @@ mod tests {
         assert_eq!(s.cell(0, 0).unwrap().codepoint, REPLACEMENT_CHARACTER);
     }
 
-    /// Phase 69b Track B.2 — BEL (0x07) is intercepted before the
-    /// decoder, exactly as in Phase 57. A BEL byte must not advance
-    /// any decoder state nor produce a cell update.
+    /// Phase 69b Track B.2 — BEL (0x07) routes through the UTF-8
+    /// decoder and the `emit_codepoint` BEL guard. When the decoder
+    /// is in the initial state, the result is identical to the
+    /// Phase 57 contract: a single [`RenderCommand::Bell`] with no
+    /// cell update.
     #[test]
     fn utf8_bel_byte_still_maps_to_bell_command() {
         let mut s = Screen::with_geometry(10, 2);
@@ -1548,10 +1564,52 @@ mod tests {
         assert_eq!(s.cell(0, 0).unwrap().codepoint, b' ' as u32);
     }
 
+    /// Phase 69b Track B.2 — when a BEL byte arrives while the
+    /// decoder is mid-sequence (e.g. one byte into a 2-byte UTF-8
+    /// codepoint), the in-flight sequence must be cancelled and
+    /// replaced by U+FFFD before the bell rings. The earlier
+    /// implementation intercepted BEL before the decoder, leaving
+    /// the pending state alive — so a following continuation byte
+    /// would silently complete the broken sequence.
+    #[test]
+    fn utf8_bel_during_pending_cancels_in_flight_sequence() {
+        let mut s = Screen::with_geometry(10, 2);
+        let mut out = Vec::new();
+        // Start a 2-byte sequence (U+00E9 → C3 A9 form) then send BEL
+        // before the continuation byte.
+        s.feed(0xC2, &mut out);
+        s.feed(0x07, &mut out);
+        // First a PutGlyph for U+FFFD (the cancelled in-flight
+        // sequence), then a Bell.
+        assert!(
+            matches!(out.first(), Some(RenderCommand::PutGlyph { codepoint, .. }) if *codepoint == REPLACEMENT_CHARACTER)
+        );
+        assert!(
+            out.iter().any(|c| matches!(c, RenderCommand::Bell)),
+            "BEL must be emitted after cancelling the pending sequence: {out:?}"
+        );
+        // Now feed a continuation byte that *would* have combined with
+        // the stale 0xC2 if the decoder had not been reset. With the
+        // fix, 0xA9 is a stray continuation → another U+FFFD, never
+        // U+00A9.
+        out.clear();
+        s.feed(0xA9, &mut out);
+        let last_glyph = out
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::PutGlyph { codepoint, .. } => Some(*codepoint),
+                _ => None,
+            })
+            .last();
+        assert_eq!(last_glyph, Some(REPLACEMENT_CHARACTER));
+    }
+
     /// Phase 69b Track F — a width-2 codepoint (CJK U+4E2D = 中)
     /// occupies the leading cell plus the trailing cell as a
-    /// wide-continuation. The renderer sees exactly one `PutGlyph`
-    /// for the leading cell.
+    /// wide-continuation. The renderer sees a `PutGlyph` for the
+    /// leading cell *and* a blank `PutGlyph` for the trailing cell
+    /// — the leader's draw covers only one 8×16 cell, so the trail
+    /// needs its own command to overwrite any previous pixels there.
     #[test]
     fn utf8_wide_codepoint_reserves_two_cells() {
         let mut s = Screen::with_geometry(10, 2);
@@ -1573,12 +1631,24 @@ mod tests {
         assert_eq!(trail.codepoint, 0);
         // Cursor advanced by 2.
         assert_eq!(s.cursor(), (0, 2));
-        // Exactly one PutGlyph for the leading cell.
-        let put_glyphs = out
+        // Two PutGlyph commands: the leading cell with the wide
+        // codepoint, and the trailing cell with a blank space so
+        // previous pixels at the trail column are overwritten.
+        let put_glyphs: Vec<_> = out
             .iter()
-            .filter(|c| matches!(c, RenderCommand::PutGlyph { .. }))
-            .count();
-        assert_eq!(put_glyphs, 1);
+            .filter_map(|c| match c {
+                RenderCommand::PutGlyph {
+                    row,
+                    col,
+                    codepoint,
+                    ..
+                } => Some((*row, *col, *codepoint)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(put_glyphs.len(), 2);
+        assert_eq!(put_glyphs[0], (0, 0, 0x4E2D));
+        assert_eq!(put_glyphs[1], (0, 1, b' ' as u32));
     }
 
     /// Phase 69b Track F — overwriting the trailing cell of a wide
@@ -1645,6 +1715,47 @@ mod tests {
         assert!(
             !displaced_trail.wide_continuation,
             "column 2 must not be an orphan wide_continuation after a new wide leader is written at column 0"
+        );
+    }
+
+    /// Phase 69b Track F — a wide glyph wrapping at the last column
+    /// still emits a leader `PutGlyph` AND a blank trail `PutGlyph`
+    /// on the destination row so the wrap target's previous pixels
+    /// in both columns are overwritten.
+    #[test]
+    fn utf8_wide_codepoint_wrap_emits_trail_blank_on_destination_row() {
+        let mut s = Screen::with_geometry(3, 2);
+        let mut out = Vec::new();
+        // Fill columns 0 and 1 on row 0 so the wide glyph cannot fit
+        // there — it must wrap to row 1.
+        s.feed(b'a', &mut out);
+        s.feed(b'b', &mut out);
+        out.clear();
+        for &b in &[0xE4u8, 0xB8, 0xAD] {
+            s.feed(b, &mut out);
+        }
+        let glyph_puts: Vec<_> = out
+            .iter()
+            .filter_map(|c| match c {
+                RenderCommand::PutGlyph {
+                    row,
+                    col,
+                    codepoint,
+                    ..
+                } => Some((*row, *col, *codepoint)),
+                _ => None,
+            })
+            .collect();
+        // The wrap path blanks the unused cell at (0, 2) before the
+        // line feed; then the destination row gets the wide leader
+        // at (1, 0) and the blank trail at (1, 1).
+        assert!(
+            glyph_puts.contains(&(1, 0, 0x4E2D)),
+            "expected leader PutGlyph at (1,0): {glyph_puts:?}"
+        );
+        assert!(
+            glyph_puts.contains(&(1, 1, b' ' as u32)),
+            "expected blank trail PutGlyph at (1,1): {glyph_puts:?}"
         );
     }
 
