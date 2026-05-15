@@ -22,3 +22,43 @@ pub mod raster;
 pub use atlas::{Atlas, AtlasError, DEFAULT_ATLAS_CAPACITY};
 pub use parser::{Font, FontError, GlyphId};
 pub use raster::{RasterBitmap, Rasterizer};
+
+/// A borrowed glyph bitmap descriptor — the common shape the
+/// renderer hands to the framebuffer owner.
+///
+/// Both the Phase 69b static [`crate::session::font::Glyph`] and the
+/// Phase 69c atlas-rasterized [`RasterBitmap`] flatten to a
+/// `GlyphView` so the framebuffer owner consumes a single shape. The
+/// view borrows from its owner; no allocation is involved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlyphView<'a> {
+    /// Pixel width of the cell.
+    pub width: u8,
+    /// Pixel height of the cell.
+    pub height: u8,
+    /// Packed bitmap data, row-major, MSB-first per byte. Bytes per
+    /// row is `ceil(width / 8)`.
+    pub bitmap: &'a [u8],
+}
+
+impl RasterBitmap {
+    /// Borrow this bitmap as the common [`GlyphView`] shape.
+    pub fn as_view(&self) -> GlyphView<'_> {
+        GlyphView {
+            width: self.width,
+            height: self.height,
+            bitmap: &self.bitmap,
+        }
+    }
+}
+
+impl crate::session::font::Glyph {
+    /// Borrow this static glyph as the common [`GlyphView`] shape.
+    pub fn as_view(&self) -> GlyphView<'_> {
+        GlyphView {
+            width: self.width,
+            height: self.height,
+            bitmap: self.bitmap,
+        }
+    }
+}

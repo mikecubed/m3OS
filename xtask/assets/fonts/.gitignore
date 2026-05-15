@@ -1,0 +1,4 @@
+# Phase 69c Track D — the font binary is fetched, not committed.
+# `cargo xtask fetch-fonts` populates this directory; only the
+# SHA-256 lives in the repository so the asset is reproducible.
+term.ttf

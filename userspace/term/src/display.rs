@@ -29,8 +29,7 @@ use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
 };
-use kernel_core::session::BLANK_GLYPH;
-use kernel_core::session::font::BasicBitmapFont;
+use kernel_core::font::GlyphView;
 use syscall_lib::STDOUT_FILENO;
 
 use crate::render::FramebufferOwner;
@@ -327,7 +326,15 @@ impl DisplayClient {
 }
 
 impl FramebufferOwner for DisplayClient {
-    fn put_glyph(&mut self, row: u16, col: u16, codepoint: u32, fg: u32, bg: u32) {
+    fn put_glyph(
+        &mut self,
+        row: u16,
+        col: u16,
+        _codepoint: u32,
+        glyph: &GlyphView<'_>,
+        fg: u32,
+        bg: u32,
+    ) {
         // Resolve fg/bg fallbacks. The screen always passes explicit
         // colours, but defending against the all-zero pair keeps a
         // future caller from rendering invisible glyphs.
@@ -355,11 +362,6 @@ impl FramebufferOwner for DisplayClient {
             None => return,
         };
 
-        // The font's `render_into` writes BGRA8888 pixels into a
-        // caller-supplied `&mut [u32]` row-major buffer. We carve
-        // a sub-slice of the cell's pixels and pass the surface
-        // stride (in u32 pixels) so glyph rows index correctly into
-        // the larger surface buffer.
         // SAFETY: see `pixels_mut` — the borrow stays inside this
         // call and the compositor snapshots before reading.
         let pixels = unsafe { self.pixels_mut() };
@@ -376,24 +378,21 @@ impl FramebufferOwner for DisplayClient {
         };
         let cell_view = &mut pixels_u32[cell_offset..];
 
-        // Phase 69b Track E — resolve through `glyph_or_fallback` so
-        // U+FFFD and uncovered codepoints (e.g. CJK before the Phase
-        // 69c tables ship) paint the centred-dot fallback glyph
-        // rather than rendering as a blank background cell. Control
-        // characters route to `BLANK_GLYPH`, which we explicitly map
-        // to a bg-only fill so they stay invisible.
-        let font = BasicBitmapFont::new();
-        let glyph = font.glyph_or_fallback(codepoint);
-        if core::ptr::eq(glyph, &BLANK_GLYPH) {
+        // Phase 69c Track E.2 — the renderer pre-resolved the
+        // codepoint to a `GlyphView`, so we paint whatever bitmap
+        // was handed in. Control codepoints and uncovered codepoints
+        // resolve to all-zero bitmaps; we treat them as "render
+        // background" and skip the bit-walk for performance.
+        if glyph.bitmap.iter().all(|&b| b == 0) {
             fill_cell_bg(
                 cell_view,
                 stride_pixels,
-                CELL_WIDTH as usize,
-                CELL_HEIGHT as usize,
+                glyph.width as usize,
+                glyph.height as usize,
                 bg,
             );
         } else {
-            let _ = glyph.render_into(cell_view, stride_pixels, fg, bg);
+            blit_glyph_view(glyph, cell_view, stride_pixels, fg, bg);
         }
     }
 
@@ -456,6 +455,42 @@ impl FramebufferOwner for DisplayClient {
             return false;
         }
         self.publish_frame()
+    }
+}
+
+/// Phase 69c Track E.2 — blit a [`GlyphView`] into the cell.
+/// Mirrors the layout `Glyph::render_into` enforced before the
+/// renderer started resolving glyphs itself: packed bits row-major,
+/// MSB-first per byte. Atlas-rasterized bitmaps share the same
+/// layout so both paths use this helper.
+fn blit_glyph_view(
+    glyph: &GlyphView<'_>,
+    cell_view: &mut [u32],
+    stride_pixels: usize,
+    fg: u32,
+    bg: u32,
+) {
+    let w = glyph.width as usize;
+    let h = glyph.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let bytes_per_row = w.div_ceil(8);
+    for row in 0..h {
+        let row_start = row * bytes_per_row;
+        for col in 0..w {
+            let byte_idx = row_start + col / 8;
+            if byte_idx >= glyph.bitmap.len() {
+                break;
+            }
+            let bit_idx = 7 - (col % 8);
+            let bit_set = (glyph.bitmap[byte_idx] >> bit_idx) & 1 == 1;
+            let dst = row * stride_pixels + col;
+            if dst >= cell_view.len() {
+                return;
+            }
+            cell_view[dst] = if bit_set { fg } else { bg };
+        }
     }
 }
 

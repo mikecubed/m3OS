@@ -204,6 +204,12 @@ fn program_main(_args: &[&str]) -> i32 {
     //    not retry the audio path forever.
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
+    // Phase 69c Track E.1 — try to load the Nerd Font asset and
+    // upgrade the renderer to atlas-backed glyph resolution. On any
+    // failure (file missing, parse error, OOM) the renderer stays
+    // on the Phase 69b static-table path and the terminal remains
+    // usable for ASCII / Latin-1 / box-drawing.
+    build_atlas(&mut renderer);
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
 
@@ -448,6 +454,115 @@ impl PtyWriter for PrimaryFdWriter {
 #[cfg(not(test))]
 fn wait_for_shell_dependencies() -> bool {
     syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
+}
+
+/// Phase 69c Track E.1 — load the Nerd Font asset from
+/// `/usr/share/fonts/m3os/term.ttf` and upgrade `renderer` to the
+/// atlas-backed glyph path. On any failure (file missing, parse
+/// error, OOM) the renderer is left on Phase 69b's static-table
+/// fallback and a single warning lands in the boot log so a
+/// developer can correlate "no Nerd Font glyphs" with "load
+/// failed". The font path is hard-coded — Phase 69c deliberately
+/// defers configurable paths to a later phase.
+#[cfg(not(test))]
+fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::Renderer<F>) {
+    const FONT_PATH: &[u8] = b"/usr/share/fonts/m3os/term.ttf\0";
+    const ATLAS_CELL_W: u16 = 8;
+    const ATLAS_CELL_H: u16 = 16;
+    let fd = syscall_lib::open(FONT_PATH, syscall_lib::O_RDONLY, 0);
+    if fd < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: font load failed; using static fallback\n",
+        );
+        return;
+    }
+    let fd = fd as i32;
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = syscall_lib::read(fd, &mut chunk);
+        if n <= 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n as usize]);
+    }
+    let _ = syscall_lib::close(fd);
+    if bytes.is_empty() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: font load failed; using static fallback\n",
+        );
+        return;
+    }
+    match kernel_core::font::Atlas::new(
+        bytes,
+        ATLAS_CELL_W,
+        ATLAS_CELL_H,
+        kernel_core::font::DEFAULT_ATLAS_CAPACITY,
+    ) {
+        Ok(atlas) => {
+            // Pre-warm with a small ASCII range so the boot log
+            // can report a glyph count. The atlas keeps a small
+            // hot set; we touch enough codepoints to clear the
+            // "atlas loaded N glyphs" gate without bloating
+            // memory.
+            let mut atlas = atlas;
+            for cp in 0x20u32..=0x7E {
+                let _ = atlas.resolve(cp);
+            }
+            let n = atlas.len();
+            renderer.set_atlas(atlas);
+            let mut buf = [0u8; 64];
+            let s = format_atlas_msg(&mut buf, n);
+            syscall_lib::write(STDOUT_FILENO, s);
+        }
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "term: font load failed; using static fallback\n",
+            );
+        }
+    }
+}
+
+/// Build the boot-log line `term: atlas loaded <N> glyphs\n` into
+/// the caller-provided buffer. `no_std`-friendly so we don't need
+/// `format!` (which would pull in `alloc::string::String` formatting
+/// into the hot path).
+#[cfg(not(test))]
+fn format_atlas_msg(buf: &mut [u8; 64], n: usize) -> &[u8] {
+    const PREFIX: &[u8] = b"term: atlas loaded ";
+    const SUFFIX: &[u8] = b" glyphs\n";
+    let mut i = 0;
+    for &b in PREFIX {
+        buf[i] = b;
+        i += 1;
+    }
+    // Write `n` decimal.
+    let mut digits = [0u8; 20];
+    let mut d_len = 0;
+    let mut v = n;
+    if v == 0 {
+        digits[0] = b'0';
+        d_len = 1;
+    } else {
+        while v > 0 {
+            digits[d_len] = b'0' + (v % 10) as u8;
+            d_len += 1;
+            v /= 10;
+        }
+    }
+    while d_len > 0 {
+        d_len -= 1;
+        buf[i] = digits[d_len];
+        i += 1;
+    }
+    for &b in SUFFIX {
+        buf[i] = b;
+        i += 1;
+    }
+    &buf[..i]
 }
 
 /// Monotonic clock for [`Bell::ring`]. Tiny wrapper around

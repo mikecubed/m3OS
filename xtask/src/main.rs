@@ -456,6 +456,11 @@ fn main() {
             cmd_regression(&regression_args);
         }
         Some("clean") => cmd_clean(),
+        // Phase 69c Track D.1 — download + checksum-verify the
+        // JetBrainsMono Nerd Font into xtask/assets/fonts/term.ttf.
+        // The font is gitignored; the checksum lives in
+        // xtask/assets/fonts/term.ttf.sha256 and is committed.
+        Some("fetch-fonts") => cmd_fetch_fonts(),
         Some("stress") => {
             let stress_args = parse_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -485,7 +490,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -8704,6 +8709,22 @@ fn populate_ext2_files(
     // missing `tic` as a hard error per A.2 acceptance.
     let terminfo_bin = compile_m3os_terminfo(output_dir);
 
+    // Phase 69c Track D.2 — stage the Nerd Font asset so `term` can
+    // resolve any Unicode codepoint at runtime through the TTF atlas.
+    // The font is fetched (not committed) by `cargo xtask fetch-fonts`
+    // into `xtask/assets/fonts/term.ttf`; a missing file means the
+    // developer forgot to fetch — treat as a hard, actionable error
+    // so a silently-fallback build doesn't ship without the icons.
+    let font_src = workspace_root().join("xtask/assets/fonts/term.ttf");
+    if !font_src.is_file() {
+        eprintln!(
+            "Error: Nerd Font asset missing at {}\n\
+             Run `cargo xtask fetch-fonts` first.",
+            font_src.display()
+        );
+        std::process::exit(1);
+    }
+
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");
     let shadow_tmp = output_dir.join("_tmp_shadow");
@@ -9018,6 +9039,18 @@ fn populate_ext2_files(
          sif usr/share/terminfo/m/m3os-term mode 0x81A4\n\
          sif usr/share/terminfo/m/m3os-term uid 0\n\
          sif usr/share/terminfo/m/m3os-term gid 0\n\
+         mkdir usr/share/fonts\n\
+         sif usr/share/fonts mode 0x41ED\n\
+         sif usr/share/fonts uid 0\n\
+         sif usr/share/fonts gid 0\n\
+         mkdir usr/share/fonts/m3os\n\
+         sif usr/share/fonts/m3os mode 0x41ED\n\
+         sif usr/share/fonts/m3os uid 0\n\
+         sif usr/share/fonts/m3os gid 0\n\
+         write \"{font_src}\" usr/share/fonts/m3os/term.ttf\n\
+         sif usr/share/fonts/m3os/term.ttf mode 0x81A4\n\
+         sif usr/share/fonts/m3os/term.ttf uid 0\n\
+         sif usr/share/fonts/m3os/term.ttf gid 0\n\
          sif dev mode 0x41ED\n\
          sif dev uid 0\n\
          sif dev gid 0\n\
@@ -9136,6 +9169,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         terminfo_bin = terminfo_bin.display(),
+        font_src = font_src.display(),
     );
 
     let mut debugfs = Command::new("debugfs")
@@ -9719,6 +9753,128 @@ fn collect_ports_entries(
 /// Gated by the env var to avoid unexpected network access in offline/CI builds.
 /// Verifies the SHA-256 checksum of the downloaded file and removes it on mismatch.
 /// Tries `curl` first, then `wget`.
+/// Phase 69c Track D.1 — fetch the JetBrainsMono Nerd Font Mono
+/// regular variant into `xtask/assets/fonts/term.ttf`. The asset is
+/// gitignored so the repository stays small; the SHA-256 checksum
+/// lives in `xtask/assets/fonts/term.ttf.sha256` (committed) and a
+/// mismatched download is treated as a hard error.
+///
+/// Subsequent runs verify the checksum and skip the download when
+/// the file already matches — this keeps the gate cheap for
+/// developers who already have the asset on disk.
+fn cmd_fetch_fonts() {
+    const FONT_URL: &str = "https://github.com/ryanoasis/nerd-fonts/raw/v3.2.1/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf";
+    let root = workspace_root();
+    let dest = root.join("xtask/assets/fonts/term.ttf");
+    let checksum_path = root.join("xtask/assets/fonts/term.ttf.sha256");
+
+    if !checksum_path.is_file() {
+        eprintln!(
+            "fetch-fonts: missing checksum file {}\n\
+             (Phase 69c Track D.1 expects this file to be committed alongside the URL.)",
+            checksum_path.display()
+        );
+        std::process::exit(1);
+    }
+    let expected = match fs::read_to_string(&checksum_path) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
+            eprintln!(
+                "fetch-fonts: failed to read {}: {e}",
+                checksum_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!(
+            "fetch-fonts: checksum file does not contain a 64-char hex digest: {}",
+            checksum_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Idempotent: skip the download when the file already matches.
+    if dest.is_file() && verify_sha256_strict(&dest, &expected) {
+        println!(
+            "fetch-fonts: {} already present and checksum matches; nothing to do.",
+            dest.display()
+        );
+        return;
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).expect("create xtask/assets/fonts");
+    }
+
+    println!("fetch-fonts: downloading JetBrainsMono Nerd Font Mono Regular (~2 MB)...");
+    println!("fetch-fonts: source: {FONT_URL}");
+
+    let curl_ok = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--output",
+            dest.to_str().expect("UTF-8 path"),
+            FONT_URL,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !curl_ok || !dest.exists() {
+        let wget_ok = Command::new("wget")
+            .args(["-q", "-O", dest.to_str().expect("UTF-8 path"), FONT_URL])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !wget_ok || !dest.exists() {
+            eprintln!(
+                "fetch-fonts: download failed (need `curl` or `wget` on PATH)\n\
+                 Manually drop the asset at {} and re-run.",
+                dest.display()
+            );
+            let _ = fs::remove_file(&dest);
+            std::process::exit(1);
+        }
+    }
+
+    if !verify_sha256_strict(&dest, &expected) {
+        eprintln!(
+            "fetch-fonts: SHA-256 mismatch on downloaded font; removing.\n\
+             Expected: {expected}\n\
+             Path:     {}",
+            dest.display()
+        );
+        let _ = fs::remove_file(&dest);
+        std::process::exit(1);
+    }
+    println!("fetch-fonts: downloaded and verified → {}", dest.display());
+}
+
+/// Hex SHA-256 of `path` compared to `expected` (lowercase hex).
+/// Returns true on a confirmed match. Implemented with the workspace
+/// `sha2` crate so this function works on hosts without
+/// `sha256sum`.
+fn verify_sha256_strict(path: &Path, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.eq_ignore_ascii_case(expected)
+}
+
 fn fetch_doom_wad(dest: &Path) {
     const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
     // SHA-256 of doom1.wad from distro.ibiblio.org (verified 2026-04-04).
