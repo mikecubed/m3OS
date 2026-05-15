@@ -125,7 +125,8 @@ Public `Termios`, `tcgetattr`, `tcsetattr`, `cfmakeraw`. Wraps the kernel ABI in
 9. Expose `tcgetattr` / `tcsetattr` / `cfmakeraw` and the `Termios` struct from `userspace/syscall-lib`.
 10. Build `tcsmoke` (or extend `tui-smoke`); add a `cargo xtask termios-smoke` gate.
 11. Cross-reference Phase 22 + Phase 29 docs; update `docs/appendix/term-escape-sequences.md` with a new "Termios contract" section.
-12. Kernel version bump to 0.69.1 (patch bump — userspace surface + kernel ldisc only; no ABI break beyond the new ioctls).
+12. Author the aligned legacy learning doc at `docs/69a-terminal-termios.md` following the template in `docs/appendix/doc-templates.md` (Overview, What This Doc Covers, Key Files, Closure of Related Phases, Related Roadmap Docs).
+13. Kernel version bump to 0.69.1 (patch bump — userspace surface + kernel ldisc only; no ABI break beyond the new ioctls).
 
 ## Acceptance Criteria
 
