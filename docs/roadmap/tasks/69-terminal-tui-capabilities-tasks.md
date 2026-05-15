@@ -177,8 +177,8 @@
 **Acceptance:**
 - [x] `Screen::resize(cols, rows)` reallocates both the primary and alternate grids, clamps the cursor to the new bounds, and re-emits a full-redraw damage hint.
 - [x] `handle_surface_resize` calls `syscall_lib::ioctl(slave_fd, TIOCSWINSZ, &Winsize { ws_row: rows, ws_col: cols, … })`.
-- [x] `tui-smoke resize` (Track H) verifies a self-installed SIGWINCH handler runs after the resize call.
-- [x] `stty size` inside `term` after a resize reports the updated rows and columns (covered by `tui-smoke`).
+- [x] `tui-smoke resize` (Track H) calls `ioctl(STDIN_FILENO, TIOCSWINSZ, &Winsize{32, 100, …})`, asserts the syscall returns `0`, and reads back `TIOCGWINSZ` to confirm the kernel TTY's `winsize` was actually updated to `(32, 100)` — the resize request and the kernel-side acceptance are both verified end-to-end.
+- [~] *Partial.* The downstream SIGWINCH delivery to the foreground process group is wired in the kernel (`kernel/src/arch/x86_64/syscall/mod.rs::TIOCSWINSZ` branch, audited in D.3) but `tui-smoke` does not yet install a SIGWINCH handler and assert the counter increments — adding that requires the userspace signal-install path that `tui-smoke` currently does not exercise. Tracked as a follow-up alongside the `InputHandler` Home/End extension.
 
 ### D.3 — Kernel SIGWINCH path verification
 
@@ -293,7 +293,7 @@
 
 **Acceptance:**
 - [x] Binary follows the four-place pipeline (workspace member, xtask `bins` array with `needs_alloc = true`, ramdisk `BIN_ENTRIES` entry, no service-conf needed since it is not a daemon).
-- [x] Subcommands: `alt-screen`, `colors`, `mouse`, `cursor`, `resize`, `paste`. Each prints `TUI_SMOKE:<name>:ok` on success and `TUI_SMOKE:<name>:fail <reason>` on failure, exiting with the matching status.
+- [x] Subcommands: `term-env`, `alt-screen`, `colors`, `mouse`, `cursor`, `resize`, `paste` (seven total — `term-env` was added during PR 168 implementation to gate the `TERM=m3os-term` environment-propagation contract from `init`/`login`/`shell`). Each prints `TUI_SMOKE:<name>:ok` on success and `TUI_SMOKE:<name>:fail <reason>` on failure, exiting with the matching status.
 - [x] Each subcommand asserts on observable state (cell snapshot, recorded `(fg,bg)`, recorded cursor shape, PTY echo bytes, `getenv("TERM")`, `stty size`-equivalent ioctl, SIGWINCH handler counter) — not just "no crash."
 - [x] Binary uses `syscall_lib::heap::BrkAllocator` per the four-place rule.
 
@@ -304,8 +304,8 @@
 **Why it matters:** A reproducible CI gate is the load-bearing acceptance signal for the phase; without it, regressions creep back.
 
 **Acceptance:**
-- [x] `cargo xtask tui-smoke` boots the kernel under QEMU, waits for the `TERM_SMOKE:ready` sentinel, then drives `tui-smoke <subcmd>` for each of the six subcommands via the existing PTY-driver shape used by `smoke-test`.
-- [x] The gate asserts all six subcommands print `TUI_SMOKE:<name>:ok` and exit zero.
+- [x] `cargo xtask tui-smoke` boots the kernel under QEMU, waits for the `TERM_SMOKE:ready` sentinel, then drives `tui-smoke <subcmd>` for each of the seven subcommands (`term-env`, `alt-screen`, `colors`, `mouse`, `cursor`, `resize`, `paste`) via the existing PTY-driver shape used by `smoke-test`. The subcommand matrix lives in a single source of truth (`xtask/src/main.rs::TUI_SMOKE_SUBCOMMANDS`) so the launcher log and `tui_smoke_steps` cannot drift.
+- [x] The gate asserts all seven subcommands print `TUI_SMOKE:<name>:ok` and exit zero.
 - [x] Total runtime under 90 s on a developer laptop; the gate is added to the pre-push hook behind `M3OS_TUI_REGRESSION=1` (matching the existing optional-regression-gate pattern).
 
 ---
