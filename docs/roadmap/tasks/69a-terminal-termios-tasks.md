@@ -18,7 +18,7 @@
 | G | ISIG-driven signal-from-terminal path (`VINTR`/`VQUIT`/`VSUSP`) | E | Planned |
 | H | Userspace surface: `Termios`, `tcgetattr`, `tcsetattr`, `cfmakeraw` in `syscall-lib` | B | Planned |
 | I | Validation: `tcsmoke` binary + `cargo xtask termios-smoke` gate | C, D, E, F, G, H | Planned |
-| J | Documentation: Phase 22 / 29 cross-refs; appendix update; kernel patch bump to 0.69.1 | I | Planned |
+| J | Documentation: Phase 22 / 29 cross-refs; appendix update; aligned legacy learning doc; kernel patch bump to 0.69.1 | I | Planned |
 
 ---
 
@@ -284,7 +284,20 @@
 - [ ] New "Termios contract" section enumerates every supported flag in each mode word.
 - [ ] Cross-refs the userspace `syscall-lib` shim and the host test crate.
 
-### J.3 — Kernel patch bump to 0.69.1
+### J.3 — Create the aligned legacy learning doc
+
+**File:** `docs/69a-terminal-termios.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a self-contained reference for the termios contract — the full POSIX flag set, VMIN/VTIME timer semantics, the ISIG signal-from-terminal path, and the cooked-vs-raw line-discipline split — without conflating it with Phase 22's initial TTY bring-up or Phase 29's PTY pair. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
+
+**Acceptance:**
+- [ ] `docs/69a-terminal-termios.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 69a`, `**Status:** Planned`, `**Source Ref:** phase-69a`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining what Phase 22 / 29 left as "minimal termios" and what Phase 69a closes (full flag plumbing, raw/cbreak mode, VMIN/VTIME, ISIG, `tcgetattr`/`tcsetattr` on both TTY0 and PTY slave).
+- [ ] Key Files table cites `kernel-core/src/tty.rs` (extended — full `Termios` + flag constants + ldisc state machine), `kernel-core/src/pty.rs` (per-pair termios state), `kernel/src/tty.rs` (ldisc action dispatch + blocking-read primitive), `kernel/src/arch/x86_64/syscall/mod.rs` (`TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` ioctl branches), `userspace/syscall-lib/src/lib.rs` (`Termios`, `tcgetattr`, `tcsetattr`, `cfmakeraw`), and `userspace/tcsmoke/src/main.rs` (validation binary).
+- [ ] Closure of Related Phases section cross-refs Phase 22 (TTY/PTY) and Phase 29 (PTY Subsystem) and explicitly notes which "minimal termios" caveats each phase doc carried that Phase 69a closes.
+- [ ] Related Roadmap Docs links `docs/roadmap/69a-terminal-termios.md` and `docs/roadmap/tasks/69a-terminal-termios-tasks.md`.
+
+### J.4 — Kernel patch bump to 0.69.1
 
 **Files:**
 - `kernel/Cargo.toml`
