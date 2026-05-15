@@ -124,3 +124,12 @@ This is sufficient for remote access and terminal multiplexing.
 - Terminal multiplexer (screen/tmux-style)
 - Dynamic PTY allocation beyond the fixed pool
 - `/dev/tty` (controlling terminal device node)
+
+## Subsequent Phase Closeout
+
+The PTY-side termios contract — `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` against
+the slave fd, full `c_iflag`/`c_oflag`/`c_lflag`/`c_cc` plumbing through the
+shared ldisc, the four-quadrant VMIN/VTIME timer threaded through
+`pty_slave_read`, and PTY master `TCGETS` returning `-ENOTTY` (matching Linux
+`n_tty.c`) — landed in **Phase 69a** (Termios Raw Mode and Line Discipline).
+See [Phase 69a](./69a-terminal-termios.md) for the closeout details.

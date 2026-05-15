@@ -170,3 +170,13 @@ if [ "${M3OS_DOOM_AUDIO_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask doom-audio-smoke..."
     cargo xtask doom-audio-smoke --timeout 120
 fi
+
+# Phase 69a Track I.2 — termios contract gate. Gated behind
+# M3OS_TERMIOS_REGRESSION=1 because the gate boots QEMU + runs six
+# /bin/tcsmoke subcommands; ~35s wall-clock.  Set the env var on
+# branches that touch the kernel TTY/PTY ldisc, the termios ioctl
+# branches, or syscall-lib's tcgetattr/tcsetattr surface.
+if [ "${M3OS_TERMIOS_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask termios-smoke..."
+    cargo xtask termios-smoke --timeout 90
+fi

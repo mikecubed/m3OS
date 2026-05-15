@@ -45,6 +45,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 const SIGINT: i32 = 2;
+const SIGHUP: i32 = 1;
 
 /// Set by the SIGINT handler in the `isig` test.
 static SIGINT_FIRED: AtomicU32 = AtomicU32::new(0);
@@ -52,6 +53,13 @@ static SIGINT_FIRED: AtomicU32 = AtomicU32::new(0);
 extern "C" fn sigint_handler(_sig: i32) {
     SIGINT_FIRED.fetch_add(1, Ordering::SeqCst);
 }
+
+/// SIGHUP handler that swallows the signal.  Needed because closing the
+/// PTY master at the end of the `isig` test sends SIGHUP to the
+/// foreground process group we installed ourselves into via TIOCSPGRP;
+/// without a handler the default action would terminate tcsmoke before
+/// it can print `TC_SMOKE:isig:ok`.
+extern "C" fn sighup_handler(_sig: i32) {}
 
 syscall_lib::entry_point!(program_main);
 
@@ -341,6 +349,11 @@ fn isig_inner(mfd: i32, sfd: i32) -> Result<(), &'static str> {
     SIGINT_FIRED.store(0, Ordering::SeqCst);
     if rt_sigaction_simple(SIGINT as usize, sigint_handler) < 0 {
         return Err("sigaction failed");
+    }
+    // Install a SIGHUP swallow so the `close_master` SIGHUP at the end of
+    // run_isig does not terminate us before we print the result line.
+    if rt_sigaction_simple(SIGHUP as usize, sighup_handler) < 0 {
+        return Err("sigaction SIGHUP failed");
     }
 
     // Make the parent the foreground process group of the slave PTY so
