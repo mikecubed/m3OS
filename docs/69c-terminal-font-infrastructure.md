@@ -219,18 +219,26 @@ Five subcommand leaves, each emitting
 - **`startup`** — opens the staged font, builds a fresh atlas,
   pre-warms `U+0020..=U+007F`, asserts ≥ 64 of those produce
   non-blank pixels and the atlas length is ≥ 64.
-- **`branch-icon`** — resolves `U+E0A0` and asserts the bitmap is
-  non-blank, then feeds the UTF-8 bytes of `U+E0A0` through a
+- **`branch-icon`** — confirms the font's cmap covers `U+E0A0`
+  (`Font::glyph_index` is `Some`), resolves the codepoint, and
+  asserts the bitmap is non-blank *and* has more ink than the
+  4-pixel fallback dot — so a stripped non-Nerd-Font asset cannot
+  silently pass. Also feeds the UTF-8 bytes of `U+E0A0` through a
   `Screen` instance and asserts `Cell::codepoint == 0xE0A0`.
-- **`emoji`** — resolves `U+1F600`. Pass either way: covered
-  glyphs produce non-blank pixels, uncovered ones fall back to
-  the centred-dot. Neither must crash.
-- **`adversarial`** — writes 2048 distinct codepoints into a 1024-
-  cap atlas and asserts `atlas.len() <= 1024`.
+- **`emoji`** — resolves `U+1F600` and asserts the bitmap is not
+  blank. Either real ink (font covered it) or the centred-dot
+  fallback shape (font did not) is acceptable; the assertion
+  rejects a silent regression that returns a blank cell.
+- **`adversarial`** — writes 2 × CAP distinct codepoints into a
+  CAP-sized atlas and asserts `atlas.len() == CAP`, the
+  first-inserted codepoint has been evicted, and the
+  most-recently-inserted one is still cached.
 - **`missing-font`** — asserts the Phase 69b static-table resolver
-  still produces ink for ASCII / Latin-1 / box-drawing. The xtask
-  harness owns the "boot with the font omitted, watch for the
-  fallback log line" half of this gate.
+  still produces ink for ASCII / Latin-1 / box-drawing. **Deferred**:
+  the complementary "boot with the font omitted, watch for the
+  fallback log line" half of this gate is not yet wired — the
+  current xtask harness always stages the font on the data disk.
+  A dedicated stripped-disk boot is tracked as a follow-up.
 
 ## Key Files
 

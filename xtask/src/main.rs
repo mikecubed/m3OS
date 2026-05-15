@@ -9783,13 +9783,6 @@ fn collect_ports_entries(
     }
 }
 
-/// Download doom1.wad (shareware, freely redistributable) into `dest`.
-///
-/// Download `doom1.wad` (shareware) to `dest` if `M3OS_DOWNLOAD_WAD=1` is set.
-///
-/// Gated by the env var to avoid unexpected network access in offline/CI builds.
-/// Verifies the SHA-256 checksum of the downloaded file and removes it on mismatch.
-/// Tries `curl` first, then `wget`.
 /// Phase 69c Track D.1 — fetch the JetBrainsMono Nerd Font Mono
 /// regular variant into `xtask/assets/fonts/term.ttf`. The asset is
 /// gitignored so the repository stays small; the SHA-256 checksum
@@ -9912,6 +9905,11 @@ fn verify_sha256_strict(path: &Path, expected: &str) -> bool {
     hex.eq_ignore_ascii_case(expected)
 }
 
+/// Download `doom1.wad` (shareware, freely redistributable) to `dest` when
+/// `M3OS_DOWNLOAD_WAD=1` is set. Gated by the env var so offline / CI builds
+/// don't make unexpected network calls. Verifies the SHA-256 checksum of the
+/// downloaded file and removes it on mismatch. Tries `curl` first, then
+/// `wget`.
 fn fetch_doom_wad(dest: &Path) {
     const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
     // SHA-256 of doom1.wad from distro.ibiblio.org (verified 2026-04-04).

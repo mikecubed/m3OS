@@ -469,11 +469,15 @@ fn run_utf8() -> Result<(), &'static str> {
 /// - `adversarial` — writes 2048 distinct codepoints to a 1024-cap
 ///   atlas. Asserts `atlas.len() <= 1024` after the stream and that
 ///   the most-recent insert is present.
-/// - `missing-font` — assertion is owned by the xtask harness
-///   (boot the kernel with the font omitted from the data disk).
-///   The in-process check is "Phase 69b's static-table resolver
-///   covers ASCII + Latin-1 + box-drawing" which the `utf8` leaf
-///   already exercises.
+/// - `missing-font` — in-process check that Phase 69b's
+///   static-table resolver still covers ASCII + Latin-1 +
+///   box-drawing. The complementary boot-log assertion (that
+///   booting with the font omitted from the data disk emits
+///   `term: font load failed; using static fallback`) is currently
+///   *not* exercised — the xtask harness always stages the font on
+///   the data disk and reuses that disk for every `fonts-*` leaf.
+///   Running the kernel against a stripped image for this single
+///   step is a documented follow-up.
 fn run_fonts(leaf: &str) -> Result<(), &'static str> {
     match leaf {
         "startup" => run_fonts_startup(),
@@ -545,12 +549,32 @@ fn run_fonts_startup() -> Result<(), &'static str> {
 
 fn run_fonts_branch_icon() -> Result<(), &'static str> {
     let bytes = load_font_bytes()?;
+    // The fallback dot is the centred 2 × 2 stamp `Atlas` returns
+    // when the font's cmap does not cover a codepoint. A real Nerd
+    // Font branch icon should both (a) have a `glyph_index` in the
+    // font and (b) rasterize to substantially more ink than the
+    // fallback's 4 pixels. Without the glyph-index check, a bare
+    // JetBrainsMono with no Nerd Font patches would silently pass
+    // because `resolve` returns the (non-blank) fallback dot.
+    {
+        let font = kernel_core::font::Font::open(&bytes).map_err(|_| "font-open-failed")?;
+        if font.glyph_index(0xE0A0).is_none() {
+            return Err("branch-icon-not-in-font-cmap");
+        }
+    }
     let mut atlas =
         kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY)
             .map_err(|_| "atlas-construct-failed")?;
     let bm = atlas.resolve(0xE0A0);
     if bm.is_blank() {
         return Err("branch-icon-rendered-blank");
+    }
+    // 4 px is the fallback-dot ink count; a real branch icon's
+    // glyph paints substantially more than that. Use 8 to leave
+    // slack for a sparsely-rendered glyph at 8 × 16 cell size while
+    // still rejecting the fallback shape.
+    if bm.ink_count() <= 4 {
+        return Err("branch-icon-rendered-as-fallback-dot");
     }
     // Also check that the screen state machine records the
     // codepoint at (0, 0) when the UTF-8 bytes for U+E0A0 land —
@@ -575,32 +599,76 @@ fn run_fonts_emoji() -> Result<(), &'static str> {
     let mut atlas =
         kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY)
             .map_err(|_| "atlas-construct-failed")?;
-    // Resolving must not crash regardless of font coverage.
-    let _ = atlas.resolve(0x1F600);
+    // Contract per Phase 69c: a covered emoji produces non-blank
+    // ink; an uncovered one returns the centred-dot fallback (also
+    // non-blank). Either way the bitmap must not be blank — a bug
+    // that returned a blank bitmap for U+1F600 would be a silent
+    // regression that "no crash" cannot catch.
+    let bm = atlas.resolve(0x1F600);
+    if bm.is_blank() {
+        return Err("emoji-resolves-blank");
+    }
     Ok(())
 }
 
 fn run_fonts_adversarial() -> Result<(), &'static str> {
     let bytes = load_font_bytes()?;
     const CAP: usize = 1024;
+    // Walk the font's cmap to collect `2 × CAP` codepoints the
+    // font actually covers. Resolving codepoints the font does not
+    // cover takes the shared-fallback path and never inserts into
+    // the cache, so streaming an arbitrary BMP range can fail to
+    // saturate the cache (e.g. JetBrainsMono Nerd Font Mono leaves
+    // wide stretches of BMP uncovered). Filtering through
+    // `glyph_index` makes the eviction assertion font-agnostic.
+    let mut covered: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    {
+        let font = kernel_core::font::Font::open(&bytes).map_err(|_| "font-open-failed")?;
+        for cp in 0x21u32..0x10000u32 {
+            if covered.len() >= 2 * CAP {
+                break;
+            }
+            // Skip codepoints the resolver treats as blank — they
+            // would not exercise the rasterize-and-insert path.
+            if cp == 0x7F || (0x80..=0x9F).contains(&cp) || cp == 0xA0 {
+                continue;
+            }
+            if font.glyph_index(cp).is_some() {
+                covered.push(cp);
+            }
+        }
+    }
+    if covered.len() < 2 * CAP {
+        return Err("adversarial-font-too-sparse-for-eviction");
+    }
     let mut atlas =
         kernel_core::font::Atlas::new(bytes, 8, 16, CAP).map_err(|_| "atlas-construct-failed")?;
-    // Walk 2048 distinct codepoints. Use a range broad enough that
-    // most will hit the font (BMP letters + symbols).
-    for i in 0u32..2048 {
-        // Skip the C0 / C1 control ranges so resolver returns ink,
-        // not the blank-codepoint shortcut.
-        let cp = 0x21 + i;
+    for &cp in &covered {
         let _ = atlas.resolve(cp);
     }
     if atlas.len() > CAP {
         return Err("atlas-exceeded-capacity");
     }
-    // Verify the very-first codepoint has been evicted (atlas was
-    // filled past capacity, so 0x21 — inserted first — should be
-    // gone). We re-resolve and trust LRU did its job; if the atlas
-    // didn't evict, the next loop in `cap`-sized chunks would.
-    let _ = atlas.resolve(0x21 + 2047);
+    // Every codepoint in `covered` had a `glyph_index` hit, so
+    // every `resolve` was a fresh insert (or hit on a still-cached
+    // earlier insert). With `covered.len() == 2 * CAP`, the cache
+    // must end fully saturated.
+    if atlas.len() != CAP {
+        return Err("atlas-not-saturated-after-overflow");
+    }
+    let first = covered[0];
+    let last = covered[covered.len() - 1];
+    // The first-inserted codepoint must have been pushed off the
+    // tail by the subsequent `2 * CAP - 1` inserts. A broken
+    // policy that evicts the newest entry would leave `first`
+    // cached and lose `last` instead — both assertions catch the
+    // regression.
+    if atlas.contains(first) {
+        return Err("adversarial-oldest-not-evicted");
+    }
+    if !atlas.contains(last) {
+        return Err("adversarial-mru-not-cached");
+    }
     Ok(())
 }
 

@@ -459,16 +459,28 @@ fn wait_for_shell_dependencies() -> bool {
 /// Phase 69c Track E.1 — load the Nerd Font asset from
 /// `/usr/share/fonts/m3os/term.ttf` and upgrade `renderer` to the
 /// atlas-backed glyph path. On any failure (file missing, parse
-/// error, OOM) the renderer is left on Phase 69b's static-table
-/// fallback and a single warning lands in the boot log so a
-/// developer can correlate "no Nerd Font glyphs" with "load
-/// failed". The font path is hard-coded — Phase 69c deliberately
-/// defers configurable paths to a later phase.
+/// error, or the staged file exceeds the hard size cap) the
+/// renderer is left on Phase 69b's static-table fallback and a
+/// single warning lands in the boot log so a developer can
+/// correlate "no Nerd Font glyphs" with "load failed". The font
+/// path is hard-coded — Phase 69c deliberately defers configurable
+/// paths to a later phase.
+///
+/// Allocation policy: this binary's `alloc_error_handler` exits the
+/// process, so an OOM during `extend_from_slice` would kill `term`
+/// rather than fall back. The size cap below bounds the worst-case
+/// allocation; a font that exceeds it is treated as a load failure
+/// so the static-table path stays reachable. Replacing the cap with
+/// `Vec::try_reserve_exact` is a documented follow-up.
 #[cfg(not(test))]
 fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::Renderer<F>) {
     const FONT_PATH: &[u8] = b"/usr/share/fonts/m3os/term.ttf\0";
     const ATLAS_CELL_W: u16 = 8;
     const ATLAS_CELL_H: u16 = 16;
+    // Hard cap on the read. JetBrainsMono Nerd Font Mono is ~2 MiB;
+    // 8 MiB leaves headroom for future patched variants while
+    // keeping the worst-case allocation bounded.
+    const MAX_FONT_BYTES: usize = 8 * 1024 * 1024;
     let fd = syscall_lib::open(FONT_PATH, syscall_lib::O_RDONLY, 0);
     if fd < 0 {
         syscall_lib::write_str(
@@ -480,15 +492,20 @@ fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::R
     let fd = fd as i32;
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut oversize = false;
     loop {
         let n = syscall_lib::read(fd, &mut chunk);
         if n <= 0 {
             break;
         }
+        if bytes.len() + n as usize > MAX_FONT_BYTES {
+            oversize = true;
+            break;
+        }
         bytes.extend_from_slice(&chunk[..n as usize]);
     }
     let _ = syscall_lib::close(fd);
-    if bytes.is_empty() {
+    if oversize || bytes.is_empty() {
         syscall_lib::write_str(
             STDOUT_FILENO,
             "term: font load failed; using static fallback\n",
@@ -502,13 +519,17 @@ fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::R
         kernel_core::font::DEFAULT_ATLAS_CAPACITY,
     ) {
         Ok(atlas) => {
-            // Pre-warm with a small ASCII range so the boot log
-            // can report a glyph count. The atlas keeps a small
-            // hot set; we touch enough codepoints to clear the
-            // "atlas loaded N glyphs" gate without bloating
-            // memory.
+            // Pre-warm a representative range so the boot log's
+            // glyph count clears the documented `N > 100` gate. We
+            // touch printable ASCII (0x20..=0x7E, 95 cps) and the
+            // Latin-1 supplement (0xA1..=0xFF, 95 cps) — together
+            // ~190 codepoints, well above the 100-glyph threshold
+            // without bloating the cache.
             let mut atlas = atlas;
             for cp in 0x20u32..=0x7E {
+                let _ = atlas.resolve(cp);
+            }
+            for cp in 0xA1u32..=0xFF {
                 let _ = atlas.resolve(cp);
             }
             let n = atlas.len();

@@ -28,6 +28,11 @@ pub const DEFAULT_ATLAS_CAPACITY: usize = 1024;
 pub enum AtlasError {
     /// Capacity is zero; the cache would never hold anything.
     CapacityTooSmall,
+    /// Cell dimensions are below the minimum the fallback-dot
+    /// renderer can safely paint. The centred-dot is a 2 × 2 stamp
+    /// whose top-left coordinate is `(cell/2) - 1`; that underflows
+    /// for `cell_w < 2` or `cell_h < 2`.
+    CellTooSmall,
     /// Outline rasterization failed for a codepoint the font claims
     /// to cover. Surfaced from [`Atlas::resolve`] as the
     /// fallback-dot path so the caller does not have to branch.
@@ -73,6 +78,9 @@ impl Atlas {
     ) -> Result<Self, AtlasError> {
         if capacity == 0 {
             return Err(AtlasError::CapacityTooSmall);
+        }
+        if cell_w < 2 || cell_h < 2 {
+            return Err(AtlasError::CellTooSmall);
         }
         // Parse once to extract metrics; we re-parse on each resolve
         // because `ttf-parser::Face` borrows from the byte buffer
@@ -120,6 +128,14 @@ impl Atlas {
     /// Bitmap dimensions handed back from [`Atlas::resolve`].
     pub fn cell_size(&self) -> (u8, u8) {
         (self.metrics.cell_w as u8, self.metrics.cell_h as u8)
+    }
+
+    /// True when `codepoint` currently occupies a cache slot. Does
+    /// not update LRU order. Exposed so callers — notably the
+    /// adversarial smoke test — can assert eviction policy without
+    /// having to inspect private slot state.
+    pub fn contains(&self, codepoint: u32) -> bool {
+        self.find_slot(codepoint).is_some()
     }
 
     /// Look up the bitmap for `codepoint`. Returns the cached entry
@@ -328,6 +344,19 @@ mod tests {
         let bytes = vec![0u8; 4];
         let err = Atlas::new(bytes, 8, 16, 0).err().expect("expected error");
         assert_eq!(err, AtlasError::CapacityTooSmall);
+    }
+
+    #[test]
+    fn cell_below_two_rejected() {
+        // cell_w = 0 / 1 or cell_h = 0 / 1 would underflow
+        // `build_fallback`'s centred-dot calculation. The constructor
+        // must reject these dimensions up front rather than relying
+        // on every caller to guard.
+        for (w, h) in [(0u16, 16u16), (1, 16), (8, 0), (8, 1), (1, 1)] {
+            let bytes = vec![0u8; 4];
+            let err = Atlas::new(bytes, w, h, 16).err().expect("expected error");
+            assert_eq!(err, AtlasError::CellTooSmall, "w={w} h={h}");
+        }
     }
 
     #[test]

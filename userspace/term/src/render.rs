@@ -226,16 +226,19 @@ impl<F: FramebufferOwner> Renderer<F> {
             return;
         }
         if !self.queue.is_empty() {
-            // Drain into a local so the field-level borrows below
-            // do not conflict with iteration. `core::mem::take`
-            // reuses the existing allocation.
-            let queue = core::mem::take(&mut self.queue);
+            // Move the queue out so the field-level borrows below
+            // do not conflict with iteration. `mem::take` leaves
+            // `self.queue` as a freshly-empty `Vec` (no allocation);
+            // after iterating we `clear()` the local and write it
+            // back so the capacity survives — the hot render path
+            // must not re-allocate every frame.
+            let mut queue = core::mem::take(&mut self.queue);
             // Split-borrow the fields so `glyph_source` and `fb`
             // can be borrowed concurrently inside the loop.
             let Self {
                 fb, glyph_source, ..
             } = self;
-            for op in queue {
+            for op in queue.drain(..) {
                 match op {
                     QueuedOp::Put {
                         row,
@@ -256,6 +259,10 @@ impl<F: FramebufferOwner> Renderer<F> {
                     QueuedOp::Scroll { amount } => fb.scroll(amount),
                 }
             }
+            // `drain(..)` left `queue` empty but with its allocation
+            // intact. Restore it so the next frame's `submit_op`
+            // pushes into the same buffer instead of re-allocating.
+            self.queue = queue;
             self.pending_submit = true;
         }
         if self.pending_submit && self.fb.submit() {
@@ -535,5 +542,32 @@ mod tests {
         let mut r = Renderer::new(FakeFb::new());
         r.apply(RenderCommand::MoveCursor { row: 1, col: 2 });
         assert!(!r.damaged());
+    }
+
+    /// `compose()` must not throw away the queue's allocation each
+    /// frame — the hot render path runs once per tick, and a Vec
+    /// that grows and re-allocates on every frame would dominate
+    /// the renderer's allocator traffic.
+    #[test]
+    fn compose_preserves_queue_capacity_across_frames() {
+        let mut r = Renderer::new(FakeFb::new());
+        for col in 0..32u16 {
+            r.apply(RenderCommand::PutGlyph {
+                row: 0,
+                col,
+                codepoint: b'A' as u32 + col as u32,
+                fg: 0,
+                bg: 0,
+            });
+        }
+        let cap_after_grow = r.queue.capacity();
+        assert!(cap_after_grow >= 32);
+        r.compose();
+        assert_eq!(r.queue.len(), 0, "compose must drain the queue");
+        assert_eq!(
+            r.queue.capacity(),
+            cap_after_grow,
+            "compose must retain the queue's capacity for reuse",
+        );
     }
 }
