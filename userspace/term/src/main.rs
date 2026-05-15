@@ -480,8 +480,8 @@ fn wait_for_shell_dependencies() -> bool {
 #[cfg(not(test))]
 fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::Renderer<F>) {
     const FONT_PATH: &[u8] = b"/usr/share/fonts/m3os/term.ttf\0";
-    const ATLAS_CELL_W: u16 = 8;
-    const ATLAS_CELL_H: u16 = 16;
+    const ATLAS_CELL_W: u8 = 8;
+    const ATLAS_CELL_H: u8 = 16;
     // Hard cap on the read. JetBrainsMono Nerd Font Mono is ~2 MiB;
     // 8 MiB leaves headroom for future patched variants while
     // keeping the worst-case allocation bounded.

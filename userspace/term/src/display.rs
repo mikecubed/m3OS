@@ -380,9 +380,12 @@ impl FramebufferOwner for DisplayClient {
 
         // Phase 69c Track E.2 — the renderer pre-resolved the
         // codepoint to a `GlyphView`, so we paint whatever bitmap
-        // was handed in. Control codepoints and uncovered codepoints
-        // resolve to all-zero bitmaps; we treat them as "render
-        // background" and skip the bit-walk for performance.
+        // was handed in. Only blank glyphs — control codepoints
+        // (`U+0000..=U+001F`, `U+007F`, the C1 range, NBSP) and the
+        // static-table blanks — produce all-zero bitmaps; we treat
+        // those as "render background" and skip the bit-walk.
+        // Uncovered codepoints come back as the visible centred-dot
+        // fallback (non-blank), so they take the blit path below.
         if glyph.bitmap.iter().all(|&b| b == 0) {
             fill_cell_bg(
                 cell_view,

@@ -150,8 +150,15 @@ impl<F: FramebufferOwner> Renderer<F> {
     /// Phase 69c Track E.2 — resolve `codepoint` through the active
     /// `GlyphSource`. Returns a borrowed view backed by either the
     /// static-table data (Phase 69b) or the atlas's owned bitmap.
-    /// Never allocates per call: the atlas hits its cache for the
-    /// hot path and the static tables are `'static`.
+    ///
+    /// Allocation: the `Static` path is allocation-free (the tables
+    /// are `'static`). The `Atlas` path is allocation-free on a
+    /// cache hit; on a miss it rasterizes the glyph (allocates a
+    /// `Vec<OutlineSegment>` plus a `RasterBitmap`) and inserts the
+    /// new slot into the cache. The hot path is hit-dominated once
+    /// the warm-up range has been pre-resolved, but a stream of
+    /// novel codepoints will allocate per miss until the cache fills
+    /// its capacity.
     pub fn glyph_pixels(&mut self, codepoint: u32) -> GlyphView<'_> {
         match &mut self.glyph_source {
             GlyphSource::Atlas(atlas) => atlas.resolve(codepoint).as_view(),

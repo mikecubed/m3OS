@@ -456,26 +456,37 @@ fn run_utf8() -> Result<(), &'static str> {
 /// `Track F.1` task list:
 ///
 /// - `startup` — the in-process check is "the staged font is
-///   readable + parses cleanly". The boot-log `term: atlas loaded N
-///   glyphs` assertion is owned by the xtask `cargo xtask tui-smoke`
-///   harness (Track F.2) because the boot log is captured at xtask
-///   level, not visible to a post-login userspace process.
+///   readable, parses cleanly, and a fresh in-process atlas warms
+///   to at least 64 non-blank printable-ASCII glyphs". The
+///   complementary boot-log assertion (that the parent `term`
+///   process logs `term: atlas loaded N glyphs` for `N > 100`) is
+///   **not** exercised by the current xtask harness — `tui_smoke_steps`
+///   waits only for the `TUI_SMOKE:fonts-startup:ok` sentinel, not
+///   the `term:` boot-log line. Wiring the harness to wait for the
+///   boot-log line is a documented follow-up.
 /// - `branch-icon` — opens the staged font, builds a fresh atlas,
-///   resolves U+E0A0, asserts the rasterized bitmap is non-blank
-///   and matches a `Screen::cell` codepoint write.
-/// - `emoji` — resolves U+1F600. Pass either way: a covered glyph
-///   produces non-blank pixels, an uncovered one falls back to the
-///   centred-dot. Neither must crash.
-/// - `adversarial` — writes 2048 distinct codepoints to a 1024-cap
-///   atlas. Asserts `atlas.len() <= 1024` after the stream and that
-///   the most-recent insert is present.
+///   confirms the font's cmap covers U+E0A0, and asserts the
+///   rasterized bitmap has more ink than the 4-pixel fallback dot
+///   so a non-Nerd-Font asset cannot silently pass. Also feeds the
+///   UTF-8 bytes through `Screen::feed` and asserts the cell's
+///   recorded codepoint.
+/// - `emoji` — feeds the UTF-8 bytes for U+1F600 through `Screen::feed`
+///   to exercise the 4-byte decode path, then resolves the codepoint.
+///   Pass either way on the resolver: a covered glyph produces
+///   non-blank pixels, an uncovered one falls back to the centred-dot
+///   (also non-blank). A regression that returns a blank bitmap or
+///   a wrong cell codepoint fails the gate.
+/// - `adversarial` — writes 2 × CAP distinct codepoints into a
+///   CAP-cap atlas. Asserts `atlas.len() == CAP` after the stream,
+///   the first-inserted codepoint has been evicted, and the
+///   most-recent insert is still cached.
 /// - `missing-font` — in-process check that Phase 69b's
 ///   static-table resolver still covers ASCII + Latin-1 +
-///   box-drawing. The complementary boot-log assertion (that
-///   booting with the font omitted from the data disk emits
-///   `term: font load failed; using static fallback`) is currently
-///   *not* exercised — the xtask harness always stages the font on
-///   the data disk and reuses that disk for every `fonts-*` leaf.
+///   box-drawing. The complementary stripped-disk variant (boot
+///   with the font omitted and watch for `term: font load failed;
+///   using static fallback` in the kernel log) is currently *not*
+///   exercised — the xtask harness always stages the font on the
+///   data disk and reuses that disk for every `fonts-*` leaf.
 ///   Running the kernel against a stripped image for this single
 ///   step is a documented follow-up.
 fn run_fonts(leaf: &str) -> Result<(), &'static str> {
@@ -529,8 +540,12 @@ fn run_fonts_startup() -> Result<(), &'static str> {
         Ok(a) => a,
         Err(_) => return Err("atlas-construct-failed"),
     };
-    // Pre-warm a representative range so the in-process check has
-    // teeth — atlas must hold ≥ 100 glyphs after this.
+    // Pre-warm printable ASCII (95 codepoints inc. space) and
+    // require at least 64 to render non-blank. We deliberately
+    // pick 64 — not 95 — because some printable codepoints
+    // (space, certain Nerd-Font-patched positions) may legitimately
+    // map to a glyph the rasterizer renders as blank at 8 × 16,
+    // and the gate must be robust to that without losing teeth.
     let mut count = 0usize;
     for cp in 0x20u32..0x80 {
         let bm = atlas.resolve(cp);
@@ -596,6 +611,24 @@ fn run_fonts_branch_icon() -> Result<(), &'static str> {
 
 fn run_fonts_emoji() -> Result<(), &'static str> {
     let bytes = load_font_bytes()?;
+    // Drive the 4-byte UTF-8 decode path through `Screen::feed`
+    // before checking the atlas — the documented smoke contract
+    // says this leaf *writes* U+1F600, not just *resolves* it. A
+    // regression in the terminal's 4-byte UTF-8 → cell pipeline
+    // for emoji would otherwise sneak past the atlas-only check.
+    // U+1F600 encodes as 0xF0 0x9F 0x98 0x80.
+    let mut s = Screen::with_geometry(10, 2);
+    let mut out: Vec<RenderCommand> = Vec::new();
+    for &b in &[0xF0u8, 0x9F, 0x98, 0x80] {
+        s.feed(b, &mut out);
+    }
+    let cell = match s.cell(0, 0) {
+        Ok(c) => c,
+        Err(_) => return Err("emoji-cell-out-of-bounds"),
+    };
+    if cell.codepoint != 0x1F600 {
+        return Err("emoji-cell-codepoint-mismatch");
+    }
     let mut atlas =
         kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY)
             .map_err(|_| "atlas-construct-failed")?;
@@ -675,9 +708,14 @@ fn run_fonts_adversarial() -> Result<(), &'static str> {
 fn run_fonts_missing_font() -> Result<(), &'static str> {
     // In-process side of the missing-font check: Phase 69b's static
     // tables must continue to resolve ASCII / Latin-1 / box-drawing
-    // even when no font is present. The xtask harness boots the
-    // kernel with the font omitted and asserts the boot log
-    // contains `term: font load failed; using static fallback`.
+    // even when no font is present. The complementary stripped-disk
+    // boot variant — boot the kernel with the font omitted and
+    // assert the kernel log contains
+    // `term: font load failed; using static fallback` — is
+    // currently *not* exercised: the `tui-smoke` xtask harness
+    // always stages the font on the data disk it builds. A
+    // dedicated stripped-image boot for this single leaf is tracked
+    // as a deferred follow-up.
     let ascii = resolve_glyph(b'A' as u32);
     if ascii.bitmap.iter().all(|&b| b == 0) {
         return Err("ascii-A-resolves-blank");

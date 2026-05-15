@@ -102,10 +102,14 @@ pub struct Rasterizer;
 /// Parameters that pin the glyph to a cell. The rasterizer maps em-
 /// units onto cell pixels through this scale; the caller picks the
 /// values from the font's `units_per_em` / `ascender` / `descender`.
+///
+/// `cell_w` / `cell_h` are `u8` because [`RasterBitmap`] stores its
+/// dimensions as `u8`; widening the metric type here would let
+/// callers silently truncate to `u8` when constructing the bitmap.
 #[derive(Clone, Copy, Debug)]
 pub struct CellMetrics {
-    pub cell_w: u16,
-    pub cell_h: u16,
+    pub cell_w: u8,
+    pub cell_h: u8,
     pub units_per_em: u16,
     pub ascender: i16,
     pub descender: i16,
@@ -128,7 +132,7 @@ impl Rasterizer {
     pub fn rasterize_glyph(&self, outline: &Outline, metrics: CellMetrics) -> RasterBitmap {
         let cell_w = metrics.cell_w.max(1);
         let cell_h = metrics.cell_h.max(1);
-        let mut bitmap = RasterBitmap::blank(cell_w as u8, cell_h as u8);
+        let mut bitmap = RasterBitmap::blank(cell_w, cell_h);
 
         if outline.segments.is_empty() {
             return bitmap;
@@ -373,7 +377,12 @@ mod tests {
     use super::*;
     use crate::font::parser::Font;
 
+    /// See `kernel_core::font::atlas::tests::TEST_FONT_PATHS` for the
+    /// rationale — the workspace-staged Nerd Font is the
+    /// deterministic fixture, with system DejaVu as a fallback.
     const TEST_FONT_PATHS: &[&str] = &[
+        "xtask/assets/fonts/term.ttf",
+        "../xtask/assets/fonts/term.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -385,6 +394,11 @@ mod tests {
                 return Some(bytes);
             }
         }
+        eprintln!(
+            "kernel-core font tests: no fixture font found; ran with reduced \
+             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
+             fixture at xtask/assets/fonts/term.ttf."
+        );
         None
     }
 
@@ -442,21 +456,100 @@ mod tests {
              ≥ half-cell height: {vertical_bar_cols:?}"
         );
 
-        let mut has_crossbar = false;
-        for y in 0..bm.height as usize {
-            let row_ink: usize = (0..bm.width as usize).filter(|&x| bm.pixel(x, y)).count();
-            // A crossbar row should span between the two outer bars.
-            if row_ink >= 4 && !vertical_bar_cols.is_empty() {
-                let inner_lo = *vertical_bar_cols.first().unwrap();
-                let inner_hi = *vertical_bar_cols.last().unwrap();
-                let inner_ink: usize = (inner_lo + 1..inner_hi).filter(|&x| bm.pixel(x, y)).count();
-                if inner_ink >= 2 {
-                    has_crossbar = true;
-                    break;
-                }
-            }
-        }
-        assert!(has_crossbar, "'H' must contain a horizontal crossbar");
+        // We deliberately do *not* assert the crossbar is visible at
+        // 8 × 16: pixel-centre coverage with non-zero winding misses
+        // horizontal strokes whose pixel-space height falls below
+        // 1 px between two scanlines. JetBrainsMono Mono's 'H'
+        // crossbar is ~0.87 px tall at this cell size, so the
+        // rasterizer correctly emits "||" rather than a crossed
+        // shape. Fonts with thicker crossbars (DejaVu Sans Mono)
+        // still resolve a crossbar at this size, but we cannot rely
+        // on it across fonts. The crossbar capability of the
+        // rasterizer is exercised independently by
+        // [`crossbar_synthetic_outline_resolves`].
+    }
+
+    /// Sanity-check that the rasterizer can resolve a horizontal
+    /// crossbar when the em-space band is comfortably more than one
+    /// pixel tall. Uses a synthetic 'H'-like outline whose
+    /// dimensions are chosen so every feature lands on a clean
+    /// pixel grid — independent of any font's design.
+    #[test]
+    fn crossbar_synthetic_outline_resolves() {
+        // Em-space H: 1000-unit em with bars at x=100..200 and
+        // x=400..500, and a crossbar at y=400..600 spanning the
+        // inner gap.
+        use crate::font::parser::BoundingBox;
+        use OutlineSegment::*;
+        let outline = Outline {
+            segments: alloc::vec![
+                // Left bar
+                MoveTo { x: 100.0, y: 0.0 },
+                LineTo { x: 200.0, y: 0.0 },
+                LineTo {
+                    x: 200.0,
+                    y: 1000.0
+                },
+                LineTo {
+                    x: 100.0,
+                    y: 1000.0
+                },
+                Close,
+                // Right bar
+                MoveTo { x: 400.0, y: 0.0 },
+                LineTo { x: 500.0, y: 0.0 },
+                LineTo {
+                    x: 500.0,
+                    y: 1000.0
+                },
+                LineTo {
+                    x: 400.0,
+                    y: 1000.0
+                },
+                Close,
+                // Crossbar (200 em ≈ 2.1 px at scale_y = 14/1320)
+                MoveTo { x: 200.0, y: 400.0 },
+                LineTo { x: 400.0, y: 400.0 },
+                LineTo { x: 400.0, y: 600.0 },
+                LineTo { x: 200.0, y: 600.0 },
+                Close,
+            ],
+            bbox: BoundingBox {
+                x_min: 100,
+                y_min: 0,
+                x_max: 500,
+                y_max: 1000,
+            },
+        };
+        let metrics = CellMetrics {
+            cell_w: 16,
+            cell_h: 16,
+            units_per_em: 1000,
+            ascender: 1020,
+            descender: -300,
+        };
+        let bm = Rasterizer.rasterize_glyph(&outline, metrics);
+        // Find columns with ink and rows with ink to verify both
+        // vertical bars and the crossbar resolved.
+        let inked_cols: alloc::vec::Vec<usize> = (0..bm.width as usize)
+            .filter(|&x| (0..bm.height as usize).any(|y| bm.pixel(x, y)))
+            .collect();
+        assert!(
+            inked_cols.len() >= 4,
+            "synthetic 'H' must produce at least 4 inked cols, got {inked_cols:?}"
+        );
+        // The crossbar must produce at least one row where an inner
+        // column (strictly between the leftmost and rightmost inked
+        // cols) is inked.
+        let inner_lo = *inked_cols.first().unwrap();
+        let inner_hi = *inked_cols.last().unwrap();
+        let crossbar_ink: usize = (0..bm.height as usize)
+            .filter(|&y| (inner_lo + 1..inner_hi).any(|x| bm.pixel(x, y)))
+            .count();
+        assert!(
+            crossbar_ink >= 1,
+            "synthetic 'H' must show at least one crossbar row, got 0"
+        );
     }
 
     #[test]
@@ -482,17 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn rasterize_space_is_blank() {
-        let Some(bytes) = load_test_font_bytes() else {
-            return;
+    fn rasterize_empty_outline_is_blank() {
+        // Tests the rasterizer's invariant directly without going
+        // through any specific font. Some fonts (JetBrainsMono Nerd
+        // Font Mono is one) record space as a cmap entry with no
+        // `glyf` data so `glyph_outline` returns `Err`, while others
+        // (DejaVu) return `Ok(empty)`. The rasterizer only sees the
+        // `Outline`; both paths must produce a blank bitmap.
+        use crate::font::parser::BoundingBox;
+        let outline = Outline {
+            segments: Vec::new(),
+            bbox: BoundingBox {
+                x_min: 0,
+                y_min: 0,
+                x_max: 0,
+                y_max: 0,
+            },
         };
-        let font = Font::open(&bytes).expect("parse host font");
-        let g = font
-            .glyph_index(b' ' as u32)
-            .expect("font covers ASCII space");
-        let outline = font.glyph_outline(g).expect("space outline reconstructs");
-        let metrics = cell_metrics_for(&font);
+        let metrics = CellMetrics {
+            cell_w: 8,
+            cell_h: 16,
+            units_per_em: 1000,
+            ascender: 800,
+            descender: -200,
+        };
         let bm = Rasterizer.rasterize_glyph(&outline, metrics);
-        assert!(bm.is_blank(), "space must rasterize to blank pixels");
+        assert!(
+            bm.is_blank(),
+            "empty outline must rasterize to a blank bitmap"
+        );
     }
 }

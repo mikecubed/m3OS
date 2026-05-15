@@ -8,9 +8,11 @@
 ## Overview
 
 Phase 69b shipped a static-table glyph resolver in
-`kernel-core::session::glyph_tables`: ASCII (`U+0020..=U+007F`),
-Latin-1 supplement (`U+0080..=U+00FF`), Unicode box-drawing
-(`U+2500..=U+257F`), and a centred-dot fallback for anything else.
+`kernel-core::session::glyph_tables`: printable ASCII
+(`U+0020..=U+007E`; `U+007F` DEL is classified as a blank control
+codepoint), Latin-1 supplement (`U+0080..=U+00FF`), Unicode
+box-drawing (`U+2500..=U+257F`), and a centred-dot fallback for
+anything else.
 That is enough for `mc`'s blue panel art, `htop`'s graph bars, and
 accented Western European text — but every modern developer TUI
 (lazygit, lf, fzf, starship, btop) emits Nerd Font private-use-area

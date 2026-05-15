@@ -163,34 +163,26 @@ impl<'a> Font<'a> {
     /// Build the outline for `glyph` by walking
     /// `ttf-parser`'s outline-builder callbacks and collecting the
     /// segments into an owned [`Outline`]. Returns
-    /// [`FontError::OutlineUnavailable`] when `ttf-parser` cannot
-    /// reconstruct the outline (composite cycle, missing data,
-    /// glyph id past `num_glyphs`).
+    /// [`FontError::OutlineUnavailable`] when `ttf-parser` returns
+    /// no outline for the glyph — that covers composite cycles,
+    /// missing `glyf` data, glyph ids past `num_glyphs`, and
+    /// bitmap-only / colour-only glyphs that have no contour data.
+    /// Surfacing the failure as an error lets the atlas paint the
+    /// visible centred-dot fallback rather than caching a blank
+    /// bitmap for a font-covered codepoint.
+    ///
+    /// Note that legitimately blank glyphs (space, NBSP, control
+    /// codepoints) report `Some(bbox)` from `outline_glyph` with no
+    /// builder callbacks, so they land in the `Ok(empty segments)`
+    /// branch below and the atlas caches a blank bitmap as
+    /// expected.
     pub fn glyph_outline(&self, glyph: GlyphId) -> Result<Outline, FontError> {
         let id = ttf_parser::GlyphId(glyph.0);
         let mut builder = OutlineCollector::default();
-        let bbox = match self.face.outline_glyph(id, &mut builder) {
-            Some(b) => b,
-            None => {
-                // `.notdef` and empty glyphs (e.g. space, control
-                // codepoints) legitimately have no outline; surface
-                // that as an empty Outline rather than an error so
-                // the caller can render a blank cell without
-                // branching on the error path.
-                if (id.0 as u32) < self.num_glyphs() as u32 {
-                    return Ok(Outline {
-                        segments: Vec::new(),
-                        bbox: BoundingBox {
-                            x_min: 0,
-                            y_min: 0,
-                            x_max: 0,
-                            y_max: 0,
-                        },
-                    });
-                }
-                return Err(FontError::OutlineUnavailable);
-            }
-        };
+        let bbox = self
+            .face
+            .outline_glyph(id, &mut builder)
+            .ok_or(FontError::OutlineUnavailable)?;
         Ok(Outline {
             segments: builder.segments,
             bbox: BoundingBox {
@@ -241,22 +233,32 @@ impl ttf_parser::OutlineBuilder for OutlineCollector {
 mod tests {
     use super::*;
 
-    /// Open a system-installed "DejaVu Sans Mono" TTF for these
-    /// tests. DejaVu is distributed under the Bitstream Vera /
-    /// DejaVu license — we use whatever copy the host has at one of
-    /// `TEST_FONT_PATHS`; no font binary is bundled in-tree. Tests
-    /// that find no font on disk short-circuit so `cargo test -p
-    /// kernel-core` still works from any directory.
+    /// Load a TTF for these tests. The workspace-staged Nerd Font
+    /// (`xtask/assets/fonts/term.ttf`, materialized by
+    /// `cargo xtask fetch-fonts`) is the deterministic fixture; the
+    /// system DejaVu Sans Mono paths and Arial are fallbacks for
+    /// minimal dev boxes. DejaVu is distributed under the Bitstream
+    /// Vera / DejaVu license; no font binary is bundled in-tree.
+    /// Tests that find no font on disk short-circuit so
+    /// `cargo test -p kernel-core` still works from any directory,
+    /// but the `eprintln!` makes the skip loud rather than silent.
     fn load_test_font_bytes() -> Option<Vec<u8>> {
         for candidate in TEST_FONT_PATHS {
             if let Ok(bytes) = std::fs::read(candidate) {
                 return Some(bytes);
             }
         }
+        eprintln!(
+            "kernel-core font tests: no fixture font found; ran with reduced \
+             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
+             fixture at xtask/assets/fonts/term.ttf."
+        );
         None
     }
 
     const TEST_FONT_PATHS: &[&str] = &[
+        "xtask/assets/fonts/term.ttf",
+        "../xtask/assets/fonts/term.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",

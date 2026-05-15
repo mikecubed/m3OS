@@ -44,7 +44,7 @@
 - [x] `Font::open(bytes: &[u8]) -> Result<Font, FontError>` validates the magic + required tables.
 - [x] `glyph_index(codepoint: u32) -> Option<GlyphId>` returns the glyph for the codepoint (or None if absent).
 - [x] `glyph_outline(glyph: GlyphId) -> Outline` returns the Bezier curve set in em-units.
-- [x] Host tests use a public-domain TTF (committed to `kernel-core/tests/fonts/` or fetched on demand): assert known codepoint → glyph mappings; assert outline contour count for a representative glyph.
+- [x] Host tests load a TTF from disk and assert known codepoint → glyph mappings and outline contour count for a representative glyph. The fixture path list prefers the workspace-staged Nerd Font (`xtask/assets/fonts/term.ttf`, materialized by `cargo xtask fetch-fonts`; SIL Open Font License 1.1 via the upstream JetBrains Mono) and falls back to system-installed DejaVu Sans Mono (Bitstream Vera / DejaVu license) or Arial. No font binary is committed in-tree; tests log a loud `eprintln!` and short-circuit when no fixture font is found instead of silently passing.
 
 ---
 
@@ -120,7 +120,7 @@
 **Acceptance:**
 - [x] After `Renderer::new(display)`, `term` opens `/usr/share/fonts/m3os/term.ttf` via `syscall_lib::open` + `read`.
 - [x] On success: constructs an `Atlas` with capacity 1024 and stashes it on the renderer.
-- [x] On any failure (file missing, parse error, OOM): logs `term: font load failed; using static fallback` and proceeds with Phase 69b's static-table path.
+- [x] On a recoverable failure — file missing, mid-read I/O error, parse error, or oversized file beyond the 8 MiB hard cap — `term` logs `term: font load failed; using static fallback` and proceeds with Phase 69b's static-table path. True OOM is **not** recovered: this binary's `alloc_error_handler` exits the process. The size cap on the font-read allocation keeps the recoverable path reachable for any reasonably-sized font; replacing the cap with `Vec::try_reserve_exact` is a documented follow-up.
 - [x] Boot log includes `term: atlas loaded N glyphs` on success.
 
 ### E.2 — Renderer atlas-backed glyph path
@@ -132,8 +132,8 @@
 **Acceptance:**
 - [x] `Renderer` carries a `GlyphSource` enum: `Static` (Phase 69b tables) or `Atlas(Atlas)`.
 - [x] `glyph_pixels(codepoint)` dispatches: `Atlas` → `atlas.resolve(codepoint)`; `Static` → `kernel_core::session::resolve_glyph(codepoint)`.
-- [x] No allocation per glyph blit (both paths return `&RasterBitmap`).
-- [x] When the atlas misses (codepoint not in the font), the resolver falls back to the static centred-dot glyph — same behaviour Phase 69b promised.
+- [x] Allocation-free on the `Static` path and on `Atlas` cache hits. An `Atlas` miss rasterizes the glyph (allocates a `Vec<OutlineSegment>` plus a `RasterBitmap`) and inserts the new slot; the hot path is hit-dominated once the warm-up range has been pre-resolved.
+- [x] When the atlas does not cover a codepoint (font cmap miss or outline reconstruction failure), the atlas returns the shared centred-dot fallback bitmap so the codepoint renders as a visible placeholder rather than a blank cell — matching Phase 69b's behaviour for uncovered codepoints.
 
 ---
 
@@ -146,11 +146,12 @@
 **Why it matters:** Phase 69c's acceptance is "the atlas works for real glyphs"; this is the gate.
 
 **Acceptance:**
-- [x] `tui-smoke fonts startup` prewarms the atlas with printable ASCII + Latin-1 (≈ 190 codepoints) so the boot log line `term: atlas loaded N glyphs` records `N > 100`; the in-process check asserts the atlas holds at least 64 non-blank printable-ASCII glyphs.
+- [x] `term::build_atlas` (Track E.1) prewarms printable ASCII + Latin-1 supplement (~190 codepoints) so the parent process's boot log records `term: atlas loaded N glyphs` with `N > 100` on the happy path.
+- [x] `tui-smoke fonts startup` opens the same staged font, builds a fresh in-process atlas, prewarms printable ASCII (95 codepoints) through it, and asserts the atlas holds at least 64 non-blank glyphs. This is a separate atlas from the one `term::build_atlas` constructs at boot; the boot-log assertion is owned by a deferred xtask harness wait — see the **Deferred** note below.
 - [x] `tui-smoke fonts branch-icon` writes U+E0A0 to the screen, asserts `Screen::cell(0, 0).codepoint == 0xE0A0`, the font's cmap covers U+E0A0 (`Font::glyph_index` is `Some`), and the rasterized bitmap has more ink than the 4-pixel fallback dot.
-- [x] `tui-smoke fonts emoji` writes U+1F600 and asserts the resolved bitmap is not blank — either real ink (font covered it) or the centred-dot fallback shape (font did not).
+- [x] `tui-smoke fonts emoji` writes U+1F600 through `Screen::feed` and asserts `Screen::cell(0, 0).codepoint == 0x1F600`, then resolves the codepoint and asserts the bitmap is not blank — either real ink (font covered it) or the centred-dot fallback shape (font did not).
 - [x] `tui-smoke fonts adversarial` writes 2 × CAP distinct codepoints in sequence; asserts no OOM, `atlas.len() == CAP`, the first-inserted codepoint has been evicted, and the most-recently-inserted one is still cached.
-- [x] `tui-smoke fonts missing-font` exercises the static-table resolver in-process — ASCII, Latin-1 supplement, and box-drawing all render with no font present. **Deferred**: a complementary xtask harness that boots a stripped data disk and asserts the boot log contains `term: font load failed; using static fallback` is tracked as a follow-up; the current `tui-smoke` run always boots with the font staged.
+- [x] `tui-smoke fonts missing-font` exercises the static-table resolver in-process — ASCII, Latin-1 supplement, and box-drawing all render with no font present. **Deferred**: two complementary xtask harness assertions remain — (a) waiting for the `term: atlas loaded N glyphs` boot-log line on the happy path so a `build_atlas` regression at boot fails the gate even when the staged font still parses; and (b) booting a stripped data disk for the `fonts-missing-font` leaf and asserting the log contains `term: font load failed; using static fallback`. The current `tui-smoke` run always boots with the font staged and only waits for the per-leaf `TUI_SMOKE:fonts-<leaf>:ok` sentinels.
 
 ### F.2 — Wire into `cargo xtask tui-smoke`
 

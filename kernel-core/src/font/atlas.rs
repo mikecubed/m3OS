@@ -70,10 +70,16 @@ impl Atlas {
     /// cell metrics. The metrics typically come from a constant —
     /// `term` uses 8 × 16 — combined with the font's
     /// `units_per_em` / `ascender` / `descender`.
+    ///
+    /// `cell_w` / `cell_h` are `u8` because [`RasterBitmap`] stores
+    /// its dimensions as `u8` and the rasterizer would otherwise
+    /// silently truncate a wider value when allocating the bitmap.
+    /// Callers that want cells larger than 255 px need a different
+    /// API.
     pub fn new(
         bytes: Vec<u8>,
-        cell_w: u16,
-        cell_h: u16,
+        cell_w: u8,
+        cell_h: u8,
         capacity: usize,
     ) -> Result<Self, AtlasError> {
         if capacity == 0 {
@@ -96,8 +102,8 @@ impl Atlas {
                 descender: font.descender(),
             }
         };
-        let fallback = build_fallback(cell_w as u8, cell_h as u8);
-        let blank = RasterBitmap::blank(cell_w as u8, cell_h as u8);
+        let fallback = build_fallback(cell_w, cell_h);
+        let blank = RasterBitmap::blank(cell_w, cell_h);
         Ok(Self {
             bytes,
             metrics,
@@ -127,7 +133,7 @@ impl Atlas {
 
     /// Bitmap dimensions handed back from [`Atlas::resolve`].
     pub fn cell_size(&self) -> (u8, u8) {
-        (self.metrics.cell_w as u8, self.metrics.cell_h as u8)
+        (self.metrics.cell_w, self.metrics.cell_h)
     }
 
     /// True when `codepoint` currently occupies a cache slot. Does
@@ -168,17 +174,27 @@ impl Atlas {
     fn rasterize(&self, codepoint: u32) -> Option<RasterBitmap> {
         let font = Font::open(&self.bytes).ok()?;
         let id = font.glyph_index(codepoint)?;
-        let outline = font.glyph_outline(id).ok()?;
-        if outline.segments.is_empty() {
-            // Glyphs without an outline (space, control codes) get
-            // a blank bitmap rather than the fallback dot — the
-            // caller treats a blank cell as "rendered, no ink".
-            return Some(RasterBitmap::blank(
-                self.metrics.cell_w as u8,
-                self.metrics.cell_h as u8,
-            ));
+        match font.glyph_outline(id) {
+            Ok(outline) if !outline.segments.is_empty() => {
+                Some(Rasterizer.rasterize_glyph(&outline, self.metrics))
+            }
+            // Empty-outline cases — either ttf-parser returned
+            // `Some(empty bbox)` for a glyph with no contours, or
+            // (via `Err`) the glyph has no outline data at all
+            // (bitmap-only / colour-only / reconstruction failure).
+            // We can't tell from the outline alone whether the
+            // codepoint is "intentionally blank" (ASCII space) or
+            // "supposed to render but unrasterizable" (bitmap-only
+            // glyph), so we use the codepoint to decide:
+            Ok(_) | Err(_) if renders_blank_when_unrasterizable(codepoint) => Some(
+                RasterBitmap::blank(self.metrics.cell_w, self.metrics.cell_h),
+            ),
+            // For every other codepoint, an absent or empty outline
+            // means "we can't draw this" — return None so
+            // [`Atlas::resolve`] hands back the visible centred-dot
+            // fallback rather than an invisible blank cell.
+            Ok(_) | Err(_) => None,
         }
-        Some(Rasterizer.rasterize_glyph(&outline, self.metrics))
     }
 
     fn find_slot(&self, codepoint: u32) -> Option<usize> {
@@ -297,6 +313,20 @@ fn is_blank_codepoint(codepoint: u32) -> bool {
         || codepoint == 0xA0
 }
 
+/// Codepoints that should render as a blank cell when the font
+/// supplies no rasterizable outline. ASCII space (`U+0020`) is the
+/// canonical printable example: some fonts (e.g. JetBrainsMono Nerd
+/// Font Mono) record space as a cmap entry with no `glyf` data, so
+/// `glyph_outline` returns `Err`. The visual expectation is still
+/// "blank cell", not the visible centred-dot fallback that
+/// uncovered-yet-supposed-to-render codepoints get. Codepoints that
+/// always render blank regardless of font (control codes, NBSP) are
+/// already filtered by [`is_blank_codepoint`] before this check
+/// runs.
+fn renders_blank_when_unrasterizable(codepoint: u32) -> bool {
+    codepoint == 0x20
+}
+
 /// Build the centred-dot fallback bitmap. Matches Phase 69b's
 /// `FALLBACK_DOT_GLYPH` shape so a font miss is visually
 /// indistinguishable from the static-table fallback.
@@ -324,7 +354,27 @@ fn build_fallback(width: u8, height: u8) -> RasterBitmap {
 mod tests {
     use super::*;
 
+    /// Test fixture font candidates, in priority order:
+    ///
+    /// 1. The repository's staged Nerd Font, materialized by
+    ///    `cargo xtask fetch-fonts`. This is the deterministic
+    ///    fixture — every developer who builds the disk image
+    ///    has this asset locally, and CI fetches it before running
+    ///    `cargo xtask check`.
+    /// 2. System-installed DejaVu Sans Mono at the canonical
+    ///    Debian / Fedora / Arch paths. Kept as a fallback so a
+    ///    fresh checkout that hasn't run `fetch-fonts` still has
+    ///    a path that works on most Linux dev machines.
+    ///
+    /// If none of these resolve, the test still short-circuits so
+    /// `cargo test -p kernel-core` does not hard-fail on a minimal
+    /// dev box — but loud `eprintln!` lines (see `load_bytes`) make
+    /// it visible that coverage was skipped instead of silently
+    /// passing.
     const TEST_FONT_PATHS: &[&str] = &[
+        // Workspace-staged Nerd Font (run `cargo xtask fetch-fonts`).
+        "xtask/assets/fonts/term.ttf",
+        "../xtask/assets/fonts/term.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -336,6 +386,11 @@ mod tests {
                 return Some(bytes);
             }
         }
+        eprintln!(
+            "kernel-core font tests: no fixture font found; ran with reduced \
+             coverage. Run `cargo xtask fetch-fonts` to stage the deterministic \
+             fixture at xtask/assets/fonts/term.ttf."
+        );
         None
     }
 
@@ -352,7 +407,7 @@ mod tests {
         // `build_fallback`'s centred-dot calculation. The constructor
         // must reject these dimensions up front rather than relying
         // on every caller to guard.
-        for (w, h) in [(0u16, 16u16), (1, 16), (8, 0), (8, 1), (1, 1)] {
+        for (w, h) in [(0u8, 16u8), (1, 16), (8, 0), (8, 1), (1, 1)] {
             let bytes = vec![0u8; 4];
             let err = Atlas::new(bytes, w, h, 16).err().expect("expected error");
             assert_eq!(err, AtlasError::CellTooSmall, "w={w} h={h}");

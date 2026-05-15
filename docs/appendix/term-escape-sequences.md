@@ -304,12 +304,16 @@ loaded font, including Nerd Font private-use-area icons
 
 The font file is staged on the ext2 data disk at
 `/usr/share/fonts/m3os/term.ttf`. The asset itself is
-**JetBrainsMono Nerd Font Mono Regular** (Apache 2.0, ~2 MB) from
-the upstream `ryanoasis/nerd-fonts` release v3.2.1. It is **not
-committed** to the repository — `cargo xtask fetch-fonts` downloads
-the file into `xtask/assets/fonts/term.ttf` and verifies the
-SHA-256 against `xtask/assets/fonts/term.ttf.sha256` (committed)
-before subsequent `cargo xtask image` runs stage it on the disk.
+**JetBrainsMono Nerd Font Mono Regular** from the upstream
+`ryanoasis/nerd-fonts` release v3.2.1, ~2 MB. The upstream
+JetBrains Mono font is distributed under the SIL Open Font
+License 1.1; the Nerd Fonts patcher applies its symbol overlay
+and the patched binary retains the upstream font license. The
+asset is **not committed** to the repository — `cargo xtask
+fetch-fonts` downloads the file into `xtask/assets/fonts/term.ttf`
+and verifies the SHA-256 against
+`xtask/assets/fonts/term.ttf.sha256` (committed) before subsequent
+`cargo xtask image` runs stage it on the disk.
 
 ### Runtime dispatch
 
@@ -322,8 +326,9 @@ before subsequent `cargo xtask image` runs stage it on the disk.
   the font does not cover fall back to the centred-dot fallback
   bitmap so the user still sees an inked cell.
 - `GlyphSource::Static` — Phase 69b static-table path. Covers
-  ASCII (`U+0020..=U+007F`), Latin-1 supplement
-  (`U+0080..=U+00FF`), Unicode box-drawing (`U+2500..=U+257F`),
+  printable ASCII (`U+0020..=U+007E`; `U+007F` DEL is a blank
+  control codepoint), Latin-1 supplement (`U+0080..=U+00FF`),
+  Unicode box-drawing (`U+2500..=U+257F`),
   and the centred-dot fallback. This is the path `term` uses
   before atlas construction completes and the permanent fallback
   if the font file is missing, corrupt, or refuses to parse.
