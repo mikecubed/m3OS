@@ -1287,6 +1287,11 @@ pub const TIOCSWINSZ: usize = 0x5414;
 
 // ===========================================================================
 // Termios types and constants (matching kernel-core layout)
+//
+// Phase 69a Track H: every constant uses the Linux numeric value so musl
+// shims work unchanged.  The kernel-core `tty.rs` module is the source of
+// truth; these duplicates are kept in sync by `tcsmoke round-trip`, which
+// asserts bit-perfect equality via `tcgetattr` / `tcsetattr`.
 // ===========================================================================
 
 pub const NCCS: usize = 19;
@@ -1296,24 +1301,62 @@ pub const ISIG: u32 = 0o000001;
 pub const ICANON: u32 = 0o000002;
 pub const ECHO: u32 = 0o000010;
 pub const ECHOE: u32 = 0o000020;
+pub const ECHOK: u32 = 0o000040;
+pub const ECHONL: u32 = 0o000100;
+pub const NOFLSH: u32 = 0o000200;
+pub const TOSTOP: u32 = 0o000400;
 pub const IEXTEN: u32 = 0o100000;
 
 // c_iflag constants
-pub const ICRNL: u32 = 0o000400;
-pub const IXON: u32 = 0o002000;
+pub const IGNBRK: u32 = 0o000001;
 pub const BRKINT: u32 = 0o000002;
+pub const IGNPAR: u32 = 0o000004;
+pub const PARMRK: u32 = 0o000010;
 pub const INPCK: u32 = 0o000020;
 pub const ISTRIP: u32 = 0o000040;
+pub const INLCR: u32 = 0o000100;
+pub const IGNCR: u32 = 0o000200;
+pub const ICRNL: u32 = 0o000400;
+pub const IUCLC: u32 = 0o001000;
+pub const IXON: u32 = 0o002000;
+pub const IXANY: u32 = 0o004000;
+pub const IXOFF: u32 = 0o010000;
+pub const IMAXBEL: u32 = 0o020000;
+pub const IUTF8: u32 = 0o040000;
 
 // c_oflag constants
 pub const OPOST: u32 = 0o000001;
 pub const ONLCR: u32 = 0o000004;
 
-// c_cflag constants
+// c_cflag constants (minimal — full baud-rate set deferred per Phase 69a)
 pub const CS8: u32 = 0o000060;
 pub const CREAD: u32 = 0o000200;
-pub const HUPCL: u32 = 0o000400;
-pub const B38400: u32 = 0o060000;
+pub const HUPCL: u32 = 0o002000;
+pub const B38400: u32 = 0o000017;
+
+// c_cc indices (Linux x86_64 layout)
+pub const VINTR: usize = 0;
+pub const VQUIT: usize = 1;
+pub const VERASE: usize = 2;
+pub const VKILL: usize = 3;
+pub const VEOF: usize = 4;
+pub const VTIME: usize = 5;
+pub const VMIN: usize = 6;
+pub const VSWTC: usize = 7;
+pub const VSTART: usize = 8;
+pub const VSTOP: usize = 9;
+pub const VSUSP: usize = 10;
+pub const VEOL: usize = 11;
+pub const VREPRINT: usize = 12;
+pub const VDISCARD: usize = 13;
+pub const VWERASE: usize = 14;
+pub const VLNEXT: usize = 15;
+pub const VEOL2: usize = 16;
+
+// `optional_actions` argument for `tcsetattr`.
+pub const TCSANOW: i32 = 0;
+pub const TCSADRAIN: i32 = 1;
+pub const TCSAFLUSH: i32 = 2;
 
 /// Terminal I/O settings, matching the Linux *kernel* `termios` layout
 /// used by the TCGETS/TCSETS ioctls (36 bytes).
@@ -1429,19 +1472,48 @@ pub fn tcgetattr(fd: i32) -> Result<Termios, isize> {
     if ret < 0 { Err(ret) } else { Ok(t) }
 }
 
-/// Set terminal attributes.
+/// Set terminal attributes (TCSANOW — apply immediately).
 pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
-    let ret = ioctl(fd, TCSETS, termios as *const Termios as usize);
+    tcsetattr_when(fd, TCSANOW, termios)
+}
+
+/// Set terminal attributes with explicit `optional_actions`.
+///
+/// `when` selects between [`TCSANOW`] (apply immediately, TCSETS),
+/// [`TCSADRAIN`] (drain output queue first, TCSETSW), or [`TCSAFLUSH`]
+/// (drain output and flush input first, TCSETSF).
+pub fn tcsetattr_when(fd: i32, when: i32, termios: &Termios) -> Result<(), isize> {
+    let req = match when {
+        TCSANOW => TCSETS,
+        TCSADRAIN => TCSETSW,
+        TCSAFLUSH => TCSETSF,
+        _ => return Err(-22), // EINVAL
+    };
+    let ret = ioctl(fd, req, termios as *const Termios as usize);
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
 /// Set terminal attributes, flushing pending input first (TCSETSF).
 ///
-/// Like [`tcsetattr`], but uses the TCSETSF ioctl which flushes the stdin
-/// buffer and TTY edit buffer before applying the new settings.
+/// Backwards-compatible alias for `tcsetattr_when(fd, TCSAFLUSH, &termios)`.
 pub fn tcsetattr_flush(fd: i32, termios: &Termios) -> Result<(), isize> {
-    let ret = ioctl(fd, TCSETSF, termios as *const Termios as usize);
-    if ret < 0 { Err(ret) } else { Ok(()) }
+    tcsetattr_when(fd, TCSAFLUSH, termios)
+}
+
+/// Apply the POSIX `cfmakeraw` clearset to `termios` in place.
+///
+/// Mirrors the kernel-side `Termios::raw_default` so userspace and kernel
+/// agree byte-for-byte on what "raw mode" means.  Clears the four input
+/// mapping bits + IGNBRK/BRKINT/PARMRK/ISTRIP, clears OPOST, clears
+/// ECHO/ECHONL/ICANON/ISIG/IEXTEN, sets character size to CS8, and sets
+/// VMIN=1 / VTIME=0 for blocking byte-by-byte reads.
+pub fn cfmakeraw(t: &mut Termios) {
+    t.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    t.c_oflag &= !OPOST;
+    t.c_lflag &= !(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    t.c_cflag = (t.c_cflag & !0o000060) | CS8;
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
 }
 
 /// Get terminal window size (rows, cols).

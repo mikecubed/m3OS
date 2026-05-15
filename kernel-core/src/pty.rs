@@ -121,6 +121,15 @@ pub struct PtyPairState {
     /// True once slave_refcount has been > 0 at least once.
     /// Used to distinguish "slave never opened" from "slave closed".
     pub slave_opened: bool,
+    /// Phase 69a Track C: IXON output suspension state.  Set when VSTOP
+    /// arrives in the master→slave stream and IXON is on; cleared on
+    /// VSTART.  Slave reads/writes consult this flag if they want to honour
+    /// software flow control.
+    pub ldisc_output_suspended: bool,
+    /// Phase 69a Track F: VTIME deadline (absolute kernel ticks).  `None`
+    /// when the timer is not armed.  Set when the slave read path arms the
+    /// VMIN/VTIME timer; cleared when the buffer drains.
+    pub ldisc_deadline_ticks: Option<u64>,
 }
 
 impl PtyPairState {
@@ -129,7 +138,7 @@ impl PtyPairState {
         PtyPairState {
             m2s: PtyRingBuffer::new(),
             s2m: PtyRingBuffer::new(),
-            termios: Termios::default_cooked(),
+            termios: Termios::cooked_default(),
             winsize: Winsize::default_console(),
             edit_buf: EditBuffer::new(),
             slave_fg_pgid: 0,
@@ -138,6 +147,8 @@ impl PtyPairState {
             eof_pending: false,
             locked: true,
             slave_opened: false,
+            ldisc_output_suspended: false,
+            ldisc_deadline_ticks: None,
         }
     }
 }

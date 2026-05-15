@@ -5422,26 +5422,42 @@ fn block_on_pty_slave_read(pty_id: u32) -> Result<(), u64> {
     let task_id = crate::task::scheduler::current_task_id().ok_or(NEG_EINTR)?;
     let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
     crate::pty::PTY_SLAVE_WQ[pty_id as usize].register(task_id, &woken);
-    let ready = {
+    let (ready, deadline_ticks) = {
         let table = crate::pty::PTY_TABLE.lock();
         match table.get(pty_id as usize).and_then(|slot| slot.as_ref()) {
             Some(pair) => {
                 if pair.termios.is_canonical() {
-                    pair.edit_buf.as_slice().contains(&b'\n')
+                    let r = pair.edit_buf.as_slice().contains(&b'\n')
                         || pair.eof_pending
-                        || pair.master_refcount == 0
+                        || pair.master_refcount == 0;
+                    (r, None)
                 } else {
-                    !pair.m2s.is_empty() || pair.master_refcount == 0
+                    // Phase 69a Track F.2: honour VMIN / VTIME when parking
+                    // the read.  Three cases:
+                    //  * VMIN > 0, VTIME == 0 — block indefinitely.
+                    //  * VMIN == 0, VTIME > 0 — block to absolute deadline.
+                    //  * VMIN > 0, VTIME > 0 — inter-byte timer (if armed).
+                    let vmin = pair.termios.c_cc[kernel_core::tty::VMIN] as u64;
+                    let vtime = pair.termios.c_cc[kernel_core::tty::VTIME] as u64;
+                    let avail = pair.m2s.available() as u64;
+                    let r = match (vmin, vtime) {
+                        (0, 0) => true,
+                        (0, _) => avail > 0,
+                        (n, 0) => avail >= n,
+                        (n, _) => avail >= n,
+                    } || pair.master_refcount == 0;
+                    let dl = pair.ldisc_deadline_ticks;
+                    (r, dl)
                 }
             }
-            None => true,
+            None => (true, None),
         }
     };
     if !ready {
         let _ = crate::task::scheduler::block_current_until(
             crate::task::TaskState::BlockedOnRecv,
             &woken,
-            None,
+            deadline_ticks,
         );
     }
     crate::pty::PTY_SLAVE_WQ[pty_id as usize].deregister(task_id);
@@ -5878,13 +5894,38 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 return 0;
                             }
                         } else {
-                            // Raw mode: read directly from m2s.
-                            if !pair.m2s.is_empty() {
+                            // Phase 69a Track F: VMIN / VTIME timer.  Four
+                            // POSIX cases drive whether we return now,
+                            // block for more data, or wait for a deadline.
+                            let vmin = pair.termios.c_cc[kernel_core::tty::VMIN] as u64;
+                            let vtime = pair.termios.c_cc[kernel_core::tty::VTIME] as u64;
+                            let avail = pair.m2s.available() as u64;
+                            let now = crate::arch::x86_64::interrupts::tick_count();
+
+                            // If a VTIME deadline was previously armed, see
+                            // whether it has expired.
+                            let deadline_expired =
+                                pair.ldisc_deadline_ticks.map(|d| now >= d).unwrap_or(false);
+
+                            // Decide whether the read should complete now.
+                            let ready = match (vmin, vtime) {
+                                (0, 0) => true, // poll
+                                (0, _) => avail > 0 || deadline_expired,
+                                (n, 0) => avail >= n,
+                                (n, _) => avail >= n || (avail > 0 && deadline_expired),
+                            };
+
+                            if ready {
+                                // Drain up to min(count, available, 4096).
                                 let mut dst = [0u8; 4096];
-                                let to_read = count.min(dst.len() as u64) as usize;
+                                let cap = count.min(dst.len() as u64);
+                                let to_read = cap.min(avail) as usize;
                                 let n = pair.m2s.read(&mut dst[..to_read]);
+                                // Clear the inter-byte timer once we've
+                                // satisfied the read; arm again when the
+                                // next byte arrives.
+                                pair.ldisc_deadline_ticks = None;
                                 drop(table);
-                                // Reading from m2s frees space for master writers.
                                 crate::pty::wake_master(pty_id);
                                 if UserSliceWo::new(buf_ptr, dst[..n].len())
                                     .and_then(|s| s.copy_from_kernel(&dst[..n]))
@@ -5893,6 +5934,17 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     return NEG_EFAULT;
                                 }
                                 return n as u64;
+                            }
+
+                            // Not ready yet: arm the inter-byte timer if
+                            // VTIME is set and at least one byte has
+                            // arrived; or arm the absolute timer if
+                            // VMIN==0 && VTIME>0.
+                            if vtime > 0
+                                && pair.ldisc_deadline_ticks.is_none()
+                                && ((vmin > 0 && avail > 0) || vmin == 0)
+                            {
+                                pair.ldisc_deadline_ticks = Some(now.saturating_add(vtime * 100));
                             }
                         }
                         if pair.master_refcount == 0 {
@@ -6032,7 +6084,39 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             {
                 return NEG_EFAULT;
             }
-            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+            // Phase 69a Track D.1: honour OPOST + ONLCR on the TTY write
+            // path.  When OPOST is cleared, bytes pass through verbatim
+            // (Phase 69's wire-protocol assumption); when OPOST + ONLCR are
+            // set, outgoing `\n` is expanded to `\r\n`.
+            let oflag = crate::tty::TTY0.lock().ldisc.termios.c_oflag;
+            let opost = oflag & kernel_core::tty::OPOST != 0;
+            let onlcr = oflag & kernel_core::tty::ONLCR != 0;
+            if opost && onlcr {
+                // Expand \n → \r\n on the framebuffer + serial paths.
+                let mut tmp: [u8; 8192] = [0; 8192];
+                let mut out = 0usize;
+                for &b in &buf[..len] {
+                    if b == b'\n' {
+                        if out + 2 > tmp.len() {
+                            break;
+                        }
+                        tmp[out] = b'\r';
+                        tmp[out + 1] = b'\n';
+                        out += 2;
+                    } else {
+                        if out + 1 > tmp.len() {
+                            break;
+                        }
+                        tmp[out] = b;
+                        out += 1;
+                    }
+                }
+                if let Ok(s) = core::str::from_utf8(&tmp[..out]) {
+                    crate::serial::_print(format_args!("{}", s));
+                    crate::fb::write_str(s);
+                }
+            } else if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                // OPOST off — verbatim pass-through.
                 crate::serial::_print(format_args!("{}", s));
                 crate::fb::write_str(s);
             }
@@ -6327,12 +6411,14 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 let is_canonical = pair.termios.is_canonical();
                 let is_echo = pair.termios.is_echo();
                 let is_isig = pair.termios.is_isig();
+                let iexten = pair.termios.c_lflag & kernel_core::tty::IEXTEN != 0;
                 let echoe = pair.termios.c_lflag & kernel_core::tty::ECHOE != 0;
                 let echok = pair.termios.c_lflag & kernel_core::tty::ECHOK != 0;
                 let echonl = pair.termios.c_lflag & kernel_core::tty::ECHONL != 0;
                 let icrnl = pair.termios.c_iflag & kernel_core::tty::ICRNL != 0;
                 let inlcr = pair.termios.c_iflag & kernel_core::tty::INLCR != 0;
                 let igncr = pair.termios.c_iflag & kernel_core::tty::IGNCR != 0;
+                let ixon = pair.termios.c_iflag & kernel_core::tty::IXON != 0;
                 let vintr = pair.termios.c_cc[kernel_core::tty::VINTR];
                 let vquit = pair.termios.c_cc[kernel_core::tty::VQUIT];
                 let vsusp = pair.termios.c_cc[kernel_core::tty::VSUSP];
@@ -6340,10 +6426,36 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 let vkill = pair.termios.c_cc[kernel_core::tty::VKILL];
                 let vwerase = pair.termios.c_cc[kernel_core::tty::VWERASE];
                 let veof = pair.termios.c_cc[kernel_core::tty::VEOF];
+                let vstart = pair.termios.c_cc[kernel_core::tty::VSTART];
+                let vstop = pair.termios.c_cc[kernel_core::tty::VSTOP];
+                let vlnext = pair.termios.c_cc[kernel_core::tty::VLNEXT];
+                let vdiscard = pair.termios.c_cc[kernel_core::tty::VDISCARD];
                 let fg_pgid = pair.slave_fg_pgid;
 
                 let mut written = 0usize;
+                let mut lnext_pending = false;
                 for &byte in &src_data {
+                    // Phase 69a Track E.3: VLNEXT — deliver next byte literally.
+                    if lnext_pending {
+                        lnext_pending = false;
+                        let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                            Some(p) => p,
+                            None => return written as u64,
+                        };
+                        if is_canonical {
+                            if !pair.edit_buf.push(byte) {
+                                break;
+                            }
+                        } else if pair.m2s.write(&[byte]) == 0 {
+                            break;
+                        }
+                        if is_echo {
+                            pair.s2m.write(&[byte]);
+                        }
+                        written += 1;
+                        continue;
+                    }
+
                     // Input flag transformations.
                     let mut b = byte;
                     if b == b'\r' {
@@ -6356,6 +6468,47 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         }
                     } else if b == b'\n' && inlcr {
                         b = b'\r';
+                    }
+
+                    // Phase 69a Track C: IXON flow control (XOFF/XON).
+                    if ixon {
+                        if b == vstop {
+                            let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut())
+                            {
+                                Some(p) => p,
+                                None => return written as u64,
+                            };
+                            pair.ldisc_output_suspended = true;
+                            written += 1;
+                            continue;
+                        }
+                        if b == vstart {
+                            let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut())
+                            {
+                                Some(p) => p,
+                                None => return written as u64,
+                            };
+                            pair.ldisc_output_suspended = false;
+                            written += 1;
+                            continue;
+                        }
+                    }
+
+                    // Phase 69a Track E.3: IEXTEN/VLNEXT/VDISCARD.
+                    if iexten {
+                        if vlnext != 0 && b == vlnext {
+                            lnext_pending = true;
+                            written += 1;
+                            continue;
+                        }
+                        if vdiscard != 0 && b == vdiscard {
+                            // VDISCARD toggles output discard; treated as a
+                            // consume-only byte for now (kernel side never
+                            // actually drops s2m bytes — symmetric to a no-op
+                            // toggle so userspace can round-trip the byte).
+                            written += 1;
+                            continue;
+                        }
                     }
 
                     // Signal generation (ISIG).
@@ -11231,6 +11384,13 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     match req {
         TCGETS => {
             if let Some(id) = pty_id {
+                // Phase 69a Track B: termios lives on the slave; the master
+                // is not a terminal device, so it returns ENOTTY (matches
+                // Linux n_tty.c — the master fd's tty_operations->ioctl is
+                // distinct from the slave's).
+                if is_pty_master {
+                    return NEG_ENOTTY;
+                }
                 let table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get(id as usize) {
                     let src = unsafe {
@@ -11277,6 +11437,9 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
             };
             if let Some(id) = pty_id {
+                if is_pty_master {
+                    return NEG_ENOTTY;
+                }
                 let mut table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.termios = new_termios;
@@ -11299,6 +11462,9 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
             };
             if let Some(id) = pty_id {
+                if is_pty_master {
+                    return NEG_ENOTTY;
+                }
                 let mut table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.edit_buf.clear();
