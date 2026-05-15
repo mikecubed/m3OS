@@ -17,7 +17,7 @@
 | F | EAW `width_of` stub + wide-cell accounting in `Screen::put_char` | B | Planned |
 | G | `IUTF8` termios erase wiring in `kernel-core::tty::Ldisc::erase_one` | None | Planned |
 | H | Validation: `tui-smoke utf8` subcommand | A, B, C, D, E, F, G | Planned |
-| I | Documentation: Phase 22b / 69 / 69a cross-refs; appendix update; kernel patch bump to 0.69.2 | H | Planned |
+| I | Documentation: Phase 22b / 69 / 69a cross-refs; appendix update; aligned legacy learning doc; kernel patch bump to 0.69.2 | H | Planned |
 
 ---
 
@@ -215,7 +215,21 @@
 - [ ] New "UTF-8 input" section documents the byte-stream contract and replacement-character rule.
 - [ ] New "Glyph coverage" section enumerates the three covered Unicode ranges and the fallback policy.
 
-### I.3 — Kernel patch bump to 0.69.2
+### I.3 — Create the aligned legacy learning doc
+
+**File:** `docs/69b-terminal-utf8-and-glyphs.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a self-contained reference for the UTF-8 wire-decoding contract and the bitmap-glyph expansion — the byte-stream state machine, the W3C replacement rule, the three covered Unicode ranges + fallback policy, the EAW double-width cell accounting stub, and the `IUTF8` erase behaviour — without conflating it with Phase 22b's ANSI parser, Phase 57's `term` bring-up, or Phase 69a's broader termios contract. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
+
+**Acceptance:**
+- [ ] `docs/69b-terminal-utf8-and-glyphs.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 69b`, `**Status:** Complete`, `**Source Ref:** phase-69b`, `**Supersedes Legacy Doc:** new`).
+- [ ] Overview is one learner-friendly paragraph explaining what Phase 57 left as "byte-cast-to-char" feed and what Phase 69b closes (UTF-8 decoder before the parser, Latin-1 + box-drawing glyph tables, fallback-dot policy, EAW wide-cell accounting stub, IUTF8 erase).
+- [ ] Key Files table cites `kernel-core/src/utf8.rs` (new — `Utf8Decoder` + `DecoderOutput`), `kernel-core/src/fb.rs` (extended — `ConsoleCmd::PutChar(u32)`, `GLYPH_TABLE_LATIN1`, `GLYPH_TABLE_BOX_DRAWING`, `resolve_glyph`, fallback-dot glyph, `width_of`), `kernel-core/src/tty.rs` (extended — `Ldisc::erase_one` IUTF8 awareness), `userspace/term/src/screen.rs` (extended — decoder field, `feed` byte path, wide-cell accounting in `put_char`, `Cell::wide_continuation`), and `userspace/tui-smoke/src/main.rs` (extended — `cmd_utf8` validation harness).
+- [ ] Closure of Related Phases section cross-refs Phase 22b (ANSI parser — notes the `PutChar` widening from `char` to `u32`), Phase 57 (Audio + Local Session — notes the `Screen::feed` upgrade from byte-cast-to-char to UTF-8 decoder + parser), Phase 69 (Terminal Contract Foundations — notes that the `Screen::feed` extension point introduced for alt-screen now also hosts the UTF-8 decoder), and Phase 69a (Termios — notes that `IUTF8` gains its first behavioural effect via the IUTF8-aware `erase_one`).
+- [ ] Deferred or Later-Phase Topics section enumerates Nerd Font / TTF infrastructure (Phase 69c), CJK glyph tables (the EAW machinery is in place; tables alone are a future phase), Unicode normalisation (NFC/NFD), combining-character handling beyond a single base glyph, bi-directional text (BiDi), and variation selectors + emoji ZWJ sequences.
+- [ ] Related Roadmap Docs links `docs/roadmap/69b-terminal-utf8-and-glyphs.md` and `docs/roadmap/tasks/69b-terminal-utf8-and-glyphs-tasks.md`.
+
+### I.4 — Kernel patch bump to 0.69.2
 
 **Files:**
 - `kernel/Cargo.toml`
