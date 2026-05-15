@@ -248,14 +248,25 @@ The decoder is strict (W3C / WHATWG contract):
 
 When the decoder reports `Invalid`, the screen renders **U+FFFD
 REPLACEMENT CHARACTER** at the current cursor position and the decoder
-resyncs on the next valid leading byte. BEL (`0x07`) is intercepted
-before the decoder so the audio bell still fires per the Phase 57
-contract.
+resyncs on the next valid leading byte. The two combined variants
+(`InvalidThenCodepoint`, `InvalidThenPending`) preserve a valid
+trailing byte that interrupted an in-flight sequence — the caller
+emits U+FFFD AND the rescued byte/sequence so no valid input is lost.
+
+BEL (`0x07`) routes through the decoder like every other byte. The
+BEL → `RenderCommand::Bell` mapping lives in `Screen::emit_codepoint`,
+which means a BEL arriving mid-multi-byte cancels the in-flight
+sequence (emitting one U+FFFD) before the bell rings — control bytes
+never silently update the decoder state.
 
 Canonical mode honours the termios `IUTF8` flag: with `IUTF8` set, a
-single VERASE press removes all continuation bytes of the most recent
-codepoint plus the leading byte (one codepoint per press). With
-`IUTF8` cleared, VERASE removes one byte (legacy behaviour).
+single VERASE press removes the most recent codepoint **iff** the
+trailing suffix decodes cleanly through the strict UTF-8 decoder
+(overlong encodings, surrogates, and codepoints above U+10FFFF all
+disqualify the suffix from whole-codepoint erase). Otherwise the
+press removes exactly one byte so successive VERASE presses drain
+the malformed region byte by byte. With `IUTF8` cleared, VERASE
+always removes one byte (legacy behaviour).
 
 ## Glyph coverage (Phase 69b)
 

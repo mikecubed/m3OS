@@ -22,13 +22,16 @@ Phase 69b closes that gap in two layers:
 
 1. **Decode** — a new strict UTF-8 state machine in
    `kernel-core/src/utf8.rs` (`Utf8Decoder` + `DecoderOutput`)
-   consumes one byte per call and surfaces `Pending`,
-   `Codepoint(u32)`, or `Invalid`. The W3C / WHATWG
-   replacement-character contract is honoured: every malformed
-   sequence yields exactly one `Invalid` and the decoder resyncs on
-   the next valid leading byte. `Screen::feed` routes every byte
-   through the decoder before reaching the Phase 22b ANSI parser; on
-   `Invalid` the screen renders U+FFFD.
+   consumes one byte per call and surfaces one of five `DecoderOutput`
+   variants: `Pending`, `Codepoint(u32)`, `Invalid`, and the two
+   resync-preservation variants `InvalidThenCodepoint(u32)` and
+   `InvalidThenPending`. The latter pair preserve a valid trailing
+   byte (or fresh multi-byte leader) that interrupted an in-flight
+   sequence: the caller emits U+FFFD AND the rescued byte/sequence
+   so the W3C / WHATWG contract is honoured without buffering.
+   `Screen::feed` routes every byte through the decoder before
+   reaching the Phase 22b ANSI parser and dispatches the combined
+   variants as a `(U+FFFD, codepoint)` pair.
 2. **Render** — the bitmap font in `kernel-core::session` is extended
    with `GLYPH_TABLE_LATIN1` (U+0080..=U+00FF) and
    `GLYPH_TABLE_BOX_DRAWING` (U+2500..=U+257F), plus a single
@@ -80,7 +83,9 @@ position (`Initial`, `Awaiting2`, `Awaiting3a`, `Awaiting3b`,
 `Awaiting4a`, `Awaiting4b`, `Awaiting4c`); each variant carries the
 codepoint value accumulated so far. `decode_byte` dispatches on the
 current state, applies the leading-byte / continuation-byte rules,
-and returns one of the three `DecoderOutput` variants. Overlong 2-byte
+and returns one of the five `DecoderOutput` variants (`Pending`,
+`Codepoint(u32)`, `Invalid`, `InvalidThenCodepoint(u32)`,
+`InvalidThenPending`). Overlong 2-byte
 encodings are rejected at the leading byte (`0xC0`, `0xC1`); overlong
 3-byte and 4-byte encodings are rejected at the trailing byte when the
 combined value falls below the minimum for the sequence length.
@@ -110,8 +115,17 @@ glyph wraps to the next row so the wide pair stays adjacent. If a
 write would overwrite the trailing half of an existing wide glyph, the
 leader is blanked first so the renderer drops its stale pixels;
 similarly if the new write would overwrite the leader, the trailing
-continuation cell is blanked. The renderer emits exactly one
-`RenderCommand::PutGlyph` for the leading cell of a wide pair.
+continuation cell is blanked. If the new write's trail column would
+displace a cell that is *itself* a wide leader, that leader's orphan
+trail at `col + 2` is blanked too so the grid stays consistent.
+
+The renderer sees two `RenderCommand::PutGlyph` commands per wide
+pair: one carrying the wide codepoint for the leading cell, and one
+carrying a blank space (`b' '`) for the trailing cell. The blank
+trail command paints background over any previous pixels in the
+trail column — `FramebufferOwner::put_glyph` paints only one 8×16
+cell per command, so the leader's draw alone does not cover both
+columns.
 
 `kernel-core/src/session/glyph_tables.rs` builds both new bitmap
 tables at compile time via `const fn`s, references them through
@@ -197,9 +211,14 @@ hot path (`LineDiscipline::process_byte`, VERASE branch) calls
   to `u32` so the parser carries the full Unicode scalar through.
 - **Phase 57 — Audio and Local Session**: the `Screen::feed`
   "byte-cast-to-char" entry point is upgraded to a UTF-8 decoder +
-  parser pipeline. BEL (`0x07`) interception still fires before the
-  decoder is consulted so Phase 57's audio-bell mapping is exactly
-  preserved.
+  parser pipeline. BEL (`0x07`) is mapped to `RenderCommand::Bell`
+  inside `Screen::emit_codepoint` after routing through the decoder,
+  so a BEL arriving mid-multi-byte cancels the in-flight UTF-8
+  sequence (emitting one U+FFFD) before the bell rings. Phase 57's
+  audio-bell mapping is preserved for isolated BEL bytes; the
+  decoder-routed path additionally prevents stale-state attacks where
+  a following continuation byte would silently complete a broken
+  sequence.
 - **Phase 69 — Terminal Contract Foundations**: the `Screen::feed`
   extension point introduced for alt-screen now also hosts the UTF-8
   decoder. The Phase 69 deferral "UTF-8 wire decoding" is closed.

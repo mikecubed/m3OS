@@ -31,7 +31,7 @@
 
 **Acceptance:**
 - [x] `Utf8Decoder::new()` returns a decoder in the `Initial` state.
-- [x] `decode_byte(b: u8) -> DecoderOutput` returns `Pending`, `Codepoint(u32)`, or `Invalid`.
+- [x] `decode_byte(b: u8) -> DecoderOutput` returns one of five variants: `Pending`, `Codepoint(u32)`, `Invalid`, `InvalidThenCodepoint(u32)` (in-flight sequence broke and offending byte was ASCII — caller emits U+FFFD then the codepoint), or `InvalidThenPending` (in-flight sequence broke and offending byte started a fresh multi-byte sequence — caller emits U+FFFD and the next byte continues).
 - [x] Every well-formed 1/2/3/4-byte sequence is decoded to the correct codepoint.
 - [x] Overlong encodings (e.g. `\xC0\xAF` for `/`) are rejected as `Invalid`.
 - [x] Surrogate codepoints (U+D800–U+DFFF) in 3-byte encoding are rejected as `Invalid`.
@@ -62,9 +62,9 @@
 
 **Acceptance:**
 - [x] `Screen` carries a `Utf8Decoder` field, initialised to `Initial`.
-- [x] `feed(byte)` first calls `decoder.decode_byte(byte)`; on `Pending`, returns immediately; on `Codepoint(c)`, passes `c` through the parser; on `Invalid`, treats it as `Codepoint(0xFFFD)`.
+- [x] `feed(byte)` first calls `decoder.decode_byte(byte)`; on `Pending`, returns immediately; on `Codepoint(c)`, passes `c` through `emit_codepoint`; on `Invalid`, treats it as `Codepoint(0xFFFD)`; on `InvalidThenCodepoint(c)`, emits U+FFFD then `c`; on `InvalidThenPending`, emits U+FFFD and leaves the decoder in its new pending state.
 - [x] ASCII escape sequences (which are pure ASCII) flow through unchanged — the decoder completes a 1-byte codepoint per byte.
-- [x] BEL (`0x07`) interception (Phase 57 behaviour) still fires before the decoder is consulted — preserves Phase 57 behaviour exactly.
+- [x] BEL (`0x07`) routes through the decoder like every other byte; the BEL → `RenderCommand::Bell` mapping lives in `Screen::emit_codepoint`. An isolated BEL still rings the bell (Phase 57 behaviour preserved); a BEL arriving mid-multi-byte cancels the in-flight UTF-8 sequence (emitting U+FFFD) before ringing.
 
 ---
 
@@ -140,8 +140,8 @@
 - [x] `Cell` gains `wide_continuation: bool`.
 - [x] `put_char` reserves `(row, col)` for the codepoint and marks `(row, col+1)` as `wide_continuation = true`, codepoint = 0.
 - [x] A wide glyph at the last column wraps to the next row.
-- [x] The renderer's PutGlyph stream emits exactly one paint command for the leading cell (the trailing continuation cell does not paint).
-- [x] Host tests cover: place a width-2 codepoint, overwrite its continuation cell with another character, assert the original glyph is correctly invalidated and the new character paints at the expected column (`utf8_wide_codepoint_reserves_two_cells`, `utf8_overwrite_trail_of_wide_cleans_lead`, `utf8_wide_codepoint_wraps_at_last_column`).
+- [x] The renderer's PutGlyph stream emits one paint command for the leading cell carrying the wide codepoint AND a second paint command for the trailing cell carrying a blank space (`b' '`) so previous pixels in the trail column are overwritten with bg. The cell-state buffer entry still carries `wide_continuation: true` for the trail so wide-cell accounting stays correct.
+- [x] Host tests cover: place a width-2 codepoint, overwrite its continuation cell with another character, assert the original glyph is correctly invalidated and the new character paints at the expected column, and verify both leader + trail-blank PutGlyphs are emitted (`utf8_wide_codepoint_reserves_two_cells`, `utf8_overwrite_trail_of_wide_cleans_lead`, `utf8_wide_codepoint_wraps_at_last_column`, `utf8_wide_codepoint_wrap_emits_trail_blank_on_destination_row`, `utf8_wide_glyph_displaces_existing_wide_leader_cleanly`).
 
 ---
 
@@ -155,9 +155,9 @@
 
 **Acceptance:**
 - [x] When `IUTF8` is cleared (legacy): `erase_one` removes exactly one byte from the line buffer.
-- [x] When `IUTF8` is set: `erase_one` removes the trailing continuation bytes (10xxxxxx) plus the leading byte.
-- [x] If the buffer trailing bytes are malformed UTF-8 (e.g. a stray leading byte): erase exactly one byte and let the next erase handle the next.
-- [x] Host tests cover: erase ASCII (1 byte), erase 2-byte Latin-1, erase 3-byte box-drawing, erase 4-byte emoji, erase across malformed input.
+- [x] When `IUTF8` is set: `erase_one` removes the trailing continuation bytes (10xxxxxx) plus the leading byte iff the candidate suffix decodes cleanly through `Utf8Decoder` (overlong encodings, UTF-16 surrogates, and codepoints above U+10FFFF all fail this check).
+- [x] If the buffer trailing bytes are malformed UTF-8 (stray leading byte, mismatched continuation count, or a suffix that fails strict UTF-8 validation): erase exactly one byte and let the next erase handle the next.
+- [x] Host tests cover: erase ASCII (1 byte), erase 2-byte Latin-1, erase 3-byte box-drawing, erase 4-byte emoji, erase across malformed input, and strict-validation rejection of overlong / surrogate / out-of-range tails (`iutf8_rejects_overlong_two_byte`, `iutf8_rejects_surrogate_three_byte`, `iutf8_rejects_above_max_four_byte`).
 
 ---
 

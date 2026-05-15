@@ -287,11 +287,9 @@ impl EditBuffer {
 
     /// Phase 69b Track G — IUTF8-aware erase. When `iutf8` is set, the
     /// erase removes the whole most-recent codepoint *iff* the buffer
-    /// tail is well-formed UTF-8 — that is, the byte preceding the
-    /// trailing continuations is a valid leading byte whose shape
-    /// matches the observed continuation count. With `iutf8` cleared,
-    /// the behaviour matches the legacy [`EditBuffer::erase_char`] —
-    /// one byte per call.
+    /// tail is strictly well-formed UTF-8. With `iutf8` cleared, the
+    /// behaviour matches the legacy [`EditBuffer::erase_char`] — one
+    /// byte per call.
     ///
     /// Returns the number of bytes removed (0 when the buffer is
     /// empty). The kernel-core ldisc only echoes a single `\x08 \x08`
@@ -299,14 +297,17 @@ impl EditBuffer {
     /// caller decide whether to echo more (e.g. a future double-width
     /// codepoint deserving two erase echoes).
     ///
-    /// Resilience: if the buffer tail is malformed UTF-8 (a stray
-    /// leading byte with no following continuation, only continuations
-    /// with no preceding leader, or a leading-byte shape that does not
-    /// match the continuation count), exactly one byte is removed so
-    /// successive `erase_one_codepoint` calls drain the malformed
-    /// region byte by byte. This matches the Linux ldisc behaviour for
-    /// the same edge case and prevents the erase from consuming a
-    /// preceding valid codepoint when its successor is malformed.
+    /// Validation flow: count trailing continuation bytes (capped at
+    /// 4 — the legal UTF-8 maximum), then re-decode the candidate
+    /// suffix through [`crate::utf8::Utf8Decoder`]. The suffix is
+    /// removed as one codepoint only when the decoder reaches
+    /// [`DecoderOutput::Codepoint`] exactly on the final byte;
+    /// anything else (overlong encoding, UTF-16 surrogate, codepoint
+    /// above U+10FFFF, stray continuation, mismatched length) falls
+    /// back to removing the single trailing byte. This matches the
+    /// Linux ldisc behaviour for the same edge cases and prevents
+    /// the erase from consuming a preceding valid codepoint when its
+    /// successor is malformed.
     pub fn erase_one_codepoint(&mut self, iutf8: bool) -> usize {
         if self.len == 0 {
             return 0;
@@ -327,41 +328,41 @@ impl EditBuffer {
             cont_count += 1;
         }
         // If the buffer is shorter than (cont_count + 1) bytes, the
-        // continuations have no preceding leader — malformed. Same
-        // handling as a mismatched leader: remove exactly one byte.
+        // continuations have no preceding leader — malformed; remove
+        // exactly one byte.
         if cont_count >= self.len {
             self.len -= 1;
             return 1;
         }
-        // Compute the continuation count the byte preceding the
-        // continuations expects. Anything other than a valid 1/2/3/4-
-        // byte UTF-8 leading byte signals malformed input.
-        let leading = self.buf[self.len - 1 - cont_count];
-        let expected_cont: Option<usize> = if leading & 0x80 == 0 {
-            Some(0) // ASCII (0xxxxxxx)
-        } else if leading & 0xE0 == 0xC0 {
-            Some(1) // 110xxxxx — 2-byte leader
-        } else if leading & 0xF0 == 0xE0 {
-            Some(2) // 1110xxxx — 3-byte leader
-        } else if leading & 0xF8 == 0xF0 {
-            Some(3) // 11110xxx — 4-byte leader
+        // Strict UTF-8 validation: feed the candidate suffix through
+        // the decoder. Only remove the suffix as a whole codepoint if
+        // every non-final byte was `Pending` and the final byte
+        // produced `Codepoint(_)`. Overlong encodings, surrogates,
+        // and out-of-range codepoints all fail this check at the
+        // appropriate byte.
+        let suffix_len = cont_count + 1;
+        let suffix_start = self.len - suffix_len;
+        let mut decoder = crate::utf8::Utf8Decoder::new();
+        let mut suffix_well_formed = true;
+        for (i, &b) in self.buf[suffix_start..self.len].iter().enumerate() {
+            let out = decoder.decode_byte(b);
+            let is_last = i + 1 == suffix_len;
+            let ok = matches!(
+                (out, is_last),
+                (crate::utf8::DecoderOutput::Pending, false)
+                    | (crate::utf8::DecoderOutput::Codepoint(_), true)
+            );
+            if !ok {
+                suffix_well_formed = false;
+                break;
+            }
+        }
+        if suffix_well_formed {
+            self.len -= suffix_len;
+            suffix_len
         } else {
-            None // continuation byte (already covered above) or invalid
-        };
-        match expected_cont {
-            Some(n) if n == cont_count => {
-                // Well-formed sequence — remove leader + continuations.
-                let removed = cont_count + 1;
-                self.len -= removed;
-                removed
-            }
-            _ => {
-                // Shape mismatch or invalid leader — remove only the
-                // trailing byte so a preceding valid codepoint is not
-                // consumed by the malformed tail.
-                self.len -= 1;
-                1
-            }
+            self.len -= 1;
+            1
         }
     }
 
@@ -1245,6 +1246,48 @@ mod tests {
         let removed = buf.erase_one_codepoint(true);
         assert_eq!(removed, 1);
         assert_eq!(buf.as_slice().len(), 16);
+    }
+
+    /// Phase 69b Track G — IUTF8 set: a tail whose byte shape "looks
+    /// like" a multi-byte sequence but decodes to a malformed scalar
+    /// (overlong, UTF-16 surrogate, or codepoint > U+10FFFF) must be
+    /// treated as malformed and erased one byte at a time. The
+    /// shape-only check from round-2 would have erased
+    /// `0xC0 0x80` / `0xED 0xA0 0x80` / `0xF5 0x80 0x80 0x80` as
+    /// whole codepoints; strict validation via [`Utf8Decoder`] now
+    /// rejects them at the trailing byte.
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_rejects_overlong_two_byte() {
+        let mut buf = EditBuffer::new();
+        buf.push(0xC0);
+        buf.push(0x80);
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), &[0xC0]);
+    }
+
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_rejects_surrogate_three_byte() {
+        let mut buf = EditBuffer::new();
+        // U+D820 surrogate, expressed as 3-byte UTF-8.
+        for &b in &[0xEDu8, 0xA0, 0x80] {
+            buf.push(b);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), &[0xED, 0xA0]);
+    }
+
+    #[test]
+    fn edit_buffer_erase_one_codepoint_iutf8_rejects_above_max_four_byte() {
+        let mut buf = EditBuffer::new();
+        // 0xF5 is an out-of-range leader (would decode > U+10FFFF).
+        for &b in &[0xF5u8, 0x80, 0x80, 0x80] {
+            buf.push(b);
+        }
+        let removed = buf.erase_one_codepoint(true);
+        assert_eq!(removed, 1);
+        assert_eq!(buf.as_slice(), &[0xF5, 0x80, 0x80]);
     }
 
     /// Phase 69b Track G — IUTF8 set: when the buffer ends with a

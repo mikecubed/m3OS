@@ -1,15 +1,29 @@
 //! Phase 69b Track A — strict UTF-8 byte-stream decoder.
 //!
 //! [`Utf8Decoder`] is a pure-logic state machine that consumes one
-//! byte at a time and emits a typed [`DecoderOutput`]:
+//! byte at a time and emits a typed [`DecoderOutput`] with five
+//! variants:
 //!
-//! - `Pending` — the byte advanced the state but no codepoint has been
-//!   completed; more bytes are needed.
+//! - `Pending` — the byte advanced the state but no codepoint has
+//!   been completed; more bytes are needed.
 //! - `Codepoint(u32)` — a full Unicode scalar value was decoded.
-//! - `Invalid` — the byte broke the in-flight (or starting) sequence;
-//!   the caller emits U+FFFD and the decoder resyncs on the next
-//!   valid leading byte (the W3C / WHATWG replacement-character
-//!   contract).
+//! - `Invalid` — the byte broke the in-flight (or starting) sequence
+//!   and the offending byte itself cannot start a fresh sequence
+//!   (stray continuation, invalid leader, or in-flight break on
+//!   another invalid byte); the caller emits exactly one U+FFFD.
+//! - `InvalidThenCodepoint(u32)` — two outputs in one step: the
+//!   in-flight sequence broke AND the offending byte was a complete
+//!   ASCII codepoint. Caller emits U+FFFD followed by the codepoint
+//!   so valid trailing data is preserved.
+//! - `InvalidThenPending` — two outputs in one step: the in-flight
+//!   sequence broke AND the offending byte started a fresh multi-byte
+//!   sequence. Caller emits U+FFFD; the next byte continues the new
+//!   sequence.
+//!
+//! Consumers MUST handle all five variants. The two combined variants
+//! are how the decoder honours the W3C "one replacement per ill-formed
+//! sequence, then resync" rule under a one-byte-one-output API
+//! without buffering valid input.
 //!
 //! The decoder is `no_std`, allocation-free, and lives in
 //! `kernel-core` so the kernel framebuffer console can use it once a
@@ -25,11 +39,12 @@
 //! - UTF-16 surrogates U+D800..U+DFFF are rejected when emitted in
 //!   3-byte UTF-8 form.
 //! - Codepoints above U+10FFFF are rejected.
-//! - On `Invalid`, the decoder returns to the initial state without
-//!   consuming the offending byte's payload — the next valid leading
-//!   byte starts a fresh sequence. If the offending byte is itself a
-//!   valid leading byte (not a continuation), the decoder honours the
-//!   W3C resync rule and reuses it to start the next sequence.
+//! - On a broken in-flight sequence, the decoder always returns to
+//!   the initial state. The offending byte is re-fed through
+//!   `decode_leading` so its result is folded into the output:
+//!   ASCII becomes `InvalidThenCodepoint`, a multi-byte leader
+//!   becomes `InvalidThenPending`, and an invalid byte collapses to
+//!   plain `Invalid`.
 
 /// Output of [`Utf8Decoder::decode_byte`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
