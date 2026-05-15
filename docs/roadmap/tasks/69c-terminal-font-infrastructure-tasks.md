@@ -15,7 +15,7 @@
 | D | Font asset staging: `cargo xtask fetch-fonts`, ext2 copy in `populate_ext2_files` | None | Planned |
 | E | `term` boot wiring + atlas-backed `Renderer::glyph_pixels`; static-table fallback preserved | C, D | Planned |
 | F | Validation: `tui-smoke fonts` subcommand | E | Planned |
-| G | Documentation: Phase 69b cross-ref; appendix update; kernel patch bump to 0.69.3 | F | Planned |
+| G | Documentation: Phase 69b cross-ref; appendix update; aligned legacy learning doc; kernel patch bump to 0.69.3 | F | Planned |
 
 ---
 
@@ -183,7 +183,21 @@
 - [ ] New "Font infrastructure" section explains the atlas → static-fallback dispatch.
 - [ ] Documents the font path `/usr/share/fonts/m3os/term.ttf` and the asset's provenance.
 
-### G.3 — Kernel patch bump to 0.69.3
+### G.3 — Create the aligned legacy learning doc
+
+**File:** `docs/69c-terminal-font-infrastructure.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a self-contained reference for the TTF font infrastructure — the parser/rasterizer/atlas pipeline, the Nerd Font asset path, the static-table fallback contract, and what Phase 69c deliberately defers (multi-font, sizing, OpenType shaping) — without conflating it with Phase 69b's bitmap-glyph expansion or Phase 69's broader terminal contract. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
+
+**Acceptance:**
+- [ ] `docs/69c-terminal-font-infrastructure.md` exists with all template fields populated (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc).
+- [ ] Overview paragraph explains what Phase 69b left as a static-table glyph path and what Phase 69c replaces it with.
+- [ ] Key Files table cites every changed file (parser, rasterizer, atlas, font module entry, term boot wiring, renderer dispatch, xtask fetch + staging, tui-smoke fonts subcommand, appendix doc).
+- [ ] Closure of Related Phases section cross-refs Phase 57, 69, 69a, 69b.
+- [ ] How This Phase Differs From Later Font Work section calls out the deferred items (multi-size, per-region fallback, OpenType features, AA, variable fonts, hot-reload, configurable path).
+- [ ] Related Roadmap Docs links design doc and task doc.
+
+### G.4 — Kernel patch bump to 0.69.3
 
 **Files:**
 - `kernel/Cargo.toml`

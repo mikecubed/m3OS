@@ -109,7 +109,8 @@ After `Renderer::new(display)`, but before the first compose, `term` reads `/usr
 7. Wire `term` to open the font at boot and switch `Renderer` to the atlas path; preserve the static-table fallback.
 8. Extend `tui-smoke` with the `fonts` subcommand.
 9. Cross-ref Phase 69b doc; extend the appendix with a "Font infrastructure" section.
-10. Kernel patch bump to 0.69.3.
+10. Create the aligned legacy learning doc at `docs/69c-terminal-font-infrastructure.md`.
+11. Kernel patch bump to 0.69.3.
 
 ## Acceptance Criteria
 
