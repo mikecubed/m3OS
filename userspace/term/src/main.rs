@@ -648,11 +648,16 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
         renderer.apply(cmd);
     }
 
+    // Phase 69 PR 168 fix — `Winsize::ws_xpixel`/`ws_ypixel` are 16-bit but
+    // the display server hands us `u32`. A pathological surface > 65535 px
+    // would wrap to a bogus small value (e.g. 70000 → 4464); saturate to
+    // `u16::MAX` so the TTY layer sees an honest "very large" sentinel
+    // instead of misreporting the size after the truncation.
     let ws = syscall_lib::Winsize {
         ws_row: rows,
         ws_col: cols,
-        ws_xpixel: width as u16,
-        ws_ypixel: height as u16,
+        ws_xpixel: width.min(u16::MAX as u32) as u16,
+        ws_ypixel: height.min(u16::MAX as u32) as u16,
     };
     let _ = syscall_lib::ioctl(
         primary_fd,

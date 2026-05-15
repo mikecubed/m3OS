@@ -20,8 +20,16 @@
 //! - `Bell` is an audio event handled by [`crate::bell::Bell`];
 //! - `SetColor` is a state update that the next `PutGlyph` carries
 //!   into the framebuffer;
-//! - `MoveCursor` is bookkeeping; the cursor sprite is deferred
-//!   (Phase 57 ships the screen, not a separate cursor layer).
+//! - `MoveCursor` is bookkeeping; the cursor sprite is deferred.
+//!   Phase 69 added DECSCUSR shape state on [`crate::screen::Screen`]
+//!   and a 500 ms blink-tick that `mark_damaged`s the frame, but the
+//!   actual cursor *pixels* (block / underline / bar fill) still need
+//!   to be painted by the framebuffer owner. A follow-up phase will
+//!   wire `Screen::cursor_shape()` + `cursor_visible` + the blink
+//!   phase into a real cursor draw; until then, `cursor_shape` and
+//!   blink are observable via host tests and the `tui-smoke cursor`
+//!   subcommand asserts state changes — they are not yet user-visible
+//!   on the framebuffer.
 
 use crate::screen::RenderCommand;
 
@@ -121,7 +129,15 @@ impl<F: FramebufferOwner> Renderer<F> {
                 // renderer receives the chosen colours per PutGlyph.
             }
             RenderCommand::Bell => { /* audio path; no pixels */ }
-            RenderCommand::MoveCursor { .. } => { /* cursor sprite is deferred to a later track */ }
+            RenderCommand::MoveCursor { .. } => {
+                // Cursor pixel rendering is deferred — Phase 69 ships
+                // DECSCUSR shape state + a blink-tick that drives
+                // `mark_damaged()`, but the actual block / underline /
+                // bar pixels need a future framebuffer-owner update.
+                // See the module-level doc comment for the full
+                // deferral notes; `tui-smoke cursor` covers the state
+                // transitions today.
+            }
             // Phase 69 Track E — mouse-mode changes are routed to
             // `MouseReporter` by the main loop; the renderer is a
             // pure pixel sink and never sees this command.

@@ -43,7 +43,18 @@ pub enum ConsoleCmd {
     /// `?1049` / `?47` (alternate-screen buffer), `?9` / `?1000` /
     /// `?1006` (mouse reporting), and `?2004` (bracketed paste). Codes
     /// the consumer does not recognise are dropped silently.
-    DecPrivateMode { code: u16, set: bool },
+    ///
+    /// A single CSI may carry multiple semicolon-separated codes
+    /// (e.g. `CSI ? 1006 ; 1000 h` from the terminfo `XM` capability);
+    /// every parsed code is preserved in `codes[..count]` and consumers
+    /// must iterate via [`DecPrivateMode::codes_slice`] so multi-mode
+    /// toggles like the xterm `?1000 + ?1006` mouse-tracking idiom land
+    /// as a single batched apply.
+    DecPrivateMode {
+        codes: [u16; MAX_PARAMS],
+        count: usize,
+        set: bool,
+    },
     /// Phase 69 Track F — DECSCUSR cursor shape (`CSI <n> SP q`). `shape`
     /// is `0..=6` per the DEC vocabulary: 0/1 blinking block, 2 steady
     /// block, 3 blinking underline, 4 steady underline, 5 blinking bar,
@@ -55,6 +66,21 @@ pub enum ConsoleCmd {
     Sgr(SgrParams),
     /// Unknown/unsupported sequence — silently ignored.
     Nop,
+}
+
+impl ConsoleCmd {
+    /// Phase 69 Track B — build a single-code `DecPrivateMode` payload.
+    /// Used by tests and by call sites that synthesize a private-mode
+    /// command outside the parser.
+    pub const fn dec_private_single(code: u16, set: bool) -> Self {
+        let mut codes = [0u16; MAX_PARAMS];
+        codes[0] = code;
+        ConsoleCmd::DecPrivateMode {
+            codes,
+            count: 1,
+            set,
+        }
+    }
 }
 
 /// Inline storage for SGR parameters (up to MAX_PARAMS values).
@@ -465,24 +491,38 @@ impl AnsiParser {
     }
 
     fn dispatch_csi_private(&self, final_byte: char) -> ConsoleCmd {
-        // Phase 69 Track B — every single-parameter `ESC [ ? <n> h/l`
-        // dispatches to `DecPrivateMode`. Code 25 (DECTCEM) used to map
-        // to a dedicated `SetCursorVisible`; that case is now folded
-        // into `DecPrivateMode { code: 25, .. }` so the alternate-screen
-        // / mouse / bracketed-paste codes share a single uniform arm.
-        // Consumers that do not recognise a code drop the command
-        // silently.
-        match final_byte {
-            'h' => ConsoleCmd::DecPrivateMode {
-                code: self.param(0, 0),
-                set: true,
-            },
-            'l' => ConsoleCmd::DecPrivateMode {
-                code: self.param(0, 0),
-                set: false,
-            },
-            _ => ConsoleCmd::Nop,
-        }
+        // Phase 69 Track B — every `ESC [ ? <p1> [; <p2> ...] h/l`
+        // dispatches to a single `DecPrivateMode` that carries all
+        // semicolon-separated codes. Code 25 (DECTCEM) used to map to
+        // a dedicated `SetCursorVisible`; that case is now folded into
+        // `DecPrivateMode { codes, .. }` so the alternate-screen, mouse,
+        // and bracketed-paste codes share a single uniform arm.
+        //
+        // Multi-code support matters for terminfo capabilities like
+        // `XM=\E[?1006;1000h/l` which toggle SGR mouse encoding and
+        // button-event tracking in one CSI; consumers iterate
+        // `codes[..count]` to keep both halves in sync. Consumers that
+        // do not recognise a code drop that code silently and continue
+        // processing the rest.
+        let set = match final_byte {
+            'h' => true,
+            'l' => false,
+            _ => return ConsoleCmd::Nop,
+        };
+        let mut codes = [0u16; MAX_PARAMS];
+        // `param_count` is 0 when the parser saw `\x1b[?h` with no
+        // numeric body; treat that as a single zero so consumers get a
+        // recognisable (and silently dropped) `code = 0` payload rather
+        // than a zero-length slice.
+        let count = if self.param_count == 0 {
+            codes[0] = 0;
+            1
+        } else {
+            let n = self.param_count.min(MAX_PARAMS);
+            codes[..n].copy_from_slice(&self.params[..n]);
+            n
+        };
+        ConsoleCmd::DecPrivateMode { codes, count, set }
     }
 }
 
@@ -539,25 +579,13 @@ mod tests {
     #[test]
     fn test_dectcem_hide() {
         let cmd = parse_str_last("\x1b[?25l");
-        assert_eq!(
-            cmd,
-            ConsoleCmd::DecPrivateMode {
-                code: 25,
-                set: false
-            }
-        );
+        assert_eq!(cmd, ConsoleCmd::dec_private_single(25, false));
     }
 
     #[test]
     fn test_dectcem_show() {
         let cmd = parse_str_last("\x1b[?25h");
-        assert_eq!(
-            cmd,
-            ConsoleCmd::DecPrivateMode {
-                code: 25,
-                set: true
-            }
-        );
+        assert_eq!(cmd, ConsoleCmd::dec_private_single(25, true));
     }
 
     #[test]
@@ -766,7 +794,7 @@ mod tests {
         // unrecognised codes are dropped at the consumer level.
         assert_eq!(
             parse_str_last("\x1b[?1h"),
-            ConsoleCmd::DecPrivateMode { code: 1, set: true }
+            ConsoleCmd::dec_private_single(1, true)
         );
     }
 
@@ -792,10 +820,48 @@ mod tests {
         for (input, code, set) in cases {
             assert_eq!(
                 parse_str_last(input),
-                ConsoleCmd::DecPrivateMode { code, set },
+                ConsoleCmd::dec_private_single(code, set),
                 "unexpected parse for {:?}",
                 input.as_bytes()
             );
+        }
+    }
+
+    /// Phase 69 Track B — multi-parameter DEC private modes
+    /// (e.g. terminfo `XM=\E[?1006;1000h`). Every code lands in
+    /// `codes[..count]` so consumers can apply each one in order.
+    #[test]
+    fn test_dec_private_multi_param() {
+        let cmd = parse_str_last("\x1b[?1006;1000h");
+        match cmd {
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                assert!(set, "expected set=true for h-terminator");
+                assert_eq!(count, 2);
+                assert_eq!(&codes[..count], &[1006u16, 1000u16]);
+            }
+            other => panic!("expected DecPrivateMode, got {:?}", other),
+        }
+
+        // Same shape on reset (`l`).
+        let cmd = parse_str_last("\x1b[?1006;1000l");
+        match cmd {
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                assert!(!set);
+                assert_eq!(count, 2);
+                assert_eq!(&codes[..count], &[1006u16, 1000u16]);
+            }
+            other => panic!("expected DecPrivateMode, got {:?}", other),
+        }
+
+        // Three-param form — e.g. enable mouse + SGR + paste in one go.
+        let cmd = parse_str_last("\x1b[?1000;1006;2004h");
+        match cmd {
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                assert!(set);
+                assert_eq!(count, 3);
+                assert_eq!(&codes[..count], &[1000u16, 1006u16, 2004u16]);
+            }
+            other => panic!("expected DecPrivateMode, got {:?}", other),
         }
     }
 

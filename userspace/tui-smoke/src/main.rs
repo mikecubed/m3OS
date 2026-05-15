@@ -255,7 +255,7 @@ fn run_resize() -> Result<(), &'static str> {
         return Err("resize-cell-three-overwritten");
     }
     // Now exercise TIOCSWINSZ on stdin if it is a TTY. The session
-    // manager binds /bin/sh0's stdin to the kernel TTY; the Linux
+    // manager binds /bin/sh0's stdin to the kernel TTY; the m3OS
     // kernel TIOCSWINSZ branch sends SIGWINCH to the foreground
     // process group, and updates `tty.winsize`. The smoke gate
     // simply asserts the ioctl returns 0 and a follow-up

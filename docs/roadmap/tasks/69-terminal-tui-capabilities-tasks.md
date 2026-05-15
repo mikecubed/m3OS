@@ -252,7 +252,7 @@
 **Why it matters:** The visual cursor must match the shape the application requested; blinking variants must visibly blink even when the PTY is idle.
 
 **Acceptance:**
-- [x] `render_cursor` reads `Screen::cursor_shape()` and draws the appropriate glyph: full-cell inverted fill for block, bottom 2 rows for underline, left 2 columns for bar.
+- [~] `render_cursor` reads `Screen::cursor_shape()` and draws the appropriate glyph: full-cell inverted fill for block, bottom 2 rows for underline, left 2 columns for bar. **Partial — Phase 69 lands `Screen::cursor_shape` state, the DECSCUSR parser, and the blink-tick `mark_damaged()` call, but the actual cursor *pixel* draw (block / underline / bar fill on the framebuffer) is deferred to a follow-up phase. `RenderCommand::MoveCursor` currently routes to a documented no-op; `tui-smoke cursor` asserts shape-state transitions but not pixel output.**
 - [x] When the current shape is a blinking variant, `main.rs` synthesizes damage every 500 ms via a `last_blink_ms` field and a forced `renderer.mark_damaged()` call; the compose throttle (`COMPOSE_INTERVAL_MS`) still applies so the upload is at most one frame per 16 ms.
 - [x] Steady shapes leave the existing damage-driven path untouched (no idle compose).
 

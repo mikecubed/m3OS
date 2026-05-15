@@ -645,7 +645,15 @@ impl Screen {
             ConsoleCmd::EraseDisplay(1) => self.erase_display_to_cursor(out),
             ConsoleCmd::EraseDisplay(_) => { /* unsupported mode — keep the screen */ }
             ConsoleCmd::EraseLine(mode) => self.erase_line(mode, out),
-            ConsoleCmd::DecPrivateMode { code, set } => self.handle_dec_private(code, set, out),
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                // Phase 69 Track B — a single CSI may carry multiple
+                // semicolon-separated codes (e.g. the terminfo `XM`
+                // capability emits `\E[?1006;1000h`). Apply each one in
+                // order so multi-mode toggles land atomically.
+                for &code in &codes[..count.min(codes.len())] {
+                    self.handle_dec_private(code, set, out);
+                }
+            }
             ConsoleCmd::CursorShape { shape } => {
                 self.cursor_shape = CursorShape::from_code(shape);
             }

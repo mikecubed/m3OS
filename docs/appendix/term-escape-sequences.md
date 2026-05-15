@@ -65,7 +65,7 @@ that do not recognise a code drop it silently.
 | Code | Name | Effect in `term` |
 |---|---|---|
 | `25` | DECTCEM | Show/hide cursor — accepted; no-op (cursor rendering is a `render::FramebufferOwner` concern). |
-| `47` | Legacy alt-screen | Alias for `?1049` — switch active grid without saving cursor. |
+| `47` | Legacy alt-screen | Aliased to `?1049` — both route through the same `switch_to_alt` / `switch_to_primary` path (save cursor + colours on enter, restore on exit). A true `?47` no-save/restore semantic is deferred. |
 | `1049` | Alt-screen + cursor save | Switch active grid + save/restore cursor and colours. |
 | `9` | X10 mouse | Press-only mouse reporting via `MouseReporter`. |
 | `1000` | Button-event mouse | Press + release via `MouseReporter`. |
@@ -89,7 +89,16 @@ parser. Mapping in `userspace/term/src/screen.rs::CursorShape::from_code`:
 | `6` | `SteadyBar`. |
 
 Blinking variants drive a 500 ms damage tick in `term`'s main loop so
-the cursor blinks even when the PTY is idle.
+the cursor *would* blink even when the PTY is idle.
+
+> **Phase 69 scope note.** The DECSCUSR parser, `Screen::cursor_shape`
+> state, and the 500 ms `mark_damaged()` blink-tick all ship in Phase 69
+> and are observable via `tui-smoke cursor`. The actual cursor *pixel*
+> render (block / underline / bar fill on the framebuffer) is deferred —
+> `RenderCommand::MoveCursor` is currently a documented no-op so the
+> blink tick repaints an identical frame. A follow-up phase will land
+> the visible cursor glyph; until then, cursor styling is wire-correct
+> but not yet user-visible.
 
 ## Mouse reporting wire format
 

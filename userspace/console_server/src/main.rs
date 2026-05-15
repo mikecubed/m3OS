@@ -817,21 +817,28 @@ impl FbRenderer {
                 }
                 _ => {}
             },
-            ConsoleCmd::DecPrivateMode { code: 25, set } => {
-                if set {
-                    self.cursor_visible = true;
-                    self.show_cursor();
-                } else {
-                    self.hide_cursor();
-                    self.cursor_visible = false;
+            ConsoleCmd::DecPrivateMode { codes, count, set } => {
+                // Phase 69 Track B — only DECTCEM (?25) is meaningful for
+                // the text-mode FB console; alt-screen, mouse, and
+                // bracketed-paste codes are owned by `term`. We iterate
+                // each parsed code so multi-param sequences like
+                // `\E[?25;1006h` still toggle the cursor even when the
+                // terminfo entry batched it with a `term`-only code.
+                for &code in &codes[..count.min(codes.len())] {
+                    if code == 25 {
+                        if set {
+                            self.cursor_visible = true;
+                            self.show_cursor();
+                        } else {
+                            self.hide_cursor();
+                            self.cursor_visible = false;
+                        }
+                    }
+                    // Any other code is owned by userspace `term`;
+                    // dropping it silently here keeps legacy text-mode
+                    // sessions undisturbed.
                 }
             }
-            // Phase 69 — alternate-screen, mouse, bracketed-paste, and
-            // any other DEC private modes are owned by `term` (the
-            // graphical terminal emulator). The kernel framebuffer
-            // console drops them silently so legacy text-mode sessions
-            // do not get confused.
-            ConsoleCmd::DecPrivateMode { .. } => {}
             // Phase 69 Track F — DECSCUSR cursor shape. The text-mode
             // FB console only paints a single-cell block today, so we
             // accept and ignore the shape selection.
