@@ -114,7 +114,8 @@ Pure-logic state machine. `Utf8Decoder::new()` starts in the `Initial` state. `d
 7. Wire `IUTF8` in `kernel-core::tty::Ldisc::erase_one`; both kernel TTY and PTY honour it.
 8. Extend `tui-smoke` with the four UTF-8 checks; gate via the existing `cargo xtask tui-smoke`.
 9. Cross-ref Phase 22b, 69, 69a docs; extend `docs/appendix/term-escape-sequences.md` with a UTF-8 section.
-10. Kernel patch bump to 0.69.2.
+10. Create the aligned legacy learning doc at `docs/69b-terminal-utf8-and-glyphs.md` (per `docs/appendix/doc-templates.md`).
+11. Kernel patch bump to 0.69.2.
 
 ## Acceptance Criteria
 
