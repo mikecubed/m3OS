@@ -331,9 +331,12 @@ before subsequent `cargo xtask image` runs stage it on the disk.
 `term` boots on `Static` and upgrades to `Atlas` when
 `/usr/share/fonts/m3os/term.ttf` opens and parses cleanly. The
 boot log records `term: atlas loaded N glyphs` on success and
-`term: font load failed; using static fallback` on any failure —
-the second message is the load-bearing signal for the
-`tui-smoke fonts missing-font` gate.
+`term: font load failed; using static fallback` on any failure.
+The current `tui-smoke fonts missing-font` gate exercises only
+the in-process static-resolver path (ASCII / Latin-1 /
+box-drawing still render with no font present); a stripped-disk
+boot variant that asserts the fallback boot-log line is tracked
+as a deferred follow-up.
 
 The renderer's `compose()` resolves the codepoint through
 `GlyphSource` and hands a `&GlyphView` to `FramebufferOwner::put_glyph`,

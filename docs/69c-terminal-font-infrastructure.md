@@ -46,9 +46,13 @@ The phase splits cleanly into three pieces:
 
 `term` opens the staged font at boot, builds the atlas, and
 upgrades the renderer's `GlyphSource` from `Static` to `Atlas`. On
-any failure (file missing, parse error, OOM) the renderer keeps
-using Phase 69b's static path; the boot log records the outcome so
-the `tui-smoke fonts missing-font` gate can pin the contract.
+a file-missing, parse-error, or oversized-file failure the
+renderer keeps using Phase 69b's static path; the boot log records
+the outcome. The current `tui-smoke fonts missing-font` gate
+exercises only the in-process static-resolver path; the
+complementary stripped-disk boot variant that pins the
+`term: font load failed; using static fallback` boot-log line is
+tracked as a deferred follow-up (see the Track F section below).
 
 ## What This Doc Covers
 

@@ -205,10 +205,15 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
     // Phase 69c Track E.1 — try to load the Nerd Font asset and
-    // upgrade the renderer to atlas-backed glyph resolution. On any
-    // failure (file missing, parse error, OOM) the renderer stays
-    // on the Phase 69b static-table path and the terminal remains
-    // usable for ASCII / Latin-1 / box-drawing.
+    // upgrade the renderer to atlas-backed glyph resolution. On a
+    // file-missing, parse-error, or oversized-file failure the
+    // renderer stays on the Phase 69b static-table path and the
+    // terminal remains usable for ASCII / Latin-1 / box-drawing.
+    // True OOM is *not* recovered here — this binary's
+    // `alloc_error_handler` exits the process; `build_atlas` bounds
+    // the worst-case font-read allocation with a hard size cap to
+    // keep the fallback path reachable. See the docstring on
+    // `build_atlas` for the full contract.
     build_atlas(&mut renderer);
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
@@ -493,9 +498,20 @@ fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::R
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut chunk = [0u8; 4096];
     let mut oversize = false;
+    let mut read_error = false;
     loop {
         let n = syscall_lib::read(fd, &mut chunk);
-        if n <= 0 {
+        if n < 0 {
+            // I/O error mid-read. Treat as a load failure rather
+            // than constructing an atlas from a partial file — a
+            // truncated TTF would parse-fail noisily, but a
+            // truncation that happens to land on a table boundary
+            // could parse and produce garbage glyphs.
+            read_error = true;
+            break;
+        }
+        if n == 0 {
+            // Clean EOF.
             break;
         }
         if bytes.len() + n as usize > MAX_FONT_BYTES {
@@ -505,7 +521,7 @@ fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::R
         bytes.extend_from_slice(&chunk[..n as usize]);
     }
     let _ = syscall_lib::close(fd);
-    if oversize || bytes.is_empty() {
+    if read_error || oversize || bytes.is_empty() {
         syscall_lib::write_str(
             STDOUT_FILENO,
             "term: font load failed; using static fallback\n",

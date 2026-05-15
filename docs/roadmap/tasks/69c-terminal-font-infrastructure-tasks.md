@@ -131,7 +131,7 @@
 
 **Acceptance:**
 - [x] `Renderer` carries a `GlyphSource` enum: `Static` (Phase 69b tables) or `Atlas(Atlas)`.
-- [x] `glyph_pixels(codepoint)` dispatches: `Atlas` → `atlas.resolve(codepoint)`; `Static` → `kernel_core::fb::resolve_glyph(codepoint)`.
+- [x] `glyph_pixels(codepoint)` dispatches: `Atlas` → `atlas.resolve(codepoint)`; `Static` → `kernel_core::session::resolve_glyph(codepoint)`.
 - [x] No allocation per glyph blit (both paths return `&RasterBitmap`).
 - [x] When the atlas misses (codepoint not in the font), the resolver falls back to the static centred-dot glyph — same behaviour Phase 69b promised.
 

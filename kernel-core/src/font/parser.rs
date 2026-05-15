@@ -241,10 +241,12 @@ impl ttf_parser::OutlineBuilder for OutlineCollector {
 mod tests {
     use super::*;
 
-    /// Open a tiny in-tree font asset for tests — the public-domain
-    /// "DejaVu Sans Mono" cut available on the host. We resolve the
-    /// path at runtime so `cargo test -p kernel-core` works from any
-    /// directory.
+    /// Open a system-installed "DejaVu Sans Mono" TTF for these
+    /// tests. DejaVu is distributed under the Bitstream Vera /
+    /// DejaVu license — we use whatever copy the host has at one of
+    /// `TEST_FONT_PATHS`; no font binary is bundled in-tree. Tests
+    /// that find no font on disk short-circuit so `cargo test -p
+    /// kernel-core` still works from any directory.
     fn load_test_font_bytes() -> Option<Vec<u8>> {
         for candidate in TEST_FONT_PATHS {
             if let Ok(bytes) = std::fs::read(candidate) {
