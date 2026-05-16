@@ -109,9 +109,9 @@ const PTY_READ_CHUNK: usize = 256;
 /// `PutGlyph` ops between calls, so a burst of PTY echo bytes (one
 /// per typed key) coalesces into a single compose pass instead of
 /// firing one full-buffer upload per character. With the Phase 56
-/// chunked-pixel path, each upload is ~252 IPC roundtrips for the
-/// 640×400 surface; without throttling, every keystroke paid that
-/// cost in series.
+/// chunked-pixel path, each full-surface upload is hundreds of IPC
+/// roundtrips for the 1280×800 surface; without throttling, every
+/// keystroke paid that cost in series.
 #[cfg(not(test))]
 const COMPOSE_INTERVAL_MS: u64 = 16;
 
@@ -480,8 +480,12 @@ fn wait_for_shell_dependencies() -> bool {
 #[cfg(not(test))]
 fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::Renderer<F>) {
     const FONT_PATH: &[u8] = b"/usr/share/fonts/m3os/term.ttf\0";
-    const ATLAS_CELL_W: u8 = 8;
-    const ATLAS_CELL_H: u8 = 16;
+    // Cell dimensions must match `term::display::{CELL_WIDTH,
+    // CELL_HEIGHT}`. The atlas rasterises into this cell size, so
+    // the bigger 16×32 cell gives the Nerd Font glyphs enough
+    // resolution to be readable at QEMU GOP defaults.
+    const ATLAS_CELL_W: u8 = term::display::CELL_WIDTH;
+    const ATLAS_CELL_H: u8 = term::display::CELL_HEIGHT;
     // Hard cap on the read. JetBrainsMono Nerd Font Mono is ~2 MiB;
     // 8 MiB leaves headroom for future patched variants while
     // keeping the worst-case allocation bounded.
@@ -783,11 +787,11 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
     width: u32,
     height: u32,
 ) {
-    // The Phase 56 renderer ships an 8×16 glyph grid (the kernel-core
-    // fallback font); replace the constants here when the font_atlas
-    // exposes runtime metrics.
-    const GLYPH_W: u32 = 8;
-    const GLYPH_H: u32 = 16;
+    // Cell metrics must track `term::display::{CELL_WIDTH,
+    // CELL_HEIGHT}` so SurfaceResized cell math (pixels → cell grid)
+    // matches the actual surface stride.
+    const GLYPH_W: u32 = term::display::CELL_WIDTH as u32;
+    const GLYPH_H: u32 = term::display::CELL_HEIGHT as u32;
     // Phase 69 PR 168 round-3 fix — a malformed `SurfaceResized` could
     // request 65535×65535 cells (~4.3B cells × `Cell` size = multi-GB)
     // and crash `term`. Cap each dimension at 1024 cells (8192×16384

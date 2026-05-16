@@ -297,12 +297,14 @@ impl MouseReporter {
 /// project into the cell grid by dividing by the renderer's glyph
 /// dimensions (`GLYPH_W` / `GLYPH_H`).
 fn compute_cell_position(event: &PointerEvent, cols: u16, rows: u16) -> (u16, u16) {
-    // GLYPH_W / GLYPH_H aren't compile-time consts of this module —
-    // approximate via the conventional 8×16 grid. The reporter is
+    // MUST match `term::display::CELL_WIDTH` / `CELL_HEIGHT`.
+    // The `display` module is gated behind the `os-binary` feature
+    // so we duplicate the literals here; mismatching them would
+    // misproject pointer pixels onto the cell grid. The reporter is
     // bounded by the cell grid regardless; an off-by-one cell at
     // the grid boundary is harmless.
-    const GLYPH_W: u16 = 8;
-    const GLYPH_H: u16 = 16;
+    const GLYPH_W: u16 = 16;
+    const GLYPH_H: u16 = 32;
     let (px_x, px_y) = match event.abs_position {
         Some((x, y)) => (x.max(0) as u32, y.max(0) as u32),
         None => (0, 0),
@@ -318,6 +320,12 @@ fn compute_cell_position(event: &PointerEvent, cols: u16, rows: u16) -> (u16, u1
 mod tests {
     use super::*;
     use kernel_core::input::events::{ModifierState, PointerButton, PointerEvent};
+
+    // Mirror the literals in `compute_cell_position`. Tests use
+    // these so the cell-coord assertions stay readable when the
+    // pixel inputs are derived from `cell × CELL_*`.
+    const CELL_W_PX: i32 = 16;
+    const CELL_H_PX: i32 = 32;
 
     fn press(button: u8, x: i32, y: i32) -> PointerEvent {
         PointerEvent {
@@ -359,15 +367,15 @@ mod tests {
 
     /// Phase 69 Track E.1 acceptance — left-button press at
     /// `(col=10, row=5)` under SGR mode emits `\x1b[<0;11;6M`.
-    /// `cell_col = (px_x / 8) + 1` — to land at col 11, the pixel
-    /// x must be 10·8 = 80 (col 11 == 10 + 1 because the encoder
-    /// reports 1-based cells).
+    /// `cell_col = (px_x / CELL_W_PX) + 1` — to land at col 11 the
+    /// pixel x must be `10 · CELL_W_PX` (col 11 == 10 + 1 because
+    /// the encoder reports 1-based cells).
     #[test]
     fn sgr_press_left_button() {
         let mut r = MouseReporter::new();
         r.enable(Mode::Sgr);
         let bytes = r
-            .encode(&press(0, 10 * 8, 5 * 16), 80, 25)
+            .encode(&press(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
             .expect("sgr enabled");
         assert_eq!(bytes.as_slice(), b"\x1b[<0;11;6M");
     }
@@ -378,7 +386,7 @@ mod tests {
         let mut r = MouseReporter::new();
         r.enable(Mode::Sgr);
         let bytes = r
-            .encode(&release(0, 10 * 8, 5 * 16), 80, 25)
+            .encode(&release(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
             .expect("sgr enabled");
         assert_eq!(bytes.as_slice(), b"\x1b[<0;11;6m");
     }
@@ -390,7 +398,7 @@ mod tests {
         let mut r = MouseReporter::new();
         r.enable(Mode::X10);
         let bytes = r
-            .encode(&press(0, 10 * 8, 5 * 16), 80, 25)
+            .encode(&press(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
             .expect("x10 enabled");
         // ESC '[' 'M' Cb Cx Cy. Cb = 0+32 = 32 = b' '. Cx = 11+32 = 43 = b'+'.
         // Cy = 6+32 = 38 = b'&'.
@@ -403,7 +411,10 @@ mod tests {
     fn x10_release_dropped() {
         let mut r = MouseReporter::new();
         r.enable(Mode::X10);
-        assert!(r.encode(&release(0, 10 * 8, 5 * 16), 80, 25).is_none());
+        assert!(
+            r.encode(&release(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+                .is_none()
+        );
     }
 
     /// Phase 69 Track E.1 acceptance — ButtonEvent mode emits release
@@ -413,7 +424,7 @@ mod tests {
         let mut r = MouseReporter::new();
         r.enable(Mode::ButtonEvent);
         let bytes = r
-            .encode(&release(0, 10 * 8, 5 * 16), 80, 25)
+            .encode(&release(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
             .expect("button-event enabled");
         // Cb = 3 + 32 = 35 = b'#'. Cx = 11+32 = 43 = b'+'. Cy = 6+32 = 38 = b'&'.
         assert_eq!(bytes.as_slice(), b"\x1b[M#+&");
@@ -457,7 +468,7 @@ mod tests {
         assert_eq!(r.tracking(), TrackingMode::Normal);
         assert_eq!(r.encoding(), EncodingMode::Legacy);
         let bytes = r
-            .encode(&press(0, 10 * 8, 5 * 16), 80, 25)
+            .encode(&press(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
             .expect("tracking still active");
         // Expect legacy wire form: ESC '[' 'M' Cb Cx Cy.
         assert_eq!(bytes.as_slice(), b"\x1b[M +&");
@@ -471,7 +482,10 @@ mod tests {
         r.set_tracking(TrackingMode::Normal);
         r.set_encoding(EncodingMode::Sgr);
         r.set_tracking(TrackingMode::Disabled);
-        assert!(r.encode(&press(0, 10 * 8, 5 * 16), 80, 25).is_none());
+        assert!(
+            r.encode(&press(0, 10 * CELL_W_PX, 5 * CELL_H_PX), 80, 25)
+                .is_none()
+        );
     }
 
     /// Phase 69 review-resolution — the legacy `enable(Mode::Sgr)`

@@ -5,7 +5,7 @@
 //!
 //! - the IPC handle for `display_server`;
 //! - the `SurfaceId` and `BufferId` term claims;
-//! - a 640 × 400 BGRA8888 [`SurfaceBuffer`] that backs the term grid
+//! - a 1280 × 800 BGRA8888 [`SurfaceBuffer`] that backs the term grid
 //!   (80 × 25 cells × 8 × 16 px);
 //! - the [`BasicBitmapFont`] used to rasterise glyphs into the
 //!   buffer.
@@ -68,10 +68,15 @@ const FALLBACK_FG_BGRA: u32 = 0x00FF_FFFF;
 pub const SURFACE_WIDTH_PX: u32 = (DEFAULT_COLS as u32) * (CELL_WIDTH as u32);
 /// Pixel height of the term surface, in pixels.
 pub const SURFACE_HEIGHT_PX: u32 = (DEFAULT_ROWS as u32) * (CELL_HEIGHT as u32);
-/// Cell pixel width — pinned to the bundled font's cell size.
-pub const CELL_WIDTH: u8 = 8;
-/// Cell pixel height — pinned to the bundled font's cell size.
-pub const CELL_HEIGHT: u8 = 16;
+/// Cell pixel width. The Phase 69c TTF atlas rasterises glyphs into
+/// this cell size, so a wider cell produces more legible Nerd Font
+/// glyphs without changing the 80×25 column/row contract. Picked
+/// 16 (2× the static IBM VGA 8×16 fallback width) so the static
+/// fallback bitmap occupies a clean integer quadrant of the cell.
+pub const CELL_WIDTH: u8 = 16;
+/// Cell pixel height. Doubled from the static font's 16-px height
+/// for the same reason as [`CELL_WIDTH`].
+pub const CELL_HEIGHT: u8 = 32;
 
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`
@@ -148,7 +153,7 @@ impl DisplayClient {
             return Err(TermError::DisplayServerUnavailable);
         }
 
-        // 4. Allocate the shared-memory region. 640 × 400 × 4 = 1 MiB
+        // 4. Allocate the shared-memory region. 1280 × 800 × 4 = ~4 MiB
         //    (256 contiguous 4 KiB pages). The SHM registry's create
         //    path rounds up to the next page boundary; the buddy
         //    allocator orders fit comfortably inside MAX_ORDER=9.
@@ -380,21 +385,22 @@ impl FramebufferOwner for DisplayClient {
 
         // Phase 69c Track E.2 — the renderer pre-resolved the
         // codepoint to a `GlyphView`, so we paint whatever bitmap
-        // was handed in. Only blank glyphs — control codepoints
-        // (`U+0000..=U+001F`, `U+007F`, the C1 range, NBSP) and the
-        // static-table blanks — produce all-zero bitmaps; we treat
-        // those as "render background" and skip the bit-walk.
-        // Uncovered codepoints come back as the visible centred-dot
-        // fallback (non-blank), so they take the blit path below.
-        if glyph.bitmap.iter().all(|&b| b == 0) {
-            fill_cell_bg(
-                cell_view,
-                stride_pixels,
-                glyph.width as usize,
-                glyph.height as usize,
-                bg,
-            );
-        } else {
+        // was handed in. Always bg-fill the full cell first so a
+        // glyph smaller than the cell (e.g. the static IBM VGA 8×16
+        // fallback in a 16×32 cell when TTF load fails) doesn't
+        // leave stale pixels in the uncovered area. Only blank
+        // glyphs (control codepoints `U+0000..=U+001F`, `U+007F`,
+        // the C1 range, NBSP, and the static-table blanks) need no
+        // further work; uncovered codepoints come back as the
+        // visible centred-dot fallback (non-blank).
+        fill_cell_bg(
+            cell_view,
+            stride_pixels,
+            CELL_WIDTH as usize,
+            CELL_HEIGHT as usize,
+            bg,
+        );
+        if !glyph.bitmap.iter().all(|&b| b == 0) {
             blit_glyph_view(glyph, cell_view, stride_pixels, fg, bg);
         }
     }
