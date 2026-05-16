@@ -127,10 +127,12 @@ pub struct DisplayClient {
 
 impl DisplayClient {
     /// Look up `display_server`, send the `Hello` + `CreateSurface`
-    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a 1 MiB
-    /// shared-memory region, and return a ready-to-submit
-    /// `DisplayClient`. Returns a typed error if the lookup, encode,
-    /// `ipc_call_buf`, or SHM allocation fails.
+    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a ~4 MiB
+    /// shared-memory region sized for the 1280 × 800 BGRA8888
+    /// surface (`SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX * 4`,
+    /// page-aligned), and return a ready-to-submit `DisplayClient`.
+    /// Returns a typed error if the lookup, encode, `ipc_call_buf`,
+    /// or SHM allocation fails.
     pub fn connect() -> Result<Self, TermError> {
         let server_handle = match Self::lookup_with_backoff() {
             Some(h) => h,

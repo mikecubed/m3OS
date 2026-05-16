@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Source Ref:** phase-69c
-**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs)
+**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations) ✅, Phase 69a (Termios Raw Mode) ✅, Phase 69b (UTF-8 + Bitmap Glyphs) ✅
 **Builds on:** Replaces the static bitmap glyph tables in `kernel-core::fb` with a TTF/OTF rasterizer + glyph atlas cache, and embeds a Nerd Font asset on the ext2 data disk so modern developer TUIs (lazygit, lf, fzf, starship glyphs, btop's gauges) render at full fidelity. Phase 69b's `resolve_glyph` accessor is the seam — its body changes from a static-table dispatch to an atlas lookup with a TTF-rasterized fallback.
 **Primary Components:** kernel-core/src/font (new module), userspace/term/src/render.rs, xtask (font asset staging), `ports/lang/font` (optional vendor crate wrapping `ttf-parser` + `ab_glyph`)
 

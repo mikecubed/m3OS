@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Source Ref:** phase-69c
-**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs)
+**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations) ✅, Phase 69a (Termios Raw Mode) ✅, Phase 69b (UTF-8 + Bitmap Glyphs) ✅
 **Goal:** Land TTF font parsing, glyph rasterization, a bounded LRU atlas, and a Nerd Font asset on the data disk so `term` resolves arbitrary Unicode codepoints — including Nerd Font private-use-area icons — at full fidelity. Phase 69b's static bitmap tables remain as the startup-fallback path.
 
 ## Track Layout

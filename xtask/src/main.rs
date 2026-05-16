@@ -8494,6 +8494,29 @@ fn create_data_disk(
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
+
+    // Phase 69c round-8 fix — the marker is part of `disk.img`'s
+    // lifecycle, not part of `output_dir`'s persistent state. Remove
+    // any stale marker before creating the new disk so a populate
+    // step that aborts before `write_font_marker` (e.g., missing
+    // `term.ttf`) cannot leave the previous marker behind and have
+    // the next run falsely accept the half-built disk as valid. The
+    // marker is re-created by `write_font_marker` inside
+    // `populate_ext2_files` only after `verify_sha256_strict`
+    // succeeds, so this path leaves the next run in one of two
+    // honest states: marker-present-and-matching (good) or
+    // marker-absent (the verify aborts with the expected error).
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    if marker_path.exists() {
+        if let Err(e) = fs::remove_file(&marker_path) {
+            eprintln!(
+                "Error: failed to remove stale font marker {}: {e}",
+                marker_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
@@ -10598,12 +10621,23 @@ fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<(
 fn cmd_clean() {
     let root = workspace_root();
     let target_dir = root.join("target");
-    let disk_img = target_dir.join("x86_64-unknown-none/release/disk.img");
+    let output_dir = target_dir.join("x86_64-unknown-none/release");
+    let disk_img = output_dir.join("disk.img");
     if disk_img.exists() {
         fs::remove_file(&disk_img).expect("failed to remove disk.img");
         println!("Removed {}", disk_img.display());
     } else {
         println!("No disk.img to remove");
+    }
+    // Phase 69c round-8 — keep the font marker's lifecycle tied to
+    // disk.img's lifecycle. Without this, a stale marker would
+    // survive `cargo xtask clean` and falsely satisfy the next
+    // `verify_font_on_existing_disk` if the next build aborted
+    // before staging the font.
+    let marker = output_dir.join(FONT_MARKER_FILENAME);
+    if marker.exists() {
+        fs::remove_file(&marker).expect("failed to remove font marker");
+        println!("Removed {}", marker.display());
     }
 }
 

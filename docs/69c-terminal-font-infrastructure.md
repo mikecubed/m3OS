@@ -3,6 +3,7 @@
 **Aligned Roadmap Phase:** Phase 69c
 **Status:** Complete
 **Source Ref:** phase-69c
+**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations) ✅, Phase 69a (Termios Raw Mode) ✅, Phase 69b (UTF-8 + Bitmap Glyphs) ✅
 **Supersedes Legacy Doc:** new
 
 ## Overview
@@ -118,9 +119,11 @@ The rasterizer turns an outline into a 1-bit `RasterBitmap`. The
 algorithm:
 
 1. **Compute pixel scale.** `scale_y = (cell_h - 2) / em_height`
-   reserves one pixel of top and bottom padding so caps and
-   descenders don't touch the cell edges. `scale_x = scale_y`
-   because Nerd Font is monospace.
+   reserves one pixel of bottom padding so descenders (`g`, `p`,
+   `y`) don't kiss the bottom cell edge. There is no top padding
+   row — the baseline math below maps the font's `ascender`
+   em-point to row 0, so caps sit flush against the top edge.
+   `scale_x = scale_y` because Nerd Font is monospace.
 2. **Centre horizontally.** The glyph bbox in pixel space is
    `(x_min * scale, x_max * scale)`; the horizontal translation
    places the glyph's midpoint at `cell_w / 2`.
