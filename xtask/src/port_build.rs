@@ -811,6 +811,8 @@ fn ensure_yacc() -> Result<(), String> {
         }
     }
     const BYACC_URL: &str = "https://invisible-mirror.net/archives/byacc/byacc-20240109.tgz";
+    // DevSkim: ignore DS173237 -- SHA-256 of the public byacc-20240109 tarball,
+    // a content-addressed integrity check consumed by fetch_tarball; not a secret.
     const BYACC_SHA: &str = "f2897779017189f1a94757705ef6f6e15dc9208ef079eea7f28abec577e08446";
 
     let root = workspace_root();
