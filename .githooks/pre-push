@@ -180,3 +180,15 @@ if [ "${M3OS_TERMIOS_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask termios-smoke..."
     cargo xtask termios-smoke --timeout 90
 fi
+
+# Phase 69d Track E.1 — tui-app regression gate. Gated behind
+# M3OS_TUI_APP_REGRESSION=1 because the gate cross-compiles ncurses +
+# libevent + less + htop + tmux (cold-build budget ~5-7 min) before
+# booting QEMU and driving 32 scripted steps. Set the env var on
+# branches that touch the ports system, the kernel TTY/PTY layer,
+# the term emulator, or any of the Phase 69-series terminal contract
+# surfaces.
+if [ "${M3OS_TUI_APP_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask tui-app-smoke..."
+    cargo xtask tui-app-smoke --timeout 300
+fi
