@@ -88,7 +88,8 @@ New subcommand boots, executes a scripted keystroke sequence through `term`, ass
 7. Build `cargo xtask tui-app-smoke`; drive all three apps through scripted sequences.
 8. Author `docs/appendix/tui-app-port-notes.md` cataloguing the ports + each app's terminal-contract coverage.
 9. Update post-Phase-57 evaluation doc with a closeout note.
-10. Kernel patch bump to 0.69.4 (userspace + ports only; no kernel changes expected).
+10. Author `docs/69d-tui-app-foundation.md` — the aligned legacy learning doc — cross-referencing 69 / 69a / 69b / 69c and enumerating the deferred TUI apps.
+11. Kernel patch bump to 0.69.4 (userspace + ports only; no kernel changes expected).
 
 ## Acceptance Criteria
 
@@ -99,6 +100,8 @@ New subcommand boots, executes a scripted keystroke sequence through `term`, ass
 - `tmux new-session` creates a session; `split-window -h` produces a visible vertical pane split; `resize-pane -R 5` shifts the divider; `detach` returns to the shell.
 - `cargo xtask tui-app-smoke` reports `:ok` for all three apps.
 - No kernel panic across the full smoke run.
+- `docs/69d-tui-app-foundation.md` exists as the aligned legacy learning doc, cross-referencing Phases 31 / 44 / 45 / 69 / 69a / 69b / 69c.
+- Kernel version bumped to `0.69.4`; `docs/roadmap/README.md` Phase 69d row flipped from Planned → Complete.
 
 ## Companion Task List
 
