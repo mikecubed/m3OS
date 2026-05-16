@@ -54,13 +54,19 @@ needs and that m3OS does not implement today.
 
 ### Port build driver
 
-`xtask/src/port_build.rs` is a 600-line Rust module that parses
+`xtask/src/port_build.rs` is a ~1000-line Rust module that parses
 `ports/<category>/<name>/Portfile`, fetches and SHA-256-verifies the
 upstream tarball into `target/port-src/`, extracts it under
 `target/port-build/<name>/`, applies any patches from
 `ports/<category>/<name>/patches/`, and dispatches to a per-port
-`build_<name>` function that runs `./configure && make && make install
-DESTDIR=...` with the m3OS musl cross-toolchain.
+`build_<name>` function that runs `./configure --prefix=/usr/local`
+followed by `make && make install DESTDIR=target/port-stage/<name>/`
+with the m3OS musl cross-toolchain.  Using `--prefix=/usr/local` +
+`DESTDIR=<stage>` (rather than baking the host stage path into the
+build via `--prefix=<stage>`) keeps autotools-emitted artefacts —
+pkg-config `.pc` files, libtool `.la` files, autoconf `sysconfdir`
+defaults — pointing at the on-target paths consumers actually see at
+runtime.
 
 Outputs are staged under `target/port-stage/<name>/{usr/local,usr/share}/`
 so the on-target file system mirrors the host stage tree byte-for-byte:

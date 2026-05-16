@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Source Ref:** phase-69d
-**Depends on:** Phase 31 (Compiler Bootstrap) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs), Phase 69c (TTF Font Infrastructure)
+**Depends on:** Phase 31 (Compiler Bootstrap) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 69 (Terminal Contract Foundations) ✅, Phase 69a (Termios Raw Mode) ✅, Phase 69b (UTF-8 + Bitmap Glyphs) ✅, Phase 69c (TTF Font Infrastructure) ✅
 **Goal:** Port ncurses and three quality TUI apps (`less`, `htop`, `tmux`) through the Phase 45 ports tree; drive each through a scripted smoke that asserts observable terminal-contract behaviour; prove the Phase 69 / 69a / 69b / 69c stack is ready for arbitrary C TUI software.
 
 ## Track Layout
@@ -96,7 +96,7 @@
 - [x] Upstream `htop` version pinned + SHA-256 verified.
 - [x] Depends on `ports/lib/ncurses` (wide variant).
 - [x] Build flags: `--disable-hwloc`, `--enable-unicode` (requires ncursesw), `--disable-affinity` (no SMP affinity API yet in m3OS). `--disable-capabilities` and `--disable-sensors` added because the host musl-cross provides no libcap or libsensors; htop's process-discovery still works against the Linux UAPI headers exposed via `-idirafter /usr/include`.
-- [x] /proc-equivalent path is whatever m3OS provides today; the binary is staged at `/usr/local/bin/htop` and `--help` runs to completion. The full curses launch SIGSEGVs in `initscr()` on m3OS today; per the Documentation Notes section, that bug routes back to a Phase 22/29 PTY follow-up.
+- [x] /proc-equivalent path is whatever m3OS provides today; the binary is staged at `/usr/local/bin/htop` and `--help` runs to completion. The full curses launch now boots to a rendered first frame (`Tasks:` header + CPU/Mem bars + F1..F10 function-key strip — see Track C.2 below) and quits cleanly on `q`; the earlier `initscr()` SIGSEGV was tracked to the Phase 22b/29 PTY work that lands before this phase, and is no longer a blocker. The remaining deferred piece is the SIGWINCH-reflow synthesis described in Track C.2 below.
 
 ### C.2 — Smoke: render + resize
 

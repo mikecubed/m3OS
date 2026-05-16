@@ -529,7 +529,7 @@ fn build_libevent(
             "--disable-libevent-regress",
             "--host=x86_64-linux-musl",
         ])
-        .arg(format!("--prefix={}", stage_prefix.display()))
+        .arg("--prefix=/usr/local")
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
@@ -542,7 +542,10 @@ fn build_libevent(
     run(&mut make_cmd, "libevent make")?;
 
     let mut install_cmd = Command::new("make");
-    install_cmd.current_dir(src).arg("install");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
     run(&mut install_cmd, "libevent install")?;
 
     let lib = stage_prefix.join("lib/libevent.a");
@@ -577,7 +580,7 @@ fn build_less(
         .current_dir(src)
         .arg("./configure")
         .args(["--with-regex=posix", "--host=x86_64-linux-musl"])
-        .arg(format!("--prefix={}", stage_prefix.display()))
+        .arg("--prefix=/usr/local")
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
@@ -591,7 +594,10 @@ fn build_less(
     run(&mut make_cmd, "less make")?;
 
     let mut install_cmd = Command::new("make");
-    install_cmd.current_dir(src).arg("install");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
     run(&mut install_cmd, "less install")?;
 
     let bin = stage_prefix.join("bin/less");
@@ -668,7 +674,7 @@ fn build_htop(
             "--enable-static-link",
             "--host=x86_64-linux-musl",
         ])
-        .arg(format!("--prefix={}", stage_prefix.display()))
+        .arg("--prefix=/usr/local")
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
@@ -684,7 +690,10 @@ fn build_htop(
     run(&mut make_cmd, "htop make")?;
 
     let mut install_cmd = Command::new("make");
-    install_cmd.current_dir(src).arg("install");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
     run(&mut install_cmd, "htop install")?;
 
     let bin = stage_prefix.join("bin/htop");
@@ -757,7 +766,7 @@ fn build_tmux(
             "--disable-utf8proc",
             "--host=x86_64-linux-musl",
         ])
-        .arg(format!("--prefix={}", stage_prefix.display()))
+        .arg("--prefix=/usr/local")
         .env("CC", cc)
         .env("AR", ar)
         .env("RANLIB", ranlib)
@@ -774,7 +783,10 @@ fn build_tmux(
     run(&mut make_cmd, "tmux make")?;
 
     let mut install_cmd = Command::new("make");
-    install_cmd.current_dir(src).arg("install");
+    install_cmd
+        .current_dir(src)
+        .arg("install")
+        .arg(format!("DESTDIR={}", stage.display()));
     run(&mut install_cmd, "tmux install")?;
 
     let bin = stage_prefix.join("bin/tmux");
@@ -876,16 +888,29 @@ fn which_on_path(tool: &str) -> Option<PathBuf> {
 }
 
 /// Prepend `dir` to the current process's PATH so subsequent
-/// `Command::new` invocations resolve through it.
+/// `Command::new` invocations resolve through it.  Uses
+/// `std::env::split_paths` to compare PATH entries by exact equality
+/// — substring matching would let `/foo/host-bin2` shadow
+/// `/foo/host-bin`.
 fn prepend_path(dir: &Path) {
-    let existing = std::env::var("PATH").unwrap_or_default();
-    if !existing.contains(dir.to_str().unwrap_or_default()) {
-        let new_path = format!("{}:{}", dir.display(), existing);
-        // SAFETY: xtask is single-threaded at this point; child processes
-        // inherit the updated env.  std::env::set_var is `unsafe` in
-        // Rust edition 2024 because of cross-thread UB risks.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let already_present = std::env::split_paths(&existing).any(|p| p == dir);
+    if already_present {
+        return;
+    }
+    let mut entries: Vec<PathBuf> = vec![dir.to_path_buf()];
+    entries.extend(std::env::split_paths(&existing));
+    match std::env::join_paths(entries) {
+        Ok(joined) => {
+            // SAFETY: xtask is single-threaded at this point; child processes
+            // inherit the updated env.  std::env::set_var is `unsafe` in
+            // Rust edition 2024 because of cross-thread UB risks.
+            unsafe {
+                std::env::set_var("PATH", joined);
+            }
+        }
+        Err(e) => {
+            eprintln!("prepend_path: join_paths failed: {e}");
         }
     }
 }
