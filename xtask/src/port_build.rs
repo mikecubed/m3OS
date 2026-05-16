@@ -630,6 +630,24 @@ fn build_htop(
     );
     let ldflags = format!("-static -L{}/lib", ncurses_prefix.display());
 
+    // htop's configure auto-detects libncurses by linking against a
+    // probe.  With `--with-termlib` on our ncurses build, both
+    // `libncurses.a` (narrow) and `libncursesw.a` (wide) coexist —
+    // alongside `libtinfo.a` (narrow tinfo) and `libtinfow.a` (wide
+    // tinfo).  Without help, autoconf finds *both* tinfo variants and
+    // appends the narrow `libtinfo.a` to the link line, which causes
+    // a TERMTYPE/TERMTYPE2 layout mismatch at runtime: setupterm
+    // populates `cur_term->type` (narrow) but the wide `termattrs_sp`
+    // dereferences `cur_term->type2.Strings` (wide) — NULL → SIGSEGV.
+    //
+    // Set `CURSES_CFLAGS`/`CURSES_LIBS` so htop's configure honors them
+    // verbatim and never even probes for a narrow tinfo.
+    let curses_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+    let curses_libs = format!("-L{}/lib -lncursesw -ltinfow", ncurses_prefix.display());
+
     let mut configure_cmd = Command::new("sh");
     configure_cmd
         .current_dir(src)
@@ -650,6 +668,8 @@ fn build_htop(
         .env("RANLIB", ranlib)
         .env("CFLAGS", &cflags)
         .env("LDFLAGS", &ldflags)
+        .env("CURSES_CFLAGS", &curses_cflags)
+        .env("CURSES_LIBS", &curses_libs)
         .env("LIBS", "-lncursesw -ltinfow");
     run(&mut configure_cmd, "htop configure")?;
 
@@ -708,6 +728,16 @@ fn build_tmux(
         libevent_prefix.display()
     );
 
+    // Same TERMTYPE/TERMTYPE2 layout-mismatch hazard as htop: tmux's
+    // autoconf detects libtinfo without `w` suffix and mixes narrow
+    // tinfo's setupterm against wide ncursesw's termattrs at runtime.
+    // tmux honors `LIBTINFO_*` so we point it straight at libtinfow.
+    let libtinfo_libs = format!("-L{}/lib -ltinfow", ncurses_prefix.display());
+    let libtinfo_cflags = format!(
+        "-I{0}/include -I{0}/include/ncursesw",
+        ncurses_prefix.display()
+    );
+
     let mut configure_cmd = Command::new("sh");
     configure_cmd
         .current_dir(src)
@@ -723,7 +753,11 @@ fn build_tmux(
         .env("AR", ar)
         .env("RANLIB", ranlib)
         .env("CFLAGS", &cflags)
-        .env("LDFLAGS", &ldflags);
+        .env("LDFLAGS", &ldflags)
+        .env("LIBTINFO_LIBS", &libtinfo_libs)
+        .env("LIBTINFO_CFLAGS", &libtinfo_cflags)
+        .env("LIBNCURSES_LIBS", &libtinfo_libs)
+        .env("LIBNCURSES_CFLAGS", &libtinfo_cflags);
     run(&mut configure_cmd, "tmux configure")?;
 
     let mut make_cmd = Command::new("make");

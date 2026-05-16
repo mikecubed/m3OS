@@ -91,23 +91,36 @@ configure runs.
   `<linux/capability.h>` unconditionally even with
   `--disable-capabilities`, because htop calls `capget()` directly via
   the syscall ABI. Fixed by `-idirafter /usr/include` (see above).
-- Runtime crash: `htop` SIGSEGVs in `initscr()` on m3OS 0.69.4. The
-  binary itself is healthy (`htop --help` runs to completion) but the
-  curses init path forks into a screen-management subprocess that
-  trips an existing m3OS-side bug. Per the Phase 69d task doc, that
-  fix lands as a back-port to whichever phase owns the offending
-  contract (likely Phase 22 ANSI parser or Phase 29 PTY layer) rather
-  than as a 69d change. The smoke gate accepts a binary-integrity
-  probe as proof-of-port until that follow-up phase lands.
+- TERMTYPE / TERMTYPE2 layout mismatch from mixed wide/narrow tinfo
+  linkage: with `--with-termlib` on ncurses, autoconf detects both
+  `libtinfo.a` (narrow) and `libtinfow.a` (wide). htop's default
+  configure search lands on `-lncursesw -ltinfo` — pulling narrow
+  `setupterm` (which populates `cur_term->type`) against wide
+  `termattrs_sp` (which dereferences `cur_term->type2.Strings`).
+  type2.Strings stays NULL → SIGSEGV at the first `termattrs()` call,
+  reading `Strings[25]` (`enter_alt_charset_mode`) at offset 0xc8 of
+  a NULL pointer.
+  Fix: pass `CURSES_CFLAGS` + `CURSES_LIBS` to htop's configure so
+  autoconf takes the explicit `-lncursesw -ltinfow` pair and never
+  probes for a narrow tinfo. With the fix in place htop renders the
+  full chrome (`Tasks:` header, CPU/Mem bars, F1–F10 strip), quits
+  on `q`, and emits the `:ok` sentinel — Phase 69d Track C.2 in full.
 
 ### tmux
 - yacc dependency: configure invokes `yacc` for `cmd-parse.y`; the host
   was missing bison/byacc. Bootstrapped byacc 20240109 from upstream
   into `target/host-bin/` as a one-time setup step.
-- Same `initscr()`-style crash as htop on the full-session lifecycle.
-  Binary integrity probe (`tmux -V`) succeeds; the full
-  `new-session/split-window/resize-pane/detach` flow is gated behind
-  the same Phase 22/29 follow-up.
+- Same TERMTYPE/TERMTYPE2 layout-mismatch hazard as htop. Fixed the
+  same way via `LIBTINFO_LIBS=-ltinfow` + `LIBNCURSES_LIBS=-lncursesw
+  -ltinfow` so tmux's autoconf takes the wide tinfo unambiguously.
+- Missing client/server syscalls: tmux's client/server protocol uses
+  `sendmsg`/`recvmsg` over a Unix socket plus `flock` for the socket
+  lock. m3OS' syscall table does not currently dispatch numbers 46
+  (sendmsg), 47 (recvmsg), or 73 (flock); the kernel logs
+  `[WARN] unhandled syscall 46 …` and returns -ENOSYS. tmux therefore
+  cannot start its server today. Binary-integrity probe (`tmux -V`)
+  succeeds; the full session lifecycle is gated behind a follow-up
+  phase that adds scatter-gather Unix-socket message I/O.
 
 ## Re-running the port build
 

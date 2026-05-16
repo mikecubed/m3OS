@@ -260,14 +260,20 @@ the kernel patch bump to 0.69.4:
 - **`less`** — full Phase 69d Track B.2 smoke. Opens `/etc/passwd`,
   asserts the alt-screen rendered the first line, quits with `q`,
   emits the `:ok` sentinel. Wired into `cargo xtask tui-app-smoke`.
-- **`htop`** — Phase 69d Track C.2 partial. Binary-integrity probe
-  (executable + `--help` returns + `/proc/stat` readable). The full
-  curses launch SIGSEGVs in `initscr()` on m3OS today; the failure
-  routes to a Phase 22 / 29 PTY follow-up per the Phase 69d task
-  doc's documentation-notes section.
+- **`htop`** — full Phase 69d Track C.2 smoke. Renders the chrome
+  (`Tasks:` header, CPU/Mem bars, F1–F10 strip), quits on `q`, and
+  emits the `:ok` sentinel. The earlier SIGSEGV at `termattrs_sp`
+  turned out to be a build-time linker confusion mixing
+  `-lncursesw -ltinfo` (narrow tinfo populates `type`, wide
+  `termattrs_sp` reads `type2.Strings` → NULL → fault). Fixed by
+  pinning `CURSES_LIBS=-lncursesw -ltinfow` in htop's configure;
+  see `docs/appendix/tui-app-port-notes.md`.
 - **`tmux`** — Phase 69d Track D.3 partial. Binary-integrity probe
-  (executable + `-V` returns). Same routing for the full session
-  lifecycle.
+  (executable + `-V` returns). The full session lifecycle is gated
+  behind missing kernel syscalls: tmux's client/server uses
+  `sendmsg`/`recvmsg`/`flock` over a Unix socket, and m3OS' syscall
+  table returns `-ENOSYS` for those numbers today. Adding
+  scatter-gather Unix-socket I/O lives in a follow-up phase.
 
 ### Forward pointers for deferred apps
 

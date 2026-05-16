@@ -4177,6 +4177,11 @@ fn run_smoke_script(
     // before formatting the (truncated) error message.  Lets the trace-ring
     // dump that the kernel emits on stuck-no-waker survive into a file we
     // can inspect post-run, instead of being lost to the 80-line tail.
+    //
+    // Phase 69d follow-up: also dump on successful exit when the env var
+    // is set, so diagnostic runs against a passing harness still produce
+    // the full trace (e.g. when probing inside-app behaviour like the
+    // htop initscr() SIGSEGV).
     let serial_dump_path = std::env::var("M3OS_SMOKE_SERIAL_DUMP").ok();
     let dump_serial = |history: &str| {
         if let Some(path) = &serial_dump_path {
@@ -7926,56 +7931,22 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
-    // ---- htop: binary-integrity probe.
-    //
-    // The Phase 69d task acceptance for htop's smoke is "renders + reflows"
-    // — the full curses launch with screen capture.  In the current m3OS
-    // build (kernel 0.69.3 + Phase 69c terminal stack), htop's `initscr()`
-    // path SIGSEGVs after the binary's main() runs through argument
-    // parsing.  The crash is in curses init, not in the binary itself,
-    // and reproduces deterministically.  Per the Phase 69d task doc:
-    //   "If an app smoke fails because of a Phase 69 / 69a / 69b / 69c
-    //    bug, the fix lands as a back-port to the originating phase
-    //    (with a comment naming the discovery).  69d itself does not
-    //    change `term` architecture — it ports and validates."
-    //
-    // We therefore validate three weaker claims that still cover the
-    // 69d port-and-stage layer:
-    //   1. The binary is present at /usr/local/bin/htop and is executable.
-    //   2. htop --help (bypasses curses init) completes successfully —
-    //      proves the cross-compile linked correctly against ncursesw.
-    //   3. /proc/{stat,meminfo} are readable (htop's data source).
-    //
-    // The full curses launch is deferred to the 22/29 PTY follow-up that
-    // closes the deeper terminal-contract bug.  Tracked in
-    // docs/appendix/tui-app-port-notes.md.
+    // ---- htop: launch, observe header, quit, sentinel ----
     steps.push(SmokeStep::Send {
-        input: "test -x /usr/local/bin/htop && echo TUI_APP_SMOKE:htop:binary-present\n",
-        label: "guest/tui-app-smoke: htop binary present",
+        input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/htop\n",
+        label: "guest/tui-app-smoke: htop launch",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "TUI_APP_SMOKE:htop:binary-present",
-        timeout_secs: 10,
-        label: "guest/tui-app-smoke: htop is executable",
+        // htop's default header includes "Tasks:" as a top-of-screen label.
+        pattern: "Tasks:",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: htop drew header",
     });
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/htop --help 2>&1 | head -1; echo TUI_APP_SMOKE:htop:help-ran\n",
-        label: "guest/tui-app-smoke: htop --help probe",
+        input: "q",
+        label: "guest/tui-app-smoke: htop quit",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "TUI_APP_SMOKE:htop:help-ran",
-        timeout_secs: 15,
-        label: "guest/tui-app-smoke: htop --help returned",
-    });
-    steps.push(SmokeStep::Send {
-        input: "head -c 64 /proc/stat 2>&1; echo TUI_APP_SMOKE:htop:proc-stat-done\n",
-        label: "guest/tui-app-smoke: probe /proc/stat",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "TUI_APP_SMOKE:htop:proc-stat-done",
-        timeout_secs: 10,
-        label: "guest/tui-app-smoke: /proc/stat read",
-    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "echo TUI_APP_SMOKE:htop:ok\n",
         label: "guest/tui-app-smoke: htop sentinel",
@@ -7988,23 +7959,23 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
-    // ---- tmux: binary-integrity probe + version sentinel.
+    // ---- tmux: binary-integrity probe.
     //
-    // Same caveat as htop: tmux's `new-session` path forks a server that
-    // calls curses + event-loop initialization, which surfaces the same
-    // class of `term`-stack bug htop exposed.  The session-lifecycle
-    // smoke (new-session / split-window / resize-pane / detach) is the
-    // task acceptance criterion, deferred behind the same 22/29 PTY
-    // follow-up as htop's full launch.
+    // The Phase 69d task acceptance for tmux is the full session
+    // lifecycle (new-session / split-window / resize-pane / detach).
+    // tmux's client/server protocol uses `sendmsg`/`recvmsg` over a
+    // Unix socket plus `flock` for the socket lock, neither of which
+    // m3OS implements today (kernel/src/arch/x86_64/syscall/mod.rs
+    // returns -ENOSYS for sysno=46/47/73 — visible in the smoke log
+    // as `[WARN] unhandled syscall 46`).  Adding scatter-gather
+    // sendmsg/recvmsg + ancillary-data handling is substantial
+    // kernel work that falls under a separate phase.
     //
-    // We validate the binary integrity claims that 69d owns:
-    //   1. /usr/local/bin/tmux is present and executable
-    //   2. `tmux -V` prints the version string we pinned (3.5a) — proves
-    //      the cross-compile linked correctly against ncursesw + libevent
-    //   3. `tmux list-sessions` against an empty server returns the
-    //      "no server running" message — verifies the server-discovery
-    //      code path runs (which exercises libevent's event_base_new and
-    //      ncurses' setupterm before any session is forked).
+    // We validate two narrower claims that 69d's port-and-stage layer
+    // does own:
+    //   1. /usr/local/bin/tmux is present and executable.
+    //   2. `tmux -V` prints the pinned version string — proves the
+    //      cross-compile linked correctly against ncursesw + libevent.
     steps.push(SmokeStep::Send {
         input: "test -x /usr/local/bin/tmux && echo TUI_APP_SMOKE:tmux:binary-present\n",
         label: "guest/tui-app-smoke: tmux binary present",
@@ -8015,7 +7986,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/tui-app-smoke: tmux is executable",
     });
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -V 2>&1; echo TUI_APP_SMOKE:tmux:version-done\n",
+        input: "/usr/local/bin/tmux -V; echo TUI_APP_SMOKE:tmux:version-done\n",
         label: "guest/tui-app-smoke: tmux -V probe",
     });
     steps.push(SmokeStep::Wait {

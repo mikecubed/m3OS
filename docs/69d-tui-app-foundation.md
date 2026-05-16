@@ -19,13 +19,22 @@ cross-compiled outputs onto the m3OS data disk under `/usr/local/`, and
 drives each app through a scripted smoke that asserts observable
 terminal-contract behaviour.
 
-The smoke gate's `less` path is the full Phase 69d Track B.2 acceptance:
-the pager opens `/etc/passwd`, the alt-screen renders the first line,
-quits with `q`, and emits a `:ok` sentinel. The `htop` and `tmux`
-paths land binary-integrity probes (executable + `--help` / `-V`
-returns) because their full-mode curses initialization tripped an
-existing `term`-stack bug; per the Phase 69d task doc, that fix routes
-back to a Phase 22 / 29 PTY follow-up rather than to 69d.
+The smoke gate's `less` and `htop` paths are the full Phase 69d Track
+B.2 and Track C.2 acceptance:
+
+- `less /etc/passwd` opens, the alt-screen renders the first line of
+  the file, the pager quits cleanly on `q`, and emits `:ok`.
+- `htop` renders the full chrome (`Tasks:` header, CPU/Mem bars, F1–F10
+  strip), quits on `q`, and emits `:ok`. The earlier SIGSEGV at
+  `termattrs_sp` turned out to be a build-time linker confusion mixing
+  `-lncursesw -ltinfo` (narrow tinfo populating `type` against wide
+  `termattrs_sp` reading `type2.Strings`); fixed by pinning
+  `CURSES_LIBS=-lncursesw -ltinfow` in htop's configure invocation.
+
+The `tmux` path is the binary-integrity probe (`tmux -V` succeeds) —
+the full session lifecycle is gated behind missing kernel syscalls
+(`sendmsg`/`recvmsg`/`flock`) that tmux's client/server protocol
+needs and that m3OS does not implement today.
 
 ## What This Doc Covers
 
@@ -170,10 +179,14 @@ validates.
 
 ## Deferred or Later-Phase Topics
 
-- Full htop curses launch (chrome rendering + SIGWINCH reflow) — pending
-  the `initscr()` SIGSEGV fix in Phase 22 / 29 follow-up
-- Full tmux session lifecycle (new-session / split / resize / detach) —
-  same routing as htop
+- htop SIGWINCH reflow synthesized from xtask — the kernel TIOCSWINSZ
+  path exists (Phase 69b) but the harness does not yet trigger
+  `SurfaceResized` programmatically; the chrome render half of
+  Track C.2 lands, the resize half waits for a harness extension.
+- Full tmux session lifecycle (new-session / split / resize / detach)
+  — pending Unix-socket `sendmsg`/`recvmsg`/`flock` support in the
+  kernel syscall table. Once those land, the existing harness can
+  drive the lifecycle directly.
 - htop process-list parity with Linux htop — tracked separately; m3OS'
   /proc is partial today
 - Larger ports (Neovim, btop, vim, …) — listed in "How This Phase

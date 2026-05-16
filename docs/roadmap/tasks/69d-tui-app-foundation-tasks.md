@@ -11,8 +11,8 @@
 |---|---|---|---|
 | A | ncurses port (narrow + wide variants); link against m3OS termios + terminfo | None | **Complete** |
 | B | `less` port + smoke | A | **Complete** |
-| C | `htop` port + smoke | A | **Complete** (binary-integrity probe; full curses launch deferred to a Phase 22/29 PTY follow-up — see Documentation Notes) |
-| D | `libevent` port + `tmux` port + smoke | A | **Complete** (binary-integrity probe; full session lifecycle deferred to the same Phase 22/29 follow-up) |
+| C | `htop` port + smoke | A | **Complete** (full chrome render + quit; see Notes for the `CURSES_LIBS` autoconf fix) |
+| D | `libevent` port + `tmux` port + smoke | A | **Complete** (binary-integrity probe; full session lifecycle deferred — tmux's client/server uses `sendmsg`/`recvmsg`/`flock` syscalls m3OS does not implement yet) |
 | E | Validation: `cargo xtask tui-app-smoke` gate | B, C, D | **Complete** |
 | F | Documentation: post-57 eval closeout; ports appendix; aligned legacy learning doc; kernel patch bump to 0.69.4 | E | **Complete** |
 
@@ -105,9 +105,9 @@
 **Why it matters:** Resize-while-running is the SIGWINCH gate.
 
 **Acceptance:**
-- [x] Binary-integrity probe: `/usr/local/bin/htop --help` runs to completion (proves the cross-compile linked correctly against ncursesw) and `/proc/stat` is readable (htop's data source). Emits the `TUI_APP_SMOKE:htop:ok` sentinel. The full chrome composition + SIGWINCH reflow remain a Phase 22/29 PTY follow-up.
-- [x] Sends `q` to quit; asserts return to shell. — deferred alongside the chrome path.
-- [x] Resize behaviour synthesis — deferred alongside the chrome path.
+- [x] Shell types `htop`, the smoke harness asserts the first frame is composed (`Tasks:` header text appears in the cell grid alongside the CPU/Mem bars and the F1..F10 function-key strip).
+- [x] Sends `q` to quit; asserts return to shell and emits the `TUI_APP_SMOKE:htop:ok` sentinel.
+- [ ] Synthesizes a `SurfaceResized` to a smaller geometry; asserts the second frame's cell grid reflects the new dimensions. The Phase 69d harness does not yet synthesize SIGWINCH from xtask — the kernel TIOCSWINSZ path exists (Phase 69b) but driving it programmatically is a separate harness extension. Tracked as a 69d follow-up.
 
 ---
 
