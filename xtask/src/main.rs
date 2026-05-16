@@ -456,6 +456,11 @@ fn main() {
             cmd_regression(&regression_args);
         }
         Some("clean") => cmd_clean(),
+        // Phase 69c Track D.1 — download + checksum-verify the
+        // JetBrainsMono Nerd Font into xtask/assets/fonts/term.ttf.
+        // The font is gitignored; the checksum lives in
+        // xtask/assets/fonts/term.ttf.sha256 and is committed.
+        Some("fetch-fonts") => cmd_fetch_fonts(),
         Some("stress") => {
             let stress_args = parse_stress_args(&args[2..]).unwrap_or_else(|err| {
                 eprintln!("Error: {err}");
@@ -485,7 +490,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -7687,6 +7692,43 @@ const TUI_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
         "TUI_SMOKE:utf8:ok",
         "TUI_SMOKE:utf8:fail",
     ),
+    // Phase 69c Track F.1 — each `fonts <leaf>` leaf exercises one
+    // acceptance bullet from the TTF infrastructure gate.
+    (
+        "fonts-startup",
+        "/bin/tui-smoke fonts startup\n",
+        "guest/tui-smoke: fonts startup — staged font parses + atlas warms",
+        "TUI_SMOKE:fonts-startup:ok",
+        "TUI_SMOKE:fonts-startup:fail",
+    ),
+    (
+        "fonts-branch-icon",
+        "/bin/tui-smoke fonts branch-icon\n",
+        "guest/tui-smoke: fonts branch-icon — U+E0A0 rasterizes to non-blank pixels",
+        "TUI_SMOKE:fonts-branch-icon:ok",
+        "TUI_SMOKE:fonts-branch-icon:fail",
+    ),
+    (
+        "fonts-emoji",
+        "/bin/tui-smoke fonts emoji\n",
+        "guest/tui-smoke: fonts emoji — U+1F600 resolves (covered or fallback)",
+        "TUI_SMOKE:fonts-emoji:ok",
+        "TUI_SMOKE:fonts-emoji:fail",
+    ),
+    (
+        "fonts-adversarial",
+        "/bin/tui-smoke fonts adversarial\n",
+        "guest/tui-smoke: fonts adversarial — atlas stays capacity-bounded",
+        "TUI_SMOKE:fonts-adversarial:ok",
+        "TUI_SMOKE:fonts-adversarial:fail",
+    ),
+    (
+        "fonts-missing-font",
+        "/bin/tui-smoke fonts missing-font\n",
+        "guest/tui-smoke: fonts missing-font — static fallback resolves ASCII/Latin-1/box-drawing",
+        "TUI_SMOKE:fonts-missing-font:ok",
+        "TUI_SMOKE:fonts-missing-font:fail",
+    ),
 ];
 
 /// Phase 69 Track H.2 — step list for the tui-smoke gate. Each
@@ -8316,6 +8358,95 @@ fn format_ext2_partition(part_tmp: &Path) {
     std::process::exit(1);
 }
 
+/// Sidecar filename written next to `disk.img` when the data-disk
+/// builder successfully stages the Phase 69c Nerd Font asset. The
+/// file contains the lowercase hex SHA-256 of the staged TTF — the
+/// same digest stored in `xtask/assets/fonts/term.ttf.sha256` — and
+/// the preserved-disk verification compares the two strings.
+const FONT_MARKER_FILENAME: &str = "disk.img.font.sha256";
+
+/// Verify that a preserved (already-existing) `disk.img` was staged
+/// with the same Phase 69c Nerd Font asset the workspace currently
+/// declares.
+///
+/// Pre-69c disks created by older `cargo xtask image` runs never had
+/// the font staged on them, and a disk staged with a stale or
+/// manually-replaced TTF would also silently bypass the fresh-disk
+/// SHA-256 check. A round-6 follow-up reviewer correctly flagged
+/// both gaps and the cost of the original `debugfs stat`
+/// implementation — extracting the full 1 GiB partition on every
+/// `cargo xtask run` to probe for a single file path. The
+/// replacement is a tiny sidecar marker (`disk.img.font.sha256`)
+/// the staging path writes after `verify_sha256_strict` accepts the
+/// TTF. The preserve branch just compares the marker against the
+/// committed checksum — O(1), no partition extraction, and now
+/// content-aware instead of presence-only.
+fn verify_font_on_existing_disk(disk_path: &Path, output_dir: &Path) {
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    let committed_sha_path = workspace_root().join("xtask/assets/fonts/term.ttf.sha256");
+
+    let committed_sha = match fs::read_to_string(&committed_sha_path) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
+            eprintln!(
+                "Error: failed to read committed font checksum file {}: {e}\n\
+                 Restore it from git \
+                 (e.g. `git checkout xtask/assets/fonts/term.ttf.sha256`).",
+                committed_sha_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let marker_sha = match fs::read_to_string(&marker_path) {
+        Ok(s) => s.trim().to_ascii_lowercase(),
+        Err(_) => {
+            eprintln!(
+                "Error: existing data disk at {} was not staged with the Phase 69c \
+                 Nerd Font asset (no sidecar marker at {}).\n\
+                 This disk was created before Phase 69c (or by a build that did not \
+                 stage the font). Run `cargo xtask clean` to delete the disk so \
+                 `cargo xtask run` / `image` recreates it with the staged font.",
+                disk_path.display(),
+                marker_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if marker_sha != committed_sha {
+        eprintln!(
+            "Error: data disk at {} was staged with a font whose SHA-256 \
+             ({marker_sha}) no longer matches the committed checksum \
+             ({committed_sha}).\n\
+             The Nerd Font asset has been updated since this disk was built. \
+             Run `cargo xtask clean` to delete the disk so it is recreated with \
+             the current asset.",
+            disk_path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Write the sidecar marker that records the staged TTF's SHA-256.
+/// Called from `populate_ext2_files` after the fresh-disk path has
+/// verified the asset against the committed checksum, so the marker
+/// always matches the digest at the moment the disk was staged.
+fn write_font_marker(output_dir: &Path, expected_font_sha: &str) {
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    if let Err(e) = fs::write(&marker_path, format!("{expected_font_sha}\n")) {
+        eprintln!(
+            "Error: failed to write font sidecar marker {}: {e}",
+            marker_path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Create a 64 MB raw data disk image with an MBR partition table and an
 /// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
@@ -8351,9 +8482,41 @@ fn create_data_disk(
                 disk_path.display()
             );
         }
+        // Phase 69c round-6 fix — `populate_ext2_files` only runs when
+        // we are creating a fresh disk, so a developer with a pre-69c
+        // `disk.img` would happily boot without
+        // `/usr/share/fonts/m3os/term.ttf`. That silently regresses
+        // `term` back to the static-fallback path and bypasses the
+        // hard error / SHA-256 check the fresh-disk path enforces.
+        // Verify the asset is present on the preserved disk and emit
+        // an actionable error if it is missing.
+        verify_font_on_existing_disk(&disk_path, output_dir);
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
+
+    // Phase 69c round-8 fix — the marker is part of `disk.img`'s
+    // lifecycle, not part of `output_dir`'s persistent state. Remove
+    // any stale marker before creating the new disk so a populate
+    // step that aborts before `write_font_marker` (e.g., missing
+    // `term.ttf`) cannot leave the previous marker behind and have
+    // the next run falsely accept the half-built disk as valid. The
+    // marker is re-created by `write_font_marker` inside
+    // `populate_ext2_files` only after `verify_sha256_strict`
+    // succeeds, so this path leaves the next run in one of two
+    // honest states: marker-present-and-matching (good) or
+    // marker-absent (the verify aborts with the expected error).
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    if marker_path.exists() {
+        if let Err(e) = fs::remove_file(&marker_path) {
+            eprintln!(
+                "Error: failed to remove stale font marker {}: {e}",
+                marker_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
@@ -8704,6 +8867,72 @@ fn populate_ext2_files(
     // missing `tic` as a hard error per A.2 acceptance.
     let terminfo_bin = compile_m3os_terminfo(output_dir);
 
+    // Phase 69c Track D.2 — stage the Nerd Font asset so `term` can
+    // resolve any Unicode codepoint at runtime through the TTF atlas.
+    // The font is fetched (not committed) by `cargo xtask fetch-fonts`
+    // into `xtask/assets/fonts/term.ttf`; a missing file means the
+    // developer forgot to fetch — treat as a hard, actionable error
+    // so a silently-fallback build doesn't ship without the icons.
+    //
+    // Re-verify the SHA-256 here (not just file presence) against the
+    // committed `term.ttf.sha256` digest so a stale, partially-copied,
+    // or manually-replaced asset can't slip into the disk image. The
+    // checksum read mirrors `cmd_fetch_fonts`.
+    let font_src = workspace_root().join("xtask/assets/fonts/term.ttf");
+    let font_sha = workspace_root().join("xtask/assets/fonts/term.ttf.sha256");
+    if !font_src.is_file() {
+        eprintln!(
+            "Error: Nerd Font asset missing at {}\n\
+             Run `cargo xtask fetch-fonts` first.",
+            font_src.display()
+        );
+        std::process::exit(1);
+    }
+    let expected_font_sha = match fs::read_to_string(&font_sha) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
+            // `cargo xtask fetch-fonts` reads (does not generate) this
+            // checksum file; pointing the developer at it would loop
+            // back to the same failure. The checksum is committed in
+            // the repository, so the real recovery is to restore the
+            // file from git.
+            eprintln!(
+                "Error: failed to read font checksum file {}: {e}\n\
+                 The checksum is committed in the repository at \
+                 xtask/assets/fonts/term.ttf.sha256 — restore it from git \
+                 (e.g. `git checkout xtask/assets/fonts/term.ttf.sha256`).",
+                font_sha.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    if expected_font_sha.len() != 64 || !expected_font_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!(
+            "Error: font checksum file does not contain a 64-char hex digest: {}",
+            font_sha.display()
+        );
+        std::process::exit(1);
+    }
+    if !verify_sha256_strict(&font_src, &expected_font_sha) {
+        eprintln!(
+            "Error: SHA-256 mismatch on staged Nerd Font asset.\n\
+             Expected: {expected_font_sha}\n\
+             Path:     {}\n\
+             Run `cargo xtask fetch-fonts` to re-stage a verified copy.",
+            font_src.display()
+        );
+        std::process::exit(1);
+    }
+    // Record the staged digest in a sidecar marker next to `disk.img`
+    // so future `cargo xtask run` / `image` invocations can prove the
+    // preserved disk was built with the current asset without doing a
+    // partition-scale `debugfs stat`. See `verify_font_on_existing_disk`.
+    write_font_marker(output_dir, &expected_font_sha);
+
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");
     let shadow_tmp = output_dir.join("_tmp_shadow");
@@ -9018,6 +9247,18 @@ fn populate_ext2_files(
          sif usr/share/terminfo/m/m3os-term mode 0x81A4\n\
          sif usr/share/terminfo/m/m3os-term uid 0\n\
          sif usr/share/terminfo/m/m3os-term gid 0\n\
+         mkdir usr/share/fonts\n\
+         sif usr/share/fonts mode 0x41ED\n\
+         sif usr/share/fonts uid 0\n\
+         sif usr/share/fonts gid 0\n\
+         mkdir usr/share/fonts/m3os\n\
+         sif usr/share/fonts/m3os mode 0x41ED\n\
+         sif usr/share/fonts/m3os uid 0\n\
+         sif usr/share/fonts/m3os gid 0\n\
+         write \"{font_src}\" usr/share/fonts/m3os/term.ttf\n\
+         sif usr/share/fonts/m3os/term.ttf mode 0x81A4\n\
+         sif usr/share/fonts/m3os/term.ttf uid 0\n\
+         sif usr/share/fonts/m3os/term.ttf gid 0\n\
          sif dev mode 0x41ED\n\
          sif dev uid 0\n\
          sif dev gid 0\n\
@@ -9136,6 +9377,7 @@ fn populate_ext2_files(
         inject_key_cmds = inject_key_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
         terminfo_bin = terminfo_bin.display(),
+        font_src = font_src.display(),
     );
 
     let mut debugfs = Command::new("debugfs")
@@ -9712,13 +9954,133 @@ fn collect_ports_entries(
     }
 }
 
-/// Download doom1.wad (shareware, freely redistributable) into `dest`.
+/// Phase 69c Track D.1 — fetch the JetBrainsMono Nerd Font Mono
+/// regular variant into `xtask/assets/fonts/term.ttf`. The asset is
+/// gitignored so the repository stays small; the SHA-256 checksum
+/// lives in `xtask/assets/fonts/term.ttf.sha256` (committed) and a
+/// mismatched download is treated as a hard error.
 ///
-/// Download `doom1.wad` (shareware) to `dest` if `M3OS_DOWNLOAD_WAD=1` is set.
-///
-/// Gated by the env var to avoid unexpected network access in offline/CI builds.
-/// Verifies the SHA-256 checksum of the downloaded file and removes it on mismatch.
-/// Tries `curl` first, then `wget`.
+/// Subsequent runs verify the checksum and skip the download when
+/// the file already matches — this keeps the gate cheap for
+/// developers who already have the asset on disk.
+fn cmd_fetch_fonts() {
+    const FONT_URL: &str = "https://github.com/ryanoasis/nerd-fonts/raw/v3.2.1/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf";
+    let root = workspace_root();
+    let dest = root.join("xtask/assets/fonts/term.ttf");
+    let checksum_path = root.join("xtask/assets/fonts/term.ttf.sha256");
+
+    if !checksum_path.is_file() {
+        eprintln!(
+            "fetch-fonts: missing checksum file {}\n\
+             (Phase 69c Track D.1 expects this file to be committed alongside the URL.)",
+            checksum_path.display()
+        );
+        std::process::exit(1);
+    }
+    let expected = match fs::read_to_string(&checksum_path) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
+            eprintln!(
+                "fetch-fonts: failed to read {}: {e}",
+                checksum_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!(
+            "fetch-fonts: checksum file does not contain a 64-char hex digest: {}",
+            checksum_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Idempotent: skip the download when the file already matches.
+    if dest.is_file() && verify_sha256_strict(&dest, &expected) {
+        println!(
+            "fetch-fonts: {} already present and checksum matches; nothing to do.",
+            dest.display()
+        );
+        return;
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).expect("create xtask/assets/fonts");
+    }
+
+    println!("fetch-fonts: downloading JetBrainsMono Nerd Font Mono Regular (~2 MB)...");
+    println!("fetch-fonts: source: {FONT_URL}");
+
+    let curl_ok = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--output",
+            dest.to_str().expect("UTF-8 path"),
+            FONT_URL,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !curl_ok || !dest.exists() {
+        let wget_ok = Command::new("wget")
+            .args(["-q", "-O", dest.to_str().expect("UTF-8 path"), FONT_URL])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !wget_ok || !dest.exists() {
+            eprintln!(
+                "fetch-fonts: download failed (need `curl` or `wget` on PATH)\n\
+                 Manually drop the asset at {} and re-run.",
+                dest.display()
+            );
+            let _ = fs::remove_file(&dest);
+            std::process::exit(1);
+        }
+    }
+
+    if !verify_sha256_strict(&dest, &expected) {
+        eprintln!(
+            "fetch-fonts: SHA-256 mismatch on downloaded font; removing.\n\
+             Expected: {expected}\n\
+             Path:     {}",
+            dest.display()
+        );
+        let _ = fs::remove_file(&dest);
+        std::process::exit(1);
+    }
+    println!("fetch-fonts: downloaded and verified → {}", dest.display());
+}
+
+/// Hex SHA-256 of `path` compared to `expected` (lowercase hex).
+/// Returns true on a confirmed match. Implemented with the workspace
+/// `sha2` crate so this function works on hosts without
+/// `sha256sum`.
+fn verify_sha256_strict(path: &Path, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex.eq_ignore_ascii_case(expected)
+}
+
+/// Download `doom1.wad` (shareware, freely redistributable) to `dest` when
+/// `M3OS_DOWNLOAD_WAD=1` is set. Gated by the env var so offline / CI builds
+/// don't make unexpected network calls. Verifies the SHA-256 checksum of the
+/// downloaded file and removes it on mismatch. Tries `curl` first, then
+/// `wget`.
 fn fetch_doom_wad(dest: &Path) {
     const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
     // SHA-256 of doom1.wad from distro.ibiblio.org (verified 2026-04-04).
@@ -10259,12 +10621,23 @@ fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<(
 fn cmd_clean() {
     let root = workspace_root();
     let target_dir = root.join("target");
-    let disk_img = target_dir.join("x86_64-unknown-none/release/disk.img");
+    let output_dir = target_dir.join("x86_64-unknown-none/release");
+    let disk_img = output_dir.join("disk.img");
     if disk_img.exists() {
         fs::remove_file(&disk_img).expect("failed to remove disk.img");
         println!("Removed {}", disk_img.display());
     } else {
         println!("No disk.img to remove");
+    }
+    // Phase 69c round-8 — keep the font marker's lifecycle tied to
+    // disk.img's lifecycle. Without this, a stale marker would
+    // survive `cargo xtask clean` and falsely satisfy the next
+    // `verify_font_on_existing_disk` if the next build aborted
+    // before staging the font.
+    let marker = output_dir.join(FONT_MARKER_FILENAME);
+    if marker.exists() {
+        fs::remove_file(&marker).expect("failed to remove font marker");
+        println!("Removed {}", marker.display());
     }
 }
 

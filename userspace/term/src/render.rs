@@ -32,12 +32,42 @@
 //!   on the framebuffer.
 
 use crate::screen::RenderCommand;
+use kernel_core::font::{Atlas, GlyphView};
+
+/// Phase 69c Track E.2 — runtime glyph-resolution policy.
+///
+/// `Static` keeps Phase 69b's `kernel_core::session::resolve_glyph`
+/// path; `Atlas` swaps in the TTF-backed atlas. `term` boots with
+/// `Static` and upgrades to `Atlas` only when the font file at
+/// `/usr/share/fonts/m3os/term.ttf` opens cleanly. Either way the
+/// renderer's compose loop is identical — the `GlyphSource` is
+/// internal state, never observable to callers.
+pub enum GlyphSource {
+    /// Phase 69b static-table path — ASCII / Latin-1 / box-drawing
+    /// + centred-dot fallback.
+    Static,
+    /// Phase 69c TTF-atlas path. Owns the atlas so the renderer's
+    /// `glyph_pixels` borrow is local.
+    Atlas(Atlas),
+}
 
 /// Pluggable framebuffer-owner seam. Production wraps the Phase 56
 /// `surface_buffer` crate; host tests record draw calls.
 pub trait FramebufferOwner {
     /// Paint a glyph cell at `(row, col)` with the given colours.
-    fn put_glyph(&mut self, row: u16, col: u16, codepoint: u32, fg: u32, bg: u32);
+    /// `glyph` is the pre-resolved 1-bit bitmap (`GlyphView`), so
+    /// the framebuffer owner does not need to know whether the
+    /// pixels came from the static tables or the TTF atlas —
+    /// resolution happens in [`Renderer::compose`].
+    fn put_glyph(
+        &mut self,
+        row: u16,
+        col: u16,
+        codepoint: u32,
+        glyph: &GlyphView<'_>,
+        fg: u32,
+        bg: u32,
+    );
 
     /// Clear the entire surface to the current background colour.
     /// Called when the screen state machine emits
@@ -87,15 +117,52 @@ pub struct Renderer<F: FramebufferOwner> {
     fb: F,
     queue: alloc::vec::Vec<QueuedOp>,
     pending_submit: bool,
+    /// Phase 69c Track E.2 — the active glyph-resolution policy.
+    /// Defaults to `Static` so callers that don't carry a font file
+    /// (host tests, early-boot) get Phase 69b's behaviour.
+    glyph_source: GlyphSource,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
     /// Wrap a framebuffer owner with a fresh renderer. Empty queue.
+    /// Uses the static Phase 69b glyph tables.
     pub fn new(fb: F) -> Self {
         Self {
             fb,
             queue: alloc::vec::Vec::new(),
             pending_submit: false,
+            glyph_source: GlyphSource::Static,
+        }
+    }
+
+    /// Phase 69c Track E.1/E.2 — install a TTF atlas as the runtime
+    /// glyph source. `term::main` calls this when the font opens
+    /// cleanly; on failure the renderer keeps using `GlyphSource::Static`.
+    pub fn set_atlas(&mut self, atlas: Atlas) {
+        self.glyph_source = GlyphSource::Atlas(atlas);
+    }
+
+    /// True when this renderer is using the atlas path. Test helper.
+    pub fn has_atlas(&self) -> bool {
+        matches!(self.glyph_source, GlyphSource::Atlas(_))
+    }
+
+    /// Phase 69c Track E.2 — resolve `codepoint` through the active
+    /// `GlyphSource`. Returns a borrowed view backed by either the
+    /// static-table data (Phase 69b) or the atlas's owned bitmap.
+    ///
+    /// Allocation: the `Static` path is allocation-free (the tables
+    /// are `'static`). The `Atlas` path is allocation-free on a
+    /// cache hit; on a miss it rasterizes the glyph (allocates a
+    /// `Vec<OutlineSegment>` plus a `RasterBitmap`) and inserts the
+    /// new slot into the cache. The hot path is hit-dominated once
+    /// the warm-up range has been pre-resolved, but a stream of
+    /// novel codepoints will allocate per miss until the cache fills
+    /// its capacity.
+    pub fn glyph_pixels(&mut self, codepoint: u32) -> GlyphView<'_> {
+        match &mut self.glyph_source {
+            GlyphSource::Atlas(atlas) => atlas.resolve(codepoint).as_view(),
+            GlyphSource::Static => kernel_core::session::resolve_glyph(codepoint).as_view(),
         }
     }
 
@@ -166,7 +233,19 @@ impl<F: FramebufferOwner> Renderer<F> {
             return;
         }
         if !self.queue.is_empty() {
-            for op in self.queue.drain(..) {
+            // Move the queue out so the field-level borrows below
+            // do not conflict with iteration. `mem::take` leaves
+            // `self.queue` as a freshly-empty `Vec` (no allocation);
+            // after iterating we `clear()` the local and write it
+            // back so the capacity survives — the hot render path
+            // must not re-allocate every frame.
+            let mut queue = core::mem::take(&mut self.queue);
+            // Split-borrow the fields so `glyph_source` and `fb`
+            // can be borrowed concurrently inside the loop.
+            let Self {
+                fb, glyph_source, ..
+            } = self;
+            for op in queue.drain(..) {
                 match op {
                     QueuedOp::Put {
                         row,
@@ -175,12 +254,22 @@ impl<F: FramebufferOwner> Renderer<F> {
                         fg,
                         bg,
                     } => {
-                        self.fb.put_glyph(row, col, codepoint, fg, bg);
+                        let view = match glyph_source {
+                            GlyphSource::Atlas(atlas) => atlas.resolve(codepoint).as_view(),
+                            GlyphSource::Static => {
+                                kernel_core::session::resolve_glyph(codepoint).as_view()
+                            }
+                        };
+                        fb.put_glyph(row, col, codepoint, &view, fg, bg);
                     }
-                    QueuedOp::Clear => self.fb.clear(),
-                    QueuedOp::Scroll { amount } => self.fb.scroll(amount),
+                    QueuedOp::Clear => fb.clear(),
+                    QueuedOp::Scroll { amount } => fb.scroll(amount),
                 }
             }
+            // `drain(..)` left `queue` empty but with its allocation
+            // intact. Restore it so the next frame's `submit_op`
+            // pushes into the same buffer instead of re-allocating.
+            self.queue = queue;
             self.pending_submit = true;
         }
         if self.pending_submit && self.fb.submit() {
@@ -224,7 +313,15 @@ mod tests {
     }
 
     impl FramebufferOwner for FakeFb {
-        fn put_glyph(&mut self, row: u16, col: u16, codepoint: u32, _fg: u32, _bg: u32) {
+        fn put_glyph(
+            &mut self,
+            row: u16,
+            col: u16,
+            codepoint: u32,
+            _glyph: &GlyphView<'_>,
+            _fg: u32,
+            _bg: u32,
+        ) {
             self.ops.push(FakeOp::Put {
                 row,
                 col,
@@ -452,5 +549,32 @@ mod tests {
         let mut r = Renderer::new(FakeFb::new());
         r.apply(RenderCommand::MoveCursor { row: 1, col: 2 });
         assert!(!r.damaged());
+    }
+
+    /// `compose()` must not throw away the queue's allocation each
+    /// frame — the hot render path runs once per tick, and a Vec
+    /// that grows and re-allocates on every frame would dominate
+    /// the renderer's allocator traffic.
+    #[test]
+    fn compose_preserves_queue_capacity_across_frames() {
+        let mut r = Renderer::new(FakeFb::new());
+        for col in 0..32u16 {
+            r.apply(RenderCommand::PutGlyph {
+                row: 0,
+                col,
+                codepoint: b'A' as u32 + col as u32,
+                fg: 0,
+                bg: 0,
+            });
+        }
+        let cap_after_grow = r.queue.capacity();
+        assert!(cap_after_grow >= 32);
+        r.compose();
+        assert_eq!(r.queue.len(), 0, "compose must drain the queue");
+        assert_eq!(
+            r.queue.capacity(),
+            cap_after_grow,
+            "compose must retain the queue's capacity for reuse",
+        );
     }
 }

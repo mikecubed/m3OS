@@ -6,6 +6,15 @@ edition = "2024"
 [dependencies]
 spin = "0.9.8"
 heapless = "0.8"
+# Phase 69c Track A — TTF/OTF parser. `no-std-float` selects
+# `ttf-parser`'s no-std float backend (via the `core_maths` crate)
+# so the crate builds under m3OS's `x86_64-unknown-none` target
+# (no `std`, no SIMD math). `core_maths` itself still pulls `libm`
+# transitively — the feature does *not* remove `libm` from the
+# build graph; it gives `ttf-parser` a `no_std` math surface that
+# routes through `core_maths`. Pinned to a minor version so a
+# breaking 0.x release does not silently change parser behaviour.
+ttf-parser = { version = "0.25", default-features = false, features = ["no-std-float"] }
 
 [dev-dependencies]
 proptest = "1"

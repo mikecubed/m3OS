@@ -1,21 +1,32 @@
-//! Phase 57 Track G.5 close-out — production display-server client.
+//! Phase 57 Track G.5 close-out — production display-server client
+//! (extended in Phase 69c for atlas-backed glyph dispatch and the
+//! 1280 × 800 / 16 × 32 cell layout).
 //!
 //! `DisplayClient` is the live counterpart to the `FakeFb` test
 //! fixture in [`crate::render::tests`]. It owns:
 //!
 //! - the IPC handle for `display_server`;
 //! - the `SurfaceId` and `BufferId` term claims;
-//! - a 640 × 400 BGRA8888 [`SurfaceBuffer`] that backs the term grid
-//!   (80 × 25 cells × 8 × 16 px);
-//! - the [`BasicBitmapFont`] used to rasterise glyphs into the
-//!   buffer.
+//! - a raw 1280 × 800 BGRA8888 shared-memory mapping (`surface_va` /
+//!   `surface_len`, allocated via `syscall_lib::shm_create` +
+//!   `shm_map`) that backs the term grid
+//!   (80 × 25 cells × 16 × 32 px — see [`CELL_WIDTH`] / [`CELL_HEIGHT`]).
+//!   The `kernel_core::display::surface_buffer::SurfaceBuffer` type
+//!   is no longer instantiated on this client path.
+//!
+//! Phase 69c replaced the in-client glyph rasteriser with the
+//! `kernel-core::font` atlas: the renderer pre-resolves each glyph
+//! to a [`GlyphView`](kernel_core::font::GlyphView) and
+//! `DisplayClient::put_glyph` simply blits the packed-bits bitmap
+//! into the backing surface — the framebuffer owner no longer
+//! branches on resolution policy.
 //!
 //! On every [`compose`](crate::render::Renderer::compose), the
 //! renderer drives `DisplayClient` through the [`FramebufferOwner`]
-//! trait. `submit` chunks the local 1 MB buffer through the
-//! `LABEL_PIXELS_CHUNK` wire (added in the same Phase 57 PR) and
-//! drives the `AttachBuffer` → `DamageSurface` → `CommitSurface`
-//! verb sequence.
+//! trait. `term` writes pixels directly into the SHM mapping (no
+//! IPC payload) and `submit` drives the `AttachSharedBuffer` (once)
+//! → `DamageSurface` → `CommitSurface` verb sequence. The legacy
+//! per-pixel `LABEL_PIXELS_CHUNK` wire is no longer the upload path.
 //!
 //! ## Why one BufferId per frame is not used
 //!
@@ -29,8 +40,7 @@ use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
     BufferId, ClientMessage, PROTOCOL_VERSION, Rect, SurfaceId, SurfaceRole,
 };
-use kernel_core::session::BLANK_GLYPH;
-use kernel_core::session::font::BasicBitmapFont;
+use kernel_core::font::GlyphView;
 use syscall_lib::STDOUT_FILENO;
 
 use crate::render::FramebufferOwner;
@@ -69,10 +79,15 @@ const FALLBACK_FG_BGRA: u32 = 0x00FF_FFFF;
 pub const SURFACE_WIDTH_PX: u32 = (DEFAULT_COLS as u32) * (CELL_WIDTH as u32);
 /// Pixel height of the term surface, in pixels.
 pub const SURFACE_HEIGHT_PX: u32 = (DEFAULT_ROWS as u32) * (CELL_HEIGHT as u32);
-/// Cell pixel width — pinned to the bundled font's cell size.
-pub const CELL_WIDTH: u8 = 8;
-/// Cell pixel height — pinned to the bundled font's cell size.
-pub const CELL_HEIGHT: u8 = 16;
+/// Cell pixel width. The Phase 69c TTF atlas rasterises glyphs into
+/// this cell size, so a wider cell produces more legible Nerd Font
+/// glyphs without changing the 80×25 column/row contract. Picked
+/// 16 (2× the static IBM VGA 8×16 fallback width) so the static
+/// fallback bitmap occupies a clean integer quadrant of the cell.
+pub const CELL_WIDTH: u8 = 16;
+/// Cell pixel height. Doubled from the static font's 16-px height
+/// for the same reason as [`CELL_WIDTH`].
+pub const CELL_HEIGHT: u8 = 32;
 
 /// Stack-sized encode buffer for protocol verbs. The widest
 /// `ClientMessage` body in Phase 57 is `SetSurfaceRole(Layer{...})`
@@ -112,10 +127,12 @@ pub struct DisplayClient {
 
 impl DisplayClient {
     /// Look up `display_server`, send the `Hello` + `CreateSurface`
-    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a 1 MiB
-    /// shared-memory region, and return a ready-to-submit
-    /// `DisplayClient`. Returns a typed error if the lookup, encode,
-    /// `ipc_call_buf`, or SHM allocation fails.
+    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a ~4 MiB
+    /// shared-memory region sized for the 1280 × 800 BGRA8888
+    /// surface (`SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX * 4`,
+    /// page-aligned), and return a ready-to-submit `DisplayClient`.
+    /// Returns a typed error if the lookup, encode, `ipc_call_buf`,
+    /// or SHM allocation fails.
     pub fn connect() -> Result<Self, TermError> {
         let server_handle = match Self::lookup_with_backoff() {
             Some(h) => h,
@@ -149,10 +166,11 @@ impl DisplayClient {
             return Err(TermError::DisplayServerUnavailable);
         }
 
-        // 4. Allocate the shared-memory region. 640 × 400 × 4 = 1 MiB
-        //    (256 contiguous 4 KiB pages). The SHM registry's create
-        //    path rounds up to the next page boundary; the buddy
-        //    allocator orders fit comfortably inside MAX_ORDER=9.
+        // 4. Allocate the shared-memory region. 1280 × 800 × 4 = ~4 MiB
+        //    (1000 contiguous 4 KiB pages). The SHM registry's create
+        //    path rounds up to the next power-of-two page count
+        //    (1024 = 4 MiB = order 10), which fits inside Phase 69c's
+        //    bumped `kernel_core::buddy::MAX_ORDER = 11` (8 MiB max).
         let byte_len = (SURFACE_WIDTH_PX as usize)
             .saturating_mul(SURFACE_HEIGHT_PX as usize)
             .saturating_mul(4);
@@ -327,7 +345,15 @@ impl DisplayClient {
 }
 
 impl FramebufferOwner for DisplayClient {
-    fn put_glyph(&mut self, row: u16, col: u16, codepoint: u32, fg: u32, bg: u32) {
+    fn put_glyph(
+        &mut self,
+        row: u16,
+        col: u16,
+        _codepoint: u32,
+        glyph: &GlyphView<'_>,
+        fg: u32,
+        bg: u32,
+    ) {
         // Resolve fg/bg fallbacks. The screen always passes explicit
         // colours, but defending against the all-zero pair keeps a
         // future caller from rendering invisible glyphs.
@@ -355,11 +381,6 @@ impl FramebufferOwner for DisplayClient {
             None => return,
         };
 
-        // The font's `render_into` writes BGRA8888 pixels into a
-        // caller-supplied `&mut [u32]` row-major buffer. We carve
-        // a sub-slice of the cell's pixels and pass the surface
-        // stride (in u32 pixels) so glyph rows index correctly into
-        // the larger surface buffer.
         // SAFETY: see `pixels_mut` — the borrow stays inside this
         // call and the compositor snapshots before reading.
         let pixels = unsafe { self.pixels_mut() };
@@ -376,24 +397,25 @@ impl FramebufferOwner for DisplayClient {
         };
         let cell_view = &mut pixels_u32[cell_offset..];
 
-        // Phase 69b Track E — resolve through `glyph_or_fallback` so
-        // U+FFFD and uncovered codepoints (e.g. CJK before the Phase
-        // 69c tables ship) paint the centred-dot fallback glyph
-        // rather than rendering as a blank background cell. Control
-        // characters route to `BLANK_GLYPH`, which we explicitly map
-        // to a bg-only fill so they stay invisible.
-        let font = BasicBitmapFont::new();
-        let glyph = font.glyph_or_fallback(codepoint);
-        if core::ptr::eq(glyph, &BLANK_GLYPH) {
-            fill_cell_bg(
-                cell_view,
-                stride_pixels,
-                CELL_WIDTH as usize,
-                CELL_HEIGHT as usize,
-                bg,
-            );
-        } else {
-            let _ = glyph.render_into(cell_view, stride_pixels, fg, bg);
+        // Phase 69c Track E.2 — the renderer pre-resolved the
+        // codepoint to a `GlyphView`, so we paint whatever bitmap
+        // was handed in. Always bg-fill the full cell first so a
+        // glyph smaller than the cell (e.g. the static IBM VGA 8×16
+        // fallback in a 16×32 cell when TTF load fails) doesn't
+        // leave stale pixels in the uncovered area. Only blank
+        // glyphs (control codepoints `U+0000..=U+001F`, `U+007F`,
+        // the C1 range, NBSP, and the static-table blanks) need no
+        // further work; uncovered codepoints come back as the
+        // visible centred-dot fallback (non-blank).
+        fill_cell_bg(
+            cell_view,
+            stride_pixels,
+            CELL_WIDTH as usize,
+            CELL_HEIGHT as usize,
+            bg,
+        );
+        if !glyph.bitmap.iter().all(|&b| b == 0) {
+            blit_glyph_view(glyph, cell_view, stride_pixels, fg, bg);
         }
     }
 
@@ -456,6 +478,42 @@ impl FramebufferOwner for DisplayClient {
             return false;
         }
         self.publish_frame()
+    }
+}
+
+/// Phase 69c Track E.2 — blit a [`GlyphView`] into the cell.
+/// Mirrors the layout `Glyph::render_into` enforced before the
+/// renderer started resolving glyphs itself: packed bits row-major,
+/// MSB-first per byte. Atlas-rasterized bitmaps share the same
+/// layout so both paths use this helper.
+fn blit_glyph_view(
+    glyph: &GlyphView<'_>,
+    cell_view: &mut [u32],
+    stride_pixels: usize,
+    fg: u32,
+    bg: u32,
+) {
+    let w = glyph.width as usize;
+    let h = glyph.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let bytes_per_row = w.div_ceil(8);
+    for row in 0..h {
+        let row_start = row * bytes_per_row;
+        for col in 0..w {
+            let byte_idx = row_start + col / 8;
+            if byte_idx >= glyph.bitmap.len() {
+                break;
+            }
+            let bit_idx = 7 - (col % 8);
+            let bit_set = (glyph.bitmap[byte_idx] >> bit_idx) & 1 == 1;
+            let dst = row * stride_pixels + col;
+            if dst >= cell_view.len() {
+                return;
+            }
+            cell_view[dst] = if bit_set { fg } else { bg };
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 # Phase 69c - TTF Font Loader and Nerd Font Asset Embedding
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-69c
-**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations), Phase 69a (Termios Raw Mode), Phase 69b (UTF-8 + Bitmap Glyphs)
+**Depends on:** Phase 57 (Audio and Local Session) ✅, Phase 69 (Terminal Contract Foundations) ✅, Phase 69a (Termios Raw Mode) ✅, Phase 69b (UTF-8 + Bitmap Glyphs) ✅
 **Builds on:** Replaces the static bitmap glyph tables in `kernel-core::fb` with a TTF/OTF rasterizer + glyph atlas cache, and embeds a Nerd Font asset on the ext2 data disk so modern developer TUIs (lazygit, lf, fzf, starship glyphs, btop's gauges) render at full fidelity. Phase 69b's `resolve_glyph` accessor is the seam — its body changes from a static-table dispatch to an atlas lookup with a TTF-rasterized fallback.
 **Primary Components:** kernel-core/src/font (new module), userspace/term/src/render.rs, xtask (font asset staging), `ports/lang/font` (optional vendor crate wrapping `ttf-parser` + `ab_glyph`)
 
@@ -100,7 +100,11 @@ After `Renderer::new(display)`, but before the first compose, `term` reads `/usr
 
 ## Implementation Outline
 
-1. Decide between vendoring `ttf-parser` + `ab_glyph` vs hand-rolling the subset; document the call.
+### Decision (Track A.1): vendor `ttf-parser`
+
+Vendoring `ttf-parser` v0.25 with `default-features = false` (no_std, zero-allocation, MIT OR Apache-2.0) is the chosen path. `ttf-parser` covers the full set of `cmap` formats m3OS could encounter from a Nerd Font asset (formats 0 / 4 / 12 / 13 / 14), handles compound `glyf` glyphs, and exposes the outline-builder trait the rasterizer needs. Hand-rolling a subset would deliver less coverage at higher maintenance cost, while still requiring the same outline-walker machinery. The rasterizer (`kernel-core/src/font/raster.rs`) and the LRU atlas (`kernel-core/src/font/atlas.rs`) are hand-rolled because their behaviour is small and m3OS-specific (1-bit coverage, centred-in-cell baseline alignment, capacity-bounded eviction).
+
+1. Decide between vendoring `ttf-parser` + `ab_glyph` vs hand-rolling the subset; document the call. **Decided: vendor `ttf-parser`. See "Decision (Track A.1)" above.**
 2. Build `kernel-core/src/font/parser.rs` (host tests on a public-domain TTF).
 3. Build `kernel-core/src/font/raster.rs` (host tests: rasterize known glyphs, assert bitmap).
 4. Build `kernel-core/src/font/atlas.rs` (host tests: cache hit, miss → rasterize, LRU eviction).

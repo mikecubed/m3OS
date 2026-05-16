@@ -109,9 +109,9 @@ const PTY_READ_CHUNK: usize = 256;
 /// `PutGlyph` ops between calls, so a burst of PTY echo bytes (one
 /// per typed key) coalesces into a single compose pass instead of
 /// firing one full-buffer upload per character. With the Phase 56
-/// chunked-pixel path, each upload is ~252 IPC roundtrips for the
-/// 640×400 surface; without throttling, every keystroke paid that
-/// cost in series.
+/// chunked-pixel path, each full-surface upload is hundreds of IPC
+/// roundtrips for the 1280×800 surface; without throttling, every
+/// keystroke paid that cost in series.
 #[cfg(not(test))]
 const COMPOSE_INTERVAL_MS: u64 = 16;
 
@@ -204,6 +204,17 @@ fn program_main(_args: &[&str]) -> i32 {
     //    not retry the audio path forever.
     let mut screen = Screen::new();
     let mut renderer = Renderer::new(display);
+    // Phase 69c Track E.1 — try to load the Nerd Font asset and
+    // upgrade the renderer to atlas-backed glyph resolution. On a
+    // file-missing, parse-error, or oversized-file failure the
+    // renderer stays on the Phase 69b static-table path and the
+    // terminal remains usable for ASCII / Latin-1 / box-drawing.
+    // True OOM is *not* recovered here — this binary's
+    // `alloc_error_handler` exits the process; `build_atlas` bounds
+    // the worst-case font-read allocation with a hard size cap to
+    // keep the fallback path reachable. See the docstring on
+    // `build_atlas` for the full contract.
+    build_atlas(&mut renderer);
     let mut input_handler = InputHandler::new();
     let mut mouse_reporter = MouseReporter::new();
 
@@ -450,6 +461,151 @@ fn wait_for_shell_dependencies() -> bool {
     syscall_lib::ipc_wait_service(SHELL_DEPENDENCY_SERVICE, 0)
 }
 
+/// Phase 69c Track E.1 — load the Nerd Font asset from
+/// `/usr/share/fonts/m3os/term.ttf` and upgrade `renderer` to the
+/// atlas-backed glyph path. On any failure (file missing, parse
+/// error, or the staged file exceeds the hard size cap) the
+/// renderer is left on Phase 69b's static-table fallback and a
+/// single warning lands in the boot log so a developer can
+/// correlate "no Nerd Font glyphs" with "load failed". The font
+/// path is hard-coded — Phase 69c deliberately defers configurable
+/// paths to a later phase.
+///
+/// Allocation policy: this binary's `alloc_error_handler` exits the
+/// process, so an OOM during `extend_from_slice` would kill `term`
+/// rather than fall back. The size cap below bounds the worst-case
+/// allocation; a font that exceeds it is treated as a load failure
+/// so the static-table path stays reachable. Replacing the cap with
+/// `Vec::try_reserve_exact` is a documented follow-up.
+#[cfg(not(test))]
+fn build_atlas<F: term::render::FramebufferOwner>(renderer: &mut term::render::Renderer<F>) {
+    const FONT_PATH: &[u8] = b"/usr/share/fonts/m3os/term.ttf\0";
+    // Cell dimensions must match `term::display::{CELL_WIDTH,
+    // CELL_HEIGHT}`. The atlas rasterises into this cell size, so
+    // the bigger 16×32 cell gives the Nerd Font glyphs enough
+    // resolution to be readable at QEMU GOP defaults.
+    const ATLAS_CELL_W: u8 = term::display::CELL_WIDTH;
+    const ATLAS_CELL_H: u8 = term::display::CELL_HEIGHT;
+    // Hard cap on the read. JetBrainsMono Nerd Font Mono is ~2 MiB;
+    // 8 MiB leaves headroom for future patched variants while
+    // keeping the worst-case allocation bounded.
+    const MAX_FONT_BYTES: usize = 8 * 1024 * 1024;
+    let fd = syscall_lib::open(FONT_PATH, syscall_lib::O_RDONLY, 0);
+    if fd < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: font load failed; using static fallback\n",
+        );
+        return;
+    }
+    let fd = fd as i32;
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut oversize = false;
+    let mut read_error = false;
+    loop {
+        let n = syscall_lib::read(fd, &mut chunk);
+        if n < 0 {
+            // I/O error mid-read. Treat as a load failure rather
+            // than constructing an atlas from a partial file — a
+            // truncated TTF would parse-fail noisily, but a
+            // truncation that happens to land on a table boundary
+            // could parse and produce garbage glyphs.
+            read_error = true;
+            break;
+        }
+        if n == 0 {
+            // Clean EOF.
+            break;
+        }
+        if bytes.len() + n as usize > MAX_FONT_BYTES {
+            oversize = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n as usize]);
+    }
+    let _ = syscall_lib::close(fd);
+    if read_error || oversize || bytes.is_empty() {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "term: font load failed; using static fallback\n",
+        );
+        return;
+    }
+    match kernel_core::font::Atlas::new(
+        bytes,
+        ATLAS_CELL_W,
+        ATLAS_CELL_H,
+        kernel_core::font::DEFAULT_ATLAS_CAPACITY,
+    ) {
+        Ok(atlas) => {
+            // Pre-warm a representative range so the boot log's
+            // glyph count clears the documented `N > 100` gate. We
+            // touch printable ASCII (0x20..=0x7E, 95 cps) and the
+            // Latin-1 supplement (0xA1..=0xFF, 95 cps) — together
+            // ~190 codepoints, well above the 100-glyph threshold
+            // without bloating the cache.
+            let mut atlas = atlas;
+            for cp in 0x20u32..=0x7E {
+                let _ = atlas.resolve(cp);
+            }
+            for cp in 0xA1u32..=0xFF {
+                let _ = atlas.resolve(cp);
+            }
+            let n = atlas.len();
+            renderer.set_atlas(atlas);
+            let mut buf = [0u8; 64];
+            let s = format_atlas_msg(&mut buf, n);
+            syscall_lib::write(STDOUT_FILENO, s);
+        }
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "term: font load failed; using static fallback\n",
+            );
+        }
+    }
+}
+
+/// Build the boot-log line `term: atlas loaded <N> glyphs\n` into
+/// the caller-provided buffer. `no_std`-friendly so we don't need
+/// `format!` (which would pull in `alloc::string::String` formatting
+/// into the hot path).
+#[cfg(not(test))]
+fn format_atlas_msg(buf: &mut [u8; 64], n: usize) -> &[u8] {
+    const PREFIX: &[u8] = b"term: atlas loaded ";
+    const SUFFIX: &[u8] = b" glyphs\n";
+    let mut i = 0;
+    for &b in PREFIX {
+        buf[i] = b;
+        i += 1;
+    }
+    // Write `n` decimal.
+    let mut digits = [0u8; 20];
+    let mut d_len = 0;
+    let mut v = n;
+    if v == 0 {
+        digits[0] = b'0';
+        d_len = 1;
+    } else {
+        while v > 0 {
+            digits[d_len] = b'0' + (v % 10) as u8;
+            d_len += 1;
+            v /= 10;
+        }
+    }
+    while d_len > 0 {
+        d_len -= 1;
+        buf[i] = digits[d_len];
+        i += 1;
+    }
+    for &b in SUFFIX {
+        buf[i] = b;
+        i += 1;
+    }
+    &buf[..i]
+}
+
 /// Monotonic clock for [`Bell::ring`]. Tiny wrapper around
 /// `clock_gettime(CLOCK_MONOTONIC)` so the bell call site is
 /// self-documenting without spending a trait abstraction on a
@@ -631,14 +787,15 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
     width: u32,
     height: u32,
 ) {
-    // The Phase 56 renderer ships an 8×16 glyph grid (the kernel-core
-    // fallback font); replace the constants here when the font_atlas
-    // exposes runtime metrics.
-    const GLYPH_W: u32 = 8;
-    const GLYPH_H: u32 = 16;
+    // Cell metrics must track `term::display::{CELL_WIDTH,
+    // CELL_HEIGHT}` so SurfaceResized cell math (pixels → cell grid)
+    // matches the actual surface stride.
+    const GLYPH_W: u32 = term::display::CELL_WIDTH as u32;
+    const GLYPH_H: u32 = term::display::CELL_HEIGHT as u32;
     // Phase 69 PR 168 round-3 fix — a malformed `SurfaceResized` could
     // request 65535×65535 cells (~4.3B cells × `Cell` size = multi-GB)
-    // and crash `term`. Cap each dimension at 1024 cells (8192×16384
+    // and crash `term`. Cap each dimension at 1024 cells (with the
+    // Phase 69c 16×32 cell metrics this corresponds to 16384×32768
     // logical pixels — well above any realistic display) and the total
     // cell budget at ~1M, which keeps `Screen::resize` allocations in
     // single-digit MB regardless of the message contents.
