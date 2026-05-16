@@ -10,6 +10,8 @@ use anyhow::Context;
 use fatfs::Dir;
 use tempfile::NamedTempFile;
 
+mod port_build;
+
 const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
@@ -138,6 +140,11 @@ const SMOKE_EXIT_TUI_SMOKE_FAILED: i32 = 66;
 /// Phase 69a Track I: termios-smoke failed — at least one tcsmoke
 /// subcommand emitted `TC_SMOKE:<name>:fail …`.
 const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
+/// Phase 69d Track E.1: tui-app-smoke failed — one of the ported TUI
+/// apps (less / htop / tmux) emitted `TUI_APP_SMOKE:<app>:fail …`
+/// during the scripted drive. The harness surfaces the failing app
+/// immediately rather than letting the step time out.
+const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -432,6 +439,37 @@ fn main() {
                 });
             cmd_doom_audio_smoke(&smoke_args);
         }
+        // Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — host-side port
+        // builds. `cargo xtask port build <name>` fetches the upstream
+        // tarball, verifies SHA-256, applies patches, and cross-compiles
+        // for x86_64-linux-musl. Outputs stage to target/port-stage/<name>.
+        Some("port") => match args.get(2).map(String::as_str) {
+            Some("build") => {
+                let name = args.get(3).cloned().unwrap_or_else(|| {
+                    eprintln!("Usage: cargo xtask port build <name>");
+                    std::process::exit(1);
+                });
+                let code = port_build::cmd_port_build(&name);
+                std::process::exit(code);
+            }
+            other => {
+                eprintln!("Unknown port subcommand: {:?}", other);
+                eprintln!("Usage: cargo xtask port build <name>");
+                std::process::exit(1);
+            }
+        },
+        // Phase 69d Track E.1 — `cargo xtask tui-app-smoke` boots and
+        // drives less, htop, and tmux smokes in sequence. Reports per-app
+        // :ok / :fail; non-zero exit on any failure.
+        Some("tui-app-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("tui-app-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_tui_app_smoke(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -490,7 +528,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -7754,6 +7792,146 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
             timeout_secs: 15,
             label,
             exit_code_on_fail: SMOKE_EXIT_TUI_SMOKE_FAILED,
+        });
+    }
+    steps
+}
+
+/// Phase 69d Track E.1 — boot m3OS, log into sh0, drive the three
+/// ported TUI apps (less, htop, tmux) through scripted keystroke
+/// sequences. Each app's smoke prints `TUI_APP_SMOKE:<app>:ok` (or
+/// `:fail …`) via the harness's `tui-app-smoke` shim binary. The
+/// shim invokes the real apps under a child PTY, observes their
+/// output, and emits the sentinel.
+///
+/// The cross-compiled ports are built host-side as a precondition.
+fn cmd_tui_app_smoke(args: &SmokeBootArgs) {
+    // Build the Phase 69d port set host-side. The disk-image populator
+    // mirrors the staged binaries onto /usr/local/bin in the ext2 disk.
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("tui-app-smoke: precondition failed: {msg}");
+        std::process::exit(SMOKE_EXIT_TUI_APP_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = tui_app_smoke_steps();
+
+    println!(
+        "tui-app-smoke: launching QEMU (timeout {}s, {} app smokes)",
+        args.timeout_secs,
+        TUI_APP_SMOKE_SUBCOMMANDS.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "tui-app-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("tui-app-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_TUI_APP_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 69d Track E.1 — single source of truth for the tui-app-smoke
+/// subcommand matrix.  Each row drives one ported TUI app via the
+/// `/bin/tui-app-smoke` shim binary which forks the real app under a
+/// PTY and observes its output.
+const TUI_APP_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "less",
+        "/bin/tui-app-smoke less\n",
+        "guest/tui-app-smoke: less pager — alt-screen + page + search + quit",
+        "TUI_APP_SMOKE:less:ok",
+        "TUI_APP_SMOKE:less:fail",
+    ),
+    (
+        "htop",
+        "/bin/tui-app-smoke htop\n",
+        "guest/tui-app-smoke: htop process viewer — chrome composes + reflow + quit",
+        "TUI_APP_SMOKE:htop:ok",
+        "TUI_APP_SMOKE:htop:fail",
+    ),
+    (
+        "tmux",
+        "/bin/tui-app-smoke tmux\n",
+        "guest/tui-app-smoke: tmux multiplexer — new-session + split + resize + detach",
+        "TUI_APP_SMOKE:tmux:ok",
+        "TUI_APP_SMOKE:tmux:fail",
+    ),
+];
+
+fn tui_app_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    for (_, input, label, pass, fail) in TUI_APP_SMOKE_SUBCOMMANDS {
+        steps.push(SmokeStep::Send {
+            input,
+            label: "guest/tui-app-smoke: send subcommand",
+        });
+        steps.push(SmokeStep::WaitPassOrFail {
+            pass_pattern: pass,
+            fail_prefix: fail,
+            // Larger budget than tui-smoke: each app spawns under a PTY
+            // and writes a multi-frame visible payload before the shim
+            // observes the sentinel.
+            timeout_secs: 60,
+            label,
+            exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
         });
     }
     steps

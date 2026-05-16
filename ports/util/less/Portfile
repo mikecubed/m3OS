@@ -1,0 +1,18 @@
+NAME=less
+VERSION=668
+DESCRIPTION="Terminal pager (upstream less, built against ncurses)"
+CATEGORY=util
+DEPS=ncurses
+URL=https://www.greenwoodsoftware.com/less/less-668.tar.gz
+SHA256=2819f55564d86d542abbecafd82ff61e819a3eec967faa36cd3e68f1596a44b8
+MAINTAINER=m3os
+
+# Phase 69d Track B.1: less is the lightest of the three apps in 69d —
+# pager-only, no event loop, no SIGWINCH heroics beyond the standard
+# terminfo curses path. Builds with the POSIX regex backend (musl ships
+# regex.h), and the upstream autoconf detects ncurses via curses.h /
+# tic-built terminfo lookups.
+#
+# Installed at /usr/local/bin/less so the existing /bin/less stub from
+# coreutils-rs stays in place for boot scripts that depend on the older
+# minimal pager.

@@ -1,0 +1,23 @@
+NAME=htop
+VERSION=3.4.0
+DESCRIPTION="Interactive process viewer (built against ncursesw)"
+CATEGORY=util
+DEPS=ncurses
+URL=https://github.com/htop-dev/htop/releases/download/3.4.0/htop-3.4.0.tar.xz
+SHA256=feaabd2d31ca27c09c367a3b1b547ea9f96105fc41f4dfa799e2f49daad5de29
+MAINTAINER=m3os
+
+# Phase 69d Track C.1: htop exercises 256-colour SGR, UTF-8 box-drawing,
+# and SIGWINCH reflow in one app. Configure flags:
+#   --disable-hwloc           — m3OS has no hwloc; htop falls back to its
+#                               internal CPU enumeration via /proc/stat.
+#   --enable-unicode          — wide-character build, requires ncursesw.
+#   --disable-affinity        — SMP affinity APIs (sched_setaffinity) are
+#                               not yet exposed in m3OS userspace; htop
+#                               works without affinity and gates the F-key
+#                               binding behind a runtime check.
+#
+# /proc on m3OS is partial: htop's process-discovery surface returns
+# only the supervised process set today. Rendering the chrome (CPU/mem
+# bars, header) is the 69d acceptance criterion; full /proc parity is
+# tracked in a separate phase.
