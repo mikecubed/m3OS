@@ -615,9 +615,18 @@ fn build_htop(
     let stage_prefix = stage.join("usr/local");
     fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
 
+    // -idirafter /usr/include … lets musl-gcc find the host's Linux UAPI
+    // headers (linux/capability.h, linux/sched.h, asm/types.h, …) without
+    // overriding musl's own libc headers. htop's process-discovery reaches
+    // into the raw capget() ABI even with --disable-capabilities, so the
+    // kernel UAPI headers are a hard requirement of the build. We also
+    // need the arch-specific asm/ directory because <linux/types.h>
+    // pulls in <asm/types.h>.
+    let arch_include = linux_uapi_arch_include();
     let cflags = format!(
-        "-O2 -I{0}/include -I{0}/include/ncursesw",
-        ncurses_prefix.display()
+        "-O2 -I{0}/include -I{0}/include/ncursesw -idirafter /usr/include -idirafter {1}",
+        ncurses_prefix.display(),
+        arch_include.display()
     );
     let ldflags = format!("-static -L{}/lib", ncurses_prefix.display());
 
@@ -670,6 +679,7 @@ fn build_tmux(
     ncurses_stage: &Path,
     libevent_stage: &Path,
 ) -> Result<(), String> {
+    ensure_yacc()?;
     let ncurses_prefix = ncurses_stage.join("usr/local");
     let libevent_prefix = libevent_stage.join("usr/local");
     if !ncurses_prefix.join("lib/libncursesw.a").exists() {
@@ -743,6 +753,97 @@ fn num_jobs() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2)
+}
+
+/// Ensure a host-side `yacc` is on PATH for tmux's `cmd-parse.y` parser
+/// generation. Prefers bison/byacc if the host already ships one;
+/// otherwise downloads and builds Berkeley yacc (byacc) 20240109 from
+/// upstream — byacc is a one-file C program with no external
+/// dependencies and builds in a few seconds.
+///
+/// On success the host_bin directory is prepended to PATH and a `yacc`
+/// symlink is staged under it, so subsequent Command::new("yacc")
+/// invocations from autoconf-generated configure scripts resolve.
+fn ensure_yacc() -> Result<(), String> {
+    for cand in &["yacc", "bison", "byacc"] {
+        if Command::new(cand)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Ok(());
+        }
+    }
+    const BYACC_URL: &str = "https://invisible-mirror.net/archives/byacc/byacc-20240109.tgz";
+    const BYACC_SHA: &str = "f2897779017189f1a94757705ef6f6e15dc9208ef079eea7f28abec577e08446";
+
+    let root = workspace_root();
+    let host_bin = root.join("target/host-bin");
+    let yacc_bin = host_bin.join("yacc");
+    if !yacc_bin.is_file() {
+        fs::create_dir_all(&host_bin).map_err(|e| format!("mkdir host_bin: {e}"))?;
+        let cache_dir = root.join("target/port-src");
+        let tarball = fetch_tarball(BYACC_URL, BYACC_SHA, &cache_dir)?;
+        let work = root.join("target/byacc-build");
+        let extracted = extract_tarball(&tarball, &work)?;
+        let prefix = host_bin.join("byacc-prefix");
+        let _ = fs::remove_dir_all(&prefix);
+        let mut configure_cmd = Command::new("sh");
+        configure_cmd
+            .current_dir(&extracted)
+            .arg("./configure")
+            .arg(format!("--prefix={}", prefix.display()))
+            .arg("--program-prefix=")
+            .env("CFLAGS", "-O2");
+        run(&mut configure_cmd, "byacc configure")?;
+        let mut make_cmd = Command::new("make");
+        make_cmd
+            .current_dir(&extracted)
+            .arg(format!("-j{}", num_jobs()));
+        run(&mut make_cmd, "byacc make")?;
+        let mut install_cmd = Command::new("make");
+        install_cmd.current_dir(&extracted).arg("install");
+        run(&mut install_cmd, "byacc install")?;
+        let installed = prefix.join("bin/yacc");
+        if !installed.is_file() {
+            return Err(format!("byacc build missing {}", installed.display()));
+        }
+        let _ = fs::remove_file(&yacc_bin);
+        std::os::unix::fs::symlink(&installed, &yacc_bin)
+            .map_err(|e| format!("symlink yacc: {e}"))?;
+        println!("byacc: bootstrapped {}", yacc_bin.display());
+    }
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    if !existing_path.contains(host_bin.to_str().unwrap_or_default()) {
+        let new_path = format!("{}:{}", host_bin.display(), existing_path);
+        // SAFETY: xtask is single-threaded at this point; child processes
+        // inherit the updated env.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+    }
+    Ok(())
+}
+
+/// Locate the arch-specific Linux UAPI directory containing `asm/types.h`.
+/// On Debian/Ubuntu this is `/usr/include/x86_64-linux-gnu`; on Arch and
+/// musl-only systems it is bundled with the host kernel headers under
+/// `/usr/include`. Returns the first candidate that exists, or falls back
+/// to `/usr/include` so the caller's `-idirafter` still resolves to a
+/// real path.
+fn linux_uapi_arch_include() -> PathBuf {
+    for cand in &[
+        "/usr/include/x86_64-linux-gnu",
+        "/usr/include/x86_64-linux-musl",
+    ] {
+        let p = PathBuf::from(cand);
+        if p.join("asm/types.h").is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("/usr/include")
 }
 
 /// Build every port in the Phase 69d set in dependency order. Used by the

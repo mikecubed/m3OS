@@ -8790,6 +8790,12 @@ fn create_data_disk(
     // Phase 45: populate ports tree and bundled source into /usr/ports/.
     let ports_src = root.join("target/ports-src");
     populate_ports_tree(&part_tmp, &root, &ports_src);
+    // Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
+    // Phase 69d port (target/port-stage/<name>/usr/local/...) onto the
+    // ext2 partition.  Only the ports whose stage exists are copied;
+    // the function is a no-op for any port that has not yet been built
+    // by `cargo xtask port build <name>` or `tui-app-smoke`.
+    populate_phase_69d_ports(&part_tmp, &root);
     // Phase 47: place doom1.wad on the ext2 partition.
     populate_doom_files(&part_tmp);
 
@@ -10098,6 +10104,156 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
             "Warning: debugfs (ports) exited with {}: {}",
             debugfs_output.status, stderr
         );
+    }
+}
+
+/// Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
+/// Phase 69d port (target/port-stage/<name>/usr/local/{bin,lib,include,share})
+/// onto the ext2 partition. Only ports whose stage exists are copied; the
+/// function is a no-op if `cargo xtask port build` has not been run.
+fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
+    const PORTS: &[&str] = &["ncurses", "libevent", "less", "htop", "tmux"];
+    let stage_root = workspace_root.join("target/port-stage");
+    if !stage_root.is_dir() {
+        return;
+    }
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut execs: Vec<String> = Vec::new();
+
+    for port in PORTS {
+        let local = stage_root.join(port).join("usr/local");
+        if local.is_dir() {
+            collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+        }
+        // Phase 69 Track A.2 — terminfo database lives under
+        // /usr/share/terminfo on the target. Mirror it from the ncurses
+        // stage so apps that call setupterm("m3os-term") at runtime
+        // find the compiled entry.
+        let share = stage_root.join(port).join("usr/share");
+        if share.is_dir() {
+            collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+        }
+    }
+
+    if files.is_empty() {
+        return;
+    }
+
+    println!(
+        "phase-69d ports: mirroring {} files ({} executables) from {} into ext2",
+        files.len(),
+        execs.len(),
+        stage_root.display()
+    );
+
+    let mut cmds = String::new();
+    // Parent dirs already created by populate_ports_tree, but be defensive
+    // and re-create them — debugfs `mkdir` of an existing dir is a no-op
+    // that prints a harmless warning we discard.
+    for d in &[
+        "usr",
+        "usr/local",
+        "usr/local/bin",
+        "usr/local/lib",
+        "usr/local/include",
+        "usr/share",
+    ] {
+        cmds.push_str(&format!("mkdir {d}\n"));
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    for dir in &dirs {
+        cmds.push_str(&format!("mkdir {dir}\n"));
+    }
+
+    // Skip symbolic-link entries (e.g. /usr/local/lib/libcurses.a → libncurses.a)
+    // because the ext2 debugfs `write` verb doesn't follow them; the regular
+    // files they point at are already in `files` from the directory walk.
+    files.retain(|(_, host)| !host.is_symlink());
+
+    for (ext2_path, host_path) in &files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
+    // Mark every directory 0755, every file 0644.
+    for dir in &dirs {
+        cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
+    }
+    for (ext2_path, _) in &files {
+        cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+    }
+    // Executables get 0755.
+    for exe in &execs {
+        cmds.push_str(&format!("sif {exe} mode 0x81ED\n"));
+    }
+    cmds.push_str("q\n");
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for phase-69d ports");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write phase-69d debugfs commands");
+    }
+    let out = debugfs.wait_with_output().expect("debugfs wait");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "Warning: debugfs (phase-69d ports) exited with {}: {}",
+            out.status, stderr
+        );
+    }
+}
+
+/// Recursively collect every regular file and directory under `src` and
+/// append matching ext2-relative paths into `dirs`, `files`, `execs`.
+/// Executable files (mode 0o755) land in `execs` so the caller can
+/// `sif {path} mode 0x81ED` after writing them.
+fn collect_phase_69d_entries(
+    src: &Path,
+    prefix: &str,
+    dirs: &mut Vec<String>,
+    files: &mut Vec<(String, PathBuf)>,
+    execs: &mut Vec<String>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    dirs.push(prefix.to_string());
+    let entries = match fs::read_dir(src) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() {
+            // Skip libcurses.a → libncurses.a symlinks; ncurses callers
+            // link the real archive directly.
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let child_prefix = format!("{prefix}/{name_str}");
+        if path.is_dir() {
+            collect_phase_69d_entries(&path, &child_prefix, dirs, files, execs);
+        } else if path.is_file() {
+            let executable = fs::metadata(&path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            files.push((child_prefix.clone(), path));
+            if executable {
+                execs.push(child_prefix);
+            }
+        }
     }
 }
 
