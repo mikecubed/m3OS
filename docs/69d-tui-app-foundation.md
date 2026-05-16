@@ -130,6 +130,7 @@ the full timeout.
 | `xtask/src/port_build.rs` | `cargo xtask port build <name>` driver: fetch + SHA-verify + extract + patch + configure + make + DESTDIR install; per-port `build_<name>` recipes; yacc auto-bootstrap |
 | `xtask/src/main.rs` | `port build` and `tui-app-smoke` subcommand handlers; `populate_phase_69d_ports` ext2 populator; per-app step matrix in `tui_app_smoke_steps` |
 | `docs/appendix/tui-app-port-notes.md` | Port matrix + per-app capability coverage + "what proved tricky" notes |
+| `docs/handoffs/2026-05-16-phase-69d-100-percent-followups.md` | Handoff doc enumerating the two remaining acceptance gaps (htop SIGWINCH reflow synthesis + tmux full session lifecycle), the kernel/userspace surfaces involved, and an estimated effort breakdown for closing them out |
 
 Ancillary edits — kernel patch bump to 0.69.4 in `kernel/Cargo.toml`,
 `Cargo.lock`, `AGENTS.md` version cursor, and `docs/roadmap/README.md`
