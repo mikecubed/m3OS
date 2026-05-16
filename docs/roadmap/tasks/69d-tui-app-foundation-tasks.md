@@ -14,7 +14,7 @@
 | C | `htop` port + smoke | A | Planned |
 | D | `libevent` port + `tmux` port + smoke | A | Planned |
 | E | Validation: `cargo xtask tui-app-smoke` gate | B, C, D | Planned |
-| F | Documentation: post-57 eval closeout; ports appendix; kernel patch bump to 0.69.4 | E | Planned |
+| F | Documentation: post-57 eval closeout; ports appendix; aligned legacy learning doc; kernel patch bump to 0.69.4 | E | Planned |
 
 ---
 
@@ -187,7 +187,21 @@
 - [ ] Table: app | ncurses variant | terminfo capabilities exercised | termios flags used | UTF-8 blocks consumed | Nerd Font glyphs (if any).
 - [ ] One paragraph per app summarising what proved tricky during the port.
 
-### F.3 — Kernel patch bump to 0.69.4
+### F.3 — Create the aligned legacy learning doc
+
+**File:** `docs/69d-tui-app-foundation.md`
+**Symbol:** (new document)
+**Why it matters:** Learners need a self-contained reference for what it took to bring real-world C TUI apps up on m3OS — the ncurses port flags, the per-app Portfile shape, which Phase 69 / 69a / 69b / 69c capabilities each app exercises, and what 69d deliberately defers (Neovim, btop, lazygit, Go and C++ toolchains) — without conflating it with Phase 45's ports system or Phase 69's terminal-contract foundations. The aligned legacy doc is the canonical companion to the roadmap design doc per `docs/appendix/doc-templates.md`.
+
+**Acceptance:**
+- [ ] `docs/69d-tui-app-foundation.md` exists with all template fields populated (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc — "none" if no predecessor).
+- [ ] Overview paragraph explains what Phase 69 / 69a / 69b / 69c left as terminal-contract foundations and what Phase 69d turns into validated real-app behaviour.
+- [ ] Key Files table cites every primary surface this phase introduces: `ports/lib/ncurses/Portfile`, `ports/lib/libevent/Portfile`, `ports/util/less/Portfile`, `ports/util/htop/Portfile`, `ports/util/tmux/Portfile`, the `tui_app_smoke` xtask subcommand, `userspace/tui-smoke` extensions (or the new `tui-app-smoke` shim), and the new ports appendix doc. Ancillary edits (kernel patch-bump files: `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, `docs/roadmap/README.md`) are covered by F.4 and intentionally not duplicated.
+- [ ] Closure of Related Phases section cross-refs Phase 31, 44, 45, 69, 69a, 69b, 69c.
+- [ ] How This Phase Differs From Later TUI Work section calls out the deferred items (Neovim with its libuv + Lua/LuaJIT + tree-sitter chain; btop after Phase 78 cross-compiled C++ toolchain; lazygit / fzf / starship after a Go toolchain port; mc, ranger, lf, vim as separate ports).
+- [ ] Related Roadmap Docs links design doc and task doc.
+
+### F.4 — Kernel patch bump to 0.69.4
 
 **Files:**
 - `kernel/Cargo.toml`
@@ -201,7 +215,8 @@
 **Acceptance:**
 - [ ] `kernel/Cargo.toml` `version = "0.69.4"`.
 - [ ] `Cargo.lock` regenerated.
-- [ ] `AGENTS.md` version cursor updated.
+- [ ] `AGENTS.md` version cursor updated (kernel version + 69d entry appended to the running phase history).
+- [ ] `docs/roadmap/README.md` Phase 69d row flipped from Planned → Complete with both milestone and tasks links resolved.
 - [ ] `cargo xtask check` passes.
 
 ---
