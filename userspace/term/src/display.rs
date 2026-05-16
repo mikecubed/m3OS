@@ -154,9 +154,10 @@ impl DisplayClient {
         }
 
         // 4. Allocate the shared-memory region. 1280 × 800 × 4 = ~4 MiB
-        //    (256 contiguous 4 KiB pages). The SHM registry's create
-        //    path rounds up to the next page boundary; the buddy
-        //    allocator orders fit comfortably inside MAX_ORDER=9.
+        //    (1000 contiguous 4 KiB pages). The SHM registry's create
+        //    path rounds up to the next power-of-two page count
+        //    (1024 = 4 MiB = order 10), which fits inside Phase 69c's
+        //    bumped `kernel_core::buddy::MAX_ORDER = 11` (8 MiB max).
         let byte_len = (SURFACE_WIDTH_PX as usize)
             .saturating_mul(SURFACE_HEIGHT_PX as usize)
             .saturating_mul(4);
