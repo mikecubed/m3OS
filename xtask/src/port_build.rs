@@ -36,12 +36,10 @@ fn workspace_root() -> PathBuf {
 /// Minimal Portfile parser. Reads `KEY=value` (or `KEY="value with spaces"`)
 /// lines and returns a map keyed by the field name. Comment lines (`#…`) and
 /// blank lines are ignored.
-fn parse_portfile(path: &Path) -> HashMap<String, String> {
+fn parse_portfile(path: &Path) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return map,
-    };
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("read Portfile {}: {e}", path.display()))?;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -53,7 +51,7 @@ fn parse_portfile(path: &Path) -> HashMap<String, String> {
             map.insert(key, value);
         }
     }
-    map
+    Ok(map)
 }
 
 /// Returns the directory of `ports/<category>/<name>/` by scanning the
@@ -186,17 +184,18 @@ fn fetch_tarball(url: &str, sha: &str, cache_dir: &Path) -> Result<PathBuf, Stri
         .next()
         .ok_or_else(|| format!("malformed URL: {url}"))?;
     let dest = cache_dir.join(basename);
+    let sha_prefix = sha_log_prefix(sha);
     if dest.exists() {
         if let Ok(actual) = sha256_file(&dest) {
             if actual == sha {
-                println!("ports: cache hit {} (sha {})", dest.display(), &sha[..16]);
+                println!("ports: cache hit {} (sha {})", dest.display(), sha_prefix);
                 return Ok(dest);
             }
             println!(
                 "ports: cached {} has stale SHA {} (expected {}) — re-fetching",
                 dest.display(),
-                &actual[..16],
-                &sha[..16]
+                sha_log_prefix(&actual),
+                sha_prefix
             );
             let _ = fs::remove_file(&dest);
         }
@@ -216,8 +215,15 @@ fn fetch_tarball(url: &str, sha: &str, cache_dir: &Path) -> Result<PathBuf, Stri
             "SHA mismatch for {url}: expected {sha}, got {actual}"
         ));
     }
-    println!("ports: verified {basename} (sha {})", &sha[..16]);
+    println!("ports: verified {basename} (sha {})", sha_prefix);
     Ok(dest)
+}
+
+/// Borrow the first 16 hex chars of a SHA-256 for log output.  Falls back
+/// to the whole string if shorter — protects against panics on
+/// unexpectedly-formatted Portfile checksums.
+fn sha_log_prefix(sha: &str) -> &str {
+    sha.get(..16).unwrap_or(sha)
 }
 
 /// Extract `tarball` into `work_dir`, replacing any prior extraction. The
@@ -307,7 +313,7 @@ fn port_build(name: &str) -> Result<(), String> {
     let port_dir =
         find_port_dir(name).ok_or_else(|| format!("port {name} not found in ports/ tree"))?;
     let portfile_path = port_dir.join("Portfile");
-    let meta = parse_portfile(&portfile_path);
+    let meta = parse_portfile(&portfile_path)?;
     let url = meta
         .get("URL")
         .cloned()
@@ -731,9 +737,12 @@ fn build_tmux(
     // Same TERMTYPE/TERMTYPE2 layout-mismatch hazard as htop: tmux's
     // autoconf detects libtinfo without `w` suffix and mixes narrow
     // tinfo's setupterm against wide ncursesw's termattrs at runtime.
-    // tmux honors `LIBTINFO_*` so we point it straight at libtinfow.
+    // tmux honors `LIBTINFO_*` (terminfo half) and `LIBNCURSES_*`
+    // (curses half) — we point both at the wide variants so tmux links
+    // against `ncursesw` + `tinfow` consistently.
     let libtinfo_libs = format!("-L{}/lib -ltinfow", ncurses_prefix.display());
-    let libtinfo_cflags = format!(
+    let libncurses_libs = format!("-L{0}/lib -lncursesw -ltinfow", ncurses_prefix.display());
+    let ncurses_cflags = format!(
         "-I{0}/include -I{0}/include/ncursesw",
         ncurses_prefix.display()
     );
@@ -755,9 +764,9 @@ fn build_tmux(
         .env("CFLAGS", &cflags)
         .env("LDFLAGS", &ldflags)
         .env("LIBTINFO_LIBS", &libtinfo_libs)
-        .env("LIBTINFO_CFLAGS", &libtinfo_cflags)
-        .env("LIBNCURSES_LIBS", &libtinfo_libs)
-        .env("LIBNCURSES_CFLAGS", &libtinfo_cflags);
+        .env("LIBTINFO_CFLAGS", &ncurses_cflags)
+        .env("LIBNCURSES_LIBS", &libncurses_libs)
+        .env("LIBNCURSES_CFLAGS", &ncurses_cflags);
     run(&mut configure_cmd, "tmux configure")?;
 
     let mut make_cmd = Command::new("make");
@@ -789,77 +798,137 @@ fn num_jobs() -> usize {
         .unwrap_or(2)
 }
 
-/// Ensure a host-side `yacc` is on PATH for tmux's `cmd-parse.y` parser
-/// generation. Prefers bison/byacc if the host already ships one;
-/// otherwise downloads and builds Berkeley yacc (byacc) 20240109 from
-/// upstream — byacc is a one-file C program with no external
-/// dependencies and builds in a few seconds.
+/// Ensure a host-side `yacc` is reachable on PATH for tmux's
+/// `cmd-parse.y` parser generation.  Autoconf-generated configure
+/// scripts shell out to `yacc` by name, so a host that ships only
+/// `bison` (Debian) or only `byacc` (without the `yacc` symlink) does
+/// not satisfy the requirement on its own.
 ///
-/// On success the host_bin directory is prepended to PATH and a `yacc`
-/// symlink is staged under it, so subsequent Command::new("yacc")
-/// invocations from autoconf-generated configure scripts resolve.
+/// Resolution order:
+///   1. If a `yacc` executable is already on PATH, do nothing.
+///   2. If `bison` or `byacc` is on PATH, stage a `yacc` symlink under
+///      `target/host-bin/` pointing at the discovered tool and prepend
+///      that directory to PATH.
+///   3. Otherwise, download and build Berkeley yacc (byacc) 20240109
+///      from upstream — byacc is a one-file C program with no external
+///      dependencies and builds in a few seconds — then stage the
+///      `yacc` symlink as in (2).
 fn ensure_yacc() -> Result<(), String> {
-    for cand in &["yacc", "bison", "byacc"] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+    if probe_tool_on_path("yacc") {
+        return Ok(());
+    }
+
+    let root = workspace_root();
+    let host_bin = root.join("target/host-bin");
+    let yacc_bin = host_bin.join("yacc");
+
+    if !yacc_bin.is_file() {
+        fs::create_dir_all(&host_bin).map_err(|e| format!("mkdir host_bin: {e}"))?;
+        if let Some(existing) = ["bison", "byacc"]
+            .into_iter()
+            .find(|t| probe_tool_on_path(t))
+            .and_then(which_on_path)
         {
-            return Ok(());
+            std::os::unix::fs::symlink(&existing, &yacc_bin)
+                .map_err(|e| format!("symlink yacc -> {}: {e}", existing.display()))?;
+            println!(
+                "yacc: staged symlink {} -> {}",
+                yacc_bin.display(),
+                existing.display()
+            );
+        } else {
+            bootstrap_byacc(&host_bin, &yacc_bin)?;
         }
     }
+    prepend_path(&host_bin);
+    Ok(())
+}
+
+/// Check whether a tool responds to `--version` on PATH without panicking
+/// on hosts where the binary is missing.
+fn probe_tool_on_path(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Resolve `tool` on PATH to its absolute path via `command -v`.  Returns
+/// None when the lookup fails or returns a relative path we can't anchor.
+fn which_on_path(tool: &str) -> Option<PathBuf> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() { Some(path) } else { None }
+}
+
+/// Prepend `dir` to the current process's PATH so subsequent
+/// `Command::new` invocations resolve through it.
+fn prepend_path(dir: &Path) {
+    let existing = std::env::var("PATH").unwrap_or_default();
+    if !existing.contains(dir.to_str().unwrap_or_default()) {
+        let new_path = format!("{}:{}", dir.display(), existing);
+        // SAFETY: xtask is single-threaded at this point; child processes
+        // inherit the updated env.  std::env::set_var is `unsafe` in
+        // Rust edition 2024 because of cross-thread UB risks.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+    }
+}
+
+/// Download + build Berkeley yacc (byacc) 20240109 and stage a `yacc`
+/// symlink in `host_bin/`.  Used as the fallback when the host ships
+/// neither `yacc`, `bison`, nor `byacc`.
+fn bootstrap_byacc(host_bin: &Path, yacc_bin: &Path) -> Result<(), String> {
     const BYACC_URL: &str = "https://invisible-mirror.net/archives/byacc/byacc-20240109.tgz";
     // DevSkim: ignore DS173237 -- SHA-256 of the public byacc-20240109 tarball,
     // a content-addressed integrity check consumed by fetch_tarball; not a secret.
     const BYACC_SHA: &str = "f2897779017189f1a94757705ef6f6e15dc9208ef079eea7f28abec577e08446";
 
     let root = workspace_root();
-    let host_bin = root.join("target/host-bin");
-    let yacc_bin = host_bin.join("yacc");
-    if !yacc_bin.is_file() {
-        fs::create_dir_all(&host_bin).map_err(|e| format!("mkdir host_bin: {e}"))?;
-        let cache_dir = root.join("target/port-src");
-        let tarball = fetch_tarball(BYACC_URL, BYACC_SHA, &cache_dir)?;
-        let work = root.join("target/byacc-build");
-        let extracted = extract_tarball(&tarball, &work)?;
-        let prefix = host_bin.join("byacc-prefix");
-        let _ = fs::remove_dir_all(&prefix);
-        let mut configure_cmd = Command::new("sh");
-        configure_cmd
-            .current_dir(&extracted)
-            .arg("./configure")
-            .arg(format!("--prefix={}", prefix.display()))
-            .arg("--program-prefix=")
-            .env("CFLAGS", "-O2");
-        run(&mut configure_cmd, "byacc configure")?;
-        let mut make_cmd = Command::new("make");
-        make_cmd
-            .current_dir(&extracted)
-            .arg(format!("-j{}", num_jobs()));
-        run(&mut make_cmd, "byacc make")?;
-        let mut install_cmd = Command::new("make");
-        install_cmd.current_dir(&extracted).arg("install");
-        run(&mut install_cmd, "byacc install")?;
-        let installed = prefix.join("bin/yacc");
-        if !installed.is_file() {
-            return Err(format!("byacc build missing {}", installed.display()));
-        }
-        let _ = fs::remove_file(&yacc_bin);
-        std::os::unix::fs::symlink(&installed, &yacc_bin)
-            .map_err(|e| format!("symlink yacc: {e}"))?;
-        println!("byacc: bootstrapped {}", yacc_bin.display());
+    let cache_dir = root.join("target/port-src");
+    let tarball = fetch_tarball(BYACC_URL, BYACC_SHA, &cache_dir)?;
+    let work = root.join("target/byacc-build");
+    let extracted = extract_tarball(&tarball, &work)?;
+    let prefix = host_bin.join("byacc-prefix");
+    let _ = fs::remove_dir_all(&prefix);
+    let mut configure_cmd = Command::new("sh");
+    configure_cmd
+        .current_dir(&extracted)
+        .arg("./configure")
+        .arg(format!("--prefix={}", prefix.display()))
+        .arg("--program-prefix=")
+        .env("CFLAGS", "-O2");
+    run(&mut configure_cmd, "byacc configure")?;
+    let mut make_cmd = Command::new("make");
+    make_cmd
+        .current_dir(&extracted)
+        .arg(format!("-j{}", num_jobs()));
+    run(&mut make_cmd, "byacc make")?;
+    let mut install_cmd = Command::new("make");
+    install_cmd.current_dir(&extracted).arg("install");
+    run(&mut install_cmd, "byacc install")?;
+    let installed = prefix.join("bin/yacc");
+    if !installed.is_file() {
+        return Err(format!("byacc build missing {}", installed.display()));
     }
-    let existing_path = std::env::var("PATH").unwrap_or_default();
-    if !existing_path.contains(host_bin.to_str().unwrap_or_default()) {
-        let new_path = format!("{}:{}", host_bin.display(), existing_path);
-        // SAFETY: xtask is single-threaded at this point; child processes
-        // inherit the updated env.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
-        }
-    }
+    let _ = fs::remove_file(yacc_bin);
+    std::os::unix::fs::symlink(&installed, yacc_bin).map_err(|e| format!("symlink yacc: {e}"))?;
+    println!("byacc: bootstrapped {}", yacc_bin.display());
     Ok(())
 }
 
@@ -972,7 +1041,7 @@ mod tests {
         writeln!(f, "URL=https://example/foo-1.2.3.tar.gz").unwrap();
         writeln!(f, "SHA256=deadbeef").unwrap();
         drop(f);
-        let m = parse_portfile(&p);
+        let m = parse_portfile(&p).expect("parse Portfile");
         assert_eq!(m.get("NAME").unwrap(), "foo");
         assert_eq!(m.get("SHA256").unwrap(), "deadbeef");
     }

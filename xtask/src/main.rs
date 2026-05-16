@@ -7804,10 +7804,14 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
 
 /// Phase 69d Track E.1 — boot m3OS, log into sh0, drive the three
 /// ported TUI apps (less, htop, tmux) through scripted keystroke
-/// sequences. Each app's smoke prints `TUI_APP_SMOKE:<app>:ok` (or
-/// `:fail …`) via the harness's `tui-app-smoke` shim binary. The
-/// shim invokes the real apps under a child PTY, observes their
-/// output, and emits the sentinel.
+/// sequences sent over the QEMU serial console. Each app's smoke
+/// invokes the real binary in the guest shell, observes the rendered
+/// output (cell-grid markers, version strings, etc.) via the serial
+/// log, and emits a per-app `TUI_APP_SMOKE:<app>:{ok,fail}` sentinel
+/// by `echo`ing it from the shell once the per-app gate succeeds.
+/// There is no in-guest shim binary — the harness composes the
+/// scenario from the SmokeStep::Send / Wait / WaitPassOrFail primitives
+/// shared with the rest of the smoke gates.
 ///
 /// The cross-compiled ports are built host-side as a precondition.
 fn cmd_tui_app_smoke(args: &SmokeBootArgs) {
@@ -7985,9 +7989,19 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "guest/tui-app-smoke: tmux is executable",
     });
+    // tmux -V must succeed AND emit the expected version string before
+    // we declare the version probe ok.  Using `&&` ensures the sentinel
+    // never fires on a failed -V (a bare `;` would let the smoke pass
+    // even if tmux is broken), and the Wait on "tmux 3.5a" pins the
+    // pinned upstream version so a future bump can't quietly downgrade.
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -V; echo TUI_APP_SMOKE:tmux:version-done\n",
+        input: "/usr/local/bin/tmux -V && echo TUI_APP_SMOKE:tmux:version-done\n",
         label: "guest/tui-app-smoke: tmux -V probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "tmux 3.5a",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux -V printed pinned version",
     });
     steps.push(SmokeStep::Wait {
         pattern: "TUI_APP_SMOKE:tmux:version-done",
