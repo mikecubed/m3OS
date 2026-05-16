@@ -121,9 +121,11 @@ impl Rasterizer {
     /// The transform is:
     ///
     /// 1. Compute the em-to-pixel scale so the full
-    ///    `ascender - descender` band fits inside the cell height
-    ///    (with one row of top padding so caps don't touch the
-    ///    top edge).
+    ///    `ascender - descender` band fits inside the cell height,
+    ///    reserving 1 px of bottom padding so descenders don't kiss
+    ///    the bottom grid line. There is no top padding row — the
+    ///    ascender em-point maps to row 0, so caps sit flush against
+    ///    the top edge.
     /// 2. Flatten each `Quad` / `Curve` segment into a polyline.
     /// 3. Translate em-space coordinates so the glyph's horizontal
     ///    midpoint lands on the cell's centre column and the baseline
@@ -144,8 +146,12 @@ impl Rasterizer {
         if em_height <= 0.0 {
             return bitmap;
         }
-        // Reserve 1 px of top + 1 px of bottom padding for an 8 × 16
-        // cell so caps and descenders don't kiss the grid lines.
+        // Reserve 1 px of bottom padding so descenders don't kiss
+        // the bottom grid line; the baseline math below maps the
+        // font's `ascender` em-point to row 0, so there is no top
+        // padding row (caps sit flush against the top edge). The
+        // `- 2.0` here pairs with the `(cell_h - 2.0)` baseline
+        // anchor: usable rows are `0..=cell_h - 2`.
         let usable_h = (cell_h as f32 - 2.0).max(1.0);
         let scale_y = usable_h / em_height;
         let scale_x = scale_y; // monospace metrics
@@ -422,8 +428,13 @@ mod tests {
 
         // Stronger shape check: 'H' must contain at least two
         // distinct vertical bars (one column on each side of the
-        // glyph) and at least one horizontal crossbar row that
-        // bridges them.
+        // glyph). The horizontal crossbar is *not* asserted here —
+        // at 8 × 16 with JetBrainsMono Nerd Font the crossbar is
+        // sub-pixel and would falsely fail the test on real fonts;
+        // the dedicated synthetic-outline test
+        // (`crossbar_synthetic_outline_resolves`) exercises the
+        // crossbar path with em-units chosen to land cleanly on the
+        // pixel grid.
         let mut vertical_bar_cols = Vec::new();
         for x in 0..bm.width as usize {
             let col_ink: usize = (0..bm.height as usize).filter(|&y| bm.pixel(x, y)).count();

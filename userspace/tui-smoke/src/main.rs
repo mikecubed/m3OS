@@ -548,8 +548,20 @@ fn run_fonts_startup() -> Result<(), &'static str> {
     if bytes.len() < 1024 {
         return Err("font-too-small");
     }
-    let atlas =
-        kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY);
+    // Cell metrics MUST match `term::display::CELL_WIDTH` /
+    // `CELL_HEIGHT` (16 × 32) — the `term::display` module is gated
+    // behind `os-binary` and not reachable from this smoke binary,
+    // so we duplicate the literals. Using a smaller cell here would
+    // exercise a different rasterization path than the production
+    // terminal and a 16 × 32-only regression could pass.
+    const CELL_W: u8 = 16;
+    const CELL_H: u8 = 32;
+    let atlas = kernel_core::font::Atlas::new(
+        bytes,
+        CELL_W,
+        CELL_H,
+        kernel_core::font::DEFAULT_ATLAS_CAPACITY,
+    );
     let mut atlas = match atlas {
         Ok(a) => a,
         Err(_) => return Err("atlas-construct-failed"),
@@ -558,10 +570,10 @@ fn run_fonts_startup() -> Result<(), &'static str> {
     // inc. space). We exclude `U+007F` (DEL) because the atlas
     // classifies it as a blank control codepoint, so it can never
     // contribute to the non-blank count below. The threshold is 64
-    // — not 95 — because some printable codepoints (space, certain
-    // Nerd-Font-patched positions) may legitimately map to a glyph
-    // the rasterizer renders as blank at 8 × 16, and the gate must
-    // be robust to that without losing teeth.
+    // — not 95 — because some printable codepoints (space) may
+    // legitimately map to a glyph the rasterizer renders as blank
+    // even at 16 × 32, and the gate must be robust to that without
+    // losing teeth.
     let mut count = 0usize;
     for cp in 0x20u32..0x7F {
         let bm = atlas.resolve(cp);
@@ -593,18 +605,28 @@ fn run_fonts_branch_icon() -> Result<(), &'static str> {
             return Err("branch-icon-not-in-font-cmap");
         }
     }
-    let mut atlas =
-        kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY)
-            .map_err(|_| "atlas-construct-failed")?;
+    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see the
+    // `run_fonts_startup` rationale comment for why the runtime
+    // metrics live here as duplicated literals.
+    const CELL_W: u8 = 16;
+    const CELL_H: u8 = 32;
+    let mut atlas = kernel_core::font::Atlas::new(
+        bytes,
+        CELL_W,
+        CELL_H,
+        kernel_core::font::DEFAULT_ATLAS_CAPACITY,
+    )
+    .map_err(|_| "atlas-construct-failed")?;
     let bm = atlas.resolve(0xE0A0);
     if bm.is_blank() {
         return Err("branch-icon-rendered-blank");
     }
     // The fallback dot paints exactly 4 px (a 2 × 2 stamp), so an
     // `ink_count() <= 4` rejection catches the fallback path
-    // without rejecting a sparsely-rasterized real glyph at 8 × 16
-    // cell size. Tightening the threshold higher would risk
-    // flagging legitimate glyphs whose 8 × 16 bitmap is sparse.
+    // without rejecting a sparsely-rasterized real glyph at 16 × 32.
+    // The 4 px threshold is independent of cell size — the fallback
+    // stamp is a fixed 2 × 2 — so the check stays valid as the cell
+    // metrics evolve.
     if bm.ink_count() <= 4 {
         return Err("branch-icon-rendered-as-fallback-dot");
     }
@@ -646,9 +668,17 @@ fn run_fonts_emoji() -> Result<(), &'static str> {
     if cell.codepoint != 0x1F600 {
         return Err("emoji-cell-codepoint-mismatch");
     }
-    let mut atlas =
-        kernel_core::font::Atlas::new(bytes, 8, 16, kernel_core::font::DEFAULT_ATLAS_CAPACITY)
-            .map_err(|_| "atlas-construct-failed")?;
+    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see
+    // `run_fonts_startup` for the rationale.
+    const CELL_W: u8 = 16;
+    const CELL_H: u8 = 32;
+    let mut atlas = kernel_core::font::Atlas::new(
+        bytes,
+        CELL_W,
+        CELL_H,
+        kernel_core::font::DEFAULT_ATLAS_CAPACITY,
+    )
+    .map_err(|_| "atlas-construct-failed")?;
     // Contract per Phase 69c: a covered emoji produces non-blank
     // ink; an uncovered one returns the centred-dot fallback (also
     // non-blank). Either way the bitmap must not be blank — a bug
@@ -691,8 +721,12 @@ fn run_fonts_adversarial() -> Result<(), &'static str> {
     if covered.len() < 2 * CAP {
         return Err("adversarial-font-too-sparse-for-eviction");
     }
-    let mut atlas =
-        kernel_core::font::Atlas::new(bytes, 8, 16, CAP).map_err(|_| "atlas-construct-failed")?;
+    // Mirror term::display::CELL_WIDTH / CELL_HEIGHT — see
+    // `run_fonts_startup` for the rationale.
+    const CELL_W: u8 = 16;
+    const CELL_H: u8 = 32;
+    let mut atlas = kernel_core::font::Atlas::new(bytes, CELL_W, CELL_H, CAP)
+        .map_err(|_| "atlas-construct-failed")?;
     for &cp in &covered {
         let _ = atlas.resolve(cp);
     }

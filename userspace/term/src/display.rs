@@ -7,8 +7,12 @@
 //!
 //! - the IPC handle for `display_server`;
 //! - the `SurfaceId` and `BufferId` term claims;
-//! - a 1280 × 800 BGRA8888 [`SurfaceBuffer`] that backs the term grid
+//! - a raw 1280 × 800 BGRA8888 shared-memory mapping (`surface_va` /
+//!   `surface_len`, allocated via `syscall_lib::shm_create` +
+//!   `shm_map`) that backs the term grid
 //!   (80 × 25 cells × 16 × 32 px — see [`CELL_WIDTH`] / [`CELL_HEIGHT`]).
+//!   The `kernel_core::display::surface_buffer::SurfaceBuffer` type
+//!   is no longer instantiated on this client path.
 //!
 //! Phase 69c replaced the in-client glyph rasteriser with the
 //! `kernel-core::font` atlas: the renderer pre-resolves each glyph

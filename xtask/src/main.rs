@@ -8358,83 +8358,90 @@ fn format_ext2_partition(part_tmp: &Path) {
     std::process::exit(1);
 }
 
-/// Verify that a preserved (already-existing) `disk.img` contains the
-/// Phase 69c Nerd Font asset at `/usr/share/fonts/m3os/term.ttf`.
+/// Sidecar filename written next to `disk.img` when the data-disk
+/// builder successfully stages the Phase 69c Nerd Font asset. The
+/// file contains the lowercase hex SHA-256 of the staged TTF — the
+/// same digest stored in `xtask/assets/fonts/term.ttf.sha256` — and
+/// the preserved-disk verification compares the two strings.
+const FONT_MARKER_FILENAME: &str = "disk.img.font.sha256";
+
+/// Verify that a preserved (already-existing) `disk.img` was staged
+/// with the same Phase 69c Nerd Font asset the workspace currently
+/// declares.
 ///
 /// Pre-69c disks created by older `cargo xtask image` runs never had
-/// the font staged on them, so a developer who runs `cargo xtask run`
-/// (or `image`) without `--fresh` would silently boot `term` on the
-/// static-fallback path — the SHA-256 + presence checks the fresh-disk
-/// staging branch enforces would be bypassed entirely. Treat the
-/// missing asset as a hard, actionable error directing the developer
-/// at `cargo xtask clean` so the disk gets recreated with the staged
-/// font.
-///
-/// Implementation: stream-copy the partition area out of the existing
-/// disk image into a temporary file, run `debugfs -R "stat …"` against
-/// the extracted partition, and inspect the output for an
-/// "ext2_lookup" / "File not found" diagnostic. `debugfs` returns a
-/// zero status even when `stat` fails to resolve a path, so the
-/// presence check has to parse the output rather than rely on the
-/// exit code.
+/// the font staged on them, and a disk staged with a stale or
+/// manually-replaced TTF would also silently bypass the fresh-disk
+/// SHA-256 check. A round-6 follow-up reviewer correctly flagged
+/// both gaps and the cost of the original `debugfs stat`
+/// implementation — extracting the full 1 GiB partition on every
+/// `cargo xtask run` to probe for a single file path. The
+/// replacement is a tiny sidecar marker (`disk.img.font.sha256`)
+/// the staging path writes after `verify_sha256_strict` accepts the
+/// TTF. The preserve branch just compares the marker against the
+/// committed checksum — O(1), no partition extraction, and now
+/// content-aware instead of presence-only.
 fn verify_font_on_existing_disk(disk_path: &Path, output_dir: &Path) {
-    const SECTOR_SIZE: u64 = 512;
-    const PARTITION_START_LBA: u64 = 2048;
-    let partition_offset = PARTITION_START_LBA * SECTOR_SIZE;
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    let committed_sha_path = workspace_root().join("xtask/assets/fonts/term.ttf.sha256");
 
-    let part_tmp = output_dir.join("disk_font_probe.tmp");
-    {
-        let mut disk = fs::File::open(disk_path).unwrap_or_else(|e| {
+    let committed_sha = match fs::read_to_string(&committed_sha_path) {
+        Ok(s) => s
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        Err(e) => {
             eprintln!(
-                "Error: cannot open existing data disk {} for font asset check: {e}",
-                disk_path.display()
+                "Error: failed to read committed font checksum file {}: {e}\n\
+                 Restore it from git \
+                 (e.g. `git checkout xtask/assets/fonts/term.ttf.sha256`).",
+                committed_sha_path.display()
             );
             std::process::exit(1);
-        });
-        disk.seek(io::SeekFrom::Start(partition_offset))
-            .unwrap_or_else(|e| {
-                eprintln!("Error: failed to seek to partition offset in disk.img: {e}");
-                std::process::exit(1);
-            });
-        let mut part_file = fs::File::create(&part_tmp).unwrap_or_else(|e| {
+        }
+    };
+
+    let marker_sha = match fs::read_to_string(&marker_path) {
+        Ok(s) => s.trim().to_ascii_lowercase(),
+        Err(_) => {
             eprintln!(
-                "Error: failed to create partition probe temp file {}: {e}",
-                part_tmp.display()
+                "Error: existing data disk at {} was not staged with the Phase 69c \
+                 Nerd Font asset (no sidecar marker at {}).\n\
+                 This disk was created before Phase 69c (or by a build that did not \
+                 stage the font). Run `cargo xtask clean` to delete the disk so \
+                 `cargo xtask run` / `image` recreates it with the staged font.",
+                disk_path.display(),
+                marker_path.display()
             );
             std::process::exit(1);
-        });
-        io::copy(&mut disk, &mut part_file).unwrap_or_else(|e| {
-            eprintln!("Error: failed to extract partition area from disk.img: {e}");
-            let _ = fs::remove_file(&part_tmp);
-            std::process::exit(1);
-        });
-    }
+        }
+    };
 
-    let output = Command::new("debugfs")
-        .arg("-R")
-        .arg("stat /usr/share/fonts/m3os/term.ttf")
-        .arg(&part_tmp)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap_or_else(|e| {
-            let _ = fs::remove_file(&part_tmp);
-            eprintln!("Error: failed to run debugfs for font asset check: {e}");
-            std::process::exit(1);
-        });
-    let _ = fs::remove_file(&part_tmp);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-    if combined.contains("File not found") || combined.contains("ext2_lookup") {
+    if marker_sha != committed_sha {
         eprintln!(
-            "Error: existing data disk at {} is missing the Phase 69c Nerd Font \
-             asset at /usr/share/fonts/m3os/term.ttf.\n\
-             This disk was created before Phase 69c staged the font. Run \
-             `cargo xtask clean` to delete the disk so it can be recreated \
-             with the staged font asset, or pass `--fresh` to recreate it now.",
+            "Error: data disk at {} was staged with a font whose SHA-256 \
+             ({marker_sha}) no longer matches the committed checksum \
+             ({committed_sha}).\n\
+             The Nerd Font asset has been updated since this disk was built. \
+             Run `cargo xtask clean` to delete the disk so it is recreated with \
+             the current asset.",
             disk_path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Write the sidecar marker that records the staged TTF's SHA-256.
+/// Called from `populate_ext2_files` after the fresh-disk path has
+/// verified the asset against the committed checksum, so the marker
+/// always matches the digest at the moment the disk was staged.
+fn write_font_marker(output_dir: &Path, expected_font_sha: &str) {
+    let marker_path = output_dir.join(FONT_MARKER_FILENAME);
+    if let Err(e) = fs::write(&marker_path, format!("{expected_font_sha}\n")) {
+        eprintln!(
+            "Error: failed to write font sidecar marker {}: {e}",
+            marker_path.display()
         );
         std::process::exit(1);
     }
@@ -8897,6 +8904,11 @@ fn populate_ext2_files(
         );
         std::process::exit(1);
     }
+    // Record the staged digest in a sidecar marker next to `disk.img`
+    // so future `cargo xtask run` / `image` invocations can prove the
+    // preserved disk was built with the current asset without doing a
+    // partition-scale `debugfs stat`. See `verify_font_on_existing_disk`.
+    write_font_marker(output_dir, &expected_font_sha);
 
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");

@@ -46,16 +46,13 @@ pub enum AtlasError {
     CellTooSmall,
     /// The font byte buffer handed to [`Atlas::new`] could not be
     /// parsed (`Font::open` failed because the bytes are malformed,
-    /// truncated, or missing required tables). Distinct from
-    /// [`OutlineUnavailable`] so callers can separate "bad font
-    /// file" from "covered glyph could not be outlined".
-    ///
-    /// [`OutlineUnavailable`]: AtlasError::OutlineUnavailable
+    /// truncated, or missing required tables). Per-glyph outline
+    /// failures (a covered codepoint whose outline cannot be
+    /// reconstructed) are not surfaced through `AtlasError` — they
+    /// are absorbed by [`Atlas::resolve`] and routed to the shared
+    /// fallback bitmap so callers do not have to branch on a
+    /// per-codepoint error type.
     Malformed,
-    /// Outline rasterization failed for a codepoint the font claims
-    /// to cover. Surfaced from [`Atlas::resolve`] as the
-    /// fallback-dot path so the caller does not have to branch.
-    OutlineUnavailable,
 }
 
 /// Bounded LRU glyph atlas. Owns the loaded font's bytes (the
@@ -87,7 +84,9 @@ const NIL: usize = usize::MAX;
 impl Atlas {
     /// Construct a fresh atlas from already-loaded font bytes plus
     /// cell metrics. The metrics typically come from a constant —
-    /// `term` uses 8 × 16 — combined with the font's
+    /// `term` currently passes 16 × 32 (see
+    /// `userspace/term/src/display.rs`'s `CELL_WIDTH` / `CELL_HEIGHT`),
+    /// and the host-side tests use 8 × 16 — combined with the font's
     /// `units_per_em` / `ascender` / `descender`.
     ///
     /// `cell_w` / `cell_h` are `u8` because [`RasterBitmap`] stores
