@@ -336,7 +336,14 @@ and verifies the SHA-256 against
 `term` boots on `Static` and upgrades to `Atlas` when
 `/usr/share/fonts/m3os/term.ttf` opens and parses cleanly. The
 boot log records `term: atlas loaded N glyphs` on success and
-`term: font load failed; using static fallback` on any failure.
+`term: font load failed; using static fallback` on the recoverable
+failure set — missing file, I/O read error, oversized read (the
+hard cap protects the heap), empty buffer, parse error, and atlas
+construction error. True allocation failure is *not* recovered
+here: `term`'s `alloc_error_handler` exits the process when the
+global allocator returns null, so `build_atlas` bounds the
+worst-case font-read allocation with a hard size cap to keep the
+fallback path reachable.
 The current `tui-smoke fonts missing-font` gate exercises only
 the in-process static-resolver path (ASCII / Latin-1 /
 box-drawing still render with no font present); a stripped-disk

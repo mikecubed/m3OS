@@ -794,7 +794,8 @@ fn handle_surface_resize<F: term::render::FramebufferOwner>(
     const GLYPH_H: u32 = term::display::CELL_HEIGHT as u32;
     // Phase 69 PR 168 round-3 fix — a malformed `SurfaceResized` could
     // request 65535×65535 cells (~4.3B cells × `Cell` size = multi-GB)
-    // and crash `term`. Cap each dimension at 1024 cells (8192×16384
+    // and crash `term`. Cap each dimension at 1024 cells (with the
+    // Phase 69c 16×32 cell metrics this corresponds to 16384×32768
     // logical pixels — well above any realistic display) and the total
     // cell budget at ~1M, which keeps `Screen::resize` allocations in
     // single-digit MB regardless of the message contents.

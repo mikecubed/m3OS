@@ -19,12 +19,18 @@ use super::parser::Font;
 use super::raster::{CellMetrics, RasterBitmap, Rasterizer};
 
 /// Default per-`term` atlas capacity (cached glyph count, not a
-/// memory ceiling). The packed 8 × 16 bitmap is 16 bytes per glyph,
-/// so the rasterized pixel data alone is ~16 KiB at 1024 entries.
-/// Real per-`term` heap footprint is several times higher: each
-/// cached entry also carries a `Slot` (codepoint + prev/next link
-/// fields + the `RasterBitmap`'s `Vec<u8>` header) plus a separately
-/// allocated bitmap heap block.
+/// memory ceiling). Packed-bitmap pixel data scales with the
+/// configured cell size — the bitmap layout is
+/// `ceil(cell_w / 8) * cell_h` bytes per glyph (see
+/// [`RasterBitmap::blank`](crate::font::raster::RasterBitmap::blank)).
+/// `term`'s current runtime cell is 16 × 32, so packed pixel data is
+/// 64 bytes per glyph (~64 KiB at 1024 entries). Real per-`term`
+/// heap footprint is higher: each cached entry also carries a `Slot`
+/// (codepoint + prev/next link fields + the `RasterBitmap`'s
+/// `Vec<u8>` header) plus a separately allocated bitmap heap block.
+/// Smaller cell sizes (e.g. an 8 × 16 host-test fixture, which packs
+/// to 16 bytes per glyph) shrink the pixel-data line-item
+/// proportionally.
 pub const DEFAULT_ATLAS_CAPACITY: usize = 1024;
 
 /// Errors observable from the atlas API.

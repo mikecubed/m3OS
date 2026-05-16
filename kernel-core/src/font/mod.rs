@@ -33,8 +33,12 @@ pub(crate) mod test_fixtures {
     /// 1. The repository's staged Nerd Font, materialized by
     ///    `cargo xtask fetch-fonts`. This is the deterministic
     ///    fixture — every developer who builds the disk image
-    ///    has this asset locally, and CI fetches it before running
-    ///    `cargo xtask check`.
+    ///    has this asset locally. CI itself does **not** call
+    ///    `cargo xtask fetch-fonts` before `cargo xtask check`,
+    ///    so the deterministic-fixture path is only guaranteed in
+    ///    local workflows (and in any future CI workflow that
+    ///    fetches the asset explicitly); CI today falls through to
+    ///    the system-font fallbacks below.
     /// 2. System-installed DejaVu Sans Mono at the canonical
     ///    Debian / Fedora / Arch paths. Kept as a fallback so a
     ///    fresh checkout that hasn't run `fetch-fonts` still has a

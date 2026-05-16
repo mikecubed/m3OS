@@ -238,13 +238,20 @@ fn run_colors() -> Result<(), &'static str> {
 
 fn run_mouse() -> Result<(), &'static str> {
     use kernel_core::input::events::{ModifierState, PointerButton, PointerEvent};
+    // Mirror the literals in `term::mouse::compute_cell_position`.
+    // The `term::display` module is gated behind `os-binary`, so we
+    // duplicate the literals here as the in-crate mouse tests do —
+    // mismatching them would mis-project the synthetic pixel input
+    // onto the cell grid and produce a stale wire string.
+    const CELL_W_PX: i32 = 16;
+    const CELL_H_PX: i32 = 32;
     let mut reporter = MouseReporter::new();
     // Off-state: disabled returns None.
     let event = PointerEvent {
         timestamp_ms: 0,
         dx: 0,
         dy: 0,
-        abs_position: Some((10 * 8, 5 * 16)),
+        abs_position: Some((10 * CELL_W_PX, 5 * CELL_H_PX)),
         button: PointerButton::Down(0),
         wheel_dx: 0,
         wheel_dy: 0,
@@ -258,6 +265,8 @@ fn run_mouse() -> Result<(), &'static str> {
         Some(b) => b,
         None => return Err("sgr-encode-returned-none"),
     };
+    // Cell origin is 1-based: a click at pixel `(10*W, 5*H)` lands on
+    // cell `(11, 6)` regardless of the cell pixel size.
     if bytes.as_slice() != b"\x1b[<0;11;6M" {
         return Err("sgr-press-wire-mismatch");
     }

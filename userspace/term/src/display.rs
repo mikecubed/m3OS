@@ -1,4 +1,6 @@
-//! Phase 57 Track G.5 close-out — production display-server client.
+//! Phase 57 Track G.5 close-out — production display-server client
+//! (extended in Phase 69c for atlas-backed glyph dispatch and the
+//! 1280 × 800 / 16 × 32 cell layout).
 //!
 //! `DisplayClient` is the live counterpart to the `FakeFb` test
 //! fixture in [`crate::render::tests`]. It owns:
@@ -6,16 +8,21 @@
 //! - the IPC handle for `display_server`;
 //! - the `SurfaceId` and `BufferId` term claims;
 //! - a 1280 × 800 BGRA8888 [`SurfaceBuffer`] that backs the term grid
-//!   (80 × 25 cells × 8 × 16 px);
-//! - the [`BasicBitmapFont`] used to rasterise glyphs into the
-//!   buffer.
+//!   (80 × 25 cells × 16 × 32 px — see [`CELL_WIDTH`] / [`CELL_HEIGHT`]).
+//!
+//! Phase 69c replaced the in-client glyph rasteriser with the
+//! `kernel-core::font` atlas: the renderer pre-resolves each glyph
+//! to a [`GlyphView`](kernel_core::font::GlyphView) and
+//! `DisplayClient::put_glyph` simply blits the packed-bits bitmap
+//! into the backing surface — the framebuffer owner no longer
+//! branches on resolution policy.
 //!
 //! On every [`compose`](crate::render::Renderer::compose), the
 //! renderer drives `DisplayClient` through the [`FramebufferOwner`]
-//! trait. `submit` chunks the local 1 MB buffer through the
-//! `LABEL_PIXELS_CHUNK` wire (added in the same Phase 57 PR) and
-//! drives the `AttachBuffer` → `DamageSurface` → `CommitSurface`
-//! verb sequence.
+//! trait. `term` writes pixels directly into the SHM mapping (no
+//! IPC payload) and `submit` drives the `AttachSharedBuffer` (once)
+//! → `DamageSurface` → `CommitSurface` verb sequence. The legacy
+//! per-pixel `LABEL_PIXELS_CHUNK` wire is no longer the upload path.
 //!
 //! ## Why one BufferId per frame is not used
 //!

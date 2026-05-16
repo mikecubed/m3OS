@@ -180,9 +180,14 @@ Special-cased codepoints:
   Phase 69b's `FALLBACK_DOT_GLYPH`, so the rendered cell looks
   identical between static and atlas paths.
 
-Capacity defaults to 1024 entries. An 8 × 16 bitmap is 16 bytes;
-1024 × 16 = 16 KiB worst-case for `term`'s atlas — well below the
-ext2 disk's per-process heap budget.
+Capacity defaults to 1024 entries. Packed-bitmap pixel data scales
+with the configured cell size (`ceil(cell_w / 8) * cell_h` bytes per
+glyph). `term`'s current runtime cell is 16 × 32, so packed pixel
+data alone is ~64 KiB at 1024 entries; an 8 × 16 host-test fixture
+packs to 16 bytes per glyph (~16 KiB at 1024 entries). Real
+per-`term` heap footprint is several times higher once `Slot`
+overhead and per-bitmap `Vec<u8>` headers are added, but still well
+below the ext2 disk's per-process heap budget.
 
 ### Track D — Asset staging (`xtask/src/main.rs`)
 
@@ -223,9 +228,16 @@ capacity, pre-warms printable ASCII (`U+0020..=U+007E`, 95 cps)
 plus the Latin-1 supplement (`U+00A1..=U+00FF`, 95 cps) — together
 ~190 codepoints — so the boot log's glyph count comfortably clears
 the documented `N > 100` gate, and calls `Renderer::set_atlas`. On
-any failure (file missing, parse error, atlas construction error)
-the function logs `term: font load failed; using static fallback`
-and returns without changing the renderer's `GlyphSource`.
+a recoverable failure — file missing, I/O read error, oversized
+read past the hard cap, empty buffer, parse error, or atlas
+construction error — the function logs `term: font load failed;
+using static fallback` and returns without changing the renderer's
+`GlyphSource`. True allocation failure is **not** recovered here:
+`term`'s `alloc_error_handler` exits the process when the global
+allocator returns null, so the static-fallback log line is
+guaranteed only for the recoverable set above. The hard read-size
+cap on the font file exists specifically to keep the fallback path
+reachable in practice.
 
 ### Track F — `tui-smoke fonts` (`userspace/tui-smoke`)
 
@@ -283,8 +295,11 @@ Phase 69c deliberately ships infrastructure, not coverage. The
 following are explicit non-goals:
 
 - **Multiple font sizes / dynamic resize.** The atlas is built at
-  one cell size (8 × 16). A future phase that wants larger cells
-  would need a per-size atlas or a re-rasterize-on-resize policy.
+  one cell size — `term` currently passes 16 × 32 (see
+  `userspace/term/src/display.rs`'s `CELL_WIDTH` / `CELL_HEIGHT`)
+  and host tests use 8 × 16. A future phase that wants more than
+  one cell size at a time would need a per-size atlas or a
+  re-rasterize-on-resize policy.
 - **Per-region font fallback.** Phase 69c uses one font. A future
   phase that wants CJK + Latin + emoji composition would need
   font-fallback logic in the atlas's `resolve` path.

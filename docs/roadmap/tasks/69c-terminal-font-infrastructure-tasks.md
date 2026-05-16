@@ -77,7 +77,7 @@
 - [x] `Atlas::new(font: Font, capacity: usize)` constructs with default capacity 1024. (Lands as `Atlas::new(bytes, cell_w, cell_h, capacity)` so the atlas owns the font bytes and the parser is re-opened internally — avoids a self-referential `Atlas<'a>`.)
 - [x] `resolve(codepoint: u32) -> &RasterBitmap` hits the cache or rasterizes + inserts.
 - [x] Cache uses LRU eviction (host test: fill to capacity + 1, oldest entry is evicted).
-- [x] `Atlas` is `!Send` and lives inside `term`'s process; no cross-process atlas sharing in 69c.
+- [x] By design, an `Atlas` lives inside one `term` process and is never shared across processes in 69c. The struct does not carry an explicit non-`Send` marker — all of its fields are auto-trait-safe (`Vec<u8>`, `Vec<Slot>`, scalars), so the type auto-implements `Send` / `Sync`. The boundary is enforced by ownership (each `term` instance constructs its own `Atlas` from a freshly-read font byte buffer) rather than by a trait-level guard. If a later phase wants cross-process atlas sharing, that work owns the synchronisation contract.
 - [x] Host tests cover: cache miss → hit transition; LRU eviction order; codepoint with no glyph in the font → fallback dot.
 
 ---
@@ -195,7 +195,7 @@
 **Acceptance:**
 - [x] `docs/69c-terminal-font-infrastructure.md` exists with all template fields populated (Aligned Roadmap Phase, Status, Source Ref, Supersedes Legacy Doc).
 - [x] Overview paragraph explains what Phase 69b left as a static-table glyph path and what Phase 69c replaces it with.
-- [x] Key Files table cites every changed file (parser, rasterizer, atlas, font module entry, term boot wiring, renderer dispatch, xtask fetch + staging, tui-smoke fonts subcommand, appendix doc).
+- [x] Key Files table cites the primary surfaces this phase introduces or rewrites — parser, rasterizer, atlas, font module entry, term boot wiring, renderer dispatch, xtask fetch + staging, tui-smoke fonts subcommand, appendix doc. Ancillary edits (kernel patch-bump files like `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`; the `MAX_ORDER` bump in `kernel-core/src/buddy.rs`; the SHM byte-size doc nit in `kernel/src/mm/shm.rs`; the `userspace/term/src/mouse.rs` cell-metric follow-up) are covered by their owning track sections (G.4 for the version bump, the Track E sub-tasks for the term-side cell-size scaling) and intentionally not duplicated in this table.
 - [x] Closure of Related Phases section cross-refs Phase 57, 69, 69a, 69b.
 - [x] How This Phase Differs From Later Font Work section calls out the deferred items (multi-size, per-region fallback, OpenType features, AA, variable fonts, hot-reload, configurable path).
 - [x] Related Roadmap Docs links design doc and task doc.

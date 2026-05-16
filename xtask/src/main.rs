@@ -8358,6 +8358,88 @@ fn format_ext2_partition(part_tmp: &Path) {
     std::process::exit(1);
 }
 
+/// Verify that a preserved (already-existing) `disk.img` contains the
+/// Phase 69c Nerd Font asset at `/usr/share/fonts/m3os/term.ttf`.
+///
+/// Pre-69c disks created by older `cargo xtask image` runs never had
+/// the font staged on them, so a developer who runs `cargo xtask run`
+/// (or `image`) without `--fresh` would silently boot `term` on the
+/// static-fallback path — the SHA-256 + presence checks the fresh-disk
+/// staging branch enforces would be bypassed entirely. Treat the
+/// missing asset as a hard, actionable error directing the developer
+/// at `cargo xtask clean` so the disk gets recreated with the staged
+/// font.
+///
+/// Implementation: stream-copy the partition area out of the existing
+/// disk image into a temporary file, run `debugfs -R "stat …"` against
+/// the extracted partition, and inspect the output for an
+/// "ext2_lookup" / "File not found" diagnostic. `debugfs` returns a
+/// zero status even when `stat` fails to resolve a path, so the
+/// presence check has to parse the output rather than rely on the
+/// exit code.
+fn verify_font_on_existing_disk(disk_path: &Path, output_dir: &Path) {
+    const SECTOR_SIZE: u64 = 512;
+    const PARTITION_START_LBA: u64 = 2048;
+    let partition_offset = PARTITION_START_LBA * SECTOR_SIZE;
+
+    let part_tmp = output_dir.join("disk_font_probe.tmp");
+    {
+        let mut disk = fs::File::open(disk_path).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: cannot open existing data disk {} for font asset check: {e}",
+                disk_path.display()
+            );
+            std::process::exit(1);
+        });
+        disk.seek(io::SeekFrom::Start(partition_offset))
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to seek to partition offset in disk.img: {e}");
+                std::process::exit(1);
+            });
+        let mut part_file = fs::File::create(&part_tmp).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: failed to create partition probe temp file {}: {e}",
+                part_tmp.display()
+            );
+            std::process::exit(1);
+        });
+        io::copy(&mut disk, &mut part_file).unwrap_or_else(|e| {
+            eprintln!("Error: failed to extract partition area from disk.img: {e}");
+            let _ = fs::remove_file(&part_tmp);
+            std::process::exit(1);
+        });
+    }
+
+    let output = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /usr/share/fonts/m3os/term.ttf")
+        .arg(&part_tmp)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| {
+            let _ = fs::remove_file(&part_tmp);
+            eprintln!("Error: failed to run debugfs for font asset check: {e}");
+            std::process::exit(1);
+        });
+    let _ = fs::remove_file(&part_tmp);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    if combined.contains("File not found") || combined.contains("ext2_lookup") {
+        eprintln!(
+            "Error: existing data disk at {} is missing the Phase 69c Nerd Font \
+             asset at /usr/share/fonts/m3os/term.ttf.\n\
+             This disk was created before Phase 69c staged the font. Run \
+             `cargo xtask clean` to delete the disk so it can be recreated \
+             with the staged font asset, or pass `--fresh` to recreate it now.",
+            disk_path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Create a 64 MB raw data disk image with an MBR partition table and an
 /// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
@@ -8393,6 +8475,15 @@ fn create_data_disk(
                 disk_path.display()
             );
         }
+        // Phase 69c round-6 fix — `populate_ext2_files` only runs when
+        // we are creating a fresh disk, so a developer with a pre-69c
+        // `disk.img` would happily boot without
+        // `/usr/share/fonts/m3os/term.ttf`. That silently regresses
+        // `term` back to the static-fallback path and bypasses the
+        // hard error / SHA-256 check the fresh-disk path enforces.
+        // Verify the asset is present on the preserved disk and emit
+        // an actionable error if it is missing.
+        verify_font_on_existing_disk(&disk_path, output_dir);
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
@@ -8774,9 +8865,16 @@ fn populate_ext2_files(
             .unwrap_or("")
             .to_ascii_lowercase(),
         Err(e) => {
+            // `cargo xtask fetch-fonts` reads (does not generate) this
+            // checksum file; pointing the developer at it would loop
+            // back to the same failure. The checksum is committed in
+            // the repository, so the real recovery is to restore the
+            // file from git.
             eprintln!(
                 "Error: failed to read font checksum file {}: {e}\n\
-                 Run `cargo xtask fetch-fonts` to restore it.",
+                 The checksum is committed in the repository at \
+                 xtask/assets/fonts/term.ttf.sha256 — restore it from git \
+                 (e.g. `git checkout xtask/assets/fonts/term.ttf.sha256`).",
                 font_sha.display()
             );
             std::process::exit(1);

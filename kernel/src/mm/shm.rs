@@ -94,8 +94,9 @@ pub enum ShmError {
     /// `MAX_ORDER` is ever raised again.
     LengthTooLarge,
     /// Buddy allocator could not produce a contiguous block of the
-    /// requested order. Phase 69c surfaces (1280×800 = ~4 MiB) fit
-    /// inside the order-11 (8 MiB) max; this fires on adversarial
+    /// requested order. Phase 69c surfaces (1280 × 800 BGRA pixels =
+    /// 1280 × 800 × 4 = ~4 MiB after the 4 bytes/pixel multiplication)
+    /// fit inside the order-11 (8 MiB) max; this fires on adversarial
     /// requests or very fragmented memory.
     OutOfContiguousFrames,
     /// Lookup against an `ShmId` that does not name a live region.
