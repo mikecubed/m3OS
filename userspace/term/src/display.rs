@@ -1,16 +1,23 @@
 //! Phase 57 Track G.5 close-out — production display-server client
 //! (extended in Phase 69c for atlas-backed glyph dispatch and the
-//! 1280 × 800 / 16 × 32 cell layout).
+//! 1280 × 800 / 16 × 32 cell layout; extended again in the
+//! 2026-05-17 less-render-disappearance fix for double-buffered
+//! publish so display_server never snapshots mid-paint).
 //!
 //! `DisplayClient` is the live counterpart to the `FakeFb` test
 //! fixture in [`crate::render::tests`]. It owns:
 //!
 //! - the IPC handle for `display_server`;
-//! - the `SurfaceId` and `BufferId` term claims;
-//! - a raw 1280 × 800 BGRA8888 shared-memory mapping (`surface_va` /
-//!   `surface_len`, allocated via `syscall_lib::shm_create` +
-//!   `shm_map`) that backs the term grid
-//!   (80 × 25 cells × 16 × 32 px — see [`CELL_WIDTH`] / [`CELL_HEIGHT`]).
+//! - the `SurfaceId` term claims;
+//! - **two** 1280 × 800 BGRA8888 shared-memory mappings (front +
+//!   back), each with its own `BufferId`. The renderer always writes
+//!   to the back mapping; on `submit` term sends
+//!   `AttachSharedBuffer(back)` + `DamageSurface` + `CommitSurface`,
+//!   flips back/front, and memcpys the just-committed pixels into
+//!   the new back so incremental ops (scroll, partial put) have an
+//!   up-to-date starting state.
+//!   See [`SurfaceMapping`] for the per-mapping fields and
+//!   [`DisplayClient::submit`] for the swap sequence.
 //!   The `kernel_core::display::surface_buffer::SurfaceBuffer` type
 //!   is no longer instantiated on this client path.
 //!
@@ -24,17 +31,25 @@
 //! On every [`compose`](crate::render::Renderer::compose), the
 //! renderer drives `DisplayClient` through the [`FramebufferOwner`]
 //! trait. `term` writes pixels directly into the SHM mapping (no
-//! IPC payload) and `submit` drives the `AttachSharedBuffer` (once)
-//! → `DamageSurface` → `CommitSurface` verb sequence. The legacy
+//! IPC payload) and `submit` drives the `AttachSharedBuffer` →
+//! `DamageSurface` → `CommitSurface` verb sequence. The legacy
 //! per-pixel `LABEL_PIXELS_CHUNK` wire is no longer the upload path.
 //!
-//! ## Why one BufferId per frame is not used
+//! ## Why double-buffering
 //!
-//! Phase 56's `AttachBuffer` consumes a `pending_bulk` slot keyed by
-//! `BufferId`. Re-using the same id every frame works because each
-//! commit drains the slot. A future tracking phase may grow per-
-//! frame ids for double-buffering; today the single-id pattern keeps
-//! the protocol footprint minimal.
+//! `docs/handoffs/2026-05-17-less-render-disappearance.md` documents
+//! a snapshot-during-write race: with a single SHM region,
+//! `display_server`'s `pixels_snapshot` would fire while term was
+//! mid-`fb.clear()` + `put_glyph` and the resulting screendump
+//! captured a torn — often nearly all-black — frame. The compose-
+//! timing trace probe in that handoff showed 14 of 45 snapshot
+//! intervals overlapping a term compose interval. Double-buffering
+//! plus the existing `pending_buffer` → `committed_buffer` move on
+//! `CommitSurface` (`userspace/display_server/src/surface.rs:677`)
+//! eliminates the overlap by construction: term writes only to the
+//! back buffer, display_server snapshots only the committed (front)
+//! buffer, and `CommitSurface` is the single atomic publication
+//! point. No protocol change required.
 
 use kernel_core::display::pixel_chunk::cell_pixel_offset;
 use kernel_core::display::protocol::{
@@ -58,8 +73,11 @@ const LOOKUP_MAX_ATTEMPTS: u32 = 2000;
 /// Surface id term claims. Stable across the binary lifetime — only
 /// one Toplevel surface per `term` instance.
 const SURFACE_ID: SurfaceId = SurfaceId(1);
-/// Buffer id term re-uses each frame. See module-level docs.
-const BUFFER_ID: BufferId = BufferId(1);
+/// Two `BufferId`s, one per SHM mapping in the double-buffered
+/// publish path. Indexed `BUFFER_IDS[back_idx]` so the protocol
+/// `buffer_id` always matches the SHM region term writes into and
+/// display_server snapshots from.
+const BUFFER_IDS: [BufferId; 2] = [BufferId(1), BufferId(2)];
 
 /// Background colour used by [`FramebufferOwner::clear`] and by
 /// [`FramebufferOwner::scroll`] when blanking the new bottom row.
@@ -96,41 +114,107 @@ const VERB_ENCODE_BUF_LEN: usize = 64;
 static DISPLAY_VERB_FAILURE_LOG_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(16);
 
-/// Production [`FramebufferOwner`] for the `term` graphical client.
+/// One SHM region paired with the `BufferId` term publishes it
+/// under. Created twice per [`DisplayClient`] for the double-buffered
+/// publish path.
 ///
-/// Phase 57d follow-up — the local pixel store is now backed by a
-/// shared-memory region that `display_server` maps read-only. Term
-/// writes pixels directly into the mapping (no IPC), then per frame
-/// sends a small `DamageSurface` + `CommitSurface` pair to publish
-/// updates. The chunked-pixel transport (`upload_chunked` /
-/// `LABEL_PIXELS_CHUNK`) is gone from the hot path.
-pub struct DisplayClient {
-    server_handle: u32,
-    /// User-virtual base of the shared-memory region. The mapping
-    /// lasts for `DisplayClient`'s lifetime; `Drop` releases it via
-    /// `sys_shm_unmap`. Sized at `SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX
-    /// * 4` rounded up to a 4 KiB page.
+/// `Drop` unmaps the region from term's address space and releases
+/// the creator-reference, returning the frames to the buddy
+/// allocator. Without the release, the region would remain pinned
+/// in the kernel's SHM registry until reboot — display_server's
+/// `CommittedBuffer::Drop` only releases its own holder reference.
+struct SurfaceMapping {
+    /// User-virtual base of the mapping. `0` means uninitialised
+    /// (alloc failed); checked by `Drop` to skip the unmap syscall.
     surface_va: u64,
-    /// Total mapped byte length (page-aligned).
+    /// Page-aligned byte length of the mapping. Same on both
+    /// mappings; tracked per-mapping so `Drop` doesn't need to read
+    /// outer state.
     surface_len: usize,
     /// SHM id assigned by the kernel registry. Travels in
     /// `AttachSharedBuffer` so `display_server` can map the same
     /// frames into its own address space.
     shm_id: u32,
-    /// True once `attach_shared_buffer_once` has succeeded — every
-    /// later submit just sends `DamageSurface` + `CommitSurface` on
-    /// the existing buffer-id binding. Re-attach is cheap (no new
-    /// mapping) but unnecessary, and the kernel's pending-bulk slot
-    /// is empty in the SHM path so we skip it.
-    attached: bool,
+    /// Protocol `BufferId` for this mapping. Stable across the
+    /// surface's lifetime; the same id is re-attached every time
+    /// the renderer publishes through this slot.
+    buffer_id: BufferId,
+}
+
+impl SurfaceMapping {
+    /// Allocate + map one SHM region of `byte_len` bytes, tag it
+    /// with `buffer_id`, and return the bundle. Returns `None` on
+    /// `shm_create` or `shm_map` failure; the caller surfaces the
+    /// failure as `TermError::DisplayServerUnavailable`.
+    fn allocate(byte_len: usize, buffer_id: BufferId) -> Option<Self> {
+        let shm_id = syscall_lib::shm_create(byte_len);
+        if shm_id == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "term: shm_create failed\n");
+            return None;
+        }
+        let surface_va = syscall_lib::shm_map(shm_id);
+        if surface_va == 0 {
+            syscall_lib::write_str(STDOUT_FILENO, "term: shm_map failed\n");
+            // Release the creator's +1 reference so the region's
+            // frames return to the buddy instead of leaking.
+            let _ = syscall_lib::shm_destroy(shm_id);
+            return None;
+        }
+        let surface_len = byte_len.div_ceil(4096) * 4096;
+        Some(Self {
+            surface_va,
+            surface_len,
+            shm_id,
+            buffer_id,
+        })
+    }
+}
+
+impl Drop for SurfaceMapping {
+    fn drop(&mut self) {
+        if self.surface_va != 0 {
+            let _ = syscall_lib::shm_unmap(self.surface_va);
+        }
+        if self.shm_id != 0 {
+            let _ = syscall_lib::shm_destroy(self.shm_id);
+        }
+    }
+}
+
+/// Production [`FramebufferOwner`] for the `term` graphical client.
+///
+/// Phase 57d gave term a single SHM mapping; the 2026-05-17 less-
+/// render-disappearance fix split that into two so display_server's
+/// `pixels_snapshot` and term's compose writes never touch the same
+/// region simultaneously. See the module-level docs and
+/// [`SurfaceMapping`] for the per-mapping fields.
+pub struct DisplayClient {
+    server_handle: u32,
+    /// Two SHM mappings indexed by `back_idx` / `1 - back_idx`. The
+    /// renderer always writes into `surfaces[back_idx]`; display_
+    /// server snapshots the *front* — i.e. the buffer named by the
+    /// most recent `CommitSurface`. The buffers swap roles on every
+    /// successful submit. See [`DisplayClient::submit`].
+    surfaces: [SurfaceMapping; 2],
+    /// Index (0 or 1) of the back buffer — the one the renderer
+    /// currently writes into. Flipped at the end of every successful
+    /// submit so the just-published buffer becomes the new front and
+    /// the previously-front buffer becomes the new back.
+    back_idx: usize,
+    /// `true` once at least one frame has been successfully published.
+    /// Used by [`DisplayClient::submit`] to skip the front-to-back
+    /// memcpy on the first frame (there is no "previous" front to
+    /// copy from; the back buffer is already pre-zeroed by the SHM
+    /// create path).
+    first_publish_done: bool,
 }
 
 impl DisplayClient {
     /// Look up `display_server`, send the `Hello` + `CreateSurface`
-    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate a ~4 MiB
-    /// shared-memory region sized for the 1280 × 800 BGRA8888
-    /// surface (`SURFACE_WIDTH_PX * SURFACE_HEIGHT_PX * 4`,
-    /// page-aligned), and return a ready-to-submit `DisplayClient`.
+    /// + `SetSurfaceRole(Toplevel)` round-trip, allocate **two**
+    /// ~4 MiB shared-memory regions (front + back) sized for the
+    /// 1280 × 800 BGRA8888 surface, and return a ready-to-submit
+    /// `DisplayClient`.
     /// Returns a typed error if the lookup, encode, `ipc_call_buf`,
     /// or SHM allocation fails.
     pub fn connect() -> Result<Self, TermError> {
@@ -166,43 +250,40 @@ impl DisplayClient {
             return Err(TermError::DisplayServerUnavailable);
         }
 
-        // 4. Allocate the shared-memory region. 1280 × 800 × 4 = ~4 MiB
-        //    (1000 contiguous 4 KiB pages). The SHM registry's create
-        //    path rounds up to the next power-of-two page count
-        //    (1024 = 4 MiB = order 10), which fits inside Phase 69c's
-        //    bumped `kernel_core::buddy::MAX_ORDER = 11` (8 MiB max).
+        // 4. Allocate the two shared-memory regions. 1280 × 800 × 4 =
+        //    ~4 MiB per region (1000 contiguous 4 KiB pages). The SHM
+        //    registry's create path rounds up to the next power-of-two
+        //    page count (1024 = 4 MiB = order 10), which fits inside
+        //    Phase 69c's bumped `kernel_core::buddy::MAX_ORDER = 11`
+        //    (8 MiB max). Two regions = ~8 MiB total, still comfortably
+        //    inside the kernel's per-process SHM budget.
         let byte_len = (SURFACE_WIDTH_PX as usize)
             .saturating_mul(SURFACE_HEIGHT_PX as usize)
             .saturating_mul(4);
-        let shm_id = syscall_lib::shm_create(byte_len);
-        if shm_id == 0 {
-            syscall_lib::write_str(STDOUT_FILENO, "term: shm_create failed\n");
-            return Err(TermError::DisplayServerUnavailable);
-        }
-        let surface_va = syscall_lib::shm_map(shm_id);
-        if surface_va == 0 {
-            syscall_lib::write_str(STDOUT_FILENO, "term: shm_map failed\n");
-            // Release the creator's +1 reference so the region's
-            // frames return to the buddy instead of leaking.
-            let _ = syscall_lib::shm_destroy(shm_id);
-            return Err(TermError::DisplayServerUnavailable);
-        }
-        // Pages are pre-zeroed by the SHM create path; no fill
-        // needed. Round byte_len up to the page boundary for the
-        // unmap on Drop — `sys_shm_create` rounded the same way.
-        let surface_len = byte_len.div_ceil(4096) * 4096;
+        let front = SurfaceMapping::allocate(byte_len, BUFFER_IDS[0])
+            .ok_or(TermError::DisplayServerUnavailable)?;
+        let back = SurfaceMapping::allocate(byte_len, BUFFER_IDS[1])
+            .ok_or(TermError::DisplayServerUnavailable)?;
 
         Ok(Self {
             server_handle,
-            surface_va,
-            surface_len,
-            shm_id,
-            attached: false,
+            // Initial layout: index 0 holds `front`, index 1 holds
+            // `back`, and `back_idx == 1` selects the back for writes.
+            // The first submit will commit `surfaces[1]`, flip
+            // `back_idx` to 0, and begin writing the next frame into
+            // `surfaces[0]`.
+            surfaces: [front, back],
+            back_idx: 1,
+            first_publish_done: false,
         })
     }
 
-    /// Mutable access to the shared-memory pixel mapping — used by
-    /// the `FramebufferOwner` impl below.
+    /// Mutable access to the back-buffer shared-memory mapping —
+    /// used by the `FramebufferOwner` impl below. The mapping
+    /// returned is always the buffer term currently writes into,
+    /// which is *not* the buffer display_server has committed for
+    /// snapshot. The two-mapping invariant is established at
+    /// `connect` and maintained by `submit`'s `back_idx` flip.
     ///
     /// # Safety
     ///
@@ -210,55 +291,96 @@ impl DisplayClient {
     /// process's mapping (`display_server`'s read-only view), which
     /// strictly speaking violates Rust's aliasing model: the compiler
     /// is entitled to assume that the bytes referenced by an
-    /// `&mut [u8]` are not observed by anyone else. Phase 57d's
-    /// shared-buffer contract is "writer wins, reader copies": the
-    /// compositor snapshots the bytes into an owned `Vec<u8>` before
-    /// reading (see `display_server::compose`), so the only concrete
-    /// hazard left is LLVM-level reordering of writes by this
-    /// process. We tolerate that for the toy-OS bring-up; a future
-    /// hardening pass can replace this with `*mut u8` + `core::ptr`
-    /// volatile writes.
+    /// `&mut [u8]` are not observed by anyone else. With double-
+    /// buffering the back buffer is *not* the buffer display_server
+    /// snapshots from (the front buffer is the one referenced by
+    /// `committed_buffer` server-side), so the concrete races the
+    /// single-buffer path documented at this site are now impossible.
+    /// The remaining LLVM-level hazard — reordering of writes by
+    /// this process — is unaffected; a future hardening pass can
+    /// replace this with `*mut u8` + `core::ptr` volatile writes.
     ///
     /// Callers must not retain the borrow across syscalls that may
     /// observe SHM bytes (e.g. `CommitSurface`); the `pixels_mut`
     /// users in this file all consume the slice within a single call.
     unsafe fn pixels_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.surface_va as *mut u8, self.surface_len) }
+        let mapping = &self.surfaces[self.back_idx];
+        unsafe {
+            core::slice::from_raw_parts_mut(mapping.surface_va as *mut u8, mapping.surface_len)
+        }
     }
 
-    /// Send `AttachSharedBuffer` exactly once for this surface. Called
-    /// from `submit` lazily so the first compose pass is the one that
-    /// pays the attach cost. Returns `true` on success.
-    fn attach_shared_buffer_once(&mut self) -> bool {
-        if self.attached {
-            return true;
-        }
+    /// Publish the current back buffer via `AttachSharedBuffer` +
+    /// `DamageSurface` + `CommitSurface`. After a successful publish
+    /// the back/front buffers swap roles: the next call to
+    /// `pixels_mut` returns the buffer display_server no longer holds
+    /// the commit reference to. Returns `true` on success.
+    ///
+    /// Re-attaching every frame is intentional. Display_server's
+    /// existing `CommitSurface` handler moves `pending_buffer` into
+    /// `committed_buffer` and drops the old committed buffer
+    /// (`userspace/display_server/src/surface.rs:646-678`); that's
+    /// the atomic publication point the snapshot-during-write race
+    /// was missing.
+    fn attach_damage_commit_back(&mut self) -> bool {
+        let mapping = &self.surfaces[self.back_idx];
         let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
         let attach = ClientMessage::AttachSharedBuffer {
             surface_id: SURFACE_ID,
-            buffer_id: BUFFER_ID,
-            shm_id: self.shm_id,
+            buffer_id: mapping.buffer_id,
+            shm_id: mapping.shm_id,
             width: SURFACE_WIDTH_PX,
             height: SURFACE_HEIGHT_PX,
         };
         if !Self::send_verb(self.server_handle, &attach, &mut buf, "AttachSharedBuffer") {
             return false;
         }
-        self.attached = true;
+        let damage = ClientMessage::DamageSurface {
+            surface_id: SURFACE_ID,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: SURFACE_WIDTH_PX,
+                h: SURFACE_HEIGHT_PX,
+            },
+        };
+        if !Self::send_verb(self.server_handle, &damage, &mut buf, "DamageSurface") {
+            return false;
+        }
+        let commit = ClientMessage::CommitSurface {
+            surface_id: SURFACE_ID,
+        };
+        if !Self::send_verb(self.server_handle, &commit, &mut buf, "CommitSurface") {
+            return false;
+        }
         true
     }
-}
 
-impl Drop for DisplayClient {
-    fn drop(&mut self) {
-        if self.surface_va != 0 {
-            let _ = syscall_lib::shm_unmap(self.surface_va);
-        }
-        // Release the creator's +1 reference reserved by `shm_create`.
-        // Without this, the region's frames stay pinned by the
-        // registry refcount even after the last unmap.
-        if self.shm_id != 0 {
-            let _ = syscall_lib::shm_destroy(self.shm_id);
+    /// Copy the just-published front buffer's pixels into the new
+    /// back buffer so incremental render commands (scroll, partial
+    /// `put_glyph`) have an up-to-date starting state. Without this
+    /// the new back would still hold pixels from *two* frames ago —
+    /// e.g. a `RenderCommand::Scroll { amount: 1 }` would scroll
+    /// stale content instead of the current screen.
+    ///
+    /// Both reads (display_server snapshot of front; term memcpy
+    /// from front) are reads, so they cannot race. The `front_idx`
+    /// expression below is `1 - back_idx` (the buffer that is no
+    /// longer the back after `submit`'s flip).
+    fn refresh_back_from_front(&mut self) {
+        let front_idx = 1 - self.back_idx;
+        let len = self.surfaces[self.back_idx].surface_len;
+        let src = self.surfaces[front_idx].surface_va as *const u8;
+        let dst = self.surfaces[self.back_idx].surface_va as *mut u8;
+        // SAFETY: both surfaces are mapped by this process for at
+        // least `len` bytes. `src` and `dst` cover disjoint
+        // mappings (different `shm_id`s, different virtual ranges),
+        // so the copy is non-overlapping. No live `&` / `&mut`
+        // borrows alias either region at this point — `submit`
+        // is the only caller and all `pixels_mut` borrows from the
+        // prior compose pass have been dropped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, len);
         }
     }
 }
@@ -312,35 +434,6 @@ impl DisplayClient {
         syscall_lib::write_str(STDOUT_FILENO, prefix);
         syscall_lib::write_str(STDOUT_FILENO, step);
         syscall_lib::write_str(STDOUT_FILENO, "\n");
-    }
-
-    /// Send `DamageSurface(full)` + `CommitSurface` to publish the
-    /// pixels term wrote into the shared region. With shared-memory
-    /// backing this is the entire submit cost — no pixel transport.
-    /// `display_server` reads pixels in place during compose.
-    fn publish_frame(&mut self) -> bool {
-        let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
-
-        let damage = ClientMessage::DamageSurface {
-            surface_id: SURFACE_ID,
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: SURFACE_WIDTH_PX,
-                h: SURFACE_HEIGHT_PX,
-            },
-        };
-        if !Self::send_verb(self.server_handle, &damage, &mut buf, "DamageSurface") {
-            return false;
-        }
-
-        let commit = ClientMessage::CommitSurface {
-            surface_id: SURFACE_ID,
-        };
-        if !Self::send_verb(self.server_handle, &commit, &mut buf, "CommitSurface") {
-            return false;
-        }
-        true
     }
 }
 
@@ -420,10 +513,10 @@ impl FramebufferOwner for DisplayClient {
     }
 
     fn clear(&mut self) {
-        // Fill the shared mapping byte-wise with the BG colour. The
-        // pixels are 4 bytes wide; we splat the same little-endian
-        // BGRA value across the whole buffer.
-        let len = self.surface_len;
+        // Fill the back-buffer mapping byte-wise with the BG colour.
+        // The pixels are 4 bytes wide; we splat the same little-
+        // endian BGRA value across the whole buffer.
+        let len = self.surfaces[self.back_idx].surface_len;
         // SAFETY: see `pixels_mut` — borrow scoped to this call.
         let pixels = unsafe { self.pixels_mut() };
         let bg_bytes = DEFAULT_BG_BGRA.to_le_bytes();
@@ -440,7 +533,7 @@ impl FramebufferOwner for DisplayClient {
         }
         let stride = (SURFACE_WIDTH_PX as usize) * 4;
         let row_bytes = stride * (CELL_HEIGHT as usize);
-        let buf_len = self.surface_len;
+        let buf_len = self.surfaces[self.back_idx].surface_len;
         // SAFETY: see `pixels_mut` — borrow scoped to this call.
         let pixels = unsafe { self.pixels_mut() };
         if amount > 0 {
@@ -471,13 +564,34 @@ impl FramebufferOwner for DisplayClient {
     }
 
     fn submit(&mut self) -> bool {
-        // First submit attaches the shared buffer; subsequent submits
-        // just publish a damage rect since the buffer-id binding is
-        // already in place.
-        if !self.attach_shared_buffer_once() {
+        // Double-buffered publish sequence (2026-05-17 less-render-
+        // disappearance fix). The renderer drained its queue into
+        // `surfaces[self.back_idx]`; we now hand that buffer to
+        // display_server via `AttachSharedBuffer` + `DamageSurface` +
+        // `CommitSurface`, then flip `back_idx` so the next compose
+        // pass writes into the buffer display_server no longer holds
+        // a commit reference to. The flip *must* happen before
+        // `refresh_back_from_front` so the memcpy's source is the
+        // just-published front (now at `1 - back_idx` after the flip)
+        // and the destination is the new back (`back_idx` after the
+        // flip).
+        if !self.attach_damage_commit_back() {
             return false;
         }
-        self.publish_frame()
+        self.back_idx = 1 - self.back_idx;
+        // First-frame skip: on the very first publish there is no
+        // meaningful "front" yet — the previously-front buffer was
+        // SHM-create-zeroed and never written to. memcpy'ing zero
+        // pixels into the new back is a no-op but adds 4 MiB of
+        // wasted bandwidth on the boot frame. Subsequent frames
+        // unconditionally copy so any incremental render command
+        // (scroll / partial put) sees an up-to-date starting state.
+        if self.first_publish_done {
+            self.refresh_back_from_front();
+        } else {
+            self.first_publish_done = true;
+        }
+        true
     }
 }
 

@@ -104,6 +104,15 @@ enum QueuedOp {
     },
 }
 
+/// Maximum number of consecutive composes the render path will
+/// defer a Clear-only queue waiting for follow-up Put ops. Each
+/// compose tick is roughly 16 ms, so 8 frames ≈ 128 ms — long
+/// enough to absorb a worst-case TCG-slow PTY chunk delay between
+/// less's `\E[2J\E[H` header and its content, short enough that a
+/// shell `clear` command (no content forthcoming) clears the screen
+/// within a single user-perceivable frame.
+const MAX_CLEAR_ONLY_DEFER: u8 = 8;
+
 /// Renderer: batches framebuffer ops per frame, calls `submit` only
 /// when damage exists. Composes against any [`FramebufferOwner`] so
 /// host tests cover behaviour without a real surface.
@@ -121,6 +130,22 @@ pub struct Renderer<F: FramebufferOwner> {
     /// Defaults to `Static` so callers that don't carry a font file
     /// (host tests, early-boot) get Phase 69b's behaviour.
     glyph_source: GlyphSource,
+    /// 2026-05-17 less-render-disappearance fix — number of
+    /// consecutive composes that have deferred a queue whose only
+    /// pixel-changing op was a `Clear` (no `Put` followed it). Held
+    /// across composes so the next call can drain both the deferred
+    /// Clear and any newly-arrived Put ops together, avoiding a
+    /// single-frame all-black publish that the double-buffer path
+    /// otherwise propagates to both buffers via
+    /// `refresh_back_from_front` and traps the screen in an all-
+    /// zero state until the next paint cycle.
+    ///
+    /// Capped at [`MAX_CLEAR_ONLY_DEFER`] composes (~`MAX_*` * 16 ms
+    /// ≈ wall-clock grace period) so a legit `clear` shell command
+    /// — where the queue is genuinely Clear-only forever — eventually
+    /// publishes the cleared screen rather than blocking indefinitely.
+    /// Reset to 0 whenever a compose actually drains.
+    clear_only_defers: u8,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
@@ -132,6 +157,7 @@ impl<F: FramebufferOwner> Renderer<F> {
             queue: alloc::vec::Vec::new(),
             pending_submit: false,
             glyph_source: GlyphSource::Static,
+            clear_only_defers: 0,
         }
     }
 
@@ -233,6 +259,34 @@ impl<F: FramebufferOwner> Renderer<F> {
             return;
         }
         if !self.queue.is_empty() {
+            // 2026-05-17 less-render-disappearance fix: defer the
+            // drain by one compose if the queue has a `Clear` but
+            // no `Put` after it. Without this, an arbitrary PTY
+            // chunk boundary right after a `\E[2J\E[H` sequence
+            // (and before the `<content>` portion) would produce
+            // a back buffer of all-zeros, which the double-buffered
+            // `refresh_back_from_front` then propagates to *both*
+            // SHM buffers — trapping the screen in an all-black
+            // state until the next paint cycle. The single-compose
+            // defer gives the next PTY chunk a 16 ms window to
+            // arrive; if a legitimate `clear` shell command never
+            // produces content, the second compose drains anyway
+            // so the user still sees a cleared screen.
+            let last_clear = self
+                .queue
+                .iter()
+                .rposition(|op| matches!(op, QueuedOp::Clear));
+            let has_put_after_clear = match last_clear {
+                Some(idx) => self.queue[idx + 1..]
+                    .iter()
+                    .any(|op| matches!(op, QueuedOp::Put { .. })),
+                None => true,
+            };
+            if !has_put_after_clear && self.clear_only_defers < MAX_CLEAR_ONLY_DEFER {
+                self.clear_only_defers += 1;
+                return;
+            }
+            self.clear_only_defers = 0;
             // Move the queue out so the field-level borrows below
             // do not conflict with iteration. `mem::take` leaves
             // `self.queue` as a freshly-empty `Vec` (no allocation);
@@ -447,10 +501,114 @@ mod tests {
     /// framebuffer would silently keep stale pixels.
     #[test]
     fn compose_emits_fb_clear_for_render_clear() {
+        // 2026-05-17 less-render-disappearance fix: a Clear-only
+        // queue (no Put after the Clear) is deferred for up to
+        // [`MAX_CLEAR_ONLY_DEFER`] consecutive composes, on the
+        // chance that the matching `<content>` portion of a
+        // `\E[2J\E[H<content>` repaint is still in transit through
+        // PTY chunking. After the cap the renderer drains anyway so
+        // a legit shell `clear` command (no content forthcoming)
+        // isn't permanently deferred.
+        let mut r = Renderer::new(FakeFb::new());
+        r.apply(RenderCommand::Clear);
+        for i in 0..MAX_CLEAR_ONLY_DEFER {
+            r.compose();
+            assert!(
+                r.fb.ops.is_empty(),
+                "compose #{i} with Clear-only queue should defer, got: {:?}",
+                r.fb.ops
+            );
+        }
+        r.compose();
+        assert_eq!(r.fb.ops, alloc::vec![FakeOp::Clear, FakeOp::Submit]);
+    }
+
+    /// Clear followed by Put drains on the *first* compose — the
+    /// defer-once gate looks at the queue tail and lets a fully-
+    /// queued repaint (Clear + at least one Put) through without
+    /// delay.
+    #[test]
+    fn compose_drains_clear_followed_by_put_in_one_pass() {
+        let mut r = Renderer::new(FakeFb::new());
+        r.apply(RenderCommand::Clear);
+        r.apply(RenderCommand::PutGlyph {
+            row: 0,
+            col: 0,
+            codepoint: b'X' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(
+            r.fb.ops,
+            alloc::vec![
+                FakeOp::Clear,
+                FakeOp::Put {
+                    row: 0,
+                    col: 0,
+                    codepoint: b'X' as u32
+                },
+                FakeOp::Submit,
+            ]
+        );
+    }
+
+    /// Clear-only first compose defers, then a Put queued before the
+    /// second compose draws normally — the deferred Clear is replayed
+    /// alongside the Put.
+    #[test]
+    fn defer_then_put_drains_clear_and_put_together() {
         let mut r = Renderer::new(FakeFb::new());
         r.apply(RenderCommand::Clear);
         r.compose();
+        assert!(r.fb.ops.is_empty(), "first compose deferred");
+        r.apply(RenderCommand::PutGlyph {
+            row: 1,
+            col: 2,
+            codepoint: b'A' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(
+            r.fb.ops,
+            alloc::vec![
+                FakeOp::Clear,
+                FakeOp::Put {
+                    row: 1,
+                    col: 2,
+                    codepoint: b'A' as u32
+                },
+                FakeOp::Submit,
+            ]
+        );
+    }
+
+    /// Once the deferred Clear has drained (with or without a Put),
+    /// the defer counter resets so the next standalone Clear gets
+    /// the full grace period again. Without the reset, an
+    /// interactive session that does many `clear` commands would
+    /// see the second `clear` skip its grace period and publish
+    /// an all-zero frame immediately after the first.
+    #[test]
+    fn defer_counter_resets_after_drain() {
+        let mut r = Renderer::new(FakeFb::new());
+        // First Clear-only cycle — exhaust the defer budget and drain.
+        r.apply(RenderCommand::Clear);
+        for _ in 0..MAX_CLEAR_ONLY_DEFER {
+            r.compose();
+        }
+        r.compose();
         assert_eq!(r.fb.ops, alloc::vec![FakeOp::Clear, FakeOp::Submit]);
+        // Second Clear-only cycle — defer counter must have reset.
+        let baseline_len = r.fb.ops.len();
+        r.apply(RenderCommand::Clear);
+        r.compose();
+        assert_eq!(
+            r.fb.ops.len(),
+            baseline_len,
+            "second Clear-only queue should defer, not drain immediately"
+        );
     }
 
     #[test]
