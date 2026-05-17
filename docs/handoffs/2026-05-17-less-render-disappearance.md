@@ -1,7 +1,8 @@
 ---
-status: open
+status: partially-fixed-still-racy
 branch: feat/phase-69d-tui-app-foundation (PR #176) — investigation surface
-last-known-good-commit: 0bdcd62
+last-known-good-commit: 8497e0c  # double-buffer + Clear-only defer
+fix-commit: 8497e0c
 date: 2026-05-17
 component: userspace/term + kernel-core/fb + userspace/display_server (compose)
 related:
@@ -393,7 +394,75 @@ The race fires on roughly one third of all compose ticks under
 the render-probe's workload. That matches the user's
 "sometimes flashes" symptom and the probe's per-frame variance.
 
-### Structural fix candidates (confirmed shape)
+### 2026-05-17 (fix landed at 8497e0c) — partial repair, race remains
+
+Implemented option 1 from the structural-fix candidates below plus a
+single-renderer-side workaround for a secondary cause the trace
+probe didn't surface:
+
+1. **Double-buffered SHM publish** in `userspace/term/src/display.rs`.
+   Two SHM regions + two `BufferId`s, alternating each frame. The
+   kernel-core surface state machine's
+   `pending_buffer → committed_buffer` move on `CommitSurface`
+   (`userspace/display_server/src/surface.rs:677`) is now the atomic
+   publication point: display_server's `pixels_snapshot` reads
+   only `committed_buffer`, and term writes only to the *other*
+   buffer until the next commit. A post-swap memcpy of the
+   just-committed front into the new back preserves the published
+   state for incremental ops (scroll, partial put).
+
+2. **Clear-only defer in the renderer** in `userspace/term/src/render.rs`.
+   Even with double-buffering, a `\E[2J` whose follow-up
+   `\E[H<content>` lands in a later PTY chunk would queue
+   `[Clear]` only and `Renderer::compose` would drain it,
+   producing an all-zero back buffer that then propagates to both
+   SHM buffers via `refresh_back_from_front`. The renderer now
+   defers a Clear-only queue for up to `MAX_CLEAR_ONLY_DEFER = 8`
+   composes (~128 ms grace period) waiting for follow-up `Put`
+   ops, then drains anyway so a legit `clear` shell command isn't
+   permanently deferred. Three new host tests cover the defer /
+   drain / counter-reset transitions.
+
+**Verification via `cargo xtask less-render-probe`**:
+
+| event | pre-fix peak | pre-fix settled (1500 ms) | post-fix settled (1500 ms) |
+|---|---|---|---|
+| after-down | 0.0022 (26×377) | 0.0000 (16×10, all-black) | 0.0020 (62×357, **real less content**) — *most runs* |
+| after-up | 0.0022 (26×377) | 0.0000 (16×10, all-black) | 0.0036 (48×389) then 0.0000 — *still racy* |
+
+Two of three runs show `after-down` retaining content past
+1500 ms. `after-up` still goes black ~80 – 200 ms after the
+keystroke in most runs. The user-visible improvement is real but
+the bug is not fully closed: less in TCG sometimes takes longer
+than the 128 ms defer window to send follow-up content after a
+`\E[2J`, and the renderer drains the deferred Clear into an
+all-zero publish at that point.
+
+Quality gates pass: `cargo xtask check`, `cargo xtask smoke-test`,
+`cargo xtask tui-smoke`, `cargo xtask tui-app-smoke`.
+
+### Open follow-ups for the next session
+
+* **Investigate why `after-up` is more flaky than `after-down`.**
+  The compose-timing trace from `0bdcd62` would reveal whether the
+  remaining `after-up` flakes are still snapshot-during-write (i.e.
+  the double-buffer didn't help that case) or a different
+  Clear-only sequence (longer defer might fix it).
+* **Consider extending `MAX_CLEAR_ONLY_DEFER`** beyond 8 frames
+  (e.g., to 16 = 256 ms) if the next-session probe shows the bug
+  fires beyond the current 128 ms window.
+* **Or replace the count-based defer with an activity-based one**:
+  defer until either a Put op arrives in the queue OR the PTY has
+  been idle for N ms. The current count is a proxy for "more PTY
+  bytes coming"; observing PTY idleness directly avoids the
+  arbitrary cap.
+* **Audit DA / DSR query responses.** If less is sending `\E[c`
+  (DA) or `\E[6n` (DSR) and waiting on a timeout because
+  m3os-term doesn't respond, the wait stretches the Clear-only
+  window. Implementing the responses would shorten less's
+  per-keystroke paint cycle and reduce defer pressure.
+
+### Structural fix candidates (confirmed shape) — pre-fix snapshot
 
 Both fix candidates eliminate the snapshot-during-write race:
 
