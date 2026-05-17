@@ -1,7 +1,7 @@
 ---
 status: open
 branch: feat/phase-69d-tui-app-foundation (PR #176) — investigation surface
-last-known-good-commit: adb9527
+last-known-good-commit: 0bdcd62
 date: 2026-05-17
 component: userspace/term + kernel-core/fb + userspace/display_server (compose)
 related:
@@ -11,6 +11,12 @@ diag-branches:
   - diag/less-render-trace          # TT:* / PI:* / EV:* / PO:* traces + TIOCSWINSZ-at-init fix
   - feat/term-csi-completion         # csr / vpa / su/sd / il / dl / ich / dch / ech dispatches
   - diag/csi-completion-test         # both stacked
+ruled-out-hypotheses:
+  - cursor-trail clear in compose.rs (EV:Ptr = 0; symptom is black not teal)
+  - 500 ms blink-tick wipe (Probe A: cursor default → SteadyBlock; bug still fires within 60 ms)
+  - LLVM / store-visibility race (Probe B: SeqCst fence before publish_frame; bug still fires)
+new-tooling:
+  - cargo xtask less-render-probe  # QMP send-key + screendump; captures the bug pixel-state
 ---
 
 # Handoff — `less` content disappears between events inside `term`
@@ -190,7 +196,167 @@ not fully cover what was wiped.  Result: holes show through to
 background, and on a uniform-content surface (less's mostly-blank
 file display) those holes look like the whole screen has gone dark.
 
-## Next-session diagnostic plan
+## 2026-05-17 follow-up — render-probe tool + ruled-out hypotheses
+
+Added a QMP-based pixel-state probe so the bug stops being invisible
+to CI, then used it to rule out two leading hypotheses.
+
+### Tool: `cargo xtask less-render-probe`
+
+Commit `0bdcd62` adds the probe. It boots m3OS with a VNC-backed
+display (the default `-display none` returns an empty screendump
+surface — `query-display-options` reports `{"type":"none"}`), waits
+for the `display.input-owner` + `TERM_SMOKE:prompt-ready` serial
+markers, then drives less via PS/2 through the QMP `send-key`
+verb. After each keystroke it burst-captures PPM screendumps at
+20 / 60 / 120 / 200 / 400 / 800 / 1500 ms and reports per-frame
+hash + non-black-pixel ratio + non-black row/col spread plus the
+peak-vs-settled diff.
+
+Components:
+- `xtask/src/qmp.rs` — minimal QMP client (`UnixStream` + JSON,
+  sequential request/reply; `send-key`, `screendump`, ASCII-to-qkey
+  translator).
+- `xtask/src/ppm.rs` — P6 reader + FNV-1a hash + black-ratio +
+  non-black-spread heuristics. No image-crate dependency.
+- `xtask/src/main.rs` — `less-render-probe` subcommand.
+
+Usage:
+
+```bash
+cargo xtask less-render-probe --timeout 240 --out /tmp/probe
+```
+
+Output goes into the `--out` directory as `00-baseline.ppm`,
+`{event}-{offset}ms.ppm`, plus `serial.log`. Default out dir is
+`$TMPDIR/m3os-less-render-probe`.
+
+### What the probe captured
+
+The bug fires on most keystrokes. Per-event signature:
+
+* **content briefly paints** — peak frame at 20 – 400 ms after the
+  keystroke; non-black pixels spread across ~40 – 60 rows × ~370 –
+  490 cols (real rendered content, not OVMF startup chrome).
+* **wipe to all-black** — by 60 – 800 ms the surface drops to
+  ~16 × 10 non-black pixels (residual OVMF chrome only; spread
+  collapses into the top-left corner).
+
+When a single frame *does* survive past 1500 ms, only the
+*most-recently-painted* bytes survive — for less that's the bottom
+status bar (rows 768 – 799 of an 800-row screen). Anything painted
+earlier in the same repaint sequence is gone. That "only the last
+paint survives" pattern is the most informative new fact and it
+points strongly at an active producer/consumer race during the
+repaint, not a passive timer wipe.
+
+### Probes that were ruled out
+
+**Probe A — disable the 500 ms blink tick.**
+Set `Screen`'s default `cursor_shape` to `CursorShape::SteadyBlock`
+(`userspace/term/src/screen.rs:360`) so `is_blinking()` returns
+false from boot and the `term/src/main.rs:378` blink path is dead.
+Two runs of `less-render-probe`:
+
+- Run 1: less-opened still wiped (peak at 400 ms → black at 800 ms),
+  `after-up` wiped at 60 ms, `after-down` retained content.
+- Run 2: `after-down` instantly wiped (no peak captured), `after-up`
+  retained content, less-opened still wiped.
+
+The blink-tick hypothesis is wrong: the bug fires far faster than
+500 ms, and disabling the tick does not change the rate.
+
+**Probe B — `SeqCst` fence before `publish_frame`.**
+Added `core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst)`
+as the first line of `publish_frame` in `userspace/term/src/display.rs`
+so every prior pixel store is globally ordered before the
+`DamageSurface` IPC. If the bug were "store-visibility / LLVM
+write-reorder," the fence would close the window. Two runs:
+
+- Run 1: less-opened retained content, `after-down` wiped instantly,
+  `after-up` wiped at 60 ms after a 20 ms peak.
+- Run 2: less-opened wiped at 800 ms, `after-down` wiped instantly,
+  `after-up` wiped at 60 ms.
+
+No improvement over baseline. The LLVM/store-visibility hypothesis
+is wrong (or at least not sufficient on its own).
+
+### Where the bug actually lives — refined hypothesis
+
+Both passive-wipe theories failed, so the remaining shape that fits
+"only the last paint survives" is a **snapshot-during-write race**
+in the SHM compose path:
+
+1. Term enters `renderer.compose` (`userspace/term/src/render.rs:231`).
+2. Drain queue: `fb.clear()` → writes `0x00` across all ~4 MiB of
+   SHM. Then `put_glyph` × N writes the glyph cells. Then `submit()`
+   sends `DamageSurface` + `CommitSurface` (publish step).
+3. **In between** clear and the final puts, a frame tick in
+   `display_server` fires and `run_compose` runs. `registry.has_damage()`
+   is `true` because a *previous* commit set it. `pixels_snapshot`
+   (`userspace/display_server/src/surface.rs:241`) does a raw-pointer
+   memcpy of the surface; the snapshot lands somewhere between
+   "all-cleared" and "fully painted." Display_server blits that
+   torn snapshot to the framebuffer.
+4. When term finishes painting (status bar last), the *next*
+   display_server tick snapshots a coherent surface and blits real
+   content — but only briefly, until the next paint cycle starts
+   the race again.
+
+The SeqCst fence in Probe B doesn't help because the race is not
+about write-ordering; it's about display_server *reading* concurrently
+with term writing. There is no happens-before edge between term's
+pixel writes and display_server's snapshot read except the kernel
+IPC system-call boundary, which is too coarse: the surface gets
+`dirty=true` long before term has finished writing the next frame.
+
+### Structural fix candidates
+
+Both fix candidates eliminate the snapshot-during-write race:
+
+1. **Double-buffering with atomic buffer-id swap.** Term allocates
+   two SHM regions (front + back), writes pixels to the back buffer,
+   and the `CommitSurface` verb names which buffer is now front.
+   `display_server` only ever snapshots the buffer named on the most
+   recent commit, so it can never see a half-written frame. Touches
+   the protocol surface (`AttachSharedBuffer` would need to carry
+   two buffer ids, or `CommitSurface` would need a buffer-id field).
+   Closes the race definitively.
+
+2. **Compose-lock IPC verb.** Term acquires a "publish lock" before
+   starting a compose pass; display_server refuses to snapshot
+   while the lock is held; term releases it after `submit`. Smaller
+   protocol footprint but adds RTT latency to every frame and a
+   potential deadlock surface (term crash with lock held).
+
+Option 1 is what real wayland / sway-style compositors do and is
+the principled close-out. It is multi-day work; the current
+single-buffer SHM was a documented Phase 57d shortcut.
+
+### Next-session diagnostic plan (revised)
+
+Before committing to double-buffering, one cheap diagnostic step
+confirms the race shape:
+
+1. **Compose-timing trace.** Instrument both sides with
+   `monotonic_micros()` brackets and log:
+   - `term:compose-start <us>` at top of `Renderer::compose`
+   - `term:compose-end <us>` after the final `fb.submit()`
+   - `dispsrv:snapshot-start <sid> <us>` at line 381 of `compose.rs`
+   - `dispsrv:snapshot-end <us>` after `pixels_snapshot()` returns
+   Run `cargo xtask less-render-probe` and grep the `serial.log` for
+   overlaps. If `dispsrv:snapshot-start` falls *between* a
+   `term:compose-start` and the matching `term:compose-end` for the
+   same surface — race confirmed.
+
+2. If overlaps observed → **implement double-buffering**. Carrying
+   the new buffer-id through `CommitSurface` is the lighter protocol
+   change than re-attaching every frame.
+
+3. If overlaps *not* observed → the race is somewhere else; capture
+   the gap that doesn't fit and re-open the hypothesis search.
+
+## Next-session diagnostic plan (original, partially superseded)
 
 1. **Reproduce on `diag/csi-completion-test`** with one more trace
    pass — instrument `display_server/src/compose.rs` with:
