@@ -356,6 +356,71 @@ confirms the race shape:
 3. If overlaps *not* observed → the race is somewhere else; capture
    the gap that doesn't fit and re-open the hypothesis search.
 
+### 2026-05-17 (compose-timing trace ran) — race confirmed
+
+Added `TC:compose-start` / `TC:compose-end` markers around
+`renderer.compose()` in `userspace/term/src/main.rs:406` and
+`DC:snap-start` / `DC:snap-end` markers around the two
+`pixels_snapshot()` call sites in
+`userspace/display_server/src/compose.rs` (fast path + general path).
+Ran `cargo xtask less-render-probe` to capture
+`/tmp/m3os-trace-probe/serial.log` and parsed it.
+
+Numbers from one run (203 trace events):
+
+| metric | value |
+|---|---|
+| term compose intervals captured | 55 |
+| term compose duration (p50 / p90 / max) | 4.9 ms / 11 ms / 15 ms |
+| display_server snapshot intervals captured | 45 |
+| snapshot duration (p50 / p90 / max) | 1.6 ms / 1.9 ms / 5.5 ms |
+| **snapshot intervals overlapping with a term compose interval** | **14 / 45 (31%)** |
+
+Sample overlap (microsecond timestamps from the run):
+
+```
+snap [6112136..6113704] (1568 us)
+  vs compose [6109377..6122117] (12740 us)
+  snap-start - compose-start = +2759 us
+```
+
+`display_server`'s `pixels_snapshot` started **2.8 ms after term began
+its compose pass** and completed before term's compose was done.
+The snapshot was reading the SHM region while term was mid-`fb.clear`
+/ `put_glyph` writes. This is exactly the snapshot-during-write race.
+
+The race fires on roughly one third of all compose ticks under
+the render-probe's workload. That matches the user's
+"sometimes flashes" symptom and the probe's per-frame variance.
+
+### Structural fix candidates (confirmed shape)
+
+Both fix candidates eliminate the snapshot-during-write race:
+
+1. **Double-buffering with atomic buffer-id swap (recommended).**
+   Term allocates two SHM regions and two `BufferId`s. Each compose:
+   * write pixels into the back buffer,
+   * send `AttachSharedBuffer { surface_id, buffer_id = back, shm_id, ... }`
+     so display_server installs the new buffer as `pending_buffer`,
+   * send `DamageSurface(full)`,
+   * send `CommitSurface`. The kernel-core surface state machine
+     already moves `pending_buffer` → `committed_buffer` on commit;
+     display_server's `pixels_snapshot` reads `committed_buffer` only.
+   * swap roles so the next compose writes to the now-released front.
+   The old `committed_buffer`'s SHM mapping has to stay alive at
+   least until the *next* commit lands so an in-flight compose-pass
+   snapshot doesn't dangle on a half-unmapped region — easiest fix
+   is to drop only after the next commit lands (one frame of
+   pinning).
+
+2. **Compose-lock IPC verb.** Smaller protocol surface but adds
+   round-trip latency and a deadlock surface (term crash mid-paint
+   leaves the lock held). Not recommended.
+
+Option 1 is what wayland and sway-style compositors do and is the
+principled close-out. The single-buffer SHM was a documented
+Phase 57d shortcut; this is the natural Phase 70 work.
+
 ## Next-session diagnostic plan (original, partially superseded)
 
 1. **Reproduce on `diag/csi-completion-test`** with one more trace
