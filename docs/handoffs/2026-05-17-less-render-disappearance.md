@@ -1,8 +1,10 @@
 ---
-status: partially-fixed-still-racy
+status: mostly-fixed-rare-residual-flake
 branch: feat/phase-69d-tui-app-foundation (PR #176) — investigation surface
-last-known-good-commit: 8497e0c  # double-buffer + Clear-only defer
-fix-commit: 8497e0c
+last-known-good-commit: d899f73  # double-buffer + Clear-only defer + always-refresh
+fix-commits:
+  - 8497e0c  # double-buffer SHM + Clear-only defer
+  - d899f73  # always refresh back-from-front (removed first-publish skip)
 date: 2026-05-17
 component: userspace/term + kernel-core/fb + userspace/display_server (compose)
 related:
@@ -461,6 +463,72 @@ Quality gates pass: `cargo xtask check`, `cargo xtask smoke-test`,
   m3os-term doesn't respond, the wait stretches the Clear-only
   window. Implementing the responses would shorten less's
   per-keystroke paint cycle and reduce defer pressure.
+
+### 2026-05-18 (always-refresh follow-up) — bug mostly closed
+
+Re-ran the compose-timing trace from the original
+`0bdcd62`-style probe instrumentation under the post-`8497e0c`
+double-buffer fix, plus added a new `DC:snap-nonzero sid=N nz=X/Y`
+trace counting non-zero bytes in each `pixels_snapshot` result.
+The trace data immediately exposed the actual residual bug:
+
+| metric | value |
+|---|---|
+| total composes | 70 |
+| composes that deferred a Clear-only queue | **0** |
+| composes that force-drained a Clear-only queue | **0** |
+| display_server snapshots | 76 |
+| snapshots showing `nz=0` (committed buffer is all-zero) | **33 of 76 (43%)** |
+
+The `Clear-only defer` mechanism added in `8497e0c` was never
+exercised — the after-up flake had nothing to do with that path. The
+all-zero snapshots came from a different bug **introduced by that
+same commit**: `DisplayClient::submit` skipped the front-to-back
+memcpy on the first publish, leaving the new back at SHM-create
+zeros. The very next compose drained its `[Put×N]`-only queue
+(no Clear) into that zero buffer, so the published frame only had
+the cells explicitly re-painted this frame — every cell from the
+first frame dropped to black. Subsequent refreshes propagated this
+zero-then-partial state forward.
+
+**Fix landed at `d899f73`:** always run `refresh_back_from_front`
+on every submit, including the first. Costs an extra ~4 MiB memcpy
+per frame (~250 MiB/s at 60 Hz) — well within budget on QEMU TCG.
+
+**Verification across 4 render-probe runs**: 3 of 4 runs show ALL
+three events settling with content visible at 1500 ms (drop =
++0.0000). One run still has both keystrokes drop to black, so the
+dominant symptom (every keypress wipes the screen) is gone but a
+residual flake remains on a separate path.
+
+Quality gates green at `d899f73`: `cargo xtask check`,
+`cargo xtask tui-smoke`, `cargo xtask tui-app-smoke`.
+
+### Remaining residual flake — for the next investigator
+
+A small fraction of probe runs still show after-down / after-up
+dropping to black at 1500 ms. The diagnostic instrumentation that
+caught the always-refresh bug needs to be re-armed to capture one of
+those failing runs:
+
+1. **Reinstate the trace probes.** The shape is well-contained:
+   `TC:compose-start` / `TC:compose-end` brackets around
+   `renderer.compose()` in `userspace/term/src/main.rs`;
+   `DC:snap-start` / `DC:snap-end` + `DC:snap-nonzero` around the
+   two `pixels_snapshot` call sites in
+   `userspace/display_server/src/compose.rs`; and a `ComposeOutcome`
+   getter on `Renderer` reporting `clears` / `puts` / `scrolls` /
+   `deferred` / `force_drained` / `drained` flags. Both blocks have
+   landed and been reverted twice in this investigation; the
+   commit history at `d899f73~` carries the diff.
+2. **Run the render-probe until a fail reproduces** and inspect the
+   serial log around the failure. If `snap-nonzero` reaches zero
+   while no compose has a Clear, the same class of bug as `d899f73`
+   is back — look for a code path that leaves a buffer at zero
+   without going through `refresh_back_from_front`.
+3. **If Clear-only IS the signature**, bump `MAX_CLEAR_ONLY_DEFER`
+   from 8 to 16, or switch to a PTY-idleness-gated defer (the
+   count-based heuristic is fragile under TCG-slow PTY transfers).
 
 ### Structural fix candidates (confirmed shape) — pre-fix snapshot
 
