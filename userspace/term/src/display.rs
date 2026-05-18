@@ -201,12 +201,6 @@ pub struct DisplayClient {
     /// submit so the just-published buffer becomes the new front and
     /// the previously-front buffer becomes the new back.
     back_idx: usize,
-    /// `true` once at least one frame has been successfully published.
-    /// Used by [`DisplayClient::submit`] to skip the front-to-back
-    /// memcpy on the first frame (there is no "previous" front to
-    /// copy from; the back buffer is already pre-zeroed by the SHM
-    /// create path).
-    first_publish_done: bool,
 }
 
 impl DisplayClient {
@@ -274,7 +268,6 @@ impl DisplayClient {
             // `surfaces[0]`.
             surfaces: [front, back],
             back_idx: 1,
-            first_publish_done: false,
         })
     }
 
@@ -565,32 +558,34 @@ impl FramebufferOwner for DisplayClient {
 
     fn submit(&mut self) -> bool {
         // Double-buffered publish sequence (2026-05-17 less-render-
-        // disappearance fix). The renderer drained its queue into
-        // `surfaces[self.back_idx]`; we now hand that buffer to
-        // display_server via `AttachSharedBuffer` + `DamageSurface` +
-        // `CommitSurface`, then flip `back_idx` so the next compose
-        // pass writes into the buffer display_server no longer holds
-        // a commit reference to. The flip *must* happen before
-        // `refresh_back_from_front` so the memcpy's source is the
-        // just-published front (now at `1 - back_idx` after the flip)
-        // and the destination is the new back (`back_idx` after the
-        // flip).
+        // disappearance fix; 2026-05-18 follow-up). The renderer
+        // drained its queue into `surfaces[self.back_idx]`; we now
+        // hand that buffer to display_server via `AttachSharedBuffer`
+        // + `DamageSurface` + `CommitSurface`, then flip `back_idx`
+        // so the next compose pass writes into the buffer display_
+        // server no longer holds a commit reference to. The flip
+        // *must* happen before `refresh_back_from_front` so the
+        // memcpy's source is the just-published front (now at
+        // `1 - back_idx` after the flip) and the destination is the
+        // new back (`back_idx` after the flip).
+        //
+        // The refresh is unconditional. The 2026-05-17 fix tried to
+        // skip the first-frame memcpy as an optimisation (the new
+        // back is SHM-create-zeroed, so copying zeros into zeros is a
+        // no-op), but that left the new back at a *stale* zero state
+        // on the second publish: the second compose would then drain
+        // its incremental Puts into a zero buffer instead of into a
+        // copy of the previous front, dropping all content that
+        // hadn't been re-painted this frame. The trace probe from the
+        // first follow-up session caught this directly — 33 of 76
+        // snapshots showed `nz=0/4096000` even though no Clear-only
+        // queue had drained. Always copying is ~4 MiB of memcpy per
+        // frame, well within budget.
         if !self.attach_damage_commit_back() {
             return false;
         }
         self.back_idx = 1 - self.back_idx;
-        // First-frame skip: on the very first publish there is no
-        // meaningful "front" yet — the previously-front buffer was
-        // SHM-create-zeroed and never written to. memcpy'ing zero
-        // pixels into the new back is a no-op but adds 4 MiB of
-        // wasted bandwidth on the boot frame. Subsequent frames
-        // unconditionally copy so any incremental render command
-        // (scroll / partial put) sees an up-to-date starting state.
-        if self.first_publish_done {
-            self.refresh_back_from_front();
-        } else {
-            self.first_publish_done = true;
-        }
+        self.refresh_back_from_front();
         true
     }
 }
