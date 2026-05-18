@@ -238,9 +238,13 @@ impl QmpClient {
         if timeout.is_zero() {
             return Err(QmpError::Timeout(timeout, what.to_string()));
         }
-        // We never *shrink* the inherited timeout below the
-        // per-stream default: QEMU's reply latency is well below 30s,
-        // and shortening it would just make the error message lie.
+        // Install the caller-supplied timeout on the stream. The
+        // command path (`QmpClient::execute`) passes the remaining
+        // budget from a 30 s deadline via
+        // `deadline.saturating_duration_since(Instant::now())`, so
+        // this value naturally shortens as the deadline approaches.
+        // Surfaces a real `QmpError::Io` if setsockopt itself fails
+        // instead of silently dropping the error.
         self.reader
             .get_ref()
             .set_read_timeout(Some(timeout))
@@ -326,12 +330,19 @@ const DIGIT_QCODES: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "
 
 /// Counter used to generate per-run unique QMP socket paths so two
 /// concurrent xtask invocations don't fight over the same path. The
-/// path lives under `$TMPDIR` and is unlinked on QEMU exit.
+/// path lives under `$TMPDIR`. Unlinking is the caller's
+/// responsibility: the QEMU-launcher in `xtask/src/main.rs` removes
+/// any stale file *before* spawning QEMU and removes the live socket
+/// *after* QEMU exits on the happy path. A crashed harness or a
+/// `kill -9` can leave the socket file behind; stray `.sock` files
+/// in `$TMPDIR` are harmless and get reaped by the next `tmpwatch`
+/// or reboot.
 static QMP_SOCKET_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Allocate a fresh QMP socket path for the current `xtask` run.
 /// The path is *not* created; we hand it to QEMU which `bind`s it,
-/// and the connect helper waits for the listener to come up.
+/// and the connect helper waits for the listener to come up. See
+/// `QMP_SOCKET_COUNTER` for the cleanup contract.
 pub fn fresh_socket_path() -> PathBuf {
     let pid = std::process::id();
     let seq = QMP_SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

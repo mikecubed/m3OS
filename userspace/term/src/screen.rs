@@ -1036,15 +1036,25 @@ impl Screen {
             }
         }
         let active = self.active_buf_mut();
-        // Shift rows up within the region: row `r` <- row `r + n`.
-        for r in top..=(bot - n as usize) {
-            let src = r + n as usize;
-            for c in 0..cols {
-                active[r * cols + c] = active[src * cols + c];
+        // When `n` equals the full region height (e.g. `CSI 999 S` on a
+        // scroll region starting at row 0), there's nothing to shift:
+        // every row gets blanked. We have to skip the shift loop entirely
+        // because `bot - n` would underflow as usize, and the blank loop
+        // would integer-wrap on `bot + 1 - n` when `bot + 1 == n`.
+        if (n as usize) < region_height as usize {
+            // Shift rows up within the region: row `r` <- row `r + n`.
+            for r in top..=(bot - n as usize) {
+                let src = r + n as usize;
+                for c in 0..cols {
+                    active[r * cols + c] = active[src * cols + c];
+                }
             }
         }
-        // Blank the bottom `n` rows of the region.
-        for r in (bot + 1 - n as usize)..=bot {
+        // Blank the bottom `n` rows of the region. When the entire region
+        // is being cleared (`n == region_height`), this iterates over
+        // every row from `top` to `bot` inclusive.
+        let blank_start = top + (region_height as usize - n as usize);
+        for r in blank_start..=bot {
             for c in 0..cols {
                 active[r * cols + c] = Cell::blank(fg, bg);
             }
@@ -2246,6 +2256,69 @@ mod tests {
                 assert!(payload.len() <= PTY_RESPONSE_MAX);
             }
             other => panic!("expected RespondToHost, got {:?}", other),
+        }
+    }
+
+    /// Regression for the Phase 69d-FU `CSI <n> S` underflow: when an
+    /// app sends `CSI 999 S` against the full primary surface, the
+    /// requested scroll count clamps to `region_height`. With the old
+    /// arithmetic, `bot - n` underflowed (`23 - 24` as usize) and the
+    /// inclusive range walked over every cell of the active buffer.
+    /// Today the path must blank the entire region, feed every evicted
+    /// row into scrollback, and emit a single `Scroll` command.
+    #[test]
+    fn csi_999_s_clears_full_region_without_underflow() {
+        let mut s = Screen::with_geometry(4, 3);
+        let _ = feed_str(&mut s, "AAAA\nBBBB\nCCCC");
+        // Three rows of distinct content, cursor at end of row 2.
+        let cmds = feed_str(&mut s, "\x1b[999S");
+        // Every cell in the active buffer must be blank.
+        for r in 0..3 {
+            for c in 0..4 {
+                assert_eq!(
+                    s.cell(r, c).unwrap().codepoint,
+                    b' ' as u32,
+                    "cell ({r},{c}) should be blank after CSI 999 S"
+                );
+            }
+        }
+        // Scrollback received all three evicted lines (the region is
+        // the full primary surface, so eviction is enabled).
+        assert!(
+            s.scrollback_len() >= 3,
+            "scrollback should hold AAAA/BBBB/CCCC"
+        );
+        // The framebuffer-level Scroll is emitted exactly once for the
+        // full-screen fast-path.
+        let scrolls = cmds
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::Scroll { .. }))
+            .count();
+        assert_eq!(scrolls, 1, "full-screen scroll emits a single Scroll cmd");
+    }
+
+    /// Companion: `CSI <n> S` on a *partial* scroll region (DECSTBM
+    /// 1;2 — rows 0 and 1, leaving row 2 untouched) with `n` equal to
+    /// the region height must blank rows 0-1, leave row 2 alone, and
+    /// must not feed scrollback (partial regions don't evict per
+    /// xterm).
+    #[test]
+    fn csi_s_clamped_on_partial_region_preserves_outside_rows() {
+        let mut s = Screen::with_geometry(4, 3);
+        let _ = feed_str(&mut s, "AAAA\nBBBB\nCCCC");
+        // DECSTBM 1;2 sets rows 0..=1 (1-based inclusive) and parks
+        // the cursor at the region's top.
+        let _ = feed_str(&mut s, "\x1b[1;2r");
+        // Scroll 999 lines: clamp to region_height = 2.
+        let _ = feed_str(&mut s, "\x1b[999S");
+        // Rows 0 and 1 are blank.
+        for c in 0..4 {
+            assert_eq!(s.cell(0, c).unwrap().codepoint, b' ' as u32);
+            assert_eq!(s.cell(1, c).unwrap().codepoint, b' ' as u32);
+        }
+        // Row 2 is untouched.
+        for c in 0..4 {
+            assert_eq!(s.cell(2, c).unwrap().codepoint, b'C' as u32);
         }
     }
 
