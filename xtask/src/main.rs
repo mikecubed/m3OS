@@ -2186,7 +2186,7 @@ const MUSL_CC_CANDIDATES: &[&str] = &[
 /// passes, the compiler is accepted and [`musl_cc_extra_ldflags`] returns
 /// the same `-L` flag so callers can plumb it into their own link
 /// commands (TCC's `--extra-ldflags`, doom's `-Wl,...`, etc.).
-fn find_musl_cc() -> Option<&'static str> {
+pub(crate) fn find_musl_cc() -> Option<&'static str> {
     static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
     *MUSL_CC.get_or_init(|| {
         let env_override = std::env::var("M3OS_MUSL_CC").ok();

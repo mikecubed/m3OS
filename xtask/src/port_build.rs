@@ -83,23 +83,27 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Locate a working musl cross-compiler on PATH.
+///
+/// Delegates to the shared [`crate::find_musl_cc`] probe so port builds
+/// honour the same toolchain selection as the rest of xtask (multi-name
+/// candidate list, env-override via `M3OS_MUSL_CC`, and the auto-generated
+/// empty-stubs path for toolchains that ship without `libdl.a` /
+/// `libpthread.a` / `librt.a`).  Without this delegation port builds
+/// hit "C compiler cannot create executables" on Arch's
+/// `musl-cross-tools`, raiden, or hand-built `musl-cross-make` — even
+/// though every other m3OS userspace target builds fine on the same
+/// toolchain.
 fn musl_cc() -> Option<&'static str> {
-    for cand in &[
-        "x86_64-linux-musl-gcc",
-        "musl-gcc",
-        "x86_64-unknown-linux-musl-gcc",
-    ] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return Some(cand);
-        }
-    }
-    None
+    crate::find_musl_cc()
+}
+
+/// Extra LDFLAGS the port build must append to whatever `-static` /
+/// `-L<stage>` flags it already passes.  Returns the stub-dir `-L` flag
+/// when the active toolchain lacked the empty `libdl.a` /
+/// `libpthread.a` / `librt.a` archives and xtask materialized them on
+/// its behalf in `target/musl-stub-libs/`.
+fn musl_extra_ldflags_joined() -> String {
+    crate::musl_cc_extra_ldflags().join(" ")
 }
 
 /// Pair of cross-compiler + companion `ar` and `ranlib` to use for static
@@ -109,11 +113,13 @@ fn musl_toolchain() -> Option<(&'static str, String, String)> {
     let ar = match cc {
         "x86_64-linux-musl-gcc" => "x86_64-linux-musl-ar".to_string(),
         "x86_64-unknown-linux-musl-gcc" => "x86_64-unknown-linux-musl-ar".to_string(),
+        "x86_64-unknown-linux-musl1.2-gcc" => "x86_64-unknown-linux-musl1.2-ar".to_string(),
         _ => "ar".to_string(),
     };
     let ranlib = match cc {
         "x86_64-linux-musl-gcc" => "x86_64-linux-musl-ranlib".to_string(),
         "x86_64-unknown-linux-musl-gcc" => "x86_64-unknown-linux-musl-ranlib".to_string(),
+        "x86_64-unknown-linux-musl1.2-gcc" => "x86_64-unknown-linux-musl1.2-ranlib".to_string(),
         _ => "ranlib".to_string(),
     };
     // Fall back to host `ar`/`ranlib` if the cross variants are missing —
@@ -426,6 +432,13 @@ fn build_ncurses(
         format!("--host={}", "x86_64-linux-musl"),
     ];
 
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags_base = if extra_ld.is_empty() {
+        "-static".to_string()
+    } else {
+        format!("-static {extra_ld}")
+    };
+
     for (pass_label, extra) in &[
         ("narrow", vec!["--disable-widec"]),
         ("wide", vec!["--enable-widec"]),
@@ -449,7 +462,7 @@ fn build_ncurses(
             .env("AR", ar)
             .env("RANLIB", ranlib)
             .env("CFLAGS", "-O2 -fPIC")
-            .env("LDFLAGS", "-static");
+            .env("LDFLAGS", &ldflags_base);
         run(
             &mut configure_cmd,
             &format!("ncurses configure ({pass_label})"),
@@ -517,6 +530,13 @@ fn build_libevent(
     let stage_prefix = stage.join("usr/local");
     fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
 
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        "-static".to_string()
+    } else {
+        format!("-static {extra_ld}")
+    };
+
     let mut configure_cmd = Command::new("sh");
     configure_cmd
         .current_dir(src)
@@ -534,7 +554,7 @@ fn build_libevent(
         .env("AR", ar)
         .env("RANLIB", ranlib)
         .env("CFLAGS", "-O2 -fPIC")
-        .env("LDFLAGS", "-static");
+        .env("LDFLAGS", &ldflags);
     run(&mut configure_cmd, "libevent configure")?;
 
     let mut make_cmd = Command::new("make");
@@ -573,7 +593,12 @@ fn build_less(
     fs::create_dir_all(&stage_prefix).map_err(|e| format!("mkdir: {e}"))?;
 
     let cflags = format!("-O2 -I{}/include", ncurses_prefix.display());
-    let ldflags = format!("-static -L{}/lib", ncurses_prefix.display());
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", ncurses_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", ncurses_prefix.display())
+    };
 
     let mut configure_cmd = Command::new("sh");
     configure_cmd
@@ -640,7 +665,12 @@ fn build_htop(
         ncurses_prefix.display(),
         arch_include.display()
     );
-    let ldflags = format!("-static -L{}/lib", ncurses_prefix.display());
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!("-static -L{}/lib", ncurses_prefix.display())
+    } else {
+        format!("-static -L{}/lib {extra_ld}", ncurses_prefix.display())
+    };
 
     // htop's configure auto-detects libncurses by linking against a
     // probe.  With `--with-termlib` on our ncurses build, both
@@ -737,11 +767,20 @@ fn build_tmux(
         ncurses_prefix.display(),
         libevent_prefix.display()
     );
-    let ldflags = format!(
-        "-static -L{}/lib -L{}/lib",
-        ncurses_prefix.display(),
-        libevent_prefix.display()
-    );
+    let extra_ld = musl_extra_ldflags_joined();
+    let ldflags = if extra_ld.is_empty() {
+        format!(
+            "-static -L{}/lib -L{}/lib",
+            ncurses_prefix.display(),
+            libevent_prefix.display()
+        )
+    } else {
+        format!(
+            "-static -L{}/lib -L{}/lib {extra_ld}",
+            ncurses_prefix.display(),
+            libevent_prefix.display()
+        )
+    };
 
     // Same TERMTYPE/TERMTYPE2 layout-mismatch hazard as htop: tmux's
     // autoconf detects libtinfo without `w` suffix and mixes narrow

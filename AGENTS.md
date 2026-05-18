@@ -100,6 +100,28 @@ Adding a new userspace binary requires changes in **four** places. Missing any o
 3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Generated binaries are staged by `xtask` under `target/generated-initrd/`; checked-in static initrd assets remain under `kernel/initrd/`. Without the ramdisk entry, `execve` returns ENOENT.
 4. **Service config (if daemon)** — add a `.conf` file to the ext2 data disk builder in `xtask/src/main.rs` (`populate_ext2_files` function) AND to the `KNOWN_CONFIGS` fallback list in `userspace/init/src/main.rs`. Run `cargo xtask clean` to recreate the disk.
 
+### Adding a New Cross-Compiled Port (ncurses-style)
+
+Ports live under `ports/<category>/<name>/Portfile` and are built host-side by `cargo xtask port build <name>`, which dispatches to a `build_<name>` function in `xtask/src/port_build.rs`. **Every new `build_*` function MUST route through the shared musl-toolchain plumbing or it will fail on toolchains that ship without empty static-compat archives** (Arch `musl-cross-tools`, raiden, hand-built `musl-cross-make`, anything that omits `libdl.a` / `libpthread.a` / `librt.a`). The "C compiler cannot create executables" configure error during the link probe is the symptom.
+
+Required wiring in every port `build_*` function:
+
+1. **Resolve the toolchain via `musl_toolchain()`** — which calls the shared `crate::find_musl_cc()` probe. Never invoke `x86_64-linux-musl-gcc` as a literal string.
+2. **Compose LDFLAGS with `musl_extra_ldflags_joined()`**:
+   ```rust
+   let extra_ld = musl_extra_ldflags_joined();
+   let ldflags = if extra_ld.is_empty() {
+       "-static -L<stage>/lib".to_string()
+   } else {
+       format!("-static -L<stage>/lib {extra_ld}")
+   };
+   ```
+   The `extra_ld` value is `-L<workspace>/target/musl-stub-libs/` when xtask auto-generated the empty archives. Without that `-L`, the configure script's `-static -ldl -lpthread -lrt` link probe fails and the build aborts with exit 77.
+3. **Pass `--host=x86_64-linux-musl`** to `./configure` so autotools picks the correct cross triple.
+4. **Use the `(cc, ar, ranlib)` tuple from `musl_toolchain()`** for `CC` / `AR` / `RANLIB` — the tuple's `ar`/`ranlib` already fall back to host `ar`/`ranlib` when the cross variants are absent (static archives are ELF-target-agnostic so this is safe).
+
+To register a new port: add the name to `PORTS` in `xtask/src/main.rs:10792`, add it to `match name` dispatch in `xtask/src/port_build.rs:port_build` (~line 366), implement `build_<name>` following the pattern above, and add the resulting binary path to `tui_app_smoke_steps` if the port participates in the gate.
+
 ## Critical Conventions
 
 ### Target flags — do not remove
