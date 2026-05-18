@@ -1,25 +1,106 @@
 ---
-status: mostly-fixed-rare-residual-flake
-branch: feat/phase-69d-tui-app-foundation (PR #176) — investigation surface
-last-known-good-commit: d899f73  # double-buffer + Clear-only defer + always-refresh
+status: closed
+branch: feat/phase-69d-tui-app-foundation (PR #176) — fix landed
+last-known-good-commit: 7e654a4  # NUL-byte / control-char filter in parser
 fix-commits:
-  - 8497e0c  # double-buffer SHM + Clear-only defer
-  - d899f73  # always refresh back-from-front (removed first-publish skip)
-date: 2026-05-17
-component: userspace/term + kernel-core/fb + userspace/display_server (compose)
+  - 8497e0c  # double-buffer SHM + Clear-only defer (race scaffolding, partial)
+  - d899f73  # always refresh back-from-front (closes regression from 8497e0c)
+  - 0d0940f  # DA / DSR responses (lets less query the terminal properly)
+  - 8c9bba7  # CSI completion (csr / vpa / su/sd / il/dl / ich/dch/ech) — cherry-picked from feat/term-csi-completion
+  - 7e654a4  # NUL + spec-defined control bytes ignored (THE actual root cause)
+date: 2026-05-17 / 2026-05-18 closeout
+component: kernel-core/fb (parser) — root cause; userspace/term, userspace/display_server (scaffolding)
 related:
   - docs/roadmap/69d-tui-app-foundation.md
   - docs/handoffs/2026-05-16-phase-69d-100-percent-followups.md
 diag-branches:
   - diag/less-render-trace          # TT:* / PI:* / EV:* / PO:* traces + TIOCSWINSZ-at-init fix
-  - feat/term-csi-completion         # csr / vpa / su/sd / il / dl / ich / dch / ech dispatches
+  - feat/term-csi-completion         # csr / vpa / su/sd / il / dl / ich / dch / ech dispatches  (merged via cherry-pick)
   - diag/csi-completion-test         # both stacked
 ruled-out-hypotheses:
   - cursor-trail clear in compose.rs (EV:Ptr = 0; symptom is black not teal)
   - 500 ms blink-tick wipe (Probe A: cursor default → SteadyBlock; bug still fires within 60 ms)
   - LLVM / store-visibility race (Probe B: SeqCst fence before publish_frame; bug still fires)
+  - DECSTBM/csr not implemented (added 8c9bba7; less is not actually using csr)
+  - snapshot-during-write race (real bug, fixed by 8497e0c; not the residual cause)
 new-tooling:
   - cargo xtask less-render-probe  # QMP send-key + screendump; captures the bug pixel-state
+---
+
+## 2026-05-18 closeout — root cause was NUL-byte padding fill
+
+**TL;DR.** The residual flake from `d899f73` was caused by `AnsiParser::process_normal`
+treating NUL (0x00) — and every other ECMA-48 "ignored when standalone" control
+byte — as `PutChar(0)`. Less sends NUL bytes as terminfo padding fill (default
+`pc` = 0), and each NUL walked the cursor across the freshly-painted screen,
+painting a blank cell at every position. With ~hundreds of padding NULs after
+every `\E[2J\E[H<content>` header, the entire screen was systematically
+overwritten with blanks before the next user keystroke.
+
+The fix at `7e654a4` adds a single match arm to `process_normal` mapping the
+spec-defined no-op control bytes (NUL plus SOH..ACK, SO/SI, DLE..ETB, CAN/SUB,
+FS..US, DEL) to `ConsoleCmd::Nop`. Three host tests pin the new behaviour.
+
+### How the trace probes found it
+
+The compose-outcome probe (added in `394a512`, reverted in `bd7e8db` after the
+fix landed) showed composes with `clears=0 puts=256 scrolls=2 submitted=1`
+publishing all-zero buffers. The `TC:put-extent` probe narrowed the puts to
+`rows=23..24 cols=0..79` (status-bar area). Decoding the PTY-byte trace
+(`PI:<hex>`) showed less emitting `\E[2J\E[H<content>` followed by many `<00>`
+bytes — the padding fill.
+
+Without the parser fix, every NUL became a `PutChar(0) → put_glyph(...,
+codepoint=0, ...)` that filled a cell with `bg` (default 0 = black) and
+advanced the cursor. Less's emit-many-NULs-as-padding pattern therefore
+walked the cursor across all 25 rows × 80 cols of the screen, blanking
+every cell.
+
+### Companion improvements landed alongside the root-cause fix
+
+The hypothesis chain was wrong twice before finding NUL, but the failed
+hypotheses produced two independently-useful improvements:
+
+* **DA / DSR responses** (`0d0940f`). `\E[c` (Primary DA) now answers
+  `\E[?6c` (VT102); `\E[5n` answers `\E[0n`; `\E[6n` answers
+  `\E[<row>;<col>R`. These are terminal-contract obligations the
+  m3os-term terminfo already advertised (`u8` / `u9` / `u7`); without
+  them, some TUI apps fall back to "dumb terminal" full-repaint mode.
+  Did not visibly move the flake but a real correctness gap.
+
+* **CSI completion** (`8c9bba7`, cherry-picked from
+  `feat/term-csi-completion`). DECSTBM (`csr`), VPA (`d`), SU (`S`) /
+  SD (`T`), IL (`L`) / DL (`M`), ICH (`@`) / DCH (`P`), ECH (`X`) are
+  now dispatched through full-fidelity screen state changes (scroll
+  region, region-aware line_feed, insert/delete lines and chars).
+  Less in this scenario does not actually emit any of these — it
+  uses `\E[H\E[J<content>` with NUL padding — but every other TUI
+  app will benefit, and the parser was already advertising these
+  capabilities in terminfo.
+
+### Verification
+
+`cargo xtask less-render-probe` across 3 runs after `7e654a4`:
+
+| event | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| less-opened (1500 ms) | 0.0036 ✓ | 0.0036 ✓ | 0.0036 ✓ |
+| after-down (1500 ms) | 0.0022 ✓ | 0.0022 ✓ | 0.0042 ✓ |
+| after-up (1500 ms) | 0.0056 ✓ | 0.0057 ✓ | 0.0036 ✓ |
+
+All 9 events show visible content at 1500 ms (vs the d899f73 baseline of
+"3 of 4 runs show ALL three events settling"). Quality gates green at
+`bd7e8db`: `cargo xtask check`, `cargo xtask tui-smoke`,
+`cargo xtask tui-app-smoke`.
+
+### Branches to dispose
+
+| Branch | Disposition |
+|---|---|
+| `feat/term-csi-completion` | Cherry-picked at `8c9bba7`. Branch can be deleted. |
+| `diag/csi-completion-test` | Discard — pure instrumentation, all useful changes folded into main fix. |
+| `diag/less-render-trace` | Discard — TIOCSWINSZ-at-init fix not yet land; the diff is small enough that a fresh PR is the right way to merge it (terminfo claims 25 rows; kernel default is 24). |
+
 ---
 
 # Handoff — `less` content disappears between events inside `term`
