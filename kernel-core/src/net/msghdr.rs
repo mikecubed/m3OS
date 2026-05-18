@@ -53,10 +53,11 @@ pub const MSG_DONTWAIT: i32 = 0x40;
 pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
 
 /// Bits the kernel knows how to honour on `sendmsg(2)`.  Today only
-/// `MSG_DONTWAIT` (recognised but treated as a hint — non-blocking is
-/// keyed off the fd's `O_NONBLOCK` instead).  Other bits cause the
-/// kernel to reject the call with `EOPNOTSUPP` so callers learn that
-/// requested semantics were not applied.
+/// `MSG_DONTWAIT`, which the syscall layer ORs into its per-call
+/// `force_nonblock` so a blocking fd can still request nonblocking
+/// semantics for one send.  Other bits cause the kernel to reject the
+/// call with `EOPNOTSUPP` so callers learn that requested semantics
+/// were not applied.
 pub const SENDMSG_SUPPORTED_FLAGS: i32 = MSG_DONTWAIT;
 
 /// Bits the kernel knows how to honour on `recvmsg(2)`.

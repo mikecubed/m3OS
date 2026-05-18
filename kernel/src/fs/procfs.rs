@@ -463,10 +463,15 @@ fn proc_name(proc: &ProcessSnapshot) -> String {
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(proc.comm.len());
-    if comm_visible_end > 0
-        && let Ok(s) = core::str::from_utf8(&proc.comm[..comm_visible_end])
-    {
-        return String::from(s);
+    if comm_visible_end > 0 {
+        // PR_SET_NAME accepts arbitrary bytes so the slice may contain
+        // invalid UTF-8 (typically because the caller passed a name
+        // truncated mid-multibyte sequence).  Use lossy decoding so
+        // `/proc/<pid>/comm` stays observably aligned with what
+        // `PR_GET_NAME` would return — falling back to cmdline/exec
+        // would expose a different (possibly longer) name than the
+        // stored comm bytes, defeating the point of `PR_SET_NAME`.
+        return String::from_utf8_lossy(&proc.comm[..comm_visible_end]).into_owned();
     }
     if let Some(first) = proc.cmdline.first() {
         String::from(basename(first))

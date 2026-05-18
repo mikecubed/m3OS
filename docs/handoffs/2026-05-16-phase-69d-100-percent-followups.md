@@ -15,7 +15,7 @@ related:
 # Handoff — Phase 69d: 100% closed
 
 All eight tracks land green.  `cargo xtask tui-app-smoke` passes
-**49 steps in ~41s**, including the full tmux session lifecycle
+**48 steps in ~45s**, including the full tmux session lifecycle
 (new-session / has-session / split-window / resize-pane / kill-session)
 along with the htop SIGWINCH reflow assertion and the `sendmsg-test`
 SCM_RIGHTS regression.
@@ -31,7 +31,7 @@ SCM_RIGHTS regression.
 | D.2 — tmux port | cross-build, staged, `tmux -V` runs | ✅ Full |
 | D.3a — tmux kernel surface | `sendmsg`/`recvmsg`/`SCM_RIGHTS` + `flock` + `prctl(PR_SET_NAME)` | ✅ Full (sendmsg-test) |
 | D.3b — tmux full session lifecycle | new-session / has-session / split / resize / kill end-to-end | ✅ Full |
-| E — `cargo xtask tui-app-smoke` gate | 49 steps in ~41s, pre-push gated | ✅ Full |
+| E — `cargo xtask tui-app-smoke` gate | 48 steps in ~45s, pre-push gated | ✅ Full |
 | F.1–F.4 — docs + version bump | task-doc checkboxes, kernel 0.69.5 | ✅ Full |
 
 ## Six real kernel bugs fixed during tmux integration
@@ -144,7 +144,7 @@ SCM_RIGHTS regression.
 cargo xtask clean
 cargo xtask check               # clippy / fmt / host tests (12 msghdr)
 cargo xtask tui-app-smoke --timeout 300
-# expected: "tui-app-smoke: PASSED (49 steps in ~41s)"
+# expected: "tui-app-smoke: PASSED (48 steps in ~45s)"
 ```
 
 ## Notes for future work

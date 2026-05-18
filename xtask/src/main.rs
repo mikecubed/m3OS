@@ -7969,12 +7969,17 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     //      redraw, quit, sentinel ----
     //
     // Phase 69d follow-up Track C.2b — htop SIGWINCH reflow.  The
-    // sequence below arms `winsize-bang` (which forks a 2-second
-    // background timer that issues `TIOCSWINSZ` on /dev/tty), then
-    // launches htop.  The kernel routes the ioctl into a SIGWINCH for
-    // the foreground pgrp (htop); htop redraws its header at the new
-    // smaller geometry, and we assert the redraw is visible by waiting
-    // for a SECOND occurrence of `Tasks:` after the geometry changes.
+    // sequence below arms `winsize-bang` (which forks a 5-second
+    // background timer that issues `TIOCSWINSZ` on the helper's
+    // inherited stdin — the controlling TTY of the post-login shell),
+    // then launches htop.  The kernel routes the ioctl into a SIGWINCH
+    // for the foreground pgrp (htop); htop redraws its header at the
+    // new smaller geometry.  The harness asserts the round-trip by
+    // waiting for the helper's `winsize-bang:fired cols=60 rows=20`
+    // sentinel, which proves the ioctl reached the kernel TTY layer at
+    // the expected geometry.  A true cell-grid reflow assertion at the
+    // new dimensions is deferred to the headless framebuffer probe in
+    // `xtask/src/{ppm,qmp}.rs`.
     steps.push(SmokeStep::Send {
         input: "/bin/winsize-bang\n",
         label: "guest/tui-app-smoke: arm winsize-bang timer",

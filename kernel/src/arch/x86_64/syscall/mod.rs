@@ -2504,10 +2504,16 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     crate::process::close_all_fds_for(pid);
 
     // Phase 69d follow-up: drop every flock entry this PID still holds.
-    // close_all_fds_for() will have released most via close(2), but if the
-    // process exited without explicitly closing fds the per-fd map still
-    // carries entries.  PID-recycle would otherwise surface stale locks.
+    // close_all_fds_for() releases the underlying handles but does NOT
+    // call the per-fd flock-release path that `sys_linux_close` runs;
+    // process-exit needs an explicit sweep of both the per-fd map AND
+    // the UnixSocket cross-fd registry.  Without the UnixSocket sweep,
+    // a process that exits while holding `LOCK_EX` on a Unix socket
+    // that other processes still reference (or that has an inflight
+    // SCM_RIGHTS copy) would leave its dead `(pid, fd)` as the
+    // exclusive holder forever (PR #177 review fix).
     crate::flock::release_all_for_pid(pid);
+    crate::flock::release_unix_socket_locks_for_pid(pid);
 
     // Phase 47 Track C: if this process owned the raw framebuffer, restore
     // console output so the shell is visible again.
@@ -8075,16 +8081,36 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     epoll_remove_fd(fd);
     // Phase 69d follow-up: drop any per-fd flock state so an fd-recycle
     // cannot surface the previous holder's lock to a fresh open.
+    //
+    // If the closing thread is a CLONE_FILES sibling of the lock
+    // holder, the shared fd table is about to lose the slot and a
+    // different sibling's `(holder_tid, fd)` entry is now stale.
+    // Release across every thread-group member that shares this fd
+    // table so a sibling's lock cannot survive the close of the fd
+    // it was keyed to (PR #177 review fix).
     {
         let pid = crate::process::current_pid();
         let backend_handle = current_fd_entry(fd).and_then(|e| match &e.backend {
             FdBackend::UnixSocket { handle } => Some(*handle),
             _ => None,
         });
+        // Collect every tid in the thread group (or just this pid for
+        // single-threaded processes).  Held briefly under PROCESS_TABLE
+        // lock — the flock module takes its own mutex, no nesting.
+        let release_pids: alloc::vec::Vec<u32> = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            match table.find(pid).and_then(|p| p.thread_group.clone()) {
+                Some(tg) => tg.members.lock().clone(),
+                None => alloc::vec![pid],
+            }
+        };
         if let Some(h) = backend_handle {
-            crate::flock::unix_socket_release(h, pid, fd as u32);
+            crate::flock::unix_socket_release_for_pids(h, &release_pids, fd as u32);
+            // Wake any contenders parked on this handle so they can
+            // re-attempt the acquire now that this fd's lock is gone.
+            crate::net::unix::wake_unix_socket(h);
         }
-        crate::flock::release_per_fd(pid, fd as u32);
+        crate::flock::release_per_fd_for_pids(&release_pids, fd as u32);
     }
     // Clear the slot and — for VfsService / Ext2Disk backends — decide
     // whether this was the last alias under the SAME PROCESS_TABLE lock
@@ -13320,16 +13346,26 @@ pub(super) fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 //
 // Phase 69d follow-up: tmux issues `prctl(PR_SET_NAME, "tmux: ...")` to
 // give its server process a recognisable name in `/proc/<pid>/comm`. We
-// implement that op fully; all other ops succeed silently (return 0) so
-// tmux's cosmetic calls don't surface as `unhandled syscall 157` log
-// noise.  Operations that have no business succeeding silently can be
-// promoted to dedicated handlers later.
+// implement PR_SET_NAME / PR_GET_NAME fully.  A small allow-list of
+// cosmetic options (PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_SET_DUMPABLE,
+// PR_GET_DUMPABLE, PR_SET_KEEPCAPS) succeed silently so common runtime
+// calls don't trip `unhandled syscall 157` log noise.  Everything else
+// — including security-sensitive options like PR_SET_NO_NEW_PRIVS and
+// PR_SET_SECCOMP — returns -EINVAL so callers learn that requested
+// semantics were not applied (PR #177 review fix).
 
 /// `PR_SET_NAME` — write a 16-byte name (15 visible + NUL) into the
 /// caller's `comm` slot.  Argument: pointer to a NUL-terminated string.
 const PR_SET_NAME: u64 = 15;
 /// `PR_GET_NAME` — read the current 16-byte `comm` slot into the caller.
 const PR_GET_NAME: u64 = 16;
+/// Allow-list of cosmetic prctl options that return success silently.
+/// These are non-security-affecting on m3OS:
+/// * `PR_SET_PDEATHSIG = 1`, `PR_GET_PDEATHSIG = 2` — parent-death signal (no kernel support)
+/// * `PR_GET_DUMPABLE = 3`, `PR_SET_DUMPABLE = 4` — core dump flag (no core dumps on m3OS)
+/// * `PR_SET_KEEPCAPS = 8`, `PR_GET_KEEPCAPS = 7` — keep capabilities across setuid (no caps on m3OS)
+/// * `PR_SET_TIMING = 14`, `PR_GET_TIMING = 13` — process timing mode (cosmetic)
+const PRCTL_COSMETIC_OPTIONS: &[u64] = &[1, 2, 3, 4, 7, 8, 13, 14];
 
 pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64) -> u64 {
     match option {
@@ -13376,9 +13412,12 @@ pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64) -> u64 {
             }
             0
         }
-        // PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_SET_DUMPABLE, etc.
-        // Cosmetic for tmux/coreutils on m3OS — return success.
-        _ => 0,
+        // Cosmetic allow-list returns success.  Unknown options fall
+        // through to -EINVAL so callers don't see silent success on
+        // security-sensitive ops the kernel does not implement
+        // (PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, PR_SET_MM, …).
+        opt if PRCTL_COSMETIC_OPTIONS.contains(&opt) => 0,
+        _ => NEG_EINVAL,
     }
 }
 
@@ -13437,13 +13476,18 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
                             if nonblock {
                                 return NEG_EWOULDBLOCK;
                             }
-                            // Blocking flock: yield and retry until the
-                            // conflicting holder releases.  Signal-checked
+                            // Blocking flock on a Unix socket: park on
+                            // the socket's wait queue.  The release
+                            // path (`unix_socket_release` from close /
+                            // explicit LOCK_UN / process exit) calls
+                            // `wake_unix_socket(h)` so contenders wake
+                            // up immediately instead of cycling
+                            // through `yield_now()`.  Signal-checked
                             // every iteration so EINTR semantics survive.
                             if has_pending_signal() {
                                 return NEG_EINTR;
                             }
-                            crate::task::yield_now();
+                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[h].sleep();
                         }
                     }
                 }
@@ -13463,7 +13507,7 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
                             if has_pending_signal() {
                                 return NEG_EINTR;
                             }
-                            crate::task::yield_now();
+                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[h].sleep();
                         }
                     }
                 }
@@ -13474,6 +13518,9 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
         LOCK_UN => {
             if let Some(h) = unix_handle {
                 unix_socket_release(h, pid, fd_u32);
+                // Wake any contenders parked on this handle so they can
+                // re-attempt their acquire now that we've released.
+                crate::net::unix::wake_unix_socket(h);
             }
             // Either remove or no-op — both are safe.
             release_per_fd(pid, fd_u32);
@@ -16269,6 +16316,25 @@ fn acquire_inflight_anc_backend(backend: &FdBackend) {
     }
 }
 
+/// True iff `acquire_inflight_anc_backend` has refcount semantics for
+/// this backend kind.  `sys_sendmsg` rejects fds whose backend would
+/// sit on the anc queue without a pin, because the sender's close path
+/// (and for VfsService / Ext2Disk the fd-table alias scan) is invisible
+/// to the in-flight copy and would tear the underlying object down
+/// before the receiver's `recvmsg` materializes it.
+fn anc_backend_is_refcounted(backend: &FdBackend) -> bool {
+    matches!(
+        backend,
+        FdBackend::PipeRead { .. }
+            | FdBackend::PipeWrite { .. }
+            | FdBackend::Socket { .. }
+            | FdBackend::UnixSocket { .. }
+            | FdBackend::PtyMaster { .. }
+            | FdBackend::PtySlave { .. }
+            | FdBackend::Epoll { .. }
+    )
+}
+
 /// Drop a refcount previously acquired by [`acquire_inflight_anc_backend`].
 /// Called from sendmsg/recvmsg rollback paths and from the receiver's
 /// SCM_RIGHTS install path when an fd slot couldn't be allocated.  Kept
@@ -16434,6 +16500,18 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                     error = NEG_EBADF;
                     return;
                 };
+                // Reject backends without inflight refcount support
+                // (VfsService, Ext2Disk, Fat32Disk, Ramdisk, Tmpfs,
+                // Dir, Proc, DeviceTTY, Dev{Null,Zero,Urandom,Full},
+                // Stdin, Stdout).  Those have no per-handle refcount
+                // for the anc-queue path to pin: the sender's close
+                // path or fd-table alias scan would tear the underlying
+                // object down before the receiver materializes it,
+                // leaving the receiver to install a stale backend.
+                if !anc_backend_is_refcounted(&sender_entry.backend) {
+                    error = NEG_EOPNOTSUPP;
+                    return;
+                }
                 acquire_inflight_anc_backend(&sender_entry.backend);
                 inflight.push(crate::net::unix::InflightFd {
                     backend: sender_entry.backend.clone(),
@@ -16468,8 +16546,12 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     // 5. Atomic delivery: stamp inflight cmsgs with the peer's current
     //    stream offset and append them to the anc queue under the same
     //    lock that extends `recv_buf`.  For blocking stream sockets the
-    //    peer buffer can be full; loop with yield_now()+signal-check
-    //    instead of returning EAGAIN on the caller's behalf.
+    //    peer buffer can be full; park on our own wait queue and retry
+    //    on every wake — matches `sys_linux_write`'s blocking contract
+    //    for the same UnixSocket backend so a full-buffer sendmsg
+    //    sleeps efficiently instead of burning scheduler turns on
+    //    `yield_now()`.  The reader's `unix_stream_read` wakes
+    //    `self.peer = unix_handle` after draining bytes.
     let mut inflight_mut = inflight;
     let written = loop {
         match crate::net::unix::unix_stream_write_with_anc(unix_handle, &payload, &mut inflight_mut)
@@ -16491,7 +16573,7 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                     }
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle].sleep();
             }
             Err(e) => {
                 for inf in &inflight_mut {
@@ -16909,7 +16991,18 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             let h = *handle;
             // Extract socket info under the lock, then check peer separately
             // to avoid nested lock acquisition (deadlock).
+            //
+            // `anc_ready` covers zero-byte SCM_RIGHTS messages: the
+            // sender wrote 0 bytes plus a non-empty cmsg, the wake
+            // fired once, and an event loop that polls before
+            // calling `recvmsg` would otherwise see `recv_buf` empty,
+            // report no POLLIN, and miss the only wake.
             let info = crate::net::unix::with_unix_socket(h, |s| {
+                let anc_ready = s
+                    .anc_queue
+                    .front()
+                    .map(|inf| inf.deliver_at_stream_pos <= s.stream_pos_consumed)
+                    .unwrap_or(false);
                 (
                     s.socket_type,
                     s.state,
@@ -16918,14 +17011,24 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                     !s.backlog.is_empty(),
                     !s.dgram_queue.is_empty(),
                     s.shut_rd,
+                    anc_ready,
                 )
             });
             match info {
-                Some((sock_type, state, peer, has_data, has_backlog, has_dgram, shut_rd)) => {
+                Some((
+                    sock_type,
+                    state,
+                    peer,
+                    has_data,
+                    has_backlog,
+                    has_dgram,
+                    shut_rd,
+                    anc_ready,
+                )) => {
                     let mut revents: i16 = 0;
                     match sock_type {
                         crate::net::unix::UnixSocketType::Stream => {
-                            if has_data {
+                            if has_data || anc_ready {
                                 revents |= POLLIN;
                             }
                             if matches!(state, crate::net::unix::UnixSocketState::Listening)

@@ -162,6 +162,56 @@ pub fn unix_socket_purge(handle: usize) {
     UNIX_SOCKET_LOCKS.lock().remove(&handle);
 }
 
+/// Release every Unix-socket flock entry owned by `pid` across every
+/// handle in the registry.  Called from `do_full_process_exit` so a
+/// process that exits without explicitly closing a locked Unix socket
+/// fd cannot leave its `(pid, fd)` exclusive holder behind — the
+/// socket object may still be alive (another process or an inflight
+/// SCM_RIGHTS copy holds a refcount), in which case `unix_socket_purge`
+/// is never called and the dead owner would otherwise block future
+/// lockers indefinitely (PR #177 review fix).
+pub fn release_unix_socket_locks_for_pid(pid: u32) {
+    let mut t = UNIX_SOCKET_LOCKS.lock();
+    t.retain(|_handle, state| {
+        if state.exclusive.map(|(p, _)| p) == Some(pid) {
+            state.exclusive = None;
+        }
+        state.shared.retain(|&(p, _)| p != pid);
+        state.exclusive.is_some() || !state.shared.is_empty()
+    });
+}
+
+/// Release every Unix-socket flock entry keyed on a specific handle for
+/// any pid in `pids`.  Called from the close path when the closing
+/// thread is a CLONE_FILES sibling of the original lock holder: the
+/// shared fd table is about to lose the slot, so any sibling's
+/// `(member_pid, fd)` entry is now stale (PR #177 review fix).
+pub fn unix_socket_release_for_pids(handle: usize, pids: &[u32], fd: u32) {
+    let mut t = UNIX_SOCKET_LOCKS.lock();
+    if let Some(state) = t.get_mut(&handle) {
+        if let Some((p, f)) = state.exclusive
+            && f == fd
+            && pids.contains(&p)
+        {
+            state.exclusive = None;
+        }
+        state
+            .shared
+            .retain(|&(p, f)| !(f == fd && pids.contains(&p)));
+        if state.exclusive.is_none() && state.shared.is_empty() {
+            t.remove(&handle);
+        }
+    }
+}
+
+/// Release every per-fd flock entry for `fd` across any pid in `pids`.
+/// Companion to [`unix_socket_release_for_pids`] for backends that have
+/// no cross-fd lock state (PR #177 review fix).
+pub fn release_per_fd_for_pids(pids: &[u32], fd: u32) {
+    let mut t = PER_FD.lock();
+    t.retain(|&(p, f), _| !(f == fd && pids.contains(&p)));
+}
+
 // ===========================================================================
 // Tests (host-only, exercised via `cargo test -p kernel` is not feasible
 // because the kernel is no_std/QEMU-only.  The state machine is small
