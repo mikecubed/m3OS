@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -138,6 +139,90 @@ static void test_uncatchable(void) {
         pass("uncatchable");
     else
         fail("uncatchable", "sigaction should reject SIGKILL/SIGSTOP");
+}
+
+/* ---- Test 3b: cross-process kill terminates a blocked child ----
+ *
+ * Phase 69d follow-up reproducer for a user-reported "kill -9 doesn't
+ * kill" symptom.  Forks a child that blocks indefinitely in pause();
+ * the parent sends SIGKILL and waitpid()s.  If the child is reaped with
+ * status WIFSIGNALED && WTERMSIG==SIGKILL, the cross-process
+ * sys_kill → wake_task_v2 → check_pending_signals chain is healthy.  A
+ * waitpid timeout (handled with alarm()) signals the bug.
+ */
+static volatile sig_atomic_t kill_target_alarm_fired = 0;
+
+static void kill_target_alarm_handler(int sig) {
+    (void)sig;
+    kill_target_alarm_fired = 1;
+}
+
+static void test_cross_process_kill(void) {
+    pid_t child = fork();
+    if (child < 0) {
+        fail("cross_process_kill", "fork failed");
+        return;
+    }
+    if (child == 0) {
+        /* Block indefinitely; parent will SIGKILL us. */
+        for (;;) {
+            pause();
+        }
+        _exit(99);
+    }
+
+    /* Parent: give the child a beat to land in pause(), then SIGKILL. */
+    struct timespec ts = {0, 50 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+
+    if (kill(child, SIGKILL) != 0) {
+        fail("cross_process_kill", "kill(SIGKILL) returned non-zero");
+        /* Best-effort cleanup. */
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return;
+    }
+
+    /* Bound the waitpid so a buggy delivery path doesn't hang the test
+     * forever.  3 s is far past the wake-and-exit budget on TCG. */
+    struct sigaction old_alarm;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kill_target_alarm_handler;
+    sa.sa_flags = SA_RESTORER;
+    kill_target_alarm_fired = 0;
+    sigaction(SIGALRM, &sa, &old_alarm);
+    alarm(3);
+
+    int status = 0;
+    pid_t reaped = waitpid(child, &status, 0);
+    alarm(0);
+    sigaction(SIGALRM, &old_alarm, NULL);
+
+    if (kill_target_alarm_fired) {
+        /* waitpid was interrupted by the timeout — child still alive. */
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        fail("cross_process_kill",
+             "waitpid timed out; SIGKILL did not terminate the child");
+        return;
+    }
+
+    if (reaped != child) {
+        fail("cross_process_kill", "waitpid returned wrong pid");
+        return;
+    }
+    if (!WIFSIGNALED(status)) {
+        fail("cross_process_kill",
+             "child did not die from a signal");
+        return;
+    }
+    if (WTERMSIG(status) != SIGKILL) {
+        fail("cross_process_kill",
+             "child died from a different signal");
+        return;
+    }
+    pass("cross_process_kill");
 }
 
 /* ---- Test 4: auto-masking prevents re-entry ---- */
@@ -332,6 +417,7 @@ int main(int argc, char *argv[]) {
     test_sigint_handler();
     test_signal_masking();
     test_uncatchable();
+    test_cross_process_kill();
     test_auto_masking();
     test_sigaction_atomicity();
     test_exec_signal_reset();
