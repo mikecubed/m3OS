@@ -66,7 +66,23 @@ pub const UNIX_DGRAM_QUEUE_MAX: usize = 32;
 /// cursor crosses `deliver_at_stream_pos`.
 pub struct InflightFd {
     pub backend: FdBackend,
+    /// Sender's stored cloexec bit, captured at `sendmsg` time.  Note
+    /// that the **receiver-visible** cloexec is decided at `recvmsg`
+    /// time per Linux's contract: cleared by default, set when the
+    /// caller passed `MSG_CMSG_CLOEXEC`.  This field is retained for
+    /// diagnostics only and is not consulted on install.
     pub cloexec: bool,
+    /// Sender's file offset at `sendmsg` time.  Preserved so a passed
+    /// regular-file fd lands in the receiver at the position the
+    /// sender had it; matches `dup(2)` semantics.
+    pub offset: usize,
+    /// Sender's `O_NONBLOCK` bit.
+    pub nonblock: bool,
+    /// Sender's read-permission bit.  An fd opened `O_WRONLY` stays
+    /// write-only on the receiver.
+    pub readable: bool,
+    /// Sender's write-permission bit.
+    pub writable: bool,
     /// Position in the receiver's incoming byte stream where this fd
     /// "rides".  Compared against the receiver's running consumed-bytes
     /// counter on every `recvmsg`.
@@ -192,6 +208,13 @@ pub fn free_unix_socket(handle: usize) {
                     orphan_anc.push(inflight);
                 }
             }
+            // Phase 69d follow-up (PR #177 review fix): purge cross-fd
+            // flock state for this handle BEFORE the slot is cleared so
+            // a concurrent allocator cannot recycle the handle and
+            // surface a previous holder's lock.  Safe to call under the
+            // table lock because the flock module only takes its own
+            // mutex.
+            crate::flock::unix_socket_purge(handle);
             // Unbind path before freeing the slot to prevent stale resolution.
             if let Some(ref path) = cleanup_path {
                 unbind_path(path);
@@ -208,10 +231,6 @@ pub fn free_unix_socket(handle: usize) {
             }
         }
     }
-    // Phase 69d follow-up: purge cross-fd flock state once the last
-    // reference to this socket drops, so a recycled handle cannot
-    // surface a previous holder's lock.
-    crate::flock::unix_socket_purge(handle);
     // Phase 69d follow-up: release refcounts on undelivered ancillary
     // fds so a `sendmsg(SCM_RIGHTS)` whose `recvmsg` never arrives does
     // not leak kernel objects (pipes, PTYs, sockets, epoll).
@@ -236,6 +255,7 @@ fn release_inflight_anc_backend(inflight: &InflightFd) {
         FdBackend::UnixSocket { handle } => free_unix_socket(*handle),
         FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+        FdBackend::Epoll { instance_id } => crate::epoll::epoll_free_pub(*instance_id),
         _ => {
             // Path-backed fds (Tmpfs, Ext2, Fat32, Ramdisk, Dir, Proc, Dev*)
             // and virtual ones (Stdin/Stdout) have no refcount to drop.
@@ -525,9 +545,12 @@ pub fn unix_stream_drain_ready_anc(handle: usize, max_count: usize) -> alloc::ve
     out
 }
 
-/// Look up the current `stream_pos_appended` on a peer socket — used by
-/// `sys_sendmsg` so the `InflightFd::deliver_at_stream_pos` rides with
-/// the **first** byte of the about-to-be-written payload.
+/// Look up the current `stream_pos_appended` on a peer socket.  Was
+/// originally used by the two-phase `sys_sendmsg` (offset query then
+/// write) before delivery became atomic in
+/// `unix_stream_write_with_anc`; kept as a public helper for
+/// diagnostics and any future caller that needs the peer's high-water
+/// mark without taking a write lock.
 pub fn peer_stream_pos_appended(handle: usize) -> Option<u64> {
     let peer = with_unix_socket(handle, |s| s.peer)?;
     let p = peer?;

@@ -294,7 +294,8 @@ static WINSIZE_BANG_ELF: &[u8] = generated_initrd_asset!("winsize-bang");
 
 // Phase 69d follow-up — `sendmsg-test` regression: SCM_RIGHTS over
 // AF_UNIX SOCK_STREAM.  Run from the post-login shell by `cargo xtask
-// regression` (and ad hoc).  Not a daemon: no `.conf`.
+// tui-app-smoke` ahead of the tmux session lifecycle (and ad hoc).
+// Not a daemon: no `.conf`.
 static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 
 // ---------------------------------------------------------------------------

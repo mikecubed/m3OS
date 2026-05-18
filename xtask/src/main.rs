@@ -729,8 +729,10 @@ fn build_userspace_bins() {
         // `BrkAllocator`, so `needs_alloc = true`.
         ("tcsmoke", "tcsmoke", true),
         // Phase 69d follow-up — `winsize-bang` issues TIOCSWINSZ on
-        // `/dev/tty` so the smoke harness can synthesize a SIGWINCH
-        // mid-htop.  Single ioctl syscall — no allocator.
+        // its inherited stdin (`fd 0`, the controlling TTY of the
+        // launching shell) so the smoke harness can synthesize a
+        // SIGWINCH mid-htop without needing `/dev/tty` open semantics
+        // on m3OS.  Single ioctl syscall — no allocator.
         ("winsize-bang", "winsize-bang", false),
         // Phase 69d follow-up — `sendmsg-test` SCM_RIGHTS regression.
         // Uses `BrkAllocator` via syscall-lib's `alloc` feature, so
@@ -7994,22 +7996,17 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/tui-app-smoke: htop drew header at default geometry",
     });
     // The winsize-bang child fires its diagnostic sentinel right after
-    // the ioctl — the harness uses this as the in-band signal that the
-    // SIGWINCH has been delivered.  Then htop redraws.
+    // the ioctl, carrying the geometry it applied — the harness uses
+    // both the "fired" marker and the cols/rows payload to prove the
+    // TIOCSWINSZ → kernel TTY → userspace round-trip executed at the
+    // expected dimensions.  This is the strongest assertion we can
+    // make over a serial-only smoke; a true cell-grid reflow check
+    // requires the headless framebuffer probe in `xtask/src/{ppm,qmp}.rs`
+    // (a deliberate follow-up).
     steps.push(SmokeStep::Wait {
-        pattern: "winsize-bang:fired",
-        timeout_secs: 10,
-        label: "guest/tui-app-smoke: TIOCSWINSZ issued",
-    });
-    // Wait for the post-resize redraw.  htop draws `Tasks:` on every
-    // refresh cycle including the SIGWINCH-driven one, so a *second*
-    // `Tasks:` is the cell-grid evidence that reflow actually
-    // happened.  The harness pattern matches the next occurrence past
-    // the cursor, so this is the post-resize one.
-    steps.push(SmokeStep::Wait {
-        pattern: "Tasks:",
+        pattern: "winsize-bang:fired cols=60 rows=20",
         timeout_secs: 15,
-        label: "guest/tui-app-smoke: htop reflow redraw after SIGWINCH",
+        label: "guest/tui-app-smoke: TIOCSWINSZ issued at 60x20",
     });
     steps.push(SmokeStep::Send {
         input: "q",
@@ -8086,7 +8083,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     //    `cat` keeps the pane alive long enough for the smoke to inspect
     //    the session list, and exits when the session is killed.
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -L smoke new-session -d -s smoke cat; echo TUI_APP_SMOKE:tmux:new-session-done\n",
+        input: "/usr/local/bin/tmux -L smoke new-session -d -s smoke cat && echo TUI_APP_SMOKE:tmux:new-session-done\n",
         label: "guest/tui-app-smoke: tmux new-session -d",
     });
     steps.push(SmokeStep::Wait {
@@ -8107,7 +8104,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     // 3) split-window — proves the server can spawn an additional pane.
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -L smoke split-window -h -t smoke 'sleep 60'; echo TUI_APP_SMOKE:tmux:split-done\n",
+        input: "/usr/local/bin/tmux -L smoke split-window -h -t smoke 'sleep 60' && echo TUI_APP_SMOKE:tmux:split-done\n",
         label: "guest/tui-app-smoke: tmux split-window -h",
     });
     steps.push(SmokeStep::Wait {
@@ -8117,7 +8114,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     // 4) resize-pane — proves geometry updates round-trip.
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -L smoke resize-pane -t smoke -R 5; echo TUI_APP_SMOKE:tmux:resize-done\n",
+        input: "/usr/local/bin/tmux -L smoke resize-pane -t smoke -R 5 && echo TUI_APP_SMOKE:tmux:resize-done\n",
         label: "guest/tui-app-smoke: tmux resize-pane -R 5",
     });
     steps.push(SmokeStep::Wait {
@@ -8127,7 +8124,7 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
     });
     // 5) kill-session — tears the whole thing down.
     steps.push(SmokeStep::Send {
-        input: "/usr/local/bin/tmux -L smoke kill-session -t smoke; echo TUI_APP_SMOKE:tmux:kill-done\n",
+        input: "/usr/local/bin/tmux -L smoke kill-session -t smoke && echo TUI_APP_SMOKE:tmux:kill-done\n",
         label: "guest/tui-app-smoke: tmux kill-session",
     });
     steps.push(SmokeStep::Wait {

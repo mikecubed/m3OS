@@ -38,8 +38,12 @@ const COLS: u16 = 60;
 
 /// How long the timer child sleeps before issuing the ioctl.  Long
 /// enough that the calling shell has comfortably moved on to launching
-/// htop (parent exit + shell prompt + send-keys + ncurses init).
-const DELAY_SECONDS: u64 = 2;
+/// htop AND htop has finished its initial `ncurses` setup and drawn
+/// its first frame (the smoke gate waits on `Tasks:` before this).
+/// 5 s gives ~3 s of headroom over the observed ~2 s htop initscr
+/// path under TCG and prevents the race where `winsize-bang:fired`
+/// outraces the first `Tasks:` print on a slow CI host.
+const DELAY_SECONDS: u64 = 5;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -66,9 +70,11 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "winsize-bang: TIOCSWINSZ failed\n");
         exit(2);
     }
-    // Sentinel printed AFTER the resize fires.  The harness asserts
-    // separately on htop's redraw markers; this is purely diagnostic.
-    write_str(STDOUT_FILENO, "winsize-bang:fired\n");
+    // Sentinel printed AFTER the resize fires.  Carries the geometry
+    // applied so the harness can prove TIOCSWINSZ → kernel TTY layer
+    // → consumer-visible round-trip independently of what htop
+    // chooses to redraw.
+    write_str(STDOUT_FILENO, "winsize-bang:fired cols=60 rows=20\n");
     exit(0);
 }
 

@@ -40,6 +40,28 @@ pub const MSG_TRUNC: i32 = 0x20;
 /// `MSG_CTRUNC` flag — control buffer was too small to hold all cmsgs.
 pub const MSG_CTRUNC: i32 = 0x08;
 
+/// `MSG_PEEK` flag — recvmsg returns data without consuming it.
+pub const MSG_PEEK: i32 = 0x02;
+
+/// `MSG_DONTWAIT` flag — operate in non-blocking mode for this call.
+pub const MSG_DONTWAIT: i32 = 0x40;
+
+/// `MSG_CMSG_CLOEXEC` flag — set `FD_CLOEXEC` on every fd installed
+/// by `SCM_RIGHTS` on the receiver side.  Without this flag the
+/// installed fds have cloexec cleared, matching Linux's `recvmsg(2)`
+/// contract regardless of what the sender's fd held.
+pub const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
+
+/// Bits the kernel knows how to honour on `sendmsg(2)`.  Today only
+/// `MSG_DONTWAIT` (recognised but treated as a hint — non-blocking is
+/// keyed off the fd's `O_NONBLOCK` instead).  Other bits cause the
+/// kernel to reject the call with `EOPNOTSUPP` so callers learn that
+/// requested semantics were not applied.
+pub const SENDMSG_SUPPORTED_FLAGS: i32 = MSG_DONTWAIT;
+
+/// Bits the kernel knows how to honour on `recvmsg(2)`.
+pub const RECVMSG_SUPPORTED_FLAGS: i32 = MSG_DONTWAIT | MSG_CMSG_CLOEXEC;
+
 // ===========================================================================
 // Alignment helpers (mirror the kernel CMSG_* macros)
 // ===========================================================================
@@ -234,24 +256,57 @@ impl<'a> CmsgView<'a> {
     }
 }
 
-/// Walk every cmsg in the control buffer and emit `(view, next_offset)` pairs
-/// via the visitor. Stops on the first truncated header.
-pub fn for_each_cmsg<'a, F>(control: &'a [u8], mut visitor: F)
+/// Reason a control buffer failed to parse end-to-end.  The kernel
+/// surface translates these to `-EINVAL` so a malformed `sendmsg`
+/// control buffer fails the syscall instead of silently dropping the
+/// truncated tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmsgWalkError {
+    /// A header lies on a cursor that has fewer than `CMSGHDR_SIZE`
+    /// bytes remaining — and the cursor is not exactly at the end of
+    /// the buffer (zero-length tail is fine).
+    TruncatedHeader,
+    /// `cmsghdr::cmsg_len` declares a payload that runs past the end
+    /// of the supplied buffer, or is shorter than the header itself.
+    InvalidLength,
+}
+
+/// Walk every cmsg in the control buffer and emit each view to the
+/// visitor.  Returns `Ok(())` only when the entire buffer parsed
+/// cleanly.  Stops on the first malformed header and reports `Err`.
+pub fn try_for_each_cmsg<'a, F>(control: &'a [u8], mut visitor: F) -> Result<(), CmsgWalkError>
 where
     F: FnMut(CmsgView<'a>),
 {
     let mut cursor = 0usize;
-    while cursor + CMSGHDR_SIZE <= control.len() {
+    while cursor < control.len() {
+        if cursor + CMSGHDR_SIZE > control.len() {
+            return Err(CmsgWalkError::TruncatedHeader);
+        }
         let remaining = &control[cursor..];
         let Some((view, next)) = CmsgView::decode(remaining) else {
-            break;
+            return Err(CmsgWalkError::InvalidLength);
         };
         visitor(view);
         if next == 0 {
+            // `next == 0` only happens on `cmsg_align(0)` which cannot
+            // occur because `cmsg_len >= CMSGHDR_SIZE = 16`; defensive
+            // break to keep the loop bounded.
             break;
         }
         cursor += next;
     }
+    Ok(())
+}
+
+/// Walk every cmsg and silently ignore parse failures.  Kept for
+/// existing call sites that intentionally tolerate truncation; new code
+/// should prefer [`try_for_each_cmsg`].
+pub fn for_each_cmsg<'a, F>(control: &'a [u8], visitor: F)
+where
+    F: FnMut(CmsgView<'a>),
+{
+    let _ = try_for_each_cmsg(control, visitor);
 }
 
 // ===========================================================================

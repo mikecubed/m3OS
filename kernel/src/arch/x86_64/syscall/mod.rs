@@ -13334,17 +13334,27 @@ const PR_GET_NAME: u64 = 16;
 pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64) -> u64 {
     match option {
         PR_SET_NAME => {
-            // Caller passes a pointer to a C string.  We copy up to 15
-            // visible bytes, ignoring the rest; the trailing NUL is
-            // implicit because `Process::set_comm` zeroes the slot first.
+            // Caller passes a pointer to a NUL-terminated C string.  We
+            // copy byte-by-byte (stopping at NUL or after 15 visible
+            // bytes) so a valid short string at the very end of a mapped
+            // region succeeds — copying a fixed 16 bytes up front would
+            // EFAULT despite the terminator being inside the mapping.
             let mut buf = [0u8; 16];
-            if UserSliceRo::new(arg2, buf.len())
-                .and_then(|s| s.copy_to_kernel(&mut buf))
-                .is_err()
-            {
-                return NEG_EFAULT;
+            let mut visible_end = 0usize;
+            for (i, slot) in buf.iter_mut().enumerate().take(15) {
+                let mut byte = [0u8; 1];
+                let Ok(slice) = UserSliceRo::new(arg2 + i as u64, 1) else {
+                    return NEG_EFAULT;
+                };
+                if slice.copy_to_kernel(&mut byte).is_err() {
+                    return NEG_EFAULT;
+                }
+                if byte[0] == 0 {
+                    break;
+                }
+                *slot = byte[0];
+                visible_end = i + 1;
             }
-            let visible_end = buf.iter().position(|&b| b == 0).unwrap_or(15).min(15);
             let pid = crate::process::current_pid();
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = table.find_mut(pid) {
@@ -13420,16 +13430,21 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
     match mode {
         LOCK_SH => {
             if let Some(h) = unix_handle {
-                match unix_socket_acquire_shared(h, pid, fd_u32) {
-                    FlockOutcome::Acquired => {}
-                    FlockOutcome::WouldBlock => {
-                        if nonblock {
-                            return NEG_EWOULDBLOCK;
+                loop {
+                    match unix_socket_acquire_shared(h, pid, fd_u32) {
+                        FlockOutcome::Acquired => break,
+                        FlockOutcome::WouldBlock => {
+                            if nonblock {
+                                return NEG_EWOULDBLOCK;
+                            }
+                            // Blocking flock: yield and retry until the
+                            // conflicting holder releases.  Signal-checked
+                            // every iteration so EINTR semantics survive.
+                            if has_pending_signal() {
+                                return NEG_EINTR;
+                            }
+                            crate::task::yield_now();
                         }
-                        // Synchronous block-until-grant is not implemented;
-                        // return EWOULDBLOCK to match LOCK_NB semantics so
-                        // callers degrade gracefully rather than hang.
-                        return NEG_EWOULDBLOCK;
                     }
                 }
             }
@@ -13438,13 +13453,18 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
         }
         LOCK_EX => {
             if let Some(h) = unix_handle {
-                match unix_socket_acquire_exclusive(h, pid, fd_u32) {
-                    FlockOutcome::Acquired => {}
-                    FlockOutcome::WouldBlock => {
-                        if nonblock {
-                            return NEG_EWOULDBLOCK;
+                loop {
+                    match unix_socket_acquire_exclusive(h, pid, fd_u32) {
+                        FlockOutcome::Acquired => break,
+                        FlockOutcome::WouldBlock => {
+                            if nonblock {
+                                return NEG_EWOULDBLOCK;
+                            }
+                            if has_pending_signal() {
+                                return NEG_EINTR;
+                            }
+                            crate::task::yield_now();
                         }
-                        return NEG_EWOULDBLOCK;
                     }
                 }
             }
@@ -16249,6 +16269,24 @@ fn acquire_inflight_anc_backend(backend: &FdBackend) {
     }
 }
 
+/// Drop a refcount previously acquired by [`acquire_inflight_anc_backend`].
+/// Called from sendmsg/recvmsg rollback paths and from the receiver's
+/// SCM_RIGHTS install path when an fd slot couldn't be allocated.  Kept
+/// next to the acquire helper so additions to the backend list stay
+/// symmetric.
+fn release_inflight_anc_backend(backend: &FdBackend) {
+    match backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+        FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+        FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
+        FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+        FdBackend::Epoll { instance_id } => crate::epoll::epoll_free_pub(*instance_id),
+        _ => {}
+    }
+}
+
 /// Maximum bytes per scatter/gather copy.  Mirrors the limit used by
 /// `sys_sendto` / `sys_recvfrom_socket`.
 const SENDMSG_MAX_BYTES: usize = 4096;
@@ -16258,9 +16296,17 @@ const SENDMSG_MAX_CONTROL: usize = 1024;
 
 pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     use kernel_core::net::msghdr::{
-        CmsgView, IOVEC_SIZE, IoVec, MSGHDR_SIZE, MsgHdr, SCM_MAX_FD, for_each_cmsg,
+        CmsgView, CmsgWalkError, IOVEC_SIZE, IoVec, MSG_DONTWAIT, MSGHDR_SIZE, MsgHdr, SCM_MAX_FD,
+        SENDMSG_SUPPORTED_FLAGS, try_for_each_cmsg,
     };
-    let _ = flags;
+
+    // Reject any flag bit the kernel doesn't honour so callers don't
+    // silently get different semantics than they asked for.
+    let flags_i32 = flags as i32;
+    if flags_i32 & !SENDMSG_SUPPORTED_FLAGS != 0 {
+        return NEG_EOPNOTSUPP;
+    }
+    let force_nonblock = flags_i32 & MSG_DONTWAIT != 0;
 
     // 1. Copy msghdr.
     let mut header_bytes = [0u8; MSGHDR_SIZE];
@@ -16290,10 +16336,25 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
+    if !entry.writable {
+        return NEG_EBADF;
+    }
+    let nonblock = entry.nonblock || force_nonblock;
     let unix_handle = match &entry.backend {
         FdBackend::UnixSocket { handle } => *handle,
         _ => return NEG_EOPNOTSUPP,
     };
+    // Reject datagram Unix sockets — they have message-boundary
+    // semantics that the stream-buffer write path does not preserve.
+    // Supporting them is a future patch; for now refuse explicitly so
+    // callers don't get silently corrupted into the stream path.
+    let socket_type = match crate::net::unix::with_unix_socket(unix_handle, |s| s.socket_type) {
+        Some(t) => t,
+        None => return NEG_EBADF,
+    };
+    if !matches!(socket_type, crate::net::unix::UnixSocketType::Stream) {
+        return NEG_EOPNOTSUPP;
+    }
 
     // 3. Decode iov array and concatenate.
     let iov_count = header.msg_iovlen as usize;
@@ -16347,7 +16408,7 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         }
 
         let mut error: u64 = 0;
-        for_each_cmsg(&control, |view: CmsgView<'_>| {
+        let walk = try_for_each_cmsg(&control, |view: CmsgView<'_>| {
             if error != 0 {
                 return;
             }
@@ -16377,23 +16438,28 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 inflight.push(crate::net::unix::InflightFd {
                     backend: sender_entry.backend.clone(),
                     cloexec: sender_entry.cloexec,
+                    offset: sender_entry.offset,
+                    nonblock: sender_entry.nonblock,
+                    readable: sender_entry.readable,
+                    writable: sender_entry.writable,
                     // Updated below once we know the post-write peer offset.
                     deliver_at_stream_pos: 0,
                 });
             }
         });
+        // Malformed control buffer (header truncated or cmsg_len lies)
+        // is a hard EINVAL — silently ignoring it would drop fds the
+        // caller intended to pass.
+        if let Err(walk_err) = walk
+            && error == 0
+        {
+            error = match walk_err {
+                CmsgWalkError::TruncatedHeader | CmsgWalkError::InvalidLength => NEG_EINVAL,
+            };
+        }
         if error != 0 {
-            // Roll back any refcounts we already bumped.
             for inf in &inflight {
-                match &inf.backend {
-                    FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
-                    FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-                    FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
-                    FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
-                    FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
-                    FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
-                    _ => {}
-                }
+                release_inflight_anc_backend(&inf.backend);
             }
             return error;
         }
@@ -16401,30 +16467,38 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
 
     // 5. Atomic delivery: stamp inflight cmsgs with the peer's current
     //    stream offset and append them to the anc queue under the same
-    //    lock that extends `recv_buf`.  This is the Linux invariant —
-    //    data and cmsg arrive together; no fast-reader race window.
+    //    lock that extends `recv_buf`.  For blocking stream sockets the
+    //    peer buffer can be full; loop with yield_now()+signal-check
+    //    instead of returning EAGAIN on the caller's behalf.
     let mut inflight_mut = inflight;
-    let written = match crate::net::unix::unix_stream_write_with_anc(
-        unix_handle,
-        &payload,
-        &mut inflight_mut,
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            // Roll back refcounts on the inflight queue — any element
-            // still in the vec was not delivered.
-            for inf in &inflight_mut {
-                match &inf.backend {
-                    FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
-                    FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-                    FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
-                    FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
-                    FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
-                    FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
-                    _ => {}
+    let written = loop {
+        match crate::net::unix::unix_stream_write_with_anc(unix_handle, &payload, &mut inflight_mut)
+        {
+            Ok(n) => break n,
+            // -EAGAIN: peer buffer full.  Honour the same blocking
+            // contract as `write(2)` on the same backend — only return
+            // EAGAIN when the fd or call is non-blocking.
+            Err(-11) => {
+                if nonblock {
+                    for inf in &inflight_mut {
+                        release_inflight_anc_backend(&inf.backend);
+                    }
+                    return NEG_EAGAIN;
                 }
+                if has_pending_signal() {
+                    for inf in &inflight_mut {
+                        release_inflight_anc_backend(&inf.backend);
+                    }
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
             }
-            return e as u64;
+            Err(e) => {
+                for inf in &inflight_mut {
+                    release_inflight_anc_backend(&inf.backend);
+                }
+                return e as u64;
+            }
         }
     };
 
@@ -16433,10 +16507,18 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
 
 pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     use kernel_core::net::msghdr::{
-        IOVEC_SIZE, IoVec, MSG_CTRUNC, MSGHDR_SIZE, MsgHdr, SCM_MAX_FD, cmsg_space,
-        encode_scm_rights,
+        IOVEC_SIZE, IoVec, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSGHDR_SIZE, MsgHdr,
+        RECVMSG_SUPPORTED_FLAGS, SCM_MAX_FD, cmsg_space, encode_scm_rights,
     };
-    let _ = flags;
+
+    // Reject unrecognized flag bits.  MSG_PEEK would require splitting
+    // the read path so as not to consume bytes; it is a future patch.
+    let flags_i32 = flags as i32;
+    if flags_i32 & !RECVMSG_SUPPORTED_FLAGS != 0 {
+        return NEG_EOPNOTSUPP;
+    }
+    let force_nonblock = flags_i32 & MSG_DONTWAIT != 0;
+    let cmsg_cloexec = flags_i32 & MSG_CMSG_CLOEXEC != 0;
 
     // 1. Copy msghdr.
     let mut header_bytes = [0u8; MSGHDR_SIZE];
@@ -16463,11 +16545,21 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
-    let nonblock = entry.nonblock;
+    if !entry.readable {
+        return NEG_EBADF;
+    }
+    let nonblock = entry.nonblock || force_nonblock;
     let unix_handle = match &entry.backend {
         FdBackend::UnixSocket { handle } => *handle,
         _ => return NEG_EOPNOTSUPP,
     };
+    let socket_type = match crate::net::unix::with_unix_socket(unix_handle, |s| s.socket_type) {
+        Some(t) => t,
+        None => return NEG_EBADF,
+    };
+    if !matches!(socket_type, crate::net::unix::UnixSocketType::Stream) {
+        return NEG_EOPNOTSUPP;
+    }
 
     // 3. Decode iov array.
     let iov_count = header.msg_iovlen as usize;
@@ -16485,9 +16577,30 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     };
     let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
 
-    // 4. Read data — block until at least one byte arrives, EOF, or signal.
+    // 4. Read data — wait until at least one byte arrives, an
+    //    ancillary-only message arrives, EOF, or signal.  Register on
+    //    the socket wait queue every iteration so wake_all's consume-
+    //    on-wake semantics cannot lose a wake (same fix that closed
+    //    the tmux-control-client hang in `sys_poll`).
     let mut tmp = alloc::vec![0u8; cap.max(1)];
     let n = loop {
+        // Zero-payload SCM_RIGHTS message: the sender wrote 0 bytes
+        // with a non-empty cmsg, so `unix_stream_read` will keep
+        // returning EAGAIN forever while the inflight fd sits on the
+        // anc queue waiting for a byte cursor that never advances.
+        // Detect this case before the read attempt and break out so
+        // step 6 below can drain the queue.
+        let anc_ready_no_bytes = crate::net::unix::with_unix_socket(unix_handle, |s| {
+            s.recv_buf.is_empty()
+                && s.anc_queue
+                    .front()
+                    .map(|inf| inf.deliver_at_stream_pos <= s.stream_pos_consumed)
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+        if anc_ready_no_bytes {
+            break 0usize;
+        }
         match crate::net::unix::unix_stream_read(unix_handle, &mut tmp[..cap]) {
             Ok(n) => break n,
             Err(-11) => {
@@ -16497,7 +16610,7 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::task::yield_now();
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle].sleep();
                 continue;
             }
             Err(e) => return e as u64,
@@ -16545,35 +16658,30 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
 
         // Install up to `keep_n` of the ready fds into the receiver's
         // fd table; release refcounts on the truncated tail.
+        //
+        // Phase 69d follow-up (PR #177 review): preserve the sender's
+        // FdEntry metadata (offset / readable / writable / nonblock)
+        // so a fd-passing operation behaves like `dup(2)` of the
+        // sender's view — a write-only fd stays write-only, a
+        // nonzero-offset regular file lands at the same offset.
+        // FD_CLOEXEC is decided by the receiver's MSG_CMSG_CLOEXEC
+        // flag (cleared by default) regardless of the sender's bit,
+        // matching Linux's `recvmsg(2)` semantics.
         for inf in ready.iter().take(keep_n) {
             let new_entry = FdEntry {
                 backend: inf.backend.clone(),
-                offset: 0,
-                readable: true,
-                writable: true,
-                cloexec: inf.cloexec,
-                nonblock: false,
+                offset: inf.offset,
+                readable: inf.readable,
+                writable: inf.writable,
+                cloexec: cmsg_cloexec,
+                nonblock: inf.nonblock,
             };
-            // alloc_fd does the lowest-free-fd search and installs.
             match alloc_fd(0, new_entry) {
                 Some(fd) => new_fds.push(fd as i32),
                 None => {
-                    // Out of fds — release this inflight and any
-                    // remaining we hadn't installed yet, plus the
-                    // unused tail past keep_n.
-                    match &inf.backend {
-                        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
-                        FdBackend::PipeWrite { pipe_id } => {
-                            crate::pipe::pipe_close_writer(*pipe_id)
-                        }
-                        FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
-                        FdBackend::UnixSocket { handle } => {
-                            crate::net::unix::free_unix_socket(*handle)
-                        }
-                        FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
-                        FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
-                        _ => {}
-                    }
+                    // Out of fds — release this inflight; keep_n
+                    // effectively shrinks for the trailing release loop.
+                    release_inflight_anc_backend(&inf.backend);
                     ctrunc = true;
                 }
             }
@@ -16581,30 +16689,31 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
 
         // Drop refcounts on the truncated tail.
         for inf in ready.iter().skip(keep_n) {
-            match &inf.backend {
-                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
-                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-                FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
-                FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
-                FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
-                FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
-                _ => {}
-            }
+            release_inflight_anc_backend(&inf.backend);
         }
 
-        // Encode the outgoing cmsg into the user's control buffer.
+        // Encode the outgoing cmsg into a kernel buffer first.  Only
+        // commit it to the user control buffer once we have proof we
+        // can write back the updated msghdr too — otherwise an EFAULT
+        // on copy-back leaves the receiver with installed fds it
+        // never learned about.
         if !new_fds.is_empty() {
             let space = cmsg_space(new_fds.len() * 4);
             let mut cmsg_buf = alloc::vec![0u8; space];
-            let n = encode_scm_rights(&mut cmsg_buf, &new_fds).unwrap_or(0);
-            if n > 0 {
-                if UserSliceWo::new(header.msg_control, n)
-                    .and_then(|s| s.copy_from_kernel(&cmsg_buf[..n]))
-                    .is_err()
-                {
+            let n_enc = encode_scm_rights(&mut cmsg_buf, &new_fds).unwrap_or(0);
+            if n_enc > 0 {
+                let user_control_ok = UserSliceWo::new(header.msg_control, n_enc)
+                    .and_then(|s| s.copy_from_kernel(&cmsg_buf[..n_enc]))
+                    .is_ok();
+                if !user_control_ok {
+                    // Roll back: close every installed fd and surface
+                    // EFAULT, leaving no orphan fds in the receiver.
+                    for fd in &new_fds {
+                        let _ = sys_linux_close(*fd as u64);
+                    }
                     return NEG_EFAULT;
                 }
-                control_bytes_written = n;
+                control_bytes_written = n_enc;
             }
         }
     }
@@ -16622,6 +16731,11 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
         .and_then(|s| s.copy_from_kernel(&encoded))
         .is_err()
     {
+        // Same rollback as the cmsg copy-back failure path so the
+        // receiver doesn't end up with installed fds it can't see.
+        for fd in &new_fds {
+            let _ = sys_linux_close(*fd as u64);
+        }
         return NEG_EFAULT;
     }
 

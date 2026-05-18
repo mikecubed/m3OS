@@ -167,8 +167,23 @@ pub extern "C" fn _start() -> ! {
     if new_fd < 3 {
         fail(b"new-fd-range");
     }
+    // The recovered fd must be a fresh allocation — not the same number
+    // as the sender's original `pipe_r`.  An implementation that
+    // mistakenly echoed the sender's fd number instead of installing a
+    // duplicate would pass every read-side check below by accident.
+    if new_fd == pipe_r {
+        fail(b"new-fd-aliases-sender");
+    }
 
-    // 5. Write to original W; read should arrive on the recovered fd.
+    // 5. Close the sender's original `pipe_r` BEFORE reading through
+    //    the recovered fd.  This is the SCM_RIGHTS refcounting
+    //    contract: an in-flight fd keeps the underlying kernel object
+    //    alive even after the sender drops its reference.  If
+    //    `unix_socket_acquire_inflight` failed to bump the pipe's
+    //    reader refcount, this `close` would unblock writers with
+    //    EPIPE and the subsequent read on `new_fd` would EOF instead
+    //    of returning `probe`.
+    let _ = close(pipe_r);
     let probe = b"HELLO";
     let w = write(pipe_w, probe);
     if w != probe.len() as isize {
@@ -187,7 +202,6 @@ pub extern "C" fn _start() -> ! {
     let _ = close(new_fd);
     let _ = close(s0);
     let _ = close(s1);
-    let _ = close(pipe_r);
     let _ = close(pipe_w);
 
     let _ = write(STDOUT_FILENO, b"SENDMSG_SMOKE:scm-rights:ok\n");
