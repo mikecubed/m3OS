@@ -2500,10 +2500,17 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // per-BAR cleanup we might need later.
     crate::syscall::device_host::release_claims_for_pid(pid);
 
-    // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
-    crate::process::close_all_fds_for(pid);
-
-    // Phase 69d follow-up: drop every flock entry this PID still holds.
+    // Phase 69d follow-up: drop every flock entry this PID still holds
+    // BEFORE closing fds.  close_all_fds_for() calls
+    // `free_unix_socket` → `wake_unix_socket`, which wakes any flock
+    // waiters; if we cleared the lock state AFTER that wake, a waiter
+    // would wake, observe the dying holder still present in
+    // UNIX_SOCKET_LOCKS, sleep again, and miss the post-clear release
+    // because `release_unix_socket_locks_for_pid` itself emits no
+    // wakeups (PR #177 review fix).  By clearing the lock state first,
+    // close_all_fds_for's wake fires against an already-released lock
+    // and waiters can acquire immediately on resumption.
+    //
     // close_all_fds_for() releases the underlying handles but does NOT
     // call the per-fd flock-release path that `sys_linux_close` runs;
     // process-exit needs an explicit sweep of both the per-fd map AND
@@ -2514,6 +2521,9 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // exclusive holder forever (PR #177 review fix).
     crate::flock::release_all_for_pid(pid);
     crate::flock::release_unix_socket_locks_for_pid(pid);
+
+    // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+    crate::process::close_all_fds_for(pid);
 
     // Phase 47 Track C: if this process owned the raw framebuffer, restore
     // console output so the shell is visible again.
@@ -13439,8 +13449,9 @@ pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64) -> u64 {
 
 pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
     use crate::flock::{
-        FlockMode, FlockOutcome, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, release_per_fd, set_per_fd,
-        unix_socket_acquire_exclusive, unix_socket_acquire_shared, unix_socket_release,
+        FlockMode, FlockOutcome, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, release_per_fd_for_pids,
+        set_per_fd, unix_socket_acquire_exclusive, unix_socket_acquire_shared,
+        unix_socket_release_for_pids,
     };
     const NEG_EWOULDBLOCK: u64 = (-11_i64) as u64;
 
@@ -13466,64 +13477,97 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
         _ => None,
     };
 
+    // Phase 69d follow-up (PR #177 review fix): the blocking flock
+    // path uses register-before-recheck — register on the wait queue
+    // first, retry the acquire under registration, only then block.
+    // A release that fires between the initial WouldBlock and
+    // `register` is caught by the post-register retry; a release that
+    // fires after register but before block is caught by `woken`
+    // already being `true` when `block_current_until` checks it.  The
+    // shape mirrors `unix_stream_read` / `pipe_read`.
+    fn flock_wait_blocking(
+        h: usize,
+        nonblock: bool,
+        mut try_acquire: impl FnMut() -> FlockOutcome,
+    ) -> Result<(), u64> {
+        loop {
+            if matches!(try_acquire(), FlockOutcome::Acquired) {
+                return Ok(());
+            }
+            if nonblock {
+                return Err(NEG_EWOULDBLOCK);
+            }
+            if has_pending_signal() {
+                return Err(NEG_EINTR);
+            }
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return Err(NEG_EINTR),
+            };
+            let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[h];
+            wq.register(task_id, &woken);
+            if matches!(try_acquire(), FlockOutcome::Acquired) {
+                wq.deregister(task_id);
+                return Ok(());
+            }
+            let _ = crate::task::scheduler::block_current_until(
+                crate::task::TaskState::BlockedOnRecv,
+                &woken,
+                None,
+            );
+            wq.deregister(task_id);
+            // Loop back: a fresh signal check + acquire retry runs at top.
+        }
+    }
+
     match mode {
         LOCK_SH => {
-            if let Some(h) = unix_handle {
-                loop {
-                    match unix_socket_acquire_shared(h, pid, fd_u32) {
-                        FlockOutcome::Acquired => break,
-                        FlockOutcome::WouldBlock => {
-                            if nonblock {
-                                return NEG_EWOULDBLOCK;
-                            }
-                            // Blocking flock on a Unix socket: park on
-                            // the socket's wait queue.  The release
-                            // path (`unix_socket_release` from close /
-                            // explicit LOCK_UN / process exit) calls
-                            // `wake_unix_socket(h)` so contenders wake
-                            // up immediately instead of cycling
-                            // through `yield_now()`.  Signal-checked
-                            // every iteration so EINTR semantics survive.
-                            if has_pending_signal() {
-                                return NEG_EINTR;
-                            }
-                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[h].sleep();
-                        }
-                    }
-                }
+            if let Some(h) = unix_handle
+                && let Err(e) =
+                    flock_wait_blocking(h, nonblock, || unix_socket_acquire_shared(h, pid, fd_u32))
+            {
+                return e;
             }
             set_per_fd(pid, fd_u32, Some(FlockMode::Shared));
             0
         }
         LOCK_EX => {
-            if let Some(h) = unix_handle {
-                loop {
-                    match unix_socket_acquire_exclusive(h, pid, fd_u32) {
-                        FlockOutcome::Acquired => break,
-                        FlockOutcome::WouldBlock => {
-                            if nonblock {
-                                return NEG_EWOULDBLOCK;
-                            }
-                            if has_pending_signal() {
-                                return NEG_EINTR;
-                            }
-                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[h].sleep();
-                        }
-                    }
-                }
+            if let Some(h) = unix_handle
+                && let Err(e) = flock_wait_blocking(h, nonblock, || {
+                    unix_socket_acquire_exclusive(h, pid, fd_u32)
+                })
+            {
+                return e;
             }
             set_per_fd(pid, fd_u32, Some(FlockMode::Exclusive));
             0
         }
         LOCK_UN => {
+            // Phase 69d follow-up (PR #177 review fix): in a
+            // CLONE_FILES thread group the fd table is shared, so a
+            // sibling can hold the actual `(holder_pid, fd)` lock
+            // entry while another sibling issues the LOCK_UN.  Mirror
+            // the close-path's thread-group sweep so an explicit
+            // unlock from any sibling clears the lock for every
+            // sibling that could have taken it on this fd.
+            let release_pids: alloc::vec::Vec<u32> = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                match table.find(pid).and_then(|p| p.thread_group.clone()) {
+                    Some(tg) => tg.members.lock().clone(),
+                    None => alloc::vec![pid],
+                }
+            };
             if let Some(h) = unix_handle {
-                unix_socket_release(h, pid, fd_u32);
+                unix_socket_release_for_pids(h, &release_pids, fd_u32);
                 // Wake any contenders parked on this handle so they can
                 // re-attempt their acquire now that we've released.
                 crate::net::unix::wake_unix_socket(h);
             }
-            // Either remove or no-op — both are safe.
-            release_per_fd(pid, fd_u32);
+            // Either remove or no-op — both are safe.  Sweep every
+            // member's `(pid, fd)` per-fd entry so the side-table can't
+            // surface a sibling's stale lock after this call returns.
+            release_per_fd_for_pids(&release_pids, fd_u32);
             0
         }
         _ => NEG_EINVAL,
@@ -16573,7 +16617,31 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                     }
                     return NEG_EINTR;
                 }
-                crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle].sleep();
+                // Phase 69d follow-up (PR #177 review fix):
+                // register-before-recheck closes the lost-wake window.
+                // If the peer drains between the failed write attempt
+                // and `block_current_until`, the wake_unix_socket call
+                // sets `woken=true` via the entry we just pushed, so
+                // the block returns immediately on the recheck-loop's
+                // next iteration.
+                let task_id = match crate::task::scheduler::current_task_id() {
+                    Some(id) => id,
+                    None => {
+                        for inf in &inflight_mut {
+                            release_inflight_anc_backend(&inf.backend);
+                        }
+                        return NEG_EINTR;
+                    }
+                };
+                let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+                let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle];
+                wq.register(task_id, &woken);
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                wq.deregister(task_id);
             }
             Err(e) => {
                 for inf in &inflight_mut {
@@ -16659,6 +16727,36 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     };
     let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
 
+    // Phase 69d follow-up (PR #177 review fix): pre-validate the
+    // writable range of every output iov BEFORE consuming bytes from
+    // the socket.  Without this, the first invalid destination is
+    // discovered AFTER `unix_stream_read` has already advanced
+    // `stream_pos_consumed`, so the drained bytes (and any ancillary
+    // fd whose `deliver_at_stream_pos` the read crossed) would be
+    // lost — the caller sees EFAULT while the data is gone.
+    //
+    // Also pre-validate the msg_control and msg_name (if non-NULL)
+    // user buffers because the post-read copy-back to those addresses
+    // is what step 7's rollback logic hangs on; the rollback closes
+    // installed fds but cannot un-drain the socket.
+    for iov in &iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        if UserSliceWo::new(iov.iov_base, iov.iov_len as usize).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+    if header.msg_controllen > 0
+        && header.msg_control != 0
+        && UserSliceWo::new(header.msg_control, header.msg_controllen as usize).is_err()
+    {
+        return NEG_EFAULT;
+    }
+    if UserSliceWo::new(msghdr_ptr, MSGHDR_SIZE).is_err() {
+        return NEG_EFAULT;
+    }
+
     // 4. Read data — wait until at least one byte arrives, an
     //    ancillary-only message arrives, EOF, or signal.  Register on
     //    the socket wait queue every iteration so wake_all's consume-
@@ -16692,7 +16790,27 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle].sleep();
+                // Phase 69d follow-up (PR #177 review fix):
+                // register-before-recheck closes the lost-wake window.
+                // If bytes or an ancillary fd arrive between the
+                // failed read attempt and `block_current_until`, the
+                // wake_unix_socket call sets `woken=true` via the
+                // entry we just pushed, so the block returns
+                // immediately and the next loop iteration sees the
+                // ready state.
+                let task_id = match crate::task::scheduler::current_task_id() {
+                    Some(id) => id,
+                    None => return NEG_EINTR,
+                };
+                let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+                let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle];
+                wq.register(task_id, &woken);
+                let _ = crate::task::scheduler::block_current_until(
+                    crate::task::TaskState::BlockedOnRecv,
+                    &woken,
+                    None,
+                );
+                wq.deregister(task_id);
                 continue;
             }
             Err(e) => return e as u64,
@@ -17231,12 +17349,24 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     };
 
     let result = loop {
+        // Phase 69d follow-up (PR #177 review fix): deregister any
+        // stale entries left on queues that did NOT wake us before
+        // re-registering.  `WaitQueue::wake_all` drains only the
+        // queue it fires from; queues we registered on in a previous
+        // iteration but that didn't wake still carry our entry, and
+        // re-registering would accumulate duplicate waiters on those
+        // queues until the syscall finally exits.  The post-register
+        // readiness scan still catches a release that fires in the
+        // deregister-then-register window.
+        deregister_all(&entries);
+
         // Clear `woken` BEFORE registering so any wake that fires
         // after register sets it to true.
         woken.store(false, core::sync::atomic::Ordering::Release);
 
         // Re-register on every iteration: `wake_all` consumed any
-        // previous registration.
+        // previous registration on queues that woke us; the explicit
+        // `deregister_all` above cleared the rest.
         registered_any = false;
         if timeout_i != 0 {
             for i in 0..nfds {

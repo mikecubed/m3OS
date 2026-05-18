@@ -2157,8 +2157,14 @@ pub const LOCK_NB: i32 = 4;
 pub const LOCK_UN: i32 = 8;
 
 /// `prctl(option, arg2, arg3, arg4, arg5)` — only `PR_SET_NAME` and
-/// `PR_GET_NAME` are implemented by the kernel today; everything else
-/// returns 0 silently.
+/// `PR_GET_NAME` are implemented by the kernel today.  A small allow-list
+/// of cosmetic options (`PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`,
+/// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`, `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`,
+/// `PR_SET_TIMING`/`PR_GET_TIMING`) returns `0` silently because nothing
+/// on m3OS relies on them.  Every other `option` — including
+/// security-sensitive ones such as `PR_SET_NO_NEW_PRIVS` and
+/// `PR_SET_SECCOMP` — returns `-EINVAL` so callers cannot rely on
+/// success semantics the syscall does not provide.
 pub fn prctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> isize {
     unsafe { syscall5(SYS_PRCTL, option, arg2, arg3, arg4, arg5) as isize }
 }

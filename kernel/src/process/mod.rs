@@ -271,13 +271,30 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
     let mut vfs_last_alias = alloc::vec::Vec::new();
+    // Phase 69d follow-up (PR #177 review fix): the `sys_linux_close`
+    // path releases per-fd and UnixSocket flock state across every
+    // CLONE_FILES sibling before tearing the slot down.  This exec-time
+    // cloexec path bypassed that release, leaving any flock taken on a
+    // close-on-exec fd lingering in `PER_FD` / `UNIX_SOCKET_LOCKS`
+    // (and blocking future contenders) until process exit.  Collect
+    // cloexec-closed fd indices and any UnixSocket backend handles
+    // so the post-lock cleanup mirrors the per-close path.
+    let mut cleared_fd_indices: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let mut cleared_unix_handles: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
+    let release_pids: alloc::vec::Vec<u32>;
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
             None => return,
         };
-        proc.fd_for_each_mut(|_i, slot| {
+        // Snapshot thread-group members BEFORE clearing slots so the
+        // flock release below covers every CLONE_FILES sibling.
+        release_pids = match proc.thread_group.clone() {
+            Some(tg) => tg.members.lock().clone(),
+            None => alloc::vec![pid],
+        };
+        proc.fd_for_each_mut(|i, slot| {
             if let Some(entry) = slot
                 && entry.cloexec
             {
@@ -287,7 +304,10 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
-                    FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
+                    FdBackend::UnixSocket { handle } => {
+                        unix_sockets.push(*handle);
+                        cleared_unix_handles.push((*handle, i as u32));
+                    }
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
@@ -295,6 +315,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     }
                     _ => {}
                 }
+                cleared_fd_indices.push(i as u32);
                 *slot = None;
             }
         });
@@ -333,7 +354,23 @@ pub fn close_cloexec_fds(pid: Pid) {
     for h in sockets {
         crate::net::release_socket_pub(h);
     }
+    // Phase 69d follow-up (PR #177 review fix): release any flock
+    // state for the cloexec-closed fds BEFORE waking peers on the
+    // affected UnixSocket handles, so a flock waiter that resumes
+    // after the wake observes the released lock and can acquire
+    // immediately.  The per-fd map is cleared across every
+    // CLONE_FILES sibling to mirror the explicit-close path.
+    for &(h, fd) in &cleared_unix_handles {
+        crate::flock::unix_socket_release_for_pids(h, &release_pids, fd);
+    }
+    for &fd in &cleared_fd_indices {
+        crate::flock::release_per_fd_for_pids(&release_pids, fd);
+    }
     for h in unix_sockets {
+        // `free_unix_socket` decrements the per-handle refcount, may
+        // tear the socket down, and unconditionally calls
+        // `wake_unix_socket` so contenders parked on flock or peer
+        // I/O wake up against the freshly released lock state.
         crate::net::unix::free_unix_socket(h);
     }
     for id in epolls {
