@@ -317,6 +317,31 @@ impl DisplayClient {
     /// was missing.
     fn attach_damage_commit_back(&mut self) -> bool {
         let mapping = &self.surfaces[self.back_idx];
+        // 2026-05-18 less-render flake probe — count non-zero bytes in
+        // term's view of the back buffer right before we hand it to
+        // display_server. If this matches `DC:snap-nonzero` from
+        // display_server's read of the same physical frames, the
+        // double-buffer wiring is correct end-to-end. A producer
+        // nonzero count of N with a consumer count of 0 says "term
+        // wrote to a buffer display_server isn't reading from" —
+        // i.e. an SHM mapping race or a buffer-id confusion.
+        let nz = {
+            // SAFETY: we have exclusive ownership of the back-buffer
+            // mapping at this point; no other thread or process
+            // mutates surfaces[back_idx] until the upcoming Attach
+            // hands it over. The slice is consumed inside this block.
+            let slice = unsafe {
+                core::slice::from_raw_parts(mapping.surface_va as *const u8, mapping.surface_len)
+            };
+            slice.iter().filter(|b| **b != 0).count()
+        };
+        syscall_lib::write_str(STDOUT_FILENO, "TC:back-nonzero nz=");
+        write_decimal_u64_local(nz as u64);
+        syscall_lib::write_str(STDOUT_FILENO, "/");
+        write_decimal_u64_local(mapping.surface_len as u64);
+        syscall_lib::write_str(STDOUT_FILENO, " shm_id=");
+        write_decimal_u64_local(mapping.shm_id as u64);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
         let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
         let attach = ClientMessage::AttachSharedBuffer {
             surface_id: SURFACE_ID,
@@ -365,6 +390,16 @@ impl DisplayClient {
         let len = self.surfaces[self.back_idx].surface_len;
         let src = self.surfaces[front_idx].surface_va as *const u8;
         let dst = self.surfaces[self.back_idx].surface_va as *mut u8;
+        // 2026-05-18 less-render flake probe — sample non-zero bytes
+        // in source and destination before and after the memcpy.
+        // Compares term's view of front vs back so we can tell
+        // whether a "back went to zero" outcome came from a stale
+        // copy (source was already zero) or from the drain that
+        // followed the refresh.
+        let src_slice = unsafe { core::slice::from_raw_parts(src, len) };
+        let nz_src = src_slice.iter().filter(|b| **b != 0).count();
+        let src_shm = self.surfaces[front_idx].shm_id;
+        let dst_shm = self.surfaces[self.back_idx].shm_id;
         // SAFETY: both surfaces are mapped by this process for at
         // least `len` bytes. `src` and `dst` cover disjoint
         // mappings (different `shm_id`s, different virtual ranges),
@@ -375,6 +410,17 @@ impl DisplayClient {
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, len);
         }
+        let dst_slice = unsafe { core::slice::from_raw_parts(dst, len) };
+        let nz_dst = dst_slice.iter().filter(|b| **b != 0).count();
+        syscall_lib::write_str(STDOUT_FILENO, "TC:refresh src_shm=");
+        write_decimal_u64_local(src_shm as u64);
+        syscall_lib::write_str(STDOUT_FILENO, " nz_src=");
+        write_decimal_u64_local(nz_src as u64);
+        syscall_lib::write_str(STDOUT_FILENO, " dst_shm=");
+        write_decimal_u64_local(dst_shm as u64);
+        syscall_lib::write_str(STDOUT_FILENO, " nz_dst=");
+        write_decimal_u64_local(nz_dst as u64);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
     }
 }
 
@@ -640,4 +686,23 @@ fn fill_cell_bg(cell_view: &mut [u32], stride_pixels: usize, cw: usize, ch: usiz
             cell_view[i] = bg;
         }
     }
+}
+
+/// 2026-05-18 less-render flake probe — inline decimal-encode + write
+/// to STDOUT. Mirrors `write_decimal_u64_serial` in `main.rs`; lives
+/// here so `display.rs`'s pre-submit probe doesn't need to plumb a
+/// callable across the module boundary.
+fn write_decimal_u64_local(value: u64) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    let mut n = value;
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(STDOUT_FILENO, &buf[idx..]);
 }

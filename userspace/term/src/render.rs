@@ -34,6 +34,76 @@
 use crate::screen::RenderCommand;
 use kernel_core::font::{Atlas, GlyphView};
 
+/// 2026-05-18 less-render flake probe — bracket each `fb.scroll(amount)`
+/// call so a probe run can see exactly which Scroll instance touched
+/// the buffer. Host tests do not exercise the `#[cfg(not(test))]` path.
+#[cfg(not(test))]
+fn scroll_trace_pre(amount: i16) {
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "TC:scroll-pre amount=");
+    write_signed_i16(amount);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+}
+
+#[cfg(not(test))]
+fn scroll_trace_post(amount: i16) {
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "TC:scroll-post amount=");
+    write_signed_i16(amount);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+}
+
+#[cfg(test)]
+fn scroll_trace_pre(_amount: i16) {}
+#[cfg(test)]
+fn scroll_trace_post(_amount: i16) {}
+
+#[cfg(not(test))]
+fn put_extent_trace(min_row: u16, max_row: u16, min_col: u16, max_col: u16, puts: u16) {
+    if puts == 0 {
+        return;
+    }
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "TC:put-extent rows=");
+    write_decimal_u32(min_row as u32);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"..");
+    write_decimal_u32(max_row as u32);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " cols=");
+    write_decimal_u32(min_col as u32);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"..");
+    write_decimal_u32(max_col as u32);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " puts=");
+    write_decimal_u32(puts as u32);
+    syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+}
+
+#[cfg(test)]
+fn put_extent_trace(_min_row: u16, _max_row: u16, _min_col: u16, _max_col: u16, _puts: u16) {}
+
+#[cfg(not(test))]
+fn write_signed_i16(value: i16) {
+    if value < 0 {
+        let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"-");
+        let mag = (-(value as i32)) as u32;
+        write_decimal_u32(mag);
+    } else {
+        write_decimal_u32(value as u32);
+    }
+}
+
+#[cfg(not(test))]
+fn write_decimal_u32(value: u32) {
+    let mut buf = [0u8; 10];
+    let mut idx = buf.len();
+    let mut n = value;
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, &buf[idx..]);
+}
+
 /// Phase 69c Track E.2 — runtime glyph-resolution policy.
 ///
 /// `Static` keeps Phase 69b's `kernel_core::session::resolve_glyph`
@@ -146,6 +216,46 @@ pub struct Renderer<F: FramebufferOwner> {
     /// publishes the cleared screen rather than blocking indefinitely.
     /// Reset to 0 whenever a compose actually drains.
     clear_only_defers: u8,
+    /// 2026-05-18 less-render flake — per-compose summary captured
+    /// while [`Renderer::compose`] runs. Read via [`Renderer::last_outcome`]
+    /// after every compose so the binary main loop can log structured
+    /// trace lines without owning the renderer's internals. Reset at
+    /// the top of every [`Renderer::compose`] call.
+    last_outcome: ComposeOutcome,
+}
+
+/// 2026-05-18 less-render flake — structured summary of a single
+/// [`Renderer::compose`] call. The main loop reads this after every
+/// compose to emit a serial trace line; reading the same fields back
+/// in a host test verifies the renderer follows the expected flow
+/// across defer / drain / submit transitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComposeOutcome {
+    /// Count of `Clear` ops drained this compose. `0` for an
+    /// incremental-only compose; `1+` indicates the framebuffer was
+    /// reset before the puts.
+    pub clears: u16,
+    /// Count of `Put` ops drained this compose.
+    pub puts: u16,
+    /// Count of `Scroll` ops drained this compose.
+    pub scrolls: u16,
+    /// True if this compose deferred a Clear-only queue waiting for
+    /// follow-up Put ops to arrive. When set, `clears`/`puts`/`scrolls`
+    /// are zero — the queue was not drained.
+    pub deferred: bool,
+    /// True if this compose force-drained a deferred Clear-only queue
+    /// after [`MAX_CLEAR_ONLY_DEFER`] cycles. When set, `clears >= 1`
+    /// and `puts == 0` — the buffer was cleared without follow-up
+    /// content. This is the documented loophole where a legitimate
+    /// shell `clear` command produces a single-frame zero publish.
+    pub force_drained: bool,
+    /// True if the compose actually called `fb.submit()` (regardless
+    /// of whether submit returned true or false). False indicates a
+    /// no-op compose (empty queue, no `pending_submit`, no submit).
+    pub submitted: bool,
+    /// Return value of `fb.submit()`; meaningful only when
+    /// `submitted` is true.
+    pub submit_ok: bool,
 }
 
 impl<F: FramebufferOwner> Renderer<F> {
@@ -158,7 +268,17 @@ impl<F: FramebufferOwner> Renderer<F> {
             pending_submit: false,
             glyph_source: GlyphSource::Static,
             clear_only_defers: 0,
+            last_outcome: ComposeOutcome::default(),
         }
+    }
+
+    /// 2026-05-18 less-render flake — return the outcome of the most
+    /// recent [`Renderer::compose`] call. The renderer resets
+    /// `last_outcome` at the top of every `compose`, so reading this
+    /// immediately after `compose` returns yields fresh data; reading
+    /// it before any `compose` runs returns `ComposeOutcome::default()`.
+    pub fn last_outcome(&self) -> ComposeOutcome {
+        self.last_outcome
     }
 
     /// Phase 69c Track E.1/E.2 — install a TTF atlas as the runtime
@@ -263,6 +383,7 @@ impl<F: FramebufferOwner> Renderer<F> {
     /// Submit any buffered damage to the framebuffer. No-op when
     /// `damaged()` is false (no work, no submit).
     pub fn compose(&mut self) {
+        self.last_outcome = ComposeOutcome::default();
         if self.queue.is_empty() && !self.pending_submit {
             return;
         }
@@ -292,7 +413,17 @@ impl<F: FramebufferOwner> Renderer<F> {
             };
             if !has_put_after_clear && self.clear_only_defers < MAX_CLEAR_ONLY_DEFER {
                 self.clear_only_defers += 1;
+                self.last_outcome.deferred = true;
                 return;
+            }
+            // If a Clear was queued without any follow-up Put across
+            // `MAX_CLEAR_ONLY_DEFER` cycles, this drain is a
+            // force-drain: the back buffer gets cleared and published
+            // as a single-frame zero publish. Track it so the trace
+            // can distinguish "legitimate `clear` command" from "PTY
+            // chunk boundary stranded a less repaint header".
+            if !has_put_after_clear {
+                self.last_outcome.force_drained = true;
             }
             self.clear_only_defers = 0;
             // Move the queue out so the field-level borrows below
@@ -307,6 +438,14 @@ impl<F: FramebufferOwner> Renderer<F> {
             let Self {
                 fb, glyph_source, ..
             } = self;
+            // 2026-05-18 less-render flake probe — accumulate per-op
+            // row/col extents to detect out-of-grid puts that the
+            // FramebufferOwner would drop silently. Logged once at
+            // end of drain.
+            let mut min_row = u16::MAX;
+            let mut max_row = 0u16;
+            let mut min_col = u16::MAX;
+            let mut max_col = 0u16;
             for op in queue.drain(..) {
                 match op {
                     QueuedOp::Put {
@@ -316,6 +455,18 @@ impl<F: FramebufferOwner> Renderer<F> {
                         fg,
                         bg,
                     } => {
+                        if row < min_row {
+                            min_row = row;
+                        }
+                        if row > max_row {
+                            max_row = row;
+                        }
+                        if col < min_col {
+                            min_col = col;
+                        }
+                        if col > max_col {
+                            max_col = col;
+                        }
                         let view = match glyph_source {
                             GlyphSource::Atlas(atlas) => atlas.resolve(codepoint).as_view(),
                             GlyphSource::Static => {
@@ -323,19 +474,43 @@ impl<F: FramebufferOwner> Renderer<F> {
                             }
                         };
                         fb.put_glyph(row, col, codepoint, &view, fg, bg);
+                        self.last_outcome.puts = self.last_outcome.puts.saturating_add(1);
                     }
-                    QueuedOp::Clear => fb.clear(),
-                    QueuedOp::Scroll { amount } => fb.scroll(amount),
+                    QueuedOp::Clear => {
+                        fb.clear();
+                        self.last_outcome.clears = self.last_outcome.clears.saturating_add(1);
+                    }
+                    QueuedOp::Scroll { amount } => {
+                        // 2026-05-18 less-render flake probe — bracket the
+                        // scroll with serial markers so a probe run can
+                        // see exactly which Scroll(amount) call zeroed
+                        // the back buffer. The amount value matters: if
+                        // it ever lands at -32768 (or wraps to a value
+                        // whose row_bytes product >= buf_len), the
+                        // display.rs scroll path falls through to
+                        // `pixels.fill(0)` and the bug shape matches
+                        // exactly what the trace shows.
+                        scroll_trace_pre(amount);
+                        fb.scroll(amount);
+                        scroll_trace_post(amount);
+                        self.last_outcome.scrolls = self.last_outcome.scrolls.saturating_add(1);
+                    }
                 }
             }
+            put_extent_trace(min_row, max_row, min_col, max_col, self.last_outcome.puts);
             // `drain(..)` left `queue` empty but with its allocation
             // intact. Restore it so the next frame's `submit_op`
             // pushes into the same buffer instead of re-allocating.
             self.queue = queue;
             self.pending_submit = true;
         }
-        if self.pending_submit && self.fb.submit() {
-            self.pending_submit = false;
+        if self.pending_submit {
+            self.last_outcome.submitted = true;
+            let ok = self.fb.submit();
+            self.last_outcome.submit_ok = ok;
+            if ok {
+                self.pending_submit = false;
+            }
         }
     }
 }

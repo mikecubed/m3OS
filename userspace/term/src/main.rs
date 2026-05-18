@@ -417,7 +417,21 @@ fn program_main(_args: &[&str]) -> i32 {
                 elapsed_ms,
                 COMPOSE_INTERVAL_MS,
             ) {
+                // 2026-05-18 less-render flake — `TC:compose-*`
+                // brackets around the renderer compose pass. Pairs
+                // with `DC:snap-*` in display_server/compose.rs so
+                // the next investigator can grep both streams from
+                // a single serial.log and decide whether the residual
+                // flake is still snapshot-during-write (overlap with
+                // a compose interval) or a different shape entirely.
+                // The `compose-end` line also carries the structured
+                // `ComposeOutcome` from the renderer so we can tell
+                // empty vs Clear-only-force-drained vs incremental.
+                // Cheap: two `clock_gettime` + a few `write_str` per
+                // compose ≈ <80 us per tick on QEMU TCG.
+                trace_compose_event(b"TC:compose-start ");
                 renderer.compose();
+                trace_compose_outcome(renderer.last_outcome());
                 last_compose_ms = now_ms;
                 did_work = true;
             }
@@ -618,6 +632,97 @@ fn format_atlas_msg(buf: &mut [u8; 64], n: usize) -> &[u8] {
         i += 1;
     }
     &buf[..i]
+}
+
+/// 2026-05-18 less-render flake — write a one-line probe trace to
+/// the serial console with a microsecond timestamp. Format:
+/// `<tag><us>\n`. Used by the compose-overlap probe to confirm
+/// whether the residual flake is still a snapshot-during-write race
+/// against display_server.
+#[cfg(not(test))]
+fn trace_compose_event(tag: &[u8]) {
+    let us = trace_now_us();
+    let _ = syscall_lib::write(STDOUT_FILENO, tag);
+    write_decimal_u64_serial(us);
+    let _ = syscall_lib::write(STDOUT_FILENO, b"\n");
+}
+
+/// 2026-05-18 less-render flake — write the structured outcome of
+/// the most recent renderer compose pass alongside the closing
+/// `TC:compose-end` timestamp. Output one line: `TC:compose-end us=
+/// <T> drained=<b> clears=<c> puts=<p> scrolls=<s> deferred=<b>
+/// force_drained=<b> submitted=<b> submit_ok=<b>`. The single-line
+/// form lets the post-run parser pull all outcome fields without
+/// stateful pairing against a separate event.
+#[cfg(not(test))]
+fn trace_compose_outcome(outcome: term::render::ComposeOutcome) {
+    let us = trace_now_us();
+    let _ = syscall_lib::write(STDOUT_FILENO, b"TC:compose-end us=");
+    write_decimal_u64_serial(us);
+    let _ = syscall_lib::write(STDOUT_FILENO, b" clears=");
+    write_decimal_u64_serial(outcome.clears as u64);
+    let _ = syscall_lib::write(STDOUT_FILENO, b" puts=");
+    write_decimal_u64_serial(outcome.puts as u64);
+    let _ = syscall_lib::write(STDOUT_FILENO, b" scrolls=");
+    write_decimal_u64_serial(outcome.scrolls as u64);
+    let _ = syscall_lib::write(
+        STDOUT_FILENO,
+        if outcome.deferred {
+            b" deferred=1"
+        } else {
+            b" deferred=0"
+        },
+    );
+    let _ = syscall_lib::write(
+        STDOUT_FILENO,
+        if outcome.force_drained {
+            b" force_drained=1"
+        } else {
+            b" force_drained=0"
+        },
+    );
+    let _ = syscall_lib::write(
+        STDOUT_FILENO,
+        if outcome.submitted {
+            b" submitted=1"
+        } else {
+            b" submitted=0"
+        },
+    );
+    let _ = syscall_lib::write(
+        STDOUT_FILENO,
+        if outcome.submit_ok {
+            b" submit_ok=1\n"
+        } else {
+            b" submit_ok=0\n"
+        },
+    );
+}
+
+#[cfg(not(test))]
+fn trace_now_us() -> u64 {
+    let (sec, nsec) = syscall_lib::clock_gettime(CLOCK_MONOTONIC);
+    let sec_u = sec.max(0) as u64;
+    let nsec_u = nsec.max(0) as u64;
+    sec_u
+        .saturating_mul(1_000_000)
+        .saturating_add(nsec_u / 1_000)
+}
+
+#[cfg(not(test))]
+fn write_decimal_u64_serial(value: u64) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    let mut n = value;
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(STDOUT_FILENO, &buf[idx..]);
 }
 
 /// Monotonic clock for [`Bell::ring`]. Tiny wrapper around

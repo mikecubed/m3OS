@@ -378,7 +378,22 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 
         let snapshots: Vec<Vec<u8>> = entries
             .iter()
-            .map(|entry| entry.buf.pixels_snapshot())
+            .map(|entry| {
+                // 2026-05-18 less-render flake — bracket the snapshot
+                // with `DC:snap-*` tags so the next investigator can
+                // grep for overlaps against the term `TC:compose-*`
+                // markers and decide whether the residual flake is
+                // still snapshot-during-write. `snap-nonzero` reports
+                // the count of non-zero bytes in the captured snapshot:
+                // when that hits zero with no Clear in the recent
+                // compose history, the d899f73-class buffer-leaked-to-
+                // zero bug is back on a different code path.
+                trace_snap_event(b"DC:snap-start sid=", entry.id);
+                let snapshot = entry.buf.pixels_snapshot();
+                trace_snap_event(b"DC:snap-end sid=", entry.id);
+                trace_snap_nonzero(entry.id, &snapshot);
+                snapshot
+            })
             .collect();
 
         let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
@@ -461,7 +476,17 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // rest of the compose pass treats as stable.
     let snapshots: Vec<Vec<u8>> = entries
         .iter()
-        .map(|entry| entry.buf.pixels_snapshot())
+        .map(|entry| {
+            // 2026-05-18 less-render flake — see the fast-path block
+            // above for the rationale; the general-path snapshot
+            // gets the same instrumentation so a probe run that hits
+            // either compose pass produces overlap data.
+            trace_snap_event(b"DC:snap-start sid=", entry.id);
+            let snapshot = entry.buf.pixels_snapshot();
+            trace_snap_event(b"DC:snap-end sid=", entry.id);
+            trace_snap_nonzero(entry.id, &snapshot);
+            snapshot
+        })
         .collect();
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
@@ -730,4 +755,60 @@ pub fn fill_background<O: FramebufferOwner>(owner: &mut O) -> Result<(), FbError
 /// factory so future phases can replace it without changing callers.
 pub fn default_layout() -> impl LayoutPolicy {
     FloatingLayout::new()
+}
+
+/// 2026-05-18 less-render flake — write a one-line probe trace to the
+/// serial console tagging a snapshot boundary with the surface id and
+/// the current microsecond timestamp. Format: `<tag><sid> <us>\n`.
+/// Pairs with `TC:compose-*` in `userspace/term/src/main.rs` so a
+/// single serial.log captures both producer and consumer timing.
+fn trace_snap_event(tag: &[u8], sid: SurfaceId) {
+    let (sec, nsec) = syscall_lib::clock_gettime(syscall_lib::CLOCK_MONOTONIC);
+    let sec_u = sec.max(0) as u64;
+    let nsec_u = nsec.max(0) as u64;
+    let us = sec_u
+        .saturating_mul(1_000_000)
+        .saturating_add(nsec_u / 1_000);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, tag);
+    write_decimal_u64(sid.0 as u64);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b" ");
+    write_decimal_u64(us);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"\n");
+}
+
+/// 2026-05-18 less-render flake — count non-zero bytes in the captured
+/// snapshot and log them as `DC:snap-nonzero sid=<n> nz=<count>/<len>\n`.
+/// Catches the d899f73-class regression: if `<count>` drops to zero
+/// without a Clear in the recent compose history, a buffer is being
+/// leaked to the wire at SHM-create zeros. Iterates the full snapshot
+/// (≈ 4 MiB for the term surface), but only on probe runs — the cost
+/// is ~6 ms per compose tick at 4 MiB on QEMU TCG, easily worth the
+/// diagnostic fidelity for one-off flake hunts. Remove after the
+/// residual flake is closed.
+fn trace_snap_nonzero(sid: SurfaceId, snapshot: &[u8]) {
+    let nz = snapshot.iter().filter(|b| **b != 0).count();
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"DC:snap-nonzero sid=");
+    write_decimal_u64(sid.0 as u64);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b" nz=");
+    write_decimal_u64(nz as u64);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"/");
+    write_decimal_u64(snapshot.len() as u64);
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, b"\n");
+}
+
+/// Inline decimal-encode + write to STDOUT. Allocation-free; the
+/// 20-byte buffer covers the full `u64` range.
+fn write_decimal_u64(value: u64) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    let mut n = value;
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let _ = syscall_lib::write(syscall_lib::STDOUT_FILENO, &buf[idx..]);
 }
