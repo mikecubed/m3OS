@@ -72,7 +72,7 @@ const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
-const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+const ENV_PATH: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os-term\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";

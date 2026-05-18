@@ -127,8 +127,8 @@ impl PtyOps for SyscallPtyOps {
         // settings; HOME is hard-coded to `/root` because Phase 57
         // term inherits init's uid (root) — the graphical-login
         // story is a future-phase concern.
-        let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-        let env_term: &[u8] = b"TERM=m3os\0";
+        let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
+        let env_term: &[u8] = b"TERM=m3os-term\0";
         let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
         let env_home: &[u8] = b"HOME=/root\0";
         let envp: [*const u8; 5] = [

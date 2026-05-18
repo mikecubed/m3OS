@@ -70,8 +70,8 @@ fn su_main(args: &[&str]) -> i32 {
     );
 
     // Exec the target user's shell.
-    let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-    let env_term: &[u8] = b"TERM=m3os\0";
+    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
+    let env_term: &[u8] = b"TERM=m3os-term\0";
     let envp: [*const u8; 3] = [env_path.as_ptr(), env_term.as_ptr(), core::ptr::null()];
 
     let mut shell_path = [0u8; 128];

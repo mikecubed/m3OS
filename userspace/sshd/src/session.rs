@@ -1319,7 +1319,7 @@ fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
     let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
     let mut user_env = [0u8; 128];
     let ue_len = build_env(b"USER=", info.username.as_bytes(), &mut user_env);
-    let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
     let env_term: &[u8] = b"TERM=xterm\0";
     let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
     let envp: [*const u8; 6] = [

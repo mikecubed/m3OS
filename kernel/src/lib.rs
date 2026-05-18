@@ -422,7 +422,11 @@ fn spawn_userspace_init() {
     let phys_off = mm::phys_offset();
 
     let argv: &[&[u8]] = &[b"/sbin/init"];
-    let envp: &[&[u8]] = &[b"PATH=/bin:/sbin:/usr/bin", b"HOME=/", b"TERM=m3os"];
+    let envp: &[&[u8]] = &[
+        b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin",
+        b"HOME=/",
+        b"TERM=m3os-term",
+    ];
 
     let (loaded, user_rsp) = {
         let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
