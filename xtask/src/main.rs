@@ -7965,6 +7965,58 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
+    // ---- procfs surface htop reads: cpuinfo + loadavg + per-CPU stat
+    //      + per-pid stat/statm.  Without these files htop renders its
+    //      chrome but every data column is empty / zero.  We validate
+    //      the rendered text up-front so a regression here is reported
+    //      at the procfs layer rather than as "htop looks wrong" — far
+    //      easier to debug from a serial-only smoke gate.
+    steps.push(SmokeStep::Send {
+        input: "head -n 2 /proc/cpuinfo\n",
+        label: "guest/tui-app-smoke: probe /proc/cpuinfo",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "processor",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/cpuinfo has processor line",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/loadavg\n",
+        label: "guest/tui-app-smoke: probe /proc/loadavg",
+    });
+    steps.push(SmokeStep::Wait {
+        // Format: "X.XX X.XX X.XX runnable/total last_pid".  m3OS
+        // synthesises identical values from the runnable count for all
+        // three windows, so the loadavg always has a "X.XX X.XX X.XX "
+        // shape with the same number repeated — the explicit ".00"
+        // suffix is enough to prove the file renders (every
+        // synthesized value is whole-second so centi is "00").
+        pattern: ".00 ",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/loadavg renders",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/stat\n",
+        label: "guest/tui-app-smoke: probe /proc/stat per-CPU lines",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "cpu0",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/stat has cpu0 line",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/1/statm\n",
+        label: "guest/tui-app-smoke: probe /proc/1/statm",
+    });
+    steps.push(SmokeStep::Wait {
+        // statm format: "size resident shared text lib data dt"
+        // — VmSize is non-zero so the line has at least one non-zero
+        // leading field followed by zeros.
+        pattern: " 0 0 0 ",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/1/statm renders",
+    });
+
     // ---- htop: launch, observe header, schedule SIGWINCH, observe
     //      redraw, quit, sentinel ----
     //

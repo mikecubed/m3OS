@@ -56,7 +56,9 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
     let rel = path.strip_prefix("/proc/")?;
     let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
     match parts.as_slice() {
-        ["meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts"] => Some(ProcfsNode::File),
+        ["meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts" | "cpuinfo" | "loadavg"] => {
+            Some(ProcfsNode::File)
+        }
         ["self"] => Some(ProcfsNode::Symlink(alloc::format!(
             "/proc/{}",
             current_pid()
@@ -65,7 +67,10 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
             let pid = parse_pid_component(pid)?;
             process_snapshot(pid).map(|_| ProcfsNode::Dir)
         }
-        [pid, "status" | "cmdline" | "comm" | "maps"] => {
+        [
+            pid,
+            "status" | "cmdline" | "comm" | "maps" | "stat" | "statm" | "io",
+        ] => {
             let pid = parse_pid_component(pid)?;
             process_snapshot(pid).map(|_| ProcfsNode::File)
         }
@@ -131,10 +136,15 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["uptime"] => render_uptime(),
         ["version"] => render_version(),
         ["mounts"] => render_mounts(),
+        ["cpuinfo"] => render_cpuinfo(),
+        ["loadavg"] => render_loadavg(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "comm"] => render_comm(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
+        [pid, "stat"] => render_pid_stat(process_snapshot(parse_pid_component(pid)?)?),
+        [pid, "statm"] => render_pid_statm(process_snapshot(parse_pid_component(pid)?)?),
+        [pid, "io"] => render_pid_io(process_snapshot(parse_pid_component(pid)?)?),
         _ => return None,
     };
     Some(text.into_bytes())
@@ -152,6 +162,8 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("uptime"), false),
             (String::from("version"), false),
             (String::from("mounts"), false),
+            (String::from("cpuinfo"), false),
+            (String::from("loadavg"), false),
         ];
         let table = PROCESS_TABLE.lock();
         let caller_euid = table.find(caller_pid).map(|proc| proc.euid).unwrap_or(0);
@@ -179,6 +191,9 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
                 (String::from("cmdline"), false),
                 (String::from("comm"), false),
                 (String::from("maps"), false),
+                (String::from("stat"), false),
+                (String::from("statm"), false),
+                (String::from("io"), false),
                 (String::from("exe"), false),
                 (String::from("fd"), true),
             ])
@@ -299,20 +314,47 @@ fn render_meminfo() -> String {
     let per_cpu_cached_kib = frames.per_cpu_cached * 4;
     let slab_pages_kib = heap.slab_pages * 4;
     let large_pages_kib = heap.page_backed_pages * 4;
+    // Phase 69d follow-up: htop and other Linux tools read Buffers,
+    // Cached, SwapTotal, SwapFree to drive the Mem/Swap bars. m3OS has
+    // no page cache and no swap so those lines stay zero, but the
+    // *presence* of the lines is what htop's parser keys off — without
+    // them the Mem bar renders without a used/cached breakdown.
     alloc::format!(
         concat!(
-            "MemTotal:     {:>8} kB\n",
-            "MemFree:      {:>8} kB\n",
-            "MemAvailable: {:>8} kB\n",
-            "PerCpuCached: {:>8} kB\n",
-            "Allocated:    {:>8} kB\n",
+            "MemTotal:       {:>8} kB\n",
+            "MemFree:        {:>8} kB\n",
+            "MemAvailable:   {:>8} kB\n",
+            "Buffers:        {:>8} kB\n",
+            "Cached:         {:>8} kB\n",
+            "SwapCached:     {:>8} kB\n",
+            "Active:         {:>8} kB\n",
+            "Inactive:       {:>8} kB\n",
+            "SwapTotal:      {:>8} kB\n",
+            "SwapFree:       {:>8} kB\n",
+            "Dirty:          {:>8} kB\n",
+            "Writeback:      {:>8} kB\n",
+            "Shmem:          {:>8} kB\n",
+            "Slab:           {:>8} kB\n",
+            "PerCpuCached:   {:>8} kB\n",
+            "Allocated:      {:>8} kB\n",
             "KernelAllocator: {}\n",
             "KernelSlabPages: {:>4} kB\n",
-            "KernelLargePages: {:>3} kB\n"
+            "KernelLargePages: {:>3} kB\n",
         ),
         total_kib,
         free_kib,
         available_kib,
+        0u64,
+        0u64,
+        0u64,
+        frames.allocated_frames * 4,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        slab_pages_kib,
         per_cpu_cached_kib,
         frames.allocated_frames * 4,
         if heap.size_class_active {
@@ -321,7 +363,64 @@ fn render_meminfo() -> String {
             "bootstrap"
         },
         slab_pages_kib,
-        large_pages_kib
+        large_pages_kib,
+    )
+}
+
+/// `/proc/cpuinfo` — one block per logical CPU. htop and similar tools
+/// count `processor` lines to size the per-CPU stat array; without this
+/// file the CPU bar count falls back to a single virtual CPU.
+fn render_cpuinfo() -> String {
+    let cores = crate::smp::core_count();
+    let mut out = String::new();
+    for core_id in 0..cores {
+        let _ = writeln!(out, "processor\t: {core_id}");
+        let _ = writeln!(out, "vendor_id\t: m3OS");
+        let _ = writeln!(out, "cpu family\t: 6");
+        let _ = writeln!(out, "model\t\t: 1");
+        let _ = writeln!(out, "model name\t: m3OS virtual x86_64 core {core_id}");
+        let _ = writeln!(out, "stepping\t: 1");
+        let _ = writeln!(out, "cpu MHz\t\t: 1000.000");
+        let _ = writeln!(out, "cache size\t: 0 KB");
+        let _ = writeln!(out, "physical id\t: 0");
+        let _ = writeln!(out, "siblings\t: {cores}");
+        let _ = writeln!(out, "core id\t\t: {core_id}");
+        let _ = writeln!(out, "cpu cores\t: {cores}");
+        let _ = writeln!(out, "fpu\t\t: yes");
+        let _ = writeln!(
+            out,
+            "flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx rdtscp lm constant_tsc nopl xtopology nonstop_tsc cpuid pni ssse3 sse4_1 sse4_2 x2apic popcnt aes xsave avx hypervisor lahf_lm"
+        );
+        let _ = writeln!(out, "bogomips\t: 2000.00");
+        let _ = writeln!(out, "clflush size\t: 64");
+        let _ = writeln!(out, "cache_alignment\t: 64");
+        let _ = writeln!(out, "address sizes\t: 48 bits physical, 48 bits virtual");
+        let _ = writeln!(out);
+    }
+    out
+}
+
+/// `/proc/loadavg` — three load averages, running/total processes,
+/// last PID. m3OS does not track real load averages; synthesise from
+/// runnable process count so htop has non-zero values to render.
+fn render_loadavg() -> String {
+    let table = PROCESS_TABLE.lock();
+    let total = table.iter().count();
+    let runnable = table
+        .iter()
+        .filter(|proc| matches!(proc.state, ProcessState::Running | ProcessState::Ready))
+        .count();
+    let last_pid = table.iter().map(|p| p.pid).max().unwrap_or(0);
+    drop(table);
+    // Format as `X.XX X.XX X.XX runnable/total last_pid`.  Using the
+    // current runnable count for all three windows is a coarse but
+    // honest approximation — m3OS does not yet drive the exponential
+    // moving averages Linux uses.
+    let load = runnable as f32;
+    let load_whole = load as u32;
+    let load_centi = ((load - load_whole as f32) * 100.0) as u32;
+    alloc::format!(
+        "{load_whole}.{load_centi:02} {load_whole}.{load_centi:02} {load_whole}.{load_centi:02} {runnable}/{total} {last_pid}\n"
     )
 }
 
@@ -335,10 +434,42 @@ fn render_stat() -> String {
         .filter(|proc| proc.state == ProcessState::Running)
         .count();
     drop(table);
-    alloc::format!(
-        "cpu  {ticks} 0 0 {} 0 0 0 0 0 0\nbtime {btime}\nprocesses {total}\nprocs_running {running}\n",
-        ticks.saturating_mul(8)
-    )
+    let cores = crate::smp::core_count() as u64;
+    // Per-Linux /proc/stat: USER_HZ for the cpu* lines is 100, so
+    // a tick (1 ms today) divides by 10 to convert ms→jiffies.
+    let jiffies_total = ticks / 10;
+    // We do not yet track per-CPU idle vs. busy ticks separately, so
+    // synthesise a plausible split: assume the system is mostly idle
+    // (90%) and divide the busy 10% evenly across cores into user time.
+    let busy_jiffies_total = jiffies_total / 10;
+    let idle_jiffies_total = jiffies_total.saturating_sub(busy_jiffies_total);
+    let per_core_busy = busy_jiffies_total
+        .checked_div(cores)
+        .unwrap_or(busy_jiffies_total);
+    let per_core_idle = idle_jiffies_total
+        .checked_div(cores)
+        .unwrap_or(idle_jiffies_total);
+
+    let mut out = String::new();
+    // Aggregate cpu line: user nice system idle iowait irq softirq steal guest guest_nice.
+    let _ = writeln!(
+        out,
+        "cpu  {busy_jiffies_total} 0 0 {idle_jiffies_total} 0 0 0 0 0 0"
+    );
+    // Per-CPU lines: htop reads these to drive its per-core CPU bars.
+    for core in 0..cores {
+        let _ = writeln!(
+            out,
+            "cpu{core} {per_core_busy} 0 0 {per_core_idle} 0 0 0 0 0 0"
+        );
+    }
+    let _ = writeln!(out, "intr 0");
+    let _ = writeln!(out, "ctxt 0");
+    let _ = writeln!(out, "btime {btime}");
+    let _ = writeln!(out, "processes {total}");
+    let _ = writeln!(out, "procs_running {running}");
+    let _ = writeln!(out, "procs_blocked 0");
+    out
 }
 
 fn render_uptime() -> String {
@@ -487,6 +618,76 @@ fn render_comm(proc: ProcessSnapshot) -> String {
     let mut name = proc_name(&proc);
     name.push('\n');
     name
+}
+
+/// Sum of `len` across all VMAs plus the standard 16-page stack, used
+/// as the process VmSize / `/proc/<pid>/stat`'s `vsize` field.
+fn proc_vm_size_bytes(proc: &ProcessSnapshot) -> u64 {
+    let mut vm = 16u64 * 4096;
+    for mapping in &proc.mappings {
+        vm = vm.saturating_add(mapping.len);
+    }
+    vm
+}
+
+/// `/proc/<pid>/stat` — the canonical 47-field whitespace-separated line
+/// Linux exposes for tools like htop, ps, top.  The exact field count
+/// (and the convention of wrapping `comm` in parentheses) is required:
+/// parsers locate `state` by scanning past the trailing `)` to handle
+/// `comm` values containing spaces / parens, and then index every
+/// subsequent field by position.
+///
+/// We populate the fields we can derive from the process snapshot and
+/// emit `0` for accounting fields we do not yet track (utime/stime,
+/// minflt/majflt, etc.) — htop tolerates zero values and falls back to
+/// drawing the row without per-process CPU%.
+fn render_pid_stat(proc: ProcessSnapshot) -> String {
+    let name = proc_name(&proc);
+    let state_char = match proc.state {
+        ProcessState::Ready | ProcessState::Running => 'R',
+        ProcessState::Blocked => 'S',
+        ProcessState::Stopped => 'T',
+        ProcessState::Zombie => 'Z',
+    };
+    let pid = proc.pid;
+    let ppid = proc.ppid;
+    // pgrp / session / tty_nr / tpgid: m3OS does not yet track these
+    // distinctly, so report the parent's pid as a best-effort and 0
+    // for TTY identifiers htop only uses to label rows.
+    let pgrp = ppid;
+    let session = ppid;
+    let vsize = proc_vm_size_bytes(&proc);
+    // rss in pages — VmSize/4096 is a generous upper bound; m3OS does
+    // not page-out so RSS ~= VmSize in practice.
+    let rss_pages = vsize / 4096;
+    // starttime in jiffies since boot: 0 is acceptable for htop, which
+    // displays this as the "TIME+" column relative to its own clock.
+    let starttime = 0u64;
+    // Fields 1..52 per Linux's `man 5 proc` (we emit 52 to match modern
+    // kernels; htop's parser uses sscanf with a fixed format).
+    alloc::format!(
+        "{pid} ({name}) {state_char} {ppid} {pgrp} {session} 0 -1 0 \
+0 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} {vsize} {rss_pages} \
+18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+    )
+}
+
+/// `/proc/<pid>/statm` — seven decimal counts (size, resident, shared,
+/// text, lib, data, dirty) measured in pages.  htop reads the `size`
+/// and `resident` fields for the memory column.
+fn render_pid_statm(proc: ProcessSnapshot) -> String {
+    let vm = proc_vm_size_bytes(&proc);
+    let pages = vm / 4096;
+    // size resident shared text lib data dt
+    alloc::format!("{pages} {pages} 0 0 0 {pages} 0\n")
+}
+
+/// `/proc/<pid>/io` — minimal accounting for tools that probe it.  We
+/// do not track per-process byte counts yet, so every counter is zero.
+fn render_pid_io(_proc: ProcessSnapshot) -> String {
+    String::from(
+        "rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n",
+    )
 }
 
 fn basename(path: &str) -> &str {
