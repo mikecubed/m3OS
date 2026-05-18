@@ -73,6 +73,20 @@ pub enum ConsoleCmd {
     /// SGR — Set Graphic Rendition. Parameters stored as a slice reference
     /// isn't possible in a Copy enum, so we use a small inline array.
     Sgr(SgrParams),
+    /// 2026-05-18 less-render follow-up — Primary Device Attributes
+    /// request (`CSI c` or `CSI 0 c`). The consumer is expected to
+    /// answer with `CSI ? ... c` describing the terminal class.
+    /// Without a response, applications like `less` fall back to
+    /// "dumb terminal" full-repaint mode, which made the snapshot-
+    /// during-write race far more visible than it had to be.
+    DeviceAttributesReq,
+    /// 2026-05-18 less-render follow-up — Device Status Report request
+    /// (`CSI <kind> n`). `kind = 5` asks "is the terminal OK?" and
+    /// expects `CSI 0 n`; `kind = 6` asks for the cursor position and
+    /// expects `CSI <row> ; <col> R`. Other kinds are not part of the
+    /// terminfo capabilities m3os-term publishes and are dropped
+    /// silently by the consumer.
+    DeviceStatusReport { kind: u16 },
     /// Unknown/unsupported sequence — silently ignored.
     Nop,
 }
@@ -475,6 +489,21 @@ impl AnsiParser {
             'J' => ConsoleCmd::EraseDisplay(self.param(0, 0)),
             // EL — Erase in Line
             'K' => ConsoleCmd::EraseLine(self.param(0, 0)),
+            // DA — Primary Device Attributes request (`CSI c` /
+            // `CSI 0 c`). The numeric parameter is ignored: per
+            // ECMA-48 / VT spec only `0` (or omitted) requests
+            // primary DA; secondary (`>`) and tertiary (`=`) DA use
+            // distinct intermediates that the parser would route
+            // through a different path entirely.
+            'c' => ConsoleCmd::DeviceAttributesReq,
+            // DSR — Device Status Report request (`CSI <kind> n`).
+            // The parser's `param(0, 0)` returns 0 when the body is
+            // empty *or* when the body is literally `0`; both forms
+            // are non-actionable for the consumer (the only valid
+            // requests are `5` and `6`) so collapsing them is safe.
+            'n' => ConsoleCmd::DeviceStatusReport {
+                kind: self.param(0, 0),
+            },
             // SGR — Select Graphic Rendition
             'm' => {
                 let count = if self.param_count == 0 {
@@ -996,6 +1025,48 @@ mod tests {
         assert_eq!(
             parse_str_last("\x1b[G"),
             ConsoleCmd::CursorHorizontalAbsolute(1)
+        );
+    }
+
+    #[test]
+    fn da_request_with_no_param_dispatches() {
+        // Bare `CSI c` is the canonical Primary Device Attributes
+        // request that less / vim / htop send at startup.
+        assert_eq!(parse_str_last("\x1b[c"), ConsoleCmd::DeviceAttributesReq);
+    }
+
+    #[test]
+    fn da_request_with_zero_param_dispatches() {
+        // `CSI 0 c` is the explicit "primary DA" form some terminfo
+        // entries emit; consumer behaviour is identical to bare DA.
+        assert_eq!(parse_str_last("\x1b[0c"), ConsoleCmd::DeviceAttributesReq);
+    }
+
+    #[test]
+    fn dsr_5_request_dispatches() {
+        assert_eq!(
+            parse_str_last("\x1b[5n"),
+            ConsoleCmd::DeviceStatusReport { kind: 5 }
+        );
+    }
+
+    #[test]
+    fn dsr_6_cursor_position_request_dispatches() {
+        // `CSI 6 n` is the cursor-position query terminfo `u7`
+        // capability — less uses it to probe terminal liveness.
+        assert_eq!(
+            parse_str_last("\x1b[6n"),
+            ConsoleCmd::DeviceStatusReport { kind: 6 }
+        );
+    }
+
+    #[test]
+    fn dsr_with_no_param_dispatches_as_kind_zero() {
+        // Per spec, omitted DSR kind defaults to 0, which the
+        // consumer ignores (only kinds 5 and 6 produce a reply).
+        assert_eq!(
+            parse_str_last("\x1b[n"),
+            ConsoleCmd::DeviceStatusReport { kind: 0 }
         );
     }
 }

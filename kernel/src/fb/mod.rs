@@ -762,6 +762,15 @@ impl FbConsole {
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }
+            // 2026-05-18 less-render follow-up — kernel framebuffer
+            // console has no back-channel to the application that
+            // wrote the query (TTY0 is one-directional: kernel writes
+            // pixels, never reads bytes back). Drop DA / DSR silently
+            // so the parser stays exhaustive without faking a reply.
+            // The userspace `term` emulator is where these actually
+            // round-trip; see `userspace/term/src/screen.rs`.
+            ConsoleCmd::DeviceAttributesReq => {}
+            ConsoleCmd::DeviceStatusReport { .. } => {}
             ConsoleCmd::Nop => {}
         }
     }

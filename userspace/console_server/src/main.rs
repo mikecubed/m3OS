@@ -850,6 +850,13 @@ impl FbRenderer {
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }
+            // 2026-05-18 less-render follow-up — console_server's
+            // remote framebuffer console has no PTY back-channel to
+            // the writer; like the kernel TTY0 path, it drops DA /
+            // DSR queries silently. Real responses live in
+            // `userspace/term`, where a PTY primary is wired up.
+            ConsoleCmd::DeviceAttributesReq => {}
+            ConsoleCmd::DeviceStatusReport { .. } => {}
             ConsoleCmd::Nop => {}
         }
     }

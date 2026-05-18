@@ -235,6 +235,14 @@ impl<F: FramebufferOwner> Renderer<F> {
             // `MouseReporter` by the main loop; the renderer is a
             // pure pixel sink and never sees this command.
             RenderCommand::SetMouseMode { .. } => {}
+            // 2026-05-18 less-render follow-up — host-bound reply
+            // bytes (DA / DSR) are intercepted by `main.rs` and
+            // written to the PTY primary. The renderer is a pure
+            // pixel sink and never sees this command in practice;
+            // a no-op match arm keeps the type system honest in
+            // case a future callsite hands the renderer the full
+            // command stream unfiltered.
+            RenderCommand::RespondToHost { .. } => {}
         }
     }
 

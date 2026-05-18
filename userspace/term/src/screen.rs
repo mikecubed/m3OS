@@ -43,6 +43,21 @@ pub const DEFAULT_FG: u32 = 0xFFFF_FFFF;
 /// Default background colour (black, BGRA8888 packed).
 pub const DEFAULT_BG: u32 = 0x0000_0000;
 
+/// 2026-05-18 less-render follow-up — Primary Device Attributes
+/// reply (`CSI ? 6 c`, VT102). Sent when the host requests DA via
+/// `CSI c`. VT102 is the minimal "real terminal, not a teletype"
+/// answer; xterm-style apps treat it as licence to use incremental-
+/// repaint sequences (`csr`, `il`/`dl`, ICH/DCH/ECH) rather than the
+/// `\E[2J\E[H<content>` full-repaint fallback. The terminfo `u8`
+/// capability pattern `\E[?%[;0123456789]c` matches this reply.
+const DA_REPLY_VT102: &[u8] = b"\x1b[?6c";
+
+/// 2026-05-18 less-render follow-up — DSR-5 "terminal OK" reply
+/// (`CSI 0 n`). Sent when the host requests device-status via
+/// `CSI 5 n`. The payload contains no terminal-specific data, so
+/// the byte sequence is fixed.
+const DSR_OK_REPLY: &[u8] = b"\x1b[0n";
+
 /// 8-entry SGR colour palette (BGRA8888).  Index `n` corresponds to
 /// SGR 30+`n` (foreground) and 40+`n` (background).
 const SGR_PALETTE: [u32; 8] = [
@@ -190,7 +205,26 @@ pub enum RenderCommand {
     /// renderer ignores this; the binary's main loop intercepts it
     /// and forwards to the [`mouse::MouseReporter`].
     SetMouseMode { code: u16, set: bool },
+    /// 2026-05-18 less-render follow-up — out-of-band bytes the
+    /// terminal owes the PTY master in reply to a query like DA
+    /// (`\E[c`) or DSR (`\E[6n`). The renderer ignores this; the
+    /// binary's main loop intercepts it and writes `bytes[..len]`
+    /// to the PTY primary so the application reads the reply on
+    /// stdin. Inline storage is sized for the longest reply m3os-
+    /// term emits: `\E[<row>;<col>R` with five-digit row/col is 14
+    /// bytes; we round up to 24 for headroom (future DA forms like
+    /// `\E[?64;1;2;6;9;15;18;21;22c` fit comfortably).
+    RespondToHost {
+        bytes: [u8; PTY_RESPONSE_MAX],
+        len: u8,
+    },
 }
+
+/// 2026-05-18 less-render follow-up — inline capacity of a
+/// [`RenderCommand::RespondToHost`] payload. Sized for the longest
+/// reply m3os-term emits today (`\E[<row>;<col>R` = 14 bytes) with
+/// headroom for future DA forms.
+pub const PTY_RESPONSE_MAX: usize = 24;
 
 /// One cell in the screen buffer.  `codepoint` is the glyph; `fg`/`bg`
 /// are the BGRA8888 packed colours at the time the cell was written.
@@ -747,6 +781,22 @@ impl Screen {
                 self.cursor_shape = CursorShape::from_code(shape);
             }
             ConsoleCmd::Sgr(sgr) => self.apply_sgr_ops(sgr.ops(), out),
+            ConsoleCmd::DeviceAttributesReq => {
+                out.push(make_response(DA_REPLY_VT102));
+            }
+            ConsoleCmd::DeviceStatusReport { kind } => match kind {
+                5 => out.push(make_response(DSR_OK_REPLY)),
+                6 => {
+                    // 1-based row;col per the VT spec — the parser
+                    // accepts `CSI <r> ; <c> H` in the same form, so
+                    // a round-trip "where am I" reply lands at the
+                    // same cell when fed back in.
+                    let row_1 = (self.cursor_row as u32) + 1;
+                    let col_1 = (self.cursor_col as u32) + 1;
+                    out.push(make_cursor_position_response(row_1, col_1));
+                }
+                _ => { /* Unknown DSR kind — silently ignored. */ }
+            },
         }
     }
 
@@ -1081,6 +1131,72 @@ impl Default for Screen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 2026-05-18 less-render follow-up — pack a fixed byte string into a
+/// [`RenderCommand::RespondToHost`] payload. Used for the DA reply
+/// and the DSR-5 reply, whose bodies are constant byte sequences.
+///
+/// Panics if `body.len() > PTY_RESPONSE_MAX`; the constants above are
+/// all well under the cap, and the host-test suite catches a future
+/// constant that exceeds the inline buffer before it can reach the
+/// wire.
+fn make_response(body: &[u8]) -> RenderCommand {
+    debug_assert!(body.len() <= PTY_RESPONSE_MAX);
+    let mut bytes = [0u8; PTY_RESPONSE_MAX];
+    bytes[..body.len()].copy_from_slice(body);
+    RenderCommand::RespondToHost {
+        bytes,
+        len: body.len() as u8,
+    }
+}
+
+/// 2026-05-18 less-render follow-up — encode a DSR-6 cursor-position
+/// reply (`CSI <row> ; <col> R`) into a [`RenderCommand::RespondToHost`].
+/// Both `row_1based` and `col_1based` are written as decimal ASCII.
+/// The screen's `cursor_row` / `cursor_col` are `u16`, so the maximum
+/// value is 65535 (five digits) → total length up to
+/// `2 + 5 + 1 + 5 + 1 = 14` bytes, which fits inside
+/// [`PTY_RESPONSE_MAX`] = 24.
+fn make_cursor_position_response(row_1based: u32, col_1based: u32) -> RenderCommand {
+    let mut bytes = [0u8; PTY_RESPONSE_MAX];
+    let mut idx = 0usize;
+    let write = |out: &mut [u8; PTY_RESPONSE_MAX], idx: &mut usize, byte: u8| {
+        out[*idx] = byte;
+        *idx += 1;
+    };
+    write(&mut bytes, &mut idx, 0x1b);
+    write(&mut bytes, &mut idx, b'[');
+    encode_decimal(row_1based, &mut bytes, &mut idx);
+    write(&mut bytes, &mut idx, b';');
+    encode_decimal(col_1based, &mut bytes, &mut idx);
+    write(&mut bytes, &mut idx, b'R');
+    RenderCommand::RespondToHost {
+        bytes,
+        len: idx as u8,
+    }
+}
+
+/// Decimal-encode `value` into `out[*idx..]`, advancing `*idx`. Writes
+/// at least one digit (the value `0` produces `b'0'`). Caller must
+/// guarantee `out` has at least 10 spare bytes — enough for the full
+/// `u32` range. The DSR-6 caller above only feeds five-digit values
+/// (cursor coords are `u16` widened to `u32`), so the bound holds.
+fn encode_decimal(value: u32, out: &mut [u8; PTY_RESPONSE_MAX], idx: &mut usize) {
+    let mut buf = [0u8; 10];
+    let mut n = value;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let digits = &buf[i..];
+    out[*idx..*idx + digits.len()].copy_from_slice(digits);
+    *idx += digits.len();
 }
 
 #[cfg(test)]
@@ -1792,6 +1908,86 @@ mod tests {
         assert_eq!(s.cursor(), (0, 0));
         // Colours stay at defaults.
         assert_eq!(s.colors(), (DEFAULT_FG, DEFAULT_BG));
+    }
+
+    fn extract_response(cmds: &[RenderCommand]) -> &[u8] {
+        for cmd in cmds {
+            if let RenderCommand::RespondToHost { bytes, len } = cmd {
+                return &bytes[..*len as usize];
+            }
+        }
+        panic!("no RespondToHost in: {:?}", cmds);
+    }
+
+    /// 2026-05-18 less-render follow-up — DA (`CSI c`) produces the
+    /// VT102 reply `CSI ? 6 c`. This is the root-cause fix for less
+    /// landing in full-repaint "dumb terminal" mode: without a reply,
+    /// less times out the query at startup and avoids the incremental
+    /// `csr`/IL/DL/ECH path the parser already dispatches.
+    #[test]
+    fn da_request_emits_vt102_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[c");
+        assert_eq!(extract_response(&cmds), b"\x1b[?6c");
+    }
+
+    /// DSR-5 ("are you there?") produces the fixed terminal-OK reply.
+    #[test]
+    fn dsr_5_emits_terminal_ok_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[5n");
+        assert_eq!(extract_response(&cmds), b"\x1b[0n");
+    }
+
+    /// DSR-6 (cursor-position query) reports the current cursor in
+    /// 1-based `row;col` form. Driven from the screen's live cursor
+    /// state so a position change between queries is observable.
+    #[test]
+    fn dsr_6_emits_cursor_position_reply_origin() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[6n");
+        // Origin cursor is (0, 0); 1-based reply is `1;1`.
+        assert_eq!(extract_response(&cmds), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn dsr_6_reply_tracks_cursor_after_movement() {
+        let mut s = Screen::with_geometry(80, 25);
+        // Move to (row=3, col=12) via 1-based CUP.
+        let _ = feed_str(&mut s, "\x1b[4;13H");
+        let cmds = feed_str(&mut s, "\x1b[6n");
+        // 1-based reply: row 4, col 13.
+        assert_eq!(extract_response(&cmds), b"\x1b[4;13R");
+    }
+
+    /// DSR with an unknown kind (e.g. `15n`, printer status) is
+    /// dropped silently — no response, no crash, no stray render op.
+    #[test]
+    fn dsr_unknown_kind_emits_no_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[15n");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, RenderCommand::RespondToHost { .. }))
+        );
+    }
+
+    /// The cursor-position encoder must not exceed [`PTY_RESPONSE_MAX`]
+    /// for the worst-case `u16` x `u16` coords the screen can produce.
+    /// A 65535-row × 65535-col grid is far beyond anything m3os-term
+    /// ships today, but the bound is what protects the inline buffer.
+    #[test]
+    fn dsr_6_reply_fits_inline_buffer_at_u16_max() {
+        let reply = make_cursor_position_response(65535, 65535);
+        match reply {
+            RenderCommand::RespondToHost { bytes, len } => {
+                let payload = &bytes[..len as usize];
+                assert_eq!(payload, b"\x1b[65535;65535R");
+                assert!(payload.len() <= PTY_RESPONSE_MAX);
+            }
+            other => panic!("expected RespondToHost, got {:?}", other),
+        }
     }
 
     /// Phase 57 G.4 property test: arbitrary ANSI byte sequences must
