@@ -850,6 +850,43 @@ impl FbRenderer {
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }
+            // 2026-05-18 less-render follow-up — console_server's
+            // remote framebuffer console has no PTY back-channel to
+            // the writer; like the kernel TTY0 path, it drops DA /
+            // DSR queries silently. Real responses live in
+            // `userspace/term`, where a PTY primary is wired up.
+            ConsoleCmd::DeviceAttributesReq => {}
+            ConsoleCmd::DeviceStatusReport { .. } => {}
+            // Phase 69d follow-up — the console_server is a single
+            // text-mode surface with no scroll-region or insert/delete
+            // semantics.  These variants exist for the userspace `term`
+            // emulator's incremental-repaint path; we accept the wire
+            // bytes (so the parser doesn't fall into garbage state) and
+            // drop them as no-ops, except for VPA + ECH which have
+            // cheap cell-grid analogs.
+            ConsoleCmd::SetScrollRegion { .. } => {}
+            ConsoleCmd::VerticalPositionAbsolute(n) => {
+                let rows = self.rows();
+                let r = (n as usize).saturating_sub(1);
+                self.cursor_row = core::cmp::min(r, rows.saturating_sub(1));
+            }
+            ConsoleCmd::InsertLines(_) => {}
+            ConsoleCmd::DeleteLines(_) => {}
+            ConsoleCmd::InsertChars(_) => {}
+            ConsoleCmd::DeleteChars(_) => {}
+            ConsoleCmd::EraseChars(n) => {
+                let cols = self.cols();
+                let n = n.max(1) as usize;
+                let end_col = core::cmp::min(self.cursor_col + n, cols);
+                self.clear_region(
+                    self.cursor_col,
+                    self.cursor_row,
+                    end_col,
+                    self.cursor_row + 1,
+                );
+            }
+            ConsoleCmd::ScrollUp(_) => {}
+            ConsoleCmd::ScrollDown(_) => {}
             ConsoleCmd::Nop => {}
         }
     }

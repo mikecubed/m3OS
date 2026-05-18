@@ -73,6 +73,54 @@ pub enum ConsoleCmd {
     /// SGR — Set Graphic Rendition. Parameters stored as a slice reference
     /// isn't possible in a Copy enum, so we use a small inline array.
     Sgr(SgrParams),
+    /// 2026-05-18 less-render follow-up — Primary Device Attributes
+    /// request (`CSI c` or `CSI 0 c`). The consumer is expected to
+    /// answer with `CSI ? ... c` describing the terminal class.
+    /// Without a response, applications like `less` fall back to
+    /// "dumb terminal" full-repaint mode, which made the snapshot-
+    /// during-write race far more visible than it had to be.
+    DeviceAttributesReq,
+    /// 2026-05-18 less-render follow-up — Device Status Report request
+    /// (`CSI <kind> n`). `kind = 5` asks "is the terminal OK?" and
+    /// expects `CSI 0 n`; `kind = 6` asks for the cursor position and
+    /// expects `CSI <row> ; <col> R`. Other kinds are not part of the
+    /// terminfo capabilities m3os-term publishes and are dropped
+    /// silently by the consumer.
+    DeviceStatusReport { kind: u16 },
+    /// DECSTBM — Set Top and Bottom Margins (`CSI <top> ; <bot> r`).
+    /// Both bounds are 1-based; when both are missing the consumer
+    /// should reset to the full screen. Less and other TUI apps use
+    /// this to limit subsequent scrolling to a sub-rectangle.
+    SetScrollRegion { top: u16, bottom: u16 },
+    /// VPA — Vertical Position Absolute (`CSI <n> d`). Moves the
+    /// cursor to row `n` (1-based) without changing the column.  Less
+    /// emits `vpa` heavily during incremental line repaints.
+    VerticalPositionAbsolute(u16),
+    /// IL — Insert N Lines (`CSI <n> L`). Inserts N blank lines at the
+    /// cursor, scrolling content within the current scroll region
+    /// downward.
+    InsertLines(u16),
+    /// DL — Delete N Lines (`CSI <n> M`). Deletes N lines starting at
+    /// the cursor, scrolling content within the current scroll region
+    /// upward.
+    DeleteLines(u16),
+    /// ICH — Insert N Characters (`CSI <n> @`). Inserts N blank cells
+    /// at the cursor, shifting the rest of the row right.
+    InsertChars(u16),
+    /// DCH — Delete N Characters (`CSI <n> P`). Deletes N cells at the
+    /// cursor, shifting the rest of the row left.
+    DeleteChars(u16),
+    /// ECH — Erase N Characters (`CSI <n> X`). Blanks N cells starting
+    /// at the cursor without moving the cursor.
+    EraseChars(u16),
+    /// SU — Scroll Up by N (`CSI <n> S`). Shifts content up within the
+    /// scroll region by N lines; top N lines are lost, bottom N
+    /// blanked.
+    ScrollUp(u16),
+    /// SD — Scroll Down by N (`CSI <n> T`). Shifts content down within
+    /// the scroll region by N lines; bottom N lines are lost, top N
+    /// blanked.
+    ScrollDown(u16),
     /// Unknown/unsupported sequence — silently ignored.
     Nop,
 }
@@ -330,6 +378,38 @@ impl AnsiParser {
             '\n' => ConsoleCmd::Newline,
             '\x08' => ConsoleCmd::Backspace,
             '\t' => ConsoleCmd::Tab,
+            // 2026-05-18 less-render flake fix — control characters that
+            // ECMA-48 / DEC VT spec define as "ignored when not part of
+            // a recognized sequence" must not advance the cursor or
+            // paint anything. Less in particular sends NUL bytes as
+            // terminfo padding fill (default `pc` = 0); without this
+            // filter every padding byte became a `PutChar(0)` that
+            // walked the cursor across the screen and erased prior
+            // cells as it went — the long-tail residual cause of the
+            // 2026-05-17 less-render-disappearance flake.
+            //
+            // Coverage:
+            //   NUL (0x00) — terminfo padding fill
+            //   SOH..ACK (0x01..=0x06) — modem control, never printable
+            //   SO (0x0E) / SI (0x0F) — character-set shift, no charset
+            //     support in m3os-term so the byte is meaningless
+            //   DLE..ETB (0x10..=0x17) — control, no terminal-side action
+            //   CAN (0x18) / SUB (0x1A) — cancel-sequence; the parser
+            //     already exits CSI on the next non-CSI byte
+            //   FS..US (0x1C..=0x1F) — separators, not printable
+            //   DEL (0x7F) — erase, no cell-grid effect
+            // 0x07 (BEL), 0x08 (BS), 0x09 (TAB), 0x0A (LF), 0x0D (CR),
+            // and 0x1B (ESC) are handled above; the BEL path in
+            // `Screen::feed` catches 0x07 before this match runs.
+            // 0x0B (VT) and 0x0C (FF) are *not* folded into LF; m3os-term
+            // treats them as Nop in the arm below alongside the other
+            // ECMA-48 "ignored when standalone" controls (a real DEC VT
+            // would do a line feed without carriage return on VT/FF, but
+            // ratchet-driven TUIs we care about never send them, and
+            // ignoring them is safer than fabricating a half-LF).
+            '\x00'..='\x06' | '\x0B'..='\x0C' | '\x0E'..='\x1A' | '\x1C'..='\x1F' | '\x7F' => {
+                ConsoleCmd::Nop
+            }
             _ => ConsoleCmd::PutChar(c as u32),
         }
     }
@@ -475,6 +555,41 @@ impl AnsiParser {
             'J' => ConsoleCmd::EraseDisplay(self.param(0, 0)),
             // EL — Erase in Line
             'K' => ConsoleCmd::EraseLine(self.param(0, 0)),
+            // DA — Primary Device Attributes request (`CSI c` /
+            // `CSI 0 c`). The numeric parameter is ignored: per
+            // ECMA-48 / VT spec only `0` (or omitted) requests
+            // primary DA; secondary (`>`) and tertiary (`=`) DA use
+            // distinct intermediates that the parser would route
+            // through a different path entirely.
+            'c' => ConsoleCmd::DeviceAttributesReq,
+            // DSR — Device Status Report request (`CSI <kind> n`).
+            // The parser's `param(0, 0)` returns 0 when the body is
+            // empty *or* when the body is literally `0`; both forms
+            // are non-actionable for the consumer (the only valid
+            // requests are `5` and `6`) so collapsing them is safe.
+            'n' => ConsoleCmd::DeviceStatusReport {
+                kind: self.param(0, 0),
+            },
+            // VPA — Vertical Position Absolute (`CSI <n> d`).
+            'd' => ConsoleCmd::VerticalPositionAbsolute(self.param(0, 1)),
+            // DECSTBM — Set Top and Bottom Margins (`CSI <top> ; <bot> r`).
+            // No params resets to full screen, encoded as (0, 0); the
+            // screen state machine interprets the zero bounds as
+            // "reset" rather than literal row zero.
+            'r' => ConsoleCmd::SetScrollRegion {
+                top: self.param(0, 0),
+                bottom: self.param(1, 0),
+            },
+            // SU / SD — Scroll Up / Down within the scroll region.
+            'S' => ConsoleCmd::ScrollUp(self.param(0, 1)),
+            'T' => ConsoleCmd::ScrollDown(self.param(0, 1)),
+            // IL / DL — Insert / Delete Lines at cursor.
+            'L' => ConsoleCmd::InsertLines(self.param(0, 1)),
+            'M' => ConsoleCmd::DeleteLines(self.param(0, 1)),
+            // ICH / DCH / ECH — Insert / Delete / Erase Characters at cursor.
+            '@' => ConsoleCmd::InsertChars(self.param(0, 1)),
+            'P' => ConsoleCmd::DeleteChars(self.param(0, 1)),
+            'X' => ConsoleCmd::EraseChars(self.param(0, 1)),
             // SGR — Select Graphic Rendition
             'm' => {
                 let count = if self.param_count == 0 {
@@ -996,6 +1111,97 @@ mod tests {
         assert_eq!(
             parse_str_last("\x1b[G"),
             ConsoleCmd::CursorHorizontalAbsolute(1)
+        );
+    }
+
+    #[test]
+    fn nul_byte_is_ignored() {
+        // 2026-05-18 less-render flake fix — NUL must not advance
+        // the cursor. Less sends NUL bytes as terminfo padding fill
+        // and the prior `PutChar(0)` behaviour walked the cursor
+        // across the screen, erasing cells in its wake.
+        assert_eq!(parse_str_last("\x00"), ConsoleCmd::Nop);
+    }
+
+    #[test]
+    fn assorted_control_bytes_are_ignored() {
+        // Spec-defined no-op control bytes the parser must drop so
+        // they don't produce stray PutChar ops. Coverage from the
+        // process_normal match above.
+        for byte in [
+            0x00u8, 0x01, 0x05, 0x06, 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x17, 0x18, 0x1A, 0x1C, 0x1F,
+            0x7F,
+        ] {
+            let s: alloc::string::String = core::iter::once(byte as char).collect();
+            assert_eq!(
+                parse_str_last(&s),
+                ConsoleCmd::Nop,
+                "byte 0x{:02x} should be ignored",
+                byte
+            );
+        }
+    }
+
+    #[test]
+    fn nul_byte_does_not_emit_put_glyph_through_chain() {
+        // Sanity: a stream of `<text>\0\0\0<text>` should produce the
+        // text PutChar ops with no PutChar(0) in between. Mirrors the
+        // less padding-fill pattern that introduced the bug.
+        let cmds = parse_str("ab\x00\x00\x00cd");
+        let only_puts: alloc::vec::Vec<_> = cmds
+            .into_iter()
+            .filter(|c| matches!(c, ConsoleCmd::PutChar(_)))
+            .collect();
+        assert_eq!(
+            only_puts,
+            alloc::vec![
+                ConsoleCmd::PutChar(b'a' as u32),
+                ConsoleCmd::PutChar(b'b' as u32),
+                ConsoleCmd::PutChar(b'c' as u32),
+                ConsoleCmd::PutChar(b'd' as u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn da_request_with_no_param_dispatches() {
+        // Bare `CSI c` is the canonical Primary Device Attributes
+        // request that less / vim / htop send at startup.
+        assert_eq!(parse_str_last("\x1b[c"), ConsoleCmd::DeviceAttributesReq);
+    }
+
+    #[test]
+    fn da_request_with_zero_param_dispatches() {
+        // `CSI 0 c` is the explicit "primary DA" form some terminfo
+        // entries emit; consumer behaviour is identical to bare DA.
+        assert_eq!(parse_str_last("\x1b[0c"), ConsoleCmd::DeviceAttributesReq);
+    }
+
+    #[test]
+    fn dsr_5_request_dispatches() {
+        assert_eq!(
+            parse_str_last("\x1b[5n"),
+            ConsoleCmd::DeviceStatusReport { kind: 5 }
+        );
+    }
+
+    #[test]
+    fn dsr_6_cursor_position_request_dispatches() {
+        // `CSI 6 n` is the cursor-position query terminfo `u7`
+        // capability — less uses it to probe terminal liveness.
+        assert_eq!(
+            parse_str_last("\x1b[6n"),
+            ConsoleCmd::DeviceStatusReport { kind: 6 }
+        );
+    }
+
+    #[test]
+    fn dsr_with_no_param_dispatches_as_kind_zero() {
+        // Per spec, omitted DSR kind defaults to 0, which the
+        // consumer ignores (only kinds 5 and 6 produce a reply).
+        assert_eq!(
+            parse_str_last("\x1b[n"),
+            ConsoleCmd::DeviceStatusReport { kind: 0 }
         );
     }
 }

@@ -762,6 +762,48 @@ impl FbConsole {
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
             }
+            // 2026-05-18 less-render follow-up — kernel framebuffer
+            // console has no back-channel to the application that
+            // wrote the query (TTY0 is one-directional: kernel writes
+            // pixels, never reads bytes back). Drop DA / DSR silently
+            // so the parser stays exhaustive without faking a reply.
+            // The userspace `term` emulator is where these actually
+            // round-trip; see `userspace/term/src/screen.rs`.
+            ConsoleCmd::DeviceAttributesReq => {}
+            ConsoleCmd::DeviceStatusReport { .. } => {}
+            // The kernel framebuffer console is a single text-mode
+            // surface with no scroll-region, scrollback, or per-row
+            // insert/delete semantics.  These variants exist for the
+            // userspace `term` emulator's incremental-repaint path
+            // (Phase 69d follow-up — less and other TUI apps emit
+            // these per the m3os-term terminfo).  Dropping them as
+            // no-ops here keeps the kernel console undisturbed while
+            // letting the variants land in the wire protocol.
+            ConsoleCmd::SetScrollRegion { .. } => {}
+            ConsoleCmd::VerticalPositionAbsolute(n) => {
+                let row = (n as usize).saturating_sub(1);
+                self.cursor_row = core::cmp::min(row, self.rows().saturating_sub(1));
+            }
+            ConsoleCmd::InsertLines(_) => {}
+            ConsoleCmd::DeleteLines(_) => {}
+            ConsoleCmd::InsertChars(_) => {}
+            ConsoleCmd::DeleteChars(_) => {}
+            ConsoleCmd::EraseChars(n) => {
+                // The cell-grid analog of ECH: blank `n` cells starting
+                // at the cursor without moving it.  Cheap to implement
+                // even on the kernel console because we already have
+                // clear_region.
+                let n = n.max(1) as usize;
+                let end_col = core::cmp::min(self.cursor_col + n, self.cols());
+                self.clear_region(
+                    self.cursor_col,
+                    self.cursor_row,
+                    end_col,
+                    self.cursor_row + 1,
+                );
+            }
+            ConsoleCmd::ScrollUp(_) => {}
+            ConsoleCmd::ScrollDown(_) => {}
             ConsoleCmd::Nop => {}
         }
     }

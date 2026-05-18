@@ -1,0 +1,19 @@
+NAME=tmux
+VERSION=3.5a
+DESCRIPTION="Terminal multiplexer (built against ncursesw + libevent)"
+CATEGORY=util
+DEPS=ncurses libevent
+URL=https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz
+SHA256=16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951
+MAINTAINER=m3os
+
+# Phase 69d Track D.2: tmux is the harshest test in the 69d set — nested
+# PTYs, control sequences, alt-screen, and mouse all exercised in one
+# binary. Configure flags:
+#   --enable-utempter=no  — m3OS has no utmp/wtmp (tracked separately).
+#   --enable-systemd=no   — m3OS uses session_manager, not systemd.
+#   --disable-debug       — release build.
+#
+# If tmux surfaces a kernel TTY/PTY bug under load, the bug routes back
+# to Phase 22 / 29 follow-ups; 69d itself ports and validates, it does
+# not change the kernel PTY layer.

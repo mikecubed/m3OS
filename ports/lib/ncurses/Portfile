@@ -1,0 +1,21 @@
+NAME=ncurses
+VERSION=6.5
+DESCRIPTION="Terminal-handling library (narrow + wide variants)"
+CATEGORY=lib
+DEPS=
+URL=https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.5.tar.gz
+SHA256=136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6
+MAINTAINER=m3os
+
+# Phase 69d Track A: ncurses is the foundation library every C TUI app links
+# against. We build both the narrow (libncurses.a) and wide (libncursesw.a)
+# variants so UTF-8-aware applications (htop, tmux, mc) can request the wide
+# entry point. Shared library support is disabled until Phase 76 lands the
+# dynamic linker; everything statically links the .a archives.
+#
+# Terminfo lives at /usr/share/terminfo (matching the path baked into the
+# Phase 69 Track A.2 m3os-term entry).
+#
+# `tic`, `infocmp`, `tput`, and `clear` are built and staged for the in-OS
+# port consumer but the actual terminfo entry is compiled host-side and
+# installed by the Phase 69 toolchain.

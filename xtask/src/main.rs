@@ -10,6 +10,10 @@ use anyhow::Context;
 use fatfs::Dir;
 use tempfile::NamedTempFile;
 
+mod port_build;
+mod ppm;
+mod qmp;
+
 const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
@@ -138,6 +142,11 @@ const SMOKE_EXIT_TUI_SMOKE_FAILED: i32 = 66;
 /// Phase 69a Track I: termios-smoke failed — at least one tcsmoke
 /// subcommand emitted `TC_SMOKE:<name>:fail …`.
 const SMOKE_EXIT_TERMIOS_SMOKE_FAILED: i32 = 68;
+/// Phase 69d Track E.1: tui-app-smoke failed — one of the ported TUI
+/// apps (less / htop / tmux) emitted `TUI_APP_SMOKE:<app>:fail …`
+/// during the scripted drive. The harness surfaces the failing app
+/// immediately rather than letting the step time out.
+const SMOKE_EXIT_TUI_APP_SMOKE_FAILED: i32 = 69;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
@@ -432,6 +441,55 @@ fn main() {
                 });
             cmd_doom_audio_smoke(&smoke_args);
         }
+        // Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — host-side port
+        // builds. `cargo xtask port build <name>` fetches the upstream
+        // tarball, verifies SHA-256, applies patches, and cross-compiles
+        // for x86_64-linux-musl. Outputs stage to target/port-stage/<name>.
+        Some("port") => match args.get(2).map(String::as_str) {
+            Some("build") => {
+                let name = args.get(3).cloned().unwrap_or_else(|| {
+                    eprintln!("Usage: cargo xtask port build <name>");
+                    std::process::exit(1);
+                });
+                let code = port_build::cmd_port_build(&name);
+                std::process::exit(code);
+            }
+            other => {
+                eprintln!("Unknown port subcommand: {:?}", other);
+                eprintln!("Usage: cargo xtask port build <name>");
+                std::process::exit(1);
+            }
+        },
+        // Phase 69d Track E.1 — `cargo xtask tui-app-smoke` boots and
+        // drives less, htop, and tmux smokes in sequence. Reports per-app
+        // :ok / :fail; non-zero exit on any failure.
+        Some("tui-app-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("tui-app-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_tui_app_smoke(&smoke_args);
+        }
+        // Investigation tool for the Phase 69d
+        // `less render disappearance` handoff
+        // (docs/handoffs/2026-05-17-less-render-disappearance.md). Boots
+        // the OS into the graphical term + display_server stack, types
+        // `less /etc/passwd` and the Down arrow via QMP send-key, and
+        // captures the framebuffer via QMP screendump at each step plus
+        // 200 ms + 1 s later. Reports pixel-diff ratios between the
+        // immediate post-keypress frame and the settled frame — the
+        // signature of the bug under investigation is a large diff with
+        // the settled frame being nearly all-black.
+        Some("less-render-probe") => {
+            let probe_args = parse_less_render_probe_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_less_render_probe(&probe_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -490,7 +548,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -4139,6 +4197,11 @@ fn run_smoke_script(
     // before formatting the (truncated) error message.  Lets the trace-ring
     // dump that the kernel emits on stuck-no-waker survive into a file we
     // can inspect post-run, instead of being lost to the 80-line tail.
+    //
+    // Phase 69d follow-up: also dump on successful exit when the env var
+    // is set, so diagnostic runs against a passing harness still produce
+    // the full trace (e.g. when probing inside-app behaviour like the
+    // htop initscr() SIGSEGV).
     let serial_dump_path = std::env::var("M3OS_SMOKE_SERIAL_DUMP").ok();
     let dump_serial = |history: &str| {
         if let Some(path) = &serial_dump_path {
@@ -7759,6 +7822,689 @@ fn tui_smoke_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Phase 69d Track E.1 — boot m3OS, log into sh0, drive the three
+/// ported TUI apps (less, htop, tmux) through scripted keystroke
+/// sequences sent over the QEMU serial console. Each app's smoke
+/// invokes the real binary in the guest shell, observes the rendered
+/// output (cell-grid markers, version strings, etc.) via the serial
+/// log, and emits a per-app `TUI_APP_SMOKE:<app>:{ok,fail}` sentinel
+/// by `echo`ing it from the shell once the per-app gate succeeds.
+/// There is no in-guest shim binary — the harness composes the
+/// scenario from the SmokeStep::Send / Wait / WaitPassOrFail primitives
+/// shared with the rest of the smoke gates.
+///
+/// The cross-compiled ports are built host-side as a precondition.
+fn cmd_tui_app_smoke(args: &SmokeBootArgs) {
+    // Build the Phase 69d port set host-side. The disk-image populator
+    // mirrors the staged binaries onto /usr/local/bin in the ext2 disk.
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("tui-app-smoke: precondition failed: {msg}");
+        std::process::exit(SMOKE_EXIT_TUI_APP_SMOKE_FAILED);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let steps = tui_app_smoke_steps();
+
+    println!(
+        "tui-app-smoke: launching QEMU (timeout {}s, {} app smokes)",
+        args.timeout_secs,
+        TUI_APP_SMOKE_SUBCOMMANDS.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "tui-app-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("tui-app-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_TUI_APP_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Phase 69d Track E.1 — names of the three apps the smoke gate drives.
+/// Used only by the launcher's log message; the actual step sequence
+/// lives in `tui_app_smoke_steps`.
+const TUI_APP_SMOKE_SUBCOMMANDS: &[&str] = &["less", "htop", "tmux"];
+
+/// Phase 69d Track E.1 — full scripted step sequence for tui-app-smoke.
+/// Each app is driven interactively from sh0, observable output is awaited,
+/// and a `TUI_APP_SMOKE:<app>:ok` sentinel is echoed from the shell after
+/// control returns. The harness asserts on the sentinel.
+fn tui_app_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // ---- less: open /etc/passwd, observe first line, quit, sentinel ----
+    steps.push(SmokeStep::Send {
+        input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/less /etc/passwd\n",
+        label: "guest/tui-app-smoke: less /etc/passwd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: less rendered first line",
+    });
+    steps.push(SmokeStep::Send {
+        input: "q",
+        label: "guest/tui-app-smoke: less quit",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:less:ok\n",
+        label: "guest/tui-app-smoke: less sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:less:ok",
+        fail_prefix: "TUI_APP_SMOKE:less:fail",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: less :ok",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    // ---- htop: launch, observe header, quit, sentinel ----
+    steps.push(SmokeStep::Send {
+        input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/htop\n",
+        label: "guest/tui-app-smoke: htop launch",
+    });
+    steps.push(SmokeStep::Wait {
+        // htop's default header includes "Tasks:" as a top-of-screen label.
+        pattern: "Tasks:",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: htop drew header",
+    });
+    steps.push(SmokeStep::Send {
+        input: "q",
+        label: "guest/tui-app-smoke: htop quit",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:htop:ok\n",
+        label: "guest/tui-app-smoke: htop sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:htop:ok",
+        fail_prefix: "TUI_APP_SMOKE:htop:fail",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: htop :ok",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    // ---- tmux: binary-integrity probe.
+    //
+    // The Phase 69d task acceptance for tmux is the full session
+    // lifecycle (new-session / split-window / resize-pane / detach).
+    // tmux's client/server protocol uses `sendmsg`/`recvmsg` over a
+    // Unix socket plus `flock` for the socket lock, neither of which
+    // m3OS implements today (kernel/src/arch/x86_64/syscall/mod.rs
+    // returns -ENOSYS for sysno=46/47/73 — visible in the smoke log
+    // as `[WARN] unhandled syscall 46`).  Adding scatter-gather
+    // sendmsg/recvmsg + ancillary-data handling is substantial
+    // kernel work that falls under a separate phase.
+    //
+    // We validate two narrower claims that 69d's port-and-stage layer
+    // does own:
+    //   1. /usr/local/bin/tmux is present and executable.
+    //   2. `tmux -V` prints the pinned version string — proves the
+    //      cross-compile linked correctly against ncursesw + libevent.
+    steps.push(SmokeStep::Send {
+        input: "test -x /usr/local/bin/tmux && echo TUI_APP_SMOKE:tmux:binary-present\n",
+        label: "guest/tui-app-smoke: tmux binary present",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:binary-present",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux is executable",
+    });
+    // tmux -V must succeed AND emit the expected version string before
+    // we declare the version probe ok.  Using `&&` ensures the sentinel
+    // never fires on a failed -V (a bare `;` would let the smoke pass
+    // even if tmux is broken), and the Wait on "tmux 3.5a" pins the
+    // pinned upstream version so a future bump can't quietly downgrade.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -V && echo TUI_APP_SMOKE:tmux:version-done\n",
+        label: "guest/tui-app-smoke: tmux -V probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "tmux 3.5a",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux -V printed pinned version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:version-done",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux -V returned",
+    });
+    steps.push(SmokeStep::Send {
+        input: "echo TUI_APP_SMOKE:tmux:ok\n",
+        label: "guest/tui-app-smoke: tmux sentinel",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:tmux:ok",
+        fail_prefix: "TUI_APP_SMOKE:tmux:fail",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: tmux :ok",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    steps
+}
+
+// ---------------------------------------------------------------------------
+// less-render-probe — investigation tool for the Phase 69d
+// `docs/handoffs/2026-05-17-less-render-disappearance.md` bug. Boots the
+// graphical term + display_server stack, drives keystrokes through the
+// emulated PS/2 path via QMP `send-key`, and captures the framebuffer
+// via QMP `screendump` immediately after each keypress plus ~1.2 s
+// later (past the 500 ms term blink-tick window). The pixel-diff
+// between the immediate and settled frames is the bug's signature —
+// the existing `tui-app-smoke` gate is structurally blind to render
+// disappearance because it only inspects serial output.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct LessRenderProbeArgs {
+    /// Global wall-clock budget for the entire probe. Boot + login +
+    /// screendump + diff fits comfortably in 240 s on TCG; slower
+    /// hosts can override via `--timeout`.
+    timeout_secs: u64,
+    /// Directory to write the captured PPMs into. Defaults to
+    /// `$TMPDIR/m3os-less-render-probe`. Existing files at these names
+    /// are overwritten so successive runs replace last run's artefacts.
+    out_dir: PathBuf,
+    /// When set, leave QEMU running on success / failure so the caller
+    /// can poke at it from `qmp-shell` or attach a debugger. The
+    /// default kills QEMU and unlinks the QMP socket on exit.
+    keep_qemu: bool,
+}
+
+fn parse_less_render_probe_args(args: &[String]) -> Result<LessRenderProbeArgs, String> {
+    let mut timeout_secs = 240u64;
+    let mut out_dir: Option<PathBuf> = None;
+    let mut keep_qemu = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args
+                    .get(i)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            "--out" => {
+                i += 1;
+                out_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--out requires a path")?.as_str(),
+                ));
+            }
+            "--keep-qemu" => keep_qemu = true,
+            other => return Err(format!("unknown less-render-probe flag: {other}")),
+        }
+        i += 1;
+    }
+    let out_dir = out_dir.unwrap_or_else(|| {
+        let mut p = std::env::temp_dir();
+        p.push("m3os-less-render-probe");
+        p
+    });
+    Ok(LessRenderProbeArgs {
+        timeout_secs,
+        out_dir,
+        keep_qemu,
+    })
+}
+
+/// Wait for `pattern` to appear in serial output. Mirrors the
+/// inline `Wait` step inside `run_smoke_script` but exposed as a
+/// reusable helper so the render-probe driver doesn't need to
+/// pretend it's a SmokeStep sequence. The caller owns the
+/// `serial_buf` / `serial_history` accumulators across calls.
+fn wait_for_serial_pattern(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    serial_buf: &mut String,
+    serial_history: &mut String,
+    pattern: &str,
+    step_timeout: std::time::Duration,
+    global_start: std::time::Instant,
+    global_timeout: std::time::Duration,
+) -> Result<(), String> {
+    let step_deadline = std::time::Instant::now() + step_timeout;
+    let global_deadline = global_start + global_timeout;
+    let deadline = step_deadline.min(global_deadline);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            append_serial_chunk(serial_buf, serial_history, &chunk);
+        }
+        let stripped = strip_ansi(serial_buf);
+        if stripped.contains(pattern) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let tail = tail_lines(&strip_ansi(serial_history), 60);
+            return Err(format!(
+                "timed out waiting for '{pattern}'\n--- last serial ---\n{tail}"
+            ));
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(chunk) => append_serial_chunk(serial_buf, serial_history, &chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let tail = tail_lines(&strip_ansi(serial_history), 60);
+                return Err(format!(
+                    "serial disconnected while waiting for '{pattern}'\n--- last serial ---\n{tail}"
+                ));
+            }
+        }
+    }
+}
+
+fn capture_frame(q: &mut qmp::QmpClient, out_dir: &Path, tag: &str) -> Result<(), String> {
+    let path = out_dir.join(format!("{tag}.ppm"));
+    q.screendump(&path)
+        .map_err(|e| format!("screendump {tag}: {e}"))?;
+    println!("less-render-probe: captured {}", path.display());
+    Ok(())
+}
+
+/// Take a burst of screendumps at the given millisecond offsets after
+/// a keystroke. Filenames are `<event>-<offset_ms>ms.ppm`. Sleep
+/// between captures is the *delta* from the previous offset, so the
+/// burst tracks the offsets relative to the original event time, not
+/// relative to the previous capture (the screendump itself takes
+/// non-trivial wall time for a 4 MiB FB).
+fn capture_burst(
+    q: &mut qmp::QmpClient,
+    out_dir: &Path,
+    event: &str,
+    offsets_ms: &[u32],
+) -> Result<(), String> {
+    let event_start = std::time::Instant::now();
+    for offset_ms in offsets_ms {
+        let target = event_start + std::time::Duration::from_millis(*offset_ms as u64);
+        let now = std::time::Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
+        }
+        let tag = format!("{event}-{offset_ms:04}ms");
+        capture_frame(q, out_dir, &tag)?;
+    }
+    Ok(())
+}
+
+fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
+    // 1. Build everything the boot needs. Mirrors `cmd_tui_app_smoke`
+    //    so the on-disk layout (less binary, terminfo, /etc/passwd)
+    //    matches the path users actually take. Without the port build
+    //    `/usr/local/bin/less` isn't on disk.
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("less-render-probe: precondition failed: {msg}");
+        std::process::exit(1);
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "less-render-probe: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "less-render-probe: capturing into {}",
+        args.out_dir.display()
+    );
+
+    // 2. Build the QEMU command line. Headless (no SDL window — the
+    //    VGA framebuffer is still emulated, which is all `screendump`
+    //    needs) plus a fresh QMP unix socket the QmpClient will
+    //    connect to once QEMU's listener is up.
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+    let mut qemu_args = qemu_args_with_devices(
+        &uefi_image,
+        &ovmf,
+        QemuDisplayMode::Headless,
+        DeviceSet::default(),
+    );
+    // No network needed; the SLIRP hostfwd-rule line otherwise binds
+    // host ports 2222 / 2323 and races concurrent xtask runs.
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Replace `-display none` with `-display vnc=unix:<sock>`. The
+    // default headless config uses `-display none`, which disables
+    // QEMU's display backend entirely and leaves screendump reading
+    // a stale / empty surface — `query-display-options` returns
+    // `{"type":"none"}` and the framebuffer image never appears in
+    // the dumped PPM. A VNC-backed display keeps the pipeline live;
+    // we never connect to the socket but the *act of having a
+    // display* causes QEMU to render the framebuffer into a surface
+    // that screendump can read. We have to mutate the existing args
+    // in place because qemu_args_with_devices_resolved already
+    // appended `-display none`.
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    // Pin the VGA device so `screendump` reads from the same surface
+    // that OVMF's GOP and m3OS's framebuffer console use. Without
+    // this, Q35 with OVMF can pick a different graphics device whose
+    // memory the screendump command can't see.
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+
+    println!(
+        "less-render-probe: launching QEMU (timeout {}s, qmp socket {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    // 3. Serial reader for the boot markers. We don't drive any
+    //    serial input today (the graphical term receives input via
+    //    PS/2 → display_server, which we feed through QMP), so the
+    //    stdin pipe stays open but unused.
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    // 4. Run the probe inside a closure so the cleanup at the bottom
+    //    runs whether we returned cleanly or hit an error mid-script.
+    let result: Result<(), String> = (|| {
+        // Both markers are necessary: input-owner registration means
+        // PS/2 keystrokes will be routed to display_server's
+        // dispatcher (not the kernel stdin_feeder); TERM_SMOKE:prompt
+        // -ready means term/sh0 has drained the shell prompt and is
+        // ready to accept commands.
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("less-render-probe: display_server owns input grab");
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("less-render-probe: term/sh0 prompt is ready");
+
+        // Connect QMP. QEMU's listener was created at process start
+        // (server,nowait) so the socket usually exists by now; the
+        // QmpClient retries with bounded backoff otherwise.
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("less-render-probe: QMP handshake complete");
+
+        // Diagnostic: list available displays so a future investigator
+        // can confirm screendump is sampling the device m3OS writes to.
+        // Useful while the QMP/screendump pipeline is still being
+        // validated end-to-end; cheap enough to keep on permanently.
+        if let Ok(reply) = q.execute("query-display-options", serde_json::json!({})) {
+            println!("less-render-probe: query-display-options -> {reply}");
+        }
+        if let Ok(reply) = q.execute("query-status", serde_json::json!({})) {
+            println!("less-render-probe: query-status -> {reply}");
+        }
+
+        // Settle delay: term may be mid-blink-frame or mid-paint of
+        // the initial prompt. 500 ms is past one blink interval.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // 4a. Baseline pre-keystroke frame.
+        capture_frame(&mut q, &args.out_dir, "00-baseline")?;
+
+        // The bug from the handoff: content appears for a brief
+        // moment (the user reports "sometimes flashes") then the
+        // screen goes black. A single capture at any one offset can
+        // miss the flash window entirely. We take a burst of
+        // captures at logarithmic offsets — short enough at the head
+        // to catch a sub-100 ms flash, long enough at the tail to
+        // confirm the screen is at rest in its final state. The
+        // report later picks the peak-content frame per event.
+        let burst_offsets_ms: &[u32] = &[20, 60, 120, 200, 400, 800, 1500];
+
+        // 4b. Type the less command into the graphical term. The
+        //     keypresses go through PS/2 → kbd_server → display_server
+        //     → focused client (term) → PTY primary → sh0 inside term.
+        q.type_text("less /etc/passwd\n")
+            .map_err(|e| format!("type less cmd: {e}"))?;
+        capture_burst(&mut q, &args.out_dir, "less-opened", burst_offsets_ms)?;
+
+        // 4c. Down arrow — the headline symptom from the handoff.
+        q.press_key("down", 20).map_err(|e| format!("down: {e}"))?;
+        capture_burst(&mut q, &args.out_dir, "after-down", burst_offsets_ms)?;
+
+        // 4d. Up arrow — the second documented repro keystroke.
+        q.press_key("up", 20).map_err(|e| format!("up: {e}"))?;
+        capture_burst(&mut q, &args.out_dir, "after-up", burst_offsets_ms)?;
+
+        // 4e. Polite exit so we don't leave less running on cleanup.
+        let _ = q.press_key("q", 20);
+        Ok(())
+    })();
+
+    // Drain any remaining serial chunks (the boot continues writing
+    // long after our markers) so the dump captures end-of-run state.
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    // 5. Cleanup. Always kill QEMU unless --keep-qemu — a hung guest
+    //    blocks the build worker indefinitely otherwise.
+    if !args.keep_qemu {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&qmp_socket);
+        let _ = std::fs::remove_file(&vnc_socket);
+    }
+
+    // Always write the serial log alongside the PPMs — render-probe is
+    // a diagnostic tool; a future investigator can grep it for kernel
+    // FB / display_server messages without re-running the probe.
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+    println!("less-render-probe: serial log -> {}", serial_log.display());
+
+    match result {
+        Ok(()) => {
+            println!();
+            print_render_probe_report(&args.out_dir);
+        }
+        Err(msg) => {
+            eprintln!("less-render-probe: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Read every PPM the probe captured, print a per-event burst table,
+/// and surface the peak-content frame vs. the settled frame for each
+/// event. The bug signature is "peak frame has much less black than
+/// the settled frame" — i.e. content appeared then was wiped.
+fn print_render_probe_report(out_dir: &Path) {
+    println!("=== less-render-probe report ===");
+
+    // Read baseline once (single frame, not a burst).
+    let baseline_path = out_dir.join("00-baseline.ppm");
+    match ppm::read_ppm(&baseline_path) {
+        Ok(f) => println!(
+            "{:<32} dim={}x{:<4} hash={:016x} non_black={:.3}",
+            "00-baseline",
+            f.width,
+            f.height,
+            f.hash(),
+            1.0 - f.black_pixel_ratio()
+        ),
+        Err(e) => println!("00-baseline <read error: {e}>"),
+    }
+
+    let events: [(&str, &str); 3] = [
+        ("less-opened", "after typing `less /etc/passwd`"),
+        ("after-down", "after pressing Down"),
+        ("after-up", "after pressing Up"),
+    ];
+    let burst_offsets_ms: &[u32] = &[20, 60, 120, 200, 400, 800, 1500];
+
+    for (event, description) in events {
+        println!();
+        println!("--- event: {event}  ({description}) ---");
+        let mut event_frames: Vec<(u32, ppm::PpmFrame)> = Vec::new();
+        for offset in burst_offsets_ms {
+            let path = out_dir.join(format!("{event}-{offset:04}ms.ppm"));
+            match ppm::read_ppm(&path) {
+                Ok(f) => {
+                    let non_black = 1.0 - f.black_pixel_ratio();
+                    let (rows, cols) = f.non_black_spread();
+                    println!(
+                        "  {offset:>5}ms   hash={:016x}  non_black={non_black:.4}  spread={rows}x{cols}",
+                        f.hash()
+                    );
+                    event_frames.push((*offset, f));
+                }
+                Err(e) => println!("  {offset:>5}ms   <read error: {e}>"),
+            }
+        }
+        // Peak vs. settled. Peak = max non_black. Settled = last burst
+        // frame. The bug shows up as "peak non_black >> settled non_black".
+        if let Some((peak_offset, peak)) = event_frames
+            .iter()
+            .max_by(|a, b| {
+                let an = 1.0 - a.1.black_pixel_ratio();
+                let bn = 1.0 - b.1.black_pixel_ratio();
+                an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(o, f)| (*o, f))
+        {
+            let last = event_frames.last().map(|(o, f)| (*o, f));
+            let peak_non_black = 1.0 - peak.black_pixel_ratio();
+            println!("  peak: {peak_offset:>5}ms non_black={peak_non_black:.4}");
+            if let Some((last_offset, last_frame)) = last {
+                let last_non_black = 1.0 - last_frame.black_pixel_ratio();
+                let diff_to_settled = ppm::pixel_diff_ratio(peak, last_frame);
+                let drop = peak_non_black - last_non_black;
+                println!(
+                    "  settled ({last_offset}ms): non_black={last_non_black:.4}  diff(peak,settled)={diff_to_settled:.4}  drop={drop:+.4}"
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("Interpretation:");
+    println!(
+        "  peak non_black > 0.05 AND drop (peak -> settled) > 0.04  -> render disappearance reproduced"
+    );
+    println!(
+        "  all frames non_black ≈ 0                                  -> framebuffer never showed content (probe / device-id issue)"
+    );
+    println!(
+        "  peak ≈ settled                                            -> content stayed (no bug)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+
 /// Phase 69a Track I — single source of truth for the tcsmoke
 /// subcommand matrix.
 const TC_SMOKE_SUBCOMMANDS: &[(&str, &str, &str, &str, &str)] = &[
@@ -8612,6 +9358,12 @@ fn create_data_disk(
     // Phase 45: populate ports tree and bundled source into /usr/ports/.
     let ports_src = root.join("target/ports-src");
     populate_ports_tree(&part_tmp, &root, &ports_src);
+    // Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
+    // Phase 69d port (target/port-stage/<name>/usr/local/...) onto the
+    // ext2 partition.  Only the ports whose stage exists are copied;
+    // the function is a no-op for any port that has not yet been built
+    // by `cargo xtask port build <name>` or `tui-app-smoke`.
+    populate_phase_69d_ports(&part_tmp, &root);
     // Phase 47: place doom1.wad on the ext2 partition.
     populate_doom_files(&part_tmp);
 
@@ -9920,6 +10672,156 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
             "Warning: debugfs (ports) exited with {}: {}",
             debugfs_output.status, stderr
         );
+    }
+}
+
+/// Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — mirror every staged
+/// Phase 69d port (target/port-stage/<name>/usr/local/{bin,lib,include,share})
+/// onto the ext2 partition. Only ports whose stage exists are copied; the
+/// function is a no-op if `cargo xtask port build` has not been run.
+fn populate_phase_69d_ports(part_path: &Path, workspace_root: &Path) {
+    const PORTS: &[&str] = &["ncurses", "libevent", "less", "htop", "tmux"];
+    let stage_root = workspace_root.join("target/port-stage");
+    if !stage_root.is_dir() {
+        return;
+    }
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut execs: Vec<String> = Vec::new();
+
+    for port in PORTS {
+        let local = stage_root.join(port).join("usr/local");
+        if local.is_dir() {
+            collect_phase_69d_entries(&local, "usr/local", &mut dirs, &mut files, &mut execs);
+        }
+        // Phase 69 Track A.2 — terminfo database lives under
+        // /usr/share/terminfo on the target. Mirror it from the ncurses
+        // stage so apps that call setupterm("m3os-term") at runtime
+        // find the compiled entry.
+        let share = stage_root.join(port).join("usr/share");
+        if share.is_dir() {
+            collect_phase_69d_entries(&share, "usr/share", &mut dirs, &mut files, &mut execs);
+        }
+    }
+
+    if files.is_empty() {
+        return;
+    }
+
+    println!(
+        "phase-69d ports: mirroring {} files ({} executables) from {} into ext2",
+        files.len(),
+        execs.len(),
+        stage_root.display()
+    );
+
+    let mut cmds = String::new();
+    // Parent dirs already created by populate_ports_tree, but be defensive
+    // and re-create them — debugfs `mkdir` of an existing dir is a no-op
+    // that prints a harmless warning we discard.
+    for d in &[
+        "usr",
+        "usr/local",
+        "usr/local/bin",
+        "usr/local/lib",
+        "usr/local/include",
+        "usr/share",
+    ] {
+        cmds.push_str(&format!("mkdir {d}\n"));
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    for dir in &dirs {
+        cmds.push_str(&format!("mkdir {dir}\n"));
+    }
+
+    // Skip symbolic-link entries (e.g. /usr/local/lib/libcurses.a → libncurses.a)
+    // because the ext2 debugfs `write` verb doesn't follow them; the regular
+    // files they point at are already in `files` from the directory walk.
+    files.retain(|(_, host)| !host.is_symlink());
+
+    for (ext2_path, host_path) in &files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
+    // Mark every directory 0755, every file 0644.
+    for dir in &dirs {
+        cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
+    }
+    for (ext2_path, _) in &files {
+        cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+    }
+    // Executables get 0755.
+    for exe in &execs {
+        cmds.push_str(&format!("sif {exe} mode 0x81ED\n"));
+    }
+    cmds.push_str("q\n");
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for phase-69d ports");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write phase-69d debugfs commands");
+    }
+    let out = debugfs.wait_with_output().expect("debugfs wait");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "Warning: debugfs (phase-69d ports) exited with {}: {}",
+            out.status, stderr
+        );
+    }
+}
+
+/// Recursively collect every regular file and directory under `src` and
+/// append matching ext2-relative paths into `dirs`, `files`, `execs`.
+/// Executable files (mode 0o755) land in `execs` so the caller can
+/// `sif {path} mode 0x81ED` after writing them.
+fn collect_phase_69d_entries(
+    src: &Path,
+    prefix: &str,
+    dirs: &mut Vec<String>,
+    files: &mut Vec<(String, PathBuf)>,
+    execs: &mut Vec<String>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    dirs.push(prefix.to_string());
+    let entries = match fs::read_dir(src) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() {
+            // Skip libcurses.a → libncurses.a symlinks; ncurses callers
+            // link the real archive directly.
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let child_prefix = format!("{prefix}/{name_str}");
+        if path.is_dir() {
+            collect_phase_69d_entries(&path, &child_prefix, dirs, files, execs);
+        } else if path.is_file() {
+            let executable = fs::metadata(&path)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            files.push((child_prefix.clone(), path));
+            if executable {
+                execs.push(child_prefix);
+            }
+        }
     }
 }
 

@@ -1,0 +1,13 @@
+NAME=libevent
+VERSION=2.1.12-stable
+DESCRIPTION="Asynchronous event notification library (tmux dependency)"
+CATEGORY=lib
+DEPS=
+URL=https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+SHA256=92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb
+MAINTAINER=m3os
+
+# Phase 69d Track D.1: libevent provides the event loop tmux requires. We
+# build the static archive only (--disable-shared); OpenSSL bindings, the
+# legacy sample programs, and debug-mode are all turned off to keep the
+# surface area small and the static binary footprint contained.

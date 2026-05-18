@@ -302,6 +302,20 @@ fn program_main(_args: &[&str]) -> i32 {
                     RenderCommand::SetMouseMode { code, set } => {
                         update_mouse_mode(&mut mouse_reporter, code, set);
                     }
+                    // 2026-05-18 less-render follow-up — host-bound
+                    // reply bytes (DA / DSR) land here. Writing back
+                    // to the PTY primary feeds the application's
+                    // stdin so it sees a real terminal at startup
+                    // and avoids the `\E[2J\E[H<content>` full-
+                    // repaint fallback the snapshot-during-write
+                    // race made so visible. Short-write / EAGAIN is
+                    // not retried: less / vim / htop tolerate a lost
+                    // reply by re-issuing the query, which the next
+                    // tick handles. A best-effort write is enough.
+                    RenderCommand::RespondToHost { bytes, len } => {
+                        let n = len as usize;
+                        let _ = syscall_lib::write(primary_fd, &bytes[..n]);
+                    }
                     other => renderer.apply(other),
                 }
             }

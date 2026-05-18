@@ -234,3 +234,52 @@ Add smokes for:
 - Existing local docs: `docs/29-pty-subsystem.md`
 - Existing local docs: `docs/22b-ansi-escape.md`
 - Existing local docs: `docs/57-audio-and-local-session.md`
+
+## Closeout (Phase 69d, 2026-05-16)
+
+The terminal-compatibility gaps this evaluation enumerated landed in five
+phases between Phase 57b and Phase 69d. Below is the per-gap status as of
+the kernel patch bump to 0.69.4:
+
+| Gap from this eval | Landed in | What shipped |
+|---|---|---|
+| Raw / cbreak termios | Phase 69a | Full POSIX termios flag set, VMIN/VTIME, IXON/IXOFF, IUTF8, isig path. `cargo xtask termios-smoke` validates each quadrant. |
+| Alternate screen buffer | Phase 69 Track B | `Screen` carries dual primary/alternate cell grids with a `SavedCursor` snapshot for `?1049` / `?47`. |
+| Cursor modes + full SGR | Phase 69 Tracks C / F | `SgrParams::ops()` yields typed `SgrOp` values covering 256-color and truecolor; `ConsoleCmd::CursorShape` drives DECSCUSR. |
+| 256-color + truecolor | Phase 69 Track C | `XTERM_256_PALETTE`-backed `color_to_bgra` resolver. |
+| UTF-8 decoding | Phase 69b | `kernel-core::utf8::Utf8Decoder` (strict W3C) routed through `Screen::feed`; `ConsoleCmd::PutChar` payload widened to `u32`. |
+| Font coverage + Nerd Font | Phase 69c | TTF rasterizer + atlas keyed by codepoint with capacity-bounded LRU eviction; JetBrainsMono Nerd Font asset embedding. |
+| Resize handling / SIGWINCH | Phase 69 Track D | `ServerMessage::SurfaceResized { width, height }` → `Screen::resize` → `ioctl(TIOCSWINSZ)` → kernel SIGWINCH delivery. |
+| Bracketed paste | Phase 69 Track G | `?2004` mode bit on `Screen`; `BE`/`BD` terminfo extensions on `m3os-term`. |
+| SGR mouse | Phase 69 Track E | `term::mouse::MouseReporter` encodes `?9` / `?1000` / `?1006`. |
+| terminfo entry | Phase 69 Track A.2 | `xtask/terminfo/m3os-term.ti` compiled with `tic -x` into `/usr/share/terminfo`. |
+| `infocmp m3os-term` | Phase 69d Track A.3 | Compiled into the staged ncurses terminfo db; runs against `infocmp` from `target/port-stage/ncurses/usr/local/bin`. |
+
+### Apps validated
+
+- **`less`** — full Phase 69d Track B.2 smoke. Opens `/etc/passwd`,
+  asserts the alt-screen rendered the first line, quits with `q`,
+  emits the `:ok` sentinel. Wired into `cargo xtask tui-app-smoke`.
+- **`htop`** — full Phase 69d Track C.2 smoke. Renders the chrome
+  (`Tasks:` header, CPU/Mem bars, F1–F10 strip), quits on `q`, and
+  emits the `:ok` sentinel. The earlier SIGSEGV at `termattrs_sp`
+  turned out to be a build-time linker confusion mixing
+  `-lncursesw -ltinfo` (narrow tinfo populates `type`, wide
+  `termattrs_sp` reads `type2.Strings` → NULL → fault). Fixed by
+  pinning `CURSES_LIBS=-lncursesw -ltinfow` in htop's configure;
+  see `docs/appendix/tui-app-port-notes.md`.
+- **`tmux`** — Phase 69d Track D.3 partial. Binary-integrity probe
+  (executable + `-V` returns). The full session lifecycle is gated
+  behind missing kernel syscalls: tmux's client/server uses
+  `sendmsg`/`recvmsg`/`flock` over a Unix socket, and m3OS' syscall
+  table returns `-ENOSYS` for those numbers today. Adding
+  scatter-gather Unix-socket I/O lives in a follow-up phase.
+
+### Forward pointers for deferred apps
+
+- **Neovim** — own phase (libuv + Lua/LuaJIT or a supported alternative + tree-sitter).
+- **btop** — own phase after Phase 78 C++ cross-compiled toolchain.
+- **lazygit, fzf, starship** — own phase after a Go toolchain port.
+- **mc** (Midnight Commander) — own phase or stretch goal (slang or ncurses).
+- **ranger / lf** — own phase (Python or Go dependencies).
+- **vim** — could land alongside the next TUI batch; not in 69d baseline.

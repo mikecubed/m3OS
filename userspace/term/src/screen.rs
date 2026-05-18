@@ -43,6 +43,21 @@ pub const DEFAULT_FG: u32 = 0xFFFF_FFFF;
 /// Default background colour (black, BGRA8888 packed).
 pub const DEFAULT_BG: u32 = 0x0000_0000;
 
+/// 2026-05-18 less-render follow-up — Primary Device Attributes
+/// reply (`CSI ? 6 c`, VT102). Sent when the host requests DA via
+/// `CSI c`. VT102 is the minimal "real terminal, not a teletype"
+/// answer; xterm-style apps treat it as licence to use incremental-
+/// repaint sequences (`csr`, `il`/`dl`, ICH/DCH/ECH) rather than the
+/// `\E[2J\E[H<content>` full-repaint fallback. The terminfo `u8`
+/// capability pattern `\E[?%[;0123456789]c` matches this reply.
+const DA_REPLY_VT102: &[u8] = b"\x1b[?6c";
+
+/// 2026-05-18 less-render follow-up — DSR-5 "terminal OK" reply
+/// (`CSI 0 n`). Sent when the host requests device-status via
+/// `CSI 5 n`. The payload contains no terminal-specific data, so
+/// the byte sequence is fixed.
+const DSR_OK_REPLY: &[u8] = b"\x1b[0n";
+
 /// 8-entry SGR colour palette (BGRA8888).  Index `n` corresponds to
 /// SGR 30+`n` (foreground) and 40+`n` (background).
 const SGR_PALETTE: [u32; 8] = [
@@ -190,7 +205,26 @@ pub enum RenderCommand {
     /// renderer ignores this; the binary's main loop intercepts it
     /// and forwards to the [`mouse::MouseReporter`].
     SetMouseMode { code: u16, set: bool },
+    /// 2026-05-18 less-render follow-up — out-of-band bytes the
+    /// terminal owes the PTY master in reply to a query like DA
+    /// (`\E[c`) or DSR (`\E[6n`). The renderer ignores this; the
+    /// binary's main loop intercepts it and writes `bytes[..len]`
+    /// to the PTY primary so the application reads the reply on
+    /// stdin. Inline storage is sized for the longest reply m3os-
+    /// term emits: `\E[<row>;<col>R` with five-digit row/col is 14
+    /// bytes; we round up to 24 for headroom (future DA forms like
+    /// `\E[?64;1;2;6;9;15;18;21;22c` fit comfortably).
+    RespondToHost {
+        bytes: [u8; PTY_RESPONSE_MAX],
+        len: u8,
+    },
 }
+
+/// 2026-05-18 less-render follow-up — inline capacity of a
+/// [`RenderCommand::RespondToHost`] payload. Sized for the longest
+/// reply m3os-term emits today (`\E[<row>;<col>R` = 14 bytes) with
+/// headroom for future DA forms.
+pub const PTY_RESPONSE_MAX: usize = 24;
 
 /// One cell in the screen buffer.  `codepoint` is the glyph; `fg`/`bg`
 /// are the BGRA8888 packed colours at the time the cell was written.
@@ -322,6 +356,14 @@ pub struct Screen {
     cursor_shape: CursorShape,
     /// Phase 69 Track G — `?2004` bracketed-paste enabled bit.
     bracketed_paste_enabled: bool,
+    /// Phase 69d-FU — DECSTBM scroll region top (0-based, inclusive).
+    /// Defaults to `0`.  Less and other TUI apps narrow this with `csr`
+    /// so subsequent newlines / SU / SD / IL / DL operate on a
+    /// sub-rectangle of the screen.
+    scroll_top: u16,
+    /// Phase 69d-FU — DECSTBM scroll region bottom (0-based, inclusive).
+    /// Defaults to `rows - 1`.
+    scroll_bottom: u16,
     /// ANSI parser state.
     parser: AnsiParser,
     /// Phase 69b Track B.2 — UTF-8 byte-stream decoder. Bytes are
@@ -359,6 +401,8 @@ impl Screen {
             bg: DEFAULT_BG,
             cursor_shape: CursorShape::BlinkingBlock,
             bracketed_paste_enabled: false,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             parser: AnsiParser::new(),
             decoder: Utf8Decoder::new(),
         }
@@ -490,6 +534,15 @@ impl Screen {
         }
         if self.cursor_col > cols {
             self.cursor_col = cols;
+        }
+        // Phase 69d-FU — reclamp the scroll region.  Any saved bounds
+        // outside the new geometry collapse to the full screen so a
+        // subsequent line_feed cannot reference a row we no longer have.
+        self.scroll_top = self.scroll_top.min(rows.saturating_sub(1));
+        self.scroll_bottom = self.scroll_bottom.min(rows.saturating_sub(1));
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
+            self.scroll_bottom = rows.saturating_sub(1);
         }
         out.push(RenderCommand::Clear);
         let cols_now = self.cols;
@@ -747,6 +800,40 @@ impl Screen {
                 self.cursor_shape = CursorShape::from_code(shape);
             }
             ConsoleCmd::Sgr(sgr) => self.apply_sgr_ops(sgr.ops(), out),
+            ConsoleCmd::DeviceAttributesReq => {
+                out.push(make_response(DA_REPLY_VT102));
+            }
+            ConsoleCmd::DeviceStatusReport { kind } => match kind {
+                5 => out.push(make_response(DSR_OK_REPLY)),
+                6 => {
+                    // 1-based row;col per the VT spec — the parser
+                    // accepts `CSI <r> ; <c> H` in the same form, so
+                    // a round-trip "where am I" reply lands at the
+                    // same cell when fed back in.
+                    let row_1 = (self.cursor_row as u32) + 1;
+                    let col_1 = (self.cursor_col as u32) + 1;
+                    out.push(make_cursor_position_response(row_1, col_1));
+                }
+                _ => { /* Unknown DSR kind — silently ignored. */ }
+            },
+            ConsoleCmd::SetScrollRegion { top, bottom } => {
+                self.set_scroll_region(top, bottom, out);
+            }
+            ConsoleCmd::VerticalPositionAbsolute(n) => {
+                let r = n.saturating_sub(1).min(self.rows.saturating_sub(1));
+                self.cursor_row = r;
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::ScrollUp(n) => self.scroll_region_up(n.max(1), out),
+            ConsoleCmd::ScrollDown(n) => self.scroll_region_down(n.max(1), out),
+            ConsoleCmd::InsertLines(n) => self.insert_lines(n.max(1), out),
+            ConsoleCmd::DeleteLines(n) => self.delete_lines(n.max(1), out),
+            ConsoleCmd::InsertChars(n) => self.insert_chars(n.max(1), out),
+            ConsoleCmd::DeleteChars(n) => self.delete_chars(n.max(1), out),
+            ConsoleCmd::EraseChars(n) => self.erase_chars(n.max(1), out),
         }
     }
 
@@ -903,9 +990,14 @@ impl Screen {
 
     fn line_feed(&mut self, out: &mut Vec<RenderCommand>) {
         self.cursor_col = 0;
-        if self.cursor_row + 1 >= self.rows {
-            self.scroll_up(out);
-        } else {
+        // Honour the DECSTBM scroll region: when the cursor sits on
+        // the bottom margin of the region, a line-feed scrolls the
+        // region up by one and the cursor stays put.  Outside the
+        // region (cursor below scroll_bottom) the cursor simply
+        // advances until it hits the bottom of the surface.
+        if self.cursor_row == self.scroll_bottom {
+            self.scroll_region_up(1, out);
+        } else if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
         }
         out.push(RenderCommand::MoveCursor {
@@ -914,32 +1006,259 @@ impl Screen {
         });
     }
 
-    fn scroll_up(&mut self, out: &mut Vec<RenderCommand>) {
+    /// Phase 69d-FU — scroll the active scroll region up by `n` lines.
+    /// The top `n` rows of the region are lost (with scrollback eviction
+    /// only when the region covers the full primary surface).  The
+    /// bottom `n` rows of the region are blanked.
+    fn scroll_region_up(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let region_height = self.scroll_bottom - self.scroll_top + 1;
+        let n = n.min(region_height);
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bottom as usize;
         let cols = self.cols as usize;
         let fg = self.fg;
         let bg = self.bg;
         let primary = matches!(self.active, ScreenSelect::Primary);
-        // Evict the top row into scrollback (capped) ONLY when the
-        // primary grid is active. Standard terminal behaviour: the
-        // alternate screen does not feed scrollback.
-        if primary {
-            let evicted: Vec<Cell> = self.buf[0..cols].to_vec();
-            if self.scrollback.len() >= SCROLLBACK_LINES {
-                self.scrollback.remove(0);
+        let full_screen = self.scroll_top == 0 && self.scroll_bottom + 1 == self.rows;
+        // Evict only when the region is the full primary surface — the
+        // alternate screen and partial regions do not feed scrollback
+        // per xterm.
+        if primary && full_screen {
+            for r in 0..n as usize {
+                let evicted: Vec<Cell> = self.buf[r * cols..(r + 1) * cols].to_vec();
+                if self.scrollback.len() >= SCROLLBACK_LINES {
+                    self.scrollback.remove(0);
+                }
+                self.scrollback.push(evicted);
             }
-            self.scrollback.push(evicted);
         }
-        // Shift every other row of the active grid up by one.
-        let total = self.cols as usize * self.rows as usize;
         let active = self.active_buf_mut();
-        for i in 0..(total - cols) {
-            active[i] = active[i + cols];
+        // When `n` equals the full region height (e.g. `CSI 999 S` on a
+        // scroll region starting at row 0), there's nothing to shift:
+        // every row gets blanked. We have to skip the shift loop entirely
+        // because `bot - n` would underflow as usize, and the blank loop
+        // would integer-wrap on `bot + 1 - n` when `bot + 1 == n`.
+        if (n as usize) < region_height as usize {
+            // Shift rows up within the region: row `r` <- row `r + n`.
+            for r in top..=(bot - n as usize) {
+                let src = r + n as usize;
+                for c in 0..cols {
+                    active[r * cols + c] = active[src * cols + c];
+                }
+            }
         }
-        // Blank the new bottom row.
-        for i in (total - cols)..total {
-            active[i] = Cell::blank(fg, bg);
+        // Blank the bottom `n` rows of the region. When the entire region
+        // is being cleared (`n == region_height`), this iterates over
+        // every row from `top` to `bot` inclusive.
+        let blank_start = top + (region_height as usize - n as usize);
+        for r in blank_start..=bot {
+            for c in 0..cols {
+                active[r * cols + c] = Cell::blank(fg, bg);
+            }
         }
-        out.push(RenderCommand::Scroll { amount: 1 });
+        // Re-emit the affected cells.  The full-screen case can use
+        // the fast `Scroll` framebuffer command; partial regions need
+        // per-cell PutGlyph since the framebuffer scroll is whole-surface.
+        if full_screen {
+            out.push(RenderCommand::Scroll { amount: n as i16 });
+        } else {
+            self.emit_region(top, bot, out);
+        }
+    }
+
+    /// Phase 69d-FU — scroll the active scroll region down by `n` lines.
+    /// The bottom `n` rows of the region are lost; the top `n` rows are
+    /// blanked.  Scrollback is never fed (xterm semantics).
+    fn scroll_region_down(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let region_height = self.scroll_bottom - self.scroll_top + 1;
+        let n = n.min(region_height);
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bottom as usize;
+        let cols = self.cols as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let active = self.active_buf_mut();
+        // Shift rows down within the region: row `r` <- row `r - n`,
+        // iterating from the bottom up so we don't clobber sources.
+        for r in (top + n as usize..=bot).rev() {
+            let src = r - n as usize;
+            for c in 0..cols {
+                active[r * cols + c] = active[src * cols + c];
+            }
+        }
+        // Blank the top `n` rows of the region.
+        for r in top..top + n as usize {
+            for c in 0..cols {
+                active[r * cols + c] = Cell::blank(fg, bg);
+            }
+        }
+        self.emit_region(top, bot, out);
+    }
+
+    /// Phase 69d-FU — re-emit every cell in rows `[top, bot]` as PutGlyph
+    /// commands so the renderer repaints the region after an in-buffer
+    /// shift.  Used by partial-region scrolls and by IL / DL.
+    fn emit_region(&self, top: usize, bot: usize, out: &mut Vec<RenderCommand>) {
+        let cols = self.cols as usize;
+        let buf = self.active_buf();
+        for r in top..=bot {
+            for c in 0..cols {
+                let cell = buf[r * cols + c];
+                out.push(RenderCommand::PutGlyph {
+                    row: r as u16,
+                    col: c as u16,
+                    codepoint: cell.codepoint,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                });
+            }
+        }
+    }
+
+    /// Phase 69d-FU — re-emit one row's cells as PutGlyphs.  Used by
+    /// ICH / DCH / ECH after an in-place row mutation.
+    fn emit_row(&self, row: usize, out: &mut Vec<RenderCommand>) {
+        let cols = self.cols as usize;
+        let buf = self.active_buf();
+        for c in 0..cols {
+            let cell = buf[row * cols + c];
+            out.push(RenderCommand::PutGlyph {
+                row: row as u16,
+                col: c as u16,
+                codepoint: cell.codepoint,
+                fg: cell.fg,
+                bg: cell.bg,
+            });
+        }
+    }
+
+    /// Phase 69d-FU — set the DECSTBM scroll region.  Both bounds are
+    /// 1-based in the wire protocol; passing `(0, 0)` resets to the
+    /// full screen.  Bounds outside the screen are clamped; an
+    /// inverted region (`top >= bottom` after clamping) also resets.
+    fn set_scroll_region(&mut self, top: u16, bottom: u16, out: &mut Vec<RenderCommand>) {
+        let (new_top, new_bottom) = if top == 0 && bottom == 0 {
+            (0u16, self.rows.saturating_sub(1))
+        } else {
+            let t = top.saturating_sub(1).min(self.rows.saturating_sub(1));
+            let b = bottom.saturating_sub(1).min(self.rows.saturating_sub(1));
+            if t >= b {
+                (0u16, self.rows.saturating_sub(1))
+            } else {
+                (t, b)
+            }
+        };
+        self.scroll_top = new_top;
+        self.scroll_bottom = new_bottom;
+        // DECSTBM moves the cursor to (1,1) per the standard.
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        out.push(RenderCommand::MoveCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+        });
+    }
+
+    /// Phase 69d-FU — IL: insert `n` blank lines at the cursor (or
+    /// rather at `cursor_row`), shifting content within the scroll
+    /// region downward.  Lines pushed past `scroll_bottom` are lost.
+    /// No-op when the cursor is outside the scroll region.
+    fn insert_lines(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 {
+            return;
+        }
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let top = self.cursor_row;
+        let saved_top = self.scroll_top;
+        self.scroll_top = top;
+        self.scroll_region_down(n, out);
+        self.scroll_top = saved_top;
+    }
+
+    /// Phase 69d-FU — DL: delete `n` lines starting at the cursor,
+    /// shifting content within the scroll region upward.  Bottom `n`
+    /// lines blanked.  No-op when the cursor is outside the scroll
+    /// region.
+    fn delete_lines(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 {
+            return;
+        }
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let top = self.cursor_row;
+        let saved_top = self.scroll_top;
+        self.scroll_top = top;
+        self.scroll_region_up(n, out);
+        self.scroll_top = saved_top;
+    }
+
+    /// Phase 69d-FU — ICH: insert `n` blank cells at the cursor,
+    /// shifting cells right.  Cells pushed past the last column are
+    /// lost.
+    fn insert_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row as usize;
+        let cols = self.cols as usize;
+        let start = self.cursor_col as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let buf = self.active_buf_mut();
+        // Shift right: iterate from end so we don't clobber sources.
+        for c in (start + n as usize..cols).rev() {
+            buf[row * cols + c] = buf[row * cols + c - n as usize];
+        }
+        for c in start..start + n as usize {
+            buf[row * cols + c] = Cell::blank(fg, bg);
+        }
+        self.emit_row(row, out);
+    }
+
+    /// Phase 69d-FU — DCH: delete `n` cells at the cursor, shifting
+    /// the rest of the row left.  Last `n` cells of the row are blanked.
+    fn delete_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row as usize;
+        let cols = self.cols as usize;
+        let start = self.cursor_col as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let buf = self.active_buf_mut();
+        for c in start..cols - n as usize {
+            buf[row * cols + c] = buf[row * cols + c + n as usize];
+        }
+        for c in cols - n as usize..cols {
+            buf[row * cols + c] = Cell::blank(fg, bg);
+        }
+        self.emit_row(row, out);
+    }
+
+    /// Phase 69d-FU — ECH: blank `n` cells starting at the cursor;
+    /// cursor position unchanged.
+    fn erase_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row;
+        let start_col = self.cursor_col;
+        for c in start_col..start_col + n {
+            self.blank_cell(row, c, out);
+        }
     }
 
     /// ED 0: blank from `(cursor_row, cursor_col)` (inclusive) to the
@@ -1081,6 +1400,72 @@ impl Default for Screen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 2026-05-18 less-render follow-up — pack a fixed byte string into a
+/// [`RenderCommand::RespondToHost`] payload. Used for the DA reply
+/// and the DSR-5 reply, whose bodies are constant byte sequences.
+///
+/// Panics if `body.len() > PTY_RESPONSE_MAX`; the constants above are
+/// all well under the cap, and the host-test suite catches a future
+/// constant that exceeds the inline buffer before it can reach the
+/// wire.
+fn make_response(body: &[u8]) -> RenderCommand {
+    debug_assert!(body.len() <= PTY_RESPONSE_MAX);
+    let mut bytes = [0u8; PTY_RESPONSE_MAX];
+    bytes[..body.len()].copy_from_slice(body);
+    RenderCommand::RespondToHost {
+        bytes,
+        len: body.len() as u8,
+    }
+}
+
+/// 2026-05-18 less-render follow-up — encode a DSR-6 cursor-position
+/// reply (`CSI <row> ; <col> R`) into a [`RenderCommand::RespondToHost`].
+/// Both `row_1based` and `col_1based` are written as decimal ASCII.
+/// The screen's `cursor_row` / `cursor_col` are `u16`, so the maximum
+/// value is 65535 (five digits) → total length up to
+/// `2 + 5 + 1 + 5 + 1 = 14` bytes, which fits inside
+/// [`PTY_RESPONSE_MAX`] = 24.
+fn make_cursor_position_response(row_1based: u32, col_1based: u32) -> RenderCommand {
+    let mut bytes = [0u8; PTY_RESPONSE_MAX];
+    let mut idx = 0usize;
+    let write = |out: &mut [u8; PTY_RESPONSE_MAX], idx: &mut usize, byte: u8| {
+        out[*idx] = byte;
+        *idx += 1;
+    };
+    write(&mut bytes, &mut idx, 0x1b);
+    write(&mut bytes, &mut idx, b'[');
+    encode_decimal(row_1based, &mut bytes, &mut idx);
+    write(&mut bytes, &mut idx, b';');
+    encode_decimal(col_1based, &mut bytes, &mut idx);
+    write(&mut bytes, &mut idx, b'R');
+    RenderCommand::RespondToHost {
+        bytes,
+        len: idx as u8,
+    }
+}
+
+/// Decimal-encode `value` into `out[*idx..]`, advancing `*idx`. Writes
+/// at least one digit (the value `0` produces `b'0'`). Caller must
+/// guarantee `out` has at least 10 spare bytes — enough for the full
+/// `u32` range. The DSR-6 caller above only feeds five-digit values
+/// (cursor coords are `u16` widened to `u32`), so the bound holds.
+fn encode_decimal(value: u32, out: &mut [u8; PTY_RESPONSE_MAX], idx: &mut usize) {
+    let mut buf = [0u8; 10];
+    let mut n = value;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let digits = &buf[i..];
+    out[*idx..*idx + digits.len()].copy_from_slice(digits);
+    *idx += digits.len();
 }
 
 #[cfg(test)]
@@ -1792,6 +2177,149 @@ mod tests {
         assert_eq!(s.cursor(), (0, 0));
         // Colours stay at defaults.
         assert_eq!(s.colors(), (DEFAULT_FG, DEFAULT_BG));
+    }
+
+    fn extract_response(cmds: &[RenderCommand]) -> &[u8] {
+        for cmd in cmds {
+            if let RenderCommand::RespondToHost { bytes, len } = cmd {
+                return &bytes[..*len as usize];
+            }
+        }
+        panic!("no RespondToHost in: {:?}", cmds);
+    }
+
+    /// 2026-05-18 less-render follow-up — DA (`CSI c`) produces the
+    /// VT102 reply `CSI ? 6 c`. This is the root-cause fix for less
+    /// landing in full-repaint "dumb terminal" mode: without a reply,
+    /// less times out the query at startup and avoids the incremental
+    /// `csr`/IL/DL/ECH path the parser already dispatches.
+    #[test]
+    fn da_request_emits_vt102_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[c");
+        assert_eq!(extract_response(&cmds), b"\x1b[?6c");
+    }
+
+    /// DSR-5 ("are you there?") produces the fixed terminal-OK reply.
+    #[test]
+    fn dsr_5_emits_terminal_ok_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[5n");
+        assert_eq!(extract_response(&cmds), b"\x1b[0n");
+    }
+
+    /// DSR-6 (cursor-position query) reports the current cursor in
+    /// 1-based `row;col` form. Driven from the screen's live cursor
+    /// state so a position change between queries is observable.
+    #[test]
+    fn dsr_6_emits_cursor_position_reply_origin() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[6n");
+        // Origin cursor is (0, 0); 1-based reply is `1;1`.
+        assert_eq!(extract_response(&cmds), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn dsr_6_reply_tracks_cursor_after_movement() {
+        let mut s = Screen::with_geometry(80, 25);
+        // Move to (row=3, col=12) via 1-based CUP.
+        let _ = feed_str(&mut s, "\x1b[4;13H");
+        let cmds = feed_str(&mut s, "\x1b[6n");
+        // 1-based reply: row 4, col 13.
+        assert_eq!(extract_response(&cmds), b"\x1b[4;13R");
+    }
+
+    /// DSR with an unknown kind (e.g. `15n`, printer status) is
+    /// dropped silently — no response, no crash, no stray render op.
+    #[test]
+    fn dsr_unknown_kind_emits_no_reply() {
+        let mut s = Screen::with_geometry(80, 25);
+        let cmds = feed_str(&mut s, "\x1b[15n");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, RenderCommand::RespondToHost { .. }))
+        );
+    }
+
+    /// The cursor-position encoder must not exceed [`PTY_RESPONSE_MAX`]
+    /// for the worst-case `u16` x `u16` coords the screen can produce.
+    /// A 65535-row × 65535-col grid is far beyond anything m3os-term
+    /// ships today, but the bound is what protects the inline buffer.
+    #[test]
+    fn dsr_6_reply_fits_inline_buffer_at_u16_max() {
+        let reply = make_cursor_position_response(65535, 65535);
+        match reply {
+            RenderCommand::RespondToHost { bytes, len } => {
+                let payload = &bytes[..len as usize];
+                assert_eq!(payload, b"\x1b[65535;65535R");
+                assert!(payload.len() <= PTY_RESPONSE_MAX);
+            }
+            other => panic!("expected RespondToHost, got {:?}", other),
+        }
+    }
+
+    /// Regression for the Phase 69d-FU `CSI <n> S` underflow: when an
+    /// app sends `CSI 999 S` against the full primary surface, the
+    /// requested scroll count clamps to `region_height`. With the old
+    /// arithmetic, `bot - n` underflowed (`23 - 24` as usize) and the
+    /// inclusive range walked over every cell of the active buffer.
+    /// Today the path must blank the entire region, feed every evicted
+    /// row into scrollback, and emit a single `Scroll` command.
+    #[test]
+    fn csi_999_s_clears_full_region_without_underflow() {
+        let mut s = Screen::with_geometry(4, 3);
+        let _ = feed_str(&mut s, "AAAA\nBBBB\nCCCC");
+        // Three rows of distinct content, cursor at end of row 2.
+        let cmds = feed_str(&mut s, "\x1b[999S");
+        // Every cell in the active buffer must be blank.
+        for r in 0..3 {
+            for c in 0..4 {
+                assert_eq!(
+                    s.cell(r, c).unwrap().codepoint,
+                    b' ' as u32,
+                    "cell ({r},{c}) should be blank after CSI 999 S"
+                );
+            }
+        }
+        // Scrollback received all three evicted lines (the region is
+        // the full primary surface, so eviction is enabled).
+        assert!(
+            s.scrollback_len() >= 3,
+            "scrollback should hold AAAA/BBBB/CCCC"
+        );
+        // The framebuffer-level Scroll is emitted exactly once for the
+        // full-screen fast-path.
+        let scrolls = cmds
+            .iter()
+            .filter(|c| matches!(c, RenderCommand::Scroll { .. }))
+            .count();
+        assert_eq!(scrolls, 1, "full-screen scroll emits a single Scroll cmd");
+    }
+
+    /// Companion: `CSI <n> S` on a *partial* scroll region (DECSTBM
+    /// 1;2 — rows 0 and 1, leaving row 2 untouched) with `n` equal to
+    /// the region height must blank rows 0-1, leave row 2 alone, and
+    /// must not feed scrollback (partial regions don't evict per
+    /// xterm).
+    #[test]
+    fn csi_s_clamped_on_partial_region_preserves_outside_rows() {
+        let mut s = Screen::with_geometry(4, 3);
+        let _ = feed_str(&mut s, "AAAA\nBBBB\nCCCC");
+        // DECSTBM 1;2 sets rows 0..=1 (1-based inclusive) and parks
+        // the cursor at the region's top.
+        let _ = feed_str(&mut s, "\x1b[1;2r");
+        // Scroll 999 lines: clamp to region_height = 2.
+        let _ = feed_str(&mut s, "\x1b[999S");
+        // Rows 0 and 1 are blank.
+        for c in 0..4 {
+            assert_eq!(s.cell(0, c).unwrap().codepoint, b' ' as u32);
+            assert_eq!(s.cell(1, c).unwrap().codepoint, b' ' as u32);
+        }
+        // Row 2 is untouched.
+        for c in 0..4 {
+            assert_eq!(s.cell(2, c).unwrap().codepoint, b'C' as u32);
+        }
     }
 
     /// Phase 57 G.4 property test: arbitrary ANSI byte sequences must
