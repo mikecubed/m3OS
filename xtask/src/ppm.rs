@@ -154,14 +154,31 @@ fn read_header(file: &mut File) -> Result<PpmHeader, String> {
     let maxval: u32 = read_token(file)?
         .parse()
         .map_err(|e| format!("bad maxval: {e}"))?;
-    // Sanity caps: 16 K × 16 K BGRA8888 is already ~1 GiB, way past
-    // anything QEMU emits. Reject larger to keep the buffer alloc
-    // bounded if the header is garbage.
-    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+    // Sanity caps. We bound *total bytes* rather than per-dimension
+    // size because the dimension cap alone is too loose to defend the
+    // buffer allocation: 16 K × 16 K × 3 is ~768 MiB and would still
+    // OOM on a corrupted header. Real QEMU screendumps for the m3OS
+    // framebuffer are at most a few MiB (1280 × 800 × 3 ≈ 3 MiB), so a
+    // 64 MiB cap is generous headroom and well below any allocation
+    // we'd accept in xtask. `checked_mul` defends usize overflow on
+    // 32-bit hosts even though we currently only target 64-bit dev
+    // machines.
+    if width == 0 || height == 0 {
         return Err(format!("nonsensical dimensions {width} x {height}"));
     }
     if maxval == 0 || maxval > 65_535 {
         return Err(format!("bad maxval {maxval}"));
+    }
+    const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
+    let total_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3))
+        .ok_or_else(|| format!("dimensions overflow usize: {width} x {height}"))?;
+    if total_bytes > MAX_PIXEL_BYTES {
+        return Err(format!(
+            "image exceeds {} MiB cap: {width} x {height} = {total_bytes} bytes",
+            MAX_PIXEL_BYTES / (1024 * 1024)
+        ));
     }
     Ok(PpmHeader {
         width,
@@ -262,6 +279,16 @@ fn read_token(file: &mut File) -> Result<String, String> {
 /// * `> 0.5` — substantial repaint (the bug we're hunting)
 pub fn pixel_diff_ratio(a: &PpmFrame, b: &PpmFrame) -> f64 {
     if a.width != b.width || a.height != b.height {
+        return 1.0;
+    }
+    // Belt-and-braces guard for manually-constructed `PpmFrame`s whose
+    // pixel buffer length doesn't match `width * height * 3` — the
+    // `chunks_exact(3).zip` below would otherwise silently truncate to
+    // the shorter buffer and under-report the difference.
+    let expected = (a.width as usize)
+        .checked_mul(a.height as usize)
+        .and_then(|wh| wh.checked_mul(3));
+    if expected != Some(a.pixels.len()) || a.pixels.len() != b.pixels.len() {
         return 1.0;
     }
     if a.pixels.is_empty() {
@@ -445,5 +472,52 @@ mod tests {
         write!(f, "P6\n0 2\n255\n").unwrap();
         f.flush().unwrap();
         assert!(read_ppm(f.path()).is_err());
+    }
+
+    #[test]
+    fn reject_dimensions_over_byte_cap() {
+        // 16384 x 16384 x 3 = 768 MiB, well past the 64 MiB header cap.
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "P6\n16384 16384\n255\n").unwrap();
+        f.flush().unwrap();
+        let err = read_ppm(f.path()).expect_err("oversized header must be rejected");
+        assert!(err.contains("64 MiB cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn diff_ratio_mismatched_buffer_length_is_one() {
+        // Manually constructed PpmFrame with width/height that agree
+        // but a pixel buffer that doesn't match `w*h*3`. The guard
+        // must early-return 1.0 instead of silently truncating via
+        // `chunks_exact(3).zip`.
+        let a = PpmFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0; 6],
+        };
+        let b = PpmFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0; 3], // half-sized buffer
+        };
+        assert_eq!(pixel_diff_ratio(&a, &b), 1.0);
+    }
+
+    #[test]
+    fn diff_ratio_buffer_length_disagrees_with_dimensions() {
+        // Buffers equal-length but neither matches `w*h*3`. The guard
+        // catches this via the `expected != Some(a.pixels.len())`
+        // check, again returning 1.0.
+        let a = PpmFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0; 9], // claims 2x1 but stores 3 pixels worth
+        };
+        let b = PpmFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0; 9],
+        };
+        assert_eq!(pixel_diff_ratio(&a, &b), 1.0);
     }
 }

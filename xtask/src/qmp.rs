@@ -241,11 +241,22 @@ impl QmpClient {
         // We never *shrink* the inherited timeout below the
         // per-stream default: QEMU's reply latency is well below 30s,
         // and shortening it would just make the error message lie.
-        let _ = self.reader.get_ref().set_read_timeout(Some(timeout));
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .map_err(QmpError::Io)?;
 
         let mut line = String::new();
         let n = self.reader.read_line(&mut line).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+            // Per-stream read-timeout expiration surfaces as WouldBlock
+            // on most Unixes (EAGAIN/EWOULDBLOCK from the underlying
+            // recv) but is documented to surface as TimedOut on some
+            // platforms; map both to QmpError::Timeout so callers get a
+            // consistent diagnostic when the deadline expires.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
                 QmpError::Timeout(timeout, what.to_string())
             } else {
                 QmpError::Io(e)

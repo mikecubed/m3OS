@@ -399,9 +399,14 @@ impl AnsiParser {
             //   FS..US (0x1C..=0x1F) — separators, not printable
             //   DEL (0x7F) — erase, no cell-grid effect
             // 0x07 (BEL), 0x08 (BS), 0x09 (TAB), 0x0A (LF), 0x0D (CR),
-            // 0x0B/0x0C (VT/FF — folded into LF for compat), and 0x1B
-            // (ESC) are handled above; the BEL path in `Screen::feed`
-            // catches 0x07 before this match runs.
+            // and 0x1B (ESC) are handled above; the BEL path in
+            // `Screen::feed` catches 0x07 before this match runs.
+            // 0x0B (VT) and 0x0C (FF) are *not* folded into LF; m3os-term
+            // treats them as Nop in the arm below alongside the other
+            // ECMA-48 "ignored when standalone" controls (a real DEC VT
+            // would do a line feed without carriage return on VT/FF, but
+            // ratchet-driven TUIs we care about never send them, and
+            // ignoring them is safer than fabricating a half-LF).
             '\x00'..='\x06' | '\x0B'..='\x0C' | '\x0E'..='\x1A' | '\x1C'..='\x1F' | '\x7F' => {
                 ConsoleCmd::Nop
             }
