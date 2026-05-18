@@ -378,6 +378,33 @@ impl AnsiParser {
             '\n' => ConsoleCmd::Newline,
             '\x08' => ConsoleCmd::Backspace,
             '\t' => ConsoleCmd::Tab,
+            // 2026-05-18 less-render flake fix — control characters that
+            // ECMA-48 / DEC VT spec define as "ignored when not part of
+            // a recognized sequence" must not advance the cursor or
+            // paint anything. Less in particular sends NUL bytes as
+            // terminfo padding fill (default `pc` = 0); without this
+            // filter every padding byte became a `PutChar(0)` that
+            // walked the cursor across the screen and erased prior
+            // cells as it went — the long-tail residual cause of the
+            // 2026-05-17 less-render-disappearance flake.
+            //
+            // Coverage:
+            //   NUL (0x00) — terminfo padding fill
+            //   SOH..ACK (0x01..=0x06) — modem control, never printable
+            //   SO (0x0E) / SI (0x0F) — character-set shift, no charset
+            //     support in m3os-term so the byte is meaningless
+            //   DLE..ETB (0x10..=0x17) — control, no terminal-side action
+            //   CAN (0x18) / SUB (0x1A) — cancel-sequence; the parser
+            //     already exits CSI on the next non-CSI byte
+            //   FS..US (0x1C..=0x1F) — separators, not printable
+            //   DEL (0x7F) — erase, no cell-grid effect
+            // 0x07 (BEL), 0x08 (BS), 0x09 (TAB), 0x0A (LF), 0x0D (CR),
+            // 0x0B/0x0C (VT/FF — folded into LF for compat), and 0x1B
+            // (ESC) are handled above; the BEL path in `Screen::feed`
+            // catches 0x07 before this match runs.
+            '\x00'..='\x06' | '\x0B'..='\x0C' | '\x0E'..='\x1A' | '\x1C'..='\x1F' | '\x7F' => {
+                ConsoleCmd::Nop
+            }
             _ => ConsoleCmd::PutChar(c as u32),
         }
     }
@@ -1079,6 +1106,55 @@ mod tests {
         assert_eq!(
             parse_str_last("\x1b[G"),
             ConsoleCmd::CursorHorizontalAbsolute(1)
+        );
+    }
+
+    #[test]
+    fn nul_byte_is_ignored() {
+        // 2026-05-18 less-render flake fix — NUL must not advance
+        // the cursor. Less sends NUL bytes as terminfo padding fill
+        // and the prior `PutChar(0)` behaviour walked the cursor
+        // across the screen, erasing cells in its wake.
+        assert_eq!(parse_str_last("\x00"), ConsoleCmd::Nop);
+    }
+
+    #[test]
+    fn assorted_control_bytes_are_ignored() {
+        // Spec-defined no-op control bytes the parser must drop so
+        // they don't produce stray PutChar ops. Coverage from the
+        // process_normal match above.
+        for byte in [
+            0x00u8, 0x01, 0x05, 0x06, 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x17, 0x18, 0x1A, 0x1C, 0x1F,
+            0x7F,
+        ] {
+            let s: alloc::string::String = core::iter::once(byte as char).collect();
+            assert_eq!(
+                parse_str_last(&s),
+                ConsoleCmd::Nop,
+                "byte 0x{:02x} should be ignored",
+                byte
+            );
+        }
+    }
+
+    #[test]
+    fn nul_byte_does_not_emit_put_glyph_through_chain() {
+        // Sanity: a stream of `<text>\0\0\0<text>` should produce the
+        // text PutChar ops with no PutChar(0) in between. Mirrors the
+        // less padding-fill pattern that introduced the bug.
+        let cmds = parse_str("ab\x00\x00\x00cd");
+        let only_puts: alloc::vec::Vec<_> = cmds
+            .into_iter()
+            .filter(|c| matches!(c, ConsoleCmd::PutChar(_)))
+            .collect();
+        assert_eq!(
+            only_puts,
+            alloc::vec![
+                ConsoleCmd::PutChar(b'a' as u32),
+                ConsoleCmd::PutChar(b'b' as u32),
+                ConsoleCmd::PutChar(b'c' as u32),
+                ConsoleCmd::PutChar(b'd' as u32),
+            ]
         );
     }
 
