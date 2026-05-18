@@ -34,6 +34,7 @@ pub mod arch;
 pub mod blk;
 pub mod epoll;
 pub mod fb;
+pub mod flock;
 pub mod fs;
 pub mod iommu;
 pub mod ipc;

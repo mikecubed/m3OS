@@ -40,6 +40,7 @@ struct ProcessSnapshot {
     cwd: String,
     exec_path: String,
     cmdline: Vec<String>,
+    comm: [u8; 16],
     user_stack_top: u64,
     brk_current: u64,
     mappings: Vec<MemoryMapping>,
@@ -64,7 +65,7 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
             let pid = parse_pid_component(pid)?;
             process_snapshot(pid).map(|_| ProcfsNode::Dir)
         }
-        [pid, "status" | "cmdline" | "maps"] => {
+        [pid, "status" | "cmdline" | "comm" | "maps"] => {
             let pid = parse_pid_component(pid)?;
             process_snapshot(pid).map(|_| ProcfsNode::File)
         }
@@ -132,6 +133,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["mounts"] => render_mounts(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
+        [pid, "comm"] => render_comm(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
         _ => return None,
     };
@@ -175,6 +177,7 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             Some(alloc::vec![
                 (String::from("status"), false),
                 (String::from("cmdline"), false),
+                (String::from("comm"), false),
                 (String::from("maps"), false),
                 (String::from("exe"), false),
                 (String::from("fd"), true),
@@ -234,6 +237,7 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
         cwd: proc.cwd.clone(),
         exec_path: proc.exec_path.clone(),
         cmdline: proc.cmdline.clone(),
+        comm: proc.comm,
         user_stack_top: proc.user_stack_top,
         brk_current: proc.brk_current,
         mappings: proc.vma_tree.iter().cloned().collect(),
@@ -454,6 +458,16 @@ fn mapping_perms(mapping: &MemoryMapping) -> String {
 }
 
 fn proc_name(proc: &ProcessSnapshot) -> String {
+    let comm_visible_end = proc
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(proc.comm.len());
+    if comm_visible_end > 0
+        && let Ok(s) = core::str::from_utf8(&proc.comm[..comm_visible_end])
+    {
+        return String::from(s);
+    }
     if let Some(first) = proc.cmdline.first() {
         String::from(basename(first))
     } else if !proc.exec_path.is_empty() {
@@ -461,6 +475,13 @@ fn proc_name(proc: &ProcessSnapshot) -> String {
     } else {
         String::from("unknown")
     }
+}
+
+/// `/proc/<pid>/comm` — the 15-byte process name plus a trailing newline.
+fn render_comm(proc: ProcessSnapshot) -> String {
+    let mut name = proc_name(&proc);
+    name.push('\n');
+    name
 }
 
 fn basename(path: &str) -> &str {

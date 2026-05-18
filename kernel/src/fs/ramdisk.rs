@@ -287,6 +287,16 @@ static TUI_SMOKE_ELF: &[u8] = generated_initrd_asset!("tui-smoke");
 // `cargo xtask termios-smoke`.  Not a daemon: no `.conf`.
 static TCSMOKE_ELF: &[u8] = generated_initrd_asset!("tcsmoke");
 
+// Phase 69d follow-up — `winsize-bang` issues TIOCSWINSZ on the
+// controlling TTY.  Run by the htop branch of `tui-app-smoke` to
+// drive a SIGWINCH mid-htop.  Not a daemon: no `.conf`.
+static WINSIZE_BANG_ELF: &[u8] = generated_initrd_asset!("winsize-bang");
+
+// Phase 69d follow-up — `sendmsg-test` regression: SCM_RIGHTS over
+// AF_UNIX SOCK_STREAM.  Run from the post-login shell by `cargo xtask
+// regression` (and ad hoc).  Not a daemon: no `.conf`.
+static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -489,6 +499,21 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "tcsmoke",
         RamdiskNode::File {
             content: TCSMOKE_ELF,
+        },
+    ),
+    // Phase 69d follow-up: winsize-bang — issues TIOCSWINSZ for the
+    // tui-app-smoke htop SIGWINCH reflow assertion.
+    (
+        "winsize-bang",
+        RamdiskNode::File {
+            content: WINSIZE_BANG_ELF,
+        },
+    ),
+    // Phase 69d follow-up: sendmsg-test — SCM_RIGHTS regression.
+    (
+        "sendmsg-test",
+        RamdiskNode::File {
+            content: SENDMSG_TEST_ELF,
         },
     ),
     // Phase 32: build tools and utilities

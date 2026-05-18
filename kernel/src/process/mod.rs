@@ -776,6 +776,10 @@ pub struct Process {
     /// Phase 57b G.6 — same `Arc<IrqSafeMutex<...>>` shape as
     /// `shared_fd_table`.
     pub shared_signal_actions: Option<Arc<IrqSafeMutex<[SignalAction; 32]>>>,
+    /// Short process name (Linux PR_SET_NAME / `/proc/<pid>/comm`).
+    /// 15 visible bytes + trailing NUL; defaults to all-zeros and is
+    /// populated by `prctl(PR_SET_NAME)` and by `execve` (basename).
+    pub comm: [u8; 16],
 }
 
 // `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
@@ -837,12 +841,34 @@ impl Process {
             thread_group: None,
             shared_fd_table: None,
             shared_signal_actions: None,
+            comm: [0u8; 16],
         }
     }
 
     /// Find the VMA containing `addr`, if any. O(log n) via BTreeMap.
     pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
         self.vma_tree.find_containing(addr)
+    }
+
+    /// Overwrite `comm` from a borrowed slice. Truncates to 15 visible
+    /// bytes (the 16th byte is reserved for the trailing NUL). Non-ASCII
+    /// bytes are copied verbatim; the caller is responsible for any
+    /// stripping it wants to do.
+    pub fn set_comm(&mut self, bytes: &[u8]) {
+        self.comm = [0u8; 16];
+        let n = bytes.len().min(15);
+        self.comm[..n].copy_from_slice(&bytes[..n]);
+    }
+
+    /// Render `comm` as a `&str`, stopping at the first NUL byte.
+    /// Returns `""` when no name has been set.
+    pub fn comm_str(&self) -> &str {
+        let end = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        core::str::from_utf8(&self.comm[..end]).unwrap_or("")
     }
 
     // -----------------------------------------------------------------
@@ -1159,6 +1185,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1220,6 +1247,7 @@ pub fn spawn_process_with_cr3(
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1285,6 +1313,7 @@ pub fn spawn_process_with_cr3_and_fds(
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

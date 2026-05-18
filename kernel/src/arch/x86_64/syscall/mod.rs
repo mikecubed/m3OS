@@ -1396,7 +1396,11 @@ mod syscall_nr {
     pub const IOCTL: u64 = 16;
     pub const NICE: u64 = 34;
     pub const UNAME: u64 = 63;
+    pub const FLOCK: u64 = 73;
+    pub const PRCTL: u64 = 157;
     pub const ARCH_PRCTL: u64 = 158;
+    pub const SENDMSG: u64 = 46;
+    pub const RECVMSG: u64 = 47;
     pub const REBOOT: u64 = 169;
     pub const FUTEX: u64 = 202;
     pub const SET_ROBUST_LIST: u64 = 273;
@@ -1606,7 +1610,24 @@ pub extern "C" fn syscall_handler(
     let strace_match = {
         let trace_pid = STRACE_PID.load(core::sync::atomic::Ordering::Relaxed);
         let pid = crate::process::current_pid();
-        trace_pid != 0 && pid == trace_pid
+        let by_pid = trace_pid != 0 && pid == trace_pid;
+        // Phase 69d follow-up: comm-prefix match for diagnosing
+        // user-space hangs (e.g., tmux during full lifecycle).  Set
+        // the `M3OS_STRACE_COMM` env var at build time to enable.
+        let by_comm = {
+            let prefix_static: &[u8] = option_env!("M3OS_STRACE_COMM").unwrap_or("").as_bytes();
+            if prefix_static.is_empty() {
+                false
+            } else {
+                let comm = crate::process::PROCESS_TABLE
+                    .lock()
+                    .find(pid)
+                    .map(|p| p.comm)
+                    .unwrap_or([0u8; 16]);
+                comm.starts_with(prefix_static)
+            }
+        };
+        by_pid || by_comm
     };
     if strace_match {
         let core_id = crate::smp::try_per_core().map(|c| c.core_id).unwrap_or(255);
@@ -1858,7 +1879,8 @@ pub extern "C" fn syscall_handler(
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
         PIPE2 => {
             let cloexec = arg1 & 0x80000 != 0;
-            sys_pipe_with_flags(arg0, cloexec)
+            let nonblock = arg1 & 0x800 != 0;
+            sys_pipe_with_flags2(arg0, cloexec, nonblock)
         }
         // -- time --
         NANOSLEEP => sys_nanosleep(arg0),
@@ -1876,7 +1898,11 @@ pub extern "C" fn syscall_handler(
             crate::task::sys_nice(arg0 as i32, uid_val) as u64
         }
         UNAME => sys_linux_uname(arg0),
+        PRCTL => sys_prctl(arg0, arg1, arg2),
         ARCH_PRCTL => sys_linux_arch_prctl(arg0, arg1),
+        FLOCK => sys_flock(arg0, arg1),
+        SENDMSG => sys_sendmsg(arg0, arg1, arg2),
+        RECVMSG => sys_recvmsg(arg0, arg1, arg2),
         REBOOT => sys_reboot(arg0),
         FUTEX => {
             let val3 = crate::task::current_task_syscall_snapshot().user_r9;
@@ -2476,6 +2502,12 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
 
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
+
+    // Phase 69d follow-up: drop every flock entry this PID still holds.
+    // close_all_fds_for() will have released most via close(2), but if the
+    // process exited without explicitly closing fds the per-fd map still
+    // carries entries.  PID-recycle would otherwise surface stale locks.
+    crate::flock::release_all_for_pid(pid);
 
     // Phase 47 Track C: if this process owned the raw framebuffer, restore
     // console output so the shell is visible again.
@@ -3313,6 +3345,14 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
 pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
+    sys_pipe_with_flags2(pipefd_ptr, cloexec, false)
+}
+
+/// Internal — handles both the cloexec and non-blocking pipe flags.
+/// Phase 69d follow-up: tmux's libevent backend asks for `O_NONBLOCK`
+/// pipes via `pipe2(2)` and falls into a poll/read loop that hangs if
+/// the kernel silently ignores the flag.
+pub(super) fn sys_pipe_with_flags2(pipefd_ptr: u64, cloexec: bool, nonblock: bool) -> u64 {
     // Pipe starts with reader_count=0, writer_count=0.
     // We bump refcounts explicitly after each successful FD allocation.
     let pipe_id = crate::pipe::create_pipe();
@@ -3323,7 +3363,7 @@ pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: true,
         writable: false,
         cloexec,
-        nonblock: false,
+        nonblock,
     };
     let write_entry = FdEntry {
         backend: FdBackend::PipeWrite { pipe_id },
@@ -3331,7 +3371,7 @@ pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: false,
         writable: true,
         cloexec,
-        nonblock: false,
+        nonblock,
     };
 
     let read_fd = match alloc_fd(3, read_entry) {
@@ -4234,6 +4274,22 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
+    // Phase 69d follow-up: inherit `comm` (PR_SET_NAME / `/proc/<pid>/comm`)
+    // from the parent.  Kept in a separate scoped lookup so the parent-state
+    // snapshot tuple above does not have to grow.
+    {
+        let parent_comm = crate::process::PROCESS_TABLE
+            .lock()
+            .find(parent_pid)
+            .map(|p| p.comm);
+        if let Some(comm) = parent_comm {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(child) = table.find_mut(child_pid) {
+                child.comm = comm;
+            }
+        }
+    }
+
     crate::task::spawn_fork_task(
         crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
         "fork-child",
@@ -4568,6 +4624,12 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.mmap_next = 0;
             proc.vma_tree.clear(); // Phase 36: clear stale VMAs from old address space.
             proc.exec_path = alloc::string::String::from(name);
+            // Phase 69d follow-up: `execve` resets `comm` to the basename
+            // of the binary, matching Linux behaviour for `/proc/<pid>/comm`.
+            {
+                let basename = name.rsplit('/').next().unwrap_or(name);
+                proc.set_comm(basename.as_bytes());
+            }
             proc.cmdline = if user_argv.is_empty() {
                 alloc::vec![alloc::string::String::from(name)]
             } else {
@@ -8011,6 +8073,19 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     }
     // Remove this FD from all epoll interest lists to prevent stale references.
     epoll_remove_fd(fd);
+    // Phase 69d follow-up: drop any per-fd flock state so an fd-recycle
+    // cannot surface the previous holder's lock to a fresh open.
+    {
+        let pid = crate::process::current_pid();
+        let backend_handle = current_fd_entry(fd).and_then(|e| match &e.backend {
+            FdBackend::UnixSocket { handle } => Some(*handle),
+            _ => None,
+        });
+        if let Some(h) = backend_handle {
+            crate::flock::unix_socket_release(h, pid, fd as u32);
+        }
+        crate::flock::release_per_fd(pid, fd as u32);
+    }
     // Clear the slot and — for VfsService / Ext2Disk backends — decide
     // whether this was the last alias under the SAME PROCESS_TABLE lock
     // acquisition. Two concurrent closes of sibling aliases would otherwise
@@ -13240,6 +13315,155 @@ pub(super) fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// prctl(option, arg2, arg3, arg4, arg5) — syscall 157
+// ---------------------------------------------------------------------------
+//
+// Phase 69d follow-up: tmux issues `prctl(PR_SET_NAME, "tmux: ...")` to
+// give its server process a recognisable name in `/proc/<pid>/comm`. We
+// implement that op fully; all other ops succeed silently (return 0) so
+// tmux's cosmetic calls don't surface as `unhandled syscall 157` log
+// noise.  Operations that have no business succeeding silently can be
+// promoted to dedicated handlers later.
+
+/// `PR_SET_NAME` — write a 16-byte name (15 visible + NUL) into the
+/// caller's `comm` slot.  Argument: pointer to a NUL-terminated string.
+const PR_SET_NAME: u64 = 15;
+/// `PR_GET_NAME` — read the current 16-byte `comm` slot into the caller.
+const PR_GET_NAME: u64 = 16;
+
+pub(super) fn sys_prctl(option: u64, arg2: u64, _arg3: u64) -> u64 {
+    match option {
+        PR_SET_NAME => {
+            // Caller passes a pointer to a C string.  We copy up to 15
+            // visible bytes, ignoring the rest; the trailing NUL is
+            // implicit because `Process::set_comm` zeroes the slot first.
+            let mut buf = [0u8; 16];
+            if UserSliceRo::new(arg2, buf.len())
+                .and_then(|s| s.copy_to_kernel(&mut buf))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            let visible_end = buf.iter().position(|&b| b == 0).unwrap_or(15).min(15);
+            let pid = crate::process::current_pid();
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.set_comm(&buf[..visible_end]);
+            }
+            0
+        }
+        PR_GET_NAME => {
+            let pid = crate::process::current_pid();
+            let comm = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).map(|p| p.comm).unwrap_or([0u8; 16])
+            };
+            if UserSliceWo::new(arg2, comm.len())
+                .and_then(|s| s.copy_from_kernel(&comm))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        // PR_SET_PDEATHSIG, PR_GET_PDEATHSIG, PR_SET_DUMPABLE, etc.
+        // Cosmetic for tmux/coreutils on m3OS — return success.
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// flock(fd, op) — syscall 73
+// ---------------------------------------------------------------------------
+//
+// Phase 69d follow-up: tmux's client/server coordination uses
+// `flock(LOCK_EX | LOCK_NB)` on the socket file to guarantee a single
+// server.  We implement two layers:
+//
+// * Cross-fd, cross-process locking on `UnixSocket` kernel objects.
+//   Two opens of the same socket file see each other's locks.
+//
+// * Per-(pid, fd) bookkeeping for every other backend.  This is what a
+//   single-process tmux relies on for self-coordination and lets
+//   `LOCK_UN` actually unlock without the kernel needing to coordinate
+//   across separate inodes for path-backed fds.
+
+pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
+    use crate::flock::{
+        FlockMode, FlockOutcome, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, release_per_fd, set_per_fd,
+        unix_socket_acquire_exclusive, unix_socket_acquire_shared, unix_socket_release,
+    };
+    const NEG_EWOULDBLOCK: u64 = (-11_i64) as u64;
+
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let op = op as i32;
+    let nonblock = op & LOCK_NB != 0;
+    let mode = op & !LOCK_NB;
+
+    let pid = crate::process::current_pid();
+    let fd_u32 = fd_idx as u32;
+
+    // Pull out the UnixSocket handle if this fd points at one, so the
+    // global cross-fd registry can coordinate two opens of the same socket.
+    let unix_handle: Option<usize> = match &entry.backend {
+        FdBackend::UnixSocket { handle } => Some(*handle),
+        _ => None,
+    };
+
+    match mode {
+        LOCK_SH => {
+            if let Some(h) = unix_handle {
+                match unix_socket_acquire_shared(h, pid, fd_u32) {
+                    FlockOutcome::Acquired => {}
+                    FlockOutcome::WouldBlock => {
+                        if nonblock {
+                            return NEG_EWOULDBLOCK;
+                        }
+                        // Synchronous block-until-grant is not implemented;
+                        // return EWOULDBLOCK to match LOCK_NB semantics so
+                        // callers degrade gracefully rather than hang.
+                        return NEG_EWOULDBLOCK;
+                    }
+                }
+            }
+            set_per_fd(pid, fd_u32, Some(FlockMode::Shared));
+            0
+        }
+        LOCK_EX => {
+            if let Some(h) = unix_handle {
+                match unix_socket_acquire_exclusive(h, pid, fd_u32) {
+                    FlockOutcome::Acquired => {}
+                    FlockOutcome::WouldBlock => {
+                        if nonblock {
+                            return NEG_EWOULDBLOCK;
+                        }
+                        return NEG_EWOULDBLOCK;
+                    }
+                }
+            }
+            set_per_fd(pid, fd_u32, Some(FlockMode::Exclusive));
+            0
+        }
+        LOCK_UN => {
+            if let Some(h) = unix_handle {
+                unix_socket_release(h, pid, fd_u32);
+            }
+            // Either remove or no-op — both are safe.
+            release_per_fd(pid, fd_u32);
+            0
+        }
+        _ => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // set_tid_address(tidptr) — syscall 218 (musl TLS initialization)
 // ---------------------------------------------------------------------------
 
@@ -13666,6 +13890,15 @@ fn sys_clone_thread(
         thread_group: Some(thread_group),
         shared_fd_table: shared_fd,
         shared_signal_actions: shared_sig,
+        // Threads inherit the parent's comm; `prctl(PR_SET_NAME)` then
+        // gives each thread its own name as Linux does.
+        comm: {
+            crate::process::PROCESS_TABLE
+                .lock()
+                .find(parent_pid)
+                .map(|p| p.comm)
+                .unwrap_or([0u8; 16])
+        },
     };
 
     PROCESS_TABLE.lock().insert(child_proc);
@@ -14450,8 +14683,17 @@ fn sys_bind_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
         return NEG_EADDRINUSE;
     }
 
-    // Create a socket node in tmpfs if the path is under /tmp.
-    if let Some(rel) = path.strip_prefix("/tmp/") {
+    // Create a socket node in tmpfs if the path is under /tmp or /run.
+    // The tmpfs API takes paths with the **leading "tmp/" prefix** —
+    // mirroring the convention used by stat / read / write throughout
+    // the syscall layer (`tmpfs_relative_path` returns "tmp/foo" not
+    // "foo").  An earlier version of this code used a bare
+    // `strip_prefix("/tmp/")`, which silently desynchronised the path
+    // namespace between bind and the rest of the FS — `mkdir
+    // /tmp/tmux-0` registered as "tmp/tmux-0" while bind looked up
+    // "tmux-0", landing on `parent_and_name` -> NotFound and the
+    // -EIO fall-through.  Use the same helper everyone else uses.
+    if let Some(rel) = tmpfs_relative_path(&path) {
         let pid = crate::process::current_pid();
         let (uid, gid, umask) = {
             let table = crate::process::PROCESS_TABLE.lock();
@@ -15975,6 +16217,418 @@ pub(super) fn sys_getsockopt(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 69d follow-up: sendmsg / recvmsg with SCM_RIGHTS support
+// ---------------------------------------------------------------------------
+//
+// Both syscalls follow the same shape:
+//   1. Copy the user-space `struct msghdr` (56 bytes on x86_64) into a
+//      kernel `MsgHdr`.
+//   2. Copy the `iovec` array and run the scatter / gather copy.
+//   3. For `sendmsg`, parse each cmsg in `msg_control` and — for
+//      `SOL_SOCKET / SCM_RIGHTS` cmsgs — clone the sender's `FdBackend`
+//      and park it on the peer's ancillary queue tagged with the byte
+//      position of the first byte that rides with it.
+//   4. For `recvmsg`, after the data copy completes, drain ancillary
+//      fds whose `deliver_at_stream_pos` is now <= the receiver's
+//      consumed-bytes cursor, install them in the receiver's fd table,
+//      and encode an outgoing `SCM_RIGHTS` cmsg into `msg_control`.
+
+/// Acquire a refcount on the underlying kernel object referenced by a
+/// `FdBackend` so a parallel handle can be parked on a peer's anc queue.
+/// Mirrors `crate::process::add_fd_refs` for a single entry.
+fn acquire_inflight_anc_backend(backend: &FdBackend) {
+    match backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+        FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
+        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
+        FdBackend::Epoll { instance_id } => epoll_add_ref_pub(*instance_id),
+        _ => {}
+    }
+}
+
+/// Maximum bytes per scatter/gather copy.  Mirrors the limit used by
+/// `sys_sendto` / `sys_recvfrom_socket`.
+const SENDMSG_MAX_BYTES: usize = 4096;
+/// Maximum bytes per ancillary-data buffer.  Generous enough for ~64
+/// fds per cmsg.
+const SENDMSG_MAX_CONTROL: usize = 1024;
+
+pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
+    use kernel_core::net::msghdr::{
+        CmsgView, IOVEC_SIZE, IoVec, MSGHDR_SIZE, MsgHdr, SCM_MAX_FD, for_each_cmsg,
+    };
+    let _ = flags;
+
+    // 1. Copy msghdr.
+    let mut header_bytes = [0u8; MSGHDR_SIZE];
+    if UserSliceRo::new(msghdr_ptr, header_bytes.len())
+        .and_then(|s| s.copy_to_kernel(&mut header_bytes))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let header = match MsgHdr::decode(&header_bytes) {
+        Some(h) => h,
+        None => return NEG_EINVAL,
+    };
+    // Linux's `UIO_MAXIOV` cap.
+    if header.msg_iovlen > 1024 {
+        return NEG_EINVAL;
+    }
+
+    // 2. Resolve the fd.  We only support AF_UNIX stream for now —
+    // datagram and AF_INET sendmsg fall through to `-EOPNOTSUPP` rather
+    // than silently shimming on top of `sys_sendto`.
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let unix_handle = match &entry.backend {
+        FdBackend::UnixSocket { handle } => *handle,
+        _ => return NEG_EOPNOTSUPP,
+    };
+
+    // 3. Decode iov array and concatenate.
+    let iov_count = header.msg_iovlen as usize;
+    let mut iov_buf = alloc::vec![0u8; iov_count.checked_mul(IOVEC_SIZE).unwrap_or(0)];
+    if iov_count > 0
+        && UserSliceRo::new(header.msg_iov, iov_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_buf))
+            .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let iovs = match IoVec::decode_array(&iov_buf, iov_count) {
+        Some(v) => v,
+        None => return NEG_EINVAL,
+    };
+
+    let total_len = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
+    let mut payload = alloc::vec![0u8; total_len];
+    {
+        let mut cursor = 0usize;
+        for iov in &iovs {
+            if cursor >= total_len {
+                break;
+            }
+            let chunk = ((total_len - cursor) as u64).min(iov.iov_len) as usize;
+            if chunk == 0 {
+                continue;
+            }
+            if UserSliceRo::new(iov.iov_base, chunk)
+                .and_then(|s| s.copy_to_kernel(&mut payload[cursor..cursor + chunk]))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            cursor += chunk;
+        }
+    }
+
+    // 4. Parse ancillary buffer and build InflightFd list.
+    let mut inflight: alloc::vec::Vec<crate::net::unix::InflightFd> = alloc::vec::Vec::new();
+    if header.msg_control != 0 && header.msg_controllen > 0 {
+        if header.msg_controllen as usize > SENDMSG_MAX_CONTROL {
+            return NEG_EINVAL;
+        }
+        let mut control = alloc::vec![0u8; header.msg_controllen as usize];
+        if UserSliceRo::new(header.msg_control, control.len())
+            .and_then(|s| s.copy_to_kernel(&mut control))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+
+        let mut error: u64 = 0;
+        for_each_cmsg(&control, |view: CmsgView<'_>| {
+            if error != 0 {
+                return;
+            }
+            if !view.is_scm_rights() {
+                // Unknown ancillary kind — Linux silently ignores
+                // unrecognized cmsgs on send.  Match that behaviour.
+                return;
+            }
+            let Some(fds) = view.scm_rights_fds() else {
+                error = NEG_EINVAL;
+                return;
+            };
+            if fds.len() > SCM_MAX_FD {
+                error = NEG_EINVAL;
+                return;
+            }
+            for sender_fd in fds {
+                if sender_fd < 0 || (sender_fd as usize) >= MAX_FDS {
+                    error = NEG_EBADF;
+                    return;
+                }
+                let Some(sender_entry) = current_fd_entry(sender_fd as usize) else {
+                    error = NEG_EBADF;
+                    return;
+                };
+                acquire_inflight_anc_backend(&sender_entry.backend);
+                inflight.push(crate::net::unix::InflightFd {
+                    backend: sender_entry.backend.clone(),
+                    cloexec: sender_entry.cloexec,
+                    // Updated below once we know the post-write peer offset.
+                    deliver_at_stream_pos: 0,
+                });
+            }
+        });
+        if error != 0 {
+            // Roll back any refcounts we already bumped.
+            for inf in &inflight {
+                match &inf.backend {
+                    FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+                    FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+                    FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+                    FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
+                    FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+                    FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+                    _ => {}
+                }
+            }
+            return error;
+        }
+    }
+
+    // 5. Atomic delivery: stamp inflight cmsgs with the peer's current
+    //    stream offset and append them to the anc queue under the same
+    //    lock that extends `recv_buf`.  This is the Linux invariant —
+    //    data and cmsg arrive together; no fast-reader race window.
+    let mut inflight_mut = inflight;
+    let written = match crate::net::unix::unix_stream_write_with_anc(
+        unix_handle,
+        &payload,
+        &mut inflight_mut,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            // Roll back refcounts on the inflight queue — any element
+            // still in the vec was not delivered.
+            for inf in &inflight_mut {
+                match &inf.backend {
+                    FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+                    FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+                    FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+                    FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
+                    FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+                    FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+                    _ => {}
+                }
+            }
+            return e as u64;
+        }
+    };
+
+    written as u64
+}
+
+pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
+    use kernel_core::net::msghdr::{
+        IOVEC_SIZE, IoVec, MSG_CTRUNC, MSGHDR_SIZE, MsgHdr, SCM_MAX_FD, cmsg_space,
+        encode_scm_rights,
+    };
+    let _ = flags;
+
+    // 1. Copy msghdr.
+    let mut header_bytes = [0u8; MSGHDR_SIZE];
+    if UserSliceRo::new(msghdr_ptr, header_bytes.len())
+        .and_then(|s| s.copy_to_kernel(&mut header_bytes))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let mut header = match MsgHdr::decode(&header_bytes) {
+        Some(h) => h,
+        None => return NEG_EINVAL,
+    };
+    if header.msg_iovlen > 1024 {
+        return NEG_EINVAL;
+    }
+
+    // 2. Resolve fd → UnixSocket handle.
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let nonblock = entry.nonblock;
+    let unix_handle = match &entry.backend {
+        FdBackend::UnixSocket { handle } => *handle,
+        _ => return NEG_EOPNOTSUPP,
+    };
+
+    // 3. Decode iov array.
+    let iov_count = header.msg_iovlen as usize;
+    let mut iov_buf = alloc::vec![0u8; iov_count.checked_mul(IOVEC_SIZE).unwrap_or(0)];
+    if iov_count > 0
+        && UserSliceRo::new(header.msg_iov, iov_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_buf))
+            .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    let iovs = match IoVec::decode_array(&iov_buf, iov_count) {
+        Some(v) => v,
+        None => return NEG_EINVAL,
+    };
+    let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
+
+    // 4. Read data — block until at least one byte arrives, EOF, or signal.
+    let mut tmp = alloc::vec![0u8; cap.max(1)];
+    let n = loop {
+        match crate::net::unix::unix_stream_read(unix_handle, &mut tmp[..cap]) {
+            Ok(n) => break n,
+            Err(-11) => {
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+                continue;
+            }
+            Err(e) => return e as u64,
+        }
+    };
+
+    // 5. Scatter the bytes into user iov entries.
+    {
+        let mut cursor = 0usize;
+        for iov in &iovs {
+            if cursor >= n {
+                break;
+            }
+            let chunk = ((n - cursor) as u64).min(iov.iov_len) as usize;
+            if chunk == 0 {
+                continue;
+            }
+            if UserSliceWo::new(iov.iov_base, chunk)
+                .and_then(|s| s.copy_from_kernel(&tmp[cursor..cursor + chunk]))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            cursor += chunk;
+        }
+    }
+
+    // 6. Drain ready ancillary fds and install them in the receiver's
+    // fd table.  We grant at most SCM_MAX_FD per call to keep the
+    // outgoing cmsg payload bounded.
+    let ready = crate::net::unix::unix_stream_drain_ready_anc(unix_handle, SCM_MAX_FD);
+    let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::with_capacity(ready.len());
+    let mut control_bytes_written: usize = 0;
+    let mut ctrunc = false;
+    if !ready.is_empty() {
+        // Compute outgoing cmsg size and decide whether the receiver's
+        // control buffer is large enough; if not, set MSG_CTRUNC and
+        // drop the extra entries from the tail.
+        let mut keep_n = ready.len();
+        let control_budget = header.msg_controllen as usize;
+        while keep_n > 0 && cmsg_space(keep_n * 4) > control_budget {
+            keep_n -= 1;
+            ctrunc = true;
+        }
+
+        // Install up to `keep_n` of the ready fds into the receiver's
+        // fd table; release refcounts on the truncated tail.
+        for inf in ready.iter().take(keep_n) {
+            let new_entry = FdEntry {
+                backend: inf.backend.clone(),
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: inf.cloexec,
+                nonblock: false,
+            };
+            // alloc_fd does the lowest-free-fd search and installs.
+            match alloc_fd(0, new_entry) {
+                Some(fd) => new_fds.push(fd as i32),
+                None => {
+                    // Out of fds — release this inflight and any
+                    // remaining we hadn't installed yet, plus the
+                    // unused tail past keep_n.
+                    match &inf.backend {
+                        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+                        FdBackend::PipeWrite { pipe_id } => {
+                            crate::pipe::pipe_close_writer(*pipe_id)
+                        }
+                        FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+                        FdBackend::UnixSocket { handle } => {
+                            crate::net::unix::free_unix_socket(*handle)
+                        }
+                        FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+                        FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+                        _ => {}
+                    }
+                    ctrunc = true;
+                }
+            }
+        }
+
+        // Drop refcounts on the truncated tail.
+        for inf in ready.iter().skip(keep_n) {
+            match &inf.backend {
+                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+                FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+                FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
+                FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+                FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+                _ => {}
+            }
+        }
+
+        // Encode the outgoing cmsg into the user's control buffer.
+        if !new_fds.is_empty() {
+            let space = cmsg_space(new_fds.len() * 4);
+            let mut cmsg_buf = alloc::vec![0u8; space];
+            let n = encode_scm_rights(&mut cmsg_buf, &new_fds).unwrap_or(0);
+            if n > 0 {
+                if UserSliceWo::new(header.msg_control, n)
+                    .and_then(|s| s.copy_from_kernel(&cmsg_buf[..n]))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+                control_bytes_written = n;
+            }
+        }
+    }
+
+    // 7. Write back the updated msghdr (controllen + flags).
+    header.msg_controllen = control_bytes_written as u64;
+    if ctrunc {
+        header.msg_flags |= MSG_CTRUNC;
+    } else {
+        // Clear MSG_CTRUNC; preserve other flags.
+        header.msg_flags &= !MSG_CTRUNC;
+    }
+    let encoded = header.encode();
+    if UserSliceWo::new(msghdr_ptr, encoded.len())
+        .and_then(|s| s.copy_from_kernel(&encoded))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+
+    n as u64
+}
+
+// ---------------------------------------------------------------------------
 // Phase 37: I/O multiplexing helpers
 // ---------------------------------------------------------------------------
 
@@ -16326,30 +16980,30 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         }
     }
 
-    // H8 fix: register waiters ONCE up front and keep them registered for
-    // the lifetime of the syscall. Previously the code re-registered on
-    // every loop iteration, and in the positive-timeout branch deregistered
-    // before yield_now(), creating a window where wakes arriving during
-    // yield hit empty WaitQueues and were silently lost. With a single
-    // registration held across all iterations, wakes always find a waiter
-    // and set the shared `woken` flag; the top-of-loop readiness scan then
-    // sees the state change on the next iteration.
+    // Phase 69d follow-up: re-register on EVERY loop iteration.
+    //
+    // The "H8 fix" comment that used to live here claimed wait queues
+    // kept registrations across `wake_all`, but they don't:
+    // `WaitQueue::wake_all` does `core::mem::take(&mut *q)` and so
+    // empties the queue.  When poll waits in a loop and gets
+    // multiple spurious wakes (e.g. a Unix socket POLLOUT wake while
+    // we're really waiting for a POLLIN), the first wake consumes
+    // our entry; subsequent wakes hit an empty queue and the task
+    // is silently lost.  Re-registering on every iteration matches
+    // the pattern used by pipe_read / unix_stream_read / stdin and
+    // is the safe default; the lost-wake-window the old comment
+    // worried about is closed by clearing `woken` BEFORE register
+    // and scanning AFTER, so a wake firing between register and
+    // block sets `woken=true` and `block_current_until` returns
+    // immediately.
     let task_id = match crate::task::scheduler::current_task_id() {
         Some(id) => id,
         None => return NEG_EINTR,
     };
     let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
-    let mut registered_any = false;
-    if timeout_i != 0 {
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i]
-                && fd_register_waiter(entry, task_id, &woken)
-            {
-                registered_any = true;
-            }
-        }
-    }
+    // `registered_any` is recomputed each iteration below.
+    let mut registered_any;
 
     let deregister_all = |entries: &[Option<FdEntry>; 256]| {
         for i in 0..nfds {
@@ -16360,10 +17014,22 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     };
 
     let result = loop {
-        // Clear the woken flag before scanning. If a wake fires after this
-        // clear, the flag will be set again and we'll see it on the next
-        // iteration's check (or the FD will show ready in the scan).
+        // Clear `woken` BEFORE registering so any wake that fires
+        // after register sets it to true.
         woken.store(false, core::sync::atomic::Ordering::Release);
+
+        // Re-register on every iteration: `wake_all` consumed any
+        // previous registration.
+        registered_any = false;
+        if timeout_i != 0 {
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i]
+                    && fd_register_waiter(entry, task_id, &woken)
+                {
+                    registered_any = true;
+                }
+            }
+        }
 
         let mut ready_count = 0u64;
 
@@ -16399,25 +17065,9 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             break NEG_EINTR;
         }
 
-        // Block until woken by an FD event or timeout.
-        //
-        // F.4: Under sched-v2, use block_current_until for both branches:
-        // - Positive timeout: pass deadline_tick so the deadline scanner
-        //   wakes us when the timeout expires (no yield_now() spin needed).
-        // - Indefinite timeout: pass None; wake comes from WaitQueue.
-        //
-        // Even when no FDs could be registered (all non-pollable), we
-        // still park instead of yield-looping.  yield_now() in this
-        // branch made `poll(non_pollable_fd, 1000ms)` busy-yield for the
-        // entire 1-second timeout, monopolising the calling core because
-        // m3OS is cooperatively scheduled — every queued task on the
-        // same core was starved.  block_current_until with the deadline
-        // wakes us at the right time without burning CPU.  If no
-        // waiters AND no deadline, we'd never wake; fall back to a
-        // single yield_now() so the syscall makes progress on its next
-        // top-of-loop scan (this is the legitimate "non-pollable FD,
-        // indefinite timeout" case — better to round-robin than to
-        // hang forever).
+        // Block until woken by an FD event or timeout.  If a wake
+        // fired between register and now, `woken` is already true and
+        // `block_current_until` returns immediately.
         if registered_any || deadline_tick.is_some() {
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
