@@ -735,4 +735,249 @@ mod tests {
             "compose must retain the queue's capacity for reuse",
         );
     }
+
+    // -----------------------------------------------------------
+    // FramebufferOwner contract validation
+    // -----------------------------------------------------------
+    //
+    // The 2026-05-17 less-render-disappearance fix landed in two
+    // commits: 8497e0c (double-buffered SHM + Clear-only defer) and
+    // d899f73 (always refresh back-from-front, no first-publish
+    // skip). The double-buffer logic lives in
+    // `userspace/term/src/display.rs::DisplayClient` and is not
+    // host-testable (it uses real `syscall_lib::shm_*` and
+    // `ipc_call_buf`). The contract DisplayClient must uphold *is*
+    // testable here: between submits, the buffer the next
+    // `put_glyph` / `scroll` writes into must contain the
+    // previously-published frame's pixels — not be zeroed out.
+    //
+    // [`StatefulFakeFb`] is a single-buffer mock of that contract.
+    // It tracks the cell grid the renderer paints into and records
+    // a snapshot on every submit. The tests below drive the
+    // renderer through real less-style compose cycles and assert
+    // the published snapshots match the expected cumulative state.
+    //
+    // If a future regression to DisplayClient breaks the back-
+    // from-front refresh, these tests still pass (the mock is not
+    // the production code), but the assertions document the
+    // expected behaviour and serve as a reference for any future
+    // FramebufferOwner implementation.
+    struct StatefulFakeFb {
+        /// Toy 8 × 4 cell grid — wide enough to exercise scrolling
+        /// without paying the full 80 × 25 cost. Cells store the
+        /// codepoint last `put_glyph` wrote there, or 0 if blank.
+        cells: [[u32; 8]; 4],
+        /// Snapshot of `cells` recorded by every `submit` call.
+        /// Tests inspect this to verify the cumulative grid state.
+        snapshots: Vec<[[u32; 8]; 4]>,
+    }
+
+    impl StatefulFakeFb {
+        fn new() -> Self {
+            Self {
+                cells: [[0u32; 8]; 4],
+                snapshots: Vec::new(),
+            }
+        }
+    }
+
+    impl FramebufferOwner for StatefulFakeFb {
+        fn put_glyph(
+            &mut self,
+            row: u16,
+            col: u16,
+            codepoint: u32,
+            _glyph: &GlyphView<'_>,
+            _fg: u32,
+            _bg: u32,
+        ) {
+            let (r, c) = (row as usize, col as usize);
+            if r < self.cells.len() && c < self.cells[0].len() {
+                self.cells[r][c] = codepoint;
+            }
+        }
+
+        fn clear(&mut self) {
+            self.cells = [[0u32; 8]; 4];
+        }
+
+        fn scroll(&mut self, amount: i16) {
+            if amount > 0 {
+                // Scroll up: shift rows up, blank the bottom rows.
+                let shift = (amount as usize).min(self.cells.len());
+                for r in 0..self.cells.len() - shift {
+                    self.cells[r] = self.cells[r + shift];
+                }
+                for r in self.cells.len() - shift..self.cells.len() {
+                    self.cells[r] = [0u32; 8];
+                }
+            } else if amount < 0 {
+                let shift = ((-(amount as i32)) as usize).min(self.cells.len());
+                for r in (shift..self.cells.len()).rev() {
+                    self.cells[r] = self.cells[r - shift];
+                }
+                for r in 0..shift {
+                    self.cells[r] = [0u32; 8];
+                }
+            }
+        }
+
+        fn submit(&mut self) -> bool {
+            self.snapshots.push(self.cells);
+            true
+        }
+    }
+
+    /// Real less-like paint sequence: first compose drains
+    /// `[Clear, Put×N]` (the initial repaint after the keystroke);
+    /// subsequent composes drain `[Put×M]` only (incremental updates
+    /// that overwrite specific cells). The cumulative published
+    /// snapshot must contain *every* cell that was ever painted,
+    /// not just the cells touched in the most recent compose.
+    ///
+    /// The pre-fix DisplayClient bug at 8497e0c silently violated
+    /// this contract: the back buffer was zeroed across the first
+    /// submit's flip, so the second compose's `[Put×M]` queue
+    /// painted M cells onto a zero buffer instead of onto the
+    /// previously-published frame. The fix at d899f73 restores
+    /// the contract by always refreshing back-from-front on
+    /// submit. This test would catch any future regression of
+    /// that contract in a host-testable FramebufferOwner impl.
+    #[test]
+    fn published_frames_accumulate_state_across_incremental_composes() {
+        let mut r = Renderer::new(StatefulFakeFb::new());
+
+        // Frame 1: full repaint — Clear + paint row 0 cells 0..4.
+        r.apply(RenderCommand::Clear);
+        for col in 0..4u16 {
+            r.apply(RenderCommand::PutGlyph {
+                row: 0,
+                col,
+                codepoint: b'A' as u32 + col as u32,
+                fg: 0,
+                bg: 0,
+            });
+        }
+        r.compose();
+        assert_eq!(r.fb.snapshots.len(), 1, "first submit");
+        assert_eq!(
+            r.fb.snapshots[0][0][..4],
+            [b'A' as u32, b'B' as u32, b'C' as u32, b'D' as u32]
+        );
+
+        // Frame 2: incremental put — paint one cell on row 1.
+        // The published frame must still contain row 0's content.
+        r.apply(RenderCommand::PutGlyph {
+            row: 1,
+            col: 2,
+            codepoint: b'X' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(r.fb.snapshots.len(), 2, "second submit");
+        let snap = &r.fb.snapshots[1];
+        assert_eq!(
+            snap[0][..4],
+            [b'A' as u32, b'B' as u32, b'C' as u32, b'D' as u32]
+        );
+        assert_eq!(snap[1][2], b'X' as u32);
+
+        // Frame 3: another incremental put. All previous cells survive.
+        r.apply(RenderCommand::PutGlyph {
+            row: 2,
+            col: 7,
+            codepoint: b'Z' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(r.fb.snapshots.len(), 3, "third submit");
+        let snap = &r.fb.snapshots[2];
+        assert_eq!(
+            snap[0][..4],
+            [b'A' as u32, b'B' as u32, b'C' as u32, b'D' as u32]
+        );
+        assert_eq!(snap[1][2], b'X' as u32);
+        assert_eq!(snap[2][7], b'Z' as u32);
+    }
+
+    /// `[Scroll, Put]` queue between Clear-painted frames: the
+    /// scroll must operate on the previously-published content
+    /// (so existing rows shift up) and the post-scroll Put paints
+    /// the new bottom row. This is the shell-newline pattern.
+    ///
+    /// A regression that zeroes the buffer on submit would scroll
+    /// blank rows instead of real content and the final snapshot
+    /// would only show the Put-painted cell.
+    #[test]
+    fn scroll_operates_on_previously_published_content() {
+        let mut r = Renderer::new(StatefulFakeFb::new());
+
+        // Frame 1: paint 4 rows of distinct cells.
+        r.apply(RenderCommand::Clear);
+        for row in 0..4u16 {
+            for col in 0..2u16 {
+                r.apply(RenderCommand::PutGlyph {
+                    row,
+                    col,
+                    codepoint: (b'1' as u32) + (row as u32),
+                    fg: 0,
+                    bg: 0,
+                });
+            }
+        }
+        r.compose();
+
+        // Frame 2: scroll up by 1, paint the new bottom row.
+        r.apply(RenderCommand::Scroll { amount: 1 });
+        r.apply(RenderCommand::PutGlyph {
+            row: 3,
+            col: 0,
+            codepoint: b'B' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        let snap = &r.fb.snapshots[1];
+        // After scroll, row 0 is the *old* row 1, row 1 is old row 2, etc.
+        assert_eq!(snap[0][0], b'2' as u32);
+        assert_eq!(snap[1][0], b'3' as u32);
+        assert_eq!(snap[2][0], b'4' as u32);
+        assert_eq!(snap[3][0], b'B' as u32);
+    }
+
+    /// Blink-tick triggered re-submit on an empty queue must
+    /// re-publish the *current* buffer state unchanged. A
+    /// regression that zeros the buffer on submit would publish
+    /// an all-blank frame, exactly the bug the user reported
+    /// before the d899f73 fix landed.
+    #[test]
+    fn blink_only_submit_republishes_existing_buffer_unchanged() {
+        let mut r = Renderer::new(StatefulFakeFb::new());
+
+        // Frame 1: paint a cell.
+        r.apply(RenderCommand::Clear);
+        r.apply(RenderCommand::PutGlyph {
+            row: 0,
+            col: 0,
+            codepoint: b'Q' as u32,
+            fg: 0,
+            bg: 0,
+        });
+        r.compose();
+        assert_eq!(r.fb.snapshots[0][0][0], b'Q' as u32);
+
+        // Frame 2: simulate the blink-tick path — no new queue ops,
+        // just `mark_damaged()` then compose. Submit must fire on
+        // the unchanged buffer and the snapshot must still hold the
+        // Q cell.
+        r.mark_damaged();
+        r.compose();
+        assert_eq!(r.fb.snapshots.len(), 2, "blink-tick submit");
+        assert_eq!(
+            r.fb.snapshots[1][0][0], b'Q' as u32,
+            "blink-only submit must preserve existing buffer state"
+        );
+    }
 }

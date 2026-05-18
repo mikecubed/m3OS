@@ -504,6 +504,38 @@ residual flake remains on a separate path.
 Quality gates green at `d899f73`: `cargo xtask check`,
 `cargo xtask tui-smoke`, `cargo xtask tui-app-smoke`.
 
+### Host test coverage for the FramebufferOwner contract
+
+The `DisplayClient` impl itself is not host-testable (it uses real
+`syscall_lib::shm_*` and `ipc_call_buf`), but the *contract* it must
+uphold is. `userspace/term/src/render.rs::tests::StatefulFakeFb` is
+a single-buffer mock of that contract — it tracks an 8×4 cell grid
+that the renderer paints into, simulates the same `clear` /
+`put_glyph` / `scroll` mutations as a real surface, and records a
+snapshot on every `submit`. Three tests drive the renderer through
+real less-style compose cycles:
+
+* `published_frames_accumulate_state_across_incremental_composes`:
+  the bug shape that 8497e0c → d899f73 fixed. First compose drains
+  `[Clear, Put×N]`, subsequent composes drain `[Put×M]` only. Asserts
+  every published snapshot contains every cell that was ever painted,
+  not just the cells touched in the most recent compose. Catches any
+  future regression to "incremental ops must paint on top of the
+  previously-published frame".
+* `scroll_operates_on_previously_published_content`: shell-newline
+  pattern — `[Scroll, Put]` between Clear-painted frames. Verifies
+  scroll shifts the *real* rows up and the Put paints the new bottom
+  row.
+* `blink_only_submit_republishes_existing_buffer_unchanged`: the
+  pre-d899f73 user-visible symptom — when only `mark_damaged` fires
+  on an empty queue, submit must re-publish the existing buffer
+  unchanged. Catches any regression that zeroes the buffer on submit.
+
+These tests don't drive `DisplayClient` directly — that still
+requires the in-QEMU `cargo xtask less-render-probe` integration
+gate — but they pin the renderer-side semantics and serve as a
+reference for any future FramebufferOwner implementation.
+
 ### Remaining residual flake — for the next investigator
 
 A small fraction of probe runs still show after-down / after-up
