@@ -366,7 +366,12 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // at a time via `LABEL_CLIENT_EVENT_PULL`. Capped at
     // `client::MAX_CLIENT_EVENT_QUEUE` per the Phase 56 resource
     // bounds; oldest is dropped when the cap is reached.
-    let mut client_event_queue: alloc::collections::VecDeque<ServerMessage> =
+    // Phase 70 — each queued event carries the target `SurfaceId` so
+    // the PULL handler can return only the events the calling client
+    // is entitled to (i.e. its own focused-surface events). The
+    // dispatcher's `InputEffect::Outbound` already names the target;
+    // we just preserve that through to the wire.
+    let mut client_event_queue: alloc::collections::VecDeque<(SurfaceId, ServerMessage)> =
         alloc::collections::VecDeque::with_capacity(client::MAX_CLIENT_EVENT_QUEUE);
     // Reusable encode buffer for the `LABEL_CLIENT_EVENT_PULL` reply
     // bulk. The largest `ServerMessage` body is `Pointer` at
@@ -428,8 +433,37 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         let pull_handled = had_graphical && header.label == client::LABEL_CLIENT_EVENT_PULL;
         if pull_handled {
             let reply_cap = header.data[3] as u32;
-            match client_event_queue.pop_front() {
-                Some(msg) => match msg.encode(&mut event_reply_buf) {
+            // Phase 70 — `data[0]` carries a client-supplied surface
+            // id and is used purely as a cooperative routing hint so
+            // a well-behaved client only drains events targeted at its
+            // own surface. This is NOT an access-control boundary:
+            // any client that knows or guesses another surface id can
+            // request it and receive that surface's queued events.
+            // Real per-client ownership (separate outbound queues per
+            // client identity) is deferred to Phase 71; until then,
+            // the shared outbound queue + cooperative filter is the
+            // minimum needed to let term + DOOM coexist without
+            // racing for each other's key events.
+            //
+            // A value of `0` is the legacy wildcard (pre-Phase-70
+            // clients pass `0`) and pops the next queued event
+            // regardless of target — keeps old `m3ctl` / `gfx-demo`
+            // callers working until they are updated.
+            let requested = header.data[0] as u32;
+            let pop_idx = if requested == 0 {
+                if client_event_queue.is_empty() {
+                    None
+                } else {
+                    Some(0usize)
+                }
+            } else {
+                client_event_queue
+                    .iter()
+                    .position(|(target, _)| target.0 == requested)
+            };
+            let popped = pop_idx.and_then(|i| client_event_queue.remove(i));
+            match popped {
+                Some((_target, msg)) => match msg.encode(&mut event_reply_buf) {
                     Ok(n) => {
                         let _ = syscall_lib::ipc_store_reply_bulk(&event_reply_buf[..n]);
                         if reply_cap != 0 {
@@ -489,16 +523,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
+            // Phase 70 — Goodbye used to wipe the entire `SurfaceRegistry`
+            // (Phase 56 single-client legacy). With multiple concurrent
+            // clients that resets every other client's surfaces, so
+            // typing `goodbye` from one app would clear the screen of
+            // every other app. Per-client surface tracking is the
+            // proper fix (and the Phase 71 follow-up); until then,
+            // expect clients to send explicit `DestroySurface` verbs
+            // for the surfaces they own before saying Goodbye. The
+            // log line still fires so a developer can confirm the
+            // disconnect happened.
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "display_server: client closed; resetting registry\n",
+                "display_server: client said Goodbye (registry preserved for other clients)\n",
             );
-            registry = SurfaceRegistry::new();
-            focused = None;
-            // E.3 — the previous cursor (if any) belonged to that
-            // client. Reset the compose context so the next first-
-            // frame draws the fallback `DefaultArrowCursor` cleanly.
-            compose_ctx = ComposeContext::new();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)
@@ -506,11 +544,46 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             focused = None;
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
         }
-        if focused.is_none()
-            && let Some((surface_id, _)) = outcome
-                .created
-                .iter()
-                .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        // Phase 70 — when focus was just dropped (a Toplevel destroy,
+        // or any other reset path), re-pick a focus target from the
+        // remaining toplevels so the keyboard does not get stuck
+        // routing to nothing. Pick the lowest-id remaining toplevel
+        // for determinism — `term`'s `SurfaceId(1)` always wins over a
+        // PID-seeded DOOM surface, so closing DOOM hands focus back
+        // to term automatically.
+        //
+        // Filter to `SurfaceRole::Toplevel` only: `surface_ids()`
+        // returns every registered surface (Cursor, Layer, anything
+        // role-less mid-handshake), and routing keyboard events to a
+        // non-Toplevel surface would misroute them entirely. PR 179
+        // round-3 review fix.
+        if focused.is_none() {
+            let fallback = registry
+                .surface_ids()
+                .into_iter()
+                .filter(|id| matches!(registry.surface_role(*id), Some(SurfaceRole::Toplevel)))
+                .min();
+            if let Some(id) = fallback {
+                focused = Some(id);
+                publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+            }
+        }
+        // Phase 70 — auto-focus the most-recently-created Toplevel. The
+        // Phase 56 baseline only granted focus when `focused.is_none()`,
+        // which meant a newly-mapped Toplevel (DOOM created after term)
+        // never received the keyboard focus. With the focus-aware
+        // dispatcher routing `KeyEvent`s only to the focused surface,
+        // every keystroke went to term while DOOM sat unfocused — the
+        // user-visible symptom was "DOOM doesn't see my keys". Moving
+        // focus to the new Toplevel matches the focus-on-create
+        // convention every floating window manager uses (sway, i3,
+        // Wayland weston, Windows). A future tiling-policy phase
+        // (Phase 71) can override this with chord-driven focus.
+        if let Some((surface_id, _)) = outcome
+            .created
+            .iter()
+            .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+            && Some(*surface_id) != focused
         {
             focused = Some(*surface_id);
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
@@ -786,7 +859,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         );
         for effect in effects {
             match effect {
-                InputEffect::Outbound(msg) => {
+                InputEffect::Outbound(target, msg) => {
                     // E.3 seam: extract the pointer's `abs_position`
                     // from any `Pointer` message the dispatcher
                     // emitted, and forward it to the next compose
@@ -804,6 +877,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // and emit a structured log line — preserving
                     // recent input is more useful than blocking forever
                     // because a client stopped pulling.
+                    //
+                    // Phase 70 — the target id is preserved alongside
+                    // the message so the PULL handler can return only
+                    // events the calling client owns.
                     if client_event_queue.len() >= client::MAX_CLIENT_EVENT_QUEUE {
                         client_event_queue.pop_front();
                         syscall_lib::write_str(
@@ -811,7 +888,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                             "display_server: outbound queue full; oldest dropped\n",
                         );
                     }
-                    client_event_queue.push_back(msg);
+                    client_event_queue.push_back((target, msg));
                 }
                 InputEffect::BindTriggered { id } => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");

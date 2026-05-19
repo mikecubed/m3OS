@@ -700,7 +700,18 @@ enum PulledEvent {
 /// thread `Pointer` into the input handler here.
 #[cfg(not(test))]
 fn pull_one_event(display_handle: u32, buf: &mut [u8]) -> PulledEvent {
-    let label = syscall_lib::ipc_call(display_handle, LABEL_CLIENT_EVENT_PULL, 0);
+    // Phase 70 — pass term's surface id so the multi-client dispatcher
+    // returns only events targeted at this client (the focus-aware
+    // routing decides target at enqueue time). Without this, the
+    // shared outbound queue would race between term and any other
+    // graphical client (e.g. DOOM) PULLing on the same endpoint.
+    // Single-sourced from `term::display::SURFACE_ID` so the value
+    // cannot drift between the handle setup and this PULL call.
+    let label = syscall_lib::ipc_call(
+        display_handle,
+        LABEL_CLIENT_EVENT_PULL,
+        term::display::SURFACE_ID.0 as u64,
+    );
     if label != LABEL_CLIENT_EVENT_PULL {
         // LABEL_CLIENT_EVENT_NONE (= 4) or transport error — no
         // event. Even on the NONE path the kernel may have staged

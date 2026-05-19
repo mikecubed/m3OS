@@ -72,7 +72,11 @@ const LOOKUP_MAX_ATTEMPTS: u32 = 2000;
 
 /// Surface id term claims. Stable across the binary lifetime — only
 /// one Toplevel surface per `term` instance.
-const SURFACE_ID: SurfaceId = SurfaceId(1);
+///
+/// `pub` so the input-loop split in `term::main` can pass the same
+/// id when PULLing from `display_server` — keeps the value single-
+/// sourced instead of repeated as a magic literal at the call site.
+pub const SURFACE_ID: SurfaceId = SurfaceId(1);
 /// Two `BufferId`s, one per SHM mapping in the double-buffered
 /// publish path. Indexed `BUFFER_IDS[back_idx]` so the protocol
 /// `buffer_id` always matches the SHM region term writes into and

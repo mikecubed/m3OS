@@ -247,8 +247,32 @@ impl LayoutPolicy for FloatingLayout {
             // Center the window in the usable rect.
             let center_x = usable.x.saturating_add((usable.w as i32 - w as i32) / 2);
             let center_y = usable.y.saturating_add((usable.h as i32 - h as i32) / 2);
-            let slot = (starting_slot + i as u32) % CASCADE_SLOTS;
-            let cascade_off = (slot as i32) * CASCADE_OFFSET_PX;
+            // Phase 70 — skip the cascade offset when the surface
+            // is at least as large as the entire usable rect on
+            // both axes (strict `w >= usable.w && h >= usable.h`,
+            // no tolerance). Two fullscreen-sized toplevels (e.g.
+            // term + DOOM, both 1280×800 in a 1280×800 output)
+            // cascaded by 32 pixels would end up partially
+            // overlapping with the lower-z surface peeking through
+            // a 32-pixel-wide strip —
+            // and because `build_occlusion_map` only fully-occludes
+            // when one rect *strictly contains* another, the lower-z
+            // surface's compose damage would still paint into the
+            // overlap region every frame the lower-z surface
+            // committed. The visible symptom is term and DOOM
+            // alternating in the overlap area. Sharing an identical
+            // rect collapses the higher-z occluder into a strict
+            // superset and the existing occlusion path suppresses
+            // every lower-z paint. Phase 71 tiling will replace this
+            // cascade entirely; until then the carve-out is the
+            // minimal fix.
+            let fills_usable = w >= usable.w && h >= usable.h;
+            let cascade_off = if fills_usable {
+                0
+            } else {
+                let slot = (starting_slot + i as u32) % CASCADE_SLOTS;
+                (slot as i32) * CASCADE_OFFSET_PX
+            };
             let rect = Rect {
                 x: center_x.saturating_add(cascade_off),
                 y: center_y.saturating_add(cascade_off),

@@ -1,8 +1,12 @@
 # Fullscreen-takeover tiers
 
-**Status:** Tier 1 landed and shipping. First-takeover path verified
-working. Second-takeover-hang and mouse-pointer-reset residuals open
-(see "Known Tier 1 reclaim residuals"). Tiers 2 and 3 deferred.
+**Status:** Tier 1 retained as fallback for non-`display_server` boots
+(headless / serial-only mode). Tier 3 landed in Phase 70 — DOOM is now
+a regular `display_server` client via `display_client_ffi` and no
+longer requires the fb-takeover wrapper. The second-takeover-hang and
+mouse-pointer-reset residuals are resolved structurally by Tier 3
+(there is no longer a takeover, so there is nothing to reclaim).
+Tier 2 remains deferred.
 
 **Branch:** `feat/57d-voluntary-preemption` — head at `8619928`.
 
@@ -184,6 +188,14 @@ forcing function to find protocol bugs that single-client `term` +
 `gfx-demo` don't exercise.
 
 ## Known Tier 1 reclaim residuals
+
+**Resolution (Phase 70):** Both residuals below — the
+second-consecutive-takeover hang and the mouse-pointer-reset on
+reclaim — are now structurally inapplicable. Phase 70 turned DOOM
+into a `display_server` client via `display_client_ffi`, eliminating
+the yield/reclaim cycle that was the root cause of both bugs. The
+prose below is preserved as a historical post-mortem of the Tier 1
+implementation.
 
 Tier 1 ships fixes for the most-visible reclaim issues, but two
 input-state-machine corners are tracked here for follow-up:

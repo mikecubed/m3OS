@@ -542,11 +542,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "display_client_ffi"
+version = "0.70.0"
+dependencies = [
+ "kernel-core",
+ "surface_buffer",
+ "syscall-lib",
+]
+
+[[package]]
 name = "display_server"
 version = "0.56.0"
 dependencies = [
  "kernel-core",
  "surface_buffer",
+ "syscall-lib",
+]
+
+[[package]]
+name = "doom-concurrent"
+version = "0.1.0"
+dependencies = [
  "syscall-lib",
 ]
 
@@ -1007,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.69.5"
+version = "0.70.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",

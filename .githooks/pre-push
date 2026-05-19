@@ -171,6 +171,19 @@ if [ "${M3OS_DOOM_AUDIO_REGRESSION:-0}" = "1" ]; then
     cargo xtask doom-audio-smoke --timeout 120
 fi
 
+# Phase 70 Track F.2 — doom concurrent-instance regression. Gated
+# behind M3OS_DOOM_CONCURRENT_REGRESSION=1 because the gate boots
+# QEMU, launches two DOOMs simultaneously under display_server, and
+# waits for both to complete the autoquit lifecycle — ~45s wall-clock.
+# Set the env var on branches that touch userspace/doom,
+# userspace/lib/display_client_ffi, userspace/display_server, or the
+# Phase 56 protocol codec so the regression catches multi-client
+# surface-buffer drift before merge.
+if [ "${M3OS_DOOM_CONCURRENT_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask doom-concurrent-smoke..."
+    cargo xtask doom-concurrent-smoke --timeout 120
+fi
+
 # Phase 69a Track I.2 — termios contract gate. Gated behind
 # M3OS_TERMIOS_REGRESSION=1 because the gate boots QEMU + runs six
 # /bin/tcsmoke subcommands; ~35s wall-clock.  Set the env var on

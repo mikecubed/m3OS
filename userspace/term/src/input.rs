@@ -52,6 +52,18 @@ impl InputHandler {
         let symbol = event.symbol;
         let modifiers = event.modifiers;
 
+        // Phase 70 — `kbd_server` now surfaces modifier-key edges
+        // (`KEY_LCTRL`, `KEY_RSHIFT`, ...) as `KeyEvent`s with
+        // `symbol = 0` so DOOM-style "Ctrl is the Fire button" clients
+        // can match by keycode. Term has no use for a stand-alone
+        // modifier event: the modifier snapshot is folded into the
+        // next non-modifier event's `modifiers` field via the chord
+        // path below. Drop these here so we don't emit a NUL byte
+        // through the `symbol <= 0x7F` clause at the bottom.
+        if symbol == 0 {
+            return;
+        }
+
         // Special keys live in the private-use area (0xE000+);
         // printable ASCII in [0x20..=0x7E] flows through verbatim.
         if let Some(seq) = special_key_sequence(symbol) {

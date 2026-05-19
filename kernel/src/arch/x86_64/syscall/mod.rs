@@ -10610,6 +10610,13 @@ pub(super) fn sys_framebuffer_release() -> u64 {
 
 pub(super) fn sys_fb_yield() -> u64 {
     let pid = crate::process::current_pid();
+    // Phase 70 — fb-takeover Tier 3 lands DOOM as a display_server
+    // client; SYS_FB_YIELD is only kept for the deprecated wrapper.
+    // Log every caller so a later cleanup phase can confirm all
+    // callers are gone before removing the dispatch arm.
+    log::warn!(
+        "SYS_FB_YIELD called by pid {pid}; syscall is deprecated (Phase 70), scheduled for removal"
+    );
     if crate::fb::fb_owner_pid() != pid {
         return NEG_EPERM;
     }
@@ -10624,6 +10631,10 @@ pub(super) fn sys_fb_yield() -> u64 {
 
 pub(super) fn sys_fb_reacquire() -> u64 {
     let pid = crate::process::current_pid();
+    // Phase 70 — paired with the SYS_FB_YIELD deprecation warn above.
+    log::warn!(
+        "SYS_FB_REACQUIRE called by pid {pid}; syscall is deprecated (Phase 70), scheduled for removal"
+    );
     let raw_input_enabled = !is_current_exec_path("/bin/display_server");
 
     // Verify the caller still has an FB VMA — `FB_REACQUIRE` is meant

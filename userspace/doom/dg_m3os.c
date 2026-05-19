@@ -1,19 +1,41 @@
 /*
- * dg_m3os.c -- doomgeneric platform layer for m3OS
+ * dg_m3os.c — Phase 70 doomgeneric platform layer for m3OS.
  *
- * Bridges the doomgeneric engine to m3OS via three custom syscalls:
- *   0x1002  sys_framebuffer_info  -- retrieve FB dimensions, stride, bpp
- *                                    (only RGB=0 and BGR=1 pixel formats supported;
- *                                     returns NEG_EINVAL for any other format)
- *   0x1003  sys_framebuffer_mmap  -- map FB physical pages into userspace
- *   0x1004  sys_read_scancode     -- poll raw PS/2 make/break scancode
+ * Phase 70 turned DOOM into a regular `display_server` client. The
+ * legacy fb-takeover path (`sys_framebuffer_acquire` + mmap + direct
+ * write) is gone; pixels now travel through:
+ *
+ *   sys_shm_create(W*H*4)          (kernel SHM region)
+ *      ↓
+ *   sys_shm_map(...)               (private read-write mapping)
+ *      ↓
+ *   dc_attach_shm_buffer(...)       (CreateSurface +
+ *                                    SetSurfaceRole(Toplevel) +
+ *                                    AttachSharedBuffer over Phase 56
+ *                                    protocol — implemented in
+ *                                    display_client_ffi)
+ *      ↓
+ *   per-frame:
+ *     memcpy(DG_ScreenBuffer -> shared region)
+ *     dc_damage_and_commit(...)     (DamageSurface + CommitSurface)
+ *
+ * Keyboard input now arrives as `ServerMessage::Key(KeyEvent)` events
+ * on the same `display_server` protocol socket via
+ * `dc_poll_event` — the focus-aware dispatcher in
+ * `display_server::input` decides whether the events reach DOOM, so
+ * an unfocused DOOM window does not see keypresses.
+ *
+ * Mouse / audio: Phase 70 does not change either path. Audio still
+ * runs through `audio_client_ffi`; mouse capture is deferred.
  *
  * Build: compiled by xtask as part of the doomgeneric binary using
- *   musl-gcc -static -O2 dg_m3os.c <doomgeneric_src/*.c> -o doom
+ *   musl-gcc -static dg_m3os.c <doomgeneric_src/*.c>
+ *           -laudio_client_ffi -ldisplay_client_ffi -o doom
  */
 
 #include "doomgeneric/doomgeneric.h"
 #include "doomgeneric/i_system.h"
+#include "display_client.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -24,184 +46,315 @@
 #include <unistd.h>
 
 /* -------------------------------------------------------------------------
- * m3OS custom syscall numbers
+ * m3OS shared-memory syscalls — mirrored from
+ * userspace/syscall-lib/src/lib.rs. DOOM is C and cannot link the Rust
+ * helper; raw inline asm keeps the wrapper count to zero and avoids any
+ * musl-side syscall renumbering surprises.
  * ------------------------------------------------------------------------- */
 
-#define SYS_FRAMEBUFFER_INFO  0x1005
-#define SYS_FRAMEBUFFER_MMAP  0x1006
-#define SYS_READ_SCANCODE     0x1007
+#define SYS_SHM_CREATE  0x1018
+#define SYS_SHM_MAP     0x1019
+#define SYS_SHM_UNMAP   0x101A
+#define SYS_SHM_DESTROY 0x101B
+
+static inline long
+syscall1(long nr, long a0)
+{
+    long ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "0"(nr), "D"(a0)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
 
 /* -------------------------------------------------------------------------
- * Framebuffer info struct -- must match the kernel FbInfo layout exactly
+ * Surface geometry — single source of truth, derived from the doomgeneric
+ * canvas the engine fills before calling DG_DrawFrame.
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t stride;   /* pixels per row (may be > width due to padding) */
-    uint32_t bpp;      /* bytes per pixel */
-    uint32_t pixel_format; /* 0 = RGB, 1 = BGR */
-} FbInfo;
+#define SURFACE_WIDTH   DOOMGENERIC_RESX
+#define SURFACE_HEIGHT  DOOMGENERIC_RESY
+#define SURFACE_BPP     4
+#define SURFACE_BYTES   ((size_t)SURFACE_WIDTH * (size_t)SURFACE_HEIGHT * (size_t)SURFACE_BPP)
+
+#define DOOM_BUFFER_ID  1u
 
 /* -------------------------------------------------------------------------
  * File-scope state
  * ------------------------------------------------------------------------- */
 
-static uint8_t  *g_fb_ptr    = NULL;  /* mapped framebuffer virtual address */
-static FbInfo    g_fb_info;           /* framebuffer geometry */
-static int       g_scale     = 1;     /* nearest-neighbour scale factor */
-static int       g_x_offset  = 0;    /* horizontal centering offset (pixels) */
-static int       g_y_offset  = 0;    /* vertical centering offset (pixels) */
+static DcHandle *g_dc       = NULL;
+static uint32_t  g_surface  = 0;
+static uint8_t  *g_bgra     = NULL;  /* mapped SHM region */
+static uint32_t  g_shm_id   = 0;
+static int       g_focused  = 1;     /* assume focused at start */
 
-/* -------------------------------------------------------------------------
- * Raw inline syscall helpers
- *
- * We use raw asm to avoid depending on musl's syscall wrappers, which may
- * not handle the m3OS custom syscall numbers correctly on all versions.
- * ------------------------------------------------------------------------- */
+/* DOOM's internal key event queue. The engine polls DG_GetKey in a
+ * drain loop; we accumulate one key per call from a small ring fed by
+ * the display protocol's event stream. */
+#define DOOM_KEY_QUEUE_LEN  32
+typedef struct {
+    int             pressed;
+    unsigned char   doom_key;
+} DoomKeyEvent;
+static DoomKeyEvent g_key_queue[DOOM_KEY_QUEUE_LEN];
+static int g_key_q_head = 0;  /* read index */
+static int g_key_q_tail = 0;  /* write index */
 
-static inline long
-syscall2(long nr, long a0, long a1)
+static int
+key_queue_push(int pressed, unsigned char dk)
 {
-    long ret;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(ret)
-        : "0"(nr), "D"(a0), "S"(a1)
-        : "rcx", "r11", "memory"
-    );
-    return ret;
+    int next = (g_key_q_tail + 1) % DOOM_KEY_QUEUE_LEN;
+    if (next == g_key_q_head) {
+        return 0;  /* full — drop event */
+    }
+    g_key_queue[g_key_q_tail].pressed  = pressed;
+    g_key_queue[g_key_q_tail].doom_key = dk;
+    g_key_q_tail = next;
+    return 1;
 }
 
-static inline long
-syscall0(long nr)
+static int
+key_queue_pop(int *pressed, unsigned char *dk)
 {
-    long ret;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(ret)
-        : "0"(nr)
-        : "rcx", "r11", "memory"
-    );
-    return ret;
+    if (g_key_q_head == g_key_q_tail) return 0;
+    *pressed = g_key_queue[g_key_q_head].pressed;
+    *dk      = g_key_queue[g_key_q_head].doom_key;
+    g_key_q_head = (g_key_q_head + 1) % DOOM_KEY_QUEUE_LEN;
+    return 1;
 }
 
 /* -------------------------------------------------------------------------
- * DG_Init -- called once by the engine at startup
- *
- * Retrieves framebuffer metadata and maps the framebuffer into this
- * process's address space.
- *
- * NOTE: doomgeneric's I_FinishUpdate already scales the 320×200 DOOM
- * frame to DOOMGENERIC_RESX × DOOMGENERIC_RESY (640×400) before calling
- * DG_DrawFrame.  DG_DrawFrame therefore does a 1:1 blit of DG_ScreenBuffer
- * to the framebuffer — no further scaling is applied here.
+ * DOOM key constants — must match doomkeys.h exactly so the engine's
+ * default key bindings line up with what DG_GetKey emits.
  * ------------------------------------------------------------------------- */
+#define KEY_ENTER       13
+#define KEY_ESCAPE      27
+#define KEY_TAB         0x09
+#define KEY_BACKSPACE   0x7f
+#define KEY_RIGHTARROW  0xae
+#define KEY_LEFTARROW   0xac
+#define KEY_UPARROW     0xad
+#define KEY_DOWNARROW   0xaf
+#define KEY_RSHIFT      (0x80+0x36)
+#define KEY_RCTRL       (0x80+0x1d)
+#define KEY_RALT        (0x80+0x38)
+#define KEY_FIRE        0xa3
+#define KEY_USE         0xa2
+#define KEY_STRAFE_L    0xa0
+#define KEY_STRAFE_R    0xa1
+
+/* -------------------------------------------------------------------------
+ * kbd_server / kernel-core hardware-neutral keycode constants
+ * (see kernel-core/src/input/keymap.rs PUA region). These are the
+ * `keycode` values carried in `KeyEvent` and the only ones we need
+ * to translate to DOOM keys; the `symbol` field already gives us the
+ * Unicode scalar for printable letters and digits.
+ * ------------------------------------------------------------------------- */
+#define KEY_KC_LSHIFT   0x0080
+#define KEY_KC_RSHIFT   0x0081
+#define KEY_KC_LCTRL    0x0082
+#define KEY_KC_RCTRL    0x0083
+#define KEY_KC_LALT     0x0084
+#define KEY_KC_RALT     0x0085
+#define KEY_KC_ESC      0x0044
+#define KEY_KC_LEFT     0x00A0
+#define KEY_KC_RIGHT    0x00A1
+#define KEY_KC_UP       0x00A2
+#define KEY_KC_DOWN     0x00A3
+
+/* Translate a `KeyEvent` to a DOOM key. Returns 1 if the event maps
+ * to a DOOM key, 0 if it should be dropped (modifier-only state
+ * changes, unknown keycodes, etc.). `pressed` follows the
+ * `KeyEventKind`: `Down`/`Repeat` → 1, `Up` → 0. */
+static int
+key_event_to_doom(uint32_t keycode, uint32_t symbol, uint8_t kind,
+                  int *pressed, unsigned char *out_dk)
+{
+    *pressed = (kind == DC_KEY_KIND_UP) ? 0 : 1;
+
+    switch (keycode) {
+    case KEY_KC_UP:     *out_dk = KEY_UPARROW;    return 1;
+    case KEY_KC_DOWN:   *out_dk = KEY_DOWNARROW;  return 1;
+    case KEY_KC_LEFT:   *out_dk = KEY_LEFTARROW;  return 1;
+    case KEY_KC_RIGHT:  *out_dk = KEY_RIGHTARROW; return 1;
+    case KEY_KC_ESC:    *out_dk = KEY_ESCAPE;     return 1;
+    case KEY_KC_LCTRL:
+    case KEY_KC_RCTRL:  *out_dk = KEY_FIRE;       return 1;
+    case KEY_KC_LSHIFT:
+    case KEY_KC_RSHIFT: *out_dk = KEY_RSHIFT;     return 1;
+    case KEY_KC_LALT:
+    case KEY_KC_RALT:   *out_dk = KEY_RALT;       return 1;
+    default:
+        break;
+    }
+
+    /* Fallback: use the post-keymap `symbol` (Unicode scalar) for
+     * printable characters. DOOM expects lowercase ASCII for letter
+     * keys and the literal codepoints 0x09 (TAB) / 0x0D (CR) for
+     * those control keys. */
+    if (symbol == 0x0D || symbol == 0x0A) {
+        *out_dk = KEY_ENTER;
+        return 1;
+    }
+    if (symbol == 0x09) {
+        *out_dk = KEY_TAB;
+        return 1;
+    }
+    if (symbol == 0x7F) {
+        *out_dk = KEY_BACKSPACE;
+        return 1;
+    }
+    if (symbol == 0x20) {
+        *out_dk = KEY_USE;  /* Space = USE/open */
+        return 1;
+    }
+    /* Letters: DOOM is happy with either case; m_controls expects
+     * lowercase for the WASD bindings the user might rebind to. */
+    if (symbol >= 'A' && symbol <= 'Z') {
+        *out_dk = (unsigned char)(symbol - 'A' + 'a');
+        return 1;
+    }
+    if (symbol >= 'a' && symbol <= 'z') {
+        *out_dk = (unsigned char)symbol;
+        return 1;
+    }
+    if (symbol >= '0' && symbol <= '9') {
+        *out_dk = (unsigned char)symbol;
+        return 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * DG_Init — Phase 70 surface bring-up.
+ *
+ * Connects to display_server, creates a Toplevel surface, allocates a
+ * shared-memory pixel region of the same dimensions doomgeneric writes
+ * into, and hands it to the compositor.
+ * ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * dg_atexit_cleanup — atexit handler that releases DOOM's compositor
+ * surface and SHM region on a clean exit (DG_DrawFrame autoquit path →
+ * I_Quit → exit(0)). Without this hook, both display_server's
+ * `SurfaceRegistry` entry and the kernel-core SHM region linger until
+ * the next display_server restart, and overlapping clients (e.g.
+ * `term`) keep colliding with a phantom DOOM toplevel. The SHM region
+ * is roughly 4 MiB (DOOMGENERIC_RESX × DOOMGENERIC_RESY × 4 bytes
+ * rounded up to a page); leaking it per run is what the doom-audio-
+ * smoke gate (two runs back-to-back) and doom-concurrent-smoke gate
+ * (two DOOMs at once) exercise.
+ *
+ * Order matters: unmap the page before destroying the SHM region so
+ * the kernel-core SHM registry sees the mapping count drop to zero
+ * before the creator reference is released.
+ * ------------------------------------------------------------------------- */
+static void dg_atexit_cleanup(void)
+{
+    if (g_bgra != NULL) {
+        (void)syscall1(SYS_SHM_UNMAP, (long)(uintptr_t)g_bgra);
+        g_bgra = NULL;
+    }
+    if (g_shm_id != 0) {
+        (void)syscall1(SYS_SHM_DESTROY, (long)(uint32_t)g_shm_id);
+        g_shm_id = 0;
+    }
+    if (g_dc != NULL) {
+        dc_disconnect(g_dc);
+        g_dc = NULL;
+    }
+}
 
 void DG_Init(void)
 {
-    /* Retrieve framebuffer geometry */
-    long rc = syscall2(SYS_FRAMEBUFFER_INFO,
-                       (long)&g_fb_info, (long)sizeof(FbInfo));
-    if (rc != 0) {
-        /* No framebuffer available — print a clear error and exit
-         * rather than silently running the game with `DG_DrawFrame`
-         * as a no-op (the user sees the init banner up to "M_Init"
-         * and then nothing for minutes; the game IS running, just
-         * not displayed). Phase 56+ ships display_server which owns
-         * the framebuffer until someone yields it; that handoff is
-         * not yet implemented for fullscreen-takeover programs like
-         * doom. */
-        fprintf(stderr, "DOOM: framebuffer info unavailable (rc=%ld). "
-                        "display_server owns the framebuffer; doom needs a tty-takeover mode "
-                        "that's not yet implemented. Aborting.\n",
-                rc);
+    int rc = dc_connect(&g_dc);
+    if (rc != DC_OK || g_dc == NULL) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
+        fprintf(stderr, "DOOM: dc_connect failed (rc=%d). "
+                        "Is display_server running? Aborting.\n", rc);
+        exit(1);
+    }
+    atexit(dg_atexit_cleanup);
+
+    rc = dc_create_toplevel(g_dc, &g_surface);
+    if (rc != DC_OK) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
+        fprintf(stderr, "DOOM: dc_create_toplevel failed (rc=%d). Aborting.\n", rc);
         exit(1);
     }
 
-    /* Guard: only RGB (0) and BGR (1) are supported by DG_DrawFrame. */
-    if (g_fb_info.pixel_format > 1) {
-        I_Error("DOOM: unsupported framebuffer pixel format %u (only RGB=0 and BGR=1 are supported)\n",
-                g_fb_info.pixel_format);
-    }
-
-    /* Map framebuffer physical pages into our virtual address space */
-    long fb_virt = syscall0(SYS_FRAMEBUFFER_MMAP);
-    if (fb_virt <= 0) {
-        fprintf(stderr, "DOOM: framebuffer mmap failed (rc=%ld). "
-                        "display_server already owns the framebuffer. Aborting.\n",
-                fb_virt);
+    /* Allocate the SHM pixel region. The kernel-core SHM registry
+     * sizes regions in page units; we round up to the next 4 KiB. */
+    long shm = syscall1(SYS_SHM_CREATE, (long)SURFACE_BYTES);
+    if (shm <= 0) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
+        fprintf(stderr, "DOOM: sys_shm_create(%zu) failed (rc=%ld). Aborting.\n",
+                SURFACE_BYTES, shm);
         exit(1);
     }
-    g_fb_ptr = (uint8_t *)fb_virt;
+    g_shm_id = (uint32_t)shm;
 
-    /* g_scale is unused (DG_DrawFrame is a 1:1 blit); set to 1 for clarity.
-     * Compute centering offsets in case the physical framebuffer is larger
-     * than DOOMGENERIC_RESX × DOOMGENERIC_RESY. */
-    g_scale = 1;
-    g_x_offset = ((int)g_fb_info.width  - DOOMGENERIC_RESX) / 2;
-    g_y_offset = ((int)g_fb_info.height - DOOMGENERIC_RESY) / 2;
-    if (g_x_offset < 0) g_x_offset = 0;
-    if (g_y_offset < 0) g_y_offset = 0;
+    long va = syscall1(SYS_SHM_MAP, (long)(uint32_t)g_shm_id);
+    if (va <= 0) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
+        fprintf(stderr, "DOOM: sys_shm_map(%u) failed (rc=%ld). Aborting.\n",
+                g_shm_id, va);
+        exit(1);
+    }
+    g_bgra = (uint8_t *)va;
 
-    /* Debug: log actual framebuffer geometry so we can diagnose rendering issues */
-    fprintf(stderr, "DG_Init: fb w=%u h=%u stride=%u bpp=%u fmt=%u virt=0x%lx\n",
-            g_fb_info.width, g_fb_info.height, g_fb_info.stride,
-            g_fb_info.bpp, g_fb_info.pixel_format, (unsigned long)g_fb_ptr);
-    fprintf(stderr, "DG_Init: DOOM canvas %dx%d  offset (%d,%d)\n",
-            DOOMGENERIC_RESX, DOOMGENERIC_RESY, g_x_offset, g_y_offset);
+    rc = dc_attach_shm_buffer(g_dc, g_surface, DOOM_BUFFER_ID, g_shm_id,
+                              (uint32_t)SURFACE_WIDTH, (uint32_t)SURFACE_HEIGHT);
+    if (rc != DC_OK) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
+        fprintf(stderr, "DOOM: dc_attach_shm_buffer failed (rc=%d). Aborting.\n", rc);
+        exit(1);
+    }
+
+    /* Zero-fill the surface so the first frame doesn't display kernel
+     * scratch data while DOOM is loading its WAD. */
+    memset(g_bgra, 0, SURFACE_BYTES);
+
+    /* DevSkim: ignore DS154189 -- diagnostic fprintf, literal fmt + scalar args */
+    fprintf(stderr,
+            "DG_Init: connected to display_server; surface_id=%u shm_id=%u %ux%u\n",
+            g_surface, g_shm_id, (uint32_t)SURFACE_WIDTH, (uint32_t)SURFACE_HEIGHT);
 }
 
 /* -------------------------------------------------------------------------
- * DG_DrawFrame -- called by the engine after every rendered frame
+ * DG_DrawFrame — per-frame blit + commit.
  *
- * Direct blit of DG_ScreenBuffer to the native framebuffer.
+ * doomgeneric's I_FinishUpdate has already scaled the 320×200 indexed
+ * DOOM canvas to DOOMGENERIC_RESX × DOOMGENERIC_RESY ARGB8888 in
+ * DG_ScreenBuffer. The byte order of DG_ScreenBuffer matches the BGRA8888
+ * the compositor expects (low byte = B, high byte = A), so a flat
+ * memcpy is the entire conversion. After the copy we send
+ * DamageSurface + CommitSurface so display_server picks the frame up
+ * on the next compose pass.
  *
- * doomgeneric's I_FinishUpdate has already scaled the 320×200 DOOM canvas
- * to DOOMGENERIC_RESX × DOOMGENERIC_RESY (640×400) in DG_ScreenBuffer
- * before calling this function.  We do NOT apply additional scaling here;
- * doing so would cause a 4× total scale and display only the upper-left
- * quarter of the scene.
- *
- * For BGR framebuffers the DG_ScreenBuffer bytes are already in [B,G,R,A]
- * order and can be memcpy'd directly.  For RGB framebuffers the R and B
- * channels must be swapped per pixel.
+ * No heap allocation in the per-frame path.
  * ------------------------------------------------------------------------- */
-
 void DG_DrawFrame(void)
 {
-    if (!g_fb_ptr) return;
-
-    /* Phase 63a Track G.4 — one-shot serial marker so the
-     * doom-audio-smoke gate has a deterministic "DOOM is past
-     * init" signal. Gated by a static flag flipped on the first
-     * invocation.
-     *
-     * Phase 63a Track H — `/tmp/doom-autoquit-tics` is a smoke-gate
-     * seam: the doom-audio-smoke harness writes the desired budget
-     * into that file before launching DOOM, and we read it once at
-     * title-ready time. The counter is incremented per
-     * `DG_DrawFrame` call (i.e. per rendered frame); in doomgeneric
-     * the engine drives one DG_DrawFrame per game tic, so a budget
-     * of N is consumed in ~N tics today. The file path keeps its
-     * historical `-tics` suffix for harness compatibility, but the
-     * accounting is in render frames. When the counter crosses the
-     * budget we call `I_Quit()` so the engine's normal Shutdown
-     * runs (which fires `m3os_sound_shutdown_inner` and emits the
-     * `M3OS_DOOM:audio_summary` line the gate parses). DOOM running
-     * under a user — `/tmp/doom-autoquit-tics` absent — sees no
-     * behavioural change. */
+    /* Phase 63a Track H autoquit-frames seam preserved verbatim from
+     * the legacy implementation: the doom-audio-smoke gate writes a
+     * frame budget into /tmp/doom-autoquit-tics, and we call I_Quit()
+     * once the budget is hit so the engine's normal shutdown runs (the
+     * `M3OS_DOOM:audio_summary` line lands in the serial log). */
     static int title_ready_printed = 0;
-    static int s_autoquit_frames = -1;
-    static int s_frame_counter = 0;
+    static int s_autoquit_frames   = -1;
+    static int s_frame_counter     = 0;
     if (!title_ready_printed) {
         title_ready_printed = 1;
-        printf("M3OS_DOOM:title_ready\n"); /* DevSkim: ignore DS154189 -- literal string, smoke-gate marker line */
+        printf("M3OS_DOOM:title_ready\n"); /* DevSkim: ignore DS154189 -- smoke-gate marker line */
         fflush(stdout);
-        FILE *f = fopen("/tmp/doom-autoquit-tics", "r"); /* DevSkim: ignore DS154189 -- literal local path, read-only, smoke-gate seam */
+        FILE *f = fopen("/tmp/doom-autoquit-tics", "r"); /* DevSkim: ignore DS154189 -- bounded read-only seam */
         if (f) {
             int n;
-            if (fscanf(f, "%d", &n) == 1 && n > 0) { /* DevSkim: ignore DS154189 -- bounded %d conversion, no string buffers involved */
+            if (fscanf(f, "%d", &n) == 1 && n > 0) { /* DevSkim: ignore DS154189 -- bounded %d conversion */
                 s_autoquit_frames = n;
             }
             fclose(f);
@@ -213,40 +366,18 @@ void DG_DrawFrame(void)
         I_Quit();
     }
 
-    const uint32_t fb_pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per FB row */
-    const int      bgr      = (g_fb_info.pixel_format == 1);
-    /* Clip to the smaller of the DOOM canvas and the physical framebuffer. */
-    const int      copy_w   = (DOOMGENERIC_RESX < (int)g_fb_info.width)
-                               ? DOOMGENERIC_RESX : (int)g_fb_info.width;
-    const int      copy_h   = (DOOMGENERIC_RESY < (int)g_fb_info.height)
-                               ? DOOMGENERIC_RESY : (int)g_fb_info.height;
+    if (!g_dc || !g_bgra) return;
 
-    for (int sy = 0; sy < copy_h; sy++) {
-        const uint32_t *src = DG_ScreenBuffer + sy * DOOMGENERIC_RESX;
-        uint8_t        *dst = g_fb_ptr
-                            + (uint32_t)(g_y_offset + sy) * fb_pitch
-                            + (uint32_t) g_x_offset       * g_fb_info.bpp;
-
-        if (bgr) {
-            /* BGR display: DG_ScreenBuffer bytes are [B,G,R,A] — copy as-is */
-            memcpy(dst, src, (size_t)copy_w * g_fb_info.bpp);
-        } else {
-            /* RGB display: swap R and B channels in each pixel */
-            for (int sx = 0; sx < copy_w; sx++) {
-                uint32_t pixel = src[sx];
-                uint8_t r = (pixel >> 16) & 0xFF;
-                uint8_t b = (pixel >>  0) & 0xFF;
-                pixel = (pixel & 0xFF00FF00u) | (b << 16) | r;
-                memcpy(dst + sx * g_fb_info.bpp, &pixel, g_fb_info.bpp);
-            }
-        }
-    }
+    /* DevSkim: ignore DS154189 -- bounded memcpy, dst/src both sized to SURFACE_BYTES (compile-time constant) */
+    memcpy(g_bgra, DG_ScreenBuffer, SURFACE_BYTES);
+    dc_damage_and_commit(g_dc, g_surface,
+                         0, 0,
+                         (uint32_t)SURFACE_WIDTH, (uint32_t)SURFACE_HEIGHT);
 }
 
 /* -------------------------------------------------------------------------
- * DG_SleepMs -- sleep for ms milliseconds
+ * DG_SleepMs / DG_GetTicksMs — unchanged from the Phase 47 implementation.
  * ------------------------------------------------------------------------- */
-
 void DG_SleepMs(uint32_t ms)
 {
     struct timespec ts;
@@ -254,10 +385,6 @@ void DG_SleepMs(uint32_t ms)
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
 }
-
-/* -------------------------------------------------------------------------
- * DG_GetTicksMs -- monotonically increasing millisecond counter
- * ------------------------------------------------------------------------- */
 
 uint32_t DG_GetTicksMs(void)
 {
@@ -267,138 +394,62 @@ uint32_t DG_GetTicksMs(void)
 }
 
 /* -------------------------------------------------------------------------
- * PS/2 Set 1 scancode to DOOM key mapping
+ * DG_GetKey — drain ServerMessage events from the protocol socket,
+ * translate Key edges to DOOM keys, and pop one per call. The legacy
+ * kbd_server lookup is gone; the focus-aware dispatcher in
+ * display_server::input now decides whether DOOM sees keypresses.
  * ------------------------------------------------------------------------- */
-
-/* DOOM key constants — must match doomkeys.h exactly so the engine's
- * default key bindings (key_fire = KEY_FIRE, key_use = KEY_USE, etc.)
- * line up with what DG_GetKey emits. */
-#define KEY_ENTER       13
-#define KEY_ESCAPE      27
-#define KEY_TAB         0x09
-#define KEY_BACKSPACE   0x7f
-/* Arrow / navigation */
-#define KEY_RIGHTARROW  0xae
-#define KEY_LEFTARROW   0xac
-#define KEY_UPARROW     0xad
-#define KEY_DOWNARROW   0xaf
-/* Modifier physical key codes (0x80 + PS/2 make code) */
-#define KEY_RSHIFT      (0x80+0x36)   /* = 0xB6 */
-#define KEY_RCTRL       (0x80+0x1d)   /* = 0x9D */
-#define KEY_RALT        (0x80+0x38)   /* = 0xB8 */
-/* Abstract action buttons — these are what key_fire / key_use / key_strafe
- * are initialised to in m_controls.c; DG_GetKey must emit these values
- * for the default bindings to fire. */
-#define KEY_FIRE        0xa3
-#define KEY_USE         0xa2
-#define KEY_STRAFE_L    0xa0
-#define KEY_STRAFE_R    0xa1
-
-static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
-{
-    /* PS/2 Set 1 make-code to DOOM key */
-    switch (scancode) {
-    case 0x48: *doom_key = KEY_UPARROW;    return 1;
-    case 0x50: *doom_key = KEY_DOWNARROW;  return 1;
-    case 0x4B: *doom_key = KEY_LEFTARROW;  return 1;
-    case 0x4D: *doom_key = KEY_RIGHTARROW; return 1;
-    case 0x1D: *doom_key = KEY_FIRE;        return 1;  /* Ctrl = fire */
-    case 0x39: *doom_key = KEY_USE;         return 1;  /* Space = use/open */
-    case 0x1C: *doom_key = KEY_ENTER;      return 1;  /* Enter */
-    case 0x01: *doom_key = KEY_ESCAPE;     return 1;  /* Escape */
-    case 0x0F: *doom_key = KEY_TAB;        return 1;  /* Tab = automap */
-    case 0x2A: /* fall through */
-    case 0x36: *doom_key = KEY_RSHIFT;     return 1;  /* Shift = run */
-    case 0x38: *doom_key = KEY_RALT;       return 1;  /* Alt = strafe */
-    /* Number keys 1-9 for weapon select */
-    case 0x02: *doom_key = '1'; return 1;
-    case 0x03: *doom_key = '2'; return 1;
-    case 0x04: *doom_key = '3'; return 1;
-    case 0x05: *doom_key = '4'; return 1;
-    case 0x06: *doom_key = '5'; return 1;
-    case 0x07: *doom_key = '6'; return 1;
-    case 0x08: *doom_key = '7'; return 1;
-    case 0x09: *doom_key = '8'; return 1;
-    case 0x0A: *doom_key = '9'; return 1;
-    /* Letter keys -- pass through ASCII */
-    default:
-        if (scancode >= 0x10 && scancode <= 0x19) {
-            /* QWERTY row: q w e r t y u i o p */
-            static const char qrow[] = "qwertyuiop";
-            *doom_key = (unsigned char)qrow[scancode - 0x10];
-            return 1;
-        }
-        if (scancode >= 0x1E && scancode <= 0x26) {
-            /* Home row: a s d f g h j k l */
-            static const char hrow[] = "asdfghjkl";
-            *doom_key = (unsigned char)hrow[scancode - 0x1E];
-            return 1;
-        }
-        if (scancode >= 0x2C && scancode <= 0x32) {
-            /* Bottom row: z x c v b n m */
-            static const char brow[] = "zxcvbnm";
-            *doom_key = (unsigned char)brow[scancode - 0x2C];
-            return 1;
-        }
-        return 0;
-    }
-}
-
-/* -------------------------------------------------------------------------
- * DG_GetKey -- return one key event per call
- *
- * Returns 1 if a key event is available, 0 otherwise.
- * Sets *pressed = 1 for key-down, 0 for key-up.
- * Sets *doomKey  to the DOOM key constant.
- * ------------------------------------------------------------------------- */
-
-/* per-make-code pressed state — used to suppress PS/2 typematic repeats */
-static uint8_t s_key_pressed[128];
-
-/* -------------------------------------------------------------------------
- * DG_GetKey -- return one key event per call
- *
- * Loops internally until it finds a meaningful key event or the raw
- * scancode queue is empty.  Extended-prefix bytes (0xE0) and typematic
- * repeats are consumed and skipped, so a return of 0 always means
- * "queue empty" and DOOM's drain loop (while DG_GetKey) works correctly.
- * ------------------------------------------------------------------------- */
-
 int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
+    if (!g_dc) return 0;
+
+    /* Drain any pending server events into the local key ring. */
     for (;;) {
-        long sc = syscall0(SYS_READ_SCANCODE);
-        if (sc == 0) return 0;   /* ring buffer truly empty */
-
-        uint8_t raw  = (uint8_t)(sc & 0xFF);
-        uint8_t make = raw & 0x7F;
-        unsigned char dk;
-
-        if (!ps2_to_doom(make, &dk)) continue;  /* skip extended prefix / unknown */
-
-        if (raw & 0x80) {
-            /* break code (key-up) */
-            s_key_pressed[make] = 0;
-            *pressed = 0;
-            *doomKey = dk;
-            return 1;
+        DcEvent ev;
+        int rc = dc_poll_event(g_dc, &ev);
+        if (rc <= 0) {
+            /* 0: queue empty; <0: transport error — surface as empty
+             * so DOOM's caller loop terminates instead of spinning. */
+            break;
         }
-
-        /* make code: skip typematic repeats */
-        if (s_key_pressed[make]) continue;
-
-        /* fresh key-down */
-        s_key_pressed[make] = 1;
-        *pressed = 1;
-        *doomKey = dk;
-        return 1;
+        switch (ev.tag) {
+        case DC_EVENT_KEY: {
+            int p;
+            unsigned char dk;
+            if (key_event_to_doom(ev.payload.key.keycode,
+                                  ev.payload.key.symbol,
+                                  ev.payload.key.kind,
+                                  &p, &dk)) {
+                key_queue_push(p, dk);
+            }
+            break;
+        }
+        case DC_EVENT_FOCUS_IN:
+            g_focused = 1;
+            break;
+        case DC_EVENT_FOCUS_OUT:
+            g_focused = 0;
+            break;
+        case DC_EVENT_SURFACE_RESIZED:
+            /* DOOM doesn't reflow on resize today; the compositor will
+             * letterbox or scale the surface. Ignore. */
+            break;
+        case DC_EVENT_DISCONNECT:
+            /* DevSkim: ignore DS154189 -- shutdown-path fprintf, literal fmt + scalar arg */
+            fprintf(stderr, "DOOM: display_server disconnect (reason=%u). Exiting.\n",
+                    ev.payload.disconnect.reason);
+            exit(0);
+        default:
+            break;
+        }
     }
+
+    return key_queue_pop(pressed, doomKey);
 }
 
 /* -------------------------------------------------------------------------
- * DG_SetWindowTitle -- no-op on m3OS (no window manager)
+ * DG_SetWindowTitle — no-op until the compositor adds a title verb.
  * ------------------------------------------------------------------------- */
-
 void DG_SetWindowTitle(const char *title)
 {
     (void)title;
@@ -407,9 +458,6 @@ void DG_SetWindowTitle(const char *title)
 /* Default IWAD path on m3OS when none is supplied by the user */
 #define DEFAULT_IWAD_PATH  "/usr/share/doom/doom1.wad"
 
-/* -------------------------------------------------------------------------
- * has_iwad_arg -- returns 1 if argv already contains "-iwad"
- * ------------------------------------------------------------------------- */
 static int has_iwad_arg(int argc, char **argv)
 {
     int i;
@@ -420,14 +468,8 @@ static int has_iwad_arg(int argc, char **argv)
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * main -- entry point: create the DOOM instance and tick forever
- * ------------------------------------------------------------------------- */
-
 int main(int argc, char **argv)
 {
-    /* Inject a default IWAD path so the user can just type "doom" without
-     * needing to be in the same directory as doom1.wad or pass -iwad. */
     if (!has_iwad_arg(argc, argv)) {
         char **new_argv = malloc((argc + 3) * sizeof(char *));
         if (new_argv) {

@@ -88,6 +88,22 @@ mod os_binary {
     syscall_lib::entry_point!(program_main);
 
     fn program_main(args: &[&str]) -> i32 {
+        // Phase 70 — fb-takeover is deprecated. DOOM and other fullscreen
+        // programs are expected to be display_server clients directly via
+        // `display_client_ffi`. The wrapper still works (the compatibility
+        // path is exercised by the existing fb-takeover smoke gate) but
+        // emits a warning on every invocation so accidental fresh callers
+        // are nudged toward the right path.
+        //
+        // Emit on both serial (durable kernel log, visible after FB
+        // yield) and fd 2 (interactive shell stderr, so the user
+        // actually sees the warning at invocation time before any
+        // FB yield happens).
+        const DEPRECATION_MSG: &str = "[fb-takeover] WARNING: fb-takeover is deprecated (Phase 70). \
+Run your application directly; it should be a display_server client.\n";
+        print_str(DEPRECATION_MSG);
+        let _ = syscall_lib::write(2, DEPRECATION_MSG.as_bytes());
+
         if args.len() < 2 {
             print_usage();
             return 2;

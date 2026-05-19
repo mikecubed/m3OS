@@ -298,6 +298,14 @@ static WINSIZE_BANG_ELF: &[u8] = generated_initrd_asset!("winsize-bang");
 // Not a daemon: no `.conf`.
 static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 
+// Phase 70 follow-up — `doom-concurrent` forks two `doom` processes
+// and waits for both. Run from the post-login shell by `cargo xtask
+// doom-concurrent-smoke` to assert real kernel-level concurrency
+// (the in-tree shell has no `&` job control or `wait` builtin, so
+// the previous shell-driven gate degraded to a sequential run).
+// Not a daemon: no `.conf`.
+static DOOM_CONCURRENT_ELF: &[u8] = generated_initrd_asset!("doom-concurrent");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -515,6 +523,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "sendmsg-test",
         RamdiskNode::File {
             content: SENDMSG_TEST_ELF,
+        },
+    ),
+    // Phase 70 follow-up: doom-concurrent — forks two doom children
+    // and waits for both. Drives the doom-concurrent-smoke gate.
+    (
+        "doom-concurrent",
+        RamdiskNode::File {
+            content: DOOM_CONCURRENT_ELF,
         },
     ),
     // Phase 32: build tools and utilities

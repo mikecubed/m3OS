@@ -6,6 +6,14 @@
 **Builds on:** Uses the framebuffer, storage, and service baseline to prove that m3OS can host a real full-screen graphical program, while explicitly avoiding the mistake of treating one graphical app as the finished GUI architecture
 **Primary Components:** kernel/src/fb, kernel/src/arch/x86_64/syscall.rs, userspace graphics demo or DOOM port, xtask/src/main.rs, docs/09-framebuffer-and-shell.md
 
+> **Phase 70 update (2026-05-19):** In Phase 70, `dg_m3os.c` was
+> rewritten to use the Phase 56 surface-buffer protocol via the new
+> `display_client_ffi` bridge. DOOM is now a regular `display_server`
+> client; the `fb-takeover` wrapper is no longer required.
+> Cross-references:
+> [`docs/roadmap/70-doom-in-gui-surface.md`](70-doom-in-gui-surface.md)
+> and [`docs/70-doom-in-gui-surface.md`](../70-doom-in-gui-surface.md).
+
 ## Milestone Goal
 
 m3OS can run DOOM as a real full-screen graphical application. The game loads its WAD data from disk, renders through the framebuffer path, accepts keyboard input for gameplay, and returns the system to a usable administration path when it exits.
