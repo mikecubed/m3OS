@@ -672,9 +672,39 @@ async fn progress_task(
                     event_session_pty_count = event_session_pty_count.saturating_add(1);
                     log_sshd_loop_counter("progress:event session_pty", event_session_pty_count);
                     log_sshd_step("session pty request");
+                    let cols = pty_req.cols();
+                    let rows = pty_req.rows();
+                    let width = pty_req.width();
+                    let height = pty_req.height();
+                    log_sshd_step_u64("session pty cols", "cols", cols as u64);
+                    log_sshd_step_u64("session pty rows", "rows", rows as u64);
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
                             set_nonblocking(master);
+                            // Apply the client-requested window size via
+                            // TIOCSWINSZ on the master fd.  Without this
+                            // the PTY stays at its default 24x80 and
+                            // curses applications (less, htop, vim,
+                            // tmux) paint into a tiny corner of the
+                            // user's actual terminal.
+                            if cols > 0 && rows > 0 {
+                                let ws = syscall_lib::Winsize {
+                                    ws_row: rows.min(u16::MAX as u32) as u16,
+                                    ws_col: cols.min(u16::MAX as u32) as u16,
+                                    ws_xpixel: width.min(u16::MAX as u32) as u16,
+                                    ws_ypixel: height.min(u16::MAX as u32) as u16,
+                                };
+                                let rc = syscall_lib::ioctl(
+                                    master,
+                                    syscall_lib::TIOCSWINSZ,
+                                    &ws as *const syscall_lib::Winsize as usize,
+                                );
+                                log_sshd_step_u64(
+                                    "session pty TIOCSWINSZ applied",
+                                    "rc",
+                                    rc as u64,
+                                );
+                            }
                             let mut st = state.borrow_mut();
                             st.pty_master = Some(master);
                             st.pty_slave = Some(slave);

@@ -913,8 +913,14 @@ impl Channel {
             ChannelReqType::Subsystem(_) => {
                 Ok(DispatchEvent::ServEvent(ServEventId::SessionSubsystem { num }))
             }
-            ChannelReqType::Pty(_) => {
-                Ok(DispatchEvent::ServEvent(ServEventId::SessionPty { num }))
+            ChannelReqType::Pty(pty) => {
+                Ok(DispatchEvent::ServEvent(ServEventId::SessionPty {
+                    num,
+                    cols: pty.cols,
+                    rows: pty.rows,
+                    width: pty.width,
+                    height: pty.height,
+                }))
             }
             ChannelReqType::Environment(_) => {
                 Ok(DispatchEvent::ServEvent(ServEventId::Environment { num }))
