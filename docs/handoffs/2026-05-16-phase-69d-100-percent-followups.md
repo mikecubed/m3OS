@@ -26,7 +26,7 @@ SCM_RIGHTS regression.
 | B — less port + smoke | open /etc/passwd, alt-screen, quit, sentinel | ✅ Full |
 | C.1 — htop port | upstream pinned, cross-build, staged | ✅ Full |
 | C.2a — htop chrome render | `Tasks:` header + bars + F1..F10 + `q` quits + sentinel | ✅ Full |
-| C.2b — htop SIGWINCH reflow | `winsize-bang` synthesises resize + second-redraw assertion | ✅ Full |
+| C.2b — htop SIGWINCH reflow | `winsize-bang` synthesises resize + `winsize-bang:fired cols=60 rows=20` ioctl round-trip sentinel | ✅ Partial — cell-grid reflow assertion deferred to headless framebuffer probe |
 | D.1 — libevent port | static archive + headers | ✅ Full |
 | D.2 — tmux port | cross-build, staged, `tmux -V` runs | ✅ Full |
 | D.3a — tmux kernel surface | `sendmsg`/`recvmsg`/`SCM_RIGHTS` + `flock` + `prctl(PR_SET_NAME)` | ✅ Full (sendmsg-test) |

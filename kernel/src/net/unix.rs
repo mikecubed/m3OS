@@ -87,6 +87,20 @@ pub struct InflightFd {
     /// "rides".  Compared against the receiver's running consumed-bytes
     /// counter on every `recvmsg`.
     pub deliver_at_stream_pos: u64,
+    /// `true` when this fd was sent alongside one or more data bytes;
+    /// `false` for ancillary-only sends (sendmsg called with empty
+    /// iov).  Drain semantics differ between the two cases: an fd
+    /// that rides with data is only deliverable once the receiver has
+    /// consumed PAST the first byte of that send
+    /// (`stream_pos_consumed > deliver_at_stream_pos`); an
+    /// ancillary-only fd is deliverable as soon as the consumed
+    /// cursor REACHES `deliver_at_stream_pos`
+    /// (`stream_pos_consumed >= deliver_at_stream_pos`).  Without the
+    /// distinction, an inflight fd queued behind backlog bytes that
+    /// happen to extend exactly to the deliver offset would surface
+    /// before the receiver actually read the fd's associated first
+    /// byte (PR #177 third-pass review fix).
+    pub has_data: bool,
 }
 
 /// Per-socket kernel object for Unix domain sockets.
@@ -502,10 +516,15 @@ pub fn unix_stream_write_with_anc(
             return Err(-11_i64); // EAGAIN
         }
         // Stamp inflight cmsgs with the **current** stream offset so
-        // they ride with the first byte of this sendmsg.
+        // they ride with the first byte of this sendmsg.  `has_data`
+        // records whether bytes followed this fd in the sendmsg so the
+        // drain side can pick the right `>` vs `>=` boundary
+        // condition.
         let deliver_at = peer.stream_pos_appended;
+        let has_data = !data.is_empty();
         for mut fd in inflight.drain(..) {
             fd.deliver_at_stream_pos = deliver_at;
+            fd.has_data = has_data;
             peer.anc_queue.push_back(fd);
         }
         let n = data.len().min(space);
@@ -535,7 +554,18 @@ pub fn unix_stream_drain_ready_anc(handle: usize, max_count: usize) -> alloc::ve
             let Some(front) = s.anc_queue.front() else {
                 break;
             };
-            if front.deliver_at_stream_pos > cursor {
+            // Data-carrying sends: receiver must have consumed PAST
+            // the first byte (cursor > deliver_at).  Ancillary-only
+            // sends: deliverable as soon as the cursor REACHES
+            // deliver_at (cursor >= deliver_at).  See the `has_data`
+            // field doc on `InflightFd` for the motivating bug
+            // (PR #177 third-pass review fix).
+            let ready = if front.has_data {
+                cursor > front.deliver_at_stream_pos
+            } else {
+                cursor >= front.deliver_at_stream_pos
+            };
+            if !ready {
                 break;
             }
             // SAFETY: front() succeeded so pop_front() must succeed.

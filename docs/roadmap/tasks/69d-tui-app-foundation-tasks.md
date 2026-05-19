@@ -107,7 +107,8 @@
 **Acceptance:**
 - [x] Shell types `htop`, the smoke harness asserts the first frame is composed (`Tasks:` header text appears in the cell grid alongside the CPU/Mem bars and the F1..F10 function-key strip).
 - [x] Sends `q` to quit; asserts return to shell and emits the `TUI_APP_SMOKE:htop:ok` sentinel.
-- [x] Synthesizes a `SurfaceResized` to a smaller geometry; asserts the resize round-trip reaches the kernel TTY layer. **Phase 69d follow-up (PR #177 review fix):** the new `userspace/winsize-bang` helper (`userspace/winsize-bang/src/main.rs`) forks a 5-second background timer and issues `TIOCSWINSZ` on inherited stdin, which the kernel routes into a `SIGWINCH` to the foreground process group.  The harness asserts the helper's `winsize-bang:fired cols=60 rows=20` diagnostic sentinel, proving the ioctl round-trip executed at the expected geometry.  A true cell-grid reflow assertion at the new dimensions is deferred to the headless framebuffer probe in `xtask/src/{ppm,qmp}.rs`, which is the only path that can observe htop's redrawn frame.
+- [x] **ioctl / SIGWINCH round-trip.** The `userspace/winsize-bang` helper (`userspace/winsize-bang/src/main.rs`) forks a 5-second background timer and issues `TIOCSWINSZ` on inherited stdin, which the kernel routes into a `SIGWINCH` to the foreground process group.  The harness asserts the helper's `winsize-bang:fired cols=60 rows=20` diagnostic sentinel, proving the ioctl reached the kernel TTY layer at the expected geometry.
+- [ ] **Framebuffer cell-grid reflow assertion.** Deferred to the headless framebuffer probe in `xtask/src/{ppm,qmp}.rs`, which is the only path that can observe htop's redrawn frame at the new dimensions and confirm the cell grid actually reflowed.  The ioctl round-trip above proves the SIGWINCH delivery half of the path; the framebuffer probe will close the visual half.
 
 ---
 

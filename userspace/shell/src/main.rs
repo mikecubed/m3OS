@@ -16,7 +16,7 @@ const MAX_TOKENS: usize = 32;
 const MAX_PATH: usize = 128;
 
 /// PATH directories to search for commands.
-const PATH_DIRS: [&[u8]; 3] = [b"/bin", b"/sbin", b"/usr/bin"];
+const PATH_DIRS: [&[u8]; 4] = [b"/usr/local/bin", b"/bin", b"/sbin", b"/usr/bin"];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {

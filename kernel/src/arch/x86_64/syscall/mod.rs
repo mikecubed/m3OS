@@ -1878,6 +1878,18 @@ pub extern "C" fn syscall_handler(
         }
         EPOLL_CREATE1 => sys_epoll_create1(arg0),
         PIPE2 => {
+            // Phase 69d follow-up (PR #177 third-pass review fix):
+            // reject unknown pipe2 flag bits with EINVAL.  Linux only
+            // accepts O_CLOEXEC (0x80000) + O_NONBLOCK (0x800) +
+            // O_DIRECT (0x4000, packet mode — not supported on m3OS);
+            // silently ignoring other bits gave callers descriptors
+            // without the semantics they asked for (e.g. a request for
+            // O_DIRECT packet semantics would silently downgrade to
+            // byte-stream).
+            const PIPE2_SUPPORTED: u64 = 0x80000 | 0x800;
+            if arg1 & !PIPE2_SUPPORTED != 0 {
+                return NEG_EINVAL;
+            }
             let cloexec = arg1 & 0x80000 != 0;
             let nonblock = arg1 & 0x800 != 0;
             sys_pipe_with_flags2(arg0, cloexec, nonblock)
@@ -6118,6 +6130,25 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     .is_err()
                                 {
                                     return NEG_EFAULT;
+                                }
+                                // Phase 69d follow-up (PR #177 third-pass
+                                // review fix): plain `read(2)` advances
+                                // `stream_pos_consumed` past any SCM_RIGHTS
+                                // entries riding with the consumed bytes,
+                                // but the caller never asked for ancillary
+                                // data — drain the now-ready entries and
+                                // release their refs so the inflight fds
+                                // do not leak.  Without this, a sender
+                                // that uses sendmsg(SCM_RIGHTS) and a
+                                // receiver that uses plain read(2) would
+                                // permanently retain the inflight refs
+                                // on the sender's fds.
+                                let dropped = crate::net::unix::unix_stream_drain_ready_anc(
+                                    handle,
+                                    usize::MAX,
+                                );
+                                for inf in &dropped {
+                                    release_inflight_anc_backend(&inf.backend);
                                 }
                                 return n as u64;
                             }
@@ -13536,14 +13567,24 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
     // fires after register but before block is caught by `woken`
     // already being `true` when `block_current_until` checks it.  The
     // shape mirrors `unix_stream_read` / `pipe_read`.
+    //
+    // Phase 69d follow-up (PR #177 third-pass review fix): the closure
+    // also revalidates the fd before each acquire attempt — a
+    // CLONE_FILES sibling can close the fd (freeing the UnixSocket
+    // handle) while this task sleeps; without revalidation the
+    // waiter would acquire a lock on a recycled / closed handle.
+    // The closure returns `Err(NEG_EBADF)` when the fd no longer
+    // points at the same UnixSocket, propagating up out of
+    // `flock_wait_blocking` so the caller surfaces EBADF instead.
     fn flock_wait_blocking(
         h: usize,
         nonblock: bool,
-        mut try_acquire: impl FnMut() -> FlockOutcome,
+        mut try_acquire: impl FnMut() -> Result<FlockOutcome, u64>,
     ) -> Result<(), u64> {
         loop {
-            if matches!(try_acquire(), FlockOutcome::Acquired) {
-                return Ok(());
+            match try_acquire()? {
+                FlockOutcome::Acquired => return Ok(()),
+                FlockOutcome::WouldBlock => {}
             }
             if nonblock {
                 return Err(NEG_EWOULDBLOCK);
@@ -13558,9 +13599,12 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
             let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[h];
             wq.register(task_id, &woken);
-            if matches!(try_acquire(), FlockOutcome::Acquired) {
-                wq.deregister(task_id);
-                return Ok(());
+            match try_acquire()? {
+                FlockOutcome::Acquired => {
+                    wq.deregister(task_id);
+                    return Ok(());
+                }
+                FlockOutcome::WouldBlock => {}
             }
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
@@ -13572,11 +13616,22 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
         }
     }
 
+    let revalidate_handle = |h: usize| -> bool {
+        match current_fd_entry(fd_idx).map(|e| e.backend) {
+            Some(FdBackend::UnixSocket { handle }) => handle == h,
+            _ => false,
+        }
+    };
+
     match mode {
         LOCK_SH => {
             if let Some(h) = unix_handle
-                && let Err(e) =
-                    flock_wait_blocking(h, nonblock, || unix_socket_acquire_shared(h, pid, fd_u32))
+                && let Err(e) = flock_wait_blocking(h, nonblock, || {
+                    if !revalidate_handle(h) {
+                        return Err(NEG_EBADF);
+                    }
+                    Ok(unix_socket_acquire_shared(h, pid, fd_u32))
+                })
             {
                 return e;
             }
@@ -13586,7 +13641,10 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
         LOCK_EX => {
             if let Some(h) = unix_handle
                 && let Err(e) = flock_wait_blocking(h, nonblock, || {
-                    unix_socket_acquire_exclusive(h, pid, fd_u32)
+                    if !revalidate_handle(h) {
+                        return Err(NEG_EBADF);
+                    }
+                    Ok(unix_socket_acquire_exclusive(h, pid, fd_u32))
                 })
             {
                 return e;
@@ -16418,12 +16476,24 @@ fn acquire_inflight_anc_backend(backend: &FdBackend) {
 /// to the in-flight copy and would tear the underlying object down
 /// before the receiver's `recvmsg` materializes it.
 fn anc_backend_is_refcounted(backend: &FdBackend) -> bool {
+    // Phase 69d follow-up (PR #177 third-pass review fix): `UnixSocket`
+    // was previously included but allowing it leaks sockets in
+    // self/cyclic SCM_RIGHTS transfers — an in-flight fd increments
+    // the socket's refcount, but `free_unix_socket` drains
+    // `anc_queue` only when the refcount reaches zero, so a socket
+    // queued on itself (or a cycle of sockets queued on each other)
+    // keeps the last reference forever.  Full garbage collection of
+    // such cycles is a substantial future patch (mirroring Linux's
+    // unix_gc); for now reject UnixSocket fds in SCM_RIGHTS with
+    // `EOPNOTSUPP` from the sendmsg path so the cycle cannot form.
+    // tmux and other current SCM_RIGHTS users on m3OS pass pipe /
+    // PTY fds, not Unix sockets, so the rejection does not regress
+    // any in-tree caller.
     matches!(
         backend,
         FdBackend::PipeRead { .. }
             | FdBackend::PipeWrite { .. }
             | FdBackend::Socket { .. }
-            | FdBackend::UnixSocket { .. }
             | FdBackend::PtyMaster { .. }
             | FdBackend::PtySlave { .. }
             | FdBackend::Epoll { .. }
@@ -16445,6 +16515,20 @@ fn release_inflight_anc_backend(backend: &FdBackend) {
         FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
         FdBackend::Epoll { instance_id } => crate::epoll::epoll_free_pub(*instance_id),
         _ => {}
+    }
+}
+
+/// Whether an in-flight ancillary fd is ready to be drained given the
+/// receiver's current `stream_pos_consumed`.  For data-carrying sends
+/// the receiver must have consumed PAST the first byte; for
+/// ancillary-only sends the fd is deliverable as soon as the consumed
+/// cursor REACHES `deliver_at_stream_pos`.  Centralised so the four
+/// recvmsg / read sites agree (PR #177 third-pass review fix).
+fn inflight_is_deliverable(inf: &crate::net::unix::InflightFd, consumed: u64) -> bool {
+    if inf.has_data {
+        consumed > inf.deliver_at_stream_pos
+    } else {
+        consumed >= inf.deliver_at_stream_pos
     }
 }
 
@@ -16555,6 +16639,16 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     }
 
     // 4. Parse ancillary buffer and build InflightFd list.
+    //
+    // Phase 69d follow-up (PR #177 third-pass review fix): reject
+    // `msg_controllen > 0 && msg_control == 0` as `EFAULT` instead of
+    // silently dropping the caller's ancillary data — Linux's
+    // sendmsg(2) reports EFAULT for this combination and applications
+    // (notably tmux) rely on the error path to surface a malformed
+    // header.
+    if header.msg_controllen > 0 && header.msg_control == 0 {
+        return NEG_EFAULT;
+    }
     let mut inflight: alloc::vec::Vec<crate::net::unix::InflightFd> = alloc::vec::Vec::new();
     if header.msg_control != 0 && header.msg_controllen > 0 {
         if header.msg_controllen as usize > SENDMSG_MAX_CONTROL {
@@ -16617,6 +16711,9 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                     writable: sender_entry.writable,
                     // Updated below once we know the post-write peer offset.
                     deliver_at_stream_pos: 0,
+                    // Updated below by `unix_stream_write_with_anc` once
+                    // it knows whether bytes followed in this sendmsg.
+                    has_data: false,
                 });
             }
         });
@@ -16668,13 +16765,17 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                     }
                     return NEG_EINTR;
                 }
-                // Phase 69d follow-up (PR #177 review fix):
-                // register-before-recheck closes the lost-wake window.
-                // If the peer drains between the failed write attempt
-                // and `block_current_until`, the wake_unix_socket call
-                // sets `woken=true` via the entry we just pushed, so
-                // the block returns immediately on the recheck-loop's
-                // next iteration.
+                // Phase 69d follow-up (PR #177 third-pass review fix):
+                // genuine register-before-block pattern with a recheck
+                // *after* registering.  If the peer drains between the
+                // initial EAGAIN and `register`, the wake_unix_socket
+                // call fires against an empty queue; the recheck below
+                // then sees the freed space and breaks immediately.
+                // If the recheck still sees EAGAIN, we are safely
+                // parked and the next `wake_unix_socket` either lands
+                // on our queued entry (woken=true) or has already
+                // landed (block_current_until's TOCTOU recheck
+                // observes woken=true and returns AlreadyTrue).
                 let task_id = match crate::task::scheduler::current_task_id() {
                     Some(id) => id,
                     None => {
@@ -16687,12 +16788,32 @@ pub(super) fn sys_sendmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
                 let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle];
                 wq.register(task_id, &woken);
-                let _ = crate::task::scheduler::block_current_until(
-                    crate::task::TaskState::BlockedOnRecv,
-                    &woken,
-                    None,
-                );
-                wq.deregister(task_id);
+                match crate::net::unix::unix_stream_write_with_anc(
+                    unix_handle,
+                    &payload,
+                    &mut inflight_mut,
+                ) {
+                    Ok(n) => {
+                        wq.deregister(task_id);
+                        break n;
+                    }
+                    Err(-11) => {
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnRecv,
+                            &woken,
+                            None,
+                        );
+                        wq.deregister(task_id);
+                        // Loop body retries the write.
+                    }
+                    Err(e) => {
+                        wq.deregister(task_id);
+                        for inf in &inflight_mut {
+                            release_inflight_anc_backend(&inf.backend);
+                        }
+                        return e as u64;
+                    }
+                }
             }
             Err(e) => {
                 for inf in &inflight_mut {
@@ -16778,25 +16899,42 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     };
     let cap = IoVec::total_len(&iovs).min(SENDMSG_MAX_BYTES as u64) as usize;
 
-    // Phase 69d follow-up (PR #177 review fix): pre-validate the
-    // writable range of every output iov BEFORE consuming bytes from
-    // the socket.  Without this, the first invalid destination is
-    // discovered AFTER `unix_stream_read` has already advanced
-    // `stream_pos_consumed`, so the drained bytes (and any ancillary
-    // fd whose `deliver_at_stream_pos` the read crossed) would be
-    // lost — the caller sees EFAULT while the data is gone.
+    // Phase 69d follow-up (PR #177 third-pass review fix): pre-validate
+    // the writable range of every output iov BEFORE consuming bytes
+    // from the socket, but only up to the bytes we may ACTUALLY write
+    // (capped at `SENDMSG_MAX_BYTES`).  An earlier version validated
+    // the FULL advertised iovec length, which rejected legitimate
+    // large receive buffers because `UserSliceWo::new` enforces a
+    // 96 KiB MAX_COPY_LEN cap.  The recv path only ever writes
+    // `min(total_iov_len, SENDMSG_MAX_BYTES)`, so only that prefix
+    // needs to be writable for the read to land safely.
     //
-    // Also pre-validate the msg_control and msg_name (if non-NULL)
-    // user buffers because the post-read copy-back to those addresses
-    // is what step 7's rollback logic hangs on; the rollback closes
-    // installed fds but cannot un-drain the socket.
+    // Without the pre-validation: the first invalid destination would
+    // be discovered AFTER `unix_stream_read` had advanced
+    // `stream_pos_consumed`, and the drained bytes (plus any
+    // ancillary fd whose `deliver_at_stream_pos` the read crossed)
+    // would be lost — the caller would see EFAULT while the data was
+    // gone.
+    //
+    // Also reject `msg_controllen > 0 && msg_control == 0` as EFAULT
+    // before consuming bytes (Linux's recvmsg(2) reports EFAULT for
+    // a null buffer with non-zero length).
+    if header.msg_controllen > 0 && header.msg_control == 0 {
+        return NEG_EFAULT;
+    }
+    let mut remaining_validate = cap as u64;
     for iov in &iovs {
-        if iov.iov_len == 0 {
+        if remaining_validate == 0 {
+            break;
+        }
+        let chunk = iov.iov_len.min(remaining_validate);
+        if chunk == 0 {
             continue;
         }
-        if UserSliceWo::new(iov.iov_base, iov.iov_len as usize).is_err() {
+        if UserSliceWo::new(iov.iov_base, chunk as usize).is_err() {
             return NEG_EFAULT;
         }
+        remaining_validate -= chunk;
     }
     if header.msg_controllen > 0
         && header.msg_control != 0
@@ -16806,6 +16944,34 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     }
     if UserSliceWo::new(msghdr_ptr, MSGHDR_SIZE).is_err() {
         return NEG_EFAULT;
+    }
+
+    // Phase 69d follow-up (PR #177 third-pass review fix): a
+    // zero-capacity recvmsg with no pending ancillary data should
+    // complete immediately with 0 instead of parking on the socket
+    // wait queue forever — Linux returns 0 for `recvmsg` with a
+    // zero-length iov when no ancillary is queued.
+    if cap == 0 {
+        let anc_already_ready = crate::net::unix::with_unix_socket(unix_handle, |s| {
+            s.anc_queue
+                .front()
+                .map(|inf| inflight_is_deliverable(inf, s.stream_pos_consumed))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+        if !anc_already_ready {
+            // Write back zeroed control/flags so caller sees a clean header.
+            header.msg_controllen = 0;
+            header.msg_flags = 0;
+            let encoded = header.encode();
+            if UserSliceWo::new(msghdr_ptr, encoded.len())
+                .and_then(|s| s.copy_from_kernel(&encoded))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            return 0;
+        }
     }
 
     // 4. Read data — wait until at least one byte arrives, an
@@ -16825,7 +16991,7 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
             s.recv_buf.is_empty()
                 && s.anc_queue
                     .front()
-                    .map(|inf| inf.deliver_at_stream_pos <= s.stream_pos_consumed)
+                    .map(|inf| inflight_is_deliverable(inf, s.stream_pos_consumed))
                     .unwrap_or(false)
         })
         .unwrap_or(false);
@@ -16841,14 +17007,19 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
-                // Phase 69d follow-up (PR #177 review fix):
-                // register-before-recheck closes the lost-wake window.
-                // If bytes or an ancillary fd arrive between the
-                // failed read attempt and `block_current_until`, the
-                // wake_unix_socket call sets `woken=true` via the
-                // entry we just pushed, so the block returns
-                // immediately and the next loop iteration sees the
-                // ready state.
+                // Phase 69d follow-up (PR #177 third-pass review fix):
+                // register-before-block with a recheck after register.
+                // The earlier inline fix omitted the recheck — if data
+                // (or an ancillary fd) arrived between the initial
+                // EAGAIN and `register`, the wake fired against an
+                // empty queue and the task could park indefinitely
+                // while the socket was readable.  The post-register
+                // re-read closes that window: either it succeeds (we
+                // deregister and break with the data) or it returns
+                // EAGAIN under registration, in which case any future
+                // wake either lands on our queued entry or has already
+                // set `woken=true` so `block_current_until` returns
+                // immediately.
                 let task_id = match crate::task::scheduler::current_task_id() {
                     Some(id) => id,
                     None => return NEG_EINTR,
@@ -16856,13 +17027,40 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
                 let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
                 let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[unix_handle];
                 wq.register(task_id, &woken);
-                let _ = crate::task::scheduler::block_current_until(
-                    crate::task::TaskState::BlockedOnRecv,
-                    &woken,
-                    None,
-                );
-                wq.deregister(task_id);
-                continue;
+                // Recheck the zero-payload SCM_RIGHTS edge case (an
+                // ancillary fd became ready between the previous check
+                // and registration) before the byte read.
+                let anc_ready_now = crate::net::unix::with_unix_socket(unix_handle, |s| {
+                    s.recv_buf.is_empty()
+                        && s.anc_queue
+                            .front()
+                            .map(|inf| inflight_is_deliverable(inf, s.stream_pos_consumed))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+                if anc_ready_now {
+                    wq.deregister(task_id);
+                    break 0usize;
+                }
+                match crate::net::unix::unix_stream_read(unix_handle, &mut tmp[..cap]) {
+                    Ok(n) => {
+                        wq.deregister(task_id);
+                        break n;
+                    }
+                    Err(-11) => {
+                        let _ = crate::task::scheduler::block_current_until(
+                            crate::task::TaskState::BlockedOnRecv,
+                            &woken,
+                            None,
+                        );
+                        wq.deregister(task_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        wq.deregister(task_id);
+                        return e as u64;
+                    }
+                }
             }
             Err(e) => return e as u64,
         }
@@ -16970,12 +17168,19 @@ pub(super) fn sys_recvmsg(fd: u64, msghdr_ptr: u64, flags: u64) -> u64 {
     }
 
     // 7. Write back the updated msghdr (controllen + flags).
+    //
+    // Phase 69d follow-up (PR #177 third-pass review fix): `msg_flags`
+    // is an OUTPUT field on recvmsg.  Linux's man page is explicit:
+    // "msg_flags is set on return".  Previously we preserved whatever
+    // bits the caller had set in the input header and only toggled
+    // MSG_CTRUNC, so a caller that reused a non-zero input header
+    // would observe phantom flags (e.g. a stale MSG_OOB bit).  Reset
+    // to 0 first and OR in only the conditions this recv actually
+    // produced.
     header.msg_controllen = control_bytes_written as u64;
+    header.msg_flags = 0;
     if ctrunc {
         header.msg_flags |= MSG_CTRUNC;
-    } else {
-        // Clear MSG_CTRUNC; preserve other flags.
-        header.msg_flags &= !MSG_CTRUNC;
     }
     let encoded = header.encode();
     if UserSliceWo::new(msghdr_ptr, encoded.len())
@@ -17170,7 +17375,7 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                 let anc_ready = s
                     .anc_queue
                     .front()
-                    .map(|inf| inf.deliver_at_stream_pos <= s.stream_pos_consumed)
+                    .map(|inf| inflight_is_deliverable(inf, s.stream_pos_consumed))
                     .unwrap_or(false);
                 (
                     s.socket_type,

@@ -129,6 +129,14 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
     let path = trim_proc_path(abs_path);
     let rel = path.strip_prefix("/proc/")?;
     let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
+    // `/proc/<pid>/comm` returns the raw stored bytes (which may not be
+    // valid UTF-8) so the result aligns with what `PR_GET_NAME` would
+    // return for the same process — short-circuit the String detour
+    // here, see [`render_comm_bytes`].
+    if let [pid, "comm"] = parts.as_slice() {
+        let proc = process_snapshot(parse_pid_component(pid)?)?;
+        return Some(render_comm_bytes(proc));
+    }
     let text = match parts.as_slice() {
         ["meminfo"] => render_meminfo(),
         ["kmsg"] => render_kmsg(),
@@ -140,7 +148,6 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
         ["loadavg"] => render_loadavg(),
         [pid, "status"] => render_status(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "cmdline"] => render_cmdline(process_snapshot(parse_pid_component(pid)?)?),
-        [pid, "comm"] => render_comm(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "maps"] => render_maps(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "stat"] => render_pid_stat(process_snapshot(parse_pid_component(pid)?)?),
         [pid, "statm"] => render_pid_statm(process_snapshot(parse_pid_component(pid)?)?),
@@ -614,10 +621,31 @@ fn proc_name(proc: &ProcessSnapshot) -> String {
 }
 
 /// `/proc/<pid>/comm` — the 15-byte process name plus a trailing newline.
-fn render_comm(proc: ProcessSnapshot) -> String {
-    let mut name = proc_name(&proc);
-    name.push('\n');
-    name
+///
+/// Returns raw bytes (not a `String`) so a `PR_SET_NAME` containing
+/// invalid UTF-8 round-trips bit-for-bit through `/proc/<pid>/comm`,
+/// matching `PR_GET_NAME` semantics.  An earlier implementation went
+/// through `String::from_utf8_lossy`, which expanded every invalid
+/// byte to a 3-byte U+FFFD replacement character and broke the
+/// `name == PR_GET_NAME(PR_SET_NAME(name))` invariant
+/// (PR #177 third-pass review fix).
+fn render_comm_bytes(proc: ProcessSnapshot) -> Vec<u8> {
+    let comm_visible_end = proc
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(proc.comm.len());
+    let mut out = if comm_visible_end > 0 {
+        proc.comm[..comm_visible_end].to_vec()
+    } else if let Some(first) = proc.cmdline.first() {
+        basename(first).as_bytes().to_vec()
+    } else if !proc.exec_path.is_empty() {
+        basename(&proc.exec_path).as_bytes().to_vec()
+    } else {
+        b"unknown".to_vec()
+    };
+    out.push(b'\n');
+    out
 }
 
 /// Sum of `len` across all VMAs plus the standard 16-page stack, used
