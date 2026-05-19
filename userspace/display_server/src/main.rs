@@ -366,7 +366,12 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // at a time via `LABEL_CLIENT_EVENT_PULL`. Capped at
     // `client::MAX_CLIENT_EVENT_QUEUE` per the Phase 56 resource
     // bounds; oldest is dropped when the cap is reached.
-    let mut client_event_queue: alloc::collections::VecDeque<ServerMessage> =
+    // Phase 70 — each queued event carries the target `SurfaceId` so
+    // the PULL handler can return only the events the calling client
+    // is entitled to (i.e. its own focused-surface events). The
+    // dispatcher's `InputEffect::Outbound` already names the target;
+    // we just preserve that through to the wire.
+    let mut client_event_queue: alloc::collections::VecDeque<(SurfaceId, ServerMessage)> =
         alloc::collections::VecDeque::with_capacity(client::MAX_CLIENT_EVENT_QUEUE);
     // Reusable encode buffer for the `LABEL_CLIENT_EVENT_PULL` reply
     // bulk. The largest `ServerMessage` body is `Pointer` at
@@ -428,8 +433,27 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         let pull_handled = had_graphical && header.label == client::LABEL_CLIENT_EVENT_PULL;
         if pull_handled {
             let reply_cap = header.data[3] as u32;
-            match client_event_queue.pop_front() {
-                Some(msg) => match msg.encode(&mut event_reply_buf) {
+            // Phase 70 — `data[0]` carries the calling client's surface
+            // id so the handler returns only events targeted at that
+            // surface. A value of `0` is the legacy wildcard (pre-
+            // Phase-70 clients pass `0`) and accepts the next queued
+            // event regardless of target — that keeps old `m3ctl`
+            // / `gfx-demo` callers working until they are updated.
+            let requested = header.data[0] as u32;
+            let pop_idx = if requested == 0 {
+                if client_event_queue.is_empty() {
+                    None
+                } else {
+                    Some(0usize)
+                }
+            } else {
+                client_event_queue
+                    .iter()
+                    .position(|(target, _)| target.0 == requested)
+            };
+            let popped = pop_idx.and_then(|i| client_event_queue.remove(i));
+            match popped {
+                Some((_target, msg)) => match msg.encode(&mut event_reply_buf) {
                     Ok(n) => {
                         let _ = syscall_lib::ipc_store_reply_bulk(&event_reply_buf[..n]);
                         if reply_cap != 0 {
@@ -815,7 +839,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         );
         for effect in effects {
             match effect {
-                InputEffect::Outbound(msg) => {
+                InputEffect::Outbound(target, msg) => {
                     // E.3 seam: extract the pointer's `abs_position`
                     // from any `Pointer` message the dispatcher
                     // emitted, and forward it to the next compose
@@ -833,6 +857,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // and emit a structured log line — preserving
                     // recent input is more useful than blocking forever
                     // because a client stopped pulling.
+                    //
+                    // Phase 70 — the target id is preserved alongside
+                    // the message so the PULL handler can return only
+                    // events the calling client owns.
                     if client_event_queue.len() >= client::MAX_CLIENT_EVENT_QUEUE {
                         client_event_queue.pop_front();
                         syscall_lib::write_str(
@@ -840,7 +868,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                             "display_server: outbound queue full; oldest dropped\n",
                         );
                     }
-                    client_event_queue.push_back(msg);
+                    client_event_queue.push_back((target, msg));
                 }
                 InputEffect::BindTriggered { id } => {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");

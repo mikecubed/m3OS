@@ -624,7 +624,15 @@ pub unsafe extern "C" fn dc_poll_event(h: *mut DcHandle, out: *mut DcEvent) -> c
     }
     // SAFETY: caller upholds validity.
     let handle = unsafe { &*h };
-    let label = syscall_lib::ipc_call(handle.server_handle, LABEL_CLIENT_EVENT_PULL, 0);
+    // Phase 70 — pass our owned surface id so the multi-client
+    // dispatcher returns only events for this client. Without this
+    // the shared outbound queue races between every PULLer on the
+    // endpoint (DOOM, term, gfx-demo, ...) and focused-client events
+    // can be consumed by a non-focused client. Slot 0 is DOOM's
+    // single Toplevel; a 0 fallback keeps the legacy wildcard
+    // semantics for callers that have not yet created a surface.
+    let owned_id = handle.owned_surfaces[0].unwrap_or(0) as u64;
+    let label = syscall_lib::ipc_call(handle.server_handle, LABEL_CLIENT_EVENT_PULL, owned_id);
     if label == LABEL_CLIENT_EVENT_NONE {
         // Drain any empty staged bulk to keep the per-task slot clean.
         let mut sink = [0u8; 1];

@@ -347,9 +347,12 @@ impl InputSource for MouseInputSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEffect {
     /// Push a `Key` or `Pointer` `ServerMessage` onto the per-client
-    /// outbound queue. Phase 56 has a single client; multi-client
-    /// routing is C.5 follow-up work.
-    Outbound(ServerMessage),
+    /// outbound queue. Phase 70 tags the target surface id (decided by
+    /// `route_key_event` / `route_pointer_event`) so the PULL handler
+    /// can filter per-client and not deliver focused-client events to
+    /// the wrong PULLer. Phase 71 will replace the shared queue with a
+    /// per-client queue.
+    Outbound(SurfaceId, ServerMessage),
     /// A registered keybind fired. Surface as a control-socket
     /// `BindTriggered` event in E.4; until the control socket is up,
     /// `main.rs` logs the event for diagnostic visibility.
@@ -456,8 +459,8 @@ impl InputWiring {
                 grab_state,
             };
             match self.dispatcher.route_key_event(&ev, &mut state) {
-                RouteDecision::DeliverTo(_id) => {
-                    effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
+                RouteDecision::DeliverTo(target_id) => {
+                    effects.push(InputEffect::Outbound(target_id, ServerMessage::Key(ev)));
                 }
                 RouteDecision::Grab(id) => {
                     effects.push(InputEffect::BindTriggered { id: id.raw() });
@@ -574,8 +577,8 @@ impl InputWiring {
                     grab_state,
                 };
                 match dispatcher.route_key_event(&ev, &mut state) {
-                    RouteDecision::DeliverTo(_id) => {
-                        effects.push(InputEffect::Outbound(ServerMessage::Key(ev)));
+                    RouteDecision::DeliverTo(target_id) => {
+                        effects.push(InputEffect::Outbound(target_id, ServerMessage::Key(ev)));
                     }
                     RouteDecision::Grab(id) => {
                         effects.push(InputEffect::BindTriggered { id: id.raw() });
@@ -630,8 +633,8 @@ impl InputWiring {
                         EnterOrLeave::Leave => InputEffect::PointerLeave(sid),
                     });
                 }
-                if decision.deliver_to.is_some() {
-                    effects.push(InputEffect::Outbound(ServerMessage::Pointer(ev)));
+                if let Some(target_id) = decision.deliver_to {
+                    effects.push(InputEffect::Outbound(target_id, ServerMessage::Pointer(ev)));
                 }
                 if let Some(target) = decision.focus_change {
                     effects.push(InputEffect::FocusChanged(target));
