@@ -248,11 +248,13 @@ impl LayoutPolicy for FloatingLayout {
             let center_x = usable.x.saturating_add((usable.w as i32 - w as i32) / 2);
             let center_y = usable.y.saturating_add((usable.h as i32 - h as i32) / 2);
             // Phase 70 — skip the cascade offset when the surface
-            // already fills the entire usable rect (within a small
-            // tolerance). Two fullscreen-sized toplevels (e.g. term +
-            // DOOM, both 1280×800 in a 1280×800 output) cascaded by 32
-            // pixels would end up partially overlapping with the
-            // lower-z surface peeking through a 32-pixel-wide strip —
+            // is at least as large as the entire usable rect on
+            // both axes (strict `w >= usable.w && h >= usable.h`,
+            // no tolerance). Two fullscreen-sized toplevels (e.g.
+            // term + DOOM, both 1280×800 in a 1280×800 output)
+            // cascaded by 32 pixels would end up partially
+            // overlapping with the lower-z surface peeking through
+            // a 32-pixel-wide strip —
             // and because `build_occlusion_map` only fully-occludes
             // when one rect *strictly contains* another, the lower-z
             // surface's compose damage would still paint into the

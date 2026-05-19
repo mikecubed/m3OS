@@ -632,62 +632,87 @@ pub unsafe extern "C" fn dc_poll_event(h: *mut DcHandle, out: *mut DcEvent) -> c
     // single Toplevel; a 0 fallback keeps the legacy wildcard
     // semantics for callers that have not yet created a surface.
     let owned_id = handle.owned_surfaces[0].unwrap_or(0) as u64;
-    let label = syscall_lib::ipc_call(handle.server_handle, LABEL_CLIENT_EVENT_PULL, owned_id);
-    if label == LABEL_CLIENT_EVENT_NONE {
-        // Drain any empty staged bulk to keep the per-task slot clean.
-        let mut sink = [0u8; 1];
-        let _ = syscall_lib::ipc_take_pending_bulk(&mut sink);
-        // SAFETY: out validity is the caller's contract.
-        unsafe {
-            core::ptr::write(out, DcEvent::none());
-        }
-        return 0;
-    }
-    if label != LABEL_CLIENT_EVENT_PULL {
-        // Any other label is a transport error or unexpected server
-        // reply — keep the slot clean and surface IO failure.
-        let mut sink = [0u8; 1];
-        let _ = syscall_lib::ipc_take_pending_bulk(&mut sink);
-        return DC_ERR_IPC;
-    }
+    // Bound the internal skip loop so a misbehaving server cannot
+    // wedge the caller. 64 non-actionable messages per call is well
+    // beyond any realistic burst (DOOM's contract surfaces only Key
+    // / FocusIn / FocusOut / SurfaceResized / Disconnect; everything
+    // else — Pointer, Welcome, SurfaceConfigured, SurfaceDestroyed,
+    // BufferReleased we don't translate — is non-actionable). If we
+    // hit the cap we yield 0 so the caller re-polls on the next
+    // frame; the remaining queued messages stay in the server's
+    // outbound queue and are drained on subsequent calls.
+    const MAX_SKIP_PER_POLL: usize = 64;
     let mut buf = [0u8; EVENT_DECODE_BUF_LEN];
-    let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
-    if n == u64::MAX {
-        // u64::MAX is the ipc_take_pending_bulk error sentinel —
-        // the server staged a PULL label but the kernel could not
-        // deliver the bulk (transport / memory-mapping failure).
-        // Surface explicitly instead of silently treating as empty.
-        unsafe {
-            core::ptr::write(out, DcEvent::none());
-        }
-        return DC_ERR_IPC;
-    }
-    if n == 0 {
-        // PULL acknowledged but no bulk staged — treat as empty.
-        unsafe {
-            core::ptr::write(out, DcEvent::none());
-        }
-        return 0;
-    }
-    let len = n as usize;
-    if len > buf.len() {
-        return DC_ERR_PROTOCOL;
-    }
-    match ServerMessage::decode(&buf[..len]) {
-        Ok((msg, _)) => {
-            let ev = server_message_to_dc_event(msg);
+    for _ in 0..MAX_SKIP_PER_POLL {
+        let label = syscall_lib::ipc_call(handle.server_handle, LABEL_CLIENT_EVENT_PULL, owned_id);
+        if label == LABEL_CLIENT_EVENT_NONE {
+            // Drain any empty staged bulk to keep the per-task slot clean.
+            let mut sink = [0u8; 1];
+            let _ = syscall_lib::ipc_take_pending_bulk(&mut sink);
             // SAFETY: out validity is the caller's contract.
             unsafe {
-                core::ptr::write(out, ev);
+                core::ptr::write(out, DcEvent::none());
             }
-            // DC_EVENT_NONE means the variant was non-actionable
-            // (Welcome / SurfaceConfigured / ...). Surface as
-            // "no event" so the caller's drain loop terminates the
-            // same way an empty server queue would.
-            if ev.tag == DC_EVENT_NONE { 0 } else { 1 }
+            return 0;
         }
-        Err(_) => DC_ERR_PROTOCOL,
+        if label != LABEL_CLIENT_EVENT_PULL {
+            // Any other label is a transport error or unexpected server
+            // reply — keep the slot clean and surface IO failure.
+            let mut sink = [0u8; 1];
+            let _ = syscall_lib::ipc_take_pending_bulk(&mut sink);
+            return DC_ERR_IPC;
+        }
+        let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
+        if n == u64::MAX {
+            // u64::MAX is the ipc_take_pending_bulk error sentinel —
+            // the server staged a PULL label but the kernel could not
+            // deliver the bulk (transport / memory-mapping failure).
+            // Surface explicitly instead of silently treating as empty.
+            unsafe {
+                core::ptr::write(out, DcEvent::none());
+            }
+            return DC_ERR_IPC;
+        }
+        if n == 0 {
+            // PULL acknowledged but no bulk staged — treat as empty.
+            unsafe {
+                core::ptr::write(out, DcEvent::none());
+            }
+            return 0;
+        }
+        let len = n as usize;
+        if len > buf.len() {
+            return DC_ERR_PROTOCOL;
+        }
+        match ServerMessage::decode(&buf[..len]) {
+            Ok((msg, _)) => {
+                let ev = server_message_to_dc_event(msg);
+                if ev.tag == DC_EVENT_NONE {
+                    // Non-actionable variant (Pointer / Welcome /
+                    // SurfaceConfigured / SurfaceDestroyed / ...).
+                    // Skip and pull the next message inline so a
+                    // burst of pointer events cannot starve a queued
+                    // key edge — DOOM's `DG_GetKey` drain loop
+                    // terminates on `rc <= 0`, so a 0 return for
+                    // each non-actionable would consume one frame
+                    // of latency per queued message.
+                    continue;
+                }
+                // SAFETY: out validity is the caller's contract.
+                unsafe {
+                    core::ptr::write(out, ev);
+                }
+                return 1;
+            }
+            Err(_) => return DC_ERR_PROTOCOL,
+        }
     }
+    // Skip budget exhausted — surface as empty so the caller
+    // re-polls on the next frame.
+    unsafe {
+        core::ptr::write(out, DcEvent::none());
+    }
+    0
 }
 
 /// Send `Goodbye`, drop the handle, and free the box. After return

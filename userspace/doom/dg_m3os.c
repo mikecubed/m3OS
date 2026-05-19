@@ -238,14 +238,30 @@ key_event_to_doom(uint32_t keycode, uint32_t symbol, uint8_t kind,
  * ------------------------------------------------------------------------- */
 /* -------------------------------------------------------------------------
  * dg_atexit_cleanup — atexit handler that releases DOOM's compositor
- * surface so a clean exit (DG_DrawFrame autoquit path → I_Quit →
- * exit(0)) doesn't leave a stale entry in display_server's
- * `SurfaceRegistry`. Without this hook, the surface lingers until the
- * next display_server restart and overlapping clients (e.g. `term`)
- * keep colliding with a phantom DOOM toplevel.
+ * surface and SHM region on a clean exit (DG_DrawFrame autoquit path →
+ * I_Quit → exit(0)). Without this hook, both display_server's
+ * `SurfaceRegistry` entry and the kernel-core SHM region linger until
+ * the next display_server restart, and overlapping clients (e.g.
+ * `term`) keep colliding with a phantom DOOM toplevel. The SHM region
+ * is roughly 4 MiB (DOOMGENERIC_RESX × DOOMGENERIC_RESY × 4 bytes
+ * rounded up to a page); leaking it per run is what the doom-audio-
+ * smoke gate (two runs back-to-back) and doom-concurrent-smoke gate
+ * (two DOOMs at once) exercise.
+ *
+ * Order matters: unmap the page before destroying the SHM region so
+ * the kernel-core SHM registry sees the mapping count drop to zero
+ * before the creator reference is released.
  * ------------------------------------------------------------------------- */
 static void dg_atexit_cleanup(void)
 {
+    if (g_bgra != NULL) {
+        (void)syscall1(SYS_SHM_UNMAP, (long)(uintptr_t)g_bgra);
+        g_bgra = NULL;
+    }
+    if (g_shm_id != 0) {
+        (void)syscall1(SYS_SHM_DESTROY, (long)(uint32_t)g_shm_id);
+        g_shm_id = 0;
+    }
     if (g_dc != NULL) {
         dc_disconnect(g_dc);
         g_dc = NULL;

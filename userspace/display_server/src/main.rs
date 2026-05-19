@@ -433,12 +433,22 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         let pull_handled = had_graphical && header.label == client::LABEL_CLIENT_EVENT_PULL;
         if pull_handled {
             let reply_cap = header.data[3] as u32;
-            // Phase 70 — `data[0]` carries the calling client's surface
-            // id so the handler returns only events targeted at that
-            // surface. A value of `0` is the legacy wildcard (pre-
-            // Phase-70 clients pass `0`) and accepts the next queued
-            // event regardless of target — that keeps old `m3ctl`
-            // / `gfx-demo` callers working until they are updated.
+            // Phase 70 — `data[0]` carries a client-supplied surface
+            // id and is used purely as a cooperative routing hint so
+            // a well-behaved client only drains events targeted at its
+            // own surface. This is NOT an access-control boundary:
+            // any client that knows or guesses another surface id can
+            // request it and receive that surface's queued events.
+            // Real per-client ownership (separate outbound queues per
+            // client identity) is deferred to Phase 71; until then,
+            // the shared outbound queue + cooperative filter is the
+            // minimum needed to let term + DOOM coexist without
+            // racing for each other's key events.
+            //
+            // A value of `0` is the legacy wildcard (pre-Phase-70
+            // clients pass `0`) and pops the next queued event
+            // regardless of target — keeps old `m3ctl` / `gfx-demo`
+            // callers working until they are updated.
             let requested = header.data[0] as u32;
             let pop_idx = if requested == 0 {
                 if client_event_queue.is_empty() {
