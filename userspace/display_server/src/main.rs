@@ -510,11 +510,36 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             focused = None;
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
         }
-        if focused.is_none()
-            && let Some((surface_id, _)) = outcome
-                .created
-                .iter()
-                .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+        // Phase 70 — when focus was just dropped (a Toplevel destroy,
+        // or any other reset path), re-pick a focus target from the
+        // remaining toplevels so the keyboard does not get stuck
+        // routing to nothing. Pick the lowest-id remaining toplevel
+        // for determinism — `term`'s `SurfaceId(1)` always wins over a
+        // PID-seeded DOOM surface, so closing DOOM hands focus back
+        // to term automatically.
+        if focused.is_none() {
+            let fallback = registry.surface_ids().into_iter().min();
+            if let Some(id) = fallback {
+                focused = Some(id);
+                publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+            }
+        }
+        // Phase 70 — auto-focus the most-recently-created Toplevel. The
+        // Phase 56 baseline only granted focus when `focused.is_none()`,
+        // which meant a newly-mapped Toplevel (DOOM created after term)
+        // never received the keyboard focus. With the focus-aware
+        // dispatcher routing `KeyEvent`s only to the focused surface,
+        // every keystroke went to term while DOOM sat unfocused — the
+        // user-visible symptom was "DOOM doesn't see my keys". Moving
+        // focus to the new Toplevel matches the focus-on-create
+        // convention every floating window manager uses (sway, i3,
+        // Wayland weston, Windows). A future tiling-policy phase
+        // (Phase 71) can override this with chord-driven focus.
+        if let Some((surface_id, _)) = outcome
+            .created
+            .iter()
+            .find(|(_, role)| matches!(role, SurfaceRole::Toplevel))
+            && Some(*surface_id) != focused
         {
             focused = Some(*surface_id);
             publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
