@@ -2,6 +2,14 @@
 name = "fb-takeover"
 version = "0.1.0"
 edition = "2024"
+# Phase 70 — fb-takeover is deprecated. DOOM now speaks the Phase 56
+# surface-buffer protocol directly via `display_client_ffi`; the
+# wrapper is retained as a compatibility shim only and will be
+# removed in a follow-up cleanup phase.
+[package.metadata]
+deprecated = true
+deprecated-since = "Phase 70"
+deprecated-reason = "DOOM now renders as a display_server client; the fb-takeover yield/reclaim cycle is obsolete."
 
 [features]
 os-binary = []

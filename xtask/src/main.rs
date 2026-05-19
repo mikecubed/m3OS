@@ -41,6 +41,8 @@ const USERSPACE_LIB_HOST_TEST_PACKAGES: &[(&str, &[&str])] = &[
     ("audio_mixer", &[]),
     // Phase 63a Track B — C-ABI veneer over audio_client
     ("audio_client_ffi", &[]),
+    // Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec
+    ("display_client_ffi", &[]),
     // Phase 64 — session_manager pure-logic `table` and `lifecycle`
     // modules. Same lib + bin split as `audio_server`; host tests
     // build the lib only and skip the `_start`-bearing binary.
@@ -441,6 +443,20 @@ fn main() {
                 });
             cmd_doom_audio_smoke(&smoke_args);
         }
+        // Phase 70 Track F — boots two concurrent DOOM instances under
+        // `display_server` and asserts both reach title_ready and exit
+        // cleanly within the timeout. Closes the Tier 1
+        // second-takeover hang structurally: with Tier 3 there is no
+        // takeover, so two DOOMs are just two clients.
+        Some("doom-concurrent-smoke") => {
+            let smoke_args = parse_smoke_boot_args("doom-concurrent-smoke", &args[2..])
+                .unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_doom_concurrent_smoke(&smoke_args);
+        }
         // Phase 69d Track A.3 / B.1 / C.1 / D.1 / D.2 — host-side port
         // builds. `cargo xtask port build <name>` fetches the upstream
         // tarball, verifies SHA-256, applies patches, and cross-compiles
@@ -548,7 +564,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -1352,6 +1368,16 @@ fn build_doom() {
         "userspace/doom/patches/w_wad.c",
         "userspace/doom/patches/st_lib.c",
         "userspace/doom/patches/doomgeneric.h",
+        // Phase 70 — DOOM links libdisplay_client_ffi.a, so its
+        // source changes must invalidate the doom binary cache the
+        // same way the C overlay files do.
+        "userspace/lib/display_client_ffi/src/lib.rs",
+        "userspace/lib/display_client_ffi/include/display_client.h",
+        // The audio FFI is already a runtime dependency of doom;
+        // including it here protects the cache against silent
+        // staticlib drift the same way the display crate above does.
+        "userspace/lib/audio_client_ffi/src/lib.rs",
+        "userspace/lib/audio_client_ffi/include/audio_client.h",
     ];
     let overlay_fingerprint = {
         let mut combined: Vec<u8> = Vec::new();
@@ -1622,6 +1648,46 @@ fn build_doom() {
         }
     }
 
+    // Phase 70 Track A0 — build the display_client_ffi staticlib.
+    // RUSTFLAGS mirror audio_client_ffi (static reloc + crt-static)
+    // so the .a is musl-link-compatible with the existing audio one.
+    // Both staticlibs ship their own `staticlib_runtime` (panic_handler
+    // + global_allocator); we resolve the duplicates at the DOOM link
+    // step via `-Wl,--allow-multiple-definition` below.
+    {
+        println!("doom: building display_client_ffi staticlib for musl...");
+        let mut cargo = Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&root)
+            .args([
+                "rustc",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-p",
+                "display_client_ffi",
+                "--crate-type=staticlib",
+            ])
+            .env(
+                "RUSTFLAGS",
+                "-C relocation-model=static -C target-feature=+crt-static",
+            );
+        apply_musl_cargo_env(&mut cargo);
+        let status = cargo.status();
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!(
+                    "warning: failed to build display_client_ffi staticlib — skipping doom build"
+                );
+                if !doom_bin.exists() {
+                    fs::write(&doom_bin, b"").unwrap();
+                }
+                return;
+            }
+        }
+    }
+
     // Include path: point to the doomgeneric source so dg_m3os.c can
     // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
     // Phase 63a Track G.1 / G.3: enable FEATURE_SOUND (our patches/
@@ -1643,6 +1709,13 @@ fn build_doom() {
                 .to_str()
                 .unwrap()
         ),
+        // Phase 70 Track A0 — display_client_ffi header.
+        format!(
+            "-I{}",
+            root.join("userspace/lib/display_client_ffi/include")
+                .to_str()
+                .unwrap()
+        ),
         "-DFEATURE_SOUND".to_string(),
     ];
     args.extend(c_files);
@@ -1653,6 +1726,15 @@ fn build_doom() {
     // Only audio_client_ffi.a is needed — audio_mixer's code is
     // rolled in as a transitive rlib dependency (see Cargo.toml).
     args.push("-l:libaudio_client_ffi.a".to_string());
+    // Phase 70 Track A0 — display_client_ffi.a brings the dc_* C
+    // verbs that wrap the Phase 56 surface-buffer protocol.
+    args.push("-l:libdisplay_client_ffi.a".to_string());
+    // Both .a files carry their own `staticlib_runtime` (panic_handler
+    // + global_allocator). The runtimes are byte-for-byte identical
+    // (libc malloc/free, abort-on-panic) so it does not matter which
+    // copy the linker keeps; `--allow-multiple-definition` lets the
+    // first definition win and silently drops the second.
+    args.push("-Wl,--allow-multiple-definition".to_string());
     args.push("-o".to_string());
     args.push(doom_bin.to_str().unwrap().to_string());
     args.extend(musl_cc_extra_ldflags());
@@ -8845,6 +8927,11 @@ fn termios_smoke_steps() -> Vec<SmokeStep> {
 /// distinct status for CI failure routing.
 const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 67;
 
+/// Phase 70 Track F — `cargo xtask doom-concurrent-smoke` exit code.
+/// Distinct from the audio gate's 67 so CI can route the
+/// concurrent-instance failure separately from the audio failure.
+const SMOKE_EXIT_DOOM_CONCURRENT_FAILED: i32 = 70;
+
 /// Phase 63a Track H — boots m3OS with the WAV AC'97 backend, runs
 /// `/bin/doom -warp 1 1`, waits for the `M3OS_DOOM:audio_summary`
 /// line emitted by `m3os_sound_shutdown_inner`, asserts
@@ -8990,14 +9077,15 @@ fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/doom-audio: install autoquit budget",
     });
     steps.push(SmokeStep::Sleep { millis: 250 });
-    // Phase 57d follow-up — `fb-takeover` yields the framebuffer
-    // from display_server, runs DOOM, then reclaims on exit. DOOM
-    // can't `sys_fb_acquire` directly while display_server holds
-    // the framebuffer (-EBUSY), so the wrapper is mandatory for
-    // any post-Phase-56 boot.
+    // Phase 70 Track D.2 — DOOM is now a regular display_server client
+    // (`dg_m3os.c` was rewritten to use the Phase 56 surface-buffer
+    // protocol through `display_client_ffi`), so the direct invocation
+    // doubles as the Tier 3 audio + direct-launch regression. The
+    // legacy `fb-takeover doom` path is still exercised — see the
+    // `fb-takeover` compatibility test under Phase 70 Track E.1.
     steps.push(SmokeStep::Send {
-        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
-        label: "guest/doom-audio: launch DOOM via fb-takeover into E1M1",
+        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        label: "guest/doom-audio: launch DOOM directly into E1M1",
     });
     steps.push(SmokeStep::Wait {
         pattern: "M3OS_DOOM:title_ready",
@@ -9021,7 +9109,7 @@ fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
     // socket-disconnect → stream-close path runs correctly.
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/fb-takeover /bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
+        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1\n",
         label: "guest/doom-audio: relaunch DOOM (stream-leak resilience)",
     });
     steps.push(SmokeStep::Wait {
@@ -9050,6 +9138,159 @@ fn doom_audio_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "guest/doom-audio: BEL re-arm PASS",
         exit_code_on_fail: SMOKE_EXIT_DOOM_AUDIO_FAILED,
+    });
+    steps
+}
+
+/// Phase 70 Track F — boots m3OS, logs in, launches two `doom -warp`
+/// instances concurrently under `display_server`, and asserts both
+/// reach `M3OS_DOOM:title_ready` and complete the autoquit lifecycle
+/// without hanging. The check is structural: two DOOMs that both
+/// finish prove the Tier 1 second-takeover hang and the
+/// mouse-pointer-reset residual no longer apply, because Tier 3
+/// eliminates the yield/reclaim cycle entirely.
+fn cmd_doom_concurrent_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Wire AC97 to a `none` audio backend (no WAV recording — this gate
+    // is about display-side concurrency, not audio output). The device
+    // still has to *exist* so `audio_server` can claim it on boot;
+    // without it the service enters a restart loop and
+    // `session_manager` slows the rest of the boot.
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        "none,id=snd0".to_string(),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+
+    let steps = doom_concurrent_smoke_steps();
+
+    println!(
+        "doom-concurrent-smoke: launching QEMU (timeout {}s)",
+        args.timeout_secs
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!(
+                "doom-concurrent-smoke: PASSED ({} steps in {elapsed}s)",
+                steps.len()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("doom-concurrent-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_DOOM_CONCURRENT_FAILED);
+        }
+    }
+}
+
+/// Step list for `cargo xtask doom-concurrent-smoke`.
+///
+/// Both DOOMs share `/tmp/doom-autoquit-tics` so each one shuts down
+/// after the same frame budget, exercising the engine's `I_Quit` path
+/// from two surfaces simultaneously. `wait` blocks the shell until
+/// both background jobs finish; the trailing
+/// `CONCURRENT_DOOM_DONE=$?` echoes the wait exit status so the
+/// harness can confirm both processes terminated without crashing.
+fn doom_concurrent_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/doom-concurrent: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // 200 frames ≈ 5.7s of gameplay per instance — plenty of time for
+    // both surfaces to render at least one committed frame and well
+    // inside the 120-second global timeout the pre-push hook sets.
+    steps.push(SmokeStep::Send {
+        input: "echo 200 > /tmp/doom-autoquit-tics\n",
+        label: "guest/doom-concurrent: install autoquit budget",
+    });
+    steps.push(SmokeStep::Sleep { millis: 250 });
+    // Launch the first instance into a background job. Redirect
+    // stdout/stderr to the same TTY so the `M3OS_DOOM:title_ready`
+    // marker still lands on serial.
+    steps.push(SmokeStep::Send {
+        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1 &\n",
+        label: "guest/doom-concurrent: launch DOOM #1",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-concurrent: DOOM #1 title_ready",
+    });
+    // Brief settle before the second launch — gives display_server
+    // time to log the first surface's Toplevel-role transition so a
+    // bug in the second connect would be visually distinct in the
+    // serial log.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 2 &\n",
+        label: "guest/doom-concurrent: launch DOOM #2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "M3OS_DOOM:title_ready",
+        timeout_secs: 60,
+        label: "guest/doom-concurrent: DOOM #2 title_ready",
+    });
+    // Both DOOMs are running. Wait for both jobs to exit, then echo
+    // the success marker. If either hangs in `BlockedOnReply`, the
+    // shell wait blocks forever and the harness times out — that is
+    // the structural assertion this gate makes.
+    steps.push(SmokeStep::Send {
+        input: "wait; echo CONCURRENT_DOOM_DONE=$?\n",
+        label: "guest/doom-concurrent: wait for both DOOMs to exit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "CONCURRENT_DOOM_DONE=0",
+        timeout_secs: 60,
+        label: "guest/doom-concurrent: both DOOMs exited cleanly",
     });
     steps
 }

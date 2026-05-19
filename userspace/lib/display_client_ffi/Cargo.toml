@@ -1,0 +1,18 @@
+[package]
+name = "display_client_ffi"
+version = "0.70.0"
+edition = "2024"
+description = "Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec + SHM lifecycle. Mirror of audio_client_ffi so DOOM can speak the surface-buffer protocol from C."
+build = "build.rs"
+
+[lib]
+name = "display_client_ffi"
+path = "src/lib.rs"
+# `staticlib` is built on demand by xtask::build_doom via
+# `cargo rustc --crate-type=staticlib --target <musl>`; the default
+# `rlib` is what cargo test consumes.
+
+[dependencies]
+kernel-core = { path = "../../../kernel-core", default-features = false }
+syscall-lib = { path = "../../syscall-lib" }
+surface_buffer = { path = "../surface_buffer" }

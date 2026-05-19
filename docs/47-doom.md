@@ -5,6 +5,15 @@
 **Source Ref:** phase-47
 **Supersedes Legacy Doc:** (none - new content)
 
+> **Phase 70 update (2026-05-19):** In Phase 70, `dg_m3os.c` was
+> rewritten to use the Phase 56 surface-buffer protocol via the new
+> `display_client_ffi` bridge. DOOM is now a regular `display_server`
+> client; the `fb-takeover` wrapper is no longer required to launch it.
+> See [`docs/roadmap/70-doom-in-gui-surface.md`](roadmap/70-doom-in-gui-surface.md)
+> and [`docs/70-doom-in-gui-surface.md`](70-doom-in-gui-surface.md) for
+> the surface-protocol bring-up and the deprecation of
+> `SYS_FB_YIELD` / `SYS_FB_REACQUIRE`.
+
 ## Overview
 
 Phase 47 is where m3OS stops proving isolated subsystems and starts carrying a real
