@@ -1038,7 +1038,11 @@ pub const SYS_CONNECT: u64 = 42;
 pub const SYS_ACCEPT: u64 = 43;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
+pub const SYS_SENDMSG: u64 = 46;
+pub const SYS_RECVMSG: u64 = 47;
 pub const SYS_SHUTDOWN: u64 = 48;
+pub const SYS_FLOCK: u64 = 73;
+pub const SYS_PRCTL: u64 = 157;
 pub const SYS_BIND: u64 = 49;
 pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
@@ -2133,6 +2137,85 @@ pub fn socketpair(domain: i32, socktype: i32, protocol: i32, sv: &mut [i32; 2]) 
             socktype as u64,
             protocol as u64,
             sv.as_mut_ptr() as u64,
+        ) as isize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 69d follow-up — prctl / flock / sendmsg / recvmsg
+// ---------------------------------------------------------------------------
+
+/// `prctl(PR_SET_NAME, ...)` option code.
+pub const PR_SET_NAME: u64 = 15;
+/// `prctl(PR_GET_NAME, ...)` option code.
+pub const PR_GET_NAME: u64 = 16;
+
+/// `flock(2)` operation codes — `LOCK_SH`, `LOCK_EX`, `LOCK_NB`, `LOCK_UN`.
+pub const LOCK_SH: i32 = 1;
+pub const LOCK_EX: i32 = 2;
+pub const LOCK_NB: i32 = 4;
+pub const LOCK_UN: i32 = 8;
+
+/// `prctl(option, arg2, arg3, arg4, arg5)` — only `PR_SET_NAME` and
+/// `PR_GET_NAME` are implemented by the kernel today.  A small allow-list
+/// of cosmetic options (`PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`,
+/// `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`, `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`,
+/// `PR_SET_TIMING`/`PR_GET_TIMING`) returns `0` silently because nothing
+/// on m3OS relies on them.  Every other `option` — including
+/// security-sensitive ones such as `PR_SET_NO_NEW_PRIVS` and
+/// `PR_SET_SECCOMP` — returns `-EINVAL` so callers cannot rely on
+/// success semantics the syscall does not provide.
+pub fn prctl(option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> isize {
+    unsafe { syscall5(SYS_PRCTL, option, arg2, arg3, arg4, arg5) as isize }
+}
+
+/// `flock(fd, op)` — advisory file lock.
+pub fn flock(fd: i32, op: i32) -> isize {
+    unsafe { syscall2(SYS_FLOCK, fd as u64, op as u64) as isize }
+}
+
+/// Linux x86_64 `struct iovec` (scatter-gather entry).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IoVec {
+    pub iov_base: *mut u8,
+    pub iov_len: usize,
+}
+
+/// Linux x86_64 `struct msghdr` (56 bytes).
+#[repr(C)]
+pub struct MsgHdr {
+    pub msg_name: *mut u8,
+    pub msg_namelen: u32,
+    pub _pad0: u32,
+    pub msg_iov: *mut IoVec,
+    pub msg_iovlen: u64,
+    pub msg_control: *mut u8,
+    pub msg_controllen: u64,
+    pub msg_flags: i32,
+    pub _pad1: u32,
+}
+
+/// `sendmsg(fd, msg, flags)`.  Returns bytes written or `-errno`.
+pub fn sendmsg(fd: i32, msg: &MsgHdr, flags: i32) -> isize {
+    unsafe {
+        syscall3(
+            SYS_SENDMSG,
+            fd as u64,
+            msg as *const MsgHdr as u64,
+            flags as u64,
+        ) as isize
+    }
+}
+
+/// `recvmsg(fd, msg, flags)`.  Returns bytes read or `-errno`.
+pub fn recvmsg(fd: i32, msg: &mut MsgHdr, flags: i32) -> isize {
+    unsafe {
+        syscall3(
+            SYS_RECVMSG,
+            fd as u64,
+            msg as *mut MsgHdr as u64,
+            flags as u64,
         ) as isize
     }
 }

@@ -66,6 +66,27 @@ fn log_sshd_step_u64(step: &str, value_name: &str, value: u64) {
     write_str(STDOUT_FILENO, "\n");
 }
 
+// Like `log_sshd_step_u64` but keeps the sign so negative syscall returns
+// (e.g. -ENOTTY / -EINVAL from `ioctl`) print as "-25" instead of an
+// unreadable 18446744073709551591.
+fn log_sshd_step_i64(step: &str, value_name: &str, value: i64) {
+    write_str(STDOUT_FILENO, "sshd: ");
+    write_str(STDOUT_FILENO, step);
+    write_str(STDOUT_FILENO, " pid=");
+    write_u64(STDOUT_FILENO, getpid() as u64);
+    write_str(STDOUT_FILENO, " ");
+    write_str(STDOUT_FILENO, value_name);
+    write_str(STDOUT_FILENO, "=");
+    let magnitude = if value < 0 {
+        write_str(STDOUT_FILENO, "-");
+        value.unsigned_abs()
+    } else {
+        value as u64
+    };
+    write_u64(STDOUT_FILENO, magnitude);
+    write_str(STDOUT_FILENO, "\n");
+}
+
 fn log_sshd_loop_counter(step: &str, count: u64) {
     if count == 1 || count.is_multiple_of(1000) {
         log_sshd_step_u64(step, "count", count);
@@ -672,9 +693,39 @@ async fn progress_task(
                     event_session_pty_count = event_session_pty_count.saturating_add(1);
                     log_sshd_loop_counter("progress:event session_pty", event_session_pty_count);
                     log_sshd_step("session pty request");
+                    let cols = pty_req.cols();
+                    let rows = pty_req.rows();
+                    let width = pty_req.width();
+                    let height = pty_req.height();
+                    log_sshd_step_u64("session pty cols", "cols", cols as u64);
+                    log_sshd_step_u64("session pty rows", "rows", rows as u64);
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
                             set_nonblocking(master);
+                            // Apply the client-requested window size via
+                            // TIOCSWINSZ on the master fd.  Without this
+                            // the PTY stays at its default 24x80 and
+                            // curses applications (less, htop, vim,
+                            // tmux) paint into a tiny corner of the
+                            // user's actual terminal.
+                            if cols > 0 && rows > 0 {
+                                let ws = syscall_lib::Winsize {
+                                    ws_row: rows.min(u16::MAX as u32) as u16,
+                                    ws_col: cols.min(u16::MAX as u32) as u16,
+                                    ws_xpixel: width.min(u16::MAX as u32) as u16,
+                                    ws_ypixel: height.min(u16::MAX as u32) as u16,
+                                };
+                                let rc = syscall_lib::ioctl(
+                                    master,
+                                    syscall_lib::TIOCSWINSZ,
+                                    &ws as *const syscall_lib::Winsize as usize,
+                                );
+                                log_sshd_step_i64(
+                                    "session pty TIOCSWINSZ applied",
+                                    "rc",
+                                    rc as i64,
+                                );
+                            }
                             let mut st = state.borrow_mut();
                             st.pty_master = Some(master);
                             st.pty_slave = Some(slave);
@@ -1319,7 +1370,7 @@ fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
     let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
     let mut user_env = [0u8; 128];
     let ue_len = build_env(b"USER=", info.username.as_bytes(), &mut user_env);
-    let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
     let env_term: &[u8] = b"TERM=xterm\0";
     let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
     let envp: [*const u8; 6] = [

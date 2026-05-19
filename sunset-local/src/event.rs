@@ -784,20 +784,49 @@ impl Drop for ServExecRequest<'_, '_> {
 }
 
 /// A PTY request
-///
-/// Placeholder, doesn't yet return the PTY information.
 pub struct ServPtyRequest<'g, 'a> {
     runner: &'g mut Runner<'a, Server>,
     num: ChanNum,
     done: bool,
+    cols: u32,
+    rows: u32,
+    width: u32,
+    height: u32,
 }
 
 impl<'g, 'a> ServPtyRequest<'g, 'a> {
-    fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
-        Self { runner, num, done: false }
+    fn new(
+        runner: &'g mut Runner<'a, Server>,
+        num: ChanNum,
+        cols: u32,
+        rows: u32,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self { runner, num, done: false, cols, rows, width, height }
     }
 
-    // TODO return PTY information to the caller
+    /// Cell columns the client requested.
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+
+    /// Cell rows the client requested.
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// Pixel width the client requested.  Often `0` when the client did
+    /// not provide pixel dimensions.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Pixel height the client requested.  Often `0` when the client did
+    /// not provide pixel dimensions.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
 
     /// Indicate that the request succeeded.
     ///
@@ -927,6 +956,14 @@ pub(crate) enum ServEventId {
     },
     SessionPty {
         num: ChanNum,
+        /// Cell columns requested by the client.
+        cols: u32,
+        /// Cell rows requested by the client.
+        rows: u32,
+        /// Pixel width requested by the client (often 0 when unknown).
+        width: u32,
+        /// Pixel height requested by the client (often 0 when unknown).
+        height: u32,
     },
     Environment {
         num: ChanNum,
@@ -980,9 +1017,11 @@ impl ServEventId {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
                 Ok(ServEvent::SessionSubsystem(ServExecRequest::new(runner, num)))
             }
-            Self::SessionPty { num } => {
+            Self::SessionPty { num, cols, rows, width, height } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
-                Ok(ServEvent::SessionPty(ServPtyRequest::new(runner, num)))
+                Ok(ServEvent::SessionPty(ServPtyRequest::new(
+                    runner, num, cols, rows, width, height,
+                )))
             }
             Self::Environment { num } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));

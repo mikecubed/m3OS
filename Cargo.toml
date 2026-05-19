@@ -116,6 +116,13 @@ members = [
     # contract. Run from the post-login shell by the
     # `cargo xtask termios-smoke` gate.
     "userspace/tcsmoke",
+    # Phase 69d follow-up — helper that issues `TIOCSWINSZ` on the
+    # controlling TTY so the `tui-app-smoke` htop reflow assertion can
+    # drive a SIGWINCH without typing on htop's stdin.
+    "userspace/winsize-bang",
+    # Phase 69d follow-up — SCM_RIGHTS regression: socketpair, sendmsg
+    # an inflight fd, recvmsg in the peer, assert recovered fd matches.
+    "userspace/sendmsg-test",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

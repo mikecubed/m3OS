@@ -728,6 +728,16 @@ fn build_userspace_bins() {
         // POSIX termios contract.  Links `syscall_lib` only, but uses
         // `BrkAllocator`, so `needs_alloc = true`.
         ("tcsmoke", "tcsmoke", true),
+        // Phase 69d follow-up — `winsize-bang` issues TIOCSWINSZ on
+        // its inherited stdin (`fd 0`, the controlling TTY of the
+        // launching shell) so the smoke harness can synthesize a
+        // SIGWINCH mid-htop without needing `/dev/tty` open semantics
+        // on m3OS.  Single ioctl syscall — no allocator.
+        ("winsize-bang", "winsize-bang", false),
+        // Phase 69d follow-up — `sendmsg-test` SCM_RIGHTS regression.
+        // Uses `BrkAllocator` via syscall-lib's `alloc` feature, so
+        // `needs_alloc = true`.
+        ("sendmsg-test", "sendmsg-test", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -2176,7 +2186,7 @@ const MUSL_CC_CANDIDATES: &[&str] = &[
 /// passes, the compiler is accepted and [`musl_cc_extra_ldflags`] returns
 /// the same `-L` flag so callers can plumb it into their own link
 /// commands (TCC's `--extra-ldflags`, doom's `-Wl,...`, etc.).
-fn find_musl_cc() -> Option<&'static str> {
+pub(crate) fn find_musl_cc() -> Option<&'static str> {
     static MUSL_CC: OnceLock<Option<&'static str>> = OnceLock::new();
     *MUSL_CC.get_or_init(|| {
         let env_override = std::env::var("M3OS_MUSL_CC").ok();
@@ -7955,7 +7965,83 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
-    // ---- htop: launch, observe header, quit, sentinel ----
+    // ---- procfs surface htop reads: cpuinfo + loadavg + per-CPU stat
+    //      + per-pid stat/statm.  Without these files htop renders its
+    //      chrome but every data column is empty / zero.  We validate
+    //      the rendered text up-front so a regression here is reported
+    //      at the procfs layer rather than as "htop looks wrong" — far
+    //      easier to debug from a serial-only smoke gate.
+    steps.push(SmokeStep::Send {
+        input: "head -n 2 /proc/cpuinfo\n",
+        label: "guest/tui-app-smoke: probe /proc/cpuinfo",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "processor",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/cpuinfo has processor line",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/loadavg\n",
+        label: "guest/tui-app-smoke: probe /proc/loadavg",
+    });
+    steps.push(SmokeStep::Wait {
+        // Format: "X.XX X.XX X.XX runnable/total last_pid".  m3OS
+        // synthesises identical values from the runnable count for all
+        // three windows, so the loadavg always has a "X.XX X.XX X.XX "
+        // shape with the same number repeated — the explicit ".00"
+        // suffix is enough to prove the file renders (every
+        // synthesized value is whole-second so centi is "00").
+        pattern: ".00 ",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/loadavg renders",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/stat\n",
+        label: "guest/tui-app-smoke: probe /proc/stat per-CPU lines",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "cpu0",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/stat has cpu0 line",
+    });
+    steps.push(SmokeStep::Send {
+        input: "cat /proc/1/statm\n",
+        label: "guest/tui-app-smoke: probe /proc/1/statm",
+    });
+    steps.push(SmokeStep::Wait {
+        // statm format: "size resident shared text lib data dt"
+        // — VmSize is non-zero so the line has at least one non-zero
+        // leading field followed by zeros.
+        pattern: " 0 0 0 ",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: /proc/1/statm renders",
+    });
+
+    // ---- htop: launch, observe header, schedule SIGWINCH, observe
+    //      redraw, quit, sentinel ----
+    //
+    // Phase 69d follow-up Track C.2b — htop SIGWINCH reflow.  The
+    // sequence below arms `winsize-bang` (which forks a 5-second
+    // background timer that issues `TIOCSWINSZ` on the helper's
+    // inherited stdin — the controlling TTY of the post-login shell),
+    // then launches htop.  The kernel routes the ioctl into a SIGWINCH
+    // for the foreground pgrp (htop); htop redraws its header at the
+    // new smaller geometry.  The harness asserts the round-trip by
+    // waiting for the helper's `winsize-bang:fired cols=60 rows=20`
+    // sentinel, which proves the ioctl reached the kernel TTY layer at
+    // the expected geometry.  A true cell-grid reflow assertion at the
+    // new dimensions is deferred to the headless framebuffer probe in
+    // `xtask/src/{ppm,qmp}.rs`.
+    steps.push(SmokeStep::Send {
+        input: "/bin/winsize-bang\n",
+        label: "guest/tui-app-smoke: arm winsize-bang timer",
+    });
+    // Quick prompt-return wait — winsize-bang's parent exits in <50ms.
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/tui-app-smoke: prompt after winsize-bang arms",
+    });
     steps.push(SmokeStep::Send {
         input: "TERM=m3os-term TERMINFO=/usr/share/terminfo /usr/local/bin/htop\n",
         label: "guest/tui-app-smoke: htop launch",
@@ -7964,7 +8050,20 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         // htop's default header includes "Tasks:" as a top-of-screen label.
         pattern: "Tasks:",
         timeout_secs: 30,
-        label: "guest/tui-app-smoke: htop drew header",
+        label: "guest/tui-app-smoke: htop drew header at default geometry",
+    });
+    // The winsize-bang child fires its diagnostic sentinel right after
+    // the ioctl, carrying the geometry it applied — the harness uses
+    // both the "fired" marker and the cols/rows payload to prove the
+    // TIOCSWINSZ → kernel TTY → userspace round-trip executed at the
+    // expected dimensions.  This is the strongest assertion we can
+    // make over a serial-only smoke; a true cell-grid reflow check
+    // requires the headless framebuffer probe in `xtask/src/{ppm,qmp}.rs`
+    // (a deliberate follow-up).
+    steps.push(SmokeStep::Wait {
+        pattern: "winsize-bang:fired cols=60 rows=20",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: TIOCSWINSZ issued at 60x20",
     });
     steps.push(SmokeStep::Send {
         input: "q",
@@ -7983,23 +8082,26 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
     });
 
-    // ---- tmux: binary-integrity probe.
+    // ---- sendmsg-test: SCM_RIGHTS regression run before tmux.
     //
-    // The Phase 69d task acceptance for tmux is the full session
-    // lifecycle (new-session / split-window / resize-pane / detach).
-    // tmux's client/server protocol uses `sendmsg`/`recvmsg` over a
-    // Unix socket plus `flock` for the socket lock, neither of which
-    // m3OS implements today (kernel/src/arch/x86_64/syscall/mod.rs
-    // returns -ENOSYS for sysno=46/47/73 — visible in the smoke log
-    // as `[WARN] unhandled syscall 46`).  Adding scatter-gather
-    // sendmsg/recvmsg + ancillary-data handling is substantial
-    // kernel work that falls under a separate phase.
-    //
-    // We validate two narrower claims that 69d's port-and-stage layer
-    // does own:
-    //   1. /usr/local/bin/tmux is present and executable.
-    //   2. `tmux -V` prints the pinned version string — proves the
-    //      cross-compile linked correctly against ncursesw + libevent.
+    // Phase 69d follow-up Track F — validates the kernel sendmsg /
+    // recvmsg paths in isolation so the tmux failure surface below
+    // can be attributed correctly: a tmux hang with sendmsg-test
+    // passing is a tmux integration issue (out of scope for the
+    // syscall layer), not an SCM_RIGHTS implementation bug.
+    steps.push(SmokeStep::Send {
+        input: "/bin/sendmsg-test\n",
+        label: "guest/tui-app-smoke: run sendmsg-test",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "SENDMSG_SMOKE:scm-rights:ok",
+        fail_prefix: "SENDMSG_SMOKE:scm-rights:fail",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: sendmsg-test SCM_RIGHTS",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+
+    // ---- tmux: full session lifecycle.
     steps.push(SmokeStep::Send {
         input: "test -x /usr/local/bin/tmux && echo TUI_APP_SMOKE:tmux:binary-present\n",
         label: "guest/tui-app-smoke: tmux binary present",
@@ -8027,6 +8129,94 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         pattern: "TUI_APP_SMOKE:tmux:version-done",
         timeout_secs: 10,
         label: "guest/tui-app-smoke: tmux -V returned",
+    });
+    // Drain any stale stdin bytes left over from htop's `q`-to-quit.
+    steps.push(SmokeStep::Send {
+        input: "\n\n: drain\n",
+        label: "guest/tui-app-smoke: drain pending input",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // 1) new-session detached, running `cat` as the pane body.
+    //    `cat` keeps the pane alive long enough for the smoke to inspect
+    //    the session list, and exits when the session is killed.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke new-session -d -s smoke cat && echo TUI_APP_SMOKE:tmux:new-session-done\n",
+        label: "guest/tui-app-smoke: tmux new-session -d",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:new-session-done",
+        timeout_secs: 30,
+        label: "guest/tui-app-smoke: tmux new-session returned",
+    });
+    // 2) has-session — explicit session-exists probe.  Less brittle than
+    //    list-sessions's output format.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke has-session -t smoke && echo TUI_APP_SMOKE:tmux:session-alive\n",
+        label: "guest/tui-app-smoke: tmux has-session -t smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:session-alive",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: tmux session is alive",
+    });
+    // 3) split-window — proves the server can spawn an additional pane.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke split-window -h -t smoke 'sleep 60' && echo TUI_APP_SMOKE:tmux:split-done\n",
+        label: "guest/tui-app-smoke: tmux split-window -h",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:split-done",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: tmux split-window returned",
+    });
+    // 4) resize-pane — proves geometry updates round-trip.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke resize-pane -t smoke -R 5 && echo TUI_APP_SMOKE:tmux:resize-done\n",
+        label: "guest/tui-app-smoke: tmux resize-pane -R 5",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:resize-done",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux resize-pane returned",
+    });
+    // 5) kill-session — tears the whole thing down.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke kill-session -t smoke && echo TUI_APP_SMOKE:tmux:kill-done\n",
+        label: "guest/tui-app-smoke: tmux kill-session",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:kill-done",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: tmux kill-session returned",
+    });
+    // 6) reconnect probe — user-reported "access not allowed" repro
+    //    path.  After a session lifecycle (the server was created,
+    //    used, and torn down), the next tmux invocation must succeed.
+    //    User's repro: `tmux` interactively → Ctrl-B d detach → next
+    //    `tmux` fails.  We approximate via a second `new-session`
+    //    against the same socket which still re-validates the socket
+    //    file through tmux's `check_socket` (S_ISSOCK check on
+    //    `/tmp/tmux-<uid>/default`).
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke new-session -d -s smoke2 cat && echo TUI_APP_SMOKE:tmux:reconnect-ok\n",
+        label: "guest/tui-app-smoke: tmux reconnect probe (second new-session)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:tmux:reconnect-ok",
+        fail_prefix: "access not allowed",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: tmux reconnect after kill-session",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+    // Clean up the second session.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke kill-session -t smoke2 2>&1; echo TUI_APP_SMOKE:tmux:cleanup-done\n",
+        label: "guest/tui-app-smoke: tmux cleanup reconnect probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:cleanup-done",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: cleanup returned",
     });
     steps.push(SmokeStep::Send {
         input: "echo TUI_APP_SMOKE:tmux:ok\n",
@@ -12454,7 +12644,7 @@ fn signal_reset_steps() -> Vec<SmokeStep> {
         label: "run signal-test",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "6 passed, 0 failed",
+        pattern: "8 passed, 0 failed",
         timeout_secs: 30,
         label: "signal-test all pass",
     });

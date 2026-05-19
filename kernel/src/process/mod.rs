@@ -271,13 +271,30 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut vfs_handles = alloc::vec::Vec::new();
     let mut ext2_last_alias = alloc::vec::Vec::new();
     let mut vfs_last_alias = alloc::vec::Vec::new();
+    // Phase 69d follow-up (PR #177 review fix): the `sys_linux_close`
+    // path releases per-fd and UnixSocket flock state across every
+    // CLONE_FILES sibling before tearing the slot down.  This exec-time
+    // cloexec path bypassed that release, leaving any flock taken on a
+    // close-on-exec fd lingering in `PER_FD` / `UNIX_SOCKET_LOCKS`
+    // (and blocking future contenders) until process exit.  Collect
+    // cloexec-closed fd indices and any UnixSocket backend handles
+    // so the post-lock cleanup mirrors the per-close path.
+    let mut cleared_fd_indices: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let mut cleared_unix_handles: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
+    let release_pids: alloc::vec::Vec<u32>;
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
             None => return,
         };
-        proc.fd_for_each_mut(|_i, slot| {
+        // Snapshot thread-group members BEFORE clearing slots so the
+        // flock release below covers every CLONE_FILES sibling.
+        release_pids = match proc.thread_group.clone() {
+            Some(tg) => tg.members.lock().clone(),
+            None => alloc::vec![pid],
+        };
+        proc.fd_for_each_mut(|i, slot| {
             if let Some(entry) = slot
                 && entry.cloexec
             {
@@ -287,7 +304,10 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
-                    FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
+                    FdBackend::UnixSocket { handle } => {
+                        unix_sockets.push(*handle);
+                        cleared_unix_handles.push((*handle, i as u32));
+                    }
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     FdBackend::VfsService { service_handle, .. } => {
@@ -295,6 +315,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     }
                     _ => {}
                 }
+                cleared_fd_indices.push(i as u32);
                 *slot = None;
             }
         });
@@ -333,7 +354,23 @@ pub fn close_cloexec_fds(pid: Pid) {
     for h in sockets {
         crate::net::release_socket_pub(h);
     }
+    // Phase 69d follow-up (PR #177 review fix): release any flock
+    // state for the cloexec-closed fds BEFORE waking peers on the
+    // affected UnixSocket handles, so a flock waiter that resumes
+    // after the wake observes the released lock and can acquire
+    // immediately.  The per-fd map is cleared across every
+    // CLONE_FILES sibling to mirror the explicit-close path.
+    for &(h, fd) in &cleared_unix_handles {
+        crate::flock::unix_socket_release_for_pids(h, &release_pids, fd);
+    }
+    for &fd in &cleared_fd_indices {
+        crate::flock::release_per_fd_for_pids(&release_pids, fd);
+    }
     for h in unix_sockets {
+        // `free_unix_socket` decrements the per-handle refcount, may
+        // tear the socket down, and unconditionally calls
+        // `wake_unix_socket` so contenders parked on flock or peer
+        // I/O wake up against the freshly released lock state.
         crate::net::unix::free_unix_socket(h);
     }
     for id in epolls {
@@ -776,6 +813,10 @@ pub struct Process {
     /// Phase 57b G.6 — same `Arc<IrqSafeMutex<...>>` shape as
     /// `shared_fd_table`.
     pub shared_signal_actions: Option<Arc<IrqSafeMutex<[SignalAction; 32]>>>,
+    /// Short process name (Linux PR_SET_NAME / `/proc/<pid>/comm`).
+    /// 15 visible bytes + trailing NUL; defaults to all-zeros and is
+    /// populated by `prctl(PR_SET_NAME)` and by `execve` (basename).
+    pub comm: [u8; 16],
 }
 
 // `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
@@ -837,12 +878,34 @@ impl Process {
             thread_group: None,
             shared_fd_table: None,
             shared_signal_actions: None,
+            comm: [0u8; 16],
         }
     }
 
     /// Find the VMA containing `addr`, if any. O(log n) via BTreeMap.
     pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
         self.vma_tree.find_containing(addr)
+    }
+
+    /// Overwrite `comm` from a borrowed slice. Truncates to 15 visible
+    /// bytes (the 16th byte is reserved for the trailing NUL). Non-ASCII
+    /// bytes are copied verbatim; the caller is responsible for any
+    /// stripping it wants to do.
+    pub fn set_comm(&mut self, bytes: &[u8]) {
+        self.comm = [0u8; 16];
+        let n = bytes.len().min(15);
+        self.comm[..n].copy_from_slice(&bytes[..n]);
+    }
+
+    /// Render `comm` as a `&str`, stopping at the first NUL byte.
+    /// Returns `""` when no name has been set.
+    pub fn comm_str(&self) -> &str {
+        let end = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        core::str::from_utf8(&self.comm[..end]).unwrap_or("")
     }
 
     // -----------------------------------------------------------------
@@ -1159,6 +1222,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1220,6 +1284,7 @@ pub fn spawn_process_with_cr3(
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1285,6 +1350,7 @@ pub fn spawn_process_with_cr3_and_fds(
         thread_group: None,
         shared_fd_table: None,
         shared_signal_actions: None,
+        comm: [0u8; 16],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -1353,7 +1419,32 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
 
     proc.pending_signals |= 1u64 << sig;
     let should_interrupt = signal_interrupts_ipc_wait(proc, sig);
+    let proc_state = proc.state;
+    let proc_blocked = proc.blocked_signals;
     drop(table);
+    // Phase 69d follow-up diagnostic: user-reported `kill -9 doesn't kill
+    // less over SSH`.  My isolated tests show wake_task_v2 correctly
+    // wakes pipe-read- and PTY-slave-read-parked children, so the bug
+    // must be a more specific interaction (sshd session tree, process
+    // state, signal-mask).  Log every delivery of the lethal signals
+    // plus SIGINT/SIGTERM so the user's repro session leaves a kernel
+    // trail we can grep when the bug fires.
+    // Phase 69d follow-up (PR #177 fifth-pass review fix): demoted
+    // from `log::info!` to `log::debug!` so a session sending many
+    // SIGINT/SIGTERM (Ctrl-C loops, job-control churn) does not
+    // saturate serial / dmesg.  Available when needed via the
+    // standard log-level controls.
+    if matches!(sig, SIGKILL | SIGTERM | SIGINT | SIGHUP | SIGBUS) {
+        log::debug!(
+            "[signal] send_signal: sig={} → pid={} state={:?} blocked={:#x} should_interrupt={} caller_pid={}",
+            sig,
+            pid,
+            proc_state,
+            proc_blocked,
+            should_interrupt,
+            current_pid(),
+        );
+    }
     if should_interrupt {
         interrupt_ipc_waits(pid);
     }
@@ -1440,7 +1531,31 @@ fn signal_interrupts_ipc_wait(proc: &Process, sig: u32) -> bool {
 }
 
 fn interrupt_ipc_waits(pid: Pid) {
-    for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
+    // Two scans:
+    //
+    //   1. `blocked_ipc_task_ids_for_pid` — the narrower set of
+    //      `BlockedOnRecv | BlockedOnSend | BlockedOnReply` tasks that
+    //      need the IPC-specific cancellation bookkeeping
+    //      (cancel_task_wait, revoke_reply_caps_for, try_deliver_message).
+    //
+    //   2. `blocked_task_ids_for_pid_any` — the full Blocked* surface
+    //      (IPC variants + `BlockedOnNotif` / `BlockedOnFutex` /
+    //      `BlockedOnWait` / `BlockedOnService`) that needs wake_task_v2.
+    //      Without this, SIGKILL silently failed against a target
+    //      parked in a non-IPC blocked state — the wake never fired,
+    //      check_pending_signals on the syscall-return path never ran,
+    //      and the user-reported "kill -9 doesn't kill less over SSH"
+    //      symptom surfaced (Phase 69d follow-up).
+    let ipc_task_ids = crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid);
+    let all_task_ids = crate::task::scheduler::blocked_task_ids_for_pid_any(pid);
+    log::debug!(
+        "[signal] interrupt_ipc_waits: pid={} ipc_wake_count={} all_wake_count={}",
+        pid,
+        ipc_task_ids.len(),
+        all_task_ids.len(),
+    );
+    // IPC-specific cleanup first.
+    for &task_id in &ipc_task_ids {
         crate::ipc::endpoint::cancel_task_wait(task_id);
         // Invalidate any reply cap other servers still hold for this task —
         // otherwise a late `ipc_reply` on a now-resumed caller could leave
@@ -1451,8 +1566,16 @@ fn interrupt_ipc_waits(pid: Pid) {
         // surface a spurious error; the signal stays pending and fires at
         // the next syscall boundary.
         crate::task::scheduler::try_deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(task_id);
+    }
+    // Wake EVERY Blocked* task for this pid — the syscall-return signal
+    // check on the post-wake path dispatches the pending signal.
+    for task_id in all_task_ids {
+        let outcome = crate::task::scheduler::wake_task_v2(task_id);
+        log::debug!(
+            "[signal] interrupt_ipc_waits: woke task_id={:?} outcome={:?}",
+            task_id,
+            outcome,
+        );
     }
 }
 

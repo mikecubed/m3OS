@@ -4449,6 +4449,43 @@ pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
         .collect()
 }
 
+/// Return ANY blocked task ids that belong to `pid` — IPC waits plus
+/// `BlockedOnNotif`, `BlockedOnFutex`, `BlockedOnWait`, `BlockedOnService`.
+/// Used by the signal-delivery interrupt path: SIGKILL / SIGTERM / SIGINT
+/// must wake a task no matter which Blocked* variant it parked on, so the
+/// post-wake syscall-return `check_pending_signals` can dispatch the
+/// signal (and SIGKILL → sys_exit terminates the target).
+///
+/// `blocked_ipc_task_ids_for_pid` is the narrower IPC-only set used by
+/// the IPC-cancellation bookkeeping in `interrupt_ipc_waits`.  Keeping
+/// the two helpers separate lets that path keep its IPC-specific
+/// `cancel_task_wait` / `revoke_reply_caps_for` / `try_deliver_message`
+/// cleanup while still firing `wake_task_v2` against the full Blocked*
+/// surface (Phase 69d follow-up: `kill -9` silently failed against
+/// `BlockedOnFutex` / `BlockedOnWait` / `BlockedOnNotif` /
+/// `BlockedOnService` parked targets).
+pub fn blocked_task_ids_for_pid_any(pid: u32) -> alloc::vec::Vec<TaskId> {
+    let sched = scheduler_lock();
+    sched
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.pid == pid
+                && matches!(
+                    task.state,
+                    TaskState::BlockedOnRecv
+                        | TaskState::BlockedOnSend
+                        | TaskState::BlockedOnReply
+                        | TaskState::BlockedOnNotif
+                        | TaskState::BlockedOnFutex
+                        | TaskState::BlockedOnWait
+                        | TaskState::BlockedOnService
+                )
+        })
+        .map(|task| task.id)
+        .collect()
+}
+
 /// The main scheduler loop. Called once per core. Never returns.
 ///
 /// Each core runs its own instance. The per-core reschedule flag gates

@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 
+use crate::process::FdBackend;
 use crate::task::scheduler::IrqSafeMutex;
 use crate::task::wait_queue::WaitQueue;
 
@@ -54,6 +55,54 @@ pub const UNIX_STREAM_BUF_SIZE: usize = 8192;
 /// Maximum number of queued datagrams per socket.
 pub const UNIX_DGRAM_QUEUE_MAX: usize = 32;
 
+/// One in-flight ancillary fd queued for delivery to a `recvmsg(2)` caller.
+///
+/// Phase 69d follow-up: tmux's client/server protocol relies on
+/// `SCM_RIGHTS`-style fd-passing.  When `sendmsg` carries fds, the kernel
+/// clones the underlying `FdBackend`, increments any associated refcounts
+/// (pipe, PTY, socket, epoll), and parks the clone on the **receiver**'s
+/// `anc_queue` tagged with the byte position of the **first** byte that
+/// rides with it.  `recvmsg` drains the queue front whenever its byte
+/// cursor crosses `deliver_at_stream_pos`.
+pub struct InflightFd {
+    pub backend: FdBackend,
+    /// Sender's stored cloexec bit, captured at `sendmsg` time.  Note
+    /// that the **receiver-visible** cloexec is decided at `recvmsg`
+    /// time per Linux's contract: cleared by default, set when the
+    /// caller passed `MSG_CMSG_CLOEXEC`.  This field is retained for
+    /// diagnostics only and is not consulted on install.
+    pub cloexec: bool,
+    /// Sender's file offset at `sendmsg` time.  Preserved so a passed
+    /// regular-file fd lands in the receiver at the position the
+    /// sender had it; matches `dup(2)` semantics.
+    pub offset: usize,
+    /// Sender's `O_NONBLOCK` bit.
+    pub nonblock: bool,
+    /// Sender's read-permission bit.  An fd opened `O_WRONLY` stays
+    /// write-only on the receiver.
+    pub readable: bool,
+    /// Sender's write-permission bit.
+    pub writable: bool,
+    /// Position in the receiver's incoming byte stream where this fd
+    /// "rides".  Compared against the receiver's running consumed-bytes
+    /// counter on every `recvmsg`.
+    pub deliver_at_stream_pos: u64,
+    /// `true` when this fd was sent alongside one or more data bytes;
+    /// `false` for ancillary-only sends (sendmsg called with empty
+    /// iov).  Drain semantics differ between the two cases: an fd
+    /// that rides with data is only deliverable once the receiver has
+    /// consumed PAST the first byte of that send
+    /// (`stream_pos_consumed > deliver_at_stream_pos`); an
+    /// ancillary-only fd is deliverable as soon as the consumed
+    /// cursor REACHES `deliver_at_stream_pos`
+    /// (`stream_pos_consumed >= deliver_at_stream_pos`).  Without the
+    /// distinction, an inflight fd queued behind backlog bytes that
+    /// happen to extend exactly to the deliver offset would surface
+    /// before the receiver actually read the fd's associated first
+    /// byte (PR #177 third-pass review fix).
+    pub has_data: bool,
+}
+
 /// Per-socket kernel object for Unix domain sockets.
 pub struct UnixSocket {
     pub socket_type: UnixSocketType,
@@ -76,6 +125,31 @@ pub struct UnixSocket {
     pub shut_wr: bool,
     /// Reference count — number of FDs pointing to this socket.
     pub refcount: u32,
+    /// Phase 69d follow-up: ancillary-data queue for `SCM_RIGHTS`.
+    pub anc_queue: VecDeque<InflightFd>,
+    /// Total bytes ever appended to `recv_buf` (monotonic; never wraps).
+    /// Used as the timestamp for `InflightFd::deliver_at_stream_pos`.
+    pub stream_pos_appended: u64,
+    /// Total bytes ever consumed from `recv_buf` (monotonic).  Used to
+    /// decide which ancillary entries are now eligible for delivery.
+    pub stream_pos_consumed: u64,
+    /// Phase 69d follow-up: credentials of the process that owns THIS
+    /// end of the socket — captured at `socket(2)` time and used as
+    /// the "peer" credentials seen by the other end via
+    /// `getsockopt(SO_PEERCRED)`.
+    pub local_pid: u32,
+    pub local_uid: u32,
+    pub local_gid: u32,
+    /// Credentials of the process that owns the PEER end of the
+    /// socket — populated at `connect(2)` / `accept(2)` /
+    /// `socketpair(2)` time by copying the peer's `local_*` triple.
+    /// `getsockopt(SO_PEERCRED)` returns this directly.  tmux's
+    /// `server_acl_join` requires SO_PEERCRED to identify the
+    /// connecting client's uid; without these fields the second
+    /// connection fails with "access not allowed".
+    pub peer_pid: u32,
+    pub peer_uid: u32,
+    pub peer_gid: u32,
 }
 
 impl UnixSocket {
@@ -93,6 +167,15 @@ impl UnixSocket {
             shut_rd: false,
             shut_wr: false,
             refcount: 1,
+            anc_queue: VecDeque::new(),
+            stream_pos_appended: 0,
+            stream_pos_consumed: 0,
+            local_pid: 0,
+            local_uid: u32::MAX,
+            local_gid: u32::MAX,
+            peer_pid: 0,
+            peer_uid: u32::MAX,
+            peer_gid: u32::MAX,
         }
     }
 }
@@ -138,6 +221,7 @@ pub fn alloc_unix_socket(socket_type: UnixSocketType) -> Option<usize> {
 pub fn free_unix_socket(handle: usize) {
     let mut cleanup_path: Option<String> = None;
     let mut peer_handle: Option<usize> = None;
+    let mut orphan_anc: alloc::vec::Vec<InflightFd> = alloc::vec::Vec::new();
     {
         let mut table = UNIX_SOCKET_TABLE.lock();
         let should_free =
@@ -153,7 +237,21 @@ pub fn free_unix_socket(handle: usize) {
                 peer_handle = entry.peer;
                 // Drain any pending backlog connections.
                 entry.backlog.clear();
+                // Phase 69d follow-up: collect undelivered SCM_RIGHTS
+                // ancillary fds so refcounts on the underlying kernel
+                // objects (pipes, PTYs, sockets, epoll) can be released
+                // below — outside the table lock.
+                while let Some(inflight) = entry.anc_queue.pop_front() {
+                    orphan_anc.push(inflight);
+                }
             }
+            // Phase 69d follow-up (PR #177 review fix): purge cross-fd
+            // flock state for this handle BEFORE the slot is cleared so
+            // a concurrent allocator cannot recycle the handle and
+            // surface a previous holder's lock.  Safe to call under the
+            // table lock because the flock module only takes its own
+            // mutex.
+            crate::flock::unix_socket_purge(handle);
             // Unbind path before freeing the slot to prevent stale resolution.
             if let Some(ref path) = cleanup_path {
                 unbind_path(path);
@@ -170,12 +268,36 @@ pub fn free_unix_socket(handle: usize) {
             }
         }
     }
+    // Phase 69d follow-up: release refcounts on undelivered ancillary
+    // fds so a `sendmsg(SCM_RIGHTS)` whose `recvmsg` never arrives does
+    // not leak kernel objects (pipes, PTYs, sockets, epoll).
+    for inflight in orphan_anc {
+        release_inflight_anc_backend(&inflight);
+    }
     // Wake peer so they see EOF/POLLHUP.
     if let Some(peer) = peer_handle {
         wake_unix_socket(peer);
     }
     // Wake any pollers on this socket.
     wake_unix_socket(handle);
+}
+
+/// Mirror of `crate::process::add_fd_refs` for a single backend — drop
+/// the refcount the matching `acquire_inflight_anc_backend` bumped.
+fn release_inflight_anc_backend(inflight: &InflightFd) {
+    match &inflight.backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+        FdBackend::Socket { handle } => crate::net::release_socket_pub(*handle),
+        FdBackend::UnixSocket { handle } => free_unix_socket(*handle),
+        FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+        FdBackend::Epoll { instance_id } => crate::epoll::epoll_free_pub(*instance_id),
+        _ => {
+            // Path-backed fds (Tmpfs, Ext2, Fat32, Ramdisk, Dir, Proc, Dev*)
+            // and virtual ones (Stdin/Stdout) have no refcount to drop.
+        }
+    }
 }
 
 /// Increment refcount (called when FD table is cloned on fork/dup).
@@ -302,6 +424,7 @@ pub fn unix_stream_write(handle: usize, data: &[u8]) -> Result<usize, i64> {
         }
         let n = data.len().min(space);
         peer.recv_buf.extend(&data[..n]);
+        peer.stream_pos_appended = peer.stream_pos_appended.saturating_add(n as u64);
         Ok(n)
     })
     .ok_or(-32_i64)??; // EPIPE — peer socket freed
@@ -318,6 +441,7 @@ pub fn unix_stream_read(handle: usize, buf: &mut [u8]) -> Result<usize, i64> {
         for (i, byte) in s.recv_buf.drain(..n).enumerate() {
             buf[i] = byte;
         }
+        s.stream_pos_consumed = s.stream_pos_consumed.saturating_add(n as u64);
         (n, s.peer, s.state, s.shut_rd)
     })
     .ok_or(-9_i64)?; // EBADF
@@ -351,6 +475,139 @@ pub fn unix_stream_read(handle: usize, buf: &mut [u8]) -> Result<usize, i64> {
     }
 
     Err(-11_i64) // EAGAIN — no data yet, peer still alive
+}
+
+// ===========================================================================
+// Phase 69d follow-up — ancillary fd passing (SCM_RIGHTS)
+// ===========================================================================
+
+/// Attach an `InflightFd` to the **peer**'s ancillary queue so that the
+/// receiver's next `recvmsg` past the current write cursor materializes
+/// the fd.  Caller is responsible for having cloned the underlying
+/// `FdBackend` and bumped any associated refcount before parking it
+/// here.  Returns `Err(-32)` (EPIPE) if the peer socket has been freed.
+pub fn unix_stream_attach_anc(handle: usize, fds: alloc::vec::Vec<InflightFd>) -> Result<(), i64> {
+    let peer_handle = with_unix_socket(handle, |s| s.peer).ok_or(-9_i64)?;
+    let Some(peer) = peer_handle else {
+        return Err(-107_i64); // ENOTCONN
+    };
+    with_unix_socket_mut(peer, |peer_sock| {
+        for fd in fds {
+            peer_sock.anc_queue.push_back(fd);
+        }
+    })
+    .ok_or(-32_i64)?;
+    // Wake the peer so a recvmsg blocked solely on ancillary data (zero
+    // payload) unblocks immediately.
+    wake_unix_socket(peer);
+    Ok(())
+}
+
+/// Atomic ancillary-then-data delivery to a stream peer.  Mirrors the
+/// Linux invariant that `sendmsg` delivers data and the cmsg as one
+/// unit — both arrive on the receiver before any side-thread can wake
+/// and start reading.  Returns the number of bytes written, or a
+/// negative errno.
+///
+/// The inflight cmsgs are stamped with `deliver_at_stream_pos = current
+/// peer.stream_pos_appended` under the same lock as the `recv_buf`
+/// extend, so by the time the wake fires, the receiver sees both the
+/// new bytes and the matching ancillary entries.
+/// Inflight vector is taken by `&mut` so the caller still owns any
+/// elements that were not consumed on the error path — letting it
+/// release refcounts on the underlying kernel objects.  On success
+/// the vector is drained empty.
+pub fn unix_stream_write_with_anc(
+    handle: usize,
+    data: &[u8],
+    inflight: &mut alloc::vec::Vec<InflightFd>,
+) -> Result<usize, i64> {
+    let peer_handle = with_unix_socket(handle, |s| {
+        if s.shut_wr {
+            return Err(-32_i64); // EPIPE
+        }
+        match s.peer {
+            Some(p) => Ok(p),
+            None => Err(-107_i64),
+        }
+    })
+    .ok_or(-9_i64)??;
+
+    let written = with_unix_socket_mut(peer_handle, |peer| {
+        let space = UNIX_STREAM_BUF_SIZE.saturating_sub(peer.recv_buf.len());
+        if space == 0 && !data.is_empty() {
+            return Err(-11_i64); // EAGAIN
+        }
+        // Stamp inflight cmsgs with the **current** stream offset so
+        // they ride with the first byte of this sendmsg.  `has_data`
+        // records whether bytes followed this fd in the sendmsg so the
+        // drain side can pick the right `>` vs `>=` boundary
+        // condition.
+        let deliver_at = peer.stream_pos_appended;
+        let has_data = !data.is_empty();
+        for mut fd in inflight.drain(..) {
+            fd.deliver_at_stream_pos = deliver_at;
+            fd.has_data = has_data;
+            peer.anc_queue.push_back(fd);
+        }
+        let n = data.len().min(space);
+        if n > 0 {
+            peer.recv_buf.extend(&data[..n]);
+            peer.stream_pos_appended = peer.stream_pos_appended.saturating_add(n as u64);
+        }
+        Ok(n)
+    })
+    .ok_or(-32_i64)??;
+
+    wake_unix_socket(peer_handle);
+    Ok(written)
+}
+
+/// Drain ancillary fds whose `deliver_at_stream_pos <= stream_pos_consumed`
+/// from `handle`'s queue, returning them to the caller.  The caller is
+/// responsible for materializing each one as a new fd in the receiver's
+/// fd table.  Refcounts on the underlying kernel objects were already
+/// incremented at `unix_stream_attach_anc` time, so the caller just
+/// installs the entry — no further refcount manipulation.
+pub fn unix_stream_drain_ready_anc(handle: usize, max_count: usize) -> alloc::vec::Vec<InflightFd> {
+    let mut out = alloc::vec::Vec::new();
+    with_unix_socket_mut(handle, |s| {
+        let cursor = s.stream_pos_consumed;
+        while out.len() < max_count {
+            let Some(front) = s.anc_queue.front() else {
+                break;
+            };
+            // Data-carrying sends: receiver must have consumed PAST
+            // the first byte (cursor > deliver_at).  Ancillary-only
+            // sends: deliverable as soon as the cursor REACHES
+            // deliver_at (cursor >= deliver_at).  See the `has_data`
+            // field doc on `InflightFd` for the motivating bug
+            // (PR #177 third-pass review fix).
+            let ready = if front.has_data {
+                cursor > front.deliver_at_stream_pos
+            } else {
+                cursor >= front.deliver_at_stream_pos
+            };
+            if !ready {
+                break;
+            }
+            // SAFETY: front() succeeded so pop_front() must succeed.
+            out.push(s.anc_queue.pop_front().unwrap());
+        }
+    });
+    out
+}
+
+/// Look up the current `stream_pos_appended` on a peer socket.  Was
+/// originally used by the two-phase `sys_sendmsg` (offset query then
+/// write) before delivery became atomic in
+/// `unix_stream_write_with_anc`; kept as a public helper for
+/// diagnostics and any future caller that needs the peer's high-water
+/// mark without taking a write lock.
+pub fn peer_stream_pos_appended(handle: usize) -> Option<u64> {
+    let peer = with_unix_socket(handle, |s| s.peer)?;
+    let p = peer?;
+    with_unix_socket(p, |s| s.stream_pos_appended)
 }
 
 // ===========================================================================

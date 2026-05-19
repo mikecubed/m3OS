@@ -16,7 +16,7 @@ const MAX_TOKENS: usize = 32;
 const MAX_PATH: usize = 128;
 
 /// PATH directories to search for commands.
-const PATH_DIRS: [&[u8]; 3] = [b"/bin", b"/sbin", b"/usr/bin"];
+const PATH_DIRS: [&[u8]; 4] = [b"/usr/local/bin", b"/bin", b"/sbin", b"/usr/bin"];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -414,7 +414,7 @@ fn exec_with_path_resolution(
     argv_ptrs[argc] = core::ptr::null();
 
     // envp: inherit from process (pass minimal env).
-    let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
     let env_home: &[u8] = b"HOME=/\0";
     let env_term: &[u8] = b"TERM=m3os-term\0";
     let envp: [*const u8; 4] = [

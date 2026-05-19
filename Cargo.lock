@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.69.4"
+version = "0.69.5"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1620,6 +1620,13 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sendmsg-test"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
 
 [[package]]
 name = "serde"
@@ -2404,6 +2411,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "winsize-bang"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

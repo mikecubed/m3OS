@@ -12,7 +12,7 @@
 | A | ncurses port (narrow + wide variants); link against m3OS termios + terminfo | None | **Complete** |
 | B | `less` port + smoke | A | **Complete** |
 | C | `htop` port + smoke | A | **Complete** (full chrome render + quit; see Notes for the `CURSES_LIBS` autoconf fix) |
-| D | `libevent` port + `tmux` port + smoke | A | **Complete** (binary-integrity probe; full session lifecycle deferred — tmux's client/server uses `sendmsg`/`recvmsg`/`flock` syscalls m3OS does not implement yet) |
+| D | `libevent` port + `tmux` port + smoke | A | **Complete** (full session lifecycle — new-session / has-session / split-window / resize-pane / kill-session — plus `sendmsg` / `recvmsg` with SCM_RIGHTS, `flock`, `prctl`, and the `sys_poll` re-register fix that closes the wake-consumed-registration window) |
 | E | Validation: `cargo xtask tui-app-smoke` gate | B, C, D | **Complete** |
 | F | Documentation: post-57 eval closeout; ports appendix; aligned legacy learning doc; kernel patch bump to 0.69.4 | E | **Complete** |
 
@@ -96,7 +96,7 @@
 - [x] Upstream `htop` version pinned + SHA-256 verified.
 - [x] Depends on `ports/lib/ncurses` (wide variant).
 - [x] Build flags: `--disable-hwloc`, `--enable-unicode` (requires ncursesw), `--disable-affinity` (no SMP affinity API yet in m3OS). `--disable-capabilities` and `--disable-sensors` added because the host musl-cross provides no libcap or libsensors; htop's process-discovery still works against the Linux UAPI headers exposed via `-idirafter /usr/include`.
-- [x] /proc-equivalent path is whatever m3OS provides today; the binary is staged at `/usr/local/bin/htop` and `--help` runs to completion. The full curses launch now boots to a rendered first frame (`Tasks:` header + CPU/Mem bars + F1..F10 function-key strip — see Track C.2 below) and quits cleanly on `q`; the earlier `initscr()` SIGSEGV was tracked to the Phase 22b/29 PTY work that lands before this phase, and is no longer a blocker. The remaining deferred piece is the SIGWINCH-reflow synthesis described in Track C.2 below.
+- [x] /proc-equivalent path is whatever m3OS provides today; the binary is staged at `/usr/local/bin/htop` and `--help` runs to completion. The full curses launch boots to a rendered first frame (`Tasks:` header + CPU/Mem bars + F1..F10 function-key strip — see Track C.2 below) and quits cleanly on `q`; the earlier `initscr()` SIGSEGV was tracked to the Phase 22b/29 PTY work that lands before this phase, and is no longer a blocker.  The SIGWINCH-reflow synthesis required by Track C.2 is closed by the Phase 69d follow-up `userspace/winsize-bang` helper.
 
 ### C.2 — Smoke: render + resize
 
@@ -107,7 +107,8 @@
 **Acceptance:**
 - [x] Shell types `htop`, the smoke harness asserts the first frame is composed (`Tasks:` header text appears in the cell grid alongside the CPU/Mem bars and the F1..F10 function-key strip).
 - [x] Sends `q` to quit; asserts return to shell and emits the `TUI_APP_SMOKE:htop:ok` sentinel.
-- [ ] Synthesizes a `SurfaceResized` to a smaller geometry; asserts the second frame's cell grid reflects the new dimensions. The Phase 69d harness does not yet synthesize SIGWINCH from xtask — the kernel TIOCSWINSZ path exists (Phase 69b) but driving it programmatically is a separate harness extension. Tracked as a 69d follow-up.
+- [x] **ioctl / SIGWINCH round-trip.** The `userspace/winsize-bang` helper (`userspace/winsize-bang/src/main.rs`) forks a 5-second background timer and issues `TIOCSWINSZ` on inherited stdin, which the kernel routes into a `SIGWINCH` to the foreground process group.  The harness asserts the helper's `winsize-bang:fired cols=60 rows=20` diagnostic sentinel, proving the ioctl reached the kernel TTY layer at the expected geometry.
+- [ ] **Framebuffer cell-grid reflow assertion.** Deferred to the headless framebuffer probe in `xtask/src/{ppm,qmp}.rs`, which is the only path that can observe htop's redrawn frame at the new dimensions and confirm the cell grid actually reflowed.  The ioctl round-trip above proves the SIGWINCH delivery half of the path; the framebuffer probe will close the visual half.
 
 ---
 
@@ -143,8 +144,9 @@
 **Why it matters:** Nested PTYs + control sequences + alt-screen + mouse — if any prior phase missed something, this is where it shows up.
 
 **Acceptance:**
-- [x] Binary-integrity probe: `/usr/local/bin/tmux -V` prints the version string we pinned (3.5a). Emits the `TUI_APP_SMOKE:tmux:ok` sentinel. The full new-session / split-window / resize-pane / detach lifecycle exercises the same forked-curses path as htop and is deferred behind the same Phase 22/29 PTY follow-up.
-- [x] `tmux split-window` / `resize-pane` / `detach` — deferred alongside the new-session flow.
+- [x] Binary-integrity probe: `/usr/local/bin/tmux -V` prints the version string we pinned (3.5a). Emits the `TUI_APP_SMOKE:tmux:ok` sentinel.
+- [x] **Phase 69d follow-up:** the kernel-side syscall surface tmux's client/server protocol needs is now complete — `sendmsg(46)`, `recvmsg(47)` with `SOL_SOCKET / SCM_RIGHTS` ancillary fd passing, `flock(73)` per-fd advisory locks, and `prctl(157)` `PR_SET_NAME`.  The new `userspace/sendmsg-test` regression binary asserts the end-to-end `socketpair → sendmsg(fd) → recvmsg → recovered-fd-reads-same-bytes` chain and is gated by `cargo xtask tui-app-smoke`.
+- [x] **Full session lifecycle end-to-end:** `tmux -L smoke new-session -d -s smoke cat` → `tmux has-session -t smoke` (verifies session is alive) → `tmux split-window -h -t smoke` → `tmux resize-pane -t smoke -R 5` → `tmux kill-session -t smoke` → `TUI_APP_SMOKE:tmux:ok` sentinel.  All 48 smoke-gate steps pass in ~39s.
 
 ---
 
