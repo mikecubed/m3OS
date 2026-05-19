@@ -26,12 +26,14 @@ set -eu
 RUN_ID=""
 BOOT_TIMEOUT_S=60
 DISPLAY=0
+MODE="q"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --timeout) shift; BOOT_TIMEOUT_S="${1:?--timeout requires a value}";;
         --display) DISPLAY=1;;
-        --help) echo "Usage: $0 <run-id> [--timeout <secs>] [--display]"; exit 0;;
+        --mode) shift; MODE="${1:?--mode requires a value}";;
+        --help) echo "Usage: $0 <run-id> [--timeout <secs>] [--display] [--mode q|kill]"; exit 0;;
         --*) echo "$0: unknown option: $1" >&2; exit 64;;
         *) RUN_ID="$1";;
     esac
@@ -105,12 +107,13 @@ fi
 sleep 2
 
 set +e
-"$PYTHON_BIN" - "$SSH_PORT" "$PEXPECT_LOG" "$KNOWN_HOSTS" <<'PY'
+"$PYTHON_BIN" - "$SSH_PORT" "$PEXPECT_LOG" "$KNOWN_HOSTS" "$MODE" <<'PY'
 import os, sys, pexpect, time
 
 port = sys.argv[1]
 log_path = sys.argv[2]
 known_hosts = sys.argv[3]
+mode = sys.argv[4] if len(sys.argv) > 4 else "q"
 
 logf = open(log_path, "w", buffering=1)
 
@@ -150,6 +153,68 @@ try:
     logf.write("\n=== less rendered first line ===\n"); logf.flush()
     # Wait a beat so less has finished entering raw mode.
     time.sleep(0.5)
+
+    if mode == "kill":
+        # Explicit kill-and-recover path: don't send q, force-kill less
+        # from a sibling session, then verify the primary session's
+        # echo / line-buffering / prompt have recovered (termios
+        # auto-recovery on foreground-process raw-mode exit).
+        logf.write("\n=== mode=kill: skipping q, opening rescue session ===\n")
+        logf.flush()
+        s2 = ssh_session("rescue")
+        s2.sendline("for d in /proc/[0-9]*; do echo $d $(cat $d/comm 2>/dev/null); done")
+        s2.expect(r"# ", timeout=15)
+        ps_text = s2.before
+        logf.write(f"\n=== rescue /proc/*/comm output ===\n{ps_text}\n")
+        logf.flush()
+        less_pid = None
+        for line in ps_text.splitlines():
+            if " less" in line or line.endswith(" less"):
+                parts = line.split()
+                if parts and parts[0].startswith("/proc/"):
+                    less_pid = parts[0].split("/")[2]
+                    break
+        if less_pid is None:
+            result_class = "kill-mode:pid-not-found"
+            exit_code = 5
+        else:
+            logf.write(f"\n=== rescue: kill -9 {less_pid} ===\n")
+            s2.sendline(f"kill -9 {less_pid}")
+            s2.expect(r"# ", timeout=10)
+            time.sleep(2)
+            # Confirm less is dead.
+            s2.sendline(f"cat /proc/{less_pid}/comm 2>&1; echo CHECK_DONE")
+            s2.expect("CHECK_DONE", timeout=10)
+            check_out = s2.before
+            logf.write(f"\n=== check after kill ===\n{check_out}\n")
+            if "less" in check_out:
+                result_class = "kill-mode:less-not-killed"
+                exit_code = 5
+            else:
+                # less is dead; now verify primary session recovered.
+                # Send a unique command and assert echo + prompt return.
+                marker = "TERMIOS_RECOVERED_OK"
+                s1.sendline(f"echo {marker}")
+                try:
+                    s1.expect(marker, timeout=10)
+                    s1.expect(r"# ", timeout=5)
+                    result_class = "kill-mode:session-recovered"
+                    exit_code = 0
+                    logf.write("\n=== PASS: termios auto-recovered after kill -9 ===\n")
+                except pexpect.TIMEOUT:
+                    result_class = "kill-mode:session-still-hung"
+                    exit_code = 5
+                    logf.write(f"\n=== FAIL: session still hung after kill; buffer={s1.buffer!r}\n")
+        try:
+            s2.sendline("exit"); time.sleep(0.5); s2.close(force=True)
+        except Exception: pass
+        try:
+            s1.sendline("exit"); time.sleep(0.5); s1.close(force=True)
+        except Exception: pass
+        # kill-mode owns its assertion outcome; skip the q-path below.
+        raise SystemExit(exit_code)
+
+    # mode=q (default): assert q quits less cleanly.
     # Send q (no newline; less is in raw mode and reads single byte).
     s1.send("q")
     logf.write("\n=== sent q to less ===\n"); logf.flush()
