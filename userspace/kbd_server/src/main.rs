@@ -178,16 +178,19 @@ impl KeyboardPipeline {
             }
         }
 
-        // Modifier and lock keys do not produce stand-alone KeyEvents;
-        // their effect is folded into the snapshot delivered with the
-        // next non-modifier event.
-        let symbol = match self.keymap.lookup(keycode, mods) {
-            Some(s) => s.0,
-            None => {
-                // Modifier / lock key — skip emission.
-                return None;
-            }
-        };
+        // Phase 70 — modifier and lock keys still surface as
+        // `KeyEvent`s, but with `symbol = 0` so clients that interpret
+        // events purely by `symbol` (e.g. `term::input::translate`)
+        // can skip them cheaply. Clients that care about modifier
+        // keys as buttons in their own right (DOOM uses Ctrl as Fire,
+        // Shift as Run, Alt as Strafe) match on the `keycode` field
+        // and receive the press/release edges they need. Before
+        // Phase 70 the modifier-key edge was swallowed here entirely,
+        // which silently dropped DOOM's Fire button. The modifier
+        // snapshot is still folded into the `modifiers` bitmask of
+        // every non-modifier event, so the chord-resolution contract
+        // (Ctrl+C in term, Shift+ABC, ...) is unchanged.
+        let symbol = self.keymap.lookup(keycode, mods).map(|s| s.0).unwrap_or(0);
 
         Some(KeyEvent {
             timestamp_ms,
