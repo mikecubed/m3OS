@@ -343,6 +343,15 @@ static void test_pty_slave_kill(void) {
     pass("pty_slave_kill");
 }
 
+/* test_futex_kill was removed: m3OS short-circuits FUTEX_WAIT to return
+ * 0 immediately when the calling process is single-threaded (no
+ * thread group), so the child never actually parks on the futex
+ * queue and the test reduces to a syscall-return signal check — not
+ * what we wanted to validate.  The defensive `interrupt_ipc_waits`
+ * expansion (now also waking BlockedOnNotif/Futex/Wait/Service)
+ * remains as the user-facing fix.
+ */
+
 /* ---- Test 4: auto-masking prevents re-entry ---- */
 
 static volatile sig_atomic_t reentry_count = 0;

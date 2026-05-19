@@ -1419,7 +1419,27 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
 
     proc.pending_signals |= 1u64 << sig;
     let should_interrupt = signal_interrupts_ipc_wait(proc, sig);
+    let proc_state = proc.state;
+    let proc_blocked = proc.blocked_signals;
     drop(table);
+    // Phase 69d follow-up diagnostic: user-reported `kill -9 doesn't kill
+    // less over SSH`.  My isolated tests show wake_task_v2 correctly
+    // wakes pipe-read- and PTY-slave-read-parked children, so the bug
+    // must be a more specific interaction (sshd session tree, process
+    // state, signal-mask).  Log every delivery of the lethal signals
+    // plus SIGINT/SIGTERM so the user's repro session leaves a kernel
+    // trail we can grep when the bug fires.
+    if matches!(sig, SIGKILL | SIGTERM | SIGINT | SIGHUP | SIGBUS) {
+        log::info!(
+            "[signal] send_signal: sig={} → pid={} state={:?} blocked={:#x} should_interrupt={} caller_pid={}",
+            sig,
+            pid,
+            proc_state,
+            proc_blocked,
+            should_interrupt,
+            current_pid(),
+        );
+    }
     if should_interrupt {
         interrupt_ipc_waits(pid);
     }
@@ -1506,7 +1526,31 @@ fn signal_interrupts_ipc_wait(proc: &Process, sig: u32) -> bool {
 }
 
 fn interrupt_ipc_waits(pid: Pid) {
-    for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
+    // Two scans:
+    //
+    //   1. `blocked_ipc_task_ids_for_pid` — the narrower set of
+    //      `BlockedOnRecv | BlockedOnSend | BlockedOnReply` tasks that
+    //      need the IPC-specific cancellation bookkeeping
+    //      (cancel_task_wait, revoke_reply_caps_for, try_deliver_message).
+    //
+    //   2. `blocked_task_ids_for_pid_any` — the full Blocked* surface
+    //      (IPC variants + `BlockedOnNotif` / `BlockedOnFutex` /
+    //      `BlockedOnWait` / `BlockedOnService`) that needs wake_task_v2.
+    //      Without this, SIGKILL silently failed against a target
+    //      parked in a non-IPC blocked state — the wake never fired,
+    //      check_pending_signals on the syscall-return path never ran,
+    //      and the user-reported "kill -9 doesn't kill less over SSH"
+    //      symptom surfaced (Phase 69d follow-up).
+    let ipc_task_ids = crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid);
+    let all_task_ids = crate::task::scheduler::blocked_task_ids_for_pid_any(pid);
+    log::info!(
+        "[signal] interrupt_ipc_waits: pid={} ipc_wake_count={} all_wake_count={}",
+        pid,
+        ipc_task_ids.len(),
+        all_task_ids.len(),
+    );
+    // IPC-specific cleanup first.
+    for &task_id in &ipc_task_ids {
         crate::ipc::endpoint::cancel_task_wait(task_id);
         // Invalidate any reply cap other servers still hold for this task —
         // otherwise a late `ipc_reply` on a now-resumed caller could leave
@@ -1517,8 +1561,16 @@ fn interrupt_ipc_waits(pid: Pid) {
         // surface a spurious error; the signal stays pending and fires at
         // the next syscall boundary.
         crate::task::scheduler::try_deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
-        // Track F.1: wake_task_v2 under sched-v2, wake_task under v1.
-        let _ = crate::task::scheduler::wake_task_v2(task_id);
+    }
+    // Wake EVERY Blocked* task for this pid — the syscall-return signal
+    // check on the post-wake path dispatches the pending signal.
+    for task_id in all_task_ids {
+        let outcome = crate::task::scheduler::wake_task_v2(task_id);
+        log::info!(
+            "[signal] interrupt_ipc_waits: woke task_id={:?} outcome={:?}",
+            task_id,
+            outcome,
+        );
     }
 }
 
