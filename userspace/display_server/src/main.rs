@@ -489,16 +489,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
+            // Phase 70 — Goodbye used to wipe the entire `SurfaceRegistry`
+            // (Phase 56 single-client legacy). With multiple concurrent
+            // clients that resets every other client's surfaces, so
+            // typing `goodbye` from one app would clear the screen of
+            // every other app. Per-client surface tracking is the
+            // proper fix (and the Phase 71 follow-up); until then,
+            // expect clients to send explicit `DestroySurface` verbs
+            // for the surfaces they own before saying Goodbye. The
+            // log line still fires so a developer can confirm the
+            // disconnect happened.
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "display_server: client closed; resetting registry\n",
+                "display_server: client said Goodbye (registry preserved for other clients)\n",
             );
-            registry = SurfaceRegistry::new();
-            focused = None;
-            // E.3 — the previous cursor (if any) belonged to that
-            // client. Reset the compose context so the next first-
-            // frame draws the fallback `DefaultArrowCursor` cleanly.
-            compose_ctx = ComposeContext::new();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)

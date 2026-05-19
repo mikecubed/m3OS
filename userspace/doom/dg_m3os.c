@@ -236,6 +236,22 @@ key_event_to_doom(uint32_t keycode, uint32_t symbol, uint8_t kind,
  * shared-memory pixel region of the same dimensions doomgeneric writes
  * into, and hands it to the compositor.
  * ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * dg_atexit_cleanup — atexit handler that releases DOOM's compositor
+ * surface so a clean exit (DG_DrawFrame autoquit path → I_Quit →
+ * exit(0)) doesn't leave a stale entry in display_server's
+ * `SurfaceRegistry`. Without this hook, the surface lingers until the
+ * next display_server restart and overlapping clients (e.g. `term`)
+ * keep colliding with a phantom DOOM toplevel.
+ * ------------------------------------------------------------------------- */
+static void dg_atexit_cleanup(void)
+{
+    if (g_dc != NULL) {
+        dc_disconnect(g_dc);
+        g_dc = NULL;
+    }
+}
+
 void DG_Init(void)
 {
     int rc = dc_connect(&g_dc);
@@ -244,6 +260,7 @@ void DG_Init(void)
                         "Is display_server running? Aborting.\n", rc);
         exit(1);
     }
+    atexit(dg_atexit_cleanup);
 
     rc = dc_create_toplevel(g_dc, &g_surface);
     if (rc != DC_OK) {

@@ -125,6 +125,15 @@ pub struct DcHandle {
     /// experiment.
     #[cfg_attr(test, allow(dead_code))]
     next_surface_id: u32,
+    /// Phase 70 — surface ids this handle has allocated through
+    /// [`dc_create_toplevel`]. Recorded so [`dc_disconnect`] can send
+    /// a `DestroySurface` for each one before saying Goodbye, freeing
+    /// the compositor-side `SurfaceRegistry` entry without disturbing
+    /// any other client's surfaces. Bounded at 4 — DOOM uses one
+    /// surface, the slack covers a future multi-surface experiment
+    /// without an unbounded allocation per handle.
+    #[cfg_attr(test, allow(dead_code))]
+    owned_surfaces: [Option<u32>; 4],
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +295,18 @@ pub fn build_goodbye(buf: &mut [u8]) -> Result<usize, ProtocolError> {
     ClientMessage::Goodbye.encode(buf)
 }
 
+/// Encode `ClientMessage::DestroySurface { surface_id }`. Phase 70 —
+/// emitted from [`dc_disconnect`] before [`build_goodbye`] so the
+/// compositor cleanly removes only this client's surface instead of
+/// relying on the per-client tracking the Phase 56 server does not
+/// yet implement.
+pub fn build_destroy_surface(buf: &mut [u8], surface_id: u32) -> Result<usize, ProtocolError> {
+    let msg = ClientMessage::DestroySurface {
+        surface_id: SurfaceId(surface_id),
+    };
+    msg.encode(buf)
+}
+
 /// Translate a decoded [`ServerMessage`] into a [`DcEvent`]. Variants
 /// the FFI does not surface (`Welcome`, `SurfaceConfigured`,
 /// `SurfaceDestroyed`, `Pointer`) collapse to `DC_EVENT_NONE`. Pure
@@ -441,6 +462,7 @@ pub unsafe extern "C" fn dc_connect(out: *mut *mut DcHandle) -> c_int {
     let handle = Box::new(DcHandle {
         server_handle,
         next_surface_id: seed,
+        owned_surfaces: [None; 4],
     });
     // SAFETY: `out` validity is the caller's contract.
     unsafe {
@@ -485,6 +507,16 @@ pub unsafe extern "C" fn dc_create_toplevel(h: *mut DcHandle, out_surface_id: *m
     };
     if !send_encoded(handle.server_handle, &buf[..n]) {
         return DC_ERR_IPC;
+    }
+    // Record the surface id so `dc_disconnect` can clean it up on the
+    // compositor side. Silently drop on overflow — a handle that
+    // claims more than four surfaces is outside DOOM's contract and
+    // should not gain implicit cleanup either way.
+    for slot in handle.owned_surfaces.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(surface_id);
+            break;
+        }
     }
     // SAFETY: `out_surface_id` validity is the caller's contract.
     unsafe {
@@ -656,6 +688,15 @@ pub unsafe extern "C" fn dc_disconnect(h: *mut DcHandle) {
     // SAFETY: caller upholds validity.
     let boxed = unsafe { Box::from_raw(h) };
     let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
+    // Phase 70 — destroy each surface we own so the compositor's
+    // `SurfaceRegistry` reclaims the entry. Failures here are
+    // best-effort: the process is exiting either way, and a stuck
+    // entry is cleared on the next `display_server` restart.
+    for owned in boxed.owned_surfaces.iter().flatten() {
+        if let Ok(n) = build_destroy_surface(&mut buf, *owned) {
+            let _ = syscall_lib::ipc_call_buf(boxed.server_handle, LABEL_VERB, 0, &buf[..n]);
+        }
+    }
     if let Ok(n) = build_goodbye(&mut buf) {
         let _ = syscall_lib::ipc_call_buf(boxed.server_handle, LABEL_VERB, 0, &buf[..n]);
     }
@@ -772,6 +813,17 @@ mod tests {
     fn goodbye_round_trip() {
         let msg = round_trip(build_goodbye);
         assert!(matches!(msg, ClientMessage::Goodbye));
+    }
+
+    #[test]
+    fn destroy_surface_round_trip() {
+        let msg = round_trip(|b| build_destroy_surface(b, 0x4001));
+        match msg {
+            ClientMessage::DestroySurface { surface_id } => {
+                assert_eq!(surface_id, SurfaceId(0x4001));
+            }
+            _ => panic!("not DestroySurface: {:?}", msg),
+        }
     }
 
     #[test]
