@@ -66,6 +66,27 @@ fn log_sshd_step_u64(step: &str, value_name: &str, value: u64) {
     write_str(STDOUT_FILENO, "\n");
 }
 
+// Like `log_sshd_step_u64` but keeps the sign so negative syscall returns
+// (e.g. -ENOTTY / -EINVAL from `ioctl`) print as "-25" instead of an
+// unreadable 18446744073709551591.
+fn log_sshd_step_i64(step: &str, value_name: &str, value: i64) {
+    write_str(STDOUT_FILENO, "sshd: ");
+    write_str(STDOUT_FILENO, step);
+    write_str(STDOUT_FILENO, " pid=");
+    write_u64(STDOUT_FILENO, getpid() as u64);
+    write_str(STDOUT_FILENO, " ");
+    write_str(STDOUT_FILENO, value_name);
+    write_str(STDOUT_FILENO, "=");
+    let magnitude = if value < 0 {
+        write_str(STDOUT_FILENO, "-");
+        value.unsigned_abs()
+    } else {
+        value as u64
+    };
+    write_u64(STDOUT_FILENO, magnitude);
+    write_str(STDOUT_FILENO, "\n");
+}
+
 fn log_sshd_loop_counter(step: &str, count: u64) {
     if count == 1 || count.is_multiple_of(1000) {
         log_sshd_step_u64(step, "count", count);
@@ -699,10 +720,10 @@ async fn progress_task(
                                     syscall_lib::TIOCSWINSZ,
                                     &ws as *const syscall_lib::Winsize as usize,
                                 );
-                                log_sshd_step_u64(
+                                log_sshd_step_i64(
                                     "session pty TIOCSWINSZ applied",
                                     "rc",
-                                    rc as u64,
+                                    rc as i64,
                                 );
                             }
                             let mut st = state.borrow_mut();
