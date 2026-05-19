@@ -54,6 +54,14 @@ jobs:
         # step always rebuilds the data disk against the current font asset.
         run: cargo xtask clean
 
+      - name: Fetch Nerd Font asset
+        # Phase 69c: xtask/assets/fonts/term.ttf is gitignored — only the
+        # SHA-256 checksum is committed. `cargo xtask image` requires the
+        # asset to be present for the `/usr/share/fonts/m3os/term.ttf`
+        # ext2 placement and aborts otherwise. Fetch + verify before image
+        # build.
+        run: cargo xtask fetch-fonts
+
       - name: Build disk images
         run: cargo xtask image
 
