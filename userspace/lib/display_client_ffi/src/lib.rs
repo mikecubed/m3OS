@@ -138,8 +138,14 @@ pub struct DcHandle {
 
 // ---------------------------------------------------------------------------
 // C-callable event tag union. Memory layout is `#[repr(C)]` so the
-// hand-written header sees the same offsets the build.rs drift check
-// validates.
+// hand-written header in `include/display_client.h` and the Rust side
+// agree on field offsets. NOTE: `build.rs` validates only the `DC_*`
+// integer constants (event tags / error codes) for drift between the
+// header and `pub const` items in this file — it does NOT validate
+// struct sizes, field offsets, or union layout. Layout agreement is
+// secured by `#[repr(C)]` here and the matching hand-written C
+// declarations; any change to the field set on either side must be
+// mirrored on the other.
 // ---------------------------------------------------------------------------
 
 /// Tagged union of server-pushed events. Mirrors the same-named C

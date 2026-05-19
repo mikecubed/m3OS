@@ -1,0 +1,11 @@
+[package]
+name = "doom-concurrent"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "doom-concurrent"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

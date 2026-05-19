@@ -125,6 +125,11 @@ members = [
     # Phase 69d follow-up — SCM_RIGHTS regression: socketpair, sendmsg
     # an inflight fd, recvmsg in the peer, assert recovered fd matches.
     "userspace/sendmsg-test",
+    # Phase 70 follow-up — helper that forks two `doom` processes and
+    # waits for both, so the `doom-concurrent-smoke` gate exercises
+    # real kernel-level concurrency rather than relying on the in-tree
+    # shell's missing `&` / `wait` job-control surface.
+    "userspace/doom-concurrent",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

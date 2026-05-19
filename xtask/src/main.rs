@@ -754,6 +754,13 @@ fn build_userspace_bins() {
         // Uses `BrkAllocator` via syscall-lib's `alloc` feature, so
         // `needs_alloc = true`.
         ("sendmsg-test", "sendmsg-test", true),
+        // Phase 70 follow-up — `doom-concurrent` forks two `doom`
+        // children and waits for both, so the
+        // `doom-concurrent-smoke` gate exercises real concurrency
+        // independent of the in-tree shell's missing `&` job control
+        // / `wait` builtin. Calls only direct syscalls (fork, execve,
+        // waitpid, write) so `needs_alloc = false`.
+        ("doom-concurrent", "doom-concurrent", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -9239,12 +9246,29 @@ fn cmd_doom_concurrent_smoke(args: &SmokeBootArgs) {
 
 /// Step list for `cargo xtask doom-concurrent-smoke`.
 ///
-/// Both DOOMs share `/tmp/doom-autoquit-tics` so each one shuts down
-/// after the same frame budget, exercising the engine's `I_Quit` path
-/// from two surfaces simultaneously. `wait` blocks the shell until
-/// both background jobs finish; the trailing
-/// `CONCURRENT_DOOM_DONE=$?` echoes the wait exit status so the
-/// harness can confirm both processes terminated without crashing.
+/// Drives the dedicated `/bin/doom-concurrent` helper binary
+/// (`userspace/doom-concurrent`), which fork+execs two `doom` children
+/// before any waitpid runs and then reaps both. Both DOOMs share
+/// `/tmp/doom-autoquit-tics` so each one shuts down after the same
+/// frame budget, exercising the engine's `I_Quit` path from two
+/// surfaces simultaneously.
+///
+/// Why the helper exists (PR 179 round-3 review fix): the in-tree
+/// shell (`userspace/shell/src/main.rs`) has no `&` job control (the
+/// tokenizer treats `&` as a regular word character and
+/// `execute_external` always `waitpid`s) and no `wait` builtin or `;`
+/// separator. The earlier shell-driven gate (`doom ... &; doom ... &;
+/// wait; echo CONCURRENT_DOOM_DONE=$?`) silently degraded into a
+/// sequential run and an unrecognized `wait;` command — the
+/// concurrency property was never actually exercised. The helper
+/// owns the fork/waitpid lifecycle directly so the gate is
+/// independent of any shell parsing surface.
+///
+/// Sentinels emitted by `/bin/doom-concurrent`:
+/// - `M3OS_DOOM_CONCURRENT:spawn=1 pid=<N>` — DOOM #1 forked.
+/// - `M3OS_DOOM_CONCURRENT:spawn=2 pid=<N>` — DOOM #2 forked. Both
+///   children are live at this point — actual concurrency.
+/// - `CONCURRENT_DOOM_DONE=0` — both children reaped with status 0.
 fn doom_concurrent_smoke_steps() -> Vec<SmokeStep> {
     let mut steps = vec![SmokeStep::Wait {
         pattern: "[m3os] Hello from kernel",
@@ -9261,43 +9285,30 @@ fn doom_concurrent_smoke_steps() -> Vec<SmokeStep> {
         label: "guest/doom-concurrent: install autoquit budget",
     });
     steps.push(SmokeStep::Sleep { millis: 250 });
-    // Launch the first instance into a background job. Redirect
-    // stdout/stderr to the same TTY so the `M3OS_DOOM:title_ready`
-    // marker still lands on serial.
+    // Launch the helper. It forks DOOM #1, prints spawn=1, forks
+    // DOOM #2, prints spawn=2, then waitpid()s both. Both DOOMs are
+    // running concurrently between spawn=2 and the first child's
+    // exit. The harness asserts each sentinel in order — if either
+    // DOOM wedges in `display_server` (e.g. `BlockedOnReply` with no
+    // one to respond), the corresponding waitpid blocks forever and
+    // the gate's global timeout fires.
     steps.push(SmokeStep::Send {
-        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 1 &\n",
-        label: "guest/doom-concurrent: launch DOOM #1",
+        input: "/bin/doom-concurrent\n",
+        label: "guest/doom-concurrent: launch helper (forks 2 DOOMs)",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "M3OS_DOOM:title_ready",
-        timeout_secs: 60,
-        label: "guest/doom-concurrent: DOOM #1 title_ready",
-    });
-    // Brief settle before the second launch — gives display_server
-    // time to log the first surface's Toplevel-role transition so a
-    // bug in the second connect would be visually distinct in the
-    // serial log.
-    steps.push(SmokeStep::Sleep { millis: 500 });
-    steps.push(SmokeStep::Send {
-        input: "/bin/doom -iwad /usr/share/doom/doom1.wad -warp 1 2 &\n",
-        label: "guest/doom-concurrent: launch DOOM #2",
+        pattern: "M3OS_DOOM_CONCURRENT:spawn=1",
+        timeout_secs: 30,
+        label: "guest/doom-concurrent: DOOM #1 forked",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "M3OS_DOOM:title_ready",
-        timeout_secs: 60,
-        label: "guest/doom-concurrent: DOOM #2 title_ready",
-    });
-    // Both DOOMs are running. Wait for both jobs to exit, then echo
-    // the success marker. If either hangs in `BlockedOnReply`, the
-    // shell wait blocks forever and the harness times out — that is
-    // the structural assertion this gate makes.
-    steps.push(SmokeStep::Send {
-        input: "wait; echo CONCURRENT_DOOM_DONE=$?\n",
-        label: "guest/doom-concurrent: wait for both DOOMs to exit",
+        pattern: "M3OS_DOOM_CONCURRENT:spawn=2",
+        timeout_secs: 30,
+        label: "guest/doom-concurrent: DOOM #2 forked (both running)",
     });
     steps.push(SmokeStep::Wait {
         pattern: "CONCURRENT_DOOM_DONE=0",
-        timeout_secs: 60,
+        timeout_secs: 90,
         label: "guest/doom-concurrent: both DOOMs exited cleanly",
     });
     steps

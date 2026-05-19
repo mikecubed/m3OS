@@ -551,8 +551,18 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // for determinism — `term`'s `SurfaceId(1)` always wins over a
         // PID-seeded DOOM surface, so closing DOOM hands focus back
         // to term automatically.
+        //
+        // Filter to `SurfaceRole::Toplevel` only: `surface_ids()`
+        // returns every registered surface (Cursor, Layer, anything
+        // role-less mid-handshake), and routing keyboard events to a
+        // non-Toplevel surface would misroute them entirely. PR 179
+        // round-3 review fix.
         if focused.is_none() {
-            let fallback = registry.surface_ids().into_iter().min();
+            let fallback = registry
+                .surface_ids()
+                .into_iter()
+                .filter(|id| matches!(registry.surface_role(*id), Some(SurfaceRole::Toplevel)))
+                .min();
             if let Some(id) = fallback {
                 focused = Some(id);
                 publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
