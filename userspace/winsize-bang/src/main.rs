@@ -28,6 +28,7 @@
 
 use syscall_lib::{
     STDIN_FILENO, STDOUT_FILENO, TIOCSWINSZ, Winsize, exit, fork, ioctl, nanosleep, write_str,
+    write_u64,
 };
 
 /// Geometry the helper applies on its single TIOCSWINSZ call.  Smaller
@@ -73,8 +74,14 @@ pub extern "C" fn _start() -> ! {
     // Sentinel printed AFTER the resize fires.  Carries the geometry
     // applied so the harness can prove TIOCSWINSZ → kernel TTY layer
     // → consumer-visible round-trip independently of what htop
-    // chooses to redraw.
-    write_str(STDOUT_FILENO, "winsize-bang:fired cols=60 rows=20\n");
+    // chooses to redraw.  Format from the `COLS`/`ROWS` constants so
+    // the sentinel cannot drift away from the ioctl payload (PR #177
+    // fifth-pass review fix).
+    write_str(STDOUT_FILENO, "winsize-bang:fired cols=");
+    write_u64(STDOUT_FILENO, COLS as u64);
+    write_str(STDOUT_FILENO, " rows=");
+    write_u64(STDOUT_FILENO, ROWS as u64);
+    write_str(STDOUT_FILENO, "\n");
     exit(0);
 }
 

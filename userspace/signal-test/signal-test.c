@@ -12,14 +12,16 @@
  * Exit code 0 = all tests passed; non-zero = failure count.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -256,9 +258,10 @@ static void test_cross_process_kill(void) {
  * the exact path: parent opens /dev/ptmx, unlocks the slave, forks a
  * child that opens /dev/pts/N and reads from it; parent SIGKILLs the
  * child and waitpid()s with an SIGALRM-bounded timeout.
+ *
+ * (Includes for `fcntl.h` and `sys/ioctl.h` are at the top of the
+ * translation unit alongside the rest of the headers.)
  */
-#include <fcntl.h>
-#include <sys/ioctl.h>
 
 static void test_pty_slave_kill(void) {
     int master = open("/dev/ptmx", O_RDWR);

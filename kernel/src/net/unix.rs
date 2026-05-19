@@ -133,6 +133,23 @@ pub struct UnixSocket {
     /// Total bytes ever consumed from `recv_buf` (monotonic).  Used to
     /// decide which ancillary entries are now eligible for delivery.
     pub stream_pos_consumed: u64,
+    /// Phase 69d follow-up: credentials of the process that owns THIS
+    /// end of the socket — captured at `socket(2)` time and used as
+    /// the "peer" credentials seen by the other end via
+    /// `getsockopt(SO_PEERCRED)`.
+    pub local_pid: u32,
+    pub local_uid: u32,
+    pub local_gid: u32,
+    /// Credentials of the process that owns the PEER end of the
+    /// socket — populated at `connect(2)` / `accept(2)` /
+    /// `socketpair(2)` time by copying the peer's `local_*` triple.
+    /// `getsockopt(SO_PEERCRED)` returns this directly.  tmux's
+    /// `server_acl_join` requires SO_PEERCRED to identify the
+    /// connecting client's uid; without these fields the second
+    /// connection fails with "access not allowed".
+    pub peer_pid: u32,
+    pub peer_uid: u32,
+    pub peer_gid: u32,
 }
 
 impl UnixSocket {
@@ -153,6 +170,12 @@ impl UnixSocket {
             anc_queue: VecDeque::new(),
             stream_pos_appended: 0,
             stream_pos_consumed: 0,
+            local_pid: 0,
+            local_uid: u32::MAX,
+            local_gid: u32::MAX,
+            peer_pid: 0,
+            peer_uid: u32::MAX,
+            peer_gid: u32::MAX,
         }
     }
 }

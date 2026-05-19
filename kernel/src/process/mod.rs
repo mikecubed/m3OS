@@ -1429,8 +1429,13 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
     // state, signal-mask).  Log every delivery of the lethal signals
     // plus SIGINT/SIGTERM so the user's repro session leaves a kernel
     // trail we can grep when the bug fires.
+    // Phase 69d follow-up (PR #177 fifth-pass review fix): demoted
+    // from `log::info!` to `log::debug!` so a session sending many
+    // SIGINT/SIGTERM (Ctrl-C loops, job-control churn) does not
+    // saturate serial / dmesg.  Available when needed via the
+    // standard log-level controls.
     if matches!(sig, SIGKILL | SIGTERM | SIGINT | SIGHUP | SIGBUS) {
-        log::info!(
+        log::debug!(
             "[signal] send_signal: sig={} → pid={} state={:?} blocked={:#x} should_interrupt={} caller_pid={}",
             sig,
             pid,
@@ -1543,7 +1548,7 @@ fn interrupt_ipc_waits(pid: Pid) {
     //      symptom surfaced (Phase 69d follow-up).
     let ipc_task_ids = crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid);
     let all_task_ids = crate::task::scheduler::blocked_task_ids_for_pid_any(pid);
-    log::info!(
+    log::debug!(
         "[signal] interrupt_ipc_waits: pid={} ipc_wake_count={} all_wake_count={}",
         pid,
         ipc_task_ids.len(),
@@ -1566,7 +1571,7 @@ fn interrupt_ipc_waits(pid: Pid) {
     // check on the post-wake path dispatches the pending signal.
     for task_id in all_task_ids {
         let outcome = crate::task::scheduler::wake_task_v2(task_id);
-        log::info!(
+        log::debug!(
             "[signal] interrupt_ipc_waits: woke task_id={:?} outcome={:?}",
             task_id,
             outcome,

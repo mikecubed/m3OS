@@ -13610,12 +13610,24 @@ pub(super) fn sys_flock(fd: u64, op: u64) -> u64 {
             let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             let wq = &crate::net::unix::UNIX_SOCKET_WAITQUEUES[h];
             wq.register(task_id, &woken);
-            match try_acquire()? {
-                FlockOutcome::Acquired => {
+            // Phase 69d follow-up (PR #177 fifth-pass review fix): the
+            // post-register `try_acquire()` may return `Err(EBADF)`
+            // when the fd was closed under us by a CLONE_FILES
+            // sibling.  The earlier `try_acquire()?` would early-
+            // return WITHOUT deregistering the waiter, leaving a
+            // stale entry on the queue that subsequent wakers would
+            // touch.  Match the outcome explicitly so every exit
+            // path goes through `wq.deregister`.
+            match try_acquire() {
+                Ok(FlockOutcome::Acquired) => {
                     wq.deregister(task_id);
                     return Ok(());
                 }
-                FlockOutcome::WouldBlock => {}
+                Ok(FlockOutcome::WouldBlock) => {}
+                Err(e) => {
+                    wq.deregister(task_id);
+                    return Err(e);
+                }
             }
             let _ = crate::task::scheduler::block_current_until(
                 crate::task::TaskState::BlockedOnRecv,
@@ -14693,6 +14705,45 @@ fn socket_handle_from_fd(
     }
 }
 
+/// Stamp the calling process's `(pid, uid, gid)` onto the local-creds
+/// fields of a freshly-allocated Unix socket so `getsockopt(SO_PEERCRED)`
+/// on the eventual peer can return them.  Called from `sys_socket`,
+/// `sys_socketpair`, `sys_accept` (server-side accepted socket), and
+/// `sys_bind_unix` (in case a listener was bound by a different
+/// process than the original creator — uncommon but defensive).
+fn stamp_unix_socket_local_creds(handle: usize) {
+    let pid = crate::process::current_pid();
+    let (uid, gid) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(p) => (p.euid, p.egid),
+            None => (0, 0),
+        }
+    };
+    crate::net::unix::with_unix_socket_mut(handle, |s| {
+        s.local_pid = pid;
+        s.local_uid = uid;
+        s.local_gid = gid;
+    });
+}
+
+/// Copy the peer socket's `local_*` credentials into this socket's
+/// `peer_*` slots.  Called from accept / connect / socketpair after
+/// the two sockets are peered, so subsequent
+/// `getsockopt(SO_PEERCRED)` calls return the other end's creator
+/// triple.
+fn link_unix_socket_peer_creds(handle: usize, peer_handle: usize) {
+    let peer_creds = crate::net::unix::with_unix_socket(peer_handle, |s| {
+        (s.local_pid, s.local_uid, s.local_gid)
+    })
+    .unwrap_or((0, u32::MAX, u32::MAX));
+    crate::net::unix::with_unix_socket_mut(handle, |s| {
+        s.peer_pid = peer_creds.0;
+        s.peer_uid = peer_creds.1;
+        s.peer_gid = peer_creds.2;
+    });
+}
+
 const NEG_ENOTSOCK: u64 = (-88_i64) as u64;
 const NEG_ENFILE: u64 = (-23_i64) as u64;
 const NEG_EADDRINUSE: u64 = (-98_i64) as u64;
@@ -14724,6 +14775,9 @@ fn sys_socket_unix(socktype: u64) -> u64 {
         Some(h) => h,
         None => return NEG_ENFILE,
     };
+    // Phase 69d follow-up: stamp the creator's credentials so the peer
+    // can read them via getsockopt(SO_PEERCRED) once connected.
+    stamp_unix_socket_local_creds(handle);
     let entry = FdEntry {
         backend: FdBackend::UnixSocket { handle },
         offset: 0,
@@ -14782,6 +14836,12 @@ pub(super) fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr:
         s.peer = Some(h1);
         s.state = crate::net::unix::UnixSocketState::Connected;
     });
+    // Phase 69d follow-up: both ends of socketpair are created by the
+    // same process, so both local and peer creds come from the caller.
+    stamp_unix_socket_local_creds(h1);
+    stamp_unix_socket_local_creds(h2);
+    link_unix_socket_peer_creds(h1, h2);
+    link_unix_socket_peer_creds(h2, h1);
 
     let cloexec = flags & SOCK_CLOEXEC != 0;
     let nonblock = flags & SOCK_NONBLOCK != 0;
@@ -15119,6 +15179,14 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
                 s.peer = Some(server_handle);
                 s.state = crate::net::unix::UnixSocketState::Connected;
             });
+            // Phase 69d follow-up: stamp the server-side accepted
+            // socket with the accepting process's creds, then link
+            // peer creds in both directions.  `ch` was stamped by
+            // the connecting process during `sys_connect_unix`; its
+            // local_* fields carry the client's uid.
+            stamp_unix_socket_local_creds(server_handle);
+            link_unix_socket_peer_creds(server_handle, ch);
+            link_unix_socket_peer_creds(ch, server_handle);
             // Wake the client (blocked in connect).
             crate::net::unix::wake_unix_socket(ch);
 
@@ -16378,18 +16446,74 @@ pub(super) fn sys_getsockopt(
     optval_ptr: u64,
     optlen_ptr: u64,
 ) -> u64 {
-    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
     const SOL_SOCKET: u64 = 1;
     const SO_REUSEADDR: u64 = 2;
     const SO_KEEPALIVE: u64 = 9;
     const SO_RCVBUF: u64 = 8;
     const SO_SNDBUF: u64 = 7;
+    const SO_PEERCRED: u64 = 17;
     const IPPROTO_TCP: u64 = 6;
     const TCP_NODELAY: u64 = 1;
+
+    // Phase 69d follow-up: SO_PEERCRED on a Unix-domain socket
+    // returns the connected peer's `struct ucred { pid, uid, gid }`.
+    // tmux's `server_acl_join` requires this to identify the
+    // connecting client's uid; rejecting the call with ENOTSOCK
+    // makes tmux refuse the connection with "access not allowed".
+    let fd_idx = fd as usize;
+    if fd_idx < MAX_FDS
+        && level == SOL_SOCKET
+        && optname == SO_PEERCRED
+        && let Some(entry) = current_fd_entry(fd_idx)
+        && let FdBackend::UnixSocket { handle } = entry.backend
+    {
+        let creds =
+            crate::net::unix::with_unix_socket(handle, |s| (s.peer_pid, s.peer_uid, s.peer_gid));
+        let (pid, uid, gid) = creds.unwrap_or((0, u32::MAX, u32::MAX));
+        // struct ucred is 12 bytes: pid(4) uid(4) gid(4).
+        const UCRED_SIZE: usize = 12;
+        if optlen_ptr != 0 {
+            let mut len_buf = [0u8; 4];
+            if UserSliceRo::new(optlen_ptr, len_buf.len())
+                .and_then(|s| s.copy_to_kernel(&mut len_buf))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            let caller_len = u32::from_ne_bytes(len_buf) as usize;
+            if caller_len < UCRED_SIZE {
+                return NEG_EINVAL;
+            }
+        }
+        if optval_ptr == 0 {
+            return NEG_EFAULT;
+        }
+        let mut buf = [0u8; UCRED_SIZE];
+        buf[0..4].copy_from_slice(&(pid as i32).to_ne_bytes());
+        buf[4..8].copy_from_slice(&uid.to_ne_bytes());
+        buf[8..12].copy_from_slice(&gid.to_ne_bytes());
+        if UserSliceWo::new(optval_ptr, buf.len())
+            .and_then(|s| s.copy_from_kernel(&buf))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        if optlen_ptr != 0 {
+            let written = (UCRED_SIZE as u32).to_ne_bytes();
+            if UserSliceWo::new(optlen_ptr, written.len())
+                .and_then(|s| s.copy_from_kernel(&written))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+        }
+        return 0;
+    }
+
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
 
     let val: i32 = match (level, optname) {
         (SOL_SOCKET, SO_REUSEADDR) => {

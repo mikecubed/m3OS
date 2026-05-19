@@ -8189,6 +8189,35 @@ fn tui_app_smoke_steps() -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "guest/tui-app-smoke: tmux kill-session returned",
     });
+    // 6) reconnect probe — user-reported "access not allowed" repro
+    //    path.  After a session lifecycle (the server was created,
+    //    used, and torn down), the next tmux invocation must succeed.
+    //    User's repro: `tmux` interactively → Ctrl-B d detach → next
+    //    `tmux` fails.  We approximate via a second `new-session`
+    //    against the same socket which still re-validates the socket
+    //    file through tmux's `check_socket` (S_ISSOCK check on
+    //    `/tmp/tmux-<uid>/default`).
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke new-session -d -s smoke2 cat && echo TUI_APP_SMOKE:tmux:reconnect-ok\n",
+        label: "guest/tui-app-smoke: tmux reconnect probe (second new-session)",
+    });
+    steps.push(SmokeStep::WaitPassOrFail {
+        pass_pattern: "TUI_APP_SMOKE:tmux:reconnect-ok",
+        fail_prefix: "access not allowed",
+        timeout_secs: 15,
+        label: "guest/tui-app-smoke: tmux reconnect after kill-session",
+        exit_code_on_fail: SMOKE_EXIT_TUI_APP_SMOKE_FAILED,
+    });
+    // Clean up the second session.
+    steps.push(SmokeStep::Send {
+        input: "/usr/local/bin/tmux -L smoke kill-session -t smoke2 2>&1; echo TUI_APP_SMOKE:tmux:cleanup-done\n",
+        label: "guest/tui-app-smoke: tmux cleanup reconnect probe",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TUI_APP_SMOKE:tmux:cleanup-done",
+        timeout_secs: 10,
+        label: "guest/tui-app-smoke: cleanup returned",
+    });
     steps.push(SmokeStep::Send {
         input: "echo TUI_APP_SMOKE:tmux:ok\n",
         label: "guest/tui-app-smoke: tmux sentinel",

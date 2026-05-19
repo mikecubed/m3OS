@@ -422,13 +422,11 @@ fn render_loadavg() -> String {
     // Format as `X.XX X.XX X.XX runnable/total last_pid`.  Using the
     // current runnable count for all three windows is a coarse but
     // honest approximation — m3OS does not yet drive the exponential
-    // moving averages Linux uses.
-    let load = runnable as f32;
-    let load_whole = load as u32;
-    let load_centi = ((load - load_whole as f32) * 100.0) as u32;
-    alloc::format!(
-        "{load_whole}.{load_centi:02} {load_whole}.{load_centi:02} {load_whole}.{load_centi:02} {runnable}/{total} {last_pid}\n"
-    )
+    // moving averages Linux uses.  Integer-only math; the centi
+    // fraction is always 00 since `runnable` is whole and pure
+    // integer formatting avoids pulling in soft-float in the kernel
+    // (PR #177 fifth-pass review fix).
+    alloc::format!("{runnable}.00 {runnable}.00 {runnable}.00 {runnable}/{total} {last_pid}\n")
 }
 
 fn render_stat() -> String {
