@@ -11872,10 +11872,21 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             }
             Err(_) => return NEG_EINVAL,
         };
+        // Phase 69d follow-up: if this tmpfs path is currently bound
+        // to a Unix-domain socket, stat must report `S_IFSOCK`
+        // (0xC000) instead of `S_IFREG` (0x8000) — tmux's
+        // `S_ISSOCK(sb.st_mode)` check on the socket file refuses
+        // with "access not allowed" otherwise, which surfaces after
+        // a detach + reconnect when the client revalidates the
+        // already-bound socket.
+        let is_bound_socket =
+            !st.is_dir && !st.is_symlink && crate::net::unix::lookup_path(name).is_some();
         let mode: u32 = if st.is_dir {
             0x4000 | st.mode as u32
         } else if st.is_symlink {
             0xA000 | 0o777
+        } else if is_bound_socket {
+            0xC000 | st.mode as u32
         } else {
             0x8000 | st.mode as u32
         };
