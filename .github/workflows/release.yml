@@ -45,6 +45,15 @@ jobs:
       - name: Lint (clippy + fmt)
         run: cargo xtask check
 
+      - name: Clean cached disk image
+        # The Cargo cache may restore a target/x86_64-unknown-none/release/disk.img
+        # from a previous release run that predates Phase 69c's Nerd Font
+        # sidecar marker. `cargo xtask image` refuses to reuse such a disk
+        # and aborts with "no sidecar marker at .../disk.img.font.sha256".
+        # `cargo xtask clean` removes disk.img and the marker so the image
+        # step always rebuilds the data disk against the current font asset.
+        run: cargo xtask clean
+
       - name: Build disk images
         run: cargo xtask image
 
