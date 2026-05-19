@@ -1370,13 +1370,21 @@ fn build_doom() {
         "userspace/doom/patches/doomgeneric.h",
         // Phase 70 — DOOM links libdisplay_client_ffi.a, so its
         // source changes must invalidate the doom binary cache the
-        // same way the C overlay files do.
+        // same way the C overlay files do. The staticlib runtime
+        // (panic/alloc shims) and the header-drift build script are
+        // both link-affecting inputs — without them, a change to
+        // either could leave a stale cached doom binary in place.
         "userspace/lib/display_client_ffi/src/lib.rs",
+        "userspace/lib/display_client_ffi/src/staticlib_runtime.rs",
+        "userspace/lib/display_client_ffi/build.rs",
         "userspace/lib/display_client_ffi/include/display_client.h",
         // The audio FFI is already a runtime dependency of doom;
         // including it here protects the cache against silent
         // staticlib drift the same way the display crate above does.
         "userspace/lib/audio_client_ffi/src/lib.rs",
+        "userspace/lib/audio_client_ffi/src/staticlib_runtime.rs",
+        "userspace/lib/audio_client_ffi/src/mixer_reexport.rs",
+        "userspace/lib/audio_client_ffi/build.rs",
         "userspace/lib/audio_client_ffi/include/audio_client.h",
     ];
     let overlay_fingerprint = {

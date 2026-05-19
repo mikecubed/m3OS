@@ -256,6 +256,7 @@ void DG_Init(void)
 {
     int rc = dc_connect(&g_dc);
     if (rc != DC_OK || g_dc == NULL) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
         fprintf(stderr, "DOOM: dc_connect failed (rc=%d). "
                         "Is display_server running? Aborting.\n", rc);
         exit(1);
@@ -264,6 +265,7 @@ void DG_Init(void)
 
     rc = dc_create_toplevel(g_dc, &g_surface);
     if (rc != DC_OK) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
         fprintf(stderr, "DOOM: dc_create_toplevel failed (rc=%d). Aborting.\n", rc);
         exit(1);
     }
@@ -272,6 +274,7 @@ void DG_Init(void)
      * sizes regions in page units; we round up to the next 4 KiB. */
     long shm = syscall1(SYS_SHM_CREATE, (long)SURFACE_BYTES);
     if (shm <= 0) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
         fprintf(stderr, "DOOM: sys_shm_create(%zu) failed (rc=%ld). Aborting.\n",
                 SURFACE_BYTES, shm);
         exit(1);
@@ -280,6 +283,7 @@ void DG_Init(void)
 
     long va = syscall1(SYS_SHM_MAP, (long)(uint32_t)g_shm_id);
     if (va <= 0) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
         fprintf(stderr, "DOOM: sys_shm_map(%u) failed (rc=%ld). Aborting.\n",
                 g_shm_id, va);
         exit(1);
@@ -289,6 +293,7 @@ void DG_Init(void)
     rc = dc_attach_shm_buffer(g_dc, g_surface, DOOM_BUFFER_ID, g_shm_id,
                               (uint32_t)SURFACE_WIDTH, (uint32_t)SURFACE_HEIGHT);
     if (rc != DC_OK) {
+        /* DevSkim: ignore DS154189 -- error-path fprintf, literal fmt + scalar args */
         fprintf(stderr, "DOOM: dc_attach_shm_buffer failed (rc=%d). Aborting.\n", rc);
         exit(1);
     }
@@ -297,6 +302,7 @@ void DG_Init(void)
      * scratch data while DOOM is loading its WAD. */
     memset(g_bgra, 0, SURFACE_BYTES);
 
+    /* DevSkim: ignore DS154189 -- diagnostic fprintf, literal fmt + scalar args */
     fprintf(stderr,
             "DG_Init: connected to display_server; surface_id=%u shm_id=%u %ux%u\n",
             g_surface, g_shm_id, (uint32_t)SURFACE_WIDTH, (uint32_t)SURFACE_HEIGHT);
@@ -346,6 +352,7 @@ void DG_DrawFrame(void)
 
     if (!g_dc || !g_bgra) return;
 
+    /* DevSkim: ignore DS154189 -- bounded memcpy, dst/src both sized to SURFACE_BYTES (compile-time constant) */
     memcpy(g_bgra, DG_ScreenBuffer, SURFACE_BYTES);
     dc_damage_and_commit(g_dc, g_surface,
                          0, 0,
@@ -412,6 +419,7 @@ int DG_GetKey(int *pressed, unsigned char *doomKey)
              * letterbox or scale the surface. Ignore. */
             break;
         case DC_EVENT_DISCONNECT:
+            /* DevSkim: ignore DS154189 -- shutdown-path fprintf, literal fmt + scalar arg */
             fprintf(stderr, "DOOM: display_server disconnect (reason=%u). Exiting.\n",
                     ev.payload.disconnect.reason);
             exit(0);

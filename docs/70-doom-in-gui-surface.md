@@ -1,7 +1,7 @@
 # DOOM In-GUI Surface (fb-takeover Tier 3)
 
 **Aligned Roadmap Phase:** Phase 70
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-70
 **Supersedes Legacy Doc:** new
 

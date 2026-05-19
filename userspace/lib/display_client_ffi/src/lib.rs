@@ -652,7 +652,17 @@ pub unsafe extern "C" fn dc_poll_event(h: *mut DcHandle, out: *mut DcEvent) -> c
     }
     let mut buf = [0u8; EVENT_DECODE_BUF_LEN];
     let n = syscall_lib::ipc_take_pending_bulk(&mut buf);
-    if n == 0 || n == u64::MAX {
+    if n == u64::MAX {
+        // u64::MAX is the ipc_take_pending_bulk error sentinel —
+        // the server staged a PULL label but the kernel could not
+        // deliver the bulk (transport / memory-mapping failure).
+        // Surface explicitly instead of silently treating as empty.
+        unsafe {
+            core::ptr::write(out, DcEvent::none());
+        }
+        return DC_ERR_IPC;
+    }
+    if n == 0 {
         // PULL acknowledged but no bulk staged — treat as empty.
         unsafe {
             core::ptr::write(out, DcEvent::none());
