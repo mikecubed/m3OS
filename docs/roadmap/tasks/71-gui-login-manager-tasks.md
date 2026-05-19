@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-71
-**Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Password Store / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
+**Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Security Foundation / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
 **Goal:** Replace the autologin-as-root session entry path with a graphical greeter that authenticates against the Phase 27 / Phase 48 password store, renders a configurable background image, and propagates the authenticated UID to a per-user `term` session; retain autologin on serial-only (headless) boots.
 
 ## Track Layout
@@ -266,7 +266,7 @@
 
 **Files:**
 - `docs/roadmap/27-user-accounts.md`
-- `docs/roadmap/48-password-store.md` (or equivalent path)
+- `docs/roadmap/48-security-foundation.md`
 - `docs/roadmap/57-audio-and-local-session.md`
 - `docs/appendix/phase-57-session-entry.md`
 
@@ -275,11 +275,9 @@
 
 **Acceptance:**
 - [ ] Phase 27 doc notes that `passwd_lib::verify` and `passwd_lib::lookup_uid` are consumed by the Phase 71 greeter.
-- [ ] Phase 48 doc notes that the trust-floor 3-failure/5 s backoff is implemented in `userspace/greeter/src/auth.rs`.
+- [ ] `docs/roadmap/48-security-foundation.md` notes that the trust-floor 3-failure/5 s backoff is implemented in `userspace/greeter/src/auth.rs`.
 - [ ] Phase 57 doc notes that the autologin-as-root path was superseded by the Phase 71 greeter for graphical sessions; headless autologin is documented as preserved.
 - [ ] `docs/appendix/phase-57-session-entry.md` updated with the new boot sequence and greeter → session_manager → user-term handoff.
-
----
 
 ---
 
@@ -308,12 +306,12 @@
 - `docs/roadmap/README.md`
 
 **Symbol:** `version` field in `kernel/Cargo.toml` `[package]`
-**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
+**Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. Phase 70 shipped `v0.70.0`; Phase 71 lifts it to `v0.71.0` so the version cursor in `AGENTS.md` and the roadmap stay accurate.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.71.0"`
+- [ ] `kernel/Cargo.toml` `version = "0.71.0"` (previously `0.70.0`)
 - [ ] `Cargo.lock` regenerated to reflect the new version
-- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.71.0`
+- [ ] `AGENTS.md` "Kernel v0.70.0" reference updated to "Kernel v0.71.0"
 - [ ] `docs/roadmap/README.md` row for Phase 71 updated to reflect Completed status at ship
 - [ ] `cargo xtask check` passes after the version bump
 - [ ] Git tag `v0.71.0` recommended at phase merge
