@@ -2,9 +2,9 @@
 
 **Status:** Planned
 **Source Ref:** phase-71
-**Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Password Store / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
+**Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Security Foundation / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
 **Builds on:** Replaces the autologin-as-root path that `session_manager` inherited from Phase 57 with a `display_server`-client greeter that authenticates against the Phase 27 / Phase 48 password store; extends the Phase 57 session boot sequence; extends Phase 56 surface roles for full-output coverage before login; extends Phase 27 `passwd_lib` UID lookup
-**Primary Components:** userspace/greeter, userspace/session_manager, userspace/init, kernel-core/passwd, docs/appendix/phase-57-session-entry.md
+**Primary Components:** userspace/greeter, userspace/session_manager, userspace/init, kernel-core/passwd, docs/appendix/phase-57-session-entry.md, docs/71-gui-login-manager.md
 
 ## Milestone Goal
 
@@ -126,6 +126,16 @@ Phase 27, Phase 48, and Phase 57 design docs updated: Phase 27 notes that
 notes that the trust-floor back-off is implemented in the greeter; Phase 57 notes
 that the autologin-as-root path is now serial-only.
 
+### Aligned learning doc and kernel version bump (Track I)
+
+A new aligned legacy learning doc at `docs/71-gui-login-manager.md` explains the
+greeter, the auth-loop / trust-floor backoff, the session-descriptor protocol,
+and UID propagation in learner-friendly terms — following the same template the
+Phase 70 learning doc uses. The kernel minor version is bumped from `0.70.0` to
+`0.71.0` in `kernel/Cargo.toml`, `Cargo.lock`, the `AGENTS.md` kernel-version
+reference, and the `docs/roadmap/README.md` Phase 71 status row, per the
+project's one-minor-version-per-shipped-phase convention.
+
 ## Important Components and How They Work
 
 ### `userspace/greeter/src/main.rs`
@@ -192,6 +202,9 @@ modifier; the verify function is unchanged.
 12. Validation: boot → greeter → auth success → `term` as user; auth failure loop;
     headless autologin.
 13. Update Phase 27, Phase 48, Phase 57 docs.
+14. Author the aligned learning doc `docs/71-gui-login-manager.md`.
+15. Bump kernel version to `0.71.0` across `kernel/Cargo.toml`, `Cargo.lock`,
+    `AGENTS.md`, and the `docs/roadmap/README.md` Phase 71 row.
 
 ## Acceptance Criteria
 
@@ -205,6 +218,10 @@ modifier; the verify function is unchanged.
 - Background image renders correctly at 1024×768; scale-to-fit does not stretch or
   crop at mismatched resolutions.
 - A headless boot (no display_server) still autologins as root on the serial console.
+- `docs/71-gui-login-manager.md` aligned legacy learning doc exists with all
+  template fields populated and links back to this roadmap doc and its task list.
+- `kernel/Cargo.toml`, `Cargo.lock`, `AGENTS.md`, and `docs/roadmap/README.md`
+  reflect kernel version `0.71.0` and `cargo xtask check` passes after the bump.
 
 ## Companion Task List
 
