@@ -2522,6 +2522,57 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     crate::flock::release_all_for_pid(pid);
     crate::flock::release_unix_socket_locks_for_pid(pid);
 
+    // Phase 69d follow-up: if the exiting process was the foreground
+    // process of a controlling PTY AND the PTY's termios is in a
+    // non-cooked state (raw mode — typically ICANON or ECHO cleared
+    // by a TUI like less / htop / vim / tmux), reset the termios to
+    // the cooked default so the shell that resumes foreground control
+    // is not stuck with a no-echo, no-line-buffer terminal.
+    //
+    // User-reported symptom: `kill -9 $(pidof less)` from a sibling
+    // SSH session kills less but leaves the original session frozen
+    // because less didn't restore termios on its way out (SIGKILL
+    // bypasses any cleanup handler).  Mirroring `xterm`'s behaviour
+    // of "shells re-set termios on foreground reclaim" by kernel-side
+    // auto-recovery on dying-foreground-process exit gives the
+    // session immediate keyboard response again — the leftover
+    // alt-screen rendering is still on the user's display but they
+    // can blindly type `reset\n` (or any command) to recover.
+    let (pid_ctty, pid_pgid) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(proc) => (proc.controlling_tty.clone(), proc.pgid),
+            None => (None, 0),
+        }
+    };
+    if let Some(crate::process::ControllingTty::Pty(pty_id)) = pid_ctty {
+        let mut ptys = crate::pty::PTY_TABLE.lock();
+        if let Some(Some(pair)) = ptys.get_mut(pty_id as usize)
+            && pair.slave_fg_pgid == pid_pgid
+        {
+            let icanon = pair.termios.c_lflag & kernel_core::tty::ICANON != 0;
+            let echo = pair.termios.c_lflag & kernel_core::tty::ECHO != 0;
+            if !icanon || !echo {
+                log::info!(
+                    "[pty] auto-recover termios on fg-exit pty_id={} pid={} pgid={} (icanon={} echo={})",
+                    pty_id,
+                    pid,
+                    pid_pgid,
+                    icanon,
+                    echo,
+                );
+                pair.termios = kernel_core::tty::Termios::cooked_default();
+                pair.edit_buf.clear();
+                pair.ldisc_output_suspended = false;
+                pair.ldisc_deadline_ticks = None;
+            }
+        }
+        drop(ptys);
+        // Wake both sides so anyone parked sees the fresh termios.
+        crate::pty::wake_master(pty_id);
+        crate::pty::wake_slave(pty_id);
+    }
+
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
 
