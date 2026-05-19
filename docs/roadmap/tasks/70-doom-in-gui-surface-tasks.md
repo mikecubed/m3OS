@@ -3,47 +3,84 @@
 **Status:** Planned
 **Source Ref:** phase-70
 **Depends on:** Phase 47 (DOOM) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
-**Goal:** Rewrite `userspace/doom/dg_m3os.c` to use the Phase 56 surface-buffer protocol (`SurfaceCreate` → `BufferCreate` → `Commit` → `DamageBuffer`), converting DOOM from a direct-framebuffer application into a regular `display_server` client; rewire keyboard input through the Phase 56 focus-aware dispatcher; mark `fb-takeover` deprecated and `SYS_FB_YIELD` / `SYS_FB_REACQUIRE` deprecated; validate that multiple concurrent DOOM windows work.
+**Goal:** Add a `display_client_ffi` C ABI bridge over the Phase 56 protocol codec, then rewrite `userspace/doom/dg_m3os.c` to use the Phase 56 surface-buffer protocol (`Hello` → `CreateSurface` → `SetSurfaceRole(Toplevel)` → `sys_shm_create` → `AttachSharedBuffer` → per-frame `DamageSurface` + `CommitSurface`), converting DOOM from a direct-framebuffer application into a regular `display_server` client; rewire keyboard input via `ServerMessage::Key(KeyEvent)` through the Phase 56 focus-aware dispatcher; mark `fb-takeover` deprecated and `SYS_FB_YIELD` / `SYS_FB_REACQUIRE` deprecated; validate that multiple concurrent DOOM windows work.
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `dg_m3os.c` surface-creation: `DG_Init` opens display-server socket, creates Toplevel surface + buffer | None | Planned |
-| B | Palette LUT and per-frame blit: precompute `palette_bgra[256]`, `DG_DrawFrame` → shared buffer → Commit + Damage | A | Planned |
-| C | Input rewiring: `DG_GetKey` consumes `SurfaceInputEvent::Key` from surface endpoint | A | Planned |
-| D | Audio path verification: smoke test that `audio_client` still works after render-path rewrite | B, C | Planned |
+| A0 | `display_client_ffi` Rust staticlib + C header wrapping `surface_buffer` + `ClientMessage` codec | None | Planned |
+| A | `dg_m3os.c` surface-creation: `DG_Init` opens `display_server` socket via FFI, sends `Hello` + `CreateSurface` + `SetSurfaceRole(Toplevel)` + `AttachSharedBuffer` | A0 | Planned |
+| B | Palette LUT and per-frame blit: precompute `palette_bgra[256]`, `DG_DrawFrame` → shared buffer → `DamageSurface` + `CommitSurface` | A | Planned |
+| C | Input rewiring: `DG_GetKey` consumes `ServerMessage::Key(KeyEvent)` from protocol socket via FFI | A | Planned |
+| D | Audio path verification + retarget `doom-audio-smoke` to direct DOOM invocation | B, C | Planned |
 | E | `fb-takeover` retirement: deprecation notice in Cargo.toml + stderr; compatibility symlink kept | None | Planned |
-| F | Concurrent-instance regression: two DOOM windows run simultaneously | B, C | Planned |
-| G | Documentation updates: `fb-takeover-tiers.md`, Phase 47 doc | F | Planned |
+| F | Concurrent-instance regression: two DOOM windows run simultaneously; pre-push wiring behind `M3OS_DOOM_CONCURRENT_REGRESSION=1` | B, C | Planned |
+| G | Documentation updates: `fb-takeover-tiers.md`, both Phase 47 docs (`docs/47-doom.md` + `docs/roadmap/47-doom.md`) | F | Planned |
 | H | `SYS_FB_YIELD` / `SYS_FB_REACQUIRE` deprecation log warns | E | Planned |
 | I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.70.0 | G, H | Planned |
 
 ---
 
+## Track A0 — `display_client_ffi` Bridge Crate
+
+### A0.1 — Create `userspace/lib/display_client_ffi/` Rust staticlib
+
+**Files:**
+- `userspace/lib/display_client_ffi/Cargo.toml`
+- `userspace/lib/display_client_ffi/build.rs`
+- `userspace/lib/display_client_ffi/src/lib.rs`
+- `userspace/lib/display_client_ffi/include/display_client.h` (generated)
+
+**Symbol:** crate root (`display_client_ffi`)
+**Why it matters:** DOOM is C; the Phase 56 protocol codec and `surface_buffer` lifecycle are Rust-only. Without an FFI bridge, every DOOM-side caller would hand-encode `ClientMessage` bytes — duplicating the encoder and bypassing `BufferLifecycle`. Mirrors the Phase 63a `audio_client_ffi` pattern.
+
+**Acceptance:**
+- [ ] Crate added to `Cargo.toml` workspace `members` with `crate-type = ["staticlib"]`.
+- [ ] Depends on `kernel-core` (for `display::protocol::ClientMessage` + `SurfaceRole`), `surface_buffer`, and `syscall-lib`.
+- [ ] `build.rs` regenerates the C header into `include/display_client.h` (or commits a hand-maintained header; either is acceptable so long as the C ABI surface stays small).
+- [ ] xtask build pipeline links `libdisplay_client_ffi.a` into `userspace/doom` the same way `libaudio_client_ffi.a` is linked today.
+
+### A0.2 — C ABI surface
+
+**File:** `userspace/lib/display_client_ffi/src/lib.rs`
+**Symbol:** `dc_connect`, `dc_create_toplevel`, `dc_attach_shm_buffer`, `dc_damage_and_commit`, `dc_poll_event`, `dc_disconnect`
+**Why it matters:** A minimal, typed surface keeps C callers honest about lifecycle ordering and makes it easy to add new verbs (e.g., cursor visibility) in a later phase without breaking DOOM.
+
+**Acceptance:**
+- [ ] `int dc_connect(dc_handle_t *out)` resolves the registered `display_server` service name (same retry discipline as `userspace/term/src/lib.rs`), opens the socket, and sends `ClientMessage::Hello { protocol_version: PROTOCOL_VERSION }`; returns `0` on success, negative `errno`-style code on failure.
+- [ ] `int dc_create_toplevel(dc_handle_t h, uint32_t *out_surface_id)` sends `CreateSurface { surface_id }` + `SetSurfaceRole { surface_id, role: SurfaceRole::Toplevel }` and returns the chosen `surface_id`.
+- [ ] `int dc_attach_shm_buffer(dc_handle_t h, uint32_t surface_id, uint32_t buffer_id, uint32_t shm_id, uint32_t width, uint32_t height)` sends `AttachSharedBuffer { surface_id, buffer_id, shm_id, width, height }`.
+- [ ] `int dc_damage_and_commit(dc_handle_t h, uint32_t surface_id, int32_t x, int32_t y, uint32_t w, uint32_t h)` sends `DamageSurface { surface_id, rect }` then `CommitSurface { surface_id }`.
+- [ ] `int dc_poll_event(dc_handle_t h, dc_event_t *out)` non-blocking; returns `1` if an event was decoded, `0` if none ready, negative on error; `dc_event_t` is a tagged C union covering `Key`, `FocusIn`, `FocusOut`, `SurfaceResized`, `BufferReleased`, `Disconnect`.
+- [ ] Host-side unit tests in `userspace/lib/display_client_ffi/src/lib.rs` (under `#[cfg(test)]`) encode-decode round-trip every emitted `ClientMessage` against the kernel-core codec.
+
+---
+
 ## Track A — Surface Creation in `DG_Init`
 
-### A.1 — Connect to display-server socket and create Toplevel surface
+### A.1 — Connect to `display_server` and create Toplevel surface
 
 **File:** `userspace/doom/dg_m3os.c`
 **Symbol:** `DG_Init`
 **Why it matters:** The entire rendering path change is gated on a surface existing; without this task all subsequent tracks have no surface to write into.
 
 **Acceptance:**
-- [ ] `DG_Init` opens the display-server control socket using the Phase 56 service-lookup path.
-- [ ] `DG_Init` sends `SurfaceCreate { role: Toplevel, title: "DOOM" }` and stores the returned surface id.
-- [ ] On failure to connect or create, `DG_Init` prints an error to serial and calls `exit(1)`.
+- [ ] `DG_Init` calls `dc_connect()` from `display_client_ffi` to resolve the `display_server` registered service name and complete the `Hello` handshake; uses the same bounded retry discipline as `term` (`userspace/term/src/lib.rs:141`).
+- [ ] `DG_Init` calls `dc_create_toplevel()` and stores the returned `surface_id` in a module-level static for later use.
+- [ ] On failure to connect, handshake, or create the surface, `DG_Init` prints an error to serial (`fprintf(stderr, ...)`) and calls `exit(1)`.
 
-### A.2 — Create shared-memory buffer
+### A.2 — Allocate and attach shared-memory pixel buffer
 
 **File:** `userspace/doom/dg_m3os.c`
 **Symbol:** `DG_Init`
-**Why it matters:** DOOM renders into a 320×200 pixel grid; the shared buffer is the medium between DOOM's render loop and the compositor.
+**Why it matters:** DOOM renders into a 320×200 BGRA pixel grid (256 KiB); the shared buffer is the medium between DOOM's render loop and the compositor. `AttachSharedBuffer` references an `shm_id` allocated via `sys_shm_create`, so the SHM region is independent of `MAX_BULK_LEN`.
 
 **Acceptance:**
-- [ ] `DG_Init` sends `BufferCreate { width: 320, height: 200, format: BGRA8888 }` on the surface socket.
-- [ ] The returned buffer fd is mmap'd; the resulting pointer is stored as `g_bgra_buffer` (or equivalent module-level pointer) for use in `DG_DrawFrame`.
-- [ ] Buffer fd is kept open for the lifetime of the process; no per-frame open/close.
+- [ ] `DG_Init` calls `sys_shm_create(320 * 200 * 4)` to allocate the pixel region; the returned `shm_id` is stored module-level.
+- [ ] `DG_Init` `sys_shm_map`s the region into the DOOM process and stores the resulting `*mut u32` as `g_bgra_buffer` for use in `DG_DrawFrame`.
+- [ ] `DG_Init` calls `dc_attach_shm_buffer(handle, surface_id, buffer_id = 1, shm_id, 320, 200)`.
+- [ ] The shm region and surface are kept open for the lifetime of the process; no per-frame allocate/attach.
 
 ---
 
@@ -68,7 +105,7 @@
 
 **Acceptance:**
 - [ ] `DG_DrawFrame` iterates the 320×200 indexed pixel array, performs a LUT lookup per pixel, and writes the BGRA8888 result into `g_bgra_buffer`.
-- [ ] After the blit, `DG_DrawFrame` sends `Commit` followed by `DamageBuffer { x: 0, y: 0, w: 320, h: 200 }` on the surface socket.
+- [ ] After the blit, `DG_DrawFrame` calls `dc_damage_and_commit(handle, surface_id, 0, 0, 320, 200)` which sends `DamageSurface { surface_id, rect: { 0, 0, 320, 200 } }` followed by `CommitSurface { surface_id }`.
 - [ ] No heap allocation in the per-frame path.
 - [ ] The previous `sys_framebuffer_acquire` + mmap + direct-write code is removed.
 
@@ -86,20 +123,20 @@
 - [ ] The `kbd_server` lookup and connection code is removed from `dg_m3os.c`.
 - [ ] No `sys_service_lookup("kbd_server")` call remains in `dg_m3os.c`.
 
-### C.2 — Read `SurfaceInputEvent::Key` from surface endpoint in `DG_GetKey`
+### C.2 — Read `ServerMessage::Key(KeyEvent)` from protocol socket in `DG_GetKey`
 
 **File:** `userspace/doom/dg_m3os.c`
 **Symbol:** `DG_GetKey`
-**Why it matters:** Phase 56 routes key events to the focused surface's input endpoint; DOOM must read from that endpoint to become a properly focused client.
+**Why it matters:** Phase 56 routes key events to the focused surface's protocol socket as `ServerMessage::Key(KeyEvent)`; DOOM must read from that socket to become a properly focused client.
 
 **Acceptance:**
-- [ ] `DG_GetKey` calls `recv_nonblocking` on the surface input endpoint; on `SurfaceInputEvent::Key`, populates DOOM's key event queue.
-- [ ] When the DOOM surface is not focused, no key events are delivered (the dispatcher does not send to unfocused surfaces — this is enforced by the Phase 56 protocol, not by DOOM).
+- [ ] `DG_GetKey` drains events via `dc_poll_event()` (non-blocking); on a `Key` event populates DOOM's key event queue; `FocusIn` / `FocusOut` toggle a local `g_focused` flag for diagnostic logging.
+- [ ] When the DOOM surface is not focused, no `Key` events are delivered (enforced by the Phase 56 focus dispatcher in `display_server::input`, not by DOOM).
 - [ ] DOOM movement (WASD / arrow keys), fire (Ctrl), and Escape function correctly during a gameplay session.
 
 ---
 
-## Track D — Audio Path Verification
+## Track D — Audio Path Verification and Gate Retarget
 
 ### D.1 — Verify `audio_client` after render-path rewrite
 
@@ -111,9 +148,21 @@
 **Why it matters:** The render-path rewrite should not affect `audio_client`; this task confirms it.
 
 **Acceptance:**
-- [ ] After the Track A + B + C rewrite, `DG_SoundStart` continues to call `audio_client::connect` and submit PCM frames.
+- [ ] After the Track A + B + C rewrite, `DG_SoundStart` continues to call `audio_client::connect` (via `audio_client_ffi`) and submit PCM frames.
 - [ ] The Phase 57 audio smoke (`cargo xtask audio-smoke`) passes with DOOM running as a surface client.
-- [ ] No audio-client connection code changed in this phase; any failure is treated as a regression to fix, not a new feature.
+- [ ] No `audio_client` or `audio_client_ffi` connection code changed in this phase; any failure is treated as a regression to fix, not a new feature.
+
+### D.2 — Retarget `cargo xtask doom-audio-smoke` to direct invocation
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `doom-audio-smoke` step list (currently around the Phase 63a Track H block)
+**Why it matters:** The existing gate today launches DOOM through `fb-takeover doom -warp 1 1`. After Phase 70, the canonical invocation is `doom -warp 1 1` with no wrapper; retargeting the gate makes it the end-to-end Tier 3 audio + direct-invocation regression. The `fb-takeover` compatibility test under Track E.1 continues to exercise the wrapper path.
+
+**Acceptance:**
+- [ ] The `doom-audio-smoke` step list invokes `doom -warp 1 1` directly with no `fb-takeover` prefix.
+- [ ] The gate still asserts `frames_consumed > 0` via `AudioControlCommand::GetStats` across two consecutive runs and the recorded WAV is non-silent.
+- [ ] The gate also asserts that the BEL path remains armed after DOOM exits (existing post-DOOM bell check is preserved).
+- [ ] `M3OS_DOOM_AUDIO_REGRESSION=1 cargo xtask doom-audio-smoke` passes end-to-end on developer hardware after Track A + B + C land.
 
 ---
 
@@ -148,6 +197,18 @@
 - [ ] Both processes reach their respective game-loop renders without hanging in `BlockedOnReply`.
 - [ ] Watchdog does not fire for either process within 30 seconds of launch.
 - [ ] Both processes exit cleanly when sent `SIGTERM`.
+- [ ] `cargo xtask <usage>` help string updated to list `doom-concurrent-smoke`.
+
+### F.2 — Wire `doom-concurrent-smoke` into pre-push hook
+
+**File:** `.githooks/pre-push`
+**Symbol:** new `M3OS_DOOM_CONCURRENT_REGRESSION=1` block
+**Why it matters:** Project convention env-gates QEMU-heavy smoke gates so developers can opt in per push without making every push a 5-minute wait. Pattern is established for `doom-audio` (line 169), `termios` (line 179), and `tui-app` (line 191).
+
+**Acceptance:**
+- [ ] `.githooks/pre-push` gains an `if [ "${M3OS_DOOM_CONCURRENT_REGRESSION:-0}" = "1" ]` block that runs `cargo xtask doom-concurrent-smoke --timeout 120`.
+- [ ] The block is positioned after the existing `M3OS_DOOM_AUDIO_REGRESSION` block so the audio gate runs first when both env-vars are set.
+- [ ] `AGENTS.md` "First-Time Setup" section is updated to mention `M3OS_DOOM_CONCURRENT_REGRESSION=1` alongside the other env-gated regressions.
 
 ---
 
@@ -163,14 +224,18 @@
 - [ ] Status line updated to: "Tier 1 retained as fallback for non-display_server boots (headless / serial-only mode). Tier 3 landed in Phase 70. Tier 2 remains deferred."
 - [ ] Known residuals section updated: second-consecutive-takeover hang and mouse-pointer-reset noted as resolved structurally by Tier 3.
 
-### G.2 — Update Phase 47 design doc
+### G.2 — Update both Phase 47 docs
 
-**File:** `docs/roadmap/47-doom.md` (or equivalent path)
+**Files:**
+- `docs/roadmap/47-doom.md` (roadmap design doc)
+- `docs/47-doom.md` (aligned legacy learning doc)
+
 **Symbol:** N/A
-**Why it matters:** Phase 47's doc describes DOOM as a direct-framebuffer application; it must note the Phase 70 rendering-path change.
+**Why it matters:** Both Phase 47 docs describe DOOM as a direct-framebuffer application; both must note the Phase 70 rendering-path change so a future reader landing in either location reaches a consistent story.
 
 **Acceptance:**
-- [ ] A "Phase 70 update" note added to Phase 47 doc: "In Phase 70, `dg_m3os.c` was rewritten to use the Phase 56 surface-buffer protocol. DOOM is now a regular `display_server` client; the `fb-takeover` wrapper is no longer required."
+- [ ] A "Phase 70 update" note is added near the top of both docs: "In Phase 70, `dg_m3os.c` was rewritten to use the Phase 56 surface-buffer protocol via the new `display_client_ffi` bridge. DOOM is now a regular `display_server` client; the `fb-takeover` wrapper is no longer required."
+- [ ] Each doc cross-links to `docs/roadmap/70-doom-in-gui-surface.md` and `docs/70-doom-in-gui-surface.md`.
 
 ---
 
@@ -232,7 +297,9 @@
 ## Documentation Notes
 
 - This phase implements Tier 3 from `docs/appendix/fb-takeover-tiers.md` verbatim; the "Components needed" list in that document is the authoritative scope checklist.
-- `audio_client` is unchanged in this phase — Track D is a verification gate, not a code-change task.
+- `audio_client` / `audio_client_ffi` are unchanged in this phase — Track D.1 is a verification gate; Track D.2 only retargets the gate's invocation path.
 - The `/bin/fb-takeover` symlink is not removed in this phase; removal is deferred to a later cleanup.
 - `SYS_FB_YIELD` and `SYS_FB_REACQUIRE` are not removed from the dispatch table in this phase; only the deprecation log warn is added.
-- The Phase 56 protocol codec (`kernel-core/src/display/protocol.rs`) is used as-is; Phase 70 adds no new protocol messages.
+- The Phase 56 protocol codec (`kernel-core/src/display/protocol.rs`) is used as-is; Phase 70 adds no new protocol messages. The actual message names that Track A0 wraps are `Hello`, `CreateSurface`, `SetSurfaceRole`, `AttachSharedBuffer`, `DamageSurface`, `CommitSurface`, and `ServerMessage::Key` / `FocusIn` / `FocusOut` / `SurfaceResized` / `BufferReleased`.
+- DOOM remains C; the protocol codec and `surface_buffer` lifecycle stay in Rust. The new `userspace/lib/display_client_ffi/` crate is the C ABI bridge, mirroring the Phase 63a `audio_client_ffi` pattern.
+- The reference client for the surface-buffer flow is `userspace/term/src/display.rs`; new implementers should read its `AttachSharedBuffer` → `DamageSurface` → `CommitSurface` sequence before starting Track A.
