@@ -12615,7 +12615,7 @@ fn signal_reset_steps() -> Vec<SmokeStep> {
         label: "run signal-test",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "7 passed, 0 failed",
+        pattern: "8 passed, 0 failed",
         timeout_secs: 30,
         label: "signal-test all pass",
     });

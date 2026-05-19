@@ -141,14 +141,25 @@ static void test_uncatchable(void) {
         fail("uncatchable", "sigaction should reject SIGKILL/SIGSTOP");
 }
 
-/* ---- Test 3b: cross-process kill terminates a blocked child ----
+/* ---- Test 3b: cross-process kill terminates a wait-queue-parked child ----
  *
  * Phase 69d follow-up reproducer for a user-reported "kill -9 doesn't
- * kill" symptom.  Forks a child that blocks indefinitely in pause();
- * the parent sends SIGKILL and waitpid()s.  If the child is reaped with
- * status WIFSIGNALED && WTERMSIG==SIGKILL, the cross-process
- * sys_kill → wake_task_v2 → check_pending_signals chain is healthy.  A
- * waitpid timeout (handled with alarm()) signals the bug.
+ * kill" symptom on a less process blocked on PTY-slave read.  The
+ * earlier draft used pause() which on m3OS falls through to syscall 34
+ * (NICE) and returns immediately, making the child busy-loop through
+ * syscall returns — every iteration runs check_pending_signals and
+ * SIGKILL terminates trivially, so the test could not surface a
+ * wake-queue wakeup bug.
+ *
+ * This version parks the child in `read(pipe_r, ...)` after closing the
+ * write end so the read blocks forever in PIPE_WAITQUEUE rather than
+ * returning EOF.  Wait, EOF would return 0 immediately when no
+ * writers remain — we need a writer to STAY open in the parent so the
+ * pipe stays alive but never produces bytes.  The parent keeps
+ * `pipe_w` open, the child closes its copy and reads on `pipe_r`; the
+ * read parks in BlockedOnRecv on the pipe wait queue.  SIGKILL must
+ * wake the task off that wait queue and check_pending_signals on the
+ * syscall-return path must terminate the process.
  */
 static volatile sig_atomic_t kill_target_alarm_fired = 0;
 
@@ -158,26 +169,41 @@ static void kill_target_alarm_handler(int sig) {
 }
 
 static void test_cross_process_kill(void) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        fail("cross_process_kill", "pipe failed");
+        return;
+    }
     pid_t child = fork();
     if (child < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
         fail("cross_process_kill", "fork failed");
         return;
     }
     if (child == 0) {
-        /* Block indefinitely; parent will SIGKILL us. */
-        for (;;) {
-            pause();
-        }
-        _exit(99);
+        /* Child: close write end and block in read.  Parent keeps the
+         * write end open so EOF is never delivered — the read genuinely
+         * parks on the pipe wait queue forever. */
+        close(pipefd[1]);
+        char buf[1];
+        ssize_t n = read(pipefd[0], buf, 1);
+        /* If we ever return, exit with a distinct code so the parent can
+         * tell the bug from a generic failure. */
+        _exit(n == 0 ? 97 : 98);
     }
 
-    /* Parent: give the child a beat to land in pause(), then SIGKILL. */
-    struct timespec ts = {0, 50 * 1000 * 1000};
+    /* Parent: close the read end so we don't hold it; keep write end
+     * open so the pipe stays alive and the child's read parks. */
+    close(pipefd[0]);
+
+    /* Give the child a beat to land in read(). */
+    struct timespec ts = {0, 100 * 1000 * 1000};
     nanosleep(&ts, NULL);
 
     if (kill(child, SIGKILL) != 0) {
         fail("cross_process_kill", "kill(SIGKILL) returned non-zero");
-        /* Best-effort cleanup. */
+        close(pipefd[1]);
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         return;
@@ -198,13 +224,13 @@ static void test_cross_process_kill(void) {
     pid_t reaped = waitpid(child, &status, 0);
     alarm(0);
     sigaction(SIGALRM, &old_alarm, NULL);
+    close(pipefd[1]);
 
     if (kill_target_alarm_fired) {
-        /* waitpid was interrupted by the timeout — child still alive. */
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         fail("cross_process_kill",
-             "waitpid timed out; SIGKILL did not terminate the child");
+             "waitpid timed out; SIGKILL did not wake the parked read");
         return;
     }
 
@@ -213,16 +239,108 @@ static void test_cross_process_kill(void) {
         return;
     }
     if (!WIFSIGNALED(status)) {
-        fail("cross_process_kill",
-             "child did not die from a signal");
+        fail("cross_process_kill", "child did not die from a signal");
         return;
     }
     if (WTERMSIG(status) != SIGKILL) {
-        fail("cross_process_kill",
-             "child died from a different signal");
+        fail("cross_process_kill", "child died from a different signal");
         return;
     }
     pass("cross_process_kill");
+}
+
+/* ---- Test 3c: cross-process kill of a PTY-slave-parked child ----
+ *
+ * The pipe-read variant passes on m3OS, but the user's reported
+ * symptom is a less process parked on a PTY slave read.  Reproduce
+ * the exact path: parent opens /dev/ptmx, unlocks the slave, forks a
+ * child that opens /dev/pts/N and reads from it; parent SIGKILLs the
+ * child and waitpid()s with an SIGALRM-bounded timeout.
+ */
+#include <fcntl.h>
+#include <sys/ioctl.h>
+
+static void test_pty_slave_kill(void) {
+    int master = open("/dev/ptmx", O_RDWR);
+    if (master < 0) {
+        fail("pty_slave_kill", "open /dev/ptmx failed");
+        return;
+    }
+    int zero = 0;
+    if (ioctl(master, 0x40045431u, &zero) != 0) { /* TIOCSPTLCK */
+        fail("pty_slave_kill", "TIOCSPTLCK failed");
+        close(master);
+        return;
+    }
+    unsigned int pty_num = 0;
+    if (ioctl(master, 0x80045430u, &pty_num) != 0) { /* TIOCGPTN */
+        fail("pty_slave_kill", "TIOCGPTN failed");
+        close(master);
+        return;
+    }
+    char slave_path[32];
+    snprintf(slave_path, sizeof(slave_path), "/dev/pts/%u", pty_num);
+
+    pid_t child = fork();
+    if (child < 0) {
+        fail("pty_slave_kill", "fork failed");
+        close(master);
+        return;
+    }
+    if (child == 0) {
+        /* Child: open the slave and block in read(). */
+        int slave = open(slave_path, O_RDWR);
+        if (slave < 0) {
+            _exit(91);
+        }
+        char buf[16];
+        ssize_t n = read(slave, buf, 16);
+        _exit(n >= 0 ? 92 : 93);
+    }
+
+    /* Parent: give the child a beat to land in the PTY-slave read. */
+    struct timespec ts = {0, 200 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+
+    if (kill(child, SIGKILL) != 0) {
+        fail("pty_slave_kill", "kill returned non-zero");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        close(master);
+        return;
+    }
+
+    struct sigaction old_alarm;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = kill_target_alarm_handler;
+    sa.sa_flags = SA_RESTORER;
+    kill_target_alarm_fired = 0;
+    sigaction(SIGALRM, &sa, &old_alarm);
+    alarm(3);
+
+    int status = 0;
+    pid_t reaped = waitpid(child, &status, 0);
+    alarm(0);
+    sigaction(SIGALRM, &old_alarm, NULL);
+    close(master);
+
+    if (kill_target_alarm_fired) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        fail("pty_slave_kill",
+             "waitpid timed out; SIGKILL did not wake PTY-slave-parked read");
+        return;
+    }
+    if (reaped != child) {
+        fail("pty_slave_kill", "waitpid wrong pid");
+        return;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+        fail("pty_slave_kill", "child did not die from SIGKILL");
+        return;
+    }
+    pass("pty_slave_kill");
 }
 
 /* ---- Test 4: auto-masking prevents re-entry ---- */
@@ -418,6 +536,7 @@ int main(int argc, char *argv[]) {
     test_signal_masking();
     test_uncatchable();
     test_cross_process_kill();
+    test_pty_slave_kill();
     test_auto_masking();
     test_sigaction_atomicity();
     test_exec_signal_reset();
