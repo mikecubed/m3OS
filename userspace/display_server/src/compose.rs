@@ -517,7 +517,12 @@ where
     // after the surface blit so they always sit on top of the surface
     // pixels. Active / inactive colour selection is driven by the
     // `focused_id` argument; `border_cfg = None` (Phase 56-compat
-    // floating layout) skips the pass entirely. Snapshot the rect /
+    // floating layout) skips the pass entirely.
+    //
+    // Borders use the **tile rect** from `arrangement`, not the
+    // letterboxed buffer rect from `surface_screen_rect`: a tile
+    // smaller than the surface (or vice-versa) still gets a border
+    // that traces the actual layout partition. Snapshot the rect /
     // id / layer triples first so we can `mark_clean` (mutable
     // registry borrow) immediately and free the immutable `entries`
     // borrow before the cursor blit needs to touch the framebuffer.
@@ -529,7 +534,18 @@ where
                 kernel_core::display::compose::ComposeLayer::Toplevel
             )
         })
-        .map(|e| (e.id, surface_screen_rect(e, arrangement)))
+        .map(|e| {
+            // Prefer the layout policy's tile rect when the surface is
+            // tiled; fall back to the surface's own rect for the Phase
+            // 56-compat floating path (which passes an empty
+            // `arrangement`).
+            let rect = arrangement
+                .iter()
+                .find(|(id, _)| *id == e.id)
+                .map(|(_, tile)| *tile)
+                .unwrap_or(e.rect);
+            (e.id, rect)
+        })
         .collect();
     drop(compose);
     drop(snapshots);

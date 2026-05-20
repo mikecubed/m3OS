@@ -76,20 +76,35 @@ impl Workspace {
     }
 
     /// Insert a window if it is not already present. Returns `true`
-    /// if the window was newly inserted.
+    /// if the window was newly inserted. Notifies the active layout
+    /// policy via `TiledLayoutPolicy::on_window_added` so policies with
+    /// persistent structure (e.g. `DwindleLayout`'s split tree) stay
+    /// consistent with the window set.
     pub fn insert(&mut self, id: SurfaceId) -> bool {
         if self.windows.contains(&id) {
             return false;
         }
         self.windows.push(id);
+        self.policies.on_window_added(
+            self.policy,
+            TiledWindow {
+                id,
+                preferred_size: (0, 0),
+            },
+        );
         true
     }
 
     /// Remove a window. Returns `true` if removed, `false` if the
-    /// window was not in this workspace.
+    /// window was not in this workspace. Notifies the active layout
+    /// policy via `TiledLayoutPolicy::on_window_removed`; in
+    /// particular, `DwindleLayout` pops its last split ratio so
+    /// resize-mode adjustments never target a stale ratio that no
+    /// longer maps to a tile.
     pub fn remove(&mut self, id: SurfaceId) -> bool {
         if let Some(idx) = self.windows.iter().position(|w| *w == id) {
             self.windows.remove(idx);
+            self.policies.on_window_removed(self.policy, id);
             true
         } else {
             false
@@ -220,6 +235,43 @@ impl PolicySet {
             PolicyKind::Grid => TiledLayoutPolicy::on_focus_changed(&mut self.grid, id),
             PolicyKind::Tabbed => TiledLayoutPolicy::on_focus_changed(&mut self.tabbed, id),
             PolicyKind::Fullscreen => TiledLayoutPolicy::on_focus_changed(&mut self.fullscreen, id),
+        }
+    }
+
+    /// Notify the active policy that a window joined the tiling set.
+    /// Default trait impl is a no-op for policies without persistent
+    /// per-window state; `DwindleLayout` / `MasterStackLayout` opt in.
+    pub fn on_window_added(&mut self, kind: PolicyKind, window: TiledWindow) {
+        match kind {
+            PolicyKind::MasterStack => {
+                TiledLayoutPolicy::on_window_added(&mut self.master_stack, window)
+            }
+            PolicyKind::Dwindle => TiledLayoutPolicy::on_window_added(&mut self.dwindle, window),
+            PolicyKind::Spiral => TiledLayoutPolicy::on_window_added(&mut self.spiral, window),
+            PolicyKind::Grid => TiledLayoutPolicy::on_window_added(&mut self.grid, window),
+            PolicyKind::Tabbed => TiledLayoutPolicy::on_window_added(&mut self.tabbed, window),
+            PolicyKind::Fullscreen => {
+                TiledLayoutPolicy::on_window_added(&mut self.fullscreen, window)
+            }
+        }
+    }
+
+    /// Notify the active policy that a window left the tiling set.
+    /// `DwindleLayout` pops its last split ratio so resize-mode does
+    /// not adjust a stale split that no longer corresponds to the
+    /// current window set.
+    pub fn on_window_removed(&mut self, kind: PolicyKind, id: SurfaceId) {
+        match kind {
+            PolicyKind::MasterStack => {
+                TiledLayoutPolicy::on_window_removed(&mut self.master_stack, id)
+            }
+            PolicyKind::Dwindle => TiledLayoutPolicy::on_window_removed(&mut self.dwindle, id),
+            PolicyKind::Spiral => TiledLayoutPolicy::on_window_removed(&mut self.spiral, id),
+            PolicyKind::Grid => TiledLayoutPolicy::on_window_removed(&mut self.grid, id),
+            PolicyKind::Tabbed => TiledLayoutPolicy::on_window_removed(&mut self.tabbed, id),
+            PolicyKind::Fullscreen => {
+                TiledLayoutPolicy::on_window_removed(&mut self.fullscreen, id)
+            }
         }
     }
 
@@ -530,6 +582,40 @@ mod tests {
             m.move_to_workspace(SurfaceId(1), 0, false),
             Err(WorkspaceError::NoOp)
         );
+    }
+
+    #[test]
+    fn dwindle_remove_pops_split_ratio() {
+        // Phase 72 review fix — `Workspace::remove` must notify the
+        // active policy so DwindleLayout's persistent split-ratio
+        // stack stays in sync with the window set. Resize-mode
+        // `adjust_focused` writes the last ratio; if removal never
+        // pops, a stale ratio gets nudged and the next tile pass
+        // re-introduces it as a phantom split.
+        let mut ws = Workspace::new(PolicyKind::Dwindle);
+        ws.insert(SurfaceId(1));
+        ws.insert(SurfaceId(2));
+        ws.insert(SurfaceId(3));
+        // Drive a tile pass so the dwindle layout materializes its
+        // two split ratios (n=3 → 2 ratios).
+        let out = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let _ = ws.tile(out, GapConfig::new(0, 0));
+        // Remove a window and adjust the focused tile. If the policy
+        // never saw the removal, it still carries the third ratio and
+        // adjust_focused targets it instead of the surviving split.
+        assert!(ws.remove(SurfaceId(3)));
+        // adjust_focused operates on the policy's current ratio
+        // stack; with no stale entry, this should not panic and should
+        // touch the ratio that actually maps to a tile.
+        ws.adjust_focused(SurfaceId(2), ResizeDirection::Right, 16)
+            .expect("dwindle adjust_focused after remove");
+        let rects = ws.tile(out, GapConfig::new(0, 0));
+        assert_eq!(rects.len(), 2, "only two windows remain");
     }
 
     #[test]

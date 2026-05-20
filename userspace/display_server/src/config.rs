@@ -60,12 +60,24 @@ impl CompositorConfig {
     }
 
     /// Parse the contents of `/etc/compositor.conf` into a
-    /// [`CompositorConfig`]. Returns `Err` only on a structural
-    /// parse failure; unknown keys / sections are logged-and-ignored
-    /// at the caller boundary so the file format can grow without
-    /// rejecting older configs.
+    /// [`CompositorConfig`].
+    ///
+    /// Unknown sections and unknown keys are **logged-and-ignored** so
+    /// the file format can grow without older parsers rejecting newer
+    /// configs. Structural failures (`MalformedLine`, `BadValue`) are
+    /// still returned as `Err` because they indicate a real syntax
+    /// problem the user can fix. The `Vec<ConfigWarning>` carries the
+    /// ignored entries so the caller can log them.
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        Self::parse_with_warnings(input).map(|(cfg, _)| cfg)
+    }
+
+    /// Parse + return any non-fatal warnings (unknown sections / keys).
+    /// The caller is expected to log the warnings; tests use this form
+    /// directly to assert which entries were skipped.
+    pub fn parse_with_warnings(input: &str) -> Result<(Self, Vec<ConfigWarning>), ConfigError> {
         let mut cfg = Self::defaults();
+        let mut warnings = Vec::new();
         let mut section = Section::Top;
         for (lineno, raw_line) in input.lines().enumerate() {
             let line = strip_comment(raw_line).trim();
@@ -79,10 +91,11 @@ impl CompositorConfig {
                     "keybinds" => Section::Keybinds,
                     "workspaces" => Section::Workspaces,
                     other => {
-                        return Err(ConfigError::UnknownSection {
+                        warnings.push(ConfigWarning::UnknownSection {
                             name: other.to_string(),
                             line: lineno + 1,
                         });
+                        Section::Unknown
                     }
                 };
                 continue;
@@ -93,15 +106,22 @@ impl CompositorConfig {
                     return Err(ConfigError::MalformedLine { line: lineno + 1 });
                 }
             };
-            match section {
-                Section::Top => {}
-                Section::Gaps => apply_gap_key(&mut cfg.gaps, k, v, lineno + 1)?,
-                Section::Borders => apply_border_key(&mut cfg.borders, k, v, lineno + 1)?,
-                Section::Keybinds => apply_keybind_key(&mut cfg.keybinds, k, v, lineno + 1)?,
-                Section::Workspaces => apply_workspace_key(&mut cfg.workspaces, k, v, lineno + 1)?,
+            let apply_result = match section {
+                Section::Top | Section::Unknown => Ok(()),
+                Section::Gaps => apply_gap_key(&mut cfg.gaps, k, v, lineno + 1),
+                Section::Borders => apply_border_key(&mut cfg.borders, k, v, lineno + 1),
+                Section::Keybinds => apply_keybind_key(&mut cfg.keybinds, k, v, lineno + 1),
+                Section::Workspaces => apply_workspace_key(&mut cfg.workspaces, k, v, lineno + 1),
+            };
+            match apply_result {
+                Ok(()) => {}
+                Err(ConfigError::UnknownKey { key, line }) => {
+                    warnings.push(ConfigWarning::UnknownKey { key, line });
+                }
+                Err(other) => return Err(other),
             }
         }
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 }
 
@@ -112,6 +132,10 @@ enum Section {
     Borders,
     Keybinds,
     Workspaces,
+    /// An unrecognized section header. Subsequent `key = value` lines
+    /// are still syntax-checked but the values are discarded, mirroring
+    /// the `UnknownSection` warning at the section header.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +144,16 @@ pub enum ConfigError {
     UnknownKey { key: String, line: usize },
     BadValue { key: String, line: usize },
     MalformedLine { line: usize },
+}
+
+/// Non-fatal parse warnings — unknown sections / keys the parser
+/// skipped without aborting. Surfaced separately from [`ConfigError`]
+/// so the caller can log them while still applying the rest of the
+/// file. Matches the documented "log-and-ignore" semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigWarning {
+    UnknownSection { name: String, line: usize },
+    UnknownKey { key: String, line: usize },
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -488,10 +522,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_section_returns_error() {
+    fn unknown_section_warns_and_continues() {
+        // Forward-compat: an older parser must not reject a newer
+        // config file just because it gained a section the parser
+        // doesn't know yet. The unknown section becomes a warning and
+        // the rest of the file still applies.
+        let (cfg, warnings) =
+            CompositorConfig::parse_with_warnings("[bogus]\nfoo = 1\n[gaps]\nouter = 5\n")
+                .expect("unknown section is non-fatal");
+        assert_eq!(cfg.gaps.outer, 5);
         assert!(matches!(
-            CompositorConfig::parse("[bogus]\nfoo = 1\n"),
-            Err(ConfigError::UnknownSection { .. })
+            warnings.as_slice(),
+            [ConfigWarning::UnknownSection { name, .. }] if name == "bogus"
+        ));
+    }
+
+    #[test]
+    fn unknown_key_warns_and_continues() {
+        // Same forward-compat story for keys inside known sections.
+        let (cfg, warnings) = CompositorConfig::parse_with_warnings(
+            "[gaps]\nouter = 5\nfuture_key = whatever\ninner = 2\n",
+        )
+        .expect("unknown key is non-fatal");
+        assert_eq!(cfg.gaps.outer, 5);
+        assert_eq!(cfg.gaps.inner, 2);
+        assert!(matches!(
+            warnings.as_slice(),
+            [ConfigWarning::UnknownKey { key, .. }] if key == "future_key"
+        ));
+    }
+
+    #[test]
+    fn bad_value_is_still_a_hard_error() {
+        // A real syntax error (not-a-number where a u16 is expected)
+        // must still surface so the user can fix it. Distinguishing
+        // unknown-key (forward-compat) from bad-value (broken syntax)
+        // is the point of separating warnings from errors.
+        assert!(matches!(
+            CompositorConfig::parse("[gaps]\nouter = not-a-number\n"),
+            Err(ConfigError::BadValue { .. })
         ));
     }
 

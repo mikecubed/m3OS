@@ -849,7 +849,7 @@ impl SurfaceRegistry {
                     let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
                     (layer_band, geometry)
                 }
-                Some(SurfaceRole::Toplevel) | None => {
+                Some(SurfaceRole::Toplevel) => {
                     if !include_toplevel(*id) {
                         continue;
                     }
@@ -858,6 +858,21 @@ impl SurfaceRegistry {
                         centre_rect(output, buf.width, buf.height),
                     )
                 }
+                // Phase 72 review fix — require an explicit
+                // `SetSurfaceRole(Toplevel)` before a surface joins
+                // the compose pass. Previously a role-less surface was
+                // treated as a Toplevel here, but the Phase 72
+                // workspace-sync path only inserts surfaces whose
+                // `outcome.created` reports `SurfaceRole::Toplevel`. A
+                // role-less surface would never join any workspace and
+                // would still be filtered out (invisible), so this
+                // arm was a phantom code path that disagreed with the
+                // insertion contract. All real clients (term, doom,
+                // greeter, display_client_ffi) send SetSurfaceRole
+                // before AttachSharedBuffer + CommitSurface; explicit
+                // omission of a role now means the surface stays
+                // unmapped until the client sends one.
+                None => continue,
             };
             entries.push(ComposeEntry {
                 id: *id,

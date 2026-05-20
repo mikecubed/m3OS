@@ -113,6 +113,11 @@ impl BindModeTable {
 /// `SUPER+R` toggles pop it.
 pub struct BindStack {
     stack: Vec<BindModeTable>,
+    /// Pixel step used when pushing the resize mode. Defaults to
+    /// [`DEFAULT_RESIZE_STEP_PX`]; the `[keybinds] resize_step_px`
+    /// config key overrides this via [`BindStack::set_resize_step_px`]
+    /// at startup and on `m3ctl reload`.
+    resize_step_px: i16,
 }
 
 impl Default for BindStack {
@@ -129,7 +134,25 @@ impl BindStack {
         let mut default = BindModeTable::new(BindMode::Default);
         register_default_chords(&mut default).expect("default chord set fits in BindTable");
         stack.push(default);
-        Self { stack }
+        Self {
+            stack,
+            resize_step_px: DEFAULT_RESIZE_STEP_PX,
+        }
+    }
+
+    /// Override the resize-mode step (pixels). Subsequent
+    /// `push_mode(BindMode::Resize)` calls use this value when
+    /// registering the H/J/K/L chords. Called once at startup from
+    /// the parsed `[keybinds] resize_step_px` and again on
+    /// `m3ctl reload`.
+    pub fn set_resize_step_px(&mut self, step: i16) {
+        self.resize_step_px = step;
+    }
+
+    /// Currently-active resize step. Useful for tests and debug
+    /// surfaces.
+    pub fn resize_step_px(&self) -> i16 {
+        self.resize_step_px
     }
 
     /// Borrow the active mode's table.
@@ -163,12 +186,14 @@ impl BindStack {
     }
 
     /// Push a fresh mode on top of the stack. The compositor calls
-    /// this from the `EnterResize` action handler.
+    /// this from the `EnterResize` action handler. Resize-mode tables
+    /// are registered with the currently-configured
+    /// [`BindStack::resize_step_px`], so chord overlays pick up the
+    /// `[keybinds] resize_step_px` config override.
     pub fn push_mode(&mut self, mode: BindMode) {
         let mut table = BindModeTable::new(mode);
         if mode == BindMode::Resize {
-            register_resize_chords(&mut table, DEFAULT_RESIZE_STEP_PX)
-                .expect("resize chord set fits");
+            register_resize_chords(&mut table, self.resize_step_px).expect("resize chord set fits");
         }
         self.stack.push(table);
     }
@@ -345,6 +370,25 @@ mod tests {
         stack.pop_to_default();
         stack.pop_to_default();
         assert_eq!(stack.active_mode(), BindMode::Default);
+    }
+
+    #[test]
+    fn configured_resize_step_propagates_to_resize_mode() {
+        // Phase 72 review fix — `[keybinds] resize_step_px = N` must
+        // reach the H/J/K/L chord actions, not get silently ignored.
+        let mut stack = BindStack::new();
+        stack.set_resize_step_px(64);
+        stack.push_mode(BindMode::Resize);
+        let bid = stack
+            .active_table()
+            .match_bind(0, KEY_H.0 as u32)
+            .expect("H bound in resize mode");
+        match stack.lookup_action(bid) {
+            Some(KeybindAction::ResizeFocused { step, .. }) => {
+                assert_eq!(step, 64, "configured step reaches the chord");
+            }
+            other => panic!("expected ResizeFocused, got {:?}", other),
+        }
     }
 
     #[test]

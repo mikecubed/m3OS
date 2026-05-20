@@ -311,6 +311,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut bind_stack = keybind::BindStack::new();
     // Apply user-supplied chord overrides from the config file.
     bind_stack.reload_default(&compositor_config.keybinds.user_chords);
+    bind_stack.set_resize_step_px(compositor_config.keybinds.resize_step_px);
 
     // Track E.4 — control-socket subscription registry and frame-stats
     // ring. The registry is keyed by `ClientId`; Phase 56 uses a
@@ -1144,13 +1145,17 @@ fn serve_one_control_request(
             ControlCommand::Reload => {
                 handle_reload(workspace_mgr, bind_stack, compositor_config, &mut reply_buf)
             }
-            ControlCommand::QueryWindows => handle_query_windows(
-                registry,
-                workspace_mgr,
-                *focused,
-                compositor_config.gaps,
-                &mut reply_buf,
-            ),
+            ControlCommand::QueryWindows => {
+                let meta = fb_owner.metadata();
+                handle_query_windows(
+                    workspace_mgr,
+                    *focused,
+                    compositor_config.gaps,
+                    meta.width,
+                    meta.height,
+                    &mut reply_buf,
+                )
+            }
             ControlCommand::QueryWorkspaces => {
                 handle_query_workspaces(workspace_mgr, &mut reply_buf)
             }
@@ -1744,8 +1749,26 @@ fn load_compositor_config(path: &str) -> Option<config::CompositorConfig> {
             return None;
         }
     };
-    match config::CompositorConfig::parse(&text) {
-        Ok(cfg) => Some(cfg),
+    match config::CompositorConfig::parse_with_warnings(&text) {
+        Ok((cfg, warnings)) => {
+            for w in &warnings {
+                match w {
+                    config::ConfigWarning::UnknownSection { .. } => {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: compositor.conf: ignoring unknown section\n",
+                        );
+                    }
+                    config::ConfigWarning::UnknownKey { .. } => {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: compositor.conf: ignoring unknown key\n",
+                        );
+                    }
+                }
+            }
+            Some(cfg)
+        }
         Err(_e) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
@@ -1979,6 +2002,7 @@ fn handle_reload(
     if let Some(new_cfg) = load_compositor_config(config::CONFIG_PATH) {
         *compositor_config = new_cfg;
         bind_stack.reload_default(&compositor_config.keybinds.user_chords);
+        bind_stack.set_resize_step_px(compositor_config.keybinds.resize_step_px);
         for i in 0..workspace::NUM_WORKSPACES {
             if let Some(ws) = workspace_mgr.workspace_mut(i) {
                 ws.set_policy(compositor_config.workspaces.defaults[i]);
@@ -1995,30 +2019,28 @@ fn handle_reload(
 }
 
 fn handle_query_windows(
-    registry: &SurfaceRegistry,
     workspace_mgr: &mut workspace::WorkspaceManager,
     focused: Option<SurfaceId>,
     gaps: layout::GapConfig,
+    output_width: u32,
+    output_height: u32,
     reply_buf: &mut [u8],
 ) -> usize {
     use kernel_core::display::control::{ControlEvent, WindowQueryEntry};
     use kernel_core::display::protocol::Rect as ProtoRect;
     // For each workspace that holds a window, run the layout and
-    // collect the per-window rect. Use the framebuffer dimensions
-    // implied by the registry's iter_compose call (the output rect
-    // is the full FB; rather than re-acquiring metadata here, the
-    // compose loop publishes it via the registry's compose plan).
-    // Cheap approximation: 1280x720 if we cannot read the FB here.
-    // The compositor's actual `compose_frame` continues to drive the
-    // authoritative rects; this is for the m3ctl query view.
+    // collect the per-window rect. The output rect comes from the
+    // framebuffer's actual metadata so the query view matches the
+    // compositor's authoritative arrangement on every real display
+    // size (instead of the previous hardcoded 1280x720 placeholder
+    // that disagreed with the rest of the repo's 1280x800 baseline).
     let output = ProtoRect {
         x: 0,
         y: 0,
-        w: 1280,
-        h: 720,
+        w: output_width,
+        h: output_height,
     };
     let mut entries: alloc::vec::Vec<WindowQueryEntry> = alloc::vec::Vec::new();
-    let _ = registry;
     for ws_idx in 0..workspace::NUM_WORKSPACES {
         let Some(ws) = workspace_mgr.workspace(ws_idx) else {
             continue;

@@ -220,6 +220,9 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                         .ok_or(ParseError::MissingArgument("workspace switch requires <n>"))?;
                     let n = parse_u8(n_str)
                         .ok_or(ParseError::BadArgument("workspace switch: n must be 1..=9"))?;
+                    if !(1..=9).contains(&n) {
+                        return Err(ParseError::BadArgument("workspace switch: n must be 1..=9"));
+                    }
                     Ok(ParsedVerb::Display(ControlCommand::SwitchWorkspace { n }))
                 }
                 _ => Err(ParseError::BadArgument(
@@ -234,6 +237,11 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
             let n = parse_u8(n_str).ok_or(ParseError::BadArgument(
                 "move-to-workspace: n must be 1..=9",
             ))?;
+            if !(1..=9).contains(&n) {
+                return Err(ParseError::BadArgument(
+                    "move-to-workspace: n must be 1..=9",
+                ));
+            }
             let follow = if args.iter().any(|a| *a == "--follow") {
                 1
             } else {
