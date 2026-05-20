@@ -10335,16 +10335,26 @@ fn populate_ext2_files(
         String::new()
     };
 
-    // Phase 71 follow-up — optional `/etc/greeter/background.{png,bmp}`
-    // staging. The greeter's `DEFAULT_BACKGROUND_PATHS` tries PNG first
-    // then BMP, so we honour the same preference at stage time.
+    // Phase 71 follow-up — `/etc/greeter/background.{png,bmp}` staging.
+    // The greeter's `DEFAULT_BACKGROUND_PATHS`
+    // (`userspace/greeter/src/config.rs`) tries PNG first then BMP, so
+    // we honour the same preference at stage time.
     //
-    // Asset paths under `xtask/assets/greeter/` are gitignored because
-    // the background is a user-personal wallpaper, not a shared
-    // canonical asset like the Nerd Font. If the developer never drops
-    // a file in, we silently skip — the greeter degrades gracefully to
-    // its `DEFAULT_BACKGROUND_COLOR`. No SHA-256 gate (user assets
-    // change too often).
+    // Asset policy under `xtask/assets/greeter/`:
+    // - `background.png` is committed — a small shared boot artifact
+    //   so fresh clones and CI all get the same login screen.
+    // - `background.bmp` is gitignored — developers can drop a local
+    //   BMP without polluting the repo, but it is *not* an automatic
+    //   visual override: if `background.png` is present, both stage
+    //   and the greeter decodes the PNG first. To actually swap the
+    //   rendered image, either replace the committed PNG, remove it
+    //   locally before staging, or point `background=/path` in
+    //   `/etc/greeter.conf` at the file you want decoded.
+    // - If neither file exists we silently skip and the greeter
+    //   degrades to `DEFAULT_BACKGROUND_COLOR`.
+    //
+    // No SHA-256 gate: the committed PNG version is enforced by git,
+    // and BMP is a free-form local override.
     let greeter_assets_root = workspace_root().join("xtask/assets/greeter");
     let greeter_bg_png = greeter_assets_root.join("background.png");
     let greeter_bg_bmp = greeter_assets_root.join("background.bmp");
