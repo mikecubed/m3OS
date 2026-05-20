@@ -422,6 +422,12 @@ where
             .zip(local_damages.iter())
             .zip(snapshots.iter())
         {
+            // Phase 72b Track K.3 follow-up — when a Toplevel surface
+            // is letterboxed inside its tile, clip the blit to the
+            // tile rect so a surface buffer larger than the tile does
+            // not visually extend past the tile boundary. Other layers
+            // (Layer / Background / Cursor) keep their None.
+            let clip_rect = surface_tile_clip(entry, arrangement);
             compose.push(ComposeSurface {
                 id: entry.id,
                 layer: entry.layer,
@@ -429,6 +435,7 @@ where
                 damage: &dmg[..],
                 pixels: snapshot.as_slice(),
                 opaque: entry.is_opaque(),
+                clip_rect,
             });
         }
 
@@ -501,6 +508,7 @@ where
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
     for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
+        let clip_rect = surface_tile_clip(entry, arrangement);
         compose.push(ComposeSurface {
             id: entry.id,
             layer: entry.layer,
@@ -508,6 +516,7 @@ where
             damage: &dmg[..],
             pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
+            clip_rect,
         });
     }
 
@@ -611,6 +620,27 @@ where
 /// where the surface is larger than its tile (it spills out and
 /// gets clipped at the output edge — the documented deferral for
 /// DOOM in the Phase 72 spec).
+/// Phase 72b Track K.3 follow-up — per-surface clip rect for tiled
+/// `Toplevel` surfaces. Returns `Some(tile_rect)` when the surface is
+/// tiled and its buffer extends past the tile boundary; the composer
+/// passes this through to `compose_frame` which intersects every blit
+/// damage rect with it. `None` for non-Toplevel layers and for the
+/// Phase 56 floating-layout fallback (empty arrangement) so existing
+/// behaviour is preserved exactly when there's no tile to clip to.
+fn surface_tile_clip(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+) -> Option<Rect> {
+    if !matches!(
+        entry.layer,
+        kernel_core::display::compose::ComposeLayer::Toplevel
+    ) {
+        return None;
+    }
+    let (_, tile) = arrangement.iter().find(|(id, _)| *id == entry.id)?;
+    Some(*tile)
+}
+
 fn surface_screen_rect(
     entry: &crate::surface::ComposeEntry<'_>,
     arrangement: &[(SurfaceId, Rect)],

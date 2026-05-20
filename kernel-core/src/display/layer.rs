@@ -710,6 +710,7 @@ mod tests {
                 damage: &layer_top_damage,
                 pixels: &layer_top_pixels,
                 opaque: false,
+                clip_rect: None,
             },
             ComposeSurface {
                 id: SurfaceId(3),
@@ -718,6 +719,7 @@ mod tests {
                 damage: &toplevel_damage,
                 pixels: &toplevel_pixels,
                 opaque: true,
+                clip_rect: None,
             },
             ComposeSurface {
                 id: SurfaceId(1),
@@ -726,6 +728,7 @@ mod tests {
                 damage: &bg_damage,
                 pixels: &bg_pixels,
                 opaque: false,
+                clip_rect: None,
             },
         ];
 

@@ -64,6 +64,15 @@ pub struct ComposeSurface<'a> {
     pub pixels: &'a [u8],
     /// Whether the surface is fully opaque. Used for occlusion culling.
     pub opaque: bool,
+    /// Phase 72b Track K.3 follow-up — optional per-surface clip rect
+    /// in output coordinates. When set, every translated damage rect
+    /// is intersected with this clip rect before the blit. Used by
+    /// tiling policies to prevent a too-large client surface from
+    /// spilling past its assigned tile while still letterbox-centred
+    /// inside it. `None` disables per-surface clipping (the historic
+    /// Phase 56 behaviour, where only the global `output` rect bounds
+    /// the blit).
+    pub clip_rect: Option<Rect>,
 }
 
 /// Errors produced by [`compose_frame`].
@@ -274,6 +283,18 @@ pub fn compose_frame<O: FramebufferOwner>(
                 Some(r) => r,
                 None => continue,
             };
+            // Phase 72b Track K.3 follow-up — per-surface clip rect.
+            // When the tiling policy assigned a tile rect smaller than
+            // the client's surface buffer, this further intersects the
+            // blit with the tile rect so the surface stays inside its
+            // tile boundary even though the buffer itself is larger.
+            let clipped = match surface.clip_rect {
+                Some(clip) => match rect_intersect(clipped, clip) {
+                    Some(r) => r,
+                    None => continue,
+                },
+                None => clipped,
+            };
             if rect_fully_occluded(clipped, &occluders) {
                 continue;
             }
@@ -341,6 +362,7 @@ mod tests {
             damage,
             pixels,
             opaque,
+            clip_rect: None,
         }
     }
 
@@ -687,6 +709,7 @@ mod tests {
                         damage: dmg.as_slice(),
                         pixels: pixels[i].as_slice(),
                         opaque: *opaque,
+                        clip_rect: None,
                     }
                 })
                 .collect();
