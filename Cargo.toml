@@ -130,6 +130,12 @@ members = [
     # real kernel-level concurrency rather than relying on the in-tree
     # shell's missing `&` / `wait` job-control surface.
     "userspace/doom-concurrent",
+    # Phase 71 — GUI login manager. `display_server` client that
+    # authenticates against /etc/passwd + /etc/shadow (Phase 27) and,
+    # on success, `setgid`s + `setuid`s + `execve`s `/bin/term`
+    # in-process so term inherits the authenticated UID/GID without a
+    # fork/pipe handoff through `session_manager`.
+    "userspace/greeter",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

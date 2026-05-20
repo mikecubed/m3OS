@@ -23,6 +23,7 @@ pub fn init_service_name(step_name: &str) -> &'static str {
         "kbd_server" => "kbd",
         "mouse_server" => "mouse_server",
         "audio_server" => "audio_server",
+        "greeter" => "greeter",
         "term" => "term",
         _ => "",
     }
@@ -276,6 +277,7 @@ mod tests {
         assert_eq!(init_service_name("kbd_server"), "kbd");
         assert_eq!(init_service_name("mouse_server"), "mouse_server");
         assert_eq!(init_service_name("audio_server"), "audio_server");
+        assert_eq!(init_service_name("greeter"), "greeter");
         assert_eq!(init_service_name("term"), "term");
         assert_eq!(init_service_name("nonexistent"), "");
     }

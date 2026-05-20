@@ -306,6 +306,15 @@ static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 // Not a daemon: no `.conf`.
 static DOOM_CONCURRENT_ELF: &[u8] = generated_initrd_asset!("doom-concurrent");
 
+// Phase 71 — `greeter` GUI login manager. Display-server client that
+// authenticates against /etc/passwd + /etc/shadow, then in-process
+// `setuid` + `execve(/bin/term)` so term inherits the authenticated
+// UID/GID. Exposed under /bin so init can spawn it directly from the
+// `/etc/services.d/greeter.conf` manifest (graphical-only boots only);
+// `session_manager` observes readiness via the IPC registry rather
+// than parenting the process.
+static GREETER_ELF: &[u8] = generated_initrd_asset!("greeter");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -802,6 +811,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "grab-hook-smoke",
         RamdiskNode::File {
             content: GRAB_HOOK_SMOKE_ELF,
+        },
+    ),
+    // Phase 71 — `greeter` GUI login manager. Spawned by `init` via
+    // `/etc/services.d/greeter.conf` in graphical-only boots (marker
+    // `/etc/m3os-graphical-only` present); `session_manager` only
+    // observes readiness via the IPC registry and is not greeter's
+    // parent. On successful authentication greeter `setuid`s to the
+    // authenticated user and `execve`s `/bin/term` in-process.
+    (
+        "greeter",
+        RamdiskNode::File {
+            content: GREETER_ELF,
         },
     ),
 ];

@@ -77,6 +77,12 @@ pub const DECLARED_SESSION_STEP_NAMES: &[&str] = &[
     "kbd_server",
     "mouse_server",
     "audio_server",
+    // Phase 71 — greeter sits between the input/output stack coming
+    // up and term being available. session_manager waits for greeter
+    // to register before declaring the boot sequence "logging in";
+    // term registers only after greeter authenticates successfully
+    // and `execve`s into it (same PID, new binary).
+    "greeter",
     "term",
 ];
 

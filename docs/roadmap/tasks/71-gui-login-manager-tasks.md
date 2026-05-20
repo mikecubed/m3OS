@@ -1,6 +1,6 @@
 # Phase 71 — GUI Login Manager: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-71
 **Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Security Foundation / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
 **Goal:** Replace the autologin-as-root session entry path with a graphical greeter that authenticates against the Phase 27 / Phase 48 password store, renders a configurable background image, and propagates the authenticated UID to a per-user `term` session; retain autologin on serial-only (headless) boots.
@@ -9,15 +9,15 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `userspace/greeter/` crate scaffold: workspace, xtask bins, surface creation, solid-color background | None | Planned |
-| B | Background image: PNG + BMP decoder, scale-to-fit blitter | A | Planned |
-| C | Input handling: username (echoed) + password (silent) field input loop | A | Planned |
-| D | Authentication loop: `passwd_lib::verify`, 3-failure / 5 s backoff, session descriptor stdout | C | Planned |
-| E | Configuration: `/etc/greeter.conf` parser, built-in defaults | A | Planned |
-| F | `session_manager` integration: greeter spawn, stdout capture, UID propagation, `term` exec | D | Planned |
-| G | Init manifest update: headless autologin preserved; graphical path routes to greeter | F | Planned |
-| H | Documentation: Phase 27, 48, 57 cross-refs; `phase-57-session-entry.md` update | F, G | Planned |
-| I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.71.0 | H | Planned |
+| A | `userspace/greeter/` crate scaffold: workspace, xtask bins, surface creation, solid-color background | None | Complete |
+| B | Background image: PNG + BMP decoder, scale-to-fit blitter | A | Complete |
+| C | Input handling: username (echoed) + password (silent) field input loop | A | Complete |
+| D | Authentication loop: `passwd_lib::verify`, 3-failure / 5 s backoff, session descriptor stdout | C | Complete |
+| E | Configuration: `/etc/greeter.conf` parser, built-in defaults | A | Complete |
+| F | `session_manager` integration: greeter spawn, stdout capture, UID propagation, `term` exec | D | Complete |
+| G | Init manifest update: headless autologin preserved; graphical path routes to greeter | F | Complete |
+| H | Documentation: Phase 27, 48, 57 cross-refs; `phase-57-session-entry.md` update | F, G | Complete |
+| I | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.71.0 | H | Complete |
 
 ---
 
@@ -35,11 +35,11 @@
 **Why it matters:** The greeter must be built by the xtask pipeline and embedded in the initrd before it can run.
 
 **Acceptance:**
-- [ ] `userspace/greeter/` is a `no_std` Rust crate with `syscall-lib` (alloc feature) and `kernel-core` dependencies.
-- [ ] `Cargo.toml` workspace `members` includes `userspace/greeter`.
-- [ ] xtask `bins` array includes `{ name: "greeter", needs_alloc: true }`.
-- [ ] `kernel/src/fs/ramdisk.rs` includes a `BIN_ENTRIES` entry for `greeter`.
-- [ ] `cargo xtask check` passes after the scaffold.
+- [x] `userspace/greeter/` is a `no_std` Rust crate with `syscall-lib` (alloc feature) and `kernel-core` dependencies.
+- [x] `Cargo.toml` workspace `members` includes `userspace/greeter`.
+- [x] xtask `bins` array includes `{ name: "greeter", needs_alloc: true }`.
+- [x] `kernel/src/fs/ramdisk.rs` includes a `BIN_ENTRIES` entry for `greeter`.
+- [x] `cargo xtask check` passes after the scaffold.
 
 ### A.2 — Surface creation and solid-color background
 
@@ -48,11 +48,11 @@
 **Why it matters:** Establishes the Phase 56 surface-buffer protocol connection before any image decode or input handling is added.
 
 **Acceptance:**
-- [ ] Greeter connects to the display-server socket via the Phase 56 service-lookup path.
-- [ ] Sends `SurfaceCreate { role: Toplevel, title: "m3OS Login" }` and stores the surface id.
-- [ ] Sends `BufferCreate { width: display_w, height: display_h, format: BGRA8888 }`.
-- [ ] Fills the buffer with a solid dark color and sends `Commit` + `DamageBuffer`.
-- [ ] Greeter process is visible as a full-output window in the compositor.
+- [x] Greeter connects to the display-server socket via the Phase 56 service-lookup path.
+- [x] Sends `SurfaceCreate { role: Toplevel, title: "m3OS Login" }` and stores the surface id.
+- [x] Sends `BufferCreate { width: display_w, height: display_h, format: BGRA8888 }`.
+- [x] Fills the buffer with a solid dark color and sends `Commit` + `DamageBuffer`.
+- [x] Greeter process is visible as a full-output window in the compositor.
 
 ---
 
@@ -65,10 +65,10 @@
 **Why it matters:** BMP is the simpler format and the most likely fallback; implementing it first gives a working image path before PNG decoding is complete.
 
 **Acceptance:**
-- [ ] `decode_bmp(data: &[u8]) -> Result<(u32, u32, Vec<u32>), ImageError>` decodes BITMAPINFOHEADER BMPs with 24-bit (RGB) and 32-bit (BGRA) color depth.
-- [ ] No external crate dependency; pure Rust, `no_std` compatible.
-- [ ] Unit tests cover: a 4×4 24-bit BMP, a 4×4 32-bit BMP, and a truncated BMP that returns `ImageError::Truncated`.
-- [ ] Output pixel format is BGRA8888 (matches surface buffer).
+- [x] `decode_bmp(data: &[u8]) -> Result<(u32, u32, Vec<u32>), ImageError>` decodes BITMAPINFOHEADER BMPs with 24-bit (RGB) and 32-bit (BGRA) color depth.
+- [x] No external crate dependency; pure Rust, `no_std` compatible.
+- [x] Unit tests cover: a 4×4 24-bit BMP, a 4×4 32-bit BMP, and a truncated BMP that returns `ImageError::Truncated`.
+- [x] Output pixel format is BGRA8888 (matches surface buffer).
 
 ### B.2 — PNG decoder integration
 
@@ -77,10 +77,10 @@
 **Why it matters:** PNG is the primary background image format; the user has a background image in PNG they wish to use.
 
 **Acceptance:**
-- [ ] `decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u32>), ImageError>` decodes baseline PNG (RGBA8 and RGB8 color types; deflate compression).
-- [ ] Uses a vendored minimal PNG library (e.g., `upng` or a purpose-built decoder) rather than `libpng` FFI, to stay `no_std`.
-- [ ] Output pixel format is BGRA8888.
-- [ ] A known-good 32×32 PNG test vector is embedded in the unit tests as `include_bytes!`.
+- [x] `decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u32>), ImageError>` decodes baseline PNG (RGBA8 and RGB8 color types; deflate compression).
+- [x] Uses a vendored minimal PNG library (e.g., `upng` or a purpose-built decoder) rather than `libpng` FFI, to stay `no_std`.
+- [x] Output pixel format is BGRA8888.
+- [x] A known-good 32×32 PNG test vector is embedded in the unit tests as `include_bytes!`.
 
 ### B.3 — Scale-to-fit blitter
 
@@ -89,9 +89,9 @@
 **Why it matters:** The background image may not match the display resolution; scale-to-fit with letterboxing ensures the image is always fully visible without stretching.
 
 **Acceptance:**
-- [ ] `blit_scale_to_fit(src: &[u32], src_w: u32, src_h: u32, dst: &mut [u32], dst_w: u32, dst_h: u32)` scales the source image uniformly (preserving aspect ratio) and centers it in the destination buffer with black letterbox bars.
-- [ ] Scaling uses nearest-neighbor interpolation (sufficient for a login background).
-- [ ] Unit test: 320×200 image → 1024×768 buffer; verify letterbox region is zero-filled and scaled image occupies the correct centered rect.
+- [x] `blit_scale_to_fit(src: &[u32], src_w: u32, src_h: u32, dst: &mut [u32], dst_w: u32, dst_h: u32)` scales the source image uniformly (preserving aspect ratio) and centers it in the destination buffer with black letterbox bars.
+- [x] Scaling uses nearest-neighbor interpolation (sufficient for a login background).
+- [x] Unit test: 320×200 image → 1024×768 buffer; verify letterbox region is zero-filled and scaled image occupies the correct centered rect.
 
 ### B.4 — Load and render background from `/etc/greeter/background.{png,bmp}`
 
@@ -100,10 +100,10 @@
 **Why it matters:** Connects the image decoder and blitter to the surface buffer in the greeter's init path.
 
 **Acceptance:**
-- [ ] `load_background` tries `/etc/greeter/background.png` first, then `/etc/greeter/background.bmp`.
-- [ ] If neither file is found, fills with a solid dark background (no error, just a fallback).
-- [ ] On decode error, falls back to solid background and emits a `log::warn!` naming the file and error.
-- [ ] Decoded image is blitted into the surface buffer via `blit_scale_to_fit` before the first `Commit`.
+- [x] `load_background` tries `/etc/greeter/background.png` first, then `/etc/greeter/background.bmp`.
+- [x] If neither file is found, fills with a solid dark background (no error, just a fallback).
+- [x] On decode error, falls back to solid background and emits a `log::warn!` naming the file and error.
+- [x] Decoded image is blitted into the surface buffer via `blit_scale_to_fit` before the first `Commit`.
 
 ---
 
@@ -116,10 +116,10 @@
 **Why it matters:** The greeter must collect typed username and password from the Phase 56 key-event stream, not from a PTY, because there is no shell running yet.
 
 **Acceptance:**
-- [ ] `read_field(surface_endpoint, echo: bool) -> String` blocks on `SurfaceInputEvent::Key` messages; appends printable characters to the input buffer; Backspace removes the last character; Enter returns the buffer.
-- [ ] When `echo = true`, typed characters are rendered in the active text field on screen.
-- [ ] When `echo = false` (password), nothing is rendered for typed characters (no stars, no indicators).
-- [ ] Ctrl-C aborts the current field and restarts the auth loop from the username prompt.
+- [x] `read_field(surface_endpoint, echo: bool) -> String` blocks on `SurfaceInputEvent::Key` messages; appends printable characters to the input buffer; Backspace removes the last character; Enter returns the buffer.
+- [x] When `echo = true`, typed characters are rendered in the active text field on screen.
+- [x] When `echo = false` (password), nothing is rendered for typed characters (no stars, no indicators).
+- [x] Ctrl-C aborts the current field and restarts the auth loop from the username prompt.
 
 ### C.2 — On-screen field rendering
 
@@ -128,11 +128,11 @@
 **Why it matters:** The user must see where they are in the login flow (username vs. password field, welcome text, error messages).
 
 **Acceptance:**
-- [ ] Renders a centered panel over the background with: welcome text (from config), a "Username:" label and echoed input, a "Password:" label (no echo), and an optional error message line.
-- [ ] Uses the Phase 57 / `kernel-core` bitmap font for glyph rendering.
-- [ ] Active field is highlighted with the configured `accent-color`.
-- [ ] Error message (wrong password, backoff countdown) is rendered in a distinct color.
-- [ ] Surface `Commit` + `DamageBuffer` is called after each keystroke that changes the visual state.
+- [x] Renders a centered panel over the background with: welcome text (from config), a "Username:" label and echoed input, a "Password:" label (no echo), and an optional error message line.
+- [x] Uses the Phase 57 / `kernel-core` bitmap font for glyph rendering.
+- [x] Active field is highlighted with the configured `accent-color`.
+- [x] Error message (wrong password, backoff countdown) is rendered in a distinct color.
+- [x] Surface `Commit` + `DamageBuffer` is called after each keystroke that changes the visual state.
 
 ---
 
@@ -145,10 +145,10 @@
 **Why it matters:** The entire purpose of the greeter is to gate session entry on successful authentication; this is the call site.
 
 **Acceptance:**
-- [ ] `attempt_login(username: &str, password: &str) -> Result<SessionDescriptor, AuthError>` calls `passwd_lib::verify(username, password)`.
-- [ ] On success, returns `SessionDescriptor { uid, gid, home, shell }` populated from `passwd_lib::lookup_uid(username)`.
-- [ ] On failure, returns `AuthError::BadPassword`.
-- [ ] No plaintext password stored or logged at any point.
+- [x] `attempt_login(username: &str, password: &str) -> Result<SessionDescriptor, AuthError>` calls `passwd_lib::verify(username, password)`.
+- [x] On success, returns `SessionDescriptor { uid, gid, home, shell }` populated from `passwd_lib::lookup_uid(username)`.
+- [x] On failure, returns `AuthError::BadPassword`.
+- [x] No plaintext password stored or logged at any point.
 
 ### D.2 — 3-failure / 5 s backoff (Phase 48 trust-floor)
 
@@ -157,21 +157,22 @@
 **Why it matters:** Without a backoff, brute-force guessing is trivially feasible from the login screen.
 
 **Acceptance:**
-- [ ] Failure counter resets to 0 on each successful login (if the greeter is reused for fast-user-switch in a later phase).
-- [ ] After 3 consecutive failures, the greeter renders "Too many attempts. Waiting 5 seconds..." and sleeps 5 s via `sys_nanosleep` before re-prompting.
-- [ ] Backoff counter resets after each successful login or after the greeter restarts.
-- [ ] Unit test: `auth_loop` with a mock `verify` that always fails returns backoff error after 3 calls.
+- [x] Failure counter resets to 0 on each successful login (if the greeter is reused for fast-user-switch in a later phase).
+- [x] After 3 consecutive failures, the greeter renders "Too many attempts. Waiting 5 seconds..." and sleeps 5 s via `sys_nanosleep` before re-prompting.
+- [x] Backoff counter resets after each successful login or after the greeter restarts.
+- [x] Unit test: `auth_loop` with a mock `verify` that always fails returns backoff error after 3 calls.
 
-### D.3 — Session descriptor stdout and exit 0
+### D.3 — Session descriptor codec and in-process handoff
 
-**File:** `userspace/greeter/src/main.rs`
-**Symbol:** `emit_session_descriptor`
-**Why it matters:** `session_manager` reads this line to learn which UID to use when spawning `term`; the format must be machine-parseable.
+**File:** `userspace/greeter/src/main.rs`, `userspace/greeter/src/session_desc.rs`
+**Symbol:** `emit_session_descriptor`, in-process `setuid` + `execve("/bin/term")`
+**Why it matters:** The shipped implementation does not hand off via a stdout descriptor + child fork; instead, the authenticated greeter process `setuid`s + `setgid`s and `execve`s `/bin/term` directly, so term inherits the UID/GID without session_manager needing to fork+pipe-parse. The session-descriptor codec remains as a host-tested encoder for any future out-of-process consumer.
 
 **Acceptance:**
-- [ ] On successful auth, greeter writes exactly one line to stdout: `uid=<N> gid=<N> home=<path> shell=<path>\n`.
-- [ ] Greeter then calls `exit(0)`.
-- [ ] Unit test: `emit_session_descriptor` with a known `SessionDescriptor` produces the expected line.
+- [x] On successful auth, greeter encodes a session descriptor via `session_desc::encode` and (for diagnostics) writes it to its log channel: `uid=<N> gid=<N> home=<path> shell=<path>\n`.
+- [x] Greeter then calls `sys_setgid(gid)` and `sys_setuid(uid)`, and on success `execve`s `/bin/term` in-process — there is no `exit(0)` on the success path because the address space becomes `term`.
+- [x] On setuid/execve failure the greeter exits non-zero so init's `restart=on-failure max_restart=3` policy respawns it.
+- [x] Unit test: `session_desc::encode` with a known `SessionDescriptor` produces the expected line.
 
 ---
 
@@ -184,11 +185,11 @@
 **Why it matters:** Allows the user to set a background image path and color scheme without recompiling the greeter.
 
 **Acceptance:**
-- [ ] `load_config() -> GreeterConfig` reads `/etc/greeter.conf` if present; missing file returns built-in defaults silently.
-- [ ] Parses `key=value` lines; ignores blank lines and lines starting with `#`.
-- [ ] Recognized keys: `background`, `prompt-color`, `accent-color`, `welcome`.
-- [ ] Unrecognized keys emit `log::warn!` and are ignored.
-- [ ] Unit test: parse a config string with all four keys; parse a config with an unrecognized key.
+- [x] `load_config() -> GreeterConfig` reads `/etc/greeter.conf` if present; missing file returns built-in defaults silently.
+- [x] Parses `key=value` lines; ignores blank lines and lines starting with `#`.
+- [x] Recognized keys: `background`, `prompt-color`, `accent-color`, `welcome`.
+- [x] Unrecognized keys emit `log::warn!` and are ignored.
+- [x] Unit test: parse a config string with all four keys; parse a config with an unrecognized key.
 
 ### E.2 — Add `greeter.conf` to xtask ext2 and init KNOWN_CONFIGS
 
@@ -200,47 +201,47 @@
 **Why it matters:** Following the pattern from AGENTS.md: service configs must be registered in both the xtask ext2 builder and the init KNOWN_CONFIGS fallback list.
 
 **Acceptance:**
-- [ ] `populate_ext2_files` writes a default `greeter.conf` to `/etc/greeter.conf` on the ext2 disk.
-- [ ] `KNOWN_CONFIGS` in `userspace/init/src/main.rs` includes `"greeter.conf"`.
-- [ ] `cargo xtask clean && cargo xtask run-gui` produces a disk with `/etc/greeter.conf` present.
+- [x] `populate_ext2_files` writes a default `greeter.conf` to `/etc/greeter.conf` on the ext2 disk.
+- [x] `KNOWN_CONFIGS` in `userspace/init/src/main.rs` includes `"greeter.conf"`.
+- [x] `cargo xtask clean && cargo xtask run-gui` produces a disk with `/etc/greeter.conf` present.
 
 ---
 
 ## Track F — `session_manager` Integration
 
-### F.1 — Boot sequence extended to spawn greeter
+### F.1 — Boot sequence extended to wait for greeter
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `run_boot_sequence`
-**Why it matters:** `session_manager` must launch greeter as the last boot step and wait for it to authenticate before spawning `term`.
+**File:** `userspace/session_manager/src/main.rs`
+**Symbol:** `run_boot_sequence`, `InitSupervisorBackend::await_ready`
+**Why it matters:** `session_manager` does not spawn greeter — `init` does, via `/etc/services.d/greeter.conf` — but the session-step sequencer must observe greeter readiness before advancing to `term` so the boot order matches `DECLARED_SESSION_STEP_NAMES`.
 
 **Acceptance:**
-- [ ] Boot sequence: `display_server → kbd_server → mouse_server → audio_server → greeter`.
-- [ ] `greeter` is spawned with a captured stdout pipe.
-- [ ] `session_manager` waits (blocking) on greeter's exit code.
-- [ ] On exit code 0, reads and parses the session descriptor line from the pipe.
+- [x] Session-step order: `display_server → kbd_server → mouse_server → audio_server → greeter → term`.
+- [x] `await_ready("greeter", ...)` polls the IPC service registry (greeter is not session_manager's child, so `sys_waitpid` is not applicable).
+- [x] In default / smoke / regression boots the `/etc/m3os-graphical-only` marker is absent, init skips `greeter.conf`, and `await_ready` short-circuits with `ready: true` while leaving the table entry at `Starting` so the Phase 64 "no `Running` without PID" invariant holds.
+- [x] In graphical-only boots greeter handles the login UI itself; on success it `setgid`s + `setuid`s + `execve`s `/bin/term` in-process, so the subsequent `await_ready("term", ...)` resolves only after a successful login.
 
 ### F.2 — UID/GID propagation and per-user `term` exec
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `spawn_user_session`
-**Why it matters:** Without setuid before exec, `term` and all descendant processes run as root despite the greeter having authenticated a different user.
+**File:** `userspace/greeter/src/main.rs`
+**Symbol:** `program_main` (post-auth `setgid`/`setuid`/`execve` block)
+**Why it matters:** Without setuid before exec, `term` and all descendant processes would run as root despite the greeter having authenticated a different user. The privilege drop happens inside the greeter process so the same PID becomes `term` — no fork, no descriptor pipe, no setuid syscalls in `session_manager`.
 
 **Acceptance:**
-- [ ] After parsing the session descriptor, `session_manager` calls `sys_setuid(uid)` and `sys_setgid(gid)` before exec'ing `term`.
-- [ ] `term` and its child shell process report the correct UID via `id` and `whoami`.
-- [ ] `passwd_lib::lookup_uid` validates that the UID from the session descriptor exists in `/etc/passwd` before setuid is called; mismatch returns an error that escalates to `text-fallback`.
+- [x] On successful authentication greeter calls `sys_setgid(gid)` then `sys_setuid(uid)` then `execve("/bin/term", ...)` in-process.
+- [x] `term` and its child shell process report the correct UID via `id` and `whoami`.
+- [x] `passwd_lib::lookup_uid` validates that the UID from `/etc/passwd` matches the authenticated username before the setuid call; mismatch causes greeter to `exit(7)` and init's `restart=on-failure` policy handles re-spawning.
 
 ### F.3 — Greeter restart policy
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `handle_greeter_exit`
-**Why it matters:** An unexpected greeter crash (non-zero, non-auth exit) must be handled by the existing `restart=on-failure` supervisor policy, not silently ignored.
+**File:** `xtask/src/main.rs` (greeter_conf), `userspace/init/src/main.rs`
+**Symbol:** `greeter_conf`, supervisor restart loop
+**Why it matters:** An unexpected greeter crash (e.g. `exit(7)` on a setuid failure) must be handled by init's existing `restart=on-failure` supervisor policy, not silently ignored. `session_manager` is not greeter's parent and cannot observe its exit code directly.
 
 **Acceptance:**
-- [ ] Exit code 0 → parse descriptor, spawn user session.
-- [ ] Exit code 1 (unexpected failure) → respawn greeter up to 3 times per minute; after 3 failures, escalate to `text-fallback`.
-- [ ] `session_manager` logs the exit code and restart decision on each non-zero exit.
+- [x] `services.d/greeter.conf` declares `restart=on-failure` with `max_restart=3`.
+- [x] init respawns greeter up to 3 times on non-zero exit; after the budget is exhausted, greeter transitions to `PermanentlyStopped` and `session_manager`'s session-step budget escalates to `text-fallback` via the `DISPLAY_CRITICAL_SERVICES` recovery path.
+- [x] init logs the exit code on each respawn decision.
 
 ---
 
@@ -249,14 +250,14 @@
 ### G.1 — Disable autologin-as-root for graphical sessions
 
 **File:** `userspace/init/src/main.rs`
-**Symbol:** `start_autologin` (or equivalent)
+**Symbol:** `graphical_only_enabled`, `skip_for_greeter_filter`
 **Why it matters:** The autologin path must not fire when a display server is running; only headless boots should skip the greeter.
 
 **Acceptance:**
-- [ ] Init checks for `GRAPHICAL_SESSION=1` in the environment (set by `session_manager` when it starts).
-- [ ] If `GRAPHICAL_SESSION=1`, the autologin-as-root path is skipped; a log line notes this.
-- [ ] If `GRAPHICAL_SESSION` is absent (headless boot), autologin-as-root proceeds as before.
-- [ ] A headless `cargo xtask run` (no `run-gui`) still autologins as root on the serial console.
+- [x] Init checks for the `/etc/m3os-graphical-only` marker file via the `graphical_only_enabled()` predicate (PID 1's env has no convenient hook for a later daemon to mutate, so the on-disk marker stands in for the original `GRAPHICAL_SESSION=1` proposal; see `docs/71-gui-login-manager.md` for the rationale).
+- [x] If the marker is present, the autologin-as-root path is skipped, `term.conf` is filtered out via `skip_for_greeter_filter`, and a log line notes the graphical-only mode.
+- [x] If the marker is absent (default / headless boot), `greeter.conf` is filtered out and autologin-as-root proceeds as before.
+- [x] A headless `cargo xtask run` (no `run-gui`, no marker) still autologins as root on the serial console.
 
 ---
 
@@ -274,10 +275,10 @@
 **Why it matters:** Each of these docs has a section or paragraph that implies root autologin is the current graphical session entry path; they must be updated to reflect Phase 71.
 
 **Acceptance:**
-- [ ] Phase 27 doc notes that `passwd_lib::verify` and `passwd_lib::lookup_uid` are consumed by the Phase 71 greeter.
-- [ ] `docs/roadmap/48-security-foundation.md` notes that the trust-floor 3-failure/5 s backoff is implemented in `userspace/greeter/src/auth.rs`.
-- [ ] Phase 57 doc notes that the autologin-as-root path was superseded by the Phase 71 greeter for graphical sessions; headless autologin is documented as preserved.
-- [ ] `docs/appendix/phase-57-session-entry.md` updated with the new boot sequence and greeter → session_manager → user-term handoff.
+- [x] Phase 27 doc notes that `passwd_lib::verify` and `passwd_lib::lookup_uid` are consumed by the Phase 71 greeter.
+- [x] `docs/roadmap/48-security-foundation.md` notes that the trust-floor 3-failure/5 s backoff is implemented in `userspace/greeter/src/auth.rs`.
+- [x] Phase 57 doc notes that the autologin-as-root path was superseded by the Phase 71 greeter for graphical sessions; headless autologin is documented as preserved.
+- [x] `docs/appendix/phase-57-session-entry.md` updated with the new boot sequence and greeter → session_manager → user-term handoff.
 
 ---
 
@@ -290,12 +291,12 @@
 **Why it matters:** Learners need a document explaining how the graphical login manager works, why it is a compositor client rather than a kernel service, and how UID propagation connects the greeter's auth decision to the user's `term` session.
 
 **Acceptance:**
-- [ ] `docs/71-gui-login-manager.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 71`, `**Status:** Planned`, `**Source Ref:** phase-71`, `**Supersedes Legacy Doc:** new`)
-- [ ] Overview explains in learner-friendly terms why the graphical login manager replaces autologin-as-root and how it fits into the Phase 57 boot sequence
-- [ ] "What This Doc Covers" list enumerates the greeter binary, background image decoding, auth loop with backoff, session descriptor protocol, UID propagation via setuid, and headless autologin preservation
-- [ ] "Core Implementation" prose walks through the greeter → session descriptor → session_manager → `term` handoff in plain language, including the trust-floor backoff
-- [ ] "Key Files" table cites `userspace/greeter/src/main.rs`, `userspace/greeter/src/auth.rs`, `userspace/greeter/src/image.rs`, `userspace/greeter/src/input.rs`, `userspace/session_manager/src/boot.rs`, and `kernel-core/src/passwd/mod.rs`
-- [ ] "Related Roadmap Docs" links both `docs/roadmap/71-gui-login-manager.md` and `docs/roadmap/tasks/71-gui-login-manager-tasks.md`
+- [x] `docs/71-gui-login-manager.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 71`, `**Status:** Planned`, `**Source Ref:** phase-71`, `**Supersedes Legacy Doc:** new`)
+- [x] Overview explains in learner-friendly terms why the graphical login manager replaces autologin-as-root and how it fits into the Phase 57 boot sequence
+- [x] "What This Doc Covers" list enumerates the greeter binary, background image decoding, auth loop with backoff, session descriptor protocol, UID propagation via setuid, and headless autologin preservation
+- [x] "Core Implementation" prose walks through the greeter → session descriptor → session_manager → `term` handoff in plain language, including the trust-floor backoff
+- [x] "Key Files" table cites `userspace/greeter/src/main.rs`, `userspace/greeter/src/auth.rs`, `userspace/greeter/src/image.rs`, `userspace/greeter/src/input.rs`, `userspace/session_manager/src/boot.rs`, and `kernel-core/src/passwd/mod.rs`
+- [x] "Related Roadmap Docs" links both `docs/roadmap/71-gui-login-manager.md` and `docs/roadmap/tasks/71-gui-login-manager-tasks.md`
 
 ### I.2 — Bump kernel version to 0.71.0
 
@@ -309,12 +310,12 @@
 **Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. Phase 70 shipped `v0.70.0`; Phase 71 lifts it to `v0.71.0` so the version cursor in `AGENTS.md` and the roadmap stay accurate.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.71.0"` (previously `0.70.0`)
-- [ ] `Cargo.lock` regenerated to reflect the new version
-- [ ] `AGENTS.md` "Kernel v0.70.0" reference updated to "Kernel v0.71.0"
-- [ ] `docs/roadmap/README.md` row for Phase 71 updated to reflect Completed status at ship
-- [ ] `cargo xtask check` passes after the version bump
-- [ ] Git tag `v0.71.0` recommended at phase merge
+- [x] `kernel/Cargo.toml` `version = "0.71.0"` (previously `0.70.0`)
+- [x] `Cargo.lock` regenerated to reflect the new version
+- [x] `AGENTS.md` "Kernel v0.70.0" reference updated to "Kernel v0.71.0"
+- [x] `docs/roadmap/README.md` row for Phase 71 updated to reflect Completed status at ship
+- [x] `cargo xtask check` passes after the version bump
+- [x] Git tag `v0.71.0` recommended at phase merge
 
 ---
 

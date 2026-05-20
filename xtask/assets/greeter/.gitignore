@@ -1,0 +1,20 @@
+# Phase 71 follow-up — greeter background asset policy.
+#
+# `background.png` IS committed at this directory — a shared boot
+# artifact so fresh clones and CI runs all paint the same login
+# screen. To change the rendered background you have three real
+# options (the greeter prefers PNG first, so simply adding a BMP
+# alongside the committed PNG will not take effect on its own):
+#
+# 1. Replace `background.png` in this directory and commit the new
+#    image (the durable shared-asset path).
+# 2. Locally remove or rename `background.png` and drop a BMP here.
+#    `populate_ext2_files` will stage the BMP and the greeter will
+#    decode it via the `.bmp` fallback in `DEFAULT_BACKGROUND_PATHS`.
+# 3. Point `background=/your/path` in `/etc/greeter.conf` at any
+#    image already on the data disk; the config-driven path wins
+#    over both file-name conventions.
+#
+# Only `background.bmp` is ignored so option (2) above stays a
+# zero-touch local override without polluting the repo.
+background.bmp

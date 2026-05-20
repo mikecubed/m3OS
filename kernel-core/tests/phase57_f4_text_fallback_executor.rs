@@ -122,20 +122,21 @@ fn stops_every_declared_service_in_reverse_order() {
     let mut restorer = RecordingRestorer::default();
     let outcome = execute_text_fallback_rollback(&mut backend, &mut restorer);
 
-    // The declared order is display → kbd → mouse → audio → term;
-    // rollback runs in reverse, so we expect term, audio, mouse, kbd,
-    // display.
+    // The declared order is display → kbd → mouse → audio → greeter
+    // → term (Phase 71 inserted greeter); rollback runs in reverse, so
+    // we expect term, greeter, audio, mouse, kbd, display.
     assert_eq!(
         backend.stop_calls,
         vec![
             "term".to_string(),
+            "greeter".to_string(),
             "audio_server".to_string(),
             "mouse_server".to_string(),
             "kbd_server".to_string(),
             "display_server".to_string(),
         ]
     );
-    assert_eq!(outcome.stops_attempted, 5);
+    assert_eq!(outcome.stops_attempted, 6);
     assert!(outcome.restorer_ok);
 }
 
@@ -162,6 +163,7 @@ fn rollback_completes_even_when_every_stop_errors() {
         backend.stop_attempts,
         vec![
             "term".to_string(),
+            "greeter".to_string(),
             "audio_server".to_string(),
             "mouse_server".to_string(),
             "kbd_server".to_string(),
@@ -170,7 +172,7 @@ fn rollback_completes_even_when_every_stop_errors() {
     );
     // The framebuffer restorer is invoked regardless of stop errors.
     assert!(restorer.invoked);
-    assert_eq!(outcome.stops_attempted, 5);
+    assert_eq!(outcome.stops_attempted, 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +188,7 @@ fn restorer_failure_surfaces_in_outcome() {
     };
     let outcome = execute_text_fallback_rollback(&mut backend, &mut restorer);
     assert!(restorer.invoked);
-    assert_eq!(outcome.stops_attempted, 5);
+    assert_eq!(outcome.stops_attempted, 6);
     assert!(!outcome.restorer_ok);
 }
 

@@ -103,10 +103,10 @@ pub const PER_SVC_RESTARTING: u8 = 0x04;
 pub const PER_SVC_FAILED: u8 = 0x05;
 
 /// Maximum number of per-service entries the [`ControlReply::ServiceStates`]
-/// reply carries. Sized to the declared session-step count
-/// ([`crate::session_supervisor::DECLARED_SESSION_STEP_NAMES`] = 5)
-/// plus a 3-slot buffer for future steps without a wire-incompatible
-/// change. Allocation-free.
+/// reply carries. Sized comfortably above the declared session-step
+/// count ([`crate::session_supervisor::DECLARED_SESSION_STEP_NAMES`] —
+/// 6 in Phase 71 after `greeter` was inserted) so a wire-incompatible
+/// change isn't needed when a track adds one more step. Allocation-free.
 pub const MAX_SERVICE_STATE_ENTRIES: usize = 8;
 
 /// Error codes carried inside a [`ControlReply::Error`].

@@ -47,7 +47,10 @@ pub const STEP_READY_TIMEOUT_MS: u64 = 5_000;
 /// [`declared_session_step_names`]). Hard-coded so the array shape is
 /// known at compile time; the runtime check below asserts the constant
 /// matches the slice.
-pub const SESSION_STEP_COUNT: usize = 5;
+///
+/// Phase 71 bumped this from 5 to 6 when `greeter` was inserted
+/// between `audio_server` and `term`.
+pub const SESSION_STEP_COUNT: usize = 6;
 
 /// One supervised step in the graphical-session boot sequence. Holds
 /// only the service name and a shared mutable borrow of the backend
@@ -145,5 +148,6 @@ pub fn build_session_steps<'b, B: SupervisorBackend>(
         ServiceStep::new(names[2], backend_cell),
         ServiceStep::new(names[3], backend_cell),
         ServiceStep::new(names[4], backend_cell),
+        ServiceStep::new(names[5], backend_cell),
     ]
 }

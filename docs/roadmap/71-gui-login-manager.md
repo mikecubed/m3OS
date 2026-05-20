@@ -1,6 +1,6 @@
 # Phase 71 - GUI Login Manager
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-71
 **Depends on:** Phase 27 (User Accounts) ✅, Phase 48 (Security Foundation / Trust Floor) ✅, Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅
 **Builds on:** Replaces the autologin-as-root path that `session_manager` inherited from Phase 57 with a `display_server`-client greeter that authenticates against the Phase 27 / Phase 48 password store; extends the Phase 57 session boot sequence; extends Phase 56 surface roles for full-output coverage before login; extends Phase 27 `passwd_lib` UID lookup

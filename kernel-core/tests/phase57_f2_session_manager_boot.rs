@@ -35,8 +35,9 @@ use kernel_core::session_supervisor::{SupervisorBackend, SupervisorError, Superv
 
 #[test]
 fn declared_session_steps_match_a4_memo_order() {
-    // The Phase 57 A.4 memo fixes the order:
-    // display_server → kbd_server → mouse_server → audio_server → term.
+    // The Phase 57 A.4 memo fixed the original 5-step order; Phase 71
+    // inserted `greeter` between `audio_server` and `term` so the
+    // graphical session reaches term only after authenticated login.
     let names = kernel_core::session_supervisor::declared_session_step_names();
     assert_eq!(
         names,
@@ -45,6 +46,7 @@ fn declared_session_steps_match_a4_memo_order() {
             "kbd_server",
             "mouse_server",
             "audio_server",
+            "greeter",
             "term",
         ]
     );
@@ -64,6 +66,7 @@ fn happy_path_with_supervisor_backend_reaches_running() {
             "kbd_server",
             "mouse_server",
             "audio_server",
+            "greeter",
             "term",
         ]
     );
@@ -106,10 +109,12 @@ fn missing_term_escalates_after_audio_succeeds() {
     // term was attempted 3 times.
     let term_attempts = backend.start_calls.iter().filter(|n| n == &"term").count();
     assert_eq!(term_attempts, 3);
-    // Rollback covers everything that started successfully.
+    // Rollback covers everything that started successfully (Phase 71
+    // inserts greeter between audio_server and term).
     assert_eq!(
         backend.stop_calls,
         &[
+            "greeter",
             "audio_server",
             "mouse_server",
             "kbd_server",
@@ -200,7 +205,9 @@ fn run_session<B: SupervisorBackend>(backend: &mut B) -> SessionState {
 
     let backend_cell = core::cell::RefCell::new(backend);
     let names = kernel_core::session_supervisor::declared_session_step_names();
-    let mut steps: [ServiceStep<'_, B>; 5] = [
+    // Phase 71 inserted `greeter` between `audio_server` and `term`,
+    // bumping the declared count from 5 to 6.
+    let mut steps: [ServiceStep<'_, B>; 6] = [
         ServiceStep {
             name: names[0],
             backend: &backend_cell,
@@ -221,14 +228,20 @@ fn run_session<B: SupervisorBackend>(backend: &mut B) -> SessionState {
             name: names[4],
             backend: &backend_cell,
         },
+        ServiceStep {
+            name: names[5],
+            backend: &backend_cell,
+        },
     ];
 
     let (s0, rest) = steps.split_at_mut(1);
     let (s1, rest) = rest.split_at_mut(1);
     let (s2, rest) = rest.split_at_mut(1);
-    let (s3, s4) = rest.split_at_mut(1);
-    let mut step_refs: [&mut dyn SessionStep; 5] =
-        [&mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0]];
+    let (s3, rest) = rest.split_at_mut(1);
+    let (s4, s5) = rest.split_at_mut(1);
+    let mut step_refs: [&mut dyn SessionStep; 6] = [
+        &mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0], &mut s5[0],
+    ];
     let mut seq = StartupSequence::new(&mut step_refs);
     seq.run(MAX_RETRIES_PER_STEP).expect("run is total")
 }

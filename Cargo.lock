@@ -844,6 +844,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "greeter"
+version = "0.71.0"
+dependencies = [
+ "kernel-core",
+ "passwd",
+ "syscall-lib",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1023,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.70.0"
+version = "0.71.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
