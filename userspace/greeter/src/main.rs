@@ -214,7 +214,12 @@ fn program_main(_args: &[&str]) -> i32 {
     // Tell `display_server` we're done so it releases the surface +
     // any focus state attached to this client. Best-effort; the
     // server cleans up on disconnect anyway.
-    let _ = send_verb(server_handle, &ClientMessage::Goodbye);
+    let _ = send_verb(
+        server_handle,
+        &ClientMessage::Goodbye {
+            client_token: greeter_client_token(),
+        },
+    );
 
     // Phase 71 F.2 — drop privileges before exec'ing the user shell so
     // `term` and every descendant runs under the authenticated UID/GID.
@@ -304,16 +309,27 @@ fn send_verb(handle: u32, msg: &ClientMessage) -> bool {
 }
 
 #[cfg(not(test))]
+fn greeter_client_token() -> u32 {
+    // Phase 72b Track K.7 — use the greeter PID so the compositor's
+    // Goodbye-scoped teardown can identify this client.
+    let pid = syscall_lib::getpid();
+    if pid > 0 { pid as u32 } else { 0x90b30001 }
+}
+
+#[cfg(not(test))]
 fn send_hello_and_create_surface(handle: u32) -> bool {
+    let token = greeter_client_token();
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         capabilities: 0,
+        client_token: token,
     };
     if !send_verb(handle, &hello) {
         return false;
     }
     let create = ClientMessage::CreateSurface {
         surface_id: SURFACE_ID,
+        client_token: token,
     };
     if !send_verb(handle, &create) {
         return false;
@@ -852,6 +868,15 @@ fn read_field(
                     }
                 }
             }
+            PulledEvent::CloseRequest => {
+                // Phase 72b Track K.6 — SUPER+Q on the login form.
+                // Abort the in-flight credential buffer and re-prompt;
+                // the operator can press SUPER+Q to clear a partially-
+                // typed credential without quitting the greeter.
+                syscall_lib::write_str(STDOUT_FILENO, "greeter: close requested; resetting form\n");
+                buf.clear();
+                dirty = true;
+            }
             PulledEvent::Disconnect => return None,
             PulledEvent::None | PulledEvent::Other => {
                 let _ = syscall_lib::nanosleep_for(0, POLL_IDLE_NS);
@@ -863,6 +888,10 @@ fn read_field(
 #[cfg(not(test))]
 enum PulledEvent {
     Key(KeyEvent),
+    /// Phase 72b Track K.6 — `SUPER+Q` close request from compositor.
+    /// Greeter does not exit (that would lock the user out); instead
+    /// it clears any in-flight credential buffer.
+    CloseRequest,
     Disconnect,
     Other,
     None,
@@ -885,6 +914,7 @@ fn pull_one_event(handle: u32, buf: &mut [u8]) -> PulledEvent {
     }
     match ServerMessage::decode(&buf[..len]) {
         Ok((ServerMessage::Key(ev), _)) => PulledEvent::Key(ev),
+        Ok((ServerMessage::CloseRequest { .. }, _)) => PulledEvent::CloseRequest,
         Ok((ServerMessage::Disconnect { .. }, _)) => PulledEvent::Disconnect,
         Ok(_) => PulledEvent::Other,
         Err(_) => PulledEvent::None,

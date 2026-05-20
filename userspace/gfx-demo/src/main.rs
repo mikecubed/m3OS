@@ -103,10 +103,17 @@ fn program_main(_args: &[&str]) -> i32 {
     // ----- Protocol round-trip -------------------------------------------
     let mut buf = [0u8; ENCODE_BUF_LEN];
 
+    // Phase 72b Track K.7 — client token (PID-derived).
+    let client_token: u32 = {
+        let pid = syscall_lib::getpid();
+        if pid > 0 { pid as u32 } else { 0x6f7a0001 }
+    };
+
     // 1. Hello.
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         capabilities: 0,
+        client_token,
     };
     if !send_message(server_handle, &hello, &mut buf, "Hello") {
         return 1;
@@ -137,6 +144,7 @@ fn program_main(_args: &[&str]) -> i32 {
     // 3. CreateSurface.
     let create = ClientMessage::CreateSurface {
         surface_id: SurfaceId(1),
+        client_token,
     };
     if !send_message(server_handle, &create, &mut buf, "CreateSurface") {
         return 1;

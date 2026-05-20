@@ -24,7 +24,9 @@ pub fn init_service_name(step_name: &str) -> &'static str {
         "mouse_server" => "mouse_server",
         "audio_server" => "audio_server",
         "greeter" => "greeter",
-        "term" => "term",
+        // Phase 72b — `term` is no longer a supervised step. It is a
+        // user-facing app launched via `[autostart]` in default boot
+        // or by `greeter::execve("/bin/term")` after auth.
         _ => "",
     }
 }
@@ -278,7 +280,8 @@ mod tests {
         assert_eq!(init_service_name("mouse_server"), "mouse_server");
         assert_eq!(init_service_name("audio_server"), "audio_server");
         assert_eq!(init_service_name("greeter"), "greeter");
-        assert_eq!(init_service_name("term"), "term");
+        // Phase 72b — `term` is no longer a supervised step.
+        assert_eq!(init_service_name("term"), "");
         assert_eq!(init_service_name("nonexistent"), "");
     }
 

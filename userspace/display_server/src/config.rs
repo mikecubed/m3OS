@@ -39,6 +39,7 @@ pub struct CompositorConfig {
     pub borders: BorderConfig,
     pub keybinds: KeybindConfig,
     pub workspaces: WorkspaceConfig,
+    pub autostart: AutostartConfig,
 }
 
 impl Default for CompositorConfig {
@@ -56,6 +57,7 @@ impl CompositorConfig {
             borders: BorderConfig::defaults(),
             keybinds: KeybindConfig::defaults(),
             workspaces: WorkspaceConfig::defaults(),
+            autostart: AutostartConfig::defaults(),
         }
     }
 
@@ -90,6 +92,7 @@ impl CompositorConfig {
                     "borders" => Section::Borders,
                     "keybinds" => Section::Keybinds,
                     "workspaces" => Section::Workspaces,
+                    "autostart" => Section::Autostart,
                     other => {
                         warnings.push(ConfigWarning::UnknownSection {
                             name: other.to_string(),
@@ -112,6 +115,7 @@ impl CompositorConfig {
                 Section::Borders => apply_border_key(&mut cfg.borders, k, v, lineno + 1),
                 Section::Keybinds => apply_keybind_key(&mut cfg.keybinds, k, v, lineno + 1),
                 Section::Workspaces => apply_workspace_key(&mut cfg.workspaces, k, v, lineno + 1),
+                Section::Autostart => apply_autostart_key(&mut cfg.autostart, k, v, lineno + 1),
             };
             match apply_result {
                 Ok(()) => {}
@@ -132,6 +136,7 @@ enum Section {
     Borders,
     Keybinds,
     Workspaces,
+    Autostart,
     /// An unrecognized section header. Subsequent `key = value` lines
     /// are still syntax-checked but the values are discarded, mirroring
     /// the `UnknownSection` warning at the section header.
@@ -463,6 +468,54 @@ fn apply_workspace_key(
     })
 }
 
+/// Phase 72b — `[autostart]` section. Each `exec = /path/to/binary`
+/// entry is appended in declaration order. After `display_server`
+/// finishes its first compose frame (so newly-mapped surfaces have a
+/// running compositor to attach to), every `entries[i]` is launched
+/// via `fork + execve` exactly once.
+///
+/// Reload via `m3ctl reload` does NOT re-run autostart — it is a
+/// one-shot per compositor lifetime, matching Hyprland's `exec-once`
+/// semantics. Long-running operator-driven respawns belong in init
+/// or session_manager, not the compositor's `[autostart]` slot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutostartConfig {
+    pub entries: Vec<String>,
+}
+
+impl AutostartConfig {
+    pub fn defaults() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+fn apply_autostart_key(
+    cfg: &mut AutostartConfig,
+    key: &str,
+    value: &str,
+    line: usize,
+) -> Result<(), ConfigError> {
+    match key {
+        "exec" => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::BadValue {
+                    key: key.to_string(),
+                    line,
+                });
+            }
+            cfg.entries.push(trimmed.to_string());
+            Ok(())
+        }
+        _ => Err(ConfigError::UnknownKey {
+            key: key.to_string(),
+            line,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +602,37 @@ mod tests {
         assert!(matches!(
             warnings.as_slice(),
             [ConfigWarning::UnknownKey { key, .. }] if key == "future_key"
+        ));
+    }
+
+    #[test]
+    fn autostart_single_exec_parses() {
+        let cfg =
+            CompositorConfig::parse("[autostart]\nexec = /bin/term\n").expect("autostart parses");
+        assert_eq!(cfg.autostart.entries, vec!["/bin/term".to_string()]);
+    }
+
+    #[test]
+    fn autostart_multiple_execs_preserve_order() {
+        let cfg = CompositorConfig::parse(
+            "[autostart]\nexec = /bin/term\nexec = /bin/clock\nexec = /bin/notifier\n",
+        )
+        .expect("multi-exec parses");
+        assert_eq!(
+            cfg.autostart.entries,
+            vec![
+                "/bin/term".to_string(),
+                "/bin/clock".to_string(),
+                "/bin/notifier".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn autostart_empty_exec_is_bad_value() {
+        assert!(matches!(
+            CompositorConfig::parse("[autostart]\nexec = \n"),
+            Err(ConfigError::BadValue { .. })
         ));
     }
 

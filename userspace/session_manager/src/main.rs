@@ -211,11 +211,9 @@ fn run_boot_sequence(backend: &mut init_backend::InitSupervisorBackend) -> Sessi
     let (s0, rest) = steps.split_at_mut(1);
     let (s1, rest) = rest.split_at_mut(1);
     let (s2, rest) = rest.split_at_mut(1);
-    let (s3, rest) = rest.split_at_mut(1);
-    let (s4, s5) = rest.split_at_mut(1);
-    let mut step_refs: [&mut dyn SessionStep; 6] = [
-        &mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0], &mut s5[0],
-    ];
+    let (s3, s4) = rest.split_at_mut(1);
+    let mut step_refs: [&mut dyn SessionStep; 5] =
+        [&mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0]];
     let mut seq = StartupSequence::new(&mut step_refs);
     match seq.run(MAX_RETRIES_PER_STEP) {
         Ok(state) => state,
@@ -301,7 +299,12 @@ mod init_backend {
     /// - `kbd_server::SERVICE_NAME`     = `"kbd"`
     /// - `mouse_server::SERVICE_NAME`   = `"mouse"`
     /// - `audio_server::SERVICE_NAME`   = `"audio.cmd"`
-    /// - `term::SERVICE_NAME`           = `"term"`
+    ///
+    /// Phase 72b — `term` is intentionally absent. `term` is a
+    /// user-facing app, not infrastructure; it does not register an
+    /// IPC service and does not participate in the boot dependency
+    /// graph. The desktop-ready signal is `display_server` (default
+    /// boot) or `greeter` (graphical-only boot).
     fn ipc_service_name(step_name: &str) -> &'static str {
         match step_name {
             "display_server" => "display",
@@ -310,9 +313,8 @@ mod init_backend {
             "audio_server" => "audio.cmd",
             // Phase 71 — greeter registers as its own service so
             // session_manager observes when the GUI login surface is
-            // up before waiting on `term`.
+            // up before declaring the boot sequence "logging in".
             "greeter" => "greeter",
-            "term" => "term",
             _ => "",
         }
     }
@@ -377,28 +379,6 @@ mod init_backend {
     /// Mirrors `kernel_core::session::RETRY_BACKOFF_MS` (200 ms) but
     /// quoted directly here so this module is the single sleep site.
     const AWAIT_POLL_MS: u32 = 200;
-
-    /// Phase 71 follow-up — per-attempt budget for the `term` step
-    /// when the graphical-only marker is present.
-    ///
-    /// In graphical-login mode, `term` only registers in the IPC
-    /// registry after the user authenticates in greeter AND greeter
-    /// `execve`s `/bin/term`. The user's typing latency is a human
-    /// choice, not a daemon malfunction, so it must NOT share the
-    /// 5 s per-attempt budget the other session steps use for
-    /// daemon-startup races.
-    ///
-    /// 5 minutes is long enough for a normal interactive login (most
-    /// users finish in <30 s); combined with `MAX_RETRIES_PER_STEP=3`
-    /// the worst-case wait before `text-fallback` is 15 minutes, which
-    /// still surfaces a truly stuck greeter through the same recovery
-    /// path operators already know — just on a budget calibrated for
-    /// humans, not for `init`'s manifest walker. The legacy 5 s/step
-    /// × 3-retry budget (`STEP_READY_TIMEOUT_MS` ×
-    /// `MAX_RETRIES_PER_STEP` = 15 s total) stays in force for every
-    /// non-`term` step and for every boot mode where the marker is
-    /// absent.
-    const GRAPHICAL_LOGIN_TERM_WAIT_MS: u64 = 300_000;
 
     impl SupervisorBackend for InitSupervisorBackend {
         fn start(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
@@ -595,25 +575,14 @@ mod init_backend {
             if service == "greeter" && !graphical_only_marker_present() {
                 return Ok(SupervisorReply::ReadyState { ready: true });
             }
-            // Phase 71 follow-up — the `term` step's await window must
-            // include the user's typing latency in graphical-login
-            // mode. `term` registers only after greeter authenticates
-            // and `execve`s `/bin/term`, so a 15 s composite budget
-            // (3 × 5 s) collapses the login screen into text-fallback
-            // before a normal user can type their credentials. Extend
-            // the budget here and only here; every other step keeps
-            // its 5 s daemon-startup budget so genuine regressions
-            // still surface within seconds.
-            let timeout_ms = if service == "term" && graphical_only_marker_present() {
-                syscall_lib::write_str(
-                    syscall_lib::STDOUT_FILENO,
-                    "session_manager: await_ready('term'): graphical-login mode, \
-                     extending budget for user authentication\n",
-                );
-                GRAPHICAL_LOGIN_TERM_WAIT_MS
-            } else {
-                timeout_ms
-            };
+            // Phase 72b — the per-step await budget. Previously the
+            // `term` step needed an extended budget under graphical
+            // login because `term` registered its IPC service only
+            // after greeter authenticated. With `term` removed from
+            // the supervised step chain in Phase 72b, the greeter
+            // step's own budget covers user typing latency (greeter
+            // execve's `/bin/term` in-process after auth; the new
+            // process is no longer a separate supervised step).
             // Poll the IPC service registry up to `timeout_ms` waiting
             // for the named service to register. `init` spawns the
             // session services in parallel based on dependency-graph

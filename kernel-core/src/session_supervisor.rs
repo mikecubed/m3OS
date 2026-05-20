@@ -64,7 +64,7 @@ pub const MAX_SERVICE_NAME_BYTES: usize = 32;
 ///
 /// Per the DRY rule in the Phase 57 task list:
 ///
-/// > Session-step ordering (display → input → audio → term) lives once
+/// > Session-step ordering (display → input → audio) lives once
 /// > in `kernel-core::session::startup` as a typed sequence;
 /// > `session_manager` consumes it.
 ///
@@ -72,18 +72,28 @@ pub const MAX_SERVICE_NAME_BYTES: usize = 32;
 /// adapter constructs one [`crate::session::SessionStep`] per name in
 /// this slice; service-manifest authors do not redeclare ordering
 /// separately.
+///
+/// Phase 72b — `term` was removed from this slice. The supervised
+/// boot chain ends at the "desktop ready" signal: `display_server`
+/// (default boot) or `greeter` (graphical-only boot). `term` is now a
+/// user-facing app launched via the compositor's `[autostart]` config
+/// in default boot, or by `greeter::execve("/bin/term")` after auth
+/// succeeds in graphical-only boot. A user-facing app must not gate
+/// the boot sequence and must support N concurrent instances — both
+/// were violated by the singleton `term::SERVICE_NAME` registration
+/// the old chain relied on.
 pub const DECLARED_SESSION_STEP_NAMES: &[&str] = &[
     "display_server",
     "kbd_server",
     "mouse_server",
     "audio_server",
-    // Phase 71 — greeter sits between the input/output stack coming
-    // up and term being available. session_manager waits for greeter
-    // to register before declaring the boot sequence "logging in";
-    // term registers only after greeter authenticates successfully
-    // and `execve`s into it (same PID, new binary).
+    // Phase 71 — greeter sits between the input/output stack and the
+    // first user-facing app. session_manager waits for greeter to
+    // register before declaring the boot sequence "logging in". After
+    // auth, greeter execve's into `/bin/term` in-process; the new
+    // term inherits the authenticated UID/GID. Phase 72b dropped the
+    // post-greeter `term` step — see the doc comment above.
     "greeter",
-    "term",
 ];
 
 /// Accessor for [`DECLARED_SESSION_STEP_NAMES`]. Function form so test

@@ -267,6 +267,12 @@ struct ServerSurface {
     /// re-blitted this surface. Cleared by [`SurfaceRegistry::mark_clean`]
     /// after each compose pass.
     dirty: bool,
+    /// Phase 72b Track K.7 — owning client's protocol token. Set when
+    /// the surface is created via `ClientMessage::CreateSurface
+    /// { client_token, .. }`. Used by [`SurfaceRegistry::destroy_client_surfaces`]
+    /// to scope `Goodbye` teardown to the disconnecting client's
+    /// surfaces only.
+    client_token: u32,
 }
 
 /// Outcome of forwarding a [`ClientMessage`] into the registry.
@@ -400,6 +406,37 @@ impl SurfaceRegistry {
         self.surfaces.get(&surface_id).and_then(|s| s.role)
     }
 
+    /// Phase 72b Track K.7 — destroy every surface owned by
+    /// `client_token`. Called by the dispatcher when a `Goodbye`
+    /// arrives so that exactly the disconnecting client's surfaces are
+    /// torn down (not the entire registry, which Phase 70 preserved
+    /// across `Goodbye` to avoid wiping other clients' surfaces).
+    ///
+    /// Returns the list of `SurfaceId`s that were destroyed so the
+    /// caller can drop them from the workspace manager + focus tracker
+    /// + last-tile-dims map.
+    pub fn destroy_client_surfaces(&mut self, client_token: u32) -> Vec<SurfaceId> {
+        let owned: Vec<SurfaceId> = self
+            .surfaces
+            .iter()
+            .filter_map(|(id, s)| {
+                if s.client_token == client_token {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in &owned {
+            // `handle_message(DestroySurface)` runs the full teardown:
+            // state-machine event, layer-conflict release, cursor-owner
+            // clear. Use that path so cleanup stays single-sourced
+            // instead of duplicating the bookkeeping here.
+            let _ = self.handle_message(&ClientMessage::DestroySurface { surface_id: *id });
+        }
+        owned
+    }
+
     /// Receive a bulk-transported pixel buffer and queue it for the next
     /// `AttachBuffer` verb. Returns `true` if accepted, `false` if the
     /// pending-bulk queue is at [`MAX_PENDING_BULK`] and the dispatcher
@@ -470,7 +507,10 @@ impl SurfaceRegistry {
     ) -> Result<DispatchResult, SurfaceShimError> {
         let mut result = DispatchResult::default();
         match msg {
-            ClientMessage::CreateSurface { surface_id } => {
+            ClientMessage::CreateSurface {
+                surface_id,
+                client_token,
+            } => {
                 if self.surfaces.contains_key(surface_id) {
                     return Err(SurfaceShimError::DuplicateSurface(*surface_id));
                 }
@@ -482,6 +522,7 @@ impl SurfaceRegistry {
                         pending_buffer: None,
                         committed_buffer: None,
                         dirty: false,
+                        client_token: *client_token,
                     },
                 );
             }
@@ -679,7 +720,7 @@ impl SurfaceRegistry {
             }
             ClientMessage::AckConfigure { .. }
             | ClientMessage::Hello { .. }
-            | ClientMessage::Goodbye => {
+            | ClientMessage::Goodbye { .. } => {
                 // Hello / Goodbye / AckConfigure are dispatched at the
                 // client-loop level (C.5), not here.
             }

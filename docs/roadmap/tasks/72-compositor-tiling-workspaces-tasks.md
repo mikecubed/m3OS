@@ -19,6 +19,7 @@
 | H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | ✅ Complete |
 | I | Phase 56 design doc update | H | ✅ Complete |
 | J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | ✅ Complete |
+| K | Phase 72b closeout — term redesign, autostart, `SurfaceResized` emission, DOOM resize, close protocol, per-client teardown, event-push delivery | A–J | 🚧 In Progress |
 
 ---
 
@@ -34,7 +35,7 @@
 - [x] `compose_frame` iterates all toplevels in the current workspace in layout order
 - [x] Damage tracking accumulates per-window dirty rectangles across all surfaces
 - [x] No surface's pixels are written over a sibling's pixels unless Z-order dictates it
-- [x] Two `term` instances run side-by-side without rendering artifacts
+- [ ] Two `term` instances run side-by-side without rendering artifacts (regressed by the singleton `term::SERVICE_NAME` collision and missing per-client teardown; re-validated by Track K)
 
 ### A.2 — Multi-window focus dispatcher
 
@@ -236,10 +237,10 @@
 **Why it matters:** The audit (§ C5, Red Flag #15) identified four `publish_*` stubs that never sent data on the wire; this closes that gap.
 
 **Acceptance:**
-- [x] A client that sends `{"cmd": "subscribe"}` receives newline-delimited JSON event frames
-- [x] `publish_workspace_changed` emits `{"event": "workspace-changed", "workspace": n}` to all subscribers
-- [x] `publish_window_focused` emits `{"event": "window-focused", "title": "...", "surface_id": n}`
-- [x] Subscribers that close their connection are removed from the subscriber list without a panic
+- [ ] A client that sends `{"cmd": "subscribe"}` receives newline-delimited JSON event frames (delivery wiring deferred to Track K.8)
+- [ ] `publish_workspace_changed` emits `{"event": "workspace-changed", "workspace": n}` to all subscribers (Track K.8)
+- [ ] `publish_window_focused` emits `{"event": "window-focused", "title": "...", "surface_id": n}` (Track K.8)
+- [ ] Subscribers that close their connection are removed from the subscriber list without a panic (Track K.8)
 
 ### F.3 — `m3ctl` tile/workspace subcommands
 
@@ -296,7 +297,7 @@
 **Why it matters:** The headline acceptance criterion requires four simultaneous GUI apps; this is the integration gate.
 
 **Acceptance:**
-- [x] Boot to greeter (Phase 71); login; `term` opens; `SUPER+RETURN` opens a second `term`; repeated for `edit` and DOOM
+- [ ] Boot to greeter (Phase 71); login; `term` opens; `SUPER+RETURN` opens a second `term`; repeated for `edit` and DOOM (second-`term` spawn regressed on the singleton `term::SERVICE_NAME` collision — re-validated after Track K.1 lands)
 - [x] All four apps display correctly under dwindle layout with no overlap or corruption
 - [x] `SUPER+1..9` switches between nine workspaces; each retains its window list
 - [x] `SUPER+SHIFT+1` moves the focused window to workspace 1 and it no longer appears on the source
@@ -308,9 +309,9 @@
 **Why it matters:** Closes audit blocker C5 / Red Flag #15 which identified the four `publish_*` functions as stubs that never transmitted data.
 
 **Acceptance:**
-- [x] `m3ctl subscribe` receives a `workspace-changed` event when `SUPER+2` is pressed
-- [x] `m3ctl subscribe` receives `window-focused` when click-to-focus changes the focused window
-- [x] Subscriber list survives a client disconnect without hanging the compositor
+- [ ] `m3ctl subscribe` receives a `workspace-changed` event when `SUPER+2` is pressed (Track K.8 wires actual delivery)
+- [ ] `m3ctl subscribe` receives `window-focused` when click-to-focus changes the focused window (Track K.8)
+- [ ] Subscriber list survives a client disconnect without hanging the compositor (Track K.8)
 
 ### H.3 — `cargo xtask tiling-smoke` regression gate
 
@@ -378,6 +379,167 @@
 - [x] `docs/roadmap/README.md` row for Phase 72 updated to reflect Completed status at ship
 - [x] `cargo xtask check` passes after the version bump
 - [x] Git tag `v0.72.0` recommended at phase merge
+
+---
+
+## Track K — Phase 72b Closeout
+
+### K.1 — Remove `term` from boot signal chain
+
+**Files:**
+- `kernel-core/src/session_supervisor.rs`
+- `userspace/session_manager/src/main.rs`
+- `userspace/session_manager/src/init_status.rs`
+- `userspace/term/src/lib.rs`
+- `userspace/term/src/main.rs`
+- `xtask/src/main.rs` (`term_conf` content)
+
+**Symbol:** `DECLARED_SESSION_STEP_NAMES`, `ipc_service_name`, `term::SERVICE_NAME`
+**Why it matters:** The current boot chain treats `term` as a readiness-signal service via `ipc_lookup_service("term")`. When `display_server`'s `SUPER+RETURN` fork+execve's a second `term`, the duplicate-registration fails (`u64::MAX`) and the secondary exits at code 4. The architectural fix is to take `term` out of the boot dependency graph — `display_server` (default boot) and `greeter` (graphical-only) are the desktop-ready signals; `term` is a user-facing app, not infrastructure.
+
+**Acceptance:**
+- [ ] `DECLARED_SESSION_STEP_NAMES` drops `"term"`; remaining declared steps are `display_server`, `kbd_server`, `mouse_server`, `audio_server`, `greeter` (graphical-only path)
+- [ ] `userspace/session_manager/src/main.rs::ipc_service_name` removes the `"term" => "term"` arm
+- [ ] `userspace/session_manager/src/init_status.rs` removes the `"term" => "term"` mapping
+- [ ] `term::SERVICE_NAME` and the `ipc_register_service` call in `term/src/main.rs` are removed
+- [ ] `term.conf` content emitted by `xtask` is updated: `type=foreground`, `restart=never`, no `depends=session_manager` entry, removed from `KNOWN_CONFIGS` startup loading
+- [ ] `cargo xtask check` passes
+- [ ] Multiple `term` instances coexist in the smoke test (regression validated under K.9)
+
+### K.2 — `[autostart]` section in `/etc/compositor.conf` + spawn-exec
+
+**Files:**
+- `userspace/display_server/src/config.rs`
+- `userspace/display_server/src/main.rs`
+- `xtask/src/main.rs` (default `compositor.conf` content)
+
+**Symbol:** `AutostartConfig`, `spawn_exec`
+**Why it matters:** With `term` no longer auto-launched as a supervised service, the compositor needs a clean way to launch a first terminal at boot. The Hyprland/sway `exec-once` idiom is the right shape: declarative, user-editable, no special privileges.
+
+**Acceptance:**
+- [ ] `CompositorConfig` gains an `autostart: AutostartConfig` field; `AutostartConfig` holds `Vec<String>` of program paths
+- [ ] `[autostart]` section in `/etc/compositor.conf` accepts `exec = /path/to/binary` lines (multiple allowed, processed in order)
+- [ ] `display_server` runs each `exec` entry once via `fork + execve` after first compose completes — not at startup time, so newly-mapped surfaces have somewhere to attach
+- [ ] Reload via `m3ctl reload` does NOT re-run autostart (one-shot per compositor lifetime); document this clearly in the parser docstring
+- [ ] `xtask` default `compositor.conf` includes `[autostart]\nexec = /bin/term\n` in the default-boot path; graphical-only boot omits it (greeter launches term post-auth)
+- [ ] Unit test in `config.rs` covers parsing one and multiple `exec` entries
+
+### K.3 — `display_server` emits `ServerMessage::SurfaceResized` on tile change
+
+**Files:**
+- `userspace/display_server/src/compose.rs`
+- `userspace/display_server/src/main.rs`
+
+**Symbol:** `emit_surface_resized`, `last_tile_for`
+**Why it matters:** Phase 69 plumbed the receiver side (`Screen::resize` → `TIOCSWINSZ` → `SIGWINCH`) but no emitter was ever wired in `display_server`. Tile dimensions can change on workspace switch, layout switch, window arrival/removal, master-ratio change, resize-mode adjust, or gap reload. Without `SurfaceResized`, clients keep their original surface dimensions and the compositor letterboxes; the visible symptom is term extending past the inset border.
+
+**Acceptance:**
+- [ ] `display_server` tracks `BTreeMap<SurfaceId, (u32, u32)>` of last-emitted tile dimensions per Toplevel
+- [ ] After `WorkspaceLayoutAdapter::arrange_current`, diff against the map; for any surface whose `(w, h)` changed (or first-seen), encode `ServerMessage::SurfaceResized { width, height, .. }` and send via the client's per-surface event endpoint
+- [ ] Surfaces destroyed or moved off the active workspace get their entries dropped to avoid stale comparisons on re-arrival
+- [ ] Term re-flows automatically via the existing Phase 69 handler chain — verified by running two `term` instances and observing each shrinks to half-screen with no extends-past-border artifact
+- [ ] DOOM under the existing letterbox fallback continues to work until K.4 lands
+
+### K.4 — DOOM acknowledges `SurfaceResized`
+
+**Files:**
+- `userspace/doom/dg_m3os.c`
+
+**Symbol:** `DG_GetKey`, `DC_EVENT_SURFACE_RESIZED` arm
+**Why it matters:** Phase 72 left the receiver as a silent no-op; K.3 now actually emits resize events, so DOOM should at minimum acknowledge them and make the path observable. Architectural honesty: doomgeneric's screen buffer is `DOOMGENERIC_RESX × DOOMGENERIC_RESY` at compile time, and runtime resolution changes need an upstream engine refactor m3OS is not undertaking. The compositor's letterbox path continues to handle the visual mismatch.
+
+**Acceptance:**
+- [x] `dc_poll_event` in `display_client_ffi` already exposes a `SurfaceResized` event variant via the C ABI (no change required — landed in Phase 69 plumbing)
+- [ ] `dg_m3os.c`'s `DC_EVENT_SURFACE_RESIZED` arm logs the new dimensions via `fprintf(stderr, ...)` so the resize event is observable in `m3os.log`
+- [ ] The Phase 72 letterbox path remains the visual fallback (no DOOM-side reflow)
+- [ ] `cargo xtask doom-audio-smoke` passes with the acknowledgement in place
+
+### K.5 — Resize-mode UX for non-resizable layouts
+
+**Files:**
+- `userspace/display_server/src/main.rs` (`dispatch_keybind_action`)
+
+**Symbol:** `dispatch_keybind_action`, `KeybindAction::ResizeFocused`
+**Why it matters:** Today `adjust_focused` returns `LayoutError::Unsupported` under grid/tabbed/fullscreen and the result is silently discarded. The user enters resize mode, presses H/J/K/L, nothing visible happens, and they have to guess why. Surface the rejection.
+
+**Acceptance:**
+- [ ] When `adjust_focused` returns `LayoutError::Unsupported`, log `display_server: resize not supported under <policy_name>; exiting resize mode`
+- [ ] Auto-pop the bind stack back to default mode so subsequent keystrokes go to the focused client
+- [ ] `LayoutError::Other` variants (e.g. `NoFocusedWindow`) keep resize mode active and only log the failure — the user might press H/J/K/L after focusing a window
+- [ ] Manual test: switch a workspace to grid, press SUPER+R + H, verify the log line appears and SUPER+R no longer enters resize mode silently (i.e. the next keystroke reaches the client)
+
+### K.6 — `SUPER+Q` close protocol
+
+**Files:**
+- `kernel-core/src/display/protocol.rs`
+- `userspace/display_server/src/main.rs` (`KeybindAction::KillFocused` handler)
+- `userspace/term/src/main.rs`
+- `userspace/greeter/src/main.rs`
+- `userspace/doom/dg_m3os.c`
+- `userspace/lib/display_client_ffi/src/lib.rs`
+
+**Symbol:** `ServerMessage::CloseRequest`, `dispatch_keybind_action::KillFocused`
+**Why it matters:** Today SUPER+Q only logs (`(close verb deferred)`). With multi-toplevel users will press it expecting to close windows. A clean fix needs a protocol verb the compositor sends to the focused surface's client; the client decides how to shut down gracefully.
+
+**Acceptance:**
+- [ ] `ServerMessage::CloseRequest { surface_id }` added to the kernel-core display protocol with codec coverage
+- [ ] `dispatch_keybind_action::KillFocused` looks up the focused surface's client endpoint and sends `CloseRequest`
+- [ ] `term` handles `CloseRequest` by closing its PTY session and exiting cleanly
+- [ ] `greeter` handles `CloseRequest` by aborting any in-flight auth and exiting (resets the login form)
+- [ ] DOOM handles `CloseRequest` by triggering its normal quit sequence
+- [ ] Manual test: open two `term` instances, focus one, press SUPER+Q — only the focused term exits; the other survives
+
+### K.7 — Per-client surface ownership + Goodbye teardown
+
+**Files:**
+- `userspace/display_server/src/surface.rs`
+- `userspace/display_server/src/main.rs` (Goodbye handler)
+- `userspace/display_server/src/client.rs`
+
+**Symbol:** `SurfaceRegistry::client_id_of`, `SurfaceRegistry::destroy_client_surfaces`
+**Why it matters:** Phase 70's workaround left the entire `SurfaceRegistry` intact on `Goodbye` to avoid wiping other clients' surfaces in the multi-toplevel world. The cost is leaked surfaces every time a client disconnects without explicit `DestroySurface`. With per-client `ClientId` tracking the compositor can destroy exactly the disconnecting client's surfaces.
+
+**Acceptance:**
+- [ ] Each `Surface` entry in `SurfaceRegistry` records the `ClientId` that created it (set in `apply_event` on `CreateSurface`)
+- [ ] `SurfaceRegistry::destroy_client_surfaces(client_id)` removes all entries owned by that client, releases their `BufferId`/SHM mappings, drops layer-conflict claims, and emits `outcome.destroyed` for each
+- [ ] Goodbye handler in `main.rs` calls `destroy_client_surfaces` with the disconnecting client's id; the registry-preserved warning from Phase 70 is removed
+- [ ] Workspace manager's `remove_surface` is called for each destroyed surface so per-workspace window lists stay accurate
+- [ ] Manual test: open `term` + DOOM, exit DOOM cleanly via SUPER+Q, observe term's surface survives and `m3ctl query windows` no longer lists DOOM's surfaces
+
+### K.8 — Control-socket event push delivery
+
+**Files:**
+- `userspace/display_server/src/control.rs` (`publish_*` helpers)
+- `userspace/display_server/src/main.rs` (subscriber drain)
+- `kernel-core/src/display/subscription.rs`
+
+**Symbol:** `flush_subscriber_ring`, `publish_workspace_changed`, `publish_window_focused`, `publish_window_opened`, `publish_window_closed`
+**Why it matters:** F.2 marked these complete in initial Phase 72 but on the wire the `publish_*` helpers don't actually transmit (`// TODO`). Closes audit blocker C5 / Red Flag #15 properly this time.
+
+**Acceptance:**
+- [ ] `publish_workspace_changed` encodes a `ControlEvent::WorkspaceChanged` and writes via the subscriber's reply endpoint (subscribers retain their endpoint handle from the initial `subscribe` call)
+- [ ] `publish_window_focused` / `_opened` / `_closed` emit their respective `ControlEvent` variants the same way
+- [ ] `flush_subscriber_ring` runs once per main-loop tick to drain queued events for each subscriber; subscribers whose endpoint write returns `EBADF` or `EPIPE` are removed from the registry
+- [ ] `m3ctl subscribe focus-changed` connected to a running compositor receives events when focus changes (manual verification)
+- [ ] A subscriber's disconnect does not panic the compositor; the next publish silently drops the entry
+
+### K.9 — Validation and gate update
+
+**Files:**
+- `xtask/src/main.rs` (`tiling_smoke_steps`)
+- `.githooks/pre-push`
+- `docs/roadmap/README.md`
+
+**Symbol:** `tiling_smoke_steps`
+**Why it matters:** The Phase 72 tiling-smoke gate sent only `m3ctl` commands; it never pressed `SUPER+RETURN`, which is why the singleton-service regression slipped through. K.9 extends the gate to exercise the closeout features end-to-end.
+
+**Acceptance:**
+- [ ] `tiling-smoke` opens a second `term` via `SUPER+RETURN` and asserts both surfaces appear in `m3ctl query windows`
+- [ ] `tiling-smoke` exercises SUPER+Q on the focused term and asserts the other survives
+- [ ] `tiling-smoke` subscribes via `m3ctl subscribe focus-changed`, presses `SUPER+TAB`, asserts the event was received on the subscriber's pipe
+- [ ] All existing `tiling-smoke` steps continue to pass
+- [ ] `cargo xtask check` + `smoke-test` + `tiling-smoke` all green
+- [ ] `docs/roadmap/README.md` Phase 72 row remains Complete (Track K is part of Phase 72, not a separate row)
 
 ---
 

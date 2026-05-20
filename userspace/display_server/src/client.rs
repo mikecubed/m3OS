@@ -129,6 +129,11 @@ pub struct DispatchOutcome {
     pub created: Vec<(SurfaceId, SurfaceRole)>,
     /// Surfaces destroyed during this dispatch.
     pub destroyed: Vec<SurfaceId>,
+    /// Phase 72b Track K.7 — set when a `Goodbye` was processed.
+    /// Carries the `client_token` from the goodbye body so the caller
+    /// can call `SurfaceRegistry::destroy_client_surfaces(token)` to
+    /// scope teardown to the disconnecting client's own surfaces.
+    pub closed_client_token: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,8 +259,9 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                         capabilities: 0,
                     });
                 }
-                ClientMessage::Goodbye => {
+                ClientMessage::Goodbye { client_token } => {
                     out.closed = true;
+                    out.closed_client_token = Some(client_token);
                 }
                 ref other => match registry.handle_message(other) {
                     Ok(result) => {

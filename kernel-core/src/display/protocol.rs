@@ -48,7 +48,12 @@ use crate::input::events::{
 /// over the legacy 19-byte wire layout). All in-tree clients
 /// (`kbd_server`, `display_server`, `m3ctl`, host fixtures) handshake
 /// at version `2`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Phase 72b Track K.7 — bumped from 2 to 3 to add `client_token` to
+/// `Hello`, `CreateSurface`, and `Goodbye`. The token lets
+/// `display_server` scope `Goodbye` teardown to the disconnecting
+/// client's own surfaces only, fixing the Phase 70 multi-client
+/// regression that preserved the entire registry on disconnect.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Fixed frame-header size: `body_len (u16) + opcode (u16)`.
 pub const FRAME_HEADER_SIZE: usize = 4;
@@ -98,6 +103,12 @@ const OP_SERVER_BUFFER_RELEASED: u16 = 0x0140;
 /// Body layout (12 bytes LE): `surface_id (u32) | width (u32) |
 /// height (u32)`.
 const OP_SERVER_SURFACE_RESIZED: u16 = 0x0141;
+/// Phase 72b Track K.6 — `CloseRequest` server→client notification.
+/// Sent in response to `SUPER+Q` / `KillFocused`. The client decides
+/// how to react (term closes its PTY session; greeter aborts auth and
+/// resets; DOOM triggers its normal quit sequence). Body layout
+/// (4 bytes LE): `surface_id (u32)`.
+const OP_SERVER_CLOSE_REQUEST: u16 = 0x0142;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_VERSION: u16 = 0x0201;
@@ -136,6 +147,10 @@ const OP_CTL_QUERY_WINDOWS: u16 = 0x0211;
 const OP_CTL_QUERY_WORKSPACES: u16 = 0x0212;
 const OP_CTL_SET_MASTER_RATIO: u16 = 0x0213;
 const OP_CTL_TILE_FULLSCREEN: u16 = 0x0214;
+/// Phase 72b Track K.8 — drain one queued subscription event for the
+/// calling control client. Closes the F.2 gap where Subscribe Ack'd
+/// but no event ever reached the subscriber on the wire.
+const OP_CTL_EVENT_PULL: u16 = 0x0215;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -350,10 +365,28 @@ pub enum ClientMessage {
     Hello {
         protocol_version: u32,
         capabilities: u32,
+        /// Phase 72b Track K.7 — client-chosen identifier used by
+        /// `display_server` to scope `Goodbye` teardown. Typically the
+        /// client's own PID via `sys_getpid`; any unique-per-process
+        /// `u32` works. The server echoes this token in surfaces and
+        /// matches it on `Goodbye` to destroy only that client's
+        /// resources.
+        client_token: u32,
     },
-    Goodbye,
+    /// Phase 72b Track K.7 — `Goodbye` carries `client_token` so the
+    /// server destroys only that client's surfaces. Previously the
+    /// server preserved every surface on disconnect (the Phase 70
+    /// multi-client workaround) which leaked surfaces every time a
+    /// client exited without explicit `DestroySurface`.
+    Goodbye {
+        client_token: u32,
+    },
     CreateSurface {
         surface_id: SurfaceId,
+        /// Phase 72b Track K.7 — owning client's token. Used to
+        /// associate the new surface with its creator for later
+        /// `Goodbye`-scoped teardown.
+        client_token: u32,
     },
     DestroySurface {
         surface_id: SurfaceId,
@@ -433,6 +466,18 @@ pub enum ServerMessage {
         surface_id: SurfaceId,
         width: u32,
         height: u32,
+    },
+    /// Phase 72b Track K.6 — graceful close request. The compositor
+    /// sends this when the user invokes the SUPER+Q chord (or any
+    /// other close affordance) against the focused surface; the
+    /// client decides how to react. `term` closes its PTY session and
+    /// exits cleanly; `greeter` aborts in-flight auth and resets the
+    /// login form; DOOM triggers its normal quit sequence. Clients
+    /// that ignore the message are not forcibly killed by the
+    /// compositor — escalation to SIGTERM/SIGKILL belongs in
+    /// init/session_manager if at all.
+    CloseRequest {
+        surface_id: SurfaceId,
     },
 }
 
@@ -564,6 +609,14 @@ pub enum ControlCommand {
     /// Phase 72 — toggle the active workspace's layout to
     /// `Fullscreen` (or back to `Dwindle` if already fullscreen).
     TileFullscreen,
+    /// Phase 72b Track K.8 — drain one queued subscription event for
+    /// the calling control client. The dispatcher returns the next
+    /// pending [`ControlEvent`] from the per-client outbound queue;
+    /// when the queue is empty, returns [`ControlEvent::Ack`] so the
+    /// caller can distinguish "no events" from a transport error.
+    /// `m3ctl subscribe` polls this verb in a loop after the initial
+    /// Subscribe Ack.
+    EventPull,
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -976,16 +1029,24 @@ impl ClientMessage {
             Self::Hello {
                 protocol_version,
                 capabilities,
-            } => encode_fixed_body(buf, OP_CLIENT_HELLO, 8, |body| {
+                client_token,
+            } => encode_fixed_body(buf, OP_CLIENT_HELLO, 12, |body| {
                 body[0..4].copy_from_slice(&protocol_version.to_le_bytes());
                 body[4..8].copy_from_slice(&capabilities.to_le_bytes());
+                body[8..12].copy_from_slice(&client_token.to_le_bytes());
             }),
-            Self::Goodbye => encode_fixed_body(buf, OP_CLIENT_GOODBYE, 0, |_| {}),
-            Self::CreateSurface { surface_id } => {
-                encode_fixed_body(buf, OP_CLIENT_CREATE_SURFACE, 4, |body| {
-                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+            Self::Goodbye { client_token } => {
+                encode_fixed_body(buf, OP_CLIENT_GOODBYE, 4, |body| {
+                    body[0..4].copy_from_slice(&client_token.to_le_bytes());
                 })
             }
+            Self::CreateSurface {
+                surface_id,
+                client_token,
+            } => encode_fixed_body(buf, OP_CLIENT_CREATE_SURFACE, 8, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&client_token.to_le_bytes());
+            }),
             Self::DestroySurface { surface_id } => {
                 encode_fixed_body(buf, OP_CLIENT_DESTROY_SURFACE, 4, |body| {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
@@ -1049,22 +1110,27 @@ impl ClientMessage {
         let (body_len, opcode, body, total) = parse_frame_header(buf)?;
         let msg = match opcode {
             OP_CLIENT_HELLO => {
-                expect_body_len(body_len, 8)?;
+                expect_body_len(body_len, 12)?;
                 let protocol_version = read_u32(body, 0)?;
                 let capabilities = read_u32(body, 4)?;
+                let client_token = read_u32(body, 8)?;
                 Self::Hello {
                     protocol_version,
                     capabilities,
+                    client_token,
                 }
             }
             OP_CLIENT_GOODBYE => {
-                expect_body_len(body_len, 0)?;
-                Self::Goodbye
+                expect_body_len(body_len, 4)?;
+                Self::Goodbye {
+                    client_token: read_u32(body, 0)?,
+                }
             }
             OP_CLIENT_CREATE_SURFACE => {
-                expect_body_len(body_len, 4)?;
+                expect_body_len(body_len, 8)?;
                 Self::CreateSurface {
                     surface_id: SurfaceId(read_u32(body, 0)?),
+                    client_token: read_u32(body, 4)?,
                 }
             }
             OP_CLIENT_DESTROY_SURFACE => {
@@ -1205,6 +1271,11 @@ impl ServerMessage {
                 body[4..8].copy_from_slice(&width.to_le_bytes());
                 body[8..12].copy_from_slice(&height.to_le_bytes());
             }),
+            Self::CloseRequest { surface_id } => {
+                encode_fixed_body(buf, OP_SERVER_CLOSE_REQUEST, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1274,6 +1345,12 @@ impl ServerMessage {
                     surface_id: SurfaceId(read_u32(body, 0)?),
                     width: read_u32(body, 4)?,
                     height: read_u32(body, 8)?,
+                }
+            }
+            OP_SERVER_CLOSE_REQUEST => {
+                expect_body_len(body_len, 4)?;
+                Self::CloseRequest {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
                 }
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
@@ -1358,6 +1435,7 @@ impl ControlCommand {
                 })
             }
             Self::TileFullscreen => encode_fixed_body(buf, OP_CTL_TILE_FULLSCREEN, 0, |_| {}),
+            Self::EventPull => encode_fixed_body(buf, OP_CTL_EVENT_PULL, 0, |_| {}),
         }
     }
 
@@ -1469,6 +1547,10 @@ impl ControlCommand {
             OP_CTL_TILE_FULLSCREEN => {
                 expect_body_len(body_len, 0)?;
                 Self::TileFullscreen
+            }
+            OP_CTL_EVENT_PULL => {
+                expect_body_len(body_len, 0)?;
+                Self::EventPull
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
@@ -1867,18 +1949,22 @@ mod tests {
         encode_decode_round_trip_client(ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             capabilities: 0,
+            client_token: 0xAABBCCDD,
         });
     }
 
     #[test]
     fn client_goodbye_round_trips() {
-        encode_decode_round_trip_client(ClientMessage::Goodbye);
+        encode_decode_round_trip_client(ClientMessage::Goodbye {
+            client_token: 0x12345678,
+        });
     }
 
     #[test]
     fn client_create_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::CreateSurface {
             surface_id: SurfaceId(1),
+            client_token: 0xFEEDC0DE,
         });
     }
 
@@ -1963,7 +2049,9 @@ mod tests {
     #[test]
     fn client_short_buffer_encode_returns_truncated() {
         let mut tiny = [0u8; FRAME_HEADER_SIZE - 1];
-        let err = ClientMessage::Goodbye.encode(&mut tiny).unwrap_err();
+        let err = ClientMessage::Goodbye { client_token: 0 }
+            .encode(&mut tiny)
+            .unwrap_err();
         assert_eq!(err, ProtocolError::Truncated);
     }
 
@@ -2536,14 +2624,22 @@ mod tests {
 
     fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
         prop_oneof![
-            (any::<u32>(), any::<u32>()).prop_map(|(protocol_version, capabilities)| {
-                ClientMessage::Hello {
-                    protocol_version,
-                    capabilities,
+            (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+                |(protocol_version, capabilities, client_token)| {
+                    ClientMessage::Hello {
+                        protocol_version,
+                        capabilities,
+                        client_token,
+                    }
+                }
+            ),
+            any::<u32>().prop_map(|client_token| ClientMessage::Goodbye { client_token }),
+            (arb_surface_id(), any::<u32>()).prop_map(|(surface_id, client_token)| {
+                ClientMessage::CreateSurface {
+                    surface_id,
+                    client_token,
                 }
             }),
-            Just(ClientMessage::Goodbye),
-            arb_surface_id().prop_map(|surface_id| ClientMessage::CreateSurface { surface_id }),
             arb_surface_id().prop_map(|surface_id| ClientMessage::DestroySurface { surface_id }),
             (arb_surface_id(), arb_surface_role()).prop_map(|(surface_id, role)| {
                 ClientMessage::SetSurfaceRole { surface_id, role }

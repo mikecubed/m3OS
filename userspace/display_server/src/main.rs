@@ -368,6 +368,23 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut registry = SurfaceRegistry::new();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 72b — `[autostart]` execution latch. Flipped to `true`
+    // after the first successful compose so the autostart entries
+    // launch exactly once per compositor lifetime, matching
+    // Hyprland's `exec-once` semantics. `m3ctl reload` does not
+    // clear the latch — long-running respawn belongs in init or
+    // session_manager.
+    let mut autostart_ran = false;
+    // Phase 72b (Track K.3) — last-known tile dimensions per Toplevel
+    // surface. After each `arrange_current`, the loop diffs against
+    // this map and emits `ServerMessage::SurfaceResized` to every
+    // surface whose `(w, h)` changed. Term re-flows via its existing
+    // Phase 69 handler (Screen::resize → TIOCSWINSZ → SIGWINCH).
+    // DOOM consumes via Phase 72b Track K.4. Position-only changes
+    // do not need notification — the client's surface buffer keeps
+    // its intrinsic size and the compositor handles repositioning.
+    let mut last_tile_dims: alloc::collections::BTreeMap<SurfaceId, (u32, u32)> =
+        alloc::collections::BTreeMap::new();
     // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
     // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
     // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
@@ -556,20 +573,39 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
-            // Phase 70 — Goodbye used to wipe the entire `SurfaceRegistry`
-            // (Phase 56 single-client legacy). With multiple concurrent
-            // clients that resets every other client's surfaces, so
-            // typing `goodbye` from one app would clear the screen of
-            // every other app. Per-client surface tracking is the
-            // proper fix (and the Phase 71 follow-up); until then,
-            // expect clients to send explicit `DestroySurface` verbs
-            // for the surfaces they own before saying Goodbye. The
-            // log line still fires so a developer can confirm the
-            // disconnect happened.
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "display_server: client said Goodbye (registry preserved for other clients)\n",
-            );
+            // Phase 72b Track K.7 — Goodbye now carries the client's
+            // own token, and the dispatcher returns it via
+            // `outcome.closed_client_token`. We scope teardown to that
+            // client's surfaces only, replacing the Phase 70
+            // "preserve everything" workaround. Surfaces that other
+            // clients still own keep their entries.
+            if let Some(token) = outcome.closed_client_token {
+                let destroyed = registry.destroy_client_surfaces(token);
+                if !destroyed.is_empty() {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: client Goodbye token=");
+                    write_u32(token);
+                    syscall_lib::write_str(STDOUT_FILENO, " destroyed=");
+                    write_u32(destroyed.len() as u32);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                }
+                for sid in &destroyed {
+                    let _ = workspace_mgr.remove_surface(*sid);
+                    last_tile_dims.remove(sid);
+                    if focused == Some(*sid) {
+                        focused = None;
+                    }
+                }
+                // Re-publish focus after the teardown so subscribers
+                // see the updated state.
+                if !destroyed.is_empty() {
+                    publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+                }
+            } else {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: client Goodbye without token (legacy v2 protocol; registry preserved)\n",
+                );
+            }
         }
         // Phase 72 — keep the workspace manager in sync with surface
         // lifecycle: every newly-rolled Toplevel joins the active
@@ -772,6 +808,48 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // remain visible across all workspaces.
             let active_ws_windows: alloc::vec::Vec<SurfaceId> =
                 workspace_mgr.current().windows().to_vec();
+            // Phase 72b Track K.3 — diff the current tile arrangement
+            // against the last-known dims map and emit `SurfaceResized`
+            // for every Toplevel whose dimensions changed. Position
+            // changes are silent (the client's buffer keeps its intrinsic
+            // size). Active workspace only: surfaces on inactive
+            // workspaces don't receive resize events until they come
+            // back into view (the next `switch_workspace` will diff and
+            // re-emit if their new tile differs).
+            let arrangement_for_diff: alloc::vec::Vec<(SurfaceId, Rect)> = workspace_mgr
+                .arrange_current(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: meta.width,
+                        h: meta.height,
+                    },
+                    compositor_config.gaps,
+                );
+            for (sid, rect) in arrangement_for_diff.iter() {
+                let entry = last_tile_dims.entry(*sid).or_insert((0, 0));
+                if entry.0 != rect.w || entry.1 != rect.h {
+                    *entry = (rect.w, rect.h);
+                    if client_event_queue.len() == client::MAX_CLIENT_EVENT_QUEUE {
+                        client_event_queue.pop_front();
+                    }
+                    client_event_queue.push_back((
+                        *sid,
+                        ServerMessage::SurfaceResized {
+                            surface_id: *sid,
+                            width: rect.w,
+                            height: rect.h,
+                        },
+                    ));
+                }
+            }
+            // Drop tracked dims for surfaces that left the active
+            // arrangement (workspace switch, destroy, move). This keeps
+            // the map bounded and prevents stale-comparison artifacts
+            // when the surface returns under a different tile size.
+            let active_set: alloc::collections::BTreeSet<SurfaceId> =
+                arrangement_for_diff.iter().map(|(sid, _)| *sid).collect();
+            last_tile_dims.retain(|sid, _| active_set.contains(sid));
             let mut adapter = WorkspaceLayoutAdapter {
                 manager: &mut workspace_mgr,
                 gaps: compositor_config.gaps,
@@ -808,6 +886,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 Ok(_) => "okN",
                 Err(_) => "err",
             };
+            // Phase 72b — fire `[autostart]` after the first successful
+            // compose so launched processes (term, future status bar)
+            // have a live compositor + framebuffer to attach to. Latch
+            // ensures one-shot semantics across the compositor lifetime.
+            if !autostart_ran && compose_result.is_ok() {
+                autostart_ran = true;
+                run_autostart(&compositor_config.autostart.entries);
+            }
             let writes_this = compose_result.as_ref().copied().unwrap_or(0);
             DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
             if entry_count <= 5 {
@@ -978,6 +1064,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                             &mut focused,
                             &mut control_subs,
                             &compositor_config,
+                            &mut client_event_queue,
                         );
                     }
                 }
@@ -1779,13 +1866,45 @@ fn load_compositor_config(path: &str) -> Option<config::CompositorConfig> {
     }
 }
 
-/// Phase 72 — `execve` a NUL-terminated path with no args/env.
-fn spawn_term() -> isize {
-    let path = b"/bin/term\0";
-    let argv_zero = b"/bin/term\0";
-    let argv: [*const u8; 2] = [argv_zero.as_ptr(), core::ptr::null()];
+/// Phase 72 / 72b — `execve` a NUL-terminated path with no args/env.
+/// Used by both the `SUPER+RETURN` keybind handler and the
+/// `[autostart]` config-driven launcher introduced in Phase 72b.
+/// `path_with_nul` and `argv0_with_nul` must each end in a `\0` byte.
+fn spawn_exec(path_with_nul: &[u8], argv0_with_nul: &[u8]) -> isize {
+    let argv: [*const u8; 2] = [argv0_with_nul.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 1] = [core::ptr::null()];
-    syscall_lib::execve(path, &argv, &envp)
+    syscall_lib::execve(path_with_nul, &argv, &envp)
+}
+
+/// `spawn_exec(/bin/term)` shorthand for the canonical SUPER+RETURN path.
+fn spawn_term() -> isize {
+    spawn_exec(b"/bin/term\0", b"/bin/term\0")
+}
+
+/// Phase 72b — run every `[autostart] exec = <path>` entry from the
+/// parsed config exactly once via `fork + execve`. Called after the
+/// first compose frame completes so the launched processes have a
+/// live compositor to connect to. `entries` is borrowed from
+/// `CompositorConfig::autostart`; the function does not retain it.
+///
+/// `path` must be staged as a NUL-terminated string at execve time;
+/// we allocate a `Vec<u8>` per entry for the `\0` suffix because the
+/// kernel ABI requires it.
+fn run_autostart(entries: &[alloc::string::String]) {
+    use alloc::vec::Vec;
+    for path in entries {
+        let mut buf: Vec<u8> = Vec::with_capacity(path.len() + 1);
+        buf.extend_from_slice(path.as_bytes());
+        buf.push(0);
+        let pid = syscall_lib::fork();
+        if pid == 0 {
+            let _ = spawn_exec(&buf, &buf);
+            syscall_lib::exit(99);
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: autostart exec=");
+        syscall_lib::write_str(STDOUT_FILENO, path);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+    }
 }
 
 /// Phase 72 — execute a typed `KeybindAction` against the live
@@ -1798,6 +1917,7 @@ fn dispatch_keybind_action(
     focused: &mut Option<SurfaceId>,
     control_subs: &mut control::ControlSubscriptions,
     cfg: &config::CompositorConfig,
+    client_event_queue: &mut alloc::collections::VecDeque<(SurfaceId, ServerMessage)>,
 ) {
     use keybind::{BindMode, KeybindAction};
     match action {
@@ -1850,12 +1970,21 @@ fn dispatch_keybind_action(
             syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN spawned term\n");
         }
         KeybindAction::KillFocused => {
-            // Placeholder — the client-side close protocol verb is
-            // deferred. Log so the keypress is observably recorded.
+            // Phase 72b Track K.6 — push `ServerMessage::CloseRequest`
+            // to the focused surface's owning client. The client
+            // decides how to shut down gracefully; the compositor
+            // does not forcibly destroy surfaces or kill processes
+            // here (escalation to SIGTERM/SIGKILL belongs in
+            // session_manager / init).
             if let Some(fid) = *focused {
-                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+Q kill-focused id=");
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+Q close-request id=");
                 write_u32(fid.0);
-                syscall_lib::write_str(STDOUT_FILENO, " (close verb deferred)\n");
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                if client_event_queue.len() == client::MAX_CLIENT_EVENT_QUEUE {
+                    client_event_queue.pop_front();
+                }
+                client_event_queue
+                    .push_back((fid, ServerMessage::CloseRequest { surface_id: fid }));
             }
         }
         KeybindAction::EnterResize => {
@@ -1872,8 +2001,44 @@ fn dispatch_keybind_action(
                     .current_mut()
                     .adjust_focused(fid, direction, step);
                 if let Err(layout::LayoutError::Unsupported) = result {
-                    // Silent no-op for grid/tabbed/fullscreen per spec.
+                    // Phase 72b K.5 — surface the rejection instead of
+                    // silently dropping H/J/K/L keypresses. The user
+                    // entered resize mode against a layout that does
+                    // not support per-tile resize (grid is uniform;
+                    // tabbed shows only the focused tile; fullscreen
+                    // is fullscreen). Log it and auto-exit resize
+                    // mode so subsequent keystrokes reach the focused
+                    // client instead of vanishing into the bind stack.
+                    let policy_name = workspace_mgr.current().policy().as_name();
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: resize not supported under '",
+                    );
+                    syscall_lib::write_str(STDOUT_FILENO, policy_name);
+                    syscall_lib::write_str(STDOUT_FILENO, "'; exiting resize mode\n");
+                    bind_stack.pop_to_default();
                 }
+                // Other variants (NoFocusedWindow etc.) keep resize
+                // mode active — the user might press H/J/K/L after
+                // focusing a window. Log a one-line warning so the
+                // failure mode is visible.
+                if let Err(other) = result.as_ref() {
+                    if !matches!(other, layout::LayoutError::Unsupported) {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: resize keystroke ignored (no focused window?)\n",
+                        );
+                    }
+                }
+                let _ = result;
+            } else {
+                // No focused window — resize chord has nothing to act
+                // on. Stay in resize mode; the user may focus a window
+                // next.
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: resize keystroke ignored (no focused window)\n",
+                );
             }
         }
     }

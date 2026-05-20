@@ -222,10 +222,19 @@ impl DisplayClient {
         };
         let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
 
+        // Phase 72b Track K.7 — use the process PID as `client_token`
+        // so the compositor can scope Goodbye teardown to this term's
+        // surfaces only.
+        let client_token: u32 = {
+            let pid = syscall_lib::getpid();
+            if pid > 0 { pid as u32 } else { 0x7e8e0001 }
+        };
+
         // 1. Hello.
         let hello = ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             capabilities: 0,
+            client_token,
         };
         if !Self::send_verb(server_handle, &hello, &mut buf, "Hello") {
             return Err(TermError::DisplayServerUnavailable);
@@ -234,6 +243,7 @@ impl DisplayClient {
         // 2. CreateSurface.
         let create = ClientMessage::CreateSurface {
             surface_id: SURFACE_ID,
+            client_token,
         };
         if !Self::send_verb(server_handle, &create, &mut buf, "CreateSurface") {
             return Err(TermError::DisplayServerUnavailable);

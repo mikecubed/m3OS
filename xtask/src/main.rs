@@ -10301,16 +10301,30 @@ fn populate_ext2_files(
     // back to stub mode and `frames_consumed` never advances.
     let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
-    // Phase 71 — `term.conf` is still written in every boot mode so the
-    // headless / smoke / regression paths (which have no GUI input
-    // source) can keep autologging into `term` on the serial console.
-    // Graphical-only boots write `/etc/m3os-graphical-only`, which
-    // makes init's `skip_for_greeter_filter` skip `term.conf` so the
-    // `greeter` binary (started via `greeter.conf` below) instead runs
-    // the GUI login form and, on success, `setuid` + `execve(/bin/term)`
-    // so term inherits the authenticated UID/GID. The two manifests
-    // are mutually exclusive at boot — not peers.
-    let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,session_manager\n";
+    // Phase 72b — `term.conf` is no longer staged as a supervised
+    // service manifest. `term` is a user-facing app that may run with
+    // N concurrent instances; supervising it as a singleton daemon
+    // caused the boot-time IPC service-name collision that broke
+    // `SUPER+RETURN` second-term spawns. The new launch sites are:
+    //   - default GUI boot: `display_server` reads `[autostart] exec
+    //     = /bin/term` from `/etc/compositor.conf` and runs it once
+    //     after first compose.
+    //   - graphical-only boot: `greeter` `execve`s `/bin/term`
+    //     in-process after successful authentication.
+    //   - headless smoke / regression boot: no `term` is started —
+    //     smoke-runner drives the kernel serial console directly and
+    //     never depended on the supervised `term` step.
+    // The literal below is retained only so the legacy `_tmp_term_conf`
+    // staging variable still compiles without modification across all
+    // downstream `format!` sites; it is staged into `/etc/services.d/`
+    // only when `M3OS_LEGACY_TERM_CONF=1` is set, for emergency
+    // bisecting against the pre-Phase-72b boot chain.
+    let term_conf = "# Phase 72b — `term` is not a supervised service.\n\
+                     # The legacy manifest is retained behind \
+                     M3OS_LEGACY_TERM_CONF=1 for bisecting only.\n\
+                     name=term\ncommand=/bin/term\ntype=daemon\n\
+                     restart=on-failure\nmax_restart=3\n\
+                     depends=display,kbd\n";
 
     // Phase 71 Track F.1 — greeter manifest. The GUI login form
     // depends on display, kbd, mouse, audio.cmd, and vfs (the latter
@@ -10358,7 +10372,17 @@ fn populate_ext2_files(
     // compositor finds non-default gaps + borders. The parser falls
     // back to defaults on any missing key, so the file's purpose is
     // mostly to document the available knobs.
-    let compositor_conf = concat!(
+    //
+    // Phase 72b — `[autostart]` is conditional on boot mode:
+    //   - Default GUI (no graphical-only marker, not smoke):
+    //     auto-launch `/bin/term` so the user lands at a terminal
+    //     without needing to press `SUPER+RETURN` first.
+    //   - Graphical-only boot: omit autostart — greeter `execve`s
+    //     `/bin/term` after authentication in-process, so a second
+    //     autostart-launched term would be a duplicate.
+    //   - Smoke / regression: omit autostart — headless tests don't
+    //     drive the GUI compositor.
+    let compositor_conf_base = concat!(
         "# m3OS compositor (Phase 72) — tiling window manager.\n",
         "# Edit and run `m3ctl reload` to apply without restart.\n",
         "\n",
@@ -10379,6 +10403,17 @@ fn populate_ext2_files(
         "follow_on_move = false\n",
         "workspace_9 = fullscreen\n",
     );
+    let compositor_conf = if !smoke_test_mode && !graphical_login {
+        format!(
+            "{compositor_conf_base}\n\
+             [autostart]\n\
+             # Phase 72b — launch one `term` after the compositor's first\n\
+             # compose frame so the default-GUI boot lands at a terminal.\n\
+             exec = /bin/term\n",
+        )
+    } else {
+        compositor_conf_base.to_string()
+    };
 
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
@@ -10640,13 +10675,29 @@ fn populate_ext2_files(
     // smoke-test mode `greeter.conf` is omitted entirely (no GUI input
     // source). A future cleanup can collapse this to a single source of
     // truth once the smoke-runner can drive the greeter form headlessly.
-    let term_write = format!(
-        "write \"{}\" etc/services.d/term.conf\n\
-         sif etc/services.d/term.conf mode 0x81A4\n\
-         sif etc/services.d/term.conf uid 0\n\
-         sif etc/services.d/term.conf gid 0\n",
-        term_conf_tmp.display()
-    );
+    // Phase 72b — stage term.conf in smoke-test mode only. The
+    // smoke gate's serial-autologin path expects term to be running
+    // by the time `smoke-runner` fires; without term, the SMOKE:log
+    // step races syslogd's startup and the marker can miss its
+    // /var/log/messages window. In default GUI mode and
+    // graphical-only mode, `term` is launched via the compositor's
+    // `[autostart]` or by greeter's in-process execve, so init does
+    // not need to supervise it. `M3OS_LEGACY_TERM_CONF=1` forces
+    // staging in non-smoke modes for emergency bisecting against
+    // the pre-Phase-72b boot chain.
+    let stage_legacy_term_conf =
+        smoke_test_mode || std::env::var_os("M3OS_LEGACY_TERM_CONF").is_some();
+    let term_write = if stage_legacy_term_conf {
+        format!(
+            "write \"{}\" etc/services.d/term.conf\n\
+             sif etc/services.d/term.conf mode 0x81A4\n\
+             sif etc/services.d/term.conf uid 0\n\
+             sif etc/services.d/term.conf gid 0\n",
+            term_conf_tmp.display()
+        )
+    } else {
+        String::new()
+    };
     let greeter_write = if smoke_test_mode {
         // Skip greeter manifest in smoke mode — no GUI input source.
         String::new()

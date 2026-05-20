@@ -185,6 +185,17 @@ mod os_binary {
         match decode_event(&reply_buf[..used]) {
             Ok((ev, _)) => {
                 print_event(&ev);
+                // Phase 72b Track K.8 — Subscribe is the entry point
+                // for a long-lived event stream. After the initial
+                // Ack lands, poll `EventPull` until SIGINT and print
+                // each delivered event. Other verbs return their
+                // single reply and exit.
+                if matches!(
+                    cmd,
+                    kernel_core::display::control::ControlCommand::Subscribe { .. }
+                ) {
+                    return poll_subscription_events(handle, &mut reply_buf);
+                }
                 0
             }
             Err(err) => {
@@ -193,6 +204,45 @@ mod os_binary {
                 print_str("\n");
                 1
             }
+        }
+    }
+
+    /// Phase 72b Track K.8 — `m3ctl subscribe` polling loop. After
+    /// the initial Subscribe Ack, repeatedly call `EventPull` and
+    /// print each delivered event. An empty queue returns `Ack`; the
+    /// loop sleeps briefly between empty polls so it doesn't burn the
+    /// CPU. SIGINT (Ctrl+C) tears the process down via the shell.
+    fn poll_subscription_events(handle: u32, reply_buf: &mut [u8]) -> i32 {
+        use kernel_core::display::control::ControlCommand;
+        let mut req_buf = [0u8; 8];
+        let req_len = match encode_command(&ControlCommand::EventPull, &mut req_buf) {
+            Ok(n) => n,
+            Err(_) => {
+                print_str("m3ctl: failed to encode EventPull\n");
+                return 1;
+            }
+        };
+        loop {
+            let label =
+                syscall_lib::ipc_call_buf(handle, LABEL_DISPLAY_CTL_CMD, 0, &req_buf[..req_len]);
+            if label == u64::MAX {
+                print_str("m3ctl: subscribe: transport error\n");
+                return 1;
+            }
+            let n = syscall_lib::ipc_take_pending_bulk(reply_buf);
+            if n != u64::MAX && n > 0 {
+                let used = n as usize;
+                if let Ok((ev, _)) = decode_event(&reply_buf[..used]) {
+                    if !matches!(ev, ControlEvent::Ack) {
+                        print_event(&ev);
+                        continue;
+                    }
+                }
+            }
+            // Empty queue / Ack — back off so we don't pin the CPU.
+            // 100 ms keeps `m3ctl subscribe` responsive enough that
+            // events surface within ~one frame of the firing event.
+            let _ = syscall_lib::nanosleep_for(0, 100_000_000);
         }
     }
 
