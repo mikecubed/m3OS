@@ -1023,6 +1023,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &mut input_wiring,
             &mut fb_yielded,
             &mut needs_post_reclaim_fill,
+            &mut workspace_mgr,
+            &mut bind_stack,
+            &mut focused,
+            &mut compositor_config,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -1051,6 +1055,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
 ///
 /// On any decode / dispatch error a structured `ControlEvent::Error`
 /// reply is sent so clients always observe a well-formed frame.
+#[allow(clippy::too_many_arguments)]
 fn serve_one_control_request(
     ep_handle: u32,
     registry: &mut SurfaceRegistry,
@@ -1064,6 +1069,10 @@ fn serve_one_control_request(
     input_wiring: &mut InputWiring,
     fb_yielded: &mut bool,
     needs_post_reclaim_fill: &mut bool,
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    bind_stack: &mut keybind::BindStack,
+    focused: &mut Option<SurfaceId>,
+    compositor_config: &mut config::CompositorConfig,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -1118,6 +1127,37 @@ fn serve_one_control_request(
                 needs_post_reclaim_fill,
                 &mut reply_buf,
             ),
+            ControlCommand::SetLayout { kind } => {
+                handle_set_layout(workspace_mgr, kind, &mut reply_buf)
+            }
+            ControlCommand::SwitchWorkspace { n } => {
+                handle_switch_workspace(workspace_mgr, focused, subscriptions, n, &mut reply_buf)
+            }
+            ControlCommand::MoveToWorkspace { n, follow } => handle_move_to_workspace(
+                workspace_mgr,
+                focused,
+                subscriptions,
+                n,
+                follow,
+                &mut reply_buf,
+            ),
+            ControlCommand::Reload => {
+                handle_reload(workspace_mgr, bind_stack, compositor_config, &mut reply_buf)
+            }
+            ControlCommand::QueryWindows => handle_query_windows(
+                registry,
+                workspace_mgr,
+                *focused,
+                compositor_config.gaps,
+                &mut reply_buf,
+            ),
+            ControlCommand::QueryWorkspaces => {
+                handle_query_workspaces(workspace_mgr, &mut reply_buf)
+            }
+            ControlCommand::SetMasterRatio { ratio_x100 } => {
+                handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf)
+            }
+            ControlCommand::TileFullscreen => handle_tile_fullscreen(workspace_mgr, &mut reply_buf),
             _ => {
                 let client = control::ClientId(0);
                 let pixel_reader =
@@ -1814,6 +1854,270 @@ fn dispatch_keybind_action(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 72 — control-socket verb handlers
+// ---------------------------------------------------------------------------
+
+fn handle_set_layout(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    kind_byte: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    let kind = match kind_byte {
+        0 => layout::PolicyKind::MasterStack,
+        1 => layout::PolicyKind::Dwindle,
+        2 => layout::PolicyKind::Spiral,
+        3 => layout::PolicyKind::Grid,
+        4 => layout::PolicyKind::Tabbed,
+        5 => layout::PolicyKind::Fullscreen,
+        _ => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::BadArgs,
+                },
+                reply_buf,
+            );
+        }
+    };
+    workspace_mgr.set_current_layout(kind);
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_switch_workspace(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: &mut Option<SurfaceId>,
+    subs: &mut control::ControlSubscriptions,
+    n: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if n == 0 || (n as usize) > workspace::NUM_WORKSPACES {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        );
+    }
+    let idx = (n - 1) as usize;
+    match workspace_mgr.switch_workspace(idx) {
+        Ok(transition) => {
+            if transition.switched {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+                publish_to_subscribers_workspace(subs, n);
+            }
+            encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+        }
+        Err(_) => encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        ),
+    }
+}
+
+fn handle_move_to_workspace(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: &mut Option<SurfaceId>,
+    subs: &mut control::ControlSubscriptions,
+    n: u8,
+    follow: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if n == 0 || (n as usize) > workspace::NUM_WORKSPACES {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        );
+    }
+    let Some(fid) = *focused else {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::UnknownSurface,
+            },
+            reply_buf,
+        );
+    };
+    let idx = (n - 1) as usize;
+    let follow_bool = follow != 0;
+    match workspace_mgr.move_to_workspace(fid, idx, follow_bool) {
+        Ok(transition) => {
+            if transition.switched {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+                publish_to_subscribers_workspace(subs, n);
+            } else if !workspace_mgr.current().windows().contains(&fid) {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+            }
+            encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+        }
+        Err(_) => encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        ),
+    }
+}
+
+fn handle_reload(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    bind_stack: &mut keybind::BindStack,
+    compositor_config: &mut config::CompositorConfig,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    if let Some(new_cfg) = load_compositor_config(config::CONFIG_PATH) {
+        *compositor_config = new_cfg;
+        bind_stack.reload_default(&compositor_config.keybinds.user_chords);
+        for i in 0..workspace::NUM_WORKSPACES {
+            if let Some(ws) = workspace_mgr.workspace_mut(i) {
+                ws.set_policy(compositor_config.workspaces.defaults[i]);
+            }
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: reloaded compositor.conf\n");
+    } else {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: reload kept previous config\n",
+        );
+    }
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_query_windows(
+    registry: &SurfaceRegistry,
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: Option<SurfaceId>,
+    gaps: layout::GapConfig,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlEvent, WindowQueryEntry};
+    use kernel_core::display::protocol::Rect as ProtoRect;
+    // For each workspace that holds a window, run the layout and
+    // collect the per-window rect. Use the framebuffer dimensions
+    // implied by the registry's iter_compose call (the output rect
+    // is the full FB; rather than re-acquiring metadata here, the
+    // compose loop publishes it via the registry's compose plan).
+    // Cheap approximation: 1280x720 if we cannot read the FB here.
+    // The compositor's actual `compose_frame` continues to drive the
+    // authoritative rects; this is for the m3ctl query view.
+    let output = ProtoRect {
+        x: 0,
+        y: 0,
+        w: 1280,
+        h: 720,
+    };
+    let mut entries: alloc::vec::Vec<WindowQueryEntry> = alloc::vec::Vec::new();
+    let _ = registry;
+    for ws_idx in 0..workspace::NUM_WORKSPACES {
+        let Some(ws) = workspace_mgr.workspace(ws_idx) else {
+            continue;
+        };
+        if ws.is_empty() {
+            continue;
+        }
+        let policy = ws.policy();
+        let policy_byte = policy_kind_to_byte(policy);
+        let _ = policy_byte;
+        // Re-tile the workspace into the synthetic 1280x720 output —
+        // the m3ctl client renders the rects as a debug view.
+        let ws_mut = workspace_mgr.workspace_mut(ws_idx).expect("idx checked");
+        let inner = layout::apply_outer_gaps(output, gaps.outer);
+        let rects = ws_mut.tile(inner, gaps);
+        for (sid, rect) in rects {
+            entries.push(WindowQueryEntry {
+                surface_id: sid,
+                workspace: (ws_idx + 1) as u8,
+                rect,
+                focused: focused == Some(sid),
+            });
+        }
+    }
+    encode_event_or_drop(&ControlEvent::WindowListReply { entries }, reply_buf)
+}
+
+fn handle_query_workspaces(
+    workspace_mgr: &workspace::WorkspaceManager,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlEvent, WorkspaceQueryEntry};
+    let mut entries: alloc::vec::Vec<WorkspaceQueryEntry> =
+        alloc::vec::Vec::with_capacity(workspace::NUM_WORKSPACES);
+    for (idx, ws) in workspace_mgr.iter() {
+        entries.push(WorkspaceQueryEntry {
+            workspace: (idx + 1) as u8,
+            policy_kind: policy_kind_to_byte(ws.policy()),
+            window_count: ws.len() as u32,
+            active: idx == workspace_mgr.current_index(),
+        });
+    }
+    encode_event_or_drop(&ControlEvent::WorkspaceListReply { entries }, reply_buf)
+}
+
+fn handle_set_master_ratio(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    ratio_x100: u16,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    let ratio = (ratio_x100 as f32) / 100.0;
+    // The PolicySet is per-workspace and the master-stack state is
+    // inside it; mutating it requires a path through the workspace.
+    // We do so here via a thin accessor.
+    if let Some(ws) = workspace_mgr.workspace_mut(workspace_mgr.current_index()) {
+        ws.set_master_ratio(ratio);
+    }
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_tile_fullscreen(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    let cur = workspace_mgr.current().policy();
+    let new = if cur == layout::PolicyKind::Fullscreen {
+        layout::PolicyKind::Dwindle
+    } else {
+        layout::PolicyKind::Fullscreen
+    };
+    workspace_mgr.set_current_layout(new);
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn policy_kind_to_byte(k: layout::PolicyKind) -> u8 {
+    match k {
+        layout::PolicyKind::MasterStack => 0,
+        layout::PolicyKind::Dwindle => 1,
+        layout::PolicyKind::Spiral => 2,
+        layout::PolicyKind::Grid => 3,
+        layout::PolicyKind::Tabbed => 4,
+        layout::PolicyKind::Fullscreen => 5,
+    }
+}
+
+/// Phase 72 — publish a `WorkspaceChanged` event to subscribers of
+/// the `FocusChanged` kind (the existing subscribable slot the new
+/// event variant reuses).
+fn publish_to_subscribers_workspace(subs: &mut control::ControlSubscriptions, workspace_num: u8) {
+    use kernel_core::display::control::ControlEvent;
+    kernel_core::display::subscription::publish_to_subscribers(
+        subs,
+        ControlEvent::WorkspaceChanged {
+            workspace: workspace_num,
+        },
+        null_subscriber_sender,
+    );
 }
 
 #[panic_handler]

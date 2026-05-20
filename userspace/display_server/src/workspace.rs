@@ -139,6 +139,14 @@ impl Workspace {
     pub fn on_focus_changed(&mut self, id: Option<SurfaceId>) {
         self.policies.on_focus_changed(self.policy, id);
     }
+
+    /// Phase 72 — set the `MasterStackLayout`'s `master_ratio` for
+    /// this workspace. No-op when a different policy is active (the
+    /// underlying state is preserved for a later toggle back to
+    /// master/stack).
+    pub fn set_master_ratio(&mut self, ratio: f32) {
+        self.policies.master_stack_mut().set_master_ratio(ratio);
+    }
 }
 
 /// All six per-kind layout-policy states bundled into one struct so a

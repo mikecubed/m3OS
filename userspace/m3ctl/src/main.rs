@@ -423,11 +423,70 @@ mod os_binary {
                 print_u32(*keycode);
                 print_str("\n");
             }
+            ControlEvent::WindowListReply { entries } => {
+                if entries.is_empty() {
+                    print_str("(no windows)\n");
+                } else {
+                    for e in entries {
+                        print_str("window id=");
+                        print_u32(e.surface_id.0);
+                        print_str(" ws=");
+                        print_u32(e.workspace as u32);
+                        print_str(" rect=(");
+                        print_u32(e.rect.x as u32);
+                        print_str(",");
+                        print_u32(e.rect.y as u32);
+                        print_str(" ");
+                        print_u32(e.rect.w);
+                        print_str("x");
+                        print_u32(e.rect.h);
+                        print_str(")");
+                        if e.focused {
+                            print_str(" *focused*");
+                        }
+                        print_str("\n");
+                    }
+                }
+            }
+            ControlEvent::WorkspaceListReply { entries } => {
+                for e in entries {
+                    print_str("workspace ");
+                    print_u32(e.workspace as u32);
+                    print_str(" policy=");
+                    print_str(policy_kind_str(e.policy_kind));
+                    print_str(" windows=");
+                    print_u32(e.window_count);
+                    if e.active {
+                        print_str(" *active*");
+                    }
+                    print_str("\n");
+                }
+            }
+            ControlEvent::WorkspaceChanged { workspace } => {
+                print_str("workspace-changed ws=");
+                print_u32(*workspace as u32);
+                print_str("\n");
+            }
             // `ControlEvent` is `#[non_exhaustive]`; future variants
             // print a typed marker rather than panicking.
             _ => {
                 print_str("(unknown event variant)\n");
             }
+        }
+    }
+
+    /// Phase 72 — map the wire-side `policy_kind` byte back to its
+    /// canonical name for the `query workspaces` printout. Mirrors
+    /// `m3ctl::parse_policy_kind` in the reverse direction.
+    fn policy_kind_str(k: u8) -> &'static str {
+        match k {
+            0 => "master-stack",
+            1 => "dwindle",
+            2 => "spiral",
+            3 => "grid",
+            4 => "tabbed",
+            5 => "fullscreen",
+            _ => "unknown",
         }
     }
 
