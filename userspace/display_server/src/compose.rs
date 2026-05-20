@@ -422,11 +422,12 @@ where
         // zero blits (its local damage list survives the clip as
         // empty / out-of-bounds and is skipped).
         // Phase 72b — surface preparation for the cursor-only fast
-        // path. Mirrors the main-path scaling: for Toplevels smaller
-        // than their tile (DOOM), substitute a tile-sized scaled
-        // snapshot and use full-tile damage so the cursor-overpaint
-        // pass re-blits the scaled content rather than the centred
-        // native-resolution surface.
+        // path. Mirrors the main-path scaling: for Toplevels whose
+        // buffer dims differ from their tile (e.g. DOOM, or a term
+        // mid-resize), substitute a tile-sized scaled snapshot and
+        // use full-tile damage so the cursor-overpaint pass re-blits
+        // the scaled content rather than the centred native-resolution
+        // surface.
         let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
         let mut effective_damages: Vec<Vec<Rect>> = Vec::with_capacity(entries.len());
         let mut effective_rects: Vec<Rect> = Vec::with_capacity(entries.len());
@@ -441,8 +442,9 @@ where
                         kernel_core::display::compose::ComposeLayer::Toplevel
                     ) && entry.buf.width > 0
                         && entry.buf.height > 0
-                        && entry.buf.width < t.w
-                        && entry.buf.height < t.h
+                        && t.w > 0
+                        && t.h > 0
+                        && (entry.buf.width != t.w || entry.buf.height != t.h)
                 }
                 None => false,
             };
@@ -570,15 +572,19 @@ where
     // rest of the compose pass treats as stable.
     // Phase 72b — per-entry pixel buffer. For most surfaces this is
     // `entry.buf.pixels_snapshot()` as before. For Toplevel surfaces
-    // smaller than their assigned tile in both dimensions (the DOOM
-    // case: 320×200 surface dropped into a 1280×800 tile) we
-    // synthesise a *scaled* snapshot via nearest-neighbour sampling
-    // so the rendered output fills the tile instead of being
-    // letterboxed centred at native resolution. Larger-or-equal
-    // surfaces stay on the existing letterbox-and-clip path so a
-    // mid-resize term (buffer still 1280×800, tile now 632×784)
-    // continues to render cleanly until its `ServerMessage::SurfaceResized`
-    // handler reallocates the SHM.
+    // whose buffer dimensions don't match their assigned tile (e.g.
+    // DOOM, which never resizes its 1280×800 backing buffer regardless
+    // of the tile it lands in) we synthesise a *scaled* snapshot via
+    // nearest-neighbour sampling so the rendered output fills the
+    // tile instead of being letterboxed centred at native resolution.
+    //
+    // The scale triggers on any dim mismatch, scaling up or down:
+    // term during its post-`SurfaceResized` transient shows briefly
+    // scaled content while it reallocates its SHM, then naturally
+    // settles to surf == tile and the scale path becomes a no-op.
+    // Aspect ratios are not preserved (`stretch`-style) — for DOOM in
+    // a non-1.6:1 tile this trades chunky-but-complete coverage for
+    // empty letterbox bars; the user explicitly asked for fit-to-tile.
     //
     // Parallel `Vec<Vec<Rect>>` holds the override damage for scaled
     // surfaces — a single full-tile rect, replacing the surface-local
@@ -597,8 +603,9 @@ where
                     kernel_core::display::compose::ComposeLayer::Toplevel
                 ) && entry.buf.width > 0
                     && entry.buf.height > 0
-                    && entry.buf.width < t.w
-                    && entry.buf.height < t.h
+                    && t.w > 0
+                    && t.h > 0
+                    && (entry.buf.width != t.w || entry.buf.height != t.h)
             }
             None => false,
         };
@@ -798,17 +805,19 @@ fn tile_for_entry(
 
 /// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of
 /// `src_w × src_h` to `dst_w × dst_h`. Used for client surfaces
-/// (currently DOOM, eventually any fixed-size client) that are
-/// smaller than their assigned tile, so the rendered output fills
-/// the tile instead of being centred at native resolution with empty
-/// margins around it.
+/// (DOOM, plus any other fixed-size client that doesn't resize its
+/// buffer in response to `ServerMessage::SurfaceResized`) so the
+/// rendered output fills the tile rather than being letterboxed
+/// centred at native resolution with empty margins around it.
 ///
-/// Pure logic: no I/O, no allocation beyond the returned `Vec<u8>`.
-/// Nearest-neighbour was chosen over bilinear because DOOM's chunky
-/// pixel-art aesthetic looks intentionally crisp under integer scaling
-/// (e.g. 320×200 → 1280×800 is exactly 4×); bilinear would smear it.
-/// Smoother filters can be added per-client when a real use case
-/// arrives.
+/// Scales up *and* down. DOOM's 1280×800 buffer in a 632×784 tile
+/// scales down to 632×784; in a 1264×784 tile it scales down to
+/// 1264×784. Aspect ratios are not preserved (stretch). Pure logic:
+/// no I/O, no allocation beyond the returned `Vec<u8>`. Nearest-
+/// neighbour was chosen over bilinear because DOOM's chunky
+/// pixel-art aesthetic looks intentionally crisp under integer
+/// scaling; bilinear would smear it. Smoother filters can be added
+/// per-client when a real use case arrives.
 fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     const BPP: usize = 4;
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
