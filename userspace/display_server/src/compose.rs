@@ -246,7 +246,20 @@ where
     // Wiring the tracker into the general-path clip decision is a
     // documented Phase 68 follow-up.
     let surface_damage = registry.has_damage();
-    if !surface_damage && !cursor_motion {
+    // Phase 72b — bypass the no-op gate when a full repaint was
+    // requested via `ComposeContext::force_full_repaint`. The gate
+    // existed before per-surface clip rects: the old assumption was
+    // "no surface damage and no cursor motion => nothing on screen
+    // changes, so skip the frame entirely." With the clip-rect
+    // change and the arrangement-change path that calls
+    // `force_full_repaint` when tiles resize, a fresh window can
+    // arrive in a frame where no live surface has new damage (the
+    // new surface hasn't committed a buffer yet, the existing tile
+    // dims changed but the buffer didn't). Without this bypass we
+    // skip the `is_first_compose` clear and the now-uncovered gap
+    // regions keep stale pixels from before the arrangement change.
+    let force_full = ctx.damage_tracker.is_full_repaint_needed();
+    if !surface_damage && !cursor_motion && !force_full {
         return Ok(0);
     }
 
