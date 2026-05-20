@@ -16,7 +16,7 @@
 | E | Borders and gaps | B | Planned |
 | F | AF_UNIX control socket | A, C | Planned |
 | G | Configuration file and hot reload | D, E, F | Planned |
-| H | Validation and integration | A–G | Planned |
+| H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | Planned |
 | I | Phase 56 design doc update | H | Planned |
 | J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | Planned |
 
@@ -61,6 +61,8 @@
 **Acceptance:**
 - [ ] Crate added to workspace `Cargo.toml` `members`
 - [ ] `LayoutPolicy` trait defines `fn layout(&self, windows: &[TiledWindow], output: Rect, gaps: GapConfig) -> Vec<(SurfaceId, Rect)>`
+- [ ] `LayoutPolicy` trait defines `fn adjust_focused(&mut self, focused: SurfaceId, direction: ResizeDirection, step: i16) -> Result<(), LayoutError>` with a default `Err(LayoutError::Unsupported)` body so per-policy support is opt-in (master/stack adjusts `master_ratio`; dwindle/spiral adjust the focused tile's parent split ratio; grid/tabbed/fullscreen return `Unsupported`)
+- [ ] `ResizeDirection` enum with `Left`/`Right`/`Up`/`Down` variants exported from the crate root
 - [ ] `FloatingLayout` from Phase 56 migrated to this crate
 - [ ] Host-side unit tests pass under `cargo test -p layout`
 
@@ -169,7 +171,8 @@
 **Acceptance:**
 - [ ] `BindStack::push_mode(table)` activates a new binding table; `pop_mode()` restores the previous
 - [ ] `SUPER+R` enters resize mode; `Escape` exits it
-- [ ] In resize mode `H/J/K/L` adjust the focused tile's size by a configurable step
+- [ ] In resize mode `H/J/K/L` dispatch to `active_policy.adjust_focused(focused, ResizeDirection::{Left,Down,Up,Right}, resize_step)` where `resize_step` is the `[keybinds] resize_step_px` value (default 32)
+- [ ] `LayoutError::Unsupported` from `adjust_focused` is logged at `debug!` and consumed (no error surface) so resize keys are silent no-ops under grid/tabbed/fullscreen
 - [ ] Normal text input is blocked while a non-default mode is active
 
 ### D.3 — Config-driven keybind reload
@@ -223,7 +226,7 @@
 **Acceptance:**
 - [ ] `display_server` opens `/run/compositor.sock` at startup
 - [ ] Framed protocol: 4-byte LE length prefix + UTF-8 JSON body
-- [ ] Accepted commands: `layout`, `workspace`, `move-to-workspace`, `reload`, `query-windows`, `query-workspaces`
+- [ ] Accepted commands: `layout`, `workspace`, `move-to-workspace`, `reload`, `query-windows`, `query-workspaces`, `subscribe`
 - [ ] Command errors return `{"ok": false, "error": "..."}` without crashing the server
 
 ### F.2 — Event push subscription
@@ -249,6 +252,9 @@
 - [ ] `m3ctl workspace switch 3` sends `{"cmd": "workspace", "action": "switch", "n": 3}`
 - [ ] `m3ctl move-to-workspace 2` sends the move command for the currently focused surface
 - [ ] `m3ctl reload` triggers config reload and prints success/error
+- [ ] `m3ctl query windows` sends `{"cmd": "query-windows"}` and pretty-prints the returned `[{surface_id, title, workspace, rect, focused}]` list
+- [ ] `m3ctl query workspaces` sends `{"cmd": "query-workspaces"}` and pretty-prints the returned `[{n, layout, window_count, active}]` list
+- [ ] `m3ctl subscribe` sends `{"cmd": "subscribe"}` and streams received newline-delimited JSON events to stdout until SIGINT
 
 ---
 
@@ -306,6 +312,21 @@
 - [ ] `m3ctl subscribe` receives `window-focused` when click-to-focus changes the focused window
 - [ ] Subscriber list survives a client disconnect without hanging the compositor
 
+### H.3 — `cargo xtask tiling-smoke` regression gate
+
+**Files:**
+- `xtask/src/main.rs`
+- `.githooks/pre-push`
+
+**Symbol:** `tiling_smoke`
+**Why it matters:** Phases 69d / 70 each added an env-gated xtask smoke that ran in the pre-push hook. Without an equivalent for Phase 72, the four-app tiling integration test (H.1) is only validated by hand and can silently regress.
+
+**Acceptance:**
+- [ ] `cargo xtask tiling-smoke` boots m3OS in graphical mode, drives `SUPER+RETURN` four times to open four `term` instances, asserts the dwindle partition is correct via a `m3ctl query windows` snapshot, exercises `SUPER+1..3` workspace switches, and exits with the standard QEMU debug-exit code on success/failure
+- [ ] Gate runs in `.githooks/pre-push` only when `M3OS_TILING_REGRESSION=1` is set (matches the Phase 69d/70 pattern)
+- [ ] `SMOKE_EXIT_TILING_SMOKE_FAILED` constant added to xtask with a distinct exit code for CI debugging
+- [ ] Updated `AGENTS.md` "First-Time Setup" hook description to mention the new gate
+
 ---
 
 ## Track I — Phase 56 Design Doc Update
@@ -320,8 +341,6 @@
 - [ ] Phase 56 "Deferred Until Later" section lists multi-toplevel tiling and workspaces as delivered in Phase 72
 - [ ] Phase 56 "Primary Components" note references `userspace/lib/layout/` as Phase 72's addition
 - [ ] Phase 56 design doc status field remains unchanged (Complete)
-
----
 
 ---
 
@@ -368,3 +387,5 @@
 - Track F closes audit blocker C5 (Red Flag #15): the four `publish_*` stubs in `userspace/display_server/src/control.rs:670, 690, 696, 703` must transmit on the wire.
 - Track D's modifier chord engine is new kernel-free work; the Phase 56 "swallow before client" input hook is already present and only needs to be wired to the `BindTable` lookup.
 - The `FloatingLayout` implementation from Phase 56 Track A.7 / E.1 migrates into `userspace/lib/layout/` in Track B.1 of this phase — the existing symbol is moved, not rewritten.
+- **DOOM tile-fit policy under H.1:** Phase 70 DOOM holds a fixed-size SHM surface via `AttachSharedBuffer` and does not consume `ServerMessage::SurfaceResized`. When DOOM's tile differs from its surface dimensions, `display_server` letterboxes the surface centred within the tile and paints the surrounding cells with `borders.inactive_color`. Teaching DOOM to respond to `SurfaceResized` (so the playfield reflows) is explicitly deferred — see the design doc "Deferred Until Later" section.
+- Track H.3's `cargo xtask tiling-smoke` follows the Phase 69d (`tui-app-smoke`) and Phase 70 (`doom-concurrent-smoke`) gating pattern: env-gated in `.githooks/pre-push` behind `M3OS_TILING_REGRESSION=1` so the default pre-push run stays fast.
