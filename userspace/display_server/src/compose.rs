@@ -135,6 +135,41 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     ctx: &mut ComposeContext,
     pointer_position: (i32, i32),
 ) -> Result<usize, ComposeError> {
+    run_compose_filtered(
+        owner,
+        layout,
+        registry,
+        ctx,
+        pointer_position,
+        |_| true,
+        None,
+        None,
+    )
+}
+
+/// Phase 72 — workspace + border-aware compose entry point.
+///
+/// `include_toplevel` filters `iter_compose` so only the current
+/// workspace's Toplevels are blitted. `border_cfg`, when `Some`,
+/// paints active / inactive borders around every Toplevel rect after
+/// the surface blit completes. `focused_id` selects which border uses
+/// the active colour.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compose_filtered<O, L, F>(
+    owner: &mut O,
+    layout: &mut L,
+    registry: &mut SurfaceRegistry,
+    ctx: &mut ComposeContext,
+    pointer_position: (i32, i32),
+    include_toplevel: F,
+    border_cfg: Option<crate::borders::BorderConfig>,
+    focused_id: Option<SurfaceId>,
+) -> Result<usize, ComposeError>
+where
+    O: FramebufferOwner,
+    L: LayoutPolicy,
+    F: Fn(SurfaceId) -> bool + Copy,
+{
     let meta = owner.metadata();
     let output = Rect {
         x: 0,
@@ -231,7 +266,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // `usable_rect` shrinking is on for any future tiling layout that
     // honours `LayoutPolicy::arrange` output.
     let toplevels: Vec<LayoutSurface> = registry
-        .iter_compose(output)
+        .iter_compose_filtered(output, include_toplevel)
         .iter()
         .filter(|e| {
             matches!(
@@ -264,7 +299,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     }
     let arrangement = &ctx.cached_arrangement;
 
-    let entries = registry.iter_compose(output);
+    let entries = registry.iter_compose_filtered(output, include_toplevel);
 
     // First-compose-pass background wipe. On the first call (and again
     // any time `ComposeContext` was reset, e.g. on client close) the
@@ -476,8 +511,45 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         });
     }
 
-    let surface_writes = compose_frame(owner, output, &mut compose)?;
+    let mut surface_writes = compose_frame(owner, output, &mut compose)?;
+
+    // Phase 72 Track E — paint borders around every Toplevel tile
+    // after the surface blit so they always sit on top of the surface
+    // pixels. Active / inactive colour selection is driven by the
+    // `focused_id` argument; `border_cfg = None` (Phase 56-compat
+    // floating layout) skips the pass entirely. Snapshot the rect /
+    // id / layer triples first so we can `mark_clean` (mutable
+    // registry borrow) immediately and free the immutable `entries`
+    // borrow before the cursor blit needs to touch the framebuffer.
+    let border_targets: Vec<(SurfaceId, Rect)> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.layer,
+                kernel_core::display::compose::ComposeLayer::Toplevel
+            )
+        })
+        .map(|e| (e.id, surface_screen_rect(e, arrangement)))
+        .collect();
+    drop(compose);
+    drop(snapshots);
+    drop(entries);
     registry.mark_clean();
+
+    if let Some(cfg) = border_cfg
+        && cfg.width > 0
+    {
+        for (id, rect) in border_targets.iter() {
+            let color = if focused_id == Some(*id) {
+                cfg.active_color
+            } else {
+                cfg.inactive_color
+            };
+            let written = crate::borders::paint_border(owner, *rect, cfg.width, color)
+                .map_err(ComposeError::from)?;
+            surface_writes = surface_writes.saturating_add(written);
+        }
+    }
 
     // Phase 56 E.3 — blit the cursor on top.
     //

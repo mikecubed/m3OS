@@ -813,6 +813,21 @@ impl SurfaceRegistry {
     /// [`CursorRenderer`](kernel_core::display::cursor::CursorRenderer)
     /// trait (via `client_cursor()`), not as a regular layered surface.
     pub fn iter_compose(&self, output: Rect) -> Vec<ComposeEntry<'_>> {
+        self.iter_compose_filtered(output, |_| true)
+    }
+
+    /// Phase 72 — workspace-aware compose iterator. `include_toplevel`
+    /// is consulted for every `Toplevel`-role surface; returning
+    /// `false` skips that surface (it lives on a non-active
+    /// workspace). `Layer` / `Background` / `Overlay` surfaces are
+    /// always included (e.g. a status bar layer is visible across all
+    /// workspaces). Cursor-role surfaces are always skipped — they
+    /// render via the `CursorRenderer` path.
+    pub fn iter_compose_filtered<F: Fn(SurfaceId) -> bool>(
+        &self,
+        output: Rect,
+        include_toplevel: F,
+    ) -> Vec<ComposeEntry<'_>> {
         let mut entries = Vec::new();
         for (id, surface) in self.surfaces.iter() {
             let Some(buf) = surface.committed_buffer.as_ref() else {
@@ -834,10 +849,15 @@ impl SurfaceRegistry {
                     let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
                     (layer_band, geometry)
                 }
-                Some(SurfaceRole::Toplevel) | None => (
-                    ComposeLayer::Toplevel,
-                    centre_rect(output, buf.width, buf.height),
-                ),
+                Some(SurfaceRole::Toplevel) | None => {
+                    if !include_toplevel(*id) {
+                        continue;
+                    }
+                    (
+                        ComposeLayer::Toplevel,
+                        centre_rect(output, buf.width, buf.height),
+                    )
+                }
             };
             entries.push(ComposeEntry {
                 id: *id,

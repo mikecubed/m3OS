@@ -555,6 +555,7 @@ name = "display_server"
 version = "0.56.0"
 dependencies = [
  "kernel-core",
+ "layout",
  "surface_buffer",
  "syscall-lib",
 ]
