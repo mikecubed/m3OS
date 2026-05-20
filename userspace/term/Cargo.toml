@@ -32,3 +32,12 @@ surface_buffer = { path = "../lib/surface_buffer" }
 # AudioClient transport (the bell tests use MockBellSink); the prod
 # sink is gated behind `cfg(all(not(test), feature = "os-binary"))`.
 audio_client = { path = "../lib/audio_client" }
+
+# Phase 72b — pure-logic `/etc/passwd` parser used by `exec_shell` to
+# resolve the current process's `getuid()` to a username + home so the
+# `USER=` and `HOME=` envp variables forwarded to ion match the
+# authenticated user (rather than the hardcoded `HOME=/root` pre-72b
+# baseline). The default feature pulls in the production syscall_lib;
+# host tests skip the dep entirely because exec_shell only runs on
+# the OS target.
+passwd = { path = "../passwd", default-features = false }

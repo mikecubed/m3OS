@@ -2019,6 +2019,7 @@ version = "0.57.0"
 dependencies = [
  "audio_client",
  "kernel-core",
+ "passwd",
  "surface_buffer",
  "syscall-lib",
 ]
