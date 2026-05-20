@@ -307,9 +307,12 @@ static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 static DOOM_CONCURRENT_ELF: &[u8] = generated_initrd_asset!("doom-concurrent");
 
 // Phase 71 — `greeter` GUI login manager. Display-server client that
-// authenticates against /etc/passwd + /etc/shadow and emits a session
-// descriptor on stdout. Exposed under /bin so `session_manager` can
-// fork+exec it as the final boot step.
+// authenticates against /etc/passwd + /etc/shadow, then in-process
+// `setuid` + `execve(/bin/term)` so term inherits the authenticated
+// UID/GID. Exposed under /bin so init can spawn it directly from the
+// `/etc/services.d/greeter.conf` manifest (graphical-only boots only);
+// `session_manager` observes readiness via the IPC registry rather
+// than parenting the process.
 static GREETER_ELF: &[u8] = generated_initrd_asset!("greeter");
 
 // ---------------------------------------------------------------------------

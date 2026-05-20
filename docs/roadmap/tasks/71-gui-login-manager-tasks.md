@@ -162,16 +162,17 @@
 - [x] Backoff counter resets after each successful login or after the greeter restarts.
 - [x] Unit test: `auth_loop` with a mock `verify` that always fails returns backoff error after 3 calls.
 
-### D.3 — Session descriptor stdout and exit 0
+### D.3 — Session descriptor codec and in-process handoff
 
-**File:** `userspace/greeter/src/main.rs`
-**Symbol:** `emit_session_descriptor`
-**Why it matters:** `session_manager` reads this line to learn which UID to use when spawning `term`; the format must be machine-parseable.
+**File:** `userspace/greeter/src/main.rs`, `userspace/greeter/src/session_desc.rs`
+**Symbol:** `emit_session_descriptor`, in-process `setuid` + `execve("/bin/term")`
+**Why it matters:** The shipped implementation does not hand off via a stdout descriptor + child fork; instead, the authenticated greeter process `setuid`s + `setgid`s and `execve`s `/bin/term` directly, so term inherits the UID/GID without session_manager needing to fork+pipe-parse. The session-descriptor codec remains as a host-tested encoder for any future out-of-process consumer.
 
 **Acceptance:**
-- [x] On successful auth, greeter writes exactly one line to stdout: `uid=<N> gid=<N> home=<path> shell=<path>\n`.
-- [x] Greeter then calls `exit(0)`.
-- [x] Unit test: `emit_session_descriptor` with a known `SessionDescriptor` produces the expected line.
+- [x] On successful auth, greeter encodes a session descriptor via `session_desc::encode` and (for diagnostics) writes it to its log channel: `uid=<N> gid=<N> home=<path> shell=<path>\n`.
+- [x] Greeter then calls `sys_setgid(gid)` and `sys_setuid(uid)`, and on success `execve`s `/bin/term` in-process — there is no `exit(0)` on the success path because the address space becomes `term`.
+- [x] On setuid/execve failure the greeter exits non-zero so init's `restart=on-failure max_restart=3` policy respawns it.
+- [x] Unit test: `session_desc::encode` with a known `SessionDescriptor` produces the expected line.
 
 ---
 
@@ -249,14 +250,14 @@
 ### G.1 — Disable autologin-as-root for graphical sessions
 
 **File:** `userspace/init/src/main.rs`
-**Symbol:** `start_autologin` (or equivalent)
+**Symbol:** `graphical_only_enabled`, `skip_for_greeter_filter`
 **Why it matters:** The autologin path must not fire when a display server is running; only headless boots should skip the greeter.
 
 **Acceptance:**
-- [x] Init checks for `GRAPHICAL_SESSION=1` in the environment (set by `session_manager` when it starts).
-- [x] If `GRAPHICAL_SESSION=1`, the autologin-as-root path is skipped; a log line notes this.
-- [x] If `GRAPHICAL_SESSION` is absent (headless boot), autologin-as-root proceeds as before.
-- [x] A headless `cargo xtask run` (no `run-gui`) still autologins as root on the serial console.
+- [x] Init checks for the `/etc/m3os-graphical-only` marker file via the `graphical_only_enabled()` predicate (PID 1's env has no convenient hook for a later daemon to mutate, so the on-disk marker stands in for the original `GRAPHICAL_SESSION=1` proposal; see `docs/71-gui-login-manager.md` for the rationale).
+- [x] If the marker is present, the autologin-as-root path is skipped, `term.conf` is filtered out via `skip_for_greeter_filter`, and a log line notes the graphical-only mode.
+- [x] If the marker is absent (default / headless boot), `greeter.conf` is filtered out and autologin-as-root proceeds as before.
+- [x] A headless `cargo xtask run` (no `run-gui`, no marker) still autologins as root on the serial console.
 
 ---
 

@@ -10058,24 +10058,31 @@ fn populate_ext2_files(
     // back to stub mode and `frames_consumed` never advances.
     let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
-    // Phase 71 — `term` is no longer spawned directly by init. The
-    // `greeter` binary (started by init via `greeter.conf` below) runs
-    // the GUI login form, then `setuid` + `execve(/bin/term)` so term
-    // inherits the authenticated UID/GID. The legacy term.conf is
-    // kept (commented) for future kiosk-mode revival.
+    // Phase 71 — `term.conf` is still written in every boot mode so the
+    // headless / smoke / regression paths (which have no GUI input
+    // source) can keep autologging into `term` on the serial console.
+    // Graphical-only boots write `/etc/m3os-graphical-only`, which
+    // makes init's `skip_for_greeter_filter` skip `term.conf` so the
+    // `greeter` binary (started via `greeter.conf` below) instead runs
+    // the GUI login form and, on success, `setuid` + `execve(/bin/term)`
+    // so term inherits the authenticated UID/GID. The two manifests
+    // are mutually exclusive at boot — not peers.
     let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,session_manager\n";
-    let _ = term_conf; // term.conf is intentionally NOT written in Phase 71
 
     // Phase 71 Track F.1 — greeter manifest. The GUI login form
-    // depends on display, kbd, mouse, audio, vfs (for /etc/passwd
-    // + /etc/shadow) and session_manager (for the boot-sequence
-    // ordering invariant). On successful authentication greeter
-    // `setuid`s to the authenticated user and `execve`s `/bin/term`
-    // in-process; the session_manager F.1 step that waits for the
-    // "term" IPC service therefore resolves only after a successful
-    // login. The `restart=on-failure` policy with `max_restart=3`
-    // matches the legacy term.conf budget; greeter's `exit(7)` on
-    // setuid failure is `on-failure` so init respawns it.
+    // depends on display, kbd, mouse, audio.cmd, and vfs (the latter
+    // for /etc/passwd + /etc/shadow). session_manager is intentionally
+    // omitted from the `depends=` list: session_manager observes greeter
+    // readiness via the IPC registry (it is not greeter's parent), so an
+    // explicit init-level dependency would just delay greeter start
+    // behind a service whose start order is already enforced upstream
+    // by `DECLARED_SESSION_STEP_NAMES`. On successful authentication
+    // greeter `setuid`s to the authenticated user and `execve`s
+    // `/bin/term` in-process; the session_manager F.1 step that waits
+    // for the "term" IPC service therefore resolves only after a
+    // successful login. The `restart=on-failure` policy with
+    // `max_restart=3` matches the legacy term.conf budget; greeter's
+    // `exit(7)` on setuid failure is `on-failure` so init respawns it.
     let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse,audio.cmd,vfs\n";
 
     // Phase 71 — `/etc/greeter.conf` is the greeter binary's runtime
@@ -10253,16 +10260,23 @@ fn populate_ext2_files(
         smoke_mode_tmp.display()
     );
 
-    // Phase 71 — graphical-session entry point. In every mode we write
-    // term.conf so init can spawn `term` directly when no GUI session
-    // is active (smoke-runner, regression suites, headless `run`). In
-    // non-smoke modes we also write greeter.conf so the GUI login form
-    // is reachable via the framebuffer — greeter runs as a peer of the
-    // serial-boot term and `execve`s `/bin/term` as the authenticated
-    // user once the operator logs in. Both processes coexist (term as
-    // root on the serial console / boot path; greeter on the GUI). A
-    // future cleanup can collapse this to a single source of truth
-    // once the smoke-runner moves to driving the greeter form.
+    // Phase 71 — graphical-session entry point. In every non-smoke mode
+    // we write BOTH `term.conf` and `greeter.conf` to the disk image;
+    // init then chooses which manifest to load at boot via
+    // `skip_for_greeter_filter`, keyed on the `/etc/m3os-graphical-only`
+    // marker file:
+    //
+    //   - marker absent (default / smoke / regression):  load term.conf,
+    //     skip greeter.conf — legacy serial-autologin path stays intact.
+    //   - marker present (graphical-only deployment):    load greeter.conf,
+    //     skip term.conf — greeter owns the login form and, on success,
+    //     `setuid` + `execve(/bin/term)` in-process so term inherits the
+    //     authenticated UID/GID.
+    //
+    // The two manifests are mutually exclusive at boot — not peers. In
+    // smoke-test mode `greeter.conf` is omitted entirely (no GUI input
+    // source). A future cleanup can collapse this to a single source of
+    // truth once the smoke-runner can drive the greeter form headlessly.
     let term_write = format!(
         "write \"{}\" etc/services.d/term.conf\n\
          sif etc/services.d/term.conf mode 0x81A4\n\

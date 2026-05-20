@@ -43,8 +43,9 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     let panel_x = width.saturating_sub(panel_w) / 2;
     let panel_y = height.saturating_sub(panel_h) / 2;
 
-    // Translucent panel background: dark with full alpha. Keeps the
-    // bitmap font glyphs legible regardless of the background image.
+    // Translucent panel background: dark navy at ~78% opacity
+    // (alpha 0xC8). Keeps the bitmap font glyphs legible while still
+    // letting some of the background image bleed through the panel.
     let panel_bg: u32 = 0xC820_2840;
     fill_rect(pixels, width, panel_x, panel_y, panel_w, panel_h, panel_bg);
 
@@ -155,7 +156,7 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
         width,
         label_x,
         hint_y,
-        "Tab to switch field, Enter to submit.",
+        "Enter or Tab to advance, Esc to cancel.",
         0xFF99_AABB,
         panel_bg,
         &font,

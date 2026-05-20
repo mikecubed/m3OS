@@ -144,7 +144,7 @@ marker file is observably equivalent and consistent with every other
 | `userspace/greeter/src/main.rs` | Binary entry point. Connects to `display_server`, paints the background + form, runs the auth loop, and on success `setuid`s + `execve`s `/bin/term` |
 | `userspace/greeter/src/auth.rs` | Pure-logic `AuthLoopState` state machine. 3-failure / 5 s backoff per Phase 48. Host-tested via `cargo test -p greeter` |
 | `userspace/greeter/src/image.rs` | BMP and PNG decoders + the scale-to-fit blitter that centres the background image with letterbox bars |
-| `userspace/greeter/src/input.rs` | Wired into `main.rs::read_field` — drains `SurfaceInputEvent::Key` messages, distinguishes echo (username) from silent (password), translates printable characters via the keymap, handles Enter / Backspace / Esc / Ctrl-C / Tab |
+| `userspace/greeter/src/main.rs` (`read_field` + `handle_key`) | Drains `ServerMessage::Key` events from the display-server input channel, distinguishes echo (username) from silent (password), translates printable characters via the keymap, handles Enter / Backspace / Esc / Ctrl-C / Tab |
 | `userspace/greeter/src/render.rs` | `render_login_ui` — paints the centred login panel, welcome banner, active-field highlight, and error / backoff message line over whatever the background image (or solid fallback) already drew |
 | `userspace/greeter/src/config.rs` | `/etc/greeter.conf` parser. `key=value` lines, `#` comments, four recognised keys (`background`, `prompt-color`, `accent-color`, `welcome`) plus typed `ConfigParseEvent` reports for unknown keys / invalid colours |
 | `userspace/greeter/src/session_desc.rs` | Encoder + decoder for the `uid=N gid=N home=P shell=P` stdout line |
