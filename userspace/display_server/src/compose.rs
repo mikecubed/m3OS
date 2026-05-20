@@ -585,12 +585,16 @@ where
 /// policy's arrangement for `Toplevel` surfaces while leaving
 /// `Layer` / `Cursor` / `Background` rects unchanged.
 ///
-/// Phase 56 close-out (G.1): without this lookup, every `Toplevel`
-/// would composite at the same `centre_rect` position and only the
-/// top-of-z-order surface would be observable in the multi-client
-/// coexistence regression. The cursor-only fast path also calls this
-/// to keep the surface→cursor-damage translation consistent with the
-/// slow-path placement.
+/// Phase 72 — `compose_frame` requires `surface.rect.w/h` to match
+/// `surface.pixels.len() / bpp` (the buffer's intrinsic dimensions);
+/// a tiling policy may assign a tile rect that differs from those
+/// dimensions, so we **letterbox** the surface centred within its
+/// assigned tile. The returned rect always carries the buffer's
+/// intrinsic width / height; only `x` / `y` are derived from the
+/// tile centre. `compose_frame`'s clip-to-output handles the case
+/// where the surface is larger than its tile (it spills out and
+/// gets clipped at the output edge — the documented deferral for
+/// DOOM in the Phase 72 spec).
 fn surface_screen_rect(
     entry: &crate::surface::ComposeEntry<'_>,
     arrangement: &[(SurfaceId, Rect)],
@@ -599,11 +603,21 @@ fn surface_screen_rect(
         entry.layer,
         kernel_core::display::compose::ComposeLayer::Toplevel
     ) {
-        arrangement
-            .iter()
-            .find(|(id, _)| *id == entry.id)
-            .map(|(_, r)| *r)
-            .unwrap_or(entry.rect)
+        if let Some((_, tile)) = arrangement.iter().find(|(id, _)| *id == entry.id) {
+            // Letterbox: keep buffer dimensions, center inside the tile.
+            let surf_w = entry.buf.width;
+            let surf_h = entry.buf.height;
+            let dx = ((tile.w as i32) - (surf_w as i32)) / 2;
+            let dy = ((tile.h as i32) - (surf_h as i32)) / 2;
+            Rect {
+                x: tile.x.saturating_add(dx),
+                y: tile.y.saturating_add(dy),
+                w: surf_w,
+                h: surf_h,
+            }
+        } else {
+            entry.rect
+        }
     } else {
         entry.rect
     }
