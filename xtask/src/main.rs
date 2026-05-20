@@ -314,7 +314,10 @@ fn main() {
             // PC-speaker binding so non-audio runs match historical
             // behavior byte-for-byte.
             let no_audio = remaining.iter().any(|a| a == "--no-audio");
-            cmd_run_gui(fresh, devices, !no_audio);
+            // Phase 71 follow-up — `run-gui` defaults to the GUI
+            // greeter; `--skip-login` flips back to serial autologin.
+            let skip_login = remaining.iter().any(|a| a == "--skip-login");
+            cmd_run_gui(fresh, devices, !no_audio, skip_login);
         }
         Some("check") => cmd_check(),
         Some("fmt") => {
@@ -564,7 +567,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -6146,6 +6149,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -6192,6 +6196,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
                 false,
                 false,
                 false,
+                false, // graphical_login — autologin / serial path
             );
         }
         let mut child = Command::new("qemu-system-x86_64")
@@ -6537,6 +6542,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -6580,6 +6586,7 @@ fn cmd_device_smoke(args: &DeviceSmokeArgs) {
                 false,
                 false,
                 false,
+                false, // graphical_login — autologin / serial path
             );
         }
 
@@ -6902,6 +6909,7 @@ fn cmd_audio_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     // Phase 63 C.2: prepare the smoke output directory and WAV path.
@@ -7239,6 +7247,7 @@ fn cmd_session_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -7339,6 +7348,7 @@ fn cmd_session_recover_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -7487,6 +7497,7 @@ fn cmd_session_restart_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -7694,6 +7705,7 @@ fn cmd_bell_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     // Prepare output directory for the WAV recording.
@@ -7760,6 +7772,7 @@ fn cmd_tui_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -7973,6 +7986,7 @@ fn cmd_tui_app_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -8506,6 +8520,7 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -8867,6 +8882,7 @@ fn cmd_termios_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -8991,6 +9007,7 @@ fn cmd_doom_audio_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let smoke_dir = prepare_audio_smoke_dir();
@@ -9189,6 +9206,7 @@ fn cmd_doom_concurrent_smoke(args: &SmokeBootArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let ovmf = find_ovmf();
@@ -9357,6 +9375,12 @@ struct ImageArgs {
     key: PathBuf,
     cert: PathBuf,
     enable_telnet: bool,
+    // Phase 71 follow-up — when `true`, suppress the
+    // `/etc/m3os-graphical-only` marker so the resulting image boots
+    // into the legacy serial-autologin term path instead of the GUI
+    // greeter. Off by default; bootable distribution images expect to
+    // present the login screen.
+    skip_login: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9411,6 +9435,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
     let mut key = None;
     let mut cert = None;
     let mut enable_telnet = false;
+    let mut skip_login = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -9442,6 +9467,9 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
             "--enable-telnet" => {
                 enable_telnet = true;
             }
+            "--skip-login" => {
+                skip_login = true;
+            }
             _ => {
                 return Err(format!("unknown image flag `{arg}`"));
             }
@@ -9458,6 +9486,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
         key: key.unwrap_or_else(|| default_key_path(workspace_root)),
         cert: cert.unwrap_or_else(|| default_cert_path(workspace_root)),
         enable_telnet,
+        skip_login,
     })
 }
 
@@ -9670,6 +9699,12 @@ fn create_data_disk(
     display_server_debug_crash: bool,
     display_server_readback: bool,
     display_server_inject_key: bool,
+    // Phase 71 follow-up — when `true`, populate the data disk with
+    // the `/etc/m3os-graphical-only` marker so init drives boot
+    // through the GUI greeter. `cargo xtask run-gui` and `cargo xtask
+    // image` default to `true`; serial-autologin and smoke/regression
+    // paths pass `false`.
+    graphical_login: bool,
 ) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
@@ -9802,6 +9837,7 @@ fn create_data_disk(
         display_server_debug_crash,
         display_server_readback,
         display_server_inject_key,
+        graphical_login,
     );
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
@@ -9965,6 +10001,12 @@ fn populate_ext2_files(
     display_server_debug_crash: bool,
     display_server_readback: bool,
     display_server_inject_key: bool,
+    // Phase 71 follow-up — when `true`, drop `/etc/m3os-graphical-only`
+    // on the data disk so init's `skip_for_greeter_filter` loads
+    // `greeter.conf` and skips `term.conf` at boot. Ignored in
+    // `smoke_test_mode` because that branch already omits
+    // `greeter.conf` entirely (no GUI input source).
+    graphical_login: bool,
 ) {
     // Standard Unix root filesystem layout.
     let passwd_content =
@@ -10269,6 +10311,29 @@ fn populate_ext2_files(
          sif etc/m3os-smoke-test-mode gid 0\n",
         smoke_mode_tmp.display()
     );
+
+    // Phase 71 follow-up — `/etc/m3os-graphical-only` marker.
+    //
+    // Init's `graphical_only_enabled()` checks only file presence, so a
+    // zero-byte file is sufficient. Written only when the caller opted
+    // in via `graphical_login` AND the build is not in smoke-test mode
+    // (smoke mode omits `greeter.conf` entirely, so the marker would
+    // have nothing to flip — keep it off there to make the intent
+    // explicit and to keep the smoke disk byte-stable). Removed by
+    // `--skip-login` on `cargo xtask run-gui` / `cargo xtask image`.
+    let graphical_only_marker_tmp = output_dir.join("_tmp_graphical_only_marker");
+    let graphical_only_cmds = if graphical_login && !smoke_test_mode {
+        fs::write(&graphical_only_marker_tmp, b"").expect("write temp graphical-only marker");
+        format!(
+            "write \"{}\" etc/m3os-graphical-only\n\
+             sif etc/m3os-graphical-only mode 0x81A4\n\
+             sif etc/m3os-graphical-only uid 0\n\
+             sif etc/m3os-graphical-only gid 0\n",
+            graphical_only_marker_tmp.display()
+        )
+    } else {
+        String::new()
+    };
 
     // Phase 71 — graphical-session entry point. In every non-smoke mode
     // we write BOTH `term.conf` and `greeter.conf` to the disk image;
@@ -10640,6 +10705,7 @@ fn populate_ext2_files(
          sif etc/hostname uid 0\n\
          sif etc/hostname gid 0\n\
          {smoke_mode_cmds}\
+         {graphical_only_cmds}\
          {skip_tcc_cmds}\
          {disable_display_cmds}\
          {debug_crash_cmds}\
@@ -10669,6 +10735,7 @@ fn populate_ext2_files(
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
+        graphical_only_cmds = graphical_only_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
@@ -10715,6 +10782,7 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&crond_conf_tmp);
     let _ = fs::remove_file(&hostname_tmp);
     let _ = fs::remove_file(&smoke_mode_tmp);
+    let _ = fs::remove_file(&graphical_only_marker_tmp);
     let _ = fs::remove_file(&empty_tmp);
     let _ = fs::remove_file(&session_manager_conf_tmp);
     let _ = fs::remove_file(&greeter_user_conf_tmp);
@@ -11704,6 +11772,10 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
+    // Phase 71 follow-up — bootable distribution images default to the
+    // GUI greeter; `cargo xtask image --skip-login` flips it back to
+    // serial autologin (useful for image-test smoke runs).
+    let graphical_login = !image_args.skip_login;
     create_data_disk(
         output_dir,
         image_args.enable_telnet,
@@ -11711,6 +11783,7 @@ fn cmd_image(image_args: &ImageArgs) {
         false,
         false,
         false,
+        graphical_login, // Phase 71 — gated by --skip-login
     );
 
     if !image_args.sign {
@@ -12111,11 +12184,12 @@ fn cmd_run(fresh: bool, devices: DeviceSet, with_audio: bool) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
     launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Headless, devices, with_audio);
 }
 
-fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
+fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool, skip_login: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -12126,6 +12200,10 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
+    // Phase 71 follow-up — `cargo xtask run-gui` defaults to the GUI
+    // greeter (`graphical_login = true`); `--skip-login` flips it back
+    // to the legacy serial autologin path for rapid dev iteration.
+    let graphical_login = !skip_login;
     create_data_disk(
         uefi_image.parent().unwrap(),
         false,
@@ -12133,6 +12211,7 @@ fn cmd_run_gui(fresh: bool, devices: DeviceSet, with_audio: bool) {
         false,
         false,
         false,
+        graphical_login, // Phase 71 — gated by --skip-login
     );
     launch_qemu_with_devices_audio(&uefi_image, QemuDisplayMode::Gui, devices, with_audio);
 }
@@ -13963,6 +14042,7 @@ fn cmd_regression(args: &RegressionArgs) {
         false,
         false,
         false,
+        false, // graphical_login — autologin / serial path
     );
 
     let mut passed = 0usize;
@@ -14018,6 +14098,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 needs_debug_crash,
                 needs_readback,
                 needs_inject_key,
+                false, // graphical_login — autologin / serial path
             );
             if needs_disable_display {
                 unsafe {
@@ -14060,6 +14141,7 @@ fn cmd_regression(args: &RegressionArgs) {
                 current_disk_has_debug_crash,
                 current_disk_has_readback,
                 current_disk_has_inject_key,
+                false, // graphical_login — autologin / serial path
             );
         }
     }
@@ -16044,6 +16126,28 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "`--key`/`--cert` require `--sign`");
+    }
+
+    /// Phase 71 follow-up — `cargo xtask image` defaults to the GUI
+    /// greeter; `--skip-login` flips it back to serial autologin.
+    #[test]
+    fn parse_image_args_skip_login_defaults_off() {
+        let workspace_root = PathBuf::from("/workspace/m3os");
+        let parsed = parse_image_args(&[], &workspace_root).unwrap();
+        assert!(
+            !parsed.skip_login,
+            "`cargo xtask image` without --skip-login must default to graphical login"
+        );
+    }
+
+    #[test]
+    fn parse_image_args_skip_login_flag_toggles_on() {
+        let workspace_root = PathBuf::from("/workspace/m3os");
+        let parsed = parse_image_args(&string_args(&["--skip-login"]), &workspace_root).unwrap();
+        assert!(
+            parsed.skip_login,
+            "`cargo xtask image --skip-login` must suppress the greeter marker"
+        );
     }
 
     #[test]
