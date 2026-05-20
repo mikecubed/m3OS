@@ -73,10 +73,36 @@ const LOOKUP_MAX_ATTEMPTS: u32 = 2000;
 /// Surface id term claims. Stable across the binary lifetime — only
 /// one Toplevel surface per `term` instance.
 ///
-/// `pub` so the input-loop split in `term::main` can pass the same
-/// id when PULLing from `display_server` — keeps the value single-
-/// sourced instead of repeated as a magic literal at the call site.
-pub const SURFACE_ID: SurfaceId = SurfaceId(1);
+/// Per-process surface id. Phase 72b — when multiple `term` instances
+/// run concurrently (e.g. spawned via `SUPER+RETURN`), each must own a
+/// distinct `SurfaceId`; otherwise the second instance's
+/// `CreateSurface` is rejected as a duplicate by display_server and
+/// its later commits target the *first* term's surface, producing the
+/// "two terms stacked into one buffer" visual stomp.
+///
+/// Mirrors the display_client_ffi seed: `0x4000 + PID`. The `0x4000`
+/// base reserves the low 16k for future statically-allocated surface
+/// ids (today: `SurfaceId(1)` for the legacy single-term path,
+/// `SurfaceId(2)` for greeter). The PID offset keeps the value
+/// unique across concurrent processes.
+///
+/// Function form rather than `const` because PID is not known at
+/// compile time. Each `term` process computes the value once at
+/// startup and caches it; the input-loop split in `term::main`
+/// re-derives via the same helper so the value stays single-sourced.
+pub fn surface_id() -> SurfaceId {
+    let pid = syscall_lib::getpid();
+    if pid > 0 {
+        SurfaceId(0x4000u32.wrapping_add(pid as u32))
+    } else {
+        // PID lookup failed — fall back to a fixed mid-range id. Two
+        // such fallbacks would collide; the assumption is that a
+        // userspace process always has a valid PID. Distinct from
+        // display_client_ffi's 0x4001 fallback so a same-fallback DOOM
+        // and term would still differ by namespace.
+        SurfaceId(0x4002)
+    }
+}
 /// Two `BufferId`s, one per SHM mapping in the double-buffered
 /// publish path. Indexed `BUFFER_IDS[back_idx]` so the protocol
 /// `buffer_id` always matches the SHM region term writes into and
@@ -97,9 +123,16 @@ const DEFAULT_BG_BGRA: u32 = 0x0000_0000;
 /// invisible glyph.
 const FALLBACK_FG_BGRA: u32 = 0x00FF_FFFF;
 
-/// Pixel width of the term surface, in pixels.
+/// Initial pixel width of the term surface, in pixels. Used at
+/// `DisplayClient::connect` to size the first SHM region. Phase 72b
+/// — the live surface dimensions are tracked as runtime fields on
+/// `DisplayClient` (`width` / `height`) and updated when the
+/// compositor sends `ServerMessage::SurfaceResized`. The constants
+/// stay public because callers still use them as the canonical
+/// "default cell-grid pixel area" sentinel.
 pub const SURFACE_WIDTH_PX: u32 = (DEFAULT_COLS as u32) * (CELL_WIDTH as u32);
-/// Pixel height of the term surface, in pixels.
+/// Initial pixel height of the term surface, in pixels. See
+/// [`SURFACE_WIDTH_PX`].
 pub const SURFACE_HEIGHT_PX: u32 = (DEFAULT_ROWS as u32) * (CELL_HEIGHT as u32);
 /// Cell pixel width. The Phase 69c TTF atlas rasterises glyphs into
 /// this cell size, so a wider cell produces more legible Nerd Font
@@ -205,6 +238,18 @@ pub struct DisplayClient {
     /// submit so the just-published buffer becomes the new front and
     /// the previously-front buffer becomes the new back.
     back_idx: usize,
+    /// Phase 72b — per-instance surface id (PID-derived). Cached at
+    /// connect time so every protocol verb references the same value.
+    /// See [`surface_id`] for the derivation.
+    surface_id: SurfaceId,
+    /// Phase 72b — current surface pixel width. Initialised from
+    /// [`SURFACE_WIDTH_PX`]; updated by [`DisplayClient::resize`] when
+    /// the compositor sends `ServerMessage::SurfaceResized`. Cached
+    /// here so every per-frame `AttachSharedBuffer` / `DamageSurface`
+    /// uses the live dimensions instead of compile-time constants.
+    width: u32,
+    /// Phase 72b — current surface pixel height. See [`width`].
+    height: u32,
 }
 
 impl DisplayClient {
@@ -229,6 +274,13 @@ impl DisplayClient {
             let pid = syscall_lib::getpid();
             if pid > 0 { pid as u32 } else { 0x7e8e0001 }
         };
+        // Phase 72b — per-instance surface id so two concurrent terms
+        // (e.g. a SUPER+RETURN spawn while a first term is running)
+        // do not collide on `SurfaceId(1)`. Without this the second
+        // term's CreateSurface is rejected as duplicate and its later
+        // commits target the *first* term's surface — the visible
+        // "two terms stacked into one buffer" symptom.
+        let sid = surface_id();
 
         // 1. Hello.
         let hello = ClientMessage::Hello {
@@ -242,7 +294,7 @@ impl DisplayClient {
 
         // 2. CreateSurface.
         let create = ClientMessage::CreateSurface {
-            surface_id: SURFACE_ID,
+            surface_id: sid,
             client_token,
         };
         if !Self::send_verb(server_handle, &create, &mut buf, "CreateSurface") {
@@ -251,7 +303,7 @@ impl DisplayClient {
 
         // 3. SetSurfaceRole(Toplevel).
         let role = ClientMessage::SetSurfaceRole {
-            surface_id: SURFACE_ID,
+            surface_id: sid,
             role: SurfaceRole::Toplevel,
         };
         if !Self::send_verb(server_handle, &role, &mut buf, "SetSurfaceRole") {
@@ -282,7 +334,77 @@ impl DisplayClient {
             // `surfaces[0]`.
             surfaces: [front, back],
             back_idx: 1,
+            surface_id: sid,
+            width: SURFACE_WIDTH_PX,
+            height: SURFACE_HEIGHT_PX,
         })
+    }
+
+    /// Phase 72b — accessor for the per-instance surface id so callers
+    /// outside this struct (e.g. the input-loop split in `term::main`)
+    /// can read the same value without redundantly calling `getpid`.
+    pub fn surface_id(&self) -> SurfaceId {
+        self.surface_id
+    }
+
+    /// Current surface pixel width. Reflects either the initial
+    /// [`SURFACE_WIDTH_PX`] or the value passed to the most recent
+    /// successful [`DisplayClient::resize`].
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Current surface pixel height. See [`width`].
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Phase 72b — reallocate the SHM front + back buffers at
+    /// `new_width × new_height` so the surface buffer matches the
+    /// compositor's assigned tile rect. Called from the term main
+    /// loop's `PulledEvent::SurfaceResized` handler.
+    ///
+    /// The Phase 56 protocol's `AttachSharedBuffer` validates the
+    /// `shm_id` byte length against `width * height * 4`; we cannot
+    /// reuse the old SHM region under new dimensions because the
+    /// server-side check would reject it. So `resize` allocates two
+    /// fresh `SurfaceMapping`s, replaces the existing pair, and lets
+    /// the old `SurfaceMapping::Drop` impls call `shm_destroy` on the
+    /// way out.
+    ///
+    /// On any allocation failure the existing buffers are kept and
+    /// the function returns `false`; the caller's compose loop will
+    /// continue rendering into the old dimensions and the next tile
+    /// change will retry.
+    pub fn resize(&mut self, new_width: u32, new_height: u32) -> bool {
+        if new_width == self.width && new_height == self.height {
+            return true;
+        }
+        if new_width == 0 || new_height == 0 {
+            return false;
+        }
+        let byte_len = (new_width as usize)
+            .saturating_mul(new_height as usize)
+            .saturating_mul(4);
+        let new_front = match SurfaceMapping::allocate(byte_len, BUFFER_IDS[0]) {
+            Some(m) => m,
+            None => return false,
+        };
+        let new_back = match SurfaceMapping::allocate(byte_len, BUFFER_IDS[1]) {
+            Some(m) => m,
+            None => {
+                // new_front drops here, releasing its SHM cleanly.
+                return false;
+            }
+        };
+        // Replace the pair atomically. The previous `surfaces[..]`
+        // values are dropped on assignment; their `SurfaceMapping::Drop`
+        // releases the old SHM regions.
+        self.surfaces = [new_front, new_back];
+        self.back_idx = 1;
+        self.width = new_width;
+        self.height = new_height;
+        true
     }
 
     /// Mutable access to the back-buffer shared-memory mapping —
@@ -333,29 +455,29 @@ impl DisplayClient {
         let mapping = &self.surfaces[self.back_idx];
         let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
         let attach = ClientMessage::AttachSharedBuffer {
-            surface_id: SURFACE_ID,
+            surface_id: self.surface_id,
             buffer_id: mapping.buffer_id,
             shm_id: mapping.shm_id,
-            width: SURFACE_WIDTH_PX,
-            height: SURFACE_HEIGHT_PX,
+            width: self.width,
+            height: self.height,
         };
         if !Self::send_verb(self.server_handle, &attach, &mut buf, "AttachSharedBuffer") {
             return false;
         }
         let damage = ClientMessage::DamageSurface {
-            surface_id: SURFACE_ID,
+            surface_id: self.surface_id,
             rect: Rect {
                 x: 0,
                 y: 0,
-                w: SURFACE_WIDTH_PX,
-                h: SURFACE_HEIGHT_PX,
+                w: self.width,
+                h: self.height,
             },
         };
         if !Self::send_verb(self.server_handle, &damage, &mut buf, "DamageSurface") {
             return false;
         }
         let commit = ClientMessage::CommitSurface {
-            surface_id: SURFACE_ID,
+            surface_id: self.surface_id,
         };
         if !Self::send_verb(self.server_handle, &commit, &mut buf, "CommitSurface") {
             return false;
@@ -468,18 +590,12 @@ impl FramebufferOwner for DisplayClient {
         // buffer. Out-of-grid requests are silently dropped — the
         // helper is host-tested in
         // `kernel_core::display::pixel_chunk::cell_pixel_offset_*`.
-        let stride_pixels = SURFACE_WIDTH_PX as usize;
-        let cell_offset = match cell_pixel_offset(
-            row,
-            col,
-            CELL_WIDTH,
-            CELL_HEIGHT,
-            SURFACE_WIDTH_PX,
-            SURFACE_HEIGHT_PX,
-        ) {
-            Some(o) => o,
-            None => return,
-        };
+        let stride_pixels = self.width as usize;
+        let cell_offset =
+            match cell_pixel_offset(row, col, CELL_WIDTH, CELL_HEIGHT, self.width, self.height) {
+                Some(o) => o,
+                None => return,
+            };
 
         // SAFETY: see `pixels_mut` — the borrow stays inside this
         // call and the compositor snapshots before reading.
@@ -538,7 +654,7 @@ impl FramebufferOwner for DisplayClient {
         if amount == 0 {
             return;
         }
-        let stride = (SURFACE_WIDTH_PX as usize) * 4;
+        let stride = (self.width as usize) * 4;
         let row_bytes = stride * (CELL_HEIGHT as usize);
         let buf_len = self.surfaces[self.back_idx].surface_len;
         // SAFETY: see `pixels_mut` — borrow scoped to this call.

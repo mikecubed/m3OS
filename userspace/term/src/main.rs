@@ -343,7 +343,11 @@ fn program_main(_args: &[&str]) -> i32 {
         //     poll, and compose still run after the queue is empty.
         let mut disconnect = false;
         loop {
-            match pull_one_event(display_handle, &mut event_buf) {
+            match pull_one_event(
+                display_handle,
+                renderer.fb_mut().surface_id(),
+                &mut event_buf,
+            ) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
                     input_handler.translate(&ev, &mut writer);
@@ -356,7 +360,28 @@ fn program_main(_args: &[&str]) -> i32 {
                 }
                 PulledEvent::SurfaceResized { width, height } => {
                     did_work = true;
-                    handle_surface_resize(primary_fd, &mut screen, &mut renderer, width, height);
+                    // Phase 72b — reallocate the SHM front+back buffers
+                    // at the new dimensions BEFORE resizing the cell
+                    // grid, so the renderer's next pass writes into a
+                    // correctly-sized buffer. If `resize` fails (out
+                    // of SHM budget), the old dimensions stick and
+                    // the cell grid follows along — the visual is
+                    // letterboxed-and-clipped to the tile but at
+                    // least nothing crashes.
+                    if !renderer.fb_mut().resize(width, height) {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "term: display.resize failed; keeping old SHM dims\n",
+                        );
+                    } else {
+                        handle_surface_resize(
+                            primary_fd,
+                            &mut screen,
+                            &mut renderer,
+                            width,
+                            height,
+                        );
+                    }
                 }
                 PulledEvent::CloseRequest => {
                     // Phase 72b Track K.6 — graceful shutdown on
@@ -716,19 +741,20 @@ enum PulledEvent {
 /// future track that adds e.g. mouse-aware shell selection would
 /// thread `Pointer` into the input handler here.
 #[cfg(not(test))]
-fn pull_one_event(display_handle: u32, buf: &mut [u8]) -> PulledEvent {
+fn pull_one_event(
+    display_handle: u32,
+    surface_id: kernel_core::display::protocol::SurfaceId,
+    buf: &mut [u8],
+) -> PulledEvent {
     // Phase 70 — pass term's surface id so the multi-client dispatcher
     // returns only events targeted at this client (the focus-aware
     // routing decides target at enqueue time). Without this, the
     // shared outbound queue would race between term and any other
     // graphical client (e.g. DOOM) PULLing on the same endpoint.
-    // Single-sourced from `term::display::SURFACE_ID` so the value
-    // cannot drift between the handle setup and this PULL call.
-    let label = syscall_lib::ipc_call(
-        display_handle,
-        LABEL_CLIENT_EVENT_PULL,
-        term::display::SURFACE_ID.0 as u64,
-    );
+    // Phase 72b — the value is now per-process (PID-derived) so two
+    // concurrent terms each pull their own events; the caller passes
+    // the same value the connect path used for `CreateSurface`.
+    let label = syscall_lib::ipc_call(display_handle, LABEL_CLIENT_EVENT_PULL, surface_id.0 as u64);
     if label != LABEL_CLIENT_EVENT_PULL {
         // LABEL_CLIENT_EVENT_NONE (= 4) or transport error — no
         // event. Even on the NONE path the kernel may have staged
