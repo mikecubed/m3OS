@@ -10253,6 +10253,42 @@ fn populate_ext2_files(
         smoke_mode_tmp.display()
     );
 
+    // Phase 71 — graphical-session entry point. In every mode we write
+    // term.conf so init can spawn `term` directly when no GUI session
+    // is active (smoke-runner, regression suites, headless `run`). In
+    // non-smoke modes we also write greeter.conf so the GUI login form
+    // is reachable via the framebuffer — greeter runs as a peer of the
+    // serial-boot term and `execve`s `/bin/term` as the authenticated
+    // user once the operator logs in. Both processes coexist (term as
+    // root on the serial console / boot path; greeter on the GUI). A
+    // future cleanup can collapse this to a single source of truth
+    // once the smoke-runner moves to driving the greeter form.
+    let term_write = format!(
+        "write \"{}\" etc/services.d/term.conf\n\
+         sif etc/services.d/term.conf mode 0x81A4\n\
+         sif etc/services.d/term.conf uid 0\n\
+         sif etc/services.d/term.conf gid 0\n",
+        term_conf_tmp.display()
+    );
+    let greeter_write = if smoke_test_mode {
+        // Skip greeter manifest in smoke mode — no GUI input source.
+        String::new()
+    } else {
+        format!(
+            "write \"{}\" etc/services.d/greeter.conf\n\
+             sif etc/services.d/greeter.conf mode 0x81A4\n\
+             sif etc/services.d/greeter.conf uid 0\n\
+             sif etc/services.d/greeter.conf gid 0\n\
+             write \"{}\" etc/greeter.conf\n\
+             sif etc/greeter.conf mode 0x81A4\n\
+             sif etc/greeter.conf uid 0\n\
+             sif etc/greeter.conf gid 0\n",
+            greeter_service_conf_tmp.display(),
+            greeter_user_conf_tmp.display(),
+        )
+    };
+    let greeter_or_term_cmds = format!("{term_write}{greeter_write}");
+
     // Phase 56 Track F.2 — drop the debug-crash marker file when the
     // F.2 regression asks for it. Production boots leave the file out;
     // init checks for the file at startup and sets its
@@ -10574,14 +10610,7 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf mode 0x81A4\n\
          sif etc/services.d/audio_server.conf uid 0\n\
          sif etc/services.d/audio_server.conf gid 0\n\
-         write \"{greeter_service_conf}\" etc/services.d/greeter.conf\n\
-         sif etc/services.d/greeter.conf mode 0x81A4\n\
-         sif etc/services.d/greeter.conf uid 0\n\
-         sif etc/services.d/greeter.conf gid 0\n\
-         write \"{greeter_user_conf}\" etc/greeter.conf\n\
-         sif etc/greeter.conf mode 0x81A4\n\
-         sif etc/greeter.conf uid 0\n\
-         sif etc/greeter.conf gid 0\n\
+         {greeter_or_term_cmds}\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -10612,8 +10641,7 @@ fn populate_ext2_files(
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
-        greeter_service_conf = greeter_service_conf_tmp.display(),
-        greeter_user_conf = greeter_user_conf_tmp.display(),
+        greeter_or_term_cmds = greeter_or_term_cmds,
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,

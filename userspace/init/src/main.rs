@@ -152,6 +152,20 @@ const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\
 /// same filter — no parallel "skip these" lists.
 const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0"];
 
+/// Phase 71 — basenames that are skipped when the graphical-only marker
+/// is NOT present. Init unconditionally writes both `term.conf` and
+/// `greeter.conf` to the disk image (see `xtask::populate_ext2_files`);
+/// at runtime, the init manifest loader applies one of two filters:
+///
+/// - default boots (no marker): skip `greeter.conf` so the legacy term
+///   path keeps working unmodified, preserving compatibility with every
+///   existing smoke + regression test that drives the serial console.
+/// - graphical-only boots (marker present): skip `term.conf` so greeter
+///   is the sole spawner of the user term (via `setuid` + `execve` after
+///   authentication).
+const GREETER_ONLY_SKIPPED_CONFS: &[&[u8]] = &[b"greeter.conf\0"];
+const GRAPHICAL_ONLY_SKIPPED_CONFS: &[&[u8]] = &[b"term.conf\0"];
+
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
@@ -976,6 +990,41 @@ impl ServiceManager {
         true
     }
 
+    /// Phase 71 — apply the greeter-vs-term skip filter based on
+    /// `/etc/m3os-graphical-only`. Returns `true` when `path` should be
+    /// skipped this boot. Logs a structured skip line on the first
+    /// matching path.
+    fn skip_for_greeter_filter(&self, path: &[u8]) -> bool {
+        let prefix = b"/etc/services.d/";
+        if path.len() <= prefix.len() {
+            return false;
+        }
+        let basename = &path[prefix.len()..];
+        let (skipped_set, log_suffix) = if graphical_only_enabled() {
+            (
+                GRAPHICAL_ONLY_SKIPPED_CONFS,
+                " (graphical-only mode; greeter owns term)\n",
+            )
+        } else {
+            (
+                GREETER_ONLY_SKIPPED_CONFS,
+                " (greeter disabled in default boot; serial path active)\n",
+            )
+        };
+        let mut i = 0;
+        while i < skipped_set.len() {
+            if skipped_set[i] == basename {
+                let log_name_end = basename.len().saturating_sub(1);
+                write_str(STDOUT_FILENO, "init: skipped ");
+                write(STDOUT_FILENO, &basename[..log_name_end]);
+                write_str(STDOUT_FILENO, log_suffix);
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Open a DGRAM socket to `/dev/log` for syslog output.
     fn open_syslog(&mut self) {
         let fd = socket(AF_UNIX as i32, SOCK_DGRAM as i32, 0);
@@ -1138,6 +1187,13 @@ impl ServiceManager {
         // 57 retired `gfx-demo.conf` from the auto-start set; the binary
         // remains under `/bin/gfx-demo` for manual protocol testing.)
         if self.skip_for_display_fallback(path) {
+            return;
+        }
+        // Phase 71 — choose between greeter.conf (graphical-only) and
+        // term.conf (default boot) based on the
+        // `/etc/m3os-graphical-only` marker. Both confs are present on
+        // the disk image; this filter selects which one init loads.
+        if self.skip_for_greeter_filter(path) {
             return;
         }
         let fd = open(path, O_RDONLY, 0);

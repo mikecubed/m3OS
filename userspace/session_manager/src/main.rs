@@ -551,6 +551,19 @@ mod init_backend {
             service: &str,
             timeout_ms: u64,
         ) -> Result<SupervisorReply, SupervisorError> {
+            // Phase 71 — in smoke-test mode greeter cannot authenticate
+            // (no GUI keyboard input) so its `greeter.conf` manifest is
+            // not loaded by init. The legacy term.conf is loaded
+            // instead, so term still registers. More generally, the
+            // greeter step is only meaningful when
+            // `/etc/m3os-graphical-only` is set; in every other boot
+            // (default, smoke-test, regression) init skips greeter.conf
+            // via the same marker check, so treat the step as
+            // satisfied to keep the boot sequence advancing to term.
+            if service == "greeter" && !graphical_only_marker_present() {
+                self.table.update_state(service, ServiceState::Running);
+                return Ok(SupervisorReply::ReadyState { ready: true });
+            }
             // Poll the IPC service registry up to `timeout_ms` waiting
             // for the named service to register. `init` spawns the
             // session services in parallel based on dependency-graph
@@ -655,6 +668,21 @@ mod init_backend {
             }
             (count as u8, entries)
         }
+    }
+
+    /// Phase 71 — best-effort presence check for
+    /// `/etc/m3os-graphical-only`. Returns `true` when the marker
+    /// file exists. Used by the `greeter` step in `await_ready` to
+    /// decide whether to wait for the greeter IPC service (graphical
+    /// boot) or treat the step as satisfied (default / smoke / regression
+    /// boot, where init skipped `greeter.conf`).
+    fn graphical_only_marker_present() -> bool {
+        let fd = syscall_lib::open(b"/etc/m3os-graphical-only\0", syscall_lib::O_RDONLY, 0);
+        if fd < 0 {
+            return false;
+        }
+        let _ = syscall_lib::close(fd as i32);
+        true
     }
 
     /// Phase 64b — one-shot non-blocking observation: does
