@@ -10335,6 +10335,55 @@ fn populate_ext2_files(
         String::new()
     };
 
+    // Phase 71 follow-up — optional `/etc/greeter/background.{png,bmp}`
+    // staging. The greeter's `DEFAULT_BACKGROUND_PATHS` tries PNG first
+    // then BMP, so we honour the same preference at stage time.
+    //
+    // Asset paths under `xtask/assets/greeter/` are gitignored because
+    // the background is a user-personal wallpaper, not a shared
+    // canonical asset like the Nerd Font. If the developer never drops
+    // a file in, we silently skip — the greeter degrades gracefully to
+    // its `DEFAULT_BACKGROUND_COLOR`. No SHA-256 gate (user assets
+    // change too often).
+    let greeter_assets_root = workspace_root().join("xtask/assets/greeter");
+    let greeter_bg_png = greeter_assets_root.join("background.png");
+    let greeter_bg_bmp = greeter_assets_root.join("background.bmp");
+    let mut greeter_bg_cmds = String::new();
+    if greeter_bg_png.is_file() || greeter_bg_bmp.is_file() {
+        greeter_bg_cmds.push_str(
+            "mkdir etc/greeter\n\
+             sif etc/greeter mode 0x41ED\n\
+             sif etc/greeter uid 0\n\
+             sif etc/greeter gid 0\n",
+        );
+        if greeter_bg_png.is_file() {
+            greeter_bg_cmds.push_str(&format!(
+                "write \"{}\" etc/greeter/background.png\n\
+                 sif etc/greeter/background.png mode 0x81A4\n\
+                 sif etc/greeter/background.png uid 0\n\
+                 sif etc/greeter/background.png gid 0\n",
+                greeter_bg_png.display()
+            ));
+            println!(
+                "greeter: staged background image {} -> /etc/greeter/background.png",
+                greeter_bg_png.display()
+            );
+        }
+        if greeter_bg_bmp.is_file() {
+            greeter_bg_cmds.push_str(&format!(
+                "write \"{}\" etc/greeter/background.bmp\n\
+                 sif etc/greeter/background.bmp mode 0x81A4\n\
+                 sif etc/greeter/background.bmp uid 0\n\
+                 sif etc/greeter/background.bmp gid 0\n",
+                greeter_bg_bmp.display()
+            ));
+            println!(
+                "greeter: staged background image {} -> /etc/greeter/background.bmp",
+                greeter_bg_bmp.display()
+            );
+        }
+    }
+
     // Phase 71 — graphical-session entry point. In every non-smoke mode
     // we write BOTH `term.conf` and `greeter.conf` to the disk image;
     // init then chooses which manifest to load at boot via
@@ -10706,6 +10755,7 @@ fn populate_ext2_files(
          sif etc/hostname gid 0\n\
          {smoke_mode_cmds}\
          {graphical_only_cmds}\
+         {greeter_bg_cmds}\
          {skip_tcc_cmds}\
          {disable_display_cmds}\
          {debug_crash_cmds}\
@@ -10736,6 +10786,7 @@ fn populate_ext2_files(
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
         graphical_only_cmds = graphical_only_cmds,
+        greeter_bg_cmds = greeter_bg_cmds,
         skip_tcc_cmds = skip_tcc_cmds,
         disable_display_cmds = disable_display_cmds,
         debug_crash_cmds = debug_crash_cmds,
