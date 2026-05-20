@@ -172,13 +172,21 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("cpuinfo"), false),
             (String::from("loadavg"), false),
         ];
+        // Phase 72b — match Linux's default `/proc` policy: every
+        // user can see every PID. Linux only hides PIDs under the
+        // opt-in `hidepid=` mount option, which m3OS does not yet
+        // implement. Without this, `htop` running as a non-root
+        // authenticated user shows only its own process tree (itself
+        // + term + ion) — the system daemons (display_server,
+        // kbd_server, mouse_server, audio_server, init) are all
+        // owned by root and were filtered out, making the TUI look
+        // empty. The per-file readers (`process_snapshot` +
+        // friends) follow the same any-user-can-read policy; the
+        // sensitive content (environ, memory pages, etc.) is gated
+        // by separate ACLs above this layer.
+        let _ = caller_pid;
         let table = PROCESS_TABLE.lock();
-        let caller_euid = table.find(caller_pid).map(|proc| proc.euid).unwrap_or(0);
-        let mut pids: Vec<u32> = table
-            .iter()
-            .filter(|proc| caller_euid == 0 || proc.pid == caller_pid || proc.euid == caller_euid)
-            .map(|proc| proc.pid)
-            .collect();
+        let mut pids: Vec<u32> = table.iter().map(|proc| proc.pid).collect();
         drop(table);
         pids.sort_unstable();
         for pid in pids {
@@ -236,12 +244,14 @@ fn parse_pid_component(component: &str) -> Option<u32> {
 
 fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     let table = PROCESS_TABLE.lock();
-    let caller_pid = current_pid();
-    let caller_euid = table.find(caller_pid).map(|proc| proc.euid).unwrap_or(0);
     let proc = table.find(pid)?;
-    if caller_euid != 0 && proc.pid != caller_pid && proc.euid != caller_euid {
-        return None;
-    }
+    // Phase 72b — match Linux's default `/proc/<pid>/*` policy: the
+    // basic snapshot (pid, ppid, state, name, exec, cmdline, memory
+    // sizes, fd target list) is readable by anyone. Sensitive bits
+    // (environ, memory contents, fd contents) are gated elsewhere.
+    // Without this, `htop` running as a non-root user couldn't read
+    // any system daemon's stat/status/cmdline and the TUI showed an
+    // empty process list.
     let mut fd_targets = Vec::new();
     for (fd, entry) in proc.fd_entries() {
         if let Some(target) = fd_target(&entry.backend) {
