@@ -39,7 +39,7 @@
 /// Maximum number of distinct step names tracked simultaneously.
 ///
 /// Sized to comfortably exceed [`crate::session_supervisor::DECLARED_SESSION_STEP_NAMES`]
-/// (currently 5) so a future step addition does not require a recompile
+/// (currently 6 — Phase 71 inserted `greeter`) so a future step addition does not require a recompile
 /// of every `Recovery` consumer. When the table is full and a new name
 /// arrives, [`Recovery::on_step_failure`] fails closed by returning
 /// [`RecoveryAction::EscalateToTextFallback`] — the policy never
@@ -217,7 +217,7 @@ pub trait FramebufferRestorer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextFallbackOutcome {
     /// Count of `stop()` calls issued during the rollback. Equals the
-    /// length of [`declared_session_step_names()`] (currently 5).
+    /// length of [`declared_session_step_names()`] (currently 6 — Phase 71 inserted `greeter`).
     pub stops_attempted: u32,
     /// Whether the [`FramebufferRestorer::restore_console`] call
     /// reported success (or expected-no-op).

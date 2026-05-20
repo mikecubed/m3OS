@@ -306,6 +306,12 @@ static SENDMSG_TEST_ELF: &[u8] = generated_initrd_asset!("sendmsg-test");
 // Not a daemon: no `.conf`.
 static DOOM_CONCURRENT_ELF: &[u8] = generated_initrd_asset!("doom-concurrent");
 
+// Phase 71 — `greeter` GUI login manager. Display-server client that
+// authenticates against /etc/passwd + /etc/shadow and emits a session
+// descriptor on stdout. Exposed under /bin so `session_manager` can
+// fork+exec it as the final boot step.
+static GREETER_ELF: &[u8] = generated_initrd_asset!("greeter");
+
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
@@ -802,6 +808,14 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "grab-hook-smoke",
         RamdiskNode::File {
             content: GRAB_HOOK_SMOKE_ELF,
+        },
+    ),
+    // Phase 71 — `greeter` GUI login manager. Spawned by
+    // `session_manager` after `audio_server` is ready.
+    (
+        "greeter",
+        RamdiskNode::File {
+            content: GREETER_ELF,
         },
     ),
 ];

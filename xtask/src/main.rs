@@ -761,6 +761,11 @@ fn build_userspace_bins() {
         // / `wait` builtin. Calls only direct syscalls (fork, execve,
         // waitpid, write) so `needs_alloc = false`.
         ("doom-concurrent", "doom-concurrent", false),
+        // Phase 71 — `greeter` GUI login manager. Lib + bin split (see
+        // `os-binary` gate below); `needs_alloc = true` because the
+        // binary links `kernel-core`, `passwd`, and uses `String` /
+        // `Vec` in the auth + render paths.
+        ("greeter", "greeter", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -800,6 +805,10 @@ fn build_userspace_bins() {
             // gate to build the OS binary; host tests compile the
             // lib only.
             "session_manager" => &["--features", "os-binary"],
+            // Phase 71: `greeter` ships a `[lib]` for host tests and
+            // a `[[bin]]` gated on the `os-binary` feature, same
+            // pattern as `term` / `session_manager`.
+            "greeter" => &["--features", "os-binary"],
             _ => &[],
         };
 
@@ -10049,14 +10058,41 @@ fn populate_ext2_files(
     // back to stub mode and `frames_consumed` never advances.
     let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
-    // Phase 57 Track G: term — graphical terminal emulator. Per the G.1
-    // acceptance bullet, the policy is on-failure with a budget of three;
-    // the dependency chain forces display, keyboard, and the session
-    // orchestrator up before term tries to claim a surface. The dep
-    // names match REGISTERED service names from each daemon's `.conf`
-    // `name=` field (display, kbd, session_manager), NOT the binary
-    // names (display_server, kbd_server, session_manager).
+    // Phase 71 — `term` is no longer spawned directly by init. The
+    // `greeter` binary (started by init via `greeter.conf` below) runs
+    // the GUI login form, then `setuid` + `execve(/bin/term)` so term
+    // inherits the authenticated UID/GID. The legacy term.conf is
+    // kept (commented) for future kiosk-mode revival.
     let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,session_manager\n";
+    let _ = term_conf; // term.conf is intentionally NOT written in Phase 71
+
+    // Phase 71 Track F.1 — greeter manifest. The GUI login form
+    // depends on display, kbd, mouse, audio, vfs (for /etc/passwd
+    // + /etc/shadow) and session_manager (for the boot-sequence
+    // ordering invariant). On successful authentication greeter
+    // `setuid`s to the authenticated user and `execve`s `/bin/term`
+    // in-process; the session_manager F.1 step that waits for the
+    // "term" IPC service therefore resolves only after a successful
+    // login. The `restart=on-failure` policy with `max_restart=3`
+    // matches the legacy term.conf budget; greeter's `exit(7)` on
+    // setuid failure is `on-failure` so init respawns it.
+    let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse,audio.cmd,vfs\n";
+
+    // Phase 71 — `/etc/greeter.conf` is the greeter binary's runtime
+    // configuration file (separate from the init service manifest at
+    // `/etc/services.d/greeter.conf` defined below). Built-in defaults
+    // are sufficient; the commented entries document every recognised
+    // key. Custom values can be edited at runtime via the post-login
+    // shell.
+    let greeter_user_conf = concat!(
+        "# m3OS greeter (Phase 71) — graphical login manager.\n",
+        "# Uncomment and set values to override the built-in defaults.\n",
+        "#\n",
+        "# background=/etc/greeter/background.png\n",
+        "# prompt-color=ffffff\n",
+        "# accent-color=4488cc\n",
+        "welcome=m3OS Login\n",
+    );
 
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
@@ -10155,6 +10191,8 @@ fn populate_ext2_files(
     let session_manager_conf_tmp = output_dir.join("_tmp_session_manager_conf");
     let audio_server_conf_tmp = output_dir.join("_tmp_audio_server_conf");
     let term_conf_tmp = output_dir.join("_tmp_term_conf");
+    let greeter_user_conf_tmp = output_dir.join("_tmp_greeter_user_conf");
+    let greeter_service_conf_tmp = output_dir.join("_tmp_greeter_service_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -10179,6 +10217,8 @@ fn populate_ext2_files(
         .expect("write temp session_manager.conf");
     fs::write(&audio_server_conf_tmp, audio_server_conf).expect("write temp audio_server.conf");
     fs::write(&term_conf_tmp, term_conf).expect("write temp term.conf");
+    fs::write(&greeter_user_conf_tmp, greeter_user_conf).expect("write temp greeter user conf");
+    fs::write(&greeter_service_conf_tmp, greeter_conf).expect("write temp greeter service conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -10534,10 +10574,14 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf mode 0x81A4\n\
          sif etc/services.d/audio_server.conf uid 0\n\
          sif etc/services.d/audio_server.conf gid 0\n\
-         write \"{term_conf}\" etc/services.d/term.conf\n\
-         sif etc/services.d/term.conf mode 0x81A4\n\
-         sif etc/services.d/term.conf uid 0\n\
-         sif etc/services.d/term.conf gid 0\n\
+         write \"{greeter_service_conf}\" etc/services.d/greeter.conf\n\
+         sif etc/services.d/greeter.conf mode 0x81A4\n\
+         sif etc/services.d/greeter.conf uid 0\n\
+         sif etc/services.d/greeter.conf gid 0\n\
+         write \"{greeter_user_conf}\" etc/greeter.conf\n\
+         sif etc/greeter.conf mode 0x81A4\n\
+         sif etc/greeter.conf uid 0\n\
+         sif etc/greeter.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -10568,7 +10612,8 @@ fn populate_ext2_files(
         display_server_conf = display_server_conf_tmp.display(),
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
-        term_conf = term_conf_tmp.display(),
+        greeter_service_conf = greeter_service_conf_tmp.display(),
+        greeter_user_conf = greeter_user_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -10620,6 +10665,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&smoke_mode_tmp);
     let _ = fs::remove_file(&empty_tmp);
     let _ = fs::remove_file(&session_manager_conf_tmp);
+    let _ = fs::remove_file(&greeter_user_conf_tmp);
+    let _ = fs::remove_file(&greeter_service_conf_tmp);
+    let _ = fs::remove_file(&term_conf_tmp);
     // Phase 56 F.3: silently best-effort; the file only exists when the
     // M3OS_DISABLE_DISPLAY_SERVER env var was set.
     let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));

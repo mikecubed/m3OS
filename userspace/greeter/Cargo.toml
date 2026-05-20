@@ -1,0 +1,29 @@
+[package]
+name = "greeter"
+version = "0.71.0"
+edition = "2024"
+description = "Phase 71 — GUI login manager (display_server client + passwd_lib auth gate)."
+
+# Phase 71: a `[lib]` target lets `cargo test -p greeter --target
+# x86_64-unknown-linux-gnu` exercise pure-logic modules (image decoder,
+# scale-to-fit blitter, auth backoff state machine, config parser) on
+# the host without the OS binary's `_start` symbol. The binary keeps
+# `entry_point!` behind the `os-binary` feature so host-test builds skip
+# it.
+[lib]
+name = "greeter"
+path = "src/lib.rs"
+
+[features]
+default = []
+os-binary = []
+
+[[bin]]
+name = "greeter"
+path = "src/main.rs"
+required-features = ["os-binary"]
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+kernel-core = { path = "../../kernel-core", default-features = false }
+passwd = { path = "../passwd", default-features = false }

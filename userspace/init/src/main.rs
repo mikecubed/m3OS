@@ -104,6 +104,24 @@ const READBACK_MARKER_PATH: &[u8] = b"/etc/display_server.readback\0";
 const ENV_DISPLAY_SERVER_INJECT_KEY: &[u8] = b"M3OS_DISPLAY_SERVER_INJECT_KEY=1\0";
 const INJECT_KEY_MARKER_PATH: &[u8] = b"/etc/display_server.inject-key\0";
 
+// Phase 71 — graphical-only gate.
+//
+// When this file exists, init skips the serial-console autologin path.
+// The graphical login is then the sole entry point into a user session.
+//
+// Default boots leave the file out so the existing smoke regression
+// (which relies on serial autologin → sh0) continues to work and so a
+// developer can recover the system via the serial console if the
+// graphical stack is wedged. Sites that want a "no serial root access"
+// deployment opt in by writing this marker.
+//
+// Spec acceptance G.1 phrased this as `GRAPHICAL_SESSION=1` in init's
+// environment, but PID 1's env is set by the kernel boot path and has
+// no convenient hook for `session_manager` to mutate — a marker file
+// is the established m3OS pattern (mirrors the F.2 debug-crash, G.1
+// readback, and G.2 inject-key gates above) and observably equivalent.
+const GRAPHICAL_ONLY_MARKER_PATH: &[u8] = b"/etc/m3os-graphical-only\0";
+
 // Runtime state files live on tmpfs under `/run` — matching the Linux
 // convention where runtime state is tmpfs-backed rather than persistent.
 // Putting them on ext2 caused init's periodic writes (every 10 s) to
@@ -162,7 +180,18 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
     b"/etc/services.d/audio_server.conf\0",
     // Phase 57 Track G: term — graphical terminal emulator.
+    // Phase 71: no longer auto-started by init. The `greeter` service
+    // below execs `/bin/term` itself on successful authentication so
+    // the `term` process inherits the user's UID/GID. The entry stays
+    // in the fallback list (best-effort; not present on disk) so a
+    // future operator-controlled term-restart path can re-enable it
+    // by writing a manifest manually.
     b"/etc/services.d/term.conf\0",
+    // Phase 71: greeter — GUI login manager. Spawns the login form,
+    // authenticates against /etc/passwd + /etc/shadow, and on success
+    // `setuid`s + `execve`s `/bin/term` in-process so term inherits
+    // the authenticated UID.
+    b"/etc/services.d/greeter.conf\0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -2482,6 +2511,20 @@ fn display_server_inject_key_enabled() -> bool {
     true
 }
 
+/// Phase 71 — graphical-only gate.
+///
+/// Returns `true` when `/etc/m3os-graphical-only` exists. When `true`,
+/// init skips the serial autologin path so the Phase 71 GUI greeter
+/// is the sole user-session entry point.
+fn graphical_only_enabled() -> bool {
+    let fd = open(GRAPHICAL_ONLY_MARKER_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SIGTERM handler — sets a flag checked in the main loop.
 //
@@ -2602,6 +2645,16 @@ pub extern "C" fn _start() -> ! {
         if mgr.login_pid < 0 {
             write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
         }
+    } else if graphical_only_enabled() {
+        // Phase 71 G.1 — graphical-only mode: the GUI greeter is the
+        // sole session entry point, so we deliberately do NOT spawn
+        // the serial login. The marker file is written by sites that
+        // want a "no serial root access" deployment.
+        write_str(
+            STDOUT_FILENO,
+            "init: graphical-only marker present, skipping serial autologin (Phase 71)\n",
+        );
+        mgr.respawn_login = false;
     } else {
         mgr.login_pid = spawn_login(
             mgr.display_server_debug_crash,

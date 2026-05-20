@@ -226,3 +226,19 @@ The single concrete change in `kernel/` for Phase 57 audio is one line of wideni
 > `docs/roadmap/tasks/69-terminal-tui-capabilities-tasks.md` for the
 > per-track breakdown.
 
+
+> **Phase 71 closure note:** Phase 57's `session_manager` boot sequence terminated at
+> `term`, which init launched directly via `term.conf` and which ran as root with
+> no authentication gate. Phase 71 (kernel v0.71.0) inserts the GUI greeter
+> (`userspace/greeter/`) between `audio_server` and `term` in
+> [`kernel_core::session_supervisor::DECLARED_SESSION_STEP_NAMES`] so the boot
+> sequence is now `display_server → kbd_server → mouse_server → audio_server →
+> greeter → term`. The greeter is a Phase 56 `display_server` client that
+> renders the background image, accepts username + password from the
+> `kbd_server` event stream, verifies against `/etc/passwd` and `/etc/shadow`
+> via the Phase 27 / Phase 48 paths, and on success `setuid`s + `execve`s
+> `/bin/term` in-process so term inherits the authenticated UID/GID. The
+> serial autologin path stays in place by default (so existing smoke tests
+> continue to work) but is gated behind an `/etc/m3os-graphical-only` marker
+> for sites that want graphical-only login. See `docs/roadmap/71-gui-login-manager.md`
+> and `docs/71-gui-login-manager.md` for the full breakdown.

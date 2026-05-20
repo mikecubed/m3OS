@@ -139,3 +139,13 @@ sticky-bit (`S_ISVTX`) enforcement in VFS unlink/rename, and atomic
 Closeout](./66-security-hygiene-closeout.md). The pre-seeded image
 password hash format was likewise upgraded to the canonical
 `$sha256i$10000$` form documented inline in `passwd_lib`.
+
+## Phase 71 Closure Note
+
+The trust-floor brute-force-defence requirement (3-failure / 5 s backoff
+before re-prompting) is implemented in `userspace/greeter/src/auth.rs`
+as the pure-logic `AuthLoopState` state machine consumed by the Phase 71
+GUI greeter. The same policy applies to graphical login attempts;
+serial login (`userspace/login/`) keeps its own re-prompt loop without
+backoff, gated by the same `/etc/shadow` hash verification path. See
+[Phase 71 — GUI Login Manager](./71-gui-login-manager.md).

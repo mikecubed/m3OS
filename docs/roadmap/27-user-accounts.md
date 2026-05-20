@@ -121,6 +121,16 @@ is replaced by ext2 in Phase 28.
 - `su root` from `user` prompts for root's password and grants a root shell.
 - `passwd` changes the current user's password, and the new password works on next login.
 
+## Consumed by Later Phases
+
+- **Phase 71 (GUI Login Manager):** the `greeter` binary at
+  `userspace/greeter/` reuses Phase 27's `/etc/passwd` lookup and the
+  `syscall_lib::sha256::verify_password` shadow-hash verification path
+  to gate graphical session entry on a successful login. The credential
+  drop (`setgid` + `setuid`) before `execve(/bin/term)` is the same
+  transition the serial `login` performs on entering a shell — Phase 71
+  is the GUI version of the same contract.
+
 ## Companion Task List
 
 - [Phase 27 Task List](./tasks/27-user-accounts-tasks.md)

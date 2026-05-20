@@ -211,9 +211,11 @@ fn run_boot_sequence(backend: &mut init_backend::InitSupervisorBackend) -> Sessi
     let (s0, rest) = steps.split_at_mut(1);
     let (s1, rest) = rest.split_at_mut(1);
     let (s2, rest) = rest.split_at_mut(1);
-    let (s3, s4) = rest.split_at_mut(1);
-    let mut step_refs: [&mut dyn SessionStep; 5] =
-        [&mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0]];
+    let (s3, rest) = rest.split_at_mut(1);
+    let (s4, s5) = rest.split_at_mut(1);
+    let mut step_refs: [&mut dyn SessionStep; 6] = [
+        &mut s0[0], &mut s1[0], &mut s2[0], &mut s3[0], &mut s4[0], &mut s5[0],
+    ];
     let mut seq = StartupSequence::new(&mut step_refs);
     match seq.run(MAX_RETRIES_PER_STEP) {
         Ok(state) => state,
@@ -306,6 +308,10 @@ mod init_backend {
             "kbd_server" => "kbd",
             "mouse_server" => "mouse",
             "audio_server" => "audio.cmd",
+            // Phase 71 — greeter registers as its own service so
+            // session_manager observes when the GUI login surface is
+            // up before waiting on `term`.
+            "greeter" => "greeter",
             "term" => "term",
             _ => "",
         }
