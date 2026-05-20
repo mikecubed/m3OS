@@ -34,7 +34,7 @@ Phase 56's `SurfaceRegistry` already stores multiple Toplevel entries; the compo
 
 ### Layout policies
 
-A single `userspace/lib/layout/` crate provides implementations of the `LayoutPolicy` trait introduced in Phase 56 (Track A.7 / E.1). Policies ship in one crate: Master/Stack, Dwindle (binary tree, alternating split direction per insertion), Spiral (dwindle variant with fixed rotation), Grid (even N×M partition), Tabbed (one tile visible at a time with a tab strip), and Fullscreen-toggle (a per-window overlay that hides chrome and covers the entire output). Floating override is a per-window attribute: windows in the floating list render above the tiled tree at their last position and size.
+A single `userspace/lib/layout/` crate provides implementations of the `LayoutPolicy` trait introduced in Phase 56 (Track A.7 / E.1). Policies ship in one crate: Master/Stack, Dwindle (binary tree, alternating split direction per insertion), Spiral (dwindle variant with fixed rotation), Grid (even N×M partition), Tabbed (one tile visible at a time with a tab strip), and Fullscreen-toggle (a per-window overlay that hides chrome and covers the entire output). Floating override is a per-window attribute: windows in the floating list render above the tiled tree at their last position and size. The trait also exposes a `adjust_focused(focused, direction, step)` hook so the resize-mode keybinds (Track D) can dispatch into the active policy — master/stack and dwindle/spiral implement meaningful behavior; grid/tabbed/fullscreen return `LayoutError::Unsupported`.
 
 ### Workspace state machine
 
@@ -101,7 +101,7 @@ Extends the existing `m3ctl` tool with tile/workspace subcommands. Connects to `
 
 ## Acceptance Criteria
 
-- Four simultaneous GUI applications (two `term` instances, `edit`, and DOOM from Phase 70) tile correctly under the dwindle layout without visual corruption or stale damage
+- Four simultaneous GUI applications (two `term` instances, `edit`, and DOOM from Phase 70) tile correctly under the dwindle layout without visual corruption or stale damage; DOOM's fixed-size SHM surface is letterboxed centred within its assigned tile (DOOM does not yet consume `SurfaceResized`)
 - `SUPER+1..9` switches between nine workspaces; each workspace retains its window list independently
 - `SUPER+SHIFT+1` moves the focused window to workspace 1; the window no longer appears on the source workspace
 - `m3ctl layout grid` switches the active workspace's layout to grid; windows re-tile within one frame
@@ -129,3 +129,5 @@ Extends the existing `m3ctl` tool with tile/workspace subcommands. Connects to `
 - Named workspaces and Hyprland-style "groups" (window sets independent of workspaces)
 - `wl_shm` Wayland compatibility shim (explicitly not Wayland; see `wayland-gap-analysis.md`)
 - Touchpad gestures for workspace switching
+- Teaching the Phase 70 DOOM port to consume `ServerMessage::SurfaceResized` (Phase 69 already plumbed the message; under Phase 72 DOOM is letterboxed within its assigned tile)
+- `LayoutPolicy::adjust_focused` implementations for grid / tabbed / fullscreen layouts (return `LayoutError::Unsupported` in Phase 72; meaningful semantics deferred)
