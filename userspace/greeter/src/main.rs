@@ -221,8 +221,13 @@ fn program_main(_args: &[&str]) -> i32 {
         },
     );
 
-    // Phase 71 F.2 — drop privileges before exec'ing the user shell so
-    // `term` and every descendant runs under the authenticated UID/GID.
+    // Phase 71 F.2 — drop privileges so any user-session work that
+    // follows runs under the authenticated UID/GID. Phase 72b stops
+    // here: greeter does NOT execve into `/bin/term` anymore, so the
+    // user lands at an empty compositor and presses `SUPER+RETURN` to
+    // spawn a terminal when they want one. The setuid/setgid still
+    // run for forward-compatibility with a future user-session
+    // process that would replace greeter in-process.
     if syscall_lib::setgid(descriptor.gid) != 0 {
         syscall_lib::write_str(STDOUT_FILENO, "greeter: setgid failed\n");
         return 7;
@@ -232,27 +237,26 @@ fn program_main(_args: &[&str]) -> i32 {
         return 7;
     }
 
-    // Build envp for term — same vars the autologin path passes.
-    let mut home_env_buf = [0u8; 256];
-    let home_env_len = build_env_string(b"HOME=", descriptor.home.as_bytes(), &mut home_env_buf);
-    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
-    let env_term: &[u8] = b"TERM=m3os-term\0";
-    let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
-    let envp: [*const u8; 5] = [
-        env_path.as_ptr(),
-        home_env_buf[..home_env_len].as_ptr(),
-        env_term.as_ptr(),
-        env_editor.as_ptr(),
-        core::ptr::null(),
-    ];
-
-    let term_path: &[u8] = b"/bin/term\0";
-    let argv: [*const u8; 2] = [term_path.as_ptr(), core::ptr::null()];
-    let ret = syscall_lib::execve(term_path, &argv, &envp);
-    syscall_lib::write_str(STDOUT_FILENO, "greeter: execve /bin/term failed: ");
-    syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-    8
+    // Phase 72b — exit cleanly (code 0). init's manifest declares
+    // `restart=on-failure`, so a 0-exit does not respawn greeter; the
+    // compositor stays up with no foreground app, matching the
+    // documented Phase 72b "empty desktop after login" UX. The user
+    // launches term via `SUPER+RETURN` (display_server's `SpawnTerm`
+    // keybind handler) or any other autostart-style mechanism they
+    // configure in `/etc/compositor.conf`.
+    //
+    // Why not execve here: tying greeter to one specific post-login
+    // app (term) was a Phase 71 expedient. With the Phase 72b
+    // compositor able to spawn apps on demand via the keybind chord
+    // engine, the auto-launch becomes redundant — and surprising,
+    // because users expect a tiling WM to land at an empty desktop
+    // after login (Hyprland / sway / i3 all do).
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "greeter: auth ok, exiting cleanly (Phase 72b)\n",
+    );
+    let _ = build_env_string;
+    0
 }
 
 /// Format `KEY=value\0` into `out`. Returns bytes written including
