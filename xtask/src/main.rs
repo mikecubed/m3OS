@@ -480,9 +480,14 @@ fn main() {
             }
         },
         // Phase 72 Track H.3 — `cargo xtask tiling-smoke` boots m3OS,
-        // drives `SUPER+RETURN` four times to open four `term` instances,
-        // asserts the dwindle partition via `m3ctl query windows`, and
-        // exercises `SUPER+1..3` workspace switches.
+        // logs in over serial, and exercises the new tiling control-
+        // socket verbs end-to-end through `m3ctl` (`version`,
+        // `query workspaces`, `workspace switch`, `layout`, `tile
+        // fullscreen`, `reload`). Spawning multiple `term` instances
+        // via `SUPER+RETURN` and asserting the dwindle partition via
+        // `m3ctl query windows` is a documented follow-up; the current
+        // gate covers the protocol surface but not the multi-window
+        // geometry.
         Some("tiling-smoke") => {
             let smoke_args =
                 parse_smoke_boot_args("tiling-smoke", &args[2..]).unwrap_or_else(|err| {
@@ -9290,11 +9295,16 @@ fn cmd_doom_concurrent_smoke(args: &SmokeBootArgs) {
 
 /// Phase 72 Track H.3 — `cargo xtask tiling-smoke`. Boots m3OS in
 /// graphical mode (autologin / serial path so the harness does not need
-/// to drive the GUI greeter), starts four `term` instances (via the
-/// shell's first instance plus three `m3ctl tile fullscreen` /
-/// `m3ctl layout dwindle` exchanges that exercise the new control-socket
-/// verbs), asserts `m3ctl query windows` returns four entries, then
-/// drives a couple of `m3ctl workspace switch <N>` calls.
+/// to drive the GUI greeter) and exercises the new tiling control-socket
+/// verbs through `m3ctl`: `version`, `query workspaces`, `workspace
+/// switch <N>`, `layout <kind>`, `tile fullscreen`, and `reload`. The
+/// gate confirms the protocol surface (control-socket round-trip,
+/// workspace state, layout-policy switching) is intact end-to-end.
+///
+/// Spawning multiple `term` instances via `SUPER+RETURN` and asserting
+/// the dwindle partition through `m3ctl query windows` is a documented
+/// Phase 72 follow-up — the current step set does not yet open multiple
+/// toplevels or check rect geometry.
 ///
 /// The smoke is bounded by the global timeout and runs entirely over
 /// the serial console — no QMP keystroke injection is required because

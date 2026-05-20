@@ -291,9 +291,13 @@ const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
 /// still comes up; terms fall back to inheriting display_server's UID.
 #[cfg(not(test))]
 fn write_session_state_file(descriptor: &SessionDescriptor) {
+    // `O_TRUNC` so a shorter new write doesn't leave trailing bytes
+    // from a longer prior write — the file's parser is line-oriented
+    // and a stale `home=` line past the new payload would otherwise
+    // corrupt the next reader's view of the session.
     let fd = syscall_lib::open(
         SESSION_STATE_PATH,
-        syscall_lib::O_WRONLY | syscall_lib::O_CREAT,
+        syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC,
         0o600,
     );
     if fd < 0 {

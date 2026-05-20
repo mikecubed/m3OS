@@ -1105,6 +1105,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                             &mut control_subs,
                             &compositor_config,
                             &mut client_event_queue,
+                            &mut compose_ctx,
                         );
                     }
                 }
@@ -1113,6 +1114,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     focused = Some(id);
                     if prev != focused {
                         publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+                        // Phase 72 review-resolution — borders use the
+                        // focused id to pick active vs inactive colour
+                        // every compose pass. Without a forced repaint
+                        // here the no-damage short-circuit can keep the
+                        // previous border colours on screen until some
+                        // unrelated surface damages. Focus changes are
+                        // user-initiated and infrequent, so paying one
+                        // full repaint per focus transition is cheap.
+                        // Also invalidates the cache so `focus_affects_
+                        // geometry()` layouts (tabbed, fullscreen) pick
+                        // the new visible surface on the next pass.
+                        compose_ctx.force_full_repaint();
+                        compose_ctx.invalidate_arrangement_cache();
                     }
                 }
                 InputEffect::PointerEnter(_id) | InputEffect::PointerLeave(_id) => {
@@ -1155,6 +1169,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &mut bind_stack,
             &mut focused,
             &mut compositor_config,
+            &mut compose_ctx,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -1201,6 +1216,7 @@ fn serve_one_control_request(
     bind_stack: &mut keybind::BindStack,
     focused: &mut Option<SurfaceId>,
     compositor_config: &mut config::CompositorConfig,
+    compose_ctx: &mut compose::ComposeContext,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -1256,21 +1272,52 @@ fn serve_one_control_request(
                 &mut reply_buf,
             ),
             ControlCommand::SetLayout { kind } => {
-                handle_set_layout(workspace_mgr, kind, &mut reply_buf)
+                // The policy state changed under the same id set; without
+                // these two calls the arrangement cache and the no-damage
+                // short-circuit would keep painting the previous policy's
+                // partition until something else damaged the framebuffer.
+                let n = handle_set_layout(workspace_mgr, kind, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
             }
             ControlCommand::SwitchWorkspace { n } => {
-                handle_switch_workspace(workspace_mgr, focused, subscriptions, n, &mut reply_buf)
+                let nbytes = handle_switch_workspace(
+                    workspace_mgr,
+                    focused,
+                    subscriptions,
+                    n,
+                    &mut reply_buf,
+                );
+                // Workspace switch usually changes the active id set (so
+                // the compose cache invalidates naturally), but the focus
+                // and active-set transition still needs the no-damage
+                // gate bypassed so borders + background recolour on the
+                // next pass.
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                nbytes
             }
-            ControlCommand::MoveToWorkspace { n, follow } => handle_move_to_workspace(
-                workspace_mgr,
-                focused,
-                subscriptions,
-                n,
-                follow,
-                &mut reply_buf,
-            ),
+            ControlCommand::MoveToWorkspace { n, follow } => {
+                let nbytes = handle_move_to_workspace(
+                    workspace_mgr,
+                    focused,
+                    subscriptions,
+                    n,
+                    follow,
+                    &mut reply_buf,
+                );
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                nbytes
+            }
             ControlCommand::Reload => {
-                handle_reload(workspace_mgr, bind_stack, compositor_config, &mut reply_buf)
+                let n = handle_reload(workspace_mgr, bind_stack, compositor_config, &mut reply_buf);
+                // Gaps / borders / per-workspace policy may all have
+                // changed; recompute arrangement and repaint.
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
             }
             ControlCommand::QueryWindows => {
                 let meta = fb_owner.metadata();
@@ -1287,9 +1334,17 @@ fn serve_one_control_request(
                 handle_query_workspaces(workspace_mgr, &mut reply_buf)
             }
             ControlCommand::SetMasterRatio { ratio_x100 } => {
-                handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf)
+                let n = handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
             }
-            ControlCommand::TileFullscreen => handle_tile_fullscreen(workspace_mgr, &mut reply_buf),
+            ControlCommand::TileFullscreen => {
+                let n = handle_tile_fullscreen(workspace_mgr, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
+            }
             _ => {
                 let client = control::ClientId(0);
                 let pixel_reader =
@@ -2085,6 +2140,7 @@ fn dispatch_keybind_action(
     control_subs: &mut control::ControlSubscriptions,
     cfg: &config::CompositorConfig,
     client_event_queue: &mut alloc::collections::VecDeque<(SurfaceId, ServerMessage)>,
+    compose_ctx: &mut compose::ComposeContext,
 ) {
     use keybind::{BindMode, KeybindAction};
     match action {
@@ -2099,6 +2155,8 @@ fn dispatch_keybind_action(
                     // to None if it is empty.
                     *focused = workspace_mgr.next_focus(None);
                     publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
                 }
             }
         }
@@ -2118,6 +2176,8 @@ fn dispatch_keybind_action(
                         *focused = workspace_mgr.next_focus(None);
                         publish_focus_changed(control_subs, *focused, null_subscriber_sender);
                     }
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
                 }
             }
         }
@@ -2126,6 +2186,11 @@ fn dispatch_keybind_action(
             if next != *focused {
                 *focused = next;
                 publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                // Repaint so border colours track the new focus, and
+                // recompute arrangement for `focus_affects_geometry()`
+                // policies (tabbed / fullscreen).
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
             }
         }
         KeybindAction::SpawnTerm => {
@@ -2196,6 +2261,13 @@ fn dispatch_keybind_action(
                             "display_server: resize keystroke ignored (no focused window?)\n",
                         );
                     }
+                }
+                // On a successful resize the policy state changed under
+                // the same id set, so the arrangement cache would
+                // otherwise keep painting the previous ratios.
+                if result.is_ok() {
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
                 }
                 let _ = result;
             } else {
@@ -2380,11 +2452,11 @@ fn handle_query_windows(
         if ws.is_empty() {
             continue;
         }
-        let policy = ws.policy();
-        let policy_byte = policy_kind_to_byte(policy);
-        let _ = policy_byte;
-        // Re-tile the workspace into the synthetic 1280x720 output —
-        // the m3ctl client renders the rects as a debug view.
+        // Re-tile the workspace into the real framebuffer rect so the
+        // `m3ctl query windows` reply reports the rects that compose
+        // would actually paint. `output` above is built from
+        // `output_width` / `output_height` (the live framebuffer
+        // metadata) — the previous synthetic 1280×720 fallback is gone.
         let ws_mut = workspace_mgr.workspace_mut(ws_idx).expect("idx checked");
         let inner = layout::apply_outer_gaps(output, gaps.outer);
         let rects = ws_mut.tile(inner, gaps);

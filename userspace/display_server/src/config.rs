@@ -162,9 +162,17 @@ pub enum ConfigWarning {
 }
 
 fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(idx) => &line[..idx],
-        None => line,
+    // `#` is a comment delimiter only when it starts the trimmed line.
+    // Treating every `#` as a delimiter breaks legitimate value uses
+    // such as `inactive_color = #888888`, where the `#` is the standard
+    // hex colour prefix. The config file's `#` line comments are always
+    // whole-line ("# header" or "  # indented note"), so anchoring the
+    // delimiter to start-of-trimmed-line covers every documented
+    // comment shape without ambiguity in the value position.
+    if line.trim_start().starts_with('#') {
+        ""
+    } else {
+        line
     }
 }
 
@@ -654,5 +662,32 @@ mod tests {
             CompositorConfig::parse("[gaps]\nnotanassignment\n"),
             Err(ConfigError::MalformedLine { line: 2 })
         ));
+    }
+
+    #[test]
+    fn hash_in_color_value_is_not_a_comment() {
+        // Regression: `strip_comment` used to truncate at the first `#`
+        // anywhere, which silently turned `inactive_color = #888888`
+        // into `inactive_color = ` and surfaced as a BadValue. `#` is
+        // a comment delimiter only at start-of-trimmed-line, so a
+        // `#RRGGBB` hex literal in the value position survives intact.
+        let cfg = CompositorConfig::parse(
+            "[borders]\nactive_color = #11223344\ninactive_color = #888888\n",
+        )
+        .expect("hex-prefixed colours parse");
+        assert_eq!(cfg.borders.active_color, 0x11223344);
+        assert_eq!(cfg.borders.inactive_color, 0x888888);
+    }
+
+    #[test]
+    fn leading_hash_still_treated_as_comment() {
+        // Companion to `hash_in_color_value_is_not_a_comment`: `#` at
+        // start-of-trimmed-line is still a comment (the documented
+        // shape) so configs that lead with `# header\n` and
+        // `  # indented note\n` keep their existing meaning.
+        let cfg =
+            CompositorConfig::parse("# top-level header\n[gaps]\n  # indented note\nouter = 7\n")
+                .expect("leading-`#` comments parse");
+        assert_eq!(cfg.gaps.outer, 7);
     }
 }

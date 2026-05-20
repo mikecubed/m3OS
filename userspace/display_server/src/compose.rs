@@ -129,6 +129,24 @@ impl ComposeContext {
         self.prev_pointer = None;
         self.prev_cursor_size = None;
     }
+
+    /// Phase 72 review-resolution — invalidate the cached arrangement
+    /// so the next compose pass calls `layout.arrange(..)` again. The
+    /// id-set check in `run_compose_filtered` only catches arrangement
+    /// changes when surfaces are added or removed; SetLayout / SetMaster
+    /// Ratio / TileFullscreen / resize-mode adjustments mutate the
+    /// active policy's internal state with the same id set, so the
+    /// cached `Vec<(SurfaceId, Rect)>` would otherwise survive across
+    /// the policy switch and the screen would stay tiled under the
+    /// previous policy until something else (a new toplevel, a destroy)
+    /// happened to change the id set.
+    ///
+    /// Clearing `cached_toplevel_ids` is the minimal invalidation: the
+    /// next compose pass's id-set comparison will report a mismatch
+    /// even if the live id set is identical, forcing the recompute.
+    pub fn invalidate_arrangement_cache(&mut self) {
+        self.cached_toplevel_ids.clear();
+    }
 }
 
 impl Default for ComposeContext {

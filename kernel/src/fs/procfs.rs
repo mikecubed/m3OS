@@ -245,19 +245,40 @@ fn parse_pid_component(component: &str) -> Option<u32> {
 fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     let table = PROCESS_TABLE.lock();
     let proc = table.find(pid)?;
+    // Resolve the caller's euid while the table is already held so a
+    // separate `PROCESS_TABLE.lock()` call doesn't deadlock with this
+    // one. A `pid == 0` caller is the kernel itself; treat as root.
+    let caller_pid = current_pid();
+    let caller_euid = if caller_pid == 0 {
+        0
+    } else {
+        table.find(caller_pid).map(|p| p.euid).unwrap_or(0)
+    };
     // Phase 72b — match Linux's default `/proc/<pid>/*` policy: the
     // basic snapshot (pid, ppid, state, name, exec, cmdline, memory
-    // sizes, fd target list) is readable by anyone. Sensitive bits
-    // (environ, memory contents, fd contents) are gated elsewhere.
-    // Without this, `htop` running as a non-root user couldn't read
-    // any system daemon's stat/status/cmdline and the TUI showed an
-    // empty process list.
-    let mut fd_targets = Vec::new();
-    for (fd, entry) in proc.fd_entries() {
-        if let Some(target) = fd_target(&entry.backend) {
-            fd_targets.push((fd, target));
+    // sizes) is readable by anyone. Without this, `htop` running as a
+    // non-root user couldn't read any system daemon's stat/status/
+    // cmdline and the TUI showed an empty process list.
+    //
+    // Per-pid `fd_targets` is more sensitive — exposing the open-file
+    // table reveals which sockets and tmpfs paths a daemon holds, an
+    // information leak compared to typical Linux defaults where
+    // `/proc/<pid>/fd` is `dr-x------` (owner-only). Gate it on the
+    // caller's euid: only root (0) or a matching euid sees the fd
+    // table; everyone else gets an empty list (the basic snapshot
+    // still works for any reader, matching Linux's `/proc/<pid>/stat`
+    // policy).
+    let fd_targets = if caller_euid == 0 || caller_euid == proc.euid {
+        let mut targets = Vec::new();
+        for (fd, entry) in proc.fd_entries() {
+            if let Some(target) = fd_target(&entry.backend) {
+                targets.push((fd, target));
+            }
         }
-    }
+        targets
+    } else {
+        Vec::new()
+    };
     Some(ProcessSnapshot {
         pid: proc.pid,
         ppid: proc.ppid,

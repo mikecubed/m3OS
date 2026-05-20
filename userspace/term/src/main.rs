@@ -363,11 +363,14 @@ fn program_main(_args: &[&str]) -> i32 {
                     // Phase 72b — reallocate the SHM front+back buffers
                     // at the new dimensions BEFORE resizing the cell
                     // grid, so the renderer's next pass writes into a
-                    // correctly-sized buffer. If `resize` fails (out
-                    // of SHM budget), the old dimensions stick and
-                    // the cell grid follows along — the visual is
-                    // letterboxed-and-clipped to the tile but at
-                    // least nothing crashes.
+                    // correctly-sized buffer. If `resize` fails (out of
+                    // SHM budget) we leave the old SHM dims AND the old
+                    // cell grid in place: the `handle_surface_resize`
+                    // path is intentionally skipped so the grid stays
+                    // consistent with the still-allocated buffer.
+                    // The compositor's letterbox/scale path keeps the
+                    // visible result coherent until the next successful
+                    // resize attempt.
                     if !renderer.fb_mut().resize(width, height) {
                         syscall_lib::write_str(
                             STDOUT_FILENO,
