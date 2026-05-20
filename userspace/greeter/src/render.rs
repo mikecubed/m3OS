@@ -43,10 +43,15 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     let panel_x = width.saturating_sub(panel_w) / 2;
     let panel_y = height.saturating_sub(panel_h) / 2;
 
-    // Translucent panel background: dark navy at ~78% opacity
-    // (alpha 0xC8). Keeps the bitmap font glyphs legible while still
-    // letting some of the background image bleed through the panel.
-    let panel_bg: u32 = 0xC820_2840;
+    // Opaque panel background: dark navy. `fill_rect` overwrites
+    // pixels without blending, and `display_server` treats
+    // `SurfaceRole::Toplevel` as opaque (see
+    // `display_server::surface::ComposeEntry::is_opaque`), so any
+    // client-side alpha here would be dropped at composition. Keep
+    // alpha at 0xFF to make that contract explicit. True translucency
+    // would require in-greeter blending against the background image
+    // before submitting the frame.
+    let panel_bg: u32 = 0xFF20_2840;
     fill_rect(pixels, width, panel_x, panel_y, panel_w, panel_h, panel_bg);
 
     let font = BasicBitmapFont::new();

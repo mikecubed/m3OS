@@ -2,8 +2,10 @@
 //!
 //! Flat key=value file with `#` comments and blank-line tolerance.
 //! Unknown keys are reported through [`ConfigParseEvent::UnknownKey`]
-//! so the binary can `log::warn!` them without the parser allocating
-//! strings.
+//! so the binary can `log::warn!` them as structured observability
+//! events. The events carry owned [`String`] payloads (key and value),
+//! so each unknown/invalid line costs one or two allocations — that
+//! tradeoff is intentional, since misconfiguration is the cold path.
 
 use alloc::string::String;
 
