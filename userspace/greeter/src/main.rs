@@ -221,6 +221,20 @@ fn program_main(_args: &[&str]) -> i32 {
         },
     );
 
+    // Phase 72b — persist the authenticated session descriptor to a
+    // well-known tmpfs path so display_server's `SpawnTerm` and
+    // `[autostart]` paths can `setuid`/`setgid` to the user before
+    // `execve`-ing the new process. Without this, every term spawned
+    // post-login would inherit display_server's UID (root) regardless
+    // of who logged in — `whoami` would say `root`, the shell prompt
+    // would read `0@m3os`, and per-user home / dotfile resolution
+    // would be wrong. Written as root (the file open happens BEFORE
+    // the setuid/setgid below) so the resulting file owner is root,
+    // the same identity display_server runs under. Best-effort: if
+    // the open or write fails, the desktop still comes up — terms
+    // just fall back to root inheritance with a log line.
+    write_session_state_file(&descriptor);
+
     // Phase 71 F.2 — drop privileges so any user-session work that
     // follows runs under the authenticated UID/GID. Phase 72b stops
     // here: greeter does NOT execve into `/bin/term` anymore, so the
@@ -257,6 +271,95 @@ fn program_main(_args: &[&str]) -> i32 {
     );
     let _ = build_env_string;
     0
+}
+
+/// Phase 72b — well-known tmpfs path where greeter persists the
+/// authenticated session descriptor for display_server to consume.
+/// Format: simple `key=value\n` lines (`uid=`, `gid=`, `user=`,
+/// `home=`) so the parser stays small and tolerant of trailing
+/// whitespace.
+#[cfg(not(test))]
+const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
+
+/// Phase 72b — write the authenticated `SessionDescriptor` to
+/// [`SESSION_STATE_PATH`]. Called before `setgid`/`setuid` so the
+/// file is owned by greeter's original UID (root, since init spawned
+/// greeter). display_server (also running as root) reads it back at
+/// `SpawnTerm` / autostart time.
+///
+/// Best-effort: every failure path just logs and returns. The desktop
+/// still comes up; terms fall back to inheriting display_server's UID.
+#[cfg(not(test))]
+fn write_session_state_file(descriptor: &SessionDescriptor) {
+    let fd = syscall_lib::open(
+        SESSION_STATE_PATH,
+        syscall_lib::O_WRONLY | syscall_lib::O_CREAT,
+        0o600,
+    );
+    if fd < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "greeter: failed to open session-state file; spawned terms will run as root\n",
+        );
+        return;
+    }
+    let fd_i32 = fd as i32;
+    // Build the body as a single concatenated buffer. Worst case:
+    // 4 u32 decimal lines + 2 short strings; 256 bytes is ample.
+    let mut buf = [0u8; 256];
+    let mut pos = 0usize;
+    let mut append = |bytes: &[u8], pos: &mut usize| {
+        for &b in bytes {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    };
+    let mut digits = [0u8; 11];
+    append(b"uid=", &mut pos);
+    let n = u32_to_decimal(descriptor.uid, &mut digits);
+    append(&digits[..n], &mut pos);
+    append(b"\ngid=", &mut pos);
+    let n = u32_to_decimal(descriptor.gid, &mut digits);
+    append(&digits[..n], &mut pos);
+    append(b"\nuser=", &mut pos);
+    append(descriptor.username.as_bytes(), &mut pos);
+    append(b"\nhome=", &mut pos);
+    append(descriptor.home.as_bytes(), &mut pos);
+    append(b"\nshell=", &mut pos);
+    append(descriptor.shell.as_bytes(), &mut pos);
+    append(b"\n", &mut pos);
+    let written = syscall_lib::write(fd_i32, &buf[..pos]);
+    if written < 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "greeter: session-state write failed\n");
+    }
+    let _ = syscall_lib::close(fd_i32);
+}
+
+/// Format `u32` into decimal digits. Returns the byte count.
+#[cfg(not(test))]
+fn u32_to_decimal(mut n: u32, out: &mut [u8]) -> usize {
+    if n == 0 {
+        if !out.is_empty() {
+            out[0] = b'0';
+            return 1;
+        }
+        return 0;
+    }
+    let mut tmp = [0u8; 11];
+    let mut len = 0usize;
+    while n > 0 && len < tmp.len() {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    // Reverse into `out`.
+    let copy = len.min(out.len());
+    for i in 0..copy {
+        out[i] = tmp[len - 1 - i];
+    }
+    copy
 }
 
 /// Format `KEY=value\0` into `out`. Returns bytes written including
@@ -581,6 +684,7 @@ impl AuthBackend for FsAuthBackend {
         Ok(SessionDescriptor {
             uid,
             gid,
+            username: username.to_string(),
             home: bytes_to_string(home),
             shell: bytes_to_string(shell),
         })

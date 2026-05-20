@@ -1886,19 +1886,125 @@ fn load_compositor_config(path: &str) -> Option<config::CompositorConfig> {
     }
 }
 
-/// Phase 72 / 72b — `execve` a NUL-terminated path with no args/env.
-/// Used by both the `SUPER+RETURN` keybind handler and the
-/// `[autostart]` config-driven launcher introduced in Phase 72b.
-/// `path_with_nul` and `argv0_with_nul` must each end in a `\0` byte.
+/// Phase 72b — authenticated session descriptor read from
+/// `/run/m3os-current-session` (written by greeter on successful
+/// auth). When present, `SpawnTerm` and `[autostart]` switch into
+/// this UID/GID before `execve` so spawned terms run as the
+/// authenticated user rather than display_server's own UID. When
+/// absent (skip-login / autologin mode), the spawn paths fall back
+/// to direct execve and the child inherits display_server's UID.
+struct SessionState {
+    uid: u32,
+    gid: u32,
+    user: alloc::string::String,
+    home: alloc::string::String,
+}
+
+const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
+
+fn read_session_state() -> Option<SessionState> {
+    let fd = syscall_lib::open(SESSION_STATE_PATH, 0 /* O_RDONLY */, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd_i32 = fd as i32;
+    let mut buf = [0u8; 512];
+    let n = syscall_lib::read(fd_i32, &mut buf);
+    let _ = syscall_lib::close(fd_i32);
+    if n <= 0 {
+        return None;
+    }
+    let bytes = &buf[..n as usize];
+    let text = core::str::from_utf8(bytes).ok()?;
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut user = alloc::string::String::new();
+    let mut home = alloc::string::String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("uid=") {
+            uid = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("gid=") {
+            gid = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("user=") {
+            user.push_str(v);
+        } else if let Some(v) = line.strip_prefix("home=") {
+            home.push_str(v);
+        }
+    }
+    Some(SessionState {
+        uid: uid?,
+        gid: gid?,
+        user,
+        home,
+    })
+}
+
+/// Phase 72 / 72b — `execve` a NUL-terminated path. Used by both
+/// the `SUPER+RETURN` keybind handler and the `[autostart]`
+/// config-driven launcher. `path_with_nul` and `argv0_with_nul` must
+/// each end in a `\0` byte. When a `SessionState` is present, the
+/// caller `setuid`/`setgid`s in the child before invoking this and
+/// passes a populated `envp_buf`; otherwise envp is empty.
 fn spawn_exec(path_with_nul: &[u8], argv0_with_nul: &[u8]) -> isize {
     let argv: [*const u8; 2] = [argv0_with_nul.as_ptr(), core::ptr::null()];
     let envp: [*const u8; 1] = [core::ptr::null()];
     syscall_lib::execve(path_with_nul, &argv, &envp)
 }
 
-/// `spawn_exec(/bin/term)` shorthand for the canonical SUPER+RETURN path.
+/// Phase 72b — `execve` with the authenticated user's `USER=` and
+/// `HOME=` envp populated. The forked child has already called
+/// `setgid`/`setuid` to the user's IDs.
+fn spawn_exec_with_session(
+    path_with_nul: &[u8],
+    argv0_with_nul: &[u8],
+    session: &SessionState,
+) -> isize {
+    let user_var = build_env_var(b"USER=", session.user.as_bytes());
+    let home_var = build_env_var(b"HOME=", session.home.as_bytes());
+    let path_var = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
+    let term_var = b"TERM=m3os-term\0";
+    let argv: [*const u8; 2] = [argv0_with_nul.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 5] = [
+        user_var.as_ptr(),
+        home_var.as_ptr(),
+        path_var.as_ptr(),
+        term_var.as_ptr(),
+        core::ptr::null(),
+    ];
+    syscall_lib::execve(path_with_nul, &argv, &envp)
+}
+
+/// Build a NUL-terminated `KEY=value` byte vector for envp use.
+fn build_env_var(prefix: &[u8], value: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(prefix.len() + value.len() + 1);
+    v.extend_from_slice(prefix);
+    v.extend_from_slice(value);
+    v.push(0);
+    v
+}
+
+/// `spawn_term` runs in the just-forked child. It consults the
+/// session state, drops privileges if a user is authenticated, and
+/// finally `execve`s `/bin/term`. Returns only on execve failure.
 fn spawn_term() -> isize {
-    spawn_exec(b"/bin/term\0", b"/bin/term\0")
+    if let Some(session) = read_session_state() {
+        if syscall_lib::setgid(session.gid) != 0 {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: setgid failed in spawned child; running as root\n",
+            );
+        }
+        if syscall_lib::setuid(session.uid) != 0 {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: setuid failed in spawned child; running as root\n",
+            );
+        }
+        spawn_exec_with_session(b"/bin/term\0", b"/bin/term\0", &session)
+    } else {
+        spawn_exec(b"/bin/term\0", b"/bin/term\0")
+    }
 }
 
 /// Phase 72b — run every `[autostart] exec = <path>` entry from the
@@ -1918,7 +2024,28 @@ fn run_autostart(entries: &[alloc::string::String]) {
         buf.push(0);
         let pid = syscall_lib::fork();
         if pid == 0 {
-            let _ = spawn_exec(&buf, &buf);
+            // Phase 72b — same setuid/setgid path as `spawn_term`.
+            // Autostart entries inherit the authenticated user's UID
+            // when greeter has staged the session file; otherwise
+            // (default-skip-login / autologin) the child runs as
+            // display_server's own UID.
+            if let Some(session) = read_session_state() {
+                if syscall_lib::setgid(session.gid) != 0 {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: autostart setgid failed; running as root\n",
+                    );
+                }
+                if syscall_lib::setuid(session.uid) != 0 {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: autostart setuid failed; running as root\n",
+                    );
+                }
+                let _ = spawn_exec_with_session(&buf, &buf, &session);
+            } else {
+                let _ = spawn_exec(&buf, &buf);
+            }
             syscall_lib::exit(99);
         }
         syscall_lib::write_str(STDOUT_FILENO, "display_server: autostart exec=");
