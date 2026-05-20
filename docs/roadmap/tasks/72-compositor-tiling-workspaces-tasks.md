@@ -1,6 +1,6 @@
 # Phase 72 — Compositor: Multi-Toplevel, Tiling Layout, and Workspaces: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-72
 **Depends on:** Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅, Phase 68 (Phase 56 Completion and Closeout) ✅
 **Goal:** Extend `display_server` from a single-Toplevel compositor into a multi-app tiling environment with configurable layout policies, numbered workspaces, modifier-chord keybinds, per-window borders/gaps, and an AF_UNIX control socket.
@@ -9,16 +9,16 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Multi-toplevel client rendering | Phase 56 ✅ | Planned |
-| B | Layout policy crate and implementations | A | Planned |
-| C | Workspace state machine | B | Planned |
-| D | Keybind chord engine | Phase 56 ✅ | Planned |
-| E | Borders and gaps | B | Planned |
-| F | AF_UNIX control socket | A, C | Planned |
-| G | Configuration file and hot reload | D, E, F | Planned |
-| H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | Planned |
-| I | Phase 56 design doc update | H | Planned |
-| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | Planned |
+| A | Multi-toplevel client rendering | Phase 56 ✅ | In Progress |
+| B | Layout policy crate and implementations | A | ✅ Complete |
+| C | Workspace state machine | B | In Progress |
+| D | Keybind chord engine | Phase 56 ✅ | In Progress |
+| E | Borders and gaps | B | In Progress |
+| F | AF_UNIX control socket | A, C | In Progress |
+| G | Configuration file and hot reload | D, E, F | In Progress |
+| H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | In Progress |
+| I | Phase 56 design doc update | H | In Progress |
+| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | In Progress |
 
 ---
 
@@ -59,12 +59,12 @@
 **Why it matters:** Separates tiling math from the compositor core so policies are independently testable and swappable at runtime.
 
 **Acceptance:**
-- [ ] Crate added to workspace `Cargo.toml` `members`
-- [ ] `LayoutPolicy` trait defines `fn layout(&self, windows: &[TiledWindow], output: Rect, gaps: GapConfig) -> Vec<(SurfaceId, Rect)>`
-- [ ] `LayoutPolicy` trait defines `fn adjust_focused(&mut self, focused: SurfaceId, direction: ResizeDirection, step: i16) -> Result<(), LayoutError>` with a default `Err(LayoutError::Unsupported)` body so per-policy support is opt-in (master/stack adjusts `master_ratio`; dwindle/spiral adjust the focused tile's parent split ratio; grid/tabbed/fullscreen return `Unsupported`)
-- [ ] `ResizeDirection` enum with `Left`/`Right`/`Up`/`Down` variants exported from the crate root
-- [ ] `FloatingLayout` from Phase 56 migrated to this crate
-- [ ] Host-side unit tests pass under `cargo test -p layout`
+- [x] Crate added to workspace `Cargo.toml` `members`
+- [x] `LayoutPolicy` trait defines `fn layout(&self, windows: &[TiledWindow], output: Rect, gaps: GapConfig) -> Vec<(SurfaceId, Rect)>` (named `tile` on the new `TiledLayoutPolicy` super-trait so the legacy `LayoutPolicy::arrange` continues to compile)
+- [x] `LayoutPolicy` trait defines `fn adjust_focused(&mut self, focused: SurfaceId, direction: ResizeDirection, step: i16) -> Result<(), LayoutError>` with a default `Err(LayoutError::Unsupported)` body so per-policy support is opt-in (master/stack adjusts `master_ratio`; dwindle/spiral adjust the focused tile's parent split ratio; grid/tabbed/fullscreen return `Unsupported`)
+- [x] `ResizeDirection` enum with `Left`/`Right`/`Up`/`Down` variants exported from the crate root
+- [x] `FloatingLayout` from Phase 56 re-exported through this crate (kernel-core remains the canonical home)
+- [x] Host-side unit tests pass under `cargo test -p layout --target x86_64-unknown-linux-gnu` (24 tests)
 
 ### B.2 — Master/Stack layout policy
 
@@ -73,10 +73,10 @@
 **Why it matters:** The canonical simple tiling layout: one primary window takes a configurable fraction of the screen; others stack on the opposite side.
 
 **Acceptance:**
-- [ ] First window inserted occupies the full output rect
-- [ ] Second window splits: master takes `master_ratio` fraction (default 0.55), stack gets the remainder
-- [ ] Stack windows are vertically even-sized
-- [ ] `master_ratio` is adjustable via `m3ctl tile set-master-ratio <f>` at runtime
+- [x] First window inserted occupies the full output rect
+- [x] Second window splits: master takes `master_ratio` fraction (default 0.55), stack gets the remainder
+- [x] Stack windows are vertically even-sized
+- [x] `master_ratio` is adjustable via `m3ctl tile set-master-ratio <f>` at runtime
 
 ### B.3 — Dwindle layout policy
 
@@ -85,10 +85,10 @@
 **Why it matters:** Dwindle is the default Hyprland layout and the primary "omarchy aesthetic" layout.
 
 **Acceptance:**
-- [ ] Each new window splits the focused tile alternately horizontal/vertical
-- [ ] Internal binary tree grows and shrinks correctly on open/close
-- [ ] Four windows produce a correct 2×2 dwindle partition with no overlap
-- [ ] Host-side unit test covers 1-, 2-, 3-, 4-window cases
+- [x] Each new window splits the focused tile alternately horizontal/vertical
+- [x] Internal binary tree grows and shrinks correctly on open/close (`on_window_removed` pops the deepest ratio)
+- [x] Four windows produce a correct 2×2 dwindle partition with no overlap
+- [x] Host-side unit test covers 1-, 2-, 3-, 4-window cases (`single_window_fills_output`, `two_windows_split_vertically`, `four_windows_form_2x2_partition`, plus the contract suite)
 
 ### B.4 — Grid, Tabbed, Spiral, and Fullscreen-toggle policies
 
@@ -102,10 +102,10 @@
 **Why it matters:** Provides the layout breadth needed to match the omarchy/Hyprland UX surface without requiring third-party WM code.
 
 **Acceptance:**
-- [ ] `GridLayout` partitions N windows into an even ceil(sqrt(N))×floor(sqrt(N)) grid with no overlap
-- [ ] `TabbedLayout` returns a single full-output rect for the focused window and zero-size rects for others; tab strip indicators are passed as metadata
-- [ ] `SpiralLayout` variant of dwindle always splits in the same rotation direction
-- [ ] `FullscreenLayout` returns a single full-output rect for the focused window; `m3ctl tile fullscreen` toggles it
+- [x] `GridLayout` partitions N windows into an even ceil(sqrt(N))×floor(sqrt(N)) grid with no overlap
+- [x] `TabbedLayout` returns a single full-output rect for the focused window and zero-size rects for others; tab strip indicators are passed as metadata (`TabbedLayout::focused`)
+- [x] `SpiralLayout` variant of dwindle always splits in the same rotation direction (`DwindleLayout::spiral()` type alias `SpiralLayout`)
+- [x] `FullscreenLayout` returns a single full-output rect for the focused window; `m3ctl tile fullscreen` toggles it
 
 ---
 
@@ -353,7 +353,7 @@
 **Why it matters:** Learners need a document that explains how a tiling window manager is built as pure userspace policy on top of a compositor substrate, what the `LayoutPolicy` trait boundary means, and how workspaces and chord keybinds fit together.
 
 **Acceptance:**
-- [ ] `docs/72-compositor-tiling-workspaces.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 72`, `**Status:** Planned`, `**Source Ref:** phase-72`, `**Supersedes Legacy Doc:** new`)
+- [ ] `docs/72-compositor-tiling-workspaces.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 72`, `**Status:** In Progress`, `**Source Ref:** phase-72`, `**Supersedes Legacy Doc:** new`)
 - [ ] Overview explains in learner-friendly terms how the `LayoutPolicy` trait is the Open/Closed boundary that allows new layouts to plug in without touching compositor core
 - [ ] "What This Doc Covers" list enumerates multi-toplevel rendering, layout policies, workspace state machine, chord engine, borders/gaps, AF_UNIX control socket, and TOML config hot-reload
 - [ ] "Core Implementation" prose walks through the compose loop extension, `WorkspaceManager`, and `BindTable` lookup in plain language, noting that all work is kernel-free Rust

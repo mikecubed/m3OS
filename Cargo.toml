@@ -97,6 +97,8 @@ members = [
     "userspace/lib/audio_client_ffi",
     # Phase 70 Track A0 — C-ABI veneer over the Phase 56 display protocol codec
     "userspace/lib/display_client_ffi",
+    # Phase 72 Track B.1 — tiling layout policies (master-stack, dwindle, grid, tabbed, spiral, fullscreen)
+    "userspace/lib/layout",
     # Phase 57 Track E.2 — userspace audio reference demo
     "userspace/audio-demo",
     # Phase 63 Track E.1 — one-shot audio stats CLI for the bell-smoke harness
