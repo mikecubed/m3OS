@@ -582,9 +582,11 @@ where
     // term during its post-`SurfaceResized` transient shows briefly
     // scaled content while it reallocates its SHM, then naturally
     // settles to surf == tile and the scale path becomes a no-op.
-    // Aspect ratios are not preserved (`stretch`-style) — for DOOM in
-    // a non-1.6:1 tile this trades chunky-but-complete coverage for
-    // empty letterbox bars; the user explicitly asked for fit-to-tile.
+    // Aspect ratio IS preserved — for DOOM in a non-1.6:1 tile this
+    // produces letterbox bars on the constrained axis rather than
+    // distorting the rendered world. Games would be visibly wrong
+    // under stretch-mode scaling; non-game clients tolerate the
+    // brief letterbox during their resize transient just fine.
     //
     // Parallel `Vec<Vec<Rect>>` holds the override damage for scaled
     // surfaces — a single full-tile rect, replacing the surface-local
@@ -804,20 +806,24 @@ fn tile_for_entry(
 }
 
 /// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of
-/// `src_w × src_h` to `dst_w × dst_h`. Used for client surfaces
-/// (DOOM, plus any other fixed-size client that doesn't resize its
-/// buffer in response to `ServerMessage::SurfaceResized`) so the
-/// rendered output fills the tile rather than being letterboxed
-/// centred at native resolution with empty margins around it.
+/// `src_w × src_h` into a tile-sized destination buffer of `dst_w ×
+/// dst_h`, **preserving the source aspect ratio**. The scaled image
+/// is centred inside the destination; any unused strip on the short
+/// axis is filled with `crate::BG_PIXEL`, producing horizontal or
+/// vertical letterbox bars depending on which axis is constrained.
 ///
-/// Scales up *and* down. DOOM's 1280×800 buffer in a 632×784 tile
-/// scales down to 632×784; in a 1264×784 tile it scales down to
-/// 1264×784. Aspect ratios are not preserved (stretch). Pure logic:
-/// no I/O, no allocation beyond the returned `Vec<u8>`. Nearest-
-/// neighbour was chosen over bilinear because DOOM's chunky
-/// pixel-art aesthetic looks intentionally crisp under integer
-/// scaling; bilinear would smear it. Smoother filters can be added
-/// per-client when a real use case arrives.
+/// Used for client surfaces (DOOM, plus any other fixed-size client
+/// that doesn't resize its buffer in response to
+/// `ServerMessage::SurfaceResized`). Aspect-preserving is the correct
+/// behaviour for games — squishing DOOM into a non-1.6:1 tile by
+/// stretching would distort the rendered world; players notice
+/// immediately.
+///
+/// Scales up *and* down. Pure logic: no I/O, no allocation beyond
+/// the returned `Vec<u8>`. Nearest-neighbour was chosen over bilinear
+/// because DOOM's chunky pixel-art aesthetic looks intentionally
+/// crisp under integer scaling; bilinear would smear it. Smoother
+/// filters can be added per-client when a real use case arrives.
 fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     const BPP: usize = 4;
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
@@ -829,27 +835,60 @@ fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h
     let dst_h_usize = dst_h as usize;
     let src_stride = src_w_usize * BPP;
     let dst_stride = dst_w_usize * BPP;
+
+    // Aspect-preserving fit: pick the smaller of the two per-axis
+    // ratios so the scaled image fits entirely inside the destination
+    // rect. Using integer math, compare `dst_w/src_w` vs `dst_h/src_h`
+    // via cross-multiply (a/b ≤ c/d ⇔ ad ≤ bc).
+    let (scaled_w, scaled_h) = {
+        let lhs = dst_w_usize * src_h_usize;
+        let rhs = dst_h_usize * src_w_usize;
+        if lhs <= rhs {
+            // Width axis is the constraint.
+            let w = dst_w_usize;
+            let h = ((src_h_usize * dst_w_usize) / src_w_usize).max(1);
+            (w, h.min(dst_h_usize))
+        } else {
+            // Height axis is the constraint.
+            let h = dst_h_usize;
+            let w = ((src_w_usize * dst_h_usize) / src_h_usize).max(1);
+            (w.min(dst_w_usize), h)
+        }
+    };
+    let off_x = (dst_w_usize - scaled_w) / 2;
+    let off_y = (dst_h_usize - scaled_h) / 2;
+
+    // Pre-fill the destination with the compositor background colour
+    // so the letterbox bars on the unused axis match the rest of the
+    // gap-fill convention. Skipped axes (where scaled_w == dst_w or
+    // scaled_h == dst_h) leave a zero-byte band that the scaled
+    // content immediately overwrites — the prefill is cheap relative
+    // to the per-pixel sample loop.
+    let bg_bytes = crate::BG_PIXEL.to_le_bytes();
     let mut out = alloc::vec![0u8; dst_stride * dst_h_usize];
-    // Pre-compute the source-column index for every destination column;
-    // shared across all rows, so doing it once keeps the inner loop's
-    // arithmetic to a single multiply and a copy. `* src_w / dst_w`
-    // is integer division — same rounding the canonical
-    // nearest-neighbour scaler uses.
-    let mut src_cols: Vec<usize> = Vec::with_capacity(dst_w_usize);
-    for dx in 0..dst_w_usize {
-        let sx = (dx * src_w_usize) / dst_w_usize;
+    for px in 0..(dst_w_usize * dst_h_usize) {
+        let off = px * BPP;
+        let take = BPP.min(bg_bytes.len());
+        out[off..off + take].copy_from_slice(&bg_bytes[..take]);
+    }
+
+    // Pre-compute the source-column index for every destination
+    // column inside the scaled region. Sharing this across rows keeps
+    // the inner loop's arithmetic to one multiply and a 4-byte copy
+    // per pixel.
+    let mut src_cols: Vec<usize> = Vec::with_capacity(scaled_w);
+    for dx in 0..scaled_w {
+        let sx = (dx * src_w_usize) / scaled_w;
         src_cols.push(sx.min(src_w_usize - 1));
     }
-    for dy in 0..dst_h_usize {
-        let sy = ((dy * src_h_usize) / dst_h_usize).min(src_h_usize - 1);
+    for dy in 0..scaled_h {
+        let sy = ((dy * src_h_usize) / scaled_h).min(src_h_usize - 1);
         let src_row_start = sy * src_stride;
-        let dst_row_start = dy * dst_stride;
-        for dx in 0..dst_w_usize {
+        let dst_row_start = (dy + off_y) * dst_stride;
+        for dx in 0..scaled_w {
             let sx = src_cols[dx];
             let src_off = src_row_start + sx * BPP;
-            let dst_off = dst_row_start + dx * BPP;
-            // 4-byte copy per pixel. Could vectorise with `copy_from_slice`
-            // but the per-pixel form keeps the indexing explicit.
+            let dst_off = dst_row_start + (dx + off_x) * BPP;
             if src_off + BPP <= src.len() && dst_off + BPP <= out.len() {
                 out[dst_off..dst_off + BPP].copy_from_slice(&src[src_off..src_off + BPP]);
             }
