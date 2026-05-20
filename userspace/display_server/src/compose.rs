@@ -421,11 +421,53 @@ where
         // surface that does not overlap the cursor union contributes
         // zero blits (its local damage list survives the clip as
         // empty / out-of-bounds and is skipped).
-        let local_damages: Vec<Vec<Rect>> = entries
-            .iter()
-            .map(|entry| {
+        // Phase 72b — surface preparation for the cursor-only fast
+        // path. Mirrors the main-path scaling: for Toplevels smaller
+        // than their tile (DOOM), substitute a tile-sized scaled
+        // snapshot and use full-tile damage so the cursor-overpaint
+        // pass re-blits the scaled content rather than the centred
+        // native-resolution surface.
+        let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+        let mut effective_damages: Vec<Vec<Rect>> = Vec::with_capacity(entries.len());
+        let mut effective_rects: Vec<Rect> = Vec::with_capacity(entries.len());
+        let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let original = entry.buf.pixels_snapshot();
+            let tile = tile_for_entry(entry, arrangement);
+            let should_scale = match tile {
+                Some(t) => {
+                    matches!(
+                        entry.layer,
+                        kernel_core::display::compose::ComposeLayer::Toplevel
+                    ) && entry.buf.width > 0
+                        && entry.buf.height > 0
+                        && entry.buf.width < t.w
+                        && entry.buf.height < t.h
+                }
+                None => false,
+            };
+            if should_scale {
+                let tile = tile.expect("checked above");
+                let scaled = nearest_neighbour_scale(
+                    &original,
+                    entry.buf.width,
+                    entry.buf.height,
+                    tile.w,
+                    tile.h,
+                );
+                snapshots.push(scaled);
+                effective_damages.push(alloc::vec![Rect {
+                    x: 0,
+                    y: 0,
+                    w: tile.w,
+                    h: tile.h,
+                }]);
+                effective_rects.push(tile);
+                scaled_flags.push(true);
+            } else {
+                snapshots.push(original);
                 let surface_rect = surface_screen_rect(entry, arrangement);
-                cursor_repaint
+                let local: Vec<Rect> = cursor_repaint
                     .iter()
                     .filter_map(|sr| {
                         let dx = (sr.x as i64) - (surface_rect.x as i64);
@@ -439,33 +481,26 @@ where
                             h: sr.h,
                         })
                     })
-                    .collect()
-            })
-            .collect();
-
-        let snapshots: Vec<Vec<u8>> = entries
-            .iter()
-            .map(|entry| entry.buf.pixels_snapshot())
-            .collect();
+                    .collect();
+                effective_damages.push(local);
+                effective_rects.push(surface_rect);
+                scaled_flags.push(false);
+            }
+        }
 
         let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-        for ((entry, dmg), snapshot) in entries
-            .iter()
-            .zip(local_damages.iter())
-            .zip(snapshots.iter())
-        {
-            // Phase 72b Track K.3 follow-up — when a Toplevel surface
-            // is letterboxed inside its tile, clip the blit to the
-            // tile rect so a surface buffer larger than the tile does
-            // not visually extend past the tile boundary. Other layers
-            // (Layer / Background / Cursor) keep their None.
-            let clip_rect = surface_tile_clip(entry, arrangement);
+        for (entry, idx) in entries.iter().zip(0..) {
+            let clip_rect = if scaled_flags[idx] {
+                None
+            } else {
+                surface_tile_clip(entry, arrangement)
+            };
             compose.push(ComposeSurface {
                 id: entry.id,
                 layer: entry.layer,
-                rect: surface_screen_rect(entry, arrangement),
-                damage: &dmg[..],
-                pixels: snapshot.as_slice(),
+                rect: effective_rects[idx],
+                damage: effective_damages[idx].as_slice(),
+                pixels: snapshots[idx].as_slice(),
                 opaque: entry.is_opaque(),
                 clip_rect,
             });
@@ -533,19 +568,88 @@ where
     // are inherent to the cross-process editing pattern; the
     // resulting `Vec<u8>` is a single-point-in-time view that the
     // rest of the compose pass treats as stable.
-    let snapshots: Vec<Vec<u8>> = entries
-        .iter()
-        .map(|entry| entry.buf.pixels_snapshot())
-        .collect();
+    // Phase 72b — per-entry pixel buffer. For most surfaces this is
+    // `entry.buf.pixels_snapshot()` as before. For Toplevel surfaces
+    // smaller than their assigned tile in both dimensions (the DOOM
+    // case: 320×200 surface dropped into a 1280×800 tile) we
+    // synthesise a *scaled* snapshot via nearest-neighbour sampling
+    // so the rendered output fills the tile instead of being
+    // letterboxed centred at native resolution. Larger-or-equal
+    // surfaces stay on the existing letterbox-and-clip path so a
+    // mid-resize term (buffer still 1280×800, tile now 632×784)
+    // continues to render cleanly until its `ServerMessage::SurfaceResized`
+    // handler reallocates the SHM.
+    //
+    // Parallel `Vec<Vec<Rect>>` holds the override damage for scaled
+    // surfaces — a single full-tile rect, replacing the surface-local
+    // damage list that compose_frame would otherwise translate.
+    let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let mut scaled_damages: Vec<Vec<Rect>> = Vec::with_capacity(entries.len());
+    let mut effective_rects: Vec<Rect> = Vec::with_capacity(entries.len());
+    let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let original = entry.buf.pixels_snapshot();
+        let tile = tile_for_entry(entry, arrangement);
+        let should_scale = match tile {
+            Some(t) => {
+                matches!(
+                    entry.layer,
+                    kernel_core::display::compose::ComposeLayer::Toplevel
+                ) && entry.buf.width > 0
+                    && entry.buf.height > 0
+                    && entry.buf.width < t.w
+                    && entry.buf.height < t.h
+            }
+            None => false,
+        };
+        if should_scale {
+            let tile = tile.expect("checked above");
+            let scaled = nearest_neighbour_scale(
+                &original,
+                entry.buf.width,
+                entry.buf.height,
+                tile.w,
+                tile.h,
+            );
+            snapshots.push(scaled);
+            scaled_damages.push(alloc::vec![Rect {
+                x: 0,
+                y: 0,
+                w: tile.w,
+                h: tile.h,
+            }]);
+            effective_rects.push(tile);
+            scaled_flags.push(true);
+        } else {
+            snapshots.push(original);
+            scaled_damages.push(Vec::new());
+            effective_rects.push(surface_screen_rect(entry, arrangement));
+            scaled_flags.push(false);
+        }
+    }
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-    for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
-        let clip_rect = surface_tile_clip(entry, arrangement);
+    for (((entry, dmg), snapshot), idx) in entries
+        .iter()
+        .zip(damages.iter())
+        .zip(snapshots.iter())
+        .zip(0..)
+    {
+        // For scaled surfaces, the pixel buffer has tile dimensions
+        // and a single full-tile damage rect — clip_rect is None
+        // because the surface IS the tile, no overflow to clip.
+        // For non-scaled surfaces, take the existing letterbox-and-
+        // clip path so a too-large buffer stays bounded by the tile.
+        let (damage_slice, clip_rect): (&[Rect], Option<Rect>) = if scaled_flags[idx] {
+            (scaled_damages[idx].as_slice(), None)
+        } else {
+            (&dmg[..], surface_tile_clip(entry, arrangement))
+        };
         compose.push(ComposeSurface {
             id: entry.id,
             layer: entry.layer,
-            rect: surface_screen_rect(entry, arrangement),
-            damage: &dmg[..],
+            rect: effective_rects[idx],
+            damage: damage_slice,
             pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
             clip_rect,
@@ -671,6 +775,78 @@ fn surface_tile_clip(
     }
     let (_, tile) = arrangement.iter().find(|(id, _)| *id == entry.id)?;
     Some(*tile)
+}
+
+/// Phase 72b — return the assigned tile rect for a Toplevel entry, or
+/// `None` if no tile is assigned (floating layout, Layer / Cursor /
+/// Background surface).
+fn tile_for_entry(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+) -> Option<Rect> {
+    if !matches!(
+        entry.layer,
+        kernel_core::display::compose::ComposeLayer::Toplevel
+    ) {
+        return None;
+    }
+    arrangement
+        .iter()
+        .find(|(id, _)| *id == entry.id)
+        .map(|(_, tile)| *tile)
+}
+
+/// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of
+/// `src_w × src_h` to `dst_w × dst_h`. Used for client surfaces
+/// (currently DOOM, eventually any fixed-size client) that are
+/// smaller than their assigned tile, so the rendered output fills
+/// the tile instead of being centred at native resolution with empty
+/// margins around it.
+///
+/// Pure logic: no I/O, no allocation beyond the returned `Vec<u8>`.
+/// Nearest-neighbour was chosen over bilinear because DOOM's chunky
+/// pixel-art aesthetic looks intentionally crisp under integer scaling
+/// (e.g. 320×200 → 1280×800 is exactly 4×); bilinear would smear it.
+/// Smoother filters can be added per-client when a real use case
+/// arrives.
+fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    const BPP: usize = 4;
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let src_w_usize = src_w as usize;
+    let src_h_usize = src_h as usize;
+    let dst_w_usize = dst_w as usize;
+    let dst_h_usize = dst_h as usize;
+    let src_stride = src_w_usize * BPP;
+    let dst_stride = dst_w_usize * BPP;
+    let mut out = alloc::vec![0u8; dst_stride * dst_h_usize];
+    // Pre-compute the source-column index for every destination column;
+    // shared across all rows, so doing it once keeps the inner loop's
+    // arithmetic to a single multiply and a copy. `* src_w / dst_w`
+    // is integer division — same rounding the canonical
+    // nearest-neighbour scaler uses.
+    let mut src_cols: Vec<usize> = Vec::with_capacity(dst_w_usize);
+    for dx in 0..dst_w_usize {
+        let sx = (dx * src_w_usize) / dst_w_usize;
+        src_cols.push(sx.min(src_w_usize - 1));
+    }
+    for dy in 0..dst_h_usize {
+        let sy = ((dy * src_h_usize) / dst_h_usize).min(src_h_usize - 1);
+        let src_row_start = sy * src_stride;
+        let dst_row_start = dy * dst_stride;
+        for dx in 0..dst_w_usize {
+            let sx = src_cols[dx];
+            let src_off = src_row_start + sx * BPP;
+            let dst_off = dst_row_start + dx * BPP;
+            // 4-byte copy per pixel. Could vectorise with `copy_from_slice`
+            // but the per-pixel form keeps the indexing explicit.
+            if src_off + BPP <= src.len() && dst_off + BPP <= out.len() {
+                out[dst_off..dst_off + BPP].copy_from_slice(&src[src_off..src_off + BPP]);
+            }
+        }
+    }
+    out
 }
 
 fn surface_screen_rect(
