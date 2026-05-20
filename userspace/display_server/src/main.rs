@@ -599,6 +599,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 // see the updated state.
                 if !destroyed.is_empty() {
                     publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+                    // Phase 72b — clear stale pixels left by the
+                    // disconnecting client. Same rationale as the
+                    // `outcome.destroyed` branch above; the Goodbye
+                    // path lands here when a client cleanly says
+                    // farewell while the destroy branch covers
+                    // explicit DestroySurface verbs.
+                    compose_ctx.force_full_repaint();
                 }
             } else {
                 syscall_lib::write_str(
@@ -618,6 +625,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         }
         for sid in outcome.destroyed.iter() {
             let _ = workspace_mgr.remove_surface(*sid);
+            // Phase 72b — drop the surface from the last-tile-dims
+            // map so a future surface that lands at the same id does
+            // not get spuriously diffed against the dead tile.
+            last_tile_dims.remove(sid);
+        }
+        // Phase 72b — surfaces leaving the active arrangement leave
+        // stale pixels in the framebuffer (term being closed, greeter
+        // exiting after auth, etc.). Force a full repaint on the next
+        // compose pass so the background is cleared and every live
+        // surface re-blits cleanly. Cheap (one full FB clear) and
+        // confined to the rare destroy path.
+        if !outcome.destroyed.is_empty() {
+            compose_ctx.force_full_repaint();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)

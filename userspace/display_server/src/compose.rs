@@ -110,6 +110,25 @@ impl ComposeContext {
     pub fn damage_tracker(&self) -> &DamageTracker {
         &self.damage_tracker
     }
+
+    /// Phase 72b — request a full-screen repaint on the next compose
+    /// pass. Called from the surface-lifecycle path in `main.rs` when
+    /// a Toplevel surface is destroyed, so stale pixels left in the
+    /// framebuffer by the dying surface (or by greeter on logout) get
+    /// cleared instead of bleeding through the gaps between live
+    /// tiles. `run_compose_filtered`'s first-compose branch already
+    /// understands `mark_full_repaint` — flipping it once here is
+    /// enough; the next pass clears the whole output and re-blits
+    /// every live surface.
+    pub fn force_full_repaint(&mut self) {
+        self.damage_tracker.mark_full_repaint();
+        // Resetting `prev_pointer`/`prev_cursor_size` to `None` also
+        // triggers `is_first_compose` in `run_compose_filtered`, which
+        // re-runs `clear_rect_to_background(output)` on the whole FB
+        // before the surface pass. Belt-and-suspenders.
+        self.prev_pointer = None;
+        self.prev_cursor_size = None;
+    }
 }
 
 impl Default for ComposeContext {

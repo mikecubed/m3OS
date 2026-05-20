@@ -720,6 +720,25 @@ impl FramebufferOwner for DisplayClient {
     }
 }
 
+/// Phase 72b — send a `Goodbye` to display_server on drop so the
+/// compositor scopes K.7 surface teardown to *this* term's surfaces
+/// only. Covers every exit path: normal return after shell exits,
+/// `CloseRequest` break, panic. The `client_token` is rebuilt from
+/// PID — the value is stable across the process lifetime so it
+/// matches what `Hello` sent at connect time.
+impl Drop for DisplayClient {
+    fn drop(&mut self) {
+        let pid = syscall_lib::getpid();
+        let client_token: u32 = if pid > 0 { pid as u32 } else { 0x7e8e0001 };
+        let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
+        let goodbye = ClientMessage::Goodbye { client_token };
+        // Best-effort — the process is exiting; if the IPC call fails
+        // we can't do anything about it. `send_verb` already swallows
+        // encode failures.
+        let _ = Self::send_verb(self.server_handle, &goodbye, &mut buf, "Goodbye(drop)");
+    }
+}
+
 /// Phase 69c Track E.2 — blit a [`GlyphView`] into the cell.
 /// Mirrors the layout `Glyph::render_into` enforced before the
 /// renderer started resolving glyphs itself: packed bits row-major,
