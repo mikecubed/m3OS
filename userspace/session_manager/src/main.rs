@@ -378,6 +378,28 @@ mod init_backend {
     /// quoted directly here so this module is the single sleep site.
     const AWAIT_POLL_MS: u32 = 200;
 
+    /// Phase 71 follow-up — per-attempt budget for the `term` step
+    /// when the graphical-only marker is present.
+    ///
+    /// In graphical-login mode, `term` only registers in the IPC
+    /// registry after the user authenticates in greeter AND greeter
+    /// `execve`s `/bin/term`. The user's typing latency is a human
+    /// choice, not a daemon malfunction, so it must NOT share the
+    /// 5 s per-attempt budget the other session steps use for
+    /// daemon-startup races.
+    ///
+    /// 5 minutes is long enough for a normal interactive login (most
+    /// users finish in <30 s); combined with `MAX_RETRIES_PER_STEP=3`
+    /// the worst-case wait before `text-fallback` is 15 minutes, which
+    /// still surfaces a truly stuck greeter through the same recovery
+    /// path operators already know — just on a budget calibrated for
+    /// humans, not for `init`'s manifest walker. The legacy 5 s/step
+    /// × 3-retry budget (`STEP_READY_TIMEOUT_MS` ×
+    /// `MAX_RETRIES_PER_STEP` = 15 s total) stays in force for every
+    /// non-`term` step and for every boot mode where the marker is
+    /// absent.
+    const GRAPHICAL_LOGIN_TERM_WAIT_MS: u64 = 300_000;
+
     impl SupervisorBackend for InitSupervisorBackend {
         fn start(&mut self, service: &str) -> Result<SupervisorReply, SupervisorError> {
             // Init drives the actual spawn via its manifest walker.
@@ -573,6 +595,25 @@ mod init_backend {
             if service == "greeter" && !graphical_only_marker_present() {
                 return Ok(SupervisorReply::ReadyState { ready: true });
             }
+            // Phase 71 follow-up — the `term` step's await window must
+            // include the user's typing latency in graphical-login
+            // mode. `term` registers only after greeter authenticates
+            // and `execve`s `/bin/term`, so a 15 s composite budget
+            // (3 × 5 s) collapses the login screen into text-fallback
+            // before a normal user can type their credentials. Extend
+            // the budget here and only here; every other step keeps
+            // its 5 s daemon-startup budget so genuine regressions
+            // still surface within seconds.
+            let timeout_ms = if service == "term" && graphical_only_marker_present() {
+                syscall_lib::write_str(
+                    syscall_lib::STDOUT_FILENO,
+                    "session_manager: await_ready('term'): graphical-login mode, \
+                     extending budget for user authentication\n",
+                );
+                GRAPHICAL_LOGIN_TERM_WAIT_MS
+            } else {
+                timeout_ms
+            };
             // Poll the IPC service registry up to `timeout_ms` waiting
             // for the named service to register. `init` spawns the
             // session services in parallel based on dependency-graph
