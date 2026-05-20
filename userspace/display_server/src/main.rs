@@ -846,10 +846,23 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     },
                     compositor_config.gaps,
                 );
+            // Phase 72b — track whether the arrangement structure
+            // changed this frame (any tile dim flipped or any surface
+            // left the active set). On a change, the now-uncovered
+            // FB regions — inner gaps that shifted, outer-gap edges
+            // newly exposed by a shrunken tile, the entire
+            // previously-occupied area when a workspace switch swaps
+            // surface sets — keep stale pixels from the old frame
+            // because compose_frame only writes inside damage rects
+            // and the gap areas are in no damage list. Force a full
+            // repaint when this happens so the background fill clears
+            // the gaps before the surface pass re-blits the live tiles.
+            let mut arrangement_changed = false;
             for (sid, rect) in arrangement_for_diff.iter() {
                 let entry = last_tile_dims.entry(*sid).or_insert((0, 0));
                 if entry.0 != rect.w || entry.1 != rect.h {
                     *entry = (rect.w, rect.h);
+                    arrangement_changed = true;
                     if client_event_queue.len() == client::MAX_CLIENT_EVENT_QUEUE {
                         client_event_queue.pop_front();
                     }
@@ -869,7 +882,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // when the surface returns under a different tile size.
             let active_set: alloc::collections::BTreeSet<SurfaceId> =
                 arrangement_for_diff.iter().map(|(sid, _)| *sid).collect();
+            let prev_tracked = last_tile_dims.len();
             last_tile_dims.retain(|sid, _| active_set.contains(sid));
+            if last_tile_dims.len() != prev_tracked {
+                arrangement_changed = true;
+            }
+            if arrangement_changed {
+                compose_ctx.force_full_repaint();
+            }
             let mut adapter = WorkspaceLayoutAdapter {
                 manager: &mut workspace_mgr,
                 gaps: compositor_config.gaps,
