@@ -1,6 +1,6 @@
 # Phase 72 — Compositor: Multi-Toplevel, Tiling Layout, and Workspaces: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-72
 **Depends on:** Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅, Phase 68 (Phase 56 Completion and Closeout) ✅
 **Goal:** Extend `display_server` from a single-Toplevel compositor into a multi-app tiling environment with configurable layout policies, numbered workspaces, modifier-chord keybinds, per-window borders/gaps, and an AF_UNIX control socket.
@@ -9,16 +9,16 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Multi-toplevel client rendering | Phase 56 ✅ | In Progress |
+| A | Multi-toplevel client rendering | Phase 56 ✅ | ✅ Complete |
 | B | Layout policy crate and implementations | A | ✅ Complete |
-| C | Workspace state machine | B | In Progress |
-| D | Keybind chord engine | Phase 56 ✅ | In Progress |
-| E | Borders and gaps | B | In Progress |
-| F | AF_UNIX control socket | A, C | In Progress |
-| G | Configuration file and hot reload | D, E, F | In Progress |
-| H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | In Progress |
-| I | Phase 56 design doc update | H | In Progress |
-| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | In Progress |
+| C | Workspace state machine | B | ✅ Complete |
+| D | Keybind chord engine | Phase 56 ✅ | ✅ Complete |
+| E | Borders and gaps | B | ✅ Complete |
+| F | AF_UNIX control socket | A, C | ✅ Complete |
+| G | Configuration file and hot reload | D, E, F | ✅ Complete |
+| H | Validation and integration (incl. `cargo xtask tiling-smoke` regression gate) | A–G | ✅ Complete |
+| I | Phase 56 design doc update | H | ✅ Complete |
+| J | Documentation and Release: aligned legacy learning doc, kernel version bump to 0.72.0 | I | ✅ Complete |
 
 ---
 
@@ -31,10 +31,10 @@
 **Why it matters:** The existing loop blits at most one Toplevel; everything above it renders incorrectly or is dropped.
 
 **Acceptance:**
-- [ ] `compose_frame` iterates all toplevels in the current workspace in layout order
-- [ ] Damage tracking accumulates per-window dirty rectangles across all surfaces
-- [ ] No surface's pixels are written over a sibling's pixels unless Z-order dictates it
-- [ ] Two `term` instances run side-by-side without rendering artifacts
+- [x] `compose_frame` iterates all toplevels in the current workspace in layout order
+- [x] Damage tracking accumulates per-window dirty rectangles across all surfaces
+- [x] No surface's pixels are written over a sibling's pixels unless Z-order dictates it
+- [x] Two `term` instances run side-by-side without rendering artifacts
 
 ### A.2 — Multi-window focus dispatcher
 
@@ -43,10 +43,10 @@
 **Why it matters:** Click-to-focus, tab-order focus, and pointer-enters-window focus must all work across more than one Toplevel.
 
 **Acceptance:**
-- [ ] `FocusDispatcher` tracks `Option<SurfaceId>` as the current focused Toplevel
-- [ ] Mouse click on an unfocused Toplevel transfers focus and repaints borders
-- [ ] Keyboard events are delivered only to the focused Toplevel
-- [ ] `SUPER+TAB` cycles focus through the current workspace window list
+- [x] `FocusDispatcher` tracks `Option<SurfaceId>` as the current focused Toplevel
+- [x] Mouse click on an unfocused Toplevel transfers focus and repaints borders
+- [x] Keyboard events are delivered only to the focused Toplevel
+- [x] `SUPER+TAB` cycles focus through the current workspace window list
 
 ---
 
@@ -118,10 +118,10 @@
 **Why it matters:** Numbered workspaces are the primary organization mechanism for multi-app use; without them, windows pile up on one screen.
 
 **Acceptance:**
-- [ ] `WorkspaceManager` holds `Vec<Workspace>` with a `current: usize` index per output
-- [ ] `switch_workspace(n)` activates workspace N, triggers full damage redraw, pushes `workspace-changed` event to control-socket subscribers
-- [ ] Each workspace retains its window list independently when not focused
-- [ ] `SUPER+1..9` keybinds are wired to `switch_workspace(1..9)`
+- [x] `WorkspaceManager` holds `Vec<Workspace>` with a `current: usize` index per output
+- [x] `switch_workspace(n)` activates workspace N, triggers full damage redraw, pushes `workspace-changed` event to control-socket subscribers
+- [x] Each workspace retains its window list independently when not focused
+- [x] `SUPER+1..9` keybinds are wired to `switch_workspace(1..9)`
 
 ### C.2 — Move-window-to-workspace
 
@@ -130,10 +130,10 @@
 **Why it matters:** Allows reorganizing open windows across workspaces without closing and reopening applications.
 
 **Acceptance:**
-- [ ] `move_to_workspace(surface_id, n)` detaches from source workspace layout tree and appends to target workspace
-- [ ] After the move, the source workspace re-layouts remaining windows immediately
-- [ ] `SUPER+SHIFT+1..9` keybinds are wired to `move_to_workspace(focused, 1..9)`
-- [ ] Follow semantics: if follow=true in config, compositor switches to target workspace after move
+- [x] `move_to_workspace(surface_id, n)` detaches from source workspace layout tree and appends to target workspace
+- [x] After the move, the source workspace re-layouts remaining windows immediately
+- [x] `SUPER+SHIFT+1..9` keybinds are wired to `move_to_workspace(focused, 1..9)`
+- [x] Follow semantics: if follow=true in config, compositor switches to target workspace after move
 
 ### C.3 — Per-workspace layout selection
 
@@ -142,9 +142,9 @@
 **Why it matters:** Different workspaces benefit from different layouts (e.g., workspace 1 is master/stack for coding, workspace 9 is fullscreen for DOOM).
 
 **Acceptance:**
-- [ ] Each `Workspace` stores an independent `Box<dyn LayoutPolicy>`
-- [ ] `m3ctl layout <name>` sets the active workspace's layout without affecting others
-- [ ] Default layout per workspace slot is configurable in `/etc/compositor.conf`
+- [x] Each `Workspace` stores an independent `Box<dyn LayoutPolicy>`
+- [x] `m3ctl layout <name>` sets the active workspace's layout without affecting others
+- [x] Default layout per workspace slot is configurable in `/etc/compositor.conf`
 
 ---
 
@@ -157,10 +157,10 @@
 **Why it matters:** Modifier chords (`SUPER+SHIFT+1`) are the entire UX of a tiling WM; without chord support the UX degrades to single-key bindings.
 
 **Acceptance:**
-- [ ] `BindTable` maps `(ModifierSet, KeySym)` → `Action`
-- [ ] Key events with an active modifier set are looked up in the bind table before delivery to clients
-- [ ] Matched chords are consumed (not forwarded to the focused client)
-- [ ] Unmatched key events with modifiers are forwarded normally
+- [x] `BindTable` maps `(ModifierSet, KeySym)` → `Action`
+- [x] Key events with an active modifier set are looked up in the bind table before delivery to clients
+- [x] Matched chords are consumed (not forwarded to the focused client)
+- [x] Unmatched key events with modifiers are forwarded normally
 
 ### D.2 — Per-mode binding tables
 
@@ -169,11 +169,11 @@
 **Why it matters:** Resize mode and presentation mode require a transient keybind context that overrides the default table without replacing it.
 
 **Acceptance:**
-- [ ] `BindStack::push_mode(table)` activates a new binding table; `pop_mode()` restores the previous
-- [ ] `SUPER+R` enters resize mode; `Escape` exits it
-- [ ] In resize mode `H/J/K/L` dispatch to `active_policy.adjust_focused(focused, ResizeDirection::{Left,Down,Up,Right}, resize_step)` where `resize_step` is the `[keybinds] resize_step_px` value (default 32)
-- [ ] `LayoutError::Unsupported` from `adjust_focused` is logged at `debug!` and consumed (no error surface) so resize keys are silent no-ops under grid/tabbed/fullscreen
-- [ ] Normal text input is blocked while a non-default mode is active
+- [x] `BindStack::push_mode(table)` activates a new binding table; `pop_mode()` restores the previous
+- [x] `SUPER+R` enters resize mode; `Escape` exits it
+- [x] In resize mode `H/J/K/L` dispatch to `active_policy.adjust_focused(focused, ResizeDirection::{Left,Down,Up,Right}, resize_step)` where `resize_step` is the `[keybinds] resize_step_px` value (default 32)
+- [x] `LayoutError::Unsupported` from `adjust_focused` is logged at `debug!` and consumed (no error surface) so resize keys are silent no-ops under grid/tabbed/fullscreen
+- [x] Normal text input is blocked while a non-default mode is active
 
 ### D.3 — Config-driven keybind reload
 
@@ -182,9 +182,9 @@
 **Why it matters:** Keybinds must be customizable without restarting the compositor.
 
 **Acceptance:**
-- [ ] `reload_from_config(path)` re-parses the `[keybinds]` section and replaces the active table
-- [ ] Syntax errors in the keybinds section log an error and retain the old table
-- [ ] `m3ctl reload` triggers this path
+- [x] `reload_from_config(path)` re-parses the `[keybinds]` section and replaces the active table
+- [x] Syntax errors in the keybinds section log an error and retain the old table
+- [x] `m3ctl reload` triggers this path
 
 ---
 
@@ -197,9 +197,9 @@
 **Why it matters:** Gaps are the visual distinction between tiled and maximized layouts; without them tiles touch the screen edge and each other.
 
 **Acceptance:**
-- [ ] `apply_gaps(rect, outer, inner, position)` returns the display rect shrunken by gap amounts
-- [ ] Outer gap is applied at screen edges; inner gap is applied between adjacent tiles
-- [ ] Zero-gap configuration produces pixel-exact tiling with no empty rows
+- [x] `apply_gaps(rect, outer, inner, position)` returns the display rect shrunken by gap amounts
+- [x] Outer gap is applied at screen edges; inner gap is applied between adjacent tiles
+- [x] Zero-gap configuration produces pixel-exact tiling with no empty rows
 
 ### E.2 — Border rendering
 
@@ -208,10 +208,10 @@
 **Why it matters:** Active/inactive border colors are the primary visual indicator of which window is focused.
 
 **Acceptance:**
-- [ ] `paint_border(rect, width, color)` draws `width` px colored rectangles on all four edges of `rect`
-- [ ] Focused window border uses `borders.active_color` from config
-- [ ] Unfocused windows use `borders.inactive_color`
-- [ ] Border pixels are painted after surface blitting so they appear on top
+- [x] `paint_border(rect, width, color)` draws `width` px colored rectangles on all four edges of `rect`
+- [x] Focused window border uses `borders.active_color` from config
+- [x] Unfocused windows use `borders.inactive_color`
+- [x] Border pixels are painted after surface blitting so they appear on top
 
 ---
 
@@ -224,10 +224,10 @@
 **Why it matters:** Scripting, status-bar integration, and the `m3ctl` CLI all depend on a queryable, command-accepting socket.
 
 **Acceptance:**
-- [ ] `display_server` opens `/run/compositor.sock` at startup
-- [ ] Framed protocol: 4-byte LE length prefix + UTF-8 JSON body
-- [ ] Accepted commands: `layout`, `workspace`, `move-to-workspace`, `reload`, `query-windows`, `query-workspaces`, `subscribe`
-- [ ] Command errors return `{"ok": false, "error": "..."}` without crashing the server
+- [x] `display_server` opens `/run/compositor.sock` at startup
+- [x] Framed protocol: 4-byte LE length prefix + UTF-8 JSON body
+- [x] Accepted commands: `layout`, `workspace`, `move-to-workspace`, `reload`, `query-windows`, `query-workspaces`, `subscribe`
+- [x] Command errors return `{"ok": false, "error": "..."}` without crashing the server
 
 ### F.2 — Event push subscription
 
@@ -236,10 +236,10 @@
 **Why it matters:** The audit (§ C5, Red Flag #15) identified four `publish_*` stubs that never sent data on the wire; this closes that gap.
 
 **Acceptance:**
-- [ ] A client that sends `{"cmd": "subscribe"}` receives newline-delimited JSON event frames
-- [ ] `publish_workspace_changed` emits `{"event": "workspace-changed", "workspace": n}` to all subscribers
-- [ ] `publish_window_focused` emits `{"event": "window-focused", "title": "...", "surface_id": n}`
-- [ ] Subscribers that close their connection are removed from the subscriber list without a panic
+- [x] A client that sends `{"cmd": "subscribe"}` receives newline-delimited JSON event frames
+- [x] `publish_workspace_changed` emits `{"event": "workspace-changed", "workspace": n}` to all subscribers
+- [x] `publish_window_focused` emits `{"event": "window-focused", "title": "...", "surface_id": n}`
+- [x] Subscribers that close their connection are removed from the subscriber list without a panic
 
 ### F.3 — `m3ctl` tile/workspace subcommands
 
@@ -248,13 +248,13 @@
 **Why it matters:** The CLI surface for control-socket commands is the primary human-facing interface for all tiling operations.
 
 **Acceptance:**
-- [ ] `m3ctl tile fullscreen` sends `{"cmd": "layout", "name": "fullscreen"}` and prints the response
-- [ ] `m3ctl workspace switch 3` sends `{"cmd": "workspace", "action": "switch", "n": 3}`
-- [ ] `m3ctl move-to-workspace 2` sends the move command for the currently focused surface
-- [ ] `m3ctl reload` triggers config reload and prints success/error
-- [ ] `m3ctl query windows` sends `{"cmd": "query-windows"}` and pretty-prints the returned `[{surface_id, title, workspace, rect, focused}]` list
-- [ ] `m3ctl query workspaces` sends `{"cmd": "query-workspaces"}` and pretty-prints the returned `[{n, layout, window_count, active}]` list
-- [ ] `m3ctl subscribe` sends `{"cmd": "subscribe"}` and streams received newline-delimited JSON events to stdout until SIGINT
+- [x] `m3ctl tile fullscreen` sends `{"cmd": "layout", "name": "fullscreen"}` and prints the response
+- [x] `m3ctl workspace switch 3` sends `{"cmd": "workspace", "action": "switch", "n": 3}`
+- [x] `m3ctl move-to-workspace 2` sends the move command for the currently focused surface
+- [x] `m3ctl reload` triggers config reload and prints success/error
+- [x] `m3ctl query windows` sends `{"cmd": "query-windows"}` and pretty-prints the returned `[{surface_id, title, workspace, rect, focused}]` list
+- [x] `m3ctl query workspaces` sends `{"cmd": "query-workspaces"}` and pretty-prints the returned `[{n, layout, window_count, active}]` list
+- [x] `m3ctl subscribe` sends `{"cmd": "subscribe"}` and streams received newline-delimited JSON events to stdout until SIGINT
 
 ---
 
@@ -267,9 +267,9 @@
 **Why it matters:** Gaps, border colors, keybinds, and default layouts must be user-customizable without recompiling.
 
 **Acceptance:**
-- [ ] `CompositorConfig::load(path)` parses `[gaps]`, `[borders]`, `[keybinds]`, and `[workspaces]` sections
-- [ ] Parse errors produce a log message and return the previous config unchanged
-- [ ] A minimal working config is written to the ext2 data disk by `xtask`
+- [x] `CompositorConfig::load(path)` parses `[gaps]`, `[borders]`, `[keybinds]`, and `[workspaces]` sections
+- [x] Parse errors produce a log message and return the previous config unchanged
+- [x] A minimal working config is written to the ext2 data disk by `xtask`
 
 ### G.2 — Hot-reload on `m3ctl reload`
 
@@ -278,9 +278,9 @@
 **Why it matters:** A compositor restart would kill all running apps; hot reload is table stakes for a usable tiling WM.
 
 **Acceptance:**
-- [ ] `reload_config()` re-parses the config file and updates gaps, borders, keybinds, and per-workspace defaults
-- [ ] Windows already open are re-layed-out under the new gap/border values immediately
-- [ ] Keybind changes take effect for the next keystroke after reload
+- [x] `reload_config()` re-parses the config file and updates gaps, borders, keybinds, and per-workspace defaults
+- [x] Windows already open are re-layed-out under the new gap/border values immediately
+- [x] Keybind changes take effect for the next keystroke after reload
 
 ---
 
@@ -296,10 +296,10 @@
 **Why it matters:** The headline acceptance criterion requires four simultaneous GUI apps; this is the integration gate.
 
 **Acceptance:**
-- [ ] Boot to greeter (Phase 71); login; `term` opens; `SUPER+RETURN` opens a second `term`; repeated for `edit` and DOOM
-- [ ] All four apps display correctly under dwindle layout with no overlap or corruption
-- [ ] `SUPER+1..9` switches between nine workspaces; each retains its window list
-- [ ] `SUPER+SHIFT+1` moves the focused window to workspace 1 and it no longer appears on the source
+- [x] Boot to greeter (Phase 71); login; `term` opens; `SUPER+RETURN` opens a second `term`; repeated for `edit` and DOOM
+- [x] All four apps display correctly under dwindle layout with no overlap or corruption
+- [x] `SUPER+1..9` switches between nine workspaces; each retains its window list
+- [x] `SUPER+SHIFT+1` moves the focused window to workspace 1 and it no longer appears on the source
 
 ### H.2 — Control socket event push smoke test
 
@@ -308,9 +308,9 @@
 **Why it matters:** Closes audit blocker C5 / Red Flag #15 which identified the four `publish_*` functions as stubs that never transmitted data.
 
 **Acceptance:**
-- [ ] `m3ctl subscribe` receives a `workspace-changed` event when `SUPER+2` is pressed
-- [ ] `m3ctl subscribe` receives `window-focused` when click-to-focus changes the focused window
-- [ ] Subscriber list survives a client disconnect without hanging the compositor
+- [x] `m3ctl subscribe` receives a `workspace-changed` event when `SUPER+2` is pressed
+- [x] `m3ctl subscribe` receives `window-focused` when click-to-focus changes the focused window
+- [x] Subscriber list survives a client disconnect without hanging the compositor
 
 ### H.3 — `cargo xtask tiling-smoke` regression gate
 
@@ -322,10 +322,10 @@
 **Why it matters:** Phases 69d / 70 each added an env-gated xtask smoke that ran in the pre-push hook. Without an equivalent for Phase 72, the four-app tiling integration test (H.1) is only validated by hand and can silently regress.
 
 **Acceptance:**
-- [ ] `cargo xtask tiling-smoke` boots m3OS in graphical mode, drives `SUPER+RETURN` four times to open four `term` instances, asserts the dwindle partition is correct via a `m3ctl query windows` snapshot, exercises `SUPER+1..3` workspace switches, and exits with the standard QEMU debug-exit code on success/failure
-- [ ] Gate runs in `.githooks/pre-push` only when `M3OS_TILING_REGRESSION=1` is set (matches the Phase 69d/70 pattern)
-- [ ] `SMOKE_EXIT_TILING_SMOKE_FAILED` constant added to xtask with a distinct exit code for CI debugging
-- [ ] Updated `AGENTS.md` "First-Time Setup" hook description to mention the new gate
+- [x] `cargo xtask tiling-smoke` boots m3OS in graphical mode, drives `SUPER+RETURN` four times to open four `term` instances, asserts the dwindle partition is correct via a `m3ctl query windows` snapshot, exercises `SUPER+1..3` workspace switches, and exits with the standard QEMU debug-exit code on success/failure
+- [x] Gate runs in `.githooks/pre-push` only when `M3OS_TILING_REGRESSION=1` is set (matches the Phase 69d/70 pattern)
+- [x] `SMOKE_EXIT_TILING_SMOKE_FAILED` constant added to xtask with a distinct exit code for CI debugging
+- [x] Updated `AGENTS.md` "First-Time Setup" hook description to mention the new gate
 
 ---
 
@@ -338,9 +338,9 @@
 **Why it matters:** The Phase 56 doc currently implies it ships a full compositor UX; the multi-toplevel tiling work is now attributed to Phase 72.
 
 **Acceptance:**
-- [ ] Phase 56 "Deferred Until Later" section lists multi-toplevel tiling and workspaces as delivered in Phase 72
-- [ ] Phase 56 "Primary Components" note references `userspace/lib/layout/` as Phase 72's addition
-- [ ] Phase 56 design doc status field remains unchanged (Complete)
+- [x] Phase 56 "Deferred Until Later" section lists multi-toplevel tiling and workspaces as delivered in Phase 72
+- [x] Phase 56 "Primary Components" note references `userspace/lib/layout/` as Phase 72's addition
+- [x] Phase 56 design doc status field remains unchanged (Complete)
 
 ---
 
@@ -353,12 +353,12 @@
 **Why it matters:** Learners need a document that explains how a tiling window manager is built as pure userspace policy on top of a compositor substrate, what the `LayoutPolicy` trait boundary means, and how workspaces and chord keybinds fit together.
 
 **Acceptance:**
-- [ ] `docs/72-compositor-tiling-workspaces.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 72`, `**Status:** In Progress`, `**Source Ref:** phase-72`, `**Supersedes Legacy Doc:** new`)
-- [ ] Overview explains in learner-friendly terms how the `LayoutPolicy` trait is the Open/Closed boundary that allows new layouts to plug in without touching compositor core
-- [ ] "What This Doc Covers" list enumerates multi-toplevel rendering, layout policies, workspace state machine, chord engine, borders/gaps, AF_UNIX control socket, and TOML config hot-reload
-- [ ] "Core Implementation" prose walks through the compose loop extension, `WorkspaceManager`, and `BindTable` lookup in plain language, noting that all work is kernel-free Rust
-- [ ] "Key Files" table cites `userspace/lib/layout/src/lib.rs`, `userspace/display_server/src/compositor.rs`, `userspace/display_server/src/workspace.rs`, `userspace/display_server/src/keybind.rs`, `userspace/display_server/src/control.rs`, and `userspace/m3ctl/src/main.rs`
-- [ ] "Related Roadmap Docs" links both `docs/roadmap/72-compositor-tiling-workspaces.md` and `docs/roadmap/tasks/72-compositor-tiling-workspaces-tasks.md`
+- [x] `docs/72-compositor-tiling-workspaces.md` exists with all template fields populated (`**Aligned Roadmap Phase:** Phase 72`, `**Status:** Complete`, `**Source Ref:** phase-72`, `**Supersedes Legacy Doc:** new`)
+- [x] Overview explains in learner-friendly terms how the `LayoutPolicy` trait is the Open/Closed boundary that allows new layouts to plug in without touching compositor core
+- [x] "What This Doc Covers" list enumerates multi-toplevel rendering, layout policies, workspace state machine, chord engine, borders/gaps, AF_UNIX control socket, and TOML config hot-reload
+- [x] "Core Implementation" prose walks through the compose loop extension, `WorkspaceManager`, and `BindTable` lookup in plain language, noting that all work is kernel-free Rust
+- [x] "Key Files" table cites `userspace/lib/layout/src/lib.rs`, `userspace/display_server/src/compositor.rs`, `userspace/display_server/src/workspace.rs`, `userspace/display_server/src/keybind.rs`, `userspace/display_server/src/control.rs`, and `userspace/m3ctl/src/main.rs`
+- [x] "Related Roadmap Docs" links both `docs/roadmap/72-compositor-tiling-workspaces.md` and `docs/roadmap/tasks/72-compositor-tiling-workspaces-tasks.md`
 
 ### J.2 — Bump kernel version to 0.72.0
 
@@ -372,12 +372,12 @@
 **Why it matters:** Project convention bumps the kernel minor version by 1 per shipped phase. The 2026-05-08 audit found `AGENTS.md` stale at `v0.51.0`; this discipline keeps the version cursor accurate.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` `version = "0.72.0"`
-- [ ] `Cargo.lock` regenerated to reflect the new version
-- [ ] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.72.0`
-- [ ] `docs/roadmap/README.md` row for Phase 72 updated to reflect Completed status at ship
-- [ ] `cargo xtask check` passes after the version bump
-- [ ] Git tag `v0.72.0` recommended at phase merge
+- [x] `kernel/Cargo.toml` `version = "0.72.0"`
+- [x] `Cargo.lock` regenerated to reflect the new version
+- [x] `AGENTS.md` "Kernel v0.X.0" reference updated to `v0.72.0`
+- [x] `docs/roadmap/README.md` row for Phase 72 updated to reflect Completed status at ship
+- [x] `cargo xtask check` passes after the version bump
+- [x] Git tag `v0.72.0` recommended at phase merge
 
 ---
 

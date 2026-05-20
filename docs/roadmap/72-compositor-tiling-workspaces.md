@@ -1,6 +1,6 @@
 # Phase 72 - Compositor: Multi-Toplevel, Tiling Layout, and Workspaces
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-72
 **Depends on:** Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅, Phase 68 (Phase 56 Completion and Closeout) ✅
 **Builds on:** Extends the Phase 56 single-Toplevel compositor into a real tiling window manager by adding multi-client rendering, swappable layout policies, numbered workspaces, a keybind chord engine, and a `hyprctl`-equivalent control socket

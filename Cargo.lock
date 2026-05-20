@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",

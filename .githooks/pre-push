@@ -205,3 +205,14 @@ if [ "${M3OS_TUI_APP_REGRESSION:-0}" = "1" ]; then
     echo "pre-push: running cargo xtask tui-app-smoke..."
     cargo xtask tui-app-smoke --timeout 300
 fi
+
+# Phase 72 Track H.3 — tiling regression gate. Gated behind
+# M3OS_TILING_REGRESSION=1 because the gate boots QEMU, exchanges
+# ~10 m3ctl verbs, and asserts the workspace + tile-fullscreen + reload
+# path end-to-end (~30-45s wall-clock). Set the env var on branches
+# that touch userspace/display_server, userspace/lib/layout,
+# userspace/m3ctl, or the Phase 72 control-socket codec.
+if [ "${M3OS_TILING_REGRESSION:-0}" = "1" ]; then
+    echo "pre-push: running cargo xtask tiling-smoke..."
+    cargo xtask tiling-smoke --timeout 120
+fi
