@@ -1,8 +1,5 @@
-# Phase 71 follow-up — the greeter background is a user-personal
-# asset, not a shared canonical one. Drop your image at
-# `background.png` (preferred) or `background.bmp` and xtask will
-# stage it at `/etc/greeter/background.{png,bmp}` on the data disk.
-# Supported formats: PNG, 24-bit RGB BMP, 32-bit BGRA BMP. The
-# greeter scales-to-fit, so any aspect ratio works.
-background.png
+# Phase 71 follow-up — `background.png` is committed (a small, shared
+# boot artifact). Drop `background.bmp` here if you want to override
+# at build time; only the BMP variant is gitignored to keep the
+# canonical PNG image stable across clones and CI.
 background.bmp
