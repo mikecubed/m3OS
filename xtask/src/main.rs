@@ -10083,7 +10083,17 @@ fn populate_ext2_files(
     // successful login. The `restart=on-failure` policy with
     // `max_restart=3` matches the legacy term.conf budget; greeter's
     // `exit(7)` on setuid failure is `on-failure` so init respawns it.
-    let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse,audio.cmd,vfs\n";
+    //
+    // `depends=` lists init manifest `name=` values (matched by
+    // `DepGraph::build` in `userspace/init/src/main.rs`). Cross-check
+    // against the sibling `*_conf` literals above: `display_server.conf`
+    // registers `name=display`, `kbd_server.conf` registers `name=kbd`,
+    // `mouse_server.conf` registers `name=mouse_server`, and
+    // `audio_server.conf` registers `name=audio_server`. Using the IPC
+    // service names (`mouse`, `audio.cmd`) or kernel subsystems (`vfs`)
+    // here would leave init unable to resolve the dep and mark greeter
+    // `PermanentlyStopped`, so it would never start.
+    let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n";
 
     // Phase 71 — `/etc/greeter.conf` is the greeter binary's runtime
     // configuration file (separate from the init service manifest at

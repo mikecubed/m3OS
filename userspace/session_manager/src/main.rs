@@ -560,8 +560,17 @@ mod init_backend {
             // (default, smoke-test, regression) init skips greeter.conf
             // via the same marker check, so treat the step as
             // satisfied to keep the boot sequence advancing to term.
+            //
+            // Leave the table entry at the `Starting` state set by
+            // `try_start`: there is no greeter process in this mode, so
+            // promoting to `Running` would lie to operators about a
+            // live PID and break the Phase 64 invariant enforced below
+            // (`Running` always pairs with a real owner PID). The
+            // sequencer only inspects the `ready: true` reply, not the
+            // per-service state, so leaving it `Starting` keeps the
+            // boot advancing without contradicting `m3ctl
+            // session-state`.
             if service == "greeter" && !graphical_only_marker_present() {
-                self.table.update_state(service, ServiceState::Running);
                 return Ok(SupervisorReply::ReadyState { ready: true });
             }
             // Poll the IPC service registry up to `timeout_ms` waiting

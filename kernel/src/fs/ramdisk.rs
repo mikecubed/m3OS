@@ -813,8 +813,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: GRAB_HOOK_SMOKE_ELF,
         },
     ),
-    // Phase 71 — `greeter` GUI login manager. Spawned by
-    // `session_manager` after `audio_server` is ready.
+    // Phase 71 — `greeter` GUI login manager. Spawned by `init` via
+    // `/etc/services.d/greeter.conf` in graphical-only boots (marker
+    // `/etc/m3os-graphical-only` present); `session_manager` only
+    // observes readiness via the IPC registry and is not greeter's
+    // parent. On successful authentication greeter `setuid`s to the
+    // authenticated user and `execve`s `/bin/term` in-process.
     (
         "greeter",
         RamdiskNode::File {

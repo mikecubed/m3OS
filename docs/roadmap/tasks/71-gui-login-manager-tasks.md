@@ -209,39 +209,39 @@
 
 ## Track F — `session_manager` Integration
 
-### F.1 — Boot sequence extended to spawn greeter
+### F.1 — Boot sequence extended to wait for greeter
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `run_boot_sequence`
-**Why it matters:** `session_manager` must launch greeter as the last boot step and wait for it to authenticate before spawning `term`.
+**File:** `userspace/session_manager/src/main.rs`
+**Symbol:** `run_boot_sequence`, `InitSupervisorBackend::await_ready`
+**Why it matters:** `session_manager` does not spawn greeter — `init` does, via `/etc/services.d/greeter.conf` — but the session-step sequencer must observe greeter readiness before advancing to `term` so the boot order matches `DECLARED_SESSION_STEP_NAMES`.
 
 **Acceptance:**
-- [x] Boot sequence: `display_server → kbd_server → mouse_server → audio_server → greeter`.
-- [x] `greeter` is spawned with a captured stdout pipe.
-- [x] `session_manager` waits (blocking) on greeter's exit code.
-- [x] On exit code 0, reads and parses the session descriptor line from the pipe.
+- [x] Session-step order: `display_server → kbd_server → mouse_server → audio_server → greeter → term`.
+- [x] `await_ready("greeter", ...)` polls the IPC service registry (greeter is not session_manager's child, so `sys_waitpid` is not applicable).
+- [x] In default / smoke / regression boots the `/etc/m3os-graphical-only` marker is absent, init skips `greeter.conf`, and `await_ready` short-circuits with `ready: true` while leaving the table entry at `Starting` so the Phase 64 "no `Running` without PID" invariant holds.
+- [x] In graphical-only boots greeter handles the login UI itself; on success it `setgid`s + `setuid`s + `execve`s `/bin/term` in-process, so the subsequent `await_ready("term", ...)` resolves only after a successful login.
 
 ### F.2 — UID/GID propagation and per-user `term` exec
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `spawn_user_session`
-**Why it matters:** Without setuid before exec, `term` and all descendant processes run as root despite the greeter having authenticated a different user.
+**File:** `userspace/greeter/src/main.rs`
+**Symbol:** `program_main` (post-auth `setgid`/`setuid`/`execve` block)
+**Why it matters:** Without setuid before exec, `term` and all descendant processes would run as root despite the greeter having authenticated a different user. The privilege drop happens inside the greeter process so the same PID becomes `term` — no fork, no descriptor pipe, no setuid syscalls in `session_manager`.
 
 **Acceptance:**
-- [x] After parsing the session descriptor, `session_manager` calls `sys_setuid(uid)` and `sys_setgid(gid)` before exec'ing `term`.
+- [x] On successful authentication greeter calls `sys_setgid(gid)` then `sys_setuid(uid)` then `execve("/bin/term", ...)` in-process.
 - [x] `term` and its child shell process report the correct UID via `id` and `whoami`.
-- [x] `passwd_lib::lookup_uid` validates that the UID from the session descriptor exists in `/etc/passwd` before setuid is called; mismatch returns an error that escalates to `text-fallback`.
+- [x] `passwd_lib::lookup_uid` validates that the UID from `/etc/passwd` matches the authenticated username before the setuid call; mismatch causes greeter to `exit(7)` and init's `restart=on-failure` policy handles re-spawning.
 
 ### F.3 — Greeter restart policy
 
-**File:** `userspace/session_manager/src/boot.rs`
-**Symbol:** `handle_greeter_exit`
-**Why it matters:** An unexpected greeter crash (non-zero, non-auth exit) must be handled by the existing `restart=on-failure` supervisor policy, not silently ignored.
+**File:** `xtask/src/main.rs` (greeter_conf), `userspace/init/src/main.rs`
+**Symbol:** `greeter_conf`, supervisor restart loop
+**Why it matters:** An unexpected greeter crash (e.g. `exit(7)` on a setuid failure) must be handled by init's existing `restart=on-failure` supervisor policy, not silently ignored. `session_manager` is not greeter's parent and cannot observe its exit code directly.
 
 **Acceptance:**
-- [x] Exit code 0 → parse descriptor, spawn user session.
-- [x] Exit code 1 (unexpected failure) → respawn greeter up to 3 times per minute; after 3 failures, escalate to `text-fallback`.
-- [x] `session_manager` logs the exit code and restart decision on each non-zero exit.
+- [x] `services.d/greeter.conf` declares `restart=on-failure` with `max_restart=3`.
+- [x] init respawns greeter up to 3 times on non-zero exit; after the budget is exhausted, greeter transitions to `PermanentlyStopped` and `session_manager`'s session-step budget escalates to `text-fallback` via the `DISPLAY_CRITICAL_SERVICES` recovery path.
+- [x] init logs the exit code on each respawn decision.
 
 ---
 
