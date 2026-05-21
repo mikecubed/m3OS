@@ -54,7 +54,7 @@ The compose loop grows an optional decoration pass: rounded corners (per-edge al
 
 ### Background customization
 
-A `userspace/wallpaper/` Layer-shell client at the `Bottom` anchor loads a raw RGBA image file from a configured path and blits it as the desktop background. Replaces the solid-color fill that Phase 56 used as its background. Reloads on `SIGTERM` (which `m3ctl` can send via the session manager).
+A `userspace/wallpaper/` Layer-shell client at the `Bottom` anchor loads a raw RGBA image file from a configured path and blits it as the desktop background. Replaces the solid-color fill that Phase 56 used as its background. Reloads on `SIGHUP` (which `m3ctl reload` sends via the session manager); `SIGTERM` shuts it down as for any supervised service.
 
 ## Important Components and How They Work
 
