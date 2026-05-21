@@ -136,8 +136,14 @@ impl ComposeContext {
     /// `clear_rect_to_background(output)` before the surface pass so
     /// pixels from now-vacated regions (a destroyed surface, a
     /// shrunken tile's old extent, a workspace switch's outgoing
-    /// surface set) are wiped. Pays the single-buffered-FB
-    /// "background flash" cost; use sparingly.
+    /// surface set) are wiped.
+    ///
+    /// With the [`KernelFramebufferOwner`] back-buffer in place the
+    /// clear + surface blits land in the back buffer first and only
+    /// reach the visible framebuffer at the next `present()` — so the
+    /// intermediate cleared-but-not-yet-painted state is never
+    /// observable. Without double buffering this path used to flash
+    /// the background colour for one or two refreshes.
     pub fn force_full_repaint_clearing_background(&mut self) {
         self.damage_tracker.mark_full_repaint();
         self.prev_pointer = None;
@@ -1143,7 +1149,14 @@ pub fn fill_background<O: FramebufferOwner>(owner: &mut O) -> Result<(), FbError
             w: meta.width,
             h: meta.height,
         },
-    )
+    )?;
+    // Phase 73 — double-buffered backend keeps `write_pixels` in the
+    // back buffer; the visible framebuffer only updates on `present()`.
+    // Call it here so callers that fill_background without immediately
+    // running a compose pass (the boot wipe before the first compose
+    // tick, the post-FB-reclaim wipe before the compositor resumes)
+    // still flush the new background to the screen.
+    owner.present()
 }
 
 /// Construct the default Phase 56 layout policy. Re-exported as a named

@@ -7,12 +7,26 @@
 //! tests live in `kernel-core`; this file just connects the trait to the
 //! real MMIO mapping.
 //!
+//! ## Phase 73 — double buffering
+//!
+//! `write_pixels` lands in a userspace-side back buffer; `present()`
+//! is the only path that copies pixels into the kernel-mapped front
+//! buffer. Every compose pass that previously wrote partial state
+//! directly to the visible framebuffer (clear-to-background, then
+//! per-surface blits, then cursor blit) now lands in the back buffer
+//! and reaches the screen as one atomic memcpy at frame end. Eliminates
+//! the "background flashes between clear and surface blit" tearing
+//! the single-buffered path exhibited on every animation tick,
+//! arrangement change, focus transition, and destroy.
+//!
 //! The owner lives for the duration of `display_server`'s ownership of
 //! the framebuffer. On drop it best-effort releases the FB; explicit
 //! shutdown paths should call `release()` first so the result is checked.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::ptr;
-use core::slice;
 
 use kernel_core::display::fb_owner::{FbError, FbMetadata, FramebufferOwner, bytes_per_pixel};
 use kernel_core::display::protocol::Rect;
@@ -37,13 +51,26 @@ pub enum AcquireError {
 /// Kernel-backed [`FramebufferOwner`]. Holds the userspace virtual address
 /// of the mapped framebuffer plus its geometry so writes can be issued
 /// without re-querying the kernel.
+///
+/// Phase 73 — `back_buffer` is a userspace-allocated mirror sized
+/// identically to the kernel-mapped front. `write_pixels` lands here
+/// (cheap CPU-cache-friendly copy); `present()` is the only path that
+/// pushes the back into the visible front. Until `present()` runs the
+/// screen shows whatever it last presented, so intermediate states
+/// (clear, then blit, then cursor) are never observable to the user.
 pub struct KernelFramebufferOwner {
     base: *mut u8,
+    back_buffer: Vec<u8>,
     metadata: FbMetadata,
     /// Total mapped byte length — used as a defensive bound on clipped
     /// writes in addition to width/height.
     byte_len: usize,
     released: bool,
+    /// `true` iff `back_buffer` differs from the kernel-mapped front.
+    /// Cleared by `present()` so consecutive `present()` calls with no
+    /// intervening writes are no-ops. Set by every `write_pixels` call
+    /// that actually touched bytes.
+    dirty: bool,
 }
 
 // SAFETY: the FB virtual address is only mutated through methods on this
@@ -102,11 +129,19 @@ impl KernelFramebufferOwner {
         // (the kernel maps full-row units).
         let byte_len = (metadata.stride_bytes as usize).saturating_mul(metadata.height as usize);
 
+        // Allocate the back buffer at the same size. Initial contents
+        // are zero; the first compose pass overwrites every byte via
+        // `fill_background` + surface blits before its terminating
+        // `present()`, so the initial zero state is never observable.
+        let back_buffer = alloc::vec![0u8; byte_len];
+
         Ok(Self {
             base,
+            back_buffer,
             metadata,
             byte_len,
             released: false,
+            dirty: false,
         })
     }
 
@@ -164,7 +199,8 @@ impl FramebufferOwner for KernelFramebufferOwner {
             return Err(FbError::Truncated);
         }
 
-        // Defensive: never write past the mapped region.
+        // Defensive: never write past the back-buffer bounds (which are
+        // identical to the kernel-mapped front-buffer bounds).
         let dest_stride = self.metadata.stride_bytes as usize;
         let dest_x_bytes = (clipped.x as usize).saturating_mul(bpp);
         let last_row_end = (clipped.y as usize)
@@ -177,23 +213,33 @@ impl FramebufferOwner for KernelFramebufferOwner {
             return Err(FbError::OutOfBounds);
         }
 
-        // SAFETY: the kernel mapped `byte_len` writable bytes at `base`,
-        // and we just bounded the write to that region. Each row is a
-        // distinct disjoint span.
-        unsafe {
-            let dest_base = self.base;
-            for row in 0..clipped.h as usize {
-                let src_row_off = (src_offset_y_rows + row) * stride + src_offset_x_bytes;
-                let dest_row_off = (clipped.y as usize + row) * dest_stride + dest_x_bytes;
-                let src_slice =
-                    slice::from_raw_parts(src.as_ptr().add(src_row_off), clipped_w_bytes);
-                ptr::copy_nonoverlapping(
-                    src_slice.as_ptr(),
-                    dest_base.add(dest_row_off),
-                    clipped_w_bytes,
-                );
-            }
+        // Land the write in the userspace back buffer. `present()` is
+        // the only path that pushes pixels into the visible front, so
+        // intermediate compose state (clear-then-blit-then-cursor) is
+        // not observable.
+        for row in 0..clipped.h as usize {
+            let src_row_off = (src_offset_y_rows + row) * stride + src_offset_x_bytes;
+            let dest_row_off = (clipped.y as usize + row) * dest_stride + dest_x_bytes;
+            self.back_buffer[dest_row_off..dest_row_off + clipped_w_bytes]
+                .copy_from_slice(&src[src_row_off..src_row_off + clipped_w_bytes]);
         }
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn present(&mut self) -> Result<(), FbError> {
+        if !self.dirty {
+            return Ok(());
+        }
+        // SAFETY: the kernel mapped `byte_len` writable bytes at `base`
+        // for our exclusive use, and `back_buffer` is exactly that
+        // many bytes (allocated in `acquire`). The two regions live in
+        // disjoint address ranges (kernel-mapped MMIO vs heap), so the
+        // copy is non-overlapping.
+        unsafe {
+            ptr::copy_nonoverlapping(self.back_buffer.as_ptr(), self.base, self.byte_len);
+        }
+        self.dirty = false;
         Ok(())
     }
 
@@ -225,13 +271,16 @@ impl FramebufferOwner for KernelFramebufferOwner {
         if off.saturating_add(4) > self.byte_len {
             return Err(FbError::OutOfBounds);
         }
-        // SAFETY: bounds check above proves [off, off+4) is within the
-        // mapped region. `read_volatile` because the framebuffer is
-        // potentially-shared kernel memory.
-        let value = unsafe {
-            let p = self.base.add(off) as *const u32;
-            core::ptr::read_volatile(p)
-        };
+        // Read from the back buffer. With double buffering the back
+        // is the source of truth between presents — readback observes
+        // pixels the compositor staged, even before the next
+        // `present()` pushes them to the kernel-mapped front.
+        let value = u32::from_le_bytes([
+            self.back_buffer[off],
+            self.back_buffer[off + 1],
+            self.back_buffer[off + 2],
+            self.back_buffer[off + 3],
+        ]);
         Ok(value)
     }
 }
