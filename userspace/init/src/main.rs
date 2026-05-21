@@ -56,8 +56,14 @@ fn alloc_error(_layout: Layout) -> ! {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MAX_SERVICES: usize = 16;
-const MAX_DISCOVERED_DISABLED: usize = 16;
+// Phase 73 — raised from 16 to 24 to make room for the new
+// `wallpaper`, `bar`, and `notifyd` desktop daemons alongside the
+// existing 14–16 services. KNOWN_CONFIGS lists 25 service paths;
+// the on-disk subset typically lands at ~19 in graphical-login
+// boots. Keeping a 24-slot ceiling leaves a small budget for future
+// additions without blowing the static arrays' memory footprint.
+const MAX_SERVICES: usize = 24;
+const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
 const MAX_NAME: usize = 32;

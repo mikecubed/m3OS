@@ -105,6 +105,7 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut notifications: VecDeque<Notification> = VecDeque::new();
     let tick_ms: u32 = 100;
+    let mut dirty = true; // first paint always commits
     loop {
         // Drain any pending connections (non-blocking).
         loop {
@@ -117,23 +118,27 @@ fn program_main(_args: &[&str]) -> i32 {
                 let _ = syscall_lib::write(STDOUT_FILENO, note.title.as_bytes());
                 syscall_lib::write_str(STDOUT_FILENO, "'\n");
                 notifications.push_back(note);
+                dirty = true;
             }
             let _ = syscall_lib::close(fd as i32);
         }
 
-        if notifications.is_empty() {
-            // Nothing to show; clear the surface only once per
-            // dismiss transition.
-            fill(pixels, BG_COLOR);
+        if dirty {
+            if notifications.is_empty() {
+                fill(pixels, BG_COLOR);
+            } else {
+                render(pixels, &notifications);
+            }
             let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
-        } else {
-            render(pixels, &notifications);
-            let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+            dirty = false;
         }
 
         let _ = syscall_lib::nanosleep_for(0, (tick_ms as u32) * 1_000_000);
 
-        // Decrement timers and pop expired notifications.
+        // Decrement timers and pop expired notifications. A repaint
+        // is needed whenever a notification dismisses (so the panel
+        // disappears from the framebuffer).
+        let before = notifications.len();
         for note in notifications.iter_mut() {
             note.remaining_ms = note.remaining_ms.saturating_sub(tick_ms);
         }
@@ -141,6 +146,9 @@ fn program_main(_args: &[&str]) -> i32 {
             && front.remaining_ms == 0
         {
             notifications.pop_front();
+        }
+        if notifications.len() != before {
+            dirty = true;
         }
     }
 }
