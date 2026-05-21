@@ -431,9 +431,41 @@ int DG_GetKey(int *pressed, unsigned char *doomKey)
             g_focused = 0;
             break;
         case DC_EVENT_SURFACE_RESIZED:
-            /* DOOM doesn't reflow on resize today; the compositor will
-             * letterbox or scale the surface. Ignore. */
+            /* Phase 72b — DOOM acknowledges the resize event but does
+             * not reflow its playfield. doomgeneric exposes a fixed
+             * DOOMGENERIC_RESX × DOOMGENERIC_RESY screen buffer baked
+             * into the engine; runtime resolution changes would
+             * require an upstream doomgeneric refactor that is out of
+             * scope for m3OS.
+             *
+             * The compositor's Phase 72 letterbox path keeps the
+             * surface centred inside its assigned tile when the tile
+             * dimensions differ from DOOM's intrinsic resolution, so
+             * the visible result remains correct — just not
+             * dynamically scaled.
+             *
+             * Logging the event makes the protocol path observable
+             * in m3os.log: K.3's SurfaceResized emitter and DOOM's
+             * receiver are wired end-to-end even though the renderer
+             * stays fixed-resolution. */
+            /* DevSkim: ignore DS154189 -- diagnostic fprintf, literal fmt + scalar args */
+            fprintf(stderr, "DOOM: SurfaceResized width=%u height=%u (engine stays at %dx%d; compositor letterboxes)\n",
+                    ev.payload.surface_resized.width,
+                    ev.payload.surface_resized.height,
+                    DOOMGENERIC_RESX, DOOMGENERIC_RESY);
             break;
+        case DC_EVENT_CLOSE_REQUEST:
+            /* Phase 72b Track K.6 — SUPER+Q close request from the
+             * compositor. doomgeneric does not expose a clean "soft
+             * quit" hook, so we trigger the same teardown path used
+             * by DC_EVENT_DISCONNECT and DG_DrawFrame's autoquit:
+             * destroy the surface + SHM, disconnect, and exit with
+             * code 0. This matches the user expectation that
+             * SUPER+Q closes the focused window.
+             */
+            /* DevSkim: ignore DS154189 -- shutdown-path fprintf, literal fmt only */
+            fprintf(stderr, "DOOM: close requested by compositor. Exiting.\n");
+            exit(0);
         case DC_EVENT_DISCONNECT:
             /* DevSkim: ignore DS154189 -- shutdown-path fprintf, literal fmt + scalar arg */
             fprintf(stderr, "DOOM: display_server disconnect (reason=%u). Exiting.\n",

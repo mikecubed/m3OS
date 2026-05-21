@@ -233,11 +233,16 @@ fn drive_surface(
 ) -> bool {
     let mut buf = [0u8; ENCODE_BUF_LEN];
 
+    // Phase 72b Track K.7 — client token derived from surface_id so
+    // each simulated client appears distinct on the wire.
+    let client_token: u32 = 0x5e0c0000u32.wrapping_add(surface_id.0);
+
     // Hello — required once per connection. We send it on every drive
     // call for simplicity; display_server's dispatcher tolerates it.
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         capabilities: 0,
+        client_token,
     };
     if !send_message(server_handle, &hello, &mut buf, "Hello") {
         return false;
@@ -254,7 +259,10 @@ fn drive_surface(
     };
     surface_buf.fill(color);
 
-    let create = ClientMessage::CreateSurface { surface_id };
+    let create = ClientMessage::CreateSurface {
+        surface_id,
+        client_token,
+    };
     if !send_message(server_handle, &create, &mut buf, "CreateSurface") {
         return false;
     }

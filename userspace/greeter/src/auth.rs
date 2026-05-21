@@ -20,6 +20,10 @@ pub const BACKOFF_DURATION_SECS: u64 = 5;
 pub struct SessionDescriptor {
     pub uid: u32,
     pub gid: u32,
+    /// Phase 72b — authenticated username. Persisted into
+    /// `/run/m3os-current-session` so display_server's spawn paths
+    /// can populate `USER=` in the spawned process's envp.
+    pub username: String,
     pub home: String,
     pub shell: String,
 }
@@ -117,6 +121,7 @@ mod tests {
         SessionDescriptor {
             uid: 1000,
             gid: 1000,
+            username: String::from("u"),
             home: String::from("/home/u"),
             shell: String::from("/bin/sh0"),
         }

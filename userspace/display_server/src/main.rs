@@ -24,12 +24,16 @@
 
 extern crate alloc;
 
+mod borders;
 mod client;
 mod compose;
+mod config;
 mod control;
 mod fb;
 mod input;
+mod keybind;
 mod surface;
+mod workspace;
 
 use core::alloc::Layout;
 use kernel_core::display::fb_owner::FramebufferOwner;
@@ -42,7 +46,8 @@ use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
 use crate::client::{FatalReason, InboundFrame, dispatch};
-use crate::compose::{ComposeContext, default_layout, fill_background, run_compose};
+use crate::compose::{ComposeContext, fill_background, run_compose_filtered};
+use crate::workspace::WorkspaceLayoutAdapter;
 
 /// Phase 57d follow-up — per-second diagnostic counters for the SHM
 /// transport bring-up. Sampled and logged once per second from the
@@ -279,6 +284,35 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut focused: Option<SurfaceId> = None;
     let mut pointer_position: (i32, i32) = (0, 0);
 
+    // ----- Phase 72 — load `/etc/compositor.conf` --------------------------
+    let mut compositor_config = config::CompositorConfig::defaults();
+    if let Some(parsed) = load_compositor_config(config::CONFIG_PATH) {
+        compositor_config = parsed;
+    }
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "display_server: compositor.conf loaded; outer_gap=",
+    );
+    write_u32(compositor_config.gaps.outer as u32);
+    syscall_lib::write_str(STDOUT_FILENO, " inner_gap=");
+    write_u32(compositor_config.gaps.inner as u32);
+    syscall_lib::write_str(STDOUT_FILENO, " border_w=");
+    write_u32(compositor_config.borders.width as u32);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
+
+    // ----- Phase 72 — workspaces + keybind chord engine --------------------
+    let mut workspace_mgr =
+        workspace::WorkspaceManager::new(compositor_config.workspaces.defaults[0]);
+    for i in 0..workspace::NUM_WORKSPACES {
+        if let Some(ws) = workspace_mgr.workspace_mut(i) {
+            ws.set_policy(compositor_config.workspaces.defaults[i]);
+        }
+    }
+    let mut bind_stack = keybind::BindStack::new();
+    // Apply user-supplied chord overrides from the config file.
+    bind_stack.reload_default(&compositor_config.keybinds.user_chords);
+    bind_stack.set_resize_step_px(compositor_config.keybinds.resize_step_px);
+
     // Track E.4 — control-socket subscription registry and frame-stats
     // ring. The registry is keyed by `ClientId`; Phase 56 uses a
     // single static `ClientId` because the in-process control endpoint
@@ -332,9 +366,25 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     const RESP_OK: u64 = 0;
     const RESP_FATAL: u64 = u64::MAX;
     let mut registry = SurfaceRegistry::new();
-    let mut layout = default_layout();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 72b — `[autostart]` execution latch. Flipped to `true`
+    // after the first successful compose so the autostart entries
+    // launch exactly once per compositor lifetime, matching
+    // Hyprland's `exec-once` semantics. `m3ctl reload` does not
+    // clear the latch — long-running respawn belongs in init or
+    // session_manager.
+    let mut autostart_ran = false;
+    // Phase 72b (Track K.3) — last-known tile dimensions per Toplevel
+    // surface. After each `arrange_current`, the loop diffs against
+    // this map and emits `ServerMessage::SurfaceResized` to every
+    // surface whose `(w, h)` changed. Term re-flows via its existing
+    // Phase 69 handler (Screen::resize → TIOCSWINSZ → SIGWINCH).
+    // DOOM consumes via Phase 72b Track K.4. Position-only changes
+    // do not need notification — the client's surface buffer keeps
+    // its intrinsic size and the compositor handles repositioning.
+    let mut last_tile_dims: alloc::collections::BTreeMap<SurfaceId, (u32, u32)> =
+        alloc::collections::BTreeMap::new();
     // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
     // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
     // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
@@ -523,20 +573,71 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             log_client_protocol_violation(outcome.fatal_reason, &header, &bulk_buf, &recent_frames);
         }
         if outcome.closed {
-            // Phase 70 — Goodbye used to wipe the entire `SurfaceRegistry`
-            // (Phase 56 single-client legacy). With multiple concurrent
-            // clients that resets every other client's surfaces, so
-            // typing `goodbye` from one app would clear the screen of
-            // every other app. Per-client surface tracking is the
-            // proper fix (and the Phase 71 follow-up); until then,
-            // expect clients to send explicit `DestroySurface` verbs
-            // for the surfaces they own before saying Goodbye. The
-            // log line still fires so a developer can confirm the
-            // disconnect happened.
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "display_server: client said Goodbye (registry preserved for other clients)\n",
-            );
+            // Phase 72b Track K.7 — Goodbye now carries the client's
+            // own token, and the dispatcher returns it via
+            // `outcome.closed_client_token`. We scope teardown to that
+            // client's surfaces only, replacing the Phase 70
+            // "preserve everything" workaround. Surfaces that other
+            // clients still own keep their entries.
+            if let Some(token) = outcome.closed_client_token {
+                let destroyed = registry.destroy_client_surfaces(token);
+                if !destroyed.is_empty() {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: client Goodbye token=");
+                    write_u32(token);
+                    syscall_lib::write_str(STDOUT_FILENO, " destroyed=");
+                    write_u32(destroyed.len() as u32);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                }
+                for sid in &destroyed {
+                    let _ = workspace_mgr.remove_surface(*sid);
+                    last_tile_dims.remove(sid);
+                    if focused == Some(*sid) {
+                        focused = None;
+                    }
+                }
+                // Re-publish focus after the teardown so subscribers
+                // see the updated state.
+                if !destroyed.is_empty() {
+                    publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+                    // Phase 72b — clear stale pixels left by the
+                    // disconnecting client. Same rationale as the
+                    // `outcome.destroyed` branch above; the Goodbye
+                    // path lands here when a client cleanly says
+                    // farewell while the destroy branch covers
+                    // explicit DestroySurface verbs.
+                    compose_ctx.force_full_repaint();
+                }
+            } else {
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: client Goodbye without token (legacy v2 protocol; registry preserved)\n",
+                );
+            }
+        }
+        // Phase 72 — keep the workspace manager in sync with surface
+        // lifecycle: every newly-rolled Toplevel joins the active
+        // workspace; every destroyed surface leaves whichever
+        // workspace currently holds it.
+        for (sid, role) in outcome.created.iter() {
+            if matches!(role, SurfaceRole::Toplevel) {
+                workspace_mgr.insert_on_current(*sid);
+            }
+        }
+        for sid in outcome.destroyed.iter() {
+            let _ = workspace_mgr.remove_surface(*sid);
+            // Phase 72b — drop the surface from the last-tile-dims
+            // map so a future surface that lands at the same id does
+            // not get spuriously diffed against the dead tile.
+            last_tile_dims.remove(sid);
+        }
+        // Phase 72b — surfaces leaving the active arrangement leave
+        // stale pixels in the framebuffer (term being closed, greeter
+        // exiting after auth, etc.). Force a full repaint on the next
+        // compose pass so the background is cleared and every live
+        // surface re-blits cleanly. Cheap (one full FB clear) and
+        // confined to the rare destroy path.
+        if !outcome.destroyed.is_empty() {
+            compose_ctx.force_full_repaint();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)
@@ -719,12 +820,89 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // the "Engineering Discipline → Observability" sample the
             // `m3ctl frame-stats` verb returns.
             let start_us = monotonic_micros();
-            let compose_result = run_compose(
+            // Phase 72 — workspace-aware compose. The adapter funnels
+            // `LayoutPolicy::arrange` calls into the current
+            // workspace's active tiling policy + outer/inner gaps.
+            // The `include_toplevel` filter masks Toplevel surfaces
+            // belonging to other workspaces; Layer / Cursor surfaces
+            // remain visible across all workspaces.
+            let active_ws_windows: alloc::vec::Vec<SurfaceId> =
+                workspace_mgr.current().windows().to_vec();
+            // Phase 72b Track K.3 — diff the current tile arrangement
+            // against the last-known dims map and emit `SurfaceResized`
+            // for every Toplevel whose dimensions changed. Position
+            // changes are silent (the client's buffer keeps its intrinsic
+            // size). Active workspace only: surfaces on inactive
+            // workspaces don't receive resize events until they come
+            // back into view (the next `switch_workspace` will diff and
+            // re-emit if their new tile differs).
+            let arrangement_for_diff: alloc::vec::Vec<(SurfaceId, Rect)> = workspace_mgr
+                .arrange_current(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: meta.width,
+                        h: meta.height,
+                    },
+                    compositor_config.gaps,
+                );
+            // Phase 72b — track whether the arrangement structure
+            // changed this frame (any tile dim flipped or any surface
+            // left the active set). On a change, the now-uncovered
+            // FB regions — inner gaps that shifted, outer-gap edges
+            // newly exposed by a shrunken tile, the entire
+            // previously-occupied area when a workspace switch swaps
+            // surface sets — keep stale pixels from the old frame
+            // because compose_frame only writes inside damage rects
+            // and the gap areas are in no damage list. Force a full
+            // repaint when this happens so the background fill clears
+            // the gaps before the surface pass re-blits the live tiles.
+            let mut arrangement_changed = false;
+            for (sid, rect) in arrangement_for_diff.iter() {
+                let entry = last_tile_dims.entry(*sid).or_insert((0, 0));
+                if entry.0 != rect.w || entry.1 != rect.h {
+                    *entry = (rect.w, rect.h);
+                    arrangement_changed = true;
+                    if client_event_queue.len() == client::MAX_CLIENT_EVENT_QUEUE {
+                        client_event_queue.pop_front();
+                    }
+                    client_event_queue.push_back((
+                        *sid,
+                        ServerMessage::SurfaceResized {
+                            surface_id: *sid,
+                            width: rect.w,
+                            height: rect.h,
+                        },
+                    ));
+                }
+            }
+            // Drop tracked dims for surfaces that left the active
+            // arrangement (workspace switch, destroy, move). This keeps
+            // the map bounded and prevents stale-comparison artifacts
+            // when the surface returns under a different tile size.
+            let active_set: alloc::collections::BTreeSet<SurfaceId> =
+                arrangement_for_diff.iter().map(|(sid, _)| *sid).collect();
+            let prev_tracked = last_tile_dims.len();
+            last_tile_dims.retain(|sid, _| active_set.contains(sid));
+            if last_tile_dims.len() != prev_tracked {
+                arrangement_changed = true;
+            }
+            if arrangement_changed {
+                compose_ctx.force_full_repaint();
+            }
+            let mut adapter = WorkspaceLayoutAdapter {
+                manager: &mut workspace_mgr,
+                gaps: compositor_config.gaps,
+            };
+            let compose_result = run_compose_filtered(
                 &mut owner,
-                &mut layout,
+                &mut adapter,
                 &mut registry,
                 &mut compose_ctx,
                 pointer_position,
+                |id| active_ws_windows.contains(&id),
+                Some(compositor_config.borders),
+                focused,
             );
             let elapsed_us = monotonic_micros().saturating_sub(start_us);
             let compose_micros = if elapsed_us > u32::MAX as u64 {
@@ -748,6 +926,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 Ok(_) => "okN",
                 Err(_) => "err",
             };
+            // Phase 72b — fire `[autostart]` after the first successful
+            // compose so launched processes (term, future status bar)
+            // have a live compositor + framebuffer to attach to. Latch
+            // ensures one-shot semantics across the compositor lifetime.
+            if !autostart_ran && compose_result.is_ok() {
+                autostart_ran = true;
+                run_autostart(&compositor_config.autostart.entries);
+            }
             let writes_this = compose_result.as_ref().copied().unwrap_or(0);
             DIAG_FB_WRITES.fetch_add(writes_this as u64, core::sync::atomic::Ordering::Relaxed);
             if entry_count <= 5 {
@@ -849,12 +1035,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         {
             input_wiring.dispatcher.forget_hovered();
         }
+        // Phase 72 — feed the active chord table from the bind stack
+        // (default or transient resize mode). The legacy `bind_table`
+        // is still mutated by the control-socket `RegisterBind`
+        // verb so existing tests keep working, but Phase 72's chord
+        // dispatch consumes the stack's active table directly: that
+        // table is the union of the built-in chord set plus any
+        // user-supplied chords parsed from `/etc/compositor.conf`.
+        let _ = &bind_table; // legacy: still mutated by control socket
         let effects = input_wiring.drain_one_pass(
             focused,
             None, // active_exclusive_layer — E.2 wires this once Layer surfaces map
             pointer_position,
             &surface_geom,
-            &bind_table,
+            bind_stack.active_table(),
             &mut grab_state,
         );
         for effect in effects {
@@ -894,26 +1088,45 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     syscall_lib::write_str(STDOUT_FILENO, "display_server: bind triggered id=");
                     write_u32(id);
                     syscall_lib::write_str(STDOUT_FILENO, "\n");
-                    // Track E.4 — surface this on the control socket
-                    // for any subscriber. The dispatcher's
-                    // `BindTriggered` carries only the `BindId`, but
-                    // the control-socket event variant carries the
-                    // (modifier_mask, keycode) pair the bind was
-                    // registered against. The `BindTable` doesn't
-                    // expose a "lookup-key-by-id" accessor today, so
-                    // Phase 56 publishes a `BindTriggered` event with
-                    // a placeholder (mask=0, keycode=id-as-keycode)
-                    // — the m3ctl client receives the event and the
-                    // id round-trips end-to-end. Richer payloads land
-                    // alongside the bind-table API extension noted
-                    // in the H.1 hand-off.
                     publish_bind_triggered(&mut control_subs, 0, id, null_subscriber_sender);
+                    // Phase 72 — translate the raw `BindId` into a
+                    // typed `KeybindAction` and execute it. Legacy
+                    // ids registered by the control-socket
+                    // `RegisterBind` verb (which writes to
+                    // `bind_table`) have no action map entry; they
+                    // surface only as the `BindTriggered` event for
+                    // m3ctl subscribers and are otherwise ignored.
+                    if let Some(action) = bind_stack.lookup_action_raw(id) {
+                        dispatch_keybind_action(
+                            action,
+                            &mut workspace_mgr,
+                            &mut bind_stack,
+                            &mut focused,
+                            &mut control_subs,
+                            &compositor_config,
+                            &mut client_event_queue,
+                            &mut compose_ctx,
+                        );
+                    }
                 }
                 InputEffect::FocusChanged(id) => {
                     let prev = focused;
                     focused = Some(id);
                     if prev != focused {
                         publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
+                        // Phase 72 review-resolution — borders use the
+                        // focused id to pick active vs inactive colour
+                        // every compose pass. Without a forced repaint
+                        // here the no-damage short-circuit can keep the
+                        // previous border colours on screen until some
+                        // unrelated surface damages. Focus changes are
+                        // user-initiated and infrequent, so paying one
+                        // full repaint per focus transition is cheap.
+                        // Also invalidates the cache so `focus_affects_
+                        // geometry()` layouts (tabbed, fullscreen) pick
+                        // the new visible surface on the next pass.
+                        compose_ctx.force_full_repaint();
+                        compose_ctx.invalidate_arrangement_cache();
                     }
                 }
                 InputEffect::PointerEnter(_id) | InputEffect::PointerLeave(_id) => {
@@ -952,6 +1165,11 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             &mut input_wiring,
             &mut fb_yielded,
             &mut needs_post_reclaim_fill,
+            &mut workspace_mgr,
+            &mut bind_stack,
+            &mut focused,
+            &mut compositor_config,
+            &mut compose_ctx,
         );
 
         // Yield briefly when the iteration had no graphical traffic so
@@ -980,6 +1198,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
 ///
 /// On any decode / dispatch error a structured `ControlEvent::Error`
 /// reply is sent so clients always observe a well-formed frame.
+#[allow(clippy::too_many_arguments)]
 fn serve_one_control_request(
     ep_handle: u32,
     registry: &mut SurfaceRegistry,
@@ -993,6 +1212,11 @@ fn serve_one_control_request(
     input_wiring: &mut InputWiring,
     fb_yielded: &mut bool,
     needs_post_reclaim_fill: &mut bool,
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    bind_stack: &mut keybind::BindStack,
+    focused: &mut Option<SurfaceId>,
+    compositor_config: &mut config::CompositorConfig,
+    compose_ctx: &mut compose::ComposeContext,
 ) {
     let mut header = syscall_lib::IpcMessage::new(0);
     let mut req_buf = [0u8; control::MAX_BULK_BYTES];
@@ -1047,6 +1271,80 @@ fn serve_one_control_request(
                 needs_post_reclaim_fill,
                 &mut reply_buf,
             ),
+            ControlCommand::SetLayout { kind } => {
+                // The policy state changed under the same id set; without
+                // these two calls the arrangement cache and the no-damage
+                // short-circuit would keep painting the previous policy's
+                // partition until something else damaged the framebuffer.
+                let n = handle_set_layout(workspace_mgr, kind, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
+            }
+            ControlCommand::SwitchWorkspace { n } => {
+                let nbytes = handle_switch_workspace(
+                    workspace_mgr,
+                    focused,
+                    subscriptions,
+                    n,
+                    &mut reply_buf,
+                );
+                // Workspace switch usually changes the active id set (so
+                // the compose cache invalidates naturally), but the focus
+                // and active-set transition still needs the no-damage
+                // gate bypassed so borders + background recolour on the
+                // next pass.
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                nbytes
+            }
+            ControlCommand::MoveToWorkspace { n, follow } => {
+                let nbytes = handle_move_to_workspace(
+                    workspace_mgr,
+                    focused,
+                    subscriptions,
+                    n,
+                    follow,
+                    &mut reply_buf,
+                );
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                nbytes
+            }
+            ControlCommand::Reload => {
+                let n = handle_reload(workspace_mgr, bind_stack, compositor_config, &mut reply_buf);
+                // Gaps / borders / per-workspace policy may all have
+                // changed; recompute arrangement and repaint.
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
+            }
+            ControlCommand::QueryWindows => {
+                let meta = fb_owner.metadata();
+                handle_query_windows(
+                    workspace_mgr,
+                    *focused,
+                    compositor_config.gaps,
+                    meta.width,
+                    meta.height,
+                    &mut reply_buf,
+                )
+            }
+            ControlCommand::QueryWorkspaces => {
+                handle_query_workspaces(workspace_mgr, &mut reply_buf)
+            }
+            ControlCommand::SetMasterRatio { ratio_x100 } => {
+                let n = handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
+            }
+            ControlCommand::TileFullscreen => {
+                let n = handle_tile_fullscreen(workspace_mgr, &mut reply_buf);
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+                n
+            }
             _ => {
                 let client = control::ClientId(0);
                 let pixel_reader =
@@ -1588,6 +1886,664 @@ fn publish_surface_lifecycle_deltas(
         publish_surface_created(subs, registry, cur[j], null_subscriber_sender);
         j += 1;
     }
+}
+
+/// Phase 72 — load `/etc/compositor.conf` from the ext2 data disk.
+/// Returns `Some(cfg)` on a clean parse; logs a one-liner and returns
+/// `None` on any read or parse failure (the caller falls back to
+/// `CompositorConfig::defaults()`).
+fn load_compositor_config(path: &str) -> Option<config::CompositorConfig> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let mut path_buf = alloc::vec::Vec::with_capacity(path.len() + 1);
+    path_buf.extend_from_slice(path.as_bytes());
+    path_buf.push(0);
+    let fd = syscall_lib::open(&path_buf, 0, 0);
+    if fd < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: compositor.conf not found; using defaults\n",
+        );
+        return None;
+    }
+    let fd_i32 = fd as i32;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = syscall_lib::read(fd_i32, &mut chunk);
+        if n <= 0 {
+            break;
+        }
+        let n_usize = n as usize;
+        buf.extend_from_slice(&chunk[..n_usize]);
+        if n_usize < chunk.len() {
+            break;
+        }
+    }
+    let _ = syscall_lib::close(fd_i32);
+    let text = match core::str::from_utf8(&buf) {
+        Ok(s) => String::from(s),
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: compositor.conf not utf-8; using defaults\n",
+            );
+            return None;
+        }
+    };
+    match config::CompositorConfig::parse_with_warnings(&text) {
+        Ok((cfg, warnings)) => {
+            for w in &warnings {
+                match w {
+                    config::ConfigWarning::UnknownSection { .. } => {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: compositor.conf: ignoring unknown section\n",
+                        );
+                    }
+                    config::ConfigWarning::UnknownKey { .. } => {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: compositor.conf: ignoring unknown key\n",
+                        );
+                    }
+                }
+            }
+            Some(cfg)
+        }
+        Err(_e) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: compositor.conf parse error; using defaults\n",
+            );
+            None
+        }
+    }
+}
+
+/// Phase 72b — authenticated session descriptor read from
+/// `/run/m3os-current-session` (written by greeter on successful
+/// auth). When present, `SpawnTerm` and `[autostart]` switch into
+/// this UID/GID before `execve` so spawned terms run as the
+/// authenticated user rather than display_server's own UID. When
+/// absent (skip-login / autologin mode), the spawn paths fall back
+/// to direct execve and the child inherits display_server's UID.
+struct SessionState {
+    uid: u32,
+    gid: u32,
+    user: alloc::string::String,
+    home: alloc::string::String,
+}
+
+const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
+
+fn read_session_state() -> Option<SessionState> {
+    let fd = syscall_lib::open(SESSION_STATE_PATH, 0 /* O_RDONLY */, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd_i32 = fd as i32;
+    let mut buf = [0u8; 512];
+    let n = syscall_lib::read(fd_i32, &mut buf);
+    let _ = syscall_lib::close(fd_i32);
+    if n <= 0 {
+        return None;
+    }
+    let bytes = &buf[..n as usize];
+    let text = core::str::from_utf8(bytes).ok()?;
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut user = alloc::string::String::new();
+    let mut home = alloc::string::String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("uid=") {
+            uid = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("gid=") {
+            gid = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("user=") {
+            user.push_str(v);
+        } else if let Some(v) = line.strip_prefix("home=") {
+            home.push_str(v);
+        }
+    }
+    Some(SessionState {
+        uid: uid?,
+        gid: gid?,
+        user,
+        home,
+    })
+}
+
+/// Phase 72 / 72b — `execve` a NUL-terminated path. Used by both
+/// the `SUPER+RETURN` keybind handler and the `[autostart]`
+/// config-driven launcher. `path_with_nul` and `argv0_with_nul` must
+/// each end in a `\0` byte. When a `SessionState` is present, the
+/// caller `setuid`/`setgid`s in the child before invoking this and
+/// passes a populated `envp_buf`; otherwise envp is empty.
+fn spawn_exec(path_with_nul: &[u8], argv0_with_nul: &[u8]) -> isize {
+    let argv: [*const u8; 2] = [argv0_with_nul.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    syscall_lib::execve(path_with_nul, &argv, &envp)
+}
+
+/// Phase 72b — `execve` with the authenticated user's `USER=` and
+/// `HOME=` envp populated. The forked child has already called
+/// `setgid`/`setuid` to the user's IDs.
+fn spawn_exec_with_session(
+    path_with_nul: &[u8],
+    argv0_with_nul: &[u8],
+    session: &SessionState,
+) -> isize {
+    let user_var = build_env_var(b"USER=", session.user.as_bytes());
+    let home_var = build_env_var(b"HOME=", session.home.as_bytes());
+    let path_var = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
+    let term_var = b"TERM=m3os-term\0";
+    let argv: [*const u8; 2] = [argv0_with_nul.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 5] = [
+        user_var.as_ptr(),
+        home_var.as_ptr(),
+        path_var.as_ptr(),
+        term_var.as_ptr(),
+        core::ptr::null(),
+    ];
+    syscall_lib::execve(path_with_nul, &argv, &envp)
+}
+
+/// Build a NUL-terminated `KEY=value` byte vector for envp use.
+fn build_env_var(prefix: &[u8], value: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(prefix.len() + value.len() + 1);
+    v.extend_from_slice(prefix);
+    v.extend_from_slice(value);
+    v.push(0);
+    v
+}
+
+/// `spawn_term` runs in the just-forked child. It consults the
+/// session state, drops privileges if a user is authenticated, and
+/// finally `execve`s `/bin/term`. Returns only on execve failure.
+fn spawn_term() -> isize {
+    if let Some(session) = read_session_state() {
+        if syscall_lib::setgid(session.gid) != 0 {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: setgid failed in spawned child; running as root\n",
+            );
+        }
+        if syscall_lib::setuid(session.uid) != 0 {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: setuid failed in spawned child; running as root\n",
+            );
+        }
+        spawn_exec_with_session(b"/bin/term\0", b"/bin/term\0", &session)
+    } else {
+        spawn_exec(b"/bin/term\0", b"/bin/term\0")
+    }
+}
+
+/// Phase 72b — run every `[autostart] exec = <path>` entry from the
+/// parsed config exactly once via `fork + execve`. Called after the
+/// first compose frame completes so the launched processes have a
+/// live compositor to connect to. `entries` is borrowed from
+/// `CompositorConfig::autostart`; the function does not retain it.
+///
+/// `path` must be staged as a NUL-terminated string at execve time;
+/// we allocate a `Vec<u8>` per entry for the `\0` suffix because the
+/// kernel ABI requires it.
+fn run_autostart(entries: &[alloc::string::String]) {
+    use alloc::vec::Vec;
+    for path in entries {
+        let mut buf: Vec<u8> = Vec::with_capacity(path.len() + 1);
+        buf.extend_from_slice(path.as_bytes());
+        buf.push(0);
+        let pid = syscall_lib::fork();
+        if pid == 0 {
+            // Phase 72b — same setuid/setgid path as `spawn_term`.
+            // Autostart entries inherit the authenticated user's UID
+            // when greeter has staged the session file; otherwise
+            // (default-skip-login / autologin) the child runs as
+            // display_server's own UID.
+            if let Some(session) = read_session_state() {
+                if syscall_lib::setgid(session.gid) != 0 {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: autostart setgid failed; running as root\n",
+                    );
+                }
+                if syscall_lib::setuid(session.uid) != 0 {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: autostart setuid failed; running as root\n",
+                    );
+                }
+                let _ = spawn_exec_with_session(&buf, &buf, &session);
+            } else {
+                let _ = spawn_exec(&buf, &buf);
+            }
+            syscall_lib::exit(99);
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: autostart exec=");
+        syscall_lib::write_str(STDOUT_FILENO, path);
+        syscall_lib::write_str(STDOUT_FILENO, "\n");
+    }
+}
+
+/// Phase 72 — execute a typed `KeybindAction` against the live
+/// compositor state. Each arm is a small state-machine step the
+/// main loop folds into its existing focus / publish helpers.
+fn dispatch_keybind_action(
+    action: keybind::KeybindAction,
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    bind_stack: &mut keybind::BindStack,
+    focused: &mut Option<SurfaceId>,
+    control_subs: &mut control::ControlSubscriptions,
+    cfg: &config::CompositorConfig,
+    client_event_queue: &mut alloc::collections::VecDeque<(SurfaceId, ServerMessage)>,
+    compose_ctx: &mut compose::ComposeContext,
+) {
+    use keybind::{BindMode, KeybindAction};
+    match action {
+        KeybindAction::SwitchWorkspace(n) => {
+            let idx = (n.saturating_sub(1)) as usize;
+            if let Ok(transition) = workspace_mgr.switch_workspace(idx) {
+                if transition.switched {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: workspace switched to ");
+                    write_u32(n as u32);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    // Pick focus from the new workspace; falls back
+                    // to None if it is empty.
+                    *focused = workspace_mgr.next_focus(None);
+                    publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
+                }
+            }
+        }
+        KeybindAction::MoveToWorkspace(n) => {
+            if let Some(fid) = *focused {
+                let idx = (n.saturating_sub(1)) as usize;
+                let follow = cfg.workspaces.follow_on_move;
+                if let Ok(transition) = workspace_mgr.move_to_workspace(fid, idx, follow) {
+                    syscall_lib::write_str(STDOUT_FILENO, "display_server: moved focused to ");
+                    write_u32(n as u32);
+                    syscall_lib::write_str(STDOUT_FILENO, "\n");
+                    if transition.switched {
+                        *focused = workspace_mgr.next_focus(None);
+                        publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                    } else if !workspace_mgr.current().windows().contains(&fid) {
+                        // Focused window left the active workspace.
+                        *focused = workspace_mgr.next_focus(None);
+                        publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                    }
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
+                }
+            }
+        }
+        KeybindAction::CycleFocus => {
+            let next = workspace_mgr.next_focus(*focused);
+            if next != *focused {
+                *focused = next;
+                publish_focus_changed(control_subs, *focused, null_subscriber_sender);
+                // Repaint so border colours track the new focus, and
+                // recompute arrangement for `focus_affects_geometry()`
+                // policies (tabbed / fullscreen).
+                compose_ctx.invalidate_arrangement_cache();
+                compose_ctx.force_full_repaint();
+            }
+        }
+        KeybindAction::SpawnTerm => {
+            let pid = syscall_lib::fork();
+            if pid == 0 {
+                let _ = spawn_term();
+                syscall_lib::exit(99);
+            }
+            syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN spawned term\n");
+        }
+        KeybindAction::KillFocused => {
+            // Phase 72b Track K.6 — push `ServerMessage::CloseRequest`
+            // to the focused surface's owning client. The client
+            // decides how to shut down gracefully; the compositor
+            // does not forcibly destroy surfaces or kill processes
+            // here (escalation to SIGTERM/SIGKILL belongs in
+            // session_manager / init).
+            if let Some(fid) = *focused {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+Q close-request id=");
+                write_u32(fid.0);
+                syscall_lib::write_str(STDOUT_FILENO, "\n");
+                if client_event_queue.len() == client::MAX_CLIENT_EVENT_QUEUE {
+                    client_event_queue.pop_front();
+                }
+                client_event_queue
+                    .push_back((fid, ServerMessage::CloseRequest { surface_id: fid }));
+            }
+        }
+        KeybindAction::EnterResize => {
+            bind_stack.push_mode(BindMode::Resize);
+            syscall_lib::write_str(STDOUT_FILENO, "display_server: entered resize mode\n");
+        }
+        KeybindAction::ExitResize => {
+            bind_stack.pop_to_default();
+            syscall_lib::write_str(STDOUT_FILENO, "display_server: exited resize mode\n");
+        }
+        KeybindAction::ResizeFocused { direction, step } => {
+            if let Some(fid) = *focused {
+                let result = workspace_mgr
+                    .current_mut()
+                    .adjust_focused(fid, direction, step);
+                if let Err(layout::LayoutError::Unsupported) = result {
+                    // Phase 72b K.5 — surface the rejection instead of
+                    // silently dropping H/J/K/L keypresses. The user
+                    // entered resize mode against a layout that does
+                    // not support per-tile resize (grid is uniform;
+                    // tabbed shows only the focused tile; fullscreen
+                    // is fullscreen). Log it and auto-exit resize
+                    // mode so subsequent keystrokes reach the focused
+                    // client instead of vanishing into the bind stack.
+                    let policy_name = workspace_mgr.current().policy().as_name();
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "display_server: resize not supported under '",
+                    );
+                    syscall_lib::write_str(STDOUT_FILENO, policy_name);
+                    syscall_lib::write_str(STDOUT_FILENO, "'; exiting resize mode\n");
+                    bind_stack.pop_to_default();
+                }
+                // Other variants (NoFocusedWindow etc.) keep resize
+                // mode active — the user might press H/J/K/L after
+                // focusing a window. Log a one-line warning so the
+                // failure mode is visible.
+                if let Err(other) = result.as_ref() {
+                    if !matches!(other, layout::LayoutError::Unsupported) {
+                        syscall_lib::write_str(
+                            STDOUT_FILENO,
+                            "display_server: resize keystroke ignored (no focused window?)\n",
+                        );
+                    }
+                }
+                // On a successful resize the policy state changed under
+                // the same id set, so the arrangement cache would
+                // otherwise keep painting the previous ratios.
+                if result.is_ok() {
+                    compose_ctx.invalidate_arrangement_cache();
+                    compose_ctx.force_full_repaint();
+                }
+                let _ = result;
+            } else {
+                // No focused window — resize chord has nothing to act
+                // on. Stay in resize mode; the user may focus a window
+                // next.
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "display_server: resize keystroke ignored (no focused window)\n",
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 72 — control-socket verb handlers
+// ---------------------------------------------------------------------------
+
+fn handle_set_layout(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    kind_byte: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    let kind = match kind_byte {
+        0 => layout::PolicyKind::MasterStack,
+        1 => layout::PolicyKind::Dwindle,
+        2 => layout::PolicyKind::Spiral,
+        3 => layout::PolicyKind::Grid,
+        4 => layout::PolicyKind::Tabbed,
+        5 => layout::PolicyKind::Fullscreen,
+        _ => {
+            return encode_event_or_drop(
+                &ControlEvent::Error {
+                    code: ControlErrorCode::BadArgs,
+                },
+                reply_buf,
+            );
+        }
+    };
+    workspace_mgr.set_current_layout(kind);
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_switch_workspace(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: &mut Option<SurfaceId>,
+    subs: &mut control::ControlSubscriptions,
+    n: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if n == 0 || (n as usize) > workspace::NUM_WORKSPACES {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        );
+    }
+    let idx = (n - 1) as usize;
+    match workspace_mgr.switch_workspace(idx) {
+        Ok(transition) => {
+            if transition.switched {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+                publish_to_subscribers_workspace(subs, n);
+            }
+            encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+        }
+        Err(_) => encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        ),
+    }
+}
+
+fn handle_move_to_workspace(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: &mut Option<SurfaceId>,
+    subs: &mut control::ControlSubscriptions,
+    n: u8,
+    follow: u8,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlErrorCode, ControlEvent};
+    if n == 0 || (n as usize) > workspace::NUM_WORKSPACES {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        );
+    }
+    let Some(fid) = *focused else {
+        return encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::UnknownSurface,
+            },
+            reply_buf,
+        );
+    };
+    let idx = (n - 1) as usize;
+    let follow_bool = follow != 0;
+    match workspace_mgr.move_to_workspace(fid, idx, follow_bool) {
+        Ok(transition) => {
+            if transition.switched {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+                publish_to_subscribers_workspace(subs, n);
+            } else if !workspace_mgr.current().windows().contains(&fid) {
+                *focused = workspace_mgr.next_focus(None);
+                publish_focus_changed(subs, *focused, null_subscriber_sender);
+            }
+            encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+        }
+        Err(_) => encode_event_or_drop(
+            &ControlEvent::Error {
+                code: ControlErrorCode::BadArgs,
+            },
+            reply_buf,
+        ),
+    }
+}
+
+fn handle_reload(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    bind_stack: &mut keybind::BindStack,
+    compositor_config: &mut config::CompositorConfig,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    if let Some(new_cfg) = load_compositor_config(config::CONFIG_PATH) {
+        *compositor_config = new_cfg;
+        bind_stack.reload_default(&compositor_config.keybinds.user_chords);
+        bind_stack.set_resize_step_px(compositor_config.keybinds.resize_step_px);
+        for i in 0..workspace::NUM_WORKSPACES {
+            if let Some(ws) = workspace_mgr.workspace_mut(i) {
+                ws.set_policy(compositor_config.workspaces.defaults[i]);
+            }
+        }
+        syscall_lib::write_str(STDOUT_FILENO, "display_server: reloaded compositor.conf\n");
+    } else {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "display_server: reload kept previous config\n",
+        );
+    }
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_query_windows(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    focused: Option<SurfaceId>,
+    gaps: layout::GapConfig,
+    output_width: u32,
+    output_height: u32,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlEvent, WindowQueryEntry};
+    use kernel_core::display::protocol::Rect as ProtoRect;
+    // For each workspace that holds a window, run the layout and
+    // collect the per-window rect. The output rect comes from the
+    // framebuffer's actual metadata so the query view matches the
+    // compositor's authoritative arrangement on every real display
+    // size (instead of the previous hardcoded 1280x720 placeholder
+    // that disagreed with the rest of the repo's 1280x800 baseline).
+    let output = ProtoRect {
+        x: 0,
+        y: 0,
+        w: output_width,
+        h: output_height,
+    };
+    let mut entries: alloc::vec::Vec<WindowQueryEntry> = alloc::vec::Vec::new();
+    for ws_idx in 0..workspace::NUM_WORKSPACES {
+        let Some(ws) = workspace_mgr.workspace(ws_idx) else {
+            continue;
+        };
+        if ws.is_empty() {
+            continue;
+        }
+        // Re-tile the workspace into the real framebuffer rect so the
+        // `m3ctl query windows` reply reports the rects that compose
+        // would actually paint. `output` above is built from
+        // `output_width` / `output_height` (the live framebuffer
+        // metadata) — the previous synthetic 1280×720 fallback is gone.
+        let ws_mut = workspace_mgr.workspace_mut(ws_idx).expect("idx checked");
+        let inner = layout::apply_outer_gaps(output, gaps.outer);
+        let rects = ws_mut.tile(inner, gaps);
+        for (sid, rect) in rects {
+            entries.push(WindowQueryEntry {
+                surface_id: sid,
+                workspace: (ws_idx + 1) as u8,
+                rect,
+                focused: focused == Some(sid),
+            });
+        }
+    }
+    encode_event_or_drop(&ControlEvent::WindowListReply { entries }, reply_buf)
+}
+
+fn handle_query_workspaces(
+    workspace_mgr: &workspace::WorkspaceManager,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::{ControlEvent, WorkspaceQueryEntry};
+    let mut entries: alloc::vec::Vec<WorkspaceQueryEntry> =
+        alloc::vec::Vec::with_capacity(workspace::NUM_WORKSPACES);
+    for (idx, ws) in workspace_mgr.iter() {
+        entries.push(WorkspaceQueryEntry {
+            workspace: (idx + 1) as u8,
+            policy_kind: policy_kind_to_byte(ws.policy()),
+            window_count: ws.len() as u32,
+            active: idx == workspace_mgr.current_index(),
+        });
+    }
+    encode_event_or_drop(&ControlEvent::WorkspaceListReply { entries }, reply_buf)
+}
+
+fn handle_set_master_ratio(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    ratio_x100: u16,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    let ratio = (ratio_x100 as f32) / 100.0;
+    // The PolicySet is per-workspace and the master-stack state is
+    // inside it; mutating it requires a path through the workspace.
+    // We do so here via a thin accessor.
+    if let Some(ws) = workspace_mgr.workspace_mut(workspace_mgr.current_index()) {
+        ws.set_master_ratio(ratio);
+    }
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn handle_tile_fullscreen(
+    workspace_mgr: &mut workspace::WorkspaceManager,
+    reply_buf: &mut [u8],
+) -> usize {
+    use kernel_core::display::control::ControlEvent;
+    let cur = workspace_mgr.current().policy();
+    let new = if cur == layout::PolicyKind::Fullscreen {
+        layout::PolicyKind::Dwindle
+    } else {
+        layout::PolicyKind::Fullscreen
+    };
+    workspace_mgr.set_current_layout(new);
+    encode_event_or_drop(&ControlEvent::Ack, reply_buf)
+}
+
+fn policy_kind_to_byte(k: layout::PolicyKind) -> u8 {
+    match k {
+        layout::PolicyKind::MasterStack => 0,
+        layout::PolicyKind::Dwindle => 1,
+        layout::PolicyKind::Spiral => 2,
+        layout::PolicyKind::Grid => 3,
+        layout::PolicyKind::Tabbed => 4,
+        layout::PolicyKind::Fullscreen => 5,
+    }
+}
+
+/// Phase 72 — publish a `WorkspaceChanged` event to subscribers of
+/// the `FocusChanged` kind (the existing subscribable slot the new
+/// event variant reuses).
+fn publish_to_subscribers_workspace(subs: &mut control::ControlSubscriptions, workspace_num: u8) {
+    use kernel_core::display::control::ControlEvent;
+    kernel_core::display::subscription::publish_to_subscribers(
+        subs,
+        ControlEvent::WorkspaceChanged {
+            workspace: workspace_num,
+        },
+        null_subscriber_sender,
+    );
 }
 
 #[panic_handler]

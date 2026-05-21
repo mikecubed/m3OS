@@ -86,7 +86,8 @@
 // declaration site is `crate::display::protocol`.
 pub use crate::display::protocol::{
     ControlCommand, ControlErrorCode, ControlEvent, EventKind, FrameStatSample, MAX_LIST_ENTRIES,
-    PROTOCOL_VERSION, ProtocolError, SurfaceId, SurfaceRoleTag,
+    PROTOCOL_VERSION, ProtocolError, SurfaceId, SurfaceRoleTag, WindowQueryEntry,
+    WorkspaceQueryEntry,
 };
 
 /// Errors returned by the E.4-facing codec free functions.

@@ -66,34 +66,21 @@ pub const BOOT_LOG_MARKER: &str = "term: spawned\n";
 /// wait for this line to confirm `term` is live.
 pub const READY_SENTINEL: &str = "TERM_SMOKE:ready\n";
 
-/// Service name under which `term` registers with the IPC service
-/// registry so `session_manager` can probe its readiness.
-pub const SERVICE_NAME: &str = "term";
-
 /// Service marker published after the graphical shell has produced enough
 /// PTY output to prove the prompt path is alive.
+///
+/// Phase 72b — `term` no longer registers a global `SERVICE_NAME`
+/// because `term` is a user-facing app (potentially many concurrent
+/// instances), not a singleton daemon. The first term to start still
+/// best-effort registers [`PROMPT_READY_SERVICE`] as a smoke-test
+/// readiness sentinel; subsequent term instances silently lose the
+/// race (a no-op, not a fatal error) because only one such sentinel
+/// is needed and any later term reaching the same point implies the
+/// graphical-shell path is alive system-wide.
 pub const PROMPT_READY_SERVICE: &str = "term.prompt-ready";
 
 /// Minimum PTY bytes before publishing [`PROMPT_READY_SERVICE`].
 pub const PROMPT_READY_MIN_BYTES: u64 = 32;
-
-/// Service-manifest restart budget — pinned at 3 per the G.1
-/// acceptance ("`restart=on-failure max_restart=3
-/// depends=display,kbd,session_manager`"). The dep names match the
-/// REGISTERED service names from each daemon's `.conf` (display_server.conf
-/// `name=display`, kbd.conf `name=kbd`, session_manager.conf
-/// `name=session_manager`), not the binary names.
-pub const SERVICE_MAX_RESTART: u32 = 3;
-
-/// Service-manifest restart policy literal.
-pub const SERVICE_RESTART_POLICY: &str = "on-failure";
-
-/// Service-manifest dependency list.  `term` requires display
-/// (compositor — registered name from display_server.conf), kbd
-/// (focus-aware key events — registered name from kbd.conf) and
-/// session_manager (entry orchestration) to be running before it can
-/// claim a surface.
-pub const SERVICE_DEPENDS: &str = "display,kbd,session_manager";
 
 /// Fixed scrollback cap in lines.  G.4 acceptance: "Scrollback fixed
 /// at 1000 lines; exceeding the cap drops the oldest line".
@@ -157,18 +144,6 @@ pub enum TermError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Phase 57 G.1 acceptance: the manifest constants record
-    /// `restart=on-failure max_restart=3 depends=display,kbd,session_manager`.
-    /// The dep names match the REGISTERED service names (from each
-    /// daemon's `.conf` `name=` field), not the binary names.  This
-    /// test pins the constants the `populate_ext2_files` helper consumes.
-    #[test]
-    fn service_manifest_constants_match_acceptance() {
-        assert_eq!(SERVICE_RESTART_POLICY, "on-failure");
-        assert_eq!(SERVICE_MAX_RESTART, 3);
-        assert_eq!(SERVICE_DEPENDS, "display,kbd,session_manager");
-    }
 
     /// Default geometry must be the documented fixed grid.
     #[test]

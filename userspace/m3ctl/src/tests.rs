@@ -275,6 +275,49 @@ fn display_subscribe_unknown_kind_returns_unknown_event_kind() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 72 — workspace verb range checks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn workspace_switch_accepts_one_through_nine() {
+    for n in 1u8..=9 {
+        let arg = format!("{n}");
+        let parsed = parse_verb("workspace", &["switch", arg.as_str()])
+            .expect("workspace switch <1..=9> should parse");
+        match parsed {
+            ParsedVerb::Display(ControlCommand::SwitchWorkspace { n: got }) => {
+                assert_eq!(got, n);
+            }
+            other => panic!("expected SwitchWorkspace, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn workspace_switch_rejects_zero_and_ten() {
+    for arg in ["0", "10", "255"] {
+        let err = parse_verb("workspace", &["switch", arg])
+            .expect_err("workspace switch outside 1..=9 should fail");
+        match err {
+            ParseError::BadArgument(_) => {}
+            other => panic!("expected BadArgument, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn move_to_workspace_rejects_zero_and_ten() {
+    for arg in ["0", "10", "255"] {
+        let err = parse_verb("move-to-workspace", &[arg])
+            .expect_err("move-to-workspace outside 1..=9 should fail");
+        match err {
+            ParseError::BadArgument(_) => {}
+            other => panic!("expected BadArgument, got {:?}", other),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unknown verb regression
 // ---------------------------------------------------------------------------
 

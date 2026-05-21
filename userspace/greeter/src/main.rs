@@ -214,10 +214,34 @@ fn program_main(_args: &[&str]) -> i32 {
     // Tell `display_server` we're done so it releases the surface +
     // any focus state attached to this client. Best-effort; the
     // server cleans up on disconnect anyway.
-    let _ = send_verb(server_handle, &ClientMessage::Goodbye);
+    let _ = send_verb(
+        server_handle,
+        &ClientMessage::Goodbye {
+            client_token: greeter_client_token(),
+        },
+    );
 
-    // Phase 71 F.2 — drop privileges before exec'ing the user shell so
-    // `term` and every descendant runs under the authenticated UID/GID.
+    // Phase 72b — persist the authenticated session descriptor to a
+    // well-known tmpfs path so display_server's `SpawnTerm` and
+    // `[autostart]` paths can `setuid`/`setgid` to the user before
+    // `execve`-ing the new process. Without this, every term spawned
+    // post-login would inherit display_server's UID (root) regardless
+    // of who logged in — `whoami` would say `root`, the shell prompt
+    // would read `0@m3os`, and per-user home / dotfile resolution
+    // would be wrong. Written as root (the file open happens BEFORE
+    // the setuid/setgid below) so the resulting file owner is root,
+    // the same identity display_server runs under. Best-effort: if
+    // the open or write fails, the desktop still comes up — terms
+    // just fall back to root inheritance with a log line.
+    write_session_state_file(&descriptor);
+
+    // Phase 71 F.2 — drop privileges so any user-session work that
+    // follows runs under the authenticated UID/GID. Phase 72b stops
+    // here: greeter does NOT execve into `/bin/term` anymore, so the
+    // user lands at an empty compositor and presses `SUPER+RETURN` to
+    // spawn a terminal when they want one. The setuid/setgid still
+    // run for forward-compatibility with a future user-session
+    // process that would replace greeter in-process.
     if syscall_lib::setgid(descriptor.gid) != 0 {
         syscall_lib::write_str(STDOUT_FILENO, "greeter: setgid failed\n");
         return 7;
@@ -227,27 +251,119 @@ fn program_main(_args: &[&str]) -> i32 {
         return 7;
     }
 
-    // Build envp for term — same vars the autologin path passes.
-    let mut home_env_buf = [0u8; 256];
-    let home_env_len = build_env_string(b"HOME=", descriptor.home.as_bytes(), &mut home_env_buf);
-    let env_path: &[u8] = b"PATH=/usr/local/bin:/bin:/sbin:/usr/bin\0";
-    let env_term: &[u8] = b"TERM=m3os-term\0";
-    let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
-    let envp: [*const u8; 5] = [
-        env_path.as_ptr(),
-        home_env_buf[..home_env_len].as_ptr(),
-        env_term.as_ptr(),
-        env_editor.as_ptr(),
-        core::ptr::null(),
-    ];
+    // Phase 72b — exit cleanly (code 0). init's manifest declares
+    // `restart=on-failure`, so a 0-exit does not respawn greeter; the
+    // compositor stays up with no foreground app, matching the
+    // documented Phase 72b "empty desktop after login" UX. The user
+    // launches term via `SUPER+RETURN` (display_server's `SpawnTerm`
+    // keybind handler) or any other autostart-style mechanism they
+    // configure in `/etc/compositor.conf`.
+    //
+    // Why not execve here: tying greeter to one specific post-login
+    // app (term) was a Phase 71 expedient. With the Phase 72b
+    // compositor able to spawn apps on demand via the keybind chord
+    // engine, the auto-launch becomes redundant — and surprising,
+    // because users expect a tiling WM to land at an empty desktop
+    // after login (Hyprland / sway / i3 all do).
+    syscall_lib::write_str(
+        STDOUT_FILENO,
+        "greeter: auth ok, exiting cleanly (Phase 72b)\n",
+    );
+    let _ = build_env_string;
+    0
+}
 
-    let term_path: &[u8] = b"/bin/term\0";
-    let argv: [*const u8; 2] = [term_path.as_ptr(), core::ptr::null()];
-    let ret = syscall_lib::execve(term_path, &argv, &envp);
-    syscall_lib::write_str(STDOUT_FILENO, "greeter: execve /bin/term failed: ");
-    syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-    8
+/// Phase 72b — well-known tmpfs path where greeter persists the
+/// authenticated session descriptor for display_server to consume.
+/// Format: simple `key=value\n` lines (`uid=`, `gid=`, `user=`,
+/// `home=`) so the parser stays small and tolerant of trailing
+/// whitespace.
+#[cfg(not(test))]
+const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
+
+/// Phase 72b — write the authenticated `SessionDescriptor` to
+/// [`SESSION_STATE_PATH`]. Called before `setgid`/`setuid` so the
+/// file is owned by greeter's original UID (root, since init spawned
+/// greeter). display_server (also running as root) reads it back at
+/// `SpawnTerm` / autostart time.
+///
+/// Best-effort: every failure path just logs and returns. The desktop
+/// still comes up; terms fall back to inheriting display_server's UID.
+#[cfg(not(test))]
+fn write_session_state_file(descriptor: &SessionDescriptor) {
+    // `O_TRUNC` so a shorter new write doesn't leave trailing bytes
+    // from a longer prior write — the file's parser is line-oriented
+    // and a stale `home=` line past the new payload would otherwise
+    // corrupt the next reader's view of the session.
+    let fd = syscall_lib::open(
+        SESSION_STATE_PATH,
+        syscall_lib::O_WRONLY | syscall_lib::O_CREAT | syscall_lib::O_TRUNC,
+        0o600,
+    );
+    if fd < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "greeter: failed to open session-state file; spawned terms will run as root\n",
+        );
+        return;
+    }
+    let fd_i32 = fd as i32;
+    // Build the body as a single concatenated buffer. Worst case:
+    // 4 u32 decimal lines + 2 short strings; 256 bytes is ample.
+    let mut buf = [0u8; 256];
+    let mut pos = 0usize;
+    let mut append = |bytes: &[u8], pos: &mut usize| {
+        for &b in bytes {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    };
+    let mut digits = [0u8; 11];
+    append(b"uid=", &mut pos);
+    let n = u32_to_decimal(descriptor.uid, &mut digits);
+    append(&digits[..n], &mut pos);
+    append(b"\ngid=", &mut pos);
+    let n = u32_to_decimal(descriptor.gid, &mut digits);
+    append(&digits[..n], &mut pos);
+    append(b"\nuser=", &mut pos);
+    append(descriptor.username.as_bytes(), &mut pos);
+    append(b"\nhome=", &mut pos);
+    append(descriptor.home.as_bytes(), &mut pos);
+    append(b"\nshell=", &mut pos);
+    append(descriptor.shell.as_bytes(), &mut pos);
+    append(b"\n", &mut pos);
+    let written = syscall_lib::write(fd_i32, &buf[..pos]);
+    if written < 0 {
+        syscall_lib::write_str(STDOUT_FILENO, "greeter: session-state write failed\n");
+    }
+    let _ = syscall_lib::close(fd_i32);
+}
+
+/// Format `u32` into decimal digits. Returns the byte count.
+#[cfg(not(test))]
+fn u32_to_decimal(mut n: u32, out: &mut [u8]) -> usize {
+    if n == 0 {
+        if !out.is_empty() {
+            out[0] = b'0';
+            return 1;
+        }
+        return 0;
+    }
+    let mut tmp = [0u8; 11];
+    let mut len = 0usize;
+    while n > 0 && len < tmp.len() {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    // Reverse into `out`.
+    let copy = len.min(out.len());
+    for i in 0..copy {
+        out[i] = tmp[len - 1 - i];
+    }
+    copy
 }
 
 /// Format `KEY=value\0` into `out`. Returns bytes written including
@@ -304,16 +420,27 @@ fn send_verb(handle: u32, msg: &ClientMessage) -> bool {
 }
 
 #[cfg(not(test))]
+fn greeter_client_token() -> u32 {
+    // Phase 72b Track K.7 — use the greeter PID so the compositor's
+    // Goodbye-scoped teardown can identify this client.
+    let pid = syscall_lib::getpid();
+    if pid > 0 { pid as u32 } else { 0x90b30001 }
+}
+
+#[cfg(not(test))]
 fn send_hello_and_create_surface(handle: u32) -> bool {
+    let token = greeter_client_token();
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         capabilities: 0,
+        client_token: token,
     };
     if !send_verb(handle, &hello) {
         return false;
     }
     let create = ClientMessage::CreateSurface {
         surface_id: SURFACE_ID,
+        client_token: token,
     };
     if !send_verb(handle, &create) {
         return false;
@@ -561,6 +688,7 @@ impl AuthBackend for FsAuthBackend {
         Ok(SessionDescriptor {
             uid,
             gid,
+            username: username.to_string(),
             home: bytes_to_string(home),
             shell: bytes_to_string(shell),
         })
@@ -852,6 +980,15 @@ fn read_field(
                     }
                 }
             }
+            PulledEvent::CloseRequest => {
+                // Phase 72b Track K.6 — SUPER+Q on the login form.
+                // Abort the in-flight credential buffer and re-prompt;
+                // the operator can press SUPER+Q to clear a partially-
+                // typed credential without quitting the greeter.
+                syscall_lib::write_str(STDOUT_FILENO, "greeter: close requested; resetting form\n");
+                buf.clear();
+                dirty = true;
+            }
             PulledEvent::Disconnect => return None,
             PulledEvent::None | PulledEvent::Other => {
                 let _ = syscall_lib::nanosleep_for(0, POLL_IDLE_NS);
@@ -863,6 +1000,10 @@ fn read_field(
 #[cfg(not(test))]
 enum PulledEvent {
     Key(KeyEvent),
+    /// Phase 72b Track K.6 — `SUPER+Q` close request from compositor.
+    /// Greeter does not exit (that would lock the user out); instead
+    /// it clears any in-flight credential buffer.
+    CloseRequest,
     Disconnect,
     Other,
     None,
@@ -885,6 +1026,7 @@ fn pull_one_event(handle: u32, buf: &mut [u8]) -> PulledEvent {
     }
     match ServerMessage::decode(&buf[..len]) {
         Ok((ServerMessage::Key(ev), _)) => PulledEvent::Key(ev),
+        Ok((ServerMessage::CloseRequest { .. }, _)) => PulledEvent::CloseRequest,
         Ok((ServerMessage::Disconnect { .. }, _)) => PulledEvent::Disconnect,
         Ok(_) => PulledEvent::Other,
         Err(_) => PulledEvent::None,

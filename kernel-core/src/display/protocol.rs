@@ -48,7 +48,12 @@ use crate::input::events::{
 /// over the legacy 19-byte wire layout). All in-tree clients
 /// (`kbd_server`, `display_server`, `m3ctl`, host fixtures) handshake
 /// at version `2`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Phase 72b Track K.7 — bumped from 2 to 3 to add `client_token` to
+/// `Hello`, `CreateSurface`, and `Goodbye`. The token lets
+/// `display_server` scope `Goodbye` teardown to the disconnecting
+/// client's own surfaces only, fixing the Phase 70 multi-client
+/// regression that preserved the entire registry on disconnect.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Fixed frame-header size: `body_len (u16) + opcode (u16)`.
 pub const FRAME_HEADER_SIZE: usize = 4;
@@ -98,6 +103,12 @@ const OP_SERVER_BUFFER_RELEASED: u16 = 0x0140;
 /// Body layout (12 bytes LE): `surface_id (u32) | width (u32) |
 /// height (u32)`.
 const OP_SERVER_SURFACE_RESIZED: u16 = 0x0141;
+/// Phase 72b Track K.6 — `CloseRequest` server→client notification.
+/// Sent in response to `SUPER+Q` / `KillFocused`. The client decides
+/// how to react (term closes its PTY session; greeter aborts auth and
+/// resets; DOOM triggers its normal quit sequence). Body layout
+/// (4 bytes LE): `surface_id (u32)`.
+const OP_SERVER_CLOSE_REQUEST: u16 = 0x0142;
 
 // Control commands (0x0200..=0x02FF)
 const OP_CTL_VERSION: u16 = 0x0201;
@@ -127,6 +138,19 @@ const OP_CTL_READBACK_PIXEL: u16 = 0x0209;
 const OP_CTL_INJECT_KEY: u16 = 0x020A;
 const OP_CTL_YIELD_FB: u16 = 0x020B;
 const OP_CTL_RECLAIM_FB: u16 = 0x020C;
+// Phase 72 — tiling/workspace control verbs.
+const OP_CTL_SET_LAYOUT: u16 = 0x020D;
+const OP_CTL_SWITCH_WORKSPACE: u16 = 0x020E;
+const OP_CTL_MOVE_TO_WORKSPACE: u16 = 0x020F;
+const OP_CTL_RELOAD: u16 = 0x0210;
+const OP_CTL_QUERY_WINDOWS: u16 = 0x0211;
+const OP_CTL_QUERY_WORKSPACES: u16 = 0x0212;
+const OP_CTL_SET_MASTER_RATIO: u16 = 0x0213;
+const OP_CTL_TILE_FULLSCREEN: u16 = 0x0214;
+/// Phase 72b Track K.8 — drain one queued subscription event for the
+/// calling control client. Closes the F.2 gap where Subscribe Ack'd
+/// but no event ever reached the subscriber on the wire.
+const OP_CTL_EVENT_PULL: u16 = 0x0215;
 
 // Control events (0x0300..=0x03FF)
 const OP_CTL_EVT_VERSION_REPLY: u16 = 0x0301;
@@ -144,6 +168,11 @@ const OP_CTL_EVT_PIXEL_REPLY: u16 = 0x0314;
 // Fires when a `Layer`-role surface is (re)configured with new anchor /
 // exclusive-zone / keyboard-interactivity bits so subscribed clients can
 // re-layout around it.
+// Phase 72 — typed reply events for `query-windows` and
+// `query-workspaces` plus a `workspace-changed` push.
+const OP_CTL_EVT_WINDOW_LIST_REPLY: u16 = 0x0317;
+const OP_CTL_EVT_WORKSPACE_LIST_REPLY: u16 = 0x0318;
+const OP_CTL_EVT_WORKSPACE_CHANGED: u16 = 0x0319;
 const OP_CTL_EVT_LAYER_EVENT: u16 = 0x0315;
 // Phase 68 Track A.3 — Cursor visibility / position transition event.
 // Fires when the compositor's pointer cursor changes visibility or
@@ -336,10 +365,28 @@ pub enum ClientMessage {
     Hello {
         protocol_version: u32,
         capabilities: u32,
+        /// Phase 72b Track K.7 — client-chosen identifier used by
+        /// `display_server` to scope `Goodbye` teardown. Typically the
+        /// client's own PID via `sys_getpid`; any unique-per-process
+        /// `u32` works. The server echoes this token in surfaces and
+        /// matches it on `Goodbye` to destroy only that client's
+        /// resources.
+        client_token: u32,
     },
-    Goodbye,
+    /// Phase 72b Track K.7 — `Goodbye` carries `client_token` so the
+    /// server destroys only that client's surfaces. Previously the
+    /// server preserved every surface on disconnect (the Phase 70
+    /// multi-client workaround) which leaked surfaces every time a
+    /// client exited without explicit `DestroySurface`.
+    Goodbye {
+        client_token: u32,
+    },
     CreateSurface {
         surface_id: SurfaceId,
+        /// Phase 72b Track K.7 — owning client's token. Used to
+        /// associate the new surface with its creator for later
+        /// `Goodbye`-scoped teardown.
+        client_token: u32,
     },
     DestroySurface {
         surface_id: SurfaceId,
@@ -419,6 +466,18 @@ pub enum ServerMessage {
         surface_id: SurfaceId,
         width: u32,
         height: u32,
+    },
+    /// Phase 72b Track K.6 — graceful close request. The compositor
+    /// sends this when the user invokes the SUPER+Q chord (or any
+    /// other close affordance) against the focused surface; the
+    /// client decides how to react. `term` closes its PTY session and
+    /// exits cleanly; `greeter` aborts in-flight auth and resets the
+    /// login form; DOOM triggers its normal quit sequence. Clients
+    /// that ignore the message are not forcibly killed by the
+    /// compositor — escalation to SIGTERM/SIGKILL belongs in
+    /// init/session_manager if at all.
+    CloseRequest {
+        surface_id: SurfaceId,
     },
 }
 
@@ -511,6 +570,53 @@ pub enum ControlCommand {
     /// surface dirty so the next compose pass repaints the screen.
     /// Issued after the takeover program exits.
     ReclaimFb,
+    /// Phase 72 — replace the active workspace's layout policy.
+    /// `kind` is a `PolicyKind` discriminant (see
+    /// [`crate::display::layout`]); the dispatcher rejects unknown
+    /// values with `BadArgs`.
+    SetLayout {
+        kind: u8,
+    },
+    /// Phase 72 — activate workspace `n` (1-based, `1..=9`).
+    SwitchWorkspace {
+        n: u8,
+    },
+    /// Phase 72 — move the currently-focused window to workspace `n`
+    /// (1-based). `follow = 1` switches to the target after the
+    /// move; `0` keeps the current workspace active.
+    MoveToWorkspace {
+        n: u8,
+        follow: u8,
+    },
+    /// Phase 72 — re-parse `/etc/compositor.conf` and apply gaps,
+    /// borders, keybinds, and per-workspace default policies. Open
+    /// windows are re-layed-out immediately.
+    Reload,
+    /// Phase 72 — return a `WindowListReply` enumerating every
+    /// registered window with its workspace, rect, focused flag, and
+    /// (optional) title.
+    QueryWindows,
+    /// Phase 72 — return a `WorkspaceListReply` enumerating every
+    /// workspace (1..=9) with its layout policy and window count.
+    QueryWorkspaces,
+    /// Phase 72 — set the `MasterStackLayout`'s master ratio for the
+    /// active workspace. Encoded as a u16 in the range `[10, 90]`
+    /// representing 0.10–0.90. Out-of-range values are clamped on
+    /// the dispatcher side; the wire value is `ratio * 100`.
+    SetMasterRatio {
+        ratio_x100: u16,
+    },
+    /// Phase 72 — toggle the active workspace's layout to
+    /// `Fullscreen` (or back to `Dwindle` if already fullscreen).
+    TileFullscreen,
+    /// Phase 72b Track K.8 — drain one queued subscription event for
+    /// the calling control client. The dispatcher returns the next
+    /// pending [`ControlEvent`] from the per-client outbound queue;
+    /// when the queue is empty, returns [`ControlEvent::Ack`] so the
+    /// caller can distinguish "no events" from a transport error.
+    /// `m3ctl subscribe` polls this verb in a loop after the initial
+    /// Subscribe Ack.
+    EventPull,
 }
 
 /// Control-socket reply or subscribed-stream event (A.8). Reply events
@@ -578,6 +684,45 @@ pub enum ControlEvent {
         hot_x: i32,
         hot_y: i32,
     },
+    /// Phase 72 — reply to `QueryWindows`. Each entry carries the
+    /// surface id, the 0-based workspace it belongs to, the
+    /// compositor-assigned rectangle, and a focused flag. The wire
+    /// layout is `count (u32) | repeat { surface_id (u32) | ws (u8) |
+    /// x (i32) | y (i32) | w (u32) | h (u32) | focused (u8) }`, so
+    /// 22 bytes per entry plus the 4-byte count header.
+    WindowListReply {
+        entries: Vec<WindowQueryEntry>,
+    },
+    /// Phase 72 — reply to `QueryWorkspaces`. Each entry carries the
+    /// 1-based workspace number, the policy discriminant, the
+    /// number of windows present, and a flag indicating whether the
+    /// workspace is currently active.
+    WorkspaceListReply {
+        entries: Vec<WorkspaceQueryEntry>,
+    },
+    /// Phase 72 — subscription push fired when the active workspace
+    /// changes. `workspace` is the new 1-based number.
+    WorkspaceChanged {
+        workspace: u8,
+    },
+}
+
+/// Phase 72 — per-window row inside [`ControlEvent::WindowListReply`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WindowQueryEntry {
+    pub surface_id: SurfaceId,
+    pub workspace: u8,
+    pub rect: Rect,
+    pub focused: bool,
+}
+
+/// Phase 72 — per-workspace row inside [`ControlEvent::WorkspaceListReply`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WorkspaceQueryEntry {
+    pub workspace: u8,
+    pub policy_kind: u8,
+    pub window_count: u32,
+    pub active: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -884,16 +1029,24 @@ impl ClientMessage {
             Self::Hello {
                 protocol_version,
                 capabilities,
-            } => encode_fixed_body(buf, OP_CLIENT_HELLO, 8, |body| {
+                client_token,
+            } => encode_fixed_body(buf, OP_CLIENT_HELLO, 12, |body| {
                 body[0..4].copy_from_slice(&protocol_version.to_le_bytes());
                 body[4..8].copy_from_slice(&capabilities.to_le_bytes());
+                body[8..12].copy_from_slice(&client_token.to_le_bytes());
             }),
-            Self::Goodbye => encode_fixed_body(buf, OP_CLIENT_GOODBYE, 0, |_| {}),
-            Self::CreateSurface { surface_id } => {
-                encode_fixed_body(buf, OP_CLIENT_CREATE_SURFACE, 4, |body| {
-                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+            Self::Goodbye { client_token } => {
+                encode_fixed_body(buf, OP_CLIENT_GOODBYE, 4, |body| {
+                    body[0..4].copy_from_slice(&client_token.to_le_bytes());
                 })
             }
+            Self::CreateSurface {
+                surface_id,
+                client_token,
+            } => encode_fixed_body(buf, OP_CLIENT_CREATE_SURFACE, 8, |body| {
+                body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                body[4..8].copy_from_slice(&client_token.to_le_bytes());
+            }),
             Self::DestroySurface { surface_id } => {
                 encode_fixed_body(buf, OP_CLIENT_DESTROY_SURFACE, 4, |body| {
                     body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
@@ -957,22 +1110,27 @@ impl ClientMessage {
         let (body_len, opcode, body, total) = parse_frame_header(buf)?;
         let msg = match opcode {
             OP_CLIENT_HELLO => {
-                expect_body_len(body_len, 8)?;
+                expect_body_len(body_len, 12)?;
                 let protocol_version = read_u32(body, 0)?;
                 let capabilities = read_u32(body, 4)?;
+                let client_token = read_u32(body, 8)?;
                 Self::Hello {
                     protocol_version,
                     capabilities,
+                    client_token,
                 }
             }
             OP_CLIENT_GOODBYE => {
-                expect_body_len(body_len, 0)?;
-                Self::Goodbye
+                expect_body_len(body_len, 4)?;
+                Self::Goodbye {
+                    client_token: read_u32(body, 0)?,
+                }
             }
             OP_CLIENT_CREATE_SURFACE => {
-                expect_body_len(body_len, 4)?;
+                expect_body_len(body_len, 8)?;
                 Self::CreateSurface {
                     surface_id: SurfaceId(read_u32(body, 0)?),
+                    client_token: read_u32(body, 4)?,
                 }
             }
             OP_CLIENT_DESTROY_SURFACE => {
@@ -1113,6 +1271,11 @@ impl ServerMessage {
                 body[4..8].copy_from_slice(&width.to_le_bytes());
                 body[8..12].copy_from_slice(&height.to_le_bytes());
             }),
+            Self::CloseRequest { surface_id } => {
+                encode_fixed_body(buf, OP_SERVER_CLOSE_REQUEST, 4, |body| {
+                    body[0..4].copy_from_slice(&surface_id.0.to_le_bytes());
+                })
+            }
         }
     }
 
@@ -1184,6 +1347,12 @@ impl ServerMessage {
                     height: read_u32(body, 8)?,
                 }
             }
+            OP_SERVER_CLOSE_REQUEST => {
+                expect_body_len(body_len, 4)?;
+                Self::CloseRequest {
+                    surface_id: SurfaceId(read_u32(body, 0)?),
+                }
+            }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
         Ok((msg, total))
@@ -1242,6 +1411,31 @@ impl ControlCommand {
             // Phase 57d follow-up — Tier 1 fullscreen-takeover yield.
             Self::YieldFb => encode_fixed_body(buf, OP_CTL_YIELD_FB, 0, |_| {}),
             Self::ReclaimFb => encode_fixed_body(buf, OP_CTL_RECLAIM_FB, 0, |_| {}),
+            // Phase 72 — tiling / workspace verbs.
+            Self::SetLayout { kind } => encode_fixed_body(buf, OP_CTL_SET_LAYOUT, 1, |body| {
+                body[0] = *kind;
+            }),
+            Self::SwitchWorkspace { n } => {
+                encode_fixed_body(buf, OP_CTL_SWITCH_WORKSPACE, 1, |body| {
+                    body[0] = *n;
+                })
+            }
+            Self::MoveToWorkspace { n, follow } => {
+                encode_fixed_body(buf, OP_CTL_MOVE_TO_WORKSPACE, 2, |body| {
+                    body[0] = *n;
+                    body[1] = *follow;
+                })
+            }
+            Self::Reload => encode_fixed_body(buf, OP_CTL_RELOAD, 0, |_| {}),
+            Self::QueryWindows => encode_fixed_body(buf, OP_CTL_QUERY_WINDOWS, 0, |_| {}),
+            Self::QueryWorkspaces => encode_fixed_body(buf, OP_CTL_QUERY_WORKSPACES, 0, |_| {}),
+            Self::SetMasterRatio { ratio_x100 } => {
+                encode_fixed_body(buf, OP_CTL_SET_MASTER_RATIO, 2, |body| {
+                    body[0..2].copy_from_slice(&ratio_x100.to_le_bytes());
+                })
+            }
+            Self::TileFullscreen => encode_fixed_body(buf, OP_CTL_TILE_FULLSCREEN, 0, |_| {}),
+            Self::EventPull => encode_fixed_body(buf, OP_CTL_EVENT_PULL, 0, |_| {}),
         }
     }
 
@@ -1316,6 +1510,47 @@ impl ControlCommand {
             OP_CTL_RECLAIM_FB => {
                 expect_body_len(body_len, 0)?;
                 Self::ReclaimFb
+            }
+            OP_CTL_SET_LAYOUT => {
+                expect_body_len(body_len, 1)?;
+                Self::SetLayout { kind: body[0] }
+            }
+            OP_CTL_SWITCH_WORKSPACE => {
+                expect_body_len(body_len, 1)?;
+                Self::SwitchWorkspace { n: body[0] }
+            }
+            OP_CTL_MOVE_TO_WORKSPACE => {
+                expect_body_len(body_len, 2)?;
+                Self::MoveToWorkspace {
+                    n: body[0],
+                    follow: body[1],
+                }
+            }
+            OP_CTL_RELOAD => {
+                expect_body_len(body_len, 0)?;
+                Self::Reload
+            }
+            OP_CTL_QUERY_WINDOWS => {
+                expect_body_len(body_len, 0)?;
+                Self::QueryWindows
+            }
+            OP_CTL_QUERY_WORKSPACES => {
+                expect_body_len(body_len, 0)?;
+                Self::QueryWorkspaces
+            }
+            OP_CTL_SET_MASTER_RATIO => {
+                expect_body_len(body_len, 2)?;
+                Self::SetMasterRatio {
+                    ratio_x100: read_u16(body, 0)?,
+                }
+            }
+            OP_CTL_TILE_FULLSCREEN => {
+                expect_body_len(body_len, 0)?;
+                Self::TileFullscreen
+            }
+            OP_CTL_EVENT_PULL => {
+                expect_body_len(body_len, 0)?;
+                Self::EventPull
             }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
@@ -1426,6 +1661,46 @@ impl ControlEvent {
                 body[1..5].copy_from_slice(&hot_x.to_le_bytes());
                 body[5..9].copy_from_slice(&hot_y.to_le_bytes());
             }),
+            Self::WindowListReply { entries } => {
+                if entries.len() as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let body_len = 4 + entries.len() * 22;
+                encode_fixed_body(buf, OP_CTL_EVT_WINDOW_LIST_REPLY, body_len, |body| {
+                    body[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+                    for (i, e) in entries.iter().enumerate() {
+                        let s = 4 + i * 22;
+                        body[s..s + 4].copy_from_slice(&e.surface_id.0.to_le_bytes());
+                        body[s + 4] = e.workspace;
+                        body[s + 5..s + 9].copy_from_slice(&e.rect.x.to_le_bytes());
+                        body[s + 9..s + 13].copy_from_slice(&e.rect.y.to_le_bytes());
+                        body[s + 13..s + 17].copy_from_slice(&e.rect.w.to_le_bytes());
+                        body[s + 17..s + 21].copy_from_slice(&e.rect.h.to_le_bytes());
+                        body[s + 21] = u8::from(e.focused);
+                    }
+                })
+            }
+            Self::WorkspaceListReply { entries } => {
+                if entries.len() as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let body_len = 4 + entries.len() * 7;
+                encode_fixed_body(buf, OP_CTL_EVT_WORKSPACE_LIST_REPLY, body_len, |body| {
+                    body[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+                    for (i, e) in entries.iter().enumerate() {
+                        let s = 4 + i * 7;
+                        body[s] = e.workspace;
+                        body[s + 1] = e.policy_kind;
+                        body[s + 2..s + 6].copy_from_slice(&e.window_count.to_le_bytes());
+                        body[s + 6] = u8::from(e.active);
+                    }
+                })
+            }
+            Self::WorkspaceChanged { workspace } => {
+                encode_fixed_body(buf, OP_CTL_EVT_WORKSPACE_CHANGED, 1, |body| {
+                    body[0] = *workspace;
+                })
+            }
         }
     }
 
@@ -1551,6 +1826,71 @@ impl ControlEvent {
                     hot_y: read_i32(body, 5)?,
                 }
             }
+            // Phase 72 — `WindowListReply`.
+            OP_CTL_EVT_WINDOW_LIST_REPLY => {
+                if body.len() < 4 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let count = read_u32(body, 0)? as usize;
+                if count as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let expected = 4 + count * 22;
+                expect_body_len(body_len, expected as u16)?;
+                let mut entries = Vec::with_capacity(count);
+                for i in 0..count {
+                    let s = 4 + i * 22;
+                    let focused = match body[s + 21] {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(ProtocolError::InvalidEnum),
+                    };
+                    entries.push(WindowQueryEntry {
+                        surface_id: SurfaceId(read_u32(body, s)?),
+                        workspace: body[s + 4],
+                        rect: Rect {
+                            x: read_i32(body, s + 5)?,
+                            y: read_i32(body, s + 9)?,
+                            w: read_u32(body, s + 13)?,
+                            h: read_u32(body, s + 17)?,
+                        },
+                        focused,
+                    });
+                }
+                Self::WindowListReply { entries }
+            }
+            // Phase 72 — `WorkspaceListReply`.
+            OP_CTL_EVT_WORKSPACE_LIST_REPLY => {
+                if body.len() < 4 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let count = read_u32(body, 0)? as usize;
+                if count as u32 > MAX_LIST_ENTRIES {
+                    return Err(ProtocolError::ListTooLong);
+                }
+                let expected = 4 + count * 7;
+                expect_body_len(body_len, expected as u16)?;
+                let mut entries = Vec::with_capacity(count);
+                for i in 0..count {
+                    let s = 4 + i * 7;
+                    let active = match body[s + 6] {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(ProtocolError::InvalidEnum),
+                    };
+                    entries.push(WorkspaceQueryEntry {
+                        workspace: body[s],
+                        policy_kind: body[s + 1],
+                        window_count: read_u32(body, s + 2)?,
+                        active,
+                    });
+                }
+                Self::WorkspaceListReply { entries }
+            }
+            OP_CTL_EVT_WORKSPACE_CHANGED => {
+                expect_body_len(body_len, 1)?;
+                Self::WorkspaceChanged { workspace: body[0] }
+            }
             _ => return Err(ProtocolError::UnknownOpcode(opcode)),
         };
         Ok((evt, total))
@@ -1609,18 +1949,22 @@ mod tests {
         encode_decode_round_trip_client(ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             capabilities: 0,
+            client_token: 0xAABBCCDD,
         });
     }
 
     #[test]
     fn client_goodbye_round_trips() {
-        encode_decode_round_trip_client(ClientMessage::Goodbye);
+        encode_decode_round_trip_client(ClientMessage::Goodbye {
+            client_token: 0x12345678,
+        });
     }
 
     #[test]
     fn client_create_surface_round_trips() {
         encode_decode_round_trip_client(ClientMessage::CreateSurface {
             surface_id: SurfaceId(1),
+            client_token: 0xFEEDC0DE,
         });
     }
 
@@ -1705,7 +2049,9 @@ mod tests {
     #[test]
     fn client_short_buffer_encode_returns_truncated() {
         let mut tiny = [0u8; FRAME_HEADER_SIZE - 1];
-        let err = ClientMessage::Goodbye.encode(&mut tiny).unwrap_err();
+        let err = ClientMessage::Goodbye { client_token: 0 }
+            .encode(&mut tiny)
+            .unwrap_err();
         assert_eq!(err, ProtocolError::Truncated);
     }
 
@@ -2278,14 +2624,22 @@ mod tests {
 
     fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
         prop_oneof![
-            (any::<u32>(), any::<u32>()).prop_map(|(protocol_version, capabilities)| {
-                ClientMessage::Hello {
-                    protocol_version,
-                    capabilities,
+            (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+                |(protocol_version, capabilities, client_token)| {
+                    ClientMessage::Hello {
+                        protocol_version,
+                        capabilities,
+                        client_token,
+                    }
+                }
+            ),
+            any::<u32>().prop_map(|client_token| ClientMessage::Goodbye { client_token }),
+            (arb_surface_id(), any::<u32>()).prop_map(|(surface_id, client_token)| {
+                ClientMessage::CreateSurface {
+                    surface_id,
+                    client_token,
                 }
             }),
-            Just(ClientMessage::Goodbye),
-            arb_surface_id().prop_map(|surface_id| ClientMessage::CreateSurface { surface_id }),
             arb_surface_id().prop_map(|surface_id| ClientMessage::DestroySurface { surface_id }),
             (arb_surface_id(), arb_surface_role()).prop_map(|(surface_id, role)| {
                 ClientMessage::SetSurfaceRole { surface_id, role }

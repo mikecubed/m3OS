@@ -49,8 +49,11 @@ pub const STEP_READY_TIMEOUT_MS: u64 = 5_000;
 /// matches the slice.
 ///
 /// Phase 71 bumped this from 5 to 6 when `greeter` was inserted
-/// between `audio_server` and `term`.
-pub const SESSION_STEP_COUNT: usize = 6;
+/// between `audio_server` and `term`. Phase 72b dropped it back to 5
+/// when `term` moved out of the supervised boot chain — see the
+/// `DECLARED_SESSION_STEP_NAMES` doc comment in
+/// `kernel-core::session_supervisor` for the rationale.
+pub const SESSION_STEP_COUNT: usize = 5;
 
 /// One supervised step in the graphical-session boot sequence. Holds
 /// only the service name and a shared mutable borrow of the backend
@@ -148,6 +151,5 @@ pub fn build_session_steps<'b, B: SupervisorBackend>(
         ServiceStep::new(names[2], backend_cell),
         ServiceStep::new(names[3], backend_cell),
         ServiceStep::new(names[4], backend_cell),
-        ServiceStep::new(names[5], backend_cell),
     ]
 }

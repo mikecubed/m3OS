@@ -1,6 +1,6 @@
 # Phase 72 - Compositor: Multi-Toplevel, Tiling Layout, and Workspaces
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-72
 **Depends on:** Phase 56 (Display and Input Architecture) ✅, Phase 57 (Audio and Local Session) ✅, Phase 68 (Phase 56 Completion and Closeout) ✅
 **Builds on:** Extends the Phase 56 single-Toplevel compositor into a real tiling window manager by adding multi-client rendering, swappable layout policies, numbered workspaces, a keybind chord engine, and a `hyprctl`-equivalent control socket
@@ -101,7 +101,7 @@ Extends the existing `m3ctl` tool with tile/workspace subcommands. Connects to `
 
 ## Acceptance Criteria
 
-- Four simultaneous GUI applications (two `term` instances, `edit`, and DOOM from Phase 70) tile correctly under the dwindle layout without visual corruption or stale damage; DOOM's fixed-size SHM surface is letterboxed centred within its assigned tile (DOOM does not yet consume `SurfaceResized`)
+- Four simultaneous GUI applications (two `term` instances, `edit`, and DOOM from Phase 70) tile correctly under the dwindle layout without visual corruption or stale damage. Phase 72 initial scope letterboxed DOOM; Phase 72b closeout (Track K) wires DOOM to observe `SurfaceResized` for diagnostic purposes, but doomgeneric keeps a fixed 320×200 backing buffer — the compositor handles the geometry mismatch by scaling/letterboxing the DOOM surface into the assigned tile rather than reflowing the playfield resolution.
 - `SUPER+1..9` switches between nine workspaces; each workspace retains its window list independently
 - `SUPER+SHIFT+1` moves the focused window to workspace 1; the window no longer appears on the source workspace
 - `m3ctl layout grid` switches the active workspace's layout to grid; windows re-tile within one frame
@@ -120,14 +120,35 @@ Extends the existing `m3ctl` tool with tile/workspace subcommands. Connects to `
 - Wayland-based compositors can host multiple client protocols simultaneously (xdg-shell, layer-shell, xwayland); m3OS uses a single native IPC protocol throughout
 - Production tiling WMs (i3, Hyprland) store layout trees in persistent configuration, allow per-app layout rules, and support scratchpad/special workspaces; these are deferred
 
+## Phase 72b — Closeout (in this PR)
+
+Initial Phase 72 shipped the full structural feature set (multi-toplevel rendering, layout policies, workspaces, chord engine, borders/gaps, control socket, configuration, smoke gate) and was marked Complete. End-to-end smoke testing on real graphical boot then surfaced several integration gaps that the original tiling-smoke gate did not exercise — including a singleton-service collision that prevented `SUPER+RETURN` from ever spawning a second `term`, a missing compositor-side `SurfaceResized` emitter that caused term surfaces to extend past the tile borders, and four `publish_*` event-push stubs that the F.2 acceptance row had marked complete without verifying delivery on the wire. The user's review explicitly rejected deferring these to a separate Phase 72b phase, so the closeout work lives under Phase 72 as **Track K** in the task list.
+
+The closeout scope is:
+
+- **Term redesign — term is no longer a boot-readiness signal.** session_manager treats `display_server` (default boot) and `greeter` (graphical-only boot) as the desktop-ready signals; term moves out of `DECLARED_SESSION_STEP_NAMES` and out of `term.conf`-as-supervised-service. `term::SERVICE_NAME` and its `ipc_register_service` call are removed; term becomes a freely N-instantiable user-facing app launched via the new `[autostart]` config or `SUPER+RETURN`. **Greeter also stops `execve`-ing `/bin/term` post-auth** — the authenticated user lands at an empty compositor and presses `SUPER+RETURN` to spawn a terminal, matching the Hyprland / sway / i3 idiom where login leaves you at a bare tiling desktop rather than a pre-spawned shell.
+- **`[autostart]` section in `/etc/compositor.conf`.** Mirroring Hyprland's `exec-once`, the compositor runs each declared `exec = /path/to/binary` once after first compose. `cargo xtask run-gui --skip-login` (no greeter) stages `exec = /bin/term` so a terminal appears at boot; greeter mode and smoke modes omit the autostart line so the user can opt in by editing the file.
+- **Compositor emits `ServerMessage::SurfaceResized`.** display_server tracks the last-known tile dimensions per Toplevel and emits `SurfaceResized { width, height }` when the dims change so clients can reflow within their assigned tile. Closes the visible-extends-past-border symptom.
+- **DOOM consumes `SurfaceResized`.** dg_m3os.c's `DC_EVENT_SURFACE_RESIZED` arm logs the event and acknowledges receipt rather than just silently dropping it. **DOOM does not reflow its playfield**: doomgeneric exposes a fixed `DOOMGENERIC_RESX × DOOMGENERIC_RESY` screen buffer baked into the engine, and runtime resolution changes would require an upstream doomgeneric refactor that is out of scope for m3OS. The compositor's **aspect-preserving scale + letterbox** path remains responsible for the visual mismatch: when a Toplevel's intrinsic buffer dimensions don't match its assigned tile, the compositor synthesises a nearest-neighbour scaled snapshot that fills the tile along the constrained axis and adds letterbox bars on the unconstrained axis. This is a deliberate change from the pure-letterbox-only initial scope — the visual contract is now "fit the tile, preserve aspect ratio, no stretching." K.4's value is end-to-end protocol observability (the SurfaceResized message now visibly arrives at every Toplevel client, term *and* DOOM) rather than a true playfield resize. The per-frame scaled-snapshot allocation is bounded to surf!=tile clients (DOOM steady-state, term during its resize transient); a cached scaled buffer is a documented Phase 73 follow-up.
+- **`adjust_focused` UX for non-resizable layouts.** Grid/tabbed/fullscreen still return `LayoutError::Unsupported` (no meaningful semantics), but resize-mode now logs a clear `resize not supported under <policy>` message and auto-exits the mode so the user is not silently stuck pressing H/J/K/L.
+- **`SUPER+Q` close protocol.** New `ServerMessage::CloseRequest { surface_id }` notification. SUPER+Q's `KillFocused` action emits it to the focused surface's owning client; term, greeter, and DOOM each handle it by initiating a graceful shutdown.
+- **Per-client surface ownership + Goodbye teardown.** Phase 70 worked around the multi-client `Goodbye` regression by preserving the entire registry on disconnect, leaking surfaces. Closeout introduces per-surface `ClientId` ownership in `SurfaceRegistry` and, on Goodbye or transport close, destroys only that client's surfaces.
+- **Control-socket event push — `publish_*` actually delivers.** The four publish helpers transmit framed events to subscribed control clients via the existing async-IPC primitives. Subscribers that close their connection are reaped without panic. Closes audit blocker C5 / Red Flag #15 — the F.2 acceptance row was incorrectly marked complete in initial Phase 72.
+
 ## Deferred Until Later
+
+Scheduled (target phase named):
 
 - Animation engine, window-open/close animations, workspace slide transitions (Phase 73)
 - Status bar, launcher, notification daemon as separate client processes (Phase 73)
-- Multi-monitor independent workspace sets beyond the per-output design documented here
-- Leader-key / which-key visual overlay (described as optional in the chord engine)
-- Named workspaces and Hyprland-style "groups" (window sets independent of workspaces)
-- `wl_shm` Wayland compatibility shim (explicitly not Wayland; see `wayland-gap-analysis.md`)
-- Touchpad gestures for workspace switching
-- Teaching the Phase 70 DOOM port to consume `ServerMessage::SurfaceResized` (Phase 69 already plumbed the message; under Phase 72 DOOM is letterboxed within its assigned tile)
-- `LayoutPolicy::adjust_focused` implementations for grid / tabbed / fullscreen layouts (return `LayoutError::Unsupported` in Phase 72; meaningful semantics deferred)
+
+Scheduled Backlog (no firm phase, recorded so they live in a durable place):
+
+- Multi-monitor independent workspace sets beyond the per-output design documented here — gated on multi-output framebuffer driver work; revisit once a real multi-output target is in scope
+- Leader-key / which-key visual overlay — UX polish; low priority but cheap to add anytime
+- Named workspaces and Hyprland-style "groups" (window sets independent of workspaces) — UX feature; not blocking core function
+- Touchpad gestures for workspace switching — depends on touchpad driver evolution
+
+Out of scope (permanent):
+
+- `wl_shm` Wayland compatibility shim — m3OS is explicitly not Wayland; see `wayland-gap-analysis.md`

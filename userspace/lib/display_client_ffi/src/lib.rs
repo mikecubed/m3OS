@@ -59,6 +59,8 @@ pub const DC_EVENT_FOCUS_OUT: u32 = 3;
 pub const DC_EVENT_SURFACE_RESIZED: u32 = 4;
 pub const DC_EVENT_BUFFER_RELEASED: u32 = 5;
 pub const DC_EVENT_DISCONNECT: u32 = 6;
+/// Phase 72b Track K.6 — `SUPER+Q` close request from the compositor.
+pub const DC_EVENT_CLOSE_REQUEST: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // KeyEventKind discriminants — mirrored in display_client.h DC_KEY_KIND_*.
@@ -134,6 +136,13 @@ pub struct DcHandle {
     /// without an unbounded allocation per handle.
     #[cfg_attr(test, allow(dead_code))]
     owned_surfaces: [Option<u32>; 4],
+    /// Phase 72b Track K.7 — client-chosen token sent in `Hello` and
+    /// echoed in every `CreateSurface` and the eventual `Goodbye`.
+    /// Default: `syscall_lib::getpid() as u32`. Stored on the handle
+    /// so `dc_disconnect` can pass the same value to `build_goodbye`
+    /// (no global state required).
+    #[cfg_attr(test, allow(dead_code))]
+    client_token: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,19 +236,30 @@ impl DcEvent {
 // encoded length so the caller can hand the slice to `ipc_call_buf`.
 // ---------------------------------------------------------------------------
 
-/// Encode `ClientMessage::Hello { protocol_version, capabilities: 0 }`.
-pub fn build_hello(buf: &mut [u8]) -> Result<usize, ProtocolError> {
+/// Encode `ClientMessage::Hello { protocol_version, capabilities: 0,
+/// client_token }`.
+///
+/// `client_token` is a client-chosen identifier the server uses to
+/// scope `Goodbye` teardown to that client's own surfaces. Callers
+/// typically pass their own PID via `syscall_lib::getpid()`.
+pub fn build_hello(buf: &mut [u8], client_token: u32) -> Result<usize, ProtocolError> {
     let msg = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         capabilities: 0,
+        client_token,
     };
     msg.encode(buf)
 }
 
-/// Encode `ClientMessage::CreateSurface { surface_id }`.
-pub fn build_create_surface(buf: &mut [u8], surface_id: u32) -> Result<usize, ProtocolError> {
+/// Encode `ClientMessage::CreateSurface { surface_id, client_token }`.
+pub fn build_create_surface(
+    buf: &mut [u8],
+    surface_id: u32,
+    client_token: u32,
+) -> Result<usize, ProtocolError> {
     let msg = ClientMessage::CreateSurface {
         surface_id: SurfaceId(surface_id),
+        client_token,
     };
     msg.encode(buf)
 }
@@ -296,9 +316,11 @@ pub fn build_commit(buf: &mut [u8], surface_id: u32) -> Result<usize, ProtocolEr
     msg.encode(buf)
 }
 
-/// Encode `ClientMessage::Goodbye`.
-pub fn build_goodbye(buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    ClientMessage::Goodbye.encode(buf)
+/// Encode `ClientMessage::Goodbye { client_token }`. The token must
+/// match the one passed to `build_hello` for this connection; the
+/// server uses it to destroy only that client's surfaces.
+pub fn build_goodbye(buf: &mut [u8], client_token: u32) -> Result<usize, ProtocolError> {
+    ClientMessage::Goodbye { client_token }.encode(buf)
 }
 
 /// Encode `ClientMessage::DestroySurface { surface_id }`. Phase 70 —
@@ -382,6 +404,18 @@ pub fn server_message_to_dc_event(msg: ServerMessage) -> DcEvent {
                 },
             },
         },
+        // Phase 72b Track K.6 — graceful close request from compositor
+        // (SUPER+Q chord). Surface to the FFI consumer with the
+        // affected surface id so DOOM / greeter / future clients can
+        // trigger their own quit sequences instead of being signalled.
+        ServerMessage::CloseRequest { surface_id } => DcEvent {
+            tag: DC_EVENT_CLOSE_REQUEST,
+            payload: DcEventPayload {
+                focus_in: DcFocusPayload {
+                    surface_id: surface_id.0,
+                },
+            },
+        },
         // Welcome, SurfaceConfigured, SurfaceDestroyed, Pointer:
         // not part of DOOM's contract — drop silently.
         _ => DcEvent::none(),
@@ -436,14 +470,6 @@ pub unsafe extern "C" fn dc_connect(out: *mut *mut DcHandle) -> c_int {
         Some(h) => h,
         None => return DC_ERR_CONNECT,
     };
-    let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
-    let n = match build_hello(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return DC_ERR_ENCODE,
-    };
-    if !send_encoded(server_handle, &buf[..n]) {
-        return DC_ERR_CONNECT;
-    }
     // Phase 70 Track F — derive the per-process surface-id seed from
     // PID so two concurrent DOOMs do not both claim `SurfaceId(1)` and
     // collide with each other (and with `term`'s long-lived
@@ -456,7 +482,12 @@ pub unsafe extern "C" fn dc_connect(out: *mut *mut DcHandle) -> c_int {
     // PID values on m3OS are small unsigned integers; +0x4000 keeps
     // them clear of `term`'s `SurfaceId(1)` and reserves the low 16k
     // for future statically-allocated surfaces.
+    //
+    // Phase 72b Track K.7 — also use PID as `client_token` so the
+    // compositor can correlate Hello / CreateSurface / Goodbye for
+    // multi-client surface ownership tracking.
     let pid = syscall_lib::getpid();
+    let client_token: u32 = if pid > 0 { pid as u32 } else { 0x4001 };
     let seed = if pid > 0 {
         0x4000u32.wrapping_add(pid as u32)
     } else {
@@ -465,10 +496,19 @@ pub unsafe extern "C" fn dc_connect(out: *mut *mut DcHandle) -> c_int {
         // userspace process always has a valid PID.
         0x4001
     };
+    let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
+    let n = match build_hello(&mut buf, client_token) {
+        Ok(n) => n,
+        Err(_) => return DC_ERR_ENCODE,
+    };
+    if !send_encoded(server_handle, &buf[..n]) {
+        return DC_ERR_CONNECT;
+    }
     let handle = Box::new(DcHandle {
         server_handle,
         next_surface_id: seed,
         owned_surfaces: [None; 4],
+        client_token,
     });
     // SAFETY: `out` validity is the caller's contract.
     unsafe {
@@ -500,7 +540,7 @@ pub unsafe extern "C" fn dc_create_toplevel(h: *mut DcHandle, out_surface_id: *m
     handle.next_surface_id = handle.next_surface_id.wrapping_add(1);
 
     let mut buf = [0u8; VERB_ENCODE_BUF_LEN];
-    let n = match build_create_surface(&mut buf, surface_id) {
+    let n = match build_create_surface(&mut buf, surface_id, handle.client_token) {
         Ok(n) => n,
         Err(_) => return DC_ERR_ENCODE,
     };
@@ -746,7 +786,7 @@ pub unsafe extern "C" fn dc_disconnect(h: *mut DcHandle) {
             let _ = syscall_lib::ipc_call_buf(boxed.server_handle, LABEL_VERB, 0, &buf[..n]);
         }
     }
-    if let Ok(n) = build_goodbye(&mut buf) {
+    if let Ok(n) = build_goodbye(&mut buf, boxed.client_token) {
         let _ = syscall_lib::ipc_call_buf(boxed.server_handle, LABEL_VERB, 0, &buf[..n]);
     }
     drop(boxed);
@@ -779,14 +819,16 @@ mod tests {
 
     #[test]
     fn hello_round_trip() {
-        let msg = round_trip(build_hello);
+        let msg = round_trip(|b| build_hello(b, 0xCAFEBABE));
         match msg {
             ClientMessage::Hello {
                 protocol_version,
                 capabilities,
+                client_token,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(capabilities, 0);
+                assert_eq!(client_token, 0xCAFEBABE);
             }
             _ => panic!("not Hello: {:?}", msg),
         }
@@ -794,9 +836,15 @@ mod tests {
 
     #[test]
     fn create_surface_round_trip() {
-        let msg = round_trip(|b| build_create_surface(b, 42));
+        let msg = round_trip(|b| build_create_surface(b, 42, 0xDEADBEEF));
         match msg {
-            ClientMessage::CreateSurface { surface_id } => assert_eq!(surface_id, SurfaceId(42)),
+            ClientMessage::CreateSurface {
+                surface_id,
+                client_token,
+            } => {
+                assert_eq!(surface_id, SurfaceId(42));
+                assert_eq!(client_token, 0xDEADBEEF);
+            }
             _ => panic!("not CreateSurface: {:?}", msg),
         }
     }
@@ -860,8 +908,11 @@ mod tests {
 
     #[test]
     fn goodbye_round_trip() {
-        let msg = round_trip(build_goodbye);
-        assert!(matches!(msg, ClientMessage::Goodbye));
+        let msg = round_trip(|b| build_goodbye(b, 0xC0FFEE));
+        match msg {
+            ClientMessage::Goodbye { client_token } => assert_eq!(client_token, 0xC0FFEE),
+            _ => panic!("not Goodbye: {:?}", msg),
+        }
     }
 
     #[test]

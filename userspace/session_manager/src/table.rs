@@ -329,7 +329,7 @@ mod tests {
         t.insert("kbd_server");
         t.insert("mouse_server");
         t.insert("audio_server");
-        t.insert("term");
+        t.insert("greeter");
         let names: Vec<_> = t.iter().map(|e| e.name.clone()).collect();
         assert_eq!(
             names,
@@ -338,7 +338,7 @@ mod tests {
                 "kbd_server".to_string(),
                 "mouse_server".to_string(),
                 "audio_server".to_string(),
-                "term".to_string(),
+                "greeter".to_string(),
             ]
         );
     }

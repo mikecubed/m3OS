@@ -45,6 +45,8 @@ extern "C" {
 #define DC_EVENT_SURFACE_RESIZED 4
 #define DC_EVENT_BUFFER_RELEASED 5
 #define DC_EVENT_DISCONNECT 6
+/* Phase 72b Track K.6 — SUPER+Q graceful close request. */
+#define DC_EVENT_CLOSE_REQUEST 7
 
 /* ---------- Key event kind (mirrors `KeyEventKind` discriminants) */
 

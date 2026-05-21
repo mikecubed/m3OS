@@ -333,6 +333,19 @@ where
                 Err(code) => ControlEvent::Error { code },
             }
         }
+        ControlCommand::EventPull => {
+            // Phase 72b Track K.8 — drain one queued subscription event
+            // for the calling client. Returning the event as the reply
+            // bulk is the simplest possible delivery model: the
+            // subscriber polls in a loop, the dispatcher pops, no
+            // separate push transport needed. An empty queue yields
+            // an `Ack` so the caller can distinguish "no events" from
+            // an error.
+            match subscriptions.drain_one(client) {
+                Some(evt) => evt,
+                None => ControlEvent::Ack,
+            }
+        }
         ControlCommand::FrameStats => ControlEvent::FrameStatsReply {
             samples: frame_stats.snapshot_newest_first(),
         },

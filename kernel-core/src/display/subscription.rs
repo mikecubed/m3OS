@@ -83,12 +83,18 @@ pub fn event_kind_of(event: &ControlEvent) -> Option<EventKind> {
         ControlEvent::BindTriggered { .. } => Some(EventKind::BindTriggered),
         ControlEvent::LayerEvent { .. } => Some(EventKind::LayerEvent),
         ControlEvent::CursorEvent { .. } => Some(EventKind::CursorEvent),
+        // Phase 72 — workspace-changed is subscribable via the
+        // existing `EventKind::FocusChanged` slot (a workspace switch
+        // is functionally a focus context change for subscribers).
+        ControlEvent::WorkspaceChanged { .. } => Some(EventKind::FocusChanged),
         ControlEvent::VersionReply { .. }
         | ControlEvent::SurfaceListReply { .. }
         | ControlEvent::Ack
         | ControlEvent::Error { .. }
         | ControlEvent::FrameStatsReply { .. }
-        | ControlEvent::PixelReply { .. } => None,
+        | ControlEvent::PixelReply { .. }
+        | ControlEvent::WindowListReply { .. }
+        | ControlEvent::WorkspaceListReply { .. } => None,
     }
 }
 

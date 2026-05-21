@@ -479,6 +479,24 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // Phase 72 Track H.3 — `cargo xtask tiling-smoke` boots m3OS,
+        // logs in over serial, and exercises the new tiling control-
+        // socket verbs end-to-end through `m3ctl` (`version`,
+        // `query workspaces`, `workspace switch`, `layout`, `tile
+        // fullscreen`, `reload`). Spawning multiple `term` instances
+        // via `SUPER+RETURN` and asserting the dwindle partition via
+        // `m3ctl query windows` is a documented follow-up; the current
+        // gate covers the protocol surface but not the multi-window
+        // geometry.
+        Some("tiling-smoke") => {
+            let smoke_args =
+                parse_smoke_boot_args("tiling-smoke", &args[2..]).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    eprintln!("Usage: {}", usage());
+                    std::process::exit(1);
+                });
+            cmd_tiling_smoke(&smoke_args);
+        }
         // Phase 69d Track E.1 — `cargo xtask tui-app-smoke` boots and
         // drives less, htop, and tmux smokes in sequence. Reports per-app
         // :ok / :fail; non-zero exit on any failure.
@@ -567,7 +585,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths."
 }
 
@@ -8972,6 +8990,10 @@ const SMOKE_EXIT_DOOM_AUDIO_FAILED: i32 = 67;
 /// concurrent-instance failure separately from the audio failure.
 const SMOKE_EXIT_DOOM_CONCURRENT_FAILED: i32 = 70;
 
+/// Phase 72 Track H.3 — `cargo xtask tiling-smoke` exit code. Distinct
+/// from every prior gate so CI can identify a tiling-specific failure.
+const SMOKE_EXIT_TILING_SMOKE_FAILED: i32 = 72;
+
 /// Phase 63a Track H — boots m3OS with the WAV AC'97 backend, runs
 /// `/bin/doom -warp 1 1`, waits for the `M3OS_DOOM:audio_summary`
 /// line emitted by `m3os_sound_shutdown_inner`, asserts
@@ -9269,6 +9291,195 @@ fn cmd_doom_concurrent_smoke(args: &SmokeBootArgs) {
             std::process::exit(SMOKE_EXIT_DOOM_CONCURRENT_FAILED);
         }
     }
+}
+
+/// Phase 72 Track H.3 — `cargo xtask tiling-smoke`. Boots m3OS in
+/// graphical mode (autologin / serial path so the harness does not need
+/// to drive the GUI greeter) and exercises the new tiling control-socket
+/// verbs through `m3ctl`: `version`, `query workspaces`, `workspace
+/// switch <N>`, `layout <kind>`, `tile fullscreen`, and `reload`. The
+/// gate confirms the protocol surface (control-socket round-trip,
+/// workspace state, layout-policy switching) is intact end-to-end.
+///
+/// Spawning multiple `term` instances via `SUPER+RETURN` and asserting
+/// the dwindle partition through `m3ctl query windows` is a documented
+/// Phase 72 follow-up — the current step set does not yet open multiple
+/// toplevels or check rect geometry.
+///
+/// The smoke is bounded by the global timeout and runs entirely over
+/// the serial console — no QMP keystroke injection is required because
+/// the new tiling verbs are exercised through `m3ctl`.
+fn cmd_tiling_smoke(args: &SmokeBootArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin / serial path
+    );
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, display_mode, DeviceSet::default());
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    qemu_args.extend([
+        "-audiodev".to_string(),
+        "none,id=snd0".to_string(),
+        "-device".to_string(),
+        "AC97,audiodev=snd0,addr=0x5".to_string(),
+    ]);
+
+    let steps = tiling_smoke_steps();
+
+    println!(
+        "tiling-smoke: launching QEMU (timeout {}s, {} steps)",
+        args.timeout_secs,
+        steps.len()
+    );
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("tiling-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("tiling-smoke: FAILED\n{msg}");
+            std::process::exit(SMOKE_EXIT_TILING_SMOKE_FAILED);
+        }
+    }
+}
+
+/// Step list for `cargo xtask tiling-smoke`.
+fn tiling_smoke_steps() -> Vec<SmokeStep> {
+    let mut steps = vec![SmokeStep::Wait {
+        pattern: "[m3os] Hello from kernel",
+        timeout_secs: 30,
+        label: "guest/tiling: kernel first message",
+    }];
+    steps.extend(boot_and_login_steps());
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    // `m3ctl version` smoke: confirm the control socket is up.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl version\n",
+        label: "guest/tiling: m3ctl version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "protocol_version=",
+        timeout_secs: 15,
+        label: "guest/tiling: m3ctl version reply",
+    });
+    // Query workspaces — should print 9 lines, with workspace 1 active.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl query workspaces\n",
+        label: "guest/tiling: query workspaces",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "workspace 1",
+        timeout_secs: 10,
+        label: "guest/tiling: query workspaces reply",
+    });
+    // Switch to workspace 2, then 3, then back to 1.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl workspace switch 2\n",
+        label: "guest/tiling: switch to workspace 2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: switch workspace 2 ack",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl workspace switch 3\n",
+        label: "guest/tiling: switch to workspace 3",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: switch workspace 3 ack",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl workspace switch 1\n",
+        label: "guest/tiling: switch back to workspace 1",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: switch workspace 1 ack",
+    });
+    // Change layout to grid, then dwindle.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl layout grid\n",
+        label: "guest/tiling: set grid layout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: grid layout ack",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl layout dwindle\n",
+        label: "guest/tiling: set dwindle layout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: dwindle layout ack",
+    });
+    // Tile fullscreen toggle.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl tile fullscreen\n",
+        label: "guest/tiling: tile fullscreen",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: tile fullscreen ack",
+    });
+    // Reload — should at minimum not panic.
+    steps.push(SmokeStep::Send {
+        input: "/bin/m3ctl reload\n",
+        label: "guest/tiling: m3ctl reload",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ack",
+        timeout_secs: 10,
+        label: "guest/tiling: m3ctl reload ack",
+    });
+    steps
 }
 
 /// Step list for `cargo xtask doom-concurrent-smoke`.
@@ -10100,16 +10311,34 @@ fn populate_ext2_files(
     // back to stub mode and `frames_consumed` never advances.
     let audio_server_conf = "name=audio_server\ncommand=/drivers/audio_server\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display\non-restart=audio_server.restart\n";
 
-    // Phase 71 — `term.conf` is still written in every boot mode so the
-    // headless / smoke / regression paths (which have no GUI input
-    // source) can keep autologging into `term` on the serial console.
-    // Graphical-only boots write `/etc/m3os-graphical-only`, which
-    // makes init's `skip_for_greeter_filter` skip `term.conf` so the
-    // `greeter` binary (started via `greeter.conf` below) instead runs
-    // the GUI login form and, on success, `setuid` + `execve(/bin/term)`
-    // so term inherits the authenticated UID/GID. The two manifests
-    // are mutually exclusive at boot — not peers.
-    let term_conf = "name=term\ncommand=/bin/term\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,session_manager\n";
+    // Phase 72b — `term.conf` is no longer staged as a supervised
+    // service manifest. `term` is a user-facing app that may run with
+    // N concurrent instances; supervising it as a singleton daemon
+    // caused the boot-time IPC service-name collision that broke
+    // `SUPER+RETURN` second-term spawns. The new launch sites are:
+    //   - default GUI boot: `display_server` reads `[autostart] exec
+    //     = /bin/term` from `/etc/compositor.conf` and runs it once
+    //     after first compose.
+    //   - graphical-only boot: `greeter` writes the session descriptor
+    //     to `/run/m3os-current-session` and exits cleanly after
+    //     authentication. display_server stays up with no foreground
+    //     app and the user spawns term explicitly via `SUPER+RETURN`
+    //     (display_server's `SpawnTerm` chord handler), matching the
+    //     Hyprland / sway / i3 idiom of landing at an empty desktop.
+    //   - headless smoke / regression boot: no `term` is started —
+    //     smoke-runner drives the kernel serial console directly and
+    //     never depended on the supervised `term` step.
+    // The literal below is retained only so the legacy `_tmp_term_conf`
+    // staging variable still compiles without modification across all
+    // downstream `format!` sites; it is staged into `/etc/services.d/`
+    // only when `M3OS_LEGACY_TERM_CONF=1` is set, for emergency
+    // bisecting against the pre-Phase-72b boot chain.
+    let term_conf = "# Phase 72b — `term` is not a supervised service.\n\
+                     # The legacy manifest is retained behind \
+                     M3OS_LEGACY_TERM_CONF=1 for bisecting only.\n\
+                     name=term\ncommand=/bin/term\ntype=daemon\n\
+                     restart=on-failure\nmax_restart=3\n\
+                     depends=display,kbd\n";
 
     // Phase 71 Track F.1 — greeter manifest. The GUI login form
     // depends on display, kbd, mouse, audio.cmd, and vfs (the latter
@@ -10118,13 +10347,18 @@ fn populate_ext2_files(
     // readiness via the IPC registry (it is not greeter's parent), so an
     // explicit init-level dependency would just delay greeter start
     // behind a service whose start order is already enforced upstream
-    // by `DECLARED_SESSION_STEP_NAMES`. On successful authentication
-    // greeter `setuid`s to the authenticated user and `execve`s
-    // `/bin/term` in-process; the session_manager F.1 step that waits
-    // for the "term" IPC service therefore resolves only after a
-    // successful login. The `restart=on-failure` policy with
-    // `max_restart=3` matches the legacy term.conf budget; greeter's
-    // `exit(7)` on setuid failure is `on-failure` so init respawns it.
+    // by `DECLARED_SESSION_STEP_NAMES`. Phase 72b — on successful
+    // authentication greeter `setuid`s to the authenticated user,
+    // writes `/run/m3os-current-session` for display_server to consume
+    // at `SpawnTerm` time, and exits cleanly (return code 0). It does
+    // NOT execve `/bin/term` in-process; display_server is responsible
+    // for spawning term when the user requests one via `SUPER+RETURN`
+    // (or another launch path), matching the empty-desktop-after-login
+    // idiom of Hyprland / sway / i3. The `restart=on-failure` policy
+    // with `max_restart=3` matches the legacy term.conf budget;
+    // greeter's `exit(7)` on setuid failure is `on-failure` so init
+    // respawns it, while the clean `exit(0)` post-auth is `on-success`
+    // and is not retried.
     //
     // `depends=` lists init manifest `name=` values (matched by
     // `DepGraph::build` in `userspace/init/src/main.rs`). Cross-check
@@ -10152,6 +10386,56 @@ fn populate_ext2_files(
         "# accent-color=4488cc\n",
         "welcome=m3OS Login\n",
     );
+
+    // Phase 72 — minimal `/etc/compositor.conf` so the post-login
+    // compositor finds non-default gaps + borders. The parser falls
+    // back to defaults on any missing key, so the file's purpose is
+    // mostly to document the available knobs.
+    //
+    // Phase 72b — `[autostart]` is conditional on boot mode:
+    //   - Default GUI (no graphical-only marker, not smoke):
+    //     auto-launch `/bin/term` so the user lands at a terminal
+    //     without needing to press `SUPER+RETURN` first.
+    //   - Graphical-only boot: omit autostart so the user lands at an
+    //     empty desktop after authentication, matching the Hyprland /
+    //     sway / i3 convention. Greeter writes
+    //     `/run/m3os-current-session` and exits cleanly; the user
+    //     spawns term explicitly via `SUPER+RETURN`
+    //     (display_server's `SpawnTerm` chord handler).
+    //   - Smoke / regression: omit autostart — headless tests don't
+    //     drive the GUI compositor.
+    let compositor_conf_base = concat!(
+        "# m3OS compositor (Phase 72) — tiling window manager.\n",
+        "# Edit and run `m3ctl reload` to apply without restart.\n",
+        "\n",
+        "[gaps]\n",
+        "outer = 8\n",
+        "inner = 6\n",
+        "\n",
+        "[borders]\n",
+        "width = 2\n",
+        "active_color = 0x005FAFFF\n",
+        "inactive_color = 0x00444444\n",
+        "\n",
+        "[keybinds]\n",
+        "resize_step_px = 32\n",
+        "\n",
+        "[workspaces]\n",
+        "default = dwindle\n",
+        "follow_on_move = false\n",
+        "workspace_9 = fullscreen\n",
+    );
+    let compositor_conf = if !smoke_test_mode && !graphical_login {
+        format!(
+            "{compositor_conf_base}\n\
+             [autostart]\n\
+             # Phase 72b — launch one `term` after the compositor's first\n\
+             # compose frame so the default-GUI boot lands at a terminal.\n\
+             exec = /bin/term\n",
+        )
+    } else {
+        compositor_conf_base.to_string()
+    };
 
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
@@ -10252,6 +10536,7 @@ fn populate_ext2_files(
     let term_conf_tmp = output_dir.join("_tmp_term_conf");
     let greeter_user_conf_tmp = output_dir.join("_tmp_greeter_user_conf");
     let greeter_service_conf_tmp = output_dir.join("_tmp_greeter_service_conf");
+    let compositor_conf_tmp = output_dir.join("_tmp_compositor_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -10278,6 +10563,7 @@ fn populate_ext2_files(
     fs::write(&term_conf_tmp, term_conf).expect("write temp term.conf");
     fs::write(&greeter_user_conf_tmp, greeter_user_conf).expect("write temp greeter user conf");
     fs::write(&greeter_service_conf_tmp, greeter_conf).expect("write temp greeter service conf");
+    fs::write(&compositor_conf_tmp, compositor_conf).expect("write temp compositor.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -10411,13 +10697,29 @@ fn populate_ext2_files(
     // smoke-test mode `greeter.conf` is omitted entirely (no GUI input
     // source). A future cleanup can collapse this to a single source of
     // truth once the smoke-runner can drive the greeter form headlessly.
-    let term_write = format!(
-        "write \"{}\" etc/services.d/term.conf\n\
-         sif etc/services.d/term.conf mode 0x81A4\n\
-         sif etc/services.d/term.conf uid 0\n\
-         sif etc/services.d/term.conf gid 0\n",
-        term_conf_tmp.display()
-    );
+    // Phase 72b — stage term.conf in smoke-test mode only. The
+    // smoke gate's serial-autologin path expects term to be running
+    // by the time `smoke-runner` fires; without term, the SMOKE:log
+    // step races syslogd's startup and the marker can miss its
+    // /var/log/messages window. In default GUI mode and
+    // graphical-only mode, `term` is launched via the compositor's
+    // `[autostart]` or by greeter's in-process execve, so init does
+    // not need to supervise it. `M3OS_LEGACY_TERM_CONF=1` forces
+    // staging in non-smoke modes for emergency bisecting against
+    // the pre-Phase-72b boot chain.
+    let stage_legacy_term_conf =
+        smoke_test_mode || std::env::var_os("M3OS_LEGACY_TERM_CONF").is_some();
+    let term_write = if stage_legacy_term_conf {
+        format!(
+            "write \"{}\" etc/services.d/term.conf\n\
+             sif etc/services.d/term.conf mode 0x81A4\n\
+             sif etc/services.d/term.conf uid 0\n\
+             sif etc/services.d/term.conf gid 0\n",
+            term_conf_tmp.display()
+        )
+    } else {
+        String::new()
+    };
     let greeter_write = if smoke_test_mode {
         // Skip greeter manifest in smoke mode — no GUI input source.
         String::new()
@@ -10436,6 +10738,17 @@ fn populate_ext2_files(
         )
     };
     let greeter_or_term_cmds = format!("{term_write}{greeter_write}");
+
+    // Phase 72 — always stage `/etc/compositor.conf` regardless of
+    // boot mode so the compositor's reload path (m3ctl reload) has
+    // a real file to read on every disk image.
+    let compositor_conf_cmds = format!(
+        "write \"{}\" etc/compositor.conf\n\
+         sif etc/compositor.conf mode 0x81A4\n\
+         sif etc/compositor.conf uid 0\n\
+         sif etc/compositor.conf gid 0\n",
+        compositor_conf_tmp.display(),
+    );
 
     // Phase 56 Track F.2 — drop the debug-crash marker file when the
     // F.2 regression asks for it. Production boots leave the file out;
@@ -10759,6 +11072,7 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf uid 0\n\
          sif etc/services.d/audio_server.conf gid 0\n\
          {greeter_or_term_cmds}\
+         {compositor_conf_cmds}\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -10792,6 +11106,7 @@ fn populate_ext2_files(
         session_manager_conf = session_manager_conf_tmp.display(),
         audio_server_conf = audio_server_conf_tmp.display(),
         greeter_or_term_cmds = greeter_or_term_cmds,
+        compositor_conf_cmds = compositor_conf_cmds,
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,

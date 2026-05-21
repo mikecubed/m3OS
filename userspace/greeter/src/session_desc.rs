@@ -3,7 +3,7 @@
 //! Wire format (greeter stdout → session_manager parser):
 //!
 //! ```text
-//! uid=<N> gid=<N> home=<path> shell=<path>\n
+//! uid=<N> gid=<N> user=<name> home=<path> shell=<path>\n
 //! ```
 //!
 //! Space-separated `key=value` pairs, one line, trailing newline.
@@ -21,9 +21,10 @@ pub fn format_session_descriptor(desc: &SessionDescriptor) -> String {
     // No format! because alloc has `format!` but kernel-core enforces
     // no_std + alloc, and `format!` ICEs are rare enough. Use it.
     alloc::format!(
-        "uid={} gid={} home={} shell={}\n",
+        "uid={} gid={} user={} home={} shell={}\n",
         desc.uid,
         desc.gid,
+        desc.username,
         desc.home,
         desc.shell
     )
@@ -43,6 +44,7 @@ pub enum ParseError {
 pub fn parse_session_descriptor(line: &str) -> Result<SessionDescriptor, ParseError> {
     let mut uid: Option<u32> = None;
     let mut gid: Option<u32> = None;
+    let mut username: Option<String> = None;
     let mut home: Option<String> = None;
     let mut shell: Option<String> = None;
     for token in line.split_whitespace() {
@@ -66,6 +68,7 @@ pub fn parse_session_descriptor(line: &str) -> Result<SessionDescriptor, ParseEr
                         .map_err(|_| ParseError::BadInteger("gid"))?,
                 )
             }
+            "user" => username = Some(String::from(value)),
             "home" => home = Some(String::from(value)),
             "shell" => shell = Some(String::from(value)),
             _ => {}
@@ -74,6 +77,7 @@ pub fn parse_session_descriptor(line: &str) -> Result<SessionDescriptor, ParseEr
     Ok(SessionDescriptor {
         uid: uid.ok_or(ParseError::MissingField("uid"))?,
         gid: gid.ok_or(ParseError::MissingField("gid"))?,
+        username: username.ok_or(ParseError::MissingField("user"))?,
         home: home.ok_or(ParseError::MissingField("home"))?,
         shell: shell.ok_or(ParseError::MissingField("shell"))?,
     })
@@ -88,18 +92,22 @@ mod tests {
         let desc = SessionDescriptor {
             uid: 1000,
             gid: 1000,
+            username: String::from("alice"),
             home: String::from("/home/alice"),
             shell: String::from("/bin/ion"),
         };
         let line = format_session_descriptor(&desc);
-        assert_eq!(line, "uid=1000 gid=1000 home=/home/alice shell=/bin/ion\n");
+        assert_eq!(
+            line,
+            "uid=1000 gid=1000 user=alice home=/home/alice shell=/bin/ion\n"
+        );
         let parsed = parse_session_descriptor(&line).unwrap();
         assert_eq!(parsed, desc);
     }
 
     #[test]
     fn missing_field_errors() {
-        let line = "uid=0 gid=0 home=/\n";
+        let line = "uid=0 gid=0 user=root home=/\n";
         assert_eq!(
             parse_session_descriptor(line),
             Err(ParseError::MissingField("shell"))
@@ -108,7 +116,7 @@ mod tests {
 
     #[test]
     fn bad_uid_errors() {
-        let line = "uid=abc gid=0 home=/ shell=/bin/sh\n";
+        let line = "uid=abc gid=0 user=root home=/ shell=/bin/sh\n";
         assert_eq!(
             parse_session_descriptor(line),
             Err(ParseError::BadInteger("uid"))

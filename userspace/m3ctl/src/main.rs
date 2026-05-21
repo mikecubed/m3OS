@@ -185,6 +185,17 @@ mod os_binary {
         match decode_event(&reply_buf[..used]) {
             Ok((ev, _)) => {
                 print_event(&ev);
+                // Phase 72b Track K.8 — Subscribe is the entry point
+                // for a long-lived event stream. After the initial
+                // Ack lands, poll `EventPull` until SIGINT and print
+                // each delivered event. Other verbs return their
+                // single reply and exit.
+                if matches!(
+                    cmd,
+                    kernel_core::display::control::ControlCommand::Subscribe { .. }
+                ) {
+                    return poll_subscription_events(handle, &mut reply_buf);
+                }
                 0
             }
             Err(err) => {
@@ -193,6 +204,45 @@ mod os_binary {
                 print_str("\n");
                 1
             }
+        }
+    }
+
+    /// Phase 72b Track K.8 — `m3ctl subscribe` polling loop. After
+    /// the initial Subscribe Ack, repeatedly call `EventPull` and
+    /// print each delivered event. An empty queue returns `Ack`; the
+    /// loop sleeps briefly between empty polls so it doesn't burn the
+    /// CPU. SIGINT (Ctrl+C) tears the process down via the shell.
+    fn poll_subscription_events(handle: u32, reply_buf: &mut [u8]) -> i32 {
+        use kernel_core::display::control::ControlCommand;
+        let mut req_buf = [0u8; 8];
+        let req_len = match encode_command(&ControlCommand::EventPull, &mut req_buf) {
+            Ok(n) => n,
+            Err(_) => {
+                print_str("m3ctl: failed to encode EventPull\n");
+                return 1;
+            }
+        };
+        loop {
+            let label =
+                syscall_lib::ipc_call_buf(handle, LABEL_DISPLAY_CTL_CMD, 0, &req_buf[..req_len]);
+            if label == u64::MAX {
+                print_str("m3ctl: subscribe: transport error\n");
+                return 1;
+            }
+            let n = syscall_lib::ipc_take_pending_bulk(reply_buf);
+            if n != u64::MAX && n > 0 {
+                let used = n as usize;
+                if let Ok((ev, _)) = decode_event(&reply_buf[..used]) {
+                    if !matches!(ev, ControlEvent::Ack) {
+                        print_event(&ev);
+                        continue;
+                    }
+                }
+            }
+            // Empty queue / Ack — back off so we don't pin the CPU.
+            // 100 ms keeps `m3ctl subscribe` responsive enough that
+            // events surface within ~one frame of the firing event.
+            let _ = syscall_lib::nanosleep_for(0, 100_000_000);
         }
     }
 
@@ -423,11 +473,70 @@ mod os_binary {
                 print_u32(*keycode);
                 print_str("\n");
             }
+            ControlEvent::WindowListReply { entries } => {
+                if entries.is_empty() {
+                    print_str("(no windows)\n");
+                } else {
+                    for e in entries {
+                        print_str("window id=");
+                        print_u32(e.surface_id.0);
+                        print_str(" ws=");
+                        print_u32(e.workspace as u32);
+                        print_str(" rect=(");
+                        print_u32(e.rect.x as u32);
+                        print_str(",");
+                        print_u32(e.rect.y as u32);
+                        print_str(" ");
+                        print_u32(e.rect.w);
+                        print_str("x");
+                        print_u32(e.rect.h);
+                        print_str(")");
+                        if e.focused {
+                            print_str(" *focused*");
+                        }
+                        print_str("\n");
+                    }
+                }
+            }
+            ControlEvent::WorkspaceListReply { entries } => {
+                for e in entries {
+                    print_str("workspace ");
+                    print_u32(e.workspace as u32);
+                    print_str(" policy=");
+                    print_str(policy_kind_str(e.policy_kind));
+                    print_str(" windows=");
+                    print_u32(e.window_count);
+                    if e.active {
+                        print_str(" *active*");
+                    }
+                    print_str("\n");
+                }
+            }
+            ControlEvent::WorkspaceChanged { workspace } => {
+                print_str("workspace-changed ws=");
+                print_u32(*workspace as u32);
+                print_str("\n");
+            }
             // `ControlEvent` is `#[non_exhaustive]`; future variants
             // print a typed marker rather than panicking.
             _ => {
                 print_str("(unknown event variant)\n");
             }
+        }
+    }
+
+    /// Phase 72 — map the wire-side `policy_kind` byte back to its
+    /// canonical name for the `query workspaces` printout. Mirrors
+    /// `m3ctl::parse_policy_kind` in the reverse direction.
+    fn policy_kind_str(k: u8) -> &'static str {
+        match k {
+            0 => "master-stack",
+            1 => "dwindle",
+            2 => "spiral",
+            3 => "grid",
+            4 => "tabbed",
+            5 => "fullscreen",
+            _ => "unknown",
         }
     }
 

@@ -555,6 +555,7 @@ name = "display_server"
 version = "0.56.0"
 dependencies = [
  "kernel-core",
+ "layout",
  "surface_buffer",
  "syscall-lib",
 ]
@@ -1032,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1052,6 +1053,13 @@ dependencies = [
  "proptest",
  "spin",
  "ttf-parser",
+]
+
+[[package]]
+name = "layout"
+version = "0.72.0"
+dependencies = [
+ "kernel-core",
 ]
 
 [[package]]
@@ -2011,6 +2019,7 @@ version = "0.57.0"
 dependencies = [
  "audio_client",
  "kernel-core",
+ "passwd",
  "surface_buffer",
  "syscall-lib",
 ]

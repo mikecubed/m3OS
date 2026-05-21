@@ -194,7 +194,136 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                 event_kind: kind,
             }))
         }
+        // Phase 72 — tiling / workspace verbs.
+        //
+        // Each maps to a single `ControlCommand` variant whose
+        // codec round-trips through `kernel-core::display::protocol`.
+        "layout" => {
+            let name = args
+                .first()
+                .copied()
+                .ok_or(ParseError::MissingArgument("layout requires <name>"))?;
+            let kind = parse_policy_kind(name)
+                .ok_or(ParseError::BadArgument("layout: unknown policy name"))?;
+            Ok(ParsedVerb::Display(ControlCommand::SetLayout { kind }))
+        }
+        "workspace" => {
+            let action = args
+                .first()
+                .copied()
+                .ok_or(ParseError::MissingArgument("workspace requires <action>"))?;
+            match action {
+                "switch" => {
+                    let n_str = args
+                        .get(1)
+                        .copied()
+                        .ok_or(ParseError::MissingArgument("workspace switch requires <n>"))?;
+                    let n = parse_u8(n_str)
+                        .ok_or(ParseError::BadArgument("workspace switch: n must be 1..=9"))?;
+                    if !(1..=9).contains(&n) {
+                        return Err(ParseError::BadArgument("workspace switch: n must be 1..=9"));
+                    }
+                    Ok(ParsedVerb::Display(ControlCommand::SwitchWorkspace { n }))
+                }
+                _ => Err(ParseError::BadArgument(
+                    "workspace: unknown action (expected 'switch')",
+                )),
+            }
+        }
+        "move-to-workspace" => {
+            let n_str = args.first().copied().ok_or(ParseError::MissingArgument(
+                "move-to-workspace requires <n>",
+            ))?;
+            let n = parse_u8(n_str).ok_or(ParseError::BadArgument(
+                "move-to-workspace: n must be 1..=9",
+            ))?;
+            if !(1..=9).contains(&n) {
+                return Err(ParseError::BadArgument(
+                    "move-to-workspace: n must be 1..=9",
+                ));
+            }
+            let follow = if args.iter().any(|a| *a == "--follow") {
+                1
+            } else {
+                0
+            };
+            Ok(ParsedVerb::Display(ControlCommand::MoveToWorkspace {
+                n,
+                follow,
+            }))
+        }
+        "reload" => Ok(ParsedVerb::Display(ControlCommand::Reload)),
+        "query" => {
+            let what = args
+                .first()
+                .copied()
+                .ok_or(ParseError::MissingArgument("query requires <what>"))?;
+            match what {
+                "windows" => Ok(ParsedVerb::Display(ControlCommand::QueryWindows)),
+                "workspaces" => Ok(ParsedVerb::Display(ControlCommand::QueryWorkspaces)),
+                _ => Err(ParseError::BadArgument(
+                    "query: expected 'windows' or 'workspaces'",
+                )),
+            }
+        }
+        "tile" => {
+            let sub = args
+                .first()
+                .copied()
+                .ok_or(ParseError::MissingArgument("tile requires <subcommand>"))?;
+            match sub {
+                "fullscreen" => Ok(ParsedVerb::Display(ControlCommand::TileFullscreen)),
+                "set-master-ratio" => {
+                    let ratio_str = args.get(1).copied().ok_or(ParseError::MissingArgument(
+                        "tile set-master-ratio requires <ratio>",
+                    ))?;
+                    let ratio = parse_ratio(ratio_str).ok_or(ParseError::BadArgument(
+                        "tile set-master-ratio: ratio must be 0.0..=1.0",
+                    ))?;
+                    Ok(ParsedVerb::Display(ControlCommand::SetMasterRatio {
+                        ratio_x100: ratio,
+                    }))
+                }
+                _ => Err(ParseError::BadArgument(
+                    "tile: unknown subcommand (expected 'fullscreen' or 'set-master-ratio')",
+                )),
+            }
+        }
         other => Err(ParseError::UnknownVerb(String::from(other))),
+    }
+}
+
+/// Parse a policy name into the wire-side `kind` byte expected by
+/// `ControlCommand::SetLayout`. Mirrors the byte mapping in
+/// `display_server::main::policy_kind_to_byte`.
+fn parse_policy_kind(name: &str) -> Option<u8> {
+    match name {
+        "master-stack" | "master_stack" | "master" => Some(0),
+        "dwindle" => Some(1),
+        "spiral" => Some(2),
+        "grid" => Some(3),
+        "tabbed" => Some(4),
+        "fullscreen" => Some(5),
+        _ => None,
+    }
+}
+
+/// Parse a ratio string (`"0.55"`) into the u16 `ratio * 100` wire
+/// encoding.
+fn parse_ratio(s: &str) -> Option<u16> {
+    let f: f32 = s.parse().ok()?;
+    if !(0.0..=1.0).contains(&f) {
+        return None;
+    }
+    Some((f * 100.0) as u16)
+}
+
+/// Parse a `u8` written either as decimal or with a `0x` hex prefix.
+pub fn parse_u8(s: &str) -> Option<u8> {
+    if let Some(rest) = s.strip_prefix("0x") {
+        u8::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse().ok()
     }
 }
 

@@ -83,6 +83,24 @@ pub trait FramebufferOwner {
 
     /// Submit the current frame to the display server.
     fn submit(&mut self) -> bool;
+
+    /// Phase 72b — per-instance surface id. Used by the input-pull
+    /// path to tell `display_server` which client owns the events it
+    /// wants drained. Default returns `SurfaceId(0)` (never matches a
+    /// real registered surface) so host-test framebuffer fakes don't
+    /// have to thread a PID through.
+    fn surface_id(&self) -> kernel_core::display::protocol::SurfaceId {
+        kernel_core::display::protocol::SurfaceId(0)
+    }
+
+    /// Phase 72b — reallocate the surface buffer at the new
+    /// dimensions. Called from term's main loop when the compositor
+    /// sends `ServerMessage::SurfaceResized`. The default returns
+    /// `false` (no-op for host-test fakes); production
+    /// `DisplayClient` reallocates the SHM front+back pair.
+    fn resize(&mut self, _width: u32, _height: u32) -> bool {
+        false
+    }
 }
 
 /// One queued framebuffer op buffered between `apply` calls and
@@ -159,6 +177,14 @@ impl<F: FramebufferOwner> Renderer<F> {
             glyph_source: GlyphSource::Static,
             clear_only_defers: 0,
         }
+    }
+
+    /// Phase 72b — borrow the inner framebuffer mutably. Used by the
+    /// term main loop to invoke `DisplayClient`-specific calls
+    /// (`surface_id`, `resize`) without pulling the framebuffer back
+    /// out of the renderer.
+    pub fn fb_mut(&mut self) -> &mut F {
+        &mut self.fb
     }
 
     /// Phase 69c Track E.1/E.2 — install a TTF atlas as the runtime

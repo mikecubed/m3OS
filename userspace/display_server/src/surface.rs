@@ -267,6 +267,12 @@ struct ServerSurface {
     /// re-blitted this surface. Cleared by [`SurfaceRegistry::mark_clean`]
     /// after each compose pass.
     dirty: bool,
+    /// Phase 72b Track K.7 — owning client's protocol token. Set when
+    /// the surface is created via `ClientMessage::CreateSurface
+    /// { client_token, .. }`. Used by [`SurfaceRegistry::destroy_client_surfaces`]
+    /// to scope `Goodbye` teardown to the disconnecting client's
+    /// surfaces only.
+    client_token: u32,
 }
 
 /// Outcome of forwarding a [`ClientMessage`] into the registry.
@@ -400,6 +406,37 @@ impl SurfaceRegistry {
         self.surfaces.get(&surface_id).and_then(|s| s.role)
     }
 
+    /// Phase 72b Track K.7 — destroy every surface owned by
+    /// `client_token`. Called by the dispatcher when a `Goodbye`
+    /// arrives so that exactly the disconnecting client's surfaces are
+    /// torn down (not the entire registry, which Phase 70 preserved
+    /// across `Goodbye` to avoid wiping other clients' surfaces).
+    ///
+    /// Returns the list of `SurfaceId`s that were destroyed so the
+    /// caller can drop them from the workspace manager + focus tracker
+    /// + last-tile-dims map.
+    pub fn destroy_client_surfaces(&mut self, client_token: u32) -> Vec<SurfaceId> {
+        let owned: Vec<SurfaceId> = self
+            .surfaces
+            .iter()
+            .filter_map(|(id, s)| {
+                if s.client_token == client_token {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in &owned {
+            // `handle_message(DestroySurface)` runs the full teardown:
+            // state-machine event, layer-conflict release, cursor-owner
+            // clear. Use that path so cleanup stays single-sourced
+            // instead of duplicating the bookkeeping here.
+            let _ = self.handle_message(&ClientMessage::DestroySurface { surface_id: *id });
+        }
+        owned
+    }
+
     /// Receive a bulk-transported pixel buffer and queue it for the next
     /// `AttachBuffer` verb. Returns `true` if accepted, `false` if the
     /// pending-bulk queue is at [`MAX_PENDING_BULK`] and the dispatcher
@@ -470,7 +507,10 @@ impl SurfaceRegistry {
     ) -> Result<DispatchResult, SurfaceShimError> {
         let mut result = DispatchResult::default();
         match msg {
-            ClientMessage::CreateSurface { surface_id } => {
+            ClientMessage::CreateSurface {
+                surface_id,
+                client_token,
+            } => {
                 if self.surfaces.contains_key(surface_id) {
                     return Err(SurfaceShimError::DuplicateSurface(*surface_id));
                 }
@@ -482,6 +522,7 @@ impl SurfaceRegistry {
                         pending_buffer: None,
                         committed_buffer: None,
                         dirty: false,
+                        client_token: *client_token,
                     },
                 );
             }
@@ -679,7 +720,7 @@ impl SurfaceRegistry {
             }
             ClientMessage::AckConfigure { .. }
             | ClientMessage::Hello { .. }
-            | ClientMessage::Goodbye => {
+            | ClientMessage::Goodbye { .. } => {
                 // Hello / Goodbye / AckConfigure are dispatched at the
                 // client-loop level (C.5), not here.
             }
@@ -813,6 +854,21 @@ impl SurfaceRegistry {
     /// [`CursorRenderer`](kernel_core::display::cursor::CursorRenderer)
     /// trait (via `client_cursor()`), not as a regular layered surface.
     pub fn iter_compose(&self, output: Rect) -> Vec<ComposeEntry<'_>> {
+        self.iter_compose_filtered(output, |_| true)
+    }
+
+    /// Phase 72 — workspace-aware compose iterator. `include_toplevel`
+    /// is consulted for every `Toplevel`-role surface; returning
+    /// `false` skips that surface (it lives on a non-active
+    /// workspace). `Layer` / `Background` / `Overlay` surfaces are
+    /// always included (e.g. a status bar layer is visible across all
+    /// workspaces). Cursor-role surfaces are always skipped — they
+    /// render via the `CursorRenderer` path.
+    pub fn iter_compose_filtered<F: Fn(SurfaceId) -> bool>(
+        &self,
+        output: Rect,
+        include_toplevel: F,
+    ) -> Vec<ComposeEntry<'_>> {
         let mut entries = Vec::new();
         for (id, surface) in self.surfaces.iter() {
             let Some(buf) = surface.committed_buffer.as_ref() else {
@@ -834,10 +890,30 @@ impl SurfaceRegistry {
                     let geometry = compute_layer_geometry(output, &cfg, (buf.width, buf.height));
                     (layer_band, geometry)
                 }
-                Some(SurfaceRole::Toplevel) | None => (
-                    ComposeLayer::Toplevel,
-                    centre_rect(output, buf.width, buf.height),
-                ),
+                Some(SurfaceRole::Toplevel) => {
+                    if !include_toplevel(*id) {
+                        continue;
+                    }
+                    (
+                        ComposeLayer::Toplevel,
+                        centre_rect(output, buf.width, buf.height),
+                    )
+                }
+                // Phase 72 review fix — require an explicit
+                // `SetSurfaceRole(Toplevel)` before a surface joins
+                // the compose pass. Previously a role-less surface was
+                // treated as a Toplevel here, but the Phase 72
+                // workspace-sync path only inserts surfaces whose
+                // `outcome.created` reports `SurfaceRole::Toplevel`. A
+                // role-less surface would never join any workspace and
+                // would still be filtered out (invisible), so this
+                // arm was a phantom code path that disagreed with the
+                // insertion contract. All real clients (term, doom,
+                // greeter, display_client_ffi) send SetSurfaceRole
+                // before AttachSharedBuffer + CommitSurface; explicit
+                // omission of a role now means the surface stays
+                // unmapped until the client sends one.
+                None => continue,
             };
             entries.push(ComposeEntry {
                 id: *id,

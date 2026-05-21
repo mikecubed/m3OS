@@ -152,19 +152,25 @@ const DISABLE_DISPLAY_SERVER_MARKER: &[u8] = b"/etc/m3os-disable-display-server\
 /// same filter — no parallel "skip these" lists.
 const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0"];
 
-/// Phase 71 — basenames that are skipped when the graphical-only marker
-/// is NOT present. Init unconditionally writes both `term.conf` and
-/// `greeter.conf` to the disk image (see `xtask::populate_ext2_files`);
-/// at runtime, the init manifest loader applies one of two filters:
+/// Phase 71 / 72b — basenames that init's manifest loader skips based on
+/// boot mode. Init unconditionally tries every name in `KNOWN_CONFIGS`;
+/// the active filter blocks ones that don't belong in the current mode:
 ///
-/// - default boots (no marker): skip `greeter.conf` so the legacy term
-///   path keeps working unmodified, preserving compatibility with every
-///   existing smoke + regression test that drives the serial console.
-/// - graphical-only boots (marker present): skip `term.conf` so greeter
-///   is the sole spawner of the user term (via `setuid` + `execve` after
-///   authentication).
+/// - default boots (no graphical-only marker): skip `greeter.conf` so
+///   the framebuffer console/serial-autologin path keeps working
+///   unmodified.
+/// - graphical-only boots (marker present): skip nothing extra — the
+///   `term.conf` skip used by Phase 71 was retired in Phase 72b once
+///   `term.conf` stopped being staged as a default-mode service
+///   manifest. `term` is now launched by `display_server`'s
+///   `[autostart]` config in default GUI mode. In graphical-only mode
+///   greeter writes `/run/m3os-current-session` and exits cleanly
+///   after authentication — display_server stays up with no
+///   foreground app and the user spawns term explicitly via
+///   `SUPER+RETURN` (display_server's `SpawnTerm` chord handler).
+///   See `kernel-core::session_supervisor::DECLARED_SESSION_STEP_NAMES`.
 const GREETER_ONLY_SKIPPED_CONFS: &[&[u8]] = &[b"greeter.conf\0"];
-const GRAPHICAL_ONLY_SKIPPED_CONFS: &[&[u8]] = &[b"term.conf\0"];
+const GRAPHICAL_ONLY_SKIPPED_CONFS: &[&[u8]] = &[];
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
@@ -193,13 +199,13 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/session_manager.conf\0",
     // Phase 57 Track D.1: audio_server daemon (AC'97 driver).
     b"/etc/services.d/audio_server.conf\0",
-    // Phase 57 Track G: term — graphical terminal emulator.
-    // Phase 71: no longer auto-started by init. The `greeter` service
-    // below execs `/bin/term` itself on successful authentication so
-    // the `term` process inherits the user's UID/GID. The entry stays
-    // in the fallback list (best-effort; not present on disk) so a
-    // future operator-controlled term-restart path can re-enable it
-    // by writing a manifest manually.
+    // Phase 72b — `term.conf` is staged only in smoke-test mode (or
+    // when `M3OS_LEGACY_TERM_CONF=1` is passed to `xtask`). In default
+    // GUI mode and graphical-only mode, `term` is launched via the
+    // compositor's `[autostart]` or by greeter's in-process execve
+    // respectively; init does not supervise it. We keep the path in
+    // `KNOWN_CONFIGS` so the entry loads gracefully on every boot
+    // mode (best-effort, no error if absent).
     b"/etc/services.d/term.conf\0",
     // Phase 71: greeter — GUI login manager. Spawns the login form,
     // authenticates against /etc/passwd + /etc/shadow, and on success

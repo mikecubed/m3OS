@@ -110,6 +110,43 @@ impl ComposeContext {
     pub fn damage_tracker(&self) -> &DamageTracker {
         &self.damage_tracker
     }
+
+    /// Phase 72b — request a full-screen repaint on the next compose
+    /// pass. Called from the surface-lifecycle path in `main.rs` when
+    /// a Toplevel surface is destroyed, so stale pixels left in the
+    /// framebuffer by the dying surface (or by greeter on logout) get
+    /// cleared instead of bleeding through the gaps between live
+    /// tiles. `run_compose_filtered`'s first-compose branch already
+    /// understands `mark_full_repaint` — flipping it once here is
+    /// enough; the next pass clears the whole output and re-blits
+    /// every live surface.
+    pub fn force_full_repaint(&mut self) {
+        self.damage_tracker.mark_full_repaint();
+        // Resetting `prev_pointer`/`prev_cursor_size` to `None` also
+        // triggers `is_first_compose` in `run_compose_filtered`, which
+        // re-runs `clear_rect_to_background(output)` on the whole FB
+        // before the surface pass. Belt-and-suspenders.
+        self.prev_pointer = None;
+        self.prev_cursor_size = None;
+    }
+
+    /// Phase 72 review-resolution — invalidate the cached arrangement
+    /// so the next compose pass calls `layout.arrange(..)` again. The
+    /// id-set check in `run_compose_filtered` only catches arrangement
+    /// changes when surfaces are added or removed; SetLayout / SetMaster
+    /// Ratio / TileFullscreen / resize-mode adjustments mutate the
+    /// active policy's internal state with the same id set, so the
+    /// cached `Vec<(SurfaceId, Rect)>` would otherwise survive across
+    /// the policy switch and the screen would stay tiled under the
+    /// previous policy until something else (a new toplevel, a destroy)
+    /// happened to change the id set.
+    ///
+    /// Clearing `cached_toplevel_ids` is the minimal invalidation: the
+    /// next compose pass's id-set comparison will report a mismatch
+    /// even if the live id set is identical, forcing the recompute.
+    pub fn invalidate_arrangement_cache(&mut self) {
+        self.cached_toplevel_ids.clear();
+    }
 }
 
 impl Default for ComposeContext {
@@ -135,6 +172,41 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     ctx: &mut ComposeContext,
     pointer_position: (i32, i32),
 ) -> Result<usize, ComposeError> {
+    run_compose_filtered(
+        owner,
+        layout,
+        registry,
+        ctx,
+        pointer_position,
+        |_| true,
+        None,
+        None,
+    )
+}
+
+/// Phase 72 — workspace + border-aware compose entry point.
+///
+/// `include_toplevel` filters `iter_compose` so only the current
+/// workspace's Toplevels are blitted. `border_cfg`, when `Some`,
+/// paints active / inactive borders around every Toplevel rect after
+/// the surface blit completes. `focused_id` selects which border uses
+/// the active colour.
+#[allow(clippy::too_many_arguments)]
+pub fn run_compose_filtered<O, L, F>(
+    owner: &mut O,
+    layout: &mut L,
+    registry: &mut SurfaceRegistry,
+    ctx: &mut ComposeContext,
+    pointer_position: (i32, i32),
+    include_toplevel: F,
+    border_cfg: Option<crate::borders::BorderConfig>,
+    focused_id: Option<SurfaceId>,
+) -> Result<usize, ComposeError>
+where
+    O: FramebufferOwner,
+    L: LayoutPolicy,
+    F: Fn(SurfaceId) -> bool + Copy,
+{
     let meta = owner.metadata();
     let output = Rect {
         x: 0,
@@ -192,7 +264,20 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // Wiring the tracker into the general-path clip decision is a
     // documented Phase 68 follow-up.
     let surface_damage = registry.has_damage();
-    if !surface_damage && !cursor_motion {
+    // Phase 72b — bypass the no-op gate when a full repaint was
+    // requested via `ComposeContext::force_full_repaint`. The gate
+    // existed before per-surface clip rects: the old assumption was
+    // "no surface damage and no cursor motion => nothing on screen
+    // changes, so skip the frame entirely." With the clip-rect
+    // change and the arrangement-change path that calls
+    // `force_full_repaint` when tiles resize, a fresh window can
+    // arrive in a frame where no live surface has new damage (the
+    // new surface hasn't committed a buffer yet, the existing tile
+    // dims changed but the buffer didn't). Without this bypass we
+    // skip the `is_first_compose` clear and the now-uncovered gap
+    // regions keep stale pixels from before the arrangement change.
+    let force_full = ctx.damage_tracker.is_full_repaint_needed();
+    if !surface_damage && !cursor_motion && !force_full {
         return Ok(0);
     }
 
@@ -231,7 +316,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // `usable_rect` shrinking is on for any future tiling layout that
     // honours `LayoutPolicy::arrange` output.
     let toplevels: Vec<LayoutSurface> = registry
-        .iter_compose(output)
+        .iter_compose_filtered(output, include_toplevel)
         .iter()
         .filter(|e| {
             matches!(
@@ -264,7 +349,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     }
     let arrangement = &ctx.cached_arrangement;
 
-    let entries = registry.iter_compose(output);
+    let entries = registry.iter_compose_filtered(output, include_toplevel);
 
     // First-compose-pass background wipe. On the first call (and again
     // any time `ComposeContext` was reset, e.g. on client close) the
@@ -354,11 +439,55 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         // surface that does not overlap the cursor union contributes
         // zero blits (its local damage list survives the clip as
         // empty / out-of-bounds and is skipped).
-        let local_damages: Vec<Vec<Rect>> = entries
-            .iter()
-            .map(|entry| {
+        // Phase 72b — surface preparation for the cursor-only fast
+        // path. Mirrors the main-path scaling: for Toplevels whose
+        // buffer dims differ from their tile (e.g. DOOM, or a term
+        // mid-resize), substitute a tile-sized scaled snapshot and
+        // use full-tile damage so the cursor-overpaint pass re-blits
+        // the scaled content rather than the centred native-resolution
+        // surface.
+        let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+        let mut effective_damages: Vec<Vec<Rect>> = Vec::with_capacity(entries.len());
+        let mut effective_rects: Vec<Rect> = Vec::with_capacity(entries.len());
+        let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let original = entry.buf.pixels_snapshot();
+            let tile = tile_for_entry(entry, arrangement);
+            let should_scale = match tile {
+                Some(t) => {
+                    matches!(
+                        entry.layer,
+                        kernel_core::display::compose::ComposeLayer::Toplevel
+                    ) && entry.buf.width > 0
+                        && entry.buf.height > 0
+                        && t.w > 0
+                        && t.h > 0
+                        && (entry.buf.width != t.w || entry.buf.height != t.h)
+                }
+                None => false,
+            };
+            if should_scale {
+                let tile = tile.expect("checked above");
+                let scaled = nearest_neighbour_scale(
+                    &original,
+                    entry.buf.width,
+                    entry.buf.height,
+                    tile.w,
+                    tile.h,
+                );
+                snapshots.push(scaled);
+                effective_damages.push(alloc::vec![Rect {
+                    x: 0,
+                    y: 0,
+                    w: tile.w,
+                    h: tile.h,
+                }]);
+                effective_rects.push(tile);
+                scaled_flags.push(true);
+            } else {
+                snapshots.push(original);
                 let surface_rect = surface_screen_rect(entry, arrangement);
-                cursor_repaint
+                let local: Vec<Rect> = cursor_repaint
                     .iter()
                     .filter_map(|sr| {
                         let dx = (sr.x as i64) - (surface_rect.x as i64);
@@ -372,28 +501,28 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
                             h: sr.h,
                         })
                     })
-                    .collect()
-            })
-            .collect();
-
-        let snapshots: Vec<Vec<u8>> = entries
-            .iter()
-            .map(|entry| entry.buf.pixels_snapshot())
-            .collect();
+                    .collect();
+                effective_damages.push(local);
+                effective_rects.push(surface_rect);
+                scaled_flags.push(false);
+            }
+        }
 
         let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-        for ((entry, dmg), snapshot) in entries
-            .iter()
-            .zip(local_damages.iter())
-            .zip(snapshots.iter())
-        {
+        for (entry, idx) in entries.iter().zip(0..) {
+            let clip_rect = if scaled_flags[idx] {
+                None
+            } else {
+                surface_tile_clip(entry, arrangement)
+            };
             compose.push(ComposeSurface {
                 id: entry.id,
                 layer: entry.layer,
-                rect: surface_screen_rect(entry, arrangement),
-                damage: &dmg[..],
-                pixels: snapshot.as_slice(),
+                rect: effective_rects[idx],
+                damage: effective_damages[idx].as_slice(),
+                pixels: snapshots[idx].as_slice(),
                 opaque: entry.is_opaque(),
+                clip_rect,
             });
         }
 
@@ -459,25 +588,156 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
     // are inherent to the cross-process editing pattern; the
     // resulting `Vec<u8>` is a single-point-in-time view that the
     // rest of the compose pass treats as stable.
-    let snapshots: Vec<Vec<u8>> = entries
-        .iter()
-        .map(|entry| entry.buf.pixels_snapshot())
-        .collect();
+    // Phase 72b — per-entry pixel buffer. For most surfaces this is
+    // `entry.buf.pixels_snapshot()` as before. For Toplevel surfaces
+    // whose buffer dimensions don't match their assigned tile (e.g.
+    // DOOM, which never resizes its 1280×800 backing buffer regardless
+    // of the tile it lands in) we synthesise a *scaled* snapshot via
+    // nearest-neighbour sampling so the rendered output fills the
+    // tile instead of being letterboxed centred at native resolution.
+    //
+    // The scale triggers on any dim mismatch, scaling up or down:
+    // term during its post-`SurfaceResized` transient shows briefly
+    // scaled content while it reallocates its SHM, then naturally
+    // settles to surf == tile and the scale path becomes a no-op.
+    // Aspect ratio IS preserved — for DOOM in a non-1.6:1 tile this
+    // produces letterbox bars on the constrained axis rather than
+    // distorting the rendered world. Games would be visibly wrong
+    // under stretch-mode scaling; non-game clients tolerate the
+    // brief letterbox during their resize transient just fine.
+    //
+    // Parallel `Vec<Vec<Rect>>` holds the override damage for scaled
+    // surfaces — a single full-tile rect, replacing the surface-local
+    // damage list that compose_frame would otherwise translate.
+    let mut snapshots: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let mut scaled_damages: Vec<Vec<Rect>> = Vec::with_capacity(entries.len());
+    let mut effective_rects: Vec<Rect> = Vec::with_capacity(entries.len());
+    let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        let original = entry.buf.pixels_snapshot();
+        let tile = tile_for_entry(entry, arrangement);
+        let should_scale = match tile {
+            Some(t) => {
+                matches!(
+                    entry.layer,
+                    kernel_core::display::compose::ComposeLayer::Toplevel
+                ) && entry.buf.width > 0
+                    && entry.buf.height > 0
+                    && t.w > 0
+                    && t.h > 0
+                    && (entry.buf.width != t.w || entry.buf.height != t.h)
+            }
+            None => false,
+        };
+        if should_scale {
+            let tile = tile.expect("checked above");
+            let scaled = nearest_neighbour_scale(
+                &original,
+                entry.buf.width,
+                entry.buf.height,
+                tile.w,
+                tile.h,
+            );
+            snapshots.push(scaled);
+            scaled_damages.push(alloc::vec![Rect {
+                x: 0,
+                y: 0,
+                w: tile.w,
+                h: tile.h,
+            }]);
+            effective_rects.push(tile);
+            scaled_flags.push(true);
+        } else {
+            snapshots.push(original);
+            scaled_damages.push(Vec::new());
+            effective_rects.push(surface_screen_rect(entry, arrangement));
+            scaled_flags.push(false);
+        }
+    }
 
     let mut compose: Vec<ComposeSurface<'_>> = Vec::with_capacity(entries.len());
-    for ((entry, dmg), snapshot) in entries.iter().zip(damages.iter()).zip(snapshots.iter()) {
+    for (((entry, dmg), snapshot), idx) in entries
+        .iter()
+        .zip(damages.iter())
+        .zip(snapshots.iter())
+        .zip(0..)
+    {
+        // For scaled surfaces, the pixel buffer has tile dimensions
+        // and a single full-tile damage rect — clip_rect is None
+        // because the surface IS the tile, no overflow to clip.
+        // For non-scaled surfaces, take the existing letterbox-and-
+        // clip path so a too-large buffer stays bounded by the tile.
+        let (damage_slice, clip_rect): (&[Rect], Option<Rect>) = if scaled_flags[idx] {
+            (scaled_damages[idx].as_slice(), None)
+        } else {
+            (&dmg[..], surface_tile_clip(entry, arrangement))
+        };
         compose.push(ComposeSurface {
             id: entry.id,
             layer: entry.layer,
-            rect: surface_screen_rect(entry, arrangement),
-            damage: &dmg[..],
+            rect: effective_rects[idx],
+            damage: damage_slice,
             pixels: snapshot.as_slice(),
             opaque: entry.is_opaque(),
+            clip_rect,
         });
     }
 
-    let surface_writes = compose_frame(owner, output, &mut compose)?;
+    let mut surface_writes = compose_frame(owner, output, &mut compose)?;
+
+    // Phase 72 Track E — paint borders around every Toplevel tile
+    // after the surface blit so they always sit on top of the surface
+    // pixels. Active / inactive colour selection is driven by the
+    // `focused_id` argument; `border_cfg = None` (Phase 56-compat
+    // floating layout) skips the pass entirely.
+    //
+    // Borders use the **tile rect** from `arrangement`, not the
+    // letterboxed buffer rect from `surface_screen_rect`: a tile
+    // smaller than the surface (or vice-versa) still gets a border
+    // that traces the actual layout partition. Snapshot the rect /
+    // id / layer triples first so we can `mark_clean` (mutable
+    // registry borrow) immediately and free the immutable `entries`
+    // borrow before the cursor blit needs to touch the framebuffer.
+    let border_targets: Vec<(SurfaceId, Rect)> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.layer,
+                kernel_core::display::compose::ComposeLayer::Toplevel
+            )
+        })
+        .map(|e| {
+            // Prefer the layout policy's tile rect when the surface is
+            // tiled; fall back to the surface's own rect for the Phase
+            // 56-compat floating path (which passes an empty
+            // `arrangement`).
+            let rect = arrangement
+                .iter()
+                .find(|(id, _)| *id == e.id)
+                .map(|(_, tile)| *tile)
+                .unwrap_or(e.rect);
+            (e.id, rect)
+        })
+        .collect();
+    drop(compose);
+    drop(snapshots);
+    drop(entries);
     registry.mark_clean();
+
+    if let Some(cfg) = border_cfg
+        && cfg.width > 0
+    {
+        for (id, rect) in border_targets.iter() {
+            let color = if focused_id == Some(*id) {
+                cfg.active_color
+            } else {
+                cfg.inactive_color
+            };
+            let written = crate::borders::paint_border(owner, *rect, cfg.width, color)
+                .map_err(ComposeError::from)?;
+            surface_writes = surface_writes.saturating_add(written);
+        }
+    }
 
     // Phase 56 E.3 — blit the cursor on top.
     //
@@ -513,12 +773,148 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 /// policy's arrangement for `Toplevel` surfaces while leaving
 /// `Layer` / `Cursor` / `Background` rects unchanged.
 ///
-/// Phase 56 close-out (G.1): without this lookup, every `Toplevel`
-/// would composite at the same `centre_rect` position and only the
-/// top-of-z-order surface would be observable in the multi-client
-/// coexistence regression. The cursor-only fast path also calls this
-/// to keep the surface→cursor-damage translation consistent with the
-/// slow-path placement.
+/// Phase 72 — `compose_frame` requires `surface.rect.w/h` to match
+/// `surface.pixels.len() / bpp` (the buffer's intrinsic dimensions);
+/// a tiling policy may assign a tile rect that differs from those
+/// dimensions, so we **letterbox** the surface centred within its
+/// assigned tile. The returned rect always carries the buffer's
+/// intrinsic width / height; only `x` / `y` are derived from the
+/// tile centre. `compose_frame`'s clip-to-output handles the case
+/// where the surface is larger than its tile (it spills out and
+/// gets clipped at the output edge — the documented deferral for
+/// DOOM in the Phase 72 spec).
+/// Phase 72b Track K.3 follow-up — per-surface clip rect for tiled
+/// `Toplevel` surfaces. Returns `Some(tile_rect)` when the surface is
+/// tiled and its buffer extends past the tile boundary; the composer
+/// passes this through to `compose_frame` which intersects every blit
+/// damage rect with it. `None` for non-Toplevel layers and for the
+/// Phase 56 floating-layout fallback (empty arrangement) so existing
+/// behaviour is preserved exactly when there's no tile to clip to.
+fn surface_tile_clip(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+) -> Option<Rect> {
+    if !matches!(
+        entry.layer,
+        kernel_core::display::compose::ComposeLayer::Toplevel
+    ) {
+        return None;
+    }
+    let (_, tile) = arrangement.iter().find(|(id, _)| *id == entry.id)?;
+    Some(*tile)
+}
+
+/// Phase 72b — return the assigned tile rect for a Toplevel entry, or
+/// `None` if no tile is assigned (floating layout, Layer / Cursor /
+/// Background surface).
+fn tile_for_entry(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+) -> Option<Rect> {
+    if !matches!(
+        entry.layer,
+        kernel_core::display::compose::ComposeLayer::Toplevel
+    ) {
+        return None;
+    }
+    arrangement
+        .iter()
+        .find(|(id, _)| *id == entry.id)
+        .map(|(_, tile)| *tile)
+}
+
+/// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of
+/// `src_w × src_h` into a tile-sized destination buffer of `dst_w ×
+/// dst_h`, **preserving the source aspect ratio**. The scaled image
+/// is centred inside the destination; any unused strip on the short
+/// axis is filled with `crate::BG_PIXEL`, producing horizontal or
+/// vertical letterbox bars depending on which axis is constrained.
+///
+/// Used for client surfaces (DOOM, plus any other fixed-size client
+/// that doesn't resize its buffer in response to
+/// `ServerMessage::SurfaceResized`). Aspect-preserving is the correct
+/// behaviour for games — squishing DOOM into a non-1.6:1 tile by
+/// stretching would distort the rendered world; players notice
+/// immediately.
+///
+/// Scales up *and* down. Pure logic: no I/O, no allocation beyond
+/// the returned `Vec<u8>`. Nearest-neighbour was chosen over bilinear
+/// because DOOM's chunky pixel-art aesthetic looks intentionally
+/// crisp under integer scaling; bilinear would smear it. Smoother
+/// filters can be added per-client when a real use case arrives.
+fn nearest_neighbour_scale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    const BPP: usize = 4;
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let src_w_usize = src_w as usize;
+    let src_h_usize = src_h as usize;
+    let dst_w_usize = dst_w as usize;
+    let dst_h_usize = dst_h as usize;
+    let src_stride = src_w_usize * BPP;
+    let dst_stride = dst_w_usize * BPP;
+
+    // Aspect-preserving fit: pick the smaller of the two per-axis
+    // ratios so the scaled image fits entirely inside the destination
+    // rect. Using integer math, compare `dst_w/src_w` vs `dst_h/src_h`
+    // via cross-multiply (a/b ≤ c/d ⇔ ad ≤ bc).
+    let (scaled_w, scaled_h) = {
+        let lhs = dst_w_usize * src_h_usize;
+        let rhs = dst_h_usize * src_w_usize;
+        if lhs <= rhs {
+            // Width axis is the constraint.
+            let w = dst_w_usize;
+            let h = ((src_h_usize * dst_w_usize) / src_w_usize).max(1);
+            (w, h.min(dst_h_usize))
+        } else {
+            // Height axis is the constraint.
+            let h = dst_h_usize;
+            let w = ((src_w_usize * dst_h_usize) / src_h_usize).max(1);
+            (w.min(dst_w_usize), h)
+        }
+    };
+    let off_x = (dst_w_usize - scaled_w) / 2;
+    let off_y = (dst_h_usize - scaled_h) / 2;
+
+    // Pre-fill the destination with the compositor background colour
+    // so the letterbox bars on the unused axis match the rest of the
+    // gap-fill convention. Skipped axes (where scaled_w == dst_w or
+    // scaled_h == dst_h) leave a zero-byte band that the scaled
+    // content immediately overwrites — the prefill is cheap relative
+    // to the per-pixel sample loop.
+    let bg_bytes = crate::BG_PIXEL.to_le_bytes();
+    let mut out = alloc::vec![0u8; dst_stride * dst_h_usize];
+    for px in 0..(dst_w_usize * dst_h_usize) {
+        let off = px * BPP;
+        let take = BPP.min(bg_bytes.len());
+        out[off..off + take].copy_from_slice(&bg_bytes[..take]);
+    }
+
+    // Pre-compute the source-column index for every destination
+    // column inside the scaled region. Sharing this across rows keeps
+    // the inner loop's arithmetic to one multiply and a 4-byte copy
+    // per pixel.
+    let mut src_cols: Vec<usize> = Vec::with_capacity(scaled_w);
+    for dx in 0..scaled_w {
+        let sx = (dx * src_w_usize) / scaled_w;
+        src_cols.push(sx.min(src_w_usize - 1));
+    }
+    for dy in 0..scaled_h {
+        let sy = ((dy * src_h_usize) / scaled_h).min(src_h_usize - 1);
+        let src_row_start = sy * src_stride;
+        let dst_row_start = (dy + off_y) * dst_stride;
+        for dx in 0..scaled_w {
+            let sx = src_cols[dx];
+            let src_off = src_row_start + sx * BPP;
+            let dst_off = dst_row_start + (dx + off_x) * BPP;
+            if src_off + BPP <= src.len() && dst_off + BPP <= out.len() {
+                out[dst_off..dst_off + BPP].copy_from_slice(&src[src_off..src_off + BPP]);
+            }
+        }
+    }
+    out
+}
+
 fn surface_screen_rect(
     entry: &crate::surface::ComposeEntry<'_>,
     arrangement: &[(SurfaceId, Rect)],
@@ -527,11 +923,21 @@ fn surface_screen_rect(
         entry.layer,
         kernel_core::display::compose::ComposeLayer::Toplevel
     ) {
-        arrangement
-            .iter()
-            .find(|(id, _)| *id == entry.id)
-            .map(|(_, r)| *r)
-            .unwrap_or(entry.rect)
+        if let Some((_, tile)) = arrangement.iter().find(|(id, _)| *id == entry.id) {
+            // Letterbox: keep buffer dimensions, center inside the tile.
+            let surf_w = entry.buf.width;
+            let surf_h = entry.buf.height;
+            let dx = ((tile.w as i32) - (surf_w as i32)) / 2;
+            let dy = ((tile.h as i32) - (surf_h as i32)) / 2;
+            Rect {
+                x: tile.x.saturating_add(dx),
+                y: tile.y.saturating_add(dy),
+                w: surf_w,
+                h: surf_h,
+            }
+        } else {
+            entry.rect
+        }
     } else {
         entry.rect
     }
