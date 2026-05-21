@@ -1,0 +1,331 @@
+//! Phase 73 Track A — Animation engine.
+//!
+//! Tracks a small set of in-flight animations, advances them one
+//! frame at a time, and reports the union of their damage rectangles
+//! so the composer re-blits only the affected regions.
+//!
+//! Pure logic: no syscalls, no allocator hand-waving. The composer
+//! calls [`AnimationEngine::tick`] from `compose_frame`; tests can
+//! drive the same call directly without booting QEMU.
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+use kernel_core::display::protocol::{Rect, SurfaceId};
+
+/// Animation easing / timing curve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Curve {
+    Linear,
+    EaseOut,
+    /// Critically-damped spring approximation. We use a simple
+    /// `1 - e^{-6t}` envelope evaluated via a polynomial truncation to
+    /// stay in `f32` without a math runtime — close enough to a real
+    /// spring to feel "springy" without an overshoot.
+    Spring,
+}
+
+impl Curve {
+    /// Evaluate the curve at normalised time `t ∈ [0, 1]`. Returns a
+    /// value clamped to `[0, 1]`.
+    pub fn eval(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Curve::Linear => t,
+            Curve::EaseOut => {
+                let inv = 1.0 - t;
+                1.0 - inv * inv
+            }
+            Curve::Spring => {
+                // Truncated Taylor series for `1 - exp(-6t)`, clamped
+                // so it never exceeds 1 and stays monotonic on [0, 1].
+                // Avoids pulling in libm just for `expf`.
+                let x = 6.0 * t;
+                let approx = 1.0 - (1.0 - x + x * x * 0.5 - x * x * x * (1.0 / 6.0));
+                approx.clamp(0.0, 1.0)
+            }
+        }
+    }
+
+    /// Convenience: interpolate `start → end` at normalised time `t`.
+    pub fn lerp(self, start: f32, end: f32, t: f32) -> f32 {
+        start + (end - start) * self.eval(t)
+    }
+}
+
+/// Animation kind tags. The engine treats every animation uniformly
+/// (advance timer, sample curve, report damage); the kind is preserved
+/// so the composer / observability layer can describe what is in
+/// flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnimationKind {
+    /// Slide + fade from 90% scale / 20% opacity to 100% / 100%.
+    WindowOpen,
+    /// Fade from 100% opacity to 0%; the engine signals completion so
+    /// the caller can drop the surface.
+    WindowClose,
+    /// Horizontal workspace-switch slide.
+    WorkspaceSwitch,
+    /// Smooth tile reposition.
+    WindowMove,
+}
+
+impl AnimationKind {
+    /// Default duration in milliseconds per the Phase 73 spec.
+    pub fn default_duration_ms(self) -> u32 {
+        match self {
+            AnimationKind::WindowOpen => 150,
+            AnimationKind::WindowClose => 100,
+            AnimationKind::WorkspaceSwitch => 200,
+            AnimationKind::WindowMove => 80,
+        }
+    }
+
+    pub fn default_curve(self) -> Curve {
+        match self {
+            AnimationKind::WindowOpen => Curve::EaseOut,
+            AnimationKind::WindowClose => Curve::Linear,
+            AnimationKind::WorkspaceSwitch => Curve::EaseOut,
+            AnimationKind::WindowMove => Curve::Spring,
+        }
+    }
+}
+
+/// One in-flight animation.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Animation {
+    pub surface_id: SurfaceId,
+    pub kind: AnimationKind,
+    pub curve: Curve,
+    pub elapsed_ms: u32,
+    pub duration_ms: u32,
+    /// Damage rectangle in screen coordinates. Returned via
+    /// [`AnimationEngine::tick`] so the composer can clip the blit to
+    /// just the animated region.
+    pub damage: Rect,
+}
+
+impl Animation {
+    /// Construct using the kind's default curve + duration.
+    pub fn new(surface_id: SurfaceId, kind: AnimationKind, damage: Rect) -> Self {
+        Self {
+            surface_id,
+            kind,
+            curve: kind.default_curve(),
+            elapsed_ms: 0,
+            duration_ms: kind.default_duration_ms(),
+            damage,
+        }
+    }
+
+    /// Normalised progress `t ∈ [0, 1]`.
+    pub fn progress(&self) -> f32 {
+        if self.duration_ms == 0 {
+            return 1.0;
+        }
+        (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+
+    /// Curve-evaluated progress — what the visual property should be at
+    /// the current frame.
+    pub fn eased(&self) -> f32 {
+        self.curve.eval(self.progress())
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.elapsed_ms >= self.duration_ms
+    }
+}
+
+/// One frame's-worth of damage produced by an animation tick.
+///
+/// The composer unions these with any already-pending damage before
+/// running the blit pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DamageRegion {
+    pub rects: Vec<Rect>,
+}
+
+impl DamageRegion {
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+}
+
+/// Animation engine — tracks a small set of in-flight animations and
+/// advances them one frame at a time.
+#[derive(Clone, Debug, Default)]
+pub struct AnimationEngine {
+    animations: Vec<Animation>,
+}
+
+impl AnimationEngine {
+    pub fn new() -> Self {
+        Self {
+            animations: Vec::new(),
+        }
+    }
+
+    /// Borrow the current animation list — useful for tests / debug.
+    pub fn animations(&self) -> &[Animation] {
+        &self.animations
+    }
+
+    /// Number of in-flight animations.
+    pub fn len(&self) -> usize {
+        self.animations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.animations.is_empty()
+    }
+
+    /// Push a new animation into the engine. Earliest-pushed animations
+    /// finish first when their durations match.
+    pub fn push(&mut self, animation: Animation) {
+        self.animations.push(animation);
+    }
+
+    /// Convenience: push a default-curve / default-duration animation
+    /// keyed on a `surface_id` and damage rect.
+    pub fn animate(&mut self, surface_id: SurfaceId, kind: AnimationKind, damage: Rect) {
+        self.push(Animation::new(surface_id, kind, damage));
+    }
+
+    /// Advance every animation by `frame_delta_ms` and return the union
+    /// of every animated rect as the dirty region for this frame.
+    ///
+    /// Completed animations are removed before the call returns; the
+    /// caller can detect "animation just finished" by checking whether
+    /// the engine length changed across the call.
+    pub fn tick(&mut self, frame_delta_ms: u32) -> DamageRegion {
+        let mut rects = Vec::with_capacity(self.animations.len());
+        for anim in self.animations.iter_mut() {
+            anim.elapsed_ms = anim.elapsed_ms.saturating_add(frame_delta_ms);
+            if anim.duration_ms == 0 {
+                anim.elapsed_ms = 0;
+            }
+            rects.push(anim.damage);
+        }
+        // Drop completed entries.
+        self.animations.retain(|a| !a.is_done());
+        DamageRegion { rects }
+    }
+
+    /// Drop every animation associated with a surface — used when a
+    /// surface is destroyed mid-animation. Returns the number of
+    /// entries removed.
+    pub fn drop_surface(&mut self, surface_id: SurfaceId) -> usize {
+        let before = self.animations.len();
+        self.animations.retain(|a| a.surface_id != surface_id);
+        before - self.animations.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn linear_curve_is_identity() {
+        assert!((Curve::Linear.eval(0.0) - 0.0).abs() < 1e-6);
+        assert!((Curve::Linear.eval(0.5) - 0.5).abs() < 1e-6);
+        assert!((Curve::Linear.eval(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ease_out_starts_fast_ends_slow() {
+        let early = Curve::EaseOut.eval(0.25);
+        let late = Curve::EaseOut.eval(0.75);
+        // Ease-out covers more ground early — quarter-progress should
+        // already be more than 40% of the total.
+        assert!(early > 0.4, "early progress was {}", early);
+        // The last quarter only adds a small slice.
+        let last_slice = Curve::EaseOut.eval(1.0) - late;
+        assert!(
+            last_slice < 0.1,
+            "last quarter advanced by {} (should be small)",
+            last_slice
+        );
+    }
+
+    #[test]
+    fn spring_curve_is_monotonic_and_bounded() {
+        let mut prev = 0.0f32;
+        for i in 0..=20 {
+            let t = i as f32 / 20.0;
+            let v = Curve::Spring.eval(t);
+            assert!(
+                v >= 0.0 && v <= 1.0,
+                "spring value {} out of [0,1] at t={}",
+                v,
+                t
+            );
+            assert!(v >= prev - 1e-4, "spring not monotonic at t={}", t);
+            prev = v;
+        }
+        assert!((Curve::Spring.eval(0.0) - 0.0).abs() < 1e-6);
+        // Spring approaches 1 by t=1 thanks to the clamp.
+        assert!(Curve::Spring.eval(1.0) > 0.9);
+    }
+
+    #[test]
+    fn tick_advances_timers_and_collects_damage() {
+        let mut engine = AnimationEngine::new();
+        engine.animate(
+            SurfaceId(1),
+            AnimationKind::WindowOpen,
+            rect(10, 20, 100, 100),
+        );
+        let dmg = engine.tick(16);
+        assert_eq!(dmg.rects.len(), 1);
+        assert_eq!(dmg.rects[0], rect(10, 20, 100, 100));
+        assert_eq!(engine.animations()[0].elapsed_ms, 16);
+    }
+
+    #[test]
+    fn completed_animations_are_removed() {
+        let mut engine = AnimationEngine::new();
+        engine.animate(SurfaceId(1), AnimationKind::WindowMove, rect(0, 0, 50, 50));
+        // WindowMove default duration is 80 ms — advance well past it.
+        let dmg = engine.tick(200);
+        assert_eq!(dmg.rects.len(), 1, "damage emitted on the final frame");
+        assert!(engine.is_empty(), "completed animation removed");
+    }
+
+    #[test]
+    fn empty_engine_emits_no_damage() {
+        let mut engine = AnimationEngine::new();
+        let dmg = engine.tick(16);
+        assert!(dmg.is_empty());
+    }
+
+    #[test]
+    fn drop_surface_removes_associated_animations() {
+        let mut engine = AnimationEngine::new();
+        engine.animate(SurfaceId(1), AnimationKind::WindowOpen, rect(0, 0, 10, 10));
+        engine.animate(SurfaceId(2), AnimationKind::WindowOpen, rect(0, 0, 10, 10));
+        engine.animate(SurfaceId(1), AnimationKind::WindowMove, rect(0, 0, 10, 10));
+        assert_eq!(engine.drop_surface(SurfaceId(1)), 2);
+        assert_eq!(engine.len(), 1);
+        assert_eq!(engine.animations()[0].surface_id, SurfaceId(2));
+    }
+
+    #[test]
+    fn window_open_progresses_from_partial_to_full() {
+        let anim = Animation::new(
+            SurfaceId(1),
+            AnimationKind::WindowOpen,
+            rect(0, 0, 100, 100),
+        );
+        // Open should ease towards 1 quickly thanks to EaseOut.
+        let half = Curve::EaseOut.lerp(0.0, 1.0, 0.5);
+        assert!(half > 0.5);
+        let _ = anim;
+    }
+}

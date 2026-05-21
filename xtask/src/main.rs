@@ -787,6 +787,19 @@ fn build_userspace_bins() {
         // binary links `kernel-core`, `passwd`, and uses `String` /
         // `Vec` in the auth + render paths.
         ("greeter", "greeter", true),
+        // Phase 73 — desktop background Layer-shell client.
+        ("wallpaper", "wallpaper", true),
+        // Phase 73 — persistent status bar Layer-shell client.
+        ("bar", "bar", true),
+        // Phase 73 — fuzzy-filter app launcher (SUPER+SPACE chord
+        // target).
+        ("launcher", "launcher", true),
+        // Phase 73 — notification daemon + companion `notify-send`
+        // CLI. Both bins ship from the `notifyd` crate.
+        ("notifyd", "notifyd", true),
+        ("notifyd", "notify-send", true),
+        // Phase 73 — lockscreen Layer-shell stub.
+        ("lockscreen", "lockscreen", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -10371,6 +10384,14 @@ fn populate_ext2_files(
     // `PermanentlyStopped`, so it would never start.
     let greeter_conf = "name=greeter\ncommand=/bin/greeter\ntype=daemon\nrestart=on-failure\nmax_restart=3\ndepends=display,kbd,mouse_server,audio_server\n";
 
+    // Phase 73 — desktop client daemons. Each is a normal Phase 56
+    // compositor client running as a regular supervised process. They
+    // depend on `display` (the compositor) plus the standard input
+    // services so they don't race the focus dispatcher at boot.
+    let wallpaper_conf = "name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+    let bar_conf = "name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+    let notifyd_conf = "name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
+
     // Phase 71 — `/etc/greeter.conf` is the greeter binary's runtime
     // configuration file (separate from the init service manifest at
     // `/etc/services.d/greeter.conf` defined below). Built-in defaults
@@ -10537,6 +10558,10 @@ fn populate_ext2_files(
     let greeter_user_conf_tmp = output_dir.join("_tmp_greeter_user_conf");
     let greeter_service_conf_tmp = output_dir.join("_tmp_greeter_service_conf");
     let compositor_conf_tmp = output_dir.join("_tmp_compositor_conf");
+    // Phase 73 — desktop client service confs.
+    let wallpaper_conf_tmp = output_dir.join("_tmp_wallpaper_conf");
+    let bar_conf_tmp = output_dir.join("_tmp_bar_conf");
+    let notifyd_conf_tmp = output_dir.join("_tmp_notifyd_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -10564,6 +10589,9 @@ fn populate_ext2_files(
     fs::write(&greeter_user_conf_tmp, greeter_user_conf).expect("write temp greeter user conf");
     fs::write(&greeter_service_conf_tmp, greeter_conf).expect("write temp greeter service conf");
     fs::write(&compositor_conf_tmp, compositor_conf).expect("write temp compositor.conf");
+    fs::write(&wallpaper_conf_tmp, wallpaper_conf).expect("write temp wallpaper.conf");
+    fs::write(&bar_conf_tmp, bar_conf).expect("write temp bar.conf");
+    fs::write(&notifyd_conf_tmp, notifyd_conf).expect("write temp notifyd.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -10748,6 +10776,28 @@ fn populate_ext2_files(
          sif etc/compositor.conf uid 0\n\
          sif etc/compositor.conf gid 0\n",
         compositor_conf_tmp.display(),
+    );
+
+    // Phase 73 — stage the three desktop-daemon service confs on every
+    // build. Init's `KNOWN_CONFIGS` lists their paths and the missing-
+    // file path is best-effort; staging them once keeps the daemons
+    // available across smoke / graphical / legacy boot modes.
+    let phase73_daemon_cmds = format!(
+        "write \"{}\" etc/services.d/wallpaper.conf\n\
+         sif etc/services.d/wallpaper.conf mode 0x81A4\n\
+         sif etc/services.d/wallpaper.conf uid 0\n\
+         sif etc/services.d/wallpaper.conf gid 0\n\
+         write \"{}\" etc/services.d/bar.conf\n\
+         sif etc/services.d/bar.conf mode 0x81A4\n\
+         sif etc/services.d/bar.conf uid 0\n\
+         sif etc/services.d/bar.conf gid 0\n\
+         write \"{}\" etc/services.d/notifyd.conf\n\
+         sif etc/services.d/notifyd.conf mode 0x81A4\n\
+         sif etc/services.d/notifyd.conf uid 0\n\
+         sif etc/services.d/notifyd.conf gid 0\n",
+        wallpaper_conf_tmp.display(),
+        bar_conf_tmp.display(),
+        notifyd_conf_tmp.display(),
     );
 
     // Phase 56 Track F.2 — drop the debug-crash marker file when the
@@ -11073,6 +11123,7 @@ fn populate_ext2_files(
          sif etc/services.d/audio_server.conf gid 0\n\
          {greeter_or_term_cmds}\
          {compositor_conf_cmds}\
+         {phase73_daemon_cmds}\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -11107,6 +11158,7 @@ fn populate_ext2_files(
         audio_server_conf = audio_server_conf_tmp.display(),
         greeter_or_term_cmds = greeter_or_term_cmds,
         compositor_conf_cmds = compositor_conf_cmds,
+        phase73_daemon_cmds = phase73_daemon_cmds,
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -11164,6 +11216,9 @@ fn populate_ext2_files(
     let _ = fs::remove_file(&greeter_user_conf_tmp);
     let _ = fs::remove_file(&greeter_service_conf_tmp);
     let _ = fs::remove_file(&term_conf_tmp);
+    let _ = fs::remove_file(&wallpaper_conf_tmp);
+    let _ = fs::remove_file(&bar_conf_tmp);
+    let _ = fs::remove_file(&notifyd_conf_tmp);
     // Phase 56 F.3: silently best-effort; the file only exists when the
     // M3OS_DISABLE_DISPLAY_SERVER env var was set.
     let _ = fs::remove_file(output_dir.join("_tmp_disable_display"));

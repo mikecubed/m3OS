@@ -76,6 +76,14 @@ pub enum ParsedVerb {
     /// `kernel_core::session_control::encode_verb`, and parses the
     /// reply via `decode_reply`.
     Session(ControlVerb),
+    /// Phase 73 — `m3ctl lock`. Spawns `/bin/lockscreen` directly via
+    /// `fork + execve`. The lockscreen client requests an exclusive-
+    /// keyboard Layer surface from the compositor; the compositor's
+    /// existing focus dispatcher honours the grab. A second `m3ctl
+    /// lock` while a lockscreen is already running is observed by the
+    /// new lockscreen exiting immediately when it cannot register the
+    /// singleton `"lockscreen"` IPC service name.
+    LockScreen,
 }
 
 /// Parser-level error. Variants are *data*; callers `match` to surface
@@ -131,6 +139,11 @@ pub fn parse_verb(verb: &str, args: &[&str]) -> Result<ParsedVerb, ParseError> {
                     ParseError::BadArgument("session-restart: service name must be 1..=32 bytes")
                 }),
         },
+        // Phase 73 — local "lock" verb spawns the lockscreen client.
+        // Implemented as a direct fork+execve rather than a control
+        // command so it works on any boot mode without extending the
+        // wire protocol.
+        "lock" => Ok(ParsedVerb::LockScreen),
         // Phase 56 — display control verbs.
         "version" => Ok(ParsedVerb::Display(ControlCommand::Version)),
         "list-surfaces" => Ok(ParsedVerb::Display(ControlCommand::ListSurfaces)),

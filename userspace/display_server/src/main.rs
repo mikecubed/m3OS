@@ -24,11 +24,13 @@
 
 extern crate alloc;
 
+mod animation;
 mod borders;
 mod client;
 mod compose;
 mod config;
 mod control;
+mod decoration;
 mod fb;
 mod input;
 mod keybind;
@@ -2200,6 +2202,31 @@ fn dispatch_keybind_action(
                 syscall_lib::exit(99);
             }
             syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN spawned term\n");
+        }
+        KeybindAction::LaunchLauncher => {
+            // Phase 73 — fork + execve the launcher. If a launcher is
+            // already running, the existing process owns the chord
+            // surface and a second fork is harmless: it exits after
+            // failing to acquire the singleton service-registry slot
+            // it tries to register. Cheap (one extra fork on
+            // double-press) and keeps the code path symmetric with
+            // `SpawnTerm`.
+            let pid = syscall_lib::fork();
+            if pid == 0 {
+                if let Some(session) = read_session_state() {
+                    let _ = syscall_lib::setgid(session.gid);
+                    let _ = syscall_lib::setuid(session.uid);
+                    let _ =
+                        spawn_exec_with_session(b"/bin/launcher\0", b"/bin/launcher\0", &session);
+                } else {
+                    let _ = spawn_exec(b"/bin/launcher\0", b"/bin/launcher\0");
+                }
+                syscall_lib::exit(99);
+            }
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "display_server: SUPER+SPACE spawned launcher\n",
+            );
         }
         KeybindAction::KillFocused => {
             // Phase 72b Track K.6 — push `ServerMessage::CloseRequest`

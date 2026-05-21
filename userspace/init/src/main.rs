@@ -212,6 +212,12 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     // `setuid`s + `execve`s `/bin/term` in-process so term inherits
     // the authenticated UID.
     b"/etc/services.d/greeter.conf\0",
+    // Phase 73: native desktop client daemons.  Each is a regular
+    // Phase 56 compositor client (Layer or Toplevel surface); init
+    // supervises them so a crash respawns automatically.
+    b"/etc/services.d/wallpaper.conf\0",
+    b"/etc/services.d/bar.conf\0",
+    b"/etc/services.d/notifyd.conf\0",
 ];
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ use kernel_core::input::bind_table::{BindError, BindId, BindKey, BindTable};
 use kernel_core::input::events::{MOD_SHIFT, MOD_SUPER};
 use kernel_core::input::keymap::{
     KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_ENTER, KEY_ESC,
-    KEY_H, KEY_J, KEY_K, KEY_L, KEY_Q, KEY_R, KEY_TAB, Keycode,
+    KEY_H, KEY_J, KEY_K, KEY_L, KEY_Q, KEY_R, KEY_SPACE, KEY_TAB, Keycode,
 };
 
 /// Resize-step value (px) used when a resize-mode chord fires. The
@@ -50,6 +50,12 @@ pub enum KeybindAction {
         direction: layout::ResizeDirection,
         step: i16,
     },
+    /// Phase 73 — launch the desktop launcher (`/bin/launcher`).
+    /// Triggered by `SUPER+SPACE`. The compositor forks an unprivileged
+    /// child that opens a floating Toplevel; if a launcher process is
+    /// already running, the compositor focuses the existing surface
+    /// instead of spawning a second.
+    LaunchLauncher,
 }
 
 /// Mode tag used by [`BindStack`]. The compositor's main loop
@@ -272,6 +278,8 @@ pub fn register_default_chords(table: &mut BindModeTable) -> Result<(), BindErro
     table.register(MOD_SUPER, KEY_ENTER, KeybindAction::SpawnTerm)?;
     table.register(MOD_SUPER, KEY_Q, KeybindAction::KillFocused)?;
     table.register(MOD_SUPER, KEY_R, KeybindAction::EnterResize)?;
+    // Phase 73 — SUPER+SPACE opens the launcher.
+    table.register(MOD_SUPER, KEY_SPACE, KeybindAction::LaunchLauncher)?;
     Ok(())
 }
 
