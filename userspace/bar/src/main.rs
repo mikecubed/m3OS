@@ -107,9 +107,18 @@ fn program_main(_args: &[&str]) -> i32 {
             return 2;
         }
     };
+    // Anchor only to TOP. `compute_layer_geometry`'s
+    // "single horizontal axis anchor" rule (TOP-only, no LEFT/RIGHT)
+    // already stretches the surface to the output width — adding
+    // LEFT|RIGHT would not change geometry but *would* push the
+    // anchor mask to three edge bits, at which point
+    // `derive_exclusive_rect` rejects the surface as not a full-edge
+    // tiling and silently drops the 24 px reservation. That was the
+    // visible "bar overlaps toplevel content" symptom in the first
+    // Phase 73 attempt at this fix.
     if !conn.set_layer_role(
         Layer::Top,
-        anchor::ANCHOR_TOP | anchor::ANCHOR_LEFT | anchor::ANCHOR_RIGHT,
+        anchor::ANCHOR_TOP,
         BAR_HEIGHT_PX,
         KeyboardInteractivity::None,
     ) {
