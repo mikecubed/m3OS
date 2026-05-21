@@ -1,6 +1,6 @@
 # Phase 73 - Compositor: Polish (Bar, Launcher, Notifications, Animations, Lockscreen Stub)
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-73
 **Depends on:** Phase 72 (Compositor: Multi-Toplevel, Tiling Layout, and Workspaces) ✅, Phase 71 (Greeter and Multi-User Session) ✅
 **Builds on:** Adds the native client ecosystem and visual animation layer on top of Phase 72's tiling compositor, delivering the full omarchy/Hyprland-aesthetic desktop experience in software rendering

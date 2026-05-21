@@ -10778,27 +10778,34 @@ fn populate_ext2_files(
         compositor_conf_tmp.display(),
     );
 
-    // Phase 73 — stage the three desktop-daemon service confs on every
-    // build. Init's `KNOWN_CONFIGS` lists their paths and the missing-
-    // file path is best-effort; staging them once keeps the daemons
-    // available across smoke / graphical / legacy boot modes.
-    let phase73_daemon_cmds = format!(
-        "write \"{}\" etc/services.d/wallpaper.conf\n\
-         sif etc/services.d/wallpaper.conf mode 0x81A4\n\
-         sif etc/services.d/wallpaper.conf uid 0\n\
-         sif etc/services.d/wallpaper.conf gid 0\n\
-         write \"{}\" etc/services.d/bar.conf\n\
-         sif etc/services.d/bar.conf mode 0x81A4\n\
-         sif etc/services.d/bar.conf uid 0\n\
-         sif etc/services.d/bar.conf gid 0\n\
-         write \"{}\" etc/services.d/notifyd.conf\n\
-         sif etc/services.d/notifyd.conf mode 0x81A4\n\
-         sif etc/services.d/notifyd.conf uid 0\n\
-         sif etc/services.d/notifyd.conf gid 0\n",
-        wallpaper_conf_tmp.display(),
-        bar_conf_tmp.display(),
-        notifyd_conf_tmp.display(),
-    );
+    // Phase 73 — stage the three desktop-daemon service confs only
+    // in graphical-login boots. Their startup chatter
+    // ("display_server: AttachSharedBuffer ok ...") interleaves with
+    // the smoke / regression runner's serial output and would otherwise
+    // mask the `# ` prompt the harness waits on between steps. The
+    // daemons are also only useful in GUI sessions, so a serial /
+    // autologin boot has no reason to pay their startup cost either.
+    let phase73_daemon_cmds = if smoke_test_mode || !graphical_login {
+        String::new()
+    } else {
+        format!(
+            "write \"{}\" etc/services.d/wallpaper.conf\n\
+             sif etc/services.d/wallpaper.conf mode 0x81A4\n\
+             sif etc/services.d/wallpaper.conf uid 0\n\
+             sif etc/services.d/wallpaper.conf gid 0\n\
+             write \"{}\" etc/services.d/bar.conf\n\
+             sif etc/services.d/bar.conf mode 0x81A4\n\
+             sif etc/services.d/bar.conf uid 0\n\
+             sif etc/services.d/bar.conf gid 0\n\
+             write \"{}\" etc/services.d/notifyd.conf\n\
+             sif etc/services.d/notifyd.conf mode 0x81A4\n\
+             sif etc/services.d/notifyd.conf uid 0\n\
+             sif etc/services.d/notifyd.conf gid 0\n",
+            wallpaper_conf_tmp.display(),
+            bar_conf_tmp.display(),
+            notifyd_conf_tmp.display(),
+        )
+    };
 
     // Phase 56 Track F.2 — drop the debug-crash marker file when the
     // F.2 regression asks for it. Production boots leave the file out;
