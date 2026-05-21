@@ -26,6 +26,11 @@ use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    // The framebuffer minimum-resolution request used to live here as
+    // `config.frame_buffer.minimum_framebuffer_{width,height}` but the
+    // bootloader 0.11.15 deprecated that route — the values are now
+    // baked into the disk image at build time via `BootConfig` in the
+    // xtask's `create_uefi_image`. See xtask/src/main.rs.
     config
 };
 

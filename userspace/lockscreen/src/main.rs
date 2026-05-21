@@ -56,8 +56,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const BUFFER_ID: BufferId = BufferId(1);
-const WIDTH_PX: u32 = 1280;
-const HEIGHT_PX: u32 = 800;
 const SERVICE_NAME: &str = "lockscreen";
 
 const BG_COLOR: u32 = 0xFF_00_00_00;
@@ -100,8 +98,9 @@ fn program_main(_args: &[&str]) -> i32 {
     // rejects multi-edge anchor masks as "not a full-edge tiling",
     // which would drop our exclusive-keyboard claim along with it.
     // `compute_layer_geometry`'s single-axis stretch rule still
-    // gives us full-width geometry; we also explicitly request the
-    // intrinsic 1280×800 buffer dims and that survives.
+    // gives us full-width geometry; the surface buffer is sized to
+    // the running framebuffer so 1080p (or larger) boots get a
+    // full-output lock screen instead of a centred 1280×800 island.
     if !conn.set_layer_role(
         Layer::Overlay,
         anchor::ANCHOR_TOP,
@@ -112,7 +111,8 @@ fn program_main(_args: &[&str]) -> i32 {
         return 3;
     }
 
-    let surface = match SharedSurface::allocate(WIDTH_PX, HEIGHT_PX) {
+    let (width, height) = desktop_client::output_size();
+    let surface = match SharedSurface::allocate(width, height) {
         Some(s) => s,
         None => return 3,
     };
@@ -130,8 +130,8 @@ fn program_main(_args: &[&str]) -> i32 {
         locked_until_secs: 0,
     };
 
-    render(pixels, &state);
-    let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+    render(pixels, &state, width, height);
+    let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width, height);
 
     loop {
         // Backoff handling: while we're in the "too many attempts"
@@ -144,8 +144,8 @@ fn program_main(_args: &[&str]) -> i32 {
             state.status = Status::Idle;
             state.password.clear();
             state.failures = 0;
-            render(pixels, &state);
-            let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+            render(pixels, &state, width, height);
+            let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width, height);
         }
 
         match conn.pull_event() {
@@ -162,9 +162,8 @@ fn program_main(_args: &[&str]) -> i32 {
                     break;
                 }
                 if dirty {
-                    render(pixels, &state);
-                    let _ =
-                        conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+                    render(pixels, &state, width, height);
+                    let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width, height);
                 }
             }
             Some(ServerMessage::CloseRequest { .. }) => break,
@@ -327,21 +326,19 @@ fn clock_secs() -> u64 {
     if sec < 0 { 0 } else { sec as u64 }
 }
 
-fn render(pixels: &mut [u32], state: &UiState) {
+fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
     fill(pixels, BG_COLOR);
 
     // Centered prompt panel: 480×200.
     let panel_w: u32 = 480;
     let panel_h: u32 = 200;
-    let cx: i32 = (WIDTH_PX as i32 - panel_w as i32) / 2;
-    let cy: i32 = (HEIGHT_PX as i32 - panel_h as i32) / 2;
-    fill_rect(
-        pixels, WIDTH_PX, HEIGHT_PX, cx, cy, panel_w, panel_h, PANEL_BG,
-    );
+    let cx: i32 = (width as i32 - panel_w as i32) / 2;
+    let cy: i32 = (height as i32 - panel_h as i32) / 2;
+    fill_rect(pixels, width, height, cx, cy, panel_w, panel_h, PANEL_BG);
     fill_rect(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         cx + 20,
         cy + 20,
         panel_w - 40,
@@ -353,8 +350,8 @@ fn render(pixels: &mut [u32], state: &UiState) {
     let title_w = (title.len() as i32) * 8;
     draw_text(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         cx + (panel_w as i32 - title_w) / 2,
         cy + 36,
         title,
@@ -367,8 +364,8 @@ fn render(pixels: &mut [u32], state: &UiState) {
     user_line.push_str(&state.username);
     draw_text(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         cx + 24,
         cy + 76,
         &user_line,
@@ -384,8 +381,8 @@ fn render(pixels: &mut [u32], state: &UiState) {
     password_line.push_str(core::str::from_utf8(&mask).unwrap_or(""));
     draw_text(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         cx + 24,
         cy + 110,
         &password_line,
@@ -399,8 +396,8 @@ fn render(pixels: &mut [u32], state: &UiState) {
     let underline_w: u32 = (panel_w - 64).saturating_sub(prompt_label.len() as u32 * 8);
     fill_rect(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         underline_x,
         underline_y,
         underline_w,
@@ -417,8 +414,8 @@ fn render(pixels: &mut [u32], state: &UiState) {
     let status_w = (status_text.len() as i32) * 8;
     draw_text(
         pixels,
-        WIDTH_PX,
-        HEIGHT_PX,
+        width,
+        height,
         cx + (panel_w as i32 - status_w) / 2,
         cy + (panel_h as i32) - 32,
         status_text,

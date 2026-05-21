@@ -430,6 +430,30 @@ pub fn auto_surface_id() -> SurfaceId {
     }
 }
 
+/// Query the kernel framebuffer dimensions. Used by clients that
+/// allocate full-output surfaces (wallpaper, lockscreen, greeter, the
+/// bar's full-width Layer surface) so they size to the running
+/// hardware instead of a hardcoded resolution. Falls back to a
+/// conservative 1280×800 if the syscall fails — keeps a misconfigured
+/// boot bootable instead of crashing the client.
+pub fn output_size() -> (u32, u32) {
+    // Wire layout: `width u32 | height u32 | stride u32 | bpp u32 |
+    // pixel_format u32` — 20 bytes total, defined in
+    // `kernel::arch::x86_64::syscall::sys_framebuffer_info`.
+    let mut buf = [0u8; 20];
+    let rc = syscall_lib::framebuffer_info(&mut buf);
+    if rc < 0 {
+        return (1280, 800);
+    }
+    let width = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let height = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    if width == 0 || height == 0 {
+        (1280, 800)
+    } else {
+        (width, height)
+    }
+}
+
 /// Helper: collect a `Vec<KeyEvent>` from the connection until it
 /// produces no more events. Useful for the launcher's "drain all
 /// pending keystrokes before re-rendering" pattern.

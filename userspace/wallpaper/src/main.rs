@@ -42,8 +42,6 @@ syscall_lib::entry_point!(program_main);
 
 const CONFIG_PATH: &[u8] = b"/etc/compositor.conf\0";
 const BUFFER_ID: BufferId = BufferId(1);
-const SURFACE_WIDTH_PX: u32 = 1280;
-const SURFACE_HEIGHT_PX: u32 = 800;
 const SERVICE_NAME: &str = "wallpaper";
 const POLL_IDLE_NS: u32 = 200_000_000;
 
@@ -88,7 +86,12 @@ fn program_main(_args: &[&str]) -> i32 {
         return 3;
     }
 
-    let surface = match SharedSurface::allocate(SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX) {
+    // Size to the running framebuffer instead of a hardcoded 1280×800
+    // so a 1080p (or larger) boot fills the whole output. Phase 73:
+    // the bootloader now requests 1920×1080.
+    let (width, height) = desktop_client::output_size();
+
+    let surface = match SharedSurface::allocate(width, height) {
         Some(s) => s,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "wallpaper: SHM allocation failed\n");
@@ -97,13 +100,8 @@ fn program_main(_args: &[&str]) -> i32 {
     };
     let pixels = surface.pixels_mut();
 
-    paint(pixels);
-    if !conn.attach_damage_commit(
-        BUFFER_ID,
-        surface.shm_id,
-        SURFACE_WIDTH_PX,
-        SURFACE_HEIGHT_PX,
-    ) {
+    paint(pixels, width, height);
+    if !conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width, height) {
         surface.release();
         return 5;
     }
@@ -113,13 +111,8 @@ fn program_main(_args: &[&str]) -> i32 {
             break;
         }
         if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) {
-            paint(pixels);
-            let _ = conn.attach_damage_commit(
-                BUFFER_ID,
-                surface.shm_id,
-                SURFACE_WIDTH_PX,
-                SURFACE_HEIGHT_PX,
-            );
+            paint(pixels, width, height);
+            let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, width, height);
             syscall_lib::write_str(STDOUT_FILENO, "wallpaper: reloaded background\n");
         }
         let _ = syscall_lib::nanosleep_for(0, POLL_IDLE_NS);
@@ -130,13 +123,13 @@ fn program_main(_args: &[&str]) -> i32 {
     0
 }
 
-fn paint(pixels: &mut [u32]) {
+fn paint(pixels: &mut [u32], width: u32, height: u32) {
     let cfg = load_config();
     if let Some(path) = &cfg.path
         && let Some((w, h, image)) = load_rgba_file(path)
         && !image.is_empty()
     {
-        blit_scaled(pixels, SURFACE_WIDTH_PX, SURFACE_HEIGHT_PX, &image, w, h);
+        blit_scaled(pixels, width, height, &image, w, h);
         return;
     }
     fill(pixels, cfg.fallback_color);

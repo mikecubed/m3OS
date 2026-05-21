@@ -58,7 +58,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const BUFFER_ID: BufferId = BufferId(1);
-const BAR_WIDTH_PX: u32 = 1280;
 const BAR_HEIGHT_PX: u32 = 24;
 const SERVICE_NAME: &str = "bar";
 
@@ -126,7 +125,12 @@ fn program_main(_args: &[&str]) -> i32 {
         return 3;
     }
 
-    let surface = match SharedSurface::allocate(BAR_WIDTH_PX, BAR_HEIGHT_PX) {
+    // Size the bar to span the full output width; the kernel
+    // framebuffer query is the source of truth so 1080p / 4K boots
+    // get a full-width bar instead of a centred 1280-px strip.
+    let (bar_width_px, _output_height) = desktop_client::output_size();
+
+    let surface = match SharedSurface::allocate(bar_width_px, BAR_HEIGHT_PX) {
         Some(s) => s,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "bar: SHM allocation failed\n");
@@ -141,8 +145,8 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut control_handle: Option<u32> = lookup_display_control();
 
     let mut state = BarState::new();
-    render(pixels, &state);
-    if !conn.attach_damage_commit(BUFFER_ID, surface.shm_id, BAR_WIDTH_PX, BAR_HEIGHT_PX) {
+    render(pixels, &state, bar_width_px);
+    if !conn.attach_damage_commit(BUFFER_ID, surface.shm_id, bar_width_px, BAR_HEIGHT_PX) {
         surface.release();
         return 5;
     }
@@ -202,9 +206,9 @@ fn program_main(_args: &[&str]) -> i32 {
         }
 
         if needs_render {
-            render(pixels, &state);
+            render(pixels, &state, bar_width_px);
             let _ =
-                conn.attach_damage_commit(BUFFER_ID, surface.shm_id, BAR_WIDTH_PX, BAR_HEIGHT_PX);
+                conn.attach_damage_commit(BUFFER_ID, surface.shm_id, bar_width_px, BAR_HEIGHT_PX);
         }
 
         tick = tick.wrapping_add(1);
@@ -353,9 +357,9 @@ fn format_hh_mm(h: u32, m: u32) -> String {
     s
 }
 
-fn render(pixels: &mut [u32], state: &BarState) {
+fn render(pixels: &mut [u32], state: &BarState, bar_width_px: u32) {
     fill(pixels, BG_COLOR);
-    let w = BAR_WIDTH_PX;
+    let w = bar_width_px;
     let h = BAR_HEIGHT_PX;
 
     // Workspace indicators: 9 boxes, each 22 px wide. Geometry lives

@@ -2262,7 +2262,17 @@ fn build_kernel() -> PathBuf {
 fn create_uefi_image(kernel_binary: &Path) -> PathBuf {
     let uefi_path = kernel_binary.parent().unwrap().join("boot-uefi-m3os.img");
 
-    let builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
+    let mut builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
+    // Phase 73 — request a 1920×1080 GOP mode at boot time. The UEFI
+    // bootloader picks the closest available mode at or above these
+    // dimensions and falls back to a smaller mode if the firmware
+    // doesn't expose 1080p (QEMU's `std` VGA + recent OVMF both
+    // expose 1920×1080; earlier phases came up at 1280×800 because
+    // no minimum was requested).
+    let mut boot_cfg = bootloader::BootConfig::default();
+    boot_cfg.frame_buffer.minimum_framebuffer_width = Some(1920);
+    boot_cfg.frame_buffer.minimum_framebuffer_height = Some(1080);
+    builder.set_boot_config(&boot_cfg);
     builder
         .create_uefi_image(&uefi_path)
         .expect("failed to create UEFI disk image");
