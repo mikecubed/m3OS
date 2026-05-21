@@ -70,7 +70,17 @@ jobs:
           # 180s budget: leaves ample headroom for CI kernel rebuild (~20s),
           # disk image assembly, and QEMU boot through to userspace. A 30s
           # budget consistently SIGTERMs QEMU mid-kernel-init.
-          timeout 180 cargo xtask run 2>&1 | tee boot.log || true
+          #
+          # `--fresh` is required: the prior `Build disk images` step runs
+          # `cargo xtask image`, which (since Phase 71) stages the
+          # `/etc/m3os-graphical-only` marker in the disk. Without
+          # `--fresh`, `cargo xtask run` would short-circuit, reuse that
+          # disk, and init would wait for the GUI greeter — no serial
+          # login prompt ever appears and the smoke test below times out.
+          # `--fresh` rebuilds disk.img with `graphical_login=false`
+          # (serial autologin) for the headless boot check. The released
+          # UEFI image is unaffected; only the local disk.img is rebuilt.
+          timeout 180 cargo xtask run --fresh 2>&1 | tee boot.log || true
           # Phase 27: verify userspace init banner and login prompt
           grep -q 'm3OS init (PID 1)' boot.log
           grep -qE '(login:|ion# |\$ )' boot.log
