@@ -2930,6 +2930,20 @@ fn launch_qemu_with_devices_audio(
         );
     }
 
+    if let Ok(dump) = std::env::var("M3OS_DUMP_QEMU_ARGS") {
+        let mut buf = String::new();
+        for a in &args {
+            buf.push_str(a);
+            buf.push('\n');
+        }
+        if let Err(e) = std::fs::write(&dump, buf) {
+            eprintln!("M3OS_DUMP_QEMU_ARGS: write {dump}: {e}");
+            std::process::exit(2);
+        }
+        println!("M3OS_DUMP_QEMU_ARGS: wrote {} args to {dump}", args.len());
+        return;
+    }
+
     let status = Command::new("qemu-system-x86_64")
         .args(&args)
         .status()

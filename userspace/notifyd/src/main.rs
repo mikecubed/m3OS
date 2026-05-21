@@ -99,12 +99,22 @@ fn program_main(_args: &[&str]) -> i32 {
         None => return 4,
     };
     let pixels = surface.pixels_mut();
-    fill(pixels, BG_COLOR);
-    let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
-
+    // Phase 73 — do NOT pre-commit an empty buffer. The compositor
+    // does not honour BGRA alpha during the surface blit, so an
+    // all-zero (transparent) backing buffer reads back as solid
+    // BLACK on screen — covering the right 360 px × 420 px of every
+    // surface beneath this `Layer::Overlay`. The surface only
+    // becomes visible the first time a real notification arrives;
+    // once the queue drains the last attach-commit stays in place
+    // (a tiny visual quirk, not a glitch) until the next arrival
+    // refreshes it.
     let mut notifications: VecDeque<Notification> = VecDeque::new();
     let tick_ms: u32 = 100;
-    let mut dirty = true; // first paint always commits
+    // `dirty=false` here means: nothing to render yet, don't attach
+    // a buffer. Flipped to `true` only when a real notification is
+    // accepted from the socket.
+    let mut dirty = false;
+    let mut surface_attached = false;
     loop {
         // Drain any pending connections (non-blocking).
         loop {
@@ -124,11 +134,20 @@ fn program_main(_args: &[&str]) -> i32 {
 
         if dirty {
             if notifications.is_empty() {
-                fill(pixels, BG_COLOR);
+                // Only worth committing the empty paint if the
+                // surface is already on screen — clears the panels.
+                // If we never attached, do nothing so the surface
+                // stays unmapped and invisible.
+                if surface_attached {
+                    fill(pixels, BG_COLOR);
+                    let _ =
+                        conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+                }
             } else {
                 render(pixels, &notifications);
+                let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
+                surface_attached = true;
             }
-            let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
             dirty = false;
         }
 
