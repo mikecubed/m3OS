@@ -88,16 +88,15 @@ pub enum ShmError {
     /// (128 MiB) — the largest power-of-two page count that fits in
     /// the `u16` page count without the `(1 << order) as u16` cast
     /// wrapping. The buddy allocator's effective ceiling is currently
-    /// `MAX_ORDER = 11` (2048 pages = 8 MiB), so requests between
-    /// 8 MiB and 128 MiB will fail earlier with
+    /// `MAX_ORDER = 13` (8192 pages = 32 MiB), so requests between
+    /// 32 MiB and 128 MiB will fail earlier with
     /// [`OutOfContiguousFrames`]; this guard keeps the cast sound if
     /// `MAX_ORDER` is ever raised again.
     LengthTooLarge,
     /// Buddy allocator could not produce a contiguous block of the
-    /// requested order. Phase 69c surfaces (1280 × 800 BGRA pixels =
-    /// 1280 × 800 × 4 = ~4 MiB after the 4 bytes/pixel multiplication)
-    /// fit inside the order-11 (8 MiB) max; this fires on adversarial
-    /// requests or very fragmented memory.
+    /// requested order. Phase 73 surfaces (1920 × 1080 × 4 ≈ 7.91 MiB)
+    /// fit inside the order-13 (32 MiB) max with comfortable headroom;
+    /// this fires on adversarial requests or very fragmented memory.
     OutOfContiguousFrames,
     /// Lookup against an `ShmId` that does not name a live region.
     NotFound,

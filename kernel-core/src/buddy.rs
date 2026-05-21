@@ -1,7 +1,7 @@
 //! Buddy frame allocator for managing physical page frames.
 //!
 //! Manages page-frame numbers (PFNs) using the classic buddy algorithm with
-//! 12 order levels (0..=11). Order 0 = 4 KiB, order 11 = 8 MiB.
+//! 14 order levels (0..=13). Order 0 = 4 KiB, order 13 = 32 MiB.
 //!
 //! Design: pure data structure with no unsafe, no hardware access, fully
 //! testable on the host via `cargo test -p kernel-core`.
@@ -10,11 +10,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::array;
 
-/// Maximum allocation order. Order 0 = 1 page (4 KiB), order 11 = 2048 pages
-/// (8 MiB). Phase 69c bumped this from 9 (2 MiB) to 11 so the SHM allocator
-/// can serve the 1280×800×4 ≈ 4 MiB term surface in a single contiguous
-/// allocation; orders 10 and 11 are headroom for future graphical surfaces.
-pub const MAX_ORDER: usize = 11;
+/// Maximum allocation order. Order 0 = 1 page (4 KiB), order 13 = 8192 pages
+/// (32 MiB). History:
+///   * Phase 69c bumped this from 9 (2 MiB) to 11 (8 MiB) so the SHM
+///     allocator could serve the 1280×800×4 ≈ 4 MiB term surface.
+///   * Phase 73 bumped to 13 (32 MiB) so 1920×1080×4 ≈ 7.91 MiB surfaces
+///     don't sit right on the previous ceiling — a single 8 MiB SHM
+///     rounded to exactly order 11 left no headroom for buddy
+///     fragmentation, and the resulting failed `allocate_contiguous_zeroed`
+///     calls were silently surfacing as "greeter exits with shm_create
+///     failed" boots after the framebuffer was bumped to 1080p.
+pub const MAX_ORDER: usize = 13;
 
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
