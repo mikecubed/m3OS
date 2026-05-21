@@ -958,13 +958,9 @@ impl SurfaceRegistry {
     /// The surface (if any) currently holding the global exclusive-
     /// keyboard claim. The D.3 input dispatcher consults this to gate
     /// `KeyboardInteractivity` routing so an exclusive layer always
-    /// wins focus while mapped.
-    ///
-    /// `#[allow(dead_code)]` because D.3's `CompositorState`
-    /// `active_exclusive_layer` field that consumes this getter has not
-    /// yet merged into the integration branch. Once D.3 plumbs through,
-    /// the allow can drop.
-    #[allow(dead_code)]
+    /// wins focus while mapped. Phase 73 — wired through the main
+    /// loop's `drain_one_pass` call so the lockscreen actually
+    /// receives keystrokes.
     pub fn active_exclusive_layer(&self) -> Option<SurfaceId> {
         self.layer_conflicts.active()
     }

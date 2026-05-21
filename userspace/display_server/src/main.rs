@@ -1158,9 +1158,18 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // table is the union of the built-in chord set plus any
         // user-supplied chords parsed from `/etc/compositor.conf`.
         let _ = &bind_table; // legacy: still mutated by control socket
+        // Phase 73 — honour exclusive-keyboard claims from Layer
+        // surfaces (lockscreen, modal dialogs). `SurfaceRegistry`
+        // already tracks the active claim via its `LayerConflictTracker`;
+        // wire it through to the dispatcher so a mapped lockscreen
+        // actually receives every keystroke (the dispatcher routes the
+        // event to the exclusive layer instead of the focused
+        // Toplevel). Without this, the lockscreen never sees the
+        // unlock chord and the user is stuck.
+        let active_exclusive_layer = registry.active_exclusive_layer();
         let effects = input_wiring.drain_one_pass(
             focused,
-            None, // active_exclusive_layer — E.2 wires this once Layer surfaces map
+            active_exclusive_layer,
             pointer_position,
             &surface_geom,
             bind_stack.active_table(),
