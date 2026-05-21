@@ -25,8 +25,12 @@ pub fn init_service_name(step_name: &str) -> &'static str {
         "audio_server" => "audio_server",
         "greeter" => "greeter",
         // Phase 72b — `term` is no longer a supervised step. It is a
-        // user-facing app launched via `[autostart]` in default boot
-        // or by `greeter::execve("/bin/term")` after auth.
+        // user-facing app launched via `[autostart]` in default GUI
+        // boot, or by `SUPER+RETURN` (display_server's `SpawnTerm`
+        // chord handler) at any time. In graphical-only boot greeter
+        // exits cleanly after writing `/run/m3os-current-session` and
+        // the user lands at an empty desktop — no automatic term spawn
+        // (matches the Hyprland / sway / i3 idiom).
         _ => "",
     }
 }

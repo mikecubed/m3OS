@@ -143,13 +143,30 @@ pub fn translate_damage(surface_rect: Rect, local_damage: Rect) -> Rect {
 ///
 /// The returned list is deduplicated only by rectangle equality; callers
 /// inspect each entry independently when checking containment.
+///
+/// Phase 72 review-resolution — when an occluder carries a `clip_rect`,
+/// the rectangle we add is `surface.rect ∩ clip_rect`. The paint path in
+/// [`compose_frame`] intersects each blit with `clip_rect`, so the
+/// painted region is at most that intersection. Adding the unclipped
+/// `surface.rect` here would falsely mark pixels outside `clip_rect` as
+/// occluded — lower-layer damage in the area "inside the buffer but
+/// outside the tile" would then be skipped and the screen would show
+/// visible holes. Intersecting first keeps the occlusion map honest
+/// about what was actually painted.
 pub fn build_occlusion_map(surfaces: &[ComposeSurface<'_>], output: Rect) -> Vec<Rect> {
     let mut occluders = Vec::new();
     for surface in surfaces {
         if !surface.opaque {
             continue;
         }
-        if let Some(clipped) = rect_intersect(surface.rect, output) {
+        let painted = match surface.clip_rect {
+            Some(clip) => match rect_intersect(surface.rect, clip) {
+                Some(r) => r,
+                None => continue,
+            },
+            None => surface.rect,
+        };
+        if let Some(clipped) = rect_intersect(painted, output) {
             occluders.push(clipped);
         }
     }
@@ -546,6 +563,66 @@ mod tests {
             rect(50, 50, 10, 10),
             "cursor drawn last"
         );
+    }
+
+    #[test]
+    fn build_occlusion_map_uses_clip_rect_intersection() {
+        // Regression for the Phase 72 review-resolution finding: an
+        // opaque surface whose buffer overflows its assigned tile must
+        // only mark `surface.rect ∩ clip_rect` as occluded — not the
+        // full buffer rect — so lower-layer pixels in the "outside the
+        // tile but inside the buffer" sliver remain visible.
+        let bg = solid_pixels(100, 100, 0x11);
+        let big = solid_pixels(80, 80, 0x22);
+        let dmg_big = [rect(0, 0, 80, 80)];
+        let dmg_bg = [rect(0, 0, 100, 100)];
+        let surfaces = [
+            ComposeSurface {
+                id: SurfaceId(1),
+                layer: ComposeLayer::Background,
+                rect: rect(0, 0, 100, 100),
+                damage: &dmg_bg,
+                pixels: &bg,
+                opaque: false,
+                clip_rect: None,
+            },
+            ComposeSurface {
+                id: SurfaceId(2),
+                layer: ComposeLayer::Toplevel,
+                rect: rect(0, 0, 80, 80),
+                damage: &dmg_big,
+                pixels: &big,
+                opaque: true,
+                clip_rect: Some(rect(0, 0, 40, 40)),
+            },
+        ];
+        let occluders = build_occlusion_map(&surfaces, rect(0, 0, 100, 100));
+        assert_eq!(
+            occluders,
+            vec![rect(0, 0, 40, 40)],
+            "occluder is rect ∩ clip_rect, not the full surface rect"
+        );
+    }
+
+    #[test]
+    fn build_occlusion_map_drops_surface_when_clip_disjoint() {
+        // Defensive: if the clip rect is fully outside the surface
+        // rect, the surface paints nothing — it must not appear in the
+        // occlusion map at all (otherwise lower layers would be hidden
+        // behind an empty intersection).
+        let big = solid_pixels(10, 10, 0xAB);
+        let dmg = [rect(0, 0, 10, 10)];
+        let surfaces = [ComposeSurface {
+            id: SurfaceId(1),
+            layer: ComposeLayer::Toplevel,
+            rect: rect(0, 0, 10, 10),
+            damage: &dmg,
+            pixels: &big,
+            opaque: true,
+            clip_rect: Some(rect(50, 50, 10, 10)),
+        }];
+        let occluders = build_occlusion_map(&surfaces, rect(0, 0, 100, 100));
+        assert!(occluders.is_empty(), "disjoint clip = no occluder");
     }
 
     #[test]

@@ -163,8 +163,11 @@ const DISPLAY_FALLBACK_SKIPPED_CONFS: &[&[u8]] = &[b"display_server.conf\0"];
 ///   `term.conf` skip used by Phase 71 was retired in Phase 72b once
 ///   `term.conf` stopped being staged as a default-mode service
 ///   manifest. `term` is now launched by `display_server`'s
-///   `[autostart]` config in default GUI mode and by greeter's
-///   `execve(/bin/term)` after authentication in graphical-only mode.
+///   `[autostart]` config in default GUI mode. In graphical-only mode
+///   greeter writes `/run/m3os-current-session` and exits cleanly
+///   after authentication — display_server stays up with no
+///   foreground app and the user spawns term explicitly via
+///   `SUPER+RETURN` (display_server's `SpawnTerm` chord handler).
 ///   See `kernel-core::session_supervisor::DECLARED_SESSION_STEP_NAMES`.
 const GREETER_ONLY_SKIPPED_CONFS: &[&[u8]] = &[b"greeter.conf\0"];
 const GRAPHICAL_ONLY_SKIPPED_CONFS: &[&[u8]] = &[];

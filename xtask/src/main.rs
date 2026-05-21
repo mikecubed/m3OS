@@ -10319,8 +10319,12 @@ fn populate_ext2_files(
     //   - default GUI boot: `display_server` reads `[autostart] exec
     //     = /bin/term` from `/etc/compositor.conf` and runs it once
     //     after first compose.
-    //   - graphical-only boot: `greeter` `execve`s `/bin/term`
-    //     in-process after successful authentication.
+    //   - graphical-only boot: `greeter` writes the session descriptor
+    //     to `/run/m3os-current-session` and exits cleanly after
+    //     authentication. display_server stays up with no foreground
+    //     app and the user spawns term explicitly via `SUPER+RETURN`
+    //     (display_server's `SpawnTerm` chord handler), matching the
+    //     Hyprland / sway / i3 idiom of landing at an empty desktop.
     //   - headless smoke / regression boot: no `term` is started —
     //     smoke-runner drives the kernel serial console directly and
     //     never depended on the supervised `term` step.
@@ -10343,13 +10347,18 @@ fn populate_ext2_files(
     // readiness via the IPC registry (it is not greeter's parent), so an
     // explicit init-level dependency would just delay greeter start
     // behind a service whose start order is already enforced upstream
-    // by `DECLARED_SESSION_STEP_NAMES`. On successful authentication
-    // greeter `setuid`s to the authenticated user and `execve`s
-    // `/bin/term` in-process; the session_manager F.1 step that waits
-    // for the "term" IPC service therefore resolves only after a
-    // successful login. The `restart=on-failure` policy with
-    // `max_restart=3` matches the legacy term.conf budget; greeter's
-    // `exit(7)` on setuid failure is `on-failure` so init respawns it.
+    // by `DECLARED_SESSION_STEP_NAMES`. Phase 72b — on successful
+    // authentication greeter `setuid`s to the authenticated user,
+    // writes `/run/m3os-current-session` for display_server to consume
+    // at `SpawnTerm` time, and exits cleanly (return code 0). It does
+    // NOT execve `/bin/term` in-process; display_server is responsible
+    // for spawning term when the user requests one via `SUPER+RETURN`
+    // (or another launch path), matching the empty-desktop-after-login
+    // idiom of Hyprland / sway / i3. The `restart=on-failure` policy
+    // with `max_restart=3` matches the legacy term.conf budget;
+    // greeter's `exit(7)` on setuid failure is `on-failure` so init
+    // respawns it, while the clean `exit(0)` post-auth is `on-success`
+    // and is not retried.
     //
     // `depends=` lists init manifest `name=` values (matched by
     // `DepGraph::build` in `userspace/init/src/main.rs`). Cross-check
@@ -10387,9 +10396,12 @@ fn populate_ext2_files(
     //   - Default GUI (no graphical-only marker, not smoke):
     //     auto-launch `/bin/term` so the user lands at a terminal
     //     without needing to press `SUPER+RETURN` first.
-    //   - Graphical-only boot: omit autostart — greeter `execve`s
-    //     `/bin/term` after authentication in-process, so a second
-    //     autostart-launched term would be a duplicate.
+    //   - Graphical-only boot: omit autostart so the user lands at an
+    //     empty desktop after authentication, matching the Hyprland /
+    //     sway / i3 convention. Greeter writes
+    //     `/run/m3os-current-session` and exits cleanly; the user
+    //     spawns term explicitly via `SUPER+RETURN`
+    //     (display_server's `SpawnTerm` chord handler).
     //   - Smoke / regression: omit autostart — headless tests don't
     //     drive the GUI compositor.
     let compositor_conf_base = concat!(
