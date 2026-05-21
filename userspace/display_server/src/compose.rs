@@ -111,21 +111,35 @@ impl ComposeContext {
         &self.damage_tracker
     }
 
-    /// Phase 72b — request a full-screen repaint on the next compose
-    /// pass. Called from the surface-lifecycle path in `main.rs` when
-    /// a Toplevel surface is destroyed, so stale pixels left in the
-    /// framebuffer by the dying surface (or by greeter on logout) get
-    /// cleared instead of bleeding through the gaps between live
-    /// tiles. `run_compose_filtered`'s first-compose branch already
-    /// understands `mark_full_repaint` — flipping it once here is
-    /// enough; the next pass clears the whole output and re-blits
-    /// every live surface.
+    /// Request that every mapped surface re-blit its full rect on the
+    /// next compose pass. Used by callers (animation engine, focus
+    /// change, set-layout, ...) where surfaces stay in place but the
+    /// frame's visual state needs to recompute — e.g. an in-flight
+    /// animation that updates each tick, or a border colour change
+    /// after a focus transition.
+    ///
+    /// Critically, this method does **not** trigger
+    /// `is_first_compose` and therefore does **not** drop a
+    /// full-output `clear_rect_to_background` before the surface pass.
+    /// Direct-to-FB rendering with no double buffer means a clear
+    /// followed by a 5+ ms surface blit can be latched mid-sequence by
+    /// vsync, flashing the background colour to the user. Callers
+    /// that genuinely need to wipe stale pixels — surface destroy,
+    /// workspace switch with a different surface set, tile shrink
+    /// exposing previously-covered area — should call
+    /// [`force_full_repaint_clearing_background`] instead.
     pub fn force_full_repaint(&mut self) {
         self.damage_tracker.mark_full_repaint();
-        // Resetting `prev_pointer`/`prev_cursor_size` to `None` also
-        // triggers `is_first_compose` in `run_compose_filtered`, which
-        // re-runs `clear_rect_to_background(output)` on the whole FB
-        // before the surface pass. Belt-and-suspenders.
+    }
+
+    /// Like [`force_full_repaint`], but additionally triggers a full
+    /// `clear_rect_to_background(output)` before the surface pass so
+    /// pixels from now-vacated regions (a destroyed surface, a
+    /// shrunken tile's old extent, a workspace switch's outgoing
+    /// surface set) are wiped. Pays the single-buffered-FB
+    /// "background flash" cost; use sparingly.
+    pub fn force_full_repaint_clearing_background(&mut self) {
+        self.damage_tracker.mark_full_repaint();
         self.prev_pointer = None;
         self.prev_cursor_size = None;
     }

@@ -627,7 +627,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // path lands here when a client cleanly says
                     // farewell while the destroy branch covers
                     // explicit DestroySurface verbs.
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             } else {
                 syscall_lib::write_str(
@@ -678,7 +678,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         // surface re-blits cleanly. Cheap (one full FB clear) and
         // confined to the rare destroy path.
         if !outcome.destroyed.is_empty() {
-            compose_ctx.force_full_repaint();
+            compose_ctx.force_full_repaint_clearing_background();
         }
         if let Some(focused_id) = focused
             && outcome.destroyed.iter().any(|id| *id == focused_id)
@@ -841,6 +841,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             if delta_ms > 0 && !animation_engine.is_empty() {
                 let damage = animation_engine.tick(delta_ms);
                 if !damage.is_empty() {
+                    // Animations move pixels within already-occupied
+                    // rects — no surface vacates an area, so a
+                    // full-screen background clear is not needed.
+                    // Using the bare repaint avoids the
+                    // clear-then-blit flash that single-buffered
+                    // direct-to-FB rendering otherwise produces every
+                    // animation tick.
                     compose_ctx.force_full_repaint();
                 }
             }
@@ -958,7 +965,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 arrangement_changed = true;
             }
             if arrangement_changed {
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
             }
             let mut adapter = WorkspaceLayoutAdapter {
                 manager: &mut workspace_mgr,
@@ -1222,17 +1229,21 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     focused = Some(id);
                     if prev != focused {
                         publish_focus_changed(&mut control_subs, focused, null_subscriber_sender);
-                        // Phase 72 review-resolution — borders use the
-                        // focused id to pick active vs inactive colour
-                        // every compose pass. Without a forced repaint
-                        // here the no-damage short-circuit can keep the
-                        // previous border colours on screen until some
-                        // unrelated surface damages. Focus changes are
-                        // user-initiated and infrequent, so paying one
-                        // full repaint per focus transition is cheap.
-                        // Also invalidates the cache so `focus_affects_
-                        // geometry()` layouts (tabbed, fullscreen) pick
-                        // the new visible surface on the next pass.
+                        // Borders use the focused id to pick active vs
+                        // inactive colour every compose pass. Without
+                        // a forced repaint the no-damage short-circuit
+                        // can keep the previous border colours on
+                        // screen until some unrelated surface damages.
+                        // Focus changes don't expose any new
+                        // background area — surfaces stay in place
+                        // and the bar / toplevels overpaint their
+                        // tiles — so the bare repaint variant
+                        // suffices, avoiding the clear-then-blit
+                        // flash on every click-to-focus.
+                        // `invalidate_arrangement_cache` still fires
+                        // so `focus_affects_geometry()` layouts
+                        // (tabbed, fullscreen) pick the new visible
+                        // surface on the next pass.
                         compose_ctx.force_full_repaint();
                         compose_ctx.invalidate_arrangement_cache();
                     }
@@ -1386,7 +1397,7 @@ fn serve_one_control_request(
                 // partition until something else damaged the framebuffer.
                 let n = handle_set_layout(workspace_mgr, kind, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::SwitchWorkspace { n } => {
@@ -1403,7 +1414,7 @@ fn serve_one_control_request(
                 // gate bypassed so borders + background recolour on the
                 // next pass.
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 nbytes
             }
             ControlCommand::MoveToWorkspace { n, follow } => {
@@ -1416,7 +1427,7 @@ fn serve_one_control_request(
                     &mut reply_buf,
                 );
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 nbytes
             }
             ControlCommand::Reload => {
@@ -1424,7 +1435,7 @@ fn serve_one_control_request(
                 // Gaps / borders / per-workspace policy may all have
                 // changed; recompute arrangement and repaint.
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::QueryWindows => {
@@ -1444,13 +1455,13 @@ fn serve_one_control_request(
             ControlCommand::SetMasterRatio { ratio_x100 } => {
                 let n = handle_set_master_ratio(workspace_mgr, ratio_x100, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             ControlCommand::TileFullscreen => {
                 let n = handle_tile_fullscreen(workspace_mgr, &mut reply_buf);
                 compose_ctx.invalidate_arrangement_cache();
-                compose_ctx.force_full_repaint();
+                compose_ctx.force_full_repaint_clearing_background();
                 n
             }
             _ => {
@@ -2264,7 +2275,7 @@ fn dispatch_keybind_action(
                     *focused = workspace_mgr.next_focus(None);
                     publish_focus_changed(control_subs, *focused, null_subscriber_sender);
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             }
         }
@@ -2285,7 +2296,7 @@ fn dispatch_keybind_action(
                         publish_focus_changed(control_subs, *focused, null_subscriber_sender);
                     }
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
             }
         }
@@ -2294,9 +2305,9 @@ fn dispatch_keybind_action(
             if next != *focused {
                 *focused = next;
                 publish_focus_changed(control_subs, *focused, null_subscriber_sender);
-                // Repaint so border colours track the new focus, and
-                // recompute arrangement for `focus_affects_geometry()`
-                // policies (tabbed / fullscreen).
+                // Same rationale as `InputEffect::FocusChanged`: border
+                // recolour, no vacated area. The bare repaint variant
+                // avoids the clear-then-blit flash.
                 compose_ctx.invalidate_arrangement_cache();
                 compose_ctx.force_full_repaint();
             }
@@ -2400,7 +2411,7 @@ fn dispatch_keybind_action(
                 // otherwise keep painting the previous ratios.
                 if result.is_ok() {
                     compose_ctx.invalidate_arrangement_cache();
-                    compose_ctx.force_full_repaint();
+                    compose_ctx.force_full_repaint_clearing_background();
                 }
                 let _ = result;
             } else {
