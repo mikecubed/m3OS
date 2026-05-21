@@ -296,8 +296,6 @@
 
 ---
 
----
-
 ## Track J — Documentation and Release
 
 ### J.1 — Create the aligned legacy learning doc
