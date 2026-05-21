@@ -812,6 +812,7 @@ fn run_auth_loop(
             handle,
             shm_id,
             ActiveField::Username,
+            "",
             pixels,
             background,
             config,
@@ -822,10 +823,14 @@ fn run_auth_loop(
                 return None;
             }
         };
+        // Pass the submitted username through so the password-prompt
+        // frame keeps it visible — otherwise the user types blind
+        // into a form that has just discarded their identity.
         let password = match read_field(
             handle,
             shm_id,
             ActiveField::Password,
+            &username,
             pixels,
             background,
             config,
@@ -920,11 +925,17 @@ fn error_to_message(err: &AuthError) -> &'static str {
 /// Read one form field from the keyboard event stream. Returns the
 /// typed string when the user submits with Enter; `None` if the
 /// display server disconnects.
+///
+/// `prefill_username` carries the username submitted during the prior
+/// `read_field` call so the password-prompt frame keeps showing it
+/// (it is otherwise blanked, leaving the user to type a password into
+/// what looks like an empty form).
 #[cfg(not(test))]
 fn read_field(
     handle: u32,
     shm_id: u32,
     active: ActiveField,
+    prefill_username: &str,
     pixels: &mut [u32],
     background: &Option<Background>,
     config: &GreeterConfig,
@@ -934,8 +945,6 @@ fn read_field(
     let mut dirty = true;
     loop {
         if dirty {
-            // Repaint to show the current buffer contents (username
-            // only; password always shows empty per Phase 71 D.1).
             paint_background(
                 pixels,
                 SURFACE_WIDTH_PX,
@@ -945,10 +954,13 @@ fn read_field(
             );
             let ui_state = LoginUiState {
                 config,
+                // Username field: live buffer while typing in it,
+                // otherwise the already-submitted prefill so it stays
+                // visible during password entry.
                 username: if matches!(active, ActiveField::Username) {
                     buf.as_str()
                 } else {
-                    ""
+                    prefill_username
                 },
                 password_len: if matches!(active, ActiveField::Password) {
                     buf.len()

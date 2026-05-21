@@ -23,8 +23,10 @@ pub enum ActiveField {
 pub struct LoginUiState<'a> {
     pub config: &'a GreeterConfig,
     pub username: &'a str,
-    /// Number of password characters typed so far. The password is
-    /// never echoed — only the focus indicator changes.
+    /// Number of password characters typed so far. The renderer draws
+    /// one `*` glyph per character so the user can see the buffer is
+    /// filling up while the real password text never leaves
+    /// memory. Capped at the visible width of the field.
     pub password_len: usize,
     pub active: ActiveField,
     pub error: Option<&'a str>,
@@ -122,10 +124,26 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     );
     let pw_field_bg = field_bg_for(state.active == ActiveField::Password, accent);
     fill_rect(pixels, width, field_x, pw_y, field_w, field_h, pw_field_bg);
-    // No password echo per Phase 71 D — leave the field empty even
-    // when the user has typed. `password_len` is rendered into
-    // observability state, never on screen.
-    let _ = state.password_len;
+    // Masked echo: one `*` per typed character, capped at the visible
+    // field width so a long password doesn't overflow the panel. The
+    // real password buffer stays in the read_field caller; we only see
+    // the length here.
+    if state.password_len > 0 {
+        let glyph_w = 8usize;
+        let max_glyphs = ((field_w as usize) - 8) / glyph_w;
+        let stars = state.password_len.min(max_glyphs);
+        let mask: String = core::iter::repeat('*').take(stars).collect();
+        draw_text(
+            pixels,
+            width,
+            field_x + 4,
+            pw_y + 4,
+            &mask,
+            prompt_color,
+            pw_field_bg,
+            &font,
+        );
+    }
 
     // Error message + backoff countdown.
     let err_y = panel_y + 160;
