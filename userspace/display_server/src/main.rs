@@ -370,6 +370,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     let mut registry = SurfaceRegistry::new();
     let mut compose_ctx = ComposeContext::new();
     let mut bulk_buf = alloc::vec![0u8; client::MAX_BULK_BYTES];
+    // Phase 73 Track A — animation engine, ticked once per compose
+    // frame below. `push` will be wired up by the upcoming workspace-
+    // switch / surface-create / surface-destroy hooks; until those
+    // land the engine ticks an empty list and produces no damage.
+    let mut animation_engine = animation::AnimationEngine::new();
+    let mut last_animation_tick_us: u64 = monotonic_micros();
+    // Phase 73 Track B — pre-computed rounded-corner mask. Held here
+    // so the per-frame decoration pass (a documented follow-up) can
+    // apply it without re-allocating. Zero radius makes
+    // `RoundedCornerMask::is_disabled()` true and the future apply
+    // pass becomes a no-op.
+    let _decoration_mask =
+        decoration::RoundedCornerMask::new(compositor_config.decorations.corner_radius);
     // Phase 72b — `[autostart]` execution latch. Flipped to `true`
     // after the first successful compose so the autostart entries
     // launch exactly once per compositor lifetime, matching
@@ -623,6 +636,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         for (sid, role) in outcome.created.iter() {
             if matches!(role, SurfaceRole::Toplevel) {
                 workspace_mgr.insert_on_current(*sid);
+                // Phase 73 Track A — queue a window-open slide+fade
+                // animation against the full output. The compose loop
+                // ticks the engine once per frame; the engine self-
+                // removes when the 150 ms duration elapses.
+                animation_engine.animate(
+                    *sid,
+                    animation::AnimationKind::WindowOpen,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: meta.width,
+                        h: meta.height,
+                    },
+                );
             }
         }
         for sid in outcome.destroyed.iter() {
@@ -631,6 +658,11 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // map so a future surface that lands at the same id does
             // not get spuriously diffed against the dead tile.
             last_tile_dims.remove(sid);
+            // Phase 73 Track A — drop any in-flight animations against
+            // this surface so the engine does not advance timers for a
+            // dead client. The destroy path already forces a full
+            // repaint below.
+            animation_engine.drop_surface(*sid);
         }
         // Phase 72b — surfaces leaving the active arrangement leave
         // stale pixels in the framebuffer (term being closed, greeter
@@ -789,6 +821,22 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             syscall_lib::frame_tick_drain()
         };
         if ticks > 0 {
+            // Phase 73 Track A — advance the animation engine once per
+            // frame. When any animation is in flight, the returned
+            // `DamageRegion` is non-empty and we conservatively force a
+            // full repaint so the animated rect lands on screen. An
+            // empty engine produces no damage and skips this branch
+            // entirely.
+            let now_us = monotonic_micros();
+            let delta_us = now_us.saturating_sub(last_animation_tick_us);
+            last_animation_tick_us = now_us;
+            let delta_ms = (delta_us / 1000) as u32;
+            if delta_ms > 0 && !animation_engine.is_empty() {
+                let damage = animation_engine.tick(delta_ms);
+                if !damage.is_empty() {
+                    compose_ctx.force_full_repaint();
+                }
+            }
             // Phase 57d follow-up — post-reclaim full-screen fill.
             // After Tier 1 fullscreen-takeover, the takeover program
             // (e.g. doom) drew over the entire FB. `run_compose`
