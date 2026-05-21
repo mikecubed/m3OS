@@ -19,7 +19,7 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use desktop_client::{DisplayConnection, SharedSurface, anchor, fill};
-use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, SurfaceId};
+use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -41,7 +41,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const CONFIG_PATH: &[u8] = b"/etc/compositor.conf\0";
-const SURFACE_ID: SurfaceId = SurfaceId(1);
 const BUFFER_ID: BufferId = BufferId(1);
 const SURFACE_WIDTH_PX: u32 = 1280;
 const SURFACE_HEIGHT_PX: u32 = 800;
@@ -72,7 +71,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGHUP as usize, handle_sighup);
     let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGTERM as usize, handle_sigterm);
 
-    let conn = match DisplayConnection::connect(SURFACE_ID) {
+    let conn = match DisplayConnection::connect_auto() {
         Some(c) => c,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "wallpaper: display_server unavailable\n");

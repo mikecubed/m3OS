@@ -41,6 +41,13 @@ pub struct DisplayConnection {
 }
 
 impl DisplayConnection {
+    /// Convenience: connect using [`auto_surface_id`] so callers do
+    /// not have to remember the Phase 73 reservation table. This is
+    /// the canonical entry point for new desktop clients.
+    pub fn connect_auto() -> Option<Self> {
+        Self::connect(auto_surface_id())
+    }
+
     /// Block until `display_server` is reachable, then send the Phase
     /// 56 `Hello` + `CreateSurface` handshake. Returns `None` if the
     /// service never appears or any step fails.
@@ -387,6 +394,40 @@ fn lookup_display_with_backoff() -> Option<u32> {
 fn client_token() -> u32 {
     let pid = syscall_lib::getpid();
     if pid > 0 { pid as u32 } else { 0xD0E5_0001 }
+}
+
+/// Derive a per-process surface id that does not collide with
+/// well-known fixed ids used by other compositor clients.
+///
+/// The compositor's surface registry is keyed by `SurfaceId` globally
+/// (not per-client), so two processes that both pick `SurfaceId(1)`
+/// stomp on each other: the second `CreateSurface` is rejected as a
+/// duplicate, and all subsequent verbs (`SetSurfaceRole`,
+/// `AttachSharedBuffer`, ...) silently target the *first* process's
+/// surface. The visible symptom is that a Phase 73 daemon (bar /
+/// wallpaper / ...) starting after greeter mutates greeter's role
+/// from `Toplevel` to `Layer::Top`, turning the login page into a 24
+/// px strip at the top of the screen until greeter's session
+/// manager respawns it.
+///
+/// Reserved ranges:
+/// * `SurfaceId(1..=0x3FFF)` — fixed ids (greeter = 1, future
+///   well-known clients).
+/// * `SurfaceId(0x4000..=0x7FFF)` — `term` (`0x4000 + pid`).
+/// * `SurfaceId(0x8000..=0xFFFF)` — Phase 73 desktop clients
+///   (`0x8000 + pid`, this function).
+///
+/// Each `DisplayConnection::connect_auto` call uses this helper.
+pub fn auto_surface_id() -> SurfaceId {
+    let pid = syscall_lib::getpid();
+    if pid > 0 {
+        SurfaceId(0x8000u32.wrapping_add(pid as u32))
+    } else {
+        // PID lookup failed — fall back to a fixed mid-range id. Two
+        // such fallbacks would collide, but a userspace process
+        // without a valid PID is already in an unrecoverable state.
+        SurfaceId(0x8001)
+    }
 }
 
 /// Helper: collect a `Vec<KeyEvent>` from the connection until it

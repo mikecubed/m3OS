@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 
 use desktop_client::{DisplayConnection, SharedSurface, draw_text, fill, fill_rect, stroke_rect};
-use kernel_core::display::protocol::{BufferId, ServerMessage, SurfaceId};
+use kernel_core::display::protocol::{BufferId, ServerMessage};
 use kernel_core::input::events::KeyEventKind;
 use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_ENTER, KEY_ESC};
 use syscall_lib::STDOUT_FILENO;
@@ -38,7 +38,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 syscall_lib::entry_point!(program_main);
 
-const SURFACE_ID: SurfaceId = SurfaceId(1);
 const BUFFER_ID: BufferId = BufferId(1);
 const WIDTH_PX: u32 = 600;
 const HEIGHT_PX: u32 = 400;
@@ -68,7 +67,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let _ = syscall_lib::write(STDOUT_FILENO, &digits[..n]);
     syscall_lib::write_str(STDOUT_FILENO, " entries\n");
 
-    let conn = match DisplayConnection::connect(SURFACE_ID) {
+    let conn = match DisplayConnection::connect_auto() {
         Some(c) => c,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "launcher: display_server unavailable\n");

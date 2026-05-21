@@ -19,7 +19,7 @@ use core::alloc::Layout;
 use desktop_client::{
     DisplayConnection, SharedSurface, anchor, draw_text, fill, fill_rect, stroke_rect,
 };
-use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, SurfaceId};
+use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -41,7 +41,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const SOCKET_PATH: &str = "/run/notifyd.sock";
-const SURFACE_ID: SurfaceId = SurfaceId(1);
 const BUFFER_ID: BufferId = BufferId(1);
 const WIDTH_PX: u32 = 360;
 const HEIGHT_PX: u32 = 420;
@@ -79,7 +78,7 @@ fn program_main(_args: &[&str]) -> i32 {
         }
     };
 
-    let conn = match DisplayConnection::connect(SURFACE_ID) {
+    let conn = match DisplayConnection::connect_auto() {
         Some(c) => c,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "notifyd: display_server unavailable\n");

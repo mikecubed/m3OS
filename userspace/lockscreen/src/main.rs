@@ -16,9 +16,7 @@ extern crate alloc;
 use core::alloc::Layout;
 
 use desktop_client::{DisplayConnection, SharedSurface, anchor, draw_text, fill, fill_rect};
-use kernel_core::display::protocol::{
-    BufferId, KeyboardInteractivity, Layer, ServerMessage, SurfaceId,
-};
+use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, ServerMessage};
 use kernel_core::input::events::KeyEventKind;
 use kernel_core::input::keymap::KEY_ENTER;
 use syscall_lib::STDOUT_FILENO;
@@ -41,7 +39,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 syscall_lib::entry_point!(program_main);
 
-const SURFACE_ID: SurfaceId = SurfaceId(1);
 const BUFFER_ID: BufferId = BufferId(1);
 const WIDTH_PX: u32 = 1280;
 const HEIGHT_PX: u32 = 800;
@@ -61,7 +58,7 @@ fn program_main(_args: &[&str]) -> i32 {
         let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
     }
 
-    let conn = match DisplayConnection::connect(SURFACE_ID) {
+    let conn = match DisplayConnection::connect_auto() {
         Some(c) => c,
         None => {
             syscall_lib::write_str(STDOUT_FILENO, "lockscreen: display_server unavailable\n");
