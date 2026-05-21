@@ -400,6 +400,13 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // its intrinsic size and the compositor handles repositioning.
     let mut last_tile_dims: alloc::collections::BTreeMap<SurfaceId, (u32, u32)> =
         alloc::collections::BTreeMap::new();
+    // Phase 73 — last-computed Toplevel arrangement, used by the
+    // input dispatcher's hit-test so clicks land on the *tiled* rect
+    // (not the centred buffer rect from `iter_compose`). Updated on
+    // every frame-tick compose pass; the input drain consumes it on
+    // every iteration of the outer loop, so the hit-test lags compose
+    // by at most one frame.
+    let mut last_arrangement: alloc::vec::Vec<(SurfaceId, Rect)> = alloc::vec::Vec::new();
     // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
     // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
     // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
@@ -886,8 +893,19 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // workspaces don't receive resize events until they come
             // back into view (the next `switch_workspace` will diff and
             // re-emit if their new tile differs).
+            // Phase 73 — feed Layer-shell `exclusive_zones` into the
+            // pre-tile usable rect so the bar's 24 px top strip (and
+            // any other docked Layer surface) is excluded from the
+            // tiling area. Without this, toplevels overlap docked
+            // Layer surfaces — the visible Phase 73 bug.
+            let diff_exclusive_zones = registry.exclusive_zones(Rect {
+                x: 0,
+                y: 0,
+                w: meta.width,
+                h: meta.height,
+            });
             let arrangement_for_diff: alloc::vec::Vec<(SurfaceId, Rect)> = workspace_mgr
-                .arrange_current(
+                .arrange_current_with_exclusive(
                     Rect {
                         x: 0,
                         y: 0,
@@ -895,7 +913,9 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         h: meta.height,
                     },
                     compositor_config.gaps,
+                    &diff_exclusive_zones,
                 );
+            last_arrangement = arrangement_for_diff.clone();
             // Phase 72b — track whether the arrangement structure
             // changed this frame (any tile dim flipped or any surface
             // left the active set). On a change, the now-uncovered
@@ -1072,11 +1092,49 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             w: meta.width,
             h: meta.height,
         };
+        // Phase 73 — hit-test against the active workspace's tile
+        // arrangement, not against `iter_compose`'s centred buffer
+        // rects. Two reasons:
+        //   1. `iter_compose` is unfiltered by workspace — Toplevels on
+        //      inactive workspaces would still appear in the hit-test
+        //      slice, so clicks could land on hidden surfaces.
+        //   2. `iter_compose` reports a *centred* rect for each
+        //      Toplevel rather than its assigned tile, so a tiled
+        //      surface (e.g. master-stack right-pane) would test as
+        //      hovered only at the centre of the output. The compose
+        //      path rewrites the rect via the workspace arrangement;
+        //      input must agree with what's actually painted.
+        // Layer surfaces (status bar, dock) are still tracked from
+        // `iter_compose` so they receive Pointer / hover events.
+        let active_ws_set: alloc::collections::BTreeSet<SurfaceId> =
+            workspace_mgr.current().windows().iter().copied().collect();
+        let mut surface_geom: alloc::vec::Vec<SurfaceGeometry> = alloc::vec::Vec::new();
+        for (sid, tile) in last_arrangement.iter() {
+            if active_ws_set.contains(sid) {
+                surface_geom.push(SurfaceGeometry::toplevel(*sid, *tile));
+            }
+        }
         let compose_entries = registry.iter_compose(output_rect);
-        let surface_geom: alloc::vec::Vec<SurfaceGeometry> = compose_entries
-            .iter()
-            .map(|e| SurfaceGeometry::toplevel(e.id, e.rect))
-            .collect();
+        for entry in compose_entries.iter() {
+            if matches!(
+                entry.layer,
+                kernel_core::display::compose::ComposeLayer::Toplevel
+            ) {
+                // Already added via the workspace arrangement above —
+                // skip the centred-rect duplicate.
+                continue;
+            }
+            // Layer / Background / Top / Overlay surfaces keep their
+            // `iter_compose` rect (which already reflects the anchor
+            // + buffer geometry returned by `compute_layer_geometry`).
+            if let Some(role) = registry.surface_role(entry.id) {
+                surface_geom.push(SurfaceGeometry {
+                    id: entry.id,
+                    rect: entry.rect,
+                    role,
+                });
+            }
+        }
         // Reset hover tracking if the previously hovered surface is no
         // longer in the registry. The dispatcher cannot know this on
         // its own — the registry is the source of truth.

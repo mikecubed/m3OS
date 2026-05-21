@@ -18,7 +18,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use kernel_core::display::layout::{LayoutPolicy, LayoutSurface, OutputGeometry};
+use kernel_core::display::layout::{LayoutPolicy, LayoutSurface, OutputGeometry, usable_rect};
 use kernel_core::display::protocol::{Rect, SurfaceId};
 use layout::{
     DwindleLayout, FullscreenLayout, GapConfig, GridLayout, LayoutError, MasterStackLayout,
@@ -447,7 +447,23 @@ impl WorkspaceManager {
     /// `TiledLayoutPolicy`. Returns the per-window rectangles ready
     /// for the compose loop's blit phase.
     pub fn arrange_current(&mut self, output: Rect, gaps: GapConfig) -> Vec<(SurfaceId, Rect)> {
-        let inner = apply_outer_gaps(output, gaps.outer);
+        self.arrange_current_with_exclusive(output, gaps, &[])
+    }
+
+    /// Phase 73 — same as [`arrange_current`], but subtracts full-edge
+    /// `exclusive_zones` (e.g. the status-bar's reserved 24px strip at
+    /// the top of the output) from the output rect *before* applying
+    /// outer gaps, so toplevels never overlap docked Layer-shell
+    /// surfaces. Zones that don't tile a full edge are ignored — the
+    /// compositor caller already filters those upstream.
+    pub fn arrange_current_with_exclusive(
+        &mut self,
+        output: Rect,
+        gaps: GapConfig,
+        exclusive_zones: &[Rect],
+    ) -> Vec<(SurfaceId, Rect)> {
+        let usable = usable_rect(output, exclusive_zones);
+        let inner = apply_outer_gaps(usable, gaps.outer);
         self.workspaces[self.current].tile(inner, gaps)
     }
 
@@ -483,15 +499,18 @@ impl<'a> LayoutPolicy for WorkspaceLayoutAdapter<'a> {
         &mut self,
         _toplevels: &[LayoutSurface],
         output: OutputGeometry,
-        _exclusive_zones: &[Rect],
+        exclusive_zones: &[Rect],
     ) -> Vec<(SurfaceId, Rect)> {
         // The compose loop filters `iter_compose` to only the active
         // workspace's surfaces before calling `arrange`, but the
         // legacy trait passes `toplevels` to honour the call shape.
         // We ignore the parameter and consult `manager.current()`
         // directly — that is the source of truth for which windows
-        // tile under the active policy.
-        self.manager.arrange_current(output.rect, self.gaps)
+        // tile under the active policy. `exclusive_zones` carries the
+        // full-edge reservations declared by Layer-shell clients (Phase
+        // 73 status bar / dock / panel) so toplevels never overlap them.
+        self.manager
+            .arrange_current_with_exclusive(output.rect, self.gaps, exclusive_zones)
     }
 }
 
