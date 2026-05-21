@@ -33,7 +33,7 @@ extern crate alloc;
 use alloc::string::String;
 use core::alloc::Layout;
 
-use desktop_client::{DisplayConnection, SharedSurface, anchor, draw_text, fill, fill_rect};
+use desktop_client::{DisplayConnection, SharedSurface, anchor, draw_text_scaled, fill, fill_rect};
 use kernel_core::display::control::{ControlCommand, ControlEvent, decode_event, encode_command};
 use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, ServerMessage};
 use kernel_core::input::events::PointerButton;
@@ -58,7 +58,14 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 syscall_lib::entry_point!(program_main);
 
 const BUFFER_ID: BufferId = BufferId(1);
-const BAR_HEIGHT_PX: u32 = 24;
+/// Phase 73 (HiDPI revision) — the bar is now twice as tall and uses
+/// a 2× scaled font so it stays legible at 1080p.
+const BAR_HEIGHT_PX: u32 = 48;
+/// Pixel-doubling factor for the bar's bitmap font. Source glyphs
+/// are 8×16, rendered as 16×32 with this scale.
+const FONT_SCALE: u32 = 2;
+/// Width of one rendered text glyph cell in framebuffer pixels.
+const GLYPH_W: i32 = 8 * FONT_SCALE as i32;
 const SERVICE_NAME: &str = "bar";
 
 const BG_COLOR: u32 = 0xFF_18_18_18;
@@ -67,12 +74,13 @@ const ACTIVE_WS_COLOR: u32 = 0xFF_2E_8B_57;
 const MUTE_COLOR: u32 = 0xFF_C8_3A_3A;
 
 // Workspace-cell geometry shared between `render` and the
-// pointer-click handler.
-const WS_BOX_W: u32 = 22;
-const WS_GAP: u32 = 2;
-const WS_LEFT_PAD: i32 = 4;
-const WS_TOP_PAD: i32 = 2;
-const WS_BOX_H: u32 = 20;
+// pointer-click handler. Doubled from the old 24-pixel layout so the
+// cells line up with the 2× font.
+const WS_BOX_W: u32 = 44;
+const WS_GAP: u32 = 4;
+const WS_LEFT_PAD: i32 = 8;
+const WS_TOP_PAD: i32 = 4;
+const WS_BOX_H: u32 = 40;
 
 const DISPLAY_CONTROL_SERVICE_NAME: &str = "display-control";
 const LABEL_DISPLAY_CTL_CMD: u64 = 1;
@@ -362,8 +370,8 @@ fn render(pixels: &mut [u32], state: &BarState, bar_width_px: u32) {
     let w = bar_width_px;
     let h = BAR_HEIGHT_PX;
 
-    // Workspace indicators: 9 boxes, each 22 px wide. Geometry lives
-    // in module-level constants so the pointer-click handler in
+    // Workspace indicators: 9 boxes sized for the 2× font. Geometry
+    // lives in module-level constants so the pointer-click handler in
     // `workspace_cell_at` agrees with the painted layout.
     for i in 1u32..=9 {
         let x = ((i - 1) * (WS_BOX_W + WS_GAP)) as i32 + WS_LEFT_PAD;
@@ -374,58 +382,74 @@ fn render(pixels: &mut [u32], state: &BarState, bar_width_px: u32) {
             0xFF_2E_2E_2E
         };
         fill_rect(pixels, w, h, x, WS_TOP_PAD, WS_BOX_W, WS_BOX_H, color);
-        let label_x = x + 7;
-        let label_y = WS_TOP_PAD + 2;
+        // Centre the doubled digit inside the doubled cell.
+        let label_x = x + (WS_BOX_W as i32 - GLYPH_W) / 2;
+        let label_y = WS_TOP_PAD + (WS_BOX_H as i32 - GLYPH_W * 2) / 2;
         let digit = (b'0' + i as u8) as char;
         let mut buf = [0u8; 1];
         buf[0] = digit as u8;
         if let Ok(s) = core::str::from_utf8(&buf) {
-            draw_text(pixels, w, h, label_x, label_y, s, FG_COLOR, color);
+            draw_text_scaled(
+                pixels, w, h, label_x, label_y, s, FG_COLOR, color, FONT_SCALE,
+            );
         }
     }
 
     // Centered window title.
     if !state.title.is_empty() {
-        let est_width = (state.title.len() as i32) * 8;
+        let est_width = (state.title.len() as i32) * GLYPH_W;
         let cx = (w as i32 - est_width) / 2;
-        let cy = 4;
-        draw_text(
+        let cy = (h as i32 - GLYPH_W * 2) / 2;
+        draw_text_scaled(
             pixels,
             w,
             h,
-            cx.max(220),
+            cx.max(440),
             cy,
             &state.title,
             FG_COLOR,
             BG_COLOR,
+            FONT_SCALE,
         );
     }
 
     // Mute indicator + clock at the right.
-    let clock_x = (w as i32) - (state.clock_text.len() as i32) * 8 - 8;
-    draw_text(
+    let clock_x = (w as i32) - (state.clock_text.len() as i32) * GLYPH_W - 16;
+    let clock_y = (h as i32 - GLYPH_W * 2) / 2;
+    draw_text_scaled(
         pixels,
         w,
         h,
         clock_x,
-        4,
+        clock_y,
         &state.clock_text,
         FG_COLOR,
         BG_COLOR,
+        FONT_SCALE,
     );
     if state.mute {
         let label = "MUTE";
-        let mute_x = clock_x - (label.len() as i32 * 8) - 8;
+        let mute_x = clock_x - (label.len() as i32 * GLYPH_W) - 16;
         fill_rect(
             pixels,
             w,
             h,
-            mute_x - 4,
-            2,
-            (label.len() as u32) * 8 + 8,
-            20,
+            mute_x - 8,
+            4,
+            (label.len() as u32) * (GLYPH_W as u32) + 16,
+            h - 8,
             MUTE_COLOR,
         );
-        draw_text(pixels, w, h, mute_x, 4, label, 0xFF_FF_FF_FF, MUTE_COLOR);
+        draw_text_scaled(
+            pixels,
+            w,
+            h,
+            mute_x,
+            clock_y,
+            label,
+            0xFF_FF_FF_FF,
+            MUTE_COLOR,
+            FONT_SCALE,
+        );
     }
 }

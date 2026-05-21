@@ -288,9 +288,9 @@ pub fn stroke_rect(
     fill_rect(pixels, stride, height, x + (w as i32 - 1), y, 1, h, color);
 }
 
-/// Draw an ASCII string with the bundled 8×16 bitmap font. Returns
-/// the rendered width in pixels. Codepoints outside ASCII fall back
-/// to the centred-dot glyph.
+/// Draw an ASCII string with the bundled 8×16 bitmap font at native
+/// scale. Returns the rendered width in pixels. Codepoints outside
+/// ASCII fall back to the centred-dot glyph.
 pub fn draw_text(
     pixels: &mut [u32],
     stride: u32,
@@ -301,16 +301,36 @@ pub fn draw_text(
     fg: u32,
     bg: u32,
 ) -> i32 {
+    draw_text_scaled(pixels, stride, height, x, y, text, fg, bg, 1)
+}
+
+/// Draw an ASCII string with the bundled 8×16 bitmap font, scaled
+/// by `scale` (each source pixel becomes a `scale × scale` block).
+/// Used by HiDPI surfaces (1080p+) so the text matches the
+/// framebuffer's higher pixel density. Returns the rendered width
+/// in pixels (`8 * scale * text.len()` if nothing clipped).
+pub fn draw_text_scaled(
+    pixels: &mut [u32],
+    stride: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    text: &str,
+    fg: u32,
+    bg: u32,
+    scale: u32,
+) -> i32 {
     let font = BasicBitmapFont::new();
     let (cw, ch) = font.cell_size();
-    let cw_i = cw as i32;
+    let scale_i = scale.max(1) as i32;
+    let cw_i = cw as i32 * scale_i;
     let mut cx = x;
     for ch_byte in text.bytes() {
         if cx + cw_i > stride as i32 {
             break;
         }
         let g: &Glyph = font.glyph_or_fallback(ch_byte as u32);
-        draw_glyph_alpha(pixels, stride, height, cx, y, g, fg, bg);
+        draw_glyph_alpha(pixels, stride, height, cx, y, g, fg, bg, scale.max(1));
         cx += cw_i;
     }
     let _ = ch;
@@ -326,30 +346,42 @@ fn draw_glyph_alpha(
     g: &Glyph,
     fg: u32,
     bg: u32,
+    scale: u32,
 ) {
     let w = g.width as usize;
     let h = g.height as usize;
+    let s = scale.max(1) as i32;
     let bytes_per_row = w.div_ceil(8);
     for row in 0..h {
-        let py = y + row as i32;
-        if py < 0 || py >= height as i32 {
-            continue;
-        }
         let row_start = row * bytes_per_row;
         for col in 0..w {
-            let px = x + col as i32;
-            if px < 0 || px >= stride as i32 {
-                continue;
-            }
             let byte_idx = row_start + (col / 8);
             if byte_idx >= g.bitmap.len() {
                 continue;
             }
             let bit_idx = 7 - (col % 8);
             let bit_set = (g.bitmap[byte_idx] >> bit_idx) & 1 == 1;
-            let idx = (py * stride as i32 + px) as usize;
-            if idx < pixels.len() {
-                pixels[idx] = if bit_set { fg } else { bg };
+            let color = if bit_set { fg } else { bg };
+            // Emit a `s × s` block in the destination for this source
+            // pixel. Pixel-doubling stays sharp for monospace bitmap
+            // fonts; bilinear filtering would make small glyphs
+            // blurry.
+            for dy in 0..s {
+                let py = y + row as i32 * s + dy;
+                if py < 0 || py >= height as i32 {
+                    continue;
+                }
+                let row_off = (py as usize) * (stride as usize);
+                for dx in 0..s {
+                    let px = x + col as i32 * s + dx;
+                    if px < 0 || px >= stride as i32 {
+                        continue;
+                    }
+                    let idx = row_off + px as usize;
+                    if idx < pixels.len() {
+                        pixels[idx] = color;
+                    }
+                }
             }
         }
     }

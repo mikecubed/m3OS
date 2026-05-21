@@ -473,6 +473,16 @@ where
         for entry in entries.iter() {
             let original = entry.buf.pixels_snapshot();
             let tile = tile_for_entry(entry, arrangement);
+            // Phase 73 — only scale when the surface is **strictly
+            // larger** than the assigned tile, i.e. when letterboxing
+            // would visibly clip content. For under-sized surfaces
+            // (DOOM at 1280×800 inside a 1920×1056 tile is the
+            // canonical case) the letterbox path is dramatically
+            // cheaper than nearest-neighbour scaling the full buffer
+            // on every frame; the surface just renders at native
+            // resolution in the centre of its tile. The
+            // clip-to-tile path handles the over-sized case
+            // independently — see `surface_tile_clip` below.
             let should_scale = match tile {
                 Some(t) => {
                     matches!(
@@ -482,7 +492,7 @@ where
                         && entry.buf.height > 0
                         && t.w > 0
                         && t.h > 0
-                        && (entry.buf.width != t.w || entry.buf.height != t.h)
+                        && (entry.buf.width > t.w || entry.buf.height > t.h)
                 }
                 None => false,
             };

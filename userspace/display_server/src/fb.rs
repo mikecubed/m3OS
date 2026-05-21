@@ -71,6 +71,16 @@ pub struct KernelFramebufferOwner {
     /// intervening writes are no-ops. Set by every `write_pixels` call
     /// that actually touched bytes.
     dirty: bool,
+    /// Row-range bounding box of dirty bytes in `back_buffer`. Tracked
+    /// per `write_pixels` so `present()` can memcpy just the touched
+    /// rows rather than the whole framebuffer. `(usize::MAX, 0)` is
+    /// the "no dirt" sentinel; `usize::MAX` keeps the inclusive-min
+    /// branch sound when no writes have happened. Phase 73 — at 1080p
+    /// the full-FB memcpy was 8 MiB per present, which TCG choked on;
+    /// row-bounded copies bring typical frames back into the
+    /// few-hundred-KB range.
+    dirty_row_min: usize,
+    dirty_row_max_exclusive: usize,
 }
 
 // SAFETY: the FB virtual address is only mutated through methods on this
@@ -142,6 +152,8 @@ impl KernelFramebufferOwner {
             byte_len,
             released: false,
             dirty: false,
+            dirty_row_min: usize::MAX,
+            dirty_row_max_exclusive: 0,
         })
     }
 
@@ -224,6 +236,19 @@ impl FramebufferOwner for KernelFramebufferOwner {
                 .copy_from_slice(&src[src_row_off..src_row_off + clipped_w_bytes]);
         }
         self.dirty = true;
+        // Track the row-range of every write so `present()` can copy
+        // just those rows instead of the entire framebuffer. At 1080p
+        // the FB is 8 MiB; copying it all on every present pegged the
+        // CPU under TCG. A typical compose touches a few thousand
+        // rows at most, so row-bounded copies stay cheap.
+        let row_start = clipped.y as usize;
+        let row_end = row_start + clipped.h as usize;
+        if row_start < self.dirty_row_min {
+            self.dirty_row_min = row_start;
+        }
+        if row_end > self.dirty_row_max_exclusive {
+            self.dirty_row_max_exclusive = row_end;
+        }
         Ok(())
     }
 
@@ -231,15 +256,35 @@ impl FramebufferOwner for KernelFramebufferOwner {
         if !self.dirty {
             return Ok(());
         }
-        // SAFETY: the kernel mapped `byte_len` writable bytes at `base`
-        // for our exclusive use, and `back_buffer` is exactly that
-        // many bytes (allocated in `acquire`). The two regions live in
-        // disjoint address ranges (kernel-mapped MMIO vs heap), so the
-        // copy is non-overlapping.
-        unsafe {
-            ptr::copy_nonoverlapping(self.back_buffer.as_ptr(), self.base, self.byte_len);
+        let dest_stride = self.metadata.stride_bytes as usize;
+        // Clamp the dirty row range to the FB extents; `write_pixels`
+        // already bounded each row write against `byte_len`, but
+        // bounding here too keeps the unsafe path defensive against a
+        // future regression that forgets to.
+        let row_min = self.dirty_row_min.min(self.metadata.height as usize);
+        let row_max = self
+            .dirty_row_max_exclusive
+            .min(self.metadata.height as usize);
+        if row_max > row_min {
+            let byte_off = row_min.saturating_mul(dest_stride);
+            let byte_len = (row_max - row_min).saturating_mul(dest_stride);
+            // SAFETY: the kernel mapped `self.byte_len` writable bytes
+            // at `self.base`; `byte_off + byte_len <= self.byte_len`
+            // because `row_max <= metadata.height` and the back
+            // buffer is sized identically. The two regions are
+            // disjoint (kernel-mapped MMIO vs heap), so the copy is
+            // non-overlapping.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.back_buffer.as_ptr().add(byte_off),
+                    self.base.add(byte_off),
+                    byte_len,
+                );
+            }
         }
         self.dirty = false;
+        self.dirty_row_min = usize::MAX;
+        self.dirty_row_max_exclusive = 0;
         Ok(())
     }
 

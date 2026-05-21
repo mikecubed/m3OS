@@ -39,9 +39,18 @@ pub struct LoginUiState<'a> {
 /// Panel layout is computed once per call; everything is centered.
 /// All glyph painting goes through [`BasicBitmapFont`] (8×16 cells),
 /// kept compositor-native by [`crate::config::rgb_to_bgra`].
+/// Pixel-doubling factor for the bitmap font. Bumping from 1× to 2×
+/// keeps the login form legible at 1920×1080+; the panel size doubles
+/// to match. The text is still drawn from the 8×16 `BasicBitmapFont`
+/// glyphs — each source pixel is just emitted as a 2×2 destination
+/// block.
+const FONT_SCALE: u32 = 2;
+const GLYPH_W: u32 = 8 * FONT_SCALE;
+const GLYPH_H: u32 = 16 * FONT_SCALE;
+
 pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32, height: u32) {
-    let panel_w = 480u32;
-    let panel_h = 240u32;
+    let panel_w = 800u32;
+    let panel_h = 440u32;
     let panel_x = width.saturating_sub(panel_w) / 2;
     let panel_y = height.saturating_sub(panel_h) / 2;
 
@@ -61,11 +70,11 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     let accent = state.config.accent_color;
 
     // Welcome banner.
-    let banner_y = panel_y + 18;
+    let banner_y = panel_y + 32;
     draw_text(
         pixels,
         width,
-        panel_x + 20,
+        panel_x + 32,
         banner_y,
         &state.config.welcome,
         prompt_color,
@@ -73,12 +82,13 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
         &font,
     );
 
-    // Username row.
-    let label_x = panel_x + 20;
-    let field_x = panel_x + 130;
-    let field_w = panel_w - 150;
-    let field_h = 22u32;
-    let user_y = panel_y + 68;
+    // Username row. Layout numbers are bumped from the 1× metrics so
+    // labels and fields stay on the panel grid at 2× font scale.
+    let label_x = panel_x + 32;
+    let field_x = panel_x + 32 + GLYPH_W * 10; // room for "Username: " label
+    let field_w = panel_w - (field_x - panel_x) - 32;
+    let field_h = GLYPH_H + 8;
+    let user_y = panel_y + 120;
     draw_text(
         pixels,
         width,
@@ -102,7 +112,7 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     draw_text(
         pixels,
         width,
-        field_x + 4,
+        field_x + 8,
         user_y + 4,
         state.username,
         prompt_color,
@@ -110,8 +120,8 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
         &font,
     );
 
-    // Password row (no echo; show field highlight only).
-    let pw_y = panel_y + 108;
+    // Password row.
+    let pw_y = panel_y + 200;
     draw_text(
         pixels,
         width,
@@ -124,19 +134,14 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     );
     let pw_field_bg = field_bg_for(state.active == ActiveField::Password, accent);
     fill_rect(pixels, width, field_x, pw_y, field_w, field_h, pw_field_bg);
-    // Masked echo: one `*` per typed character, capped at the visible
-    // field width so a long password doesn't overflow the panel. The
-    // real password buffer stays in the read_field caller; we only see
-    // the length here.
     if state.password_len > 0 {
-        let glyph_w = 8usize;
-        let max_glyphs = ((field_w as usize) - 8) / glyph_w;
+        let max_glyphs = ((field_w as usize) - 16) / (GLYPH_W as usize);
         let stars = state.password_len.min(max_glyphs);
         let mask: String = core::iter::repeat('*').take(stars).collect();
         draw_text(
             pixels,
             width,
-            field_x + 4,
+            field_x + 8,
             pw_y + 4,
             &mask,
             prompt_color,
@@ -146,7 +151,7 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     }
 
     // Error message + backoff countdown.
-    let err_y = panel_y + 160;
+    let err_y = panel_y + 296;
     if let Some(secs) = state.backoff_seconds_remaining {
         let msg = format_backoff(secs);
         draw_text(
@@ -173,7 +178,7 @@ pub fn render_login_ui(state: &LoginUiState<'_>, pixels: &mut [u32], width: u32,
     }
 
     // Hint at the bottom of the panel: how to submit.
-    let hint_y = panel_y + panel_h - 28;
+    let hint_y = panel_y + panel_h - GLYPH_H - 16;
     draw_text(
         pixels,
         width,
@@ -231,6 +236,8 @@ fn draw_text(
 ) {
     let (cell_w, cell_h) = font.cell_size();
     let stride = width as usize;
+    let scale = FONT_SCALE as usize;
+    let cell_w_scaled = (cell_w as u32) * FONT_SCALE;
     let mut cursor_x = x;
     for ch in text.chars() {
         if ch == '\n' {
@@ -239,11 +246,11 @@ fn draw_text(
         if let Some(glyph) = font.glyph(ch as u32) {
             let cell_x = cursor_x as usize;
             let cell_y = y as usize;
-            // Render glyph row by row into the surface.
+            // Render glyph row by row, pixel-doubling each source
+            // pixel into a `FONT_SCALE × FONT_SCALE` destination block.
             let bytes_per_row = (glyph.width as usize).div_ceil(8);
             for row in 0..glyph.height as usize {
                 let row_start = row * bytes_per_row;
-                let py = cell_y + row;
                 for col in 0..glyph.width as usize {
                     let byte_idx = row_start + col / 8;
                     if byte_idx >= glyph.bitmap.len() {
@@ -251,15 +258,21 @@ fn draw_text(
                     }
                     let bit_idx = 7 - (col % 8);
                     let bit_set = (glyph.bitmap[byte_idx] >> bit_idx) & 1 == 1;
-                    let px = cell_x + col;
-                    let idx = py * stride + px;
-                    if idx < pixels.len() {
-                        pixels[idx] = if bit_set { fg } else { bg };
+                    let color = if bit_set { fg } else { bg };
+                    for dy in 0..scale {
+                        let py = cell_y + row * scale + dy;
+                        for dx in 0..scale {
+                            let px = cell_x + col * scale + dx;
+                            let idx = py * stride + px;
+                            if idx < pixels.len() {
+                                pixels[idx] = color;
+                            }
+                        }
                     }
                 }
             }
         }
-        cursor_x = cursor_x.saturating_add(cell_w as u32);
+        cursor_x = cursor_x.saturating_add(cell_w_scaled);
     }
     let _ = cell_h;
 }

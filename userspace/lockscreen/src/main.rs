@@ -31,7 +31,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 
-use desktop_client::{DisplayConnection, SharedSurface, anchor, draw_text, fill, fill_rect};
+use desktop_client::{DisplayConnection, SharedSurface, anchor, draw_text_scaled, fill, fill_rect};
 use kernel_core::display::protocol::{BufferId, KeyboardInteractivity, Layer, ServerMessage};
 use kernel_core::input::events::{KeyEvent, KeyEventKind};
 use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_ENTER};
@@ -68,6 +68,10 @@ const FAILURE_THRESHOLD: u32 = 3;
 const BACKOFF_SECS: u64 = 5;
 const MAX_PASSWORD_LEN: usize = 128;
 const SESSION_STATE_PATH: &[u8] = b"/run/m3os-current-session\0";
+/// 2× scaled bitmap font keeps the prompt legible at 1080p+.
+const FONT_SCALE: u32 = 2;
+const GLYPH_W: i32 = 8 * FONT_SCALE as i32;
+const GLYPH_H: i32 = 16 * FONT_SCALE as i32;
 
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "lockscreen: starting (Phase 73)\n");
@@ -329,9 +333,9 @@ fn clock_secs() -> u64 {
 fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
     fill(pixels, BG_COLOR);
 
-    // Centered prompt panel: 480×200.
-    let panel_w: u32 = 480;
-    let panel_h: u32 = 200;
+    // Centered prompt panel sized for the 2× font.
+    let panel_w: u32 = 800;
+    let panel_h: u32 = 320;
     let cx: i32 = (width as i32 - panel_w as i32) / 2;
     let cy: i32 = (height as i32 - panel_h as i32) / 2;
     fill_rect(pixels, width, height, cx, cy, panel_w, panel_h, PANEL_BG);
@@ -339,38 +343,40 @@ fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
         pixels,
         width,
         height,
-        cx + 20,
-        cy + 20,
-        panel_w - 40,
-        2,
+        cx + 32,
+        cy + 32,
+        panel_w - 64,
+        3,
         ACCENT_COLOR,
     );
 
     let title = "Screen locked";
-    let title_w = (title.len() as i32) * 8;
-    draw_text(
+    let title_w = (title.len() as i32) * GLYPH_W;
+    draw_text_scaled(
         pixels,
         width,
         height,
         cx + (panel_w as i32 - title_w) / 2,
-        cy + 36,
+        cy + 56,
         title,
         FG_COLOR,
         PANEL_BG,
+        FONT_SCALE,
     );
 
     // User line.
     let mut user_line = String::from("user: ");
     user_line.push_str(&state.username);
-    draw_text(
+    draw_text_scaled(
         pixels,
         width,
         height,
-        cx + 24,
-        cy + 76,
+        cx + 40,
+        cy + 120,
         &user_line,
         FG_COLOR,
         PANEL_BG,
+        FONT_SCALE,
     );
 
     // Password line with `*` masking.
@@ -379,21 +385,23 @@ fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
     let mut mask: Vec<u8> = Vec::with_capacity(state.password.len());
     mask.resize(state.password.len().min(32), b'*');
     password_line.push_str(core::str::from_utf8(&mask).unwrap_or(""));
-    draw_text(
+    draw_text_scaled(
         pixels,
         width,
         height,
-        cx + 24,
-        cy + 110,
+        cx + 40,
+        cy + 176,
         &password_line,
         FG_COLOR,
         PANEL_BG,
+        FONT_SCALE,
     );
 
     // Underline beneath the input area to make the field discoverable.
-    let underline_x = cx + 24 + (prompt_label.len() as i32) * 8;
-    let underline_y = cy + 110 + 18;
-    let underline_w: u32 = (panel_w - 64).saturating_sub(prompt_label.len() as u32 * 8);
+    let underline_x = cx + 40 + (prompt_label.len() as i32) * GLYPH_W;
+    let underline_y = cy + 176 + GLYPH_H + 4;
+    let underline_w: u32 =
+        (panel_w - 80).saturating_sub(prompt_label.len() as u32 * GLYPH_W as u32);
     fill_rect(
         pixels,
         width,
@@ -401,7 +409,7 @@ fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
         underline_x,
         underline_y,
         underline_w,
-        1,
+        2,
         ACCENT_COLOR,
     );
 
@@ -411,15 +419,16 @@ fn render(pixels: &mut [u32], state: &UiState, width: u32, height: u32) {
         Status::Backoff => ("Too many attempts; try again shortly", ERROR_COLOR),
         Status::Unlocked => ("Unlocking...", ACCENT_COLOR),
     };
-    let status_w = (status_text.len() as i32) * 8;
-    draw_text(
+    let status_w = (status_text.len() as i32) * GLYPH_W;
+    draw_text_scaled(
         pixels,
         width,
         height,
         cx + (panel_w as i32 - status_w) / 2,
-        cy + (panel_h as i32) - 32,
+        cy + (panel_h as i32) - 64,
         status_text,
         status_color,
         PANEL_BG,
+        FONT_SCALE,
     );
 }
