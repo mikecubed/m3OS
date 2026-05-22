@@ -179,17 +179,92 @@ impl DamageRegion {
     }
 }
 
+/// Snapshot of an outgoing-workspace surface, captured at the moment
+/// the user switched workspaces. The engine animates it from
+/// `from_rect` to `to_rect` over `duration_ms` so the user sees the
+/// old workspace slide off-screen instead of being instantly cleared.
+///
+/// Ghosts are decoupled from the live [`super::surface::SurfaceRegistry`]
+/// on purpose — the surface might be reused by a different workspace,
+/// or its client might commit a new buffer mid-slide; either would
+/// corrupt the slide-out if we re-read from the live buffer. The
+/// snapshot is an owned `Vec<u8>` so the ghost is self-contained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceGhost {
+    /// Owned pixel snapshot at the moment of capture. Layout matches
+    /// the framebuffer's native pixel format (BGRA8888 on the kernel
+    /// FB; the snapshot path that fills this in must match that).
+    pub pixels: Vec<u8>,
+    /// Width / height of `pixels` in pixels (not bytes).
+    pub buf_width: u32,
+    pub buf_height: u32,
+    /// Rect the ghost occupied in the previous workspace's layout.
+    pub from_rect: Rect,
+    /// Off-screen rect the ghost lerps toward. Computed by the caller
+    /// as `from_rect` shifted by the *opposite* direction of the
+    /// incoming workspace so the two slides cross paths cleanly.
+    pub to_rect: Rect,
+    /// Animation timer state.
+    pub elapsed_ms: u32,
+    pub duration_ms: u32,
+    pub curve: Curve,
+}
+
+impl WorkspaceGhost {
+    /// Construct a ghost with the workspace-switch default duration
+    /// and ease-out curve so it tracks the incoming animation in
+    /// timing and feel.
+    pub fn new(pixels: Vec<u8>, buf_width: u32, buf_height: u32, from: Rect, to: Rect) -> Self {
+        Self {
+            pixels,
+            buf_width,
+            buf_height,
+            from_rect: from,
+            to_rect: to,
+            elapsed_ms: 0,
+            duration_ms: AnimationKind::WorkspaceSwitch.default_duration_ms(),
+            curve: AnimationKind::WorkspaceSwitch.default_curve(),
+        }
+    }
+
+    /// Normalised progress `t ∈ [0, 1]`.
+    pub fn progress(&self) -> f32 {
+        if self.duration_ms == 0 {
+            return 1.0;
+        }
+        (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+
+    /// Current animated rect — what the compositor should blit into
+    /// this frame.
+    pub fn current_rect(&self) -> Rect {
+        let t = self.curve.eval(self.progress());
+        lerp_rect(self.from_rect, self.to_rect, t).rect
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.elapsed_ms >= self.duration_ms
+    }
+}
+
 /// Animation engine — tracks a small set of in-flight animations and
 /// advances them one frame at a time.
 #[derive(Clone, Debug, Default)]
 pub struct AnimationEngine {
     animations: Vec<Animation>,
+    /// Workspace-leave ghosts — pixel snapshots of the previous
+    /// workspace's surfaces that animate off-screen during a switch.
+    /// Separate from `animations` so they survive the surface-id
+    /// `drop_surface` paths (the ghost owns its pixels and does not
+    /// reference a live `SurfaceId`).
+    ghosts: Vec<WorkspaceGhost>,
 }
 
 impl AnimationEngine {
     pub fn new() -> Self {
         Self {
             animations: Vec::new(),
+            ghosts: Vec::new(),
         }
     }
 
@@ -252,7 +327,7 @@ impl AnimationEngine {
     /// caller can detect "animation just finished" by checking whether
     /// the engine length changed across the call.
     pub fn tick(&mut self, frame_delta_ms: u32) -> DamageRegion {
-        let mut rects = Vec::with_capacity(self.animations.len());
+        let mut rects = Vec::with_capacity(self.animations.len() + self.ghosts.len());
         for anim in self.animations.iter_mut() {
             anim.elapsed_ms = anim.elapsed_ms.saturating_add(frame_delta_ms);
             if anim.duration_ms == 0 {
@@ -260,9 +335,39 @@ impl AnimationEngine {
             }
             rects.push(anim.damage);
         }
+        // Advance ghosts too; the damage rect for a ghost is the
+        // union of its from / to rects so the compose pass repaints
+        // whatever pixels the slide traverses each frame.
+        for ghost in self.ghosts.iter_mut() {
+            ghost.elapsed_ms = ghost.elapsed_ms.saturating_add(frame_delta_ms);
+            if ghost.duration_ms == 0 {
+                ghost.elapsed_ms = 0;
+            }
+            rects.push(rect_union(ghost.from_rect, ghost.to_rect));
+        }
         // Drop completed entries.
         self.animations.retain(|a| !a.is_done());
+        self.ghosts.retain(|g| !g.is_done());
         DamageRegion { rects }
+    }
+
+    /// Push a workspace-leave ghost. The engine renders it on every
+    /// subsequent compose pass until its timer expires.
+    pub fn push_ghost(&mut self, ghost: WorkspaceGhost) {
+        self.ghosts.push(ghost);
+    }
+
+    /// Borrow the active ghost list — the compositor iterates this in
+    /// its per-frame pass and blits each ghost at
+    /// [`WorkspaceGhost::current_rect`].
+    pub fn ghosts(&self) -> &[WorkspaceGhost] {
+        &self.ghosts
+    }
+
+    /// Discard every ghost. Used when the workspace switch was
+    /// cancelled or superseded so stale ghosts don't keep painting.
+    pub fn clear_ghosts(&mut self) {
+        self.ghosts.clear();
     }
 
     /// Drop every animation associated with a surface — used when a

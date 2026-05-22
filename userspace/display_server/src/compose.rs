@@ -301,6 +301,14 @@ where
     // dims changed but the buffer didn't). Without this bypass we
     // skip the `is_first_compose` clear and the now-uncovered gap
     // regions keep stale pixels from before the arrangement change.
+    // Phase 73 follow-up — VBE flip backend requires a full repaint
+    // every frame (see the trait-method doc on
+    // `needs_full_repaint_per_frame`). Mark the tracker dirty here so
+    // every downstream `is_full_repaint_needed()` check returns true
+    // and the general path redraws every tile from scratch.
+    if owner.needs_full_repaint_per_frame() {
+        ctx.damage_tracker.mark_full_repaint();
+    }
     let force_full = ctx.damage_tracker.is_full_repaint_needed();
     if !surface_damage && !cursor_motion && !force_full {
         return Ok(0);
@@ -438,7 +446,15 @@ where
     // pixels than the framebuffer resolution for any non-pathological
     // cursor size — the optimisation the fast path was designed for,
     // without the hole-trail regression.
-    if !surface_damage && cursor_motion && !is_first_compose {
+    // Phase 73 follow-up — backends that report
+    // `needs_full_repaint_per_frame() = true` (the VBE Y_OFFSET
+    // page-flip path) cannot use the cursor-only fast path: the flip
+    // exposes a half that only contains pixels written this frame, so
+    // any region the fast path skips would show stale content from
+    // two flips ago. Skip the fast path entirely in that case so the
+    // general path below redraws every surface from scratch.
+    let backend_requires_full = owner.needs_full_repaint_per_frame();
+    if !surface_damage && cursor_motion && !is_first_compose && !backend_requires_full {
         let cursor: &dyn CursorRenderer = match &client_cursor_clone {
             Some(cc) => cc,
             None => &default,
@@ -604,6 +620,21 @@ where
                 };
                 let written = crate::borders::paint_border(owner, rect, cfg.width, color)
                     .map_err(ComposeError::from)?;
+                surface_writes = surface_writes.saturating_add(written);
+            }
+        }
+
+        // Phase 73 follow-up — paint workspace-leave ghosts in the
+        // cursor-only fast path too. A ghost that started during a
+        // workspace switch keeps animating across subsequent
+        // cursor-only frames; without this branch the slide would
+        // freeze whenever no other surface had damage.
+        if let Some(engine) = animations
+            && !engine.ghosts().is_empty()
+        {
+            for ghost in engine.ghosts() {
+                let written =
+                    blit_workspace_ghost(owner, output, ghost).map_err(ComposeError::from)?;
                 surface_writes = surface_writes.saturating_add(written);
             }
         }
@@ -862,21 +893,36 @@ where
         }
     }
 
+    // Phase 73 follow-up — paint workspace-leave ghosts over the
+    // current frame. Each ghost is the pixel snapshot of an outgoing
+    // surface from the previous workspace, animated off-screen in the
+    // opposite direction of the incoming slide. Drawn after the
+    // border pass so a ghost can travel over (or alongside) the new
+    // workspace's tiles during the transition. The ghost owns its
+    // pixel buffer so it survives any registry mutation that occurs
+    // during the slide.
+    if let Some(engine) = animations
+        && !engine.ghosts().is_empty()
+    {
+        for ghost in engine.ghosts() {
+            let written = blit_workspace_ghost(owner, output, ghost).map_err(ComposeError::from)?;
+            surface_writes = surface_writes.saturating_add(written);
+        }
+    }
+
     // Phase 56 E.3 — blit the cursor on top.
     //
-    // Rationale: `compose_frame` already presented the surfaces.
-    // We sample the cursor pixel-by-pixel and write directly to the
-    // framebuffer, then call `present()` again. (The kernel
-    // framebuffer's `present` is currently a no-op default impl, so
-    // the duplicate is free; future hardware paths that swap on
-    // present will need to be careful here.)
+    // Phase 73 follow-up: `present()` no longer fires inside
+    // `compose_frame`, so this is the single visible update for the
+    // whole frame — surfaces, borders, ghosts, and the cursor all
+    // land in the back buffer first and reach the screen together.
     let cursor: &dyn CursorRenderer = match &client_cursor_clone {
         Some(cc) => cc,
         None => &default,
     };
     let cursor_writes =
         blit_cursor(owner, output, cursor, pointer_position).map_err(ComposeError::from)?;
-    if cursor_writes > 0 {
+    if surface_writes + cursor_writes > 0 {
         owner.present().map_err(ComposeError::from)?;
     }
 
@@ -1098,6 +1144,85 @@ fn surface_screen_rect(
 ///
 /// Returns the number of `write_pixels` calls issued — useful for
 /// frame-stats / observability.
+/// Paint one workspace-leave ghost into the framebuffer at its
+/// current animated rect. The ghost's pixel snapshot is
+/// nearest-neighbour-scaled from `(buf_width, buf_height)` to the
+/// animated rect's dims; the resulting blit is clipped against
+/// `output` so a ghost that has slid mostly off-screen contributes
+/// only the on-screen sliver. Returns the number of `write_pixels`
+/// calls issued (1 when the ghost has any visible area, 0 otherwise).
+fn blit_workspace_ghost<O: FramebufferOwner>(
+    owner: &mut O,
+    output: Rect,
+    ghost: &crate::animation::WorkspaceGhost,
+) -> Result<usize, FbError> {
+    let current = ghost.current_rect();
+    if current.w == 0
+        || current.h == 0
+        || ghost.buf_width == 0
+        || ghost.buf_height == 0
+        || ghost.pixels.is_empty()
+    {
+        return Ok(0);
+    }
+    let bpp = bytes_per_pixel(owner.metadata().pixel_format) as usize;
+    let expected_src = (ghost.buf_width as usize)
+        .saturating_mul(ghost.buf_height as usize)
+        .saturating_mul(bpp);
+    if ghost.pixels.len() < expected_src {
+        // Mismatched snapshot — best-effort skip so a stale ghost
+        // can't read past its buffer.
+        return Ok(0);
+    }
+
+    // Scale the snapshot once to the animated dimensions so the
+    // write_pixels target is a tightly-packed buffer the FbOwner
+    // contract can consume.
+    let scaled = nearest_neighbour_scale(
+        &ghost.pixels,
+        ghost.buf_width,
+        ghost.buf_height,
+        current.w,
+        current.h,
+    );
+
+    // Clip the animated rect against `output`. The ghost can be
+    // partially or fully off-screen during the slide; the on-screen
+    // sliver is the only thing we blit.
+    let left = current.x.max(output.x);
+    let top = current.y.max(output.y);
+    let right = current
+        .x
+        .saturating_add(current.w as i32)
+        .min(output.x.saturating_add(output.w as i32));
+    let bottom = current
+        .y
+        .saturating_add(current.h as i32)
+        .min(output.y.saturating_add(output.h as i32));
+    if right <= left || bottom <= top {
+        return Ok(0);
+    }
+    let clip = Rect {
+        x: left,
+        y: top,
+        w: (right - left) as u32,
+        h: (bottom - top) as u32,
+    };
+    let src_x_off = (left - current.x) as usize;
+    let src_y_off = (top - current.y) as usize;
+    let src_row_stride = (current.w as usize) * bpp;
+    // Extract the clipped sub-buffer as tightly-packed bytes.
+    let mut clipped_buf: Vec<u8> = Vec::with_capacity((clip.w as usize) * (clip.h as usize) * bpp);
+    for row in 0..(clip.h as usize) {
+        let src_row_off = (src_y_off + row) * src_row_stride + src_x_off * bpp;
+        let row_bytes = (clip.w as usize) * bpp;
+        clipped_buf.extend_from_slice(&scaled[src_row_off..src_row_off + row_bytes]);
+    }
+    let stride = clip.w * bpp as u32;
+    owner.write_pixels(clip, &clipped_buf, stride)?;
+    Ok(1)
+}
+
 fn blit_cursor<O: FramebufferOwner>(
     owner: &mut O,
     output: Rect,

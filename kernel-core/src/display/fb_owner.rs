@@ -126,6 +126,24 @@ pub trait FramebufferOwner {
     fn read_pixel(&self, _x: u32, _y: u32) -> Result<u32, FbError> {
         Err(FbError::OutOfBounds)
     }
+
+    /// Phase 73 follow-up — backend hint for the compositor.
+    ///
+    /// `true` means the backend's [`present`] swaps to a half that
+    /// only contains pixels written since the *previous* present, not
+    /// a true mirror of the front buffer (e.g. the VBE Y_OFFSET
+    /// page-flip path in `userspace/display_server/src/fb.rs`).
+    /// Compositors must avoid the cursor-only / delta-update fast
+    /// paths in that case — those rely on the back buffer carrying
+    /// the previous frame's content verbatim, which a page-flipped
+    /// half does not.
+    ///
+    /// Default `false` so every existing backend (the memcpy
+    /// userspace double-buffer, the `RecordingFramebufferOwner` test
+    /// double) keeps its delta-update behaviour.
+    fn needs_full_repaint_per_frame(&self) -> bool {
+        false
+    }
 }
 
 /// Bytes per pixel for a [`PixelFormat`]. Both Phase 56 formats are 4 bytes;

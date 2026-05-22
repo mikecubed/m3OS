@@ -407,6 +407,18 @@ impl FramebufferOwner for KernelFramebufferOwner {
         }
     }
 
+    fn needs_full_repaint_per_frame(&self) -> bool {
+        // Flip mode swaps to a half that only contains pixels written
+        // since the previous present — partial-damage frames would
+        // leave stale content from two frames ago in any region the
+        // compositor didn't touch. Forcing a full repaint per frame
+        // keeps the visible half always-correct in exchange for ~8
+        // MiB of pixel writes per frame (cheap relative to the memcpy
+        // we just removed). Memcpy mode keeps the cursor-only fast
+        // path because its back buffer is a true mirror of the front.
+        matches!(self.backend, Backend::Flip { .. })
+    }
+
     /// Phase 56 close-out (G.1) — read one BGRA8888 pixel from the
     /// mapped framebuffer at `(x, y)`. Returns
     /// [`FbError::OutOfBounds`] if the coordinate falls outside the

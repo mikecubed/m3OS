@@ -940,6 +940,10 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     compositor_config.gaps,
                     &diff_exclusive_zones,
                 );
+            // Capture the outgoing arrangement *before* overwriting
+            // `last_arrangement` so the workspace-ghost capture below
+            // can iterate the rects the user just left behind.
+            let prev_arrangement = last_arrangement.clone();
             last_arrangement = arrangement_for_diff.clone();
             // Workspace-switch detection: when the active workspace
             // changed since last frame, push a `WorkspaceSwitch`
@@ -953,15 +957,52 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             let current_ws = workspace_mgr.current_index();
             let workspace_switched = current_ws != last_workspace_idx;
             if workspace_switched {
+                // Direction-aware slide: when stepping forward
+                // (`current_ws > last_workspace_idx`) the new
+                // workspace slides in from the right; when stepping
+                // backward it slides in from the left. Without this
+                // sign check every switch always slid in from the
+                // right, which made bouncing between two adjacent
+                // workspaces feel directionally wrong.
                 let output_w = meta.width as i32;
+                let forward = current_ws > last_workspace_idx;
+                let offset_x = if forward { output_w } else { -output_w };
                 for (sid, rect) in arrangement_for_diff.iter() {
                     let from = Rect {
-                        x: rect.x.saturating_add(output_w),
+                        x: rect.x.saturating_add(offset_x),
                         y: rect.y,
                         w: rect.w,
                         h: rect.h,
                     };
                     animation_engine.animate_workspace_switch(*sid, from, *rect);
+                }
+                // Phase 73 follow-up — slide the outgoing workspace
+                // off-screen too. Capture a pixel snapshot of every
+                // surface that was visible in the previous workspace
+                // and push it into the animation engine as a ghost
+                // that lerps from its `prev_arrangement` rect to an
+                // off-screen rect opposite the incoming direction.
+                // Without this the previous workspace's surfaces
+                // simply disappear at switch time, which the user
+                // reads as a jarring "jump" instead of a slide.
+                //
+                // A stale ghost set from a rapid double-switch would
+                // double-paint mid-transition; drop them first so only
+                // the most recent switch contributes.
+                animation_engine.clear_ghosts();
+                let outgoing_offset = -offset_x;
+                for (sid, rect) in prev_arrangement.iter() {
+                    if let Some((pixels, buf_w, buf_h)) = snapshot_surface(&registry, *sid) {
+                        let to = Rect {
+                            x: rect.x.saturating_add(outgoing_offset),
+                            y: rect.y,
+                            w: rect.w,
+                            h: rect.h,
+                        };
+                        animation_engine.push_ghost(animation::WorkspaceGhost::new(
+                            pixels, buf_w, buf_h, *rect, to,
+                        ));
+                    }
                 }
                 last_workspace_idx = current_ws;
             }
@@ -1772,6 +1813,42 @@ fn handle_fb_reclaim_request(
 
 /// Try to acquire the framebuffer with bounded retry, in case another
 /// short-lived process is still releasing ownership at boot.
+/// Phase 73 follow-up — workspace-leave ghost capture.
+///
+/// Returns `(pixels, buf_width, buf_height)` for the surface's
+/// currently-committed buffer, or `None` if the surface has no
+/// committed buffer (the workspace switch caught it pre-attach) or no
+/// longer exists in the registry. The pixel snapshot is an owned
+/// `Vec<u8>` so the ghost is self-contained — the surface can be
+/// destroyed, re-committed, or moved to another workspace without
+/// corrupting the off-screen slide.
+fn snapshot_surface(
+    registry: &SurfaceRegistry,
+    surface_id: kernel_core::display::protocol::SurfaceId,
+) -> Option<(alloc::vec::Vec<u8>, u32, u32)> {
+    // `iter_compose_filtered` already skips Cursor-role surfaces and
+    // surfaces without a committed buffer; targeting by `==` returns
+    // at most one entry. The wider iteration is acceptable here
+    // because workspace switches are user-driven and rare relative to
+    // frame composition.
+    let output = kernel_core::display::protocol::Rect {
+        x: 0,
+        y: 0,
+        // Width/height are unused by `iter_compose_filtered` for the
+        // snapshot path — the layer/role geometry computation uses
+        // them, but we discard everything except `entry.buf`.
+        w: 0,
+        h: 0,
+    };
+    let entries = registry.iter_compose_filtered(output, |id| id == surface_id);
+    let entry = entries.into_iter().next()?;
+    Some((
+        entry.buf.pixels_snapshot(),
+        entry.buf.width,
+        entry.buf.height,
+    ))
+}
+
 fn acquire_framebuffer_with_backoff() -> Result<KernelFramebufferOwner, &'static str> {
     const MAX_ATTEMPTS: u32 = 8;
     const BACKOFF_NS: u32 = 5_000_000; // 5 ms
