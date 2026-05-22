@@ -52,9 +52,11 @@ pub enum KeybindAction {
     },
     /// Phase 73 — launch the desktop launcher (`/bin/launcher`).
     /// Triggered by `SUPER+SPACE`. The compositor forks an unprivileged
-    /// child that opens a floating Toplevel; if a launcher process is
-    /// already running, the compositor focuses the existing surface
-    /// instead of spawning a second.
+    /// child that opens a floating Toplevel. If a launcher process is
+    /// already running, the second child exits immediately when it
+    /// fails to register the singleton `"launcher"` IPC service name —
+    /// so the user-visible effect is "one launcher at a time" without
+    /// any focus-lookup logic in the compositor.
     LaunchLauncher,
 }
 

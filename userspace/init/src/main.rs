@@ -56,13 +56,16 @@ fn alloc_error(_layout: Layout) -> ! {
 // Constants
 // ---------------------------------------------------------------------------
 
-// Phase 73 — raised from 16 to 24 to make room for the new
-// `wallpaper`, `bar`, and `notifyd` desktop daemons alongside the
-// existing 14–16 services. KNOWN_CONFIGS lists 25 service paths;
-// the on-disk subset typically lands at ~19 in graphical-login
-// boots. Keeping a 24-slot ceiling leaves a small budget for future
-// additions without blowing the static arrays' memory footprint.
-const MAX_SERVICES: usize = 24;
+// Phase 73 — `KNOWN_CONFIGS` below lists 25 service paths after the
+// new `wallpaper`, `bar`, and `notifyd` daemons were added. The
+// fallback loader (`load_services_from_known_configs`) stops adding
+// services once `self.count >= MAX_SERVICES`, so a 24-slot ceiling
+// would silently drop the 25th entry on any boot where every config
+// loads. Sized to `KNOWN_CONFIGS.len()` (25) + 3 headroom for future
+// additions; the static arrays' memory footprint is dominated by
+// `MAX_NAME` + `MAX_CMD` per slot and the extra ~400 bytes are
+// negligible.
+const MAX_SERVICES: usize = 28;
 const MAX_DISCOVERED_DISABLED: usize = 24;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;

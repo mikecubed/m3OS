@@ -84,10 +84,35 @@ fn program_main(args: &[&str]) -> i32 {
 
     let len = payload.len() as u32;
     let len_bytes = len.to_le_bytes();
-    let _ = syscall_lib::write(fd as i32, &len_bytes);
-    let _ = syscall_lib::write(fd as i32, payload.as_bytes());
+    let ok = write_all(fd as i32, &len_bytes) && write_all(fd as i32, payload.as_bytes());
     let _ = syscall_lib::close(fd as i32);
+    if !ok {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "notify-send: short write — notifyd would see a truncated frame\n",
+        );
+        return 1;
+    }
     0
+}
+
+/// Loop until every byte is written. The underlying socket is the
+/// kernel's AF_UNIX stream which can short-write under pressure; the
+/// notifyd framing parser requires the full prefix + body or it
+/// silently drops the connection.
+fn write_all(fd: i32, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        let n = syscall_lib::write(fd, buf);
+        if n <= 0 {
+            return false;
+        }
+        let written = n as usize;
+        if written > buf.len() {
+            return false;
+        }
+        buf = &buf[written..];
+    }
+    true
 }
 
 fn json_escape(s: &str) -> alloc::string::String {

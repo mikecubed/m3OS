@@ -53,11 +53,26 @@ const PROMPT_BG: u32 = 0xFF_22_22_22;
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "launcher: starting (Phase 73)\n");
 
+    // Singleton guard: only one launcher should ever own the
+    // `"launcher"` IPC service name. A second SUPER+SPACE press while a
+    // launcher is already up forks here, fails to register, and exits
+    // immediately. Cheap (one extra fork) and keeps the chord symmetric
+    // with `SpawnTerm`.
     let ep = syscall_lib::create_endpoint();
-    if ep != u64::MAX
-        && let Ok(ep_u32) = u32::try_from(ep)
-    {
-        let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+    if ep == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "launcher: create_endpoint failed\n");
+        return 4;
+    }
+    let Ok(ep_u32) = u32::try_from(ep) else {
+        syscall_lib::write_str(STDOUT_FILENO, "launcher: endpoint id out of u32 range\n");
+        return 4;
+    };
+    if syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME) == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "launcher: another instance is already running — exiting\n",
+        );
+        return 0;
     }
 
     let candidates = scan_executables();

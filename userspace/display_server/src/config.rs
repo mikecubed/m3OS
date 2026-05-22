@@ -42,7 +42,10 @@ pub struct CompositorConfig {
     pub keybinds: KeybindConfig,
     pub workspaces: WorkspaceConfig,
     pub autostart: AutostartConfig,
-    pub wallpaper: WallpaperConfig,
+    // `[wallpaper]` is owned by the `userspace/wallpaper` client; the
+    // compositor only needs to recognise the section header so it does
+    // not emit an `UnknownSection` warning on every parse. See
+    // `Section::Wallpaper` below.
 }
 
 impl Default for CompositorConfig {
@@ -62,7 +65,6 @@ impl CompositorConfig {
             keybinds: KeybindConfig::defaults(),
             workspaces: WorkspaceConfig::defaults(),
             autostart: AutostartConfig::defaults(),
-            wallpaper: WallpaperConfig::defaults(),
         }
     }
 
@@ -126,7 +128,10 @@ impl CompositorConfig {
                 Section::Keybinds => apply_keybind_key(&mut cfg.keybinds, k, v, lineno + 1),
                 Section::Workspaces => apply_workspace_key(&mut cfg.workspaces, k, v, lineno + 1),
                 Section::Autostart => apply_autostart_key(&mut cfg.autostart, k, v, lineno + 1),
-                Section::Wallpaper => apply_wallpaper_key(&mut cfg.wallpaper, k, v, lineno + 1),
+                // `[wallpaper]` keys are validated by the wallpaper
+                // client's own parser; skip them silently here so the
+                // section is not flagged as unknown.
+                Section::Wallpaper => Ok(()),
             };
             match apply_result {
                 Ok(()) => {}
@@ -563,62 +568,6 @@ fn apply_decoration_key(
         "shadow_offset_x" => cfg.shadow_offset_x = parse_i32(key, value, line)?,
         "shadow_offset_y" => cfg.shadow_offset_y = parse_i32(key, value, line)?,
         "shadow_color" => cfg.shadow_color = parse_color(key, value, line)?,
-        _ => {
-            return Err(ConfigError::UnknownKey {
-                key: key.to_string(),
-                line,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `[wallpaper]` section. The `wallpaper` client reads `path` for its
-/// background image and falls back to `fallback_color` (BGRA8888) when
-/// the path is missing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WallpaperConfig {
-    pub path: Option<String>,
-    pub fallback_color: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl WallpaperConfig {
-    pub fn defaults() -> Self {
-        Self {
-            path: None,
-            fallback_color: 0x002B_5A4B,
-            width: 0,
-            height: 0,
-        }
-    }
-}
-
-impl Default for WallpaperConfig {
-    fn default() -> Self {
-        Self::defaults()
-    }
-}
-
-fn apply_wallpaper_key(
-    cfg: &mut WallpaperConfig,
-    key: &str,
-    value: &str,
-    line: usize,
-) -> Result<(), ConfigError> {
-    match key {
-        "path" => {
-            let trimmed = value.trim();
-            cfg.path = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
-        }
-        "fallback_color" => cfg.fallback_color = parse_color(key, value, line)?,
-        "width" => cfg.width = parse_u32(key, value, line)?,
-        "height" => cfg.height = parse_u32(key, value, line)?,
         _ => {
             return Err(ConfigError::UnknownKey {
                 key: key.to_string(),

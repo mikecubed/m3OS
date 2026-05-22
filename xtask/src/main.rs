@@ -10410,8 +10410,11 @@ fn populate_ext2_files(
 
     // Phase 73 — desktop client daemons. Each is a normal Phase 56
     // compositor client running as a regular supervised process. They
-    // depend on `display` (the compositor) plus the standard input
-    // services so they don't race the focus dispatcher at boot.
+    // depend only on `display` (the compositor) — none of them claim
+    // keyboard focus (wallpaper is `Background`, bar is `Top`, notifyd
+    // is `Overlay` with `KeyboardInteractivity::None`), so the focus
+    // dispatcher race that motivates explicit input-server deps for
+    // greeter does not apply here.
     let wallpaper_conf = "name=wallpaper\ncommand=/bin/wallpaper\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
     let bar_conf = "name=bar\ncommand=/bin/bar\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";
     let notifyd_conf = "name=notifyd\ncommand=/bin/notifyd\ntype=daemon\nrestart=on-failure\nmax_restart=5\ndepends=display\n";

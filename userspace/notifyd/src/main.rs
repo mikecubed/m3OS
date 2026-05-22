@@ -116,11 +116,19 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut dirty = false;
     let mut surface_attached = false;
     loop {
-        // Drain any pending connections (non-blocking).
+        // Drain any pending connections (listener is non-blocking).
         loop {
             let fd = syscall_lib::accept(listen_fd, None);
             if fd < 0 {
                 break;
+            }
+            // Set accepted fd non-blocking so a misbehaving client that
+            // connects but never sends (or sends only a partial frame)
+            // cannot wedge the notifyd loop — `read_notification` does
+            // bounded retries with a total budget on EAGAIN.
+            if syscall_lib::set_nonblocking(fd as i32) < 0 {
+                let _ = syscall_lib::close(fd as i32);
+                continue;
             }
             if let Some(note) = read_notification(fd as i32) {
                 syscall_lib::write_str(STDOUT_FILENO, "notifyd: notification accepted: '");
@@ -202,37 +210,72 @@ fn open_listener() -> Option<i32> {
     Some(fd as i32)
 }
 
+/// `-EAGAIN` on a non-blocking fd with no data ready. Local
+/// `syscall_lib` does not export the constant; the kernel uses the
+/// Linux convention.
+const NEG_EAGAIN: isize = -11;
+/// Per-attempt sleep when the fd is non-blocking but the client hasn't
+/// finished writing yet. Granular enough that a well-behaved client
+/// (which writes immediately after `connect`) hits at most one or two
+/// sleeps; coarse enough that the bounded retry budget below remains
+/// short.
+const READ_RETRY_NS: u32 = 5_000_000; // 5 ms
+/// Maximum retries per `read_exact` call. 5 ms × 20 = 100 ms total —
+/// bounds the daemon's accept-drain loop even when a peer connects and
+/// stalls indefinitely.
+const READ_RETRY_MAX: u32 = 20;
+
 fn read_notification(fd: i32) -> Option<Notification> {
     let mut len_buf = [0u8; 4];
-    let mut read = 0usize;
-    while read < 4 {
-        let n = syscall_lib::read(fd, &mut len_buf[read..]);
-        if n <= 0 {
-            return None;
-        }
-        read += n as usize;
+    if !read_exact(fd, &mut len_buf) {
+        return None;
     }
     let body_len = u32::from_le_bytes(len_buf) as usize;
     if body_len == 0 || body_len > 8192 {
         return None;
     }
     let mut body = alloc::vec![0u8; body_len];
-    let mut total = 0usize;
-    while total < body_len {
-        let n = syscall_lib::read(fd, &mut body[total..]);
-        if n <= 0 {
-            return None;
-        }
-        total += n as usize;
+    if !read_exact(fd, &mut body) {
+        return None;
     }
     let text = core::str::from_utf8(&body).ok()?;
     parse_notification(text)
 }
 
+/// Read exactly `buf.len()` bytes from a non-blocking fd, sleeping
+/// between attempts when the kernel reports EAGAIN. Returns `false` on
+/// EOF, hard error, or after `READ_RETRY_MAX` consecutive EAGAINs —
+/// the caller drops the connection in that case so a stalled client
+/// cannot wedge the daemon.
+fn read_exact(fd: i32, buf: &mut [u8]) -> bool {
+    let mut got = 0usize;
+    let mut idle = 0u32;
+    while got < buf.len() {
+        let n = syscall_lib::read(fd, &mut buf[got..]);
+        if n > 0 {
+            got += n as usize;
+            idle = 0;
+            continue;
+        }
+        if n == NEG_EAGAIN {
+            if idle >= READ_RETRY_MAX {
+                return false;
+            }
+            idle += 1;
+            let _ = syscall_lib::nanosleep_for(0, READ_RETRY_NS);
+            continue;
+        }
+        // 0 = EOF, any other negative = hard error.
+        return false;
+    }
+    true
+}
+
 fn parse_notification(text: &str) -> Option<Notification> {
     // Minimal JSON-ish extractor: looks for "title": "...", "body":
-    // "...", "timeout_ms": <int>. Whitespace-tolerant. Does not
-    // honour escape sequences except `\"`.
+    // "...", "timeout_ms": <int>. Whitespace-tolerant. Honours `\"`
+    // and `\\` so notify-send payloads with embedded quotes survive
+    // the round-trip — see `notify_send::json_escape`.
     let title = extract_string(text, "title")?;
     let body = extract_string(text, "body")?;
     let timeout = extract_int(text, "timeout_ms").unwrap_or(5000) as u32;
@@ -248,11 +291,40 @@ fn extract_string(text: &str, key: &str) -> Option<String> {
     let pos = text.find(&needle)?;
     let rest = &text[pos + needle.len()..];
     let colon = rest.find(':')?;
-    let after_colon = &rest[colon + 1..].trim_start();
-    let quote = after_colon.find('"')?;
-    let body = &after_colon[quote + 1..];
-    let end = body.find('"')?;
-    Some(body[..end].to_string())
+    let after_colon = rest[colon + 1..].trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    // Walk the value, decoding `\"` and `\\` so an escaped quote
+    // inside the value does not terminate the string early. Other
+    // backslash escapes pass through with their leading `\` preserved;
+    // notify-send only emits `\"`, `\\`, `\n`, `\r`, `\t`, so the
+    // round-trip preserves whatever the user supplied. Char-based
+    // iteration keeps multi-byte UTF-8 codepoints intact.
+    let mut out = String::with_capacity(after_colon.len());
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => return None,
+            }
+            continue;
+        }
+        if c == '"' {
+            return Some(out);
+        }
+        out.push(c);
+    }
+    None
 }
 
 fn extract_int(text: &str, key: &str) -> Option<i64> {

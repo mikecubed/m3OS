@@ -239,12 +239,24 @@ fn load_rgba_file(path: &str) -> Option<(u32, u32, Vec<u32>)> {
     if data.len() >= 12 && &data[0..4] == b"RGBA" {
         let w = u32::from_le_bytes(data[4..8].try_into().ok()?);
         let h = u32::from_le_bytes(data[8..12].try_into().ok()?);
-        let need = (w as usize) * (h as usize) * 4;
-        if data.len() < 12 + need {
+        // Reject pathological dimensions before any multiplication.
+        // 8192 × 8192 RGBA is 256 MiB — already well past anything we
+        // would ever render and a safe ceiling for the checked math
+        // below. A malformed header that escapes this check would
+        // either overflow `usize` (32-bit hosts) or trigger a huge
+        // allocation that the brk allocator can't satisfy.
+        const MAX_DIM: u32 = 8192;
+        if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
             return None;
         }
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for i in 0..(w * h) as usize {
+        let pixel_count = (w as usize).checked_mul(h as usize)?;
+        let need = pixel_count.checked_mul(4)?;
+        let total = need.checked_add(12)?;
+        if data.len() < total {
+            return None;
+        }
+        let mut pixels = Vec::with_capacity(pixel_count);
+        for i in 0..pixel_count {
             let off = 12 + i * 4;
             let px = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
             pixels.push(px);

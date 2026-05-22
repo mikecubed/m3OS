@@ -76,11 +76,28 @@ const GLYPH_H: i32 = 16 * FONT_SCALE as i32;
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "lockscreen: starting (Phase 73)\n");
 
+    // Singleton guard: only one lockscreen should ever own the
+    // `"lockscreen"` IPC service name. `m3ctl lock` forks an
+    // unprivileged child unconditionally; if a lockscreen is already
+    // running, that child reaches this point, fails to register, and
+    // exits without claiming an exclusive-keyboard surface. Without
+    // this guard, repeated `m3ctl lock` invocations would stack new
+    // overlays on top of each other.
     let ep = syscall_lib::create_endpoint();
-    if ep != u64::MAX
-        && let Ok(ep_u32) = u32::try_from(ep)
-    {
-        let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+    if ep == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "lockscreen: create_endpoint failed\n");
+        return 4;
+    }
+    let Ok(ep_u32) = u32::try_from(ep) else {
+        syscall_lib::write_str(STDOUT_FILENO, "lockscreen: endpoint id out of u32 range\n");
+        return 4;
+    };
+    if syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME) == u64::MAX {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "lockscreen: another instance is already running — exiting\n",
+        );
+        return 0;
     }
 
     let username = read_session_username();
