@@ -920,6 +920,7 @@ impl SurfaceRegistry {
                 layer: role_layer,
                 rect,
                 buf,
+                dirty: surface.dirty,
             });
         }
         // Stable order: by layer ascending (composer requires this),
@@ -974,6 +975,13 @@ pub struct ComposeEntry<'a> {
     pub layer: ComposeLayer,
     pub rect: Rect,
     pub buf: &'a CommittedBuffer,
+    /// Phase 73 follow-up — `true` iff this surface committed a new
+    /// buffer since the last [`SurfaceRegistry::mark_clean`] call.
+    /// Used by the compositor's buffer-age damage tracker so the
+    /// VBE flip backend's `prev_frame_damage` only includes surfaces
+    /// that actually changed (instead of conservatively marking every
+    /// Toplevel tile dirty every general-path frame).
+    pub dirty: bool,
 }
 
 impl<'a> ComposeEntry<'a> {

@@ -693,14 +693,27 @@ where
         })
         .collect();
 
-    // Phase 68 Track B — feed each mapped surface's screen rect into
-    // the tracker so the union covers everything the compose pass
-    // will touch. `union_rect()` is observable from outside this
-    // function via [`ComposeContext::damage_tracker`] for tests and
-    // debug dumps; the cursor-only fast path above already returned
-    // by this point.
+    // Phase 73 follow-up — feed each *dirty* surface's screen rect
+    // into the tracker. Previously every entry's rect was marked
+    // unconditionally, which made `prev_frame_damage` (the
+    // buffer-age history) conservatively cover every Toplevel tile
+    // — the next cursor-only frame in flip mode then had to repaint
+    // every tile even when only one surface actually changed. With
+    // the per-entry dirty bit threaded through from
+    // [`SurfaceRegistry::iter_compose_filtered`] we mark only the
+    // surfaces that committed new pixels this frame, so a term
+    // update keeps every other tile in the cheap cursor-only
+    // steady state.
+    //
+    // `force_full` short-circuits the filter — a workspace switch
+    // or first compose explicitly demands that every tile be
+    // repaintable next frame, so we mark every entry regardless of
+    // its commit state (the dirty bit is also stale for the
+    // first-compose case because no commit has cleared it yet).
     for entry in entries.iter() {
-        ctx.damage_tracker.mark_dirty(entry.rect);
+        if entry.dirty || force_full {
+            ctx.damage_tracker.mark_dirty(entry.rect);
+        }
     }
 
     // Snapshot the current pixel contents of every compose entry into

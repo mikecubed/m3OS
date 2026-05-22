@@ -2778,20 +2778,33 @@ fn qemu_args_with_devices_resolved(
                 "sdl".to_string(),
                 "-audiodev".to_string(),
                 "none,id=noaudio".to_string(),
+                // Phase 73 follow-up — pin the standard VGA device.
+                // Without an explicit `-vga` the q35 + OVMF default
+                // varies by OVMF build: older OVMF exposes GOP via
+                // an implicit device, but recent OVMF builds (and
+                // certain KVM-host combinations) expose nothing at
+                // all and `bootloader_api` reports "no framebuffer"
+                // — the symptom the user hit after the VBE prototype
+                // landed without an explicit `-vga`. `std` forces
+                // the QEMU `VGA` device which OVMF reliably wires
+                // through GOP, and matches the device class the
+                // `-global VGA.vgamem_mb=32` below targets so the
+                // doubled VRAM for VBE page-flip actually lands.
+                "-vga".to_string(),
+                "std".to_string(),
+                // Bump VGA VRAM so the kernel can request a virtual
+                // framebuffer that is `2 × visible_height` rows tall
+                // (true hardware page flip via VBE Y_OFFSET panning).
+                // At 1920 × 1080 × 4 the doubled buffer is ~16.6 MiB,
+                // just past the default `vgamem_mb=16`; 32 MiB leaves
+                // comfortable headroom. Confined to the GUI arm so
+                // headless boots (no display device) don't emit a
+                // noisy "global VGA.vgamem_mb=32 not used" warning.
+                "-global".to_string(),
+                "VGA.vgamem_mb=32".to_string(),
             ]);
         }
     }
-
-    // Phase 73 follow-up — bump the Bochs VGA VRAM so the kernel can
-    // request a virtual framebuffer that is `2 × visible_height` rows
-    // tall (true hardware page flip via VBE Y_OFFSET panning). At
-    // 1920×1080×4 the doubled buffer is ~16.6 MiB, just past the
-    // default `vgamem_mb=16`; 32 MiB leaves comfortable headroom and
-    // keeps both `-vga std` (xtask-pinned) and the implicit q35 VGA
-    // device happy on every code path that builds the QEMU command.
-    // `-global` applies to the device regardless of whether it is
-    // explicit on the command line.
-    args.extend(["-global".to_string(), "VGA.vgamem_mb=32".to_string()]);
 
     // Phase 55a Track F.1: collect every required `-machine` property into a
     // single comma-joined value. Emitting two `-machine` options would let QEMU
