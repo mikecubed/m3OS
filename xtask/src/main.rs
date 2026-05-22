@@ -527,6 +527,14 @@ fn main() {
             });
             cmd_less_render_probe(&probe_args);
         }
+        Some("compositor-stress") => {
+            let stress_args = parse_compositor_stress_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_compositor_stress(&stress_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -2733,15 +2741,18 @@ fn qemu_args_with_devices_resolved(
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 73 (4K follow-up): increase RAM to 4 GiB. At
-        // 3840x2160 a single fullscreen surface is ~33 MiB; a
-        // handful of those plus the framebuffer, page tables,
-        // kernel heap, shm_cache, and per-process userspace heaps
-        // saturate 1 GiB very quickly. 4 GiB matches what any real
-        // 4K-capable machine ships with and gives the SHM cache +
-        // multi-term load comfortable headroom.
+        // Phase 36: 1 GiB. (A 4 GiB bump was attempted on the
+        // Phase 73 4K branch but uncovered a separate kernel boot
+        // hang under `-display vnc=unix:...` + `-vga std` at any
+        // RAM size > 1 GiB — boot halts after the bootstrap heap
+        // log and never reaches `task::kstack::init`'s "[kstack]
+        // pool ready" marker. The fix has to be a real
+        // investigation of that interaction, not a knob.
+        // Headless smoke / regression paths boot fine at 4 GiB
+        // because they use `-display none` without an attached VGA
+        // device. Reverting to 1 GiB until that's diagnosed.)
         "-m".to_string(),
-        "4096".to_string(),
+        "1024".to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
     ];
@@ -8812,6 +8823,336 @@ fn cmd_less_render_probe(args: &LessRenderProbeArgs) {
             std::process::exit(1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// compositor-stress — reproduce the compositor OOM seen when a user
+// rapidly spawns terms across multiple workspaces. Boots the graphical
+// stack headlessly, then drives SUPER+RETURN spawn-term and SUPER+1..9
+// workspace-switch keybinds through QMP `send-key` at a configurable
+// cadence, while watching serial output for "KERNEL PANIC". Exits
+// non-zero if a panic appears within the budget.
+//
+// The serial transcript is always written to the output directory so
+// post-mortem investigation has the same artefact the user has been
+// pasting into the chat.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CompositorStressArgs {
+    /// Global wall-clock budget for the whole probe.
+    timeout_secs: u64,
+    /// Per-cycle term-spawn count. A cycle is "spawn N terms, then
+    /// rotate through workspaces" — multiplied by `cycles`.
+    spawns_per_cycle: u32,
+    /// Number of cycles to run.
+    cycles: u32,
+    /// Inter-keystroke delay in milliseconds. Below 100 ms exercises
+    /// the spawn-throttle gate; above 100 ms exercises the steady-
+    /// state SHM cache behaviour without throttling.
+    keystroke_gap_ms: u32,
+    /// Workspaces to round-robin between. The user's reproducer
+    /// typically uses 1, 2, 3.
+    workspaces: Vec<u8>,
+    /// Directory to write the serial log into.
+    out_dir: PathBuf,
+    /// Use KVM for near-native execution speed. The user's repro is
+    /// `cargo xtask run-gui --kvm` so this matches the load profile.
+    /// At 4K resolution with multiple terms TCG can stretch boot to
+    /// many minutes; KVM completes in seconds.
+    kvm: bool,
+}
+
+fn parse_compositor_stress_args(args: &[String]) -> Result<CompositorStressArgs, String> {
+    let mut timeout_secs = 240u64;
+    let mut spawns_per_cycle = 4u32;
+    let mut cycles = 4u32;
+    let mut keystroke_gap_ms = 150u32;
+    let mut workspaces: Vec<u8> = vec![1, 2, 3];
+    let mut out_dir: Option<PathBuf> = None;
+    let mut kvm = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kvm" => kvm = true,
+            "--timeout" => {
+                i += 1;
+                timeout_secs = args
+                    .get(i)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            "--spawns-per-cycle" => {
+                i += 1;
+                spawns_per_cycle = args
+                    .get(i)
+                    .ok_or("--spawns-per-cycle requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --spawns-per-cycle value")?;
+            }
+            "--cycles" => {
+                i += 1;
+                cycles = args
+                    .get(i)
+                    .ok_or("--cycles requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --cycles value")?;
+            }
+            "--keystroke-gap-ms" => {
+                i += 1;
+                keystroke_gap_ms = args
+                    .get(i)
+                    .ok_or("--keystroke-gap-ms requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --keystroke-gap-ms value")?;
+            }
+            "--workspaces" => {
+                i += 1;
+                let s = args
+                    .get(i)
+                    .ok_or("--workspaces requires a comma-separated list")?;
+                workspaces = s
+                    .split(',')
+                    .map(|x| x.trim().parse::<u8>().map_err(|_| "bad workspace number"))
+                    .collect::<Result<Vec<u8>, &str>>()?;
+                if workspaces.is_empty() || workspaces.iter().any(|w| !(1..=9).contains(w)) {
+                    return Err("--workspaces must list numbers in 1..=9".to_string());
+                }
+            }
+            "--out" => {
+                i += 1;
+                out_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--out requires a path")?.as_str(),
+                ));
+            }
+            other => return Err(format!("unknown compositor-stress flag: {other}")),
+        }
+        i += 1;
+    }
+    let out_dir = out_dir.unwrap_or_else(|| {
+        let mut p = std::env::temp_dir();
+        p.push("m3os-compositor-stress");
+        p
+    });
+    Ok(CompositorStressArgs {
+        timeout_secs,
+        spawns_per_cycle,
+        cycles,
+        keystroke_gap_ms,
+        workspaces,
+        out_dir,
+        kvm,
+    })
+}
+
+fn cmd_compositor_stress(args: &CompositorStressArgs) {
+    // Build the image — mirror less-render-probe rather than cmd_image
+    // so we get the autologin/serial term path (graphical_login=false)
+    // that drops us straight into a running compositor + term with no
+    // greeter to drive through. The harness can then issue
+    // SUPER+RETURN immediately.
+    if let Err(msg) = port_build::build_phase_69d_ports() {
+        eprintln!("compositor-stress: precondition failed: {msg}");
+        std::process::exit(1);
+    }
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = std::fs::remove_file(&disk_img);
+    }
+    create_data_disk(
+        uefi_image.parent().unwrap(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false, // graphical_login — autologin/serial path
+    );
+    let ovmf = find_ovmf();
+    if let Err(e) = std::fs::create_dir_all(&args.out_dir) {
+        eprintln!(
+            "compositor-stress: cannot create out dir {}: {e}",
+            args.out_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let qmp_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let vnc_socket = qmp::fresh_socket_path();
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let mut devices = DeviceSet::default();
+    devices.kvm = args.kvm;
+    let mut qemu_args =
+        qemu_args_with_devices(&uefi_image, &ovmf, QemuDisplayMode::Headless, devices);
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    let mut idx = 0;
+    while idx + 1 < qemu_args.len() {
+        if qemu_args[idx] == "-display" && qemu_args[idx + 1] == "none" {
+            qemu_args[idx + 1] = format!("vnc=unix:{}", vnc_socket.display());
+            break;
+        }
+        idx += 1;
+    }
+    qemu_args.push("-qmp".to_string());
+    qemu_args.push(format!("unix:{},server,nowait", qmp_socket.display()));
+    qemu_args.push("-vga".to_string());
+    qemu_args.push("std".to_string());
+    // NOTE: deliberately *not* setting `-global VGA.vgamem_mb=32` —
+    // it pushes the framebuffer to 3840x2160 (matches the user's
+    // 4K repro) but also hangs boot under KVM+VNC here. We test at
+    // the smaller mode the default vgamem yields (~2560x1600) and
+    // still exercise the SHM cache / per-surface buffer paths;
+    // the actual memory cost the harness probes scales with surface
+    // count, not single-surface size.
+
+    println!(
+        "compositor-stress: launching QEMU (timeout {}s, qmp {})",
+        args.timeout_secs,
+        qmp_socket.display()
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&qemu_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_history = String::new();
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let global_timeout = std::time::Duration::from_secs(args.timeout_secs);
+
+    let outcome: Result<(), String> = (|| {
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "display_server: registered as 'display.input-owner'",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("compositor-stress: display_server owns input grab");
+        wait_for_serial_pattern(
+            &rx,
+            &mut serial_buf,
+            &mut serial_history,
+            "TERM_SMOKE:prompt-ready",
+            std::time::Duration::from_secs(args.timeout_secs.min(180)),
+            global_start,
+            global_timeout,
+        )?;
+        println!("compositor-stress: term/sh0 prompt is ready; starting stress");
+
+        let qmp_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut q = qmp::QmpClient::connect(&qmp_socket, qmp_deadline)
+            .map_err(|e| format!("qmp connect: {e}"))?;
+        println!("compositor-stress: QMP handshake complete");
+
+        let gap = std::time::Duration::from_millis(args.keystroke_gap_ms as u64);
+        // The qcode for the Super/Meta key in QEMU. PS/2 emulation
+        // reports `meta_l` for the left Windows key; the m3OS kbd_server
+        // sees it as the same scancode the keybind table maps to SUPER.
+        let super_key = "meta_l";
+        let digit_qcodes = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+        for cycle in 0..args.cycles {
+            // Each cycle: rotate to a fresh workspace, then spawn N terms.
+            let ws_n = args.workspaces[cycle as usize % args.workspaces.len()];
+            let ws_qcode = digit_qcodes[(ws_n - 1) as usize];
+            println!(
+                "compositor-stress: cycle {}: SUPER+{} (switch workspace)",
+                cycle + 1,
+                ws_n
+            );
+            q.press_chord(&[super_key, ws_qcode], 30)
+                .map_err(|e| format!("workspace switch: {e}"))?;
+            std::thread::sleep(gap);
+            // Bail out fast if the kernel already panicked.
+            if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                return Err("kernel panicked after workspace switch".to_string());
+            }
+            for s in 0..args.spawns_per_cycle {
+                println!(
+                    "compositor-stress: cycle {}, spawn {} (SUPER+RETURN)",
+                    cycle + 1,
+                    s + 1
+                );
+                q.press_chord(&[super_key, "ret"], 30)
+                    .map_err(|e| format!("SUPER+RETURN: {e}"))?;
+                std::thread::sleep(gap);
+                if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                    return Err(format!(
+                        "kernel panicked after cycle {} spawn {}",
+                        cycle + 1,
+                        s + 1
+                    ));
+                }
+            }
+        }
+
+        // Settle: let the kernel chew on the final batch for a bit
+        // and verify it stays alive.
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < settle_deadline {
+            if drain_and_check_panic(&rx, &mut serial_buf, &mut serial_history)? {
+                return Err("kernel panicked during settle window".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Ok(())
+    })();
+
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&qmp_socket);
+    let _ = std::fs::remove_file(&vnc_socket);
+
+    let serial_log = args.out_dir.join("serial.log");
+    let _ = std::fs::write(&serial_log, &serial_history);
+    println!("compositor-stress: serial log -> {}", serial_log.display());
+
+    match outcome {
+        Ok(()) => {
+            println!("compositor-stress: PASSED (no kernel panic)");
+        }
+        Err(msg) => {
+            eprintln!("compositor-stress: FAILED — {msg}");
+            let tail = tail_lines(&strip_ansi(&serial_history), 80);
+            eprintln!("--- last 80 lines of serial ---\n{tail}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Drain pending serial chunks into history and return `true` if a
+/// `KERNEL PANIC` marker has appeared. The compositor-stress driver
+/// calls this after every keystroke so it can stop spinning the
+/// moment the OOM fires instead of timing out the global budget.
+fn drain_and_check_panic(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    serial_buf: &mut String,
+    serial_history: &mut String,
+) -> Result<bool, String> {
+    while let Ok(chunk) = rx.try_recv() {
+        append_serial_chunk(serial_buf, serial_history, &chunk);
+    }
+    let stripped = strip_ansi(serial_buf);
+    Ok(stripped.contains("KERNEL PANIC"))
 }
 
 /// Read every PPM the probe captured, print a per-event burst table,

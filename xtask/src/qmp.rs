@@ -177,6 +177,27 @@ impl QmpClient {
         Ok(())
     }
 
+    /// Press a chord (multiple keys at once) by qcode list.
+    /// QEMU's `send-key` accepts an array of key objects and presses
+    /// them all simultaneously then releases; chord ordering inside
+    /// the array doesn't matter to QEMU. Used for compositor
+    /// keybinds like SUPER+RETURN (`&["meta_l", "ret"]`) or
+    /// SUPER+1..9 workspace switches (`&["meta_l", "1"]`).
+    pub fn press_chord(&mut self, qcodes: &[&str], hold_ms: u32) -> Result<(), QmpError> {
+        let keys: Vec<Value> = qcodes
+            .iter()
+            .map(|qc| json!({"type": "qcode", "data": qc}))
+            .collect();
+        let _ = self.execute(
+            "send-key",
+            json!({
+                "keys": keys,
+                "hold-time": hold_ms,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Type a literal ASCII string, one PS/2 keypress per character.
     /// Whitespace, punctuation, and shift-modified letters are mapped
     /// through [`ascii_to_qkeys`]. Characters outside the supported
