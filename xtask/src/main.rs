@@ -2741,16 +2741,13 @@ fn qemu_args_with_devices_resolved(
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 36: 1 GiB. (A 4 GiB bump was attempted on the
-        // Phase 73 4K branch but uncovered a separate kernel boot
-        // hang under `-display vnc=unix:...` + `-vga std` at any
-        // RAM size > 1 GiB — boot halts after the bootstrap heap
-        // log and never reaches `task::kstack::init`'s "[kstack]
-        // pool ready" marker. The fix has to be a real
-        // investigation of that interaction, not a knob.
-        // Headless smoke / regression paths boot fine at 4 GiB
-        // because they use `-display none` without an attached VGA
-        // device. Reverting to 1 GiB until that's diagnosed.)
+        // Phase 36: 1 GiB. A 2-4 GiB bump on the Phase 73 4K branch
+        // also triggers a kernel boot hang past `[mm] bootstrap heap
+        // initialized` in some QEMU configurations; the root cause
+        // sits in mm / kstack init and not in any of the recent
+        // compositor work. Holding at 1 GiB until that's
+        // diagnosed; the SHM-cache + caps + per-surface tracking
+        // already bound the per-frame memory cost at 4K.
         "-m".to_string(),
         "1024".to_string(),
         "-smp".to_string(),

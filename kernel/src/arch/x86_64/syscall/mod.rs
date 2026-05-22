@@ -10323,21 +10323,47 @@ pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
         return u64::MAX;
     }
     let pid = crate::process::current_pid();
-    match crate::mm::shm::create(byte_len as usize, pid) {
-        Ok((id, _start_phys, _page_count)) => u64::from(id.0),
-        Err(crate::mm::shm::ShmError::ProcessCapExceeded) => {
-            // Distinct log so the failure mode is identifiable in
-            // boot transcripts. Returns the same u64::MAX as every
-            // other shm_create failure path — the client surfaces
-            // it as "out of memory" without needing to distinguish
-            // the cause.
-            log::warn!(
-                "[shm] create: per-process cap exceeded pid={} byte_len={}",
+    let result = crate::mm::shm::create(byte_len as usize, pid);
+    // Always log the create with the post-create buddy state. This
+    // is the diagnostic seam the leak hunts need: walking the boot
+    // transcript pairs every shm_create with the resulting free-page
+    // count so we see exactly when the buddy starts running out and
+    // which creates consumed the headroom.
+    let (free, total) = crate::mm::frame_allocator::free_frame_count();
+    match &result {
+        Ok((id, _, page_count)) => {
+            log::info!(
+                "[shm] create ok pid={} byte_len={} pages={} id={} buddy={}/{}",
                 pid,
-                byte_len
+                byte_len,
+                page_count,
+                id.0,
+                free,
+                total
             );
-            u64::MAX
         }
+        Err(crate::mm::shm::ShmError::ProcessCapExceeded) => {
+            log::warn!(
+                "[shm] create: per-process cap exceeded pid={} byte_len={} buddy={}/{}",
+                pid,
+                byte_len,
+                free,
+                total
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "[shm] create failed pid={} byte_len={} err={:?} buddy={}/{}",
+                pid,
+                byte_len,
+                e,
+                free,
+                total
+            );
+        }
+    }
+    match result {
+        Ok((id, _start_phys, _page_count)) => u64::from(id.0),
         Err(_) => u64::MAX,
     }
 }
@@ -10566,9 +10592,24 @@ pub(super) fn sys_shm_destroy(shm_id_arg: u64) -> u64 {
         return u64::MAX;
     }
     let id = crate::mm::shm::ShmId(shm_id_arg as u32);
+    let pid = crate::process::current_pid();
     match crate::mm::shm::decref(id) {
-        Ok(_) => 0,
-        Err(_) => u64::MAX,
+        Ok(was_last_ref) => {
+            let (free, total) = crate::mm::frame_allocator::free_frame_count();
+            log::info!(
+                "[shm] destroy pid={} id={} last_ref={} buddy={}/{}",
+                pid,
+                id.0,
+                was_last_ref,
+                free,
+                total
+            );
+            0
+        }
+        Err(e) => {
+            log::warn!("[shm] destroy failed pid={} id={} err={:?}", pid, id.0, e);
+            u64::MAX
+        }
     }
 }
 

@@ -919,6 +919,24 @@ pub fn handle_panic(info: &core::panic::PanicInfo) -> ! {
 /// allocator-local reclaim and any eligible heap-growth retry — if we reach
 /// here the allocation truly is out of options.
 pub fn handle_alloc_error(layout: alloc::alloc::Layout) -> ! {
+    // Print frame-allocator state before panicking so the post-mortem
+    // log shows exactly how exhausted the buddy was — distinguishes
+    // "kernel heap fragmented but buddy has free frames" from "buddy
+    // is fully empty, every byte of system RAM is accounted for
+    // somewhere". The current calling task's pid is also useful: if
+    // it's a fresh fork child trying to allocate its kernel stack
+    // we know the culprit is process-creation cost.
+    let (free, total) = crate::mm::frame_allocator::free_frame_count();
+    let pid = crate::process::current_pid();
+    serial::_panic_print(format_args!(
+        "[alloc_error] layout={:?} buddy free={}/{} pages ({} MiB free / {} MiB total) pid={}\n",
+        layout,
+        free,
+        total,
+        (free * 4) / 1024,
+        (total * 4) / 1024,
+        pid,
+    ));
     panic!(
         "kernel OOM: failed to allocate {:?} after heap growth retry",
         layout

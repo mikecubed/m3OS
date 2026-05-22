@@ -696,6 +696,18 @@ pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
     Some(frame)
 }
 
+/// Snapshot of frame-allocator state for diagnostics. Returns
+/// `(free_count, total_frames)`. `free_count` is the sum of the
+/// bootstrap free list plus every free block in the buddy
+/// allocator (where almost all frames live after `init_buddy`);
+/// `total_frames` is the count of usable frames discovered at
+/// boot. Best-effort under races since this is purely for logging.
+pub fn free_frame_count() -> (usize, usize) {
+    let guard = FRAME_ALLOCATOR.0.lock();
+    let buddy_free = guard.buddy.as_ref().map(|b| b.free_count()).unwrap_or(0);
+    (guard.free_count + buddy_free, guard.total_frames)
+}
+
 /// Return a frame to the allocator.
 ///
 /// If refcounting is initialized, decrements the reference count first.
