@@ -2521,6 +2521,17 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // per-BAR cleanup we might need later.
     crate::syscall::device_host::release_claims_for_pid(pid);
 
+    // Clear this PID's slot in the SHM per-process byte budget. The
+    // SHM regions themselves stay alive while other mappers reference
+    // them; the budget just stops tracking them against the (now
+    // dead) creator. Without this, if the kernel ever reuses pid N
+    // after a creator exited holding live SHMs, the new pid N would
+    // start with a non-zero budget — and could be falsely capped.
+    // The leftover entries' final decrefs are no-ops via
+    // `release_bytes`'s saturating subtract against the absent map
+    // entry.
+    crate::mm::shm::release_creator(pid);
+
     // Phase 69d follow-up: drop every flock entry this PID still holds
     // BEFORE closing fds.  close_all_fds_for() calls
     // `free_unix_socket` → `wake_unix_socket`, which wakes any flock
@@ -10311,8 +10322,22 @@ pub(super) fn sys_shm_create(byte_len: u64) -> u64 {
     if byte_len == 0 {
         return u64::MAX;
     }
-    match crate::mm::shm::create(byte_len as usize) {
+    let pid = crate::process::current_pid();
+    match crate::mm::shm::create(byte_len as usize, pid) {
         Ok((id, _start_phys, _page_count)) => u64::from(id.0),
+        Err(crate::mm::shm::ShmError::ProcessCapExceeded) => {
+            // Distinct log so the failure mode is identifiable in
+            // boot transcripts. Returns the same u64::MAX as every
+            // other shm_create failure path — the client surfaces
+            // it as "out of memory" without needing to distinguish
+            // the cause.
+            log::warn!(
+                "[shm] create: per-process cap exceeded pid={} byte_len={}",
+                pid,
+                byte_len
+            );
+            u64::MAX
+        }
         Err(_) => u64::MAX,
     }
 }

@@ -60,6 +60,47 @@ static DIAG_COMPOSES_RUN: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 static DIAG_FB_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DIAG_PROTOCOL_VIOLATION_LOG_BUDGET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(16);
+
+/// Monotonic-microsecond timestamp of the most recent fork/spawn
+/// initiated by a keybind handler (`SpawnTerm`, `LaunchLauncher`).
+/// Drives the [`MIN_SPAWN_INTERVAL_US`] coalescing gate so a user
+/// mashing SUPER+RETURN can't fork N processes in a tight loop —
+/// each spawn allocates a 64 KiB kernel stack + new page tables +
+/// initial SHM regions, and N simultaneous forks compound until
+/// the buddy can't satisfy a contiguous run. The gate keeps single
+/// presses snappy (the 100 ms window is below human perception)
+/// and turns adversarial mashing into bounded one-at-a-time
+/// serialisation.
+static LAST_SPAWN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Minimum interval between successive spawn-from-keybind events,
+/// in microseconds. 100 ms is comfortably below the per-key
+/// repeat-delay threshold and indistinguishable from instant for
+/// deliberate user input, but a single mashed chord (typical
+/// key-repeat rate ~30 Hz = one event per 33 ms) coalesces to at
+/// most one fork per 100 ms.
+const MIN_SPAWN_INTERVAL_US: u64 = 100_000;
+
+/// Return `true` when a fresh keybind-driven spawn should fire
+/// (and atomically record the time as the latest spawn);
+/// `false` when the previous spawn was too recent. Single-threaded
+/// daemon, but `compare_exchange` keeps the call-site honest if
+/// the input drain ever becomes concurrent.
+fn try_consume_spawn_budget() -> bool {
+    let now = monotonic_micros();
+    let prev = LAST_SPAWN_US.load(core::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(prev) < MIN_SPAWN_INTERVAL_US {
+        return false;
+    }
+    LAST_SPAWN_US
+        .compare_exchange(
+            prev,
+            now,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+}
 use crate::control::{
     ControlSubscriptions, DebugCrashPolicy, null_subscriber_sender, publish_bind_triggered,
     publish_focus_changed, publish_surface_created, publish_surface_destroyed, record_frame_sample,
@@ -2418,6 +2459,16 @@ fn dispatch_keybind_action(
             }
         }
         KeybindAction::SpawnTerm => {
+            // Coalesce rapid mashes: each fork allocates a 64 KiB
+            // kernel stack + new page tables + initial SHM regions,
+            // so N near-simultaneous forks pressurise the buddy
+            // allocator. The throttle keeps a single press snappy
+            // and bounds keymashing to one spawn per
+            // MIN_SPAWN_INTERVAL_US.
+            if !try_consume_spawn_budget() {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+RETURN throttled\n");
+                return;
+            }
             let pid = syscall_lib::fork();
             if pid == 0 {
                 let _ = spawn_term();
@@ -2432,7 +2483,11 @@ fn dispatch_keybind_action(
             // failing to acquire the singleton service-registry slot
             // it tries to register. Cheap (one extra fork on
             // double-press) and keeps the code path symmetric with
-            // `SpawnTerm`.
+            // `SpawnTerm`. Same throttle for the same reason.
+            if !try_consume_spawn_budget() {
+                syscall_lib::write_str(STDOUT_FILENO, "display_server: SUPER+SPACE throttled\n");
+                return;
+            }
             let pid = syscall_lib::fork();
             if pid == 0 {
                 if let Some(session) = read_session_state() {

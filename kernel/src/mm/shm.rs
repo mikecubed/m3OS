@@ -100,14 +100,39 @@ pub enum ShmError {
     OutOfContiguousFrames,
     /// Lookup against an `ShmId` that does not name a live region.
     NotFound,
+    /// Granting the requested `byte_len` would push the calling
+    /// process over [`PER_PROCESS_SHM_CAP_BYTES`]. A clean
+    /// back-pressure error the client can surface as "out of
+    /// memory" — strictly preferable to letting one runaway process
+    /// fragment the buddy allocator and OOM-panic the whole kernel
+    /// next time anything tries to allocate a contiguous order-4
+    /// run (new kernel stacks, large `Vec`s, etc).
+    ProcessCapExceeded,
 }
 
+/// Maximum total bytes of live SHM regions a single process may
+/// hold open at once, as measured by the sum of page-rounded
+/// allocations on `sys_shm_create`. 256 MiB comfortably exceeds
+/// the working set of any expected client (term: ~16 MiB
+/// double-buffer at typical tile sizes; bar / wallpaper / launcher
+/// similar order of magnitude) while bounding the worst-case
+/// damage a runaway or misbehaving process can do.
+pub const PER_PROCESS_SHM_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// One row of the registry. Holds the contiguous frame run plus the
-/// shared refcount.
+/// shared refcount plus the creator pid so the per-process byte
+/// accounting can be reclaimed on final decref.
 struct ShmEntry {
     start_phys: u64,
     page_count: u16,
     refcount: AtomicU32,
+    /// PID of the process that called [`create`]. Stored so the
+    /// last [`decref`] (the one that returns frames to the buddy)
+    /// can subtract this region's byte count from the right
+    /// per-process budget — even when the destroyer is not the
+    /// creator (e.g. the SHM outlives the creator while a mapper
+    /// still holds it).
+    creator_pid: u32,
 }
 
 /// Module-level state. A `Mutex<BTreeMap>` is overkill for the
@@ -115,6 +140,18 @@ struct ShmEntry {
 /// surface lifecycle), but the BTreeMap gives us O(log n) lookup
 /// without constraining `ShmId` to be a slot index.
 static REGISTRY: Mutex<BTreeMap<ShmId, ShmEntry>> = Mutex::new(BTreeMap::new());
+
+/// Per-process accounting of live SHM bytes (sum of
+/// `page_count * 4096` over every region this pid has created and
+/// that has not yet been fully released). [`create`] increments the
+/// matching entry under the cap check; the final [`decref`]
+/// subtracts. Stale entries — a process exited without destroying
+/// its SHMs and another mapper is keeping them alive — are pruned
+/// on the next refcount-zero event, since the entry's `creator_pid`
+/// still points at the (now-dead) pid; `saturating_sub` handles the
+/// case where the bookkeeping has already been cleared by
+/// [`release_creator`].
+static PROCESS_BYTES: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
 
 /// Counter for monotonic id allocation. Wraps after 2^32 ids — for
 /// reference, allocating one id per CPU cycle that's still ~50s of
@@ -129,7 +166,7 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// `1` — the caller is responsible for one matching [`decref`] (via
 /// the unmap syscall, or via `decref` directly if the cap is dropped
 /// before any mapping is installed).
-pub fn create(byte_len: usize) -> Result<(ShmId, u64, u16), ShmError> {
+pub fn create(byte_len: usize, creator_pid: u32) -> Result<(ShmId, u64, u16), ShmError> {
     if byte_len == 0 {
         return Err(ShmError::InvalidLength);
     }
@@ -140,8 +177,32 @@ pub fn create(byte_len: usize) -> Result<(ShmId, u64, u16), ShmError> {
         return Err(ShmError::LengthTooLarge);
     }
     let order = pages.next_power_of_two().trailing_zeros() as usize;
-    let frame = frame_allocator::allocate_contiguous_zeroed(order)
-        .ok_or(ShmError::OutOfContiguousFrames)?;
+    let page_count_u64 = 1u64 << order;
+    let allocated_bytes = page_count_u64 * 4096;
+    // Per-process cap check, performed *before* we touch the buddy
+    // allocator so a denied request leaves no side effect. The
+    // accounting tracks page-rounded bytes (what the kernel actually
+    // commits), not the user-requested `byte_len`, so the cap reflects
+    // real memory cost.
+    {
+        let mut pb = PROCESS_BYTES.lock();
+        let current = pb.get(&creator_pid).copied().unwrap_or(0);
+        let new_total = current.saturating_add(allocated_bytes);
+        if new_total > PER_PROCESS_SHM_CAP_BYTES {
+            return Err(ShmError::ProcessCapExceeded);
+        }
+        pb.insert(creator_pid, new_total);
+    }
+    // Reserve the frames. On failure we have to undo the budget
+    // increment, otherwise a denied buddy allocation would leak the
+    // cap counter.
+    let frame = match frame_allocator::allocate_contiguous_zeroed(order) {
+        Some(f) => f,
+        None => {
+            release_bytes(creator_pid, allocated_bytes);
+            return Err(ShmError::OutOfContiguousFrames);
+        }
+    };
     let start_phys = frame.start_address().as_u64();
     let page_count = (1usize << order) as u16;
 
@@ -162,9 +223,36 @@ pub fn create(byte_len: usize) -> Result<(ShmId, u64, u16), ShmError> {
             start_phys,
             page_count,
             refcount: AtomicU32::new(1),
+            creator_pid,
         },
     );
     Ok((id, start_phys, page_count))
+}
+
+/// Subtract `bytes` from the byte budget tracked against `pid`.
+/// Removes the map entry when the count reaches zero so dead pids
+/// don't accumulate. Saturating to handle the case where
+/// [`release_creator`] cleared the budget mid-flight (a creator
+/// process exit while a mapper is still holding the SHM alive).
+fn release_bytes(pid: u32, bytes: u64) {
+    let mut pb = PROCESS_BYTES.lock();
+    if let Some(current) = pb.get_mut(&pid) {
+        *current = current.saturating_sub(bytes);
+        if *current == 0 {
+            pb.remove(&pid);
+        }
+    }
+}
+
+/// Clear all per-process SHM byte accounting for `pid` — called by
+/// the process-exit path so a fresh PID assignment after teardown
+/// starts with a clean budget even when the exiting process left
+/// SHM regions alive via other mappers. Subsequent
+/// refcount-zero decrefs against stale `creator_pid` entries are
+/// no-ops via [`release_bytes`]'s saturating subtract.
+pub fn release_creator(pid: u32) {
+    let mut pb = PROCESS_BYTES.lock();
+    pb.remove(&pid);
 }
 
 /// Increment the refcount for an existing region and return its
@@ -193,6 +281,12 @@ pub fn decref(id: ShmId) -> Result<bool, ShmError> {
     // serialise SHM activity behind the global frame-allocator lock.
     let entry = reg.remove(&id).expect("entry vanished after refcount-zero");
     drop(reg);
+    // Return the byte count to the creator's per-process budget
+    // before freeing the frames; the order matters only if another
+    // task is concurrently waiting on cap headroom (and even then,
+    // either ordering is correct since we never temporarily
+    // double-count).
+    release_bytes(entry.creator_pid, (entry.page_count as u64) * 4096);
     let order = (entry.page_count as usize).trailing_zeros() as usize;
     frame_allocator::free_contiguous(entry.start_phys, order);
     Ok(true)
