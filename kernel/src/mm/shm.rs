@@ -244,13 +244,41 @@ fn release_bytes(pid: u32, bytes: u64) {
     }
 }
 
-/// Clear all per-process SHM byte accounting for `pid` — called by
-/// the process-exit path so a fresh PID assignment after teardown
-/// starts with a clean budget even when the exiting process left
-/// SHM regions alive via other mappers. Subsequent
-/// refcount-zero decrefs against stale `creator_pid` entries are
-/// no-ops via [`release_bytes`]'s saturating subtract.
+/// Release every SHM region this `pid` created — called by the
+/// process-exit path. Drops the creator's `+1` reference (the
+/// implicit ref [`create`] installs and the userspace `shm_destroy`
+/// syscall normally clears). Without this, a process that exits
+/// without explicitly destroying its SHMs leaks the creator ref
+/// forever: the frames stay alive as long as any other mapper
+/// holds the region, and even after the last mapper unmaps, the
+/// creator ref keeps `refcount > 0` so [`decref`] never returns
+/// the frames to the buddy. Greeter exit, terminated terms,
+/// SIGKILLed clients, panicked clients — all of them previously
+/// silently leaked their SHM frames.
+///
+/// Also clears the per-process byte budget so a fresh PID
+/// assignment starts clean.
+///
+/// Implementation: take a snapshot of `(shm_id, page_count)` pairs
+/// under the registry lock, drop the lock, then call [`decref`]
+/// on each one. Holding the lock across [`decref`]'s
+/// `frame_allocator::free_contiguous` call would serialise SHM
+/// activity behind the buddy allocator.
 pub fn release_creator(pid: u32) {
+    let to_release: alloc::vec::Vec<ShmId> = {
+        let reg = REGISTRY.lock();
+        reg.iter()
+            .filter(|(_, entry)| entry.creator_pid == pid)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in to_release {
+        let _ = decref(id);
+    }
+    // Clear the budget entry too. `release_bytes` calls during the
+    // decrefs above already cleared individual entries, but the
+    // map entry may still exist if some decrefs short-circuited or
+    // failed; remove() makes it definitive.
     let mut pb = PROCESS_BYTES.lock();
     pb.remove(&pid);
 }
