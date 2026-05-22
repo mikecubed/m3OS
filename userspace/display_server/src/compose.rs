@@ -201,6 +201,7 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
         |_| true,
         None,
         None,
+        None,
     )
 }
 
@@ -210,7 +211,10 @@ pub fn run_compose<O: FramebufferOwner, L: LayoutPolicy>(
 /// workspace's Toplevels are blitted. `border_cfg`, when `Some`,
 /// paints active / inactive borders around every Toplevel rect after
 /// the surface blit completes. `focused_id` selects which border uses
-/// the active colour.
+/// the active colour. `animations`, when `Some`, supplies per-surface
+/// transforms (window-open scale-up, window-move slide, ...) the
+/// compose pass applies to the natural tile rect before snapshotting
+/// and blitting.
 #[allow(clippy::too_many_arguments)]
 pub fn run_compose_filtered<O, L, F>(
     owner: &mut O,
@@ -221,6 +225,7 @@ pub fn run_compose_filtered<O, L, F>(
     include_toplevel: F,
     border_cfg: Option<crate::borders::BorderConfig>,
     focused_id: Option<SurfaceId>,
+    animations: Option<&crate::animation::AnimationEngine>,
 ) -> Result<usize, ComposeError>
 where
     O: FramebufferOwner,
@@ -472,17 +477,11 @@ where
         let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let original = entry.buf.pixels_snapshot();
-            let tile = tile_for_entry(entry, arrangement);
-            // Phase 73 — only scale when the surface is **strictly
-            // larger** than the assigned tile, i.e. when letterboxing
-            // would visibly clip content. For under-sized surfaces
-            // (DOOM at 1280×800 inside a 1920×1056 tile is the
-            // canonical case) the letterbox path is dramatically
-            // cheaper than nearest-neighbour scaling the full buffer
-            // on every frame; the surface just renders at native
-            // resolution in the centre of its tile. The
-            // clip-to-tile path handles the over-sized case
-            // independently — see `surface_tile_clip` below.
+            let (tile, anim_forced) = animated_tile_for_entry(entry, arrangement, animations);
+            // See the general path below for the full rationale on
+            // the should_scale predicate. Same rule: scale to fill
+            // when an animation forces a transformed rect; else only
+            // when the buffer is strictly larger than the tile.
             let should_scale = match tile {
                 Some(t) => {
                     matches!(
@@ -492,7 +491,8 @@ where
                         && entry.buf.height > 0
                         && t.w > 0
                         && t.h > 0
-                        && (entry.buf.width > t.w || entry.buf.height > t.h)
+                        && ((anim_forced && (entry.buf.width != t.w || entry.buf.height != t.h))
+                            || (!anim_forced && (entry.buf.width > t.w || entry.buf.height > t.h)))
                 }
                 None => false,
             };
@@ -516,7 +516,24 @@ where
                 scaled_flags.push(true);
             } else {
                 snapshots.push(original);
-                let surface_rect = surface_screen_rect(entry, arrangement);
+                // Animations that didn't trigger should_scale produce
+                // a translate-only effect: keep the buffer dims,
+                // shift the rect by the animation's offset.
+                let surface_rect = match tile {
+                    Some(t) if anim_forced => {
+                        let surf_w = entry.buf.width;
+                        let surf_h = entry.buf.height;
+                        let dx = (t.w as i32 - surf_w as i32) / 2;
+                        let dy = (t.h as i32 - surf_h as i32) / 2;
+                        Rect {
+                            x: t.x.saturating_add(dx),
+                            y: t.y.saturating_add(dy),
+                            w: surf_w,
+                            h: surf_h,
+                        }
+                    }
+                    _ => surface_screen_rect(entry, arrangement),
+                };
                 let local: Vec<Rect> = cursor_repaint
                     .iter()
                     .filter_map(|sr| {
@@ -679,7 +696,13 @@ where
     let mut scaled_flags: Vec<bool> = Vec::with_capacity(entries.len());
     for entry in entries.iter() {
         let original = entry.buf.pixels_snapshot();
-        let tile = tile_for_entry(entry, arrangement);
+        let (tile, anim_forced) = animated_tile_for_entry(entry, arrangement, animations);
+        // Phase 73 — only scale when the surface is **strictly
+        // larger** than the assigned tile, i.e. when letterboxing
+        // would visibly clip content. Animation transforms override
+        // this — when an animation provides a transformed rect
+        // (scale-up on window open, slide on window move) we always
+        // scale to fill the animated rect.
         let should_scale = match tile {
             Some(t) => {
                 matches!(
@@ -689,7 +712,8 @@ where
                     && entry.buf.height > 0
                     && t.w > 0
                     && t.h > 0
-                    && (entry.buf.width != t.w || entry.buf.height != t.h)
+                    && ((anim_forced && (entry.buf.width != t.w || entry.buf.height != t.h))
+                        || (!anim_forced && (entry.buf.width > t.w || entry.buf.height > t.h)))
             }
             None => false,
         };
@@ -712,9 +736,30 @@ where
             effective_rects.push(tile);
             scaled_flags.push(true);
         } else {
+            // Non-scaled path: surface drawn at its natural size,
+            // letterboxed inside whichever rect the animation produced
+            // (or the tile from the workspace arrangement).
+            let surface_rect = match tile {
+                Some(t) if anim_forced => {
+                    // Animation requested a translate without a
+                    // scale change (rect dims match buffer); centre
+                    // the surface inside the animated rect.
+                    let surf_w = entry.buf.width;
+                    let surf_h = entry.buf.height;
+                    let dx = (t.w as i32 - surf_w as i32) / 2;
+                    let dy = (t.h as i32 - surf_h as i32) / 2;
+                    Rect {
+                        x: t.x.saturating_add(dx),
+                        y: t.y.saturating_add(dy),
+                        w: surf_w,
+                        h: surf_h,
+                    }
+                }
+                _ => surface_screen_rect(entry, arrangement),
+            };
             snapshots.push(original);
             scaled_damages.push(Vec::new());
-            effective_rects.push(surface_screen_rect(entry, arrangement));
+            effective_rects.push(surface_rect);
             scaled_flags.push(false);
         }
     }
@@ -731,8 +776,22 @@ where
         // because the surface IS the tile, no overflow to clip.
         // For non-scaled surfaces, take the existing letterbox-and-
         // clip path so a too-large buffer stays bounded by the tile.
+        // While an animation is forcing a transformed rect we drop
+        // the tile clip so the surface can extend outside its
+        // arrangement-assigned tile (move animations lerp the rect
+        // through positions that may partially leave the natural
+        // tile).
+        let anim_forced_idx = matches!(
+            animations.and_then(|eng| {
+                tile_for_entry(entry, arrangement)
+                    .and_then(|nat| eng.effective_transform(entry.id, nat))
+            }),
+            Some(_)
+        );
         let (damage_slice, clip_rect): (&[Rect], Option<Rect>) = if scaled_flags[idx] {
             (scaled_damages[idx].as_slice(), None)
+        } else if anim_forced_idx {
+            (&dmg[..], None)
         } else {
             (&dmg[..], surface_tile_clip(entry, arrangement))
         };
@@ -885,6 +944,30 @@ fn tile_for_entry(
         .iter()
         .find(|(id, _)| *id == entry.id)
         .map(|(_, tile)| *tile)
+}
+
+/// Resolve the destination rect a Toplevel should be drawn into this
+/// frame, taking any active animation into account. Returns
+/// `(rect, force_scale)` where `force_scale = true` indicates the
+/// animation is requesting a non-identity transform, so the compose
+/// pass must use the nearest-neighbour-scale path even if the buffer
+/// and rect happen to share the same dimensions. Non-Toplevel
+/// surfaces and Toplevels with no active animation produce
+/// `(natural_tile, false)`.
+fn animated_tile_for_entry(
+    entry: &crate::surface::ComposeEntry<'_>,
+    arrangement: &[(SurfaceId, Rect)],
+    animations: Option<&crate::animation::AnimationEngine>,
+) -> (Option<Rect>, bool) {
+    let natural = tile_for_entry(entry, arrangement);
+    let animated = match (animations, natural) {
+        (Some(eng), Some(nat)) => eng.effective_transform(entry.id, nat).map(|t| t.rect),
+        _ => None,
+    };
+    match animated {
+        Some(rect) => (Some(rect), true),
+        None => (natural, false),
+    }
 }
 
 /// Phase 72b — nearest-neighbour scale a BGRA8888 source buffer of

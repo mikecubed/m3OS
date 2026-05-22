@@ -400,6 +400,12 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // its intrinsic size and the compositor handles repositioning.
     let mut last_tile_dims: alloc::collections::BTreeMap<SurfaceId, (u32, u32)> =
         alloc::collections::BTreeMap::new();
+    // Phase 73 — full tile rect per surface (position + size). Used to
+    // detect *position* changes that drive `WindowMove` animations;
+    // the dims-only map above still gates `SurfaceResized` so clients
+    // that don't care about position don't get spurious notifications.
+    let mut last_tile_rects: alloc::collections::BTreeMap<SurfaceId, Rect> =
+        alloc::collections::BTreeMap::new();
     // Phase 73 — last-computed Toplevel arrangement, used by the
     // input dispatcher's hit-test so clicks land on the *tiled* rect
     // (not the centred buffer rect from `iter_compose`). Updated on
@@ -613,6 +619,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 for sid in &destroyed {
                     let _ = workspace_mgr.remove_surface(*sid);
                     last_tile_dims.remove(sid);
+                    last_tile_rects.remove(sid);
                     if focused == Some(*sid) {
                         focused = None;
                     }
@@ -665,6 +672,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // map so a future surface that lands at the same id does
             // not get spuriously diffed against the dead tile.
             last_tile_dims.remove(sid);
+            last_tile_rects.remove(sid);
             // Phase 73 Track A — drop any in-flight animations against
             // this surface so the engine does not advance timers for a
             // dead client. The destroy path already forces a full
@@ -936,6 +944,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // the gaps before the surface pass re-blits the live tiles.
             let mut arrangement_changed = false;
             for (sid, rect) in arrangement_for_diff.iter() {
+                // Dim-change check drives `SurfaceResized` -> client.
                 let entry = last_tile_dims.entry(*sid).or_insert((0, 0));
                 if entry.0 != rect.w || entry.1 != rect.h {
                     *entry = (rect.w, rect.h);
@@ -952,6 +961,17 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         },
                     ));
                 }
+                // Rect-change check drives `WindowMove` animations.
+                // Triggers on position-only changes too; skip when we
+                // don't have a previous rect yet (i.e. the surface
+                // just joined the active arrangement, in which case
+                // WindowOpen is already animating it).
+                let prev_rect = last_tile_rects.insert(*sid, *rect);
+                if let Some(prev) = prev_rect
+                    && prev != *rect
+                {
+                    animation_engine.animate_move(*sid, prev, *rect);
+                }
             }
             // Drop tracked dims for surfaces that left the active
             // arrangement (workspace switch, destroy, move). This keeps
@@ -961,6 +981,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 arrangement_for_diff.iter().map(|(sid, _)| *sid).collect();
             let prev_tracked = last_tile_dims.len();
             last_tile_dims.retain(|sid, _| active_set.contains(sid));
+            last_tile_rects.retain(|sid, _| active_set.contains(sid));
             if last_tile_dims.len() != prev_tracked {
                 arrangement_changed = true;
             }
@@ -980,6 +1001,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                 |id| active_ws_windows.contains(&id),
                 Some(compositor_config.borders),
                 focused,
+                Some(&animation_engine),
             );
             let elapsed_us = monotonic_micros().saturating_sub(start_us);
             let compose_micros = if elapsed_us > u32::MAX as u64 {

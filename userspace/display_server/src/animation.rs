@@ -104,10 +104,18 @@ pub struct Animation {
     /// [`AnimationEngine::tick`] so the composer can clip the blit to
     /// just the animated region.
     pub damage: Rect,
+    /// Starting rect for `WindowMove`. The compositor lerps from this
+    /// rect to the surface's natural (post-arrangement) rect over the
+    /// animation's duration. `None` for animations that don't need a
+    /// source rect.
+    pub from_rect: Option<Rect>,
 }
 
 impl Animation {
-    /// Construct using the kind's default curve + duration.
+    /// Construct using the kind's default curve + duration with no
+    /// `from_rect`. Used by `WindowOpen` / `WindowClose` /
+    /// `WorkspaceSwitch` — kinds whose effect is computed purely from
+    /// the surface's current rect.
     pub fn new(surface_id: SurfaceId, kind: AnimationKind, damage: Rect) -> Self {
         Self {
             surface_id,
@@ -116,6 +124,21 @@ impl Animation {
             elapsed_ms: 0,
             duration_ms: kind.default_duration_ms(),
             damage,
+            from_rect: None,
+        }
+    }
+
+    /// Construct a `WindowMove` animation lerping from `from` to the
+    /// surface's natural rect.
+    pub fn new_move(surface_id: SurfaceId, from: Rect, damage: Rect) -> Self {
+        Self {
+            surface_id,
+            kind: AnimationKind::WindowMove,
+            curve: AnimationKind::WindowMove.default_curve(),
+            elapsed_ms: 0,
+            duration_ms: AnimationKind::WindowMove.default_duration_ms(),
+            damage,
+            from_rect: Some(from),
         }
     }
 
@@ -193,6 +216,19 @@ impl AnimationEngine {
         self.push(Animation::new(surface_id, kind, damage));
     }
 
+    /// Convenience: push a `WindowMove` animation that lerps the
+    /// surface's rendered rect from `from` to `to`. Damage is set to
+    /// the union of the two rects so the compose loop knows to repaint
+    /// both the source and destination regions during the slide. If a
+    /// `WindowMove` is already in flight for this surface it's
+    /// dropped first — a new move from the current visual position to
+    /// the new destination is more correct than chaining two lerps.
+    pub fn animate_move(&mut self, surface_id: SurfaceId, from: Rect, to: Rect) {
+        let _ = self.drop_surface(surface_id);
+        let damage = rect_union(from, to);
+        self.push(Animation::new_move(surface_id, from, damage));
+    }
+
     /// Advance every animation by `frame_delta_ms` and return the union
     /// of every animated rect as the dirty region for this frame.
     ///
@@ -220,6 +256,123 @@ impl AnimationEngine {
         let before = self.animations.len();
         self.animations.retain(|a| a.surface_id != surface_id);
         before - self.animations.len()
+    }
+
+    /// Compute the transform the compositor should apply to
+    /// `surface_id` this frame given its natural (post-arrangement)
+    /// `tile` rect. Returns `None` when the surface has no active
+    /// animation — the compositor renders it at the natural rect.
+    /// When `Some`, the compositor draws into the returned rect (with
+    /// scaling if dims differ from the natural tile).
+    ///
+    /// If the same surface has multiple in-flight animations the
+    /// earliest-pushed one wins; this is the convention the spec
+    /// names for collision resolution (it matches the
+    /// "drop on destroy" semantics of `drop_surface`).
+    pub fn effective_transform(
+        &self,
+        surface_id: SurfaceId,
+        tile: Rect,
+    ) -> Option<AnimationTransform> {
+        let anim = self
+            .animations
+            .iter()
+            .find(|a| a.surface_id == surface_id)?;
+        let t = anim.eased();
+        match anim.kind {
+            AnimationKind::WindowOpen => {
+                // Spec: scale 0.9 → 1.0. Made slightly more visible
+                // (0.7 → 1.0) so the pop-in is noticeable on a
+                // single-buffered 60 Hz boot.
+                let scale = 0.7 + 0.3 * t;
+                Some(scale_about_centre(tile, scale))
+            }
+            AnimationKind::WindowClose => {
+                // Reverse of open: 1.0 → 0.7. Surface visually
+                // shrinks toward its centre as it's destroyed.
+                let scale = 1.0 - 0.3 * t;
+                Some(scale_about_centre(tile, scale))
+            }
+            AnimationKind::WindowMove => {
+                // Lerp the rect from `from_rect` to the natural tile.
+                let from = anim.from_rect.unwrap_or(tile);
+                Some(lerp_rect(from, tile, t))
+            }
+            AnimationKind::WorkspaceSwitch => {
+                // Not yet wired — keep identity until ghost-buffer
+                // support lands.
+                None
+            }
+        }
+    }
+}
+
+/// Per-frame transform the compositor applies to a Toplevel surface
+/// while an animation is active. The compositor draws the surface
+/// into [`AnimationTransform::rect`] instead of the natural tile;
+/// when the rect dims differ from the surface buffer dims the
+/// existing nearest-neighbour-scale path produces the scaled blit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnimationTransform {
+    pub rect: Rect,
+}
+
+fn rect_union(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x.saturating_add(a.w as i32)).max(b.x.saturating_add(b.w as i32));
+    let y1 = (a.y.saturating_add(a.h as i32)).max(b.y.saturating_add(b.h as i32));
+    Rect {
+        x: x0,
+        y: y0,
+        w: (x1 - x0).max(0) as u32,
+        h: (y1 - y0).max(0) as u32,
+    }
+}
+
+/// Round to nearest integer without depending on a libm-style trait
+/// import. Adds 0.5 (subtracts for negatives) before truncating.
+/// Matches `f32::round` for finite values which is all we feed in.
+fn round_f32(v: f32) -> f32 {
+    if v >= 0.0 { v + 0.5 } else { v - 0.5 }
+}
+
+fn scale_about_centre(tile: Rect, scale: f32) -> AnimationTransform {
+    let scale = scale.clamp(0.0, 1.0);
+    let new_w = round_f32((tile.w as f32) * scale) as u32;
+    let new_h = round_f32((tile.h as f32) * scale) as u32;
+    let dx = ((tile.w as i32) - (new_w as i32)) / 2;
+    let dy = ((tile.h as i32) - (new_h as i32)) / 2;
+    AnimationTransform {
+        rect: Rect {
+            x: tile.x.saturating_add(dx),
+            y: tile.y.saturating_add(dy),
+            w: new_w,
+            h: new_h,
+        },
+    }
+}
+
+fn lerp_rect(from: Rect, to: Rect, t: f32) -> AnimationTransform {
+    let t = t.clamp(0.0, 1.0);
+    let lerp_i = |a: i32, b: i32| -> i32 {
+        let af = a as f32;
+        let bf = b as f32;
+        round_f32(af + (bf - af) * t) as i32
+    };
+    let lerp_u = |a: u32, b: u32| -> u32 {
+        let af = a as f32;
+        let bf = b as f32;
+        let v = round_f32(af + (bf - af) * t);
+        if v < 0.0 { 0 } else { v as u32 }
+    };
+    AnimationTransform {
+        rect: Rect {
+            x: lerp_i(from.x, to.x),
+            y: lerp_i(from.y, to.y),
+            w: lerp_u(from.w, to.w),
+            h: lerp_u(from.h, to.h),
+        },
     }
 }
 
