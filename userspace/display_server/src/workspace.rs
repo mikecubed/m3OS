@@ -462,9 +462,32 @@ impl WorkspaceManager {
         gaps: GapConfig,
         exclusive_zones: &[Rect],
     ) -> Vec<(SurfaceId, Rect)> {
+        self.arrange_workspace_with_exclusive(self.current, output, gaps, exclusive_zones)
+    }
+
+    /// Arrange an *arbitrary* workspace, not just the active one. Used
+    /// by the workspace-slide path: during a slide the compositor
+    /// renders both the outgoing and incoming workspaces' tiles, with
+    /// per-workspace x-offsets driven by the slide's progress. The
+    /// outgoing workspace's surfaces stay alive in the registry and
+    /// their tiles need to be computed against this output's geometry
+    /// so they can be offset off-screen.
+    ///
+    /// Returns an empty arrangement when `idx` is out of range — same
+    /// graceful-rejection contract as [`switch_workspace`].
+    pub fn arrange_workspace_with_exclusive(
+        &mut self,
+        idx: usize,
+        output: Rect,
+        gaps: GapConfig,
+        exclusive_zones: &[Rect],
+    ) -> Vec<(SurfaceId, Rect)> {
+        if idx >= NUM_WORKSPACES {
+            return Vec::new();
+        }
         let usable = usable_rect(output, exclusive_zones);
         let inner = apply_outer_gaps(usable, gaps.outer);
-        self.workspaces[self.current].tile(inner, gaps)
+        self.workspaces[idx].tile(inner, gaps)
     }
 
     /// Cycle keyboard focus through the active workspace's window
@@ -483,15 +506,39 @@ impl WorkspaceManager {
     }
 }
 
+/// Per-frame workspace-slide context the compose pass feeds into
+/// [`WorkspaceLayoutAdapter`] so the adapter can merge the outgoing
+/// and incoming workspaces' tile arrangements into a single offset-
+/// aware result. `None` between slides — the adapter then arranges
+/// just the active workspace, byte-for-byte the same as Phase 72.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlideContext {
+    /// Index of the workspace sliding *out*.
+    pub from_ws: usize,
+    /// X-offset applied to every tile of the outgoing workspace.
+    pub from_offset_x: i32,
+    /// X-offset applied to every tile of the incoming (active)
+    /// workspace.
+    pub to_offset_x: i32,
+}
+
 /// A [`LayoutPolicy`] adapter that delegates `arrange` to the
 /// currently-active workspace's tiling policy. Lets the existing
 /// Phase 56 `run_compose` flow stay byte-for-byte unchanged while the
 /// new tiling logic plugs in at the trait boundary. Consumers borrow
 /// a `WorkspaceManager` and a `GapConfig`; `arrange` then routes to
 /// the right per-policy state.
+///
+/// During a workspace transition the optional [`SlideContext`] makes
+/// the adapter return the merged offset arrangement: tiles for the
+/// outgoing workspace shifted by `from_offset_x`, tiles for the
+/// active workspace shifted by `to_offset_x`. The compose pass then
+/// blits both sets at the offset positions and the user sees a real
+/// slide instead of an instant snap.
 pub struct WorkspaceLayoutAdapter<'a> {
     pub manager: &'a mut WorkspaceManager,
     pub gaps: GapConfig,
+    pub slide: Option<SlideContext>,
 }
 
 impl<'a> LayoutPolicy for WorkspaceLayoutAdapter<'a> {
@@ -501,16 +548,50 @@ impl<'a> LayoutPolicy for WorkspaceLayoutAdapter<'a> {
         output: OutputGeometry,
         exclusive_zones: &[Rect],
     ) -> Vec<(SurfaceId, Rect)> {
-        // The compose loop filters `iter_compose` to only the active
-        // workspace's surfaces before calling `arrange`, but the
-        // legacy trait passes `toplevels` to honour the call shape.
-        // We ignore the parameter and consult `manager.current()`
-        // directly — that is the source of truth for which windows
-        // tile under the active policy. `exclusive_zones` carries the
-        // full-edge reservations declared by Layer-shell clients (Phase
-        // 73 status bar / dock / panel) so toplevels never overlap them.
-        self.manager
-            .arrange_current_with_exclusive(output.rect, self.gaps, exclusive_zones)
+        // The compose loop filters `iter_compose` to the union of
+        // active and outgoing workspace surfaces before calling
+        // `arrange`, but the legacy trait passes `toplevels` to honour
+        // the call shape. We ignore the parameter and consult
+        // `manager` directly — that is the source of truth for which
+        // windows tile under which policy. `exclusive_zones` carries
+        // the full-edge reservations declared by Layer-shell clients
+        // (Phase 73 status bar / dock / panel) so toplevels never
+        // overlap them.
+        let active =
+            self.manager
+                .arrange_current_with_exclusive(output.rect, self.gaps, exclusive_zones);
+        let Some(slide) = self.slide else {
+            return active;
+        };
+        // Slide in flight — also arrange the outgoing workspace and
+        // apply each side's offset. Both arrangements use the same
+        // output rect and exclusive zones so the two sliding panels
+        // are geometrically consistent (a surface that ends up under
+        // the bar in workspace A is under the bar in workspace B's
+        // arrangement too).
+        let outgoing = self.manager.arrange_workspace_with_exclusive(
+            slide.from_ws,
+            output.rect,
+            self.gaps,
+            exclusive_zones,
+        );
+        let mut merged: Vec<(SurfaceId, Rect)> = Vec::with_capacity(active.len() + outgoing.len());
+        for (sid, r) in outgoing {
+            merged.push((sid, translate_rect_x(r, slide.from_offset_x)));
+        }
+        for (sid, r) in active {
+            merged.push((sid, translate_rect_x(r, slide.to_offset_x)));
+        }
+        merged
+    }
+}
+
+fn translate_rect_x(r: Rect, dx: i32) -> Rect {
+    Rect {
+        x: r.x.saturating_add(dx),
+        y: r.y,
+        w: r.w,
+        h: r.h,
     }
 }
 

@@ -7,6 +7,16 @@
 //! Pure logic: no syscalls, no allocator hand-waving. The composer
 //! calls [`AnimationEngine::tick`] from `compose_frame`; tests can
 //! drive the same call directly without booting QEMU.
+//!
+//! Workspace-switch transitions are handled by [`WorkspaceSlide`]
+//! rather than per-surface animations: a single slide value drives
+//! the offset of every Toplevel in both the outgoing and incoming
+//! workspace, with no per-surface allocation. This is the same
+//! pattern Hyprland / KWin / Mutter use — the compositor never
+//! snapshots pixels for a transition, it just renders the live
+//! surfaces at a transformed position. Replaced the original
+//! `WorkspaceGhost` design, which copied 8 MiB of pixels per surface
+//! per switch and exhausted the kernel heap under rapid switching.
 
 extern crate alloc;
 
@@ -58,6 +68,10 @@ impl Curve {
 /// (advance timer, sample curve, report damage); the kind is preserved
 /// so the composer / observability layer can describe what is in
 /// flight.
+///
+/// Workspace transitions are *not* per-surface animations — they live
+/// in [`WorkspaceSlide`] and apply a uniform x-offset to every
+/// Toplevel in the workspace. See the module docs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnimationKind {
     /// Slide + fade from 90% scale / 20% opacity to 100% / 100%.
@@ -65,8 +79,6 @@ pub enum AnimationKind {
     /// Fade from 100% opacity to 0%; the engine signals completion so
     /// the caller can drop the surface.
     WindowClose,
-    /// Horizontal workspace-switch slide.
-    WorkspaceSwitch,
     /// Smooth tile reposition.
     WindowMove,
 }
@@ -80,7 +92,6 @@ impl AnimationKind {
         match self {
             AnimationKind::WindowOpen => 350,
             AnimationKind::WindowClose => 220,
-            AnimationKind::WorkspaceSwitch => 260,
             AnimationKind::WindowMove => 180,
         }
     }
@@ -89,11 +100,15 @@ impl AnimationKind {
         match self {
             AnimationKind::WindowOpen => Curve::EaseOut,
             AnimationKind::WindowClose => Curve::EaseOut,
-            AnimationKind::WorkspaceSwitch => Curve::EaseOut,
             AnimationKind::WindowMove => Curve::Spring,
         }
     }
 }
+
+/// Default duration of a workspace-slide transition in milliseconds.
+/// Matches the old `AnimationKind::WorkspaceSwitch` default so the
+/// perceived feel of the switch is unchanged.
+pub const WORKSPACE_SLIDE_DURATION_MS: u32 = 260;
 
 /// One in-flight animation.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -116,9 +131,8 @@ pub struct Animation {
 
 impl Animation {
     /// Construct using the kind's default curve + duration with no
-    /// `from_rect`. Used by `WindowOpen` / `WindowClose` /
-    /// `WorkspaceSwitch` — kinds whose effect is computed purely from
-    /// the surface's current rect.
+    /// `from_rect`. Used by `WindowOpen` / `WindowClose` — kinds whose
+    /// effect is computed purely from the surface's current rect.
     pub fn new(surface_id: SurfaceId, kind: AnimationKind, damage: Rect) -> Self {
         Self {
             surface_id,
@@ -179,54 +193,36 @@ impl DamageRegion {
     }
 }
 
-/// Snapshot of an outgoing-workspace surface, captured at the moment
-/// the user switched workspaces. The engine animates it from
-/// `from_rect` to `to_rect` over `duration_ms` so the user sees the
-/// old workspace slide off-screen instead of being instantly cleared.
+/// Single workspace-slide state. Drives the x-offset applied to every
+/// Toplevel in the outgoing (`from_ws`) and incoming (`to_ws`)
+/// workspaces during a transition. The compositor reads the offsets
+/// from [`WorkspaceSlide::from_offset_x`] / [`to_offset_x`] each frame
+/// and applies them to the workspace's natural tile arrangement.
 ///
-/// Ghosts are decoupled from the live [`super::surface::SurfaceRegistry`]
-/// on purpose — the surface might be reused by a different workspace,
-/// or its client might commit a new buffer mid-slide; either would
-/// corrupt the slide-out if we re-read from the live buffer. The
-/// snapshot is an owned `Vec<u8>` so the ghost is self-contained.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceGhost {
-    /// Owned pixel snapshot at the moment of capture. Layout matches
-    /// the framebuffer's native pixel format (BGRA8888 on the kernel
-    /// FB; the snapshot path that fills this in must match that).
-    pub pixels: Vec<u8>,
-    /// Width / height of `pixels` in pixels (not bytes).
-    pub buf_width: u32,
-    pub buf_height: u32,
-    /// Rect the ghost occupied in the previous workspace's layout.
-    pub from_rect: Rect,
-    /// Off-screen rect the ghost lerps toward. Computed by the caller
-    /// as `from_rect` shifted by the *opposite* direction of the
-    /// incoming workspace so the two slides cross paths cleanly.
-    pub to_rect: Rect,
-    /// Animation timer state.
+/// Constant-size, no per-surface allocation. Replaces the original
+/// `WorkspaceGhost` design which copied the entire pixel buffer of
+/// every outgoing surface (8 MiB+ per surface at 1920×1080).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WorkspaceSlide {
+    /// Index of the workspace sliding *out*.
+    pub from_ws: usize,
+    /// Index of the workspace sliding *in*.
+    pub to_ws: usize,
+    /// `+1` when the new workspace enters from the right (forward
+    /// step), `-1` when it enters from the left (backward step). Drives
+    /// the sign of the offset.
+    pub direction: i32,
+    /// Output width in pixels — the magnitude of a full-screen slide.
+    pub output_width: i32,
+    /// Elapsed milliseconds since the slide started.
     pub elapsed_ms: u32,
+    /// Total slide duration in milliseconds.
     pub duration_ms: u32,
+    /// Easing curve.
     pub curve: Curve,
 }
 
-impl WorkspaceGhost {
-    /// Construct a ghost with the workspace-switch default duration
-    /// and ease-out curve so it tracks the incoming animation in
-    /// timing and feel.
-    pub fn new(pixels: Vec<u8>, buf_width: u32, buf_height: u32, from: Rect, to: Rect) -> Self {
-        Self {
-            pixels,
-            buf_width,
-            buf_height,
-            from_rect: from,
-            to_rect: to,
-            elapsed_ms: 0,
-            duration_ms: AnimationKind::WorkspaceSwitch.default_duration_ms(),
-            curve: AnimationKind::WorkspaceSwitch.default_curve(),
-        }
-    }
-
+impl WorkspaceSlide {
     /// Normalised progress `t ∈ [0, 1]`.
     pub fn progress(&self) -> f32 {
         if self.duration_ms == 0 {
@@ -235,11 +231,28 @@ impl WorkspaceGhost {
         (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
     }
 
-    /// Current animated rect — what the compositor should blit into
-    /// this frame.
-    pub fn current_rect(&self) -> Rect {
-        let t = self.curve.eval(self.progress());
-        lerp_rect(self.from_rect, self.to_rect, t).rect
+    /// Curve-evaluated progress.
+    pub fn eased(&self) -> f32 {
+        self.curve.eval(self.progress())
+    }
+
+    /// X-offset to apply to every tile in the outgoing (`from_ws`)
+    /// workspace this frame. Starts at `0` and lerps to `-output_width
+    /// * direction` as the slide completes — i.e. the outgoing
+    /// workspace slides off in the opposite direction of `direction`.
+    pub fn from_offset_x(&self) -> i32 {
+        let t = self.eased();
+        let mag = (t * self.output_width as f32) as i32;
+        -mag * self.direction
+    }
+
+    /// X-offset to apply to every tile in the incoming (`to_ws`)
+    /// workspace this frame. Starts at `output_width * direction` (off
+    /// screen on the entry side) and lerps to `0` (in place).
+    pub fn to_offset_x(&self) -> i32 {
+        let t = self.eased();
+        let mag = ((1.0 - t) * self.output_width as f32) as i32;
+        mag * self.direction
     }
 
     pub fn is_done(&self) -> bool {
@@ -252,19 +265,17 @@ impl WorkspaceGhost {
 #[derive(Clone, Debug, Default)]
 pub struct AnimationEngine {
     animations: Vec<Animation>,
-    /// Workspace-leave ghosts — pixel snapshots of the previous
-    /// workspace's surfaces that animate off-screen during a switch.
-    /// Separate from `animations` so they survive the surface-id
-    /// `drop_surface` paths (the ghost owns its pixels and does not
-    /// reference a live `SurfaceId`).
-    ghosts: Vec<WorkspaceGhost>,
+    /// Active workspace transition, if any. `None` between switches.
+    /// At most one slide is in flight at a time — a fresh switch
+    /// replaces the in-flight one.
+    slide: Option<WorkspaceSlide>,
 }
 
 impl AnimationEngine {
     pub fn new() -> Self {
         Self {
             animations: Vec::new(),
-            ghosts: Vec::new(),
+            slide: None,
         }
     }
 
@@ -279,7 +290,7 @@ impl AnimationEngine {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.animations.is_empty()
+        self.animations.is_empty() && self.slide.is_none()
     }
 
     /// Push a new animation into the engine. Earliest-pushed animations
@@ -307,17 +318,49 @@ impl AnimationEngine {
         self.push(Animation::new_move(surface_id, from, damage));
     }
 
-    /// Convenience: push a `WorkspaceSwitch` animation that slides
-    /// `surface_id` into its natural `to` rect from `from`. Used by
-    /// the main loop when the active workspace changes so every
-    /// surface in the new workspace appears to slide in from off-
-    /// screen rather than snapping to its final position.
-    pub fn animate_workspace_switch(&mut self, surface_id: SurfaceId, from: Rect, to: Rect) {
-        let _ = self.drop_surface(surface_id);
-        let damage = rect_union(from, to);
-        let mut anim = Animation::new(surface_id, AnimationKind::WorkspaceSwitch, damage);
-        anim.from_rect = Some(from);
-        self.push(anim);
+    /// Borrow the active workspace slide, if any.
+    pub fn workspace_slide(&self) -> Option<&WorkspaceSlide> {
+        self.slide.as_ref()
+    }
+
+    /// Start (or replace) a workspace slide. `direction` is `+1` when
+    /// the new workspace enters from the right, `-1` from the left.
+    /// `output_width` is the framebuffer width in pixels.
+    ///
+    /// A `from_ws == to_ws` request clears any in-flight slide. Any
+    /// existing slide is replaced wholesale — there is no progress
+    /// preservation across retargets. Mainstream compositors accept
+    /// this minor visual snap to keep the state bounded; we do the
+    /// same.
+    pub fn request_workspace_slide(
+        &mut self,
+        from_ws: usize,
+        to_ws: usize,
+        direction: i32,
+        output_width: i32,
+    ) {
+        if from_ws == to_ws || output_width <= 0 {
+            self.slide = None;
+            return;
+        }
+        let dir = if direction >= 0 { 1 } else { -1 };
+        self.slide = Some(WorkspaceSlide {
+            from_ws,
+            to_ws,
+            direction: dir,
+            output_width,
+            elapsed_ms: 0,
+            duration_ms: WORKSPACE_SLIDE_DURATION_MS,
+            curve: Curve::EaseOut,
+        });
+    }
+
+    /// Cancel any in-flight workspace slide without producing damage.
+    /// Used when the compose loop detects state that invalidates the
+    /// slide entirely (e.g. the framebuffer was reclaimed from a
+    /// fullscreen takeover and the previous slide context is stale).
+    pub fn clear_workspace_slide(&mut self) {
+        self.slide = None;
     }
 
     /// Advance every animation by `frame_delta_ms` and return the union
@@ -327,7 +370,7 @@ impl AnimationEngine {
     /// caller can detect "animation just finished" by checking whether
     /// the engine length changed across the call.
     pub fn tick(&mut self, frame_delta_ms: u32) -> DamageRegion {
-        let mut rects = Vec::with_capacity(self.animations.len() + self.ghosts.len());
+        let mut rects = Vec::with_capacity(self.animations.len() + 1);
         for anim in self.animations.iter_mut() {
             anim.elapsed_ms = anim.elapsed_ms.saturating_add(frame_delta_ms);
             if anim.duration_ms == 0 {
@@ -335,44 +378,38 @@ impl AnimationEngine {
             }
             rects.push(anim.damage);
         }
-        // Advance ghosts too; the damage rect for a ghost is the
-        // union of its from / to rects so the compose pass repaints
-        // whatever pixels the slide traverses each frame.
-        for ghost in self.ghosts.iter_mut() {
-            ghost.elapsed_ms = ghost.elapsed_ms.saturating_add(frame_delta_ms);
-            if ghost.duration_ms == 0 {
-                ghost.elapsed_ms = 0;
+        // Advance the workspace slide. While in flight the slide
+        // damages the full output rect — a workspace transition is the
+        // closest thing to a true full-screen repaint we have, and
+        // emitting a single screen-spanning rect is cheaper than
+        // computing the per-surface dirty list at sub-pixel sliding
+        // offsets.
+        if let Some(slide) = self.slide.as_mut() {
+            slide.elapsed_ms = slide.elapsed_ms.saturating_add(frame_delta_ms);
+            if slide.duration_ms == 0 {
+                slide.elapsed_ms = 0;
             }
-            rects.push(rect_union(ghost.from_rect, ghost.to_rect));
+            rects.push(Rect {
+                x: 0,
+                y: 0,
+                w: slide.output_width.max(0) as u32,
+                h: u32::MAX,
+            });
         }
-        // Drop completed entries.
         self.animations.retain(|a| !a.is_done());
-        self.ghosts.retain(|g| !g.is_done());
+        if let Some(slide) = self.slide.as_ref()
+            && slide.is_done()
+        {
+            self.slide = None;
+        }
         DamageRegion { rects }
-    }
-
-    /// Push a workspace-leave ghost. The engine renders it on every
-    /// subsequent compose pass until its timer expires.
-    pub fn push_ghost(&mut self, ghost: WorkspaceGhost) {
-        self.ghosts.push(ghost);
-    }
-
-    /// Borrow the active ghost list — the compositor iterates this in
-    /// its per-frame pass and blits each ghost at
-    /// [`WorkspaceGhost::current_rect`].
-    pub fn ghosts(&self) -> &[WorkspaceGhost] {
-        &self.ghosts
-    }
-
-    /// Discard every ghost. Used when the workspace switch was
-    /// cancelled or superseded so stale ghosts don't keep painting.
-    pub fn clear_ghosts(&mut self) {
-        self.ghosts.clear();
     }
 
     /// Drop every animation associated with a surface — used when a
     /// surface is destroyed mid-animation. Returns the number of
-    /// entries removed.
+    /// entries removed. Does not touch the workspace slide; a surface
+    /// destroyed mid-slide simply stops appearing in the registry's
+    /// compose iterator on the next frame.
     pub fn drop_surface(&mut self, surface_id: SurfaceId) -> usize {
         let before = self.animations.len();
         self.animations.retain(|a| a.surface_id != surface_id);
@@ -382,14 +419,17 @@ impl AnimationEngine {
     /// Compute the transform the compositor should apply to
     /// `surface_id` this frame given its natural (post-arrangement)
     /// `tile` rect. Returns `None` when the surface has no active
-    /// animation — the compositor renders it at the natural rect.
-    /// When `Some`, the compositor draws into the returned rect (with
-    /// scaling if dims differ from the natural tile).
+    /// per-surface animation — the compositor renders it at the
+    /// natural rect. When `Some`, the compositor draws into the
+    /// returned rect (with scaling if dims differ from the natural
+    /// tile).
     ///
-    /// If the same surface has multiple in-flight animations the
-    /// earliest-pushed one wins; this is the convention the spec
-    /// names for collision resolution (it matches the
-    /// "drop on destroy" semantics of `drop_surface`).
+    /// The workspace slide is *not* applied here; it is folded into
+    /// the tile arrangement by the layout adapter before the compose
+    /// pass reaches this method. That keeps per-surface animations
+    /// (WindowOpen / WindowMove) and workspace transitions
+    /// composable: an open animation on a slide-in surface scales the
+    /// already-offset rect.
     pub fn effective_transform(
         &self,
         surface_id: SurfaceId,
@@ -415,11 +455,8 @@ impl AnimationEngine {
                 let scale = 1.0 - 0.6 * t;
                 Some(scale_about_centre(tile, scale))
             }
-            AnimationKind::WindowMove | AnimationKind::WorkspaceSwitch => {
-                // Both lerp the rect from `from_rect` to the natural
-                // tile. WorkspaceSwitch sets `from_rect` to the
-                // natural tile shifted off-screen, which produces a
-                // slide-in for each surface in the new workspace.
+            AnimationKind::WindowMove => {
+                // Lerp the rect from `from_rect` to the natural tile.
                 let from = anim.from_rect.unwrap_or(tile);
                 Some(lerp_rect(from, tile, t))
             }
@@ -515,10 +552,7 @@ mod tests {
     fn ease_out_starts_fast_ends_slow() {
         let early = Curve::EaseOut.eval(0.25);
         let late = Curve::EaseOut.eval(0.75);
-        // Ease-out covers more ground early — quarter-progress should
-        // already be more than 40% of the total.
         assert!(early > 0.4, "early progress was {}", early);
-        // The last quarter only adds a small slice.
         let last_slice = Curve::EaseOut.eval(1.0) - late;
         assert!(
             last_slice < 0.1,
@@ -543,7 +577,6 @@ mod tests {
             prev = v;
         }
         assert!((Curve::Spring.eval(0.0) - 0.0).abs() < 1e-6);
-        // Spring approaches 1 by t=1 thanks to the clamp.
         assert!(Curve::Spring.eval(1.0) > 0.9);
     }
 
@@ -565,8 +598,7 @@ mod tests {
     fn completed_animations_are_removed() {
         let mut engine = AnimationEngine::new();
         engine.animate(SurfaceId(1), AnimationKind::WindowMove, rect(0, 0, 50, 50));
-        // WindowMove default duration is 80 ms — advance well past it.
-        let dmg = engine.tick(200);
+        let dmg = engine.tick(500);
         assert_eq!(dmg.rects.len(), 1, "damage emitted on the final frame");
         assert!(engine.is_empty(), "completed animation removed");
     }
@@ -590,15 +622,57 @@ mod tests {
     }
 
     #[test]
-    fn window_open_progresses_from_partial_to_full() {
-        let anim = Animation::new(
-            SurfaceId(1),
-            AnimationKind::WindowOpen,
-            rect(0, 0, 100, 100),
-        );
-        // Open should ease towards 1 quickly thanks to EaseOut.
-        let half = Curve::EaseOut.lerp(0.0, 1.0, 0.5);
-        assert!(half > 0.5);
-        let _ = anim;
+    fn workspace_slide_offsets_start_off_screen_and_end_at_zero() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(0, 1, 1, 1920);
+        let slide = engine.workspace_slide().expect("slide installed");
+        // At progress=0 the incoming workspace is off-screen-right.
+        assert_eq!(slide.to_offset_x(), 1920);
+        // The outgoing workspace is in place.
+        assert_eq!(slide.from_offset_x(), 0);
+    }
+
+    #[test]
+    fn workspace_slide_completes_after_duration() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(0, 1, 1, 1920);
+        engine.tick(WORKSPACE_SLIDE_DURATION_MS + 50);
+        assert!(engine.workspace_slide().is_none());
+    }
+
+    #[test]
+    fn workspace_slide_direction_negative_enters_from_left() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(2, 0, -1, 1920);
+        let slide = engine.workspace_slide().expect("slide installed");
+        // Backward step: new workspace enters from the left → negative
+        // to_offset at t=0.
+        assert_eq!(slide.to_offset_x(), -1920);
+    }
+
+    #[test]
+    fn workspace_slide_request_with_same_ws_is_a_noop() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(3, 3, 1, 1920);
+        assert!(engine.workspace_slide().is_none());
+    }
+
+    #[test]
+    fn workspace_slide_retarget_replaces_in_flight() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(0, 1, 1, 1920);
+        engine.tick(100);
+        engine.request_workspace_slide(1, 2, 1, 1920);
+        let slide = engine.workspace_slide().expect("retarget installed");
+        assert_eq!(slide.from_ws, 1);
+        assert_eq!(slide.to_ws, 2);
+        assert_eq!(slide.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn engine_is_not_empty_while_slide_in_flight() {
+        let mut engine = AnimationEngine::new();
+        engine.request_workspace_slide(0, 1, 1, 1920);
+        assert!(!engine.is_empty());
     }
 }
