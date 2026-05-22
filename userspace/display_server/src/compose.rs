@@ -89,6 +89,18 @@ pub struct ComposeContext {
     /// once per cursor old/new bounding box; `union_rect` is the
     /// blit clip rectangle.
     damage_tracker: DamageTracker,
+    /// Phase 73 follow-up — buffer-age damage history.
+    ///
+    /// Snapshots the previous frame's damage rectangles so the flip
+    /// backend (where the about-to-be-written half last held *frame
+    /// N-2*'s content) can compute the correct repaint region as
+    /// `damage(N) ∪ damage(N-1)` — the buffer-age technique standard
+    /// double-buffered Wayland / X compositors apply via
+    /// `EGL_EXT_buffer_age`. Inert in memcpy mode (the back buffer is
+    /// a true mirror of the front there, so no historical union is
+    /// needed). Saved at the end of every compose pass before
+    /// `damage_tracker.reset()` clears the live tracker.
+    prev_frame_damage: Vec<Rect>,
 }
 
 impl ComposeContext {
@@ -102,6 +114,7 @@ impl ComposeContext {
             cached_toplevel_ids: Vec::new(),
             cached_arrangement: Vec::new(),
             damage_tracker: DamageTracker::new(),
+            prev_frame_damage: Vec::new(),
         }
     }
 
@@ -289,6 +302,13 @@ where
     // Wiring the tracker into the general-path clip decision is a
     // documented Phase 68 follow-up.
     let surface_damage = registry.has_damage();
+    // Phase 73 follow-up — buffer-age awareness for the flip backend.
+    // When `true`, the about-to-be-written back half is two frames
+    // stale; the cursor-trail clear and the cursor-only fast path
+    // must extend their per-frame region with the *previous* frame's
+    // damage so the post-flip visible buffer matches the current
+    // frame's content rather than frame N-2's.
+    let needs_buffer_age = owner.needs_full_repaint_per_frame();
     // Phase 72b — bypass the no-op gate when a full repaint was
     // requested via `ComposeContext::force_full_repaint`. The gate
     // existed before per-surface clip rects: the old assumption was
@@ -301,14 +321,6 @@ where
     // dims changed but the buffer didn't). Without this bypass we
     // skip the `is_first_compose` clear and the now-uncovered gap
     // regions keep stale pixels from before the arrangement change.
-    // Phase 73 follow-up — VBE flip backend requires a full repaint
-    // every frame (see the trait-method doc on
-    // `needs_full_repaint_per_frame`). Mark the tracker dirty here so
-    // every downstream `is_full_repaint_needed()` check returns true
-    // and the general path redraws every tile from scratch.
-    if owner.needs_full_repaint_per_frame() {
-        ctx.damage_tracker.mark_full_repaint();
-    }
     let force_full = ctx.damage_tracker.is_full_repaint_needed();
     if !surface_damage && !cursor_motion && !force_full {
         return Ok(0);
@@ -421,6 +433,15 @@ where
         for rect in damage {
             clear_rect_to_background(owner, rect)?;
         }
+        // Phase 73 follow-up — in flip mode, also wipe the previous
+        // frame's damage rects to background so the upcoming per-
+        // surface re-blits cover any stale pixels the back half
+        // inherited from frame N-2.
+        if needs_buffer_age {
+            for rect in ctx.prev_frame_damage.iter() {
+                clear_rect_to_background(owner, *rect)?;
+            }
+        }
     }
 
     if entries.is_empty() && !cursor_motion {
@@ -446,15 +467,7 @@ where
     // pixels than the framebuffer resolution for any non-pathological
     // cursor size — the optimisation the fast path was designed for,
     // without the hole-trail regression.
-    // Phase 73 follow-up — backends that report
-    // `needs_full_repaint_per_frame() = true` (the VBE Y_OFFSET
-    // page-flip path) cannot use the cursor-only fast path: the flip
-    // exposes a half that only contains pixels written this frame, so
-    // any region the fast path skips would show stale content from
-    // two flips ago. Skip the fast path entirely in that case so the
-    // general path below redraws every surface from scratch.
-    let backend_requires_full = owner.needs_full_repaint_per_frame();
-    if !surface_damage && cursor_motion && !is_first_compose && !backend_requires_full {
+    if !surface_damage && cursor_motion && !is_first_compose {
         let cursor: &dyn CursorRenderer = match &client_cursor_clone {
             Some(cc) => cc,
             None => &default,
@@ -472,7 +485,16 @@ where
         let prev_size = ctx.prev_cursor_size.expect(
             "cursor fast path: prev_cursor_size set whenever cursor_motion && !is_first_compose",
         );
-        let cursor_repaint = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+        let mut cursor_repaint = cursor_damage(prev_pos, prev_size, pointer_position, cursor_size);
+        // Phase 73 follow-up — fold the previous frame's damage
+        // rects into the cursor-only repaint region when the backend
+        // is two frames stale (`needs_full_repaint_per_frame() ==
+        // true`, i.e. the VBE Y_OFFSET flip backend). Without this
+        // union the post-flip visible half would show frame N-2's
+        // pixels in any region the cursor union does not cover.
+        if needs_buffer_age {
+            cursor_repaint.extend_from_slice(&ctx.prev_frame_damage);
+        }
 
         // Per-surface damage = cursor union translated into surface-
         // local coordinates. `compose_frame` clips each local rect
@@ -646,9 +668,10 @@ where
         }
         ctx.prev_pointer = Some(pointer_position);
         ctx.prev_cursor_size = Some(cursor_size);
-        // Keep the damage tracker observable to tests but clear it
-        // so the next frame starts empty.
-        ctx.damage_tracker.reset();
+        // Phase 73 follow-up — snapshot the frame's actual damage
+        // rects so the next compose pass can do buffer-age union when
+        // the flip backend is active. Reset the live tracker after.
+        snapshot_damage(ctx);
         return Ok(surface_writes + cursor_writes);
     }
 
@@ -932,10 +955,34 @@ where
 
     // Phase 68 Track B — clear the damage tracker now that the
     // compose pass has consumed everything. The next frame starts
-    // empty; cursor motion / surface commits repopulate it.
-    ctx.damage_tracker.reset();
+    // empty; cursor motion / surface commits repopulate it. Phase 73
+    // follow-up — but first capture this frame's rects into
+    // `prev_frame_damage` so the next compose pass can do
+    // buffer-age union when the flip backend is active.
+    snapshot_damage(ctx);
 
     Ok(surface_writes + cursor_writes)
+}
+
+/// Copy this frame's [`DamageTracker`] rects into
+/// [`ComposeContext::prev_frame_damage`] and reset the live tracker
+/// for the next pass. Centralised so both compose paths (cursor-only
+/// fast path and general path) feed the same buffer-age history. A
+/// full-repaint marker is stored as the whole `output` rect so the
+/// next frame still over-paints every previously-stale pixel rather
+/// than skipping the union as "no prior damage".
+fn snapshot_damage(ctx: &mut ComposeContext) {
+    ctx.prev_frame_damage.clear();
+    if ctx.damage_tracker.is_full_repaint_needed() {
+        if let Some(union) = ctx.damage_tracker.union_rect() {
+            ctx.prev_frame_damage.push(union);
+        }
+    } else {
+        for rect in ctx.damage_tracker.rects() {
+            ctx.prev_frame_damage.push(*rect);
+        }
+    }
+    ctx.damage_tracker.reset();
 }
 
 /// Resolve a `ComposeEntry`'s screen-space rect, honouring the layout
