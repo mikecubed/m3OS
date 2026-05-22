@@ -2733,9 +2733,15 @@ fn qemu_args_with_devices_resolved(
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 36: increase RAM to 1 GB for larger disk image and extended storage workloads.
+        // Phase 73 (4K follow-up): increase RAM to 4 GiB. At
+        // 3840x2160 a single fullscreen surface is ~33 MiB; a
+        // handful of those plus the framebuffer, page tables,
+        // kernel heap, shm_cache, and per-process userspace heaps
+        // saturate 1 GiB very quickly. 4 GiB matches what any real
+        // 4K-capable machine ships with and gives the SHM cache +
+        // multi-term load comfortable headroom.
         "-m".to_string(),
-        "1024".to_string(),
+        "4096".to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
     ];
