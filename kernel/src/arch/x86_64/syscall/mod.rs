@@ -10345,19 +10345,17 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
     };
     let total_size = (page_count as u64) * 4096;
 
-    // Build the per-page PhysFrame array the user_space helper expects.
+    // The SHM region is a single contiguous run from `start_phys`
+    // for `page_count` pages, so we feed it directly to the
+    // contiguous-mapping helper instead of building a per-page
+    // `Vec<PhysFrame>` scratch (~63 KiB at 4K resolution). The
+    // per-call kernel-heap alloc was the dominant fragmenter of
+    // the buddy allocator under the steady-state per-frame
+    // `AttachSharedBuffer` traffic clients emit; eliminating it
+    // bounds `sys_shm_map`'s allocation footprint to a few small
+    // entries (the VMA tree node + the page-table-walk's frame
+    // allocator overhead).
     use x86_64::structures::paging::{PhysFrame, Size4KiB};
-    let mut frames = alloc::vec::Vec::with_capacity(page_count as usize);
-    for i in 0..(page_count as u64) {
-        let phys_addr = x86_64::PhysAddr::new(start_phys + i * 4096);
-        match PhysFrame::<Size4KiB>::from_start_address(phys_addr) {
-            Ok(f) => frames.push(f),
-            Err(_) => {
-                let _ = crate::mm::shm::decref(id);
-                return u64::MAX;
-            }
-        }
-    }
 
     let pid = crate::process::current_pid();
     let addr_space = {
@@ -10419,12 +10417,18 @@ pub(super) fn sys_shm_map(shm_id_arg: u64) -> u64 {
         let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
 
         if unsafe {
-            crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, shm_pte_flags())
+            crate::mm::user_space::map_user_frames_contiguous(
+                &mut mapper,
+                virt_addr,
+                start_phys,
+                page_count as u64,
+                shm_pte_flags(),
+            )
         }
         .is_err()
         {
             log::warn!(
-                "[shm] map: map_user_frames failed pid={} virt={:#x} pages={}",
+                "[shm] map: map_user_frames_contiguous failed pid={} virt={:#x} pages={}",
                 pid,
                 virt_addr,
                 page_count

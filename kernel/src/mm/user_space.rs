@@ -87,26 +87,105 @@ pub unsafe fn map_user_frames(
             "map_user_frames: virt_base must be 4 KiB-aligned"
         );
         let mut alloc = GlobalFrameAlloc;
-        let mut mapped_pages = alloc::vec::Vec::new();
+        let mut mapped: u64 = 0;
         for (i, &frame) in frames.iter().enumerate() {
             let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
             match mapper.map_to(page, frame, flags, &mut alloc) {
                 Ok(flush) => {
                     flush.flush();
-                    mapped_pages.push(page);
+                    mapped += 1;
                 }
                 Err(_) => {
-                    while let Some(mapped_page) = mapped_pages.pop() {
-                        if let Ok((_frame, flush)) = mapper.unmap(mapped_page) {
-                            flush.flush();
-                        }
-                    }
+                    rollback_user_mapping(mapper, virt_base, mapped);
                     return Err("map_to failed");
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Map a contiguous run of `page_count` physical frames starting at
+/// `base_phys` (which must be 4 KiB-aligned) into the user address
+/// space at `virt_base`.
+///
+/// Equivalent to building a `[PhysFrame; page_count]` and calling
+/// [`map_user_frames`], but without the heap allocation. For large
+/// SHM mappings (a 4K framebuffer surface is 8 064 pages =
+/// ~63 KiB of `PhysFrame` scratch) the per-call `Vec` is the leading
+/// source of kernel-heap churn on every `sys_shm_map`, fragmenting
+/// the buddy under 60 Hz client-attach traffic.
+///
+/// # Safety
+/// `virt_base` and `base_phys` must both be 4 KiB-aligned; the
+/// frames `[base_phys, base_phys + page_count * 4096)` must be
+/// valid physical memory the caller is allowed to expose to the
+/// target address space; `mapper` must be the address space that
+/// will receive the mapping. Misaligned bases cause
+/// `Page::containing_address` / `PhysFrame::from_start_address` to
+/// round down and map the wrong page.
+pub unsafe fn map_user_frames_contiguous(
+    mapper: &mut OffsetPageTable,
+    virt_base: u64,
+    base_phys: u64,
+    page_count: u64,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    unsafe {
+        debug_assert!(
+            virt_base.is_multiple_of(4096),
+            "map_user_frames_contiguous: virt_base must be 4 KiB-aligned"
+        );
+        debug_assert!(
+            base_phys.is_multiple_of(4096),
+            "map_user_frames_contiguous: base_phys must be 4 KiB-aligned"
+        );
+        let mut alloc = GlobalFrameAlloc;
+        for i in 0..page_count {
+            let phys = x86_64::PhysAddr::new(base_phys + i * 4096);
+            let frame = match PhysFrame::<Size4KiB>::from_start_address(phys) {
+                Ok(f) => f,
+                Err(_) => {
+                    rollback_user_mapping(mapper, virt_base, i);
+                    return Err("invalid base_phys alignment");
+                }
+            };
+            let vaddr = VirtAddr::new(virt_base + i * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(vaddr);
+            match mapper.map_to(page, frame, flags, &mut alloc) {
+                Ok(flush) => flush.flush(),
+                Err(_) => {
+                    rollback_user_mapping(mapper, virt_base, i);
+                    return Err("map_to failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Unmap the first `mapped` pages of a partially-built mapping
+/// starting at `virt_base`. Used by both
+/// [`map_user_frames`] and [`map_user_frames_contiguous`] on the
+/// failure path so a partial mapping doesn't leak page-table entries
+/// when `map_to` fails part-way through. The rollback uses
+/// integer arithmetic instead of a `Vec` of pushed pages — the
+/// `map_to` loop above is strictly contiguous, so we know exactly
+/// which `mapped` virtual addresses got installed.
+///
+/// # Safety
+/// `mapper` must be the address space that received the partial
+/// mapping; `virt_base` must be the same base that was passed to
+/// the failing map call; `mapped` must not exceed the number of
+/// pages actually installed.
+unsafe fn rollback_user_mapping(mapper: &mut OffsetPageTable, virt_base: u64, mapped: u64) {
+    for i in 0..mapped {
+        let vaddr = VirtAddr::new(virt_base + i * 4096);
+        let page: Page<Size4KiB> = Page::containing_address(vaddr);
+        if let Ok((_frame, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
     }
 }
 
