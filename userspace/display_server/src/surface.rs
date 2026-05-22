@@ -358,29 +358,43 @@ pub struct SurfaceRegistry {
     /// holder of the previous Rc just dropped) — the strong cache
     /// keeps the mapping live until eviction.
     ///
-    /// Capped at [`SHM_CACHE_CAPACITY`]; oldest entries are evicted
-    /// when full. Eviction drops the cache's strong ref — if a
-    /// surface still holds the same `Rc<SharedMapping>` the kernel
-    /// mapping persists; otherwise `sys_shm_unmap` fires
-    /// immediately. Either way the cache stays bounded and the
-    /// kernel heap is not under pressure from per-frame remaps.
+    /// Bounded by [`SHM_CACHE_BUDGET_BYTES`] (sum of `mapping.len`
+    /// across all entries), **not** by entry count. Each cached
+    /// strong `Rc` pins the underlying kernel SHM frames in
+    /// physical memory through display_server's mapping; an
+    /// entry-count cap would let a handful of fullscreen surfaces
+    /// (4K = ~33 MiB each) pin the entire system RAM. The byte
+    /// budget keeps cache memory bounded regardless of surface
+    /// size — at 64 MiB total, that's 2 fullscreen entries, or
+    /// 8 quarter-screen, or 64 of a 1 MiB bar. Eviction is FIFO
+    /// (insertion order); when the cache holds the only ref to a
+    /// mapping, eviction's `Rc` drop calls `sys_shm_unmap`.
     shm_cache: BTreeMap<u32, Rc<SharedMapping>>,
     /// Eviction queue: shm_ids in insertion order. Used as a simple
-    /// FIFO when the cache exceeds its cap. A real LRU would require
-    /// a doubly-linked-list approach; FIFO eviction is adequate when
-    /// the working set fits the cap (the typical case — clients use
-    /// 2–4 shm_ids in steady state). Mirrors `shm_cache` membership.
+    /// FIFO when the cache exceeds its byte budget. A real LRU
+    /// would require a doubly-linked-list approach; FIFO eviction
+    /// is adequate when the working set fits the budget (the
+    /// typical case — clients use 2-4 shm_ids in steady state).
+    /// Mirrors `shm_cache` membership.
     shm_cache_order: Vec<u32>,
+    /// Running total of `mapping.len` over every entry in
+    /// `shm_cache`. Maintained inline by `insert_shm` so the
+    /// eviction loop doesn't re-iterate the whole cache to compute
+    /// the sum on every insert.
+    shm_cache_bytes: usize,
 }
 
-/// Maximum number of cached SHM mappings. Sized comfortably above
-/// the working set of any expected client load: 4 toplevels × 2
-/// buffers each (term, launcher) + bar + wallpaper + greeter + a
-/// few headroom slots. Hitting this cap means *some* shm_id is
-/// being evicted and re-mapped, which still beats the no-cache
-/// baseline by orders of magnitude — every recurring shm_id in the
-/// active rotation stays hot.
-const SHM_CACHE_CAPACITY: usize = 32;
+/// Maximum total bytes of cached SHM mappings. 64 MiB comfortably
+/// holds the typical working set (4 toplevels × 2 buffers at
+/// tiled sizes, plus bar / wallpaper / cursor) while preventing
+/// pathological pinning: at 4K a single fullscreen surface is
+/// ~33 MiB, so an unbounded-by-bytes cache holding even a few
+/// could pin the entire 1 GiB QEMU RAM and OOM the kernel from
+/// the *outside* — which is exactly what happened in m3os.log.
+/// 64 MiB caps the cost at ~6% of total RAM, keeping the rest
+/// available for kernel heap, page tables, kernel stacks, and
+/// the framebuffer.
+const SHM_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 impl SurfaceRegistry {
     pub fn new() -> Self {
@@ -392,7 +406,8 @@ impl SurfaceRegistry {
             client_cursor: None,
             client_cursor_owner: None,
             shm_cache: BTreeMap::new(),
-            shm_cache_order: Vec::with_capacity(SHM_CACHE_CAPACITY),
+            shm_cache_order: Vec::new(),
+            shm_cache_bytes: 0,
         }
     }
 
@@ -409,22 +424,38 @@ impl SurfaceRegistry {
     /// strong `Rc` so the kernel mapping survives the gap between
     /// `CommittedBuffer` releases and the next `AttachSharedBuffer`
     /// (the failure mode the previous `Weak`-only version had).
-    /// Evicts the oldest entry when capacity is exceeded; dropping
-    /// the cache's strong ref calls `sys_shm_unmap` if no surface
-    /// still holds the mapping, otherwise leaves the surface as the
-    /// final holder. Replaces any existing entry for the same id.
+    /// Evicts the oldest entry while the total cached bytes
+    /// exceed [`SHM_CACHE_BUDGET_BYTES`]; dropping the cache's
+    /// strong ref calls `sys_shm_unmap` if no surface still holds
+    /// the mapping, otherwise leaves the surface as the final
+    /// holder. Replaces any existing entry for the same id.
     fn insert_shm(&mut self, shm_id: u32, mapping: &Rc<SharedMapping>) {
-        if self.shm_cache.insert(shm_id, mapping.clone()).is_some() {
-            // Existing entry replaced — move the id to the back of
-            // the FIFO so it ages out after newer inserts. Without
-            // this the order vector would have a duplicate that
-            // misrepresents eviction priority.
+        let new_bytes = mapping.len;
+        if let Some(prev) = self.shm_cache.insert(shm_id, mapping.clone()) {
+            // Existing entry replaced. Subtract its bytes from the
+            // running total; the old `Rc` is dropped at end-of-scope
+            // (after this fn returns, since the local binding `prev`
+            // owns it). Move the id to the back of the FIFO so it
+            // ages out after newer inserts — without this the order
+            // vector would have a duplicate that misrepresents
+            // eviction priority.
+            self.shm_cache_bytes = self.shm_cache_bytes.saturating_sub(prev.len);
             self.shm_cache_order.retain(|id| *id != shm_id);
+            drop(prev);
         }
         self.shm_cache_order.push(shm_id);
-        while self.shm_cache_order.len() > SHM_CACHE_CAPACITY {
+        self.shm_cache_bytes = self.shm_cache_bytes.saturating_add(new_bytes);
+        // Evict oldest entries until under budget. The just-inserted
+        // entry can itself be the one that gets evicted on a single
+        // oversize insert — that's correct: the cache can never hold
+        // an entry larger than the budget, and the lookup just
+        // re-maps next time (still cheap thanks to the kernel-side
+        // `map_user_frames_contiguous` change).
+        while self.shm_cache_bytes > SHM_CACHE_BUDGET_BYTES && !self.shm_cache_order.is_empty() {
             let oldest = self.shm_cache_order.remove(0);
-            self.shm_cache.remove(&oldest);
+            if let Some(evicted) = self.shm_cache.remove(&oldest) {
+                self.shm_cache_bytes = self.shm_cache_bytes.saturating_sub(evicted.len);
+            }
         }
     }
 
