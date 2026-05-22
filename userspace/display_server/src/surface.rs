@@ -20,7 +20,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::rc::{Rc, Weak};
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use kernel_core::display::compose::ComposeLayer;
@@ -348,23 +348,39 @@ pub struct SurfaceRegistry {
     /// for that id clears the slot — without this, a destroyed
     /// cursor surface would leave a stale `ClientCursor` behind.
     client_cursor_owner: Option<SurfaceId>,
-    /// Cache of live shared-memory mappings keyed by `shm_id`. The
-    /// `Weak` lets the underlying [`Rc<SharedMapping>`] drop (and the
-    /// kernel unmap fire) when no live `CommittedBuffer` references
-    /// it anymore. A subsequent `AttachSharedBuffer` for the same
-    /// `shm_id` then falls back through to a fresh `sys_shm_map`;
-    /// the dead `Weak` is overwritten by the new mapping's downgrade.
+    /// Cache of live shared-memory mappings keyed by `shm_id`,
+    /// holding **strong** [`Rc<SharedMapping>`] references so the
+    /// mapping survives the brief window between one
+    /// `CommittedBuffer` being released (e.g. `CommitSurface`
+    /// promoting `pending` over `committed`) and the next frame's
+    /// `AttachSharedBuffer` arriving. A `Weak`-only cache misses
+    /// every attach under double-buffered ping-pong (the *only*
+    /// holder of the previous Rc just dropped) — the strong cache
+    /// keeps the mapping live until eviction.
     ///
-    /// Without this cache, every per-frame `AttachSharedBuffer`
-    /// (term and other clients re-attach on every commit by design)
-    /// triggers a `sys_shm_map`, which allocates a ~63 KiB
-    /// `Vec<PhysFrame>` on the kernel heap at 4K resolution. At
-    /// 60 Hz × N clients this fragments the buddy allocator and
-    /// OOMs the next contiguous-page allocation (kernel-stack
-    /// creation for a new process — what crashed when the user
-    /// spawned a fourth term in m3os.log).
-    shm_cache: BTreeMap<u32, Weak<SharedMapping>>,
+    /// Capped at [`SHM_CACHE_CAPACITY`]; oldest entries are evicted
+    /// when full. Eviction drops the cache's strong ref — if a
+    /// surface still holds the same `Rc<SharedMapping>` the kernel
+    /// mapping persists; otherwise `sys_shm_unmap` fires
+    /// immediately. Either way the cache stays bounded and the
+    /// kernel heap is not under pressure from per-frame remaps.
+    shm_cache: BTreeMap<u32, Rc<SharedMapping>>,
+    /// Eviction queue: shm_ids in insertion order. Used as a simple
+    /// FIFO when the cache exceeds its cap. A real LRU would require
+    /// a doubly-linked-list approach; FIFO eviction is adequate when
+    /// the working set fits the cap (the typical case — clients use
+    /// 2–4 shm_ids in steady state). Mirrors `shm_cache` membership.
+    shm_cache_order: Vec<u32>,
 }
+
+/// Maximum number of cached SHM mappings. Sized comfortably above
+/// the working set of any expected client load: 4 toplevels × 2
+/// buffers each (term, launcher) + bar + wallpaper + greeter + a
+/// few headroom slots. Hitting this cap means *some* shm_id is
+/// being evicted and re-mapped, which still beats the no-cache
+/// baseline by orders of magnitude — every recurring shm_id in the
+/// active rotation stays hot.
+const SHM_CACHE_CAPACITY: usize = 32;
 
 impl SurfaceRegistry {
     pub fn new() -> Self {
@@ -376,25 +392,40 @@ impl SurfaceRegistry {
             client_cursor: None,
             client_cursor_owner: None,
             shm_cache: BTreeMap::new(),
+            shm_cache_order: Vec::with_capacity(SHM_CACHE_CAPACITY),
         }
     }
 
     /// Look up a cached SHM mapping for `shm_id`. Returns `Some(rc)`
-    /// when a live mapping is still held by at least one
-    /// `CommittedBuffer`; returns `None` when no cache entry exists
-    /// or the previous mapping has been fully released. The caller
+    /// — a fresh clone of the cached `Rc` — when the mapping is
+    /// live; `None` when no cache entry exists. The caller
     /// (`AttachSharedBuffer` handler) calls `sys_shm_map` on a miss
-    /// and inserts the resulting `Weak` via [`Self::insert_shm`].
+    /// and inserts the resulting `Rc` via [`Self::insert_shm`].
     fn lookup_shm(&self, shm_id: u32) -> Option<Rc<SharedMapping>> {
-        self.shm_cache.get(&shm_id).and_then(Weak::upgrade)
+        self.shm_cache.get(&shm_id).cloned()
     }
 
-    /// Insert a freshly-mapped SHM region into the cache. Subsequent
-    /// `AttachSharedBuffer` calls for `shm_id` will reuse this
-    /// mapping until every `Rc` is dropped. Existing dead `Weak` at
-    /// the same key is overwritten.
+    /// Insert a freshly-mapped SHM region into the cache. Holds a
+    /// strong `Rc` so the kernel mapping survives the gap between
+    /// `CommittedBuffer` releases and the next `AttachSharedBuffer`
+    /// (the failure mode the previous `Weak`-only version had).
+    /// Evicts the oldest entry when capacity is exceeded; dropping
+    /// the cache's strong ref calls `sys_shm_unmap` if no surface
+    /// still holds the mapping, otherwise leaves the surface as the
+    /// final holder. Replaces any existing entry for the same id.
     fn insert_shm(&mut self, shm_id: u32, mapping: &Rc<SharedMapping>) {
-        self.shm_cache.insert(shm_id, Rc::downgrade(mapping));
+        if self.shm_cache.insert(shm_id, mapping.clone()).is_some() {
+            // Existing entry replaced — move the id to the back of
+            // the FIFO so it ages out after newer inserts. Without
+            // this the order vector would have a duplicate that
+            // misrepresents eviction priority.
+            self.shm_cache_order.retain(|id| *id != shm_id);
+        }
+        self.shm_cache_order.push(shm_id);
+        while self.shm_cache_order.len() > SHM_CACHE_CAPACITY {
+            let oldest = self.shm_cache_order.remove(0);
+            self.shm_cache.remove(&oldest);
+        }
     }
 
     /// Phase 56 Track E.3 — the currently active client cursor, if any.
