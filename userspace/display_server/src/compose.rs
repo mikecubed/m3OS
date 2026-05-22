@@ -556,7 +556,41 @@ where
             });
         }
 
-        let surface_writes = compose_frame(owner, output, &mut compose)?;
+        let mut surface_writes = compose_frame(owner, output, &mut compose)?;
+
+        // Repaint Toplevel borders. The cursor-trail clear above
+        // wiped the underlying pixels with the background colour
+        // wherever the cursor passed; if its trail crossed a tile
+        // border, that border is now missing on the back buffer and
+        // would visibly flicker on every cursor move. Borders are
+        // 4 thin strips per Toplevel, so repainting them on every
+        // cursor frame is cheap relative to the surface-blit pass
+        // we're already doing.
+        if let Some(cfg) = border_cfg
+            && cfg.width > 0
+        {
+            for entry in entries.iter().filter(|e| {
+                matches!(
+                    e.layer,
+                    kernel_core::display::compose::ComposeLayer::Toplevel
+                )
+            }) {
+                let rect = arrangement
+                    .iter()
+                    .find(|(id, _)| *id == entry.id)
+                    .map(|(_, tile)| *tile)
+                    .unwrap_or(entry.rect);
+                let color = if focused_id == Some(entry.id) {
+                    cfg.active_color
+                } else {
+                    cfg.inactive_color
+                };
+                let written = crate::borders::paint_border(owner, rect, cfg.width, color)
+                    .map_err(ComposeError::from)?;
+                surface_writes = surface_writes.saturating_add(written);
+            }
+        }
+
         let cursor_writes =
             blit_cursor(owner, output, cursor, pointer_position).map_err(ComposeError::from)?;
         if surface_writes + cursor_writes > 0 {

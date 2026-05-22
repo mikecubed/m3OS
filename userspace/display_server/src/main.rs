@@ -1099,42 +1099,38 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             w: meta.width,
             h: meta.height,
         };
-        // Phase 73 — hit-test against the active workspace's tile
-        // arrangement, not against `iter_compose`'s centred buffer
-        // rects. Two reasons:
-        //   1. `iter_compose` is unfiltered by workspace — Toplevels on
-        //      inactive workspaces would still appear in the hit-test
-        //      slice, so clicks could land on hidden surfaces.
-        //   2. `iter_compose` reports a *centred* rect for each
-        //      Toplevel rather than its assigned tile, so a tiled
-        //      surface (e.g. master-stack right-pane) would test as
-        //      hovered only at the centre of the output. The compose
-        //      path rewrites the rect via the workspace arrangement;
-        //      input must agree with what's actually painted.
-        // Layer surfaces (status bar, dock) are still tracked from
-        // `iter_compose` so they receive Pointer / hover events.
+        // Build the dispatcher's hit-test slice in compose layer
+        // order so `hit_test`'s reverse-iteration picks the front-most
+        // surface first: Background, then Bottom, then Toplevel, then
+        // Top, then Overlay. `iter_compose` already returns surfaces
+        // in that order, so we just walk it once. For Toplevels we
+        // substitute the tile rect from the last frame's arrangement
+        // (so clicks land on the *tiled* rect, not `iter_compose`'s
+        // centred buffer rect) and filter out Toplevels on other
+        // workspaces. Layer surfaces keep their `iter_compose` rect
+        // (compute_layer_geometry already resolved anchor + buffer
+        // dims to a final placement). Phase 73 — earlier revisions
+        // pushed Toplevels first and Layer surfaces after, which
+        // inverted the layer order and made the wallpaper Background
+        // (full-output rect) win every hit-test → clicks on the
+        // terminal never produced a focus change.
         let active_ws_set: alloc::collections::BTreeSet<SurfaceId> =
             workspace_mgr.current().windows().iter().copied().collect();
+        let tile_lookup: alloc::collections::BTreeMap<SurfaceId, Rect> =
+            last_arrangement.iter().copied().collect();
         let mut surface_geom: alloc::vec::Vec<SurfaceGeometry> = alloc::vec::Vec::new();
-        for (sid, tile) in last_arrangement.iter() {
-            if active_ws_set.contains(sid) {
-                surface_geom.push(SurfaceGeometry::toplevel(*sid, *tile));
-            }
-        }
         let compose_entries = registry.iter_compose(output_rect);
         for entry in compose_entries.iter() {
             if matches!(
                 entry.layer,
                 kernel_core::display::compose::ComposeLayer::Toplevel
             ) {
-                // Already added via the workspace arrangement above —
-                // skip the centred-rect duplicate.
-                continue;
-            }
-            // Layer / Background / Top / Overlay surfaces keep their
-            // `iter_compose` rect (which already reflects the anchor
-            // + buffer geometry returned by `compute_layer_geometry`).
-            if let Some(role) = registry.surface_role(entry.id) {
+                if !active_ws_set.contains(&entry.id) {
+                    continue;
+                }
+                let rect = tile_lookup.get(&entry.id).copied().unwrap_or(entry.rect);
+                surface_geom.push(SurfaceGeometry::toplevel(entry.id, rect));
+            } else if let Some(role) = registry.surface_role(entry.id) {
                 surface_geom.push(SurfaceGeometry {
                     id: entry.id,
                     rect: entry.rect,
