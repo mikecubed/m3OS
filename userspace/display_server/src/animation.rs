@@ -72,20 +72,23 @@ pub enum AnimationKind {
 }
 
 impl AnimationKind {
-    /// Default duration in milliseconds per the Phase 73 spec.
+    /// Default duration in milliseconds. Phase 73 (HiDPI revision)
+    /// bumped these from the original sketch — the previous timings
+    /// were tuned for the 1280×800 framebuffer and at 1920×1080 the
+    /// effects flew by too fast to perceive.
     pub fn default_duration_ms(self) -> u32 {
         match self {
-            AnimationKind::WindowOpen => 150,
-            AnimationKind::WindowClose => 100,
-            AnimationKind::WorkspaceSwitch => 200,
-            AnimationKind::WindowMove => 80,
+            AnimationKind::WindowOpen => 350,
+            AnimationKind::WindowClose => 220,
+            AnimationKind::WorkspaceSwitch => 260,
+            AnimationKind::WindowMove => 180,
         }
     }
 
     pub fn default_curve(self) -> Curve {
         match self {
             AnimationKind::WindowOpen => Curve::EaseOut,
-            AnimationKind::WindowClose => Curve::Linear,
+            AnimationKind::WindowClose => Curve::EaseOut,
             AnimationKind::WorkspaceSwitch => Curve::EaseOut,
             AnimationKind::WindowMove => Curve::Spring,
         }
@@ -229,6 +232,19 @@ impl AnimationEngine {
         self.push(Animation::new_move(surface_id, from, damage));
     }
 
+    /// Convenience: push a `WorkspaceSwitch` animation that slides
+    /// `surface_id` into its natural `to` rect from `from`. Used by
+    /// the main loop when the active workspace changes so every
+    /// surface in the new workspace appears to slide in from off-
+    /// screen rather than snapping to its final position.
+    pub fn animate_workspace_switch(&mut self, surface_id: SurfaceId, from: Rect, to: Rect) {
+        let _ = self.drop_surface(surface_id);
+        let damage = rect_union(from, to);
+        let mut anim = Animation::new(surface_id, AnimationKind::WorkspaceSwitch, damage);
+        anim.from_rect = Some(from);
+        self.push(anim);
+    }
+
     /// Advance every animation by `frame_delta_ms` and return the union
     /// of every animated rect as the dirty region for this frame.
     ///
@@ -281,27 +297,26 @@ impl AnimationEngine {
         let t = anim.eased();
         match anim.kind {
             AnimationKind::WindowOpen => {
-                // Spec: scale 0.9 → 1.0. Made slightly more visible
-                // (0.7 → 1.0) so the pop-in is noticeable on a
-                // single-buffered 60 Hz boot.
-                let scale = 0.7 + 0.3 * t;
+                // Scale 0.4 → 1.0 about the tile centre. Bigger range
+                // than the spec sketch (0.9 → 1.0) so the pop-in is
+                // impossible to miss at 1080p.
+                let scale = 0.4 + 0.6 * t;
                 Some(scale_about_centre(tile, scale))
             }
             AnimationKind::WindowClose => {
-                // Reverse of open: 1.0 → 0.7. Surface visually
-                // shrinks toward its centre as it's destroyed.
-                let scale = 1.0 - 0.3 * t;
+                // Mirror of open: 1.0 → 0.4. Renders via the
+                // ghost-snapshot mechanism in main.rs so the surface
+                // keeps painting after the client has disconnected.
+                let scale = 1.0 - 0.6 * t;
                 Some(scale_about_centre(tile, scale))
             }
-            AnimationKind::WindowMove => {
-                // Lerp the rect from `from_rect` to the natural tile.
+            AnimationKind::WindowMove | AnimationKind::WorkspaceSwitch => {
+                // Both lerp the rect from `from_rect` to the natural
+                // tile. WorkspaceSwitch sets `from_rect` to the
+                // natural tile shifted off-screen, which produces a
+                // slide-in for each surface in the new workspace.
                 let from = anim.from_rect.unwrap_or(tile);
                 Some(lerp_rect(from, tile, t))
-            }
-            AnimationKind::WorkspaceSwitch => {
-                // Not yet wired — keep identity until ghost-buffer
-                // support lands.
-                None
             }
         }
     }

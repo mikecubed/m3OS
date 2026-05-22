@@ -413,6 +413,20 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
     // every iteration of the outer loop, so the hit-test lags compose
     // by at most one frame.
     let mut last_arrangement: alloc::vec::Vec<(SurfaceId, Rect)> = alloc::vec::Vec::new();
+    // Phase 73 — last active workspace index. When this changes (the
+    // user invokes SUPER+1..9 / `m3ctl workspace switch`), the main
+    // loop pushes a `WorkspaceSwitch` slide-in for each surface in
+    // the newly-active workspace so the transition has motion
+    // instead of snapping instantly to the destination set.
+    let mut last_workspace_idx: usize = workspace_mgr.current_index();
+    // Surfaces the compose loop has rendered at least once. The
+    // `WindowOpen` animation is pushed when a Toplevel first enters
+    // this set so the open-pop is paid by the FIRST visible frame —
+    // not at SetSurfaceRole time, when the client typically hasn't
+    // committed its first buffer yet and the animation's first
+    // 50–100 ms would be invisible.
+    let mut rendered_surfaces: alloc::collections::BTreeSet<SurfaceId> =
+        alloc::collections::BTreeSet::new();
     // Phase 57d follow-up — Tier 1 fullscreen-takeover gate. When a
     // control client (e.g. `/bin/fb-takeover`) sends `YieldFb`, the
     // server drops framebuffer ownership via `SYS_FB_YIELD` and sets
@@ -620,6 +634,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     let _ = workspace_mgr.remove_surface(*sid);
                     last_tile_dims.remove(sid);
                     last_tile_rects.remove(sid);
+                    rendered_surfaces.remove(sid);
                     if focused == Some(*sid) {
                         focused = None;
                     }
@@ -650,20 +665,14 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
         for (sid, role) in outcome.created.iter() {
             if matches!(role, SurfaceRole::Toplevel) {
                 workspace_mgr.insert_on_current(*sid);
-                // Phase 73 Track A — queue a window-open slide+fade
-                // animation against the full output. The compose loop
-                // ticks the engine once per frame; the engine self-
-                // removes when the 150 ms duration elapses.
-                animation_engine.animate(
-                    *sid,
-                    animation::AnimationKind::WindowOpen,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        w: meta.width,
-                        h: meta.height,
-                    },
-                );
+                // The WindowOpen animation is *not* pushed here.
+                // SetSurfaceRole fires before the client has
+                // committed its first buffer, so the engine would
+                // tick for 50–100 ms with the surface still invisible
+                // — by the time it landed on screen the pop-in would
+                // be 30–60% complete. The animation is pushed below,
+                // once the surface actually shows up in the compose
+                // entries list, so the user sees the full effect.
             }
         }
         for sid in outcome.destroyed.iter() {
@@ -673,6 +682,7 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
             // not get spuriously diffed against the dead tile.
             last_tile_dims.remove(sid);
             last_tile_rects.remove(sid);
+            rendered_surfaces.remove(sid);
             // Phase 73 Track A — drop any in-flight animations against
             // this surface so the engine does not advance timers for a
             // dead client. The destroy path already forces a full
@@ -931,17 +941,30 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     &diff_exclusive_zones,
                 );
             last_arrangement = arrangement_for_diff.clone();
-            // Phase 72b — track whether the arrangement structure
-            // changed this frame (any tile dim flipped or any surface
-            // left the active set). On a change, the now-uncovered
-            // FB regions — inner gaps that shifted, outer-gap edges
-            // newly exposed by a shrunken tile, the entire
-            // previously-occupied area when a workspace switch swaps
-            // surface sets — keep stale pixels from the old frame
-            // because compose_frame only writes inside damage rects
-            // and the gap areas are in no damage list. Force a full
-            // repaint when this happens so the background fill clears
-            // the gaps before the surface pass re-blits the live tiles.
+            // Workspace-switch detection: when the active workspace
+            // changed since last frame, push a `WorkspaceSwitch`
+            // slide-in animation for every surface in the new
+            // arrangement. The animation lerps each surface in from
+            // off-screen-right so the transition has visible motion
+            // instead of the surfaces snapping to their destination
+            // instantly. Runs before the first-render / move passes
+            // below so workspace-switch is the dominant animation
+            // when both could apply.
+            let current_ws = workspace_mgr.current_index();
+            let workspace_switched = current_ws != last_workspace_idx;
+            if workspace_switched {
+                let output_w = meta.width as i32;
+                for (sid, rect) in arrangement_for_diff.iter() {
+                    let from = Rect {
+                        x: rect.x.saturating_add(output_w),
+                        y: rect.y,
+                        w: rect.w,
+                        h: rect.h,
+                    };
+                    animation_engine.animate_workspace_switch(*sid, from, *rect);
+                }
+                last_workspace_idx = current_ws;
+            }
             let mut arrangement_changed = false;
             for (sid, rect) in arrangement_for_diff.iter() {
                 // Dim-change check drives `SurfaceResized` -> client.
@@ -961,16 +984,28 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                         },
                     ));
                 }
-                // Rect-change check drives `WindowMove` animations.
-                // Triggers on position-only changes too; skip when we
-                // don't have a previous rect yet (i.e. the surface
-                // just joined the active arrangement, in which case
-                // WindowOpen is already animating it).
+                // Rect-change check. First appearance of a surface in
+                // the active arrangement → WindowOpen pop-in (unless
+                // workspace-switch already pushed a slide-in for it).
+                // Subsequent rect changes → WindowMove spring lerp.
                 let prev_rect = last_tile_rects.insert(*sid, *rect);
-                if let Some(prev) = prev_rect
-                    && prev != *rect
-                {
-                    animation_engine.animate_move(*sid, prev, *rect);
+                match prev_rect {
+                    None => {
+                        if !workspace_switched && !rendered_surfaces.contains(sid) {
+                            animation_engine.animate(
+                                *sid,
+                                animation::AnimationKind::WindowOpen,
+                                *rect,
+                            );
+                        }
+                        rendered_surfaces.insert(*sid);
+                    }
+                    Some(prev) if prev != *rect => {
+                        if !workspace_switched {
+                            animation_engine.animate_move(*sid, prev, *rect);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Drop tracked dims for surfaces that left the active
