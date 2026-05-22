@@ -9,15 +9,28 @@
 //!
 //! ## Phase 73 — double buffering
 //!
-//! `write_pixels` lands in a userspace-side back buffer; `present()`
-//! is the only path that copies pixels into the kernel-mapped front
-//! buffer. Every compose pass that previously wrote partial state
-//! directly to the visible framebuffer (clear-to-background, then
-//! per-surface blits, then cursor blit) now lands in the back buffer
-//! and reaches the screen as one atomic memcpy at frame end. Eliminates
-//! the "background flashes between clear and surface blit" tearing
-//! the single-buffered path exhibited on every animation tick,
-//! arrangement change, focus transition, and destroy.
+//! Two backends are wired here, picked at acquire time:
+//!
+//! * **Memcpy back-buffer** (default fallback). `write_pixels` lands
+//!   in a userspace `Vec<u8>` sized identically to the visible
+//!   framebuffer; `present()` row-bounds the dirty range and memcpys
+//!   it into the kernel-mapped MMIO front. Intermediate compose state
+//!   (clear, then surface blits, then cursor) is never observable to
+//!   the user because every intermediate write lands in heap memory.
+//!   The visible-frame memcpy itself can still race the scanout
+//!   cursor on the framebuffer hardware, producing residual tearing.
+//!
+//! * **VBE page-flip** (when `framebuffer_pageflip_query()` returns a
+//!   non-zero back-buffer Y offset at acquire time). The kernel-mmap
+//!   spans both halves of a virtual framebuffer that is `2 × height`
+//!   rows tall; `write_pixels` writes directly into the half that is
+//!   *not* currently being scanned out (the "back" half), and
+//!   `present()` calls a single `framebuffer_pageflip(new_offset)`
+//!   syscall which writes the VBE `Y_OFFSET` register. The display
+//!   device applies the new offset on the next scanout cycle, so the
+//!   compositor never has to memcpy 8 MiB per frame and the screen
+//!   only ever shows a complete frame. Roles swap after each flip:
+//!   what was "back" becomes "front" and vice versa.
 //!
 //! The owner lives for the duration of `display_server`'s ownership of
 //! the framebuffer. On drop it best-effort releases the FB; explicit
@@ -52,35 +65,59 @@ pub enum AcquireError {
 /// of the mapped framebuffer plus its geometry so writes can be issued
 /// without re-querying the kernel.
 ///
-/// Phase 73 — `back_buffer` is a userspace-allocated mirror sized
-/// identically to the kernel-mapped front. `write_pixels` lands here
-/// (cheap CPU-cache-friendly copy); `present()` is the only path that
-/// pushes the back into the visible front. Until `present()` runs the
-/// screen shows whatever it last presented, so intermediate states
-/// (clear, then blit, then cursor) are never observable to the user.
+/// Phase 73 — see the module doc for the two backend modes
+/// (`Backend::Memcpy` and `Backend::Flip`).
 pub struct KernelFramebufferOwner {
     base: *mut u8,
-    back_buffer: Vec<u8>,
     metadata: FbMetadata,
-    /// Total mapped byte length — used as a defensive bound on clipped
-    /// writes in addition to width/height.
-    byte_len: usize,
+    /// Total mapped byte length of one visible-half worth of pixels.
+    /// In flip mode the kernel mapping is `2 × byte_len_visible`
+    /// (front half + back half); in memcpy mode it equals the kernel
+    /// mapping size.
+    byte_len_visible: usize,
     released: bool,
-    /// `true` iff `back_buffer` differs from the kernel-mapped front.
-    /// Cleared by `present()` so consecutive `present()` calls with no
-    /// intervening writes are no-ops. Set by every `write_pixels` call
-    /// that actually touched bytes.
-    dirty: bool,
-    /// Row-range bounding box of dirty bytes in `back_buffer`. Tracked
-    /// per `write_pixels` so `present()` can memcpy just the touched
-    /// rows rather than the whole framebuffer. `(usize::MAX, 0)` is
-    /// the "no dirt" sentinel; `usize::MAX` keeps the inclusive-min
-    /// branch sound when no writes have happened. Phase 73 — at 1080p
-    /// the full-FB memcpy was 8 MiB per present, which TCG choked on;
-    /// row-bounded copies bring typical frames back into the
-    /// few-hundred-KB range.
-    dirty_row_min: usize,
-    dirty_row_max_exclusive: usize,
+    backend: Backend,
+}
+
+enum Backend {
+    /// Single kernel-mapped front + userspace memcpy back. Used on
+    /// every non-Bochs framebuffer and on Bochs boots where VBE
+    /// double-buffering could not be enabled (e.g. insufficient
+    /// `vgamem`).
+    Memcpy {
+        back_buffer: Vec<u8>,
+        /// `true` iff `back_buffer` differs from the kernel-mapped
+        /// front. Cleared by `present()` so consecutive `present()`
+        /// calls with no intervening writes are no-ops.
+        dirty: bool,
+        /// Row-range bounding box of dirty bytes in `back_buffer`.
+        /// Tracked per `write_pixels` so `present()` can memcpy just
+        /// the touched rows rather than the whole framebuffer.
+        /// `(usize::MAX, 0)` is the "no dirt" sentinel; `usize::MAX`
+        /// keeps the inclusive-min branch sound when no writes have
+        /// happened. At 1080p the full-FB memcpy was 8 MiB per
+        /// present, which TCG choked on; row-bounded copies bring
+        /// typical frames back into the few-hundred-KB range.
+        dirty_row_min: usize,
+        dirty_row_max_exclusive: usize,
+    },
+    /// VBE page-flip mode. The kernel mapping spans both halves of a
+    /// virtual framebuffer; we render into whichever half is *not*
+    /// currently being scanned out (`back_y_offset_pixels`) and ask
+    /// the kernel to swap roles via [`syscall_lib::framebuffer_pageflip`]
+    /// on `present()`.
+    Flip {
+        /// Visible height in pixels. The non-zero `Y_OFFSET` value
+        /// the kernel will accept for a flip; doubles as the byte
+        /// offset between the two halves in the kernel mapping
+        /// (multiplied by `stride_bytes`).
+        visible_height: u32,
+        /// Y offset of the half currently being scanned out.
+        front_y_offset: u32,
+        /// `true` iff the back half was touched since the last
+        /// `present()`. Cleared by `present()`.
+        dirty: bool,
+    },
 }
 
 // SAFETY: the FB virtual address is only mutated through methods on this
@@ -135,25 +172,47 @@ impl KernelFramebufferOwner {
         }
 
         let base = mmap_ret as *mut u8;
-        // Total bytes the kernel actually mapped: stride_bytes * height
-        // (the kernel maps full-row units).
-        let byte_len = (metadata.stride_bytes as usize).saturating_mul(metadata.height as usize);
+        // Visible-half bytes: stride_bytes * height. Used as the
+        // defensive bound on clipped writes and as the offset between
+        // front/back halves when flip mode is active.
+        let byte_len_visible =
+            (metadata.stride_bytes as usize).saturating_mul(metadata.height as usize);
 
-        // Allocate the back buffer at the same size. Initial contents
-        // are zero; the first compose pass overwrites every byte via
-        // `fill_background` + surface blits before its terminating
-        // `present()`, so the initial zero state is never observable.
-        let back_buffer = alloc::vec![0u8; byte_len];
+        // Probe the kernel for VBE double-buffer support. A non-zero
+        // value is the visible height in pixels (and therefore the
+        // back-half Y offset); zero means "no hardware support, fall
+        // back to memcpy". The kernel's mmap already gave us
+        // `2 × byte_len_visible` of mapped pages when the probe is
+        // non-zero, so the second half is addressable without any
+        // additional syscalls.
+        let pageflip_back_y = syscall_lib::framebuffer_pageflip_query();
+        let backend = if pageflip_back_y == metadata.height {
+            Backend::Flip {
+                visible_height: pageflip_back_y,
+                front_y_offset: 0,
+                dirty: false,
+            }
+        } else {
+            // Allocate the userspace back buffer for the memcpy path.
+            // Initial contents are zero; the first compose pass
+            // overwrites every byte via `fill_background` + surface
+            // blits before its terminating `present()`, so the
+            // initial zero state is never observable.
+            let back_buffer = alloc::vec![0u8; byte_len_visible];
+            Backend::Memcpy {
+                back_buffer,
+                dirty: false,
+                dirty_row_min: usize::MAX,
+                dirty_row_max_exclusive: 0,
+            }
+        };
 
         Ok(Self {
             base,
-            back_buffer,
             metadata,
-            byte_len,
+            byte_len_visible,
             released: false,
-            dirty: false,
-            dirty_row_min: usize::MAX,
-            dirty_row_max_exclusive: 0,
+            backend,
         })
     }
 
@@ -211,8 +270,9 @@ impl FramebufferOwner for KernelFramebufferOwner {
             return Err(FbError::Truncated);
         }
 
-        // Defensive: never write past the back-buffer bounds (which are
-        // identical to the kernel-mapped front-buffer bounds).
+        // Defensive: never write past one visible-half bounds. The
+        // bytes-per-row math is identical for both backends; flip mode
+        // just shifts the destination by `back_y_offset × stride`.
         let dest_stride = self.metadata.stride_bytes as usize;
         let dest_x_bytes = (clipped.x as usize).saturating_mul(bpp);
         let last_row_end = (clipped.y as usize)
@@ -221,71 +281,130 @@ impl FramebufferOwner for KernelFramebufferOwner {
             .saturating_mul(dest_stride)
             .saturating_add(dest_x_bytes)
             .saturating_add(clipped_w_bytes);
-        if last_row_end > self.byte_len {
+        if last_row_end > self.byte_len_visible {
             return Err(FbError::OutOfBounds);
         }
 
-        // Land the write in the userspace back buffer. `present()` is
-        // the only path that pushes pixels into the visible front, so
-        // intermediate compose state (clear-then-blit-then-cursor) is
-        // not observable.
-        for row in 0..clipped.h as usize {
-            let src_row_off = (src_offset_y_rows + row) * stride + src_offset_x_bytes;
-            let dest_row_off = (clipped.y as usize + row) * dest_stride + dest_x_bytes;
-            self.back_buffer[dest_row_off..dest_row_off + clipped_w_bytes]
-                .copy_from_slice(&src[src_row_off..src_row_off + clipped_w_bytes]);
-        }
-        self.dirty = true;
-        // Track the row-range of every write so `present()` can copy
-        // just those rows instead of the entire framebuffer. At 1080p
-        // the FB is 8 MiB; copying it all on every present pegged the
-        // CPU under TCG. A typical compose touches a few thousand
-        // rows at most, so row-bounded copies stay cheap.
-        let row_start = clipped.y as usize;
-        let row_end = row_start + clipped.h as usize;
-        if row_start < self.dirty_row_min {
-            self.dirty_row_min = row_start;
-        }
-        if row_end > self.dirty_row_max_exclusive {
-            self.dirty_row_max_exclusive = row_end;
+        match &mut self.backend {
+            Backend::Memcpy {
+                back_buffer,
+                dirty,
+                dirty_row_min,
+                dirty_row_max_exclusive,
+            } => {
+                for row in 0..clipped.h as usize {
+                    let src_row_off = (src_offset_y_rows + row) * stride + src_offset_x_bytes;
+                    let dest_row_off = (clipped.y as usize + row) * dest_stride + dest_x_bytes;
+                    back_buffer[dest_row_off..dest_row_off + clipped_w_bytes]
+                        .copy_from_slice(&src[src_row_off..src_row_off + clipped_w_bytes]);
+                }
+                *dirty = true;
+                let row_start = clipped.y as usize;
+                let row_end = row_start + clipped.h as usize;
+                if row_start < *dirty_row_min {
+                    *dirty_row_min = row_start;
+                }
+                if row_end > *dirty_row_max_exclusive {
+                    *dirty_row_max_exclusive = row_end;
+                }
+            }
+            Backend::Flip {
+                visible_height,
+                front_y_offset,
+                dirty,
+            } => {
+                // The back half is whichever one is not currently
+                // being scanned out. With only two halves, that's
+                // `0` XOR `visible_height`.
+                let back_y_offset = if *front_y_offset == 0 {
+                    *visible_height as usize
+                } else {
+                    0
+                };
+                let back_byte_offset = back_y_offset * dest_stride;
+                // SAFETY: the kernel mapped `2 × byte_len_visible`
+                // writable bytes at `self.base`. We bounded the
+                // visible-half destination above; adding the back
+                // offset keeps us inside the second half because the
+                // halves are the same size.
+                unsafe {
+                    let dest_base = self.base.add(back_byte_offset);
+                    for row in 0..clipped.h as usize {
+                        let src_row_off = (src_offset_y_rows + row) * stride + src_offset_x_bytes;
+                        let dest_row_off = (clipped.y as usize + row) * dest_stride + dest_x_bytes;
+                        ptr::copy_nonoverlapping(
+                            src.as_ptr().add(src_row_off),
+                            dest_base.add(dest_row_off),
+                            clipped_w_bytes,
+                        );
+                    }
+                }
+                *dirty = true;
+            }
         }
         Ok(())
     }
 
     fn present(&mut self) -> Result<(), FbError> {
-        if !self.dirty {
-            return Ok(());
-        }
-        let dest_stride = self.metadata.stride_bytes as usize;
-        // Clamp the dirty row range to the FB extents; `write_pixels`
-        // already bounded each row write against `byte_len`, but
-        // bounding here too keeps the unsafe path defensive against a
-        // future regression that forgets to.
-        let row_min = self.dirty_row_min.min(self.metadata.height as usize);
-        let row_max = self
-            .dirty_row_max_exclusive
-            .min(self.metadata.height as usize);
-        if row_max > row_min {
-            let byte_off = row_min.saturating_mul(dest_stride);
-            let byte_len = (row_max - row_min).saturating_mul(dest_stride);
-            // SAFETY: the kernel mapped `self.byte_len` writable bytes
-            // at `self.base`; `byte_off + byte_len <= self.byte_len`
-            // because `row_max <= metadata.height` and the back
-            // buffer is sized identically. The two regions are
-            // disjoint (kernel-mapped MMIO vs heap), so the copy is
-            // non-overlapping.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    self.back_buffer.as_ptr().add(byte_off),
-                    self.base.add(byte_off),
-                    byte_len,
-                );
+        match &mut self.backend {
+            Backend::Memcpy {
+                back_buffer,
+                dirty,
+                dirty_row_min,
+                dirty_row_max_exclusive,
+            } => {
+                if !*dirty {
+                    return Ok(());
+                }
+                let dest_stride = self.metadata.stride_bytes as usize;
+                // Clamp the dirty row range to the FB extents.
+                let row_min = (*dirty_row_min).min(self.metadata.height as usize);
+                let row_max = (*dirty_row_max_exclusive).min(self.metadata.height as usize);
+                if row_max > row_min {
+                    let byte_off = row_min.saturating_mul(dest_stride);
+                    let byte_len = (row_max - row_min).saturating_mul(dest_stride);
+                    // SAFETY: see acquire() — the kernel mapped
+                    // `byte_len_visible` writable bytes (or more in
+                    // flip mode, but flip mode never takes this
+                    // branch). `byte_off + byte_len` ≤
+                    // `byte_len_visible` because `row_max ≤
+                    // metadata.height`. Source and destination are
+                    // disjoint (kernel-mapped MMIO vs heap).
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            back_buffer.as_ptr().add(byte_off),
+                            self.base.add(byte_off),
+                            byte_len,
+                        );
+                    }
+                }
+                *dirty = false;
+                *dirty_row_min = usize::MAX;
+                *dirty_row_max_exclusive = 0;
+                Ok(())
+            }
+            Backend::Flip {
+                visible_height,
+                front_y_offset,
+                dirty,
+            } => {
+                if !*dirty {
+                    return Ok(());
+                }
+                let new_offset = if *front_y_offset == 0 {
+                    *visible_height
+                } else {
+                    0
+                };
+                let rc = syscall_lib::framebuffer_pageflip(new_offset);
+                if rc < 0 {
+                    return Err(FbError::Unsupported);
+                }
+                *front_y_offset = new_offset;
+                *dirty = false;
+                Ok(())
             }
         }
-        self.dirty = false;
-        self.dirty_row_min = usize::MAX;
-        self.dirty_row_max_exclusive = 0;
-        Ok(())
     }
 
     /// Phase 56 close-out (G.1) — read one BGRA8888 pixel from the
@@ -313,20 +432,52 @@ impl FramebufferOwner for KernelFramebufferOwner {
         let off = (y as usize)
             .saturating_mul(dest_stride)
             .saturating_add(dest_x_bytes);
-        if off.saturating_add(4) > self.byte_len {
+        if off.saturating_add(4) > self.byte_len_visible {
             return Err(FbError::OutOfBounds);
         }
-        // Read from the back buffer. With double buffering the back
-        // is the source of truth between presents — readback observes
-        // pixels the compositor staged, even before the next
-        // `present()` pushes them to the kernel-mapped front.
-        let value = u32::from_le_bytes([
-            self.back_buffer[off],
-            self.back_buffer[off + 1],
-            self.back_buffer[off + 2],
-            self.back_buffer[off + 3],
-        ]);
-        Ok(value)
+        match &self.backend {
+            Backend::Memcpy { back_buffer, .. } => {
+                // Read from the userspace back buffer — it is the
+                // source of truth between presents, so the test-only
+                // `ReadBackPixel` verb observes pixels the compositor
+                // staged before the next memcpy reaches the front.
+                Ok(u32::from_le_bytes([
+                    back_buffer[off],
+                    back_buffer[off + 1],
+                    back_buffer[off + 2],
+                    back_buffer[off + 3],
+                ]))
+            }
+            Backend::Flip {
+                visible_height,
+                front_y_offset,
+                ..
+            } => {
+                // Read from whichever half is currently being scanned
+                // out (the visible front). The back half holds
+                // in-flight, partially-rendered pixels which would
+                // mislead the test-only verb. The byte offset is
+                // (front_y_offset × stride) plus the row offset.
+                let half_byte_off = (*front_y_offset as usize) * dest_stride;
+                let full_off = half_byte_off + off;
+                // SAFETY: front_y_offset is 0 or visible_height; both
+                // map to addresses inside the `2 × byte_len_visible`
+                // kernel mapping. We bounded `off` against
+                // `byte_len_visible` above, so `full_off + 4` ≤
+                // `2 × byte_len_visible`.
+                let bytes = unsafe {
+                    let p = self.base.add(full_off);
+                    [
+                        core::ptr::read_volatile(p),
+                        core::ptr::read_volatile(p.add(1)),
+                        core::ptr::read_volatile(p.add(2)),
+                        core::ptr::read_volatile(p.add(3)),
+                    ]
+                };
+                let _ = visible_height; // keep field documented + reachable
+                Ok(u32::from_le_bytes(bytes))
+            }
+        }
     }
 }
 

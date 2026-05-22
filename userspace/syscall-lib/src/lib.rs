@@ -301,6 +301,19 @@ pub const SYS_FB_YIELD: u64 = 0x101C;
 /// process owns the framebuffer.
 pub const SYS_FB_REACQUIRE: u64 = 0x101D;
 
+/// Phase 73 follow-up: page-flip the hardware framebuffer.
+///
+/// Dual mode based on `arg0`:
+/// * `u64::MAX` → query mode. Returns `back_y_offset_pixels` (the
+///   non-zero `Y_OFFSET` value the kernel will accept for a flip).
+///   Returns `0` if VBE double-buffering was not enabled at boot —
+///   callers should fall back to the userspace memcpy path.
+/// * `0` or `back_y_offset_pixels` → write the value to the VBE
+///   `Y_OFFSET` register; returns `0` on success. The flip is applied
+///   by the display device on the next scanout cycle.
+/// * any other value → `-EINVAL`.
+pub const SYS_FRAMEBUFFER_PAGEFLIP: u64 = 0x101F;
+
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
@@ -2343,6 +2356,32 @@ pub fn framebuffer_mmap() -> u64 {
 /// mapping was found despite the owner flag being set).
 pub fn framebuffer_release() -> isize {
     unsafe { syscall0(SYS_FRAMEBUFFER_RELEASE) as isize }
+}
+
+/// Phase 73 follow-up: probe hardware double-buffering support.
+/// Returns the `back_y_offset_pixels` value (the non-zero `Y_OFFSET`
+/// the kernel will accept for [`framebuffer_pageflip`]). Returns `0`
+/// when VBE double-buffering was not enabled at boot — callers fall
+/// back to the userspace memcpy path.
+pub fn framebuffer_pageflip_query() -> u32 {
+    let raw = unsafe { syscall1(SYS_FRAMEBUFFER_PAGEFLIP, u64::MAX) };
+    // Kernel may return an errno-shaped value if the syscall is
+    // entirely unrouted (older kernels). Treat anything in the
+    // high-errno range as "unsupported, fall back".
+    if raw > u64::MAX - 4096 {
+        return 0;
+    }
+    u32::try_from(raw).unwrap_or(0)
+}
+
+/// Phase 73 follow-up: ask the kernel to write `y_offset` to the VBE
+/// `Y_OFFSET` register. `y_offset` must be `0` or the value returned
+/// by [`framebuffer_pageflip_query`]. Returns 0 on success, negative
+/// errno on failure (`-EPERM` if the caller does not own the
+/// framebuffer, `-EINVAL` for an unsupported offset, `-ENOSYS` if VBE
+/// double-buffering was not enabled).
+pub fn framebuffer_pageflip(y_offset: u32) -> isize {
+    unsafe { syscall1(SYS_FRAMEBUFFER_PAGEFLIP, y_offset as u64) as isize }
 }
 
 /// Phase 57d follow-up: yield framebuffer ownership without unmapping

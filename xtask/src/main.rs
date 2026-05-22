@@ -2782,6 +2782,17 @@ fn qemu_args_with_devices_resolved(
         }
     }
 
+    // Phase 73 follow-up — bump the Bochs VGA VRAM so the kernel can
+    // request a virtual framebuffer that is `2 × visible_height` rows
+    // tall (true hardware page flip via VBE Y_OFFSET panning). At
+    // 1920×1080×4 the doubled buffer is ~16.6 MiB, just past the
+    // default `vgamem_mb=16`; 32 MiB leaves comfortable headroom and
+    // keeps both `-vga std` (xtask-pinned) and the implicit q35 VGA
+    // device happy on every code path that builds the QEMU command.
+    // `-global` applies to the device regardless of whether it is
+    // explicit on the command line.
+    args.extend(["-global".to_string(), "VGA.vgamem_mb=32".to_string()]);
+
     // Phase 55a Track F.1: collect every required `-machine` property into a
     // single comma-joined value. Emitting two `-machine` options would let QEMU
     // silently drop the earlier one — e.g. `--gui --iommu` would lose

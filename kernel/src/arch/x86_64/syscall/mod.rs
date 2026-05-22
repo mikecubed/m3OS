@@ -1514,6 +1514,14 @@ mod syscall_nr {
     /// Used by display_server's compose-log line during the held-key
     /// cursor-freeze investigation. Strip once root-caused.
     pub const PS2_DIAG_COUNTER: u64 = 0x101E;
+    /// Phase 73 follow-up: page-flip the hardware framebuffer to
+    /// `y_offset` rows (arg0). Only `0` and `framebuffer.back_y_offset`
+    /// are accepted; any other value returns `NEG_EINVAL`. Requires
+    /// that VBE double-buffering was enabled at boot (the kernel
+    /// returns `NEG_ENOSYS` otherwise so userspace can fall back to
+    /// the memcpy path). The caller must currently own the framebuffer
+    /// (`NEG_EPERM` if not). Returns `0` on success.
+    pub const FRAMEBUFFER_PAGEFLIP: u64 = 0x101F;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1933,6 +1941,7 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_RELEASE => sys_framebuffer_release(),
         FB_YIELD => sys_fb_yield(),
         FB_REACQUIRE => sys_fb_reacquire(),
+        FRAMEBUFFER_PAGEFLIP => sys_framebuffer_pageflip(arg0),
         PS2_DIAG_COUNTER => sys_ps2_diag_counter(arg0),
         READ_MOUSE_PACKET => sys_read_mouse_packet(arg0, arg1),
         FRAME_TICK_HZ => sys_frame_tick_hz(),
@@ -10658,6 +10667,47 @@ pub(super) fn sys_fb_reacquire() -> u64 {
         0
     } else {
         NEG_EBUSY
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 73 follow-up — page-flip the hardware framebuffer (0x101F)
+//
+// Dual-purpose syscall:
+//   * arg0 == u64::MAX → query mode, returns `back_y_offset_pixels` as a
+//     u64. Returns 0 if VBE double-buffering was not enabled at boot
+//     (caller falls back to the memcpy path).
+//   * arg0 ∈ { 0, back_y_offset_pixels } → write the value to the VBE
+//     Y_OFFSET register and return 0. The flip is applied by the
+//     display device on the next scanout cycle.
+//   * any other arg0 → NEG_EINVAL.
+//
+// The "query" sentinel avoids a separate syscall for capability discovery
+// and keeps `sys_framebuffer_info`'s wire format unchanged.
+// ---------------------------------------------------------------------------
+
+const PAGEFLIP_QUERY: u64 = u64::MAX;
+
+pub(super) fn sys_framebuffer_pageflip(arg0: u64) -> u64 {
+    if arg0 == PAGEFLIP_QUERY {
+        return crate::fb::framebuffer_back_y_offset_pixels() as u64;
+    }
+    if !crate::fb::vbe::doublebuffer_ready() {
+        return NEG_ENOSYS;
+    }
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return NEG_EPERM;
+    }
+    let y_offset = match u32::try_from(arg0) {
+        Ok(v) => v,
+        Err(_) => return NEG_EINVAL,
+    };
+    // SAFETY: ring-0 context; VBE I/O ports are device-owned.
+    match unsafe { crate::fb::vbe::pageflip(y_offset) } {
+        Ok(()) => 0,
+        Err(crate::fb::vbe::FlipError::NotReady) => NEG_ENOSYS,
+        Err(crate::fb::vbe::FlipError::BadOffset) => NEG_EINVAL,
     }
 }
 

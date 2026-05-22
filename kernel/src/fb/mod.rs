@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+pub mod vbe;
+
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
@@ -368,6 +370,11 @@ struct FbConsole {
     cursor_visible: bool,
     /// Whether the cursor is currently rendered on screen (XOR'd).
     cursor_rendered: bool,
+    /// Phase 73 follow-up — when non-zero, hardware double-buffering is
+    /// active and the value is the visible height in pixels (the only
+    /// non-zero `Y_OFFSET` the page-flip syscall accepts). Zero means
+    /// single-buffered.
+    back_y_offset_pixels: u32,
 }
 
 // SAFETY: FbConsole is only accessed under a spin::Mutex; the raw pointer is
@@ -391,6 +398,7 @@ impl FbConsole {
             bg_color: BG,
             cursor_visible: true,
             cursor_rendered: false,
+            back_y_offset_pixels: 0,
         }
     }
 
@@ -967,6 +975,40 @@ pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
         core::ptr::write_bytes(buf_ptr, 0x00, total_bytes);
     }
 
+    // Phase 73 follow-up — try to enable hardware double-buffering via
+    // Bochs VBE panning. On success the LFB extends to `2 × height`
+    // rows inside the same BAR, so we widen `byte_len` to expose the
+    // back half through `sys_framebuffer_mmap`. The kernel console
+    // keeps writing to rows `[0, height)` which remain `Y_OFFSET = 0`
+    // (i.e. visible) until userspace explicitly flips.
+    //
+    // Failure is intentionally silent at the warn level — every
+    // non-Bochs framebuffer (real UEFI hardware, vmware-svga, etc.)
+    // takes this path, and the userspace compositor falls back to the
+    // single-buffered memcpy without needing the kernel to surface the
+    // distinction.
+    match unsafe { vbe::enable_doublebuffer() } {
+        Ok(visible_height) => {
+            console.back_y_offset_pixels = visible_height;
+            // Extend `byte_len` so `sys_framebuffer_mmap` maps both
+            // halves of the virtual framebuffer. The new bytes live
+            // inside the same MMIO BAR as the visible half; the kernel
+            // page mapper will set up valid PTEs for them on demand.
+            console.byte_len = info.byte_len.checked_mul(2).unwrap_or(info.byte_len);
+            log::info!(
+                "[fb] VBE double-buffer enabled (visible {}px, back at row {})",
+                visible_height,
+                visible_height
+            );
+        }
+        Err(e) => {
+            log::info!(
+                "[fb] VBE double-buffer unavailable ({:?}); single-buffer mode",
+                e
+            );
+        }
+    }
+
     console.cursor_col = 0;
     console.cursor_row = 0;
 
@@ -1028,6 +1070,14 @@ pub fn framebuffer_raw_info() -> Option<(usize, usize, usize, usize, PixelFormat
 pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
     let guard = CONSOLE.lock();
     guard.as_ref().map(|c| (c.buf as u64, c.byte_len))
+}
+
+/// Phase 73 follow-up — visible-height value (in pixels) at which
+/// userspace should call the page-flip syscall to swap to the back
+/// half of the double-buffered framebuffer. `0` means single-buffered.
+pub fn framebuffer_back_y_offset_pixels() -> u32 {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| c.back_y_offset_pixels).unwrap_or(0)
 }
 
 /// Suppresses all framebuffer console output.
