@@ -253,6 +253,25 @@ struct ServerSurface {
     role: Option<SurfaceRole>,
     pending_buffer: Option<CommittedBuffer>,
     committed_buffer: Option<CommittedBuffer>,
+    /// Per-surface SHM mappings keyed by `BufferId`. Each entry is
+    /// a strong `Rc<SharedMapping>` the surface holds for as long
+    /// as the client keeps that `BufferId` alive on this surface.
+    /// `AttachSharedBuffer(surface_id, buffer_id, shm_id)` first
+    /// checks this map: if `buffer_id` is already mapped to the
+    /// same `shm_id`, the existing `Rc` is reused (no `sys_shm_map`
+    /// call); if `buffer_id` previously held a different `shm_id`,
+    /// the old `Rc` is replaced (drops the old mapping); if the
+    /// `buffer_id` is new, a fresh `sys_shm_map` populates it.
+    ///
+    /// This replaces the previous global byte-budget cache, which
+    /// thrashed at compositor scale: with 9+ terms × 2 buffers each
+    /// at 16 MiB per buffer the working set (~288 MiB) didn't fit
+    /// in any reasonable budget without pinning a quarter of system
+    /// RAM, and every cache miss became a per-frame `sys_shm_map`
+    /// (kernel-heap pressure → eventual OOM). Per-surface tracking
+    /// stays hot for the lifetime of the surface and drops cleanly
+    /// when the client destroys it.
+    buffer_mappings: BTreeMap<BufferId, Rc<SharedMapping>>,
     /// Set when a new buffer is committed and the composer hasn't yet
     /// re-blitted this surface. Cleared by [`SurfaceRegistry::mark_clean`]
     /// after each compose pass.
@@ -348,53 +367,7 @@ pub struct SurfaceRegistry {
     /// for that id clears the slot — without this, a destroyed
     /// cursor surface would leave a stale `ClientCursor` behind.
     client_cursor_owner: Option<SurfaceId>,
-    /// Cache of live shared-memory mappings keyed by `shm_id`,
-    /// holding **strong** [`Rc<SharedMapping>`] references so the
-    /// mapping survives the brief window between one
-    /// `CommittedBuffer` being released (e.g. `CommitSurface`
-    /// promoting `pending` over `committed`) and the next frame's
-    /// `AttachSharedBuffer` arriving. A `Weak`-only cache misses
-    /// every attach under double-buffered ping-pong (the *only*
-    /// holder of the previous Rc just dropped) — the strong cache
-    /// keeps the mapping live until eviction.
-    ///
-    /// Bounded by [`SHM_CACHE_BUDGET_BYTES`] (sum of `mapping.len`
-    /// across all entries), **not** by entry count. Each cached
-    /// strong `Rc` pins the underlying kernel SHM frames in
-    /// physical memory through display_server's mapping; an
-    /// entry-count cap would let a handful of fullscreen surfaces
-    /// (4K = ~33 MiB each) pin the entire system RAM. The byte
-    /// budget keeps cache memory bounded regardless of surface
-    /// size — at 64 MiB total, that's 2 fullscreen entries, or
-    /// 8 quarter-screen, or 64 of a 1 MiB bar. Eviction is FIFO
-    /// (insertion order); when the cache holds the only ref to a
-    /// mapping, eviction's `Rc` drop calls `sys_shm_unmap`.
-    shm_cache: BTreeMap<u32, Rc<SharedMapping>>,
-    /// Eviction queue: shm_ids in insertion order. Used as a simple
-    /// FIFO when the cache exceeds its byte budget. A real LRU
-    /// would require a doubly-linked-list approach; FIFO eviction
-    /// is adequate when the working set fits the budget (the
-    /// typical case — clients use 2-4 shm_ids in steady state).
-    /// Mirrors `shm_cache` membership.
-    shm_cache_order: Vec<u32>,
-    /// Running total of `mapping.len` over every entry in
-    /// `shm_cache`. Maintained inline by `insert_shm` so the
-    /// eviction loop doesn't re-iterate the whole cache to compute
-    /// the sum on every insert.
-    shm_cache_bytes: usize,
 }
-
-/// Maximum total bytes of cached SHM mappings. 64 MiB comfortably
-/// holds the typical working set (4 toplevels × 2 buffers at
-/// tiled sizes, plus bar / wallpaper / cursor) while preventing
-/// pathological pinning: at 4K a single fullscreen surface is
-/// ~33 MiB, so an unbounded-by-bytes cache holding even a few
-/// could pin the entire 1 GiB QEMU RAM and OOM the kernel from
-/// the *outside* — which is exactly what happened in m3os.log.
-/// 64 MiB caps the cost at ~6% of total RAM, keeping the rest
-/// available for kernel heap, page tables, kernel stacks, and
-/// the framebuffer.
-const SHM_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 impl SurfaceRegistry {
     pub fn new() -> Self {
@@ -405,57 +378,6 @@ impl SurfaceRegistry {
             layer_conflicts: LayerConflictTracker::new(),
             client_cursor: None,
             client_cursor_owner: None,
-            shm_cache: BTreeMap::new(),
-            shm_cache_order: Vec::new(),
-            shm_cache_bytes: 0,
-        }
-    }
-
-    /// Look up a cached SHM mapping for `shm_id`. Returns `Some(rc)`
-    /// — a fresh clone of the cached `Rc` — when the mapping is
-    /// live; `None` when no cache entry exists. The caller
-    /// (`AttachSharedBuffer` handler) calls `sys_shm_map` on a miss
-    /// and inserts the resulting `Rc` via [`Self::insert_shm`].
-    fn lookup_shm(&self, shm_id: u32) -> Option<Rc<SharedMapping>> {
-        self.shm_cache.get(&shm_id).cloned()
-    }
-
-    /// Insert a freshly-mapped SHM region into the cache. Holds a
-    /// strong `Rc` so the kernel mapping survives the gap between
-    /// `CommittedBuffer` releases and the next `AttachSharedBuffer`
-    /// (the failure mode the previous `Weak`-only version had).
-    /// Evicts the oldest entry while the total cached bytes
-    /// exceed [`SHM_CACHE_BUDGET_BYTES`]; dropping the cache's
-    /// strong ref calls `sys_shm_unmap` if no surface still holds
-    /// the mapping, otherwise leaves the surface as the final
-    /// holder. Replaces any existing entry for the same id.
-    fn insert_shm(&mut self, shm_id: u32, mapping: &Rc<SharedMapping>) {
-        let new_bytes = mapping.len;
-        if let Some(prev) = self.shm_cache.insert(shm_id, mapping.clone()) {
-            // Existing entry replaced. Subtract its bytes from the
-            // running total; the old `Rc` is dropped at end-of-scope
-            // (after this fn returns, since the local binding `prev`
-            // owns it). Move the id to the back of the FIFO so it
-            // ages out after newer inserts — without this the order
-            // vector would have a duplicate that misrepresents
-            // eviction priority.
-            self.shm_cache_bytes = self.shm_cache_bytes.saturating_sub(prev.len);
-            self.shm_cache_order.retain(|id| *id != shm_id);
-            drop(prev);
-        }
-        self.shm_cache_order.push(shm_id);
-        self.shm_cache_bytes = self.shm_cache_bytes.saturating_add(new_bytes);
-        // Evict oldest entries until under budget. The just-inserted
-        // entry can itself be the one that gets evicted on a single
-        // oversize insert — that's correct: the cache can never hold
-        // an entry larger than the budget, and the lookup just
-        // re-maps next time (still cheap thanks to the kernel-side
-        // `map_user_frames_contiguous` change).
-        while self.shm_cache_bytes > SHM_CACHE_BUDGET_BYTES && !self.shm_cache_order.is_empty() {
-            let oldest = self.shm_cache_order.remove(0);
-            if let Some(evicted) = self.shm_cache.remove(&oldest) {
-                self.shm_cache_bytes = self.shm_cache_bytes.saturating_sub(evicted.len);
-            }
         }
     }
 
@@ -608,6 +530,7 @@ impl SurfaceRegistry {
                         role: None,
                         pending_buffer: None,
                         committed_buffer: None,
+                        buffer_mappings: BTreeMap::new(),
                         dirty: false,
                         client_token: *client_token,
                     },
@@ -654,57 +577,77 @@ impl SurfaceRegistry {
                 width,
                 height,
             } => {
-                // Reuse a cached mapping when this `shm_id` is
-                // already live somewhere in the registry — typically
-                // when the client re-sends `AttachSharedBuffer` every
-                // frame against its double-buffer slots. The cache
-                // hits on the alternate frame's attach because the
-                // previous frame's `CommittedBuffer` (now `committed`)
-                // still holds the `Rc<SharedMapping>`. A miss falls
-                // through to a single `sys_shm_map`; the kernel-side
-                // `Vec<PhysFrame>` scratch alloc happens once per
-                // shm_id per lifetime, not once per frame.
+                // Per-surface buffer cache: the client identifies its
+                // own backing storage with a stable `BufferId`. Look up
+                // the surface's current mapping for that id and reuse
+                // it iff the shm_id still matches — that's the
+                // double-buffer ping-pong case where the same two
+                // `buffer_id`s carry the same two `shm_id`s for the
+                // lifetime of the surface. A shm_id mismatch means
+                // the client reallocated (e.g. SurfaceResized → fresh
+                // SHMs); replace the old mapping (Rc drop fires
+                // `sys_shm_unmap`) and map the new one. A truly new
+                // buffer_id (first attach for that slot) falls through
+                // to a single `sys_shm_map`.
+                //
+                // No global cache, no byte budget, no eviction. The
+                // working set is the union of every live surface's
+                // mappings, bounded by client behaviour rather than by
+                // a knob in the compositor.
                 let byte_count = (*width as usize)
                     .saturating_mul(*height as usize)
                     .saturating_mul(4);
-                let mapping = match self.lookup_shm(*shm_id) {
-                    Some(existing) => existing,
-                    None => {
-                        let user_va = syscall_lib::shm_map(*shm_id);
-                        if user_va == 0 {
-                            // Phase 57d follow-up — log the failure so the
-                            // intermittent boot-1 "no terminal" symptom (where
-                            // display_server silently drops AttachSharedBuffer
-                            // and the surface never gets pixels) produces a
-                            // visible signal in the boot transcript.
+                let mapping = {
+                    // Inspect the surface's existing entry first.
+                    let existing = self
+                        .surfaces
+                        .get(surface_id)
+                        .and_then(|s| s.buffer_mappings.get(buffer_id))
+                        .cloned();
+                    match existing {
+                        Some(rc) if rc.shm_id == *shm_id => rc,
+                        _ => {
+                            let user_va = syscall_lib::shm_map(*shm_id);
+                            if user_va == 0 {
+                                // Phase 57d follow-up — log the failure so the
+                                // intermittent boot-1 "no terminal" symptom (where
+                                // display_server silently drops AttachSharedBuffer
+                                // and the surface never gets pixels) produces a
+                                // visible signal in the boot transcript.
+                                syscall_lib::write_str(
+                                    syscall_lib::STDOUT_FILENO,
+                                    "display_server: AttachSharedBuffer shm_map failed shm_id=",
+                                );
+                                write_u32_log(*shm_id);
+                                syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
+                                return Err(SurfaceShimError::ShmMapFailed {
+                                    shm_id: *shm_id,
+                                    buffer_id: *buffer_id,
+                                });
+                            }
                             syscall_lib::write_str(
                                 syscall_lib::STDOUT_FILENO,
-                                "display_server: AttachSharedBuffer shm_map failed shm_id=",
+                                "display_server: AttachSharedBuffer mapped shm_id=",
                             );
                             write_u32_log(*shm_id);
+                            syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
+                            write_u64_log(user_va);
                             syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-                            return Err(SurfaceShimError::ShmMapFailed {
+                            Rc::new(SharedMapping {
                                 shm_id: *shm_id,
-                                buffer_id: *buffer_id,
-                            });
+                                user_va,
+                                len: byte_count,
+                            })
                         }
-                        syscall_lib::write_str(
-                            syscall_lib::STDOUT_FILENO,
-                            "display_server: AttachSharedBuffer mapped shm_id=",
-                        );
-                        write_u32_log(*shm_id);
-                        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, " va=");
-                        write_u64_log(user_va);
-                        syscall_lib::write_str(syscall_lib::STDOUT_FILENO, "\n");
-                        let rc = Rc::new(SharedMapping {
-                            shm_id: *shm_id,
-                            user_va,
-                            len: byte_count,
-                        });
-                        self.insert_shm(*shm_id, &rc);
-                        rc
                     }
                 };
+                // Update the surface's per-buffer slot. If a previous
+                // Rc for this `buffer_id` existed with a different
+                // shm_id, the insert drops it here — `sys_shm_unmap`
+                // fires when the surface was the last holder.
+                if let Some(s) = self.surfaces.get_mut(surface_id) {
+                    s.buffer_mappings.insert(*buffer_id, mapping.clone());
+                }
                 let buf = CommittedBuffer {
                     buffer_id: *buffer_id,
                     width: *width,
