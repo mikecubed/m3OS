@@ -301,11 +301,19 @@ impl<T> IrqSafeMutex<T> {
 }
 
 impl<T: ?Sized> IrqSafeMutex<T> {
+    #[track_caller]
     pub fn lock(&self) -> IrqSafeGuard<'_, T> {
         // Phase 57b F.1 — raise `preempt_count` *before* masking IRQs.  The
         // helper is lock-free by mandate (Phase 57b D.2) so it cannot
         // recurse through this very call.
-        preempt_disable();
+        //
+        // `[track_caller]` plus the explicit `Location::caller()` capture
+        // here surfaces the real call site (the user of `IrqSafeMutex::lock`,
+        // not line 308 inside this function) in the [preempt-depth]
+        // diagnostic warning. Without this, every IrqSafeMutex acquisition
+        // appears to come from `scheduler.rs:308` and the warning is
+        // useless for finding the actual deep-nesting culprit.
+        preempt_disable_at(core::panic::Location::caller());
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -327,8 +335,9 @@ impl<T: ?Sized> IrqSafeMutex<T> {
     /// `try_lock`; on `None` (acquire failed) the raise is undone with a
     /// paired [`preempt_enable`] before returning, so a failed `try_lock`
     /// has zero net effect on the per-task counter.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
-        preempt_disable();
+        preempt_disable_at(core::panic::Location::caller());
         let was_enabled = interrupts::are_enabled();
         if was_enabled {
             interrupts::disable();
@@ -2013,6 +2022,23 @@ fn dump_preempt_trace_for_task(task_idx: usize) {
 #[inline]
 #[track_caller]
 pub fn preempt_disable() {
+    preempt_disable_at(core::panic::Location::caller());
+}
+
+/// Variant of [`preempt_disable`] that accepts an explicit caller location.
+///
+/// Used by [`IrqSafeMutex::lock`] / [`IrqSafeMutex::try_lock`] so the
+/// `[preempt-depth]` diagnostic surfaces the *user* of the mutex rather
+/// than line 308 inside `IrqSafeMutex::lock` itself. Without this routing
+/// every IrqSafeMutex acquisition reports the same `scheduler.rs:308`
+/// location in the warning, and the diagnostic is useless for tracking
+/// down deep-nesting bugs.
+///
+/// Callers that aren't wrapping their own location pass-through still use
+/// the plain [`preempt_disable`] — it just inlines a `Location::caller()`
+/// capture here, preserving the historical behaviour.
+#[inline]
+pub fn preempt_disable_at(location: &'static core::panic::Location<'static>) {
     // Phase 57b F.1 — `IrqSafeMutex::lock` now calls this helper on every
     // lock acquisition, including a few callsites reachable before per-core
     // data is initialised (early boot, the `#[cfg(test)]` harness, panic
@@ -2041,7 +2067,6 @@ pub fn preempt_disable() {
     // pointee outlives this load.
     let prev = unsafe { (*ptr).fetch_add(1, core::sync::atomic::Ordering::Acquire) };
     let new_value = prev + 1;
-    let location = core::panic::Location::caller();
     record_preempt_trace(1, prev, new_value, location);
     // Phase 57e Bug #9 — immediate warning when nesting exceeds the
     // expected maximum (preempt_disable + IrqSafeMutex pi_lock + IrqSafeMutex
@@ -2049,6 +2074,7 @@ pub fn preempt_disable() {
     // either a legitimate deeper nesting (worth knowing about) or an
     // unbalanced disable that's accumulating — either way the next
     // forensic capture wants the immediate caller.
+    //
     if new_value >= 5
         && PREEMPT_LEAK_LOG_BUDGET.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) > 0
     {
@@ -2283,13 +2309,33 @@ pub fn peek_preempt_count_irq() -> i32 {
 /// Ready tasks (the "stale-ready 30 s + cpu-hog" Bug #9 fingerprint).
 ///
 /// Until the leak is hunted down at its source, the user-return boundary
-/// clamps `preempt_count` to zero unconditionally and logs the first 32
+/// clamps `preempt_count` to zero unconditionally and logs the first N
 /// non-zero observations so the next forensic capture pinpoints the
 /// imbalance.  The clamp itself is correct by the same invariant that
 /// `preempt_frame_to_scheduler` already relies on: any kernel work that
 /// raised the counter must have lowered it before this boundary; a
 /// non-zero value is by definition a bug, and zeroing it cannot widen
 /// any race that wasn't already broken.
+///
+/// Note (2026-05-23): the warning emission path itself acquires
+/// `DMESG_RING` + `SERIAL1` via `_kernel_print`, each of which goes
+/// through `IrqSafeMutex::lock → preempt_disable_at`. When a warning
+/// fires at depth N, the recursive lock acquisitions inside the log
+/// path also see depth ≥ 5 and trigger nested warnings, burning ~32
+/// budget slots per real event and inflating reported depths.
+///
+/// An obvious fix — a per-core re-entry guard that suppresses the
+/// nested warnings — turned out to be load-bearing: removing the
+/// multi-ms recursive-log delay broke 4 GiB GUI boot somewhere in the
+/// `wait_icr_idle`/IPI delivery path (the recursion was inadvertently
+/// providing the wait window the IPI handshake needed). That's a
+/// real latent bug, but unblocking it requires more focused
+/// investigation than the diagnostic-quality fix in this commit.
+///
+/// Treat the diagnostic accordingly: a stream of warnings with
+/// `caller=kernel/src/serial.rs:40` (or :41 / :61) is recursion noise;
+/// the *single* warning with a different caller (e.g.
+/// `kernel/src/smp/ipi.rs:56`) is the real call site.
 static PREEMPT_LEAK_LOG_BUDGET: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(32);
 
