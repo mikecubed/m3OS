@@ -2907,9 +2907,35 @@ fn qemu_args_with_devices_resolved(
             args.extend(["-display".to_string(), "none".to_string()]);
         }
         QemuDisplayMode::Gui => {
+            // Display backend selection. SDL is the historical default but
+            // is known to misbehave with QEMU 8.x on some Wayland and X11
+            // setups (gitlab qemu-project/qemu#2048, gitlab-#1902); set
+            // `M3OS_GUI_BACKEND=gtk` or `=vnc` to swap in a different
+            // backend without touching code. `=vnc` opens a server on
+            // `:0` so a host `vncviewer localhost:5900` (or any RFB
+            // client) can attach.
+            let backend = std::env::var("M3OS_GUI_BACKEND").unwrap_or_else(|_| "sdl".to_string());
+            let (display_arg, mention_vnc) = match backend.as_str() {
+                "sdl" => ("sdl".to_string(), false),
+                "gtk" => ("gtk".to_string(), false),
+                "vnc" => ("vnc=:0".to_string(), true),
+                other => {
+                    eprintln!(
+                        "warning: M3OS_GUI_BACKEND={other:?} not recognised; falling back to sdl. \
+                         Supported: sdl, gtk, vnc."
+                    );
+                    ("sdl".to_string(), false)
+                }
+            };
+            if mention_vnc {
+                eprintln!(
+                    "M3OS_GUI_BACKEND=vnc: QEMU listening on port 5900 — attach with \
+                     `vncviewer localhost:5900` (or `gvncviewer localhost:0`)."
+                );
+            }
             args.extend([
                 "-display".to_string(),
-                "sdl".to_string(),
+                display_arg,
                 "-audiodev".to_string(),
                 "none,id=noaudio".to_string(),
                 // Phase 73 follow-up — pin the standard VGA device.
@@ -2924,8 +2950,16 @@ fn qemu_args_with_devices_resolved(
                 // through GOP, and matches the device class the
                 // `-global VGA.vgamem_mb=32` below targets so the
                 // doubled VRAM for VBE page-flip actually lands.
+                //
+                // Override via `M3OS_GUI_VGA=<bochs-display|virtio-vga|...>`
+                // to swap in an alternative QEMU display device. Useful
+                // when investigating black-screen issues at 4K — the
+                // `std` device's 32 MiB VRAM is 98.9% utilized by a
+                // single 3840×2160×4 framebuffer, leaving no headroom
+                // for VBE double-buffering, and OVMF's default GOP mode
+                // list only goes up to 2560×1600.
                 "-vga".to_string(),
-                "std".to_string(),
+                std::env::var("M3OS_GUI_VGA").unwrap_or_else(|_| "std".to_string()),
                 // Bump VGA VRAM so the kernel can request a virtual
                 // framebuffer that is `2 × visible_height` rows tall
                 // (true hardware page flip via VBE Y_OFFSET panning).
