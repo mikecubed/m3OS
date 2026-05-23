@@ -2741,15 +2741,19 @@ fn qemu_args_with_devices_resolved(
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 36: 1 GiB. A 2-4 GiB bump on the Phase 73 4K branch
-        // also triggers a kernel boot hang past `[mm] bootstrap heap
-        // initialized` in some QEMU configurations; the root cause
-        // sits in mm / kstack init and not in any of the recent
-        // compositor work. Holding at 1 GiB until that's
-        // diagnosed; the SHM-cache + caps + per-surface tracking
-        // already bound the per-frame memory cost at 4K.
+        // Phase 73 (4K follow-up): 2 GiB. Doubles the previous
+        // 1 GiB budget so the multi-term + workspace load at 4K
+        // has headroom for many surface buffers + per-process
+        // heaps without saturating physical memory. The
+        // `init_buddy` self-deadlock that previously hung boot
+        // at >1 GiB was fixed in
+        // `kernel/src/mm/frame_allocator.rs`. (Pushed past 2 GiB
+        // TCG boot becomes prohibitively slow because
+        // `BuddyAllocator::free()` scales with frame count; KVM
+        // handles 4+ GiB fine, but the headless smoke / regression
+        // suites would time out under TCG.)
         "-m".to_string(),
-        "1024".to_string(),
+        "2048".to_string(),
         "-smp".to_string(),
         qemu_smp_count().to_string(),
     ];

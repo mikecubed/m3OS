@@ -508,28 +508,61 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
 /// Drains all frames from the free list into the buddy allocator, which
 /// coalesces them into the largest possible blocks.
 pub fn init_buddy() {
-    let mut alloc = FRAME_ALLOCATOR.0.lock();
+    // Read frame-allocator state without holding the lock across any
+    // heap allocations. Critical: the bootstrap heap can `grow_heap`
+    // on a `Vec` push, and `grow_heap` itself calls `allocate_frame`,
+    // which re-locks `FRAME_ALLOCATOR`. Holding the lock across a
+    // `Vec` push (or any allocation that crosses the initial heap
+    // ceiling) therefore self-deadlocks — observed at ≥2 GiB RAM,
+    // where the per-frame Vec hits the 8 MiB initial-heap boundary
+    // mid-drain and the kernel hangs forever spinning on its own
+    // mutex.
+    let (initial_free, total_pfns) = {
+        let alloc = FRAME_ALLOCATOR.0.lock();
+        (alloc.free_count, (alloc.max_frame_number as usize) + 1)
+    };
 
-    // Drain all frames from the free list.
-    let mut frames = Vec::new();
-    while let Some(phys) = alloc.pop_frame() {
-        frames.push(phys);
-    }
+    // Pre-allocate to exact capacity *before* re-acquiring the lock,
+    // so every push during the drain is a constant-time slot fill —
+    // no grow-doubling, no allocator re-entry.
+    let mut frames: Vec<u64> = Vec::with_capacity(initial_free);
 
-    let total_pfns = (alloc.max_frame_number as usize) + 1;
+    // Build the buddy bitmaps before draining. This allocation is the
+    // other large heap consumer (a few hundred KiB of bitmap vectors)
+    // and we want it done while the free-list path is still active so
+    // any `grow_heap` calls — if they happen — succeed.
     let mut buddy = BuddyAllocator::new(total_pfns);
 
-    // Sort frames so contiguous runs are added in order for better coalescing.
+    // Now drain the free list with the lock held. No allocation
+    // happens inside this scope: `frames` already has capacity, and
+    // `pop_frame` is allocation-free.
+    {
+        let mut alloc = FRAME_ALLOCATOR.0.lock();
+        while let Some(phys) = alloc.pop_frame() {
+            frames.push(phys);
+        }
+    }
+
+    // Sort frames so contiguous runs are added in order for better
+    // coalescing. Allocator-free.
     frames.sort_unstable();
 
-    // Feed each frame into the buddy allocator (it will coalesce buddies).
+    // Feed each frame into the buddy allocator (it will coalesce
+    // buddies). `buddy.free` reads/writes its bitmap vecs in place
+    // and never allocates.
     for phys in &frames {
         let pfn = (*phys / PAGE_SIZE) as usize;
         buddy.free(pfn, 0);
     }
 
     let buddy_free = buddy.free_count();
-    alloc.buddy = Some(buddy);
+    // Install the buddy under the lock. The free-list inside `alloc`
+    // is empty at this point; subsequent `allocate_frame` calls
+    // route through `buddy`.
+    {
+        let mut alloc = FRAME_ALLOCATOR.0.lock();
+        alloc.buddy = Some(buddy);
+    }
 
     log::info!(
         "[mm] buddy allocator: {} free pages across {} orders",
