@@ -909,6 +909,24 @@ fn program_main(_args: &[&str], env: &[&str]) -> i32 {
                     // animation tick.
                     compose_ctx.force_full_repaint();
                 }
+                // The cached arrangement in `ComposeContext` is keyed
+                // on the toplevel id set, so it only recomputes when
+                // surfaces are added or removed. During a workspace
+                // slide the id set stays constant across frames (both
+                // workspaces' surfaces are in the merged filter), so
+                // without an explicit invalidation `layout.arrange`
+                // would run once at slide-start and the cached rects
+                // — with frame-0 offsets baked in — would survive the
+                // entire 260 ms duration. The user-visible symptom is
+                // "no slide motion at all": the workspace appears to
+                // snap on slide-end when the id set finally shrinks
+                // and arrange runs again. Invalidating per tick while
+                // a slide is in flight is cheap (two `arrange_*` calls
+                // per frame) and lets the per-frame `from_offset_x` /
+                // `to_offset_x` values actually drive on-screen motion.
+                if animation_engine.workspace_slide().is_some() {
+                    compose_ctx.invalidate_arrangement_cache();
+                }
             }
             // Phase 57d follow-up — post-reclaim full-screen fill.
             // After Tier 1 fullscreen-takeover, the takeover program
