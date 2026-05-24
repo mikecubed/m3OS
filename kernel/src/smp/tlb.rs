@@ -47,6 +47,20 @@ static SHOOTDOWN_USE_CR3_RELOAD: AtomicBool = AtomicBool::new(false);
 /// `invlpg` for each page.
 const INVLPG_THRESHOLD: u64 = 32;
 
+/// Per-core counter of `IPI_TLB_SHOOTDOWN` invocations actually serviced by
+/// [`handle_tlb_shootdown_ipi`]. Incremented from the IDT entry on each
+/// recipient; read by [`wait_for_shootdown_acks_or_panic`] before/after the
+/// spin so the timeout diagnostic can dump a per-recipient delta and tell us
+/// definitively whether each target's IPI handler fired at all during the
+/// hang.
+///
+/// Sized to [`crate::smp::MAX_CORES`] (16) to match the largest core_id the
+/// crate exposes. `Relaxed` ordering is sufficient: this counter is read only
+/// from panic / diagnostic context, never participates in correctness
+/// synchronisation (`SHOOTDOWN_PENDING` carries the ack semantics).
+static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
+
 /// Spin on `SHOOTDOWN_PENDING > 0` with a generous timeout. On timeout, dump
 /// the request state and which APIC IDs we sent to vs the final pending
 /// count, then panic. Designed for the 4 GiB-RAM-on-Zen 5 hang investigation
@@ -70,6 +84,13 @@ fn wait_for_shootdown_acks_or_panic(
     } else {
         10_000_000_000
     };
+    // Snapshot the per-core IPI-serviced counter so a timeout panic can dump
+    // a per-recipient delta and tell us definitively whether each target's
+    // IDT handler actually fired during the spin window.
+    let mut serviced_at_start = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
+        serviced_at_start[i] = slot.load(Ordering::Relaxed);
+    }
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     let mut iterations: u64 = 0;
     while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
@@ -81,13 +102,35 @@ fn wait_for_shootdown_acks_or_panic(
                 let pending = SHOOTDOWN_PENDING.load(Ordering::Acquire);
                 let my_core = super::per_core().core_id;
                 let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
-                panic!(
+                // Build a per-core "serviced before → after" map. Format
+                // is compact (one line per core) so the panic dump stays
+                // within `_panic_print`'s budget.
+                let mut serviced_now = [0u64; crate::smp::MAX_CORES];
+                for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
+                    serviced_now[i] = slot.load(Ordering::Relaxed);
+                }
+                // Use _panic_print directly so the dump goes out even if
+                // log infrastructure is wedged.
+                crate::serial::_panic_print(format_args!(
                     "[tlb] {site} stuck >500ms: SHOOTDOWN_PENDING={pending} \
                      (of {expected_targets} targets), my_core={my_core}, \
-                     range={range_start:#x}..{range_end:#x}, ICR_LOW={icr_low:#010x} \
-                     (bit 12 = delivery-pending), recipients=[{recipients_repr}], \
-                     iterations={iterations}, tsc_per_ms={tsc_per_ms}"
-                );
+                     range={range_start:#x}..{range_end:#x}, \
+                     ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
+                     recipients=[{recipients_repr}], iterations={iterations}, \
+                     tsc_per_ms={tsc_per_ms}\n[tlb] per-core IPI-serviced \
+                     counter (before → after):\n"
+                ));
+                for i in 0..crate::smp::MAX_CORES {
+                    let before = serviced_at_start[i];
+                    let after = serviced_now[i];
+                    if before != 0 || after != 0 || i == my_core as usize {
+                        let delta = after.wrapping_sub(before);
+                        crate::serial::_panic_print(format_args!(
+                            "[tlb]   core {i}: {before} → {after} (delta {delta})\n"
+                        ));
+                    }
+                }
+                panic!("[tlb] {site} ack timeout — see per-core dump above");
             }
         }
     }
@@ -403,6 +446,16 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
 /// Called from the IDT handler. Reads the target address or range, executes
 /// the appropriate flush, and decrements the pending count.
 pub fn handle_tlb_shootdown_ipi() {
+    // Diagnostic counter for the 4 GiB-hang investigation: bump the
+    // per-core ack count before doing any TLB work. If a sender times out
+    // waiting for our ack, `wait_for_shootdown_acks_or_panic` reads this
+    // counter to determine whether our IDT entry fired at all.
+    if let Some(pc) = super::try_per_core()
+        && let Some(slot) = TLB_IPI_SERVICED.get(pc.core_id as usize)
+    {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
     let start = SHOOTDOWN_RANGE_START.load(Ordering::Acquire);
     let end = SHOOTDOWN_RANGE_END.load(Ordering::Acquire);
 
