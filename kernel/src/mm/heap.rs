@@ -882,6 +882,11 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     // current core. The IPI infrastructure (`smp::tlb`) already runs in
     // the page-fault demand-paging path; reusing the range API keeps the
     // shootdown to a single IPI handshake instead of one per page.
+    //
+    // We hold `GROW_HEAP_LOCK` (an `IrqSafeMutex`) here, so IF is
+    // currently 0. The shootdown helper enforces IF=1 for the duration of
+    // its handshake itself — see `tlb_shootdown_range_kernel` — so this
+    // call is safe even from inside an IrqSafeMutex region.
     let flush_start = (HEAP_START + current_mapped) as u64;
     let flush_end = flush_start + bytes_mapped as u64;
     if crate::smp::is_per_core_ready() {

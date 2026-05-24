@@ -61,6 +61,65 @@ const INVLPG_THRESHOLD: u64 = 32;
 static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
     [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
 
+/// RAII guard that temporarily enables interrupts for the lifetime of a TLB
+/// shootdown handshake, then restores the previous IF state on `Drop`.
+///
+/// The shootdown protocol fundamentally requires IF=1 on the spinning core:
+/// concurrent kernel-VMA mutations on other cores broadcast their own IPIs
+/// to this core, and the only way this core can ack them (and thereby
+/// release the *other* sender's spin) is to actually take the interrupt.
+/// If we spin with IF=0, every other concurrent shootdown that targets us
+/// stalls forever — which collapses into a multi-core IF=0 deadlock the
+/// moment two or more cores are doing kernel-VMA mutations at the same
+/// time. Diagnosed at 4 GiB guest RAM via
+/// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`: every recipient
+/// core's per-core `timer Δ` and `tlb-ipi Δ` were both 0 during the 500 ms
+/// sender spin — i.e., no recipient ever took *any* interrupt while the
+/// sender was waiting — which only happens if every recipient is also
+/// inside an IF=0 region.
+///
+/// We can safely enable interrupts inside the shootdown helpers themselves
+/// because:
+///   * `preempt_count` is already raised (each shootdown helper calls
+///     `preempt_disable` at entry, and outer callers that hold an
+///     `IrqSafeMutex` also raised it). A timer tick that lands during the
+///     spin sets the reschedule flag but does *not* preempt this task off
+///     this core, so the spin loop and its associated atomics keep their
+///     identity.
+///   * The handlers that can fire in this window are LAPIC timer (atomic
+///     tick + EOI, no allocation, no locks contended by the shootdown
+///     path) and the TLB-shootdown IPI itself (`handle_tlb_shootdown_ipi`:
+///     atomic decrement + local TLB flush + EOI, lock-free).
+///
+/// The Drop restores IF to whatever it was at construction, so callers
+/// that legitimately had IF=0 (e.g., already-CLI'd outer
+/// `IrqSafeMutex`) observe no net change after the helper returns —
+/// `IrqSafeGuard::Drop` then restores the original (pre-lock) IF state on
+/// its own as usual.
+struct ShootdownIrqWindow {
+    was_enabled: bool,
+}
+
+impl ShootdownIrqWindow {
+    #[inline(always)]
+    fn open() -> Self {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        if !was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        Self { was_enabled }
+    }
+}
+
+impl Drop for ShootdownIrqWindow {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !self.was_enabled {
+            x86_64::instructions::interrupts::disable();
+        }
+    }
+}
+
 /// Spin on `SHOOTDOWN_PENDING > 0` with a generous timeout. On timeout, dump
 /// the request state and which APIC IDs we sent to vs the final pending
 /// count, then panic. Designed for the 4 GiB-RAM-on-Zen 5 hang investigation
@@ -249,15 +308,15 @@ pub fn tlb_shootdown(addr: u64) {
             ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
         }
 
-        // Spin-wait for all remote cores to acknowledge.  IF stays
-        // enabled here; a self-targeted IRQ (timer, etc.) is allowed
-        // to fire and return.  Remote cores' IPI handlers run with
-        // their own IF state, never contend for `SHOOTDOWN_LOCK`,
-        // and only touch the `SHOOTDOWN_*` atomics.
-        // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
-        // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-        // this core can service its own IRQs.  Cannot yield here: we are still inside
-        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
+        // Spin-wait for all remote cores to acknowledge. `ShootdownIrqWindow`
+        // enforces IF=1 for the duration of the spin so this core can
+        // service incoming IPIs from other cores' concurrent shootdowns
+        // (and so its own LAPIC timer keeps firing). Even when an outer
+        // caller holds an `IrqSafeMutex` (which CLI'd at acquire), the
+        // window enables IF here and restores the prior state on Drop —
+        // the lock guard's own `InterruptRestore::drop` then restores the
+        // original pre-lock IF state on lock release.
+        let _irq_window = ShootdownIrqWindow::open();
         wait_for_shootdown_acks_or_panic(
             "tlb_shootdown",
             targets as u8,
@@ -358,13 +417,11 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
             }
         }
 
-        // Spin-wait for acknowledgment from all targeted cores.  IF stays
-        // enabled; remote cores must be able to receive their IPIs and
-        // ack via the `SHOOTDOWN_*` atomics.
-        // IPI-bounded: remote-CPU IPI handlers complete within IPI delivery latency
-        // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
-        // this core can service its own IRQs.  Cannot yield here: we are still inside
-        // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
+        // Spin-wait for acknowledgment from all targeted cores. See the
+        // matching note + `ShootdownIrqWindow` rationale in `tlb_shootdown`
+        // above — IF MUST be 1 during the spin so this core services
+        // peers' concurrent shootdowns and ack-deadlock is avoided.
+        let _irq_window = ShootdownIrqWindow::open();
         wait_for_shootdown_acks_or_panic(
             "tlb_shootdown_range",
             targets,
@@ -463,7 +520,12 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
             ipi::send_ipi(apic_id, ipi::IPI_TLB_SHOOTDOWN);
         }
 
-        // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
+        // IPI-bounded spin; same IF/preempt discipline as
+        // `tlb_shootdown_range`. `ShootdownIrqWindow` keeps IF=1 across
+        // the wait even when callers (e.g. `mm::heap::grow_heap`) hold an
+        // outer `IrqSafeMutex` whose acquire would otherwise leave IF=0
+        // — the prior bug that caused the 4 GiB-on-Zen-5 deadlock.
+        let _irq_window = ShootdownIrqWindow::open();
         wait_for_shootdown_acks_or_panic(
             "tlb_shootdown_range_kernel",
             targets as u8,
