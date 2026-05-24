@@ -47,6 +47,52 @@ static SHOOTDOWN_USE_CR3_RELOAD: AtomicBool = AtomicBool::new(false);
 /// `invlpg` for each page.
 const INVLPG_THRESHOLD: u64 = 32;
 
+/// Spin on `SHOOTDOWN_PENDING > 0` with a generous timeout. On timeout, dump
+/// the request state and which APIC IDs we sent to vs the final pending
+/// count, then panic. Designed for the 4 GiB-RAM-on-Zen 5 hang investigation
+/// (docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md): converts a
+/// previously-silent infinite spin into an actionable panic.
+///
+/// 500 ms is ~5 orders of magnitude over the SDM-spec ~1 µs IPI delivery
+/// latency; comfortable margin under TCG without inflating real-hang
+/// detection time. tsc_per_ms() returns 0 before APIC calibration; fall
+/// back to a ~10G-cycle absolute ceiling (~10 s at 1 GHz) in that window.
+fn wait_for_shootdown_acks_or_panic(
+    site: &'static str,
+    expected_targets: u8,
+    range_start: u64,
+    range_end: u64,
+    recipients_repr: core::fmt::Arguments<'_>,
+) {
+    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+    let timeout_tsc: u64 = if tsc_per_ms > 0 {
+        tsc_per_ms.saturating_mul(500)
+    } else {
+        10_000_000_000
+    };
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let mut iterations: u64 = 0;
+    while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
+        core::hint::spin_loop();
+        iterations += 1;
+        if iterations.is_multiple_of(4096) {
+            let now = unsafe { core::arch::x86_64::_rdtsc() };
+            if now.wrapping_sub(start_tsc) > timeout_tsc {
+                let pending = SHOOTDOWN_PENDING.load(Ordering::Acquire);
+                let my_core = super::per_core().core_id;
+                let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
+                panic!(
+                    "[tlb] {site} stuck >500ms: SHOOTDOWN_PENDING={pending} \
+                     (of {expected_targets} targets), my_core={my_core}, \
+                     range={range_start:#x}..{range_end:#x}, ICR_LOW={icr_low:#010x} \
+                     (bit 12 = delivery-pending), recipients=[{recipients_repr}], \
+                     iterations={iterations}, tsc_per_ms={tsc_per_ms}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API (T031, T034)
 // ---------------------------------------------------------------------------
@@ -135,9 +181,13 @@ pub fn tlb_shootdown(addr: u64) {
         // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
         // this core can service its own IRQs.  Cannot yield here: we are still inside
         // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown",
+            targets as u8,
+            addr,
+            addr + 4096,
+            format_args!("{:?}", &recipients[..targets]),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -238,9 +288,13 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         // + IRQ-handler runtime (both bounded and lock-free).  IF is enabled here so
         // this core can service its own IRQs.  Cannot yield here: we are still inside
         // the preempt_disable()/preempt_enable() region wrapping the SHOOTDOWN_* atomics.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown_range",
+            targets,
+            aligned_start,
+            aligned_end,
+            format_args!("remote_mask={:#018x}", remote_mask),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
@@ -333,9 +387,13 @@ pub fn tlb_shootdown_range_kernel(start: u64, end: u64) {
         }
 
         // IPI-bounded spin; same IF/preempt discipline as `tlb_shootdown_range`.
-        while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
-            core::hint::spin_loop();
-        }
+        wait_for_shootdown_acks_or_panic(
+            "tlb_shootdown_range_kernel",
+            targets as u8,
+            aligned_start,
+            aligned_end,
+            format_args!("{:?}", &recipients[..targets]),
+        );
     }
     crate::task::scheduler::preempt_enable();
 }
