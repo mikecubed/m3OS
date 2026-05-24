@@ -91,6 +91,22 @@ fn wait_for_shootdown_acks_or_panic(
     for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
         serviced_at_start[i] = slot.load(Ordering::Relaxed);
     }
+    // Also snapshot per-core LAPIC timer ticks. The diagnostic discriminates:
+    //   * timer-delta > 0, ipi-delta = 0  → core's interrupts work but it
+    //     specifically isn't taking vector 0xFD (vector masking, IDT entry
+    //     missing, dispatch race) — bug is IPI-specific.
+    //   * timer-delta = 0, ipi-delta = 0  → core has IF=0 for the entire
+    //     window (or its LAPIC timer is dead) — bug is interrupt-delivery
+    //     generic, almost certainly the recursive log path holding IrqSafeMutex.
+    //   * timer-delta > 0, ipi-delta > 0  → core ack'd but the atomic
+    //     accounting is wrong somewhere.
+    let mut timer_at_start = [0u64; crate::smp::MAX_CORES];
+    for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
+        .iter()
+        .enumerate()
+    {
+        timer_at_start[i] = slot.load(Ordering::Relaxed);
+    }
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     let mut iterations: u64 = 0;
     while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
@@ -102,31 +118,49 @@ fn wait_for_shootdown_acks_or_panic(
                 let pending = SHOOTDOWN_PENDING.load(Ordering::Acquire);
                 let my_core = super::per_core().core_id;
                 let icr_low = unsafe { ipi::lapic_read(ipi::LAPIC_ICR_LOW) };
-                // Build a per-core "serviced before → after" map. Format
-                // is compact (one line per core) so the panic dump stays
-                // within `_panic_print`'s budget.
+                // Build per-core "before → after" maps for both counters.
                 let mut serviced_now = [0u64; crate::smp::MAX_CORES];
                 for (i, slot) in TLB_IPI_SERVICED.iter().enumerate() {
                     serviced_now[i] = slot.load(Ordering::Relaxed);
                 }
-                // Use _panic_print directly so the dump goes out even if
-                // log infrastructure is wedged.
+                let mut timer_now = [0u64; crate::smp::MAX_CORES];
+                for (i, slot) in crate::arch::x86_64::interrupts::TIMER_TICKS_PER_CORE
+                    .iter()
+                    .enumerate()
+                {
+                    timer_now[i] = slot.load(Ordering::Relaxed);
+                }
+                // Use _panic_print directly so the dump goes out even if the
+                // log infrastructure is wedged on the recursive DMESG_RING
+                // path.
                 crate::serial::_panic_print(format_args!(
                     "[tlb] {site} stuck >500ms: SHOOTDOWN_PENDING={pending} \
                      (of {expected_targets} targets), my_core={my_core}, \
                      range={range_start:#x}..{range_end:#x}, \
                      ICR_LOW={icr_low:#010x} (bit 12 = delivery-pending), \
                      recipients=[{recipients_repr}], iterations={iterations}, \
-                     tsc_per_ms={tsc_per_ms}\n[tlb] per-core IPI-serviced \
-                     counter (before → after):\n"
+                     tsc_per_ms={tsc_per_ms}\n\
+                     [tlb] per-core diagnostics — \
+                     tlb-ipi serviced (before → after, delta), \
+                     LAPIC-timer ticks (before → after, delta):\n"
                 ));
                 for i in 0..crate::smp::MAX_CORES {
-                    let before = serviced_at_start[i];
-                    let after = serviced_now[i];
-                    if before != 0 || after != 0 || i == my_core as usize {
-                        let delta = after.wrapping_sub(before);
+                    let ipi_before = serviced_at_start[i];
+                    let ipi_after = serviced_now[i];
+                    let tmr_before = timer_at_start[i];
+                    let tmr_after = timer_now[i];
+                    if ipi_before != 0
+                        || ipi_after != 0
+                        || tmr_before != 0
+                        || tmr_after != 0
+                        || i == my_core as usize
+                    {
+                        let ipi_delta = ipi_after.wrapping_sub(ipi_before);
+                        let tmr_delta = tmr_after.wrapping_sub(tmr_before);
                         crate::serial::_panic_print(format_args!(
-                            "[tlb]   core {i}: {before} → {after} (delta {delta})\n"
+                            "[tlb]   core {i}: ipi {ipi_before} → {ipi_after} \
+                             (Δ{ipi_delta})  timer {tmr_before} → {tmr_after} \
+                             (Δ{tmr_delta})\n"
                         ));
                     }
                 }

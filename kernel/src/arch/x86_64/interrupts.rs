@@ -1416,6 +1416,26 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
+/// Per-core LAPIC timer tick counter. Bumped at the very top of every
+/// `timer_handler_*` entry, before any further code. Diagnostic surface for
+/// the 4 GiB-hang investigation
+/// (docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md): if a recipient
+/// core's count stops advancing during a TLB-shootdown wait, that core has
+/// IF=0 for the entire window (or its LAPIC timer stopped). If it's still
+/// advancing but TLB-IPI-serviced is not, the bug is specific to IPI vector
+/// dispatch / delivery, not generic interrupt servicing.
+pub static TIMER_TICKS_PER_CORE: [AtomicU64; crate::smp::MAX_CORES] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
+
+#[inline(always)]
+fn bump_timer_ticks_for_current_core() {
+    if let Some(pc) = crate::smp::try_per_core()
+        && let Some(slot) = TIMER_TICKS_PER_CORE.get(pc.core_id as usize)
+    {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 57d Track G — voluntary preemption IRQ-return helpers
 // ---------------------------------------------------------------------------
@@ -1519,6 +1539,7 @@ unsafe fn check_and_preempt_user(frame: &mut PreemptTrapFrameUser, trigger: Pree
 /// ring 3.  `frame` points directly at the on-stack [`PreemptTrapFrameUser`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
+    bump_timer_ticks_for_current_core();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
@@ -1592,6 +1613,7 @@ pub unsafe extern "C" fn timer_handler_kernel(
     frame: &mut PreemptTrapFrameKernel,
     captured_kernel_rsp: u64,
 ) {
+    bump_timer_ticks_for_current_core();
     if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         crate::time::on_timer_tick_isr();
