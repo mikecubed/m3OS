@@ -250,10 +250,9 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 // # Phase 57b F.1 — preempt-discipline wiring
 //
 // `IrqSafeMutex::lock` raises the per-task `preempt_count` via
-// [`preempt_disable`] *before* masking interrupts; `IrqSafeGuard::Drop`
-// drops the count via [`preempt_enable`] *after* the spin guard has
-// released the lock and IF has been restored.  The drop order is
-// load-bearing:
+// [`preempt_disable`] *before* anything else; `IrqSafeGuard::Drop` drops
+// the count via [`preempt_enable`] *after* the spin guard has released the
+// lock and IF has been restored.  The drop order is load-bearing:
 //
 //   1. Inner spin guard releases the lock (Phase 57a invariant — preserves
 //      the unlock-before-IF-restore window so an ISR cannot reach a
@@ -261,10 +260,50 @@ type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, 
 //   2. [`InterruptRestore`] restores IF.
 //   3. [`PreemptRestore`] decrements `preempt_count` last.
 //
-// Lock-acquire order is the inverse: raise `preempt_count` first, mask IF,
-// take the spin lock.  See Phase 57b F.1 in
-// `docs/roadmap/tasks/57b-preemption-foundation-tasks.md` and the
-// recursion-safety regression test below.
+// # 2026-05-24 — IRQ window during contended spin (4 GiB-hang fix)
+//
+// Lock-acquire order: raise `preempt_count`, mask IF, then test-then-
+// test-and-set on the inner `spin::Mutex`.  When `try_lock` fails the
+// loop briefly re-enables IF (only if the caller had IF=1) and waits on
+// `is_locked` before retrying.  See
+// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+//
+// Why we need the IRQ window: the previous unconditional "CLI then spin"
+// caused a multi-core deadlock at higher guest RAM.  Every core competing
+// for a hot IrqSafeMutex (notably `DMESG_RING` and `SERIAL1` during
+// AP-init logging, or `GROW_HEAP_LOCK` during concurrent bootstrap-heap
+// growth) spun with IF=0, which prevented them from servicing any other
+// core's `tlb_shootdown_*` IPI.  One core inside `grow_heap →
+// tlb_shootdown_range_kernel` would broadcast and spin on
+// `SHOOTDOWN_PENDING` forever waiting for acks from cores that could not
+// run their IDT handler.
+//
+// Why the IRQ window is *outside* the held region (not "spin with IF=1
+// then CLI"): the simpler "spin with IF=1 then CLI" pattern leaves a
+// race window where this core holds the inner spin guard but IF is still
+// 1, so a same-core IRQ handler that tries to take the same lock
+// (e.g. `log::warn!` → `DMESG_RING.lock()` from a fault handler) would
+// deadlock on the held inner lock.  The test-then-test-and-set pattern
+// guarantees that whenever we *hold* the guard, IF is masked — same
+// invariant the original code maintained.
+//
+// Safety of the IRQ window:
+//   * `preempt_count` is already raised, so a timer tick during the
+//     window sets the reschedule flag but cannot preempt us off this
+//     core — the spin keeps its identity.
+//   * We hold no inner spin guard during the window (we already failed
+//     `try_lock`), so an IRQ that re-takes this same lock from inside
+//     `log::{debug,warn}!` → `_kernel_print` → `DMESG_RING`/`SERIAL1`
+//     runs through its own `IrqSafeMutex::lock` path normally and
+//     returns; we then resume our own spin without ever observing
+//     held-while-IRQ-enabled.
+//   * The window is conditional on `was_enabled` — nested IrqSafeMutex
+//     callers (caller had IF=0) keep the historical IF=0 spin semantics,
+//     so we never leak an IRQ window into a region the outer caller
+//     intended to be IRQ-free.
+//
+// See `kernel/src/smp/tlb.rs::ShootdownIrqWindow` for the matching
+// sender-side fix and the recursion-safety regression test below.
 //
 // `try_lock` mirrors the same pattern: it raises `preempt_count` *before*
 // the inner `try_lock` call and undoes the raise (paired
@@ -303,26 +342,62 @@ impl<T> IrqSafeMutex<T> {
 impl<T: ?Sized> IrqSafeMutex<T> {
     #[track_caller]
     pub fn lock(&self) -> IrqSafeGuard<'_, T> {
-        // Phase 57b F.1 — raise `preempt_count` *before* masking IRQs.  The
+        // Phase 57b F.1 — raise `preempt_count` *before* anything else.  The
         // helper is lock-free by mandate (Phase 57b D.2) so it cannot
         // recurse through this very call.
         //
         // `[track_caller]` plus the explicit `Location::caller()` capture
         // here surfaces the real call site (the user of `IrqSafeMutex::lock`,
-        // not line 308 inside this function) in the [preempt-depth]
+        // not the line inside this function) in the [preempt-depth]
         // diagnostic warning. Without this, every IrqSafeMutex acquisition
-        // appears to come from `scheduler.rs:308` and the warning is
+        // would appear to come from this function and the warning would be
         // useless for finding the actual deep-nesting culprit.
         preempt_disable_at(core::panic::Location::caller());
         let was_enabled = interrupts::are_enabled();
+        // 2026-05-24 — test-then-test-and-set with IRQ window.
+        //
+        // We mask IRQs *before* the atomic acquire attempt so that the
+        // held region always runs with IF=0 (matches the historical
+        // invariant — no same-core IRQ handler can ever observe a
+        // half-acquired lock, and no IRQ handler can deadlock by trying
+        // to re-acquire a lock its interrupted code already holds).
+        //
+        // Between acquire attempts, however, we briefly re-enable IRQs so
+        // that cross-core IPIs — specifically TLB shootdowns from a peer
+        // core inside `tlb_shootdown_range_kernel` — can be serviced on
+        // this core while we wait.  Without this window every core
+        // spinning to acquire any IrqSafeMutex would block all cross-core
+        // shootdowns, which deadlocked the system at 4 GiB guest RAM (see
+        // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`).
         if was_enabled {
             interrupts::disable();
         }
-        let guard = self.inner.lock();
-        IrqSafeGuard {
-            guard,
-            _restore: InterruptRestore { was_enabled },
-            _preempt: PreemptRestore,
+        loop {
+            if let Some(guard) = self.inner.try_lock() {
+                return IrqSafeGuard {
+                    guard,
+                    _restore: InterruptRestore { was_enabled },
+                    _preempt: PreemptRestore,
+                };
+            }
+            if was_enabled {
+                // IRQ window: re-enable IF while the inner lock looks
+                // taken so this core can service incoming IPIs.  Only
+                // honour this for callers that had IF=1 — nested
+                // IrqSafeMutex callers (IF already masked) keep the
+                // original IF=0 spin semantics so we never leak an
+                // IRQ window into a region the outer caller intended to
+                // be IRQ-free.
+                interrupts::enable();
+                while self.inner.is_locked() {
+                    core::hint::spin_loop();
+                }
+                interrupts::disable();
+            } else {
+                while self.inner.is_locked() {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 

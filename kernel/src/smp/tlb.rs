@@ -78,6 +78,14 @@ static TLB_IPI_SERVICED: [AtomicU64; crate::smp::MAX_CORES] =
 /// sender was waiting — which only happens if every recipient is also
 /// inside an IF=0 region.
 ///
+/// Sender-side coverage (this RAII guard) is necessary but not sufficient:
+/// recipients that happen to be spinning to acquire an unrelated
+/// `IrqSafeMutex` would also be stuck IF=0 and unable to ack our IPI.  The
+/// matching recipient-side fix landed in `IrqSafeMutex::lock` on the same
+/// day — that path now spins with IF=1 and only masks IF once the lock is
+/// held.  Together the two fixes mean every cross-core spin in the kernel
+/// keeps IF=1 long enough to take a shootdown IPI.
+///
 /// We can safely enable interrupts inside the shootdown helpers themselves
 /// because:
 ///   * `preempt_count` is already raised (each shootdown helper calls
