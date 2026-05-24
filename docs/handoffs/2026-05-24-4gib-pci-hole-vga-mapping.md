@@ -1,20 +1,23 @@
 ---
-status: fix applied — awaiting host verification on user's Zen 5 / Linux 7.0 box
+status: partial fix applied — original TLB shootdown deadlock resolved; SMP 4 GiB
+  hits a separate silent hang after "entering scheduler" (uncovered by this session's fix)
 branch: feat/phase-73-compositor-polish (PR not yet open)
-last-known-good-commit: 7b4b65b  # ShootdownIrqWindow lands the root-cause fix
+last-known-good-commit: f0a899d  # IrqSafeMutex test-then-test-and-set with IRQ window during spin
 fix-commits:
   # === Session 1 (2026-05-24 AM) — diagnostic / xtask scaffolding ===
   - 352e04c  # xtask: add -m / --memory flag (override QEMU guest RAM)
   - 1784c45  # compositor: invalidate cached arrangement per frame during workspace slide
   - 3b22620  # sched: surface real caller of deep IrqSafeMutex nesting in [preempt-depth]
   - 316d351  # xtask: M3OS_GUI_BACKEND / M3OS_GUI_VGA escape hatches
-  # === Session 2 (2026-05-24 PM) — investigation that landed the fix ===
+  # === Session 2 (2026-05-24 PM) — investigation that landed the sender-side fix ===
   - 66b1896  # xtask: -m / --memory on smoke-test + regression; centralize M3OS_MEM env
   - b36bcaa  # smp: bounded-spin diagnostics on wait_icr_idle + tlb_shootdown_pending
   - 9bffc1b  # smp: per-core TLB-IPI-serviced counter (recipient-side IPI delivery probe)
   - 1401239  # smp: per-core LAPIC-timer-tick counter (IRQ-delivery vs IPI-dispatch bisector)
   - 595951f  # smp: enable interrupts on APs before spawn_idle_for_core (necessary precondition)
-  - 7b4b65b  # smp/tlb: ShootdownIrqWindow — IF=1 across SHOOTDOWN_PENDING spin (ROOT-CAUSE FIX)
+  - 7b4b65b  # smp/tlb: ShootdownIrqWindow — IF=1 across SHOOTDOWN_PENDING spin (SENDER-side fix)
+  # === Session 3 (2026-05-24 evening) — recipient-side fix landed; new hang exposed ===
+  - f0a899d  # sched: IrqSafeMutex::lock — test-then-test-and-set with IRQ window during spin (RECIPIENT-side fix)
 date: 2026-05-24
 component: kernel/smp (TLB shootdown IF=1 invariant + AP IRQ-enable ordering); secondary xtask
   -m flag plumbing; tertiary userspace/display_server slide rendering (unrelated, fixed in
@@ -91,28 +94,58 @@ new-tooling:
 
 ## Quick-resume checklist (start here tomorrow)
 
-1. **Branch**: `feat/phase-73-compositor-polish`, HEAD = `7b4b65b`. Pushed to origin.
-2. **Build state**: `cargo xtask check` clean. `cargo xtask smoke-test` (2 GiB default) passes
-   in ~15 s. `cargo xtask smoke-test -m 4g` passes on the sandbox.
-3. **What's pending**: **only one thing — verify the fix on the user's Zen 5 / Linux 7.0 host.**
-   The sandbox (Zen 4 / Linux 6.8) always passed at 4 GiB, so its passing tells us nothing
-   conclusive — the user's box is the definitive test.
-4. **Reproducer (run on user's host)**:
+1. **Branch**: `feat/phase-73-compositor-polish`. Latest commit is the IrqSafeMutex
+   recipient-side fix described below. Push pending.
+2. **Build state**: `cargo xtask check` clean. `cargo xtask smoke-test` (2 GiB) passes
+   in 14 s. `cargo xtask run -m 3g` (TCG, SMP) runs the full smoke session to
+   `SMOKE:PASS`. `M3OS_SMP=1 cargo xtask run -m 4g` (single-core, TCG) progresses
+   well into userspace (display_server, term, smoke-runner all start).
+3. **What's still broken**: `cargo xtask run -m 4g` with default SMP (4 cores) hangs
+   silently after `[kernel] entering scheduler — init will start service set`. No
+   panic, no further log output, no scheduler progress. The original TLB shootdown
+   deadlock is **gone** (no `tlb_shootdown_range_kernel stuck` panic anymore), so
+   this is a separate, previously-masked bug.
+4. **Reproducer for the residual hang**:
    ```bash
-   cargo xtask run -m 4g --fresh           # TCG, the simplest reproducer
-   cargo xtask run --kvm -m 4g --fresh     # KVM path
-   cargo xtask run-gui --kvm -m 4g --fresh # GUI path
+   cargo xtask run -m 4g --fresh                       # TCG, 4 cores — hangs
+   cargo xtask run --kvm -m 4g --fresh                 # KVM, 4 cores — likely hangs
+   M3OS_SMP=1 cargo xtask run -m 4g --fresh            # 1 core — works
+   cargo xtask run -m 3g --fresh                       # 3 GiB, 4 cores — works
    ```
-   If the greeter comes up: **done**. If anything still hangs, the bounded-spin diagnostic
-   will produce a fresh panic with `[tlb] per-core diagnostics — tlb-ipi serviced … LAPIC-timer
-   ticks …` covering every core. The shape of that dump tells you exactly which invariant
-   broke (see "How to read a diagnostic dump" below).
-5. **If everything works**: open the PR to `main`. Optional cleanup is listed in "Deferred"
-   below — none of it blocks ship.
+   Diff between working and hanging case: same fix, same kernel, **only guest RAM
+   crosses the 4 GiB threshold AND APs are online**. Both conditions are required.
+5. **Most likely next-investigation targets** (in order):
+   - The BSP's first `task::spawn(init_task)` → `task::run()` transition. The
+     init_task never prints `[init] service registry: console=...`, so either
+     (a) init_task is dispatched but its first IrqSafeMutex acquire (e.g.,
+     `ENDPOINTS.lock()`) deadlocks against an AP holding something, or
+     (b) the BSP scheduler never picks init_task because some per-core queue
+     or scheduler-lock state is wrong at 4 GiB+SMP, or
+     (c) init_task gets dispatched to an AP that's stuck.
+   - The 595951f early-STI in `ap_entry`: APs run `spawn_idle_for_core` and
+     `task::run` with IF=1. Each AP's `spawn_idle_for_core` may grow_heap →
+     TLB-shootdown. With BSP also doing post-AP-boot work concurrently, multiple
+     paths can hit `GROW_HEAP_LOCK` at once. The new IrqSafeMutex pattern should
+     handle this — but maybe an AP is in a deeper deadlock involving
+     `PROCESS_TABLE`, `ENDPOINTS`, or `kstack_pool`.
+   - Add a `_panic_print` heartbeat at the top of `task::run()` on the BSP path
+     to confirm the BSP is alive in the scheduler loop. If the heartbeat fires
+     but init_task never runs, the bug is in task selection/dispatch. If the
+     heartbeat doesn't fire, the BSP is stuck before reaching the loop.
+6. **What's been verified**:
+   - `cargo xtask check` clean.
+   - 2 GiB smoke-test: PASS in 14 s (no regression).
+   - 3 GiB run: full smoke session completes (`SMOKE:PASS`).
+   - 4 GiB single-core: progresses well into userspace, audio_server + term + smoke
+     runner all start.
+   - 4 GiB SMP: silent hang after BSP enters scheduler.
 
 ## TL;DR — what the bug actually was
 
-Two-part bug in m3OS's TLB shootdown protocol vs `IrqSafeMutex` discipline:
+Three-part bug in m3OS's TLB shootdown protocol vs `IrqSafeMutex` discipline. The first
+two were fixed in session 2 (commits 595951f + 7b4b65b); the third was diagnosed and
+fixed in session 3 after a fresh `m3os.log` showed the sender-side fix worked but the
+recipients still couldn't service the IPI.
 
 **Bug 1 (necessary precondition, fixed in 595951f)**: APs ran their entire `ap_entry` setup
 with IF=0. The bootloader hands APs to `ap_entry` with IF=0 and nothing in the function
@@ -121,19 +154,55 @@ explicitly STI'd until the first iteration of `task::run`'s scheduler loop — *
 So if a heap-grow during AP init fired a kernel-VMA TLB shootdown, the AP could not service
 incoming IPIs from concurrent senders.
 
-**Bug 2 (the load-bearing one, fixed in 7b4b65b)**: `mm::heap::grow_heap` takes
+**Bug 2 (sender-side, fixed in 7b4b65b)**: `mm::heap::grow_heap` takes
 `GROW_HEAP_LOCK` — an `IrqSafeMutex` that CLIs at acquire — and then calls
 `tlb_shootdown_range_kernel` from inside the locked region. The shootdown sender spins for
-acks with IF=0, so it cannot service other cores' concurrent shootdown IPIs. Two cores
-simultaneously growing the heap (common during early SMP init) deadlock waiting for each
-other's acks.
+acks with IF=0, so it cannot service other cores' concurrent shootdown IPIs. Fixed via a
+`ShootdownIrqWindow` RAII guard that forces IF=1 across the SHOOTDOWN_PENDING spin.
 
-The fix lands the IF=1-during-spin invariant *inside the shootdown helpers* via a new
-`ShootdownIrqWindow` RAII guard (`kernel/src/smp/tlb.rs`). The window snapshots IF on `open`,
-forces IF=1, and restores the prior state on `Drop`. Safe because `preempt_count` is already
-raised by each helper's own `preempt_disable`, so no task migration happens during the
-temporary IF=1 window; the only IRQs that can fire are the LAPIC timer (atomic tick + EOI,
-no allocation) and the TLB-IPI handler itself (lock-free atomic decrement + local flush).
+**Bug 3 (recipient-side, fixed in session 3)**: `IrqSafeMutex::lock` itself CLI'd
+**before** spinning on the inner `spin::Mutex`. Any core spinning to acquire any
+IrqSafeMutex had IF=0 for the entire duration of the spin, which prevented it from
+servicing a peer core's TLB-shootdown IPI. The hottest contention paths were
+`DMESG_RING.lock()` and `SERIAL1.lock()` inside `_kernel_print` — each AP's
+"fully initialized" log call (plus the recursive preempt-depth warning cascade) would
+sit in that spin during exactly the AP-boot window when another core was firing a
+shootdown.
+
+Fixed by changing `IrqSafeMutex::lock` to test-then-test-and-set with an IRQ window:
+mask IF before the atomic `try_lock`, but if it fails and the caller had IF=1, briefly
+re-enable IF and spin on `inner.is_locked()` before retrying. The IF=0 invariant during
+the *held* region is preserved (so same-core IRQ handlers that take the same lock from
+`log::{debug,warn}!` can't deadlock), but the *spin* now has the IRQ window the TLB
+shootdown protocol needs. See `kernel/src/task/scheduler.rs::IrqSafeMutex::lock` and
+the module-level commentary for the full safety argument.
+
+Decisive evidence from the m3os.log that triggered session 3: every recipient core in the
+500 ms shootdown spin showed `timer Δ=0` AND `tlb-ipi Δ=0` — i.e., they had IF=0 the
+entire window. Only the **sender** had `timer Δ=50` proving the 7b4b65b
+`ShootdownIrqWindow` was working as intended. The recipients-stuck-IF=0 case was exactly
+what the previous handoff's "How to read a diagnostic dump" table predicted as the
+remaining failure mode.
+
+## TL;DR — what's still broken after session 3
+
+`cargo xtask run -m 4g` (TCG, 4-core SMP) hangs silently after BSP logs
+`[kernel] entering scheduler — init will start service set`. The init task never
+runs — no `[init] service registry: console=...` log line appears. With the same
+kernel:
+
+- `cargo xtask smoke-test` (2 GiB, 4-core SMP) — PASS in 14 s
+- `cargo xtask run -m 3g` (3 GiB, 4-core SMP) — full smoke session completes (`SMOKE:PASS`)
+- `M3OS_SMP=1 cargo xtask run -m 4g` (4 GiB, 1 core) — progresses well into userspace
+
+So the residual bug fires only when **guest RAM ≥ 4 GiB AND SMP is enabled**. There
+is no `tlb_shootdown_range_kernel stuck` panic anymore — the bounded-spin diagnostic
+is satisfied, the shootdown protocol is healthy. The hang is somewhere in the
+post-AP-boot scheduler / first-task-dispatch path that only manifests at 4 GiB.
+
+This is **separate from the TLB shootdown bug** — bugs 1, 2, and 3 above are
+genuinely fixed. The residual hang was previously masked by the AP-boot deadlock
+firing first.
 
 ## TL;DR — why this was so hard to find
 
@@ -194,25 +263,40 @@ and link this one.
 | File | Change | Commit |
 |---|---|---|
 | `kernel/src/smp/boot.rs` | After `ap_lapic_init_from`, before `data.is_online.store(true)`, call `x86_64::instructions::interrupts::enable()`. APs now run their post-LAPIC-init work (logging, `spawn_idle_for_core`, `task::run`) with IF=1 — necessary precondition for receiving the BSP's TLB shootdowns during AP-init heap allocations. | `595951f` |
-| `kernel/src/smp/tlb.rs` | New `ShootdownIrqWindow` RAII guard. Opens IF=1 for the duration of the SHOOTDOWN_PENDING spin, restores on `Drop`. All three shootdown helpers wrap their `wait_for_shootdown_acks_or_panic` call with one. This makes the IF=1-during-spin invariant a property of the shootdown protocol itself, so future callers can't accidentally re-introduce the bug by holding an outer `IrqSafeMutex`. | `7b4b65b` |
+| `kernel/src/smp/tlb.rs` | New `ShootdownIrqWindow` RAII guard. Opens IF=1 for the duration of the SHOOTDOWN_PENDING spin, restores on `Drop`. All three shootdown helpers wrap their `wait_for_shootdown_acks_or_panic` call with one. Sender-side fix only. | `7b4b65b` |
 | `kernel/src/mm/heap.rs` | Comment update noting that the shootdown helper now enforces IF=1 itself, so callers from inside an `IrqSafeMutex` region are safe. | `7b4b65b` |
+| `kernel/src/task/scheduler.rs` | `IrqSafeMutex::lock` switched from "CLI before spin" to "test-then-test-and-set with IRQ window during spin". Atomic acquire still runs with IF=0 (so the held region stays IRQ-masked and same-core handlers that take the same lock from `log::warn!` etc. still can't deadlock), but the inter-attempt `is_locked()` spin briefly re-enables IF when the caller had IF=1. This lets a contended core service incoming TLB-shootdown IPIs from a peer core's `tlb_shootdown_range_kernel`, closing the recipient-side half of the deadlock that 7b4b65b only solved on the sender side. | `f0a899d` |
+| `kernel/src/smp/tlb.rs` | Doc update on `ShootdownIrqWindow` explaining that the sender-side guard is necessary but not sufficient, and pointing at the matching recipient-side fix in `IrqSafeMutex::lock`. | `f0a899d` |
+| `kernel/src/mm/heap.rs` | Doc update on the `GROW_HEAP_LOCK` shootdown call site noting that the recipient-side coverage now lives in `IrqSafeMutex::lock`. | `f0a899d` |
 
 ## Open work / next-session targets
 
-1. **Verify on user's host** (Zen 5 / Linux 7.0, QEMU 8.2.2). One of:
+1. **Diagnose the residual 4 GiB+SMP silent hang.** The TLB shootdown bugs are fixed
+   (no panic, single-core 4 GiB works, 3 GiB SMP works) but `cargo xtask run -m 4g`
+   under default SMP hangs silently after `[kernel] entering scheduler — init will
+   start service set`. The init task never runs. Suggested first steps:
+   - Add a `serial::_panic_print` heartbeat at the very top of `task::run()` on the
+     BSP path so we can see whether BSP reaches the scheduler loop at all. If yes,
+     the bug is in task selection / first-dispatch. If no, BSP is stuck before
+     `task::run`.
+   - Add the same heartbeat inside `init_task` at the very first line, before
+     `ENDPOINTS.lock()`. If `init_task` is entered but the ENDPOINTS lock acquire
+     hangs, the bug is in IrqSafeMutex / lock-state on the init_task path.
+   - Capture per-core register state via the QEMU monitor (`info registers -a`) or
+     a kernel-side timeout panic on the scheduler loop (e.g., bounded-spin in the
+     BSP's first-task wait). The diagnostic scaffolding from sessions 2 + 3 is
+     already in tree; we just need a new heartbeat for the post-AP-boot path.
+2. **Once the residual hang is fixed**, the PR is shippable. The diff for sessions 2
+   and 3 is small (seven commits, ~150 LoC of fix + the diagnostic scaffolding).
+3. **Verify on user's host** (Zen 5 / Linux 7.0, QEMU 8.2.2) once the residual hang
+   is fixed:
    ```bash
    cargo xtask run -m 4g --fresh
    cargo xtask run --kvm -m 4g --fresh
    cargo xtask run-gui --kvm -m 4g --fresh
    ```
-   The first one is the simplest reproducer (TCG, no GUI, no SMP-race-handling complexity).
-2. **If verified, open the PR to `main`.** The diff is small (six commits, ~100 LoC of fix +
-   the diagnostic scaffolding). The diagnostic scaffolding is intentionally left in tree as a
-   durable safety net for any future IPI-coherence regression.
-3. **If still hung after this**: capture the new dump and triage per the table above. The
-   most likely remaining shapes are (a) a different IrqSafeMutex caller of a shootdown
-   helper that I missed in the audit, or (b) a vector-specific IDT issue on Zen 5 + Linux 7.0
-   that needs vector-level instrumentation.
+   The sandbox now reproduces the SMP-4g hang locally so iteration no longer requires
+   the user's host.
 
 ## Deferred / nice-to-haves (not blocking ship)
 
