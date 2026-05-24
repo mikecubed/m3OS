@@ -258,16 +258,55 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
     // `M3OS_MEM` env-var alias — matches the `-m`/`--memory` flag for CI
     // and tmux-session use where flag-plumbing is awkward. Flag wins if
     // both are set (handed to `extract_device_flags` first).
-    if devices.memory_mib.is_none() {
-        if let Some(spec) = std::env::var_os("M3OS_MEM") {
-            let spec = spec.to_string_lossy().into_owned();
-            if !spec.is_empty() {
-                devices.memory_mib = Some(parse_memory_spec(&spec)?);
-            }
-        }
-    }
+    apply_memory_env_fallback(&mut devices)?;
 
     Ok((devices, remaining))
+}
+
+/// Populate `devices.memory_mib` from `M3OS_MEM=` if no explicit flag set it.
+///
+/// Centralized so every QEMU launch path — including the smoke variants that
+/// have their own arg parsers and never call `extract_device_flags` — picks
+/// up the env-var override consistently. Called both from `extract_device_flags`
+/// (so the flag still wins) and from `qemu_args_with_devices_resolved` (catch-all
+/// for subcommands that build a `DeviceSet` without flag parsing). Idempotent:
+/// silently no-ops if `memory_mib` is already set.
+fn apply_memory_env_fallback(devices: &mut DeviceSet) -> Result<(), String> {
+    if devices.memory_mib.is_some() {
+        return Ok(());
+    }
+    if let Some(spec) = std::env::var_os("M3OS_MEM") {
+        let spec = spec.to_string_lossy().into_owned();
+        if !spec.is_empty() {
+            devices.memory_mib = Some(parse_memory_spec(&spec)?);
+        }
+    }
+    Ok(())
+}
+
+/// Parse an `-m <spec>` / `--memory <spec>` / `-m=<spec>` / `--memory=<spec>`
+/// argument out of the slice at `*index`, advancing the index past any consumed
+/// value. Returns `Ok(Some(mib))` if the current arg matched, `Ok(None)` if it
+/// didn't (caller should handle the arg via its own dispatch), and `Err(_)` on
+/// malformed input. Mirrors the parsing in `extract_device_flags` so the
+/// smoke / regression subcommand parsers can opt in to the same surface area
+/// without duplicating the suffix-stripping logic.
+fn try_take_memory_arg(args: &[String], index: &mut usize) -> Result<Option<u32>, String> {
+    let arg = &args[*index];
+    if arg == "-m" || arg == "--memory" {
+        *index += 1;
+        let spec = args
+            .get(*index)
+            .ok_or_else(|| format!("missing value for `{arg}`"))?;
+        return Ok(Some(parse_memory_spec(spec)?));
+    }
+    if let Some(spec) = arg
+        .strip_prefix("-m=")
+        .or_else(|| arg.strip_prefix("--memory="))
+    {
+        return Ok(Some(parse_memory_spec(spec)?));
+    }
+    Ok(None)
 }
 
 fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> {
@@ -682,7 +721,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet] [--skip-login]|run [--fresh] [--no-audio] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|run-gui [--fresh] [--no-audio] [--skip-login] [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|clean|check|fetch-fonts|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--features <list>|--features=<list>|-F <list>]... [--iommu] [--kvm] [-m <spec>|--memory <spec>] [--device nvme|e1000|audio]...|smoke-test [--display] [--timeout <secs>] [--kvm] [-m <spec>|--memory <spec>]|device-smoke --device nvme|e1000|audio [--iommu] [--kvm] [--timeout <secs>] [--display]|ssh-e1000-banner-check [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display] [-m <spec>|--memory <spec>]|audio-smoke [--timeout <secs>] [--display]|session-smoke [--timeout <secs>] [--display]|session-recover-smoke [--timeout <secs>] [--display]|session-restart-smoke [--timeout <secs>] [--display]|bell-smoke [--timeout <secs>] [--display]|tui-smoke [--timeout <secs>] [--display]|tui-app-smoke [--timeout <secs>] [--display]|less-render-probe [--timeout <secs>] [--out <dir>] [--keep-qemu]|termios-smoke [--timeout <secs>] [--display]|doom-audio-smoke [--timeout <secs>] [--display]|doom-concurrent-smoke [--timeout <secs>] [--display]|tiling-smoke [--timeout <secs>] [--display]|port build <name>|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|soak [--duration <Nh|Nm|Ns>] [--output-dir <path>] [--max-runs <N>] [--keep-pass-logs]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>\n\
      Note: --kvm requires /dev/kvm on the host (Linux + VT-x/AMD-V). Equivalent env var: M3OS_KVM=1. Expect ~10x speedup on CPU/syscall paths.\n\
      Memory: -m / --memory accepts `<N>g` / `<N>G` (GiB), `<N>m` / `<N>M` (MiB), or bare `<N>` (MiB). Min 256 MiB; default 2048. Examples: `-m 4g`, `-m=2048m`, `--memory 1024`. Env-var alias: M3OS_MEM=4g. >2 GiB under TCG triggers a slow-boot warning — pair with --kvm."
 }
@@ -2842,9 +2881,21 @@ fn qemu_args_with_devices_resolved(
     uefi_image: &Path,
     ovmf: &Path,
     display_mode: QemuDisplayMode,
-    devices: DeviceSet,
+    mut devices: DeviceSet,
     nvme_image: Option<&Path>,
 ) -> Vec<String> {
+    // Catch-all M3OS_MEM env-var fallback. `extract_device_flags` already
+    // applies this for `run` / `run-gui` / `test` / `device-smoke`, but the
+    // dedicated smoke parsers (audio-smoke, tui-smoke, regression, …) build
+    // a `DeviceSet` of their own without going through `extract_device_flags`.
+    // Centralizing the env-var check here means `M3OS_MEM=4g` works for
+    // every subcommand without needing per-parser plumbing.
+    if let Err(e) = apply_memory_env_fallback(&mut devices) {
+        // Match the loudness of the flag path — bad spec aborts the build
+        // rather than silently falling back to the default.
+        eprintln!("error parsing M3OS_MEM: {e}");
+        std::process::exit(1);
+    }
     // Phase 73 (4K follow-up): 2 GiB default. Doubles the previous
     // 1 GiB budget so the multi-term + workspace load at 4K has
     // headroom for many surface buffers + per-process heaps without
@@ -4118,6 +4169,7 @@ struct SmokeTestArgs {
     display: bool,
     timeout_secs: u64,
     kvm: bool,
+    memory_mib: Option<u32>,
 }
 
 fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
@@ -4131,9 +4183,15 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     // `M3OS_SMOKE_SKIP_TCC_COMPILE=1`.
     let mut timeout_secs = 300u64;
     let mut kvm = false;
+    let mut memory_mib: Option<u32> = None;
 
     let mut index = 0;
     while index < args.len() {
+        if let Some(mib) = try_take_memory_arg(args, &mut index)? {
+            memory_mib = Some(mib);
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--display" => display = true,
             "--kvm" => kvm = true,
@@ -4159,6 +4217,7 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
         display,
         timeout_secs,
         kvm,
+        memory_mib,
     })
 }
 
@@ -6407,6 +6466,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     };
     let mut devices = DeviceSet::default();
     devices.kvm = smoke_args.kvm;
+    devices.memory_mib = smoke_args.memory_mib;
     let mut args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, devices);
     // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
     for arg in args.iter_mut() {
@@ -13217,15 +13277,22 @@ struct RegressionArgs {
     test_name: Option<String>,
     timeout_secs: Option<u64>,
     display: bool,
+    memory_mib: Option<u32>,
 }
 
 fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
     let mut test_name = None;
     let mut timeout_secs = None;
     let mut display = false;
+    let mut memory_mib: Option<u32> = None;
     let mut index = 0;
 
     while index < args.len() {
+        if let Some(mib) = try_take_memory_arg(args, &mut index)? {
+            memory_mib = Some(mib);
+            index += 1;
+            continue;
+        }
         match args[index].as_str() {
             "--test" => {
                 index += 1;
@@ -13254,6 +13321,7 @@ fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
         test_name,
         timeout_secs,
         display,
+        memory_mib,
     })
 }
 
@@ -15102,7 +15170,14 @@ fn cmd_regression(args: &RegressionArgs) {
         }
 
         print!("  {}: ", test.name);
-        let result = run_regression_test(test, &uefi_image, &ovmf, timeout, args.display);
+        let result = run_regression_test(
+            test,
+            &uefi_image,
+            &ovmf,
+            timeout,
+            args.display,
+            args.memory_mib,
+        );
 
         match result {
             Ok(serial_log) => {
@@ -15149,16 +15224,25 @@ fn run_regression_test(
     ovmf: &Path,
     timeout_secs: u64,
     display: bool,
+    memory_mib: Option<u32>,
 ) -> Result<String, (String, String)> {
     let display_mode = if display {
         QemuDisplayMode::Gui
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = if test.devices == DeviceSet::default() {
+    // Apply the operator's `-m` / `--memory` override to whichever DeviceSet
+    // the test declared. When the override is `None`, the test's own
+    // DeviceSet (and the centralized `M3OS_MEM` fallback inside
+    // `qemu_args_with_devices_resolved`) determines the guest RAM size.
+    let mut devices = test.devices;
+    if memory_mib.is_some() {
+        devices.memory_mib = memory_mib;
+    }
+    let mut args = if devices == DeviceSet::default() {
         qemu_args(uefi_image, ovmf, display_mode)
     } else {
-        qemu_args_with_devices(uefi_image, ovmf, display_mode, test.devices)
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, devices)
     };
     // Strip hostfwd to avoid port conflicts.
     for arg in args.iter_mut() {
