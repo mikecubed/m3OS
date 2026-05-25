@@ -884,14 +884,12 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     // shootdown to a single IPI handshake instead of one per page.
     //
     // We hold `GROW_HEAP_LOCK` (an `IrqSafeMutex`) here, so IF is
-    // currently 0.  The shootdown helper enforces IF=1 for the duration
-    // of its handshake itself — see `tlb_shootdown_range_kernel`'s
-    // `ShootdownIrqWindow` — so the SENDER side is safe to call from
-    // inside an IrqSafeMutex region.  The matching RECIPIENT-side fix
-    // landed in `IrqSafeMutex::lock` (2026-05-24): cores spinning to
-    // acquire any other IrqSafeMutex now spin with IF=1, so they can
-    // service our shootdown IPI even mid-acquire.  See
-    // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+    // currently 0.  As of session 5 (2026-05-25) the shootdown is
+    // delivered via NMI rather than a Fixed-mode IPI, so recipient
+    // cores ack regardless of their IF state — this call is safe from
+    // any kernel context, including nested IrqSafeMutex regions.  See
+    // `arch::x86_64::interrupts::nmi_handler`, `smp::ipi::send_nmi`,
+    // and `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
     let flush_start = (HEAP_START + current_mapped) as u64;
     let flush_end = flush_start + bytes_mapped as u64;
     if crate::smp::is_per_core_ready() {

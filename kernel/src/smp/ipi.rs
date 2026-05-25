@@ -111,6 +111,31 @@ pub fn send_ipi(target_apic_id: u8, vector: u8) {
     }
 }
 
+/// Send a Non-Maskable Interrupt to a specific APIC ID.
+///
+/// NMI delivery mode (`100b` in ICR_LOW bits 8-10) bypasses the
+/// recipient's `IF` mask — the NMI fires even if the recipient is
+/// inside a CLI'd region. Used by `smp::tlb` to deliver TLB shootdown
+/// requests to cores that may be holding an `IrqSafeMutex` (which
+/// CLIs on acquire). The vector field is ignored for NMI delivery;
+/// the recipient's IDT entry for vector 2 (`non_maskable_interrupt`)
+/// handles the dispatch.
+///
+/// See `arch::x86_64::interrupts::nmi_handler` for the receiver-side
+/// implementation and `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`
+/// for the bug class this fix addresses.
+pub fn send_nmi(target_apic_id: u8) {
+    unsafe {
+        wait_icr_idle();
+        lapic_write(LAPIC_ICR_HIGH, (target_apic_id as u32) << 24);
+        // Delivery mode = NMI (100b) in bits 8:10 → 0x400.
+        // Destination shorthand = none (00) in bits 18:19.
+        // Vector is ignored for NMI delivery.
+        lapic_write(LAPIC_ICR_LOW, 0x0000_0400);
+        wait_icr_idle();
+    }
+}
+
 /// Send an IPI to all cores except the calling core.
 ///
 /// Uses the ICR shorthand "all excluding self" (bits 19:18 = 11).
@@ -140,5 +165,19 @@ pub fn send_ipi_to_core(core_id: u8, vector: u8) {
         && data.is_online.load(core::sync::atomic::Ordering::Acquire)
     {
         send_ipi(data.apic_id, vector);
+    }
+}
+
+/// Send an NMI to a specific logical core ID.
+///
+/// Looks up the core's APIC ID from the per-core data table and delegates
+/// to [`send_nmi`]. Returns without sending if the core ID is invalid or
+/// the core is not yet online. Used by `smp::tlb` to deliver shootdowns
+/// to cores by logical id.
+pub fn send_nmi_to_core(core_id: u8) {
+    if let Some(data) = super::get_core_data(core_id)
+        && data.is_online.load(core::sync::atomic::Ordering::Acquire)
+    {
+        send_nmi(data.apic_id);
     }
 }

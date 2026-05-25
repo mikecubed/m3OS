@@ -637,6 +637,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
+    // NMI (vector 2) — used as the cross-core TLB shootdown delivery
+    // mechanism. NMI fires regardless of IF, so it bypasses the entire
+    // class of bug where a recipient core is CLI'd inside a nested
+    // IrqSafeMutex region and cannot service a Fixed-delivery IPI. See
+    // `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md` and the
+    // sender side in `smp::ipi::send_nmi` / `smp::tlb`.
+    idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
 
     // Hardware IRQs — timer and reschedule IPI use raw naked-asm entry stubs
     // (Phase 57d Track B) so they are installed via `set_handler_addr`.
@@ -2093,6 +2100,41 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(stack_frame: InterruptStackF
     crate::smp::tlb::handle_tlb_shootdown_ipi();
     super::apic::lapic_eoi();
     assert_preempt_count_zero_on_return_to_user(&stack_frame);
+}
+
+/// NMI handler — services TLB shootdown requests via NMI delivery.
+///
+/// # Why NMI for TLB shootdown
+///
+/// Cross-core TLB shootdown was previously delivered as a Fixed-mode IPI
+/// (vector 0xFD). Fixed IPIs are masked by `IF=0`, so a recipient core
+/// inside any IrqSafeMutex region (which CLIs on acquire) could not
+/// service the shootdown. When that recipient was itself the sender of
+/// another shootdown — or contended on a different IrqSafeMutex nested
+/// inside an outer one — the shootdown spin would deadlock for 500 ms
+/// and panic. Diagnosed across sessions 2-4 in
+/// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+///
+/// NMI delivery bypasses `IF` entirely. The recipient services the
+/// shootdown regardless of what kernel section it is inside. This
+/// eliminates the entire class of "nested IrqSafeMutex → no ack"
+/// failures.
+///
+/// # Safety / re-entry
+///
+/// The handler body must do only operations that are safe to perform
+/// in any kernel context — no locks, no allocation, no logging
+/// (`log::warn!` would re-enter through DMESG_RING). `handle_tlb_shootdown_ipi`
+/// satisfies this: atomic counter bumps + `invlpg` / `CR3` reload only.
+///
+/// `gs_base` is safe to read because m3OS sets both `gs_base` and
+/// `kernel_gs_base` to the same per-core data pointer and never
+/// `swapgs`'s — the value is valid in any context.
+///
+/// NMI does **not** require `lapic_eoi()` — NMI is delivered out of
+/// band of the LAPIC ISR/IRR machinery.
+extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    crate::smp::tlb::handle_tlb_shootdown_ipi();
 }
 
 /// Allocator-local cache drain IPI handler (vector 0xFC).
