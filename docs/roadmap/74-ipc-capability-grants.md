@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-74
-**Depends on:** Phase 6 (IPC Core) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅
+**Depends on:** Phase 6 (IPC Core) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 57a (Scheduler Rewrite) ✅
 **Builds on:** Closes the "deferred to Phase 7+" IPC capability-grant and bulk-transfer items opened in Phase 6, using the IOMMU substrate from Phase 55a as the zero-copy transport where present
 **Primary Components:** `kernel/src/ipc/mod.rs`, `kernel/src/mm/`, `kernel/src/syscall/`, `userspace/syscall-lib`
 

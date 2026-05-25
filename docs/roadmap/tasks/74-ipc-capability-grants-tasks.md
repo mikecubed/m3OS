@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-74
-**Depends on:** Phase 6 (IPC Core) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 57a (Scheduler Rewrite) ✅
+**Depends on:** Phase 6 (IPC Core) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 57a (Scheduler Rewrite) ✅
 **Goal:** Close four IPC deferrals accumulated since Phase 6: capability handles in IPC messages, page-grant zero-copy bulk transfer, per-call IPC timeouts, and many-to-one notification binding.
 
 ## Track Layout
@@ -181,8 +181,8 @@
 ### E.2 — Update Phase 6, Phase 50, and Phase 55c design docs
 
 **Files:**
-- `docs/roadmap/06-ipc-core.md` (or equivalent)
-- `docs/roadmap/50-capability-system.md` (or equivalent)
+- `docs/roadmap/06-ipc-core.md`
+- `docs/roadmap/50-ipc-completion.md`
 - `docs/roadmap/55c-ring-3-driver-correctness-closure.md`
 
 **Symbol:** N/A
@@ -218,8 +218,6 @@
 - [ ] `map_client_audio_buffer` accepts a page-grant for a PCM ring buffer from the client
 - [ ] The DMA descriptor in the AC'97 driver points directly at the transferred pages
 - [ ] Audio playback quality is unchanged after the migration
-
----
 
 ---
 
