@@ -47,7 +47,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::{
-    Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB,
+    Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
+    mapper::TranslateResult,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -223,6 +224,21 @@ pub fn with_grant<R>(id: GrantId, f: impl FnOnce(&mut PageGrant) -> R) -> Option
         .and_then(|slot| slot.as_mut().map(f))
 }
 
+/// Read the grant's frame list without consuming the registry entry or
+/// releasing the per-frame pins. Used by [`sys_page_grant_recv`] to walk
+/// the page-table mapping side first, so [`consume`] only runs once the
+/// mapping has fully landed and the syscall is committed.
+///
+/// Returns `None` if `id` is invalid or the grant has already been
+/// consumed.
+pub fn peek_grant_frames(id: GrantId) -> Option<Vec<u64>> {
+    let reg = GRANT_REGISTRY.lock();
+    reg.get(id.0 as usize)?
+        .as_ref()
+        .filter(|g| !g.consumed)
+        .map(|g| g.frames.clone())
+}
+
 /// Consume the grant, removing it from the registry and returning the
 /// owned object so the receiver can map its frames into the new address
 /// space. A `None` result indicates the grant id has already been
@@ -300,13 +316,33 @@ pub fn sys_page_grant_send(sender: TaskId, pages_vaddr: u64, n_pages: u64) -> u6
     };
 
     let mut frames: Vec<u64> = Vec::with_capacity(n_pages);
+    // Per-page original PTE flags captured in Phase A0 (pre-walk). The
+    // rollback path uses these to restore each prefix page with its
+    // exact prior permissions instead of a fixed
+    // PRESENT|WRITABLE|USER_ACCESSIBLE|NO_EXECUTE set — that hardcoded
+    // set could silently change read-only or executable mappings into
+    // writable/NX ones when a grant range crossed an unmapped page.
+    let mut orig_flags: Vec<PageTableFlags> = Vec::with_capacity(n_pages);
 
     // SAFETY: cr3_frame names the sender's PML4. No other OffsetPageTable
     // over the same frame is alive on this core (we drop `mapper` before
     // any syscall path can re-enter).
     let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
 
-    // Phase A: walk + unmap. On error, restore the prefix.
+    // Phase A0: pre-walk to verify every page is mapped and snapshot its
+    // PTE flags before any unmap mutates the page table. If any page in
+    // the requested range is unmapped, reject the whole call with no
+    // side effects — the sender observes the failure as a pure no-op.
+    for i in 0..n_pages {
+        let vaddr = pages_vaddr + (i as u64) * 4096;
+        match mapper.translate(VirtAddr::new(vaddr)) {
+            TranslateResult::Mapped { flags, .. } => orig_flags.push(flags),
+            _ => return u64::MAX,
+        }
+    }
+
+    // Phase A: walk + unmap. On error, restore the prefix using the
+    // per-page flags captured in Phase A0.
     for i in 0..n_pages {
         let vaddr = pages_vaddr + (i as u64) * 4096;
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(vaddr));
@@ -316,11 +352,8 @@ pub fn sys_page_grant_send(sender: TaskId, pages_vaddr: u64, n_pages: u64) -> u6
                 frames.push(frame.start_address().as_u64() / 4096);
             }
             Err(_) => {
-                // Restore prefix: re-map every PFN already extracted.
-                let flags = PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_EXECUTE;
+                // Restore prefix: re-map every PFN already extracted
+                // with its original PTE flag set.
                 let mut alloc = GlobalFrameAlloc;
                 for (j, &pfn) in frames.iter().enumerate() {
                     let restore_addr = pages_vaddr + (j as u64) * 4096;
@@ -332,9 +365,10 @@ pub fn sys_page_grant_send(sender: TaskId, pages_vaddr: u64, n_pages: u64) -> u6
                         Ok(f) => f,
                         Err(_) => continue,
                     };
-                    // SAFETY: restoring a mapping the kernel just removed; the
-                    // restored entry uses the same flags as the original
-                    // user-rw-anonymous-mapping flags.
+                    let flags = orig_flags[j];
+                    // SAFETY: restoring a mapping the kernel just removed
+                    // with the exact PTE flags captured in Phase A0; no
+                    // permission widening or executable-bit flipping.
                     if let Ok(flush) =
                         unsafe { mapper.map_to(restore_page, restore_frame, flags, &mut alloc) }
                     {
@@ -476,19 +510,13 @@ pub fn iommu_remap_grant(receiver_pid: u32, frames: &[u64]) -> Result<(), &'stat
 /// `u64::MAX` on any error (invalid handle, double-consume, no free VA,
 /// page-table walk failure).
 pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
-    // Validate cap type before consuming the grant.
+    // Validate cap type — peek only; we do not remove the cap or
+    // consume the grant until the page-table mapping has fully landed.
+    // Until then, any early-error path leaves the cap + grant in their
+    // pre-call state so the caller can retry.
     let grant_id = match crate::task::scheduler::task_cap(receiver, grant_cap) {
         Ok(Capability::PageGrant { grant_id }) => GrantId(grant_id),
         _ => return u64::MAX,
-    };
-
-    // Drop the cap so a retried call cannot double-consume even if the
-    // page-table side fails. Matches the one-shot semantics of `Reply`.
-    let _ = crate::task::scheduler::remove_task_cap(receiver, grant_cap);
-
-    let grant = match consume(grant_id) {
-        Some(g) => g,
-        None => return u64::MAX,
     };
 
     let pid = match crate::task::scheduler::pid_for_task_id(receiver) {
@@ -504,11 +532,20 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
         Err(_) => return u64::MAX,
     };
 
-    let n_pages = grant.n_pages();
+    // Read the frame list without consuming the registry slot or
+    // releasing the per-frame pins. Both are released by the [`consume`]
+    // call at the bottom of the function, only on the success path.
+    let frames = match peek_grant_frames(grant_id) {
+        Some(f) => f,
+        None => return u64::MAX,
+    };
+
+    let n_pages = frames.len();
     let bytes = (n_pages as u64) * 4096;
 
     // Reserve a fresh user VA range via the process's mmap bump
-    // pointer. Mirrors `device_host::reserve_user_va_for_pid`.
+    // pointer. Mirrors `device_host::reserve_user_va_for_pid`. On VA
+    // exhaustion the grant + cap are untouched, so the caller may retry.
     let base = match reserve_user_va(pid, bytes) {
         Some(v) => v,
         None => return u64::MAX,
@@ -524,7 +561,7 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
     let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
     let mut alloc = GlobalFrameAlloc;
 
-    for (i, &pfn) in grant.frames.iter().enumerate() {
+    for (i, &pfn) in frames.iter().enumerate() {
         let vaddr = base + (i as u64) * 4096;
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(vaddr));
         let frame = match PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(pfn * 4096)) {
@@ -535,8 +572,8 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
             }
         };
         // SAFETY: the destination VA was just reserved from mmap_next
-        // and is not mapped; the frame came from the consumed grant and
-        // is not aliased.
+        // and is not mapped; the frame came from the peeked grant and
+        // is still pinned (consume runs at the bottom of this function).
         match unsafe { mapper.map_to(page, frame, flags, &mut alloc) } {
             Ok(flush) => flush.flush(),
             Err(_) => {
@@ -551,7 +588,14 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
     // is identity-fallback (see `iommu_remap_grant`); a future
     // hardening pass that wires per-domain IOVA mapping can hook the
     // same call site without changing the syscall ABI.
-    let _ = iommu_remap_grant(pid, &grant.frames);
+    let _ = iommu_remap_grant(pid, &frames);
+
+    // Mapping landed end-to-end. Now (and only now) consume the grant —
+    // dropping the registry entry and releasing the per-frame pins — and
+    // remove the one-shot capability from the receiver's cap table. Any
+    // earlier failure leaves both intact so the caller can retry.
+    let _ = consume(grant_id);
+    let _ = crate::task::scheduler::remove_task_cap(receiver, grant_cap);
 
     base
 }

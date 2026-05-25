@@ -1,6 +1,6 @@
 # Phase 74 — IPC Capability Grants and Bulk Transfers: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-74
 **Depends on:** Phase 6 (IPC Core) ✅, Phase 55a (IOMMU Substrate) ✅, Phase 55b (Ring-3 Driver Host) ✅, Phase 55c (Ring-3 Driver Correctness Closure) ✅, Phase 57a (Scheduler Rewrite) ✅
 **Goal:** Close four IPC deferrals accumulated since Phase 6: capability handles in IPC messages, page-grant zero-copy bulk transfer, per-call IPC timeouts, and many-to-one notification binding.
@@ -10,7 +10,7 @@
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
 | A | `sys_cap_grant` surface — capability slots in IPC messages | Phase 6 ✅ | Complete |
-| B | Page-grant bulk transfer and frame-allocator epoch tracking | Phase 55a ✅, A | Complete (per-frame allocator epoch hook is a documented future hardening) |
+| B | Page-grant bulk transfer and frame-allocator epoch tracking | Phase 55a ✅, A | Complete (per-frame allocator grant-epoch hook landed in `mm::frame_allocator::free_frame` and is counted in `GRANTED_FREE_REFUSALS`) |
 | C | IPC timeouts (`ipc_call_timeout`, `ipc_recv_timeout`) | Phase 57a ✅ | Complete |
 | D | Many-to-one notification binding (`sys_notif_bind`) | Phase 55c ✅ | Complete |
 | E | Documentation updates and deferral comment removal | A–D | Complete |

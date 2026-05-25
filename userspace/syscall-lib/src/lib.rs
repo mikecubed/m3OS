@@ -465,13 +465,17 @@ pub const CAP_SLOTS_PER_MSG: usize = 2;
 /// IPC message data: label, 4 u64 words, plus the Phase 74 cap-slot fields.
 ///
 /// The Phase 74 fields ([`IpcMessage::cap_slots`] / [`IpcMessage::n_caps`])
-/// are placed at the **end** of the struct so the byte layout of the
-/// pre-Phase-74 header (label + data) is unchanged. Existing kernel
-/// syscalls that emit the 40-byte header (`ipc_recv_msg`,
-/// `ipc_try_recv_msg`, `ipc_reply_recv_msg`) leave the cap-slot bytes
-/// untouched — callers that do not opt into the new cap-aware syscalls
-/// continue to observe `n_caps = 0` (the Default), which the kernel
-/// treats as "no caps to transfer".
+/// are placed at the **end** of the struct so the offsets of the pre-Phase-74
+/// fields (label + data) are unchanged. Every kernel recv-shaped syscall —
+/// `ipc_recv_msg` (`0x110E`), `ipc_try_recv_msg` (`0x1113`),
+/// `ipc_reply_recv_msg` (`0x110F`), and the new cap-aware
+/// `ipc_recv_with_caps` (`0x1118`) — emits the full 56-byte
+/// `build_cap_msg_wire` header (label + 4 data words + cap_slots + n_caps +
+/// padding). When a sender attaches no capabilities the kernel still writes
+/// the trailing cap-slot bytes, but with `n_caps = 0` and `cap_slots = [0;
+/// 2]`, so legacy callers observe identical end-to-end behaviour to the
+/// pre-Phase-74 wire (the kernel treats `n_caps == 0` as "no caps to
+/// transfer" and never inserts handles into the receiver's cap table).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IpcMessage {
@@ -1038,48 +1042,40 @@ pub fn ipc_recv_with_caps(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u
 // Phase 74 Track C.3 — IPC timeout wrappers
 // ===========================================================================
 
-/// Phase 74 Track C.3 — call an endpoint with a timeout.
+/// Phase 74 Track C.3 — call an endpoint with an absolute deadline.
 ///
-/// `timeout_ns` is a **relative** timeout in nanoseconds. Internally, the
-/// kernel uses an absolute CLOCK_MONOTONIC deadline; this wrapper does the
-/// relative→absolute conversion by reading the current monotonic clock and
-/// adding `timeout_ns`. A `timeout_ns == 0` value returns `NEG_ETIMEDOUT`
-/// (-110 cast to u64) immediately if no receiver is already queued —
-/// matching Linux's `clock_nanosleep(TIMER_ABSTIME)` zero-deadline
-/// semantics.
+/// `deadline_ns` is an **absolute** CLOCK_MONOTONIC deadline in nanoseconds
+/// since boot, matching the kernel ABI (`SYS_IPC_CALL_TIMEOUT`) and Linux's
+/// `clock_nanosleep(TIMER_ABSTIME)` semantics. A deadline that has already
+/// passed (including `0`) returns `NEG_ETIMEDOUT` (-110 cast to `u64`)
+/// immediately if no receiver is already queued.
+///
+/// To wait "at most N nanoseconds from now", read CLOCK_MONOTONIC and add
+/// the relative timeout yourself before calling. Phase 74 does not provide a
+/// bundled relative-timeout helper; the choice keeps the wrapper a thin
+/// pass-through so deadline computation lives in a single place per caller.
 ///
 /// **Note:** for a kernel BSP whose tick rate is 1 ms (`1 tick = 1 ms`),
-/// timeouts below 1_000_000 ns round down to 0 ticks, producing immediate
-/// timeout behaviour. Sub-millisecond IPC timeouts are not supported in
-/// Phase 74.
-pub fn ipc_call_timeout(ep_cap_handle: u32, label: u64, data0: u64, timeout_ns: u64) -> u64 {
-    // For Phase 74 we treat the user-supplied `timeout_ns` directly as
-    // the absolute deadline-nanoseconds value forwarded to the kernel.
-    // The kernel's `deadline_ns_to_ticks` converts ns → ticks; the
-    // returned `tick_count` is a count-since-boot, which `clock_gettime
-    // (CLOCK_MONOTONIC)` also reports in nanoseconds-since-boot. The
-    // identity `deadline_ticks = deadline_ns / NS_PER_TICK` therefore
-    // matches at the boot epoch on both sides without an extra
-    // userspace `clock_gettime` round-trip. Callers that want a
-    // "wait at most N ns from now" semantic should add the result of
-    // `clock_gettime` themselves; the kernel-side helper is absolute.
+/// the kernel rounds the absolute deadline down to tick granularity. Sub-
+/// millisecond IPC deadlines are not supported in Phase 74.
+pub fn ipc_call_timeout(ep_cap_handle: u32, label: u64, data0: u64, deadline_ns: u64) -> u64 {
     unsafe {
         syscall4(
             SYS_IPC_CALL_TIMEOUT,
             ep_cap_handle as u64,
             label,
             data0,
-            timeout_ns,
+            deadline_ns,
         )
     }
 }
 
-/// Phase 74 Track C.3 — receive on an endpoint with a timeout.
+/// Phase 74 Track C.3 — receive on an endpoint with an absolute deadline.
 ///
-/// `timeout_ns` shares the same absolute-CLOCK_MONOTONIC semantics as
+/// `deadline_ns` shares the same absolute-CLOCK_MONOTONIC semantics as
 /// [`ipc_call_timeout`].
-pub fn ipc_recv_timeout(ep_cap_handle: u32, timeout_ns: u64) -> u64 {
-    unsafe { syscall2(SYS_IPC_RECV_TIMEOUT, ep_cap_handle as u64, timeout_ns) }
+pub fn ipc_recv_timeout(ep_cap_handle: u32, deadline_ns: u64) -> u64 {
+    unsafe { syscall2(SYS_IPC_RECV_TIMEOUT, ep_cap_handle as u64, deadline_ns) }
 }
 
 // ===========================================================================

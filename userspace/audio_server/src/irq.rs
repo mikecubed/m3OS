@@ -372,9 +372,23 @@ pub fn run_io_loop(
                             let pcm_len = *len as usize;
                             let n_caps = frame.n_caps as usize;
                             let idx = *cap_slot_index as usize;
+                            // Require `n_pages == ceil(pcm_len / 4096)` so the
+                            // protocol fields are self-consistent and a client
+                            // cannot claim a larger page count than the PCM
+                            // payload actually needs. `sys_page_grant_recv`
+                            // does not report the actual mapped length, so the
+                            // server's only safe anchor is `pcm_len` itself;
+                            // bounding `n_pages` to the page count needed to
+                            // cover `pcm_len` prevents a malicious client from
+                            // tricking the server into computing
+                            // `mapped_bytes > kernel_mapping_size` and then
+                            // reading past the mapping.
+                            let required_pages = pcm_len.div_ceil(4096);
                             if streams.open.is_none() {
                                 DispatchOutcome::SubmitError(AudioError::InvalidArgument)
                             } else if idx >= n_caps {
+                                DispatchOutcome::SubmitError(AudioError::InvalidArgument)
+                            } else if *n_pages as usize != required_pages {
                                 DispatchOutcome::SubmitError(AudioError::InvalidArgument)
                             } else {
                                 let cap = frame.cap_slots[idx];
@@ -382,30 +396,22 @@ pub fn run_io_loop(
                                 if user_va == u64::MAX {
                                     DispatchOutcome::SubmitError(AudioError::Internal)
                                 } else {
-                                    let mapped_bytes = (*n_pages as usize).saturating_mul(4096);
-                                    if pcm_len > mapped_bytes {
-                                        DispatchOutcome::SubmitError(AudioError::InvalidArgument)
-                                    } else {
-                                        let stream_id =
-                                            streams.open.as_ref().map(|s| s.stream_id).unwrap_or(0);
-                                        // SAFETY: `sys_page_grant_recv`
-                                        // mapped `mapped_bytes` of
-                                        // user-accessible memory at
-                                        // `user_va`; we read `pcm_len`
-                                        // bytes which is bounded by the
-                                        // check above.
-                                        let pcm = unsafe {
-                                            core::slice::from_raw_parts(
-                                                user_va as *const u8,
-                                                pcm_len,
-                                            )
-                                        };
-                                        match streams.submit(backend, stream_id, pcm) {
-                                            Ok(_) => DispatchOutcome::SubmitAck {
-                                                frames_consumed: streams.stats().frames_consumed,
-                                            },
-                                            Err(e) => DispatchOutcome::SubmitError(e),
-                                        }
+                                    let stream_id =
+                                        streams.open.as_ref().map(|s| s.stream_id).unwrap_or(0);
+                                    // SAFETY: `sys_page_grant_recv` mapped
+                                    // exactly `required_pages * 4096` bytes
+                                    // (validated against `n_pages` above) at
+                                    // `user_va`; we read `pcm_len` bytes which
+                                    // is bounded by `required_pages * 4096`
+                                    // by construction of `required_pages`.
+                                    let pcm = unsafe {
+                                        core::slice::from_raw_parts(user_va as *const u8, pcm_len)
+                                    };
+                                    match streams.submit(backend, stream_id, pcm) {
+                                        Ok(_) => DispatchOutcome::SubmitAck {
+                                            frames_consumed: streams.stats().frames_consumed,
+                                        },
+                                        Err(e) => DispatchOutcome::SubmitError(e),
                                     }
                                 }
                             }

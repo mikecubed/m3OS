@@ -875,6 +875,22 @@ impl SurfaceRegistry {
                         buffer_id: *buffer_id,
                     });
                 }
+                // Reject mismatched `n_pages` *before* consuming the grant so a
+                // client that lied about the page count cannot trick the server
+                // into trusting a larger mapping than the kernel installed.
+                // `sys_page_grant_recv` does not report the actual mapped
+                // length, so the only safe anchor we have is the server-derived
+                // `byte_count` (= width × height × 4, both already bounded by
+                // `MAX_SURFACE_DIMENSION`). Requiring `n_pages == ceil(byte_count
+                // / 4096)` makes the protocol fields self-consistent.
+                let required_pages = byte_count.div_ceil(4096);
+                if *n_pages as usize != required_pages {
+                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                        width: *width,
+                        height: *height,
+                        buffer_id: *buffer_id,
+                    });
+                }
                 let user_va = syscall_lib::page_grant_recv(server_cap);
                 if user_va == u64::MAX {
                     syscall_lib::write_str(
@@ -888,15 +904,12 @@ impl SurfaceRegistry {
                         buffer_id: *buffer_id,
                     });
                 }
-                let len = (*n_pages as usize).saturating_mul(4096);
-                if len < byte_count {
-                    // n_pages * 4096 must cover the pixel byte count.
-                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
-                        width: *width,
-                        height: *height,
-                        buffer_id: *buffer_id,
-                    });
-                }
+                // `len` is now anchored to the server-derived pixel byte count,
+                // not the client-supplied `n_pages`. Subsequent `as_slice` /
+                // `snapshot` calls read at most `byte_count` bytes, which is
+                // guaranteed to fit inside the kernel-installed mapping
+                // because `required_pages * 4096 >= byte_count` by construction.
+                let len = byte_count;
                 syscall_lib::write_str(
                     syscall_lib::STDOUT_FILENO,
                     "display_server: AttachPageGrantBuffer mapped cap=",
