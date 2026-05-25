@@ -132,15 +132,27 @@ pub trait FramebufferOwner {
     /// `true` means the backend's [`present`] swaps to a half that
     /// only contains pixels written since the *previous* present, not
     /// a true mirror of the front buffer (e.g. the VBE Y_OFFSET
-    /// page-flip path in `userspace/display_server/src/fb.rs`).
-    /// Compositors must avoid the cursor-only / delta-update fast
-    /// paths in that case — those rely on the back buffer carrying
-    /// the previous frame's content verbatim, which a page-flipped
-    /// half does not.
+    /// page-flip path in `userspace/display_server/src/fb.rs`). The
+    /// about-to-be-written half therefore last held *frame N-2*'s
+    /// content, so a naive delta blit would leave stale pixels from
+    /// two frames ago anywhere the current frame's damage does not
+    /// cover.
+    ///
+    /// The compositor handles this by applying the **buffer-age**
+    /// technique (standard double-buffered Wayland / X compositors
+    /// implement this via `EGL_EXT_buffer_age`): it tracks the
+    /// previous frame's damage and, when this hint is `true`, unions
+    /// it into the current frame's repaint region. That keeps the
+    /// cursor-only and delta-update fast paths usable on flip backends
+    /// at the cost of one extra frame of damage history. The compose
+    /// pass in `userspace/display_server/src/compose.rs` consumes the
+    /// hint via `ComposeContext::prev_frame_damage`.
     ///
     /// Default `false` so every existing backend (the memcpy
     /// userspace double-buffer, the `RecordingFramebufferOwner` test
-    /// double) keeps its delta-update behaviour.
+    /// double) keeps its single-frame delta-update behaviour — its
+    /// back buffer is a true mirror of the front, so no historical
+    /// union is needed.
     fn needs_full_repaint_per_frame(&self) -> bool {
         false
     }

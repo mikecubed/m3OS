@@ -324,6 +324,19 @@ pub enum SurfaceShimError {
         shm_id: u32,
         buffer_id: BufferId,
     },
+    /// `AttachSharedBuffer` carried `width`/`height` whose
+    /// `width * height * 4` byte product overflows `usize` or exceeds
+    /// the compositor's per-surface dimension cap. Previously the byte
+    /// count was computed with `saturating_mul`, which silently produced
+    /// `usize::MAX` for absurd client inputs and then handed that length
+    /// to `from_raw_parts` / `Vec::with_capacity` over the SHM mapping
+    /// (potential UB / OOM). The dispatcher now rejects the attach
+    /// before any pointer math.
+    ShmDimensionsTooLarge {
+        width: u32,
+        height: u32,
+        buffer_id: BufferId,
+    },
 }
 
 impl From<LayerError> for SurfaceShimError {
@@ -594,9 +607,38 @@ impl SurfaceRegistry {
                 // working set is the union of every live surface's
                 // mappings, bounded by client behaviour rather than by
                 // a knob in the compositor.
-                let byte_count = (*width as usize)
-                    .saturating_mul(*height as usize)
-                    .saturating_mul(4);
+                // Compute the SHM byte count with checked arithmetic.
+                // Previously this was `saturating_mul`, which silently
+                // produced `usize::MAX` for absurd client-supplied
+                // `width`/`height` and then handed that length to
+                // `from_raw_parts` / `Vec::with_capacity` over the
+                // mapping (potential UB / OOM). Reject overflow and
+                // out-of-cap dimensions before any pointer math. The
+                // dimension cap is generous — 16384 in each axis
+                // covers every realistic display plus headroom — and
+                // exists strictly to keep the `width * height * 4`
+                // product well inside `usize`.
+                const MAX_SURFACE_DIMENSION: u32 = 16_384;
+                if *width > MAX_SURFACE_DIMENSION || *height > MAX_SURFACE_DIMENSION {
+                    return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                        width: *width,
+                        height: *height,
+                        buffer_id: *buffer_id,
+                    });
+                }
+                let byte_count = match (*width as usize)
+                    .checked_mul(*height as usize)
+                    .and_then(|wh| wh.checked_mul(4))
+                {
+                    Some(n) => n,
+                    None => {
+                        return Err(SurfaceShimError::ShmDimensionsTooLarge {
+                            width: *width,
+                            height: *height,
+                            buffer_id: *buffer_id,
+                        });
+                    }
+                };
                 let mapping = {
                     // Inspect the surface's existing entry first.
                     let existing = self

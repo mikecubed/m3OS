@@ -49,7 +49,18 @@ fn program_main(args: &[&str]) -> i32 {
             idx += 2;
             continue;
         }
-        let _ = positional.push(arg);
+        if positional.push(arg).is_err() {
+            // `positional` is a fixed-capacity `heapless::Vec<&str, 4>`;
+            // silently dropping the extra args would let `notify-send`
+            // run with the wrong TITLE/BODY (callers expect only the
+            // first two slots) so report the error instead of pretending
+            // it succeeded.
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "notify-send: too many positional arguments (max 4)\n",
+            );
+            return 1;
+        }
         idx += 1;
     }
     if positional.len() < 2 {

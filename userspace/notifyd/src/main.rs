@@ -72,8 +72,16 @@ fn program_main(_args: &[&str]) -> i32 {
     let ep = syscall_lib::create_endpoint();
     if ep != u64::MAX
         && let Ok(ep_u32) = u32::try_from(ep)
+        && syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME) == u64::MAX
     {
-        let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+        // Mirrors the singleton guard in launcher/lockscreen: a second
+        // notifyd would race for `/run/notifyd.sock` and double-deliver
+        // pop-ups when both managed to bind on different paths.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "notifyd: another instance is already running — exiting\n",
+        );
+        return 0;
     }
 
     let listen_fd = match open_listener() {

@@ -409,13 +409,19 @@ impl FramebufferOwner for KernelFramebufferOwner {
 
     fn needs_full_repaint_per_frame(&self) -> bool {
         // Flip mode swaps to a half that only contains pixels written
-        // since the previous present — partial-damage frames would
-        // leave stale content from two frames ago in any region the
-        // compositor didn't touch. Forcing a full repaint per frame
-        // keeps the visible half always-correct in exchange for ~8
-        // MiB of pixel writes per frame (cheap relative to the memcpy
-        // we just removed). Memcpy mode keeps the cursor-only fast
-        // path because its back buffer is a true mirror of the front.
+        // since the previous present — the about-to-be-written half
+        // last held frame N-2's content, so partial-damage frames
+        // would leave stale pixels from two frames ago anywhere the
+        // current frame's damage does not cover. The compositor
+        // handles this by tracking the previous frame's damage and
+        // unioning it into the current frame's repaint region (the
+        // buffer-age technique; see `ComposeContext::prev_frame_damage`
+        // in `compose.rs`). That keeps the cursor-only and delta-update
+        // fast paths usable on the flip backend at the cost of one
+        // extra frame of damage history — no full-screen repaint
+        // required. Memcpy mode returns `false` because its back buffer
+        // is a true mirror of the front, so single-frame delta damage
+        // is already always-correct.
         matches!(self.backend, Backend::Flip { .. })
     }
 

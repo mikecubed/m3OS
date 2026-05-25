@@ -281,11 +281,12 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                     Err(_) => {
                         // Recoverable surface-shim errors
                         // (UnknownSurface, DuplicateSurface, StateMachine,
-                        // PendingBulkIdMismatch). The protocol explicitly
-                        // allows the server to reply with an error message
-                        // rather than disconnect on these; Phase 56's
-                        // minimum behaviour is to log via the dispatcher
-                        // and let the client recover.
+                        // PendingBulkIdMismatch, ShmDimensionsTooLarge).
+                        // The protocol explicitly allows the server to
+                        // reply with an error message rather than
+                        // disconnect on these; Phase 56's minimum
+                        // behaviour is to log via the dispatcher and let
+                        // the client recover.
                     }
                 },
             },

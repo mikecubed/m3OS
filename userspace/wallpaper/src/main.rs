@@ -69,8 +69,17 @@ fn program_main(_args: &[&str]) -> i32 {
     let ep = syscall_lib::create_endpoint();
     if ep != u64::MAX
         && let Ok(ep_u32) = u32::try_from(ep)
+        && syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME) == u64::MAX
     {
-        let _ = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+        // Mirrors the singleton guard in launcher/lockscreen: a second
+        // wallpaper instance would create another Background-layer
+        // surface and waste an SHM mapping, so exit cleanly instead
+        // of silently running side-by-side with the first instance.
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "wallpaper: another instance is already running — exiting\n",
+        );
+        return 0;
     }
 
     let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGHUP as usize, handle_sighup);
