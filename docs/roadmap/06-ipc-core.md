@@ -99,6 +99,7 @@ the path used for IRQ delivery to userspace.
 
 ## Deferred Until Later
 
-- Large page-grant transfers
-- IPC timeouts and cancellation
-- Advanced scheduling policies around IPC
+- **Large page-grant transfers** — **closed in Phase 74** (`sys_page_grant_send` / `sys_page_grant_recv`, syscall numbers `0x1020` / `0x1021`). The `PageGrant` kernel object, monotonic grant-epoch in the frame allocator, and userspace `page_grant_send` / `page_grant_recv` wrappers all live in Phase 74's first cut; the page-table unmap + TLB shootdown + IOMMU remap path is a scoped follow-up tracked in `docs/74-ipc-capability-grants.md`.
+- **Capability grants via IPC messages** — **closed in Phase 74** (`Message::cap_slots` + `n_caps`, `sys_ipc_call_with_caps` / `sys_ipc_recv_with_caps`, syscall numbers `0x1117` / `0x1118`). Existing `sys_ipc_call` callers default to `n_caps = 0` and observe identical pre-Phase-74 behaviour.
+- **IPC timeouts and cancellation** — **closed in Phase 74** (`sys_ipc_call_timeout` / `sys_ipc_recv_timeout`, syscall numbers `0x1119` / `0x111A`). Delivered using the existing Phase 57a `block_current_until` deadline path with race-free endpoint-queue cleanup.
+- Advanced scheduling policies around IPC (remain deferred to a future phase).

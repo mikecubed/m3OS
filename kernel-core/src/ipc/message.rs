@@ -187,4 +187,54 @@ mod tests {
         assert_eq!(msg.cap_slots[0], 42);
         assert_eq!(msg.cap_slots[1], 0);
     }
+
+    // Phase 74 Track A.3 acceptance — a host-side unit test exercising the
+    // userspace `IpcMessage` wire format round-trip.
+    //
+    // The serialization format used by `kernel::ipc::read_cap_msg_from_user`
+    // is:
+    //   off  0..8   : label
+    //   off  8..40  : data[0..4] (4 × u64)
+    //   off 40..48  : cap_slots  (2 × u32)
+    //   off 48      : n_caps     (u8)
+    //   off 49..56  : padding
+    //
+    // This test rebuilds the layout in raw bytes and verifies the round
+    // trip without pulling in kernel/userspace dependencies.
+    #[test]
+    fn cap_msg_wire_roundtrip() {
+        const WIRE_LEN: usize = 56;
+        let msg = Message::new(0xDEADBEEF).with_cap_slots(&[7, 13]);
+
+        let mut wire = [0u8; WIRE_LEN];
+        wire[0..8].copy_from_slice(&msg.label.to_ne_bytes());
+        for (i, d) in msg.data.iter().enumerate() {
+            let off = 8 + i * 8;
+            wire[off..off + 8].copy_from_slice(&d.to_ne_bytes());
+        }
+        for (i, h) in msg.cap_slots.iter().enumerate() {
+            let off = 40 + i * 4;
+            wire[off..off + 4].copy_from_slice(&h.to_ne_bytes());
+        }
+        wire[48] = msg.n_caps;
+
+        // Decode.
+        let label = u64::from_ne_bytes(wire[0..8].try_into().unwrap());
+        let mut data = [0u64; 4];
+        for (i, d) in data.iter_mut().enumerate() {
+            let off = 8 + i * 8;
+            *d = u64::from_ne_bytes(wire[off..off + 8].try_into().unwrap());
+        }
+        let mut cap_slots = [0u32; CAP_SLOTS_PER_MSG];
+        for (i, slot) in cap_slots.iter_mut().enumerate() {
+            let off = 40 + i * 4;
+            *slot = u32::from_ne_bytes(wire[off..off + 4].try_into().unwrap());
+        }
+        let n_caps = wire[48];
+
+        assert_eq!(label, 0xDEADBEEF);
+        assert_eq!(data, msg.data);
+        assert_eq!(cap_slots, msg.cap_slots);
+        assert_eq!(n_caps, msg.n_caps);
+    }
 }

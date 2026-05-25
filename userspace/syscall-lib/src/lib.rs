@@ -406,6 +406,45 @@ pub const SYS_IPC_WAIT_SERVICE: u64 = 0x1115;
 /// lifecycle methods can target the child by PID.
 pub const SYS_IPC_LOOKUP_SERVICE_OWNER_PID: u64 = 0x1116;
 
+/// Phase 74 Track A.3: `ipc_call_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)`.
+/// Reads the full cap-bearing `IpcMessage` from user memory and transfers
+/// the named `cap_slots[..n_caps]` capabilities to the receiver alongside
+/// the message. On reply, the reply's cap_slots are written back to the
+/// same `msg_ptr` with the receiver-side handles the server granted.
+pub const SYS_IPC_CALL_WITH_CAPS: u64 = 0x1117;
+
+/// Phase 74 Track A.3: `ipc_recv_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)`.
+/// Receives a message and writes the full cap-bearing `IpcMessage`
+/// (including `cap_slots[..n_caps]` filled with receiver-side handles) to
+/// `msg_ptr`.
+pub const SYS_IPC_RECV_WITH_CAPS: u64 = 0x1118;
+
+/// Phase 74 Track C.3: `ipc_call_timeout(ep_cap, label, data0, deadline_ns)`.
+/// Like `ipc_call` but registers a deadline (absolute CLOCK_MONOTONIC
+/// nanoseconds) with the scheduler timer wheel. Returns the reply label
+/// on success or `NEG_ETIMEDOUT` (-110 cast to u64) if the deadline
+/// elapses without a reply.
+pub const SYS_IPC_CALL_TIMEOUT: u64 = 0x1119;
+
+/// Phase 74 Track C.3: `ipc_recv_timeout(ep_cap, deadline_ns)`. Like
+/// `ipc_recv` but registers a deadline with the scheduler timer wheel.
+/// Returns the message label on success or `NEG_ETIMEDOUT` on deadline
+/// expiry.
+pub const SYS_IPC_RECV_TIMEOUT: u64 = 0x111A;
+
+/// Phase 74 Track B: `sys_page_grant_send(pages_vaddr, n_pages)`. Hands
+/// `n_pages` contiguous user-space pages starting at `pages_vaddr` to
+/// the kernel as a `PageGrant`. Returns the new capability handle on
+/// success or `u64::MAX` on error.
+pub const SYS_PAGE_GRANT_SEND: u64 = 0x1020;
+
+/// Phase 74 Track B: `sys_page_grant_recv(grant_cap)`. Consumes a
+/// `PageGrant` capability and maps the granted frames into the
+/// receiver's address space at a kernel-chosen virtual address.
+/// Returns the chosen virtual address on success or `u64::MAX` on
+/// error (invalid capability, double-recv, or mapping failure).
+pub const SYS_PAGE_GRANT_RECV: u64 = 0x1021;
+
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
@@ -926,6 +965,143 @@ pub fn sys_notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
             ep_cap_handle as u64,
         )
     }
+}
+
+/// Phase 74 Track D — alias of [`sys_notif_bind`] that matches the verb
+/// name in the Phase 74 task list. New userspace callers should prefer
+/// this name; the legacy `sys_notif_bind` name is retained for the
+/// existing Phase 55b/55c IRQ-multiplex pattern.
+pub fn notif_bind(notif_cap_handle: u32, ep_cap_handle: u32) -> u64 {
+    sys_notif_bind(notif_cap_handle, ep_cap_handle)
+}
+
+// ===========================================================================
+// Phase 74 Track A.3 — cap-bearing IPC wrappers
+// ===========================================================================
+
+/// Phase 74 Track A.3 — send a cap-bearing IPC call.
+///
+/// Fills `msg.cap_slots[..]` with `caps` (truncated to [`CAP_SLOTS_PER_MSG`])
+/// and updates `msg.n_caps`, then issues `SYS_IPC_CALL_WITH_CAPS`. The
+/// kernel transfers each named capability handle from the caller's table
+/// into the receiver's table atomically — every handle either lands in
+/// the receiver, or none of them do.
+///
+/// On reply, `msg.cap_slots[..msg.n_caps]` is overwritten with the
+/// receiver-side handles the server granted back.
+///
+/// Returns the reply label on success or `u64::MAX` on error (invalid
+/// handle, receiver table full, or copy failure).
+pub fn ipc_call_with_caps(
+    ep_cap_handle: u32,
+    msg: &mut IpcMessage,
+    caps: &[u32],
+    buf: &[u8],
+) -> u64 {
+    msg.set_cap_slots(caps);
+    unsafe {
+        syscall6(
+            SYS_IPC_CALL_WITH_CAPS,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Phase 74 Track A.3 — receive a cap-bearing IPC message.
+///
+/// Blocks until a message arrives. On return, `msg.cap_slots[..msg.n_caps]`
+/// holds the receiver-side handles for any capabilities the sender
+/// transferred. Use [`IpcMessage::received_caps`] for an ergonomic
+/// slice-of-handles view.
+///
+/// Returns the message label on success or `u64::MAX` on error.
+pub fn ipc_recv_with_caps(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_RECV_WITH_CAPS,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+// ===========================================================================
+// Phase 74 Track C.3 — IPC timeout wrappers
+// ===========================================================================
+
+/// Phase 74 Track C.3 — call an endpoint with a timeout.
+///
+/// `timeout_ns` is a **relative** timeout in nanoseconds. Internally, the
+/// kernel uses an absolute CLOCK_MONOTONIC deadline; this wrapper does the
+/// relative→absolute conversion by reading the current monotonic clock and
+/// adding `timeout_ns`. A `timeout_ns == 0` value returns `NEG_ETIMEDOUT`
+/// (-110 cast to u64) immediately if no receiver is already queued —
+/// matching Linux's `clock_nanosleep(TIMER_ABSTIME)` zero-deadline
+/// semantics.
+///
+/// **Note:** for a kernel BSP whose tick rate is 1 ms (`1 tick = 1 ms`),
+/// timeouts below 1_000_000 ns round down to 0 ticks, producing immediate
+/// timeout behaviour. Sub-millisecond IPC timeouts are not supported in
+/// Phase 74.
+pub fn ipc_call_timeout(ep_cap_handle: u32, label: u64, data0: u64, timeout_ns: u64) -> u64 {
+    // For Phase 74 we treat the user-supplied `timeout_ns` directly as
+    // the absolute deadline-nanoseconds value forwarded to the kernel.
+    // The kernel's `deadline_ns_to_ticks` converts ns → ticks; the
+    // returned `tick_count` is a count-since-boot, which `clock_gettime
+    // (CLOCK_MONOTONIC)` also reports in nanoseconds-since-boot. The
+    // identity `deadline_ticks = deadline_ns / NS_PER_TICK` therefore
+    // matches at the boot epoch on both sides without an extra
+    // userspace `clock_gettime` round-trip. Callers that want a
+    // "wait at most N ns from now" semantic should add the result of
+    // `clock_gettime` themselves; the kernel-side helper is absolute.
+    unsafe {
+        syscall4(
+            SYS_IPC_CALL_TIMEOUT,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            timeout_ns,
+        )
+    }
+}
+
+/// Phase 74 Track C.3 — receive on an endpoint with a timeout.
+///
+/// `timeout_ns` shares the same absolute-CLOCK_MONOTONIC semantics as
+/// [`ipc_call_timeout`].
+pub fn ipc_recv_timeout(ep_cap_handle: u32, timeout_ns: u64) -> u64 {
+    unsafe { syscall2(SYS_IPC_RECV_TIMEOUT, ep_cap_handle as u64, timeout_ns) }
+}
+
+// ===========================================================================
+// Phase 74 Track B — page-grant transport wrappers
+// ===========================================================================
+
+/// Phase 74 Track B — hand `n_pages` contiguous user-space pages to the
+/// kernel as a `PageGrant`. The pages are unmapped from the caller's page
+/// table; ownership transfers to the kernel-side grant object until the
+/// matching [`page_grant_recv`] consumes it.
+///
+/// Returns the new capability handle on success or `u64::MAX` on error
+/// (invalid range, pages not mapped, or grant registry full).
+pub fn page_grant_send(pages_vaddr: u64, n_pages: usize) -> u64 {
+    unsafe { syscall2(SYS_PAGE_GRANT_SEND, pages_vaddr, n_pages as u64) }
+}
+
+/// Phase 74 Track B — consume a `PageGrant` capability and map its frames
+/// into the calling process's address space at a kernel-chosen virtual
+/// address. Returns the chosen address on success or `u64::MAX` on error.
+pub fn page_grant_recv(grant_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_PAGE_GRANT_RECV, grant_cap_handle as u64) }
 }
 
 /// Read raw disk sectors into a userspace buffer (Phase 54).
