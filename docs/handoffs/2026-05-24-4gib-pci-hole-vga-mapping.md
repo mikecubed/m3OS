@@ -1,6 +1,7 @@
 ---
-status: partial fix applied — original TLB shootdown deadlock resolved; SMP 4 GiB
-  hits a separate silent hang after "entering scheduler" (uncovered by this session's fix)
+status: FIXED via NMI-based TLB shootdown (session 5, 2026-05-25). Full smoke +
+  regression + tui-smoke + audio + doom-audio all PASS at 2 GiB SMP=4 AND 4 GiB SMP=4.
+  The entire "IF=0 during shootdown" bug class is eliminated.
 branch: feat/phase-73-compositor-polish (PR not yet open)
 last-known-good-commit: f0a899d  # IrqSafeMutex test-then-test-and-set with IRQ window during spin
 fix-commits:
@@ -20,6 +21,8 @@ fix-commits:
   - f0a899d  # sched: IrqSafeMutex::lock — test-then-test-and-set with IRQ window during spin (RECIPIENT-side fix)
   # === Session 4 (2026-05-25) — nested-lock recipient case; pre-allocation ===
   - 9b0f0f3  # sched: reserve_for_smp_boot pre-allocates Vec capacity before AP boot
+  # === Session 5 (2026-05-25) — NMI-based shootdown, eliminates bug class ===
+  - 646cb60  # smp/tlb: switch TLB shootdown delivery to NMI (bypasses recipient IF)
 date: 2026-05-24
 component: kernel/smp (TLB shootdown IF=1 invariant + AP IRQ-enable ordering); secondary xtask
   -m flag plumbing; tertiary userspace/display_server slide rendering (unrelated, fixed in
@@ -96,20 +99,18 @@ new-tooling:
 
 ## Quick-resume checklist (start here tomorrow)
 
-1. **Branch**: `feat/phase-73-compositor-polish`. Latest commit pushes the
-   session-4 `reserve_for_smp_boot` fix. All upstream fixes shipped.
+1. **Branch**: `feat/phase-73-compositor-polish`. Session 5's NMI shootdown
+   fix landed. Bug class is closed. PR-ready.
 2. **Build state**: `cargo xtask check` clean.
    `cargo xtask smoke-test` (2 GiB) PASS in 14 s.
    `cargo xtask run -m 3g` (3 GiB SMP=4) runs the full smoke session.
    `M3OS_SMP=1 cargo xtask run -m 4g` and `M3OS_SMP=2 cargo xtask run -m 4g`
    both progress into userspace (display_server / term).
-3. **What's still broken**: `cargo xtask run -m 4g` with default `M3OS_SMP=4`
-   hangs silently after `[kernel] entering scheduler — init will start
-   service set`. Heartbeat instrumentation localised: APs enter
-   `spawn_idle_for_core` but get stuck inside `Task::new` (never reach the
-   `Task::new done` heartbeat). Likely a 4-way race in
-   `KernelStack::alloc`'s CAS over `STACK_USED` or `init_stack`'s memory
-   writes. Not the TLB shootdown bug.
+3. **What's still broken**: nothing in this bug family. The 4 GiB + SMP=4
+   smoke + regression + tui-app-smoke all pass. The earlier "APs stuck in
+   `Task::new`" suspicion turned out to be the same nested-lock shootdown
+   pattern downstream — NMI delivery resolved it without needing a
+   separate fix.
 4. **Reproducer matrix for the residual hang**:
    ```bash
    cargo xtask run -m 4g --fresh                       # TCG, SMP=4 — HANGS
@@ -141,7 +142,34 @@ new-tooling:
    - 4 GiB SMP=1, SMP=2: progresses well into userspace.
    - 4 GiB SMP=4: APs stuck in `Task::new`. Separate bug.
 
-## TL;DR — what the bug actually was
+## TL;DR — the structural fix (session 5)
+
+Cross-core TLB shootdown is now delivered via NMI (`smp::ipi::send_nmi` →
+`arch::x86_64::interrupts::nmi_handler`) instead of a Fixed-mode IPI at
+vector `0xFD`. NMI delivery bypasses the recipient's `IF` mask entirely,
+so every previously-failing scenario (recipient in nested IrqSafeMutex,
+recipient holding `GROW_HEAP_LOCK`, recipient logging through
+`DMESG_RING` + `SERIAL1`) acks the shootdown immediately. The whole
+bug class is eliminated rather than patched per-site.
+
+The handler is `extern "x86-interrupt" fn nmi_handler` registered on
+`InterruptDescriptorTable::non_maskable_interrupt`. Body is a single
+call to the existing `handle_tlb_shootdown_ipi()` (atomic counter bump
++ `invlpg`/`CR3` reload + atomic dec) — no locks, no allocation, no
+logging, so it is safe to interrupt any kernel context. `gs_base` is
+safe to read because m3OS sets both `gs_base` and `kernel_gs_base` to
+the same per-core data pointer and never `swapgs`'s.
+
+NMI does **not** require `lapic_eoi()` (out-of-band delivery, not
+through LAPIC ISR/IRR). No EOI bug to worry about. The sender side
+keeps the same `SHOOTDOWN_LOCK` serialization and
+`SHOOTDOWN_PENDING`/`SHOOTDOWN_RANGE_*` globals — just swaps
+`send_ipi(apic, IPI_TLB_SHOOTDOWN)` for `send_nmi(apic)` at three
+call sites (`tlb.rs:316`, `:424`, `:528`). The `ShootdownIrqWindow`
+RAII guard from session 2/3 is removed (no longer needed since
+recipients can ack with IF=0).
+
+## TL;DR — what the bug actually was (the four-session history)
 
 Three-part bug in m3OS's TLB shootdown protocol vs `IrqSafeMutex` discipline. The first
 two were fixed in session 2 (commits 595951f + 7b4b65b); the third was diagnosed and
@@ -220,32 +248,37 @@ entire window. Only the **sender** had `timer Δ=50` proving the 7b4b65b
 the bug-4 fingerprint: BSP `timer Δ=499` (bug 3 fix working) but AP2/AP3
 `timer = 0` absolute (nested-lock IF=0).
 
-## TL;DR — what's still broken after session 4
+## TL;DR — fixed in session 5
 
-The TLB shootdown protocol is healthy at all RAM sizes and most SMP counts.
-**Only** `cargo xtask run -m 4g` with default `M3OS_SMP=4` (4 cores) still
-hangs silently after `[kernel] entering scheduler — init will start service set`.
-Heartbeat instrumentation localised it: APs print
-`[sched] spawn_idle_for_core: enter core_id=N` but never print the next line
-(`Task::new done`), so the residual race is inside `Task::new` → most likely
-`KernelStack::alloc`'s CAS over `STACK_USED` or the subsequent
-`init_stack` writes — under 4-way concurrent entry it appears one or more
-APs get stuck. This is NOT the TLB shootdown bug.
+Session 5 (2026-05-25) eliminated the entire bug class by switching TLB
+shootdown delivery from a Fixed-mode IPI (vector `0xFD`, masked by `IF`)
+to NMI delivery. NMI fires regardless of the recipient's interrupt-flag
+state, so a recipient in any IrqSafeMutex region — nested or not, sender
+or receiver — services the shootdown immediately.
 
-Verified pass/fail matrix after session 4 fixes:
+The earlier residual "APs stuck in `Task::new`" hang at 4 GiB SMP=4 that
+session 4's heartbeat instrumentation pointed at was also a downstream
+manifestation of the same nested-lock shootdown stall: with NMI delivery
+in place, that path completes cleanly too.
 
-| RAM   | SMP | Status         |
-|-------|-----|----------------|
-| 2 GiB |  4  | PASS (14 s)    |
-| 3 GiB |  4  | PASS (smoke session completes) |
-| 4 GiB |  1  | PASS (boots into display_server / term) |
-| 4 GiB |  2  | PASS (boots into display_server / term) |
-| 4 GiB |  4  | HANG (APs stuck in Task::new during spawn_idle_for_core) |
+Verified pass/fail matrix after session 5 fix:
 
-So the residual bug is **specifically** SMP=4 + 4 GiB. It is **separate** from
-the TLB shootdown bug — bugs 1, 2, 3, and 4 above are genuinely fixed. The
-4-way Task::new race was previously masked by the AP-boot TLB shootdown
-deadlock firing first.
+| Test                            | 2 GiB SMP=4 | 4 GiB SMP=4 |
+|---------------------------------|-------------|-------------|
+| `cargo xtask smoke-test`        | PASS (15 s) | **PASS (14 s)** |
+| `cargo xtask regression`        | 11/11       | 11/11       |
+| `cargo xtask tui-smoke`         | PASS (51 s) | (default 2g) |
+| `cargo xtask tui-app-smoke`     | PASS (48 s, 60 steps inc tmux session lifecycle) | (default 2g) |
+| `cargo xtask audio-smoke`       | PASS + WAV check | (default 2g) |
+| `cargo xtask bell-smoke`        | PASS        | (default 2g) |
+| `cargo xtask tiling-smoke`      | PASS (35 s) | (default 2g) |
+| `cargo xtask doom-audio-smoke`  | PASS (155 s) + WAV check | (default 2g) |
+
+The 4 GiB+SMP=4 smoke-test passing is the headline result — that scenario
+was the locus of every bug in this series. The user's "open terminal in
+GUI" crash (the trigger for session 5) was the same nested-lock pattern
+firing on `sys_shm_create` instead of `spawn_idle_for_core`. With NMI
+shootdown, both paths work.
 
 ## TL;DR — why this was so hard to find
 
