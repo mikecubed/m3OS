@@ -269,6 +269,12 @@ pub fn kernel_main_entry(boot_info: &'static mut BootInfo) -> ! {
     // Phase 25: Boot Application Processors.
     // Only if SMP was initialized and there are APs to boot.
     if smp::is_per_core_ready() && smp::core_count() > 1 {
+        // 2026-05-25 — pre-reserve scheduler Vec capacity + warm the slab
+        // caches before APs come online so that concurrent
+        // `spawn_idle_for_core` calls from APs cannot trigger
+        // `grow_heap` from inside `scheduler_lock`. See
+        // `task::scheduler::reserve_for_smp_boot` for the full rationale.
+        task::scheduler::reserve_for_smp_boot();
         smp::boot::boot_aps();
     }
 

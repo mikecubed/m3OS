@@ -548,6 +548,66 @@ impl core::ops::DerefMut for SchedulerGuard<'_> {
 
 static SCHEDULER_INNER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
 
+/// Pre-reserve `tasks` / `fpu_states` Vec capacity so that subsequent
+/// `Vec::push` calls inside `alloc_task_slot` cannot trigger `grow_heap`.
+///
+/// # Why
+///
+/// `alloc_task_slot` runs inside [`scheduler_lock`] (an `IrqSafeMutex`,
+/// IF=0 in the held region). When `sched.tasks.push` exceeds the current
+/// Vec capacity, the Vec reallocates via the global allocator; if the
+/// bootstrap heap is short on free space the allocator falls into
+/// `grow_heap` → `GROW_HEAP_LOCK.lock()` → `tlb_shootdown_range_kernel`.
+/// All of that runs with IF=0 inherited from the outer `scheduler_lock`,
+/// and the recipients of the shootdown — sibling APs that are themselves
+/// inside their own `spawn_idle_for_core` → `scheduler_lock` path — are
+/// also CLI'd and can't service the IPI. Result: shootdown timeout panic
+/// at 4 GiB guest RAM with 4-core SMP, as diagnosed in
+/// `docs/handoffs/2026-05-24-4gib-pci-hole-vga-mapping.md`.
+///
+/// Call this from BSP **before** [`crate::smp::boot::boot_aps`] so the
+/// Vec growth happens single-core (no IPI possible) and AP-boot pushes
+/// fit inside the pre-reserved capacity.
+///
+/// Capacity sized to fit the expected boot-time tasks: one idle per
+/// MAX_CORES + init + a small headroom. Userspace task spawns after
+/// boot run with IF=1 at the outer (syscall) frame, so a later
+/// realloc-triggered `grow_heap` from inside `scheduler_lock` is no
+/// longer a deadlock — the would-be recipient cores can service the IPI.
+pub fn reserve_for_smp_boot() {
+    let target = crate::smp::MAX_CORES + 16;
+    // Allocate the pre-sized Vec buffers **outside** the scheduler_lock so
+    // that any `grow_heap` triggered by the allocator runs in a top-level
+    // IF=1 context — not inside an IrqSafeMutex region where the
+    // resulting `tlb_shootdown_range_kernel` would broadcast IPIs that
+    // every other CLI'd core could not service.
+    let mut tasks_buf: Vec<crate::mm::slab_box::SlabBox<Task>> = Vec::with_capacity(target);
+    let mut fpu_buf: Vec<crate::mm::slab_box::SlabBox<XSaveArea>> = Vec::with_capacity(target);
+    let mut sched = scheduler_lock();
+    // Move any existing slots into the pre-sized buffers (preserving order
+    // — `pop` returns LIFO so we reverse). `Vec::pop` does not deallocate
+    // the original buffer; it is dropped when `sched.tasks` is replaced
+    // below, deferring that deallocation to outside the held region in
+    // principle — though in practice the original Vec was capacity 0 so
+    // there is nothing to free.
+    while let Some(t) = sched.tasks.pop() {
+        tasks_buf.push(t);
+    }
+    while let Some(f) = sched.fpu_states.pop() {
+        fpu_buf.push(f);
+    }
+    tasks_buf.reverse();
+    fpu_buf.reverse();
+    sched.tasks = tasks_buf;
+    sched.fpu_states = fpu_buf;
+    let tasks_cap = sched.tasks.capacity();
+    let fpu_cap = sched.fpu_states.capacity();
+    drop(sched);
+    log::info!(
+        "[sched] reserved boot capacity: tasks.cap={tasks_cap} fpu_states.cap={fpu_cap} (target={target})"
+    );
+}
+
 /// Acquire the global scheduler lock, setting the per-CPU `holds_scheduler_lock`
 /// flag for the Phase 57a B.3 lock-ordering assertion.
 ///
