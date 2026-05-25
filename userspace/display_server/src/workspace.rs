@@ -451,7 +451,7 @@ impl WorkspaceManager {
     }
 
     /// Phase 73 — same as [`arrange_current`], but subtracts full-edge
-    /// `exclusive_zones` (e.g. the status-bar's reserved 24px strip at
+    /// `exclusive_zones` (e.g. the status-bar's reserved 48px strip at
     /// the top of the output) from the output rect *before* applying
     /// outer gaps, so toplevels never overlap docked Layer-shell
     /// surfaces. Zones that don't tile a full edge are ignored — the

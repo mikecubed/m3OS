@@ -17,7 +17,7 @@ use core::alloc::Layout;
 use desktop_client::{DisplayConnection, SharedSurface, draw_text, fill, fill_rect, stroke_rect};
 use kernel_core::display::protocol::{BufferId, ServerMessage};
 use kernel_core::input::events::KeyEventKind;
-use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_ENTER, KEY_ESC};
+use kernel_core::input::keymap::{KEY_BACKSPACE, KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
@@ -134,6 +134,21 @@ fn program_main(_args: &[&str]) -> i32 {
                     filtered = filter(&candidates, &query);
                     selected = 0;
                     dirty = true;
+                    continue;
+                }
+                if kc == KEY_UP.0 {
+                    if !filtered.is_empty() && selected > 0 {
+                        selected -= 1;
+                        dirty = true;
+                    }
+                    continue;
+                }
+                if kc == KEY_DOWN.0 {
+                    let max_idx = filtered.len().min(MAX_VISIBLE).saturating_sub(1);
+                    if selected < max_idx {
+                        selected += 1;
+                        dirty = true;
+                    }
                     continue;
                 }
                 if let Some(ch) = char::from_u32(ev.symbol)
@@ -313,8 +328,6 @@ fn render(pixels: &mut [u32], query: &str, filtered: &[&String], selected: usize
         24,
         PROMPT_BG,
     );
-    let prompt = "▶ ";
-    let _ = prompt;
     draw_text(
         pixels, WIDTH_PX, HEIGHT_PX, 12, 8, "> ", FG_COLOR, PROMPT_BG,
     );

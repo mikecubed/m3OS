@@ -48,7 +48,13 @@ const PANEL_HEIGHT: u32 = 80;
 const PANEL_GAP: u32 = 8;
 const SERVICE_NAME: &str = "notifyd";
 
-const BG_COLOR: u32 = 0x00_00_00_00; // transparent surface fill
+// The compositor surface-blit path ignores BGRA alpha, so the
+// "transparent" semantic we'd prefer collapses to whatever the buffer
+// holds. We render the surface with an intentional opaque "stack
+// surround" colour so the inter-panel + below-panel region matches a
+// notification-tray look rather than accidentally displaying as
+// solid black.
+const BG_COLOR: u32 = 0xFF_18_18_1A;
 const PANEL_BG: u32 = 0xFF_22_22_2A;
 const PANEL_FG: u32 = 0xFF_E8_E8_E8;
 const PANEL_TITLE: u32 = 0xFF_FF_C8_60;
@@ -114,7 +120,6 @@ fn program_main(_args: &[&str]) -> i32 {
     // a buffer. Flipped to `true` only when a real notification is
     // accepted from the socket.
     let mut dirty = false;
-    let mut surface_attached = false;
     loop {
         // Drain any pending connections (listener is non-blocking).
         loop {
@@ -142,19 +147,17 @@ fn program_main(_args: &[&str]) -> i32 {
 
         if dirty {
             if notifications.is_empty() {
-                // Only worth committing the empty paint if the
-                // surface is already on screen — clears the panels.
-                // If we never attached, do nothing so the surface
-                // stays unmapped and invisible.
-                if surface_attached {
-                    fill(pixels, BG_COLOR);
-                    let _ =
-                        conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
-                }
+                // No fresh paint when the queue empties: committing
+                // an "empty" frame just reproduces the surround
+                // backdrop without panels, which still shows as a
+                // 360×420 opaque rectangle since compositor blits
+                // opaque. Leaving the previously-attached buffer in
+                // place is a smaller visual quirk (the last panels
+                // linger briefly) than reintroducing the top-right
+                // black/grey overlay on every drain.
             } else {
                 render(pixels, &notifications);
                 let _ = conn.attach_damage_commit(BUFFER_ID, surface.shm_id, WIDTH_PX, HEIGHT_PX);
-                surface_attached = true;
             }
             dirty = false;
         }
@@ -381,22 +384,30 @@ fn render(pixels: &mut [u32], notifications: &VecDeque<Notification>) {
             PANEL_TITLE,
             PANEL_BG,
         );
-        // Wrap long body lines crudely at 40 chars.
+        // Wrap long body lines at 40 characters per row. Iterate over
+        // `char_indices` so multi-byte UTF-8 codepoints are never
+        // split — a naive 40-byte chunk would corrupt non-ASCII
+        // bodies and silently drop lines via `from_utf8`.
         let mut line_y = y + 30;
-        let body_bytes = note.body.as_bytes();
-        let mut start = 0;
-        while start < body_bytes.len() {
-            let end = (start + 40).min(body_bytes.len());
-            if let Ok(s) = core::str::from_utf8(&body_bytes[start..end]) {
+        let body = note.body.as_str();
+        let mut line_start_byte = 0usize;
+        let mut chars_in_line = 0u32;
+        let mut iter = body.char_indices().peekable();
+        while let Some((idx, ch)) = iter.next() {
+            chars_in_line += 1;
+            let next_byte = idx + ch.len_utf8();
+            if chars_in_line >= 40 || iter.peek().is_none() {
+                let slice = &body[line_start_byte..next_byte];
                 draw_text(
-                    pixels, WIDTH_PX, HEIGHT_PX, 12, line_y, s, PANEL_FG, PANEL_BG,
+                    pixels, WIDTH_PX, HEIGHT_PX, 12, line_y, slice, PANEL_FG, PANEL_BG,
                 );
+                line_y += 16;
+                if line_y > y + (PANEL_HEIGHT as i32) - 12 {
+                    break;
+                }
+                line_start_byte = next_byte;
+                chars_in_line = 0;
             }
-            line_y += 16;
-            if line_y > y + (PANEL_HEIGHT as i32) - 12 {
-                break;
-            }
-            start = end;
         }
         y += PANEL_HEIGHT as i32 + PANEL_GAP as i32;
         if y > HEIGHT_PX as i32 {

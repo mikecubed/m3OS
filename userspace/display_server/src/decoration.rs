@@ -1,13 +1,15 @@
-//! Phase 73 Track B — Window decorations.
+//! Phase 73 Track B — Window decorations (pre-computed buffers only).
 //!
-//! Two CPU-side decorations the compose loop applies after the
-//! surface blit:
+//! Two CPU-side decoration buffers intended for the compose loop's
+//! post-blit pass. The buffers themselves land in this phase; the
+//! per-frame application pass (mask blend + shadow blit against the
+//! framebuffer) is deferred and documented in the PR description.
 //!
-//! * [`RoundedCornerMask`] — pre-computed alpha ramp painted over the
-//!   four corners of each Toplevel surface to round them off without
-//!   needing GPU shaders.
-//! * [`DropShadow`] — pre-computed alpha falloff buffer drawn behind a
-//!   Toplevel for a sense of depth.
+//! * [`RoundedCornerMask`] — pre-computed alpha ramp for the four
+//!   corners of a Toplevel surface, suitable for rounding them off
+//!   without GPU shaders once the apply pass lands.
+//! * [`DropShadow`] — pre-computed alpha falloff buffer that will be
+//!   drawn behind a Toplevel for a sense of depth.
 //!
 //! Both structures are configured from `[decorations]` in
 //! `/etc/compositor.conf`. A zero radius / zero blur disables the pass
@@ -42,7 +44,8 @@ impl DecorationConfig {
             shadow_blur: 12,
             shadow_offset_x: 0,
             shadow_offset_y: 4,
-            // Translucent black: pre-multiplied alpha BGRA.
+            // Translucent black, straight-alpha BGRA. The apply pass
+            // multiplies by the per-pixel alpha at blend time.
             shadow_color: 0x80_00_00_00,
         }
     }
@@ -192,7 +195,11 @@ pub struct DropShadow {
     pub height: u32,
     pub blur_radius: u32,
     pub color: u32,
-    /// Pre-multiplied BGRA8888 pixels (width × height).
+    /// Straight-alpha BGRA8888 pixels (width × height). The RGB
+    /// channels stay at the configured `color`'s RGB and only the
+    /// alpha channel varies with the falloff. The (future) apply
+    /// pass is responsible for multiplying by alpha before blending
+    /// into the framebuffer.
     pub pixels: Vec<u32>,
 }
 

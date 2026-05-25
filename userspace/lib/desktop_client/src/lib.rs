@@ -201,7 +201,15 @@ pub struct SharedSurface {
 
 impl SharedSurface {
     pub fn allocate(width: u32, height: u32) -> Option<Self> {
-        let byte_len = (width as usize) * (height as usize) * 4;
+        // Reject pathological dimensions and use checked arithmetic so
+        // a caller passing huge values can never advertise width/height
+        // in `AttachSharedBuffer` that overflows past the SHM mapping.
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return None;
+        }
+        let byte_len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         let shm_id = syscall_lib::shm_create(byte_len);
         if shm_id == 0 {
             return None;

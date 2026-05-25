@@ -2,7 +2,7 @@
 name = "lockscreen"
 version = "0.73.0"
 edition = "2024"
-description = "Phase 73 — lockscreen Layer-shell client stub"
+description = "Phase 73 — lockscreen Layer-shell client with /etc/shadow password authentication"
 
 [[bin]]
 name = "lockscreen"

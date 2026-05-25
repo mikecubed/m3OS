@@ -4,6 +4,13 @@
 //! path + fallback colour. Maps a full-output Layer surface at the
 //! Background layer so the picture sits behind every tiled window.
 //!
+//! On-disk format: 12-byte header (`b"RGBA"` magic + u32 width + u32
+//! height, little-endian) followed by `width × height` packed
+//! `(R, G, B, A)` byte pixels. The decoder swaps R↔B per pixel so the
+//! resulting BGRA8888 surface displays the image with correct colours
+//! on a little-endian framebuffer (where a `u32` pixel `0xAARRGGBB`
+//! renders red as red, not blue).
+//!
 //! On `SIGHUP` the loader rescans the config and reloads the image.
 //! `SIGTERM` exits cleanly.
 
@@ -255,10 +262,22 @@ fn load_rgba_file(path: &str) -> Option<(u32, u32, Vec<u32>)> {
         if data.len() < total {
             return None;
         }
+        // The on-disk format is `RGBA` magic + raw RGBA bytes (R, G,
+        // B, A) per pixel — the same byte order an image-editor
+        // export-as-raw produces. The compositor surface, however,
+        // expects BGRA8888 little-endian (so the u32 reads as
+        // `0xAARRGGBB` on x86). Swap R↔B during decode so a red
+        // pixel `(0xFF, 0, 0, 0xFF)` in the file lands as
+        // `0xFF_FF_00_00` (opaque red) in the surface rather than
+        // `0xFF_00_00_FF` (opaque blue).
         let mut pixels = Vec::with_capacity(pixel_count);
         for i in 0..pixel_count {
             let off = 12 + i * 4;
-            let px = u32::from_le_bytes(data[off..off + 4].try_into().ok()?);
+            let r = data[off];
+            let g = data[off + 1];
+            let b = data[off + 2];
+            let a = data[off + 3];
+            let px = ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
             pixels.push(px);
         }
         Some((w, h, pixels))

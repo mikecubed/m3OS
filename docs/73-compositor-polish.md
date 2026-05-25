@@ -118,14 +118,19 @@ auto-dismiss after their `timeout_ms`.
 exits. Used by the smoke test and any script that wants to surface a
 pop-up.
 
-### Lockscreen stub
+### Lockscreen
 
 `m3ctl lock` forks `/bin/lockscreen`, which requests a full-output
 Layer surface with `KeyboardInteractivity::Exclusive`. The compositor
 already honours the grant: every keystroke goes to the lockscreen
-until it exits. The stub draws a centred "Locked — press Enter to
-unlock" message and exits when Enter is pressed. Real credential
-verification is deferred to a Phase 71b follow-up.
+until it exits. The lockscreen reads the active user from
+`/run/m3os-current-session`, draws a centred prompt with a masked
+password field, and validates input against `/etc/shadow` via
+`syscall_lib::sha256::verify_password` — the same primitive the
+greeter uses. Enter submits, Backspace deletes one character, and
+three consecutive failures lock the input out for ~5 seconds. Only a
+successful verification exits the process so the compositor can
+release the exclusive-keyboard grant.
 
 ### Wallpaper
 

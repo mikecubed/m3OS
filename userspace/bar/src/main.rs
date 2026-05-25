@@ -1,9 +1,16 @@
 //! Phase 73 Track C — status bar Layer-shell client.
 //!
-//! Renders a 24-pixel-tall persistent bar at the top of the primary
+//! Renders a 48-pixel-tall persistent bar at the top of the primary
 //! output. Shows nine workspace indicators (highlighting the active
-//! one), the focused window title, an HH:MM wall-clock, and an
-//! audio-mute hint.
+//! one) and an HH:MM wall-clock.
+//!
+//! `BarState::title` and `BarState::mute` are reserved slots — the
+//! render path will draw them when populated, but no subscription
+//! channels exist yet to populate either field, so they remain blank
+//! at runtime. Wiring them up requires the per-client subscribable
+//! events follow-up (focused-title) and an `audio_server` query path
+//! (mute state); both are documented as deferred in the PR
+//! description.
 //!
 //! ## Gating: graphical-only sessions wait for login
 //!
@@ -93,7 +100,7 @@ fn program_main(_args: &[&str]) -> i32 {
     // In graphical-only mode the greeter owns the framebuffer until a
     // user authenticates. Wait for the session marker before we
     // declare our Layer surface, so the login screen is not pierced
-    // by a 24 px bar at the top.
+    // by a 48 px bar at the top (`BAR_HEIGHT_PX`).
     if file_exists(GRAPHICAL_ONLY_MARKER_PATH) {
         syscall_lib::write_str(STDOUT_FILENO, "bar: waiting for login session\n");
         wait_for_session_marker();
@@ -120,9 +127,9 @@ fn program_main(_args: &[&str]) -> i32 {
     // LEFT|RIGHT would not change geometry but *would* push the
     // anchor mask to three edge bits, at which point
     // `derive_exclusive_rect` rejects the surface as not a full-edge
-    // tiling and silently drops the 24 px reservation. That was the
-    // visible "bar overlaps toplevel content" symptom in the first
-    // Phase 73 attempt at this fix.
+    // tiling and silently drops the `BAR_HEIGHT_PX` (48 px)
+    // reservation. That was the visible "bar overlaps toplevel
+    // content" symptom in the first Phase 73 attempt at this fix.
     if !conn.set_layer_role(
         Layer::Top,
         anchor::ANCHOR_TOP,
@@ -285,9 +292,10 @@ fn workspace_cell_at(abs: Option<(i32, i32)>) -> Option<u8> {
 }
 
 /// Issue `ControlCommand::SwitchWorkspace { n }`. Best-effort: the
-/// reply Ack / Error is decoded but the bar does not surface either
-/// — the next `QueryWorkspaces` tick will reflect the actual state
-/// the compositor settled on.
+/// reply payload is drained but not decoded — the next
+/// `QueryWorkspaces` tick will reflect the actual state the
+/// compositor settled on, so a per-reply Ack / Error check would only
+/// be noise.
 fn send_switch_workspace(handle: u32, n: u8) -> Option<()> {
     let mut req_buf = [0u8; 32];
     let req_len = encode_command(&ControlCommand::SwitchWorkspace { n }, &mut req_buf).ok()?;
@@ -328,7 +336,13 @@ fn query_active_workspace(handle: u32) -> Option<u8> {
 struct BarState {
     active_workspace: u8,
     clock_text: String,
+    /// Focused-window title. Reserved for the per-client subscribable
+    /// events follow-up — `render` honours a non-empty value, but
+    /// nothing in the main loop populates it yet.
     title: String,
+    /// Audio mute hint. Reserved for an `audio_server` query path —
+    /// `render` paints the "MUTE" badge when set, but nothing in the
+    /// main loop populates it yet.
     mute: bool,
 }
 
