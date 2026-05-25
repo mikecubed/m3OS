@@ -853,6 +853,28 @@ pub(crate) fn free_frame_direct(phys: u64) {
 /// count reaches zero.  Does **not** zero — see [`allocate_contiguous_zeroed`].
 #[allow(dead_code)]
 pub fn free_contiguous(phys: u64, order: usize) {
+    // Phase 74 Track B hardening — refuse to free any frame in the
+    // contiguous range that is currently pinned by a live page-grant.
+    // `is_frame_granted` short-circuits via an atomic counter when no
+    // grants are live, so the common case pays a single relaxed load
+    // per frame; only when grants are active do we walk the registry.
+    let n_frames = 1usize << order;
+    for i in 0..n_frames {
+        let frame_phys = phys + (i as u64) * 4096;
+        if crate::ipc::page_grant::is_frame_granted(frame_phys) {
+            crate::ipc::page_grant::record_granted_free_refusal();
+            log::warn!(
+                "[frame_allocator] free_contiguous: refusing to free range \
+                 base PFN {:#x} order {} — frame {:#x} (PFN {:#x}) is granted",
+                phys / 4096,
+                order,
+                frame_phys,
+                frame_phys / 4096,
+            );
+            return;
+        }
+    }
+
     if !release_last_reference(phys) {
         return;
     }

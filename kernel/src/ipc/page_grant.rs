@@ -44,7 +44,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
@@ -73,8 +73,9 @@ static GRANT_REGISTRY: Mutex<Vec<Option<PageGrant>>> = Mutex::new(Vec::new());
 
 /// Per-frame grant tracker — maps each pinned PFN (physical frame
 /// number) to the grant epoch that owns it. The frame allocator
-/// consults this table on every `free_frame` call via
-/// [`is_frame_granted`] and refuses to free a pinned frame.
+/// consults this table on every `free_frame` / `free_frame_direct` /
+/// `free_contiguous` call via [`is_frame_granted`] and refuses to free
+/// a pinned frame.
 ///
 /// Entries are installed by [`pin_frames`] (called from
 /// [`PageGrant::new`]) and removed by [`unpin_frames`] (called from
@@ -82,6 +83,19 @@ static GRANT_REGISTRY: Mutex<Vec<Option<PageGrant>>> = Mutex::new(Vec::new());
 /// page table). A `BTreeMap` keeps lookups O(log n) without depending
 /// on a hash allocator.
 static GRANTED_FRAMES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Cheap fast-path counter shadowing [`GRANTED_FRAMES`]'s entry count.
+///
+/// `free_frame` and `free_contiguous` are on the kernel-wide allocator hot
+/// path; taking [`GRANTED_FRAMES`]'s mutex on every free would serialise
+/// every frame return through the page-grant subsystem. When the count
+/// is zero we know no live grant can match any PFN and the allocator can
+/// skip the mutex entirely. Maintained in lockstep with the map: bumped
+/// inside [`pin_frames`] for each newly-inserted entry, decremented inside
+/// [`unpin_frames`] for each removed entry, both while holding
+/// [`GRANTED_FRAMES`]'s mutex so the counter never observes a count that
+/// disagrees with the map's actual size.
+static PINNED_FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Register `frames` as pinned by the supplied grant epoch.
 ///
@@ -91,9 +105,12 @@ static GRANTED_FRAMES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 /// simultaneously.
 fn pin_frames(frames: &[u64], epoch: u64) {
     let mut map = GRANTED_FRAMES.lock();
+    let mut newly_inserted: usize = 0;
     for &pfn in frames {
         match map.insert(pfn, epoch) {
-            None => {}
+            None => {
+                newly_inserted += 1;
+            }
             Some(existing) if existing == epoch => {}
             Some(existing) => {
                 panic!(
@@ -103,6 +120,9 @@ fn pin_frames(frames: &[u64], epoch: u64) {
             }
         }
     }
+    if newly_inserted > 0 {
+        PINNED_FRAME_COUNT.fetch_add(newly_inserted, Ordering::Release);
+    }
 }
 
 /// Release the pins held by `epoch` over `frames`. Frames not pinned by
@@ -111,23 +131,42 @@ fn pin_frames(frames: &[u64], epoch: u64) {
 /// own bookkeeping.
 fn unpin_frames(frames: &[u64], epoch: u64) {
     let mut map = GRANTED_FRAMES.lock();
+    let mut removed: usize = 0;
     for &pfn in frames {
         if let Some(&existing) = map.get(&pfn)
             && existing == epoch
         {
             map.remove(&pfn);
+            removed += 1;
         }
+    }
+    if removed > 0 {
+        PINNED_FRAME_COUNT.fetch_sub(removed, Ordering::Release);
     }
 }
 
 /// Frame-allocator integration: returns `true` if `phys` (a byte
 /// address) names a 4 KiB frame currently pinned by some live grant.
 ///
-/// Called from `mm::frame_allocator::free_frame` (and the contiguous
-/// variant) to refuse `free()` on a granted frame and emit a
-/// rate-limited warning. The function is `pub` so the allocator can
-/// import it without exposing the grant registry's internal structure.
+/// Called from `mm::frame_allocator::free_frame`,
+/// `mm::frame_allocator::free_frame_direct`, and
+/// `mm::frame_allocator::free_contiguous` to refuse `free()` on a
+/// granted frame and emit a per-call diagnostic warning (the warning
+/// is not currently rate-limited — refusals are rare enough today that
+/// the log volume is bounded by the grant lifetime).
+///
+/// Hot-path optimisation: the [`PINNED_FRAME_COUNT`] atomic shadows the
+/// underlying map's size, so when no grants are live the call returns
+/// immediately without touching the [`GRANTED_FRAMES`] mutex. The
+/// allocator's free paths can therefore call this guard unconditionally
+/// without imposing global serialisation in the common case.
+///
+/// The function is `pub` so the allocator can import it without
+/// exposing the grant registry's internal structure.
 pub fn is_frame_granted(phys: u64) -> bool {
+    if PINNED_FRAME_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
     let pfn = phys / 4096;
     GRANTED_FRAMES.lock().contains_key(&pfn)
 }

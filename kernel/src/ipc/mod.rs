@@ -1264,6 +1264,19 @@ fn ipc_take_pending_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u6
 /// - padding        :  7 bytes
 const CAP_MSG_WIRE_LEN: usize = 56;
 
+// The wire layout above (CAP_MSG_WIRE_LEN, the `40 + i*4` cap-slot offsets
+// in `build_cap_msg_wire` / `read_cap_msg_from_user`, and the `wire[48]`
+// n_caps offset) is hand-coded for `CAP_SLOTS_PER_MSG == 2`. If the slot
+// count ever changes, every offset above must be reviewed and the userspace
+// wire mirror in `syscall-lib::IpcMessage` updated in lockstep. This
+// const-assert turns silent ABI drift into a compile-time error.
+const _: () = assert!(
+    kernel_core::ipc::message::CAP_SLOTS_PER_MSG == 2,
+    "CAP_MSG_WIRE_LEN and the cap-slot encode/decode offsets in build_cap_msg_wire \
+     / read_cap_msg_from_user assume CAP_SLOTS_PER_MSG == 2; update both before \
+     changing the slot count.",
+);
+
 /// Phase 74 Track A — atomically transfer the capability handles named in
 /// `msg.cap_slots[..msg.n_caps]` from `sender` to `receiver`.
 ///

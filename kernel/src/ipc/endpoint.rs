@@ -1157,6 +1157,23 @@ pub fn call_msg_with_deadline(
         }
     }
 
+    // Phase 74 — late-reply protection on deadline expiry. If the
+    // request was already delivered (matched_receiver path) or picked
+    // up by a receiver before the deadline fired, the receiver holds a
+    // `Capability::Reply(caller)`. Without intervention, a late
+    // `ipc_reply` from that receiver would drop a stale reply into
+    // `caller.pending_msg`, which the caller's NEXT `ipc_call` would
+    // mistakenly consume as its own reply. Revoke any outstanding
+    // reply caps for this caller BEFORE the final `take_message` so
+    // (a) replies in flight that already consumed the cap inside
+    // `sys_ipc_reply` still deliver, and (b) any later `ipc_reply`
+    // attempt fails fast at `remove_task_cap` and never reaches
+    // `deliver_message`. Mirrors the signal-interrupt path's revoke
+    // (see `process::interrupt_ipc_waits`).
+    if matches!(outcome, scheduler::BlockOutcome::DeadlineExpired) {
+        scheduler::revoke_reply_caps_for(caller);
+    }
+
     match scheduler::take_message(caller) {
         Some(msg) => msg,
         None => match outcome {

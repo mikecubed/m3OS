@@ -83,8 +83,12 @@ impl Message {
     }
 
     /// Phase 74: attach up to [`CAP_SLOTS_PER_MSG`] capability handles to
-    /// this message. `handles.len()` must not exceed [`CAP_SLOTS_PER_MSG`];
-    /// excess entries are silently truncated.
+    /// this message.
+    ///
+    /// If `handles.len() > CAP_SLOTS_PER_MSG`, only the leading
+    /// [`CAP_SLOTS_PER_MSG`] entries are copied and the remainder is
+    /// silently dropped. Callers that need an error on overflow must
+    /// validate `handles.len()` themselves before calling this method.
     pub fn with_cap_slots(mut self, handles: &[CapHandle]) -> Self {
         let n = core::cmp::min(handles.len(), CAP_SLOTS_PER_MSG);
         for (i, h) in handles.iter().take(n).enumerate() {
