@@ -1523,9 +1523,32 @@ mod syscall_nr {
     /// (`NEG_EPERM` if not). Returns `0` on success.
     pub const FRAMEBUFFER_PAGEFLIP: u64 = 0x101F;
 
+    /// Phase 74 Track B: hand `n_pages` contiguous user-space pages
+    /// starting at virtual address `pages_vaddr` to the kernel as a
+    /// `PageGrant` kernel object. The pages are unmapped from the
+    /// sender's page table, TLB-shotdown, and tracked via a grant
+    /// epoch in the frame allocator so they cannot be freed while
+    /// the grant is live. Returns the new `CapHandle` of the grant
+    /// capability on success, or `u64::MAX` on error.
+    ///
+    /// `sys_page_grant_send(pages_vaddr, n_pages) -> CapHandle | u64::MAX`.
+    pub const PAGE_GRANT_SEND: u64 = 0x1020;
+    /// Phase 74 Track B: consume a `PageGrant` capability handed to
+    /// the receiver and map the granted pages into the receiver's
+    /// address space at a kernel-chosen virtual address. Returns the
+    /// chosen virtual address on success, or `u64::MAX` on error.
+    /// The grant capability is consumed and cannot be received again.
+    ///
+    /// `sys_page_grant_recv(grant_cap) -> vaddr | u64::MAX`.
+    pub const PAGE_GRANT_RECV: u64 = 0x1021;
+
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x1116;
+    // Phase 74 extension: cap-bearing IPC (0x1117/0x1118) and per-call
+    // timeouts (0x1119/0x111A). Page-grant transport (Track B) lives in
+    // the custom-syscall range at 0x1020/0x1021 because it is not an
+    // endpoint operation. See `kernel/src/ipc/page_grant.rs`.
+    pub const IPC_LAST: u64 = 0x111A;
 
     // -- device host (Phase 55b Track B) --
     //
@@ -1990,6 +2013,26 @@ pub extern "C" fn syscall_handler(
                 per_core_syscall_arg3(),
                 crate::task::current_task_syscall_snapshot().user_r8,
             )
+        }
+        // -- Phase 74 page-grant transport --
+        PAGE_GRANT_SEND => {
+            // sys_page_grant_send(pages_vaddr, n_pages) -> CapHandle | u64::MAX
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return u64::MAX,
+            };
+            crate::ipc::page_grant::sys_page_grant_send(task_id, arg0, arg1)
+        }
+        PAGE_GRANT_RECV => {
+            // sys_page_grant_recv(grant_cap) -> vaddr | u64::MAX
+            let task_id = match crate::task::scheduler::current_task_id() {
+                Some(id) => id,
+                None => return u64::MAX,
+            };
+            if arg0 > u64::from(u32::MAX) {
+                return u64::MAX;
+            }
+            crate::ipc::page_grant::sys_page_grant_recv(task_id, arg0 as u32)
         }
         // -- device host (Phase 55b Track B) --
         SYS_DEVICE_CLAIM => {

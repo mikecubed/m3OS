@@ -416,12 +416,40 @@ pub const SYS_BLOCK_WRITE: u64 = 0x1012;
 // IPC wrappers (Phase 52)
 // ===========================================================================
 
-/// IPC message data: 4 u64 words.
+/// Phase 74: maximum number of capability handles transferred per IPC message
+/// via the [`IpcMessage::cap_slots`] field. Sized at 2 so a typical server
+/// reply can return both a fresh endpoint capability and a related
+/// notification capability without forcing a second `sys_cap_grant`
+/// round-trip.
+pub const CAP_SLOTS_PER_MSG: usize = 2;
+
+/// IPC message data: label, 4 u64 words, plus the Phase 74 cap-slot fields.
+///
+/// The Phase 74 fields ([`IpcMessage::cap_slots`] / [`IpcMessage::n_caps`])
+/// are placed at the **end** of the struct so the byte layout of the
+/// pre-Phase-74 header (label + data) is unchanged. Existing kernel
+/// syscalls that emit the 40-byte header (`ipc_recv_msg`,
+/// `ipc_try_recv_msg`, `ipc_reply_recv_msg`) leave the cap-slot bytes
+/// untouched — callers that do not opt into the new cap-aware syscalls
+/// continue to observe `n_caps = 0` (the Default), which the kernel
+/// treats as "no caps to transfer".
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IpcMessage {
     pub label: u64,
     pub data: [u64; 4],
+    /// Phase 74: capability handles to transfer with this message. Valid
+    /// entries are `cap_slots[..n_caps as usize]`. Senders fill this before
+    /// calling [`ipc_call_with_caps`]; receivers read the granted handles
+    /// from this field after [`ipc_recv_with_caps`] returns.
+    pub cap_slots: [u32; CAP_SLOTS_PER_MSG],
+    /// Phase 74: count of valid entries in [`IpcMessage::cap_slots`]. `0`
+    /// (the default) preserves pre-Phase-74 semantics — no capability
+    /// transfer happens at delivery time.
+    pub n_caps: u8,
+    /// Padding to make the struct size a multiple of 8 bytes so future
+    /// fields land at a predictable offset.
+    _pad: [u8; 7],
 }
 
 impl IpcMessage {
@@ -429,6 +457,9 @@ impl IpcMessage {
         Self {
             label,
             data: [0; 4],
+            cap_slots: [0; CAP_SLOTS_PER_MSG],
+            n_caps: 0,
+            _pad: [0; 7],
         }
     }
 
@@ -445,6 +476,25 @@ impl IpcMessage {
         } else {
             Some(raw as u32)
         }
+    }
+
+    /// Phase 74: fill the cap-slot fields with `handles` and update
+    /// [`IpcMessage::n_caps`]. Excess entries beyond [`CAP_SLOTS_PER_MSG`]
+    /// are silently truncated, matching the kernel-side
+    /// `Message::with_cap_slots` helper.
+    pub fn set_cap_slots(&mut self, handles: &[u32]) {
+        let n = core::cmp::min(handles.len(), CAP_SLOTS_PER_MSG);
+        for (i, h) in handles.iter().take(n).enumerate() {
+            self.cap_slots[i] = *h;
+        }
+        self.n_caps = n as u8;
+    }
+
+    /// Phase 74: return the slice of capability handles delivered with this
+    /// message.
+    pub fn received_caps(&self) -> &[u32] {
+        let n = core::cmp::min(self.n_caps as usize, CAP_SLOTS_PER_MSG);
+        &self.cap_slots[..n]
     }
 }
 

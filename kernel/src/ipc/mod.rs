@@ -31,14 +31,20 @@
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
 //!
-//! Deferred to Phase 7+: capability grants via IPC, page-capability bulk
-//! transfers, IPC timeouts.
+//! Phase 74: capability grants via IPC and IPC timeouts are now delivered
+//! (syscalls 0x1117–0x111A and the cap-bearing variants of `ipc_call` /
+//! `ipc_recv_msg`). Page-capability bulk transfer lives in
+//! [`page_grant`] (syscalls 0x1020 / 0x1021).
+//! Many-to-one notification binding (`sys_notif_bind`, syscall 0x1111) is
+//! also Phase 74 — it closes the Phase 55c deferred item alongside the
+//! ones from Phase 6.
 
 pub mod capability;
 pub mod cleanup;
 pub mod endpoint;
 pub mod message;
 pub mod notification;
+pub mod page_grant;
 pub mod registry;
 
 use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
@@ -190,6 +196,10 @@ pub use registry::RegistryError;
 /// | 21 | 0x1114 | `ipc_service_exists(name_ptr, name_len)` | `arg0, arg1` → 1 if registered, 0 otherwise |
 /// | 22 | 0x1115 | `ipc_wait_service(name_ptr, name_len, timeout_ms)` | `arg0..2` → 1 ready, 0 timeout |
 /// | 23 | 0x1116 | `ipc_lookup_service_owner_pid(name_ptr, name_len)` | `arg0, arg1` → owner PID or `u64::MAX` |
+/// | 24 | 0x1117 | `ipc_call_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, `u64::MAX` on error (Phase 74 Track A) |
+/// | 25 | 0x1118 | `ipc_recv_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label, `u64::MAX` on error (Phase 74 Track A) |
+/// | 26 | 0x1119 | `ipc_call_timeout(ep_cap, label, data0, deadline_ns)` | `arg0..3` → label or `NEG_ETIMEDOUT` (Phase 74 Track C) |
+/// | 27 | 0x111A | `ipc_recv_timeout(ep_cap, deadline_ns)` | `arg0..1` → label or `NEG_ETIMEDOUT` (Phase 74 Track C) |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -469,6 +479,57 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // Phase 57e Bug #3 fix — per-task snapshot, see crate::task.
             let buf_len = crate::task::current_task_syscall_snapshot().user_r9;
             ipc_recv_msg(task_id, ep_id, arg3, arg4, buf_len)
+        }
+        24 => {
+            // Phase 74 Track A: ipc_call_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)
+            //
+            // Reads the full IpcMessage (including cap_slots / n_caps) from
+            // userspace, validates and transfers each named capability to the
+            // receiver, then performs an `ipc_call_buf`-shaped send-and-block.
+            // On reply, the cap_slots field of the reply is updated with any
+            // cap handles the server granted back.
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_call_with_caps(task_id, ep_id, arg1, arg2, arg3),
+                _ => u64::MAX,
+            }
+        }
+        25 => {
+            // Phase 74 Track A: ipc_recv_with_caps(ep_cap, msg_ptr, buf_ptr, buf_len)
+            //
+            // Receives a message and writes the full cap-bearing IpcMessage
+            // (label + data + cap_slots + n_caps) to msg_ptr. Any caps the
+            // sender transferred have already been inserted into the
+            // receiver's capability table; their new handles appear in
+            // `cap_slots[..n_caps]`.
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_recv_with_caps(task_id, ep_id, arg1, arg2, arg3),
+                _ => u64::MAX,
+            }
+        }
+        26 => {
+            // Phase 74 Track C: ipc_call_timeout(ep_cap, label, data0, deadline_ns)
+            //
+            // Like `ipc_call` but registers a deadline in the scheduler timer
+            // wheel; if the call does not complete before `deadline_ns`
+            // (absolute CLOCK_MONOTONIC nanoseconds), returns `NEG_ETIMEDOUT`.
+            match cap {
+                Capability::Endpoint(ep_id) => {
+                    let msg = message::Message::with2(arg1, arg2, 0);
+                    ipc_call_timeout(task_id, ep_id, msg, arg3)
+                }
+                _ => u64::MAX,
+            }
+        }
+        27 => {
+            // Phase 74 Track C: ipc_recv_timeout(ep_cap, deadline_ns)
+            //
+            // Like `ipc_recv` but registers a deadline in the scheduler timer
+            // wheel; if no message arrives before `deadline_ns`, returns
+            // `NEG_ETIMEDOUT`.
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_recv_timeout(task_id, ep_id, arg1),
+                _ => u64::MAX,
+            }
         }
         _ => u64::MAX,
     }
@@ -1185,4 +1246,283 @@ fn ipc_take_pending_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u6
     }
 
     copy_len as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 74 Track A — capability transfer via IPC (`sys_cap_grant` in-message)
+// ---------------------------------------------------------------------------
+
+/// Phase 74: wire-format size of the cap-bearing [`IpcMessageWire`] struct
+/// shared with `userspace/syscall-lib/src/lib.rs::IpcMessage`. Composed of:
+/// - `label`        :  8 bytes
+/// - `data[0..4]`   : 32 bytes
+/// - `cap_slots`    :  8 bytes (2 × u32)
+/// - `n_caps`       :  1 byte
+/// - padding        :  7 bytes
+const CAP_MSG_WIRE_LEN: usize = 56;
+
+/// Phase 74 Track A — atomically transfer the capability handles named in
+/// `msg.cap_slots[..msg.n_caps]` from `sender` to `receiver`.
+///
+/// Returns the receiver-side handles (mutates `msg.cap_slots` in place to
+/// hold them on success). Validates every source handle before mutating any
+/// state; on receiver-side `TableFull` failure or invalid handle, rolls back
+/// any caps already transferred and returns the inserting [`CapError`].
+///
+/// The transfer uses [`crate::task::scheduler::grant_task_cap`] under the
+/// scheduler lock for each slot, matching the atomicity guarantee of the
+/// existing single-cap `sys_cap_grant` path.
+fn ipc_transfer_caps(
+    sender: crate::task::TaskId,
+    receiver: crate::task::TaskId,
+    msg: &mut message::Message,
+) -> Result<(), CapError> {
+    use crate::task::scheduler;
+    use kernel_core::ipc::message::CAP_SLOTS_PER_MSG;
+
+    let n = msg.n_caps as usize;
+    if n == 0 {
+        return Ok(());
+    }
+    if n > CAP_SLOTS_PER_MSG {
+        return Err(CapError::InvalidHandle);
+    }
+    if sender == receiver {
+        // Cap transfer to self is a no-op — the handles already live in
+        // the sender table. Preserve the source handles so the receiver
+        // sees the same indices it sent.
+        return Ok(());
+    }
+
+    // Phase A: pre-validate every source handle. This is racy against
+    // concurrent revocation but tightens the common-case failure mode:
+    // a typo'd handle returns `InvalidHandle` before any partial state
+    // mutation.
+    for i in 0..n {
+        scheduler::task_cap(sender, msg.cap_slots[i])?;
+    }
+
+    // Phase B: transfer each handle in turn. `grant_task_cap` performs
+    // an atomic remove-from-source + insert-into-target under the
+    // scheduler lock. If any transfer fails (validation lost the race
+    // or the receiver table truly cannot grow), roll back the already-
+    // transferred caps by granting them back.
+    let mut new_handles = [0u32; CAP_SLOTS_PER_MSG];
+    let mut transferred = 0usize;
+    for i in 0..n {
+        match scheduler::grant_task_cap(sender, msg.cap_slots[i], receiver) {
+            Ok(handle) => {
+                new_handles[i] = handle;
+                transferred += 1;
+            }
+            Err(err) => {
+                for &h in new_handles.iter().take(transferred) {
+                    let _ = scheduler::grant_task_cap(receiver, h, sender);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    // Mutate the message in place so the receiver observes the new
+    // receiver-side handles instead of the sender's now-stale indices.
+    for (i, handle) in new_handles.iter().enumerate().take(n) {
+        msg.cap_slots[i] = *handle;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+#[allow(dead_code)]
+const NEG_EINVAL_IPC: u64 = (-22_i64) as u64;
+#[allow(dead_code)]
+const NEG_ENOSPC_IPC: u64 = (-28_i64) as u64;
+
+/// Phase 74 Track A — read a cap-bearing IPC message wire-form from user
+/// memory and produce the kernel-side [`message::Message`].
+fn read_cap_msg_from_user(msg_ptr: u64) -> Option<message::Message> {
+    if msg_ptr == 0 {
+        return None;
+    }
+    let mut wire = [0u8; CAP_MSG_WIRE_LEN];
+    UserSliceRo::new(msg_ptr, wire.len())
+        .and_then(|s| s.copy_to_kernel(&mut wire))
+        .ok()?;
+    let label = u64::from_ne_bytes(wire[0..8].try_into().ok()?);
+    let mut data = [0u64; 4];
+    for (i, d) in data.iter_mut().enumerate() {
+        let off = 8 + i * 8;
+        *d = u64::from_ne_bytes(wire[off..off + 8].try_into().ok()?);
+    }
+    let mut cap_slots = [0u32; kernel_core::ipc::message::CAP_SLOTS_PER_MSG];
+    for (i, slot) in cap_slots.iter_mut().enumerate() {
+        let off = 40 + i * 4;
+        *slot = u32::from_ne_bytes(wire[off..off + 4].try_into().ok()?);
+    }
+    Some(message::Message {
+        label,
+        data,
+        cap: None,
+        cap_slots,
+        n_caps: wire[48],
+    })
+}
+
+/// Phase 74 Track A — write a cap-bearing IPC message back to user memory.
+fn write_cap_msg_to_user(msg_ptr: u64, msg: &message::Message) -> bool {
+    if msg_ptr == 0 {
+        return true;
+    }
+    let mut wire = [0u8; CAP_MSG_WIRE_LEN];
+    wire[0..8].copy_from_slice(&msg.label.to_ne_bytes());
+    for i in 0..4 {
+        let off = 8 + i * 8;
+        wire[off..off + 8].copy_from_slice(&msg.data[i].to_ne_bytes());
+    }
+    for i in 0..kernel_core::ipc::message::CAP_SLOTS_PER_MSG {
+        let off = 40 + i * 4;
+        wire[off..off + 4].copy_from_slice(&msg.cap_slots[i].to_ne_bytes());
+    }
+    wire[48] = msg.n_caps;
+    UserSliceWo::new(msg_ptr, wire.len())
+        .and_then(|s| s.copy_from_kernel(&wire))
+        .is_ok()
+}
+
+/// Phase 74 Track A.2 / A.3 — `sys_ipc_call_with_caps(ep, msg_ptr, buf_ptr, buf_len)`.
+///
+/// Reads the full cap-bearing message from user memory, transfers any
+/// `cap_slots[..n_caps]` capabilities to the receiver atomically, performs
+/// an `ipc_call_buf`-shaped send-and-block, and on reply writes the
+/// receiver-side cap handles back into `msg_ptr`'s `cap_slots`.
+fn ipc_call_with_caps(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+) -> u64 {
+    use crate::task::scheduler;
+
+    let mut msg = match read_cap_msg_from_user(msg_ptr) {
+        Some(m) => m,
+        None => return u64::MAX,
+    };
+
+    // Validate the cap_slots upfront — `ipc_transfer_caps` runs at delivery
+    // time, but failing early here saves the bulk allocation on a bad
+    // handle. Note: this only catches obviously-invalid handles; the
+    // authoritative validate-and-transfer happens at rendezvous (see
+    // [`endpoint::call_msg_with_caps`]).
+    if msg.n_caps as usize > kernel_core::ipc::message::CAP_SLOTS_PER_MSG {
+        return u64::MAX;
+    }
+
+    // Optional bulk payload (Phase 52 buf-bearing path).
+    if buf_len > 0 {
+        let len = buf_len as usize;
+        if len > MAX_BULK_LEN {
+            return u64::MAX;
+        }
+        let mut bulk = alloc::vec![0u8; len];
+        if UserSliceRo::new(buf_ptr, bulk.len())
+            .and_then(|s| s.copy_to_kernel(&mut bulk))
+            .is_err()
+        {
+            return u64::MAX;
+        }
+        msg.data[1] = len as u64;
+        scheduler::deliver_bulk(task_id, bulk);
+    }
+
+    let reply = endpoint::call_msg_with_caps(task_id, ep_id, msg);
+    if reply.label == u64::MAX {
+        return u64::MAX;
+    }
+    if !write_cap_msg_to_user(msg_ptr, &reply) {
+        return u64::MAX;
+    }
+    reply.label
+}
+
+/// Phase 74 Track A.2 / A.3 — `sys_ipc_recv_with_caps(ep, msg_ptr, buf_ptr, buf_len)`.
+///
+/// Receives a message and writes the full cap-bearing IpcMessage
+/// (including cap_slots filled with the receiver-side handles created at
+/// transfer time) to `msg_ptr`.
+fn ipc_recv_with_caps(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+) -> u64 {
+    use crate::task::scheduler;
+
+    let msg = endpoint::recv_msg(task_id, ep_id);
+    if msg.label == u64::MAX {
+        return u64::MAX;
+    }
+    if !write_cap_msg_to_user(msg_ptr, &msg) {
+        return u64::MAX;
+    }
+
+    if buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
+        let copy_len = bulk.len().min(buf_len as usize);
+        if copy_len > 0
+            && UserSliceWo::new(buf_ptr, copy_len)
+                .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+                .is_err()
+        {
+            return u64::MAX;
+        }
+    }
+
+    msg.label
+}
+
+// ---------------------------------------------------------------------------
+// Phase 74 Track C — IPC timeouts
+// ---------------------------------------------------------------------------
+
+/// Convert a userspace absolute CLOCK_MONOTONIC deadline (nanoseconds) into
+/// the scheduler's tick clock. The kernel BSP tick rate is 1 ms (see
+/// `arch::x86_64::interrupts::tick_count`), so the conversion divides by
+/// 1 000 000 ns/tick. A `deadline_ns == 0` value is treated as a literal
+/// "expire immediately" deadline (matches Linux's `clock_nanosleep(0)`
+/// behaviour).
+fn deadline_ns_to_ticks(deadline_ns: u64) -> u64 {
+    deadline_ns / 1_000_000
+}
+
+/// Phase 74 Track C.1 — `sys_ipc_call_timeout(ep_cap, label, data0, deadline_ns)`.
+///
+/// Blocks waiting for an `ipc_call`-shaped reply with a deadline. Returns
+/// the reply label on success or `NEG_ETIMEDOUT` if the deadline elapses
+/// without a reply.
+fn ipc_call_timeout(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg: message::Message,
+    deadline_ns: u64,
+) -> u64 {
+    let deadline_ticks = deadline_ns_to_ticks(deadline_ns);
+    endpoint::call_msg_with_deadline(task_id, ep_id, msg, Some(deadline_ticks)).label
+}
+
+/// Phase 74 Track C.1 — `sys_ipc_recv_timeout(ep_cap, deadline_ns)`.
+///
+/// Blocks waiting for a message on `ep_id` with a deadline. Returns the
+/// received message label on success or `NEG_ETIMEDOUT` if no message
+/// arrives before the deadline.
+fn ipc_recv_timeout(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    deadline_ns: u64,
+) -> u64 {
+    let deadline_ticks = deadline_ns_to_ticks(deadline_ns);
+    endpoint::recv_msg_with_deadline(task_id, ep_id, Some(deadline_ticks)).label
 }

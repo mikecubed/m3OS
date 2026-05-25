@@ -991,6 +991,181 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     call_msg(caller, ep_id, msg).label
 }
 
+/// Phase 74 Track A.2 — `call_msg` variant that carries `cap_slots`
+/// alongside the message body. The capability transfer happens inside the
+/// existing rendezvous path (see [`transfer_cap`]); this entry point only
+/// exists to make the call site self-documenting and to keep all
+/// cap-bearing IPC traffic visibly separate in stack traces.
+pub fn call_msg_with_caps(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
+    call_msg(caller, ep_id, msg)
+}
+
+/// Phase 74 Track C.1 — `recv_msg` variant that registers a deadline with
+/// the scheduler timer wheel. Returns the received message on success or
+/// a sentinel `Message::new(NEG_ETIMEDOUT as u64)` if the deadline
+/// elapses before any sender arrives.
+///
+/// `deadline_ticks` is the absolute scheduler-tick deadline (1 tick = 1 ms
+/// on the BSP). `None` reverts to the legacy unbounded `recv_msg`
+/// behaviour.
+pub fn recv_msg_with_deadline(
+    receiver: TaskId,
+    ep_id: EndpointId,
+    deadline_ticks: Option<u64>,
+) -> Message {
+    use core::sync::atomic::AtomicBool;
+
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
+    // Fast path: sender already queued. Reuse `recv_msg`'s pop-sender
+    // motion since it carries the full delivery atomicity.
+    {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
+        };
+        if !ep.senders.is_empty() {
+            drop(reg);
+            return recv_msg(receiver, ep_id);
+        }
+        ep.receivers.push_back(receiver);
+    }
+
+    // Block with deadline. The block primitive returns
+    // `BlockOutcome::DeadlineExpired` when the wake-deadline scanner
+    // observes our entry expired — at that point we are still queued in
+    // `ep.receivers`. Race-free cleanup: remove ourselves from the queue
+    // and surface ETIMEDOUT only when no message was delivered.
+    let woken = AtomicBool::new(false);
+    let outcome = scheduler::block_current_until(
+        crate::task::TaskState::BlockedOnRecv,
+        &woken,
+        deadline_ticks,
+    );
+
+    // Cleanup: remove from receivers queue if still present (the IPC
+    // completion path normally pops us, but on a deadline expiry it does
+    // not). Run under the same lock that delivery uses, so a racing
+    // delivery either sees us in the queue (and dequeues us, delivering
+    // a message that take_message will surface) or we win the lock and
+    // strip ourselves out.
+    {
+        let mut reg = ENDPOINTS.lock();
+        if let Some(ep) = reg.get_mut(ep_id) {
+            ep.receivers.retain(|&r| r != receiver);
+        }
+    }
+
+    match scheduler::take_message(receiver) {
+        Some(msg) => msg,
+        None => match outcome {
+            scheduler::BlockOutcome::DeadlineExpired => Message::new(NEG_ETIMEDOUT),
+            _ => Message::new(u64::MAX),
+        },
+    }
+}
+
+/// Phase 74 Track C.1 — `call_msg` variant that registers a deadline with
+/// the scheduler timer wheel. The deadline covers BOTH the send-side block
+/// (waiting for a receiver to pick up the message) AND the reply-side
+/// block (waiting for the server's reply); whichever block is currently
+/// active when the deadline fires wakes with `NEG_ETIMEDOUT`.
+pub fn call_msg_with_deadline(
+    caller: TaskId,
+    ep_id: EndpointId,
+    msg: Message,
+    deadline_ticks: Option<u64>,
+) -> Message {
+    use core::sync::atomic::AtomicBool;
+
+    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+
+    // Drain stale pending_msg so the deadline-block primitive does not
+    // observe a leftover and short-circuit (same hygiene as `call_msg`).
+    let _ = scheduler::take_message(caller);
+
+    let (matched_receiver, pending_hook) = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
+        };
+        if let Some(receiver) = ep.receivers.pop_front() {
+            (Some(receiver), None)
+        } else {
+            ep.senders.push_back(PendingSend {
+                task: caller,
+                msg,
+                wants_reply: true,
+            });
+            (None, ep.on_pending_send)
+        }
+    };
+    if matched_receiver.is_none()
+        && let Some(hook) = pending_hook
+    {
+        hook();
+    }
+
+    if let Some(receiver) = matched_receiver {
+        // Sender-already-met path: insert the reply cap and deliver. Mirrors
+        // `call_msg`'s sender-found branch exactly except we use the
+        // deadline-aware block primitive at the bottom of this function.
+        let reply_cap_handle = match scheduler::insert_cap(receiver, Capability::Reply(caller)) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let mut reg = ENDPOINTS.lock();
+                if let Some(ep) = reg.get_mut(ep_id)
+                    && !ep.closed
+                {
+                    ep.receivers.push_front(receiver);
+                } else {
+                    drop(reg);
+                    let _ = scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
+                }
+                return Message::new(u64::MAX);
+            }
+        };
+        let mut delivered = msg;
+        if transfer_cap(caller, receiver, &mut delivered).is_err() {
+            let _ = scheduler::remove_task_cap(receiver, reply_cap_handle);
+            let _ = scheduler::deliver_message_and_wake(receiver, Message::new(u64::MAX));
+            return Message::new(u64::MAX);
+        }
+        transfer_bulk(caller, receiver);
+        crate::task::scheduler::preempt_disable();
+        scheduler::deliver_message(receiver, delivered.with_reply_cap_handle(reply_cap_handle));
+        let _ = crate::task::scheduler::wake_task_v2(receiver);
+        crate::task::scheduler::preempt_enable();
+    }
+
+    // Block waiting for the reply with the supplied deadline.
+    let woken = AtomicBool::new(false);
+    let outcome = scheduler::block_current_until(
+        crate::task::TaskState::BlockedOnReply,
+        &woken,
+        deadline_ticks,
+    );
+
+    // Race-free cleanup: pull ourselves out of the senders queue if we
+    // never matched a receiver and the deadline expired before delivery.
+    {
+        let mut reg = ENDPOINTS.lock();
+        if let Some(ep) = reg.get_mut(ep_id) {
+            ep.senders.retain(|p| p.task != caller);
+        }
+    }
+
+    match scheduler::take_message(caller) {
+        Some(msg) => msg,
+        None => match outcome {
+            scheduler::BlockOutcome::DeadlineExpired => Message::new(NEG_ETIMEDOUT),
+            _ => Message::new(u64::MAX),
+        },
+    }
+}
+
 /// Remove a task from any endpoint sender/receiver wait queues.
 ///
 /// Used when signal delivery needs to interrupt a task blocked inside IPC so it
@@ -1091,7 +1266,11 @@ pub fn reply_recv_msg(
 /// capability, so the two writes never race. Any future caller that
 /// needs both must extend the IPC message format — `data[3]` cannot
 /// carry both a transferred-cap handle and a reply-cap handle.
-fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<(), CapError> {
+fn transfer_cap(sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<(), CapError> {
+    // Phase 6/50 legacy single-cap path: `msg.cap = Some(_)` carries a
+    // capability the kernel pre-validated (the sender's table is not
+    // consulted — `Capability` is a value type). Insert directly into the
+    // receiver and stash the new handle in `data[3]`.
     if let Some(cap) = msg.cap.take() {
         match scheduler::insert_cap(receiver, cap) {
             Ok(handle) => {
@@ -1107,7 +1286,6 @@ fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<
                     task_idx: receiver.0 as u32,
                     ep: u32::MAX, // sentinel: capability transfer, not endpoint delivery
                 });
-                Ok(())
             }
             Err(e) => {
                 log::warn!(
@@ -1116,12 +1294,18 @@ fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<
                 );
                 // Put the cap back so the sender doesn't lose it.
                 msg.cap = Some(cap);
-                Err(e)
+                return Err(e);
             }
         }
-    } else {
-        Ok(())
     }
+
+    // Phase 74 Track A: `cap_slots[..n_caps]` carries capability *handles*
+    // (indices into the sender's table). `ipc_transfer_caps` atomically
+    // moves each named handle from `sender` to `receiver` and rewrites the
+    // slot to hold the receiver-side handle. On any failure the prefix is
+    // rolled back inside the helper so neither table partial-mutates.
+    super::ipc_transfer_caps(sender, receiver, msg)?;
+    Ok(())
 }
 
 /// Variant of `send` that also transfers an attached capability.

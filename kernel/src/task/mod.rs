@@ -473,7 +473,8 @@ pub struct Task {
     /// `AtomicU64`, written lock-free from the timer ISR only by the CPU
     /// currently running this task (Linux's `task_struct.utime` model). The
     /// `#[repr(transparent)]` of `AtomicU64` over `u64` means
-    /// `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` (448) is preserved without
+    /// `EXPECTED_TASK_PREEMPT_FRAME_OFFSET` (464 since Phase 74's
+    /// `Message` cap-slot extension; was 448 prior) is preserved without
     /// padding.
     pub user_ticks: core::sync::atomic::AtomicU64,
     /// Wall-clock milliseconds the task has spent in ring 0. Same access
@@ -683,7 +684,14 @@ pub struct Task {
 /// Documented byte offset of [`Task::preempt_frame`] inside [`Task`].  Pins
 /// the value at the time Phase 57b E.2 landed (448).  Treat as the source
 /// of truth that Phase 57d's assembly entry stub is written against.
-pub const EXPECTED_TASK_PREEMPT_FRAME_OFFSET: usize = 448;
+// Phase 74 bump: extending `Message` with `cap_slots: [CapHandle; 2]` and
+// `n_caps: u8` (rounded up to the next 8-byte alignment) added 16 bytes to
+// `Task::pending_msg`, shifting `preempt_frame` from 448 to 464. No assembly
+// in `arch/x86_64/` uses this offset directly — the `preempt_resume_to_user`
+// asm takes `*const PreemptFrame` in `rdi` so it is layout-agnostic. The
+// constant is updated and the regression gate continues to fire on any
+// further drift.
+pub const EXPECTED_TASK_PREEMPT_FRAME_OFFSET: usize = 464;
 
 const _: () = assert!(
     core::mem::offset_of!(Task, preempt_frame) == EXPECTED_TASK_PREEMPT_FRAME_OFFSET,

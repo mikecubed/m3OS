@@ -1,14 +1,34 @@
-use super::capability::Capability;
+use super::capability::{CapHandle, Capability};
+
+/// Maximum number of capability handles transferred in a single IPC message
+/// via the Phase 74 `cap_slots` field. Sized at 2 so a typical server reply
+/// can return both a fresh endpoint capability and a related notification
+/// capability without forcing a second `sys_cap_grant` round-trip.
+pub const CAP_SLOTS_PER_MSG: usize = 2;
 
 /// A small, register-sized IPC message.
+///
+/// Phase 74 adds the [`Message::cap_slots`] / [`Message::n_caps`] fields for
+/// inline capability grants on the rendezvous path. `n_caps = 0` (the
+/// default) reproduces the pre-Phase-74 wire form exactly — no caller
+/// already on the simple `sys_ipc_call` path observes any behaviour change.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Message {
     /// Operation identifier, chosen by convention between sender and receiver.
     pub label: u64,
     /// Inline data payload — up to 4 machine words.
     pub data: [u64; 4],
-    /// Optional capability transferred with this message.
+    /// Optional capability transferred with this message (kernel-internal
+    /// fast path; preserved for Phase 6 / Phase 50 callers).
     pub cap: Option<Capability>,
+    /// Phase 74: capability handles the sender hands to the receiver as part
+    /// of this IPC. Valid entries are `cap_slots[..n_caps as usize]`. The
+    /// remaining slots are ignored.
+    pub cap_slots: [CapHandle; CAP_SLOTS_PER_MSG],
+    /// Phase 74: count of valid entries in [`Message::cap_slots`]. `0`
+    /// (the default) preserves pre-Phase-74 semantics — no capability
+    /// transfer happens at delivery time.
+    pub n_caps: u8,
 }
 
 impl Message {
@@ -18,6 +38,8 @@ impl Message {
             label,
             data: [0; 4],
             cap: None,
+            cap_slots: [0; CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         }
     }
 
@@ -27,6 +49,8 @@ impl Message {
             label,
             data: [d0, 0, 0, 0],
             cap: None,
+            cap_slots: [0; CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         }
     }
 
@@ -36,6 +60,8 @@ impl Message {
             label,
             data: [d0, d1, 0, 0],
             cap: None,
+            cap_slots: [0; CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         }
     }
 
@@ -53,6 +79,18 @@ impl Message {
     /// must not use this word for request payloads.
     pub const fn with_reply_cap_handle(mut self, handle: u32) -> Self {
         self.data[3] = handle as u64;
+        self
+    }
+
+    /// Phase 74: attach up to [`CAP_SLOTS_PER_MSG`] capability handles to
+    /// this message. `handles.len()` must not exceed [`CAP_SLOTS_PER_MSG`];
+    /// excess entries are silently truncated.
+    pub fn with_cap_slots(mut self, handles: &[CapHandle]) -> Self {
+        let n = core::cmp::min(handles.len(), CAP_SLOTS_PER_MSG);
+        for (i, h) in handles.iter().take(n).enumerate() {
+            self.cap_slots[i] = *h;
+        }
+        self.n_caps = n as u8;
         self
     }
 }
@@ -118,5 +156,35 @@ mod tests {
         let msg = Message::with2(7, 10, 20).with_reply_cap_handle(5);
 
         assert_eq!(msg.data, [10, 20, 0, 5]);
+    }
+
+    #[test]
+    fn default_message_has_zero_cap_slots() {
+        let msg = Message::new(42);
+        assert_eq!(msg.n_caps, 0);
+        assert_eq!(msg.cap_slots, [0; CAP_SLOTS_PER_MSG]);
+    }
+
+    #[test]
+    fn with_cap_slots_records_handles_and_count() {
+        let msg = Message::new(1).with_cap_slots(&[7, 13]);
+        assert_eq!(msg.n_caps, 2);
+        assert_eq!(msg.cap_slots, [7, 13]);
+    }
+
+    #[test]
+    fn with_cap_slots_truncates_excess_handles() {
+        let msg = Message::new(1).with_cap_slots(&[7, 13, 19, 23]);
+        assert_eq!(msg.n_caps as usize, CAP_SLOTS_PER_MSG);
+        assert_eq!(msg.cap_slots[0], 7);
+        assert_eq!(msg.cap_slots[1], 13);
+    }
+
+    #[test]
+    fn with_cap_slots_partial_fill_keeps_count() {
+        let msg = Message::new(1).with_cap_slots(&[42]);
+        assert_eq!(msg.n_caps, 1);
+        assert_eq!(msg.cap_slots[0], 42);
+        assert_eq!(msg.cap_slots[1], 0);
     }
 }
