@@ -136,6 +136,13 @@ pub struct RecvFrame {
     /// Matches the layout in [`kernel_core::driver_ipc::block`] or
     /// [`kernel_core::driver_ipc::net`] depending on the peer.
     pub bulk: alloc::vec::Vec<u8>,
+    /// Phase 74 Track F — capability handles the IPC layer transferred
+    /// via `Message::cap_slots`. Valid entries are
+    /// `cap_slots[..n_caps as usize]`. Empty `n_caps == 0` for
+    /// pre-Phase-74 messages.
+    pub cap_slots: [u32; syscall_lib::CAP_SLOTS_PER_MSG],
+    /// Phase 74 Track F — count of valid entries in [`cap_slots`].
+    pub n_caps: u8,
 }
 
 /// Minimum IPC surface consumed by [`block::BlockServer`] and
@@ -266,6 +273,8 @@ impl SyscallBackend {
             data0: msg.data[0],
             reply_cap_handle,
             bulk: buf,
+            cap_slots: msg.cap_slots,
+            n_caps: msg.n_caps,
         })
     }
 }
@@ -520,6 +529,8 @@ pub(crate) mod mock {
             data0: 7,
             reply_cap_handle: 5,
             bulk: vec![1, 2, 3],
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
         mock.push_notification(0b1010_0101);
 
@@ -565,6 +576,8 @@ mod tests {
                 data0: 0x55,
                 reply_cap_handle: 7,
                 bulk: alloc::vec![1, 2, 3],
+                cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+                n_caps: 0,
             })
         );
     }

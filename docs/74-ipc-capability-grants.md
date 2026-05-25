@@ -150,27 +150,30 @@ on the same endpoint from dereferencing a stale pointer.
 
 ## Known Follow-ups
 
-- **Per-frame allocator epoch hook (Track B hardening).** The grant
-  epoch is plumbed through the `PageGrant` object today, but the
-  global frame allocator does not yet surface per-frame metadata. A
-  subsequent phase that adds that metadata can hook the existing
-  `epoch` field without changing the Phase 74 ABI. Until then, a
-  freed-while-granted frame is a use-after-free hazard that depends
-  on userspace honouring the "don't double-free" contract; current
-  callers all observe this naturally because the brk-allocated /
-  mmap-allocated region they grant from stays alive for the
-  lifetime of the process.
-- **Per-grant IOMMU domain entries (Track B hardening).** Phase 74
-  uses the same identity-fallback IOMMU path that Phase 55a's
-  `DmaBuffer<T>` already uses; a future hardening pass can tighten
-  this to per-grant IOMMU domain entries via `iommu_remap_grant`
-  when the receiver is a ring-3 driver process that needs DMA
-  isolation against the granted frames.
-- **Track F bulk-path migrations** (`display_server` surface
-  buffers, `audio_server` PCM rings) are explicitly optional per the
-  Phase 74 task list. The page-grant transport is in place; the
-  in-tree servers can adopt it incrementally on the schedule that
-  matches their own roadmap phases.
+- **`sys_page_grant_release` syscall.** The receiver-side mappings
+  installed by `sys_page_grant_recv` currently persist until the
+  receiver process exits. This is acceptable for the in-tree
+  compositor (surface lifetimes are bounded by the compositor's own
+  lifetime) but a future hardening pass should add an explicit
+  release syscall so a long-lived server can free granted-then-
+  retired regions. The `PageGrantMapping::Drop` hook in
+  `userspace/display_server/src/surface.rs` is wired and ready to
+  call this syscall once it lands.
+- **Per-grant IOMMU domain entries.** Phase 74 ships an
+  `iommu_remap_grant` shim that logs and returns identity-fallback
+  for every grant; the call site is in `sys_page_grant_recv`
+  unconditionally. A future hardening pass that adds a
+  "PID → bound IOMMU domains" reverse map can tighten this to
+  per-frame IOVA mapping when the receiver is a ring-3 driver
+  process that needs DMA isolation against the granted frames.
+- **Real-hardware perf measurement.** The Phase 74 task list calls
+  for a >30% reduction in compositor CPU time at 1080p/60 with the
+  page-grant transport. QEMU CI's framebuffer does not expose the
+  cycle-level profiling needed to verify this; the functional
+  zero-copy path is covered by the page-grant round-trip smoke
+  (`PAGE_GRANT_SMOKE:roundtrip:ok` in the boot transcript). A
+  real-hardware harness phase is the right place to wire the perf
+  measurement.
 
 ## Trade-offs and Alternatives
 

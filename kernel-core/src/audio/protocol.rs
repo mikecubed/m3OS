@@ -66,6 +66,13 @@ const OP_CLIENT_SUBMIT_FRAMES: u16 = 0x0002;
 const OP_CLIENT_DRAIN: u16 = 0x0003;
 const OP_CLIENT_CLOSE: u16 = 0x0004;
 const OP_CLIENT_CONTROL_COMMAND: u16 = 0x0005;
+/// Phase 74 Track F.2 — zero-copy PCM submission via Phase 74
+/// page-grant transport. The client transfers a
+/// `Capability::PageGrant` for its PCM ring alongside this message
+/// (via IPC `cap_slots`); the audio server consumes the grant and
+/// drains frames directly from the granted pages without re-copying
+/// the PCM data through the IPC bulk path.
+const OP_CLIENT_SUBMIT_FRAMES_PAGE_GRANT: u16 = 0x0006;
 
 // Server → client (0x0100..=0x01FF)
 const OP_SERVER_OPENED: u16 = 0x0101;
@@ -315,6 +322,21 @@ pub enum ClientMessage {
     /// PCM frames for the open stream. `len > MAX_SUBMIT_BYTES` is
     /// rejected at encode time as [`ProtocolError::PayloadTooLarge`].
     SubmitFrames { len: u32 },
+    /// Phase 74 Track F.2 — zero-copy PCM submission via page-grant
+    /// transport. The client transfers a `Capability::PageGrant` for
+    /// its PCM ring via the IPC message's `cap_slots`; the audio
+    /// server consumes the grant and drains frames directly from the
+    /// granted pages.
+    ///
+    /// `len` is the byte length of valid PCM data (≤ `n_pages * 4096`
+    /// and ≤ `MAX_SUBMIT_BYTES`). `cap_slot_index` is the index into
+    /// the IPC cap_slots the kernel wrote the receiver-side grant
+    /// handle into (typically `0`).
+    SubmitFramesPageGrant {
+        cap_slot_index: u32,
+        n_pages: u32,
+        len: u32,
+    },
     /// Block until every submitted frame has been consumed by the device.
     Drain,
     /// Close the open stream and release the device for the next opener.
@@ -393,6 +415,20 @@ impl ClientMessage {
                     body[0..4].copy_from_slice(&len.to_le_bytes());
                 })
             }
+            Self::SubmitFramesPageGrant {
+                cap_slot_index,
+                n_pages,
+                len,
+            } => {
+                if (*len as usize) > MAX_SUBMIT_BYTES {
+                    return Err(ProtocolError::PayloadTooLarge);
+                }
+                encode_fixed(buf, OP_CLIENT_SUBMIT_FRAMES_PAGE_GRANT, 12, |body| {
+                    body[0..4].copy_from_slice(&cap_slot_index.to_le_bytes());
+                    body[4..8].copy_from_slice(&n_pages.to_le_bytes());
+                    body[8..12].copy_from_slice(&len.to_le_bytes());
+                })
+            }
             Self::Drain => encode_fixed(buf, OP_CLIENT_DRAIN, 0, |_| {}),
             Self::Close => encode_fixed(buf, OP_CLIENT_CLOSE, 0, |_| {}),
             Self::ControlCommand(cmd) => {
@@ -432,6 +468,23 @@ impl ClientMessage {
                     return Err(ProtocolError::PayloadTooLarge);
                 }
                 Ok((Self::SubmitFrames { len }, total))
+            }
+            OP_CLIENT_SUBMIT_FRAMES_PAGE_GRANT => {
+                expect_body_len(body_len, 12)?;
+                let cap_slot_index = read_u32_at(body, 0)?;
+                let n_pages = read_u32_at(body, 4)?;
+                let len = read_u32_at(body, 8)?;
+                if (len as usize) > MAX_SUBMIT_BYTES {
+                    return Err(ProtocolError::PayloadTooLarge);
+                }
+                Ok((
+                    Self::SubmitFramesPageGrant {
+                        cap_slot_index,
+                        n_pages,
+                        len,
+                    },
+                    total,
+                ))
             }
             OP_CLIENT_DRAIN => {
                 expect_body_len(body_len, 0)?;

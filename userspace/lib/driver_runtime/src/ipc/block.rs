@@ -282,6 +282,8 @@ mod tests {
             data0: 0,
             reply_cap_handle: 0,
             bulk: read_request_bytes(0x42, 0x1000, 4, 0xdead_beef),
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = BlockServer::with_backend(endpoint(), mock);
@@ -343,6 +345,8 @@ mod tests {
             data0: 0,
             reply_cap_handle: 0,
             bulk: full,
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = BlockServer::with_backend(endpoint(), mock);
@@ -381,6 +385,8 @@ mod tests {
             data0: 0,
             reply_cap_handle: 0,
             bulk: garbage,
+            cap_slots: [0; syscall_lib::CAP_SLOTS_PER_MSG],
+            n_caps: 0,
         });
 
         let server = BlockServer::with_backend(endpoint(), mock);

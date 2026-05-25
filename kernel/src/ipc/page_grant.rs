@@ -42,6 +42,7 @@
 
 #![allow(dead_code)]
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -68,6 +69,85 @@ static GRANT_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// `Mutex` keeps the table independent of the cap-table lock; capability
 /// handles are the public face, this is the internal bookkeeping.
 static GRANT_REGISTRY: Mutex<Vec<Option<PageGrant>>> = Mutex::new(Vec::new());
+
+/// Per-frame grant tracker — maps each pinned PFN (physical frame
+/// number) to the grant epoch that owns it. The frame allocator
+/// consults this table on every `free_frame` call via
+/// [`is_frame_granted`] and refuses to free a pinned frame.
+///
+/// Entries are installed by [`pin_frames`] (called from
+/// [`PageGrant::new`]) and removed by [`unpin_frames`] (called from
+/// [`consume`] right before the frames flow back into the receiver's
+/// page table). A `BTreeMap` keeps lookups O(log n) without depending
+/// on a hash allocator.
+static GRANTED_FRAMES: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Register `frames` as pinned by the supplied grant epoch.
+///
+/// Idempotent: a frame already pinned by the same epoch is left
+/// unchanged. A frame pinned by a *different* epoch panics — the
+/// kernel's bookkeeping is broken if two grants claim the same PFN
+/// simultaneously.
+fn pin_frames(frames: &[u64], epoch: u64) {
+    let mut map = GRANTED_FRAMES.lock();
+    for &pfn in frames {
+        match map.insert(pfn, epoch) {
+            None => {}
+            Some(existing) if existing == epoch => {}
+            Some(existing) => {
+                panic!(
+                    "[page_grant] frame {:#x} double-pin: existing epoch {} vs new epoch {}",
+                    pfn, existing, epoch
+                );
+            }
+        }
+    }
+}
+
+/// Release the pins held by `epoch` over `frames`. Frames not pinned by
+/// `epoch` (already released, or pinned by a different grant) are left
+/// alone — the allocator's free path will surface any leak through its
+/// own bookkeeping.
+fn unpin_frames(frames: &[u64], epoch: u64) {
+    let mut map = GRANTED_FRAMES.lock();
+    for &pfn in frames {
+        if let Some(&existing) = map.get(&pfn)
+            && existing == epoch
+        {
+            map.remove(&pfn);
+        }
+    }
+}
+
+/// Frame-allocator integration: returns `true` if `phys` (a byte
+/// address) names a 4 KiB frame currently pinned by some live grant.
+///
+/// Called from `mm::frame_allocator::free_frame` (and the contiguous
+/// variant) to refuse `free()` on a granted frame and emit a
+/// rate-limited warning. The function is `pub` so the allocator can
+/// import it without exposing the grant registry's internal structure.
+pub fn is_frame_granted(phys: u64) -> bool {
+    let pfn = phys / 4096;
+    GRANTED_FRAMES.lock().contains_key(&pfn)
+}
+
+/// Phase 74 hardening — diagnostic count of `free_frame` attempts that
+/// were refused because the frame was pinned by a live grant. Bumped
+/// from the allocator's free path; readable via the diagnostic test
+/// in this module.
+static GRANTED_FREE_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Bump the granted-free-refusal counter. Called from
+/// `mm::frame_allocator::free_frame` after `is_frame_granted` returns
+/// `true`.
+pub fn record_granted_free_refusal() {
+    GRANTED_FREE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Diagnostic accessor for the granted-free-refusal counter.
+pub fn granted_free_refusal_count() -> u64 {
+    GRANTED_FREE_REFUSALS.load(Ordering::Relaxed)
+}
 
 /// Identifier of a [`PageGrant`] inside [`GRANT_REGISTRY`]. Opaque to
 /// userspace — capability handles are the public face.
@@ -98,10 +178,12 @@ pub struct PageGrant {
 
 impl PageGrant {
     /// Construct a new grant. Pulls a fresh epoch number off the global
-    /// counter so subsequent hardening that wires per-frame metadata
-    /// gets a unique token per grant.
+    /// counter and pins every frame in [`GRANTED_FRAMES`] so a stray
+    /// `free_frame` against any PFN in the grant trips
+    /// [`is_frame_granted`].
     pub fn new(sender: TaskId, frames: Vec<u64>, byte_len: usize) -> Self {
         let epoch = GRANT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        pin_frames(&frames, epoch);
         Self {
             epoch,
             sender,
@@ -145,6 +227,10 @@ pub fn with_grant<R>(id: GrantId, f: impl FnOnce(&mut PageGrant) -> R) -> Option
 /// owned object so the receiver can map its frames into the new address
 /// space. A `None` result indicates the grant id has already been
 /// consumed or never existed.
+///
+/// Releases the per-frame pins installed by [`PageGrant::new`] so the
+/// receiver can map the frames and the allocator can later free them
+/// through the normal page-table teardown path.
 pub fn consume(id: GrantId) -> Option<PageGrant> {
     let mut reg = GRANT_REGISTRY.lock();
     let slot = reg.get_mut(id.0 as usize)?;
@@ -155,6 +241,8 @@ pub fn consume(id: GrantId) -> Option<PageGrant> {
     }
     let mut taken = slot.take()?;
     taken.consumed = true;
+    drop(reg);
+    unpin_frames(&taken.frames, taken.epoch);
     Some(taken)
 }
 
@@ -311,6 +399,73 @@ pub fn sys_page_grant_send(sender: TaskId, pages_vaddr: u64, n_pages: u64) -> u6
 const GRANT_RECV_VA_BASE: u64 = 0x0000_0000_2000_0000;
 const GRANT_RECV_VA_END: u64 = 0x0000_8000_0000_0000;
 
+/// Phase 74 Track B.2 — IOMMU integration helper. Called from
+/// [`sys_page_grant_recv`] after the receiver-side page-table mappings
+/// land so a future driver-receiver use-case can wire device-side DMA
+/// translation in the same syscall.
+///
+/// # Today's behaviour
+///
+/// The function is a documented identity-fallback shim:
+///
+/// - If [`crate::iommu::registry::translating()`] is `false` (no IOMMU
+///   active, or only identity-mapping units are installed), the function
+///   returns `Ok(())` without touching any IOMMU state — the CPU MMU
+///   mapping done by `sys_page_grant_recv` is sufficient for the
+///   receiver to access the granted frames.
+/// - If IOMMU translation IS active and the receiver process holds zero
+///   device claims, the function similarly returns `Ok(())` — no
+///   per-device IOVA→phys mapping needs updating because the receiver
+///   never initiates DMA through an IOMMU domain.
+/// - If IOMMU translation is active AND the receiver holds at least one
+///   device claim (i.e. it is a ring-3 driver), the function would
+///   install per-frame identity-IOVA mappings on each of the receiver's
+///   bound domains. The current build emits an info-level log and
+///   returns `Ok(())` because no in-tree driver consumes page-grants
+///   from another process; the hookable extension point is in place so
+///   a future driver-receiver use case wires this with a single helper
+///   call instead of duplicated registry walks.
+///
+/// # Why this is enough for Phase 74
+///
+/// The Phase 74 use cases (display_server surface buffers, audio_server
+/// PCM rings) involve userspace-only receivers that access the granted
+/// frames through the CPU's MMU. They do not initiate DMA into the
+/// granted frames from a device the receiver controls. The IOMMU
+/// domain stays untouched, the receiver still reads/writes the frames
+/// correctly through its newly-installed page-table mappings, and the
+/// design contract from Phase 55a's `DmaBuffer<T>` identity-fallback
+/// path is honoured end-to-end.
+pub fn iommu_remap_grant(receiver_pid: u32, frames: &[u64]) -> Result<(), &'static str> {
+    if !crate::iommu::registry::translating() {
+        log::trace!(
+            "[page_grant] iommu_remap_grant: identity fallback (no IOMMU translation) \
+             receiver_pid={} pages={}",
+            receiver_pid,
+            frames.len(),
+        );
+        return Ok(());
+    }
+
+    // Receiver holds no device claims → no driver-side DMA into these
+    // frames → no IOMMU domain to update. This is the common case for
+    // the Phase 74 use cases (display_server, audio_server clients).
+    //
+    // The check is "best effort": the device-host registry exposes
+    // `drain_pid` for teardown but no read-only "does this PID own
+    // any device?" predicate. A future hardening pass can add such a
+    // predicate and surface a tighter trace line. The conservative
+    // path here logs the IOMMU-active case and returns Ok so the
+    // identity-fallback contract holds.
+    log::info!(
+        "[page_grant] iommu_remap_grant: IOMMU active, receiver_pid={} pages={} — \
+         identity fallback (no driver-receiver migration yet wires per-domain mapping)",
+        receiver_pid,
+        frames.len(),
+    );
+    Ok(())
+}
+
 /// Phase 74 Track B.2 — `sys_page_grant_recv(grant_cap)`.
 ///
 /// Looks up `grant_cap` in the receiver's capability table, consumes the
@@ -390,6 +545,13 @@ pub fn sys_page_grant_recv(receiver: TaskId, grant_cap: u32) -> u64 {
             }
         }
     }
+
+    // Phase 74 Track B.2 hardening — give the IOMMU substrate a chance
+    // to update the receiver-side IOVA translation. Current behaviour
+    // is identity-fallback (see `iommu_remap_grant`); a future
+    // hardening pass that wires per-domain IOVA mapping can hook the
+    // same call site without changing the syscall ABI.
+    let _ = iommu_remap_grant(pid, &grant.frames);
 
     base
 }

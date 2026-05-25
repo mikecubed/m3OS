@@ -951,8 +951,16 @@ fn ipc_recv_msg(
         return u64::MAX;
     }
 
-    // Write the IpcMessage header (label + 4 data words = 40 bytes) to
-    // userspace.  Layout must match syscall_lib::IpcMessage.
+    // Write the cap-bearing IpcMessage (label + 4 data words + cap_slots
+    // + n_caps = 56 bytes) to userspace. Layout matches the Phase 74
+    // syscall_lib::IpcMessage.
+    //
+    // Phase 74 Track F.1 — bumped from 40 bytes to 56 bytes so legacy
+    // recv callers automatically see Phase 74 cap_slots when a sender
+    // transfers caps through them. All in-tree userspace IpcMessage
+    // values were bumped to 56 bytes in the Phase 74 syscall-lib edit;
+    // pre-Phase-74 callers observe `n_caps = 0` (the default) and
+    // identical legacy behaviour.
     //
     // `msg.data[1]` is preserved as the sender wrote it: for messages from
     // `ipc_send_with_bulk` it's the bulk length, but kernel-internal IPC
@@ -962,12 +970,7 @@ fn ipc_recv_msg(
     // which made doom's WAD-directory load return the same first chunk
     // repeatedly and the lump-name lookup miss `PNAMES`.
     if msg_ptr != 0 {
-        let mut header = [0u8; 40];
-        header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
-        for (i, &d) in msg.data.iter().enumerate() {
-            let off = 8 + i * 8;
-            header[off..off + 8].copy_from_slice(&d.to_ne_bytes());
-        }
+        let header = build_cap_msg_wire(&msg);
         if UserSliceWo::new(msg_ptr, header.len())
             .and_then(|s| s.copy_from_kernel(&header))
             .is_err()
@@ -1040,13 +1043,13 @@ fn ipc_try_recv_msg(
     // chasing (display_server seeing `bulk_len=24` with stale `bulk_buf`
     // bytes) now needs a fix that doesn't conflate the size carried in
     // `data[1]` with whatever value the userspace protocol carries there.
+    //
+    // Phase 74 Track F.1 — header bumped from 40 to 56 bytes via
+    // `build_cap_msg_wire` so non-blocking recv callers also observe
+    // any Phase 74 cap_slots a sender transferred. See `ipc_recv_msg`
+    // for the wire-format rationale.
     if msg_ptr != 0 {
-        let mut header = [0u8; 40];
-        header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
-        for (i, &d) in msg.data.iter().enumerate() {
-            let off = 8 + i * 8;
-            header[off..off + 8].copy_from_slice(&d.to_ne_bytes());
-        }
+        let header = build_cap_msg_wire(&msg);
         if UserSliceWo::new(msg_ptr, header.len())
             .and_then(|s| s.copy_from_kernel(&header))
             .is_err()
@@ -1374,20 +1377,28 @@ fn write_cap_msg_to_user(msg_ptr: u64, msg: &message::Message) -> bool {
     if msg_ptr == 0 {
         return true;
     }
-    let mut wire = [0u8; CAP_MSG_WIRE_LEN];
-    wire[0..8].copy_from_slice(&msg.label.to_ne_bytes());
-    for i in 0..4 {
-        let off = 8 + i * 8;
-        wire[off..off + 8].copy_from_slice(&msg.data[i].to_ne_bytes());
-    }
-    for i in 0..kernel_core::ipc::message::CAP_SLOTS_PER_MSG {
-        let off = 40 + i * 4;
-        wire[off..off + 4].copy_from_slice(&msg.cap_slots[i].to_ne_bytes());
-    }
-    wire[48] = msg.n_caps;
+    let wire = build_cap_msg_wire(msg);
     UserSliceWo::new(msg_ptr, wire.len())
         .and_then(|s| s.copy_from_kernel(&wire))
         .is_ok()
+}
+
+/// Phase 74 Track F.1 — build the 56-byte cap-bearing wire form of `msg`.
+/// Shared by [`ipc_recv_msg`] / [`ipc_try_recv_msg`] / [`write_cap_msg_to_user`]
+/// so the cap_slot delivery format stays one source of truth.
+fn build_cap_msg_wire(msg: &message::Message) -> [u8; CAP_MSG_WIRE_LEN] {
+    let mut wire = [0u8; CAP_MSG_WIRE_LEN];
+    wire[0..8].copy_from_slice(&msg.label.to_ne_bytes());
+    for (i, &d) in msg.data.iter().enumerate() {
+        let off = 8 + i * 8;
+        wire[off..off + 8].copy_from_slice(&d.to_ne_bytes());
+    }
+    for (i, &h) in msg.cap_slots.iter().enumerate() {
+        let off = 40 + i * 4;
+        wire[off..off + 4].copy_from_slice(&h.to_ne_bytes());
+    }
+    wire[48] = msg.n_caps;
+    wire
 }
 
 /// Phase 74 Track A.2 / A.3 — `sys_ipc_call_with_caps(ep, msg_ptr, buf_ptr, buf_len)`.

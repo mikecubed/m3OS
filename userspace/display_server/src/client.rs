@@ -263,32 +263,45 @@ pub fn dispatch(frame: InboundFrame<'_>, registry: &mut SurfaceRegistry) -> Disp
                     out.closed = true;
                     out.closed_client_token = Some(client_token);
                 }
-                ref other => match registry.handle_message(other) {
-                    Ok(result) => {
-                        out.outbound.extend(result.outbound);
-                        out.created.extend(result.created);
-                        out.destroyed.extend(result.destroyed);
+                ref other => {
+                    // Phase 74 Track F.1 — publish the IPC cap_slots
+                    // into the registry's per-dispatch scratch so the
+                    // `AttachPageGrantBuffer` handler can look up the
+                    // receiver-side grant cap by index. Clear after
+                    // dispatch so a stray cap from one message cannot
+                    // leak into the next.
+                    registry.set_pending_caps(frame.header.cap_slots, frame.header.n_caps);
+                    let result = registry.handle_message(other);
+                    registry.clear_pending_caps();
+                    match result {
+                        Ok(result) => {
+                            out.outbound.extend(result.outbound);
+                            out.created.extend(result.created);
+                            out.destroyed.extend(result.destroyed);
+                        }
+                        Err(crate::surface::SurfaceShimError::ShmMapFailed { .. }) => {
+                            // SHM mapping failures are not a recoverable
+                            // verb error: without a backing buffer the
+                            // client's surface cannot progress. Treat as
+                            // fatal so the dispatcher disconnects and
+                            // forces a clean reconnect rather than
+                            // leaving the client permanently without a
+                            // committed buffer.
+                            return DispatchOutcome::fatal(FatalReason::ShmMapFailed);
+                        }
+                        Err(_) => {
+                            // Recoverable surface-shim errors
+                            // (UnknownSurface, DuplicateSurface,
+                            // StateMachine, PendingBulkIdMismatch,
+                            // ShmDimensionsTooLarge). The protocol
+                            // explicitly allows the server to reply with
+                            // an error message rather than disconnect
+                            // on these; Phase 56's minimum behaviour is
+                            // to log via the dispatcher and let the
+                            // client recover.
+                        }
                     }
-                    Err(crate::surface::SurfaceShimError::ShmMapFailed { .. }) => {
-                        // SHM mapping failures are not a recoverable verb
-                        // error: without a backing buffer the client's
-                        // surface cannot progress. Treat as fatal so the
-                        // dispatcher disconnects and forces a clean
-                        // reconnect rather than leaving the client
-                        // permanently without a committed buffer.
-                        return DispatchOutcome::fatal(FatalReason::ShmMapFailed);
-                    }
-                    Err(_) => {
-                        // Recoverable surface-shim errors
-                        // (UnknownSurface, DuplicateSurface, StateMachine,
-                        // PendingBulkIdMismatch, ShmDimensionsTooLarge).
-                        // The protocol explicitly allows the server to
-                        // reply with an error message rather than
-                        // disconnect on these; Phase 56's minimum
-                        // behaviour is to log via the dispatcher and let
-                        // the client recover.
-                    }
-                },
+                }
             },
             Err(_) => {
                 return DispatchOutcome::fatal(FatalReason::VerbDecode);
