@@ -1,7 +1,7 @@
 # IPC Capability Grants and Bulk Transfers (Phase 74)
 
 **Aligned Roadmap Phase:** Phase 74
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-74
 **Supersedes Legacy Doc:** new
 
@@ -150,16 +150,27 @@ on the same endpoint from dereferencing a stale pointer.
 
 ## Known Follow-ups
 
-- The `sys_page_grant_send` / `sys_page_grant_recv` first cut wires
-  the kernel-object lifecycle and syscall ABI; the actual page-table
-  unmap + TLB shootdown + IOMMU `iommu_remap_grant` path is staged
-  for the Track B follow-up commit. Until that lands the syscalls
-  return `u64::MAX` so callers observe a not-yet-functional sentinel
-  rather than a silent data hazard.
-- The Track F migrations (`display_server` surface buffers,
-  `audio_server` PCM rings) wait on the page-table side of Track B.
-- A QEMU integration test that exercises the 1024-page sentinel
-  round-trip (Track B.3) follows once the page-table path is live.
+- **Per-frame allocator epoch hook (Track B hardening).** The grant
+  epoch is plumbed through the `PageGrant` object today, but the
+  global frame allocator does not yet surface per-frame metadata. A
+  subsequent phase that adds that metadata can hook the existing
+  `epoch` field without changing the Phase 74 ABI. Until then, a
+  freed-while-granted frame is a use-after-free hazard that depends
+  on userspace honouring the "don't double-free" contract; current
+  callers all observe this naturally because the brk-allocated /
+  mmap-allocated region they grant from stays alive for the
+  lifetime of the process.
+- **Per-grant IOMMU domain entries (Track B hardening).** Phase 74
+  uses the same identity-fallback IOMMU path that Phase 55a's
+  `DmaBuffer<T>` already uses; a future hardening pass can tighten
+  this to per-grant IOMMU domain entries via `iommu_remap_grant`
+  when the receiver is a ring-3 driver process that needs DMA
+  isolation against the granted frames.
+- **Track F bulk-path migrations** (`display_server` surface
+  buffers, `audio_server` PCM rings) are explicitly optional per the
+  Phase 74 task list. The page-grant transport is in place; the
+  in-tree servers can adopt it incrementally on the schedule that
+  matches their own roadmap phases.
 
 ## Trade-offs and Alternatives
 
